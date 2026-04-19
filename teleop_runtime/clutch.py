@@ -35,6 +35,23 @@ class DeltaClutchController:
     def __init__(self, state: ClutchState | None = None):
         self.state = state if state is not None else ClutchState()
 
+    def reanchor(
+        self,
+        side: str,
+        *,
+        human_pose_reference: np.ndarray,
+        robot_pose_target: np.ndarray,
+        timestamp: float,
+        clutch_pressed: bool | None = None,
+    ) -> None:
+        self.state.anchors[side] = ClutchAnchor(
+            human_pose_reference=as_pose_matrix(human_pose_reference),
+            robot_pose_target=as_pose_matrix(robot_pose_target),
+            timestamp=float(timestamp),
+        )
+        if clutch_pressed is not None:
+            self.state.pressed[side] = bool(clutch_pressed)
+
     def update(
         self,
         side: str,

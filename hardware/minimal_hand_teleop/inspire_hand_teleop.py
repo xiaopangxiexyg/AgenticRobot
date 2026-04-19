@@ -22,6 +22,10 @@ from hardware.teleop_hand.hand_q6_reader import (
     Q6_ORDER,
     SingleHandQ6Reader,
 )
+from teleop_runtime.hand_mapping import (
+    DEFAULT_INSPIRE_HAND_JOINT_ORDER,
+    TARGET_INSPIRE_HAND_Q6_ORDER,
+)
 
 ReaderType = Union[SingleHandQ6Reader, BimanualHandQ6Reader]
 
@@ -112,8 +116,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--joint-order",
         type=parse_joint_order,
-        default=np.asarray([5, 4, 3, 2, 0, 1], dtype=np.int64),
-        help="Permutation applied to input q6 before sending, e.g. 0,1,2,3,4,5",
+        default=np.asarray(DEFAULT_INSPIRE_HAND_JOINT_ORDER, dtype=np.int64),
+        help=(
+            "Permutation applied to input q6 before sending. "
+            f"Default maps reader q6 into InspireTac q6 order {list(TARGET_INSPIRE_HAND_Q6_ORDER)}, "
+            "for example 0,1,2,3,4,5 keeps the source order unchanged."
+        ),
     )
     parser.add_argument(
         "--gain",
@@ -290,6 +298,7 @@ def main() -> None:
     )
 
     print(f"[Config] q6_order={Q6_ORDER}")
+    print(f"[Config] inspire_q6_order={list(TARGET_INSPIRE_HAND_Q6_ORDER)}")
     print(
         "[Config] "
         f"mode={'dry-run' if args.dry_run else 'hardware'} "

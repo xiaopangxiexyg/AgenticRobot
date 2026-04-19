@@ -155,6 +155,7 @@ class VivePoseSource(ObservationSource):
                 "tracker_name": tracker_name or config.name,
                 "role": tracker_role or config.role,
                 "valid": valid,
+                "error": tracker.get("error"),
                 "config": config,
             }
         return parsed
@@ -213,13 +214,20 @@ class VivePoseSource(ObservationSource):
             tracker_payload = latest.get(config.channel_name)
             if tracker_payload is None:
                 continue
+            receiver_timestamp = tracker_payload.get("receiver_timestamp")
+            sender_timestamp = tracker_payload.get("timestamp")
+            channel_timestamp = (
+                float(receiver_timestamp)
+                if receiver_timestamp is not None
+                else float(sender_timestamp)
+            )
             channels[config.channel_name] = ObservationChannel(
                 channel_name=config.channel_name,
                 capability="pose6d",
                 side=config.side,
                 value=np.asarray(tracker_payload["pose"], dtype=float).copy(),
                 frame_name="vive_world",
-                timestamp=float(tracker_payload["timestamp"]),
+                timestamp=channel_timestamp,
                 source_name=self.name,
                 valid=bool(tracker_payload["valid"]),
                 critical=config.critical,
@@ -227,7 +235,9 @@ class VivePoseSource(ObservationSource):
                     "tracker_name": tracker_payload.get("tracker_name", config.name),
                     "tracker_role": tracker_payload.get("role", config.role),
                     "seq": tracker_payload.get("seq"),
-                    "receiver_timestamp": tracker_payload.get("receiver_timestamp"),
+                    "receiver_timestamp": receiver_timestamp,
+                    "sender_timestamp": sender_timestamp,
+                    "sender_error": tracker_payload.get("error"),
                 },
             )
         return channels

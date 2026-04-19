@@ -7,7 +7,11 @@ from typing import Any
 
 import numpy as np
 
+from .tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
 from .transforms import as_pose_matrix, clip_pose_translation, identity_pose, invert_pose
+
+VIRTUAL_DESK_SWEEP_CONVENTION_VERSION = 2
+DEFAULT_VIRTUAL_DESK_POST_YAW_DEG = 180.0
 
 
 def _array_or_none(value: Any) -> np.ndarray | None:
@@ -30,6 +34,22 @@ def _to_serializable(value: Any) -> Any:
     return value
 
 
+def _yaw_pose_deg(yaw_deg: float) -> np.ndarray:
+    yaw_rad = np.deg2rad(float(yaw_deg))
+    cos_yaw = float(np.cos(yaw_rad))
+    sin_yaw = float(np.sin(yaw_rad))
+    pose = identity_pose()
+    pose[:3, :3] = np.array(
+        [
+            [cos_yaw, -sin_yaw, 0.0],
+            [sin_yaw, cos_yaw, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    return pose
+
+
 @dataclass
 class DeskFrameConfig:
     name: str = "desk"
@@ -48,8 +68,8 @@ class ArmCalibration:
     home_qpos: np.ndarray | None = None
     home_pose_debug: np.ndarray | None = None
     home_pose_fine: np.ndarray | None = None
-    tcp_debug_frame: str = "rm_eef"
-    tcp_fine_frame: str = "hand_base"
+    tcp_debug_frame: str = HAND_BASE_TCP_FRAME
+    tcp_fine_frame: str = HAND_BASE_TCP_FRAME
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -59,20 +79,26 @@ class ArmCalibration:
         self.home_qpos = _array_or_none(self.home_qpos)
         self.home_pose_debug = _array_or_none(self.home_pose_debug)
         self.home_pose_fine = _array_or_none(self.home_pose_fine)
+        active_home_pose = self.home_pose_fine
+        if active_home_pose is None:
+            active_home_pose = self.home_pose_debug
+        if active_home_pose is not None:
+            pose = as_pose_matrix(active_home_pose)
+            self.home_pose_debug = pose.copy()
+            self.home_pose_fine = pose.copy()
+        self.tcp_debug_frame = HAND_BASE_TCP_FRAME
+        self.tcp_fine_frame = HAND_BASE_TCP_FRAME
 
-    def tcp_frame_name(self, tcp_mode: str) -> str:
-        if tcp_mode == "rm_eef":
-            return self.tcp_debug_frame
-        if tcp_mode == "hand_base":
-            return self.tcp_fine_frame
-        raise ValueError(f"Unsupported tcp_mode: {tcp_mode}")
+    def tcp_frame_name(self, tcp_mode: str | None = None) -> str:
+        return canonical_tcp_frame(tcp_mode)
 
-    def home_pose_for_tcp_mode(self, tcp_mode: str) -> np.ndarray | None:
-        if tcp_mode == "rm_eef":
-            return None if self.home_pose_debug is None else self.home_pose_debug.copy()
-        if tcp_mode == "hand_base":
-            return None if self.home_pose_fine is None else self.home_pose_fine.copy()
-        raise ValueError(f"Unsupported tcp_mode: {tcp_mode}")
+    def home_pose_for_tcp_mode(self, tcp_mode: str | None = None) -> np.ndarray | None:
+        _ = canonical_tcp_frame(tcp_mode)
+        if self.home_pose_fine is not None:
+            return self.home_pose_fine.copy()
+        if self.home_pose_debug is not None:
+            return self.home_pose_debug.copy()
+        return None
 
 
 @dataclass
@@ -129,17 +155,28 @@ class TeleopCalibration:
         if effector_name in self.arms:
             self.arms[effector_name].home_qpos = qpos_array.copy()
 
-    def capture_home_pose(self, effector_name: str, pose: Any, *, tcp_mode: str) -> None:
+    def capture_home_pose(
+        self,
+        effector_name: str,
+        pose: Any,
+        *,
+        tcp_mode: str | None = None,
+    ) -> None:
         pose_matrix = as_pose_matrix(pose)
         if effector_name not in self.arms:
             raise KeyError(f"No arm calibration registered for effector '{effector_name}'.")
-        if tcp_mode == "rm_eef":
-            self.arms[effector_name].home_pose_debug = pose_matrix
-            return
-        if tcp_mode == "hand_base":
-            self.arms[effector_name].home_pose_fine = pose_matrix
-            return
-        raise ValueError(f"Unsupported tcp_mode: {tcp_mode}")
+        _ = canonical_tcp_frame(tcp_mode)
+        self.arms[effector_name].home_pose_debug = pose_matrix.copy()
+        self.arms[effector_name].home_pose_fine = pose_matrix.copy()
+
+    def clear_home_state(self) -> None:
+        self.captured_home_qpos = {}
+        for arm in self.arms.values():
+            arm.home_qpos = None
+            arm.home_pose_debug = None
+            arm.home_pose_fine = None
+        self.metadata.pop("home_capture", None)
+        self.metadata.pop("home_ready", None)
 
     def get_tracker_offset(self, tracker_role: str) -> np.ndarray:
         return self.tracker_offsets.get(tracker_role, identity_pose()).copy()
@@ -178,12 +215,68 @@ class TeleopCalibration:
             side=side,
         )
 
-    def target_frame_name(self, side: str, tcp_mode: str) -> str:
+    def target_frame_name(self, side: str, tcp_mode: str | None = None) -> str:
         return self.get_arm_for_side(side).tcp_frame_name(tcp_mode)
 
     def clip_pose_to_workspace(self, pose_desk: Any, side: str) -> np.ndarray:
         arm = self.get_arm_for_side(side)
         return clip_pose_translation(pose_desk, arm.workspace_min, arm.workspace_max)
+
+    def _apply_virtual_desk_post_rotation(self, yaw_deg: float, *, update_offsets: bool) -> None:
+        current_world_to_desk = self.world_to_desk_pose()
+        if current_world_to_desk is None:
+            return
+
+        post_rotation = _yaw_pose_deg(yaw_deg)
+        self.set_world_to_desk(current_world_to_desk @ post_rotation)
+        self.metadata["virtual_desk_post_yaw_deg"] = float(yaw_deg)
+
+        virtual_desk_metadata = self.metadata.get("virtual_desk")
+        if isinstance(virtual_desk_metadata, dict):
+            updated_world_to_desk = self.world_to_desk_pose()
+            if updated_world_to_desk is not None:
+                virtual_desk_metadata["T_W_V"] = updated_world_to_desk.tolist()
+                rotation = updated_world_to_desk[:3, :3]
+                virtual_desk_metadata["x_axis_world"] = rotation[:, 0].tolist()
+                virtual_desk_metadata["y_axis_world"] = rotation[:, 1].tolist()
+                virtual_desk_metadata["z_axis_world"] = rotation[:, 2].tolist()
+
+        if not update_offsets:
+            return
+
+        tracker_metadata = self.metadata.get("tracker_offset_calibration")
+        for tracker_role, current_offset in tuple(self.tracker_offsets.items()):
+            updated_offset = as_pose_matrix(current_offset) @ post_rotation
+            self.tracker_offsets[str(tracker_role)] = updated_offset
+            if not isinstance(tracker_metadata, dict):
+                continue
+            tracker_info = tracker_metadata.get(str(tracker_role))
+            if not isinstance(tracker_info, dict):
+                continue
+            if tracker_info.get("coarse_offset") is not None:
+                tracker_info["coarse_offset"] = updated_offset.tolist()
+            if tracker_info.get("final_offset") is not None:
+                tracker_info["final_offset"] = updated_offset.tolist()
+            if tracker_info.get("fine_tune_rpy_deg") is not None:
+                tracker_info["fine_tune_rpy_deg"] = [0.0, 0.0, 0.0]
+
+    def ensure_virtual_desk_scene_alignment(self) -> bool:
+        calibration_mode = str(self.metadata.get("calibration_mode", ""))
+        if calibration_mode != "vive_rm65_virtual_desk":
+            return False
+
+        explicit_post_yaw = self.metadata.get("virtual_desk_post_yaw_deg")
+        if explicit_post_yaw is None:
+            self._apply_virtual_desk_post_rotation(
+                DEFAULT_VIRTUAL_DESK_POST_YAW_DEG,
+                update_offsets=True,
+            )
+            self.metadata["virtual_desk_scene_alignment_defaulted"] = True
+
+        self.metadata["virtual_desk_sweep_convention_version"] = (
+            VIRTUAL_DESK_SWEEP_CONVENTION_VERSION
+        )
+        return explicit_post_yaw is None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -199,10 +292,8 @@ class TeleopCalibration:
                     "workspace_min": _to_serializable(arm.workspace_min),
                     "workspace_max": _to_serializable(arm.workspace_max),
                     "home_qpos": _to_serializable(arm.home_qpos),
-                    "home_pose_debug": _to_serializable(arm.home_pose_debug),
-                    "home_pose_fine": _to_serializable(arm.home_pose_fine),
-                    "tcp_debug_frame": arm.tcp_debug_frame,
-                    "tcp_fine_frame": arm.tcp_fine_frame,
+                    "home_pose": _to_serializable(arm.home_pose_for_tcp_mode()),
+                    "tcp_frame": arm.tcp_frame_name(),
                     "metadata": _to_serializable(arm.metadata),
                 }
                 for name, arm in self.arms.items()
@@ -227,15 +318,36 @@ class TeleopCalibration:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TeleopCalibration":
         desk_payload = payload.get("desk_frame", {})
-        arms = {
-            name: ArmCalibration(**arm_payload)
-            for name, arm_payload in payload.get("arms", {}).items()
-        }
+        arms: dict[str, ArmCalibration] = {}
+        for name, arm_payload in payload.get("arms", {}).items():
+            home_pose = arm_payload.get("home_pose")
+            if home_pose is None:
+                home_pose = arm_payload.get("home_pose_fine")
+            if home_pose is None:
+                home_pose = arm_payload.get("home_pose_debug")
+            tcp_frame = arm_payload.get("tcp_frame")
+            if tcp_frame is None:
+                tcp_frame = arm_payload.get("tcp_fine_frame")
+            if tcp_frame is None:
+                tcp_frame = arm_payload.get("tcp_debug_frame")
+            arms[name] = ArmCalibration(
+                name=arm_payload["name"],
+                side=arm_payload["side"],
+                T_D_B=arm_payload.get("T_D_B"),
+                workspace_min=arm_payload.get("workspace_min"),
+                workspace_max=arm_payload.get("workspace_max"),
+                home_qpos=arm_payload.get("home_qpos"),
+                home_pose_debug=home_pose,
+                home_pose_fine=home_pose,
+                tcp_debug_frame=canonical_tcp_frame(tcp_frame),
+                tcp_fine_frame=canonical_tcp_frame(tcp_frame),
+                metadata=arm_payload.get("metadata", {}),
+            )
         hands = {
             name: HandCalibration(**hand_payload)
             for name, hand_payload in payload.get("hands", {}).items()
         }
-        return cls(
+        calibration = cls(
             desk_frame=DeskFrameConfig(
                 name=desk_payload.get("name", "desk"),
                 axes=desk_payload.get("axes", {"x": "forward", "y": "left", "z": "up"}),
@@ -248,6 +360,8 @@ class TeleopCalibration:
             captured_home_qpos=payload.get("captured_home_qpos", {}),
             metadata=payload.get("metadata", {}),
         )
+        calibration.ensure_virtual_desk_scene_alignment()
+        return calibration
 
     def save_json(self, path: str | Path) -> None:
         path = Path(path)

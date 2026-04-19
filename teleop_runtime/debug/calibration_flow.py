@@ -16,6 +16,12 @@ def _normalize(vector: Any) -> np.ndarray:
     return array / norm
 
 
+def _angle_deg(a: Any, b: Any) -> float:
+    a_unit = _normalize(a)
+    b_unit = _normalize(b)
+    return float(np.rad2deg(np.arccos(np.clip(np.dot(a_unit, b_unit), -1.0, 1.0))))
+
+
 def pose_from_rotation_translation(rotation: Any, translation: Any) -> np.ndarray:
     pose = identity_pose()
     pose[:3, :3] = np.asarray(rotation, dtype=float).reshape(3, 3)
@@ -116,6 +122,11 @@ class VirtualDeskCalibrationResult:
     xy_non_orthogonality_deg: float
     xz_non_orthogonality_deg: float
     yz_non_orthogonality_deg: float
+    x_axis_correction_deg: float
+    y_axis_correction_deg: float
+    z_axis_correction_deg: float
+    z_axis_alignment_before_flip_deg: float
+    handedness_flip_applied: bool
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -127,6 +138,11 @@ class VirtualDeskCalibrationResult:
             "xy_non_orthogonality_deg": self.xy_non_orthogonality_deg,
             "xz_non_orthogonality_deg": self.xz_non_orthogonality_deg,
             "yz_non_orthogonality_deg": self.yz_non_orthogonality_deg,
+            "x_axis_correction_deg": self.x_axis_correction_deg,
+            "y_axis_correction_deg": self.y_axis_correction_deg,
+            "z_axis_correction_deg": self.z_axis_correction_deg,
+            "z_axis_alignment_before_flip_deg": self.z_axis_alignment_before_flip_deg,
+            "handedness_flip_applied": self.handedness_flip_applied,
             "x_fit": self.x_fit.to_metadata(),
             "y_fit": self.y_fit.to_metadata(),
             "z_fit": self.z_fit.to_metadata(),
@@ -178,16 +194,19 @@ def fit_virtual_desk_frame(
     y_fit = fit_signed_axis_from_poses(y_sweep_poses)
     z_fit = fit_signed_axis_from_poses(z_sweep_poses)
 
-    x_axis = _normalize(x_fit.axis_world)
+    x_raw = _normalize(x_fit.axis_world)
     y_raw = _normalize(y_fit.axis_world)
-    y_axis = y_raw - float(np.dot(y_raw, x_axis)) * x_axis
-    y_axis = _normalize(y_axis)
-    z_axis = _normalize(np.cross(x_axis, y_axis))
-
-    z_hint = _normalize(z_fit.axis_world)
-    if float(np.dot(z_axis, z_hint)) < 0.0:
+    z_raw = _normalize(z_fit.axis_world)
+    y_projected = y_raw - float(np.dot(y_raw, x_raw)) * x_raw
+    y_axis = _normalize(y_projected)
+    z_axis = _normalize(np.cross(x_raw, y_axis))
+    z_axis_alignment_before_flip_deg = _angle_deg(z_axis, z_raw)
+    handedness_flip_applied = False
+    if float(np.dot(z_axis, z_raw)) < 0.0:
         y_axis = -y_axis
         z_axis = -z_axis
+        handedness_flip_applied = True
+    x_axis = x_raw
 
     origin_world = np.mean(
         np.asarray([as_pose_matrix(pose)[:3, 3] for pose in neutral_poses], dtype=float),
@@ -198,9 +217,12 @@ def fit_virtual_desk_frame(
         origin_world,
     )
 
-    xy_non_orthogonality_deg = abs(90.0 - np.rad2deg(np.arccos(np.clip(np.dot(x_axis, y_raw), -1.0, 1.0))))
-    xz_non_orthogonality_deg = abs(90.0 - np.rad2deg(np.arccos(np.clip(np.dot(x_axis, z_hint), -1.0, 1.0))))
-    yz_non_orthogonality_deg = abs(90.0 - np.rad2deg(np.arccos(np.clip(np.dot(y_axis, z_axis), -1.0, 1.0))))
+    xy_non_orthogonality_deg = abs(90.0 - _angle_deg(x_raw, y_raw))
+    xz_non_orthogonality_deg = abs(90.0 - _angle_deg(x_raw, z_raw))
+    yz_non_orthogonality_deg = abs(90.0 - _angle_deg(y_raw, z_raw))
+    x_axis_correction_deg = _angle_deg(x_axis, x_raw)
+    y_axis_correction_deg = _angle_deg(y_axis, y_raw)
+    z_axis_correction_deg = _angle_deg(z_axis, z_raw)
 
     return VirtualDeskCalibrationResult(
         T_W_V=T_W_V,
@@ -214,6 +236,11 @@ def fit_virtual_desk_frame(
         xy_non_orthogonality_deg=float(xy_non_orthogonality_deg),
         xz_non_orthogonality_deg=float(xz_non_orthogonality_deg),
         yz_non_orthogonality_deg=float(yz_non_orthogonality_deg),
+        x_axis_correction_deg=float(x_axis_correction_deg),
+        y_axis_correction_deg=float(y_axis_correction_deg),
+        z_axis_correction_deg=float(z_axis_correction_deg),
+        z_axis_alignment_before_flip_deg=float(z_axis_alignment_before_flip_deg),
+        handedness_flip_applied=bool(handedness_flip_applied),
     )
 
 

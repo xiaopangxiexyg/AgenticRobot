@@ -38,9 +38,13 @@ class InspireTacHandBackend(EffectorBackend):
         self.hand = None
         self._lock = threading.Lock()
         self._last_sent_command: np.ndarray | None = None
+        self._last_sent_command_timestamp: float | None = None
         self._latest_joint_pos: np.ndarray | None = None
+        self._latest_joint_timestamp: float | None = None
         self._latest_tactile: np.ndarray | None = None
+        self._latest_tactile_timestamp: float | None = None
         self._latest_tactile_dict: dict[str, np.ndarray] | None = None
+        self._latest_telemetry_timestamp: float | None = None
         self._telemetry_error: str | None = None
         self._stop_event: threading.Event | None = None
         self._telemetry_thread: threading.Thread | None = None
@@ -54,11 +58,17 @@ class InspireTacHandBackend(EffectorBackend):
             return
         from hardware.inspire_tac.inspire_tac_modbus import InspireTacModbus
 
-        self.hand = InspireTacModbus(
-            ip=self.config.hand_ip,
-            port=self.config.port,
-            max_fingertip_force=self.config.max_fingertip_force,
-        )
+        try:
+            self.hand = InspireTacModbus(
+                ip=self.config.hand_ip,
+                port=self.config.port,
+                max_fingertip_force=self.config.max_fingertip_force,
+            )
+        except Exception as exc:
+            self.hand = None
+            self._telemetry_error = f"connect_failed: {exc}"
+            return
+        self._telemetry_error = None
         if self.config.enable_telemetry:
             self._stop_event = threading.Event()
             self._telemetry_thread = threading.Thread(
@@ -88,6 +98,7 @@ class InspireTacHandBackend(EffectorBackend):
             )
         target = np.clip(target, 0.0, 1.0)
 
+        command_time = time.time()
         if self._last_sent_command is not None:
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < self.config.send_threshold:
@@ -96,8 +107,32 @@ class InspireTacHandBackend(EffectorBackend):
         if self.hand is not None:
             with self._lock:
                 self.hand.set_joint_pos(target.tolist())
+            self._latest_joint_pos = target.copy()
+        else:
+            self._latest_joint_pos = target.copy()
 
         self._last_sent_command = target.copy()
+        self._last_sent_command_timestamp = command_time
+
+    @staticmethod
+    def _normalize_joint_pos(joint_pos: object) -> np.ndarray:
+        q6 = np.asarray(joint_pos, dtype=float).reshape(-1)
+        if q6.shape != (6,) or not np.all(np.isfinite(q6)):
+            raise ValueError(f"InspireTac read_joint_pos() returned invalid q6 shape {q6.shape}.")
+        return np.clip(q6, 0.0, 1.0)
+
+    def read_joint_pos_now(self) -> np.ndarray | None:
+        if self.hand is None:
+            return None
+        request_started_at = time.time()
+        with self._lock:
+            joint_pos = self.hand.read_joint_pos()
+        normalized = self._normalize_joint_pos(joint_pos)
+        self._latest_joint_pos = normalized.copy()
+        self._latest_joint_timestamp = request_started_at
+        self._latest_telemetry_timestamp = time.time()
+        self._telemetry_error = None
+        return normalized.copy()
 
     def _telemetry_loop(self) -> None:
         assert self._stop_event is not None
@@ -107,7 +142,10 @@ class InspireTacHandBackend(EffectorBackend):
                 with self._lock:
                     if self.hand is None:
                         return
-                    self._latest_joint_pos = np.asarray(self.hand.read_joint_pos(), dtype=float)
+                    joint_request_started_at = time.time()
+                    self._latest_joint_pos = self._normalize_joint_pos(self.hand.read_joint_pos())
+                    self._latest_joint_timestamp = joint_request_started_at
+                    tactile_request_started_at = time.time()
                     if self.config.tactile_regions:
                         tactile_vec, tactile_dict = self.hand.read_tac_data(
                             target_regions=list(self.config.tactile_regions)
@@ -115,9 +153,11 @@ class InspireTacHandBackend(EffectorBackend):
                     else:
                         tactile_vec, tactile_dict = self.hand.read_tac_data()
                 self._latest_tactile = np.asarray(tactile_vec, dtype=float)
+                self._latest_tactile_timestamp = tactile_request_started_at
                 self._latest_tactile_dict = {
                     name: np.asarray(value, dtype=float) for name, value in tactile_dict.items()
                 }
+                self._latest_telemetry_timestamp = time.time()
                 self._telemetry_error = None
             except Exception as exc:
                 self._telemetry_error = str(exc)
@@ -131,11 +171,16 @@ class InspireTacHandBackend(EffectorBackend):
             "last_sent_command": None
             if self._last_sent_command is None
             else self._last_sent_command.copy(),
+            "last_sent_command_timestamp": self._last_sent_command_timestamp,
             "joint_pos": None if self._latest_joint_pos is None else self._latest_joint_pos.copy(),
+            "joint_timestamp": self._latest_joint_timestamp,
             "tactile": None if self._latest_tactile is None else self._latest_tactile.copy(),
+            "tactile_timestamp": self._latest_tactile_timestamp,
             "tactile_dict": None
             if self._latest_tactile_dict is None
             else {name: value.copy() for name, value in self._latest_tactile_dict.items()},
+            "telemetry_timestamp": self._latest_telemetry_timestamp,
+            "tactile_regions": tuple(self.config.tactile_regions),
             "telemetry_error": self._telemetry_error,
         }
 

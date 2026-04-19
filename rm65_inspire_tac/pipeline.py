@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from xml.etree import ElementTree as ET
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -18,7 +19,7 @@ from .schemas import (
 )
 
 DEFAULT_LEFT_ARM_QPOS = np.array([1.57, -0.47, 1.94, 0.0, 0.70, -1.57], dtype=float)
-DEFAULT_RIGHT_ARM_QPOS = np.array([-1.57, -0.47, 1.94, 3.14, -0.70, -1.57], dtype=float)
+DEFAULT_RIGHT_ARM_QPOS = np.array([-1.57, -0.47, 1.94, 3.10, -0.70, -1.57], dtype=float)
 
 _POSE_TRANSFORM_LEFT = np.array(
     [
@@ -41,6 +42,51 @@ _POSE_TRANSFORM_RIGHT = np.array(
 
 
 @dataclass(frozen=True)
+class HandProxyBoxSpec:
+    name: str
+    side: Literal["left", "right"]
+    geometry_name: str
+    parent_link_name: str
+    box_size_xyz: tuple[float, float, float]
+    joint_origin_xyz: tuple[float, float, float]
+    joint_origin_rpy: tuple[float, float, float]
+    box_origin_xyz: tuple[float, float, float]
+    box_origin_rpy: tuple[float, float, float]
+    color_rgba: tuple[float, float, float, float]
+
+    def parent_to_box_pose_matrix(self) -> np.ndarray:
+        return _pose_matrix_from_xyz_rpy(
+            self.joint_origin_xyz,
+            self.joint_origin_rpy,
+        ) @ _pose_matrix_from_xyz_rpy(
+            self.box_origin_xyz,
+            self.box_origin_rpy,
+        )
+
+
+@dataclass(frozen=True)
+class FixedSceneBoxSpec:
+    name: str
+    geometry_name: str
+    parent_link_name: str
+    box_size_xyz: tuple[float, float, float]
+    joint_origin_xyz: tuple[float, float, float]
+    joint_origin_rpy: tuple[float, float, float]
+    box_origin_xyz: tuple[float, float, float]
+    box_origin_rpy: tuple[float, float, float]
+    color_rgba: tuple[float, float, float, float]
+
+    def world_to_box_pose_matrix(self) -> np.ndarray:
+        return _pose_matrix_from_xyz_rpy(
+            self.joint_origin_xyz,
+            self.joint_origin_rpy,
+        ) @ _pose_matrix_from_xyz_rpy(
+            self.box_origin_xyz,
+            self.box_origin_rpy,
+        )
+
+
+@dataclass(frozen=True)
 class DualArmSceneProfile:
     name: str
     urdf_path: Path
@@ -48,9 +94,155 @@ class DualArmSceneProfile:
     left_frame_name: str
     right_frame_name: str
     collision_pairs: tuple[tuple[str, str], ...]
+    hand_proxy_boxes: tuple[HandProxyBoxSpec, ...]
+    fixed_scene_boxes: tuple[FixedSceneBoxSpec, ...]
     left_pose_transform: np.ndarray
     right_pose_transform: np.ndarray
     solution_layout: Literal["auto", "dual_arm_hand"]
+
+
+def _parse_float_tuple(
+    text: str | None,
+    *,
+    count: int,
+    default: tuple[float, ...] | None = None,
+) -> tuple[float, ...]:
+    if text is None:
+        if default is None:
+            raise ValueError("Missing numeric tuple text.")
+        return default
+    values = tuple(float(value) for value in text.split())
+    if len(values) != count:
+        raise ValueError(f"Expected {count} values, got {values}.")
+    return values
+
+
+def _pose_matrix_from_xyz_rpy(
+    xyz: tuple[float, float, float],
+    rpy: tuple[float, float, float],
+) -> np.ndarray:
+    pose = np.eye(4, dtype=float)
+    pose[:3, :3] = R.from_euler("xyz", np.asarray(rpy, dtype=float)).as_matrix()
+    pose[:3, 3] = np.asarray(xyz, dtype=float)
+    return pose
+
+
+def _find_named_xml_element(root: ET.Element, tag: str, name: str) -> ET.Element:
+    for element in root.findall(tag):
+        if element.get("name") == name:
+            return element
+    raise ValueError(f"Could not find <{tag} name='{name}'> in scene URDF.")
+
+
+def _parse_origin(element: ET.Element) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    origin = element.find("origin")
+    if origin is None:
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+    xyz = _parse_float_tuple(origin.get("xyz"), count=3, default=(0.0, 0.0, 0.0))
+    rpy = _parse_float_tuple(origin.get("rpy"), count=3, default=(0.0, 0.0, 0.0))
+    return xyz, rpy
+
+
+def _extract_link_box_geometry(
+    link_element: ET.Element,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    for container_tag in ("collision", "visual"):
+        for container in link_element.findall(container_tag):
+            box = container.find("geometry/box")
+            if box is None:
+                continue
+            size = _parse_float_tuple(box.get("size"), count=3)
+            xyz, rpy = _parse_origin(container)
+            return size, xyz, rpy
+    raise ValueError(f"Link '{link_element.get('name')}' does not contain a box geometry.")
+
+
+def _extract_link_color_rgba(link_element: ET.Element) -> tuple[float, float, float, float]:
+    for visual in link_element.findall("visual"):
+        color = visual.find("material/color")
+        if color is None:
+            continue
+        return _parse_float_tuple(color.get("rgba"), count=4)
+    return (0.8, 0.8, 0.8, 0.25)
+
+
+def _build_hand_proxy_spec(
+    root: ET.Element,
+    *,
+    link_name: str,
+    side: Literal["left", "right"],
+) -> HandProxyBoxSpec:
+    link_element = _find_named_xml_element(root, "link", link_name)
+    size, box_origin_xyz, box_origin_rpy = _extract_link_box_geometry(link_element)
+    joint_element = None
+    for candidate in root.findall("joint"):
+        child = candidate.find("child")
+        if child is not None and child.get("link") == link_name:
+            joint_element = candidate
+            break
+    if joint_element is None:
+        raise ValueError(f"Could not find fixed joint for proxy link '{link_name}'.")
+    parent = joint_element.find("parent")
+    if parent is None or parent.get("link") is None:
+        raise ValueError(f"Proxy link '{link_name}' is missing a parent link in its joint.")
+    joint_origin_xyz, joint_origin_rpy = _parse_origin(joint_element)
+    return HandProxyBoxSpec(
+        name=link_name,
+        side=side,
+        geometry_name=f"{link_name}_0",
+        parent_link_name=parent.get("link"),
+        box_size_xyz=size,
+        joint_origin_xyz=joint_origin_xyz,
+        joint_origin_rpy=joint_origin_rpy,
+        box_origin_xyz=box_origin_xyz,
+        box_origin_rpy=box_origin_rpy,
+        color_rgba=_extract_link_color_rgba(link_element),
+    )
+
+
+def _build_fixed_scene_box_spec(
+    root: ET.Element,
+    *,
+    link_name: str,
+) -> FixedSceneBoxSpec:
+    link_element = _find_named_xml_element(root, "link", link_name)
+    size, box_origin_xyz, box_origin_rpy = _extract_link_box_geometry(link_element)
+    joint_element = None
+    for candidate in root.findall("joint"):
+        child = candidate.find("child")
+        if child is not None and child.get("link") == link_name:
+            joint_element = candidate
+            break
+    if joint_element is None:
+        raise ValueError(f"Could not find fixed joint for scene box link '{link_name}'.")
+    parent = joint_element.find("parent")
+    if parent is None or parent.get("link") is None:
+        raise ValueError(f"Scene box '{link_name}' is missing a parent link in its joint.")
+    joint_origin_xyz, joint_origin_rpy = _parse_origin(joint_element)
+    return FixedSceneBoxSpec(
+        name=link_name,
+        geometry_name=f"{link_name}_0",
+        parent_link_name=parent.get("link"),
+        box_size_xyz=size,
+        joint_origin_xyz=joint_origin_xyz,
+        joint_origin_rpy=joint_origin_rpy,
+        box_origin_xyz=box_origin_xyz,
+        box_origin_rpy=box_origin_rpy,
+        color_rgba=_extract_link_color_rgba(link_element),
+    )
+
+
+def _load_hand_proxy_boxes(urdf_path: Path) -> tuple[HandProxyBoxSpec, ...]:
+    root = ET.parse(urdf_path).getroot()
+    return (
+        _build_hand_proxy_spec(root, link_name="left_hand_proxy", side="left"),
+        _build_hand_proxy_spec(root, link_name="right_hand_proxy", side="right"),
+    )
+
+
+def _load_fixed_scene_box(urdf_path: Path, *, link_name: str) -> FixedSceneBoxSpec:
+    root = ET.parse(urdf_path).getroot()
+    return _build_fixed_scene_box_spec(root, link_name=link_name)
 
 
 def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
@@ -62,15 +254,13 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             "arm_link3_0",
             "arm_link4_0",
             "arm_link5_0",
-            "arm_link6_0",
         )
         right_links = (
-            "xxx_arm_link1_0",
-            "xxx_arm_link2_0",
-            "xxx_arm_link3_0",
-            "xxx_arm_link4_0",
-            "xxx_arm_link5_0",
-            "xxx_arm_link6_0",
+            "right_arm_link1_0",
+            "right_arm_link2_0",
+            "right_arm_link3_0",
+            "right_arm_link4_0",
+            "right_arm_link5_0",
         )
         collision_pairs = tuple((left, right) for left in left_links for right in right_links)
         return DualArmSceneProfile(
@@ -78,8 +268,60 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             urdf_path=asset_dir / "rm65_dual_arm.urdf",
             package_dirs=(asset_dir,),
             left_frame_name="arm_link6",
-            right_frame_name="xxx_arm_link6",
+            right_frame_name="right_arm_link6",
             collision_pairs=collision_pairs,
+            hand_proxy_boxes=(),
+            fixed_scene_boxes=(),
+            left_pose_transform=_POSE_TRANSFORM_LEFT,
+            right_pose_transform=_POSE_TRANSFORM_RIGHT,
+            solution_layout="auto",
+        )
+    if name == "dual_arm_hand_proxy_open":
+        urdf_path = asset_dir / "rm65_dual_arm_hand_proxy_open.urdf"
+        hand_proxy_boxes = _load_hand_proxy_boxes(urdf_path)
+        camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="camera_pole")
+        left_links = (
+            "arm_link1_0",
+            "arm_link2_0",
+            "arm_link3_0",
+            "arm_link4_0",
+            "arm_link5_0",
+            "left_hand_proxy_0",
+        )
+        right_links = (
+            "right_arm_link1_0",
+            "right_arm_link2_0",
+            "right_arm_link3_0",
+            "right_arm_link4_0",
+            "right_arm_link5_0",
+            "right_hand_proxy_0",
+        )
+        collision_pairs = list((left, right) for left in left_links for right in right_links)
+        collision_pairs.extend(
+            (
+                spec.geometry_name,
+                "arm_link2_0" if spec.side == "left" else "right_arm_link2_0",
+            )
+            for spec in hand_proxy_boxes
+        )
+        collision_pairs.extend(
+            (spec.geometry_name, camera_pole_box.geometry_name) for spec in hand_proxy_boxes
+        )
+        collision_pairs.extend(
+            (
+                ("arm_link2_0", camera_pole_box.geometry_name),
+                ("right_arm_link2_0", camera_pole_box.geometry_name),
+            )
+        )
+        return DualArmSceneProfile(
+            name=name,
+            urdf_path=urdf_path,
+            package_dirs=(asset_dir,),
+            left_frame_name="arm_link6",
+            right_frame_name="right_arm_link6",
+            collision_pairs=tuple(collision_pairs),
+            hand_proxy_boxes=hand_proxy_boxes,
+            fixed_scene_boxes=(camera_pole_box,),
             left_pose_transform=_POSE_TRANSFORM_LEFT,
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="auto",
@@ -91,7 +333,6 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             "left_arm_link3_0",
             "left_arm_link4_0",
             "left_arm_link5_0",
-            "left_arm_link6_0",
             "left_thumb_1_0",
             "left_thumb_2_0",
             "left_thumb_3_0",
@@ -111,7 +352,6 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             "right_arm_link3_0",
             "right_arm_link4_0",
             "right_arm_link5_0",
-            "right_arm_link6_0",
             "right_thumb_1_0",
             "right_thumb_2_0",
             "right_thumb_3_0",
@@ -133,6 +373,8 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             left_frame_name="left_arm_link6",
             right_frame_name="right_arm_link6",
             collision_pairs=collision_pairs,
+            hand_proxy_boxes=(),
+            fixed_scene_boxes=(),
             left_pose_transform=_POSE_TRANSFORM_LEFT,
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="dual_arm_hand",
@@ -144,7 +386,6 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             "arm_link3_0",
             "arm_link4_0",
             "arm_link5_0",
-            "arm_link6_0",
             "left_hand_0",
         )
         right_links = (
@@ -153,15 +394,12 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             "xxx_arm_link3_0",
             "xxx_arm_link4_0",
             "xxx_arm_link5_0",
-            "xxx_arm_link6_0",
             "right_hand_0",
         )
         collision_pairs = [(left, right) for left in left_links for right in right_links]
         collision_pairs.extend(
             [
-                ("arm_link6_0", "table_0"),
                 ("left_hand_0", "table_0"),
-                ("xxx_arm_link6_0", "table_0"),
                 ("right_hand_0", "table_0"),
             ]
         )
@@ -172,6 +410,8 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             left_frame_name="arm_link6",
             right_frame_name="xxx_arm_link6",
             collision_pairs=tuple(collision_pairs),
+            hand_proxy_boxes=(),
+            fixed_scene_boxes=(),
             left_pose_transform=_POSE_TRANSFORM_LEFT,
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="auto",
@@ -271,7 +511,7 @@ class DualArmMultiTaskSimulator:
     def __init__(
         self,
         scene_profile: str | DualArmSceneProfile = "dual_arm",
-        solver: str | None = "osqp",
+        solver: str | None = None,
         frequency: float = 7.0,
         low_control_dt: float = 0.02,
         policy_control_dt: float = 0.1,

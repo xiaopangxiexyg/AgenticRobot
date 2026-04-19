@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R, Slerp
 
 
 def identity_pose() -> np.ndarray:
@@ -108,4 +109,20 @@ def clip_pose_translation(
         out[:3, 3] = np.maximum(out[:3, 3], np.asarray(min_xyz, dtype=float))
     if max_xyz is not None:
         out[:3, 3] = np.minimum(out[:3, 3], np.asarray(max_xyz, dtype=float))
+    return out
+
+
+def interpolate_pose(start_pose: Any, end_pose: Any, alpha: float) -> np.ndarray:
+    start = as_pose_matrix(start_pose)
+    end = as_pose_matrix(end_pose)
+    blend = float(np.clip(alpha, 0.0, 1.0))
+    if blend <= 0.0:
+        return start
+    if blend >= 1.0:
+        return end
+
+    out = identity_pose()
+    out[:3, 3] = (1.0 - blend) * start[:3, 3] + blend * end[:3, 3]
+    key_rots = R.from_matrix(np.stack((start[:3, :3], end[:3, :3]), axis=0))
+    out[:3, :3] = Slerp([0.0, 1.0], key_rots)([blend]).as_matrix()[0]
     return out

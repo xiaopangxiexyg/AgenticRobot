@@ -67,7 +67,7 @@ def run_arm_hand_controller(robot_ip, tgt_now, tgt_changed, current_tgt_done, lo
 
 class RM65_Inspire_Controller:
     def __init__(self, 
-                 ip="192.168.1.19", 
+                 ip="192.168.1.20", 
                  max_angvel=[0.2]*6, # max angvel for each arm joint, in rad/s
                  control_dt=0.02, # low-level control frequency for the arm
                  ):

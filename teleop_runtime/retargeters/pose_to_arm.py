@@ -7,10 +7,12 @@ import numpy as np
 
 from ..calibration import TeleopCalibration
 from ..clutch import DeltaClutchController
+from ..hand_tcp_alignment import apply_local_pose_rotation
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
-from ..transforms import as_pose_matrix, invert_pose
+from ..tcp import HAND_BASE_TCP_FRAME
+from ..transforms import as_pose_matrix, rotation_is_orthonormal
 
 
 def _rotation_about_z(yaw_rad: float) -> np.ndarray:
@@ -38,12 +40,20 @@ class PoseToArmRetargeterConfig:
     translation_scale: float = 1.0
     workspace_clip: bool = True
     output_frame_name: str = "arm_base"
+    input_local_rotation_offset: np.ndarray | Sequence[float] | None = None
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
             self.effector_name = f"{self.side}_arm"
         if not self.clutch_channel_names:
             self.clutch_channel_names = (f"{self.side}_clutch_button", "clutch_button")
+        if self.input_local_rotation_offset is not None:
+            rotation = np.asarray(self.input_local_rotation_offset, dtype=float).reshape(3, 3)
+            if not rotation_is_orthonormal(rotation):
+                raise ValueError(
+                    "input_local_rotation_offset must be an orthonormal 3x3 rotation matrix."
+                )
+            self.input_local_rotation_offset = rotation.copy()
 
 
 @register_retargeter("pose_to_arm")
@@ -70,13 +80,18 @@ class PoseToArmRetargeter(Retargeter):
         self._last_target_pose_desk: np.ndarray | None = None
         self._home_human_pose_desk: np.ndarray | None = None
         self._home_robot_pose_desk: np.ndarray | None = None
+        self._input_local_rotation_offset = (
+            None
+            if self.config.input_local_rotation_offset is None
+            else np.asarray(self.config.input_local_rotation_offset, dtype=float).reshape(3, 3).copy()
+        )
 
     @property
     def name(self) -> str:
         return f"pose_to_arm_{self.config.side}"
 
     def set_home_anchors(self, *, human_pose_desk: np.ndarray, robot_pose_desk: np.ndarray) -> None:
-        self._home_human_pose_desk = as_pose_matrix(human_pose_desk)
+        self._home_human_pose_desk = self._apply_input_local_rotation(human_pose_desk)
         self._home_robot_pose_desk = as_pose_matrix(robot_pose_desk)
         self._last_target_pose_desk = self._home_robot_pose_desk.copy()
 
@@ -84,6 +99,120 @@ class PoseToArmRetargeter(Retargeter):
         self._home_human_pose_desk = None
         self._home_robot_pose_desk = None
         self._last_target_pose_desk = None
+
+    @property
+    def last_target_pose_desk(self) -> np.ndarray | None:
+        return None if self._last_target_pose_desk is None else self._last_target_pose_desk.copy()
+
+    @property
+    def home_human_pose_desk(self) -> np.ndarray | None:
+        if self._home_human_pose_desk is None:
+            return None
+        return self._home_human_pose_desk.copy()
+
+    @property
+    def home_robot_pose_desk(self) -> np.ndarray | None:
+        if self._home_robot_pose_desk is None:
+            return None
+        return self._home_robot_pose_desk.copy()
+
+    def resolve_absolute_target_from_observation(
+        self,
+        observation: TeleopObservation,
+        calibration: TeleopCalibration,
+    ) -> dict[str, object] | None:
+        channel = observation.get_channel(self.config.input_channel_name)
+        if channel is None or not channel.valid:
+            return None
+        pose_desk, pose_operator = self._resolve_pose_desk_and_operator(
+            channel=channel,
+            calibration=calibration,
+        )
+        target_pose_desk = self._apply_absolute_mapping(pose_desk)
+        target_pose_desk = self._apply_orientation_policy(target_pose_desk)
+        if self.config.workspace_clip:
+            target_pose_desk = calibration.clip_pose_to_workspace(
+                target_pose_desk,
+                side=self.config.side,
+            )
+        return {
+            "channel": channel,
+            "clutch_pressed": self._resolve_clutch_pressed(observation),
+            "pose_operator": pose_operator,
+            "target_pose_desk": target_pose_desk,
+            "tracker_role": self._resolve_tracker_role(channel),
+        }
+
+    def reanchor_to_current_input(
+        self,
+        observation: TeleopObservation,
+        calibration: TeleopCalibration,
+        *,
+        robot_pose_desk: np.ndarray,
+    ) -> None:
+        channel = observation.get_channel(self.config.input_channel_name)
+        if channel is None or not channel.valid:
+            raise RuntimeError(
+                f"{self.name} cannot reanchor without a valid '{self.config.input_channel_name}' channel."
+            )
+        pose_desk, _ = self._resolve_pose_desk_and_operator(
+            channel=channel,
+            calibration=calibration,
+        )
+        human_reference = self._apply_clutch_reference_mapping(pose_desk)
+        clutch_pressed = self._resolve_clutch_pressed(observation)
+        self.clutch_controller.reanchor(
+            self.config.side,
+            human_pose_reference=human_reference,
+            robot_pose_target=robot_pose_desk,
+            timestamp=float(channel.timestamp),
+            clutch_pressed=clutch_pressed,
+        )
+        self._last_target_pose_desk = as_pose_matrix(robot_pose_desk)
+
+    def build_command_from_target_pose_desk(
+        self,
+        *,
+        target_pose_desk: np.ndarray,
+        observation: TeleopObservation,
+        calibration: TeleopCalibration,
+        pose_operator: np.ndarray | None = None,
+    ) -> TeleopCommand:
+        command = TeleopCommand(timestamp=observation.timestamp)
+        channel = observation.get_channel(self.config.input_channel_name)
+        if channel is None or not channel.valid:
+            command.metadata["skipped"] = self.config.input_channel_name
+            return command
+
+        target_tcp_frame = calibration.target_frame_name(self.config.side)
+        target_pose = as_pose_matrix(target_pose_desk)
+        self._last_target_pose_desk = target_pose.copy()
+        target_pose_base = calibration.desk_to_base(target_pose, side=self.config.side)
+        clutch_pressed = self._resolve_clutch_pressed(observation)
+
+        command.add_command(
+            EffectorCommand(
+                effector_name=str(self.config.effector_name),
+                side=self.config.side,
+                command_type="cartesian_pose",
+                value=target_pose_base,
+                frame_name=self.config.output_frame_name,
+                metadata={
+                    "tcp_mode": HAND_BASE_TCP_FRAME,
+                    "tcp_frame": target_tcp_frame,
+                    "control_mode": self.config.control_mode,
+                    "orientation_mode": self.config.orientation_mode,
+                    "input_channel": self.config.input_channel_name,
+                    "tracker_role": self._resolve_tracker_role(channel),
+                    "clutch_pressed": clutch_pressed,
+                    "target_pose_operator": None
+                    if pose_operator is None
+                    else as_pose_matrix(pose_operator),
+                    "target_pose_desk": target_pose,
+                },
+            )
+        )
+        return command
 
     def retarget(
         self, observation: TeleopObservation, calibration: TeleopCalibration | None = None
@@ -96,8 +225,6 @@ class PoseToArmRetargeter(Retargeter):
         if calibration is None:
             raise RuntimeError(f"{self.name} requires a TeleopCalibration instance.")
 
-        tcp_mode = str(observation.metadata.get("tcp_mode", "hand_base"))
-        target_tcp_frame = calibration.target_frame_name(self.config.side, tcp_mode)
         pose_desk, pose_operator = self._resolve_pose_desk_and_operator(
             channel=channel,
             calibration=calibration,
@@ -118,9 +245,9 @@ class PoseToArmRetargeter(Retargeter):
             robot_anchor = (
                 self._last_target_pose_desk.copy()
                 if self._last_target_pose_desk is not None
-                else self._apply_absolute_mapping(pose_desk)
+                else self._apply_clutch_reference_mapping(pose_desk)
             )
-            human_reference = self._apply_absolute_mapping(pose_desk)
+            human_reference = self._apply_clutch_reference_mapping(pose_desk)
             target_pose_desk = self.clutch_controller.update(
                 side=self.config.side,
                 clutch_pressed=clutch_pressed,
@@ -138,31 +265,12 @@ class PoseToArmRetargeter(Retargeter):
                 target_pose_desk,
                 side=self.config.side,
             )
-
-        self._last_target_pose_desk = target_pose_desk.copy()
-        target_pose_base = calibration.desk_to_base(target_pose_desk, side=self.config.side)
-
-        command.add_command(
-            EffectorCommand(
-                effector_name=str(self.config.effector_name),
-                side=self.config.side,
-                command_type="cartesian_pose",
-                value=target_pose_base,
-                frame_name=self.config.output_frame_name,
-                metadata={
-                    "tcp_mode": tcp_mode,
-                    "tcp_frame": target_tcp_frame,
-                    "control_mode": self.config.control_mode,
-                    "orientation_mode": self.config.orientation_mode,
-                    "input_channel": self.config.input_channel_name,
-                    "tracker_role": self._resolve_tracker_role(channel),
-                    "clutch_pressed": clutch_pressed,
-                    "target_pose_operator": pose_operator,
-                    "target_pose_desk": target_pose_desk,
-                },
-            )
+        return self.build_command_from_target_pose_desk(
+            target_pose_desk=target_pose_desk,
+            observation=observation,
+            calibration=calibration,
+            pose_operator=pose_operator,
         )
-        return command
 
     def _resolve_clutch_pressed(self, observation: TeleopObservation) -> bool:
         for channel_name in self.config.clutch_channel_names:
@@ -195,31 +303,61 @@ class PoseToArmRetargeter(Retargeter):
         if frame_name in {"vive_world", "world"}:
             pose_operator = calibration.world_to_operator(pose, tracker_role=tracker_role)
             pose_desk = calibration.operator_to_desk(pose_operator)
-            return pose_desk, pose_operator
+            return (
+                self._apply_input_local_rotation(pose_desk),
+                self._apply_input_local_rotation(pose_operator),
+            )
         if frame_name.endswith("_operator") or frame_name == "operator":
             pose_operator = pose
             pose_desk = calibration.operator_to_desk(pose_operator)
-            return pose_desk, pose_operator
+            return (
+                self._apply_input_local_rotation(pose_desk),
+                self._apply_input_local_rotation(pose_operator),
+            )
         if frame_name in {calibration.desk_frame.name, "desk"}:
             pose_desk = pose
             if calibration.T_O_D is None:
                 raise RuntimeError("Cannot recover operator-frame pose without T_O_D calibration.")
             pose_operator = calibration.T_O_D @ pose_desk
-            return pose_desk, pose_operator
+            return (
+                self._apply_input_local_rotation(pose_desk),
+                self._apply_input_local_rotation(pose_operator),
+            )
         raise ValueError(
             f"{self.name} does not know how to map input frame '{frame_name or '<none>'}' to desk."
         )
 
-    def _apply_absolute_mapping(self, pose_desk: np.ndarray) -> np.ndarray:
+    def _apply_input_local_rotation(self, pose: np.ndarray) -> np.ndarray:
+        if self._input_local_rotation_offset is None:
+            return as_pose_matrix(pose)
+        return apply_local_pose_rotation(pose, self._input_local_rotation_offset)
+
+    def _apply_clutch_reference_mapping(self, pose_desk: np.ndarray) -> np.ndarray:
         current_human_pose = as_pose_matrix(pose_desk)
+        target = current_human_pose.copy()
+        translation_scale = float(self.config.translation_scale)
         if self._home_human_pose_desk is None or self._home_robot_pose_desk is None:
-            target = current_human_pose.copy()
-            target[:3, 3] = target[:3, 3] * float(self.config.translation_scale)
+            target[:3, 3] = current_human_pose[:3, 3] * translation_scale
             return target
 
-        relative_pose = invert_pose(self._home_human_pose_desk) @ current_human_pose
-        relative_pose[:3, 3] = relative_pose[:3, 3] * float(self.config.translation_scale)
-        return self._home_robot_pose_desk @ relative_pose
+        delta_translation = (
+            current_human_pose[:3, 3] - self._home_human_pose_desk[:3, 3]
+        ) * translation_scale
+        target[:3, 3] = self._home_robot_pose_desk[:3, 3] + delta_translation
+        return target
+
+    def _apply_absolute_mapping(self, pose_desk: np.ndarray) -> np.ndarray:
+        current_human_pose = as_pose_matrix(pose_desk)
+        target = self._apply_clutch_reference_mapping(current_human_pose)
+        if self._home_human_pose_desk is None or self._home_robot_pose_desk is None:
+            return target
+
+        target[:3, :3] = (
+            self._home_robot_pose_desk[:3, :3]
+            @ self._home_human_pose_desk[:3, :3].T
+            @ current_human_pose[:3, :3]
+        )
+        return target
 
     def _apply_orientation_policy(self, pose_desk: np.ndarray) -> np.ndarray:
         target = as_pose_matrix(pose_desk)

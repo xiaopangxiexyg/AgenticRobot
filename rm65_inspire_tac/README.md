@@ -97,6 +97,7 @@ teleop/rm65_inspire_tac_portable/
 这是原始多任务 IK 变体的统一入口。内置三个 profile：
 
 - `dual_arm`
+- `dual_arm_hand_proxy_open`
 - `dual_arm_hand`
 - `dual_arm_cylinder_table`
 
@@ -249,8 +250,8 @@ retargeter = RM65InspireTacRetargeter(
 simulator = DualArmMultiTaskSimulator(scene_profile="dual_arm")
 
 hardware = BimanualRM65InspireTacSystem.from_configs(
-    left=ArmHardwareConfig(arm_ip="192.168.1.18", hand_ip="192.168.11.218"),
-    right=ArmHardwareConfig(arm_ip="192.168.1.19", hand_ip="192.168.11.219"),
+    left=ArmHardwareConfig(arm_ip="192.168.101.21", hand_ip="192.168.11.218"),
+    right=ArmHardwareConfig(arm_ip="192.168.1.20", hand_ip="192.168.11.219"),
 )
 
 teleop = retargeter.retarget()

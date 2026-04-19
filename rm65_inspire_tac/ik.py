@@ -5,6 +5,12 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from .ik_tuning import (
+    RM65IKTuningConfig,
+    generate_rm65_wrist_flip_candidates,
+    load_ik_tuning_config,
+    weighted_joint_distance_score,
+)
 from .paths import require_asset_path
 
 
@@ -21,7 +27,12 @@ def _to_pose_matrix(pose: np.ndarray) -> np.ndarray:
 
 
 class SingleArmIKSolver:
-    def __init__(self, urdf_path: str | Path | None = None, eef_name: str = "hand_base"):
+    def __init__(
+        self,
+        urdf_path: str | Path | None = None,
+        eef_name: str = "hand_base",
+        ik_tuning: RM65IKTuningConfig | None = None,
+    ):
         try:
             import pinocchio as pin
         except ModuleNotFoundError as exc:
@@ -46,6 +57,16 @@ class SingleArmIKSolver:
         self.num_dofs = self.model.nv
         self.q_min = self.model.lowerPositionLimit.copy()
         self.q_max = self.model.upperPositionLimit.copy()
+        self.ik_tuning = ik_tuning if ik_tuning is not None else load_ik_tuning_config()
+        objective = self.ik_tuning.objective_weights()
+        self._position_weight = float(objective.single_arm_position_weight)
+        self._orientation_weight = float(objective.single_arm_orientation_weight)
+        self._joint_distance_weights = np.asarray(
+            self.ik_tuning.branch_normalization.joint_distance_weights,
+            dtype=float,
+        )
+        self.last_branch_selection = "original"
+        self.last_branch_distance_score_deg = 0.0
 
     def compute_pose(self, qpos: np.ndarray) -> np.ndarray:
         qpos = np.asarray(qpos, dtype=float)
@@ -77,6 +98,25 @@ class SingleArmIKSolver:
         max_joint_step: float | np.ndarray = 0.05,
         damping: float = 0.1,
     ) -> np.ndarray:
+        current_qpos = np.asarray(current_qpos, dtype=float)
+        raw_qpos = self._solve_step_raw(
+            target_pose=target_pose,
+            current_qpos=current_qpos,
+            max_joint_step=max_joint_step,
+            damping=damping,
+        )
+        return self._normalize_branch(
+            candidate_qpos=raw_qpos,
+            reference_qpos=current_qpos,
+        )
+
+    def _solve_step_raw(
+        self,
+        target_pose: np.ndarray,
+        current_qpos: np.ndarray,
+        max_joint_step: float | np.ndarray = 0.05,
+        damping: float = 0.1,
+    ) -> np.ndarray:
         target_pose = _to_pose_matrix(target_pose)
         current_qpos = np.asarray(current_qpos, dtype=float)
 
@@ -86,8 +126,23 @@ class SingleArmIKSolver:
         error = np.concatenate([pos_err, rot_err])
 
         jacobian = self.compute_jacobian(current_qpos)
+        weighting = np.diag(
+            [
+                self._position_weight,
+                self._position_weight,
+                self._position_weight,
+                self._orientation_weight,
+                self._orientation_weight,
+                self._orientation_weight,
+            ]
+        )
+        weighted_error = weighting @ error
+        weighted_jacobian = weighting @ jacobian
         regularizer = (damping**2) * np.eye(6, dtype=float)
-        joint_update = jacobian.T @ np.linalg.solve(jacobian @ jacobian.T + regularizer, error)
+        joint_update = weighted_jacobian.T @ np.linalg.solve(
+            weighted_jacobian @ weighted_jacobian.T + regularizer,
+            weighted_error,
+        )
 
         max_joint_step = np.asarray(max_joint_step, dtype=float)
         if max_joint_step.shape == ():
@@ -105,7 +160,12 @@ class SingleArmIKSolver:
         tolerance: float = 1e-4,
     ) -> np.ndarray:
         target_pose = _to_pose_matrix(target_pose)
-        q = np.zeros(self.num_dofs, dtype=float) if q_init is None else np.asarray(q_init, dtype=float)
+        reference_q = (
+            np.zeros(self.num_dofs, dtype=float)
+            if q_init is None
+            else np.asarray(q_init, dtype=float)
+        )
+        q = reference_q.copy()
 
         for _ in range(max_iterations):
             current_pose = self.compute_pose(q)
@@ -114,10 +174,51 @@ class SingleArmIKSolver:
             error = np.concatenate([pos_err, rot_err])
             if np.linalg.norm(error) < tolerance:
                 break
-            q = self.solve_step(
+            q = self._solve_step_raw(
                 target_pose=target_pose,
                 current_qpos=q,
                 max_joint_step=max_joint_step,
                 damping=damping,
             )
-        return q
+        return self._normalize_branch(candidate_qpos=q, reference_qpos=reference_q)
+
+    def _normalize_branch(
+        self,
+        *,
+        candidate_qpos: np.ndarray,
+        reference_qpos: np.ndarray,
+    ) -> np.ndarray:
+        candidate = np.asarray(candidate_qpos, dtype=float).reshape(-1)
+        reference = np.asarray(reference_qpos, dtype=float).reshape(-1)
+        if not self.ik_tuning.branch_normalization.enabled:
+            self.last_branch_selection = "disabled"
+            self.last_branch_distance_score_deg = weighted_joint_distance_score(
+                reference_q=reference,
+                candidate_q=candidate,
+                joint_distance_weights=self._joint_distance_weights,
+            )
+            return candidate.copy()
+
+        candidates = generate_rm65_wrist_flip_candidates(
+            candidate,
+            q_min=self.q_min,
+            q_max=self.q_max,
+            limit_tolerance_rad=float(self.ik_tuning.branch_normalization.limit_tolerance_rad),
+        )
+        best = min(
+            candidates,
+            key=lambda q: weighted_joint_distance_score(
+                reference_q=reference,
+                candidate_q=q,
+                joint_distance_weights=self._joint_distance_weights,
+            ),
+        )
+        self.last_branch_selection = (
+            "original" if np.allclose(best, candidate, atol=1e-8) else "wrist_flip"
+        )
+        self.last_branch_distance_score_deg = weighted_joint_distance_score(
+            reference_q=reference,
+            candidate_q=best,
+            joint_distance_weights=self._joint_distance_weights,
+        )
+        return np.asarray(best, dtype=float).copy()

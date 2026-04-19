@@ -20,8 +20,21 @@ from .diagnostics import (
     TeleopRunState,
     TeleopStateMachine,
 )
+from .episodes import (
+    EpisodeRecorder,
+    EpisodeRecorderConfig,
+    EpisodeStartSideCheck,
+    EpisodeValidationReport,
+    compare_start_qpos_pair,
+    episode_start_qpos_pair,
+    load_episode,
+    require_valid_episode,
+    validate_episode,
+)
 from .recording import RecordingConfig, SessionRecorder
 from .retargeters import (
+    DualArmCollisionAwareRetargeter,
+    DualArmCollisionAwareRetargeterConfig,
     JointsToDexHandRetargeter,
     JointsToDexHandRetargeterConfig,
     PoseToArmRetargeter,
@@ -57,6 +70,12 @@ __all__ = [
     "ClutchState",
     "DeltaClutchController",
     "DeskFrameConfig",
+    "DualArmCollisionAwareRetargeter",
+    "DualArmCollisionAwareRetargeterConfig",
+    "EpisodeRecorder",
+    "EpisodeRecorderConfig",
+    "EpisodeStartSideCheck",
+    "EpisodeValidationReport",
     "EffectorCommand",
     "FaultEvent",
     "FaultSeverity",
@@ -91,7 +110,11 @@ __all__ = [
     "backend_registry",
     "build_annotated_dual_rm65_calibration",
     "build_bimanual_session",
+    "compare_start_qpos_pair",
     "default_vive_tracker_configs",
+    "episode_start_qpos_pair",
+    "load_episode",
+    "require_valid_episode",
     "register_backend",
     "register_retargeter",
     "register_rig",
@@ -99,4 +122,5 @@ __all__ = [
     "retargeter_registry",
     "rig_registry",
     "source_registry",
+    "validate_episode",
 ]

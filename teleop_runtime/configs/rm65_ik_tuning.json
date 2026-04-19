@@ -1,0 +1,39 @@
+{
+  "ik_objective_mode": "orientation_priority",
+  "objective_modes": {
+    "orientation_priority": {
+      "single_arm_position_weight": 1.0,
+      "single_arm_orientation_weight": 1.0,
+      "dual_arm_position_cost": 1.0,
+      "dual_arm_orientation_cost": 1.0
+    },
+    "position_priority": {
+      "single_arm_position_weight": 1.0,
+      "single_arm_orientation_weight": 0.2,
+      "dual_arm_position_cost": 1.0,
+      "dual_arm_orientation_cost": 0.2
+    }
+  },
+  "branch_normalization": {
+    "enabled": true,
+    "joint_distance_weights": [4.0, 3.0, 2.0, 1.25, 1.0, 0.75],
+    "limit_tolerance_rad": 1e-05
+  },
+  "jump_gate": {
+    "enabled": true,
+    "small_pose_translation_m": 0.05,
+    "small_pose_rotation_deg": 5.0,
+    "per_joint_jump_deg": [15.0, 15.0, 18.0, 25.0, 30.0, 45.0],
+    "weighted_jump_threshold_deg": 35.0,
+    "relaxed_per_joint_jump_deg": [25.0, 25.0, 30.0, 40.0, 50.0, 70.0],
+    "relaxed_weighted_jump_threshold_deg": 55.0,
+    "release_translation_m": 0.08,
+    "release_rotation_deg": 12.0,
+    "seed_expansion_after_hold_frames": 1
+  },
+  "dual_arm_recovery": {
+    "enable_seed_expansion": true,
+    "seed_modes": ["current", "left_flip", "right_flip", "both_flip"],
+    "check_collision_on_branch_switch": true
+  }
+}

@@ -16,6 +16,7 @@ from .schemas import (
     latest_channel_timestamp,
     merge_teleop_commands,
 )
+from .tcp import canonical_tcp_frame
 
 
 @dataclass
@@ -29,6 +30,21 @@ class TeleopSessionConfig:
     stale_timeout_sec: float = 0.5
     record_enabled: bool = True
     allow_hardware_after_debug_pass: bool = True
+    auto_recovery_enabled: bool = True
+    recovery_healthy_frame_count: int = 10
+    non_freezing_fault_codes: tuple[str, ...] = ("low_control_rate",)
+    auto_recoverable_fault_codes: tuple[str, ...] = (
+        "missing_channel",
+        "invalid_channel",
+        "invalid_pose",
+        "stale_channel",
+        "translation_jump",
+        "rotation_jump",
+        "low_control_rate",
+    )
+
+    def __post_init__(self) -> None:
+        self.tcp_mode = canonical_tcp_frame(self.tcp_mode)
 
 
 @dataclass
@@ -68,9 +84,14 @@ class TeleopSession:
         self.rate_tracker = RateTracker()
         self.debug_passed = False
         self._started = False
+        self._freeze_fault_codes: tuple[str, ...] = ()
+        self._freeze_channel_names: tuple[str, ...] = ()
+        self._healthy_frames_since_fault_clear = 0
 
     def _transition(self, new_state: TeleopRunState, reason: str = "") -> None:
         old_state = self.state_machine.state
+        if old_state == new_state:
+            return
         self.state_machine.transition(new_state, reason)
         if self.recorder is not None:
             self.recorder.record_state_transition(old_state.value, new_state.value, reason)
@@ -108,6 +129,39 @@ class TeleopSession:
     def fault(self, reason: str) -> None:
         self._transition(TeleopRunState.FAULT, reason)
 
+    def build_command(self, observation: TeleopObservation) -> TeleopCommand:
+        return self._build_command(observation)
+
+    def finish_recovery(self, reason: str = "recovery complete") -> None:
+        if self.state_machine.state not in {
+            TeleopRunState.FROZEN,
+            TeleopRunState.RECOVERING,
+        }:
+            return
+        self._clear_recovery_context()
+        self._transition(TeleopRunState.ARMED, reason)
+
+    def _clear_recovery_context(self) -> None:
+        self._freeze_fault_codes = ()
+        self._freeze_channel_names = ()
+        self._healthy_frames_since_fault_clear = 0
+
+    def _record_freeze_context(self, faults: Sequence[FaultEvent]) -> None:
+        self._freeze_fault_codes = tuple(sorted({fault.code for fault in faults}))
+        self._freeze_channel_names = tuple(
+            sorted({fault.channel_name for fault in faults if fault.channel_name})
+        )
+        self._healthy_frames_since_fault_clear = 0
+        self.safety_monitor.request_pose_baseline_reset_many(self._freeze_channel_names)
+
+    def _freeze_is_auto_recoverable(self) -> bool:
+        if not self.config.auto_recovery_enabled:
+            return False
+        if not self._freeze_fault_codes:
+            return False
+        recoverable = set(self.config.auto_recoverable_fault_codes)
+        return all(code in recoverable for code in self._freeze_fault_codes)
+
     def _fault_from_violation(self, violation: SafetyViolation, timestamp: float) -> FaultEvent:
         return FaultEvent(
             code=violation.code,
@@ -117,6 +171,9 @@ class TeleopSession:
             channel_name=violation.channel_name,
             metadata=dict(violation.metadata),
         )
+
+    def _fault_should_freeze(self, fault: FaultEvent) -> bool:
+        return fault.code not in set(self.config.non_freezing_fault_codes)
 
     def poll_sources(self, now: float) -> tuple[dict[str, ObservationChannel], list[FaultEvent]]:
         merged: dict[str, ObservationChannel] = {}
@@ -187,13 +244,69 @@ class TeleopSession:
             if self.recorder is not None:
                 self.recorder.record_fault(fault)
 
-        if faults and self.safety_monitor.config.freeze_on_fault:
-            self.freeze(faults[0].code)
+        freeze_faults = [fault for fault in faults if self._fault_should_freeze(fault)]
+
+        if freeze_faults and self.safety_monitor.config.freeze_on_fault:
+            self._record_freeze_context(freeze_faults)
+            self.freeze(freeze_faults[0].code)
             return SessionStepResult(
                 timestamp=current_time,
                 state=self.state_machine.state,
                 control_hz=control_hz,
                 channels=channels,
+                faults=faults,
+            )
+
+        if self.state_machine.state in {
+            TeleopRunState.FAULT,
+        }:
+            return SessionStepResult(
+                timestamp=current_time,
+                state=self.state_machine.state,
+                control_hz=control_hz,
+                channels=channels,
+                faults=faults,
+            )
+
+        if self.state_machine.state == TeleopRunState.FROZEN:
+            if not self._freeze_is_auto_recoverable():
+                return SessionStepResult(
+                    timestamp=current_time,
+                    state=self.state_machine.state,
+                    control_hz=control_hz,
+                    channels=channels,
+                    faults=faults,
+                )
+            self._healthy_frames_since_fault_clear += 1
+            if self._healthy_frames_since_fault_clear < max(
+                1, int(self.config.recovery_healthy_frame_count)
+            ):
+                return SessionStepResult(
+                    timestamp=current_time,
+                    state=self.state_machine.state,
+                    control_hz=control_hz,
+                    channels=channels,
+                    faults=faults,
+                )
+            observation = self._build_observation(channels, current_time)
+            self._transition(TeleopRunState.RECOVERING, "auto recovery ready")
+            return SessionStepResult(
+                timestamp=current_time,
+                state=self.state_machine.state,
+                control_hz=control_hz,
+                channels=channels,
+                observation=observation,
+                faults=faults,
+            )
+
+        if self.state_machine.state == TeleopRunState.RECOVERING:
+            observation = self._build_observation(channels, current_time)
+            return SessionStepResult(
+                timestamp=current_time,
+                state=self.state_machine.state,
+                control_hz=control_hz,
+                channels=channels,
+                observation=observation,
                 faults=faults,
             )
 

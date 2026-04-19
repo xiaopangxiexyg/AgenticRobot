@@ -44,7 +44,7 @@ def read6(client, reg, n_short=6, use_byte=False): # 1 short = 2 bytes
 
 
 class InspireTacModbus:
-    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800):
+    def __init__(self, ip = '192.168.12.210', port = 6000, max_fingertip_force=800):
         self.client = open_modbus(ip, port)
 
         # 寄存器地址
@@ -501,34 +501,38 @@ if __name__ == '__main__':
     from tqdm import trange
     import numpy as np
     test = InspireTacModbus(max_fingertip_force=800)
-    test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    # test.set_joint_pos([1, 1, 1, 1, 1, 1])
     
     # test.set_joint_pos(np.ones(6))
     # time.sleep(5.0)
-    # # test.set_joint_pos([0, 0, 0, 0, 1, 1])
+    # time.sleep(1)
+
+    test.set_joint_pos([0, 0, 0, 0, 1, 1])
+    joint_pos = test.read_joint_pos()
+    tac_vec, tac_dict = test.read_tac_data()
     test.set_joint_pos([1, 1, 1, 1, 1, 1])
-    test.set_joint_pos([0.5, 0.5, 0.5, 0.5, 1, 1])
-    time.sleep(1)
+    # test.set_joint_pos([0.5, 0.5, 0.5, 0.5, 1, 1])
+    # test.set_joint_pos([0, 0, 0, 0, 1, 1])
 
-    #test.get_default_speed_force()
-    visualizer = TactileVisualizer()
-    last_time = time.time()
-    while True:
-        joint_pos = test.read_joint_pos()
-        print('Joint pos:', np.round(joint_pos, 3))
-        # tac_vec, tac_dict = test.read_tac_data()
-        test.set_force([300]*6)
-        test.set_joint_pos([0, 0, 0, 0, 0.5, 0.5])
-        # test.set_joint_pos([0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+    # #test.get_default_speed_force()
+    # visualizer = TactileVisualizer()
+    # last_time = time.time()
+    # while True:
+    print('Joint pos:', np.round(joint_pos, 3))
+    print('Tactile data:', tac_vec)
+    #     # tac_vec, tac_dict = test.read_tac_data()
+    #     # test.set_force([300]*6)
+    #     test.set_joint_pos([0, 0, 0, 0, 0.5, 0.5])
+    #     # test.set_joint_pos([0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
 
-        # visualizer.update(tac_dict)
-        #test.set_joint_pos([np.cos(t/100)/2+0.5]*6)
-        #print(joint_pos)
+    #     # visualizer.update(tac_dict)
+    #     #test.set_joint_pos([np.cos(t/100)/2+0.5]*6)
+    #     #print(joint_pos)
 
 
-        interval = time.time() - last_time
-        last_time = time.time()
-        print(f'time: {interval*1000:.1f} ms')
+    #     interval = time.time() - last_time
+    #     last_time = time.time()
+    #     print(f'time: {interval*1000:.1f} ms')
 
     test.close()
 

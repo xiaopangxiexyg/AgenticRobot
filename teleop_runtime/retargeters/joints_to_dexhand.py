@@ -6,6 +6,7 @@ from typing import Sequence
 import numpy as np
 
 from ..calibration import TeleopCalibration
+from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
@@ -16,7 +17,7 @@ class JointsToDexHandRetargeterConfig:
     side: str
     input_channel_name: str
     effector_name: str | None = None
-    joint_order: tuple[int, ...] = (5, 4, 3, 2, 0, 1)
+    joint_order: tuple[int, ...] = DEFAULT_INSPIRE_HAND_JOINT_ORDER
     invert: bool = True
     gain: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     bias: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)

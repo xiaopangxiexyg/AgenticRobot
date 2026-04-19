@@ -6,24 +6,57 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..calibration import TeleopCalibration
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     build_annotated_dual_rm65_calibration,
 )
-from ..retargeters import PoseToArmRetargeter, PoseToArmRetargeterConfig
+from ..diagnostics import TeleopRunState
+from ..episodes import EpisodeRecorder, EpisodeRecorderConfig
+from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, TARGET_INSPIRE_HAND_Q6_ORDER
+from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
+from ..hand_render import (
+    LEFT_HAND_RENDER_JOINT_NAMES,
+    RIGHT_HAND_RENDER_JOINT_NAMES,
+    inspire_q6_to_render_qpos,
+    open_hand_render_qpos,
+)
+from ..initial_alignment import TeleopInitialAlignment
+from ..retargeters import (
+    DualArmCollisionAwareRetargeter,
+    DualArmCollisionAwareRetargeterConfig,
+    JointsToDexHandRetargeter,
+    JointsToDexHandRetargeterConfig,
+    PoseToArmRetargeter,
+    PoseToArmRetargeterConfig,
+)
 from ..safety import TeleopSafetyConfig
+from ..schemas import TeleopObservation, latest_channel_timestamp, merge_teleop_commands
 from ..session import TeleopSession, TeleopSessionConfig
+from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
-from ..transforms import as_pose_matrix
+from ..tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
+from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
+from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event
+from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
 from rm65_inspire_tac.paths import require_asset_path
-from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
-from rm65_inspire_tac.rendering import SapienArmHandRenderer
+from rm65_inspire_tac.pipeline import (
+    DEFAULT_LEFT_ARM_QPOS,
+    DEFAULT_RIGHT_ARM_QPOS,
+    DualArmSceneProfile,
+    build_dual_arm_scene_profile,
+)
+from rm65_inspire_tac.rendering import DebugBoxOverlay, DebugBoxTemplate, SapienArmHandRenderer
 
 
 def _positive_float(text: str) -> float:
@@ -40,6 +73,56 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
+def _alpha_float(text: str) -> float:
+    value = float(text)
+    if not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError("alpha must be in (0, 1]")
+    return value
+
+
+def _parse_joint_order(text: str) -> tuple[int, ...]:
+    parts = [part.strip() for part in str(text).split(",") if part.strip()]
+    if len(parts) != 6:
+        raise argparse.ArgumentTypeError("joint order must contain 6 comma-separated indices")
+    try:
+        order = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid joint order: {text}") from exc
+    if sorted(order) != [0, 1, 2, 3, 4, 5]:
+        raise argparse.ArgumentTypeError("joint order must be a permutation of 0,1,2,3,4,5")
+    return order
+
+
+def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:
+    parts = [part.strip() for part in str(text).split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("arm max angvel must be a float or 6 comma-separated floats")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid arm max angvel: {text}") from exc
+    if len(values) == 1:
+        value = float(values[0])
+        if value <= 0.0:
+            raise argparse.ArgumentTypeError("arm max angvel must be positive")
+        return (value,) * 6
+    if len(values) != 6:
+        raise argparse.ArgumentTypeError("arm max angvel must contain 1 or 6 floats")
+    if any(value <= 0.0 for value in values):
+        raise argparse.ArgumentTypeError("arm max angvel must be positive")
+    return tuple(float(value) for value in values)
+
+
+def _log(tag: str, message: str, *, now: float | None = None) -> None:
+    log_event(tag, message, now=now)
+
+
+def _qpos_summary(qpos: np.ndarray | None) -> str:
+    if qpos is None:
+        return "None"
+    return str(np.round(np.asarray(qpos, dtype=float), 3).tolist())
+
+
 class TerminalClutchInput:
     def __init__(self, keyboard_source: KeyboardButtonSource):
         self.keyboard_source = keyboard_source
@@ -49,26 +132,47 @@ class TerminalClutchInput:
         self.left_pressed = False
         self.right_pressed = False
         self._calibration_requested = False
+        self._episode_start_requested = False
+        self._episode_stop_requested = False
 
     def start(self) -> None:
         if not self.enabled:
             return
-        self._old_attrs = termios.tcgetattr(sys.stdin.fileno())
-        tty.setcbreak(sys.stdin.fileno())
+        try:
+            self._old_attrs = termios.tcgetattr(sys.stdin.fileno())
+            tty.setcbreak(sys.stdin.fileno())
+        except (OSError, termios.error):
+            self.enabled = False
+            self._old_attrs = None
 
     def close(self) -> None:
         if self.enabled and self._old_attrs is not None:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_attrs)
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_attrs)
+            except (OSError, termios.error):
+                pass
             self._old_attrs = None
 
     def poll(self) -> None:
         if not self.enabled:
             return
         while True:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+            except OSError:
+                self.enabled = False
+                self._old_attrs = None
+                _log("Keys", "terminal input became unavailable; keyboard controls disabled for this run.")
+                return
             if not ready:
                 return
-            char = sys.stdin.read(1)
+            try:
+                char = sys.stdin.read(1)
+            except OSError:
+                self.enabled = False
+                self._old_attrs = None
+                _log("Keys", "terminal input became unavailable; keyboard controls disabled for this run.")
+                return
             if not char:
                 return
             if char == "q":
@@ -76,6 +180,12 @@ class TerminalClutchInput:
                 return
             if char in {"p", "\n", "\r"}:
                 self._calibration_requested = True
+                continue
+            if char == "t":
+                self._episode_start_requested = True
+                continue
+            if char == "s":
+                self._episode_stop_requested = True
                 continue
             if char == "z":
                 self.left_pressed = not self.left_pressed
@@ -109,23 +219,53 @@ class TerminalClutchInput:
         self._calibration_requested = False
         return requested
 
+    def consume_episode_start_request(self) -> bool:
+        requested = self._episode_start_requested
+        self._episode_start_requested = False
+        return requested
+
+    def consume_episode_stop_request(self) -> bool:
+        requested = self._episode_stop_requested
+        self._episode_stop_requested = False
+        return requested
+
 
 @dataclass(frozen=True)
 class VirtualRunComponents:
     session: TeleopSession
-    left_backend: RM65ArmBackend
-    right_backend: RM65ArmBackend
+    left_preview_backend: RM65ArmBackend
+    right_preview_backend: RM65ArmBackend
+    left_state_backend: RM65ArmBackend | None
+    right_state_backend: RM65ArmBackend | None
+    left_hand_backend: InspireTacHandBackend | None
+    right_hand_backend: InspireTacHandBackend | None
+    initial_alignment: TeleopInitialAlignment | None
+    collision_scene_profile: DualArmSceneProfile
+    dual_arm_retargeter: DualArmCollisionAwareRetargeter | None
+    collision_guard_requested: bool
+    collision_guard_setup_error: str | None
     renderer: SapienArmHandRenderer | None
     keyboard_source: KeyboardButtonSource
     left_retargeter: PoseToArmRetargeter
     right_retargeter: PoseToArmRetargeter
+    left_hand_retargeter: JointsToDexHandRetargeter | None
+    right_hand_retargeter: JointsToDexHandRetargeter | None
+
+
+@dataclass
+class RecoveryPlan:
+    mode: str
+    started_at: float
+    duration_sec: float = 0.0
+    payload: dict[str, object] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Use real VIVE wrist trackers as input and visualize dual RM65 arm motion "
-            "in SAPIEN without connecting real robot hardware."
+            "Use real VIVE wrist trackers as input and preview dual RM65 arm motion "
+            "in SAPIEN. In arm-mode=real, the script can read the current real-arm start pose "
+            "or initialize from a saved initial-alignment file, but never sends any motion command to hardware."
         )
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver")
@@ -138,13 +278,100 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tcp-mode",
-        choices=["rm_eef", "hand_base"],
-        default="rm_eef",
-        help="TCP frame passed into IK and visualization.",
+        type=str,
+        default=HAND_BASE_TCP_FRAME,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--arm-mode",
+        choices=["real", "virtual"],
+        default="real",
+        help="Use real RM65 state as the rendered start pose, or pure virtual preview only.",
+    )
+    parser.add_argument("--left-arm-ip", type=str, default="", help="Optional left RM65 IP for read-only start-pose sync")
+    parser.add_argument("--right-arm-ip", type=str, default="", help="Optional right RM65 IP for read-only start-pose sync")
+    parser.add_argument("--left-hand-port", type=str, default="", help="Optional left hand teleop serial port")
+    parser.add_argument("--right-hand-port", type=str, default="", help="Optional right hand teleop serial port")
+    parser.add_argument("--hand-reader-baudrate", type=int, default=115200, help="Hand teleop serial baudrate")
+    parser.add_argument("--hand-reader-timeout", type=float, default=0.05, help="Hand teleop serial timeout in seconds")
+    parser.add_argument("--show-hand-raw-lines", action="store_true", help="Print every raw line from hand teleop serial devices")
+    parser.add_argument(
+        "--hand-joint-order",
+        type=_parse_joint_order,
+        default=DEFAULT_INSPIRE_HAND_JOINT_ORDER,
+        help=(
+            "Permutation applied to hand q6 before mapping to InspireTac q6. "
+            f"Default maps into InspireTac order {list(TARGET_INSPIRE_HAND_Q6_ORDER)}."
+        ),
+    )
+    parser.add_argument(
+        "--hand-invert",
+        dest="hand_invert",
+        action="store_true",
+        help="Invert normalized q6 before sending/rendering. Default is enabled.",
+    )
+    parser.add_argument(
+        "--hand-no-invert",
+        dest="hand_invert",
+        action="store_false",
+        help="Disable q6 inversion if the hand already moves in the correct direction.",
+    )
+    parser.set_defaults(hand_invert=True)
+    parser.add_argument(
+        "--hand-command-alpha",
+        type=_alpha_float,
+        default=1.0,
+        help="EMA smoothing factor for hand q6 mapping.",
+    )
+    parser.add_argument(
+        "--hand-send-threshold",
+        type=float,
+        default=0.002,
+        help="Only update preview hand state when max q6 delta exceeds this threshold.",
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Scale applied to desk-frame translation")
+    parser.add_argument(
+        "--no-collision",
+        "--disable-collision-avoidance",
+        "--disable-dual-arm-collision-avoidance",
+        dest="disable_dual_arm_collision_avoidance",
+        action="store_true",
+        help="Disable joint-space dual-arm collision avoidance and fall back to two independent arm retargeters.",
+    )
+    parser.add_argument(
+        "--collision-avoidance-mode",
+        choices=["boundary_slide", "freeze_on_contact"],
+        default="boundary_slide",
+        help="Behavior when the operator pushes both arms toward collision.",
+    )
+    parser.add_argument(
+        "--collision-scene-profile",
+        choices=[
+            "dual_arm",
+            "dual_arm_hand_proxy_open",
+            "dual_arm_hand",
+            "dual_arm_cylinder_table",
+        ],
+        default="dual_arm_hand_proxy_open",
+        help=(
+            "Joint-space collision scene profile used by the dual-arm solver. "
+            "'dual_arm_hand_proxy_open' keeps arm IK at 12DoF while attaching fixed open-hand "
+            "proxy geometry to both wrists for collision."
+        ),
+    )
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control/update rate")
-    parser.add_argument("--print-hz", type=_positive_float, default=2.0, help="Console print rate")
+    parser.add_argument(
+        "--arm-max-angvel",
+        type=_parse_arm_max_angvel,
+        default=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5),
+        help="Scalar or 6 comma-separated arm joint velocity limits in rad/s.",
+    )
+    parser.add_argument(
+        "--print-hz",
+        type=_positive_float,
+        default=2.0,
+        help="Legacy console progress throttle. Most logs are now emitted only on change.",
+    )
     parser.add_argument(
         "--left-right-base-distance",
         type=float,
@@ -184,19 +411,108 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--keyboard-clutch", action="store_true", help="Enable terminal clutch toggles: z/x/c/r, q to quit")
     parser.add_argument("--no-record", action="store_true", help="Disable JSONL recording for this session")
+    parser.add_argument(
+        "--no-episode-recording",
+        action="store_true",
+        help="Disable episode trajectory recording support for this run.",
+    )
+    parser.add_argument(
+        "--episode-root",
+        type=str,
+        default="",
+        help=(
+            "Optional directory used to store episode_XXXXXX subdirectories. "
+            "Defaults to <session_record_root>/trajectories when session recording is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--record-auto-start",
+        action="store_true",
+        help="Start an episode automatically when the control loop begins.",
+    )
+    parser.add_argument(
+        "--load-profile",
+        type=str,
+        default="",
+        help="Optional calibration profile to load before runtime home calibration.",
+    )
+    parser.add_argument(
+        "--load-initial-alignment",
+        type=str,
+        default="",
+        help=(
+            "Optional initial-alignment JSON saved by rm65_real_debug. "
+            "When provided, preview startup uses the saved arm qpos and skips real-arm start-state reads. "
+            "This does not skip tracker home capture."
+        ),
+    )
+    parser.add_argument(
+        "--ik-tuning-json",
+        type=str,
+        default="",
+        help="Optional RM65 IK tuning JSON. Defaults to teleop_runtime/configs/rm65_ik_tuning.json.",
+    )
+    parser.add_argument(
+        "--recovery-healthy-frames",
+        type=int,
+        default=8,
+        help="Number of consecutive fault-free control frames required before auto recovery starts.",
+    )
+    parser.add_argument(
+        "--recovery-ramp-sec",
+        type=_positive_float,
+        default=1.0,
+        help="Absolute-control recovery ramp duration used in arm-mode=real style recovery.",
+    )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
+    args.tcp_mode = HAND_BASE_TCP_FRAME
+    return args
 
 
 def build_components(args: argparse.Namespace) -> VirtualRunComponents:
-    calibration = build_annotated_dual_rm65_calibration(
-        left_right_base_distance=args.left_right_base_distance
+    preview_control_dt = 1.0 / float(args.hz)
+    preview_dry_run_fast = args.arm_mode != "real"
+    collision_guard_requested = not args.disable_dual_arm_collision_avoidance
+    arm_max_angvel = np.asarray(args.arm_max_angvel, dtype=float).reshape(6)
+    realistic_joint_step = tuple((arm_max_angvel * preview_control_dt).tolist())
+    collision_scene_profile = build_dual_arm_scene_profile(args.collision_scene_profile)
+    ik_tuning = load_ik_tuning_config(args.ik_tuning_json or None)
+    initial_alignment = (
+        TeleopInitialAlignment.load_json(args.load_initial_alignment)
+        if args.load_initial_alignment
+        else None
     )
+    if args.load_profile:
+        calibration = TeleopCalibration.load_json(args.load_profile)
+    else:
+        calibration = build_annotated_dual_rm65_calibration(
+            left_right_base_distance=args.left_right_base_distance
+        )
     calibration.metadata.update(
         {
             "left_tracker_name": args.left_tracker_name,
             "right_tracker_name": args.right_tracker_name,
             "aux_tracker_name": args.aux_tracker_name,
+            "arm_mode": args.arm_mode,
+            "left_arm_ip": args.left_arm_ip,
+            "right_arm_ip": args.right_arm_ip,
+            "left_hand_port": getattr(args, "left_hand_port", ""),
+            "right_hand_port": getattr(args, "right_hand_port", ""),
+            "hand_reader_baudrate": int(getattr(args, "hand_reader_baudrate", 115200)),
+            "hand_joint_order": list(getattr(args, "hand_joint_order", DEFAULT_INSPIRE_HAND_JOINT_ORDER)),
+            "hand_invert": bool(getattr(args, "hand_invert", True)),
+            "hand_command_alpha": float(getattr(args, "hand_command_alpha", 1.0)),
+            "hand_send_threshold": float(getattr(args, "hand_send_threshold", 0.002)),
+            "preview_control_dt": preview_control_dt,
+            "preview_dry_run_fast": preview_dry_run_fast,
+            "dual_arm_collision_avoidance_requested": collision_guard_requested,
+            "collision_avoidance_mode": args.collision_avoidance_mode,
+            "collision_scene_profile": args.collision_scene_profile,
+            "ik_tuning_source": ik_tuning.source_path,
+            "ik_objective_mode": ik_tuning.ik_objective_mode,
+            "initial_alignment_source": args.load_initial_alignment,
         }
     )
     keyboard_source = KeyboardButtonSource(name="terminal_clutch")
@@ -249,6 +565,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             effector_name="left_arm",
             control_mode=args.control_mode,
             translation_scale=args.translation_scale,
+            input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
     right_retargeter = PoseToArmRetargeter(
@@ -258,8 +575,121 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             effector_name="right_arm",
             control_mode=args.control_mode,
             translation_scale=args.translation_scale,
+            input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
+    dual_arm_retargeter = None
+    collision_guard_setup_error = None
+    retargeters = []
+    if collision_guard_requested:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="no QP solver found on your system.*",
+                    category=UserWarning,
+                )
+                dual_arm_retargeter = DualArmCollisionAwareRetargeter(
+                    DualArmCollisionAwareRetargeterConfig(
+                        control_mode=args.control_mode,
+                        translation_scale=args.translation_scale,
+                        scene_profile=collision_scene_profile.name,
+                        contact_mode=args.collision_avoidance_mode,
+                        solver_frequency=args.hz,
+                        enforce_realistic_joint_step=bool(args.arm_mode == "real"),
+                        left_execution_max_joint_step_rad=realistic_joint_step,
+                        right_execution_max_joint_step_rad=realistic_joint_step,
+                        left_initial_qpos=DEFAULT_LEFT_ARM_QPOS,
+                        right_initial_qpos=DEFAULT_RIGHT_ARM_QPOS,
+                        ik_tuning=ik_tuning,
+                    ),
+                    left_pose_retargeter=left_retargeter,
+                    right_pose_retargeter=right_retargeter,
+                )
+        except (ModuleNotFoundError, RuntimeError, ValueError) as exc:
+            collision_guard_setup_error = f"{type(exc).__name__}: {exc}"
+        else:
+            retargeters.append(dual_arm_retargeter)
+    if dual_arm_retargeter is None:
+        retargeters.extend((left_retargeter, right_retargeter))
+
+    calibration.metadata.update(
+        {
+            "dual_arm_collision_avoidance_enabled": dual_arm_retargeter is not None,
+            "collision_avoidance_setup_error": collision_guard_setup_error,
+        }
+    )
+
+    left_hand_port = getattr(args, "left_hand_port", "") or ""
+    right_hand_port = getattr(args, "right_hand_port", "") or ""
+    hand_source = None
+    if left_hand_port or right_hand_port:
+        hand_source = HandQ6Source.from_bimanual(
+            left_port=left_hand_port or None,
+            right_port=right_hand_port or None,
+            baudrate=int(getattr(args, "hand_reader_baudrate", 115200)),
+            timeout=float(getattr(args, "hand_reader_timeout", 0.05)),
+            show_raw_lines=bool(getattr(args, "show_hand_raw_lines", False)),
+            critical=False,
+            strict_expected=False,
+        )
+
+    left_hand_retargeter = None
+    right_hand_retargeter = None
+    if left_hand_port:
+        left_hand_retargeter = JointsToDexHandRetargeter(
+            JointsToDexHandRetargeterConfig(
+                side="left",
+                input_channel_name="left_hand_q6",
+                effector_name="left_hand",
+                joint_order=tuple(getattr(args, "hand_joint_order", DEFAULT_INSPIRE_HAND_JOINT_ORDER)),
+                invert=bool(getattr(args, "hand_invert", True)),
+                alpha=float(getattr(args, "hand_command_alpha", 1.0)),
+            )
+        )
+    if right_hand_port:
+        right_hand_retargeter = JointsToDexHandRetargeter(
+            JointsToDexHandRetargeterConfig(
+                side="right",
+                input_channel_name="right_hand_q6",
+                effector_name="right_hand",
+                joint_order=tuple(getattr(args, "hand_joint_order", DEFAULT_INSPIRE_HAND_JOINT_ORDER)),
+                invert=bool(getattr(args, "hand_invert", True)),
+                alpha=float(getattr(args, "hand_command_alpha", 1.0)),
+            )
+        )
+
+    left_hand_backend = None
+    if left_hand_port:
+        left_hand_backend = InspireTacHandBackend(
+            InspireTacHandBackendConfig(
+                hand_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                send_threshold=float(getattr(args, "hand_send_threshold", 0.002)),
+            )
+        )
+    right_hand_backend = None
+    if right_hand_port:
+        right_hand_backend = InspireTacHandBackend(
+            InspireTacHandBackendConfig(
+                hand_ip="0.0.0.0",
+                side="right",
+                connect_hardware=False,
+                send_threshold=float(getattr(args, "hand_send_threshold", 0.002)),
+            )
+        )
+
+    session_sources = [
+        VivePoseSource(
+            tracker_configs=tracker_configs,
+            host=args.host,
+            port=args.port,
+        ),
+        keyboard_source,
+    ]
+    if hand_source is not None:
+        session_sources.append(hand_source)
 
     session = TeleopSession(
         config=TeleopSessionConfig(
@@ -267,53 +697,99 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             tcp_mode=args.tcp_mode,
             record_enabled=not args.no_record,
             allow_hardware_after_debug_pass=False,
+            recovery_healthy_frame_count=max(1, int(args.recovery_healthy_frames)),
+            non_freezing_fault_codes=("low_control_rate",),
         ),
-        sources=[
-            VivePoseSource(
-                tracker_configs=tracker_configs,
-                host=args.host,
-                port=args.port,
-            ),
-            keyboard_source,
-        ],
-        retargeters=[left_retargeter, right_retargeter],
+        sources=session_sources,
+        retargeters=retargeters,
         rig=None,
         calibration=calibration,
         safety_config=TeleopSafetyConfig(
             freeze_on_fault=True,
             required_channels=("left_wrist_pose", "right_wrist_pose"),
+            invalid_frame_limit=3,
         ),
     )
 
     arm_urdf_path = require_asset_path("rm65_arm.urdf")
-    left_backend = RM65ArmBackend(
+    left_initial_qpos = tuple(DEFAULT_LEFT_ARM_QPOS.tolist())
+    right_initial_qpos = tuple(DEFAULT_RIGHT_ARM_QPOS.tolist())
+    if initial_alignment is not None:
+        left_alignment = initial_alignment.get_side("left")
+        right_alignment = initial_alignment.get_side("right")
+        if left_alignment is not None and left_alignment.arm_qpos is not None:
+            left_initial_qpos = tuple(
+                np.asarray(left_alignment.arm_qpos, dtype=float).reshape(6).tolist()
+            )
+        if right_alignment is not None and right_alignment.arm_qpos is not None:
+            right_initial_qpos = tuple(
+                np.asarray(right_alignment.arm_qpos, dtype=float).reshape(6).tolist()
+            )
+    left_preview_backend = RM65ArmBackend(
         RM65ArmBackendConfig(
             arm_ip="0.0.0.0",
             side="left",
             default_tcp_frame=args.tcp_mode,
             arm_urdf_path=arm_urdf_path,
             connect_hardware=False,
-            initial_qpos=tuple(DEFAULT_LEFT_ARM_QPOS.tolist()),
+            control_dt=preview_control_dt,
+            max_angvel=tuple(arm_max_angvel.tolist()),
+            dry_run_fast=preview_dry_run_fast,
+            initial_qpos=left_initial_qpos,
+            ik_tuning=ik_tuning,
         )
     )
-    right_backend = RM65ArmBackend(
+    right_preview_backend = RM65ArmBackend(
         RM65ArmBackendConfig(
             arm_ip="0.0.0.0",
             side="right",
             default_tcp_frame=args.tcp_mode,
             arm_urdf_path=arm_urdf_path,
             connect_hardware=False,
-            initial_qpos=tuple(DEFAULT_RIGHT_ARM_QPOS.tolist()),
+            control_dt=preview_control_dt,
+            max_angvel=tuple(arm_max_angvel.tolist()),
+            dry_run_fast=preview_dry_run_fast,
+            initial_qpos=right_initial_qpos,
+            ik_tuning=ik_tuning,
         )
     )
+    left_state_backend = None
+    right_state_backend = None
+    if initial_alignment is None:
+        if args.left_arm_ip:
+            left_state_backend = RM65ArmBackend(
+                RM65ArmBackendConfig(
+                    arm_ip=args.left_arm_ip,
+                    side="left",
+                    default_tcp_frame=args.tcp_mode,
+                    arm_urdf_path=arm_urdf_path,
+                    connect_hardware=True,
+                    max_angvel=tuple(arm_max_angvel.tolist()),
+                    initial_qpos=None,
+                    ik_tuning=ik_tuning,
+                )
+            )
+        if args.right_arm_ip:
+            right_state_backend = RM65ArmBackend(
+                RM65ArmBackendConfig(
+                    arm_ip=args.right_arm_ip,
+                    side="right",
+                    default_tcp_frame=args.tcp_mode,
+                    arm_urdf_path=arm_urdf_path,
+                    connect_hardware=True,
+                    max_angvel=tuple(arm_max_angvel.tolist()),
+                    initial_qpos=None,
+                    ik_tuning=ik_tuning,
+                )
+            )
     renderer = None
     if not args.skip_renderer:
         try:
             renderer = SapienArmHandRenderer(
-                left_urdf_path=arm_urdf_path,
-                left_retargeting_joint_names=(),
-                right_urdf_path=arm_urdf_path,
-                right_retargeting_joint_names=(),
+                left_urdf_path=require_asset_path("rm65_inspire_tac_left.urdf"),
+                left_retargeting_joint_names=LEFT_HAND_RENDER_JOINT_NAMES,
+                right_urdf_path=require_asset_path("rm65_inspire_tac_right.urdf"),
+                right_retargeting_joint_names=RIGHT_HAND_RENDER_JOINT_NAMES,
                 left_right_base_distance=args.left_right_base_distance,
                 show_viewer=not args.headless,
             )
@@ -323,14 +799,48 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
                 "has a usable Vulkan/OpenGL render device, or rerun with --skip-renderer "
                 "to validate the teleop loop without visualization."
             ) from exc
+        renderer.reserve_debug_frames(
+            (
+                "desk",
+                "left_arm_base",
+                "right_arm_base",
+                "left_tracker",
+                "right_tracker",
+                "left_hand_home",
+                "right_hand_home",
+                "left_robot_home",
+                "right_robot_home",
+                "left_tcp_actual",
+                "right_tcp_actual",
+                "left_tcp_target",
+                "right_tcp_target",
+            )
+        )
+        renderer.reserve_debug_boxes(_collision_debug_box_templates(collision_scene_profile))
+    if dual_arm_retargeter is not None:
+        dual_arm_retargeter.set_current_qpos_pair(
+            left_qpos=_state_qpos(left_preview_backend, DEFAULT_LEFT_ARM_QPOS),
+            right_qpos=_state_qpos(right_preview_backend, DEFAULT_RIGHT_ARM_QPOS),
+        )
     return VirtualRunComponents(
         session=session,
-        left_backend=left_backend,
-        right_backend=right_backend,
+        left_preview_backend=left_preview_backend,
+        right_preview_backend=right_preview_backend,
+        left_state_backend=left_state_backend,
+        right_state_backend=right_state_backend,
+        left_hand_backend=left_hand_backend,
+        right_hand_backend=right_hand_backend,
+        initial_alignment=initial_alignment,
+        collision_scene_profile=collision_scene_profile,
+        dual_arm_retargeter=dual_arm_retargeter,
+        collision_guard_requested=collision_guard_requested,
+        collision_guard_setup_error=collision_guard_setup_error,
         renderer=renderer,
         keyboard_source=keyboard_source,
         left_retargeter=left_retargeter,
         right_retargeter=right_retargeter,
+        left_hand_retargeter=left_hand_retargeter,
+        right_hand_retargeter=right_hand_retargeter,
     )
 
 
@@ -340,6 +850,419 @@ def _state_qpos(backend: RM65ArmBackend, fallback: np.ndarray) -> np.ndarray:
     if qpos is None:
         return fallback.copy()
     return np.asarray(qpos, dtype=float).copy()
+
+
+def _has_live_real_state(components: VirtualRunComponents) -> bool:
+    return components.left_state_backend is not None or components.right_state_backend is not None
+
+
+def _preview_should_follow_live_real_state(
+    *,
+    arm_mode: str,
+    components: VirtualRunComponents,
+) -> bool:
+    return arm_mode == "real" and _has_live_real_state(components)
+
+
+def _manual_calibration_confirmation_required(
+    args: argparse.Namespace,
+    components: VirtualRunComponents,
+) -> bool:
+    _ = components
+    return not bool(args.auto_calibrate)
+
+
+def _pose_translation_summary(pose: np.ndarray | None) -> str:
+    if pose is None:
+        return "None"
+    return str(np.round(np.asarray(pose[:3, 3], dtype=float), 4).tolist())
+
+
+def _pose_rotation_summary(pose: np.ndarray | None) -> str:
+    if pose is None:
+        return "None"
+    pose_matrix = as_pose_matrix(pose)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Gimbal lock detected.*", category=UserWarning)
+        euler_deg = R.from_matrix(pose_matrix[:3, :3]).as_euler("xyz", degrees=True)
+    return str(np.round(np.asarray(euler_deg, dtype=float), 1).tolist())
+
+
+def _relative_rotation_summary(reference_pose: np.ndarray | None, pose: np.ndarray | None) -> str:
+    if reference_pose is None or pose is None:
+        return "None"
+    relative_pose = np.linalg.inv(as_pose_matrix(reference_pose)) @ as_pose_matrix(pose)
+    return _pose_rotation_summary(relative_pose)
+
+
+def _dominant_axis_label(axis: np.ndarray) -> str:
+    vector = np.asarray(axis, dtype=float).reshape(3)
+    dominant_index = int(np.argmax(np.abs(vector)))
+    dominant_value = float(vector[dominant_index])
+    sign = "+" if dominant_value >= 0.0 else "-"
+    return f"{sign}{'xyz'[dominant_index]}({abs(dominant_value):.3f})"
+
+
+def _tracker_axis_mapping_summary(offset: np.ndarray | None) -> str:
+    if offset is None:
+        return "None"
+    rotation = as_pose_matrix(offset)[:3, :3]
+    tracker_axes = np.eye(3, dtype=float)
+    return ", ".join(
+        f"tracker_{axis_name}->hand_{_dominant_axis_label(rotation.T @ tracker_axes[index])}"
+        for index, axis_name in enumerate(("x", "y", "z"))
+    )
+
+
+def _tracker_rpy_mapping_summary(offset: np.ndarray | None) -> str:
+    if offset is None:
+        return "None"
+    rotation = as_pose_matrix(offset)[:3, :3]
+    tracker_axes = np.eye(3, dtype=float)
+    labels = ("roll(x)", "pitch(y)", "yaw(z)")
+    return ", ".join(
+        f"{labels[index]}->{_dominant_axis_label(rotation.T @ tracker_axes[index])}"
+        for index in range(3)
+    )
+
+
+def _channel_pose_raw_in_desk(channel, calibration: TeleopCalibration) -> np.ndarray:
+    pose = as_pose_matrix(channel.value)
+    frame_name = channel.frame_name or ""
+    if frame_name in {"vive_world", "world"}:
+        pose_operator = calibration.world_to_operator(pose, tracker_role=None)
+        return calibration.operator_to_desk(pose_operator)
+    if frame_name.endswith("_operator") or frame_name == "operator":
+        return calibration.operator_to_desk(pose)
+    if frame_name in {calibration.desk_frame.name, "desk"}:
+        return pose
+    raise ValueError(f"Unsupported calibration input frame: {frame_name or '<none>'}")
+
+
+def _robot_home_mode_label(components: VirtualRunComponents) -> str:
+    if components.initial_alignment is not None:
+        return "tracker_home + alignment_robot_home"
+    if _has_live_real_state(components):
+        return "tracker_home + real_robot_home"
+    return "tracker_home + preview_robot_home"
+
+
+def _resolve_robot_home_for_side(
+    components: VirtualRunComponents,
+    *,
+    side: str,
+) -> tuple[np.ndarray, np.ndarray | None, str]:
+    calibration = components.session.calibration
+    assert calibration is not None
+    preview_backend = (
+        components.left_preview_backend
+        if side == "left"
+        else components.right_preview_backend
+    )
+    state_backend = (
+        components.left_state_backend
+        if side == "left"
+        else components.right_state_backend
+    )
+
+    if components.initial_alignment is not None:
+        alignment_state = components.initial_alignment.get_side(side)
+        if alignment_state is not None:
+            qpos = None
+            if alignment_state.arm_qpos is not None:
+                qpos = np.asarray(alignment_state.arm_qpos, dtype=float).copy()
+                preview_backend.set_local_qpos(qpos)
+                _sync_dual_arm_retargeter_from_preview(components)
+            if alignment_state.tcp_pose_desk is not None:
+                return alignment_state.tcp_pose_desk.copy(), qpos, "initial_alignment_pose_desk"
+            if alignment_state.tcp_pose_base is not None:
+                return (
+                    calibration.get_arm_for_side(side).T_D_B @ alignment_state.tcp_pose_base,
+                    qpos,
+                    "initial_alignment_pose_base",
+                )
+            if qpos is not None:
+                return _preview_tcp_pose_desk(components, side=side), qpos, "initial_alignment_qpos"
+
+    if state_backend is not None:
+        state = state_backend.refresh_state_from_hardware()
+        qpos = state.get("current_qpos")
+        if qpos is not None:
+            qpos_array = np.asarray(qpos, dtype=float).copy()
+            preview_backend.set_local_qpos(qpos_array)
+            _sync_dual_arm_retargeter_from_preview(components)
+            return _preview_tcp_pose_desk(components, side=side), qpos_array, "real_current_state"
+
+    qpos = preview_backend.get_state()["current_qpos"]
+    return _preview_tcp_pose_desk(components, side=side), qpos, "preview_current_state"
+
+
+def _build_renderer_debug_frames(
+    components: VirtualRunComponents,
+    *,
+    channels: dict[str, object] | None,
+) -> dict[str, np.ndarray]:
+    calibration = components.session.calibration
+    assert calibration is not None
+    frames: dict[str, np.ndarray] = {"desk": identity_pose()}
+    for side, retargeter in (
+        ("left", components.left_retargeter),
+        ("right", components.right_retargeter),
+    ):
+        arm = calibration.get_arm_for_side(side)
+        if arm.T_D_B is not None:
+            frames[f"{side}_arm_base"] = arm.T_D_B.copy()
+        frames[f"{side}_tcp_actual"] = _preview_tcp_pose_desk(components, side=side)
+        if retargeter.last_target_pose_desk is not None:
+            frames[f"{side}_tcp_target"] = retargeter.last_target_pose_desk
+        if retargeter.home_human_pose_desk is not None:
+            frames[f"{side}_hand_home"] = retargeter.home_human_pose_desk
+        if retargeter.home_robot_pose_desk is not None:
+            frames[f"{side}_robot_home"] = retargeter.home_robot_pose_desk
+        if not channels:
+            continue
+        channel = channels.get(f"{side}_wrist_pose")
+        if channel is None or not channel.valid:
+            continue
+        try:
+            frames[f"{side}_tracker"] = _channel_pose_in_desk(channel, calibration)
+        except Exception:
+            continue
+    return frames
+
+
+def _collision_debug_box_templates(
+    profile: DualArmSceneProfile,
+) -> dict[str, DebugBoxTemplate]:
+    boxes = {
+        spec.name: DebugBoxTemplate(
+            size_xyz=spec.box_size_xyz,
+            color_rgba=spec.color_rgba,
+        )
+        for spec in profile.hand_proxy_boxes
+    }
+    boxes.update(
+        {
+            spec.name: DebugBoxTemplate(
+                size_xyz=spec.box_size_xyz,
+                color_rgba=spec.color_rgba,
+            )
+            for spec in profile.fixed_scene_boxes
+        }
+    )
+    return boxes
+
+
+def _build_renderer_debug_boxes(
+    components: VirtualRunComponents,
+) -> dict[str, DebugBoxOverlay]:
+    profile = components.collision_scene_profile
+    boxes = {
+        spec.name: DebugBoxOverlay(
+            pose_matrix=_preview_tcp_pose_desk(components, side=spec.side)
+            @ spec.parent_to_box_pose_matrix(),
+            size_xyz=spec.box_size_xyz,
+            color_rgba=spec.color_rgba,
+        )
+        for spec in profile.hand_proxy_boxes
+    }
+    boxes.update(
+        {
+            spec.name: DebugBoxOverlay(
+                pose_matrix=spec.world_to_box_pose_matrix(),
+                size_xyz=spec.box_size_xyz,
+                color_rgba=spec.color_rgba,
+            )
+            for spec in profile.fixed_scene_boxes
+        }
+    )
+    return boxes
+
+
+def _emit_tracker_axis_mapping_logs(components: VirtualRunComponents) -> None:
+    calibration = components.session.calibration
+    assert calibration is not None
+    for tracker_role in ("left_wrist", "right_wrist"):
+        offset = calibration.tracker_offsets.get(tracker_role)
+        if offset is None:
+            continue
+        _log(
+            "TrackerAxes",
+            f"{tracker_role} tracker_mount_compensation_rpy_xyz_deg={_pose_rotation_summary(offset)} "
+            f"tracker_axis_to_hand_axis={_tracker_axis_mapping_summary(offset)} "
+            f"tracker_rpy_to_hand_rpy={_tracker_rpy_mapping_summary(offset)}",
+        )
+
+
+def _emit_home_alignment_logs(components: VirtualRunComponents) -> None:
+    for side, retargeter in (
+        ("left", components.left_retargeter),
+        ("right", components.right_retargeter),
+    ):
+        if retargeter.home_human_pose_desk is None or retargeter.home_robot_pose_desk is None:
+            continue
+        relative_pose = (
+            np.linalg.inv(retargeter.home_human_pose_desk) @ retargeter.home_robot_pose_desk
+        )
+        _log(
+            "HomeAxes",
+            f"{side} home_human_rpy_xyz_deg={_pose_rotation_summary(retargeter.home_human_pose_desk)} "
+            f"home_robot_rpy_xyz_deg={_pose_rotation_summary(retargeter.home_robot_pose_desk)} "
+            f"robot_from_human_rpy_xyz_deg={_pose_rotation_summary(relative_pose)}",
+        )
+
+
+def _emit_collision_proxy_logs(components: VirtualRunComponents) -> None:
+    profile = components.collision_scene_profile
+    if not profile.hand_proxy_boxes and not profile.fixed_scene_boxes:
+        return
+    expected_self_pairs = {
+        (
+            spec.geometry_name,
+            "arm_link2_0" if spec.side == "left" else "right_arm_link2_0",
+        )
+        for spec in profile.hand_proxy_boxes
+    }
+    self_pairs = tuple(pair for pair in profile.collision_pairs if pair in expected_self_pairs)
+    _log(
+        "CollisionProxy",
+        f"profile={profile.name} urdf={profile.urdf_path} self_pairs={self_pairs}",
+    )
+    for spec in profile.hand_proxy_boxes:
+        _log(
+            "CollisionProxy",
+            f"{spec.side} geometry={spec.geometry_name} parent={spec.parent_link_name} "
+            f"size_m={np.round(np.asarray(spec.box_size_xyz, dtype=float), 4).tolist()} "
+            f"joint_xyz_m={np.round(np.asarray(spec.joint_origin_xyz, dtype=float), 4).tolist()} "
+            f"joint_rpy_deg={np.round(np.rad2deg(np.asarray(spec.joint_origin_rpy, dtype=float)), 1).tolist()} "
+            f"box_xyz_m={np.round(np.asarray(spec.box_origin_xyz, dtype=float), 4).tolist()} "
+            f"box_rpy_deg={np.round(np.rad2deg(np.asarray(spec.box_origin_rpy, dtype=float)), 1).tolist()}",
+        )
+    for spec in profile.fixed_scene_boxes:
+        _log(
+            "CollisionProxy",
+            f"fixed_box geometry={spec.geometry_name} parent={spec.parent_link_name} "
+            f"size_m={np.round(np.asarray(spec.box_size_xyz, dtype=float), 4).tolist()} "
+            f"joint_xyz_m={np.round(np.asarray(spec.joint_origin_xyz, dtype=float), 4).tolist()} "
+            f"joint_rpy_deg={np.round(np.rad2deg(np.asarray(spec.joint_origin_rpy, dtype=float)), 1).tolist()} "
+            f"box_xyz_m={np.round(np.asarray(spec.box_origin_xyz, dtype=float), 4).tolist()} "
+            f"box_rpy_deg={np.round(np.rad2deg(np.asarray(spec.box_origin_rpy, dtype=float)), 1).tolist()}",
+        )
+
+
+def _emit_runtime_orientation_logs(
+    components: VirtualRunComponents,
+    *,
+    channels: dict[str, object],
+    now: float,
+    gate: ChangeGate,
+) -> None:
+    calibration = components.session.calibration
+    assert calibration is not None
+    for side, retargeter in (
+        ("left", components.left_retargeter),
+        ("right", components.right_retargeter),
+    ):
+        channel = channels.get(f"{side}_wrist_pose")
+        if channel is None or not channel.valid:
+            continue
+        try:
+            raw_pose = _channel_pose_raw_in_desk(channel, calibration)
+            human_pose = _channel_pose_in_desk(channel, calibration)
+        except Exception:
+            continue
+        target_pose = retargeter.last_target_pose_desk
+        actual_pose = _preview_tcp_pose_desk(components, side=side)
+        snapshot = (
+            tuple(np.round(raw_pose[:3, :3].reshape(-1), 2).tolist()),
+            tuple(np.round(human_pose[:3, :3].reshape(-1), 2).tolist()),
+            tuple(np.round(actual_pose[:3, :3].reshape(-1), 2).tolist()),
+            None
+            if target_pose is None
+            else tuple(np.round(target_pose[:3, :3].reshape(-1), 2).tolist()),
+        )
+        if not gate.should_emit(
+            f"orientation_debug_{side}",
+            snapshot,
+            now=now,
+            heartbeat_sec=1.5,
+        ):
+            continue
+        _log(
+            "Orientation",
+            f"{side} raw_rpy_xyz_deg={_pose_rotation_summary(raw_pose)} "
+            f"hand_rpy_xyz_deg={_pose_rotation_summary(human_pose)} "
+            f"target_rpy_xyz_deg={_pose_rotation_summary(target_pose)} "
+            f"actual_rpy_xyz_deg={_pose_rotation_summary(actual_pose)} "
+            f"human_rel_rpy_xyz_deg={_relative_rotation_summary(retargeter.home_human_pose_desk, human_pose)} "
+            f"target_rel_rpy_xyz_deg={_relative_rotation_summary(retargeter.home_robot_pose_desk, target_pose)} "
+            f"actual_rel_rpy_xyz_deg={_relative_rotation_summary(retargeter.home_robot_pose_desk, actual_pose)}",
+            now=now,
+        )
+
+
+def _sync_preview_from_real_state(
+    components: VirtualRunComponents,
+    *,
+    now: float | None = None,
+    required: bool,
+) -> dict[str, bool]:
+    synced = {"left": False, "right": False}
+    backends = (
+        ("left", components.left_state_backend, components.left_preview_backend),
+        ("right", components.right_state_backend, components.right_preview_backend),
+    )
+    active = [
+        (side, state_backend, preview_backend)
+        for side, state_backend, preview_backend in backends
+        if state_backend is not None
+    ]
+    state_read_executor = getattr(components, "arm_state_read_executor", None)
+    parallel_submit_failed = False
+    if state_read_executor is not None and len(active) > 1:
+        try:
+            future_map = {
+                state_read_executor.submit(state_backend.refresh_state_from_hardware): (
+                    side,
+                    preview_backend,
+                )
+                for side, state_backend, preview_backend in active
+            }
+        except RuntimeError:
+            parallel_submit_failed = True
+        else:
+            for future, (side, preview_backend) in future_map.items():
+                state = future.result()
+                qpos = state.get("current_qpos")
+                if qpos is None:
+                    if required:
+                        raise RuntimeError(
+                            f"{side}_arm real-state sync failed: no current_qpos available from hardware."
+                        )
+                    continue
+                preview_backend.set_local_qpos(qpos)
+                synced[side] = True
+    if state_read_executor is None or len(active) <= 1 or parallel_submit_failed:
+        for side, state_backend, preview_backend in active:
+            state = state_backend.refresh_state_from_hardware()
+            qpos = state.get("current_qpos")
+            if qpos is None:
+                if required:
+                    raise RuntimeError(
+                        f"{side}_arm real-state sync failed: no current_qpos available from hardware."
+                    )
+                continue
+            preview_backend.set_local_qpos(qpos)
+            synced[side] = True
+    if components.dual_arm_retargeter is not None:
+        left_qpos = components.left_preview_backend.get_state()["current_qpos"]
+        right_qpos = components.right_preview_backend.get_state()["current_qpos"]
+        if left_qpos is not None and right_qpos is not None:
+            components.dual_arm_retargeter.set_current_qpos_pair(
+                left_qpos=left_qpos,
+                right_qpos=right_qpos,
+            )
+    return synced
 
 
 def _mean_pose(poses: list[np.ndarray]) -> np.ndarray:
@@ -377,7 +1300,7 @@ def _channel_pose_in_desk(channel, calibration) -> np.ndarray:
 def _runtime_home_calibration(
     components: VirtualRunComponents,
     *,
-    tcp_mode: str,
+    arm_mode: str,
     timeout_sec: float,
     num_samples: int,
 ) -> None:
@@ -385,20 +1308,67 @@ def _runtime_home_calibration(
     assert calibration is not None
     left_tracker = calibration.metadata.get("left_tracker_name")
     right_tracker = calibration.metadata.get("right_tracker_name")
-    print(
-        "[Calibration] expecting "
+    _log(
+        "Calibration",
+        "expecting "
         f"left_wrist_pose<-{left_tracker or 'left_wrist role'}, "
-        f"right_wrist_pose<-{right_tracker or 'right_wrist role'}"
+        f"right_wrist_pose<-{right_tracker or 'right_wrist role'}",
     )
-    print(
-        "[Calibration] keep both wrist trackers steady in the desired home pose "
+    _log(
+        "Calibration",
+        "logical arm mapping: left_wrist_pose -> left_arm(slot at desk -Y / screen-left), "
+        "right_wrist_pose -> right_arm(slot at desk +Y / screen-right)",
+    )
+    try:
+        left_arm = calibration.get_arm_for_side("left")
+        right_arm = calibration.get_arm_for_side("right")
+        if left_arm.T_D_B is not None and right_arm.T_D_B is not None:
+            _log(
+                "Calibration",
+                "visual slots: "
+                f"left_arm desk_y={left_arm.T_D_B[1, 3]:+.4f}, "
+                f"right_arm desk_y={right_arm.T_D_B[1, 3]:+.4f}",
+            )
+    except Exception:
+        pass
+    _log(
+        "Calibration",
+        "keep both wrist trackers steady in the desired home pose "
         f"for about {max(num_samples / 60.0, 0.5):.1f}s. "
-        "This captures per-session home anchors; it does not yet solve a full desk/world extrinsic."
+        "This captures per-session tracker home on top of the saved tracker/station calibration.",
     )
+    _log(
+        "Calibration",
+        f"home_capture_mode={_robot_home_mode_label(components)}",
+    )
+    if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
+        synced = _sync_preview_from_real_state(components, required=False)
+        _log(
+            "Calibration",
+            f"start-pose source=real synced={synced}; pressing 'p' will capture tracker home and current real-arm home",
+        )
+    elif _has_live_real_state(components):
+        _log(
+            "Calibration",
+            "start-pose source=virtual preview; pressing 'p' will capture tracker home and read current real-arm home from the provided arm IPs",
+        )
+    elif components.initial_alignment is not None:
+        _log(
+            "Calibration",
+            "start-pose source=initial_alignment; pressing 'p' will capture tracker home only, while robot home comes from the saved alignment",
+        )
+    else:
+        _log(
+            "Calibration",
+            "start-pose source=virtual preview defaults/current local state; pressing 'p' will capture tracker home and current preview arm home",
+        )
     start_time = time.time()
     left_samples: list[np.ndarray] = []
     right_samples: list[np.ndarray] = []
     observed_channels: set[str] = set()
+    sample_markers = sorted({1, max(1, num_samples // 2), num_samples})
+    left_reported: set[int] = set()
+    right_reported: set[int] = set()
 
     while len(left_samples) < num_samples or len(right_samples) < num_samples:
         now = time.time()
@@ -409,41 +1379,96 @@ def _runtime_home_calibration(
                 "Verify sender tracker_role values and receiver tracker-name arguments."
             )
         channels, _ = components.session.poll_sources(now)
+        _update_optional_hand_preview_from_channels(
+            components,
+            channels,
+            timestamp=now,
+        )
+        if components.renderer is not None:
+            left_qpos = _state_qpos(components.left_preview_backend, DEFAULT_LEFT_ARM_QPOS)
+            right_qpos = _state_qpos(components.right_preview_backend, DEFAULT_RIGHT_ARM_QPOS)
+            components.renderer.set_debug_frames(
+                _build_renderer_debug_frames(
+                    components,
+                    channels=channels,
+                )
+            )
+            components.renderer.set_debug_boxes(_build_renderer_debug_boxes(components))
+            components.renderer.render_data(
+                left_qpos_arm=left_qpos,
+                left_qpos_hand=_hand_render_qpos(components.left_hand_backend, "left"),
+                right_qpos_arm=right_qpos,
+                right_qpos_hand=_hand_render_qpos(components.right_hand_backend, "right"),
+                capture_image=False,
+            )
         left_channel = channels.get("left_wrist_pose")
         if left_channel is not None:
             if left_channel.channel_name not in observed_channels:
                 metadata = left_channel.metadata or {}
-                print(
-                    "[Calibration] observed "
+                _log(
+                    "Calibration",
+                    "observed "
                     f"{left_channel.channel_name} <- "
                     f"{metadata.get('tracker_name')}:{metadata.get('tracker_role')} "
-                    f"frame={left_channel.frame_name}"
+                    f"frame={left_channel.frame_name}",
+                    now=now,
                 )
                 observed_channels.add(left_channel.channel_name)
             if left_channel.valid and len(left_samples) < num_samples:
                 left_samples.append(_channel_pose_in_desk(left_channel, calibration))
+                for marker in sample_markers:
+                    if len(left_samples) >= marker and marker not in left_reported:
+                        left_reported.add(marker)
+                        _log(
+                            "Calibration",
+                            f"left progress {len(left_samples)}/{num_samples}",
+                            now=now,
+                        )
         right_channel = channels.get("right_wrist_pose")
         if right_channel is not None:
             if right_channel.channel_name not in observed_channels:
                 metadata = right_channel.metadata or {}
-                print(
-                    "[Calibration] observed "
+                _log(
+                    "Calibration",
+                    "observed "
                     f"{right_channel.channel_name} <- "
                     f"{metadata.get('tracker_name')}:{metadata.get('tracker_role')} "
-                    f"frame={right_channel.frame_name}"
+                    f"frame={right_channel.frame_name}",
+                    now=now,
                 )
                 observed_channels.add(right_channel.channel_name)
             if right_channel.valid and len(right_samples) < num_samples:
                 right_samples.append(_channel_pose_in_desk(right_channel, calibration))
+                for marker in sample_markers:
+                    if len(right_samples) >= marker and marker not in right_reported:
+                        right_reported.add(marker)
+                        _log(
+                            "Calibration",
+                            f"right progress {len(right_samples)}/{num_samples}",
+                            now=now,
+                        )
         if len(left_samples) < num_samples or len(right_samples) < num_samples:
             time.sleep(0.01)
 
     left_human_home = _mean_pose(left_samples)
     right_human_home = _mean_pose(right_samples)
-    left_robot_home_base = components.left_backend.compute_tcp_pose(tcp_mode)
-    right_robot_home_base = components.right_backend.compute_tcp_pose(tcp_mode)
-    left_robot_home_desk = calibration.get_arm_for_side("left").T_D_B @ left_robot_home_base
-    right_robot_home_desk = calibration.get_arm_for_side("right").T_D_B @ right_robot_home_base
+    if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
+        synced = _sync_preview_from_real_state(components, required=False)
+        _log("Calibration", f"locked preview start pose from real state synced={synced}")
+    left_robot_home_desk, left_qpos, left_robot_source = _resolve_robot_home_for_side(
+        components,
+        side="left",
+    )
+    right_robot_home_desk, right_qpos, right_robot_source = _resolve_robot_home_for_side(
+        components,
+        side="right",
+    )
+    _log(
+        "Calibration",
+        "robot_home "
+        f"left_source={left_robot_source} left_xyz={_pose_translation_summary(left_robot_home_desk)} "
+        f"right_source={right_robot_source} right_xyz={_pose_translation_summary(right_robot_home_desk)}",
+    )
 
     components.left_retargeter.set_home_anchors(
         human_pose_desk=left_human_home,
@@ -453,31 +1478,51 @@ def _runtime_home_calibration(
         human_pose_desk=right_human_home,
         robot_pose_desk=right_robot_home_desk,
     )
-    calibration.capture_home_pose("left_arm", left_robot_home_desk, tcp_mode=tcp_mode)
-    calibration.capture_home_pose("right_arm", right_robot_home_desk, tcp_mode=tcp_mode)
-    print(
-        "[Calibration] runtime home captured "
-        f"left_samples={len(left_samples)} right_samples={len(right_samples)}"
+    calibration.capture_home_pose("left_arm", left_robot_home_desk)
+    calibration.capture_home_pose("right_arm", right_robot_home_desk)
+    if left_qpos is not None:
+        calibration.capture_home_qpos("left_arm", left_qpos)
+    if right_qpos is not None:
+        calibration.capture_home_qpos("right_arm", right_qpos)
+    _log(
+        "Calibration",
+        f"runtime home captured left_samples={len(left_samples)} right_samples={len(right_samples)} "
+        f"left_q={_qpos_summary(left_qpos)} right_q={_qpos_summary(right_qpos)}",
     )
 
 
 def _wait_for_calibration_start(
     components: VirtualRunComponents,
     clutch_input: TerminalClutchInput,
+    *,
+    arm_mode: str,
 ) -> bool:
     if not clutch_input.enabled:
-        print(
-            "[Calibration] stdin is not interactive; starting automatically. "
-            "Use --auto-calibrate explicitly in non-interactive runs."
+        _log(
+            "Calibration",
+            "stdin is not interactive; starting automatically. "
+            "Use --auto-calibrate explicitly in non-interactive runs.",
         )
         return True
 
-    print(
-        "[Calibration] position robot and trackers first, then press 'p' or Enter to start home calibration. "
-        "Press 'q' to quit."
-    )
-    empty_hand = np.empty(0, dtype=float)
-    next_print_time = 0.0
+    _log("Calibration", "HOME CAPTURE IS ARMED. Position robot and trackers first, then press 'p' or Enter.",)
+    if components.initial_alignment is not None:
+        _log(
+            "Calibration",
+            "P action: capture tracker home only. Robot home will be loaded from --load-initial-alignment.",
+        )
+    elif _has_live_real_state(components):
+        _log(
+            "Calibration",
+            "P action: capture tracker home and current real-arm home together.",
+        )
+    else:
+        _log(
+            "Calibration",
+            "P action: capture tracker home and current preview arm home together.",
+        )
+    _log("Calibration", "Press 'q' to quit.")
+    status_gate = ChangeGate()
     while True:
         loop_start = time.time()
         clutch_input.poll()
@@ -486,98 +1531,939 @@ def _wait_for_calibration_start(
         if clutch_input.consume_calibration_request():
             return True
 
+        if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
+            _sync_preview_from_real_state(components, required=False)
+
+        channels, _ = components.session.poll_sources(loop_start)
+        _update_optional_hand_preview_from_channels(
+            components,
+            channels,
+            timestamp=loop_start,
+        )
         if components.renderer is not None:
-            left_qpos = _state_qpos(components.left_backend, DEFAULT_LEFT_ARM_QPOS)
-            right_qpos = _state_qpos(components.right_backend, DEFAULT_RIGHT_ARM_QPOS)
+            left_qpos = _state_qpos(components.left_preview_backend, DEFAULT_LEFT_ARM_QPOS)
+            right_qpos = _state_qpos(components.right_preview_backend, DEFAULT_RIGHT_ARM_QPOS)
+            components.renderer.set_debug_frames(
+                _build_renderer_debug_frames(
+                    components,
+                    channels=channels,
+                )
+            )
+            components.renderer.set_debug_boxes(_build_renderer_debug_boxes(components))
             components.renderer.render_data(
                 left_qpos_arm=left_qpos,
-                left_qpos_hand=empty_hand,
+                left_qpos_hand=_hand_render_qpos(components.left_hand_backend, "left"),
                 right_qpos_arm=right_qpos,
-                right_qpos_hand=empty_hand,
+                right_qpos_hand=_hand_render_qpos(components.right_hand_backend, "right"),
+                capture_image=False,
             )
 
-        if loop_start >= next_print_time:
-            channels, _ = components.session.poll_sources(loop_start)
-            print(
-                "[Calibration] waiting_for_key "
-                f"channels={sorted(channels)} "
-                "ready_key='p/Enter'"
+        ready = {
+            name: bool(channels.get(name) is not None and channels[name].valid)
+            for name in ("left_wrist_pose", "right_wrist_pose")
+        }
+        status_snapshot = (
+            tuple(sorted(ready.items())),
+        )
+        if status_gate.should_emit("wait_for_key_status", status_snapshot, now=loop_start):
+            _log(
+                "Calibration",
+                f"waiting_for_key tracker_ready={ready} ready_key='p/Enter' arm_mode={arm_mode}",
+                now=loop_start,
             )
-            next_print_time = loop_start + 1.0
+        elif status_gate.should_emit(
+            "wait_for_key_heartbeat",
+            "waiting",
+            now=loop_start,
+            heartbeat_sec=3.0,
+        ):
+            _log(
+                "Calibration",
+                f"still_waiting ready={ready} ready_key='p/Enter'",
+                now=loop_start,
+            )
         time.sleep(0.02)
+
+
+def _sync_dual_arm_retargeter_from_preview(components: VirtualRunComponents) -> None:
+    if components.dual_arm_retargeter is None:
+        return
+    left_qpos = components.left_preview_backend.get_state()["current_qpos"]
+    right_qpos = components.right_preview_backend.get_state()["current_qpos"]
+    if left_qpos is None or right_qpos is None:
+        return
+    components.dual_arm_retargeter.set_current_qpos_pair(
+        left_qpos=left_qpos,
+        right_qpos=right_qpos,
+    )
+
+
+def _preview_tcp_pose_desk(
+    components: VirtualRunComponents,
+    *,
+    side: str,
+) -> np.ndarray:
+    calibration = components.session.calibration
+    assert calibration is not None
+    backend = (
+        components.left_preview_backend
+        if side == "left"
+        else components.right_preview_backend
+    )
+    pose_base = backend.compute_tcp_pose()
+    return calibration.get_arm_for_side(side).T_D_B @ pose_base
+
+
+def _send_preview_command(
+    components: VirtualRunComponents,
+    command,
+) -> None:
+    left_command = command.commands.get("left_arm")
+    if left_command is not None:
+        components.left_preview_backend.send_command(left_command)
+    right_command = command.commands.get("right_arm")
+    if right_command is not None:
+        components.right_preview_backend.send_command(right_command)
+
+
+def _hand_observation_for_step(
+    components: VirtualRunComponents,
+    step_result,
+) -> TeleopObservation | None:
+    if step_result.observation is not None:
+        return step_result.observation
+    return _hand_observation_from_channels(
+        components,
+        step_result.channels,
+        timestamp=step_result.timestamp,
+    )
+
+
+def _hand_observation_from_channels(
+    components: VirtualRunComponents,
+    channels,
+    *,
+    timestamp: float | None = None,
+) -> TeleopObservation | None:
+    if not channels:
+        return None
+    observation_timestamp = latest_channel_timestamp(channels)
+    if observation_timestamp is None:
+        observation_timestamp = time.time() if timestamp is None else float(timestamp)
+    return TeleopObservation(
+        channels={name: channel.copy() for name, channel in channels.items()},
+        timestamp=observation_timestamp,
+        metadata={"tcp_mode": components.session.config.tcp_mode},
+    )
+
+
+def _build_optional_hand_command_from_observation(
+    components: VirtualRunComponents,
+    observation: TeleopObservation | None,
+):
+    if (
+        components.left_hand_retargeter is None
+        and components.right_hand_retargeter is None
+    ):
+        return None
+    if observation is None:
+        return None
+    commands = []
+    if components.left_hand_retargeter is not None:
+        commands.append(
+            components.left_hand_retargeter.retarget(
+                observation,
+                components.session.calibration,
+            )
+        )
+    if components.right_hand_retargeter is not None:
+        commands.append(
+            components.right_hand_retargeter.retarget(
+                observation,
+                components.session.calibration,
+            )
+        )
+    if not commands:
+        return None
+    command = merge_teleop_commands(commands)
+    if not command.commands:
+        return None
+    return command
+
+
+def _build_optional_hand_command(
+    components: VirtualRunComponents,
+    step_result,
+):
+    return _build_optional_hand_command_from_observation(
+        components,
+        _hand_observation_for_step(components, step_result),
+    )
+
+
+def _send_optional_hand_command(
+    components: VirtualRunComponents,
+    hand_command,
+) -> None:
+    if hand_command is None:
+        return
+    left_command = hand_command.commands.get("left_hand")
+    if left_command is not None and components.left_hand_backend is not None:
+        components.left_hand_backend.send_command(left_command)
+    right_command = hand_command.commands.get("right_hand")
+    if right_command is not None and components.right_hand_backend is not None:
+        components.right_hand_backend.send_command(right_command)
+
+
+def _update_optional_hand_preview_from_channels(
+    components: VirtualRunComponents,
+    channels,
+    *,
+    timestamp: float | None = None,
+):
+    hand_command = _build_optional_hand_command_from_observation(
+        components,
+        _hand_observation_from_channels(
+            components,
+            channels,
+            timestamp=timestamp,
+        ),
+    )
+    _send_optional_hand_command(components, hand_command)
+    return hand_command
+
+
+def _hand_state_q6(backend: InspireTacHandBackend | None) -> np.ndarray | None:
+    if backend is None:
+        return None
+    joint_pos = backend.get_state().get("joint_pos")
+    if joint_pos is None:
+        return None
+    q6 = np.asarray(joint_pos, dtype=float).reshape(-1)
+    if q6.shape != (6,) or not np.all(np.isfinite(q6)):
+        return None
+    return np.clip(q6, 0.0, 1.0)
+
+
+def _hand_render_qpos(backend: InspireTacHandBackend | None, side: str) -> np.ndarray:
+    q6 = _hand_state_q6(backend)
+    if q6 is None:
+        return open_hand_render_qpos(side)
+    return inspire_q6_to_render_qpos(q6)
+
+
+def _episode_root_dir(
+    args: argparse.Namespace,
+    components: VirtualRunComponents,
+) -> Path | None:
+    if args.episode_root:
+        return Path(args.episode_root)
+    if components.session.recorder is not None:
+        return Path(components.session.recorder.root_dir) / "trajectories"
+    return None
+
+
+def _build_episode_metadata(
+    args: argparse.Namespace,
+    components: VirtualRunComponents,
+    *,
+    start_reason: str,
+) -> dict[str, object]:
+    calibration = components.session.calibration
+    assert calibration is not None
+    session_record_root = (
+        None if components.session.recorder is None else str(components.session.recorder.root_dir)
+    )
+    return {
+        "source_entrypoint": "teleop_runtime.debug.run_vive_sapien_virtual",
+        "start_reason": start_reason,
+        "control_mode": args.control_mode,
+        "arm_mode": args.arm_mode,
+        "hz": float(args.hz),
+        "translation_scale": float(args.translation_scale),
+        "left_right_base_distance_m": float(args.left_right_base_distance),
+        "collision_scene_profile": args.collision_scene_profile,
+        "collision_avoidance_mode": args.collision_avoidance_mode,
+        "collision_guard_requested": bool(components.collision_guard_requested),
+        "collision_guard_enabled": bool(components.dual_arm_retargeter is not None),
+        "session_record_root": session_record_root,
+        "load_profile": args.load_profile or None,
+        "load_initial_alignment": args.load_initial_alignment or None,
+        "left_hand_port": getattr(args, "left_hand_port", "") or None,
+        "right_hand_port": getattr(args, "right_hand_port", "") or None,
+        "hand_reader_baudrate": int(getattr(args, "hand_reader_baudrate", 115200)),
+        "hand_joint_order": list(getattr(args, "hand_joint_order", DEFAULT_INSPIRE_HAND_JOINT_ORDER)),
+        "hand_invert": bool(getattr(args, "hand_invert", True)),
+        "hand_command_alpha": float(getattr(args, "hand_command_alpha", 1.0)),
+        "hand_send_threshold": float(getattr(args, "hand_send_threshold", 0.002)),
+        "calibration_snapshot": calibration.to_dict(),
+        "initial_alignment_snapshot": (
+            None if components.initial_alignment is None else components.initial_alignment.to_dict()
+        ),
+    }
+
+
+def _start_episode_recording(
+    recorder: EpisodeRecorder,
+    args: argparse.Namespace,
+    components: VirtualRunComponents,
+    *,
+    now: float,
+    start_reason: str,
+) -> Path | None:
+    episode_dir = recorder.start_episode(
+        metadata=_build_episode_metadata(
+            args,
+            components,
+            start_reason=start_reason,
+        ),
+        timestamp=now,
+    )
+    if episode_dir is not None:
+        _log("Episode", f"recording started -> {episode_dir}", now=now)
+    return episode_dir
+
+
+def _stop_episode_recording(
+    recorder: EpisodeRecorder,
+    *,
+    now: float,
+    end_reason: str,
+    summary: dict[str, object] | None = None,
+) -> Path | None:
+    episode_dir = recorder.stop_episode(
+        end_reason=end_reason,
+        summary=summary,
+        timestamp=now,
+    )
+    if episode_dir is not None:
+        _log("Episode", f"recording stopped reason={end_reason} -> {episode_dir}", now=now)
+    return episode_dir
+
+
+def _backend_tcp_pose_base_or_none(backend: RM65ArmBackend) -> np.ndarray | None:
+    try:
+        return backend.compute_tcp_pose()
+    except Exception:
+        return None
+
+
+def _backend_tcp_pose_desk_or_none(
+    components: VirtualRunComponents,
+    *,
+    side: str,
+) -> np.ndarray | None:
+    try:
+        return _preview_tcp_pose_desk(components, side=side)
+    except Exception:
+        return None
+
+
+def _episode_arm_payload(
+    components: VirtualRunComponents,
+    *,
+    side: str,
+) -> dict[str, object]:
+    backend = (
+        components.left_preview_backend
+        if side == "left"
+        else components.right_preview_backend
+    )
+    state = backend.get_state()
+    return {
+        "current_qpos": state.get("current_qpos"),
+        "last_target_qpos": state.get("last_target_qpos"),
+        "last_command": state.get("last_command"),
+        "ik_metadata": state.get("ik_metadata"),
+        "tcp_pose_base": _backend_tcp_pose_base_or_none(backend),
+        "tcp_pose_desk": _backend_tcp_pose_desk_or_none(components, side=side),
+    }
+
+
+def _episode_hand_payload(
+    components: VirtualRunComponents,
+    *,
+    side: str,
+) -> dict[str, object] | None:
+    backend = (
+        components.left_hand_backend
+        if side == "left"
+        else components.right_hand_backend
+    )
+    if backend is None:
+        return None
+    state = backend.get_state()
+    return {
+        "joint_pos": state.get("joint_pos"),
+        "last_sent_command": state.get("last_sent_command"),
+        "tactile": state.get("tactile"),
+        "tactile_dict": state.get("tactile_dict"),
+        "telemetry_error": state.get("telemetry_error"),
+    }
+
+
+def _build_episode_frame(
+    components: VirtualRunComponents,
+    *,
+    step_index: int,
+    step_result,
+    active_command,
+    hand_command,
+    recovery_plan: RecoveryPlan | None,
+    left_clutch: bool,
+    right_clutch: bool,
+) -> dict[str, object]:
+    if step_result.state == TeleopRunState.RECOVERING:
+        if active_command is None:
+            active_command_source = "recovery_wait"
+        elif recovery_plan is None:
+            active_command_source = "recovery_direct"
+        else:
+            active_command_source = "recovery_plan"
+    elif active_command is None:
+        active_command_source = "none"
+    else:
+        active_command_source = "session"
+
+    return {
+        "step_index": int(step_index),
+        "state": step_result.state.value,
+        "control_hz": float(step_result.control_hz),
+        "active_command_source": active_command_source,
+        "recovery_plan_mode": None if recovery_plan is None else recovery_plan.mode,
+        "channels": dict(step_result.channels),
+        "channel_validity": {
+            name: bool(channel.valid)
+            for name, channel in sorted(step_result.channels.items())
+        },
+        "clutch": {
+            "left": bool(left_clutch),
+            "right": bool(right_clutch),
+        },
+        "faults": list(step_result.faults),
+        "session_command": step_result.command,
+        "active_command": active_command,
+        "hand_command": hand_command,
+        "arms": {
+            "left": _episode_arm_payload(components, side="left"),
+            "right": _episode_arm_payload(components, side="right"),
+        },
+        "hands": {
+            "left": _episode_hand_payload(components, side="left"),
+            "right": _episode_hand_payload(components, side="right"),
+        },
+    }
+
+
+def _start_recovery_plan(
+    components: VirtualRunComponents,
+    observation,
+    *,
+    now: float,
+    arm_mode: str,
+    control_mode: str,
+    ramp_sec: float,
+) -> tuple[RecoveryPlan | None, object | None, bool]:
+    calibration = components.session.calibration
+    assert calibration is not None
+    _sync_dual_arm_retargeter_from_preview(components)
+
+    if control_mode == "delta_clutch":
+        components.left_retargeter.reanchor_to_current_input(
+            observation,
+            calibration,
+            robot_pose_desk=_preview_tcp_pose_desk(
+                components,
+                side="left",
+            ),
+        )
+        components.right_retargeter.reanchor_to_current_input(
+            observation,
+            calibration,
+            robot_pose_desk=_preview_tcp_pose_desk(
+                components,
+                side="right",
+            ),
+        )
+        _sync_dual_arm_retargeter_from_preview(components)
+        return None, components.session.build_command(observation), True
+
+    if arm_mode == "virtual":
+        return None, components.session.build_command(observation), True
+
+    if components.dual_arm_retargeter is not None:
+        context = components.dual_arm_retargeter.build_target_context(observation, calibration)
+        return (
+            RecoveryPlan(
+                mode="absolute_ramp_dual",
+                started_at=now,
+                duration_sec=float(ramp_sec),
+                payload={
+                    "context": context,
+                    "start_targets": components.dual_arm_retargeter.current_world_targets(),
+                    "end_targets": {
+                        "left": context.left_target.copy(),
+                        "right": context.right_target.copy(),
+                    },
+                },
+            ),
+            None,
+            False,
+        )
+
+    left_resolution = components.left_retargeter.resolve_absolute_target_from_observation(
+        observation,
+        calibration,
+    )
+    right_resolution = components.right_retargeter.resolve_absolute_target_from_observation(
+        observation,
+        calibration,
+    )
+    if left_resolution is None or right_resolution is None:
+        raise RuntimeError("Absolute recovery requires both wrist channels to be valid.")
+    return (
+        RecoveryPlan(
+            mode="absolute_ramp_independent",
+            started_at=now,
+            duration_sec=float(ramp_sec),
+            payload={
+                "start_targets": {
+                    "left": _preview_tcp_pose_desk(components, side="left"),
+                    "right": _preview_tcp_pose_desk(components, side="right"),
+                },
+                "end_resolutions": {
+                    "left": left_resolution,
+                    "right": right_resolution,
+                },
+            },
+        ),
+        None,
+        False,
+    )
+
+
+def _advance_recovery_plan(
+    components: VirtualRunComponents,
+    observation,
+    plan: RecoveryPlan,
+    *,
+    now: float,
+) -> tuple[object, bool]:
+    calibration = components.session.calibration
+    assert calibration is not None
+    alpha = 1.0
+    if plan.duration_sec > 1e-6:
+        alpha = float(np.clip((now - plan.started_at) / plan.duration_sec, 0.0, 1.0))
+
+    if plan.mode == "absolute_ramp_dual":
+        assert components.dual_arm_retargeter is not None
+        context = plan.payload["context"]
+        start_targets = plan.payload["start_targets"]
+        end_targets = plan.payload["end_targets"]
+        command = components.dual_arm_retargeter.build_command_for_context(
+            context,
+            targets=components.dual_arm_retargeter.interpolate_world_targets(
+                start_targets,
+                end_targets,
+                alpha,
+            ),
+        )
+        command.timestamp = observation.timestamp
+        return command, alpha >= 1.0
+
+    if plan.mode == "absolute_ramp_independent":
+        start_targets = plan.payload["start_targets"]
+        end_resolutions = plan.payload["end_resolutions"]
+        left_pose = interpolate_pose(
+            start_targets["left"],
+            end_resolutions["left"]["target_pose_desk"],
+            alpha,
+        )
+        right_pose = interpolate_pose(
+            start_targets["right"],
+            end_resolutions["right"]["target_pose_desk"],
+            alpha,
+        )
+        left_command = components.left_retargeter.build_command_from_target_pose_desk(
+            target_pose_desk=left_pose,
+            observation=observation,
+            calibration=calibration,
+            pose_operator=end_resolutions["left"].get("pose_operator"),
+        )
+        right_command = components.right_retargeter.build_command_from_target_pose_desk(
+            target_pose_desk=right_pose,
+            observation=observation,
+            calibration=calibration,
+            pose_operator=end_resolutions["right"].get("pose_operator"),
+        )
+        command = merge_teleop_commands((left_command, right_command))
+        command.timestamp = observation.timestamp
+        return command, alpha >= 1.0
+
+    raise ValueError(f"Unsupported recovery plan mode: {plan.mode}")
 
 
 def main() -> None:
     args = parse_args()
     components = build_components(args)
     clutch_input = TerminalClutchInput(components.keyboard_source)
-    empty_hand = np.empty(0, dtype=float)
+    episode_recorder = EpisodeRecorder(
+        root_dir=_episode_root_dir(args, components),
+        config=EpisodeRecorderConfig(enabled=not args.no_episode_recording),
+    )
     try:
-        components.left_backend.start()
-        components.right_backend.start()
+        components.left_preview_backend.start()
+        components.right_preview_backend.start()
+        if components.left_state_backend is not None:
+            components.left_state_backend.start()
+        if components.right_state_backend is not None:
+            components.right_state_backend.start()
+        if components.left_hand_backend is not None:
+            components.left_hand_backend.start()
+        if components.right_hand_backend is not None:
+            components.right_hand_backend.start()
         components.session.start()
         clutch_input.start()
-        if not args.auto_calibrate:
-            should_continue = _wait_for_calibration_start(components, clutch_input)
+        if args.arm_mode == "real":
+            if components.initial_alignment is not None:
+                _log(
+                    "ArmMode",
+                    "real-mode recovery behavior is enabled, but preview startup pose is loaded from "
+                    f"{args.load_initial_alignment}; no real-arm state read is needed, and robot home at 'p' time will also come from this alignment.",
+                )
+            else:
+                _log(
+                    "ArmMode",
+                    "real mode: will read current RM65 start pose and copy it into the local preview; no motion command is sent to hardware.",
+                )
+                if not args.left_arm_ip and not args.right_arm_ip:
+                    _log(
+                        "ArmMode",
+                        "no real arm IP provided; falling back to virtual preview state for both sides.",
+                    )
+            _log(
+                "ArmMode",
+                f"preview motion is step-limited at hz={args.hz:.1f} using dry-run IK, rather than instant dry-run convergence.",
+            )
+        else:
+            _log("ArmMode", "virtual mode: rendering uses local unlimited-speed preview backends only.")
+            if _has_live_real_state(components):
+                _log(
+                    "ArmMode",
+                    "arm IPs are present in virtual mode; preview startup pose stays local, but pressing 'p' will sample current real-arm home read-only.",
+                )
+            if components.initial_alignment is not None:
+                _log(
+                    "ArmMode",
+                    "virtual mode already avoids any real-arm state read; "
+                    "load-initial-alignment will set the initial preview qpos and also provide robot home at 'p' time.",
+                )
+        if components.initial_alignment is not None:
+            _log(
+                "InitialAlignment",
+                f"source={args.load_initial_alignment} "
+                f"left_q={_qpos_summary(components.initial_alignment.get_side('left').arm_qpos if components.initial_alignment.get_side('left') is not None else None)} "
+                f"right_q={_qpos_summary(components.initial_alignment.get_side('right').arm_qpos if components.initial_alignment.get_side('right') is not None else None)}",
+            )
+        if components.left_hand_retargeter is not None or components.right_hand_retargeter is not None:
+            _log(
+                "HandTeleop",
+                "enabled "
+                f"left_port={getattr(args, 'left_hand_port', '') or None} "
+                f"right_port={getattr(args, 'right_hand_port', '') or None} "
+                f"joint_order={list(getattr(args, 'hand_joint_order', DEFAULT_INSPIRE_HAND_JOINT_ORDER))} "
+                f"invert={bool(getattr(args, 'hand_invert', True))} "
+                f"alpha={float(getattr(args, 'hand_command_alpha', 1.0)):.3f}",
+            )
+        else:
+            _log("HandTeleop", "disabled; arm teleop path remains unchanged.")
+        if components.session.calibration.metadata.get("virtual_desk_scene_alignment_defaulted"):
+            _log(
+                "VirtualDesk",
+                "applied default desk-to-scene yaw 180deg so tracker poses align with the SAPIEN/RM65 scene.",
+            )
+        _emit_tracker_axis_mapping_logs(components)
+        _log(
+            "IK",
+            f"objective_mode={components.session.calibration.metadata.get('ik_objective_mode')} "
+            f"tuning={components.session.calibration.metadata.get('ik_tuning_source')}",
+        )
+        if components.collision_guard_setup_error is not None:
+            _log(
+                "CollisionGuard",
+                "disabled automatically; "
+                f"{components.collision_guard_setup_error}. "
+                "Falling back to two independent arm retargeters. "
+                "Use --no-collision to disable this explicitly.",
+            )
+        if components.dual_arm_retargeter is not None:
+            _log(
+                "CollisionGuard",
+                "enabled "
+                f"scene_profile={args.collision_scene_profile} "
+                f"pairs={len(components.dual_arm_retargeter.profile.collision_pairs)} "
+                f"mode={args.collision_avoidance_mode}",
+            )
+        else:
+            _log("CollisionGuard", "disabled; using two independent arm retargeters.")
+        _emit_collision_proxy_logs(components)
+        if components.initial_alignment is not None:
+            _log(
+                "Calibration",
+                "load-initial-alignment will provide robot home at 'p' time. "
+                "Press 'p' after both wrist trackers are in the desired session home pose.",
+            )
+        if _manual_calibration_confirmation_required(args, components):
+            should_continue = _wait_for_calibration_start(
+                components,
+                clutch_input,
+                arm_mode=args.arm_mode,
+            )
             if not should_continue:
                 return
         _runtime_home_calibration(
             components,
-            tcp_mode=args.tcp_mode,
+            arm_mode=args.arm_mode,
             timeout_sec=args.calibration_timeout,
             num_samples=args.calibration_samples,
         )
+        _emit_home_alignment_logs(components)
+        if legacy_tcp_mode_requested(args.requested_tcp_mode):
+            _log(
+                "TCP",
+                "legacy --tcp-mode rm_eef was requested; runtime now uses hand_base only.",
+            )
         components.session.set_calibration_ready()
         components.session.mark_debug_passed()
         components.session.arm_hardware()
+        clutch_input.consume_episode_start_request()
+        clutch_input.consume_episode_stop_request()
 
         if args.keyboard_clutch:
-            print("[Keys] p/Enter=start calibration, z=left clutch, x=right clutch, c=both, r=release, q=quit")
+            _log(
+                "Keys",
+                "p/Enter=start calibration, t=start episode, s=stop episode, z=left clutch, x=right clutch, c=both, r=release, q=quit",
+            )
         elif args.control_mode == "delta_clutch":
-            print("[Info] delta_clutch is running with both clutch buttons held true by default.")
+            _log("Info", "delta_clutch is running with both clutch buttons held true by default.")
+        if episode_recorder.config.enabled:
+            auto_start_note = " auto_start=on" if args.record_auto_start else " auto_start=off"
+            _log(
+                "Episode",
+                f"recording ready root={episode_recorder.root_dir or _episode_root_dir(args, components)} "
+                f"start_key='t' stop_key='s'{auto_start_note}",
+            )
 
-        next_print_time = 0.0
+        status_gate = ChangeGate()
+        orientation_gate = ChangeGate()
         step_index = 0
+        recovery_plan: RecoveryPlan | None = None
+        episode_last_state: str | None = None
+        if args.record_auto_start and episode_recorder.config.enabled:
+            _start_episode_recording(
+                episode_recorder,
+                args,
+                components,
+                now=time.time(),
+                start_reason="auto_start",
+            )
         while True:
             loop_start = time.time()
             clutch_input.poll()
             if clutch_input.should_quit:
+                if episode_recorder.is_recording:
+                    _stop_episode_recording(
+                        episode_recorder,
+                        now=loop_start,
+                        end_reason="quit_requested",
+                        summary={
+                            "last_step_index": step_index,
+                            "last_state": episode_last_state,
+                        },
+                    )
                 break
+            if clutch_input.consume_episode_stop_request() and episode_recorder.config.enabled:
+                if episode_recorder.is_recording:
+                    _stop_episode_recording(
+                        episode_recorder,
+                        now=loop_start,
+                        end_reason="manual_key_stop",
+                        summary={
+                            "last_step_index": step_index,
+                            "last_state": episode_last_state,
+                        },
+                    )
+                    episode_last_state = None
+            if clutch_input.consume_episode_start_request() and episode_recorder.config.enabled:
+                if not episode_recorder.is_recording:
+                    _start_episode_recording(
+                        episode_recorder,
+                        args,
+                        components,
+                        now=loop_start,
+                        start_reason="manual_key_start",
+                    )
 
             step_result = components.session.run_step(now=loop_start)
-            if step_result.command is not None:
-                left_command = step_result.command.commands.get("left_arm")
-                if left_command is not None:
-                    components.left_backend.send_command(left_command)
-                right_command = step_result.command.commands.get("right_arm")
-                if right_command is not None:
-                    components.right_backend.send_command(right_command)
+            active_command = step_result.command
+            if step_result.state == TeleopRunState.RECOVERING:
+                if step_result.observation is None:
+                    active_command = None
+                elif recovery_plan is None:
+                    recovery_plan, active_command, recovery_done = _start_recovery_plan(
+                        components,
+                        step_result.observation,
+                        now=loop_start,
+                        arm_mode=args.arm_mode,
+                        control_mode=args.control_mode,
+                        ramp_sec=args.recovery_ramp_sec,
+                    )
+                    if not episode_recorder.is_recording:
+                        if recovery_plan is None:
+                            _log(
+                                "Recovery",
+                                f"direct mode arm_mode={args.arm_mode} control_mode={args.control_mode}",
+                                now=loop_start,
+                            )
+                        else:
+                            _log(
+                                "Recovery",
+                                f"start mode={recovery_plan.mode} duration={recovery_plan.duration_sec:.2f}s",
+                                now=loop_start,
+                            )
+                    if recovery_done:
+                        components.session.finish_recovery("recovery completed")
+                        recovery_plan = None
+                else:
+                    active_command, recovery_done = _advance_recovery_plan(
+                        components,
+                        step_result.observation,
+                        recovery_plan,
+                        now=loop_start,
+                    )
+                    if recovery_done:
+                        components.session.finish_recovery("recovery completed")
+                        if not episode_recorder.is_recording:
+                            _log("Recovery", "completed", now=loop_start)
+                        recovery_plan = None
+            else:
+                recovery_plan = None
 
-            left_qpos = _state_qpos(components.left_backend, DEFAULT_LEFT_ARM_QPOS)
-            right_qpos = _state_qpos(components.right_backend, DEFAULT_RIGHT_ARM_QPOS)
+            if active_command is not None:
+                _send_preview_command(components, active_command)
+                if args.arm_mode == "real":
+                    _sync_dual_arm_retargeter_from_preview(components)
+
+            hand_command = _build_optional_hand_command(components, step_result)
+            _send_optional_hand_command(components, hand_command)
+
+            left_qpos = _state_qpos(components.left_preview_backend, DEFAULT_LEFT_ARM_QPOS)
+            right_qpos = _state_qpos(components.right_preview_backend, DEFAULT_RIGHT_ARM_QPOS)
             if components.renderer is not None:
+                components.renderer.set_debug_frames(
+                    _build_renderer_debug_frames(
+                        components,
+                        channels=step_result.channels,
+                    )
+                )
+                components.renderer.set_debug_boxes(_build_renderer_debug_boxes(components))
                 components.renderer.render_data(
                     left_qpos_arm=left_qpos,
-                    left_qpos_hand=empty_hand,
+                    left_qpos_hand=_hand_render_qpos(components.left_hand_backend, "left"),
                     right_qpos_arm=right_qpos,
-                    right_qpos_hand=empty_hand,
+                    right_qpos_hand=_hand_render_qpos(components.right_hand_backend, "right"),
+                    capture_image=False,
+                )
+            if not episode_recorder.is_recording:
+                _emit_runtime_orientation_logs(
+                    components,
+                    channels=step_result.channels,
+                    now=loop_start,
+                    gate=orientation_gate,
                 )
 
-            if loop_start >= next_print_time:
-                fault_codes = [
-                    f"{fault.code}:{fault.channel_name}" if fault.channel_name else fault.code
-                    for fault in step_result.faults
-                ]
-                print(
-                    "[VirtualRun] "
+            fault_codes = tuple(
+                f"{fault.code}:{fault.channel_name}" if fault.channel_name else fault.code
+                for fault in step_result.faults
+            )
+            channel_valid = tuple(
+                sorted((name, bool(channel.valid)) for name, channel in step_result.channels.items())
+            )
+            clutch_channels = components.keyboard_source.get_latest_channels()
+            left_clutch_channel = clutch_channels.get("left_clutch_button")
+            right_clutch_channel = clutch_channels.get("right_clutch_button")
+            left_clutch = bool(left_clutch_channel.value) if left_clutch_channel is not None else False
+            right_clutch = bool(right_clutch_channel.value) if right_clutch_channel is not None else False
+            if episode_recorder.is_recording:
+                if episode_last_state != step_result.state.value:
+                    episode_recorder.record_event(
+                        "state_change",
+                        payload={
+                            "old_state": episode_last_state,
+                            "new_state": step_result.state.value,
+                        },
+                        timestamp=loop_start,
+                    )
+                    episode_last_state = step_result.state.value
+                episode_recorder.record_frame(
+                    _build_episode_frame(
+                        components,
+                        step_index=step_index,
+                        step_result=step_result,
+                        active_command=active_command,
+                        hand_command=hand_command,
+                        recovery_plan=recovery_plan,
+                        left_clutch=left_clutch,
+                        right_clutch=right_clutch,
+                    ),
+                    timestamp=loop_start,
+                )
+            collision_status = None
+            collision_fallback = None
+            jump_gate_status = None
+            branch_candidate = None
+            if active_command is not None:
+                collision_status = active_command.metadata.get("collision_avoidance_status")
+                collision_fallback = active_command.metadata.get(
+                    "collision_avoidance_fallback_reason"
+                )
+                jump_gate_status = active_command.metadata.get("ik_jump_gate_status")
+                branch_candidate = active_command.metadata.get("ik_branch_candidate")
+            status_snapshot = (
+                step_result.state.value,
+                fault_codes,
+                channel_valid,
+                left_clutch,
+                right_clutch,
+                collision_status,
+                collision_fallback,
+                jump_gate_status,
+                branch_candidate,
+            )
+            if (
+                not episode_recorder.is_recording
+                and status_gate.should_emit("virtual_run_status", status_snapshot, now=loop_start)
+            ):
+                collision_bits = ""
+                if collision_status is not None:
+                    collision_bits = f" collision={collision_status}"
+                    if collision_fallback:
+                        collision_bits += f" fallback={collision_fallback}"
+                if jump_gate_status is not None:
+                    collision_bits += f" ik={jump_gate_status}"
+                if branch_candidate is not None:
+                    collision_bits += f" branch={branch_candidate}"
+                _log(
+                    "VirtualRun",
                     f"step={step_index} hz={step_result.control_hz:.1f} "
                     f"state={step_result.state.value} "
                     f"channels={sorted(step_result.channels)} "
-                    f"left_clutch={components.keyboard_source.get_latest_channels().get('left_clutch_button').value} "
-                    f"right_clutch={components.keyboard_source.get_latest_channels().get('right_clutch_button').value} "
-                    f"faults={fault_codes}"
+                    f"left_clutch={left_clutch} "
+                    f"right_clutch={right_clutch} "
+                    f"faults={list(fault_codes)}"
+                    f"{collision_bits}",
+                    now=loop_start,
                 )
-                next_print_time = loop_start + (1.0 / args.print_hz)
 
             step_index += 1
             if args.max_steps > 0 and step_index >= args.max_steps:
@@ -587,10 +2473,26 @@ def main() -> None:
             if remaining > 0:
                 time.sleep(remaining)
     finally:
+        if episode_recorder.is_recording:
+            _stop_episode_recording(
+                episode_recorder,
+                now=time.time(),
+                end_reason="shutdown",
+                summary={"reason": "finally"},
+            )
+        episode_recorder.close()
         clutch_input.close()
         components.session.close()
-        components.left_backend.close()
-        components.right_backend.close()
+        if components.left_hand_backend is not None:
+            components.left_hand_backend.close()
+        if components.right_hand_backend is not None:
+            components.right_hand_backend.close()
+        components.left_preview_backend.close()
+        components.right_preview_backend.close()
+        if components.left_state_backend is not None:
+            components.left_state_backend.close()
+        if components.right_state_backend is not None:
+            components.right_state_backend.close()
 
 
 if __name__ == "__main__":

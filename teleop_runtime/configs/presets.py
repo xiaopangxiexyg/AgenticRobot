@@ -5,6 +5,7 @@ import math
 import numpy as np
 
 from ..calibration import ArmCalibration, TeleopCalibration
+from ..scene_layout import rm65_base_y_for_side, rm65_base_yaw_for_side
 from ..transforms import identity_pose
 
 
@@ -35,7 +36,6 @@ def build_annotated_dual_rm65_calibration(
 ) -> TeleopCalibration:
     workspace_min = np.asarray(workspace_min, dtype=float)
     workspace_max = np.asarray(workspace_max, dtype=float)
-    half_distance = float(left_right_base_distance) * 0.5
 
     return TeleopCalibration(
         T_W_O=identity_pose(),
@@ -44,23 +44,35 @@ def build_annotated_dual_rm65_calibration(
             "left_arm": ArmCalibration(
                 name="left_arm",
                 side="left",
-                T_D_B=_pose_xyz_rz(0.0, -half_distance, 0.0, -math.pi / 2.0),
+                T_D_B=_pose_xyz_rz(
+                    0.0,
+                    rm65_base_y_for_side("left", left_right_base_distance),
+                    0.0,
+                    rm65_base_yaw_for_side("left"),
+                ),
                 workspace_min=workspace_min.copy(),
                 workspace_max=workspace_max.copy(),
                 metadata={
                     "preset": "annotated_dual_rm65",
                     "base_distance_m": float(left_right_base_distance),
+                    "desk_slot": "-y(screen_left)",
                 },
             ),
             "right_arm": ArmCalibration(
                 name="right_arm",
                 side="right",
-                T_D_B=_pose_xyz_rz(0.0, half_distance, 0.0, math.pi / 2.0),
+                T_D_B=_pose_xyz_rz(
+                    0.0,
+                    rm65_base_y_for_side("right", left_right_base_distance),
+                    0.0,
+                    rm65_base_yaw_for_side("right"),
+                ),
                 workspace_min=workspace_min.copy(),
                 workspace_max=workspace_max.copy(),
                 metadata={
                     "preset": "annotated_dual_rm65",
                     "base_distance_m": float(left_right_base_distance),
+                    "desk_slot": "+y(screen_right)",
                 },
             ),
         },
@@ -68,8 +80,9 @@ def build_annotated_dual_rm65_calibration(
             "preset": "annotated_dual_rm65",
             "base_distance_m": float(left_right_base_distance),
             "note": (
-                "Dual-arm desk/base relation aligned with the previous annotated "
-                "bimanual visualization setup."
+                "Dual-arm desk/base relation for teleop_runtime where desk axes are "
+                "+x=forward, +y=left, +z=up, while the default viewer places "
+                "left_arm at desk -Y (screen-left) and right_arm at desk +Y (screen-right)."
             ),
         },
     )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import numpy as np
 
@@ -37,6 +37,25 @@ class SafetyMonitor:
     def __init__(self, config: TeleopSafetyConfig | None = None):
         self.config = config if config is not None else TeleopSafetyConfig()
         self._last_pose_by_channel: dict[str, np.ndarray] = {}
+        self._consecutive_invalid_by_channel: dict[str, int] = {}
+        self._pose_reset_pending_by_channel: set[str] = set()
+
+    def _invalid_count_reached(self, channel_name: str) -> tuple[int, bool]:
+        count = int(self._consecutive_invalid_by_channel.get(channel_name, 0)) + 1
+        self._consecutive_invalid_by_channel[channel_name] = count
+        limit = max(1, int(self.config.invalid_frame_limit))
+        return count, count >= limit
+
+    def _reset_invalid_count(self, channel_name: str) -> None:
+        self._consecutive_invalid_by_channel[channel_name] = 0
+
+    def request_pose_baseline_reset(self, channel_name: str) -> None:
+        self._last_pose_by_channel.pop(channel_name, None)
+        self._pose_reset_pending_by_channel.add(channel_name)
+
+    def request_pose_baseline_reset_many(self, channel_names: Iterable[str]) -> None:
+        for channel_name in channel_names:
+            self.request_pose_baseline_reset(str(channel_name))
 
     def evaluate_channels(
         self, channels: Mapping[str, ObservationChannel], now: float
@@ -44,6 +63,7 @@ class SafetyMonitor:
         violations: list[SafetyViolation] = []
         for required in self.config.required_channels:
             if required not in channels:
+                self.request_pose_baseline_reset(required)
                 violations.append(
                     SafetyViolation(
                         code="missing_channel",
@@ -55,20 +75,31 @@ class SafetyMonitor:
         for channel_name, channel in channels.items():
             if not channel.valid:
                 if channel.critical:
-                    violations.append(
-                        SafetyViolation(
-                            code="invalid_channel",
-                            message=f"Channel '{channel_name}' is marked invalid.",
-                            channel_name=channel_name,
+                    self.request_pose_baseline_reset(channel_name)
+                    invalid_count, reached_limit = self._invalid_count_reached(channel_name)
+                    if reached_limit:
+                        violations.append(
+                            SafetyViolation(
+                                code="invalid_channel",
+                                message=(
+                                    f"Channel '{channel_name}' is marked invalid for "
+                                    f"{invalid_count} consecutive frame(s), reaching limit "
+                                    f"{self.config.invalid_frame_limit}."
+                                ),
+                                channel_name=channel_name,
+                                metadata={"invalid_count": int(invalid_count)},
+                            )
                         )
-                    )
                 continue
 
             if not channel.critical:
+                self._reset_invalid_count(channel_name)
                 continue
 
             age = max(0.0, now - float(channel.timestamp))
             if age > self.config.stale_timeout_sec:
+                self._reset_invalid_count(channel_name)
+                self.request_pose_baseline_reset(channel_name)
                 violations.append(
                     SafetyViolation(
                         code="stale_channel",
@@ -80,22 +111,36 @@ class SafetyMonitor:
                         metadata={"age_sec": age},
                     )
                 )
+                continue
 
+            # A valid channel should clear transient invalid counters even if it is not pose6d.
+            self._reset_invalid_count(channel_name)
             if channel.capability != "pose6d":
                 continue
 
             valid_pose, error = validate_pose_matrix(channel.value)
             if not valid_pose:
-                violations.append(
-                    SafetyViolation(
-                        code="invalid_pose",
-                        message=f"Channel '{channel_name}' pose is invalid: {error}",
-                        channel_name=channel_name,
+                self.request_pose_baseline_reset(channel_name)
+                invalid_count, reached_limit = self._invalid_count_reached(channel_name)
+                if reached_limit:
+                    violations.append(
+                        SafetyViolation(
+                            code="invalid_pose",
+                            message=(
+                                f"Channel '{channel_name}' pose is invalid for "
+                                f"{invalid_count} consecutive frame(s): {error}"
+                            ),
+                            channel_name=channel_name,
+                            metadata={"invalid_count": int(invalid_count)},
+                        )
                     )
-                )
                 continue
 
             current_pose = as_pose_matrix(channel.value)
+            if channel_name in self._pose_reset_pending_by_channel:
+                self._last_pose_by_channel[channel_name] = current_pose
+                self._pose_reset_pending_by_channel.discard(channel_name)
+                continue
             previous_pose = self._last_pose_by_channel.get(channel_name)
             if previous_pose is not None:
                 translation_jump = translation_distance(previous_pose, current_pose)

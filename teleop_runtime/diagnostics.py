@@ -14,6 +14,7 @@ class TeleopRunState(str, Enum):
     ARMED = "ARMED"
     RUNNING = "RUNNING"
     FROZEN = "FROZEN"
+    RECOVERING = "RECOVERING"
     FAULT = "FAULT"
     ESTOP = "ESTOP"
 

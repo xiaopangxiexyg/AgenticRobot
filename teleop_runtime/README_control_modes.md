@@ -120,8 +120,8 @@ pose_base     = inv(T_D_B) @ pose_desk
 - `T_W_O = I`
 - `T_O_D = I`
 - 左右臂底座距离默认 `0.525 m`
-- 左臂底座在 desk 下约为 `y = -0.2625 m`，偏航 `-90°`
-- 右臂底座在 desk 下约为 `y = +0.2625 m`，偏航 `+90°`
+- 左臂底座在 desk 下约为 `y = +0.2625 m`，偏航 `-90°`
+- 右臂底座在 desk 下约为 `y = -0.2625 m`，偏航 `+90°`
 
 因此在默认虚拟跑法里，preset 本身仍然是：
 
@@ -154,13 +154,12 @@ pose_base     = inv(T_D_B) @ pose_desk
 5. 转到 `base`
 6. 输出 `command_type="cartesian_pose"` 的 `EffectorCommand`
 
-对应的核心行为是：
+对应的核心行为现在是：
 
 ```text
-relative_pose      = inv(home_human_pose_desk) @ current_human_pose_desk
-target_pose_desk   = home_robot_pose_desk @ relative_pose
-target_translation = relative_pose.translation * translation_scale
-target_rotation    = relative_pose.rotation
+delta_translation  = current_human.translation - home_human.translation
+target_translation = home_robot.translation + translation_scale * delta_translation
+target_rotation    = home_robot.rotation * inv(home_human.rotation) * current_human.rotation
 ```
 
 当前默认配置下：
@@ -171,42 +170,74 @@ target_rotation    = relative_pose.rotation
 
 所以绝对控制默认就是：
 
-- 启动时先把“人的 home pose”和“机器人的 home TCP pose”对齐
-- 之后跟踪“当前 pose 相对 home 的变化”
+- 启动时先把“人的 home 位姿”和“机器人的 home TCP 位姿”对齐
+- 之后在 `desk` 全局坐标中跟踪人手相对 home 的平移变化
+- 末端方向默认跟踪 tracker 相对 home 的姿态变化，因此 tracker 保持在 home 不动时机器人也会保持在 robot home
 - 超出工作空间的平移会被裁剪回安全范围
 
 只有在**没有建立 home anchor** 的情况下，`_apply_absolute_mapping(...)` 才会退回旧的“直接把当前 pose 当作目标 pose”行为。  
 但当前 [run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 会在进入主循环前等待你手动触发 runtime home calibration，所以虚拟跑法默认不会走这个 fallback。
 
-### 4.2 后端如何执行
+### 4.2 默认双臂碰撞规避层
 
-目标位姿进入 [teleop_runtime/backends/arms/rm65.py](./backends/arms/rm65.py) 后：
+当前 [run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 在双臂模式下默认会先走一层
+`DualArmCollisionAwareRetargeter`：
 
-1. 根据 `tcp_frame` 选择 IK solver
-2. 用 `SingleArmIKSolver.solve_step(...)` 求一小步关节目标
-3. 按 `max_angvel * control_dt` 限制单步关节变化
-4. 真机模式下调用 `Movej_CANFD(...)`
+1. 仍然先用左右两侧 `PoseToArmRetargeter` 生成 `cartesian_pose`
+2. 再把左右 TCP 目标一起送进 joint-space 双臂多任务 IK
+3. 最终输出两条 `command_type="joint_vector"` 的机械臂命令
 
-所以即便上游给的是“绝对位姿”，底层执行仍然是**逐帧、限幅的 IK 追踪**，不是一次性硬跳到目标姿态。
+默认参数是：
 
-### 4.3 启动后的预期效果
+- `collision_scene_profile="dual_arm"`
+- `collision_avoidance_mode="boundary_slide"`
+- 运行依赖：`pinocchio + pink + qpsolvers`
+
+这层行为有两个工程模式：
+
+- `boundary_slide`：目标继续推向碰撞区时，解会沿可行边界继续移动
+- `freeze_on_contact`：一旦进入接触阈值附近，就保持最近安全关节位姿
+
+如果你显式加：
+
+```bash
+--no-collision
+```
+
+才会退回到旧的“两条独立 `cartesian_pose` -> 两个单臂 backend”路径。
+旧参数 `--disable-dual-arm-collision-avoidance` 和 `--disable-collision-avoidance` 仍然兼容。
+
+### 4.3 后端如何执行
+
+目标命令进入 [teleop_runtime/backends/arms/rm65.py](./backends/arms/rm65.py) 后：
+
+1. 如果上游输出的是 `cartesian_pose`，backend 自己做单臂 IK
+2. 如果上游输出的是 `joint_vector`，backend 只做关节步长限制
+3. 真机模式下再调用 `Movej_CANFD(...)`
+
+也就是说：
+
+- 旧路径：`cartesian_pose`，单臂 IK 在 backend 内完成
+- 新默认双臂路径：`joint_vector`，联合 IK 已经在 retargeter 层完成
+
+### 4.4 启动后的预期效果
 
 `absolute` 模式下，预期看到的行为是：
 
-- VIVE tracker 相对启动 home 的位置变化，会映射成虚拟机械臂末端的相对位置变化
-- VIVE tracker 相对启动 home 的姿态变化，会映射成末端姿态变化
+- VIVE tracker 在 `desk` 中向前/左/上移动时，机器人 TCP 也按同一全局方向移动
+- VIVE tracker 当前姿态变化，会直接映射成末端姿态变化
 - 不需要 clutch，就会持续响应输入
 - 如果 `T_W_O / T_O_D / T_D_B` 不准，机械臂目标会明显偏、歪，或者一开始就在不合理位置
 - 如果输入 tracker 瞬时跳变，目标也会跟着跳，只是后端 IK 和关节步长限制会把执行动作稍微抹平
 
-### 4.4 适用场景
+### 4.5 适用场景
 
 当前 `absolute` 更适合：
 
 - 检查坐标系有没有对上
 - 检查 tracker 角色映射有没有写反
 - 检查左右臂基座外参是否合理
-- 调试 `rm_eef` 和 `hand_base` 两个 TCP frame
+- 调试当前统一固定的 `hand_base` TCP frame
 
 它不一定适合作为第一选择的真机精细遥操作模式，因为对标定质量非常敏感。
 
@@ -278,8 +309,8 @@ target.rotation = current_human.rotation
 
 也就是说，当前 `delta_clutch` 不是“只增量平移、姿态冻结”的版本，而是：
 
-- 平移：相对 anchor 做增量
-- 姿态：按住 clutch 时直接跟随当前 tracker 姿态
+- 平移：相对 anchor 做全局平移增量
+- 姿态：按住 clutch 时直接跟随当前 tracker 的全局姿态
 
 3. **clutch 松开期间**
 
@@ -360,7 +391,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode rm_eef \
+  --tcp-mode hand_base \
   --control-mode absolute
 ```
 
@@ -374,11 +405,12 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 ```text
 [Calibration] expecting left_wrist_pose<-tracker_1, right_wrist_pose<-tracker_2
-[Calibration] waiting_for_key channels=['left_clutch_button', 'left_wrist_pose', 'right_clutch_button', 'right_wrist_pose'] ready_key='p/Enter'
+[Calibration] HOME CAPTURE IS ARMED. Position robot and trackers first, then press 'p' or Enter.
+[Calibration] waiting_for_key tracker_ready={'left_wrist_pose': True, 'right_wrist_pose': True} ready_key='p/Enter'
 [Calibration] observed left_wrist_pose <- tracker_1:left_wrist frame=vive_world
 [Calibration] observed right_wrist_pose <- tracker_2:right_wrist frame=vive_world
 [Calibration] runtime home captured left_samples=20 right_samples=20
-[VirtualRun] step=123 hz=29.9 state=ARMED channels=['left_clutch_button', 'left_wrist_pose', 'right_clutch_button', 'right_wrist_pose'] left_clutch=False right_clutch=False faults=[]
+[VirtualRun] step=123 hz=29.9 state=ARMED channels=['left_clutch_button', 'left_wrist_pose', 'right_clutch_button', 'right_wrist_pose'] left_clutch=False right_clutch=False faults=[] collision=tracking
 ```
 
 如果左右腕部通道没进来，常见现象是：
@@ -396,7 +428,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode rm_eef \
+  --tcp-mode hand_base \
   --control-mode delta_clutch \
   --keyboard-clutch
 ```
@@ -409,7 +441,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode rm_eef \
+  --tcp-mode hand_base \
   --control-mode delta_clutch
 ```
 
@@ -418,7 +450,10 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 ### 6.5 常用附加参数
 
 - `--translation-scale`：调整平移缩放比
-- `--tcp-mode rm_eef|hand_base`：选择 IK/可视化使用的 TCP
+- `--collision-avoidance-mode boundary_slide|freeze_on_contact`：双臂推向碰撞区时的默认行为
+- `--collision-scene-profile dual_arm|dual_arm_hand_proxy_open|dual_arm_hand|dual_arm_cylinder_table`：当前 joint-space 双臂碰撞场景 profile，默认先用 `dual_arm_hand_proxy_open`
+- `--no-collision`：退回旧的两条独立单臂链路
+- `--tcp-mode hand_base`：当前 runtime 固定使用 `hand_base`
 - `--skip-renderer`：不启动 SAPIEN，只跑控制主链
 - `--headless`：创建渲染器但不弹 viewer
 - `--hz`：主循环频率
@@ -474,7 +509,7 @@ keyboard.set_button("left_clutch_button", False, side="left", critical=False)
 keyboard.set_button("right_clutch_button", False, side="right", critical=False)
 
 session = TeleopSession(
-    config=TeleopSessionConfig(mode="bimanual", tcp_mode="rm_eef"),
+    config=TeleopSessionConfig(mode="bimanual", tcp_mode="hand_base"),
     sources=[
         VivePoseSource(
             tracker_configs=[

@@ -45,8 +45,8 @@ python minimal_teleop/inspire_hand_teleop.py \
 
 ```bash
 python minimal_teleop/inspire_hand_teleop.py \
-  --left-port /dev/ttyACM0 \
-  --right-port /dev/ttyACM1 \
+  --left-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
+  --right-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00 \
   --source-side right \
   --hand-ip 192.168.11.210
 ```
@@ -97,10 +97,22 @@ python minimal_teleop/inspire_hand_teleop.py \
 
 ### 3. 调整关节顺序
 
-默认关节顺序是 reader 当前输出顺序：
+当前 reader 输出的 `q6` 语义是：
 
 ```text
 [thumb_yaw, thumb_flex, index, middle, ring, pinky]
+```
+
+默认 `--joint-order` 不是恒等映射，而是：
+
+```text
+[5, 4, 3, 2, 0, 1]
+```
+
+也就是默认会把 reader 的 `q6` 重排成 InspireTac 使用的顺序：
+
+```text
+[pinky, ring, middle, index, thumb_yaw, thumb_flex]
 ```
 
 如果后续硬件接线或语义顺序不同，可以用：
