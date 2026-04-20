@@ -19,6 +19,7 @@ debug.sh
 debug.yaml
 depre
 
+!portable_init_UV/assets
 
 .codex
 .tmp_collect_probe/
