@@ -48,6 +48,18 @@ def _append_jsonl(path: Path, payload: Any) -> None:
         handle.write(json.dumps(_to_serializable(payload), ensure_ascii=True) + "\n")
 
 
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        rows.append(json.loads(text))
+    return rows
+
+
 def _coerce_video_frame(image: Any, *, color_space: str = "rgb") -> np.ndarray:
     cv2 = _require_cv2()
     frame = np.asarray(image)
@@ -152,6 +164,11 @@ class LeRobotV21Writer:
     def episode_stats_path(self) -> Path:
         return self.meta_dir / "episodes_stats.jsonl"
 
+    @property
+    def next_episode_index(self) -> int:
+        with self._lock:
+            return int(self._next_episode_index)
+
     def _prepare_dataset_root(self) -> None:
         self.meta_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -159,8 +176,31 @@ class LeRobotV21Writer:
         for path in (self.episodes_path, self.tasks_path, self.episode_stats_path):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(exist_ok=True)
+        self._load_existing_dataset_state()
         self._ensure_task_manifest()
         self._write_info_locked()
+
+    def _load_existing_dataset_state(self) -> None:
+        episode_rows = _read_jsonl(self.episodes_path)
+        stats_rows = _read_jsonl(self.episode_stats_path)
+        self._finalized_episode_count = len(episode_rows)
+        if stats_rows:
+            self._finalized_frame_count = sum(
+                int(row.get("frame_count", 0))
+                for row in stats_rows
+            )
+        else:
+            self._finalized_frame_count = sum(
+                int(row.get("frame_count", 0))
+                for row in episode_rows
+            )
+        max_episode_index = -1
+        for row in episode_rows:
+            try:
+                max_episode_index = max(max_episode_index, int(row.get("episode_index", -1)))
+            except (TypeError, ValueError):
+                continue
+        self._next_episode_index = max(self._next_episode_index, max_episode_index + 1)
 
     def _ensure_task_manifest(self) -> None:
         if not self.config.task_id:
@@ -431,6 +471,32 @@ class LeRobotV21Writer:
         if state.writer is not None:
             state.writer.release()
             state.writer = None
+
+    def _recompute_next_episode_index_locked(self) -> None:
+        max_episode_index = -1
+        for row in _read_jsonl(self.episodes_path):
+            try:
+                max_episode_index = max(max_episode_index, int(row.get("episode_index", -1)))
+            except (TypeError, ValueError):
+                continue
+        if self._episodes:
+            max_episode_index = max(max_episode_index, max(self._episodes))
+        self._next_episode_index = max_episode_index + 1
+
+    def discard_episode(self, episode_index: int) -> bool:
+        with self._lock:
+            episode = self._episodes.pop(int(episode_index), None)
+            if episode is None:
+                self._recompute_next_episode_index_locked()
+                return False
+            for state in episode.video_states.values():
+                self._close_video_state(state)
+                try:
+                    state.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._recompute_next_episode_index_locked()
+            return True
 
     def _finalize_episode_locked(
         self,

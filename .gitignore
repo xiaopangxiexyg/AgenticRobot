@@ -21,6 +21,11 @@ depre
 
 
 .codex
+.tmp_collect_probe/
+.tmp_collect_probe2/
+
+dataset_collection
+
 .cache/
 .pytest_cache/
 .mypy_cache/

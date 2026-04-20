@@ -11,7 +11,7 @@ from handeye_utils import *
 from teleop.mocap.vive_data_receiver import VIVEDataReceiver
 import pyrealsense2 as rs
 
-# robot = Arm(RM65, '192.168.1.19')
+# robot = Arm(RM65, '192.168.1.20')
 # for t in range(100):
 #     res, joint_now, pose, arm_err, sys_err = robot.Get_Current_Arm_State()
 #     print(res, pose)

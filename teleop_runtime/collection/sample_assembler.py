@@ -168,6 +168,9 @@ class SampleAssembler:
         self.config = config if config is not None else SampleAssemblerConfig()
         self._last_action = _nan_vector(26)
 
+    def reset_last_action(self) -> None:
+        self._last_action = _nan_vector(26)
+
     def _side_enabled(self, side: str) -> bool:
         return str(side) in self.config.active_sides
 
@@ -319,6 +322,11 @@ class CollectorSampleBuilder:
         self._episode_index += 1
         self._frame_index = 0
         return int(self._episode_index)
+
+    def set_episode(self, episode_index: int) -> None:
+        self._episode_index = int(episode_index)
+        self._frame_index = 0
+        self.assembler.reset_last_action()
 
     def _snapshot_arm_states(self, components: CollectorComponents) -> dict[str, dict[str, Any]]:
         states: dict[str, dict[str, Any]] = {}

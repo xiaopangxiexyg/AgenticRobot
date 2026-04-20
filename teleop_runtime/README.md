@@ -20,13 +20,17 @@
 - `RM65ArmBackend`
 - `InspireTacHandBackend`
 - `BimanualRig`
+- 独立数据采集 CLI runner：
+  [teleop_runtime/collection/run_collect.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
+- 数据采集使用说明：
+  [teleop_runtime/collection/README.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/README.md)
 - 交互式 calibration debug app：
   [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py)
 - 默认录制：`teleop_records/<timestamp>/`
 
 ## 当前未实现
 
-- 通用真机 CLI runner
+- 通用真机 teleop CLI runner
 - 基于固定物理工装的 `desk/world` 绝对外参向导
 - runtime 内部的双臂耦合 IK backend
 - 键盘事件采集线程
@@ -564,10 +568,10 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20 \
-  --left-hand-port /dev/serial/by-id/your_left_hand \
-  --right-hand-port /dev/serial/by-id/your_right_hand \
-  --left-hand-ip 192.168.11.210 \
-  --right-hand-ip 192.168.11.211 \
+  --left-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
+  --right-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00 \
+  --left-hand-ip 192.168.12.210 \
+  --right-hand-ip 192.168.11.210 \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
 

@@ -53,6 +53,10 @@ from .registry import (
 from .safety import SafetyMonitor, SafetyViolation, TeleopSafetyConfig
 from .schemas import EffectorCommand, ObservationChannel, TeleopCommand, TeleopObservation
 from .session import SessionStepResult, TeleopSession, TeleopSessionConfig
+from .sources.camera import (
+    RealSenseRGBCameraConfig,
+    RealSenseRGBSource,
+)
 from .sources.hand import HandQ6Source
 from .sources.misc import KeyboardButtonSource
 from .sources.pose import VivePoseSource, ViveTrackerConfig
@@ -61,6 +65,7 @@ from .configs import (
     build_annotated_dual_rm65_calibration,
     build_bimanual_session,
     default_vive_tracker_configs,
+    load_realsense_camera_config_map,
 )
 
 __all__ = [
@@ -90,6 +95,8 @@ __all__ = [
     "PoseToArmRetargeter",
     "PoseToArmRetargeterConfig",
     "RateTracker",
+    "RealSenseRGBCameraConfig",
+    "RealSenseRGBSource",
     "RecordingConfig",
     "RM65ArmBackend",
     "RM65ArmBackendConfig",
@@ -114,6 +121,7 @@ __all__ = [
     "default_vive_tracker_configs",
     "episode_start_qpos_pair",
     "load_episode",
+    "load_realsense_camera_config_map",
     "require_valid_episode",
     "register_backend",
     "register_retargeter",

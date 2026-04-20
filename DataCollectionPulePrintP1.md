@@ -438,31 +438,23 @@ teleop_runtime/collection/
 
 ### RM65 arm state
 
-当前建议：
+最终口径：
 
-- 不再把“每步都直接硬件读状态”当成当前代码基线
-- 先承认当前真实入口的实际策略：
-  - 启动 / 标定阶段：使用 `left_state_backend/right_state_backend`
-  - 运行阶段：当前 episode metadata 已明确写成 `runtime_arm_state_source = last_commanded_action`
+- `Phase 1 collector` **不保留**运行期 `state_backend.refresh_state_from_hardware()`
+- 启动 / 标定阶段的 state backend 仍可继续服务 bring-up / 对位 / 校准
+- 但 dataset 运行期 arm observation 固定按 `runtime_arm_state_source = last_commanded_action`
 
-这意味着 `Phase 1` collector 必须显式做一个选择：
+collector 里 arm state 的具体来源统一为：
 
-#### 方案 A：继承当前 runtime 口径
+- `current_qpos` 取 command/preview backend 的本地状态
+- `tcp pose` 优先由当前本地 `qpos` 做 FK 计算
+- 如果没有可用 FK，再退回最后一次 command 附带的 cartesian target metadata
 
-- `observation.state` 里的 arm 状态主要来自 command/preview backend
-- 优点是完全复用当前已打通的真机 runtime
-- 缺点是这更接近“命令态 / 估计态”，不是持续硬件测量态
+处理结论：
 
-#### 方案 B：为 dataset 保留持续真实状态采样
-
-- 让 state backend 在采集期间继续工作
-- 周期性 `refresh_state_from_hardware()`
-- 把真实硬件态作为 observation 记录
-
-当前建议：
-
-- `Phase 1` 文档先按 **方案 A 作为当前代码基线**
-- 如果后续确认训练更需要真实 measured state，再把方案 B 作为增强项单独加回
+- `Phase 1` 不再保留“持续真实硬件测量态”作为默认方案
+- 如果后续确认训练必须依赖 measured state，再作为单独增强项加回
+- collector 必须把 `arm_state_source=last_commanded_action` 写进 sample 或 meta
 
 ### Inspire hand + tactile state
 
@@ -822,9 +814,10 @@ dataset_root/
 
 ### 实现要求
 
-- source 内部维护最新 RGB frame 缓存
+- source 内部维护一个很小的最新 RGB frame 缓存
 - 提供 camera timestamp / receive timestamp / frame counter
-- writer 在采样时直接从 source 取 frame
+- 每条 sample 只匹配并保留与该 sample 时间最接近的那一帧
+- 不额外保留未被 sample 选中的其它视频帧
 - 不把大图像塞进 `ObservationChannel`
 
 ### Done 条件
@@ -1260,20 +1253,19 @@ dataset_root/
 
 ## 7. 推荐下一步
 
-最合理的下一步不是先写 writer，而是先做下面三件事：
+当前语义已经冻结：
 
-1. 补 `T1`
-   - 尤其是 `PoseToArmRetargeter` 新字段
-   - `InspireTacHandBackend` telemetry timestamp
-   - `RM65ArmBackend` 的 `arm_state_source / last_command_timestamp`
-2. 做 `T2`
+1. arm observation 固定来自 `last_commanded_action`
+2. 视频只保留每条 sample 命中的最近帧
+
+因此更合理的下一步是：
+
+1. 做 `T2`
    - `realsense.json`
    - `RealSenseRGBSource`
-3. 做 `T3`
-   - 先把独立 collector runtime 和 component builder 定下来
-4. 再做 `T4`
-   - 明确 sample contract 中 arm observation 到底来自 `last_commanded_action` 还是持续硬件测量态
-5. 再做 `T5`
-   - 先把 async writer/backpressure contract 定下来
-
-等 sample contract 跑通以后，再写 parquet/mp4 writer，返工最少。
+2. 继续补 `T3/T6`
+   - collector runtime builder
+   - `run_collect.py`
+3. 用真机最小 episode 把 `T5` writer 链路接上
+4. 最后做 `T7`
+   - replay bridge 或 sidecar replay 验证

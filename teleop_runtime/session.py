@@ -123,6 +123,10 @@ class TeleopSession:
             raise RuntimeError("Rig is not ready.")
         self._transition(TeleopRunState.ARMED, "hardware armed")
 
+    def hold_hardware(self, reason: str = "manual hold") -> None:
+        self._clear_recovery_context()
+        self._transition(TeleopRunState.DEBUG_ONLY, reason)
+
     def freeze(self, reason: str) -> None:
         self._transition(TeleopRunState.FROZEN, reason)
 
