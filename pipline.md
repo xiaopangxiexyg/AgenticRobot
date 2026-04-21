@@ -10,6 +10,12 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 ```
 
+## 0. 下载解压assets: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
+文件名：assets.zip
+有效期限：2026-06-08 14:10
+提取码：YIlq
+
+
 ## 1. 固定设备配置
 
 当前 README 中使用的设备配置如下：
@@ -85,7 +91,7 @@ PY
 
 ## 3. 启动 VIVE Sender
 
-在 VIVE 机器或同一台采集电脑的独立终端启动 sender：
+在 VIVE 机器或同一台采集电脑的独立终端(Windows)启动 sender：
 
 ```bash
 cd "$REPO"
@@ -101,6 +107,8 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 ```
 
 如果 sender 和 receiver 在同一台机器上临时自测，可以把 `VIVE_TARGET_HOST` 改成 `127.0.0.1`。
+
+
 
 ## 4. Virtual SAPIEN 验证
 
