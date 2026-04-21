@@ -199,6 +199,8 @@ python -m teleop_runtime.collection.run_collect \
   --right-hand-ip "$RIGHT_HAND_IP" \
   --hand-telemetry-hz 10 \
   --hand-tactile-regions thumb_1,index_1,middle_1,ring_1,little_1,palm \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.02 \
   --camera-config "$CAMERA_CONFIG" \
   --write-video \
   --hz 30 \
