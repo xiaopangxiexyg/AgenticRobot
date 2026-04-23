@@ -10,7 +10,7 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 ```
 
-## 0. 下载解压assets: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
+## 0. 下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
 文件名：assets.zip
 有效期限：2026-06-08 14:10
 提取码：YIlq
