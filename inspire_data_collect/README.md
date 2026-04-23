@@ -2,6 +2,11 @@
 
 只含 Inspire Tac 手的数据采集便携包，不依赖 `teleop_runtime`。保留原工程的 `assets` 不复制；运行时只需要本目录、硬件可访问、以及 Python 依赖。
 
+## 首先下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
+文件名：assets.zip
+有效期限：2026-06-08 14:10
+提取码：YIlq
+
 ## 依赖
 
 硬件与导出所需：
