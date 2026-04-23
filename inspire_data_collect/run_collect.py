@@ -9,8 +9,6 @@ import tty
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from inspire_data_collect.async_writer import AsyncWriterConfig, AsyncWriterPool
@@ -333,42 +331,21 @@ def collect_faults(
     return faults
 
 
-def format_tactile_sum(hand_state: dict[str, Any] | None) -> str:
-    if not hand_state:
-        return "-"
-    tactile = hand_state.get("tactile")
-    if tactile is None:
-        return "-"
-    values = np.asarray(tactile, dtype=float).reshape(-1)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return "-"
-    return f"{float(np.sum(finite)):.3f}"
+def print_controls() -> None:
+    print("\n" + "=" * 50)
+    print("数据采集循环已启动 / Starting data collection loop...")
+    print("控制说明 / Controls:")
+    print("  'Z' = 开始录制 / Start episode")
+    print("  'C' = 保存当前片段 / Save current episode")
+    print("  'D' = 丢弃当前片段 / Discard current episode")
+    print("  'Q' = 退出程序 / Quit program")
+    print("=" * 50 + "\n")
 
 
-def print_status(
-    *,
-    recording: bool,
-    episode_index: int | None,
-    frame_index: int,
-    control_hz: float,
-    active_sides: tuple[str, ...],
-    hand_states: dict[str, dict[str, Any]],
-    camera_sources: dict[str, RealSenseRGBSource],
-) -> None:
-    tactile_text = " ".join(
-        f"{side}_tac={format_tactile_sum(hand_states.get(side))}"
-        for side in active_sides
-    )
-    camera_text = " ".join(
-        f"{camera_key}_frames={source.device_info().get('frame_count', 0)}"
-        for camera_key, source in camera_sources.items()
-    )
-    episode_text = "-" if episode_index is None else str(episode_index)
-    print(
-        f"[status] rec={int(recording)} ep={episode_text} frame={frame_index} "
-        f"hz={control_hz:.1f} {tactile_text} {camera_text}".rstrip()
-    )
+def print_standby(next_episode_index: int) -> None:
+    print("Standby, Ready to start data collection...")
+    print(f"  下一个片段编号 Next episode ID: {next_episode_index}\n")
+    print("=" * 100)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -426,7 +403,6 @@ def main(argv: list[str] | None = None) -> int:
     current_episode: int | None = None
     recording = False
     loop_rate = LoopRate()
-    last_status_at = 0.0
     step_count = 0
 
     def start_episode() -> None:
@@ -452,17 +428,20 @@ def main(argv: list[str] | None = None) -> int:
         current_episode = writer.start_episode(metadata=metadata)
         sample_builder.set_episode(current_episode)
         recording = True
-        print(f"[record] start episode {current_episode}")
+        print(f"\n开始录制片段 Start recording episode: {current_episode}")
 
-    def finish_episode(*, save: bool) -> None:
+    def finish_episode(*, save: bool, show_standby: bool = True) -> None:
         nonlocal current_episode, recording
         if current_episode is None:
             recording = False
             return
         episode_index = int(current_episode)
         frame_count = int(sample_builder.frame_index)
+        print(f"\n录制完成 Recording finished for episode {episode_index}")
+        print(f"  数据帧数 Data frames: {frame_count}")
         writer_pool.join()
         if save and frame_count > 0:
+            print(f"  正在保存片段 Saving episode {episode_index}...")
             for job in writer.plan_finalize_episode(
                 episode_index,
                 summary={
@@ -473,12 +452,14 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 writer_pool.submit(job)
             writer_pool.join()
-            print(f"[record] saved episode {episode_index} frames={frame_count}")
+            print(f"  已保存片段 Episode saved {episode_index}")
         else:
             writer.discard_episode(episode_index)
-            print(f"[record] discarded episode {episode_index} frames={frame_count}")
+            print(f"  丢弃片段 Discarding episode {episode_index}")
         current_episode = None
         recording = False
+        if show_standby:
+            print_standby(writer.next_episode_index)
 
     try:
         source.start()
@@ -498,13 +479,11 @@ def main(argv: list[str] | None = None) -> int:
                     for camera_key, source in camera_sources.items()
                 },
             )
+        print_controls()
         if args.record_auto_start:
             start_episode()
-
-        print(
-            "Keys: z=start, c=save current episode, d=discard current episode, q=quit. "
-            "The first 7 action/state slots are reserved for one arm and filled with NaN."
-        )
+        else:
+            print_standby(writer.next_episode_index)
         with NonBlockingKeyboard() as keyboard:
             while True:
                 loop_started_at = time.time()
@@ -516,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                 elif key == "d":
                     finish_episode(save=False)
                 elif key == "q":
+                    print("\n正在退出数据采集 Quitting the data collection...\n")
                     break
 
                 channels = source.get_latest_channels()
@@ -555,18 +535,6 @@ def main(argv: list[str] | None = None) -> int:
                     for job in writer.plan_sample_jobs(sample):
                         writer_pool.submit(job)
 
-                if loop_started_at - last_status_at >= float(args.status_sec):
-                    print_status(
-                        recording=recording,
-                        episode_index=current_episode,
-                        frame_index=sample_builder.frame_index,
-                        control_hz=control_hz,
-                        active_sides=active_sides,
-                        hand_states=hand_states,
-                        camera_sources=camera_sources,
-                    )
-                    last_status_at = loop_started_at
-
                 step_count += 1
                 if int(args.max_steps) > 0 and step_count >= int(args.max_steps):
                     break
@@ -574,11 +542,11 @@ def main(argv: list[str] | None = None) -> int:
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)
     except KeyboardInterrupt:
-        print("\n[stop] keyboard interrupt")
+        print("\n\n检测到键盘中断，正在停止数据采集 Stopping data collection...\n")
     finally:
         try:
             if recording:
-                finish_episode(save=True)
+                finish_episode(save=True, show_standby=False)
         finally:
             for backend in backends.values():
                 backend.close()
