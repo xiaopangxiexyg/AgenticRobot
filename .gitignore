@@ -19,6 +19,8 @@ debug.sh
 debug.yaml
 depre
 
+hand_camera_dataset
+
 !portable_init_UV/assets
 
 .codex

@@ -9,8 +9,10 @@
 - `retargeter.py`: 将遥操作手 6DoF 映射为 Inspire 手 6DoF 指令，支持关节重排、反向和 EMA。
 - `inspire_tac_modbus.py`: 包内 Inspire Tac Modbus 驱动，负责关节控制、关节读取、触觉读取。
 - `hand_backend.py`: 封装 Inspire Tac 控制和后台遥测线程。
+- `realsense_rgb.py`: 单路 RealSense RGB 后台采集，维护 nearest-frame buffer。
+- `video_frame.py`: 视频帧结构和按时间戳取最近帧的缓存。
 - `tactile_visualizer.py`: OpenCV 触觉 UV 可视化，显示 1062 维触觉。
-- `writer.py`: LeRobot 风格 parquet/meta 导出，手数据完整写入，并预留单臂 7DoF 扩展位。
+- `writer.py`: LeRobot 风格 parquet/meta/video 导出，手数据完整写入，并预留单臂 7DoF 扩展位。
 - `run_collect.py`: 完整采集入口。
 
 ## 代码结构
@@ -19,7 +21,7 @@
 
 ```text
 HandQ6Source -> HandRetargeter -> InspireTacHandBackend -> HandSampleBuilder -> HandOnlyLeRobotWriter
-                  serial q6        hand command/readback     action/state row     parquet/meta
+RealSenseRGBSource ------------------------------------------^                    parquet/meta/video
 ```
 
 关键类：
@@ -27,8 +29,9 @@ HandQ6Source -> HandRetargeter -> InspireTacHandBackend -> HandSampleBuilder -> 
 - `HandQ6Source`: 每只遥操作手一个后台线程，持续读串口帧，并缓存最新 `ObservationChannel`。
 - `HandRetargeter`: 从 `left_hand_q6` / `right_hand_q6` 取源数据，按 `DEFAULT_INSPIRE_HAND_JOINT_ORDER=(5,4,3,2,0,1)` 重排，再按需取反，输出 `EffectorCommand`。
 - `InspireTacHandBackend`: 负责 `set_joint_pos()` 下发，后台遥测线程读 `read_joint_pos()` 和 `read_tac_data()`。
+- `RealSenseRGBSource`: 启动 RealSense color stream，后台线程将 RGB 帧推入 `NearestFrameBuffer`。
 - `HandSampleBuilder`: 将当前 commands、hand states、faults 合成一帧 `HandSample`。
-- `HandOnlyLeRobotWriter`: 接收异步写盘任务，写 `data/*.parquet` 和 `meta/*.jsonl/json`。
+- `HandOnlyLeRobotWriter`: 接收异步写盘任务，写 `data/*.parquet`、`meta/*.jsonl/json` 和可选 `videos/*.mp4`。
 
 最小代码调用示例：
 
@@ -50,7 +53,7 @@ backend = InspireTacHandBackend(
         side="right",
         hand_ip="192.168.12.210",
         enable_telemetry=True,
-        tactile_regions=(),  # empty means read all tactile regions
+        tactile_regions=("all",),  # "all" reads all tactile regions; () disables tactile reads
     )
 )
 
@@ -65,6 +68,8 @@ hand_state = backend.get_state()
 
 ## 运行
 
+无相机默认模式：
+
 ```bash
 conda activate grasp_py310_copy
 
@@ -76,6 +81,36 @@ python -m inspire_data_collect \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.12.211 \
   --visualize-tactile
+```
+
+单 RealSense 相机，使用包内 `realsense.json`：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./hand_camera_dataset \
+  --active-sides both \
+  --left-hand-port /dev/ttyACM0 \
+  --right-hand-port /dev/ttyACM1 \
+  --left-hand-ip 192.168.12.210 \
+  --right-hand-ip 192.168.12.211 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json
+```
+
+单 RealSense 相机，直接用序列号配置：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./hand_camera_dataset \
+  --active-sides right \
+  --right-hand-port /dev/ttyACM0 \
+  --right-hand-ip 192.168.12.210 \
+  --camera-mode single \
+  --camera-key front \
+  --camera-serial 213222079798 \
+  --camera-width 1280 \
+  --camera-height 720 \
+  --camera-fps 30
 ```
 
 单右手：
@@ -91,6 +126,8 @@ python -m inspire_data_collect \
 
 按键：`z` 开始 episode，`c` 保存当前 episode，`d` 丢弃当前 episode，`q` 退出。加 `--record-auto-start` 可启动后直接采集。
 
+触觉读取：`--hand-tactile-regions all` 表示读取全部触觉区域；传空字符串 `--hand-tactile-regions ""` 表示不读取触觉。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
+
 ## 输出
 
 目录结构：
@@ -102,6 +139,14 @@ dataset_root/
   meta/episodes.jsonl
   meta/episodes_stats.jsonl
   meta/tasks.jsonl
+```
+
+启用相机后额外生成：
+
+```text
+dataset_root/
+  meta/devices/realsense.json
+  videos/observation.images.front/chunk-000/episode_000000.mp4
 ```
 
 `action` 和 `observation.state` 均为 19 维：
@@ -122,6 +167,16 @@ dataset_root/
 - `teleop.action_source.<side>_hand_q6`: 遥操作源手 6DoF。
 
 `meta/info.json` 中的 `reserved_spaces` 明确记录单臂 7DoF 的 shape 和 slice，后续接入单臂时直接填充前 7 维即可。
+
+启用相机后，每帧还会写出：
+
+- `camera_keys`: 当前帧包含的 camera key。
+- `observation.images.<camera_key>.source_timestamp`: 被选中的相机帧时间戳。
+- `observation.images.<camera_key>.receive_timestamp`: 收到该帧的本机时间。
+- `observation.images.<camera_key>.age_sec`: 样本时间与相机帧时间差。
+- `observation.images.<camera_key>.source_frame_index`: RealSense 源帧序号。
+- `observation.images.<camera_key>.video_frame_index`: 写入 mp4 后的视频帧序号。
+- `observation.images.<camera_key>.path`: 相对 dataset root 的视频路径。
 
 导出的最小示例：
 
@@ -160,8 +215,14 @@ pool.close(wait=True)
 pip install pyserial pymodbus==2.5.3 pyarrow numpy
 ```
 
-触觉可视化额外需要：
+触觉可视化和视频导出需要：
 
 ```bash
 pip install opencv-python
+```
+
+RealSense 需要：
+
+```bash
+pip install pyrealsense2
 ```

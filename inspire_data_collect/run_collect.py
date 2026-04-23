@@ -28,6 +28,11 @@ if __package__ in (None, ""):
         parse_tactile_regions,
     )
     from inspire_data_collect.hand_source import HandQ6Source
+    from inspire_data_collect.realsense_rgb import (
+        RealSenseRGBCameraConfig,
+        RealSenseRGBSource,
+        load_realsense_camera_config_map,
+    )
     from inspire_data_collect.retargeter import HandRetargeter, HandRetargeterConfig
     from inspire_data_collect.tactile_visualizer import (
         TactileUVVisualizer,
@@ -49,6 +54,11 @@ else:
     from .hand_backend import InspireTacHandBackend, InspireTacHandBackendConfig
     from .hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
     from .hand_source import HandQ6Source
+    from .realsense_rgb import (
+        RealSenseRGBCameraConfig,
+        RealSenseRGBSource,
+        load_realsense_camera_config_map,
+    )
     from .retargeter import HandRetargeter, HandRetargeterConfig
     from .tactile_visualizer import (
         TactileUVVisualizer,
@@ -64,6 +74,9 @@ else:
         HandSampleBuilder,
         WriterConfig,
     )
+
+
+DEFAULT_CAMERA_CONFIG_PATH = Path(__file__).resolve().parent / "realsense.json"
 
 
 def parse_joint_order(text: str) -> tuple[int, ...]:
@@ -155,10 +168,35 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-steps", type=int, default=0, help="0 means run until stopped")
     parser.add_argument("--record-auto-start", action="store_true")
 
+    parser.add_argument(
+        "--camera-mode",
+        choices=["none", "single"],
+        default="none",
+        help="Camera mode. 'single' enables one RealSense RGB camera.",
+    )
+    parser.add_argument(
+        "--camera-config",
+        type=Path,
+        default=DEFAULT_CAMERA_CONFIG_PATH,
+        help="RealSense JSON config. Used when --camera-mode single and --camera-serial is empty.",
+    )
+    parser.add_argument("--camera-key", type=str, default="front")
+    parser.add_argument("--camera-serial", type=str, default="")
+    parser.add_argument("--camera-width", type=int, default=1280)
+    parser.add_argument("--camera-height", type=int, default=720)
+    parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument("--camera-keep-last", type=int, default=4)
+    parser.add_argument("--camera-color-space", choices=["rgb", "bgr"], default="rgb")
+    parser.add_argument("--camera-wait-timeout-ms", type=int, default=200)
+    parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
+
     parser.add_argument("--writer-workers", type=int, default=2)
     parser.add_argument("--writer-queue-size", type=int, default=256)
     parser.add_argument("--chunk-size", type=int, default=1000)
     parser.add_argument("--parquet-compression", type=str, default="zstd")
+    parser.add_argument("--video-codec", type=str, default="mp4v")
+    parser.add_argument("--write-video", dest="write_video", action="store_true", default=True)
+    parser.add_argument("--no-video", dest="write_video", action="store_false")
     parser.add_argument("--write-parquet", dest="write_parquet", action="store_true", default=True)
     parser.add_argument("--no-parquet", dest="write_parquet", action="store_false")
 
@@ -178,6 +216,17 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--hz must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
+    if args.camera_mode == "single":
+        if not args.camera_serial and not Path(args.camera_config).exists():
+            raise ValueError(
+                "--camera-mode single requires --camera-serial or an existing --camera-config."
+            )
+        if int(args.camera_width) <= 0 or int(args.camera_height) <= 0:
+            raise ValueError("--camera-width/--camera-height must be positive.")
+        if int(args.camera_fps) <= 0:
+            raise ValueError("--camera-fps must be positive.")
+        if int(args.camera_keep_last) <= 0:
+            raise ValueError("--camera-keep-last must be positive.")
     for side in active_sides:
         if not getattr(args, f"{side}_hand_port"):
             raise ValueError(f"--{side}-hand-port is required for active side '{side}'.")
@@ -234,6 +283,35 @@ def build_components(
     return source, retargeters, backends
 
 
+def build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSource]:
+    if args.camera_mode == "none":
+        return {}
+    if args.camera_serial:
+        config = RealSenseRGBCameraConfig(
+            serial=str(args.camera_serial),
+            width=int(args.camera_width),
+            height=int(args.camera_height),
+            fps=int(args.camera_fps),
+            camera_key=str(args.camera_key),
+            keep_last=int(args.camera_keep_last),
+            color_space=str(args.camera_color_space),
+            wait_timeout_ms=int(args.camera_wait_timeout_ms),
+            auto_exposure_priority=args.camera_auto_exposure_priority,
+            metadata={"source": "cli"},
+        )
+        return {config.camera_key: RealSenseRGBSource(config)}
+
+    camera_configs = load_realsense_camera_config_map(Path(args.camera_config))
+    if len(camera_configs) != 1:
+        raise ValueError(
+            f"--camera-mode single expects exactly one camera config, got {len(camera_configs)}."
+        )
+    return {
+        camera_key: RealSenseRGBSource(config)
+        for camera_key, config in camera_configs.items()
+    }
+
+
 def hand_state_snapshot(backends: dict[str, InspireTacHandBackend]) -> dict[str, dict[str, Any]]:
     return {side: backend.get_state() for side, backend in backends.items()}
 
@@ -276,15 +354,20 @@ def print_status(
     control_hz: float,
     active_sides: tuple[str, ...],
     hand_states: dict[str, dict[str, Any]],
+    camera_sources: dict[str, RealSenseRGBSource],
 ) -> None:
     tactile_text = " ".join(
         f"{side}_tac={format_tactile_sum(hand_states.get(side))}"
         for side in active_sides
     )
+    camera_text = " ".join(
+        f"{camera_key}_frames={source.device_info().get('frame_count', 0)}"
+        for camera_key, source in camera_sources.items()
+    )
     episode_text = "-" if episode_index is None else str(episode_index)
     print(
         f"[status] rec={int(recording)} ep={episode_text} frame={frame_index} "
-        f"hz={control_hz:.1f} {tactile_text}"
+        f"hz={control_hz:.1f} {tactile_text} {camera_text}".rstrip()
     )
 
 
@@ -295,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     add_args(parser)
     args = parser.parse_args(argv)
     active_sides = validate_args(args)
+    camera_sources = build_camera_sources(args)
 
     writer = HandOnlyLeRobotWriter(
         WriterConfig(
@@ -302,10 +386,12 @@ def main(argv: list[str] | None = None) -> int:
             chunk_size=int(args.chunk_size),
             nominal_fps=float(args.hz),
             parquet_compression=str(args.parquet_compression),
+            video_codec=str(args.video_codec),
             task_id=str(args.task_id),
             task_description=str(args.task_description),
             dataset_name=str(args.dataset_name),
             write_parquet=bool(args.write_parquet),
+            write_video=bool(args.write_video and camera_sources),
         )
     )
     writer_pool = AsyncWriterPool(
@@ -319,6 +405,10 @@ def main(argv: list[str] | None = None) -> int:
     sample_builder = HandSampleBuilder(
         active_sides=active_sides,
         episode_index=writer.next_episode_index,
+        camera_buffers={
+            camera_key: source.frame_buffer()
+            for camera_key, source in camera_sources.items()
+        },
     )
     source, retargeters, backends = build_components(args, active_sides)
     visualizer = (
@@ -352,6 +442,12 @@ def main(argv: list[str] | None = None) -> int:
             "joint_order": list(args.hand_joint_order),
             "hand_invert": bool(args.hand_invert),
             "tactile_regions": list(parse_tactile_regions(args.hand_tactile_regions)),
+            "camera_mode": str(args.camera_mode),
+            "camera_keys": sorted(camera_sources),
+            "camera_config_path": None
+            if args.camera_mode == "none" or args.camera_serial
+            else str(args.camera_config),
+            "write_video": bool(args.write_video and camera_sources),
         }
         current_episode = writer.start_episode(metadata=metadata)
         sample_builder.set_episode(current_episode)
@@ -369,7 +465,11 @@ def main(argv: list[str] | None = None) -> int:
         if save and frame_count > 0:
             for job in writer.plan_finalize_episode(
                 episode_index,
-                summary={"frame_count": frame_count, "active_sides": list(active_sides)},
+                summary={
+                    "frame_count": frame_count,
+                    "active_sides": list(active_sides),
+                    "camera_keys": sorted(camera_sources),
+                },
             ):
                 writer_pool.submit(job)
             writer_pool.join()
@@ -386,8 +486,18 @@ def main(argv: list[str] | None = None) -> int:
             backend.start()
             if not backend.is_ready() and not args.allow_hand_connect_failure:
                 raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
+        for camera_source in camera_sources.values():
+            camera_source.start()
 
         writer_pool.start()
+        if camera_sources:
+            writer.write_device_config(
+                "realsense",
+                {
+                    camera_key: source.device_info()
+                    for camera_key, source in camera_sources.items()
+                },
+            )
         if args.record_auto_start:
             start_episode()
 
@@ -453,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
                         control_hz=control_hz,
                         active_sides=active_sides,
                         hand_states=hand_states,
+                        camera_sources=camera_sources,
                     )
                     last_status_at = loop_started_at
 
@@ -471,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             for backend in backends.values():
                 backend.close()
+            for camera_source in camera_sources.values():
+                camera_source.close()
             source.close()
             if visualizer is not None:
                 visualizer.close()

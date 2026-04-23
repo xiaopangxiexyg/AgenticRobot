@@ -17,6 +17,7 @@ from .common import (
     vector_list,
     vector_or_none,
 )
+from .video_frame import NearestFrameBuffer, VideoFrame
 
 ARM_DOF = 7
 HAND_DOF = 6
@@ -25,7 +26,16 @@ ACTION_DIM = ARM_DOF + HAND_DOF * 2
 OBSERVATION_STATE_DIM = ARM_DOF + HAND_DOF * 2
 
 ROW_JOB_KIND = "hand_only.row"
+VIDEO_FRAME_JOB_KIND = "hand_only.video_frame"
 FINALIZE_EPISODE_JOB_KIND = "hand_only.finalize_episode"
+
+
+def _require_cv2():
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Video export requires opencv-python.") from exc
+    return cv2
 
 
 def episode_id_from_index(index: int) -> str:
@@ -36,6 +46,34 @@ def chunk_id_from_episode_index(index: int, *, chunk_size: int) -> str:
     if int(chunk_size) <= 0:
         raise ValueError("chunk_size must be positive.")
     return f"chunk-{int(index) // int(chunk_size):03d}"
+
+
+def camera_video_channel(camera_key: str) -> str:
+    return f"observation.images.{str(camera_key)}"
+
+
+def _coerce_video_frame(image: Any, *, color_space: str = "rgb") -> np.ndarray:
+    cv2 = _require_cv2()
+    frame = np.asarray(image)
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
+    elif frame.ndim == 3 and frame.shape[2] == 3:
+        frame = frame.astype(np.uint8, copy=False)
+        if str(color_space).lower() == "rgb":
+            frame = frame[..., ::-1]
+        elif str(color_space).lower() != "bgr":
+            raise ValueError(f"Unsupported video color_space '{color_space}'.")
+    elif frame.ndim == 3 and frame.shape[2] == 4:
+        frame = frame.astype(np.uint8, copy=False)
+        if str(color_space).lower() == "rgba":
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        elif str(color_space).lower() == "bgra":
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        else:
+            raise ValueError(f"Unsupported 4-channel video color_space '{color_space}'.")
+    else:
+        raise ValueError(f"Unsupported video frame shape {frame.shape}.")
+    return np.ascontiguousarray(frame)
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -82,6 +120,14 @@ def write_rows_to_parquet(
 
 
 @dataclass(frozen=True)
+class CameraFrameMatch:
+    camera_key: str
+    frame: VideoFrame | None
+    selected_timestamp: float | None
+    age_sec: float | None
+
+
+@dataclass(frozen=True)
 class HandSample:
     index: int
     episode_index: int
@@ -97,6 +143,7 @@ class HandSample:
     commands: dict[str, EffectorCommand] = field(default_factory=dict)
     hand_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     faults: list[str] = field(default_factory=list)
+    camera_frames: dict[str, CameraFrameMatch] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -107,8 +154,12 @@ class HandSampleBuilder:
         active_sides: tuple[str, ...],
         episode_index: int = 0,
         sample_index_start: int = 0,
+        camera_buffers: Mapping[str, NearestFrameBuffer] | None = None,
     ):
         self.active_sides = tuple(str(side) for side in active_sides)
+        self.camera_buffers = {
+            str(camera_key): buffer for camera_key, buffer in dict(camera_buffers or {}).items()
+        }
         self._episode_index = int(episode_index)
         self._frame_index = 0
         self._sample_index = int(sample_index_start)
@@ -170,6 +221,36 @@ class HandSampleBuilder:
             dtype=np.float32,
         )
 
+    def _camera_matches(
+        self,
+        *,
+        timestamp: float,
+        camera_frames: Mapping[str, VideoFrame | None] | None,
+    ) -> dict[str, CameraFrameMatch]:
+        if camera_frames is None:
+            camera_frames = {
+                camera_key: buffer.get_nearest(timestamp)
+                for camera_key, buffer in self.camera_buffers.items()
+            }
+        matches: dict[str, CameraFrameMatch] = {}
+        for camera_key, frame in camera_frames.items():
+            key = str(camera_key)
+            if frame is None:
+                matches[key] = CameraFrameMatch(
+                    camera_key=key,
+                    frame=None,
+                    selected_timestamp=None,
+                    age_sec=None,
+                )
+                continue
+            matches[key] = CameraFrameMatch(
+                camera_key=key,
+                frame=frame,
+                selected_timestamp=float(frame.source_timestamp),
+                age_sec=float(timestamp - float(frame.source_timestamp)),
+            )
+        return matches
+
     def build(
         self,
         *,
@@ -179,6 +260,7 @@ class HandSampleBuilder:
         channels: Mapping[str, ObservationChannel],
         commands: Mapping[str, EffectorCommand],
         hand_states: Mapping[str, Mapping[str, Any] | None],
+        camera_frames: Mapping[str, VideoFrame | None] | None = None,
         faults: list[str] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> HandSample:
@@ -206,6 +288,10 @@ class HandSampleBuilder:
                 str(side): dict(state or {}) for side, state in hand_states.items()
             },
             faults=[] if faults is None else [str(fault) for fault in faults],
+            camera_frames=self._camera_matches(
+                timestamp=float(timestamp),
+                camera_frames=camera_frames,
+            ),
             metadata={} if metadata is None else dict(to_serializable(dict(metadata))),
         )
         self._last_action = action.copy()
@@ -248,7 +334,11 @@ def _split_observation_state(observation_state: np.ndarray) -> dict[str, list[fl
     return result
 
 
-def hand_sample_to_row(sample: HandSample) -> dict[str, Any]:
+def hand_sample_to_row(
+    sample: HandSample,
+    *,
+    camera_video_paths: Mapping[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, bool]]:
     action_split = _split_action(sample.action)
     observation_split = _split_observation_state(sample.observation_state)
     command_metadata_by_effector = {
@@ -264,7 +354,7 @@ def hand_sample_to_row(sample: HandSample) -> dict[str, Any]:
         "control_hz": float(sample.control_hz),
         "active_sides": list(sample.active_sides),
         "arm_state_source": "reserved_single_arm_7dof",
-        "camera_keys": [],
+        "camera_keys": sorted(sample.camera_frames.keys()),
         "fault_codes": list(sample.faults),
         "action": np.asarray(sample.action, dtype=np.float32).tolist(),
         "action.arm.joint_target": action_split["arm"],
@@ -309,7 +399,19 @@ def hand_sample_to_row(sample: HandSample) -> dict[str, Any]:
             command_metadata.get("source_q6"),
             length=HAND_DOF,
         )
-    return row
+    camera_expectations: dict[str, bool] = {}
+    for camera_key, match in sample.camera_frames.items():
+        prefix = camera_video_channel(camera_key)
+        frame = match.frame
+        camera_expectations[str(camera_key)] = frame is not None
+        row[f"{prefix}.source_timestamp"] = match.selected_timestamp
+        row[f"{prefix}.receive_timestamp"] = None if frame is None else frame.receive_timestamp
+        row[f"{prefix}.age_sec"] = match.age_sec
+        row[f"{prefix}.source_frame_index"] = None if frame is None else frame.frame_index
+        row[f"{prefix}.video_frame_index"] = None
+        if camera_video_paths is not None and camera_key in camera_video_paths:
+            row[f"{prefix}.path"] = str(camera_video_paths[camera_key])
+    return row, camera_expectations
 
 
 @dataclass
@@ -318,11 +420,13 @@ class WriterConfig:
     chunk_size: int = 1000
     nominal_fps: float = 30.0
     parquet_compression: str = "zstd"
+    video_codec: str = "mp4v"
     task_id: str = "hand_only"
     task_description: str = ""
     dataset_name: str = ""
     format_name: str = "hand_only_lerobot_v2.1_style"
     write_parquet: bool = True
+    write_video: bool = True
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
@@ -330,6 +434,19 @@ class WriterConfig:
             raise ValueError("chunk_size must be positive.")
         if float(self.nominal_fps) <= 0.0:
             raise ValueError("nominal_fps must be positive.")
+
+
+@dataclass
+class _VideoState:
+    camera_key: str
+    relative_path: str
+    path: Path
+    expected_by_sample: dict[int, bool] = field(default_factory=dict)
+    pending_frames: dict[int, np.ndarray] = field(default_factory=dict)
+    writer: Any | None = None
+    frame_size: tuple[int, int] | None = None
+    next_sample_index: int = 0
+    next_video_frame_index: int = 0
 
 
 @dataclass
@@ -342,6 +459,7 @@ class _EpisodeState:
     start_timestamp: float | None = None
     end_timestamp: float | None = None
     control_hz_values: list[float] = field(default_factory=list)
+    video_states: dict[str, _VideoState] = field(default_factory=dict)
 
 
 class HandOnlyLeRobotWriter:
@@ -350,6 +468,7 @@ class HandOnlyLeRobotWriter:
         self.root_dir = Path(config.root_dir)
         self.meta_dir = self.root_dir / "meta"
         self.data_dir = self.root_dir / "data"
+        self.videos_dir = self.root_dir / "videos"
         self._lock = threading.RLock()
         self._episodes: dict[int, _EpisodeState] = {}
         self._next_episode_index = 0
@@ -381,6 +500,7 @@ class HandOnlyLeRobotWriter:
     def _prepare_dataset_root(self) -> None:
         self.meta_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.videos_dir.mkdir(parents=True, exist_ok=True)
         for path in (self.episodes_path, self.tasks_path, self.episode_stats_path):
             path.touch(exist_ok=True)
         self._load_existing_dataset_state()
@@ -430,6 +550,8 @@ class HandOnlyLeRobotWriter:
                 "episode_count": int(self._finalized_episode_count),
                 "frame_count": int(self._finalized_frame_count),
                 "write_parquet": bool(self.config.write_parquet),
+                "write_video": bool(self.config.write_video),
+                "video_codec": str(self.config.video_codec),
                 "task_id": self.config.task_id,
                 "task_description": self.config.task_description,
                 "reserved_spaces": {
@@ -463,6 +585,11 @@ class HandOnlyLeRobotWriter:
                 },
             },
         )
+
+    def write_device_config(self, name: str, payload: Any) -> Path:
+        path = self.meta_dir / "devices" / f"{name}.json"
+        _write_json(path, payload)
+        return path
 
     def start_episode(
         self,
@@ -502,19 +629,72 @@ class HandOnlyLeRobotWriter:
         chunk_id = chunk_id_from_episode_index(episode_index, chunk_size=self.config.chunk_size)
         return str(Path("data") / chunk_id / f"{episode_id_from_index(episode_index)}.parquet")
 
+    def _episode_video_relative_path(self, episode_index: int, camera_key: str) -> str:
+        chunk_id = chunk_id_from_episode_index(episode_index, chunk_size=self.config.chunk_size)
+        return str(
+            Path("videos")
+            / camera_video_channel(camera_key)
+            / chunk_id
+            / f"{episode_id_from_index(episode_index)}.mp4"
+        )
+
+    def _ensure_video_state(self, episode: _EpisodeState, camera_key: str) -> _VideoState:
+        if camera_key in episode.video_states:
+            return episode.video_states[camera_key]
+        relative_path = self._episode_video_relative_path(episode.episode_index, camera_key)
+        state = _VideoState(
+            camera_key=str(camera_key),
+            relative_path=relative_path,
+            path=self.root_dir / relative_path,
+        )
+        episode.video_states[camera_key] = state
+        return state
+
     def plan_sample_jobs(self, sample: HandSample) -> list[WriteJob]:
         with self._lock:
             self._ensure_episode_state(sample.episode_index)
-        return [
+        camera_video_paths = (
+            {
+                camera_key: self._episode_video_relative_path(sample.episode_index, camera_key)
+                for camera_key in sample.camera_frames
+            }
+            if self.config.write_video
+            else None
+        )
+        row, camera_expectations = hand_sample_to_row(
+            sample,
+            camera_video_paths=camera_video_paths,
+        )
+        if not self.config.write_video:
+            camera_expectations = {camera_key: False for camera_key in camera_expectations}
+        jobs = [
             WriteJob(
                 kind=ROW_JOB_KIND,
                 payload={
                     "episode_index": int(sample.episode_index),
                     "frame_index": int(sample.frame_index),
-                    "row": hand_sample_to_row(sample),
+                    "row": row,
+                    "camera_expectations": dict(camera_expectations),
                 },
             )
         ]
+        if self.config.write_video:
+            for camera_key, match in sample.camera_frames.items():
+                if match.frame is None:
+                    continue
+                jobs.append(
+                    WriteJob(
+                        kind=VIDEO_FRAME_JOB_KIND,
+                        payload={
+                            "episode_index": int(sample.episode_index),
+                            "frame_index": int(sample.frame_index),
+                            "camera_key": str(camera_key),
+                            "image": match.frame.image,
+                            "color_space": match.frame.metadata.get("color_space", "rgb"),
+                        },
+                    )
+                )
+        return jobs
 
     def plan_finalize_episode(
         self,
@@ -536,6 +716,9 @@ class HandOnlyLeRobotWriter:
         with self._lock:
             if job.kind == ROW_JOB_KIND:
                 self._handle_row_job(job.payload)
+                return
+            if job.kind == VIDEO_FRAME_JOB_KIND:
+                self._handle_video_frame_job(job.payload)
                 return
             if job.kind == FINALIZE_EPISODE_JOB_KIND:
                 self._finalize_episode_locked(
@@ -559,10 +742,82 @@ class HandOnlyLeRobotWriter:
         control_hz = row.get("control_hz")
         if control_hz is not None:
             episode.control_hz_values.append(float(control_hz))
+        for camera_key, expects_frame in dict(payload.get("camera_expectations", {})).items():
+            video_state = self._ensure_video_state(episode, str(camera_key))
+            video_state.expected_by_sample[frame_index] = bool(expects_frame)
+            self._drain_video_state(episode, video_state)
+
+    def _handle_video_frame_job(self, payload: Mapping[str, Any]) -> None:
+        episode = self._ensure_episode_state(int(payload["episode_index"]))
+        camera_key = str(payload["camera_key"])
+        video_state = self._ensure_video_state(episode, camera_key)
+        video_state.pending_frames[int(payload["frame_index"])] = _coerce_video_frame(
+            payload["image"],
+            color_space=str(payload.get("color_space", "rgb")),
+        )
+        self._drain_video_state(episode, video_state)
+
+    def _open_video_writer(self, state: _VideoState, frame: np.ndarray) -> None:
+        cv2 = _require_cv2()
+        height, width = frame.shape[:2]
+        state.path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(
+            str(state.path),
+            cv2.VideoWriter_fourcc(*self.config.video_codec),
+            float(self.config.nominal_fps),
+            (int(width), int(height)),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for '{state.path}'.")
+        state.writer = writer
+        state.frame_size = (int(width), int(height))
+
+    def _drain_video_state(self, episode: _EpisodeState, state: _VideoState) -> None:
+        while state.next_sample_index in state.expected_by_sample:
+            sample_index = int(state.next_sample_index)
+            expects_frame = bool(state.expected_by_sample[sample_index])
+            if not expects_frame:
+                del state.expected_by_sample[sample_index]
+                state.next_sample_index += 1
+                continue
+            if sample_index not in state.pending_frames:
+                return
+            frame = state.pending_frames.pop(sample_index)
+            if state.writer is None:
+                self._open_video_writer(state, frame)
+            assert state.frame_size is not None
+            expected_width, expected_height = state.frame_size
+            if frame.shape[1] != expected_width or frame.shape[0] != expected_height:
+                raise ValueError(
+                    f"Video frame for camera '{state.camera_key}' has shape {frame.shape[:2]}, "
+                    f"expected {(expected_height, expected_width)}."
+                )
+            assert state.writer is not None
+            state.writer.write(frame)
+            row = episode.rows_by_frame.get(sample_index)
+            if row is not None:
+                row[f"{camera_video_channel(state.camera_key)}.video_frame_index"] = int(
+                    state.next_video_frame_index
+                )
+            del state.expected_by_sample[sample_index]
+            state.next_video_frame_index += 1
+            state.next_sample_index += 1
+
+    def _close_video_state(self, state: _VideoState) -> None:
+        if state.writer is not None:
+            state.writer.release()
+            state.writer = None
 
     def discard_episode(self, episode_index: int) -> bool:
         with self._lock:
             episode = self._episodes.pop(int(episode_index), None)
+            if episode is not None:
+                for state in episode.video_states.values():
+                    self._close_video_state(state)
+                    try:
+                        state.path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             self._next_episode_index = max(
                 [int(row.get("episode_index", -1)) for row in _read_jsonl(self.episodes_path)] + [-1]
             ) + 1
@@ -575,6 +830,20 @@ class HandOnlyLeRobotWriter:
         summary: Mapping[str, Any] | None = None,
     ) -> None:
         episode = self._ensure_episode_state(int(episode_index))
+        for state in episode.video_states.values():
+            self._drain_video_state(episode, state)
+            unresolved = [
+                frame_index
+                for frame_index, expects_frame in sorted(state.expected_by_sample.items())
+                if expects_frame
+            ]
+            if unresolved:
+                raise RuntimeError(
+                    f"Episode {episode.episode_id} camera '{state.camera_key}' is missing "
+                    f"selected frames for frame indices {unresolved[:8]}."
+                )
+            self._close_video_state(state)
+
         rows = [episode.rows_by_frame[index] for index in sorted(episode.rows_by_frame)]
         if not rows:
             raise RuntimeError(f"Episode {episode.episode_id} does not contain any rows.")
@@ -596,6 +865,18 @@ class HandOnlyLeRobotWriter:
             if not episode.control_hz_values
             else float(np.mean(np.asarray(episode.control_hz_values, dtype=float)))
         )
+        camera_keys = sorted(
+            {
+                str(camera_key)
+                for row in rows
+                for camera_key in row.get("camera_keys", [])
+            }
+        )
+        video_paths = {
+            camera_key: state.relative_path
+            for camera_key, state in episode.video_states.items()
+            if state.next_video_frame_index > 0
+        }
         episode_record = {
             "episode_index": int(episode.episode_index),
             "episode_id": episode.episode_id,
@@ -604,7 +885,7 @@ class HandOnlyLeRobotWriter:
             "end_timestamp": episode.end_timestamp,
             "duration_sec": float(duration_sec),
             "parquet_path": parquet_relative_path if self.config.write_parquet else None,
-            "video_paths": {},
+            "video_paths": video_paths,
             "metadata": dict(episode.metadata),
             "summary": {} if summary is None else dict(to_serializable(dict(summary))),
         }
@@ -618,7 +899,7 @@ class HandOnlyLeRobotWriter:
             "nominal_fps": float(self.config.nominal_fps),
             "active_sides": list(rows[0].get("active_sides", [])),
             "arm_state_source": "reserved_single_arm_7dof",
-            "camera_keys": [],
+            "camera_keys": camera_keys,
             "fault_count": int(sum(len(row.get("fault_codes", [])) for row in rows)),
         }
         _append_jsonl(self.episodes_path, episode_record)
