@@ -2,6 +2,27 @@
 
 只含 Inspire Tac 手的数据采集便携包，不依赖 `teleop_runtime`。保留原工程的 `assets` 不复制；运行时只需要本目录、硬件可访问、以及 Python 依赖。
 
+## 依赖
+
+硬件与导出所需：
+
+```bash
+pip install pyserial pymodbus==2.5.3 pyarrow numpy
+```
+
+触觉可视化和视频导出需要：
+
+```bash
+pip install opencv-python
+```
+
+RealSense 需要：
+
+```bash
+pip install pyrealsense2
+```
+
+
 ## 模块
 
 - `hand/serial_hand_q6_reader.py`: 读取遥操作手串口 `ANGLES:`，自动零位标定，输出归一化 6DoF。
@@ -230,24 +251,4 @@ for job in writer.plan_sample_jobs(sample):
 for job in writer.plan_finalize_episode(episode_index):
     pool.submit(job)
 pool.close(wait=True)
-```
-
-## 依赖
-
-硬件与导出所需：
-
-```bash
-pip install pyserial pymodbus==2.5.3 pyarrow numpy
-```
-
-触觉可视化和视频导出需要：
-
-```bash
-pip install opencv-python
-```
-
-RealSense 需要：
-
-```bash
-pip install pyrealsense2
 ```
