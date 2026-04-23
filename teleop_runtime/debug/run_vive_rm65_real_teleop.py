@@ -21,9 +21,9 @@ from ..configs import (
 from ..diagnostics import TeleopRunState
 from ..episodes import EpisodeRecorder, EpisodeRecorderConfig, compare_start_qpos_pair
 from ..hand_mapping import (
-    ALL_TACTILE_REGION_NAMES,
     DEFAULT_INSPIRE_HAND_JOINT_ORDER,
     TARGET_INSPIRE_HAND_Q6_ORDER,
+    parse_tactile_regions,
 )
 from ..hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
@@ -46,11 +46,17 @@ from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..tactile_visualizer import (
+    TactileUVVisualizer,
+    TactileVisualizerConfig,
+    tactile_by_side_from_backends,
+)
 from ..tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
 from .log_utils import ChangeGate
 from .run_vive_sapien_virtual import (
     RecoveryPlan,
     TerminalClutchInput,
+    _active_sides_from_args,
     _advance_recovery_plan,
     _build_episode_frame,
     _build_renderer_debug_boxes,
@@ -65,6 +71,7 @@ from .run_vive_sapien_virtual import (
     _manual_calibration_confirmation_required,
     _non_negative_int,
     _alpha_float,
+    _parse_active_sides,
     _parse_arm_max_angvel,
     _parse_joint_order,
     _positive_float,
@@ -90,8 +97,9 @@ from rm65_inspire_tac.rendering import SapienArmHandRenderer
 @dataclass(frozen=True)
 class RealTeleopComponents:
     session: TeleopSession
-    left_command_backend: RM65ArmBackend
-    right_command_backend: RM65ArmBackend
+    active_sides: tuple[str, ...]
+    left_command_backend: RM65ArmBackend | None
+    right_command_backend: RM65ArmBackend | None
     left_preview_backend: RM65ArmBackend
     right_preview_backend: RM65ArmBackend
     left_state_backend: RM65ArmBackend | None
@@ -127,6 +135,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver")
     parser.add_argument("--port", type=int, default=9999, help="UDP bind port for the VIVE receiver")
+    parser.add_argument(
+        "--active-sides",
+        type=_parse_active_sides,
+        default=("left", "right"),
+        help="One of: left, right, both.",
+    )
     parser.add_argument("--left-arm-ip", type=str, default="", help="Left RM65 IP")
     parser.add_argument("--right-arm-ip", type=str, default="", help="Right RM65 IP")
     parser.add_argument("--left-hand-ip", type=str, default="", help="Optional left InspireTac IP")
@@ -192,6 +206,23 @@ def parse_args() -> argparse.Namespace:
             "Suppress normal stdout logs and print only real-time left/right hand tactile sums. "
             "Teleop behavior is unchanged. Disabled by default."
         ),
+    )
+    parser.add_argument(
+        "--visualize-tactile",
+        action="store_true",
+        help="Show the InspireTac tactile UV OpenCV window during real teleop.",
+    )
+    parser.add_argument(
+        "--tactile-vis-value-scale",
+        type=float,
+        default=0.05,
+        help="Scale used by the tactile visualizer response curve.",
+    )
+    parser.add_argument(
+        "--tactile-vis-size",
+        type=int,
+        default=640,
+        help="Per-hand tactile visualizer panel size in pixels.",
     )
     parser.add_argument(
         "--max-fingertip-force",
@@ -439,10 +470,47 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite")
     args = parser.parse_args()
+    if int(args.tactile_vis_size) <= 0:
+        parser.error("--tactile-vis-size must be positive.")
     args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
     args.tcp_mode = HAND_BASE_TCP_FRAME
-    if not args.left_arm_ip or not args.right_arm_ip:
-        raise SystemExit("Real teleop requires both --left-arm-ip and --right-arm-ip.")
+    active_sides = _active_sides_from_args(args)
+    if bool(args.visualize_tactile):
+        tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
+        if not tactile_regions:
+            parser.error(
+                "--visualize-tactile requires non-empty --hand-tactile-regions, "
+                "for example 'thumb_1,index_1,palm' or 'all'."
+            )
+        missing_hand_ip_sides = [
+            side for side in active_sides if not str(getattr(args, f"{side}_hand_ip") or "")
+        ]
+        if missing_hand_ip_sides:
+            parser.error(
+                "--visualize-tactile requires real InspireTac hand IPs for active sides; "
+                f"missing={missing_hand_ip_sides}."
+            )
+    logical_ip_by_side: dict[str, tuple[str, str]] = {}
+    inactive_config: list[str] = []
+    for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
+        if not arm_ip:
+            continue
+        if logical_side not in active_sides:
+            inactive_config.append(f"{source_name}->{logical_side}")
+            continue
+        logical_ip_by_side[logical_side] = (source_name, arm_ip)
+    missing = [side for side in active_sides if side not in logical_ip_by_side]
+    if missing:
+        raise SystemExit(
+            "Real teleop requires an RM65 IP for every active logical side; "
+            f"missing={missing} active_sides={list(active_sides)} "
+            f"swap_arm_sides={bool(args.swap_arm_sides)}."
+        )
+    if inactive_config:
+        raise SystemExit(
+            "Inactive logical side received an arm IP; remove it or include that side "
+            f"in --active-sides. inactive={inactive_config}"
+        )
     return args
 
 
@@ -454,16 +522,7 @@ def _resolve_logical_side_assignments(args: argparse.Namespace) -> dict[str, tup
 
 
 def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, (tuple, list)):
-        parts = [str(item).strip() for item in value if str(item).strip()]
-    else:
-        parts = [part.strip() for part in str(value).split(",") if part.strip()]
-    lowered = {part.lower() for part in parts}
-    if "all" in lowered:
-        return ALL_TACTILE_REGION_NAMES
-    return tuple(parts)
+    return parse_tactile_regions(value)
 
 
 def _alignment_qpos_pair(alignment: TeleopInitialAlignment | None) -> dict[str, np.ndarray] | None:
@@ -481,6 +540,8 @@ def _alignment_qpos_pair(alignment: TeleopInitialAlignment | None) -> dict[str, 
 def _start_state_summary(checks: dict[str, object]) -> str:
     parts: list[str] = []
     for side in ("left", "right"):
+        if side not in checks:
+            continue
         check = checks[side]
         parts.append(
             f"{side}: max_abs={check.max_abs_joint_error_deg:.2f}deg "
@@ -506,6 +567,7 @@ def _build_episode_metadata(
         "start_reason": start_reason,
         "control_mode": args.control_mode,
         "arm_mode": "real",
+        "active_sides": list(components.active_sides),
         "runtime_arm_state_source": "last_commanded_action",
         "hz": float(args.hz),
         "translation_scale": float(args.translation_scale),
@@ -580,10 +642,51 @@ def _stop_episode_recording(
 
 
 def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
+    active_sides = _active_sides_from_args(args)
+    logical_ip_by_side: dict[str, tuple[str, str]] = {}
+    inactive_arm_config: list[str] = []
+    for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
+        if not arm_ip:
+            continue
+        if logical_side not in active_sides:
+            inactive_arm_config.append(f"{source_name}->{logical_side}")
+            continue
+        logical_ip_by_side[logical_side] = (source_name, arm_ip)
+    if inactive_arm_config:
+        raise ValueError(
+            "Inactive logical side received an arm IP; remove it or include that side "
+            f"in --active-sides. inactive={inactive_arm_config}"
+        )
+    missing_arm_sides = [side for side in active_sides if side not in logical_ip_by_side]
+    if missing_arm_sides:
+        raise ValueError(
+            "Real teleop requires an RM65 IP for every active logical side; "
+            f"missing={missing_arm_sides} active_sides={list(active_sides)} "
+            f"swap_arm_sides={bool(args.swap_arm_sides)}."
+        )
+    for side in ("left", "right"):
+        if side in active_sides:
+            continue
+        present = [
+            f"--{side}-hand-ip" if str(getattr(args, f"{side}_hand_ip", "") or "") else "",
+            f"--{side}-hand-port" if str(getattr(args, f"{side}_hand_port", "") or "") else "",
+        ]
+        present = [value for value in present if value]
+        if present:
+            raise ValueError(
+                f"Inactive side '{side}' received hand configuration {present}; "
+                "remove those flags or include the side in --active-sides."
+            )
     control_dt = 1.0 / float(args.hz)
     arm_io_threads = max(1, int(args.arm_io_threads))
-    collision_guard_requested = not args.disable_dual_arm_collision_avoidance
-    arm_max_angvel = np.asarray(args.arm_max_angvel, dtype=float).reshape(6)
+    collision_guard_requested = (
+        set(active_sides) == {"left", "right"}
+        and not args.disable_dual_arm_collision_avoidance
+    )
+    arm_max_angvel = np.asarray(
+        getattr(args, "arm_max_angvel", (0.35, 0.35, 0.35, 0.5, 0.5, 0.5)),
+        dtype=float,
+    ).reshape(6)
     realistic_joint_step = tuple((arm_max_angvel * control_dt).tolist())
     collision_scene_profile = build_dual_arm_scene_profile(args.collision_scene_profile)
     ik_tuning = load_ik_tuning_config(args.ik_tuning_json or None)
@@ -604,6 +707,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "left_tracker_name": args.left_tracker_name,
             "right_tracker_name": args.right_tracker_name,
             "aux_tracker_name": args.aux_tracker_name,
+            "active_sides": list(active_sides),
             "arm_mode": "real",
             "left_arm_ip": args.left_arm_ip,
             "right_arm_ip": args.right_arm_ip,
@@ -652,22 +756,27 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         critical=False,
     )
 
-    tracker_configs = [
-        ViveTrackerConfig(
-            name=args.left_tracker_name,
-            side="left",
-            role="left_wrist",
-            channel_name="left_wrist_pose",
-            legacy_index=0,
-        ),
-        ViveTrackerConfig(
-            name=args.right_tracker_name,
-            side="right",
-            role="right_wrist",
-            channel_name="right_wrist_pose",
-            legacy_index=1,
-        ),
-    ]
+    tracker_configs: list[ViveTrackerConfig] = []
+    if "left" in active_sides:
+        tracker_configs.append(
+            ViveTrackerConfig(
+                name=args.left_tracker_name,
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+                legacy_index=0,
+            )
+        )
+    if "right" in active_sides:
+        tracker_configs.append(
+            ViveTrackerConfig(
+                name=args.right_tracker_name,
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+                legacy_index=1,
+            )
+        )
     if args.aux_tracker_name:
         tracker_configs.append(
             ViveTrackerConfig(
@@ -741,7 +850,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         else:
             retargeters.append(dual_arm_retargeter)
     if dual_arm_retargeter is None:
-        retargeters.extend((left_retargeter, right_retargeter))
+        side_retargeters = {"left": left_retargeter, "right": right_retargeter}
+        retargeters.extend(side_retargeters[side] for side in active_sides)
 
     calibration.metadata.update(
         {
@@ -755,8 +865,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     hand_source = None
     if left_hand_port or right_hand_port:
         hand_source = HandQ6Source.from_bimanual(
-            left_port=left_hand_port or None,
-            right_port=right_hand_port or None,
+            left_port=(left_hand_port or None) if "left" in active_sides else None,
+            right_port=(right_hand_port or None) if "right" in active_sides else None,
             baudrate=int(getattr(args, "hand_reader_baudrate", 115200)),
             timeout=float(getattr(args, "hand_reader_timeout", 0.05)),
             show_raw_lines=bool(getattr(args, "show_hand_raw_lines", False)),
@@ -766,7 +876,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
 
     left_hand_retargeter = None
     right_hand_retargeter = None
-    if left_hand_port:
+    if "left" in active_sides and left_hand_port:
         left_hand_retargeter = JointsToDexHandRetargeter(
             JointsToDexHandRetargeterConfig(
                 side="left",
@@ -777,7 +887,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 alpha=float(getattr(args, "hand_command_alpha", 1.0)),
             )
         )
-    if right_hand_port:
+    if "right" in active_sides and right_hand_port:
         right_hand_retargeter = JointsToDexHandRetargeter(
             JointsToDexHandRetargeterConfig(
                 side="right",
@@ -797,7 +907,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     hand_telemetry_hz = float(getattr(args, "hand_telemetry_hz", max(float(args.hz), 10.0)))
 
     left_hand_backend = None
-    if left_hand_port or args.left_hand_ip:
+    if "left" in active_sides and (left_hand_port or args.left_hand_ip):
         left_hand_backend = InspireTacHandBackend(
             InspireTacHandBackendConfig(
                 hand_ip=args.left_hand_ip or "0.0.0.0",
@@ -811,7 +921,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             )
         )
     right_hand_backend = None
-    if right_hand_port or args.right_hand_ip:
+    if "right" in active_sides and (right_hand_port or args.right_hand_ip):
         right_hand_backend = InspireTacHandBackend(
             InspireTacHandBackendConfig(
                 hand_ip=args.right_hand_ip or "0.0.0.0",
@@ -874,6 +984,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         )
     )
     for _source_name, (logical_side, arm_ip) in side_assignments.items():
+        if not arm_ip or logical_side not in active_sides:
+            continue
         command_backend = RM65ArmBackend(
             RM65ArmBackendConfig(
                 arm_ip=arm_ip,
@@ -921,20 +1033,19 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         else:
             right_command_backend = command_backend
             right_state_backend = state_backend
-    if (
-        left_command_backend is None
-        or right_command_backend is None
-        or left_state_backend is None
-        or right_state_backend is None
-    ):
-        raise RuntimeError("Failed to resolve logical left/right arm assignments.")
+    for side in active_sides:
+        command_backend = left_command_backend if side == "left" else right_command_backend
+        state_backend = left_state_backend if side == "left" else right_state_backend
+        if command_backend is None or state_backend is None:
+            raise RuntimeError(f"Failed to resolve logical {side} arm assignment.")
 
     left_hand_control_via_rig = left_hand_retargeter is not None and left_hand_backend is not None
     right_hand_control_via_rig = right_hand_retargeter is not None and right_hand_backend is not None
-    rig_backends = {
-        "left_arm": left_command_backend,
-        "right_arm": right_command_backend,
-    }
+    rig_backends = {}
+    if "left" in active_sides and left_command_backend is not None:
+        rig_backends["left_arm"] = left_command_backend
+    if "right" in active_sides and right_command_backend is not None:
+        rig_backends["right_arm"] = right_command_backend
     if left_hand_control_via_rig:
         rig_backends["left_hand"] = left_hand_backend
     if right_hand_control_via_rig:
@@ -959,7 +1070,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         calibration=calibration,
         safety_config=TeleopSafetyConfig(
             freeze_on_fault=True,
-            required_channels=("left_wrist_pose", "right_wrist_pose"),
+            required_channels=tuple(f"{side}_wrist_pose" for side in active_sides),
             invalid_frame_limit=3,
             minimum_control_hz=float(args.minimum_control_hz),
             target_control_hz=float(args.hz),
@@ -1010,15 +1121,16 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
 
     arm_state_read_executor = (
         ThreadPoolExecutor(
-            max_workers=min(arm_io_threads, 2),
+            max_workers=min(arm_io_threads, len(active_sides)),
             thread_name_prefix="rm65_state",
         )
-        if arm_io_threads > 1
+        if arm_io_threads > 1 and len(active_sides) > 1
         else None
     )
 
     return RealTeleopComponents(
         session=session,
+        active_sides=active_sides,
         left_command_backend=left_command_backend,
         right_command_backend=right_command_backend,
         left_preview_backend=left_preview_backend,
@@ -1071,6 +1183,9 @@ def _run_initial_alignment_start_check(
         "left": _state_qpos(components.left_preview_backend, DEFAULT_LEFT_ARM_QPOS),
         "right": _state_qpos(components.right_preview_backend, DEFAULT_RIGHT_ARM_QPOS),
     }
+    inactive_sides = set(("left", "right")) - set(components.active_sides)
+    for side in inactive_sides:
+        current_qpos_pair[side] = recorded_qpos_pair[side]
     checks = compare_start_qpos_pair(
         current_qpos_pair=current_qpos_pair,
         recorded_qpos_pair=recorded_qpos_pair,
@@ -1078,8 +1193,9 @@ def _run_initial_alignment_start_check(
         max_abs_threshold_deg=float(args.max_start_joint_error_deg),
         weighted_threshold_deg=float(args.max_start_weighted_error_deg),
     )
+    checks = {side: checks[side] for side in components.active_sides}
     _log("StartCheck", f"initial-alignment check: {_start_state_summary(checks)}")
-    for side in ("left", "right"):
+    for side in components.active_sides:
         check = checks[side]
         _log(
             "StartCheck",
@@ -1103,12 +1219,16 @@ def _sync_preview_from_real_state_real(
     now: float | None = None,
     required: bool,
 ) -> dict[str, bool]:
-    synced = {"left": False, "right": False}
+    synced = {side: False for side in components.active_sides}
     backends = (
         ("left", components.left_state_backend, components.left_preview_backend),
         ("right", components.right_state_backend, components.right_preview_backend),
     )
-    active = [(side, state_backend, preview_backend) for side, state_backend, preview_backend in backends if state_backend is not None]
+    active = [
+        (side, state_backend, preview_backend)
+        for side, state_backend, preview_backend in backends
+        if side in components.active_sides and state_backend is not None
+    ]
     parallel_submit_failed = False
     if components.arm_state_read_executor is not None and len(active) > 1:
         try:
@@ -1135,7 +1255,7 @@ def _sync_preview_from_real_state_real(
                 synced[side] = True
     if components.arm_state_read_executor is None or len(active) <= 1 or parallel_submit_failed:
         for side, state_backend, preview_backend in backends:
-            if state_backend is None:
+            if side not in components.active_sides or state_backend is None:
                 continue
             state = state_backend.refresh_state_from_hardware()
             qpos = state.get("current_qpos")
@@ -1159,6 +1279,8 @@ def _sync_real_execution_step_limits(
     if components.dual_arm_retargeter is None:
         return
     if not components.dual_arm_retargeter.config.enforce_realistic_joint_step:
+        return
+    if components.left_command_backend is None or components.right_command_backend is None:
         return
     tracker = components.arm_loop_step_dt_tracker
     current_time = time.time() if now is None else float(now)
@@ -1204,6 +1326,21 @@ def _apply_active_arm_command_to_preview_real(
     right_command = active_command.commands.get("right_arm")
     if right_command is not None:
         components.right_preview_backend.send_command(right_command)
+
+
+def _command_backend_for_side(
+    components: RealTeleopComponents,
+    side: str,
+) -> RM65ArmBackend | None:
+    return components.left_command_backend if side == "left" else components.right_command_backend
+
+
+def _active_command_backend(components: RealTeleopComponents) -> RM65ArmBackend | None:
+    for side in components.active_sides:
+        backend = _command_backend_for_side(components, side)
+        if backend is not None:
+            return backend
+    return None
 
 
 def _extract_hand_command_from_command(command: TeleopCommand | None) -> TeleopCommand | None:
@@ -1298,6 +1435,32 @@ def _emit_tactile_sum_only_status(
     stream.flush()
 
 
+def _hand_backend_for_side(
+    components: RealTeleopComponents,
+    side: str,
+) -> InspireTacHandBackend | None:
+    if side == "left":
+        return components.left_hand_backend
+    if side == "right":
+        return components.right_hand_backend
+    return None
+
+
+def _build_tactile_visualizer(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> TactileUVVisualizer | None:
+    if not bool(args.visualize_tactile):
+        return None
+    return TactileUVVisualizer(
+        TactileVisualizerConfig(
+            enabled_sides=active_sides,
+            image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+            value_scale=float(args.tactile_vis_value_scale),
+        )
+    )
+
+
 def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
     if components.arm_state_read_executor is not None:
         components.arm_state_read_executor.shutdown(wait=True)
@@ -1306,6 +1469,7 @@ def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
 def main() -> None:
     args = parse_args()
     components = _build_components(args)
+    tactile_visualizer = _build_tactile_visualizer(args, components.active_sides)
     clutch_input = TerminalClutchInput(components.keyboard_source)
     episode_recorder = EpisodeRecorder(
         root_dir=_episode_root_dir(args, components),
@@ -1338,6 +1502,8 @@ def main() -> None:
         _sync_real_execution_step_limits(components)
 
         for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
+            if not arm_ip or logical_side not in components.active_sides:
+                continue
             _log("ArmMode", f"{source_name}={arm_ip} -> logical_{logical_side}_arm")
         if components.left_hand_retargeter is not None or components.right_hand_retargeter is not None:
             _log(
@@ -1605,6 +1771,14 @@ def main() -> None:
                         stream=console_stream,
                     )
 
+            if tactile_visualizer is not None:
+                tactile_visualizer.update(
+                    tactile_by_side_from_backends(
+                        components.active_sides,
+                        lambda side: _hand_backend_for_side(components, side),
+                    )
+                )
+
             left_qpos = _state_qpos(components.left_preview_backend, DEFAULT_LEFT_ARM_QPOS)
             right_qpos = _state_qpos(components.right_preview_backend, DEFAULT_RIGHT_ARM_QPOS)
             if components.renderer is not None:
@@ -1680,8 +1854,22 @@ def main() -> None:
                 branch_candidate = active_command.metadata.get("ik_branch_candidate")
             left_hw_state = components.left_state_backend.get_state() if components.left_state_backend is not None else {}
             right_hw_state = components.right_state_backend.get_state() if components.right_state_backend is not None else {}
-            left_command_state = components.left_command_backend.get_state()
-            right_command_state = components.right_command_backend.get_state()
+            left_command_state = (
+                components.left_command_backend.get_state()
+                if components.left_command_backend is not None
+                else {}
+            )
+            right_command_state = (
+                components.right_command_backend.get_state()
+                if components.right_command_backend is not None
+                else {}
+            )
+            active_command_backend = _active_command_backend(components)
+            base_control_dt = (
+                float(active_command_backend.config.control_dt)
+                if active_command_backend is not None
+                else 1.0 / float(args.hz)
+            )
             hardware_snapshot = (
                 left_hw_state.get("hardware_result_code"),
                 right_hw_state.get("hardware_result_code"),
@@ -1693,7 +1881,7 @@ def main() -> None:
                     float(
                         components.arm_loop_step_dt_tracker.get("smoothed_loop_dt", args.hz and (1.0 / float(args.hz)))
                     )
-                    / float(components.left_command_backend.config.control_dt),
+                    / base_control_dt,
                     3,
                 ),
             )
@@ -1733,7 +1921,7 @@ def main() -> None:
                     f"right_hw_init={right_hw_state.get('hardware_result_code')}:{right_hw_state.get('hardware_result_text')} "
                     f"left_step_scale={float(left_command_state.get('effective_step_scale', 1.0)):.2f} "
                     f"right_step_scale={float(right_command_state.get('effective_step_scale', 1.0)):.2f} "
-                    f"target_step_scale={float(components.arm_loop_step_dt_tracker.get('smoothed_loop_dt', components.left_command_backend.config.control_dt)) / float(components.left_command_backend.config.control_dt):.2f} "
+                    f"target_step_scale={float(components.arm_loop_step_dt_tracker.get('smoothed_loop_dt', base_control_dt)) / base_control_dt:.2f} "
                     f"left_clutch={left_clutch} "
                     f"right_clutch={right_clutch} "
                     f"faults={list(fault_codes)}"
@@ -1769,6 +1957,8 @@ def main() -> None:
             components.left_hand_backend.close()
         if components.right_hand_backend is not None and not components.right_hand_control_via_rig:
             components.right_hand_backend.close()
+        if tactile_visualizer is not None:
+            tactile_visualizer.close()
         if original_stdout is not None:
             sys.stdout = original_stdout
         if silenced_stdout is not None:

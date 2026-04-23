@@ -13,9 +13,9 @@ import numpy as np
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from ..configs import ANNOTATED_DUAL_RM65_BASE_DISTANCE_M
 from ..hand_mapping import (
-    ALL_TACTILE_REGION_NAMES,
     DEFAULT_INSPIRE_HAND_JOINT_ORDER,
     TARGET_INSPIRE_HAND_Q6_ORDER,
+    parse_tactile_regions,
 )
 from ..hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
@@ -70,13 +70,7 @@ def _parse_joint_order(text: str) -> tuple[int, ...]:
 
 
 def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    parts = [part.strip() for part in str(value).split(",") if part.strip()]
-    lowered = {part.lower() for part in parts}
-    if "all" in lowered:
-        return ALL_TACTILE_REGION_NAMES
-    return tuple(parts)
+    return parse_tactile_regions(value)
 
 
 def _q6_summary(value: object) -> str:
