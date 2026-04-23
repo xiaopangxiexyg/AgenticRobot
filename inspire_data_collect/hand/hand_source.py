@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .common import ObservationChannel
+from ..common import ObservationChannel
 
 
 @dataclass(frozen=True)

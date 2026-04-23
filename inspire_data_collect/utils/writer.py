@@ -8,8 +8,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .async_writer import WriteJob
-from .common import (
+from ..async_writer import WriteJob
+from ..common import (
     EffectorCommand,
     ObservationChannel,
     nan_vector,
@@ -17,7 +17,7 @@ from .common import (
     vector_list,
     vector_or_none,
 )
-from .video_frame import NearestFrameBuffer, VideoFrame
+from ..video_frame import NearestFrameBuffer, VideoFrame
 
 ARM_DOF = 7
 HAND_DOF = 6

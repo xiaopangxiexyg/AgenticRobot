@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .common import EffectorCommand
+from ..common import EffectorCommand
 from .hand_mapping import parse_tactile_regions
 
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .common import EffectorCommand, ObservationChannel
+from ..common import EffectorCommand, ObservationChannel
 from .hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER
 
 

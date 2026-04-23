@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .hand_backend import InspireTacHandBackend
+from ..hand.hand_backend import InspireTacHandBackend
 
 
 @dataclass(frozen=True)

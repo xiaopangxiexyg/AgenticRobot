@@ -19,27 +19,27 @@ if __package__ in (None, ""):
         assert_inactive_side_config_empty,
         parse_active_sides,
     )
-    from inspire_data_collect.hand_backend import (
+    from inspire_data_collect.hand.hand_backend import (
         InspireTacHandBackend,
         InspireTacHandBackendConfig,
     )
-    from inspire_data_collect.hand_mapping import (
+    from inspire_data_collect.hand.hand_mapping import (
         DEFAULT_INSPIRE_HAND_JOINT_ORDER,
         parse_tactile_regions,
     )
-    from inspire_data_collect.hand_source import HandQ6Source
-    from inspire_data_collect.realsense_rgb import (
+    from inspire_data_collect.hand.hand_source import HandQ6Source
+    from inspire_data_collect.utils.realsense_rgb import (
         RealSenseRGBCameraConfig,
         RealSenseRGBSource,
         load_realsense_camera_config_map,
     )
-    from inspire_data_collect.retargeter import HandRetargeter, HandRetargeterConfig
-    from inspire_data_collect.tactile_visualizer import (
+    from inspire_data_collect.hand.retargeter import HandRetargeter, HandRetargeterConfig
+    from inspire_data_collect.utils.tactile_visualizer import (
         TactileUVVisualizer,
         TactileVisualizerConfig,
         tactile_by_side_from_backends,
     )
-    from inspire_data_collect.writer import (
+    from inspire_data_collect.utils.writer import (
         ACTION_DIM,
         ARM_DOF,
         HAND_DOF,
@@ -51,21 +51,21 @@ if __package__ in (None, ""):
 else:
     from .async_writer import AsyncWriterConfig, AsyncWriterPool
     from .common import ALL_SIDES, assert_inactive_side_config_empty, parse_active_sides
-    from .hand_backend import InspireTacHandBackend, InspireTacHandBackendConfig
-    from .hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
-    from .hand_source import HandQ6Source
-    from .realsense_rgb import (
+    from .hand.hand_backend import InspireTacHandBackend, InspireTacHandBackendConfig
+    from .hand.hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
+    from .hand.hand_source import HandQ6Source
+    from .utils.realsense_rgb import (
         RealSenseRGBCameraConfig,
         RealSenseRGBSource,
         load_realsense_camera_config_map,
     )
-    from .retargeter import HandRetargeter, HandRetargeterConfig
-    from .tactile_visualizer import (
+    from .hand.retargeter import HandRetargeter, HandRetargeterConfig
+    from .utils.tactile_visualizer import (
         TactileUVVisualizer,
         TactileVisualizerConfig,
         tactile_by_side_from_backends,
     )
-    from .writer import (
+    from .utils.writer import (
         ACTION_DIM,
         ARM_DOF,
         HAND_DOF,

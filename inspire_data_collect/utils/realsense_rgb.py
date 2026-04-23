@@ -9,8 +9,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .common import to_serializable
-from .video_frame import NearestFrameBuffer, VideoFrame
+from ..common import to_serializable
+from ..video_frame import NearestFrameBuffer, VideoFrame
 
 
 def _load_pyrealsense2():
