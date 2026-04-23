@@ -21,9 +21,9 @@ from ..configs import (
 from ..diagnostics import TeleopRunState
 from ..episodes import EpisodeRecorder, EpisodeRecorderConfig, compare_start_qpos_pair
 from ..hand_mapping import (
-    ALL_TACTILE_REGION_NAMES,
     DEFAULT_INSPIRE_HAND_JOINT_ORDER,
     TARGET_INSPIRE_HAND_Q6_ORDER,
+    parse_tactile_regions,
 )
 from ..hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
@@ -46,6 +46,11 @@ from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..tactile_visualizer import (
+    TactileUVVisualizer,
+    TactileVisualizerConfig,
+    tactile_by_side_from_backends,
+)
 from ..tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
 from .log_utils import ChangeGate
 from .run_vive_sapien_virtual import (
@@ -201,6 +206,23 @@ def parse_args() -> argparse.Namespace:
             "Suppress normal stdout logs and print only real-time left/right hand tactile sums. "
             "Teleop behavior is unchanged. Disabled by default."
         ),
+    )
+    parser.add_argument(
+        "--visualize-tactile",
+        action="store_true",
+        help="Show the InspireTac tactile UV OpenCV window during real teleop.",
+    )
+    parser.add_argument(
+        "--tactile-vis-value-scale",
+        type=float,
+        default=0.05,
+        help="Scale used by the tactile visualizer response curve.",
+    )
+    parser.add_argument(
+        "--tactile-vis-size",
+        type=int,
+        default=640,
+        help="Per-hand tactile visualizer panel size in pixels.",
     )
     parser.add_argument(
         "--max-fingertip-force",
@@ -448,9 +470,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite")
     args = parser.parse_args()
+    if int(args.tactile_vis_size) <= 0:
+        parser.error("--tactile-vis-size must be positive.")
     args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
     args.tcp_mode = HAND_BASE_TCP_FRAME
     active_sides = _active_sides_from_args(args)
+    if bool(args.visualize_tactile):
+        tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
+        if not tactile_regions:
+            parser.error(
+                "--visualize-tactile requires non-empty --hand-tactile-regions, "
+                "for example 'thumb_1,index_1,palm' or 'all'."
+            )
+        missing_hand_ip_sides = [
+            side for side in active_sides if not str(getattr(args, f"{side}_hand_ip") or "")
+        ]
+        if missing_hand_ip_sides:
+            parser.error(
+                "--visualize-tactile requires real InspireTac hand IPs for active sides; "
+                f"missing={missing_hand_ip_sides}."
+            )
     logical_ip_by_side: dict[str, tuple[str, str]] = {}
     inactive_config: list[str] = []
     for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
@@ -483,16 +522,7 @@ def _resolve_logical_side_assignments(args: argparse.Namespace) -> dict[str, tup
 
 
 def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, (tuple, list)):
-        parts = [str(item).strip() for item in value if str(item).strip()]
-    else:
-        parts = [part.strip() for part in str(value).split(",") if part.strip()]
-    lowered = {part.lower() for part in parts}
-    if "all" in lowered:
-        return ALL_TACTILE_REGION_NAMES
-    return tuple(parts)
+    return parse_tactile_regions(value)
 
 
 def _alignment_qpos_pair(alignment: TeleopInitialAlignment | None) -> dict[str, np.ndarray] | None:
@@ -1405,6 +1435,32 @@ def _emit_tactile_sum_only_status(
     stream.flush()
 
 
+def _hand_backend_for_side(
+    components: RealTeleopComponents,
+    side: str,
+) -> InspireTacHandBackend | None:
+    if side == "left":
+        return components.left_hand_backend
+    if side == "right":
+        return components.right_hand_backend
+    return None
+
+
+def _build_tactile_visualizer(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> TactileUVVisualizer | None:
+    if not bool(args.visualize_tactile):
+        return None
+    return TactileUVVisualizer(
+        TactileVisualizerConfig(
+            enabled_sides=active_sides,
+            image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+            value_scale=float(args.tactile_vis_value_scale),
+        )
+    )
+
+
 def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
     if components.arm_state_read_executor is not None:
         components.arm_state_read_executor.shutdown(wait=True)
@@ -1413,6 +1469,7 @@ def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
 def main() -> None:
     args = parse_args()
     components = _build_components(args)
+    tactile_visualizer = _build_tactile_visualizer(args, components.active_sides)
     clutch_input = TerminalClutchInput(components.keyboard_source)
     episode_recorder = EpisodeRecorder(
         root_dir=_episode_root_dir(args, components),
@@ -1714,6 +1771,14 @@ def main() -> None:
                         stream=console_stream,
                     )
 
+            if tactile_visualizer is not None:
+                tactile_visualizer.update(
+                    tactile_by_side_from_backends(
+                        components.active_sides,
+                        lambda side: _hand_backend_for_side(components, side),
+                    )
+                )
+
             left_qpos = _state_qpos(components.left_preview_backend, DEFAULT_LEFT_ARM_QPOS)
             right_qpos = _state_qpos(components.right_preview_backend, DEFAULT_RIGHT_ARM_QPOS)
             if components.renderer is not None:
@@ -1892,6 +1957,8 @@ def main() -> None:
             components.left_hand_backend.close()
         if components.right_hand_backend is not None and not components.right_hand_control_via_rig:
             components.right_hand_backend.close()
+        if tactile_visualizer is not None:
+            tactile_visualizer.close()
         if original_stdout is not None:
             sys.stdout = original_stdout
         if silenced_stdout is not None:

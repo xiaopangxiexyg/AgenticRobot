@@ -160,7 +160,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hand-send-threshold", type=float, default=0.002)
     parser.add_argument("--hand-telemetry-hz", type=float, default=10.0)
     parser.add_argument("--hand-tactile-regions", type=str, default="all")
-    parser.add_argument("--max-fingertip-force", type=int, default=800)
+    parser.add_argument("--max-fingertip-force", type=int, default=1200)
 
     parser.add_argument("--hz", type=float, default=30.0, help="Main control loop rate")
     parser.add_argument("--minimum-control-hz", type=float, default=0.0)

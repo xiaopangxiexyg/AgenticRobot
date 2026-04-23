@@ -33,7 +33,9 @@ dataset_collection
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-teleop_records
+teleop_records/*
+!teleop_records/calibration_profiles/
+
 *.egg-info/
 *.whl
 

@@ -18,7 +18,7 @@ from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from ..calibration import TeleopCalibration
 from ..configs import build_annotated_dual_rm65_calibration
-from ..hand_mapping import ALL_TACTILE_REGION_NAMES, DEFAULT_INSPIRE_HAND_JOINT_ORDER
+from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
 from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from ..retargeters import (
     DualArmCollisionAwareRetargeter,
@@ -36,6 +36,11 @@ from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_ma
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..tactile_visualizer import (
+    TactileUVVisualizer,
+    TactileVisualizerConfig,
+    tactile_by_side_from_backends,
+)
 from ..transforms import as_pose_matrix
 from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
@@ -110,13 +115,7 @@ def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:
 
 
 def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    parts = [part.strip() for part in str(value).split(",") if part.strip()]
-    lowered = {part.lower() for part in parts}
-    if "all" in lowered:
-        return ALL_TACTILE_REGION_NAMES
-    return tuple(parts)
+    return parse_tactile_regions(value)
 
 
 def _parse_active_sides(text: str) -> tuple[str, ...]:
@@ -149,6 +148,32 @@ def _assert_side_config_consistency(args: argparse.Namespace, active_sides: tupl
                 f"Inactive side '{side}' received configuration for {present}; "
                 "either remove those flags or include the side in --active-sides."
             )
+
+
+def _assert_tactile_visualization_config(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> None:
+    if not bool(args.visualize_tactile):
+        return
+    if not bool(args.with_tactile):
+        raise ValueError(
+            "--visualize-tactile requires tactile polling; remove --without-tactile."
+        )
+    tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
+    if not tactile_regions:
+        raise ValueError(
+            "--visualize-tactile requires non-empty --hand-tactile-regions, for example "
+            "'thumb_1,index_1,palm' or 'all'."
+        )
+    missing_ip_sides = [
+        side for side in active_sides if not str(getattr(args, f"{side}_hand_ip") or "")
+    ]
+    if missing_ip_sides:
+        raise ValueError(
+            "--visualize-tactile requires real InspireTac hand IPs for active sides; "
+            f"missing={missing_ip_sides}."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,6 +234,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-tactile", dest="with_tactile", action="store_true")
     parser.add_argument("--without-tactile", dest="with_tactile", action="store_false")
     parser.set_defaults(with_tactile=True)
+    parser.add_argument(
+        "--visualize-tactile",
+        action="store_true",
+        help="Show the InspireTac tactile UV OpenCV window while collecting.",
+    )
+    parser.add_argument(
+        "--tactile-vis-value-scale",
+        type=float,
+        default=0.05,
+        help="Scale used by the tactile visualizer response curve.",
+    )
+    parser.add_argument(
+        "--tactile-vis-size",
+        type=_positive_int,
+        default=640,
+        help="Per-hand tactile visualizer panel size in pixels.",
+    )
     parser.add_argument("--max-fingertip-force", type=int, default=800, help="InspireTac max fingertip force.")
     parser.add_argument(
         "--control-mode",
@@ -298,6 +340,7 @@ class CollectApp:
     sample_builder: CollectorSampleBuilder
     runtime: CollectionRuntime
     control_state: "CollectControlState"
+    tactile_visualizer: TactileUVVisualizer | None
 
 
 @dataclass
@@ -524,6 +567,21 @@ def _build_backends(
     return all_backends, rig_backends
 
 
+def _build_tactile_visualizer(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> TactileUVVisualizer | None:
+    if not bool(args.visualize_tactile):
+        return None
+    return TactileUVVisualizer(
+        TactileVisualizerConfig(
+            enabled_sides=active_sides,
+            image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+            value_scale=float(args.tactile_vis_value_scale),
+        )
+    )
+
+
 def _episode_metadata(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
@@ -545,6 +603,10 @@ def _episode_metadata(
         "right_hand_ip": args.right_hand_ip or None,
         "left_hand_port": args.left_hand_port or None,
         "right_hand_port": args.right_hand_port or None,
+        "hand_tactile_regions": list(_parse_hand_tactile_regions(args.hand_tactile_regions))
+        if args.with_tactile
+        else [],
+        "visualize_tactile": bool(args.visualize_tactile),
         "camera_keys": sorted(camera_sources),
         "camera_config_path": None if args.no_camera else str(args.camera_config),
         "calibration_path": args.load_profile or None,
@@ -603,6 +665,11 @@ def _channel_pose_in_desk(channel: ObservationChannel, calibration: TeleopCalibr
 def _arm_backend(app: CollectApp, side: str) -> RM65ArmBackend | None:
     backend = app.components.backends.get(f"{side}_arm")
     return backend if isinstance(backend, RM65ArmBackend) else None
+
+
+def _hand_backend(app: CollectApp, side: str) -> InspireTacHandBackend | None:
+    backend = app.components.backends.get(f"{side}_hand")
+    return backend if isinstance(backend, InspireTacHandBackend) else None
 
 
 def _seed_dual_arm_retargeter_from_backends(app: CollectApp) -> None:
@@ -928,6 +995,7 @@ def _handle_key(
 def build_collect_app(args: argparse.Namespace) -> CollectApp:
     active_sides = tuple(args.active_sides)
     _assert_side_config_consistency(args, active_sides)
+    _assert_tactile_visualization_config(args, active_sides)
     calibration = _load_calibration(args)
     calibration.clear_home_state()
     camera_sources = _build_camera_sources(args)
@@ -956,6 +1024,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     retargeters = list(arm_retargeters) + list(hand_retargeters.values())
 
     all_backends, rig_backends = _build_backends(args, active_sides)
+    tactile_visualizer = _build_tactile_visualizer(args, active_sides)
     rig_backend_names = set(rig_backends)
     for side in hand_retargeters:
         hand_backend = all_backends.get(f"{side}_hand")
@@ -1060,6 +1129,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         sample_builder=sample_builder,
         runtime=runtime,
         control_state=control_state,
+        tactile_visualizer=tactile_visualizer,
     )
 
 
@@ -1131,6 +1201,13 @@ def main() -> int:
             if app.calibration.metadata.get("home_ready"):
                 result = runtime.step(now=loop_started_at)
                 step_count += 1
+            if app.tactile_visualizer is not None:
+                app.tactile_visualizer.update(
+                    tactile_by_side_from_backends(
+                        app.active_sides,
+                        lambda side: _hand_backend(app, side),
+                    )
+                )
             if (loop_started_at - last_status_at) >= float(args.status_sec):
                 print(_status_line(step_count, runtime, result, app))
                 last_status_at = loop_started_at
@@ -1148,8 +1225,12 @@ def main() -> int:
             try:
                 key_controller.close()
             finally:
-                runtime.close()
-                _close_unmanaged_backends(app.unmanaged_backends)
+                try:
+                    if app.tactile_visualizer is not None:
+                        app.tactile_visualizer.close()
+                finally:
+                    runtime.close()
+                    _close_unmanaged_backends(app.unmanaged_backends)
 
     print(
         f"done saved_episodes={app.control_state.saved_episodes} "

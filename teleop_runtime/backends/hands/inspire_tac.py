@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ...hand_mapping import parse_tactile_regions
 from ...interfaces import EffectorBackend
 from ...registry import register_backend
 from ...schemas import EffectorCommand
@@ -29,6 +30,7 @@ class InspireTacHandBackendConfig:
             self.effector_name = f"{self.side}_hand"
         if self.telemetry_hz <= 0.0:
             raise ValueError("telemetry_hz must be positive.")
+        self.tactile_regions = parse_tactile_regions(self.tactile_regions)
 
 
 @register_backend("inspire_tac_hand")
@@ -145,18 +147,26 @@ class InspireTacHandBackend(EffectorBackend):
                     joint_request_started_at = time.time()
                     self._latest_joint_pos = self._normalize_joint_pos(self.hand.read_joint_pos())
                     self._latest_joint_timestamp = joint_request_started_at
-                    tactile_request_started_at = time.time()
-                    if self.config.tactile_regions:
+                    tactile_regions = tuple(self.config.tactile_regions)
+                    tactile_request_started_at = None
+                    tactile_vec = None
+                    tactile_dict = None
+                    if tactile_regions:
+                        tactile_request_started_at = time.time()
                         tactile_vec, tactile_dict = self.hand.read_tac_data(
-                            target_regions=list(self.config.tactile_regions)
+                            target_regions=list(tactile_regions)
                         )
-                    else:
-                        tactile_vec, tactile_dict = self.hand.read_tac_data()
-                self._latest_tactile = np.asarray(tactile_vec, dtype=float)
-                self._latest_tactile_timestamp = tactile_request_started_at
-                self._latest_tactile_dict = {
-                    name: np.asarray(value, dtype=float) for name, value in tactile_dict.items()
-                }
+                if tactile_vec is None or tactile_dict is None:
+                    self._latest_tactile = None
+                    self._latest_tactile_timestamp = None
+                    self._latest_tactile_dict = None
+                else:
+                    self._latest_tactile = np.asarray(tactile_vec, dtype=float)
+                    self._latest_tactile_timestamp = tactile_request_started_at
+                    self._latest_tactile_dict = {
+                        str(name): np.asarray(value, dtype=float)
+                        for name, value in tactile_dict.items()
+                    }
                 self._latest_telemetry_timestamp = time.time()
                 self._telemetry_error = None
             except Exception as exc:

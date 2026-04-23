@@ -35,3 +35,15 @@ ALL_TACTILE_REGION_NAMES = (
     "thumb_4",
     "palm",
 )
+
+
+def parse_tactile_regions(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (tuple, list)):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if "all" in {part.lower() for part in parts}:
+        return ALL_TACTILE_REGION_NAMES
+    return tuple(parts)
