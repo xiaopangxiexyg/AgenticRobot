@@ -113,6 +113,74 @@ def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:
     return tuple(float(value) for value in values)
 
 
+def _parse_active_sides(text: str) -> tuple[str, ...]:
+    value = str(text).strip().lower()
+    if value == "both":
+        return ("left", "right")
+    if value in {"left", "right"}:
+        return (value,)
+    raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+
+
+def _normalize_active_sides(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ("left", "right")
+    if isinstance(value, str):
+        return _parse_active_sides(value)
+    sides = tuple(str(side).strip().lower() for side in value if str(side).strip())
+    if sides == ("both",):
+        return ("left", "right")
+    invalid = set(sides) - {"left", "right"}
+    if invalid:
+        raise ValueError(f"Unsupported active side(s): {sorted(invalid)}")
+    ordered = tuple(side for side in ("left", "right") if side in set(sides))
+    if not ordered:
+        raise ValueError("At least one active side is required.")
+    return ordered
+
+
+def _active_sides_from_args(args: argparse.Namespace) -> tuple[str, ...]:
+    return _normalize_active_sides(getattr(args, "active_sides", ("left", "right")))
+
+
+def _active_side_set(components) -> set[str]:
+    return set(_normalize_active_sides(getattr(components, "active_sides", ("left", "right"))))
+
+
+def _side_retargeter(components, side: str) -> PoseToArmRetargeter:
+    return components.left_retargeter if side == "left" else components.right_retargeter
+
+
+def _side_preview_backend(components, side: str) -> RM65ArmBackend:
+    return components.left_preview_backend if side == "left" else components.right_preview_backend
+
+
+def _side_state_backend(components, side: str) -> RM65ArmBackend | None:
+    return components.left_state_backend if side == "left" else components.right_state_backend
+
+
+def _assert_inactive_side_config_empty(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+    *,
+    suffixes: tuple[str, ...],
+) -> None:
+    active = set(active_sides)
+    for side in ("left", "right"):
+        if side in active:
+            continue
+        present = [
+            f"--{side.replace('_', '-')}-{suffix.replace('_', '-')}"
+            for suffix in suffixes
+            if str(getattr(args, f"{side}_{suffix}", "") or "")
+        ]
+        if present:
+            raise ValueError(
+                f"Inactive side '{side}' received configuration {present}; "
+                "remove those flags or include the side in --active-sides."
+            )
+
+
 def _log(tag: str, message: str, *, now: float | None = None) -> None:
     log_event(tag, message, now=now)
 
@@ -233,6 +301,7 @@ class TerminalClutchInput:
 @dataclass(frozen=True)
 class VirtualRunComponents:
     session: TeleopSession
+    active_sides: tuple[str, ...]
     left_preview_backend: RM65ArmBackend
     right_preview_backend: RM65ArmBackend
     left_state_backend: RM65ArmBackend | None
@@ -270,6 +339,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver")
     parser.add_argument("--port", type=int, default=9999, help="UDP bind port for the VIVE receiver")
+    parser.add_argument(
+        "--active-sides",
+        type=_parse_active_sides,
+        default=("left", "right"),
+        help="One of: left, right, both.",
+    )
     parser.add_argument(
         "--control-mode",
         choices=["absolute", "delta_clutch"],
@@ -472,10 +547,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_components(args: argparse.Namespace) -> VirtualRunComponents:
+    active_sides = _active_sides_from_args(args)
+    _assert_inactive_side_config_empty(
+        args,
+        active_sides,
+        suffixes=("arm_ip", "hand_port"),
+    )
     preview_control_dt = 1.0 / float(args.hz)
     preview_dry_run_fast = args.arm_mode != "real"
-    collision_guard_requested = not args.disable_dual_arm_collision_avoidance
-    arm_max_angvel = np.asarray(args.arm_max_angvel, dtype=float).reshape(6)
+    collision_guard_requested = (
+        set(active_sides) == {"left", "right"}
+        and not args.disable_dual_arm_collision_avoidance
+    )
+    arm_max_angvel = np.asarray(
+        getattr(args, "arm_max_angvel", (0.35, 0.35, 0.35, 0.5, 0.5, 0.5)),
+        dtype=float,
+    ).reshape(6)
     realistic_joint_step = tuple((arm_max_angvel * preview_control_dt).tolist())
     collision_scene_profile = build_dual_arm_scene_profile(args.collision_scene_profile)
     ik_tuning = load_ik_tuning_config(args.ik_tuning_json or None)
@@ -495,6 +582,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             "left_tracker_name": args.left_tracker_name,
             "right_tracker_name": args.right_tracker_name,
             "aux_tracker_name": args.aux_tracker_name,
+            "active_sides": list(active_sides),
             "arm_mode": args.arm_mode,
             "left_arm_ip": args.left_arm_ip,
             "right_arm_ip": args.right_arm_ip,
@@ -530,22 +618,27 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         critical=False,
     )
 
-    tracker_configs = [
-        ViveTrackerConfig(
-            name=args.left_tracker_name,
-            side="left",
-            role="left_wrist",
-            channel_name="left_wrist_pose",
-            legacy_index=0,
-        ),
-        ViveTrackerConfig(
-            name=args.right_tracker_name,
-            side="right",
-            role="right_wrist",
-            channel_name="right_wrist_pose",
-            legacy_index=1,
-        ),
-    ]
+    tracker_configs: list[ViveTrackerConfig] = []
+    if "left" in active_sides:
+        tracker_configs.append(
+            ViveTrackerConfig(
+                name=args.left_tracker_name,
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+                legacy_index=0,
+            )
+        )
+    if "right" in active_sides:
+        tracker_configs.append(
+            ViveTrackerConfig(
+                name=args.right_tracker_name,
+                side="right",
+                role="right_wrist",
+                channel_name="right_wrist_pose",
+                legacy_index=1,
+            )
+        )
     if args.aux_tracker_name:
         tracker_configs.append(
             ViveTrackerConfig(
@@ -611,7 +704,8 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         else:
             retargeters.append(dual_arm_retargeter)
     if dual_arm_retargeter is None:
-        retargeters.extend((left_retargeter, right_retargeter))
+        side_retargeters = {"left": left_retargeter, "right": right_retargeter}
+        retargeters.extend(side_retargeters[side] for side in active_sides)
 
     calibration.metadata.update(
         {
@@ -625,8 +719,8 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
     hand_source = None
     if left_hand_port or right_hand_port:
         hand_source = HandQ6Source.from_bimanual(
-            left_port=left_hand_port or None,
-            right_port=right_hand_port or None,
+            left_port=(left_hand_port or None) if "left" in active_sides else None,
+            right_port=(right_hand_port or None) if "right" in active_sides else None,
             baudrate=int(getattr(args, "hand_reader_baudrate", 115200)),
             timeout=float(getattr(args, "hand_reader_timeout", 0.05)),
             show_raw_lines=bool(getattr(args, "show_hand_raw_lines", False)),
@@ -636,7 +730,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
 
     left_hand_retargeter = None
     right_hand_retargeter = None
-    if left_hand_port:
+    if "left" in active_sides and left_hand_port:
         left_hand_retargeter = JointsToDexHandRetargeter(
             JointsToDexHandRetargeterConfig(
                 side="left",
@@ -647,7 +741,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
                 alpha=float(getattr(args, "hand_command_alpha", 1.0)),
             )
         )
-    if right_hand_port:
+    if "right" in active_sides and right_hand_port:
         right_hand_retargeter = JointsToDexHandRetargeter(
             JointsToDexHandRetargeterConfig(
                 side="right",
@@ -660,7 +754,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         )
 
     left_hand_backend = None
-    if left_hand_port:
+    if "left" in active_sides and left_hand_port:
         left_hand_backend = InspireTacHandBackend(
             InspireTacHandBackendConfig(
                 hand_ip="0.0.0.0",
@@ -670,7 +764,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             )
         )
     right_hand_backend = None
-    if right_hand_port:
+    if "right" in active_sides and right_hand_port:
         right_hand_backend = InspireTacHandBackend(
             InspireTacHandBackendConfig(
                 hand_ip="0.0.0.0",
@@ -706,7 +800,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         calibration=calibration,
         safety_config=TeleopSafetyConfig(
             freeze_on_fault=True,
-            required_channels=("left_wrist_pose", "right_wrist_pose"),
+            required_channels=tuple(f"{side}_wrist_pose" for side in active_sides),
             invalid_frame_limit=3,
         ),
     )
@@ -756,7 +850,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
     left_state_backend = None
     right_state_backend = None
     if initial_alignment is None:
-        if args.left_arm_ip:
+        if "left" in active_sides and args.left_arm_ip:
             left_state_backend = RM65ArmBackend(
                 RM65ArmBackendConfig(
                     arm_ip=args.left_arm_ip,
@@ -769,7 +863,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
                     ik_tuning=ik_tuning,
                 )
             )
-        if args.right_arm_ip:
+        if "right" in active_sides and args.right_arm_ip:
             right_state_backend = RM65ArmBackend(
                 RM65ArmBackendConfig(
                     arm_ip=args.right_arm_ip,
@@ -824,6 +918,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         )
     return VirtualRunComponents(
         session=session,
+        active_sides=active_sides,
         left_preview_backend=left_preview_backend,
         right_preview_backend=right_preview_backend,
         left_state_backend=left_state_backend,
@@ -853,7 +948,7 @@ def _state_qpos(backend: RM65ArmBackend, fallback: np.ndarray) -> np.ndarray:
 
 
 def _has_live_real_state(components: VirtualRunComponents) -> bool:
-    return components.left_state_backend is not None or components.right_state_backend is not None
+    return any(_side_state_backend(components, side) is not None for side in components.active_sides)
 
 
 def _preview_should_follow_live_real_state(
@@ -1005,10 +1100,8 @@ def _build_renderer_debug_frames(
     calibration = components.session.calibration
     assert calibration is not None
     frames: dict[str, np.ndarray] = {"desk": identity_pose()}
-    for side, retargeter in (
-        ("left", components.left_retargeter),
-        ("right", components.right_retargeter),
-    ):
+    for side in components.active_sides:
+        retargeter = _side_retargeter(components, side)
         arm = calibration.get_arm_for_side(side)
         if arm.T_D_B is not None:
             frames[f"{side}_arm_base"] = arm.T_D_B.copy()
@@ -1082,7 +1175,7 @@ def _build_renderer_debug_boxes(
 def _emit_tracker_axis_mapping_logs(components: VirtualRunComponents) -> None:
     calibration = components.session.calibration
     assert calibration is not None
-    for tracker_role in ("left_wrist", "right_wrist"):
+    for tracker_role in tuple(f"{side}_wrist" for side in components.active_sides):
         offset = calibration.tracker_offsets.get(tracker_role)
         if offset is None:
             continue
@@ -1095,10 +1188,8 @@ def _emit_tracker_axis_mapping_logs(components: VirtualRunComponents) -> None:
 
 
 def _emit_home_alignment_logs(components: VirtualRunComponents) -> None:
-    for side, retargeter in (
-        ("left", components.left_retargeter),
-        ("right", components.right_retargeter),
-    ):
+    for side in components.active_sides:
+        retargeter = _side_retargeter(components, side)
         if retargeter.home_human_pose_desk is None or retargeter.home_robot_pose_desk is None:
             continue
         relative_pose = (
@@ -1159,10 +1250,8 @@ def _emit_runtime_orientation_logs(
 ) -> None:
     calibration = components.session.calibration
     assert calibration is not None
-    for side, retargeter in (
-        ("left", components.left_retargeter),
-        ("right", components.right_retargeter),
-    ):
+    for side in components.active_sides:
+        retargeter = _side_retargeter(components, side)
         channel = channels.get(f"{side}_wrist_pose")
         if channel is None or not channel.valid:
             continue
@@ -1207,7 +1296,7 @@ def _sync_preview_from_real_state(
     now: float | None = None,
     required: bool,
 ) -> dict[str, bool]:
-    synced = {"left": False, "right": False}
+    synced = {side: False for side in components.active_sides}
     backends = (
         ("left", components.left_state_backend, components.left_preview_backend),
         ("right", components.right_state_backend, components.right_preview_backend),
@@ -1215,7 +1304,7 @@ def _sync_preview_from_real_state(
     active = [
         (side, state_backend, preview_backend)
         for side, state_backend, preview_backend in backends
-        if state_backend is not None
+        if side in _active_side_set(components) and state_backend is not None
     ]
     state_read_executor = getattr(components, "arm_state_read_executor", None)
     parallel_submit_failed = False
@@ -1306,18 +1395,21 @@ def _runtime_home_calibration(
 ) -> None:
     calibration = components.session.calibration
     assert calibration is not None
-    left_tracker = calibration.metadata.get("left_tracker_name")
-    right_tracker = calibration.metadata.get("right_tracker_name")
-    _log(
-        "Calibration",
-        "expecting "
-        f"left_wrist_pose<-{left_tracker or 'left_wrist role'}, "
-        f"right_wrist_pose<-{right_tracker or 'right_wrist role'}",
+    active_sides = components.active_sides
+    tracker_expectations = ", ".join(
+        f"{side}_wrist_pose<-{calibration.metadata.get(f'{side}_tracker_name') or f'{side}_wrist role'}"
+        for side in active_sides
     )
     _log(
         "Calibration",
-        "logical arm mapping: left_wrist_pose -> left_arm(slot at desk -Y / screen-left), "
-        "right_wrist_pose -> right_arm(slot at desk +Y / screen-right)",
+        f"expecting {tracker_expectations}",
+    )
+    mapping_summary = ", ".join(
+        f"{side}_wrist_pose -> {side}_arm" for side in active_sides
+    )
+    _log(
+        "Calibration",
+        f"logical arm mapping: {mapping_summary}",
     )
     try:
         left_arm = calibration.get_arm_for_side("left")
@@ -1333,7 +1425,7 @@ def _runtime_home_calibration(
         pass
     _log(
         "Calibration",
-        "keep both wrist trackers steady in the desired home pose "
+        "keep active wrist tracker(s) steady in the desired home pose "
         f"for about {max(num_samples / 60.0, 0.5):.1f}s. "
         "This captures per-session tracker home on top of the saved tracker/station calibration.",
     )
@@ -1363,19 +1455,18 @@ def _runtime_home_calibration(
             "start-pose source=virtual preview defaults/current local state; pressing 'p' will capture tracker home and current preview arm home",
         )
     start_time = time.time()
-    left_samples: list[np.ndarray] = []
-    right_samples: list[np.ndarray] = []
+    samples: dict[str, list[np.ndarray]] = {side: [] for side in active_sides}
     observed_channels: set[str] = set()
     sample_markers = sorted({1, max(1, num_samples // 2), num_samples})
-    left_reported: set[int] = set()
-    right_reported: set[int] = set()
+    reported: dict[str, set[int]] = {side: set() for side in active_sides}
 
-    while len(left_samples) < num_samples or len(right_samples) < num_samples:
+    while any(len(samples[side]) < num_samples for side in active_sides):
         now = time.time()
         if now - start_time > timeout_sec:
+            counts = {side: len(samples[side]) for side in active_sides}
             raise TimeoutError(
-                "Timed out waiting for both wrist trackers during runtime calibration. "
-                f"left_samples={len(left_samples)} right_samples={len(right_samples)}. "
+                "Timed out waiting for active wrist tracker(s) during runtime calibration. "
+                f"sample_counts={counts}. "
                 "Verify sender tracker_role values and receiver tracker-name arguments."
             )
         channels, _ = components.session.poll_sources(now)
@@ -1401,93 +1492,62 @@ def _runtime_home_calibration(
                 right_qpos_hand=_hand_render_qpos(components.right_hand_backend, "right"),
                 capture_image=False,
             )
-        left_channel = channels.get("left_wrist_pose")
-        if left_channel is not None:
-            if left_channel.channel_name not in observed_channels:
-                metadata = left_channel.metadata or {}
+        for side in active_sides:
+            channel = channels.get(f"{side}_wrist_pose")
+            if channel is None:
+                continue
+            if channel.channel_name not in observed_channels:
+                metadata = channel.metadata or {}
                 _log(
                     "Calibration",
                     "observed "
-                    f"{left_channel.channel_name} <- "
+                    f"{channel.channel_name} <- "
                     f"{metadata.get('tracker_name')}:{metadata.get('tracker_role')} "
-                    f"frame={left_channel.frame_name}",
+                    f"frame={channel.frame_name}",
                     now=now,
                 )
-                observed_channels.add(left_channel.channel_name)
-            if left_channel.valid and len(left_samples) < num_samples:
-                left_samples.append(_channel_pose_in_desk(left_channel, calibration))
+                observed_channels.add(channel.channel_name)
+            if channel.valid and len(samples[side]) < num_samples:
+                samples[side].append(_channel_pose_in_desk(channel, calibration))
                 for marker in sample_markers:
-                    if len(left_samples) >= marker and marker not in left_reported:
-                        left_reported.add(marker)
+                    if len(samples[side]) >= marker and marker not in reported[side]:
+                        reported[side].add(marker)
                         _log(
                             "Calibration",
-                            f"left progress {len(left_samples)}/{num_samples}",
+                            f"{side} progress {len(samples[side])}/{num_samples}",
                             now=now,
                         )
-        right_channel = channels.get("right_wrist_pose")
-        if right_channel is not None:
-            if right_channel.channel_name not in observed_channels:
-                metadata = right_channel.metadata or {}
-                _log(
-                    "Calibration",
-                    "observed "
-                    f"{right_channel.channel_name} <- "
-                    f"{metadata.get('tracker_name')}:{metadata.get('tracker_role')} "
-                    f"frame={right_channel.frame_name}",
-                    now=now,
-                )
-                observed_channels.add(right_channel.channel_name)
-            if right_channel.valid and len(right_samples) < num_samples:
-                right_samples.append(_channel_pose_in_desk(right_channel, calibration))
-                for marker in sample_markers:
-                    if len(right_samples) >= marker and marker not in right_reported:
-                        right_reported.add(marker)
-                        _log(
-                            "Calibration",
-                            f"right progress {len(right_samples)}/{num_samples}",
-                            now=now,
-                        )
-        if len(left_samples) < num_samples or len(right_samples) < num_samples:
+        if any(len(samples[side]) < num_samples for side in active_sides):
             time.sleep(0.01)
 
-    left_human_home = _mean_pose(left_samples)
-    right_human_home = _mean_pose(right_samples)
     if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
         synced = _sync_preview_from_real_state(components, required=False)
         _log("Calibration", f"locked preview start pose from real state synced={synced}")
-    left_robot_home_desk, left_qpos, left_robot_source = _resolve_robot_home_for_side(
-        components,
-        side="left",
-    )
-    right_robot_home_desk, right_qpos, right_robot_source = _resolve_robot_home_for_side(
-        components,
-        side="right",
-    )
+    home_summaries: list[str] = []
+    qpos_summaries: list[str] = []
+    for side in active_sides:
+        human_home = _mean_pose(samples[side])
+        robot_home_desk, qpos, robot_source = _resolve_robot_home_for_side(
+            components,
+            side=side,
+        )
+        _side_retargeter(components, side).set_home_anchors(
+            human_pose_desk=human_home,
+            robot_pose_desk=robot_home_desk,
+        )
+        calibration.capture_home_pose(f"{side}_arm", robot_home_desk)
+        if qpos is not None:
+            calibration.capture_home_qpos(f"{side}_arm", qpos)
+        home_summaries.append(
+            f"{side}_source={robot_source} {side}_xyz={_pose_translation_summary(robot_home_desk)}"
+        )
+        qpos_summaries.append(f"{side}_q={_qpos_summary(qpos)}")
+    _log("Calibration", "robot_home " + " ".join(home_summaries))
+    sample_counts = {side: len(values) for side, values in samples.items()}
     _log(
         "Calibration",
-        "robot_home "
-        f"left_source={left_robot_source} left_xyz={_pose_translation_summary(left_robot_home_desk)} "
-        f"right_source={right_robot_source} right_xyz={_pose_translation_summary(right_robot_home_desk)}",
-    )
-
-    components.left_retargeter.set_home_anchors(
-        human_pose_desk=left_human_home,
-        robot_pose_desk=left_robot_home_desk,
-    )
-    components.right_retargeter.set_home_anchors(
-        human_pose_desk=right_human_home,
-        robot_pose_desk=right_robot_home_desk,
-    )
-    calibration.capture_home_pose("left_arm", left_robot_home_desk)
-    calibration.capture_home_pose("right_arm", right_robot_home_desk)
-    if left_qpos is not None:
-        calibration.capture_home_qpos("left_arm", left_qpos)
-    if right_qpos is not None:
-        calibration.capture_home_qpos("right_arm", right_qpos)
-    _log(
-        "Calibration",
-        f"runtime home captured left_samples={len(left_samples)} right_samples={len(right_samples)} "
-        f"left_q={_qpos_summary(left_qpos)} right_q={_qpos_summary(right_qpos)}",
+        f"runtime home captured sample_counts={sample_counts} "
+        + " ".join(qpos_summaries),
     )
 
 
@@ -1560,7 +1620,7 @@ def _wait_for_calibration_start(
 
         ready = {
             name: bool(channels.get(name) is not None and channels[name].valid)
-            for name in ("left_wrist_pose", "right_wrist_pose")
+            for name in tuple(f"{side}_wrist_pose" for side in components.active_sides)
         }
         status_snapshot = (
             tuple(sorted(ready.items())),
@@ -1779,6 +1839,7 @@ def _build_episode_metadata(
         "start_reason": start_reason,
         "control_mode": args.control_mode,
         "arm_mode": args.arm_mode,
+        "active_sides": list(components.active_sides),
         "hz": float(args.hz),
         "translation_scale": float(args.translation_scale),
         "left_right_base_distance_m": float(args.left_right_base_distance),
@@ -1928,6 +1989,7 @@ def _build_episode_frame(
     return {
         "step_index": int(step_index),
         "state": step_result.state.value,
+        "active_sides": list(components.active_sides),
         "control_hz": float(step_result.control_hz),
         "active_command_source": active_command_source,
         "recovery_plan_mode": None if recovery_plan is None else recovery_plan.mode,
@@ -1969,22 +2031,15 @@ def _start_recovery_plan(
     _sync_dual_arm_retargeter_from_preview(components)
 
     if control_mode == "delta_clutch":
-        components.left_retargeter.reanchor_to_current_input(
-            observation,
-            calibration,
-            robot_pose_desk=_preview_tcp_pose_desk(
-                components,
-                side="left",
-            ),
-        )
-        components.right_retargeter.reanchor_to_current_input(
-            observation,
-            calibration,
-            robot_pose_desk=_preview_tcp_pose_desk(
-                components,
-                side="right",
-            ),
-        )
+        for side in components.active_sides:
+            _side_retargeter(components, side).reanchor_to_current_input(
+                observation,
+                calibration,
+                robot_pose_desk=_preview_tcp_pose_desk(
+                    components,
+                    side=side,
+                ),
+            )
         _sync_dual_arm_retargeter_from_preview(components)
         return None, components.session.build_command(observation), True
 
@@ -2011,16 +2066,17 @@ def _start_recovery_plan(
             False,
         )
 
-    left_resolution = components.left_retargeter.resolve_absolute_target_from_observation(
-        observation,
-        calibration,
-    )
-    right_resolution = components.right_retargeter.resolve_absolute_target_from_observation(
-        observation,
-        calibration,
-    )
-    if left_resolution is None or right_resolution is None:
-        raise RuntimeError("Absolute recovery requires both wrist channels to be valid.")
+    end_resolutions: dict[str, dict[str, object]] = {}
+    for side in components.active_sides:
+        resolution = _side_retargeter(components, side).resolve_absolute_target_from_observation(
+            observation,
+            calibration,
+        )
+        if resolution is None:
+            raise RuntimeError(
+                f"Absolute recovery requires active wrist channel '{side}_wrist_pose' to be valid."
+            )
+        end_resolutions[side] = resolution
     return (
         RecoveryPlan(
             mode="absolute_ramp_independent",
@@ -2028,13 +2084,10 @@ def _start_recovery_plan(
             duration_sec=float(ramp_sec),
             payload={
                 "start_targets": {
-                    "left": _preview_tcp_pose_desk(components, side="left"),
-                    "right": _preview_tcp_pose_desk(components, side="right"),
+                    side: _preview_tcp_pose_desk(components, side=side)
+                    for side in components.active_sides
                 },
-                "end_resolutions": {
-                    "left": left_resolution,
-                    "right": right_resolution,
-                },
+                "end_resolutions": end_resolutions,
             },
         ),
         None,
@@ -2074,29 +2127,22 @@ def _advance_recovery_plan(
     if plan.mode == "absolute_ramp_independent":
         start_targets = plan.payload["start_targets"]
         end_resolutions = plan.payload["end_resolutions"]
-        left_pose = interpolate_pose(
-            start_targets["left"],
-            end_resolutions["left"]["target_pose_desk"],
-            alpha,
-        )
-        right_pose = interpolate_pose(
-            start_targets["right"],
-            end_resolutions["right"]["target_pose_desk"],
-            alpha,
-        )
-        left_command = components.left_retargeter.build_command_from_target_pose_desk(
-            target_pose_desk=left_pose,
-            observation=observation,
-            calibration=calibration,
-            pose_operator=end_resolutions["left"].get("pose_operator"),
-        )
-        right_command = components.right_retargeter.build_command_from_target_pose_desk(
-            target_pose_desk=right_pose,
-            observation=observation,
-            calibration=calibration,
-            pose_operator=end_resolutions["right"].get("pose_operator"),
-        )
-        command = merge_teleop_commands((left_command, right_command))
+        commands = []
+        for side, resolution in end_resolutions.items():
+            target_pose = interpolate_pose(
+                start_targets[side],
+                resolution["target_pose_desk"],
+                alpha,
+            )
+            commands.append(
+                _side_retargeter(components, side).build_command_from_target_pose_desk(
+                    target_pose_desk=target_pose,
+                    observation=observation,
+                    calibration=calibration,
+                    pose_operator=resolution.get("pose_operator"),
+                )
+            )
+        command = merge_teleop_commands(commands)
         command.timestamp = observation.timestamp
         return command, alpha >= 1.0
 

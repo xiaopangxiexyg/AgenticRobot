@@ -41,7 +41,6 @@ from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
-from .tactile_visualizer import TactileUVVisualizer, TactileVisualizerConfig
 from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 
 
@@ -283,17 +282,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite.")
     parser.add_argument("--status-sec", type=_positive_float, default=2.0, help="Status print interval in seconds.")
-    parser.add_argument(
-        "--visualize-tactile",
-        action="store_true",
-        help="Show live dual-hand tactile UV visualization in a separate OpenCV window.",
-    )
-    parser.add_argument(
-        "--tactile-vis-value-scale",
-        type=_positive_float,
-        default=0.05,
-        help="Value mapped to full color intensity in tactile visualization.",
-    )
     return parser.parse_args()
 
 
@@ -310,7 +298,6 @@ class CollectApp:
     sample_builder: CollectorSampleBuilder
     runtime: CollectionRuntime
     control_state: "CollectControlState"
-    tactile_visualizer: TactileUVVisualizer | None
 
 
 @dataclass
@@ -616,25 +603,6 @@ def _channel_pose_in_desk(channel: ObservationChannel, calibration: TeleopCalibr
 def _arm_backend(app: CollectApp, side: str) -> RM65ArmBackend | None:
     backend = app.components.backends.get(f"{side}_arm")
     return backend if isinstance(backend, RM65ArmBackend) else None
-
-
-def _hand_backend(app: CollectApp, side: str) -> InspireTacHandBackend | None:
-    backend = app.components.backends.get(f"{side}_hand")
-    return backend if isinstance(backend, InspireTacHandBackend) else None
-
-
-def _update_tactile_visualizer(app: CollectApp) -> None:
-    visualizer = app.tactile_visualizer
-    if visualizer is None:
-        return
-    tactile_by_side: dict[str, np.ndarray | None] = {"left": None, "right": None}
-    for side in app.active_sides:
-        hand_backend = _hand_backend(app, side)
-        if hand_backend is None:
-            continue
-        tactile = hand_backend.get_state().get("tactile")
-        tactile_by_side[side] = None if tactile is None else np.asarray(tactile, dtype=float).reshape(-1)
-    visualizer.update(tactile_by_side)
 
 
 def _seed_dual_arm_retargeter_from_backends(app: CollectApp) -> None:
@@ -1076,14 +1044,6 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             auto_start_writer_pool=True,
         ),
     )
-    tactile_visualizer: TactileUVVisualizer | None = None
-    if bool(args.visualize_tactile):
-        tactile_visualizer = TactileUVVisualizer(
-            TactileVisualizerConfig(
-                enabled_sides=active_sides,
-                value_scale=float(args.tactile_vis_value_scale),
-            )
-        )
     return CollectApp(
         active_sides=active_sides,
         components=components,
@@ -1100,7 +1060,6 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         sample_builder=sample_builder,
         runtime=runtime,
         control_state=control_state,
-        tactile_visualizer=tactile_visualizer,
     )
 
 
@@ -1168,8 +1127,6 @@ def main() -> int:
             if should_quit:
                 break
 
-            _update_tactile_visualizer(app)
-
             result = None
             if app.calibration.metadata.get("home_ready"):
                 result = runtime.step(now=loop_started_at)
@@ -1191,8 +1148,6 @@ def main() -> int:
             try:
                 key_controller.close()
             finally:
-                if app.tactile_visualizer is not None:
-                    app.tactile_visualizer.close()
                 runtime.close()
                 _close_unmanaged_backends(app.unmanaged_backends)
 

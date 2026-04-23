@@ -23,6 +23,9 @@ from teleop_runtime.debug.run_vive_sapien_virtual import (
     _update_optional_hand_preview_from_channels,
     build_components,
 )
+from teleop_runtime.debug.run_vive_rm65_real_teleop import (
+    _build_components as build_real_components,
+)
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from teleop_runtime.hand_render import inspire_q6_to_render_qpos
@@ -517,6 +520,135 @@ class TeleopRecoveryTests(unittest.TestCase):
             components.session.close()
             components.left_preview_backend.close()
             components.right_preview_backend.close()
+
+    def test_virtual_components_single_right_arm_use_single_arm_retargeter(self) -> None:
+        args = SimpleNamespace(
+            active_sides=("right",),
+            hz=30.0,
+            arm_mode="virtual",
+            disable_dual_arm_collision_avoidance=False,
+            ik_tuning_json="",
+            load_initial_alignment="",
+            load_profile="",
+            left_right_base_distance=0.525,
+            left_tracker_name="tracker_1",
+            right_tracker_name="tracker_2",
+            aux_tracker_name="",
+            control_mode="absolute",
+            translation_scale=1.0,
+            collision_scene_profile="dual_arm_hand_proxy_open",
+            collision_avoidance_mode="boundary_slide",
+            arm_max_angvel=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5),
+            recovery_healthy_frames=8,
+            no_record=True,
+            host="0.0.0.0",
+            port=9999,
+            tcp_mode="hand_base",
+            left_arm_ip="",
+            right_arm_ip="",
+            skip_renderer=True,
+            headless=True,
+            left_hand_port="",
+            right_hand_port="",
+            hand_reader_baudrate=115200,
+            hand_reader_timeout=0.05,
+            show_hand_raw_lines=False,
+            hand_joint_order=(5, 4, 3, 2, 0, 1),
+            hand_invert=True,
+            hand_command_alpha=1.0,
+            hand_send_threshold=0.002,
+        )
+        components = build_components(args)
+        try:
+            self.assertEqual(components.active_sides, ("right",))
+            self.assertIsNone(components.dual_arm_retargeter)
+            self.assertEqual([retargeter.name for retargeter in components.session.retargeters], ["pose_to_arm_right"])
+            self.assertEqual(
+                components.session.safety_monitor.config.required_channels,
+                ("right_wrist_pose",),
+            )
+        finally:
+            components.session.close()
+            components.left_preview_backend.close()
+            components.right_preview_backend.close()
+
+    def test_real_components_single_left_arm_use_single_arm_retargeter(self) -> None:
+        args = SimpleNamespace(
+            active_sides=("left",),
+            hz=30.0,
+            disable_dual_arm_collision_avoidance=False,
+            ik_tuning_json="",
+            load_initial_alignment="",
+            load_profile="",
+            left_right_base_distance=0.525,
+            left_tracker_name="tracker_1",
+            right_tracker_name="tracker_2",
+            aux_tracker_name="",
+            control_mode="absolute",
+            translation_scale=1.0,
+            collision_scene_profile="dual_arm_hand_proxy_open",
+            collision_avoidance_mode="boundary_slide",
+            recovery_healthy_frames=8,
+            no_record=True,
+            host="0.0.0.0",
+            port=9999,
+            tcp_mode="hand_base",
+            left_arm_ip="192.168.1.18",
+            right_arm_ip="",
+            left_hand_ip="",
+            right_hand_ip="",
+            left_hand_port="",
+            right_hand_port="",
+            hand_reader_baudrate=115200,
+            hand_reader_timeout=0.05,
+            show_hand_raw_lines=False,
+            hand_joint_order=(5, 4, 3, 2, 0, 1),
+            hand_invert=True,
+            hand_command_alpha=1.0,
+            hand_send_threshold=0.002,
+            hand_telemetry_hz=30.0,
+            hand_tactile_regions="",
+            max_fingertip_force=800,
+            teleop_hardware_ip="",
+            teleop_hardware_port=0,
+            swap_arm_sides=False,
+            arm_max_angvel=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5),
+            minimum_control_hz=15.0,
+            status_sec=1.0,
+            skip_renderer=True,
+            headless=True,
+            keyboard_clutch=False,
+            rm65_hardware_read_retries=0,
+            rm65_hardware_read_retry_delay_sec=0.02,
+            arm_io_threads=2,
+            arm_step_dt_scaling=True,
+            arm_step_dt_alpha=0.25,
+            arm_step_dt_max_scale=2.0,
+            arm_step_dt_stall_reset_sec=0.25,
+            max_start_joint_error_deg=5.0,
+            max_start_weighted_error_deg=12.0,
+            ignore_start_mismatch=False,
+        )
+        components = build_real_components(args)
+        try:
+            self.assertEqual(components.active_sides, ("left",))
+            self.assertIsNone(components.dual_arm_retargeter)
+            self.assertIsNotNone(components.left_command_backend)
+            self.assertIsNone(components.right_command_backend)
+            self.assertEqual(set(components.session.rig.backends), {"left_arm"})
+            self.assertEqual([retargeter.name for retargeter in components.session.retargeters], ["pose_to_arm_left"])
+            self.assertEqual(
+                components.session.safety_monitor.config.required_channels,
+                ("left_wrist_pose",),
+            )
+        finally:
+            components.session.close()
+            components.left_preview_backend.close()
+            components.right_preview_backend.close()
+            if components.left_state_backend is not None:
+                components.left_state_backend.close()
+            if components.right_state_backend is not None:
+                components.right_state_backend.close()
 
     def test_robot_home_prefers_initial_alignment_pose_and_qpos(self) -> None:
         left_pose = _pose(tx=0.33, yaw_deg=10.0)
