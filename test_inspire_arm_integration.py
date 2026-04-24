@@ -77,6 +77,52 @@ class InspireArmIntegrationTests(unittest.TestCase):
         self.assertIsNone(state["qpos"])
         self.assertFalse(state["arm_enabled"])
 
+    def test_fr3_backend_startup_alignment_ramps_from_current_qpos(self) -> None:
+        backend = FR3ArmBackend(
+            FR3ArmBackendConfig(
+                host="127.0.0.1",
+                connect_hardware=True,
+                startup_align_enabled=True,
+                startup_align_duration_s=10.0,
+                startup_align_threshold_rad=0.0,
+            )
+        )
+        start_q = np.zeros(ARM_DOF, dtype=np.float32)
+        target_q = np.ones(ARM_DOF, dtype=np.float32)
+        with backend._state_lock:
+            backend._latest_qpos = start_q.copy()
+
+        backend.send_command(
+            EffectorCommand(
+                effector_name="arm",
+                side="right",
+                value=target_q,
+                timestamp=time.time(),
+                metadata={},
+            )
+        )
+        state = backend.get_state()
+        np.testing.assert_allclose(state["last_sent_command"], start_q, atol=1e-4)
+        self.assertTrue(state["startup_alignment_active"])
+        self.assertFalse(state["startup_alignment_complete"])
+
+        with backend._state_lock:
+            backend._startup_align_started_at = time.time() - 20.0
+        backend.send_command(
+            EffectorCommand(
+                effector_name="arm",
+                side="right",
+                value=target_q,
+                timestamp=time.time(),
+                metadata={},
+            )
+        )
+        state = backend.get_state()
+        np.testing.assert_allclose(state["last_sent_command"], target_q, atol=1e-4)
+        self.assertFalse(state["startup_alignment_active"])
+        self.assertTrue(state["startup_alignment_complete"])
+        self.assertEqual(state["startup_alignment_progress"], 1.0)
+
     def test_writer_rows_fill_arm_vector_when_command_and_state_exist(self) -> None:
         arm_target = np.linspace(0.1, 0.7, ARM_DOF, dtype=np.float32)
         arm_qpos = np.linspace(-0.1, -0.7, ARM_DOF, dtype=np.float32)
@@ -109,6 +155,15 @@ class InspireArmIntegrationTests(unittest.TestCase):
                 "state_source": "fr3_joint_control_client.cached",
                 "last_sent_command": arm_target,
                 "qpos": arm_qpos,
+                "startup_alignment_enabled": True,
+                "startup_alignment_active": False,
+                "startup_alignment_complete": True,
+                "startup_alignment_progress": 1.0,
+                "startup_alignment_duration_s": 5.0,
+                "startup_alignment_start_max_delta_rad": 0.5,
+                "startup_alignment_start_qpos": np.zeros(ARM_DOF, dtype=np.float32),
+                "startup_alignment_initial_target": arm_target,
+                "startup_alignment_latest_target": arm_target,
             },
             hand_states={},
         )
@@ -122,6 +177,11 @@ class InspireArmIntegrationTests(unittest.TestCase):
         np.testing.assert_allclose(row["observation.arm.qpos"], arm_qpos)
         self.assertTrue(row["arm_enabled"])
         self.assertEqual(row["arm_state_source"], "fr3_joint_control_client.cached")
+        self.assertTrue(row["observation.arm.startup_alignment_complete"])
+        np.testing.assert_allclose(
+            row["observation.arm.startup_alignment_latest_target"],
+            arm_target,
+        )
         self.assertEqual(row["teleop.action_source.arm_mapping"], "dynamixel_to_robot_arm")
 
     def test_writer_info_declares_arm_and_hand_layout(self) -> None:

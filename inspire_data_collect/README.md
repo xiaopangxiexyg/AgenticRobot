@@ -40,7 +40,7 @@ pip install pyrealsense2
 - `utils/tactile_visualizer.py`: OpenCV 触觉 UV 可视化，显示 1062 维触觉。
 - `arm/exo_joint_source.py`: 读取 7DoF Dynamixel 外骨骼关节缓存。
 - `arm/retargeter.py`: 复用 `exo_teleop` 的 `dynamixel_to_robot_arm` 映射，并做 FR3 安全关节裁剪。
-- `arm/fr3_backend.py`: 封装 `FR3JointClient`，后台轮询 FR3 状态缓存并下发关节目标。
+- `arm/fr3_backend.py`: 封装 `FR3JointClient`，后台轮询 FR3 状态缓存，下发关节目标，并在启动阶段做 FR3 当前姿态到外骨骼目标的慢速插值对齐。
 - `utils/writer.py`: LeRobot 风格 parquet/meta/video 导出，手数据完整写入，并支持单臂 7DoF 动作和状态位。
 - `run_collect.py`: 完整采集入口。
 
@@ -61,7 +61,7 @@ RealSenseRGBSource -----------------------------------------^
 - `InspireTacHandBackend`: 负责 `set_joint_pos()` 下发，后台遥测线程读 `read_joint_pos()` 和 `read_tac_data()`。
 - `ExoJointSource`: 从外骨骼 Dynamixel 读取 7DoF 关节角，输出 `arm_exo_joint_qpos`。
 - `FR3ArmRetargeter`: 将外骨骼关节映射到 FR3 7DoF 目标，写入裁剪和映射元数据。
-- `FR3ArmBackend`: 使用两条 TCP 连接的 `FR3JointClient` 下发 `send_q()`，并通过后台 poller 获取 FR3 状态。
+- `FR3ArmBackend`: 使用两条 TCP 连接的 `FR3JointClient` 下发 `send_q()`，通过后台 poller 获取 FR3 状态；第一次收到外骨骼目标时默认先从 FR3 当前 qpos 插值到外骨骼映射目标，避免启动瞬间跳变。
 - `RealSenseRGBSource`: 启动 RealSense color stream，后台线程将 RGB 帧推入 `NearestFrameBuffer`。
 - `HandSampleBuilder`: 将当前 commands、arm state、hand states、faults 合成一帧 `HandSample`。
 - `HandOnlyLeRobotWriter`: 接收异步写盘任务，写 `data/*.parquet`、`meta/*.jsonl/json` 和可选 `videos/*.mp4`。
@@ -413,7 +413,7 @@ PY
 
 ### 8. 最小闭环短测
 
-前面所有单项测试都通过后，再做不录制数据的短时闭环。这个命令会按外骨骼目标下发 FR3，请确认 FR3 和外骨骼都处于安全姿态，并先用较低主循环频率短测。
+前面所有单项测试都通过后，再做不录制数据的短时闭环。这个命令会按外骨骼目标下发 FR3，请确认 FR3 和外骨骼都处于安全姿态，并先用较低主循环频率短测。默认会先用 `--arm-startup-align-duration-s 5.0` 从 FR3 当前姿态慢速插值到外骨骼映射目标，插值结束后才进入直接随动。
 
 ```bash
 python -m inspire_data_collect \
@@ -427,6 +427,7 @@ python -m inspire_data_collect \
   --exo-port "$EXO_PORT" \
   --fr3-host "$FR3_HOST" \
   --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
   --hz 10 \
   --max-steps 100 \
   --no-parquet \
@@ -524,8 +525,11 @@ python -m inspire_data_collect \
   --fr3-host 192.168.20.172 \
   --fr3-port 5558 \
   --fr3-state-poll-hz 20 \
+  --arm-startup-align-duration-s 5.0 \
   --arm-shrink-deg 10
 ```
+
+外骨骼到 FR3 是直接关节映射，程序刚启动时 FR3 当前关节和外骨骼映射目标通常不一致。默认启用启动对齐：FR3 后端第一次收到 arm 指令时，会以 FR3 当前 `qpos` 为起点，在 `--arm-startup-align-duration-s` 秒内线性插值到外骨骼当前目标；最大关节差低于 `--arm-startup-align-threshold-rad` 时会跳过插值。启动对齐期间操作者应尽量保持外骨骼不动，等插值结束后再进入正常随动。确认二者已经物理对齐且需要完全直接随动时，才使用 `--disable-arm-startup-align`。
 
 单 RealSense 相机，使用包内 `realsense.json`：
 
@@ -595,6 +599,7 @@ dataset_root/YYYY-MM-DD_task-name/
 - `action.arm.joint_target`: 7 维 FR3 关节目标；未启用 arm 时为 `NaN`。
 - `observation.arm.qpos`: 7 维 FR3 当前关节状态；未启用 arm 或状态暂不可用时为 `NaN`。
 - `observation.arm.dq`: 7 维 FR3 关节速度，若服务端未返回则为 null。
+- `observation.arm.startup_alignment_*`: FR3 启动对齐插值状态、进度、起点和目标。
 - `action.right_hand.joint_target`、`action.left_hand.joint_target`。
 - `observation.right_hand.qpos`、`observation.left_hand.qpos`。
 - `observation.hand.<side>.tactile`: 1062 维触觉向量。

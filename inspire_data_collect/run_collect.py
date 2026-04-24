@@ -206,6 +206,23 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fr3-max-state-age-s", type=float, default=0.5)
     parser.add_argument("--fr3-state-ready-timeout-s", type=float, default=2.0)
     parser.add_argument("--arm-shrink-deg", type=float, default=10.0)
+    parser.add_argument(
+        "--disable-arm-startup-align",
+        action="store_true",
+        help="Disable the initial FR3 ramp from current qpos to the exoskeleton-mapped target.",
+    )
+    parser.add_argument(
+        "--arm-startup-align-duration-s",
+        type=float,
+        default=5.0,
+        help="Seconds used to interpolate FR3 from current qpos to the initial exoskeleton target.",
+    )
+    parser.add_argument(
+        "--arm-startup-align-threshold-rad",
+        type=float,
+        default=0.02,
+        help="Skip startup interpolation when max joint mismatch is below this threshold.",
+    )
 
     parser.add_argument("--left-hand-port", type=str, default="")
     parser.add_argument("--right-hand-port", type=str, default="")
@@ -306,6 +323,10 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--fr3-state-ready-timeout-s must be positive.")
         if float(args.arm_shrink_deg) < 0.0:
             raise ValueError("--arm-shrink-deg must be non-negative.")
+        if float(args.arm_startup_align_duration_s) < 0.0:
+            raise ValueError("--arm-startup-align-duration-s must be non-negative.")
+        if float(args.arm_startup_align_threshold_rad) < 0.0:
+            raise ValueError("--arm-startup-align-threshold-rad must be non-negative.")
     if args.camera_mode == "single":
         if not args.camera_serial and not Path(args.camera_config).exists():
             raise ValueError(
@@ -403,6 +424,9 @@ def build_arm_components(
             state_poll_hz=float(args.fr3_state_poll_hz),
             max_state_age_s=float(args.fr3_max_state_age_s),
             wait_state_timeout_s=float(args.fr3_state_ready_timeout_s),
+            startup_align_enabled=not bool(args.disable_arm_startup_align),
+            startup_align_duration_s=float(args.arm_startup_align_duration_s),
+            startup_align_threshold_rad=float(args.arm_startup_align_threshold_rad),
         )
     )
     return source, retargeter, backend
@@ -572,6 +596,14 @@ def main(argv: list[str] | None = None) -> int:
             "arm_enabled": bool(args.enable_arm),
             "arm_side": str(args.arm_side),
             "arm_shrink_deg": float(args.arm_shrink_deg) if args.enable_arm else None,
+            "arm_startup_align_enabled": bool(args.enable_arm)
+            and not bool(args.disable_arm_startup_align),
+            "arm_startup_align_duration_s": float(args.arm_startup_align_duration_s)
+            if args.enable_arm
+            else None,
+            "arm_startup_align_threshold_rad": float(args.arm_startup_align_threshold_rad)
+            if args.enable_arm
+            else None,
             "exo_port": None if arm_source is None else arm_source.device_info().get("port"),
             "exo_baudrate": None if arm_source is None else arm_source.device_info().get("baudrate"),
             "fr3_host": None if arm_backend is None else arm_backend.device_info().get("host"),
@@ -648,7 +680,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.enable_arm:
             print(
                 "单臂 FR3 随动 / Single-arm FR3 follow: "
-                f"side={args.arm_side}, host={args.fr3_host}:{args.fr3_port}"
+                f"side={args.arm_side}, host={args.fr3_host}:{args.fr3_port}, "
+                f"startup_align={'off' if args.disable_arm_startup_align else str(args.arm_startup_align_duration_s) + 's'}"
             )
         print_controls()
         if args.record_auto_start:

@@ -446,6 +446,36 @@ def hand_sample_to_row(
         length=ARM_DOF,
     )
     row["action.arm.last_sent_timestamp"] = arm_state.get("last_sent_command_timestamp")
+    row["observation.arm.startup_alignment_enabled"] = arm_state.get(
+        "startup_alignment_enabled"
+    )
+    row["observation.arm.startup_alignment_active"] = arm_state.get(
+        "startup_alignment_active"
+    )
+    row["observation.arm.startup_alignment_complete"] = arm_state.get(
+        "startup_alignment_complete"
+    )
+    row["observation.arm.startup_alignment_progress"] = arm_state.get(
+        "startup_alignment_progress"
+    )
+    row["observation.arm.startup_alignment_duration_s"] = arm_state.get(
+        "startup_alignment_duration_s"
+    )
+    row["observation.arm.startup_alignment_start_max_delta_rad"] = arm_state.get(
+        "startup_alignment_start_max_delta_rad"
+    )
+    row["observation.arm.startup_alignment_start_qpos"] = vector_list(
+        arm_state.get("startup_alignment_start_qpos"),
+        length=ARM_DOF,
+    )
+    row["observation.arm.startup_alignment_initial_target"] = vector_list(
+        arm_state.get("startup_alignment_initial_target"),
+        length=ARM_DOF,
+    )
+    row["observation.arm.startup_alignment_latest_target"] = vector_list(
+        arm_state.get("startup_alignment_latest_target"),
+        length=ARM_DOF,
+    )
     row["teleop.action_source.arm_exo_qpos"] = vector_list(
         arm_command_metadata.get("source_qpos"),
         length=ARM_DOF,
