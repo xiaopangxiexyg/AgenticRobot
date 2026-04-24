@@ -13,6 +13,7 @@ class TactileVisualizerConfig:
     enabled_sides: tuple[str, ...] = ("left", "right")
     window_name: str = "inspire_hand_tactile_uv"
     image_size: tuple[int, int] = (640, 640)
+    resizable_window: bool = True
     value_scale: float = 0.05
     point_radius_min: int = 1
     point_radius_max: int = 6
@@ -104,6 +105,7 @@ class TactileUVVisualizer:
             "right": self._build_layout_pixel_coords("right"),
         }
         self._canvas = self._build_canvas_template()
+        self._window_created = False
         self._closed = False
 
     @staticmethod
@@ -226,6 +228,20 @@ class TactileUVVisualizer:
         size_strength = np.clip(size_strength, 0.0, 1.0)
         return color_strength, size_strength
 
+    def _ensure_window(self, canvas: np.ndarray) -> None:
+        if self._window_created:
+            return
+        flag = (
+            self._cv2.WINDOW_NORMAL
+            if self.config.resizable_window
+            else self._cv2.WINDOW_AUTOSIZE
+        )
+        self._cv2.namedWindow(self.config.window_name, flag)
+        if self.config.resizable_window:
+            height, width = canvas.shape[:2]
+            self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
+        self._window_created = True
+
     def update(self, tactile_by_side: dict[str, np.ndarray | None]) -> None:
         if self._closed:
             return
@@ -249,6 +265,7 @@ class TactileUVVisualizer:
                 2,
                 self._cv2.LINE_AA,
             )
+        self._ensure_window(canvas)
         self._cv2.imshow(self.config.window_name, canvas)
         self._cv2.waitKey(1)
 

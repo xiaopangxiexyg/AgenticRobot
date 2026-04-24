@@ -1,3 +1,3 @@
-"""Portable hand-only InspireTac data collector."""
+"""Portable InspireTac data collector with optional single-arm FR3 support."""
 
 __all__ = []

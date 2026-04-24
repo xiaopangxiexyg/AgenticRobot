@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import re
 import select
 import sys
 import termios
 import time
 import tty
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from inspire_data_collect.arm.exo_joint_source import ExoJointSource, ExoJointSourceConfig
+    from inspire_data_collect.arm.fr3_backend import FR3ArmBackend, FR3ArmBackendConfig
+    from inspire_data_collect.arm.retargeter import FR3ArmRetargeter, FR3ArmRetargeterConfig
     from inspire_data_collect.async_writer import AsyncWriterConfig, AsyncWriterPool
     from inspire_data_collect.common import (
         ALL_SIDES,
@@ -47,6 +52,9 @@ if __package__ in (None, ""):
         WriterConfig,
     )
 else:
+    from .arm.exo_joint_source import ExoJointSource, ExoJointSourceConfig
+    from .arm.fr3_backend import FR3ArmBackend, FR3ArmBackendConfig
+    from .arm.retargeter import FR3ArmRetargeter, FR3ArmRetargeterConfig
     from .async_writer import AsyncWriterConfig, AsyncWriterPool
     from .common import ALL_SIDES, assert_inactive_side_config_empty, parse_active_sides
     from .hand.hand_backend import InspireTacHandBackend, InspireTacHandBackendConfig
@@ -129,12 +137,75 @@ class LoopRate:
         return float(self.hz)
 
 
+def _sanitize_task_name_for_path(task_name: str) -> str:
+    text = str(task_name).strip()
+    if not text:
+        return "task"
+    text = re.sub(r"[\\/]+", "-", text)
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    text = text.strip("._-")
+    return text or "task"
+
+
+def _default_task_id_from_name(task_name: str) -> str:
+    slug = _sanitize_task_name_for_path(task_name).lower()
+    slug = re.sub(r"[^0-9a-z_-]+", "_", slug)
+    slug = re.sub(r"_+", "_", slug).strip("._-")
+    return slug or "task"
+
+
+def resolve_collection_layout(
+    args: argparse.Namespace,
+) -> tuple[Path, str, str, str, str]:
+    task_name = str(getattr(args, "task_name", "")).strip()
+    task_id = str(getattr(args, "task_id", "")).strip() or _default_task_id_from_name(task_name)
+    task_description = str(getattr(args, "task_description", "")).strip() or task_name
+    date_prefix = datetime.now().strftime("%Y-%m-%d")
+    dataset_dir_name = f"{date_prefix}_{_sanitize_task_name_for_path(task_name)}"
+    dataset_root = Path(args.dataset_root) / dataset_dir_name
+    dataset_name = str(getattr(args, "dataset_name", "")).strip() or dataset_dir_name
+    return dataset_root, task_name, task_id, task_description, dataset_name
+
+
 def add_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset-root", type=Path, required=True, help="Output dataset root")
-    parser.add_argument("--task-id", type=str, default="hand_only")
-    parser.add_argument("--task-description", type=str, default="hand-only Inspire Tac collection")
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        required=True,
+        help="Base output directory. Actual dataset path is <dataset-root>/<YYYY-MM-DD>_<task-name>.",
+    )
+    parser.add_argument(
+        "--task-name",
+        type=str,
+        required=True,
+        help="Required task name used for dataset folder naming and meta.",
+    )
+    parser.add_argument("--task-id", type=str, default="")
+    parser.add_argument("--task-description", type=str, default="")
     parser.add_argument("--dataset-name", type=str, default="")
     parser.add_argument("--active-sides", type=parse_active_sides, default=ALL_SIDES)
+
+    parser.add_argument(
+        "--enable-arm",
+        action="store_true",
+        help="Enable exoskeleton -> single-arm FR3 follow control and logging.",
+    )
+    parser.add_argument(
+        "--arm-side",
+        choices=["right", "left"],
+        default="right",
+        help="Single-arm label stored into dataset rows and metadata.",
+    )
+    parser.add_argument("--exo-port", type=str, default="")
+    parser.add_argument("--exo-baudrate", type=int, default=57600)
+    parser.add_argument("--fr3-host", type=str, default="192.168.20.172")
+    parser.add_argument("--fr3-port", type=int, default=5558)
+    parser.add_argument("--fr3-timeout-s", type=float, default=5.0)
+    parser.add_argument("--fr3-state-poll-hz", type=float, default=20.0)
+    parser.add_argument("--fr3-max-state-age-s", type=float, default=0.5)
+    parser.add_argument("--fr3-state-ready-timeout-s", type=float, default=2.0)
+    parser.add_argument("--arm-shrink-deg", type=float, default=10.0)
 
     parser.add_argument("--left-hand-port", type=str, default="")
     parser.add_argument("--right-hand-port", type=str, default="")
@@ -201,6 +272,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--visualize-tactile", action="store_true")
     parser.add_argument("--tactile-vis-value-scale", type=float, default=0.05)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
+    parser.add_argument(
+        "--tactile-vis-window-mode",
+        choices=["resizable", "autosize"],
+        default="resizable",
+        help="'resizable' lets the OpenCV window be resized by dragging; 'autosize' keeps the rendered image size.",
+    )
 
 
 def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
@@ -214,6 +291,21 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--hz must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
+    if args.enable_arm:
+        if int(args.exo_baudrate) <= 0:
+            raise ValueError("--exo-baudrate must be positive.")
+        if int(args.fr3_port) <= 0:
+            raise ValueError("--fr3-port must be positive.")
+        if float(args.fr3_timeout_s) <= 0.0:
+            raise ValueError("--fr3-timeout-s must be positive.")
+        if float(args.fr3_state_poll_hz) <= 0.0:
+            raise ValueError("--fr3-state-poll-hz must be positive.")
+        if float(args.fr3_max_state_age_s) <= 0.0:
+            raise ValueError("--fr3-max-state-age-s must be positive.")
+        if float(args.fr3_state_ready_timeout_s) <= 0.0:
+            raise ValueError("--fr3-state-ready-timeout-s must be positive.")
+        if float(args.arm_shrink_deg) < 0.0:
+            raise ValueError("--arm-shrink-deg must be non-negative.")
     if args.camera_mode == "single":
         if not args.camera_serial and not Path(args.camera_config).exists():
             raise ValueError(
@@ -281,6 +373,41 @@ def build_components(
     return source, retargeters, backends
 
 
+def build_arm_components(
+    args: argparse.Namespace,
+) -> tuple[ExoJointSource | None, FR3ArmRetargeter | None, FR3ArmBackend | None]:
+    if not args.enable_arm:
+        return None, None, None
+    source = ExoJointSource(
+        ExoJointSourceConfig(
+            side=str(args.arm_side),
+            port=str(args.exo_port),
+            baudrate=int(args.exo_baudrate),
+        )
+    )
+    retargeter = FR3ArmRetargeter(
+        FR3ArmRetargeterConfig(
+            side=str(args.arm_side),
+            input_channel_name="arm_exo_joint_qpos",
+            effector_name="arm",
+            shrink_deg=float(args.arm_shrink_deg),
+        )
+    )
+    backend = FR3ArmBackend(
+        FR3ArmBackendConfig(
+            host=str(args.fr3_host),
+            port=int(args.fr3_port),
+            timeout_s=float(args.fr3_timeout_s),
+            side=str(args.arm_side),
+            effector_name="arm",
+            state_poll_hz=float(args.fr3_state_poll_hz),
+            max_state_age_s=float(args.fr3_max_state_age_s),
+            wait_state_timeout_s=float(args.fr3_state_ready_timeout_s),
+        )
+    )
+    return source, retargeter, backend
+
+
 def build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSource]:
     if args.camera_mode == "none":
         return {}
@@ -314,12 +441,19 @@ def hand_state_snapshot(backends: dict[str, InspireTacHandBackend]) -> dict[str,
     return {side: backend.get_state() for side, backend in backends.items()}
 
 
+def arm_state_snapshot(backend: FR3ArmBackend | None) -> dict[str, Any]:
+    if backend is None:
+        return {}
+    return backend.get_state()
+
+
 def collect_faults(
     *,
     active_sides: tuple[str, ...],
     control_hz: float,
     minimum_control_hz: float,
     hand_states: dict[str, dict[str, Any]],
+    arm_state: dict[str, Any] | None = None,
 ) -> list[str]:
     faults: list[str] = []
     if minimum_control_hz > 0.0 and control_hz > 0.0 and control_hz < minimum_control_hz:
@@ -328,6 +462,10 @@ def collect_faults(
         error = hand_states.get(side, {}).get("telemetry_error")
         if error:
             faults.append(f"{side}_hand_telemetry:{error}")
+    if arm_state:
+        error = arm_state.get("state_error")
+        if error:
+            faults.append(f"arm_state:{error}")
     return faults
 
 
@@ -350,23 +488,25 @@ def print_standby(next_episode_index: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Hand-only Inspire Tac collection with tactile visualization."
+        description="Inspire Tac collection with optional single-arm FR3 teleoperation."
     )
     add_args(parser)
     args = parser.parse_args(argv)
     active_sides = validate_args(args)
+    dataset_root, task_name, task_id, task_description, dataset_name = resolve_collection_layout(args)
     camera_sources = build_camera_sources(args)
 
     writer = HandOnlyLeRobotWriter(
         WriterConfig(
-            root_dir=args.dataset_root,
+            root_dir=dataset_root,
             chunk_size=int(args.chunk_size),
             nominal_fps=float(args.hz),
             parquet_compression=str(args.parquet_compression),
             video_codec=str(args.video_codec),
-            task_id=str(args.task_id),
-            task_description=str(args.task_description),
-            dataset_name=str(args.dataset_name),
+            task_name=str(task_name),
+            task_id=str(task_id),
+            task_description=str(task_description),
+            dataset_name=str(dataset_name),
             write_parquet=bool(args.write_parquet),
             write_video=bool(args.write_video and camera_sources),
         )
@@ -388,12 +528,14 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     source, retargeters, backends = build_components(args, active_sides)
+    arm_source, arm_retargeter, arm_backend = build_arm_components(args)
     visualizer = (
         TactileUVVisualizer(
             TactileVisualizerConfig(
                 enabled_sides=active_sides,
                 image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
                 value_scale=float(args.tactile_vis_value_scale),
+                resizable_window=str(args.tactile_vis_window_mode) == "resizable",
             )
         )
         if args.visualize_tactile
@@ -410,6 +552,9 @@ def main(argv: list[str] | None = None) -> int:
         if recording:
             return
         metadata = {
+            "task_name": task_name,
+            "task_id": task_id,
+            "task_description": task_description,
             "active_sides": list(active_sides),
             "reserved_single_arm_dof": ARM_DOF,
             "action_dim": ACTION_DIM,
@@ -424,6 +569,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.camera_mode == "none" or args.camera_serial
             else str(args.camera_config),
             "write_video": bool(args.write_video and camera_sources),
+            "arm_enabled": bool(args.enable_arm),
+            "arm_side": str(args.arm_side),
+            "arm_shrink_deg": float(args.arm_shrink_deg) if args.enable_arm else None,
+            "exo_port": None if arm_source is None else arm_source.device_info().get("port"),
+            "exo_baudrate": None if arm_source is None else arm_source.device_info().get("baudrate"),
+            "fr3_host": None if arm_backend is None else arm_backend.device_info().get("host"),
+            "fr3_port": None if arm_backend is None else arm_backend.device_info().get("port"),
         }
         current_episode = writer.start_episode(metadata=metadata)
         sample_builder.set_episode(current_episode)
@@ -463,10 +615,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         source.start()
+        if arm_source is not None:
+            arm_source.start()
+            if not arm_source.is_ready():
+                raise RuntimeError(f"arm exoskeleton source is not ready: {arm_source.device_info()}")
         for side, backend in backends.items():
             backend.start()
             if not backend.is_ready() and not args.allow_hand_connect_failure:
                 raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
+        if arm_backend is not None:
+            arm_backend.start()
+            if not arm_backend.is_ready():
+                raise RuntimeError(f"FR3 arm backend is not ready: {arm_backend.device_info()}")
         for camera_source in camera_sources.values():
             camera_source.start()
 
@@ -479,6 +639,17 @@ def main(argv: list[str] | None = None) -> int:
                     for camera_key, source in camera_sources.items()
                 },
             )
+        if arm_source is not None:
+            writer.write_device_config("arm_exo", arm_source.device_info())
+        if arm_backend is not None:
+            writer.write_device_config("fr3", arm_backend.device_info())
+        print(f"数据集目录 / Dataset directory: {dataset_root}")
+        print(f"任务名称 / Task name: {task_name}")
+        if args.enable_arm:
+            print(
+                "单臂 FR3 随动 / Single-arm FR3 follow: "
+                f"side={args.arm_side}, host={args.fr3_host}:{args.fr3_port}"
+            )
         print_controls()
         if args.record_auto_start:
             start_episode()
@@ -488,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 loop_started_at = time.time()
                 key = keyboard.poll()
+                key = None if key is None else key.lower()
                 if key == "z":
                     start_episode()
                 elif key == "c":
@@ -499,7 +671,14 @@ def main(argv: list[str] | None = None) -> int:
                     break
 
                 channels = source.get_latest_channels()
+                if arm_source is not None:
+                    channels.update(arm_source.get_latest_channels())
                 commands = {}
+                if arm_retargeter is not None and arm_backend is not None:
+                    arm_command = arm_retargeter.retarget(channels, timestamp=loop_started_at)
+                    if arm_command is not None:
+                        commands[arm_command.effector_name] = arm_command
+                        arm_backend.send_command(arm_command)
                 for side, retargeter in retargeters.items():
                     command = retargeter.retarget(channels, timestamp=loop_started_at)
                     if command is None:
@@ -508,12 +687,14 @@ def main(argv: list[str] | None = None) -> int:
                     backends[side].send_command(command)
 
                 hand_states = hand_state_snapshot(backends)
+                arm_state = arm_state_snapshot(arm_backend)
                 control_hz = loop_rate.tick(loop_started_at)
                 faults = collect_faults(
                     active_sides=active_sides,
                     control_hz=control_hz,
                     minimum_control_hz=float(args.minimum_control_hz),
                     hand_states=hand_states,
+                    arm_state=arm_state,
                 )
 
                 if visualizer is not None:
@@ -528,6 +709,7 @@ def main(argv: list[str] | None = None) -> int:
                         control_hz=control_hz,
                         channels=channels,
                         commands=commands,
+                        arm_state=arm_state,
                         hand_states=hand_states,
                         faults=faults,
                         metadata={"step_count": step_count},
@@ -548,6 +730,10 @@ def main(argv: list[str] | None = None) -> int:
             if recording:
                 finish_episode(save=True, show_standby=False)
         finally:
+            if arm_backend is not None:
+                arm_backend.close()
+            if arm_source is not None:
+                arm_source.close()
             for backend in backends.values():
                 backend.close()
             for camera_source in camera_sources.values():

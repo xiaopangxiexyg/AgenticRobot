@@ -2,14 +2,17 @@ import argparse
 # import pybullet as p
 import numpy as np
 import time
+import sys
+from pathlib import Path
 
 # from chaoyi_sandbox.franka_sim.sim import FrankaDexUMI
 
-from drivers.arm_exo.motors_config import make_default_arm_params
-from drivers.arm_exo.motors_to_robot import dynamixel_to_robot_arm
-from drivers.arm_exo.motors_driver import DynamixelDriver
+if __package__ in (None, ""):
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from drivers.fr3_joint_control_client import FR3JointClient
+from exo_teleop.arm_exo.motors_config import make_default_arm_params
+from exo_teleop.arm_exo.motors_to_robot import dynamixel_to_robot_arm
+from exo_teleop.fr3_joint_control_client import FR3JointClient
 
 
 def safe_clip(robot_q_rad, shrink_deg=10.0, print_if_clip=True):
@@ -64,6 +67,7 @@ def main():
     dt = 1.0 / float(args.hz)
 
     cfg = make_default_arm_params()
+    from exo_teleop.arm_exo.motors_driver import DynamixelDriver
 
     with FR3JointClient(args.host, args.port, timeout_s=args.timeout_s) as fr3, DynamixelDriver(cfg) as driver:
         # warmup

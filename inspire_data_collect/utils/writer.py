@@ -141,6 +141,7 @@ class HandSample:
     observation_last_action: np.ndarray
     channels: dict[str, ObservationChannel] = field(default_factory=dict)
     commands: dict[str, EffectorCommand] = field(default_factory=dict)
+    arm_state: dict[str, Any] = field(default_factory=dict)
     hand_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     faults: list[str] = field(default_factory=list)
     camera_frames: dict[str, CameraFrameMatch] = field(default_factory=dict)
@@ -200,10 +201,37 @@ class HandSampleBuilder:
         value = vector_or_none(state.get("joint_pos"), length=HAND_DOF)
         return value if value is not None else nan_vector(HAND_DOF)
 
-    def _build_action_vector(self, commands: Mapping[str, EffectorCommand]) -> np.ndarray:
+    def _arm_command_or_nan(
+        self,
+        commands: Mapping[str, EffectorCommand],
+        arm_state: Mapping[str, Any] | None,
+    ) -> np.ndarray:
+        state = dict(arm_state or {})
+        actual_sent = vector_or_none(state.get("last_sent_command"), length=ARM_DOF)
+        if actual_sent is not None:
+            return actual_sent
+        command = commands.get("arm")
+        if command is None:
+            return nan_vector(ARM_DOF)
+        value = vector_or_none(command.value, length=ARM_DOF)
+        return value if value is not None else nan_vector(ARM_DOF)
+
+    def _arm_state_or_nan(
+        self,
+        arm_state: Mapping[str, Any] | None,
+    ) -> np.ndarray:
+        state = dict(arm_state or {})
+        value = vector_or_none(state.get("qpos"), length=ARM_DOF)
+        return value if value is not None else nan_vector(ARM_DOF)
+
+    def _build_action_vector(
+        self,
+        commands: Mapping[str, EffectorCommand],
+        arm_state: Mapping[str, Any] | None,
+    ) -> np.ndarray:
         return np.concatenate(
             (
-                nan_vector(ARM_DOF),
+                self._arm_command_or_nan(commands, arm_state),
                 *(self._hand_command_or_nan(commands, side) for side in HAND_VECTOR_ORDER),
             ),
             dtype=np.float32,
@@ -211,11 +239,12 @@ class HandSampleBuilder:
 
     def _build_observation_state(
         self,
+        arm_state: Mapping[str, Any] | None,
         hand_states: Mapping[str, Mapping[str, Any] | None],
     ) -> np.ndarray:
         return np.concatenate(
             (
-                nan_vector(ARM_DOF),
+                self._arm_state_or_nan(arm_state),
                 *(self._hand_state_or_nan(hand_states, side) for side in HAND_VECTOR_ORDER),
             ),
             dtype=np.float32,
@@ -259,6 +288,7 @@ class HandSampleBuilder:
         control_hz: float,
         channels: Mapping[str, ObservationChannel],
         commands: Mapping[str, EffectorCommand],
+        arm_state: Mapping[str, Any] | None,
         hand_states: Mapping[str, Mapping[str, Any] | None],
         camera_frames: Mapping[str, VideoFrame | None] | None = None,
         faults: list[str] | None = None,
@@ -267,8 +297,8 @@ class HandSampleBuilder:
         copied_commands = {
             name: command.copy() for name, command in commands.items()
         }
-        action = self._build_action_vector(copied_commands)
-        observation_state = self._build_observation_state(hand_states)
+        action = self._build_action_vector(copied_commands, arm_state)
+        observation_state = self._build_observation_state(arm_state, hand_states)
         sample = HandSample(
             index=int(self._sample_index),
             episode_index=int(self._episode_index),
@@ -284,6 +314,7 @@ class HandSampleBuilder:
                 name: channel.copy() for name, channel in channels.items()
             },
             commands=copied_commands,
+            arm_state={} if arm_state is None else dict(to_serializable(dict(arm_state))),
             hand_states={
                 str(side): dict(state or {}) for side, state in hand_states.items()
             },
@@ -341,10 +372,30 @@ def hand_sample_to_row(
 ) -> tuple[dict[str, Any], dict[str, bool]]:
     action_split = _split_action(sample.action)
     observation_split = _split_observation_state(sample.observation_state)
+    arm_state = sample.arm_state or {}
     command_metadata_by_effector = {
         name: {} if command.metadata is None else dict(command.metadata)
         for name, command in sample.commands.items()
     }
+    arm_command_metadata = command_metadata_by_effector.get("arm", {})
+    arm_side = str(
+        arm_state.get("arm_side")
+        or arm_command_metadata.get("arm_side")
+        or sample.metadata.get("arm_side")
+        or "right"
+    )
+    arm_enabled = bool(
+        arm_state.get("arm_enabled")
+        or sample.metadata.get("arm_enabled")
+        or ("arm" in sample.commands)
+    )
+    arm_state_source = str(
+        arm_state.get("state_source")
+        or ("fr3_joint_control_client.cached" if arm_enabled else "disabled")
+    )
+    clip_mask = arm_command_metadata.get("clip_mask")
+    if clip_mask is not None:
+        clip_mask = [bool(value) for value in list(clip_mask)]
     row: dict[str, Any] = {
         "index": int(sample.index),
         "episode_index": int(sample.episode_index),
@@ -353,7 +404,9 @@ def hand_sample_to_row(
         "session_state": sample.session_state,
         "control_hz": float(sample.control_hz),
         "active_sides": list(sample.active_sides),
-        "arm_state_source": "reserved_single_arm_7dof",
+        "arm_enabled": bool(arm_enabled),
+        "arm_side": arm_side,
+        "arm_state_source": arm_state_source,
         "camera_keys": sorted(sample.camera_frames.keys()),
         "fault_codes": list(sample.faults),
         "action": np.asarray(sample.action, dtype=np.float32).tolist(),
@@ -377,6 +430,35 @@ def hand_sample_to_row(
         ),
         "faults_json": json.dumps(to_serializable(sample.faults), ensure_ascii=True, sort_keys=True),
     }
+    row["observation.arm.dq"] = vector_list(arm_state.get("dq"), length=ARM_DOF)
+    row["observation.arm.controller_timestamp"] = arm_state.get("controller_timestamp")
+    row["observation.arm.receive_timestamp"] = arm_state.get("state_receive_timestamp")
+    row["observation.arm.cache_age_sec"] = arm_state.get("state_age_sec")
+    row["observation.arm.server_age_sec"] = arm_state.get("server_age_s")
+    row["observation.arm.state_error"] = arm_state.get("state_error")
+    row["observation.arm.raw_state_json"] = json.dumps(
+        to_serializable(arm_state.get("raw_state")),
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    row["action.replay.arm_joint_target"] = vector_list(
+        arm_state.get("last_sent_command"),
+        length=ARM_DOF,
+    )
+    row["action.arm.last_sent_timestamp"] = arm_state.get("last_sent_command_timestamp")
+    row["teleop.action_source.arm_exo_qpos"] = vector_list(
+        arm_command_metadata.get("source_qpos"),
+        length=ARM_DOF,
+    )
+    row["teleop.action_source.arm_source_timestamp"] = arm_command_metadata.get("source_timestamp")
+    row["teleop.action_source.arm_preclip_joint_target"] = vector_list(
+        arm_command_metadata.get("preclip_joint_target"),
+        length=ARM_DOF,
+    )
+    row["teleop.action_source.arm_clip_mask"] = clip_mask
+    row["teleop.action_source.arm_clipped"] = arm_command_metadata.get("clipped")
+    row["teleop.action_source.arm_mapping"] = arm_command_metadata.get("mapping")
+    row["teleop.action_source.arm_shrink_deg"] = arm_command_metadata.get("shrink_deg")
     for side in HAND_VECTOR_ORDER:
         hand_state = sample.hand_states.get(side) or {}
         command_metadata = command_metadata_by_effector.get(f"{side}_hand", {})
@@ -421,6 +503,7 @@ class WriterConfig:
     nominal_fps: float = 30.0
     parquet_compression: str = "zstd"
     video_codec: str = "mp4v"
+    task_name: str = ""
     task_id: str = "hand_only"
     task_description: str = ""
     dataset_name: str = ""
@@ -430,6 +513,10 @@ class WriterConfig:
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
+        self.task_name = str(self.task_name).strip()
+        self.task_id = str(self.task_id).strip()
+        self.task_description = str(self.task_description).strip()
+        self.dataset_name = str(self.dataset_name).strip() or self.root_dir.name
         if int(self.chunk_size) <= 0:
             raise ValueError("chunk_size must be positive.")
         if float(self.nominal_fps) <= 0.0:
@@ -525,21 +612,71 @@ class HandOnlyLeRobotWriter:
         self._next_episode_index = max_episode_index + 1
 
     def _ensure_task_manifest(self) -> None:
-        if not self.config.task_id:
+        task_name = self.config.task_name or self.config.task_description or self.config.task_id
+        if not task_name:
             return
-        existing = self.tasks_path.read_text(encoding="utf-8").splitlines()
-        task_prefix = f"\"task_id\": \"{self.config.task_id}\""
-        if any(task_prefix in line for line in existing):
-            return
-        _append_jsonl(
-            self.tasks_path,
-            {
-                "task_id": self.config.task_id,
-                "description": self.config.task_description,
-            },
-        )
+        existing_rows = _read_jsonl(self.tasks_path)
+        for row in existing_rows:
+            if row.get("task") == task_name:
+                return
+            if self.config.task_id and row.get("task_id") == self.config.task_id:
+                return
+        next_task_index = max(
+            [int(row.get("task_index", -1)) for row in existing_rows] + [-1]
+        ) + 1
+        task_record = {
+            "task_index": int(next_task_index),
+            "task": task_name,
+        }
+        if self.config.task_id:
+            task_record["task_id"] = self.config.task_id
+        if self.config.task_description:
+            task_record["description"] = self.config.task_description
+        _append_jsonl(self.tasks_path, task_record)
+
+    def _task_manifest_rows(self) -> list[dict[str, Any]]:
+        rows = _read_jsonl(self.tasks_path)
+        if rows:
+            return rows
+        task_name = self.config.task_name or self.config.task_description or self.config.task_id
+        if not task_name:
+            return []
+        task_record = {
+            "task_index": 0,
+            "task": task_name,
+        }
+        if self.config.task_id:
+            task_record["task_id"] = self.config.task_id
+        if self.config.task_description:
+            task_record["description"] = self.config.task_description
+        return [task_record]
+
+    def _task_names(self) -> list[str]:
+        tasks: list[str] = []
+        for row in self._task_manifest_rows():
+            task = str(row.get("task", "")).strip()
+            if task and task not in tasks:
+                tasks.append(task)
+        return tasks
+
+    def _primary_task_index(self) -> int | None:
+        task_name = self.config.task_name or self.config.task_description or self.config.task_id
+        if not task_name:
+            return None
+        for row in self._task_manifest_rows():
+            if row.get("task") == task_name:
+                try:
+                    return int(row.get("task_index"))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _primary_task_name(self) -> str:
+        return self.config.task_name or self.config.task_description or self.config.task_id
 
     def _write_info_locked(self) -> None:
+        task_names = self._task_names()
+        primary_task_index = self._primary_task_index()
         _write_json(
             self.info_path,
             {
@@ -552,8 +689,11 @@ class HandOnlyLeRobotWriter:
                 "write_parquet": bool(self.config.write_parquet),
                 "write_video": bool(self.config.write_video),
                 "video_codec": str(self.config.video_codec),
+                "task_name": self._primary_task_name(),
                 "task_id": self.config.task_id,
                 "task_description": self.config.task_description,
+                "task_index": primary_task_index,
+                "tasks": task_names,
                 "reserved_spaces": {
                     "single_arm_dof": ARM_DOF,
                     "action.arm.joint_target": {"shape": [ARM_DOF], "slice": [0, ARM_DOF]},
@@ -578,6 +718,14 @@ class HandOnlyLeRobotWriter:
                     "observation.last_action": {"shape": [ACTION_DIM], "dtype": "float32"},
                     "action.arm.joint_target": {"shape": [ARM_DOF], "dtype": "float32"},
                     "observation.arm.qpos": {"shape": [ARM_DOF], "dtype": "float32"},
+                    "action.replay.arm_joint_target": {"shape": [ARM_DOF], "dtype": "float32"},
+                    "observation.arm.dq": {"shape": [ARM_DOF], "dtype": "float32"},
+                    "teleop.action_source.arm_exo_qpos": {"shape": [ARM_DOF], "dtype": "float32"},
+                    "teleop.action_source.arm_preclip_joint_target": {
+                        "shape": [ARM_DOF],
+                        "dtype": "float32",
+                    },
+                    "teleop.action_source.arm_clip_mask": {"shape": [ARM_DOF], "dtype": "bool"},
                     "action.right_hand.joint_target": {"shape": [HAND_DOF], "dtype": "float32"},
                     "action.left_hand.joint_target": {"shape": [HAND_DOF], "dtype": "float32"},
                     "observation.right_hand.qpos": {"shape": [HAND_DOF], "dtype": "float32"},
@@ -898,7 +1046,9 @@ class HandOnlyLeRobotWriter:
             "mean_control_hz": mean_control_hz,
             "nominal_fps": float(self.config.nominal_fps),
             "active_sides": list(rows[0].get("active_sides", [])),
-            "arm_state_source": "reserved_single_arm_7dof",
+            "arm_enabled": bool(rows[0].get("arm_enabled", False)),
+            "arm_side": rows[0].get("arm_side"),
+            "arm_state_source": rows[0].get("arm_state_source"),
             "camera_keys": camera_keys,
             "fault_count": int(sum(len(row.get("fault_codes", [])) for row in rows)),
         }
