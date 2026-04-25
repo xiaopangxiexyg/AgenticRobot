@@ -324,7 +324,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite.")
     parser.add_argument("--status-sec", type=_positive_float, default=2.0, help="Status print interval in seconds.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.no_camera):
+        args.write_video = False
+    return args
 
 
 @dataclass(frozen=True)
@@ -1175,6 +1178,8 @@ def main() -> int:
                     for camera_key, source in app.camera_sources.items()
                 },
             )
+        elif args.no_camera:
+            _log("Camera", "--no-camera active; no RealSense config was loaded and no camera sources were started.")
 
         _log("Collect", f"ready -> {args.dataset_root}")
         _log("Keys", "p=calibrate/follow, z=start recording, c=save episode, d=discard recording, h=hold+clear home, q=quit; keys are case-insensitive.")
