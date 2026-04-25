@@ -47,6 +47,7 @@ from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
 from ..tactile_visualizer import (
+    AsyncTactileUVVisualizer,
     TactileUVVisualizer,
     TactileVisualizerConfig,
     tactile_by_side_from_backends,
@@ -1449,16 +1450,17 @@ def _hand_backend_for_side(
 def _build_tactile_visualizer(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
-) -> TactileUVVisualizer | None:
+) -> TactileUVVisualizer | AsyncTactileUVVisualizer | None:
     if not bool(args.visualize_tactile):
         return None
-    return TactileUVVisualizer(
-        TactileVisualizerConfig(
-            enabled_sides=active_sides,
-            image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
-            value_scale=float(args.tactile_vis_value_scale),
-        )
+    config = TactileVisualizerConfig(
+        enabled_sides=active_sides,
+        image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+        value_scale=float(args.tactile_vis_value_scale),
     )
+    if not bool(args.skip_renderer):
+        return AsyncTactileUVVisualizer(config)
+    return TactileUVVisualizer(config)
 
 
 def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
@@ -1470,6 +1472,15 @@ def main() -> None:
     args = parse_args()
     components = _build_components(args)
     tactile_visualizer = _build_tactile_visualizer(args, components.active_sides)
+    if tactile_visualizer is not None:
+        tactile_vis_mode = (
+            "subprocess" if isinstance(tactile_visualizer, AsyncTactileUVVisualizer) else "same_process"
+        )
+        _log(
+            "TactileVis",
+            f"enabled mode={tactile_vis_mode} active_sides={list(components.active_sides)} "
+            f"regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', ())))}",
+        )
     clutch_input = TerminalClutchInput(components.keyboard_source)
     episode_recorder = EpisodeRecorder(
         root_dir=_episode_root_dir(args, components),
