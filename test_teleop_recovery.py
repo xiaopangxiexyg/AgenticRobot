@@ -14,6 +14,7 @@ from scipy.spatial.transform import Rotation as R
 
 from teleop_runtime.backends.hands.inspire_tac import InspireTacHandBackend, InspireTacHandBackendConfig
 from teleop_runtime.calibration import TeleopCalibration
+from teleop_runtime.collection.run_collect import _drive_recovery_step, build_collect_app, parse_args
 from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.debug.run_vive_sapien_virtual import (
     _build_optional_hand_command,
@@ -36,7 +37,7 @@ from teleop_runtime.retargeters.joints_to_dexhand import (
     JointsToDexHandRetargeterConfig,
 )
 from teleop_runtime.safety import SafetyMonitor, TeleopSafetyConfig
-from teleop_runtime.schemas import ObservationChannel
+from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.schemas import TeleopObservation
 from teleop_runtime.session import TeleopSession, TeleopSessionConfig
 from teleop_runtime.sources.hand import HandQ6Source
@@ -310,6 +311,202 @@ class TeleopRecoveryTests(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_collect_recovery_driver_sends_delta_command_and_finishes(self) -> None:
+        sent_commands = []
+
+        class FakeRig:
+            def send_commands(self, command):
+                sent_commands.append(command)
+
+        class FakeSession:
+            def __init__(self):
+                self.rig = FakeRig()
+                self.finished = []
+
+            def build_command(self, observation):
+                command = TeleopCommand(timestamp=observation.timestamp)
+                command.add_command(
+                    EffectorCommand(
+                        effector_name="left_arm",
+                        side="left",
+                        command_type="joint_vector",
+                        value=np.zeros(6, dtype=float),
+                    )
+                )
+                return command
+
+            def finish_recovery(self, reason):
+                self.finished.append(reason)
+
+        class FakePoseRetargeter:
+            def __init__(self):
+                self.reanchors = []
+
+            def reanchor_to_current_input(self, observation, calibration, *, robot_pose_desk):
+                del observation, calibration
+                self.reanchors.append(np.asarray(robot_pose_desk, dtype=float).copy())
+
+        session = FakeSession()
+        pose_retargeter = FakePoseRetargeter()
+        app = SimpleNamespace(
+            active_sides=("left",),
+            components=SimpleNamespace(session=session),
+            calibration=None,
+            pose_retargeters={"left": pose_retargeter},
+            hand_retargeters={},
+            dual_arm_retargeter=None,
+        )
+        observation = TeleopObservation(channels={}, timestamp=123.0)
+        result = SimpleNamespace(
+            state=TeleopRunState.RECOVERING,
+            observation=observation,
+        )
+        args = SimpleNamespace(control_mode="delta_clutch", recovery_ramp_sec=1.0)
+
+        with patch(
+            "teleop_runtime.collection.run_collect._backend_tcp_pose_desk",
+            return_value=identity_pose(),
+        ), patch(
+            "teleop_runtime.collection.run_collect._seed_dual_arm_retargeter_from_backends",
+            return_value=None,
+        ):
+            next_plan = _drive_recovery_step(
+                app,
+                args,
+                result,
+                None,
+                now=1.0,
+            )
+
+        self.assertIsNone(next_plan)
+        self.assertEqual(session.finished, ["recovery completed"])
+        self.assertEqual(len(sent_commands), 1)
+        self.assertIn("left_arm", sent_commands[0].commands)
+        self.assertEqual(len(pose_retargeter.reanchors), 1)
+
+    def test_collect_recovery_driver_advances_absolute_ramp_and_finishes(self) -> None:
+        sent_commands = []
+
+        class FakeRig:
+            def send_commands(self, command):
+                sent_commands.append(command)
+
+        class FakeSession:
+            def __init__(self):
+                self.rig = FakeRig()
+                self.finished = []
+
+            def finish_recovery(self, reason):
+                self.finished.append(reason)
+
+        class FakePoseRetargeter:
+            def __init__(self):
+                self.resolved = 0
+                self.built_targets = []
+
+            def resolve_absolute_target_from_observation(self, observation, calibration):
+                del observation, calibration
+                self.resolved += 1
+                target_pose = identity_pose()
+                target_pose[0, 3] = 0.2
+                return {"target_pose_desk": target_pose, "pose_operator": None}
+
+            def build_command_from_target_pose_desk(
+                self,
+                *,
+                target_pose_desk,
+                observation,
+                calibration,
+                pose_operator=None,
+            ):
+                del calibration, pose_operator
+                self.built_targets.append(np.asarray(target_pose_desk, dtype=float).copy())
+                command = TeleopCommand(timestamp=observation.timestamp)
+                command.add_command(
+                    EffectorCommand(
+                        effector_name="left_arm",
+                        side="left",
+                        command_type="cartesian_pose",
+                        value=np.asarray(target_pose_desk, dtype=float),
+                    )
+                )
+                return command
+
+        session = FakeSession()
+        pose_retargeter = FakePoseRetargeter()
+        app = SimpleNamespace(
+            active_sides=("left",),
+            components=SimpleNamespace(session=session),
+            calibration=None,
+            pose_retargeters={"left": pose_retargeter},
+            hand_retargeters={},
+            dual_arm_retargeter=None,
+        )
+        observation = TeleopObservation(channels={}, timestamp=123.0)
+        result = SimpleNamespace(
+            state=TeleopRunState.RECOVERING,
+            observation=observation,
+        )
+        args = SimpleNamespace(control_mode="absolute", recovery_ramp_sec=1.0)
+
+        with patch(
+            "teleop_runtime.collection.run_collect._backend_tcp_pose_desk",
+            return_value=identity_pose(),
+        ), patch(
+            "teleop_runtime.collection.run_collect._seed_dual_arm_retargeter_from_backends",
+            return_value=None,
+        ):
+            plan = _drive_recovery_step(
+                app,
+                args,
+                result,
+                None,
+                now=10.0,
+            )
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.mode, "absolute_ramp_independent")
+            self.assertEqual(sent_commands, [])
+            self.assertEqual(session.finished, [])
+
+            next_plan = _drive_recovery_step(
+                app,
+                args,
+                result,
+                plan,
+                now=11.1,
+            )
+
+        self.assertIsNone(next_plan)
+        self.assertEqual(session.finished, ["recovery completed"])
+        self.assertEqual(len(sent_commands), 1)
+        self.assertIn("left_arm", sent_commands[0].commands)
+        self.assertEqual(pose_retargeter.resolved, 1)
+        np.testing.assert_allclose(pose_retargeter.built_targets[-1][0, 3], 0.2)
+
+    def test_collect_default_invalid_frame_limit_matches_real_teleop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--dataset-root",
+                    tmp_dir,
+                    "--active-sides",
+                    "left",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--no-camera",
+                    "--no-video",
+                ],
+            ):
+                args = parse_args()
+            app = build_collect_app(args)
+            try:
+                self.assertEqual(app.components.session.safety_monitor.config.invalid_frame_limit, 3)
+            finally:
+                app.runtime.close()
+
     def test_optional_hand_source_startup_failure_is_fail_open(self) -> None:
         source = HandQ6Source.from_single_hand(
             port="/dev/fake_left_hand",
@@ -343,6 +540,145 @@ class TeleopRecoveryTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 source.start()
+
+    def test_hand_source_recovers_after_transient_read_error(self) -> None:
+        created_readers = []
+
+        class FakeSerial:
+            def __init__(self):
+                self.is_open = True
+                self.open_count = 0
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+                self.is_open = False
+
+            def open(self):
+                self.open_count += 1
+                self.is_open = True
+
+            def reset_input_buffer(self):
+                return None
+
+            def reset_output_buffer(self):
+                return None
+
+        class RecoveringReader:
+            def __init__(self, *, port, side, baudrate, timeout, **kwargs):
+                del timeout, kwargs
+                self.port = port
+                self.side = side
+                self.baudrate = baudrate
+                self.ser = FakeSerial()
+                self.calls = 0
+                created_readers.append(self)
+
+            def read_frame(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("transient serial error")
+                return {
+                    "timestamp": np.asarray([time.time()], dtype=float),
+                    "norm": np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
+                    "port": self.port,
+                    "baudrate": self.baudrate,
+                }
+
+            def close(self):
+                self.ser.close()
+
+        source = HandQ6Source.from_single_hand(
+            port="/dev/fake_left_hand",
+            side="left",
+            critical=False,
+            strict_expected=False,
+        )
+        source._READ_ERROR_RETRY_SEC = 0.01
+        source._READ_ERROR_LOG_INTERVAL_SEC = 60.0
+        with patch(
+            "hardware.teleop_hand.hand_q6_reader.SingleHandQ6Reader",
+            RecoveringReader,
+        ):
+            source.start()
+            try:
+                channel = None
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    channel = source.get_latest_channels().get("left_hand_q6")
+                    if channel is not None and channel.valid:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(channel)
+                assert channel is not None
+                self.assertTrue(channel.valid)
+                np.testing.assert_allclose(
+                    channel.value,
+                    np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=float),
+                )
+                self.assertEqual(channel.metadata["reader_recovery_count"], 1)
+                self.assertGreaterEqual(created_readers[0].ser.open_count, 1)
+            finally:
+                source.close()
+
+    def test_inspire_hand_backend_reconnects_and_retries_failed_send(self) -> None:
+        fake_modbus_module = types.ModuleType("hardware.inspire_tac.inspire_tac_modbus")
+        created_hands = []
+
+        class FakeModbus:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+                self.index = len(created_hands) + 1
+                self.sent = []
+                self.closed = False
+                created_hands.append(self)
+
+            def set_joint_pos(self, target):
+                if self.index == 1:
+                    raise RuntimeError("write failed")
+                self.sent.append(list(target))
+
+            def close(self):
+                self.closed = True
+
+        fake_modbus_module.InspireTacModbus = FakeModbus
+        backend = InspireTacHandBackend(
+            InspireTacHandBackendConfig(
+                hand_ip="192.0.2.2",
+                side="left",
+                connect_hardware=True,
+                reconnect_cooldown_sec=0.0,
+            )
+        )
+        with patch.dict(sys.modules, {"hardware.inspire_tac.inspire_tac_modbus": fake_modbus_module}):
+            backend.start()
+            backend.send_command(
+                EffectorCommand(
+                    effector_name="left_hand",
+                    side="left",
+                    command_type="joint_vector",
+                    value=np.asarray([0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=float),
+                )
+            )
+        try:
+            self.assertEqual(len(created_hands), 2)
+            self.assertTrue(created_hands[0].closed)
+            state = backend.get_state()
+            self.assertEqual(state["reconnect_count"], 1)
+            self.assertIsNone(state["telemetry_error"])
+            self.assertEqual(len(created_hands[1].sent), 1)
+            np.testing.assert_allclose(
+                np.asarray(created_hands[1].sent[0], dtype=float),
+                np.asarray([0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=float),
+                atol=1e-6,
+            )
+            np.testing.assert_allclose(
+                state["joint_pos"],
+                np.asarray([0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=float),
+                atol=1e-6,
+            )
+        finally:
+            backend.close()
 
     def test_inspire_q6_render_mapping_expands_to_hand_q12(self) -> None:
         q12 = inspire_q6_to_render_qpos([1.0, 0.5, 1.0, 0.0, 0.25, 0.75])

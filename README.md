@@ -5,7 +5,7 @@
 默认假设在采集电脑上执行，工作目录固定为：
 
 ```bash
-cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop
+cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 ```
@@ -48,6 +48,35 @@ export LEFT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if
 export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00
 ```
 
+### 遥操作手 zero pose 固定标定
+
+q6 遥操作手默认读取固定 zero pose 标定，不再每次启动都要求保持 zero pose。固定标定文件是：
+
+```text
+hardware/teleop_hand/exo_hand_zero_pose.json
+```
+
+当前文件由 18 次 zero pose 记录汇总得到，稳定性摘要：
+
+| 侧别 | 记录数 | 最大 span |
+| --- | ---: | ---: |
+| left | 9 | `0.0315 deg` |
+| right | 9 | `0.2700 deg` |
+
+正常 teleop 和采集命令不需要额外参数。如果更换外骨骼、重新装配手指连杆、或希望更新固定值，再显式加 `--exo-hand-calibration`。该模式会重新做 zero pose 稳定检查，保存本次结果，并更新上面的固定标定 JSON。
+
+最简重新标定命令：
+
+```bash
+python hardware/teleop_hand/check_zero_pose_calibration.py \
+  --left-port "$LEFT_HAND_PORT" \
+  --right-port "$RIGHT_HAND_PORT" \
+  --rounds 1 \
+  --exo-hand-calibration
+```
+
+如果只想多次检查稳定性而不更新固定值，去掉 `--exo-hand-calibration`，并把 `--rounds` 调大即可。
+
 ## 2. 单摄像头配置
 
 默认单相机配置文件已经固定到：
@@ -77,6 +106,8 @@ teleop_runtime/configs/devices/realsense.json
 ```text
 videos/observation.images.front/chunk-000/episode_000000.mp4
 ```
+
+如果需要采集时同时查看实时 RealSense RGB 画面，给采集命令追加 `--vis_cam`。预览窗口使用实际采集的帧和分辨率，例如当前 `front` 是 `1280x720@30`。`--vis_cam` 不能和 `--no-camera` 同时使用；传 `--no-camera` 时程序从启动阶段就不会连接任何 RealSense。
 
 如果相机启动失败，先确认系统能看到该 serial：
 
@@ -170,6 +201,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 
 检查点：
 
+- 默认使用固定 q6 zero pose 标定；只有需要更新固定值时才追加 `--exo-hand-calibration`。
 - 按 `p` 前双臂必须在安全起始位。
 - `p` 后才进入本次 session 的 home 对齐和随动。
 - 先小范围移动 wrist tracker，确认机械臂方向和速度安全。
@@ -204,6 +236,7 @@ python -m teleop_runtime.collection.run_collect \
   --visualize-tactile \
   --tactile-vis-value-scale 0.02 \
   --camera-config "$CAMERA_CONFIG" \
+  --vis_cam \
   --write-video \
   --hz 30 \
   --nominal-fps 30 \
@@ -218,6 +251,8 @@ python -m teleop_runtime.collection.run_collect \
 ```bash
 --max-steps 300
 ```
+
+如果当前终端没有显示环境，删除 `--vis_cam`；这不会影响视频写盘。需要完全不占用相机时才使用 `--no-camera`，此时也不会写出 RealSense 视频。
 
 采集按键流程：
 
@@ -309,6 +344,8 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 | 机械臂方向不对 | 先回到 virtual SAPIEN 验证 profile，不要直接在真机上调 |
 | 相机启动失败 | `realsense.json` serial 是否为 `213222079798`，`pyrealsense2` 是否能枚举设备 |
 | 没有 mp4 | 是否误传 `--no-camera` 或 `--no-video`，`meta/episodes.jsonl` 的 `video_paths` 是否为空 |
+| q6 手部开合零位不对 | 先检查是否更换过外骨骼或连杆；需要更新固定值时运行 `--exo-hand-calibration` |
+| `--vis_cam` 没窗口 | 当前终端是否有 `DISPLAY` 或 `WAYLAND_DISPLAY`；无显示环境时删除该参数 |
 | 回放没有视频窗口 | 使用 `--video-mode window`，并确认当前终端有 `DISPLAY` 或 `WAYLAND_DISPLAY` |
 | 采集频率下降 | 降低 tactile 区域/频率，先用 `--hand-telemetry-hz 10`，相机长测前先做短测 |
 
@@ -317,6 +354,9 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 已接入：
 
 - 单 RealSense RGB 配置：`front`，serial `213222079798`
+- q6 遥操作手固定 zero pose 标定，支持 `--exo-hand-calibration` 更新固定值
+- 采集时 RealSense 实时预览：`--vis_cam`
+- `--no-camera` 从启动阶段跳过 RealSense 连接和视频写盘
 - 采集写出：parquet、meta、calibration、device config、mp4
 - SAPIEN 回放：双臂双手 action replay
 - 视频回放：OpenCV window，按 parquet 的 `video_frame_index` 同步
