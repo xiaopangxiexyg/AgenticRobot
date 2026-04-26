@@ -38,7 +38,7 @@ datasets
 .ruff_cache/
 teleop_records/*
 !teleop_records/calibration_profiles/
-
+!teleop_records/hand_zero_pose_calibrations/
 *.egg-info/
 *.whl
 

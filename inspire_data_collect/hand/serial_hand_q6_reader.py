@@ -35,6 +35,62 @@ def _safe_name(text: object) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", str(text or "unknown")).strip("_") or "unknown"
 
 
+def _unique_text(values: Sequence[object]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _port_identity(port: str | None) -> dict[str, object]:
+    if not port:
+        return {"port": None, "port_realpath": None, "port_aliases": []}
+    port_text = str(port)
+    aliases: list[str] = [port_text]
+    realpath: str | None = None
+    try:
+        path = Path(port_text)
+        if path.exists():
+            realpath = str(path.resolve())
+            aliases.append(realpath)
+    except OSError:
+        realpath = None
+
+    if realpath is not None:
+        for alias_dir in (Path("/dev/serial/by-id"), Path("/dev/serial/by-path")):
+            if not alias_dir.exists():
+                continue
+            try:
+                candidates = sorted(alias_dir.iterdir())
+            except OSError:
+                continue
+            for candidate in candidates:
+                try:
+                    if str(candidate.resolve()) == realpath:
+                        aliases.append(str(candidate))
+                except OSError:
+                    continue
+    return {
+        "port": port_text,
+        "port_realpath": realpath,
+        "port_aliases": _unique_text(aliases),
+    }
+
+
+def _stable_port_aliases(aliases: Sequence[object]) -> set[str]:
+    stable_prefixes = ("/dev/serial/by-id/", "/dev/serial/by-path/")
+    return {
+        str(alias)
+        for alias in aliases
+        if str(alias).startswith(stable_prefixes)
+    }
+
+
 def _offset_for_side(side: str) -> np.ndarray:
     offset = np.asarray(OFFSET, dtype=np.float32)
     if str(side) == "left":
@@ -42,24 +98,126 @@ def _offset_for_side(side: str) -> np.ndarray:
     return offset
 
 
-def _calibration_from_deg_at_0(side: str, deg_at_0: Sequence[float]) -> dict[str, np.ndarray]:
-    deg0 = np.asarray(deg_at_0, dtype=np.float32).reshape(6)
-    offset = _offset_for_side(side)
-    return {"deg_at_0": deg0, "deg_at_1": deg0 + offset}
+def _calibration_from_payload(side: str, payload: dict[str, Any]) -> dict[str, np.ndarray]:
+    deg0 = np.asarray(payload["deg_at_0"], dtype=np.float32).reshape(6)
+    if "deg_at_1" in payload:
+        deg1 = np.asarray(payload["deg_at_1"], dtype=np.float32).reshape(6)
+    else:
+        deg1 = deg0 + _offset_for_side(side)
+    return {"deg_at_0": deg0, "deg_at_1": deg1}
+
+
+def _find_port_calibration_payload(
+    payload: dict[str, Any],
+    *,
+    side: str,
+    port: str,
+) -> dict[str, Any] | None:
+    side_registry = payload.get("port_calibrations", {}).get(str(side), {})
+    if not isinstance(side_registry, dict):
+        return None
+    identity = _port_identity(port)
+    aliases = set(str(alias) for alias in identity.get("port_aliases", []))
+    stable_aliases = _stable_port_aliases(tuple(aliases))
+    preferred_aliases = stable_aliases if stable_aliases else aliases
+    for alias in preferred_aliases:
+        value = side_registry.get(alias)
+        if isinstance(value, dict):
+            return value
+    for value in side_registry.values():
+        if not isinstance(value, dict):
+            continue
+        entry_aliases = set(str(alias) for alias in value.get("port_aliases", []))
+        for key in ("port", "port_realpath"):
+            if value.get(key):
+                entry_aliases.add(str(value[key]))
+        if preferred_aliases.intersection(entry_aliases):
+            return value
+    return None
+
+
+def _record_matches_port_identity(record: dict[str, Any], identity: dict[str, object]) -> bool:
+    aliases = set(str(alias) for alias in identity.get("port_aliases", []))
+    stable_aliases = _stable_port_aliases(tuple(aliases))
+    preferred_aliases = stable_aliases if stable_aliases else aliases
+    record_aliases = set(str(alias) for alias in record.get("port_aliases", []))
+    for key in ("port", "port_realpath"):
+        if record.get(key):
+            record_aliases.add(str(record[key]))
+    return bool(preferred_aliases.intersection(record_aliases))
+
+
+def _load_latest_zero_pose_record_for_port(
+    *,
+    side: str,
+    port: str,
+    record_dir: str | Path | None = None,
+) -> tuple[dict[str, Any], Path] | None:
+    root = Path(record_dir) if record_dir is not None else _default_zero_pose_record_dir()
+    if not root.exists():
+        return None
+    identity = _port_identity(port)
+    matches: list[tuple[float, Path, dict[str, Any]]] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(payload.get("side")) != str(side):
+            continue
+        if not _record_matches_port_identity(payload, identity):
+            continue
+        try:
+            timestamp = float(payload.get("timestamp", 0.0))
+        except Exception:
+            timestamp = 0.0
+        matches.append((timestamp, path, payload))
+    if not matches:
+        return None
+    _, path, payload = max(matches, key=lambda item: item[0])
+    return payload, path
 
 
 def load_exo_hand_calibration(
     side: str,
     calibration_path: str | Path | None = None,
+    *,
+    port: str | None = None,
 ) -> dict[str, np.ndarray]:
     path = Path(calibration_path) if calibration_path is not None else _default_exo_hand_calibration_path()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if port is not None:
+        port_payload = _find_port_calibration_payload(payload, side=str(side), port=str(port))
+        if port_payload is None:
+            record_match = _load_latest_zero_pose_record_for_port(side=str(side), port=str(port))
+            if record_match is None:
+                raise KeyError(
+                    f"Missing port-specific exo hand zero pose calibration for "
+                    f"side={side!r}, port={port!r} in {path}"
+                )
+            record_payload, record_path = record_match
+            calib = _calibration_from_payload(str(side), record_payload)
+            _update_fixed_exo_hand_calibration(
+                side=str(side),
+                port=str(port),
+                baudrate=record_payload.get("baudrate"),
+                deg_at_0=calib["deg_at_0"],
+                record_path=record_path,
+                calibration_path=path,
+            )
+            print(
+                f"[Calib:{side}] imported latest zero pose record for port={port} "
+                f"from {record_path}"
+            )
+            return calib
+        calib = _calibration_from_payload(str(side), port_payload)
+        print(f"[Calib:{side}] loaded port-marked exo hand zero pose for port={port} <- {path}")
+        return calib
     try:
         side_payload = payload["calibrations"][str(side)]
-        deg_at_0 = side_payload["deg_at_0"]
     except KeyError as exc:
         raise KeyError(f"Missing fixed exo hand zero pose calibration for side={side!r} in {path}") from exc
-    calib = _calibration_from_deg_at_0(str(side), deg_at_0)
+    calib = _calibration_from_payload(str(side), side_payload)
     print(f"[Calib:{side}] loaded fixed exo hand zero pose <- {path}")
     return calib
 
@@ -67,6 +225,8 @@ def load_exo_hand_calibration(
 def _update_fixed_exo_hand_calibration(
     *,
     side: str,
+    port: str | None,
+    baudrate: int | None,
     deg_at_0: np.ndarray,
     record_path: Path | None,
     calibration_path: str | Path | None = None,
@@ -79,21 +239,40 @@ def _update_fixed_exo_hand_calibration(
     payload.setdefault("calibrations", {})
     offset = _offset_for_side(side)
     deg0 = np.asarray(deg_at_0, dtype=float).reshape(6)
-    payload["calibrations"][str(side)] = {
+    side_entry = {
         "deg_at_0": deg0.tolist(),
         "offset": np.asarray(offset, dtype=float).tolist(),
         "deg_at_1": (deg0 + np.asarray(offset, dtype=float)).tolist(),
     }
+    payload["calibrations"][str(side)] = dict(side_entry)
     timestamp = time.time()
+    identity = _port_identity(port)
+    port_key = str(port) if port is not None else f"{side}_unknown_port"
+    port_entry = {
+        **side_entry,
+        "side": str(side),
+        "baudrate": None if baudrate is None else int(baudrate),
+        "record_path": None if record_path is None else str(record_path),
+        "updated_at": timestamp,
+        "updated_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
+        **identity,
+    }
+    payload.setdefault("port_calibrations", {})
+    payload["port_calibrations"].setdefault(str(side), {})
+    payload["port_calibrations"][str(side)][port_key] = port_entry
+    for alias in identity.get("port_aliases", []):
+        payload["port_calibrations"][str(side)][str(alias)] = port_entry
     payload["updated_at"] = timestamp
     payload["updated_at_local"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
     payload["last_update"] = {
         "side": str(side),
+        "port": None if port is None else str(port),
+        "baudrate": None if baudrate is None else int(baudrate),
         "record_path": None if record_path is None else str(record_path),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"[Calib:{side}] updated fixed exo hand zero pose -> {path}")
+    print(f"[Calib:{side}] updated exo hand zero pose registry for port={port} -> {path}")
     return path
 
 
@@ -122,11 +301,14 @@ def _save_zero_pose_calibration_record(
         f"{_safe_name(side)}_{_safe_name(port)}.json"
     )
     path = record_dir / filename
+    identity = _port_identity(port)
     payload = {
         "timestamp": timestamp,
         "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
         "side": str(side),
         "port": None if port is None else str(port),
+        "port_realpath": identity.get("port_realpath"),
+        "port_aliases": identity.get("port_aliases", []),
         "baudrate": None if baudrate is None else int(baudrate),
         "q6_order": list(Q6_ORDER),
         "zero_pose_required": True,
@@ -239,6 +421,8 @@ def auto_calibrate(
     if update_fixed:
         _update_fixed_exo_hand_calibration(
             side=side,
+            port=port,
+            baudrate=baudrate,
             deg_at_0=deg_at_0,
             record_path=record_path,
             calibration_path=calibration_path,
@@ -328,10 +512,10 @@ class SingleHandQ6Reader:
             "(for ttyACM USB CDC devices, baudrate may be nominal)"
         )
         self.ser = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=self.timeout)
-        self.calib = (
-            None
-            if self.raw_only
-            else auto_calibrate(
+        if self.raw_only:
+            self.calib = None
+        elif self.exo_hand_calibration:
+            self.calib = auto_calibrate(
                 ser=self.ser,
                 side=self.side,
                 port=self.port,
@@ -340,9 +524,28 @@ class SingleHandQ6Reader:
                 update_fixed=True,
                 calibration_path=self.calibration_path,
             )
-            if self.exo_hand_calibration
-            else load_exo_hand_calibration(self.side, self.calibration_path)
-        )
+        else:
+            try:
+                self.calib = load_exo_hand_calibration(
+                    self.side,
+                    self.calibration_path,
+                    port=self.port,
+                )
+            except KeyError as exc:
+                print(f"[Calib:{self.side}] {exc}")
+                print(
+                    f"[Calib:{self.side}] port={self.port} is not marked; "
+                    "running zero pose calibration and recording it."
+                )
+                self.calib = auto_calibrate(
+                    ser=self.ser,
+                    side=self.side,
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    show_raw_lines=self.show_raw_lines,
+                    update_fixed=True,
+                    calibration_path=self.calibration_path,
+                )
 
     def read_frame(self) -> dict[str, object]:
         while True:

@@ -132,13 +132,15 @@ ls -l /dev/serial/by-id/
 
 右手示例；左手把变量和通道名改成 `LEFT_HAND_PORT` / `left_hand_q6`。
 
-默认会读取仓库内固定标定：
+默认会读取仓库内标定注册表：
 
 ```text
 hardware/teleop_hand/exo_hand_zero_pose.json
 ```
 
-这份标定由 18 次 zero pose 记录汇总得到，当前最大 span 为 left `0.0315 deg`、right `0.2700 deg`。因此普通采集不需要每次重新保持 zero pose。若更换外骨骼、重新装配手指连杆，或需要更新固定值，再显式运行 zero pose 标定：
+采集启动时会按当前 `side + port` 查找 `port_calibrations`。如果注册表还没有当前串口，但 `teleop_records/hand_zero_pose_calibrations/` 里已有匹配的历史记录，程序会自动导入最新记录；如果两处都没有，程序会要求保持 zero pose 并自动重新标定，然后把结果写回注册表和时间戳记录。若更换外骨骼、重新装配手指连杆，或需要强制更新当前串口记录，在采集命令中追加 `--exo-hand-calibration`。
+
+也可以用下面的检查工具手动更新：
 
 ```bash
 python hardware/teleop_hand/check_zero_pose_calibration.py \
@@ -148,7 +150,7 @@ python hardware/teleop_hand/check_zero_pose_calibration.py \
   --exo-hand-calibration
 ```
 
-去掉 `--exo-hand-calibration` 时只保存每次检查结果，不更新固定标定 JSON。
+去掉 `--exo-hand-calibration` 时只保存每次检查结果，不更新固定标定 JSON。正式采集建议使用 `/dev/serial/by-id/...` 这类稳定 port 名称；程序也会记录当前 port 的 realpath 和 by-id/by-path alias，后续同一设备换成等价 alias 时仍可匹配。
 
 ```bash
 export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
@@ -319,7 +321,7 @@ PY
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
 
-正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致。`--vis_cam` 只支持 `--camera-mode single`。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小。`--vis_cam` 只支持 `--camera-mode single`。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 

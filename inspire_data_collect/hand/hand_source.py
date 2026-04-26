@@ -150,6 +150,11 @@ class HandQ6Source:
             "reader_error_count": int(self._reader_error_counts.get(side, 0)),
             "reader_recovery_count": int(self._reader_recovery_counts.get(side, 0)),
         }
+        for key in ("deg_at_0", "deg_at_1"):
+            if key in packet:
+                metadata[key] = np.asarray(packet[key], dtype=float).reshape(-1).tolist()
+        if "q6_order" in packet:
+            metadata["q6_order"] = list(packet["q6_order"])
         if recovered_after_errors > 0:
             metadata["recovered_after_errors"] = int(recovered_after_errors)
         return ObservationChannel(

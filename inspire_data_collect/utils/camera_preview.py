@@ -13,6 +13,7 @@ class CameraPreviewConfig:
     window_prefix: str = "realsense"
     preflight_highgui: bool = True
     preflight_timeout_sec: float = 3.0
+    resizable_window: bool = True
 
 
 class CameraPreviewer:
@@ -63,7 +64,8 @@ class CameraPreviewer:
         if name in self._window_names:
             return
         cv2 = self._require_cv2()
-        cv2.namedWindow(name, cv2.WINDOW_AUTOSIZE)
+        flag = cv2.WINDOW_NORMAL if self.config.resizable_window else cv2.WINDOW_AUTOSIZE
+        cv2.namedWindow(name, flag)
         self._window_names.add(name)
 
     def _display_image(self, frame: Any) -> np.ndarray:
