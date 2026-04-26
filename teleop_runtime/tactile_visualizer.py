@@ -108,6 +108,7 @@ class TactileUVVisualizer:
             "right": self._build_layout_pixel_coords("right"),
         }
         self._canvas = self._build_canvas_template()
+        self._latest_canvas: np.ndarray | None = None
         self._window_created = False
         self._closed = False
 
@@ -269,7 +270,15 @@ class TactileUVVisualizer:
                 self._cv2.LINE_AA,
             )
         self._ensure_window(canvas)
+        self._latest_canvas = canvas
         self._cv2.imshow(self.config.window_name, canvas)
+        self._cv2.waitKey(1)
+
+    def poll_events(self) -> None:
+        if self._closed:
+            return
+        if self._latest_canvas is not None:
+            self._cv2.imshow(self.config.window_name, self._latest_canvas)
         self._cv2.waitKey(1)
 
     def close(self) -> None:
@@ -308,13 +317,16 @@ def _run_tactile_visualizer_process(
     try:
         while True:
             try:
-                payload = input_queue.get(timeout=0.1)
+                payload = input_queue.get(timeout=0.015)
             except queue.Empty:
+                visualizer.poll_events()
                 continue
             if payload == _ASYNC_CLOSE_SENTINEL:
                 break
             if isinstance(payload, dict):
                 visualizer.update(payload)
+            else:
+                visualizer.poll_events()
     except KeyboardInterrupt:
         pass
     finally:
