@@ -557,11 +557,9 @@ python -m inspire_data_collect \
 python -m inspire_data_collect \
   --dataset-root ./datasets \
   --task-name hand_camera \
-  --active-sides both \
-  --left-hand-port /dev/ttyACM0 \
-  --right-hand-port /dev/ttyACM1 \
-  --left-hand-ip 192.168.12.210 \
-  --right-hand-ip 192.168.12.211 \
+  --active-sides right\
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --right-hand-ip 192.168.11.210 \
   --camera-mode single \
   --camera-config inspire_data_collect/realsense.json \
   --vis_cam

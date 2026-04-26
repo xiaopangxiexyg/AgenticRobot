@@ -30,6 +30,7 @@ hand_camera_dataset
 .tmp_collect_probe2/
 
 dataset_collection
+datasets
 
 .cache/
 .pytest_cache/
