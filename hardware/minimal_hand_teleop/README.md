@@ -26,17 +26,17 @@ conda activate grasp_py310_copy
 假设你的手部输入设备接在 `/dev/ttyACM0`，当前控制的是默认右手 Inspire：
 
 ```bash
-python minimal_teleop/inspire_hand_teleop.py \
-  --port /dev/ttyACM0 \
+python minimal_hand_teleop/inspire_hand_teleop.py \
+  --port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00 \
   --side right \
-  --hand-ip 192.168.11.210
+  --hand-ip 192.168.12.210
 ```
 
 如果你是左手输入设备驱动这只右手 Inspire：
 
 ```bash
-python minimal_teleop/inspire_hand_teleop.py \
-  --port /dev/ttyACM0 \
+python minimal_hand_teleop/inspire_hand_teleop.py \
+  --port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
   --side left \
   --hand-ip 192.168.11.210
 ```

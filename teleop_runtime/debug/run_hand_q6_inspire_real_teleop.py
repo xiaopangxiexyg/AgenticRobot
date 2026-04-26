@@ -156,6 +156,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-hand-port", type=str, default="", help="Optional right hand teleop serial port")
     parser.add_argument("--hand-reader-baudrate", type=int, default=115200, help="Hand teleop serial baudrate")
     parser.add_argument("--hand-reader-timeout", type=float, default=0.05, help="Hand teleop serial timeout in seconds")
+    parser.add_argument(
+        "--exo-hand-calibration",
+        action="store_true",
+        help="Re-run exoskeleton hand zero-pose calibration and update the fixed calibration file.",
+    )
+    parser.add_argument(
+        "--exo-hand-calibration-path",
+        type=str,
+        default="",
+        help="Optional fixed exoskeleton hand zero-pose calibration JSON path.",
+    )
     parser.add_argument("--show-hand-raw-lines", action="store_true", help="Print every raw line from hand teleop serial devices")
     parser.add_argument(
         "--hand-joint-order",
@@ -291,6 +302,8 @@ def _build_components(args: argparse.Namespace) -> HandOnlyComponents:
         baudrate=int(args.hand_reader_baudrate),
         timeout=float(args.hand_reader_timeout),
         show_raw_lines=bool(args.show_hand_raw_lines),
+        exo_hand_calibration=bool(args.exo_hand_calibration),
+        calibration_path=str(args.exo_hand_calibration_path or "") or None,
         critical=False,
         strict_expected=False,
     )

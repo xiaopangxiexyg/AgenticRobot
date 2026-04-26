@@ -5,21 +5,42 @@ from typing import Sequence
 import numpy as np
 
 
-def open_modbus(ip: str, port: int):
+DEFAULT_MODBUS_TIMEOUT_SEC = 0.5
+
+
+def _response_is_error(response: object) -> bool:
+    if response is None:
+        return True
+    is_error = getattr(response, "isError", None)
+    return bool(is_error()) if callable(is_error) else False
+
+
+def open_modbus(ip: str, port: int, *, timeout: float = DEFAULT_MODBUS_TIMEOUT_SEC):
     from pymodbus.client.sync import ModbusTcpClient
 
-    client = ModbusTcpClient(ip, int(port))
-    client.connect()
+    client = ModbusTcpClient(ip, int(port), timeout=float(timeout))
+    if not client.connect():
+        client.close()
+        raise RuntimeError(f"failed to connect InspireTac Modbus {ip}:{port}")
     return client
 
 
 def write_register(client: object, address: int, values: Sequence[int]) -> None:
-    client.write_registers(int(address), list(values))
+    payload = list(values)
+    response = client.write_registers(int(address), payload)
+    if _response_is_error(response):
+        raise RuntimeError(
+            f"Modbus write_registers failed address={address} values={payload}: {response}"
+        )
 
 
 def read_register(client: object, address: int, count: int) -> list[int]:
     response = client.read_holding_registers(int(address), int(count))
-    return response.registers if response.isError() is False else []
+    if _response_is_error(response):
+        raise RuntimeError(
+            f"Modbus read_holding_registers failed address={address} count={count}: {response}"
+        )
+    return list(response.registers)
 
 
 def write6(client: object, reg: int, val: Sequence[int]) -> None:
@@ -45,8 +66,12 @@ class InspireTacModbus:
         ip: str = "192.168.12.210",
         port: int = 6000,
         max_fingertip_force: int = 800,
+        timeout: float = DEFAULT_MODBUS_TIMEOUT_SEC,
     ):
-        self.client = open_modbus(ip, int(port))
+        self.ip = str(ip)
+        self.port = int(port)
+        self.timeout = float(timeout)
+        self.client = open_modbus(self.ip, self.port, timeout=self.timeout)
         self.regdict = {
             "ID": 1000,
             "baudrate": 1001,

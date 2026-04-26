@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 import time
+from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
@@ -19,6 +21,128 @@ Q6_ORDER = (
 
 SIM_Q6_UPPER_RAD = np.array([1.54, 0.60, 1.57, 1.57, 1.57, 1.57], dtype=np.float32)
 SIM_Q6_LOWER_RAD = np.zeros(6, dtype=np.float32)
+
+
+def _default_zero_pose_record_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "teleop_records" / "hand_zero_pose_calibrations"
+
+
+def _default_exo_hand_calibration_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "hardware" / "teleop_hand" / "exo_hand_zero_pose.json"
+
+
+def _safe_name(text: object) -> str:
+    return re.sub(r"[^0-9A-Za-z_.-]+", "_", str(text or "unknown")).strip("_") or "unknown"
+
+
+def _offset_for_side(side: str) -> np.ndarray:
+    offset = np.asarray(OFFSET, dtype=np.float32)
+    if str(side) == "left":
+        offset = -offset
+    return offset
+
+
+def _calibration_from_deg_at_0(side: str, deg_at_0: Sequence[float]) -> dict[str, np.ndarray]:
+    deg0 = np.asarray(deg_at_0, dtype=np.float32).reshape(6)
+    offset = _offset_for_side(side)
+    return {"deg_at_0": deg0, "deg_at_1": deg0 + offset}
+
+
+def load_exo_hand_calibration(
+    side: str,
+    calibration_path: str | Path | None = None,
+) -> dict[str, np.ndarray]:
+    path = Path(calibration_path) if calibration_path is not None else _default_exo_hand_calibration_path()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        side_payload = payload["calibrations"][str(side)]
+        deg_at_0 = side_payload["deg_at_0"]
+    except KeyError as exc:
+        raise KeyError(f"Missing fixed exo hand zero pose calibration for side={side!r} in {path}") from exc
+    calib = _calibration_from_deg_at_0(str(side), deg_at_0)
+    print(f"[Calib:{side}] loaded fixed exo hand zero pose <- {path}")
+    return calib
+
+
+def _update_fixed_exo_hand_calibration(
+    *,
+    side: str,
+    deg_at_0: np.ndarray,
+    record_path: Path | None,
+    calibration_path: str | Path | None = None,
+) -> Path:
+    path = Path(calibration_path) if calibration_path is not None else _default_exo_hand_calibration_path()
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        payload = {"calibrations": {}}
+    payload.setdefault("calibrations", {})
+    offset = _offset_for_side(side)
+    deg0 = np.asarray(deg_at_0, dtype=float).reshape(6)
+    payload["calibrations"][str(side)] = {
+        "deg_at_0": deg0.tolist(),
+        "offset": np.asarray(offset, dtype=float).tolist(),
+        "deg_at_1": (deg0 + np.asarray(offset, dtype=float)).tolist(),
+    }
+    timestamp = time.time()
+    payload["updated_at"] = timestamp
+    payload["updated_at_local"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    payload["last_update"] = {
+        "side": str(side),
+        "record_path": None if record_path is None else str(record_path),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[Calib:{side}] updated fixed exo hand zero pose -> {path}")
+    return path
+
+
+def _save_zero_pose_calibration_record(
+    *,
+    side: str,
+    port: str | None,
+    baudrate: int | None,
+    deg_at_0: np.ndarray,
+    deg_at_1: np.ndarray,
+    offset: np.ndarray,
+    sample_count: int,
+    used_samples: list[list[float]],
+    stable_window: int,
+    stable_eps: float,
+    save_dir: str | Path | None = None,
+) -> Path:
+    record_dir = Path(save_dir) if save_dir is not None else _default_zero_pose_record_dir()
+    record_dir.mkdir(parents=True, exist_ok=True)
+    used_array = np.asarray(used_samples, dtype=np.float32)
+    ranges = np.ptp(used_array, axis=0) if used_array.size else np.zeros(6, dtype=np.float32)
+    timestamp = time.time()
+    timestamp_text = time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp))
+    filename = (
+        f"{timestamp_text}_{int((timestamp % 1.0) * 1000):03d}_"
+        f"{_safe_name(side)}_{_safe_name(port)}.json"
+    )
+    path = record_dir / filename
+    payload = {
+        "timestamp": timestamp,
+        "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
+        "side": str(side),
+        "port": None if port is None else str(port),
+        "baudrate": None if baudrate is None else int(baudrate),
+        "q6_order": list(Q6_ORDER),
+        "zero_pose_required": True,
+        "sample_count": int(sample_count),
+        "used_count": int(len(used_samples)),
+        "stable_window": int(stable_window),
+        "stable_eps_deg": float(stable_eps),
+        "used_range_deg": np.asarray(ranges, dtype=float).tolist(),
+        "used_max_range_deg": float(np.max(ranges)) if ranges.size else 0.0,
+        "deg_at_0": np.asarray(deg_at_0, dtype=float).tolist(),
+        "offset": np.asarray(offset, dtype=float).tolist(),
+        "deg_at_1": np.asarray(deg_at_1, dtype=float).tolist(),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[Calib:{side}] saved zero pose calibration -> {path}")
+    return path
 
 
 def parse_angles_line(line: str) -> list[float] | None:
@@ -48,11 +172,16 @@ def norm6_to_q6_rad(norm6: Sequence[float]) -> np.ndarray:
 def auto_calibrate(
     ser: Any,
     side: str,
+    port: str | None = None,
+    baudrate: int | None = None,
     max_samples: int = 200,
     min_samples: int = 30,
     stable_window: int = 20,
     stable_eps: float = 0.5,
     show_raw_lines: bool = False,
+    save_dir: str | Path | None = None,
+    update_fixed: bool = False,
+    calibration_path: str | Path | None = None,
 ) -> dict[str, np.ndarray]:
     print(f"[Calib:{side}] keep the hand device at zero pose...")
     samples: list[list[float]] = []
@@ -91,11 +220,29 @@ def auto_calibrate(
         [sum(sample[index] for sample in used) / len(used) for index in range(6)],
         dtype=np.float32,
     )
-    offset = np.asarray(OFFSET, dtype=np.float32)
-    if side == "left":
-        offset = -offset
+    offset = _offset_for_side(side)
     deg_at_1 = deg_at_0 + offset
     print(f"[Calib:{side}] finished")
+    record_path = _save_zero_pose_calibration_record(
+        side=side,
+        port=port,
+        baudrate=baudrate,
+        deg_at_0=deg_at_0,
+        deg_at_1=deg_at_1,
+        offset=offset,
+        sample_count=len(samples),
+        used_samples=used,
+        stable_window=stable_window,
+        stable_eps=stable_eps,
+        save_dir=save_dir,
+    )
+    if update_fixed:
+        _update_fixed_exo_hand_calibration(
+            side=side,
+            deg_at_0=deg_at_0,
+            record_path=record_path,
+            calibration_path=calibration_path,
+        )
     return {"deg_at_0": deg_at_0, "deg_at_1": deg_at_1}
 
 
@@ -162,6 +309,8 @@ class SingleHandQ6Reader:
         timeout: float = 0.05,
         raw_only: bool = False,
         show_raw_lines: bool = False,
+        exo_hand_calibration: bool = False,
+        calibration_path: str | Path | None = None,
     ):
         import serial
 
@@ -171,6 +320,8 @@ class SingleHandQ6Reader:
         self.timeout = float(timeout)
         self.raw_only = bool(raw_only)
         self.show_raw_lines = bool(show_raw_lines)
+        self.exo_hand_calibration = bool(exo_hand_calibration)
+        self.calibration_path = calibration_path
 
         print(
             f"[Open:{self.side}] port={self.port} baudrate={self.baudrate} "
@@ -183,8 +334,14 @@ class SingleHandQ6Reader:
             else auto_calibrate(
                 ser=self.ser,
                 side=self.side,
+                port=self.port,
+                baudrate=self.baudrate,
                 show_raw_lines=self.show_raw_lines,
+                update_fixed=True,
+                calibration_path=self.calibration_path,
             )
+            if self.exo_hand_calibration
+            else load_exo_hand_calibration(self.side, self.calibration_path)
         )
 
     def read_frame(self) -> dict[str, object]:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+import queue
+import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -13,6 +16,7 @@ class TactileVisualizerConfig:
     enabled_sides: tuple[str, ...] = ("left", "right")
     window_name: str = "inspire_hand_tactile_uv"
     image_size: tuple[int, int] = (640, 640)
+    resizable_window: bool = True
     value_scale: float = 0.05
     point_radius_min: int = 1
     point_radius_max: int = 6
@@ -104,6 +108,8 @@ class TactileUVVisualizer:
             "right": self._build_layout_pixel_coords("right"),
         }
         self._canvas = self._build_canvas_template()
+        self._latest_canvas: np.ndarray | None = None
+        self._window_created = False
         self._closed = False
 
     @staticmethod
@@ -226,6 +232,20 @@ class TactileUVVisualizer:
         size_strength = np.clip(size_strength, 0.0, 1.0)
         return color_strength, size_strength
 
+    def _ensure_window(self, canvas: np.ndarray) -> None:
+        if self._window_created:
+            return
+        flag = (
+            self._cv2.WINDOW_NORMAL
+            if self.config.resizable_window
+            else self._cv2.WINDOW_AUTOSIZE
+        )
+        self._cv2.namedWindow(self.config.window_name, flag)
+        if self.config.resizable_window:
+            height, width = canvas.shape[:2]
+            self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
+        self._window_created = True
+
     def update(self, tactile_by_side: dict[str, np.ndarray | None]) -> None:
         if self._closed:
             return
@@ -249,7 +269,16 @@ class TactileUVVisualizer:
                 2,
                 self._cv2.LINE_AA,
             )
+        self._ensure_window(canvas)
+        self._latest_canvas = canvas
         self._cv2.imshow(self.config.window_name, canvas)
+        self._cv2.waitKey(1)
+
+    def poll_events(self) -> None:
+        if self._closed:
+            return
+        if self._latest_canvas is not None:
+            self._cv2.imshow(self.config.window_name, self._latest_canvas)
         self._cv2.waitKey(1)
 
     def close(self) -> None:
@@ -258,8 +287,142 @@ class TactileUVVisualizer:
         self._closed = True
         try:
             self._cv2.destroyWindow(self.config.window_name)
+            self._cv2.waitKey(1)
         except Exception:
             pass
+
+
+_ASYNC_CLOSE_SENTINEL = "__teleop_tactile_visualizer_close__"
+
+
+def _run_tactile_visualizer_process(
+    config: TactileVisualizerConfig,
+    input_queue: Any,
+    ready_queue: Any,
+) -> None:
+    visualizer: TactileUVVisualizer | None = None
+    try:
+        visualizer = TactileUVVisualizer(config)
+        visualizer.update({})
+    except Exception as exc:  # noqa: BLE001
+        ready_queue.put(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+        return
+    ready_queue.put({"ok": True})
+    try:
+        while True:
+            try:
+                payload = input_queue.get(timeout=0.015)
+            except queue.Empty:
+                visualizer.poll_events()
+                continue
+            if payload == _ASYNC_CLOSE_SENTINEL:
+                break
+            if isinstance(payload, dict):
+                visualizer.update(payload)
+            else:
+                visualizer.poll_events()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if visualizer is not None:
+            visualizer.close()
+
+
+class AsyncTactileUVVisualizer:
+    """Run the OpenCV tactile window in a fresh process.
+
+    SAPIEN viewers and OpenCV HighGUI can load different GUI/render backends in
+    one process. A spawn child keeps the tactile window independent of SAPIEN.
+    """
+
+    def __init__(
+        self,
+        config: TactileVisualizerConfig,
+        *,
+        startup_timeout_sec: float = 3.0,
+    ):
+        self.config = config
+        self._closed = False
+        self._ctx = mp.get_context("spawn")
+        self._input_queue = self._ctx.Queue(maxsize=2)
+        self._ready_queue = self._ctx.Queue(maxsize=1)
+        self._process = self._ctx.Process(
+            target=_run_tactile_visualizer_process,
+            args=(self.config, self._input_queue, self._ready_queue),
+            name="tactile_uv_visualizer",
+            daemon=True,
+        )
+        self._process.start()
+        try:
+            ready = self._ready_queue.get(timeout=float(startup_timeout_sec))
+        except queue.Empty:
+            if self._process.is_alive():
+                return
+            raise RuntimeError("Tactile visualizer process exited during startup.")
+        if not isinstance(ready, dict) or ready.get("ok") is not True:
+            error = ready.get("error") if isinstance(ready, dict) else repr(ready)
+            details = ready.get("traceback", "") if isinstance(ready, dict) else ""
+            self.close()
+            raise RuntimeError(
+                "Tactile visualizer process failed to start: "
+                f"{error}\n{details}".rstrip()
+            )
+
+    def update(self, tactile_by_side: dict[str, np.ndarray | None]) -> None:
+        if self._closed or not self._process.is_alive():
+            return
+        payload = {
+            str(side): None if tactile is None else np.asarray(tactile, dtype=np.float32).reshape(-1)
+            for side, tactile in tactile_by_side.items()
+        }
+        try:
+            self._input_queue.put_nowait(payload)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._input_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._input_queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.is_alive():
+            try:
+                self._input_queue.put_nowait(_ASYNC_CLOSE_SENTINEL)
+            except queue.Full:
+                try:
+                    self._input_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._input_queue.put_nowait(_ASYNC_CLOSE_SENTINEL)
+                except queue.Full:
+                    pass
+            self._process.join(timeout=2.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1.0)
+        else:
+            self._process.join(timeout=0.1)
+        for q in (self._input_queue, self._ready_queue):
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
 
 
 def tactile_by_side_from_backends(

@@ -36,6 +36,7 @@ if __package__ in (None, ""):
         RealSenseRGBSource,
         load_realsense_camera_config_map,
     )
+    from inspire_data_collect.utils.camera_preview import CameraPreviewer
     from inspire_data_collect.hand.retargeter import HandRetargeter, HandRetargeterConfig
     from inspire_data_collect.utils.tactile_visualizer import (
         TactileUVVisualizer,
@@ -65,6 +66,7 @@ else:
         RealSenseRGBSource,
         load_realsense_camera_config_map,
     )
+    from .utils.camera_preview import CameraPreviewer
     from .hand.retargeter import HandRetargeter, HandRetargeterConfig
     from .utils.tactile_visualizer import (
         TactileUVVisualizer,
@@ -231,6 +233,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hand-modbus-port", type=int, default=6000)
     parser.add_argument("--hand-reader-baudrate", type=int, default=115200)
     parser.add_argument("--hand-reader-timeout", type=float, default=0.05)
+    parser.add_argument(
+        "--exo-hand-calibration",
+        action="store_true",
+        help="Re-run exoskeleton hand zero-pose calibration and update the fixed calibration file.",
+    )
+    parser.add_argument(
+        "--exo-hand-calibration-path",
+        type=str,
+        default="",
+        help="Optional fixed exoskeleton hand zero-pose calibration JSON path.",
+    )
     parser.add_argument("--show-hand-raw-lines", action="store_true")
     parser.add_argument("--allow-hand-connect-failure", action="store_true")
 
@@ -275,6 +288,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-color-space", choices=["rgb", "bgr"], default="rgb")
     parser.add_argument("--camera-wait-timeout-ms", type=int, default=200)
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
+    parser.add_argument(
+        "--vis_cam",
+        "--vis-cam",
+        dest="vis_cam",
+        action="store_true",
+        help="Show live RealSense RGB frames at the same resolution used for collection.",
+    )
 
     parser.add_argument("--writer-workers", type=int, default=2)
     parser.add_argument("--writer-queue-size", type=int, default=256)
@@ -306,6 +326,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
     )
     if float(args.hz) <= 0.0:
         raise ValueError("--hz must be positive.")
+    if float(args.status_sec) <= 0.0:
+        raise ValueError("--status-sec must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
     if args.enable_arm:
@@ -338,6 +360,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--camera-fps must be positive.")
         if int(args.camera_keep_last) <= 0:
             raise ValueError("--camera-keep-last must be positive.")
+    elif bool(args.vis_cam):
+        raise ValueError("--vis_cam requires --camera-mode single.")
     for side in active_sides:
         if not getattr(args, f"{side}_hand_port"):
             raise ValueError(f"--{side}-hand-port is required for active side '{side}'.")
@@ -358,6 +382,8 @@ def build_components(
         baudrate=int(args.hand_reader_baudrate),
         timeout=float(args.hand_reader_timeout),
         show_raw_lines=bool(args.show_hand_raw_lines),
+        exo_hand_calibration=bool(args.exo_hand_calibration),
+        calibration_path=str(args.exo_hand_calibration_path or "") or None,
         critical=True,
     )
 
@@ -511,6 +537,43 @@ def print_standby(next_episode_index: int) -> None:
     print("=" * 100)
 
 
+def compact_log_value(value: object, *, max_chars: int = 90) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def camera_status_text(
+    camera_sources: dict[str, RealSenseRGBSource],
+    camera_previewer: CameraPreviewer | None,
+) -> str:
+    if not camera_sources:
+        return "camera=off"
+    bits: list[str] = []
+    if camera_previewer is not None and camera_previewer.disabled_reason:
+        bits.append(
+            "preview=disabled:"
+            + compact_log_value(camera_previewer.disabled_reason, max_chars=80)
+        )
+    for camera_key, camera_source in sorted(camera_sources.items()):
+        try:
+            info = camera_source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            bits.append(f"{camera_key}=status_error:{type(exc).__name__}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        last_error = info.get("last_error")
+        if last_error:
+            bits.append(
+                f"{camera_key}=frames:{frame_count},err:"
+                f"{compact_log_value(last_error, max_chars=70)}"
+            )
+        else:
+            bits.append(f"{camera_key}=frames:{frame_count}")
+    return "camera=" + ";".join(bits)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspire Tac collection with optional single-arm FR3 teleoperation."
@@ -520,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
     active_sides = validate_args(args)
     dataset_root, task_name, task_id, task_description, dataset_name = resolve_collection_layout(args)
     camera_sources = build_camera_sources(args)
+    camera_previewer = CameraPreviewer() if bool(args.vis_cam) and camera_sources else None
 
     writer = HandOnlyLeRobotWriter(
         WriterConfig(
@@ -571,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     recording = False
     loop_rate = LoopRate()
     step_count = 0
+    last_status_at = 0.0
 
     def start_episode() -> None:
         nonlocal current_episode, recording
@@ -587,9 +652,12 @@ def main(argv: list[str] | None = None) -> int:
             "hand_vector_order": list(HAND_VECTOR_ORDER),
             "joint_order": list(args.hand_joint_order),
             "hand_invert": bool(args.hand_invert),
+            "exo_hand_calibration": bool(args.exo_hand_calibration),
+            "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
             "tactile_regions": list(parse_tactile_regions(args.hand_tactile_regions)),
             "camera_mode": str(args.camera_mode),
             "camera_keys": sorted(camera_sources),
+            "vis_cam": bool(args.vis_cam),
             "camera_config_path": None
             if args.camera_mode == "none" or args.camera_serial
             else str(args.camera_config),
@@ -647,6 +715,23 @@ def main(argv: list[str] | None = None) -> int:
             print_standby(writer.next_episode_index)
 
     try:
+        if camera_sources:
+            print(
+                "[Camera] configured "
+                f"cameras={sorted(camera_sources)} mode={args.camera_mode} "
+                f"vis_cam={bool(args.vis_cam)}"
+            )
+            if camera_previewer is not None:
+                if camera_previewer.ensure_available():
+                    print(
+                        "[Camera] --vis_cam display preflight ok; "
+                        "preview windows will open when the main loop starts."
+                    )
+                else:
+                    print(
+                        "[Camera] --vis_cam requested but preview is disabled: "
+                        f"{camera_previewer.disabled_reason}"
+                    )
         source.start()
         if arm_source is not None:
             arm_source.start()
@@ -672,6 +757,8 @@ def main(argv: list[str] | None = None) -> int:
                     for camera_key, source in camera_sources.items()
                 },
             )
+            if camera_previewer is not None and camera_previewer.disabled_reason is None:
+                print(f"[Camera] --vis_cam active for cameras={sorted(camera_sources)}")
         if arm_source is not None:
             writer.write_device_config("arm_exo", arm_source.device_info())
         if arm_backend is not None:
@@ -735,6 +822,18 @@ def main(argv: list[str] | None = None) -> int:
                     visualizer.update(
                         tactile_by_side_from_backends(active_sides, backends.get)
                     )
+                if camera_previewer is not None:
+                    camera_previewer.update(camera_sources)
+
+                if loop_started_at - last_status_at >= float(args.status_sec):
+                    frame_count = int(sample_builder.frame_index)
+                    rec_state = "on" if recording else "off"
+                    print(
+                        f"[Status] step={step_count} hz={control_hz:.2f} "
+                        f"recording={rec_state} episode={current_episode} "
+                        f"frames={frame_count} {camera_status_text(camera_sources, camera_previewer)}"
+                    )
+                    last_status_at = loop_started_at
 
                 if recording and current_episode is not None:
                     sample = sample_builder.build(
@@ -772,6 +871,8 @@ def main(argv: list[str] | None = None) -> int:
                 backend.close()
             for camera_source in camera_sources.values():
                 camera_source.close()
+            if camera_previewer is not None:
+                camera_previewer.close()
             source.close()
             if visualizer is not None:
                 visualizer.close()

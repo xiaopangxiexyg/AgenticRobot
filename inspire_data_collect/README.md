@@ -30,7 +30,7 @@ pip install pyrealsense2
 
 ## 模块
 
-- `hand/serial_hand_q6_reader.py`: 读取遥操作手串口 `ANGLES:`，自动零位标定，输出归一化 6DoF。
+- `hand/serial_hand_q6_reader.py`: 读取遥操作手串口 `ANGLES:`，默认加载固定 zero pose 标定，输出归一化 6DoF；需要更新固定值时用 `--exo-hand-calibration`。
 - `hand/hand_source.py`: 并行读取左/右手串口，产出 `left_hand_q6`、`right_hand_q6` 通道。
 - `hand/retargeter.py`: 将遥操作手 6DoF 映射为 Inspire 手 6DoF 指令，支持关节重排、反向和 EMA。
 - `hand/inspire_tac_modbus.py`: 包内 Inspire Tac Modbus 驱动，负责关节控制、关节读取、触觉读取。
@@ -131,6 +131,24 @@ ls -l /dev/serial/by-id/
 ### 1. 遥操作手串口 q6
 
 右手示例；左手把变量和通道名改成 `LEFT_HAND_PORT` / `left_hand_q6`。
+
+默认会读取仓库内固定标定：
+
+```text
+hardware/teleop_hand/exo_hand_zero_pose.json
+```
+
+这份标定由 18 次 zero pose 记录汇总得到，当前最大 span 为 left `0.0315 deg`、right `0.2700 deg`。因此普通采集不需要每次重新保持 zero pose。若更换外骨骼、重新装配手指连杆，或需要更新固定值，再显式运行 zero pose 标定：
+
+```bash
+python hardware/teleop_hand/check_zero_pose_calibration.py \
+  --left-port "$LEFT_HAND_PORT" \
+  --right-port "$RIGHT_HAND_PORT" \
+  --rounds 1 \
+  --exo-hand-calibration
+```
+
+去掉 `--exo-hand-calibration` 时只保存每次检查结果，不更新固定标定 JSON。
 
 ```bash
 export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
@@ -300,6 +318,8 @@ PY
 ```
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
+
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致。`--vis_cam` 只支持 `--camera-mode single`。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 
@@ -543,7 +563,8 @@ python -m inspire_data_collect \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.12.211 \
   --camera-mode single \
-  --camera-config inspire_data_collect/realsense.json
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam
 ```
 
 单 RealSense 相机，直接用序列号配置：
@@ -560,8 +581,13 @@ python -m inspire_data_collect \
   --camera-serial 213222079798 \
   --camera-width 1280 \
   --camera-height 720 \
-  --camera-fps 30
+  --camera-fps 30 \
+  --vis_cam
 ```
+
+如果当前终端没有 `DISPLAY` 或 `WAYLAND_DISPLAY`，可以删除 `--vis_cam`；即使保留该参数，程序也会禁用预览窗口并继续采集。运行中可看 `[Status] ... camera=front=frames:<N>` 判断 RealSense 是否持续产帧。
+
+手部外骨骼 zero pose：默认读取固定标定；需要重新标定并更新固定值时，在任意采集命令中追加 `--exo-hand-calibration`。也可以用 `--exo-hand-calibration-path PATH` 指定另一份固定标定 JSON。
 
 触觉读取：`--hand-tactile-regions all` 表示读取全部触觉区域；传空字符串 `--hand-tactile-regions ""` 表示不读取触觉。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
 

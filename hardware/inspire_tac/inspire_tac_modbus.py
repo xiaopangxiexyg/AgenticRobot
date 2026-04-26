@@ -4,19 +4,36 @@ import cv2
 import numpy as np
 
 
-def open_modbus(ip, port):
-    client = ModbusTcpClient(ip, port)
-    client.connect()
+DEFAULT_MODBUS_TIMEOUT_SEC = 0.5
+
+
+def _response_is_error(response):
+    if response is None:
+        return True
+    is_error = getattr(response, "isError", None)
+    return bool(is_error()) if callable(is_error) else False
+
+
+def open_modbus(ip, port, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+    client = ModbusTcpClient(ip, port, timeout=float(timeout))
+    if not client.connect():
+        client.close()
+        raise RuntimeError(f"failed to connect InspireTac Modbus {ip}:{port}")
     return client
 
 def write_register(client, address, values):
     # Modbus 写入寄存器，传入寄存器地址和要写入的值列表
-    client.write_registers(address, values)
+    response = client.write_registers(address, values)
+    if _response_is_error(response):
+        raise RuntimeError(f"Modbus write_registers failed address={address} values={values}: {response}")
+    return response
 
 def read_register(client, address, count):
     # Modbus 读取寄存器
     response = client.read_holding_registers(address, count)
-    return response.registers if response.isError() is False else []
+    if _response_is_error(response):
+        raise RuntimeError(f"Modbus read_holding_registers failed address={address} count={count}: {response}")
+    return response.registers
 
 def write6(client, reg, val):
     val_reg = []
@@ -44,8 +61,11 @@ def read6(client, reg, n_short=6, use_byte=False): # 1 short = 2 bytes
 
 
 class InspireTacModbus:
-    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800):
-        self.client = open_modbus(ip, port)
+    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+        self.ip = ip
+        self.port = port
+        self.timeout = float(timeout)
+        self.client = open_modbus(ip, port, timeout=self.timeout)
 
         # 寄存器地址
         self.regdict = {
@@ -503,11 +523,13 @@ if __name__ == '__main__':
     test = InspireTacModbus(max_fingertip_force=800)
     # test.set_joint_pos([1, 1, 1, 1, 1, 1])
     
+    
     # test.set_joint_pos(np.ones(6))
     # time.sleep(5.0)
     # time.sleep(1)
 
     test.set_joint_pos([0, 0, 0, 0, 1, 1])
+    time.sleep(1.0)
     joint_pos = test.read_joint_pos()
     tac_vec, tac_dict = test.read_tac_data()
     test.set_joint_pos([1, 1, 1, 1, 1, 1])

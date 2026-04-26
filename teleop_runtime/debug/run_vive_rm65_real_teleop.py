@@ -47,6 +47,7 @@ from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
 from ..tactile_visualizer import (
+    AsyncTactileUVVisualizer,
     TactileUVVisualizer,
     TactileVisualizerConfig,
     tactile_by_side_from_backends,
@@ -149,6 +150,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-hand-port", type=str, default="", help="Optional right hand teleop serial port")
     parser.add_argument("--hand-reader-baudrate", type=int, default=115200, help="Hand teleop serial baudrate")
     parser.add_argument("--hand-reader-timeout", type=float, default=0.05, help="Hand teleop serial timeout in seconds")
+    parser.add_argument(
+        "--exo-hand-calibration",
+        action="store_true",
+        help="Re-run exoskeleton hand zero-pose calibration and update the fixed calibration file.",
+    )
+    parser.add_argument(
+        "--exo-hand-calibration-path",
+        type=str,
+        default="",
+        help="Optional fixed exoskeleton hand zero-pose calibration JSON path.",
+    )
     parser.add_argument("--show-hand-raw-lines", action="store_true", help="Print every raw line from hand teleop serial devices")
     parser.add_argument(
         "--hand-joint-order",
@@ -585,6 +597,8 @@ def _build_episode_metadata(
         "left_hand_port": getattr(args, "left_hand_port", "") or None,
         "right_hand_port": getattr(args, "right_hand_port", "") or None,
         "hand_reader_baudrate": int(getattr(args, "hand_reader_baudrate", 115200)),
+        "exo_hand_calibration": bool(getattr(args, "exo_hand_calibration", False)),
+        "exo_hand_calibration_path": getattr(args, "exo_hand_calibration_path", "") or None,
         "hand_joint_order": list(getattr(args, "hand_joint_order", DEFAULT_INSPIRE_HAND_JOINT_ORDER)),
         "hand_invert": bool(getattr(args, "hand_invert", True)),
         "hand_command_alpha": float(getattr(args, "hand_command_alpha", 1.0)),
@@ -716,6 +730,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "left_hand_port": getattr(args, "left_hand_port", ""),
             "right_hand_port": getattr(args, "right_hand_port", ""),
             "hand_reader_baudrate": int(getattr(args, "hand_reader_baudrate", 115200)),
+            "exo_hand_calibration": bool(getattr(args, "exo_hand_calibration", False)),
+            "exo_hand_calibration_path": getattr(args, "exo_hand_calibration_path", "") or None,
             "hand_joint_order": list(getattr(args, "hand_joint_order", DEFAULT_INSPIRE_HAND_JOINT_ORDER)),
             "hand_invert": bool(getattr(args, "hand_invert", True)),
             "hand_command_alpha": float(getattr(args, "hand_command_alpha", 1.0)),
@@ -870,6 +886,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             baudrate=int(getattr(args, "hand_reader_baudrate", 115200)),
             timeout=float(getattr(args, "hand_reader_timeout", 0.05)),
             show_raw_lines=bool(getattr(args, "show_hand_raw_lines", False)),
+            exo_hand_calibration=bool(getattr(args, "exo_hand_calibration", False)),
+            calibration_path=str(getattr(args, "exo_hand_calibration_path", "") or "") or None,
             critical=False,
             strict_expected=False,
         )
@@ -1446,19 +1464,39 @@ def _hand_backend_for_side(
     return None
 
 
+def _hand_channel_status(
+    components: RealTeleopComponents,
+    channels: dict[str, object],
+) -> tuple[str, ...]:
+    statuses: list[str] = []
+    for side in components.active_sides:
+        channel = channels.get(f"{side}_hand_q6")
+        if channel is None:
+            continue
+        valid = bool(getattr(channel, "valid", False))
+        if valid:
+            statuses.append(f"{side}=ok")
+            continue
+        metadata = getattr(channel, "metadata", {}) or {}
+        read_error = str(metadata.get("read_error") or "invalid")
+        statuses.append(f"{side}=invalid:{read_error}")
+    return tuple(statuses)
+
+
 def _build_tactile_visualizer(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
-) -> TactileUVVisualizer | None:
+) -> TactileUVVisualizer | AsyncTactileUVVisualizer | None:
     if not bool(args.visualize_tactile):
         return None
-    return TactileUVVisualizer(
-        TactileVisualizerConfig(
-            enabled_sides=active_sides,
-            image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
-            value_scale=float(args.tactile_vis_value_scale),
-        )
+    config = TactileVisualizerConfig(
+        enabled_sides=active_sides,
+        image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+        value_scale=float(args.tactile_vis_value_scale),
     )
+    if not bool(args.skip_renderer):
+        return AsyncTactileUVVisualizer(config)
+    return TactileUVVisualizer(config)
 
 
 def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
@@ -1468,8 +1506,26 @@ def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
 
 def main() -> None:
     args = parse_args()
-    components = _build_components(args)
-    tactile_visualizer = _build_tactile_visualizer(args, components.active_sides)
+    tactile_visualizer = None
+    if bool(args.visualize_tactile) and not bool(args.skip_renderer):
+        tactile_visualizer = _build_tactile_visualizer(args, _active_sides_from_args(args))
+    try:
+        components = _build_components(args)
+    except Exception:
+        if tactile_visualizer is not None:
+            tactile_visualizer.close()
+        raise
+    if tactile_visualizer is None:
+        tactile_visualizer = _build_tactile_visualizer(args, components.active_sides)
+    if tactile_visualizer is not None:
+        tactile_vis_mode = (
+            "subprocess" if isinstance(tactile_visualizer, AsyncTactileUVVisualizer) else "same_process"
+        )
+        _log(
+            "TactileVis",
+            f"enabled mode={tactile_vis_mode} active_sides={list(components.active_sides)} "
+            f"regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', ())))}",
+        )
     clutch_input = TerminalClutchInput(components.keyboard_source)
     episode_recorder = EpisodeRecorder(
         root_dir=_episode_root_dir(args, components),
@@ -1811,6 +1867,7 @@ def main() -> None:
             channel_valid = tuple(
                 sorted((name, bool(channel.valid)) for name, channel in step_result.channels.items())
             )
+            hand_input_status = _hand_channel_status(components, step_result.channels)
             clutch_channels = components.keyboard_source.get_latest_channels()
             left_clutch_channel = clutch_channels.get("left_clutch_button")
             right_clutch_channel = clutch_channels.get("right_clutch_button")
@@ -1897,6 +1954,7 @@ def main() -> None:
                 branch_candidate,
                 hardware_snapshot,
                 step_scale_snapshot,
+                hand_input_status,
             )
             if status_gate.should_emit(
                 "real_teleop_status",
@@ -1913,6 +1971,7 @@ def main() -> None:
                     collision_bits += f" ik={jump_gate_status}"
                 if branch_candidate is not None:
                     collision_bits += f" branch={branch_candidate}"
+                hand_bits = "" if not hand_input_status else f" hand_q6={list(hand_input_status)}"
                 _log(
                     "RealTeleop",
                     f"step={step_index} hz={step_result.control_hz:.1f} "
@@ -1925,7 +1984,8 @@ def main() -> None:
                     f"left_clutch={left_clutch} "
                     f"right_clutch={right_clutch} "
                     f"faults={list(fault_codes)}"
-                    f"{collision_bits}",
+                    f"{collision_bits}"
+                    f"{hand_bits}",
                     now=loop_start,
                 )
 

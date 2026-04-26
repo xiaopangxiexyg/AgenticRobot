@@ -6,7 +6,7 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,9 +28,15 @@ from ..retargeters import (
     PoseToArmRetargeter,
     PoseToArmRetargeterConfig,
 )
+from ..diagnostics import TeleopRunState
 from ..rigs import BimanualRig
 from ..safety import TeleopSafetyConfig
-from ..schemas import ObservationChannel
+from ..schemas import (
+    ObservationChannel,
+    TeleopCommand,
+    TeleopObservation,
+    merge_teleop_commands,
+)
 from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
 from ..sources.hand import HandQ6Source
@@ -41,9 +47,10 @@ from ..tactile_visualizer import (
     TactileVisualizerConfig,
     tactile_by_side_from_backends,
 )
-from ..transforms import as_pose_matrix
+from ..transforms import as_pose_matrix, interpolate_pose
 from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
+from .camera_preview import CameraPreviewer
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
 from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
@@ -207,6 +214,17 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Hand q6 serial timeout in seconds.",
     )
+    parser.add_argument(
+        "--exo-hand-calibration",
+        action="store_true",
+        help="Re-run exoskeleton hand zero-pose calibration and update the fixed calibration file.",
+    )
+    parser.add_argument(
+        "--exo-hand-calibration-path",
+        type=str,
+        default="",
+        help="Optional fixed exoskeleton hand zero-pose calibration JSON path.",
+    )
     parser.add_argument("--show-hand-raw-lines", action="store_true", help="Print raw hand q6 lines.")
     parser.add_argument(
         "--hand-joint-order",
@@ -273,6 +291,24 @@ def parse_args() -> argparse.Namespace:
         help="Freeze when control rate drops below this threshold.",
     )
     parser.add_argument(
+        "--invalid-frame-limit",
+        type=_positive_int,
+        default=3,
+        help="Freeze after this many consecutive invalid critical tracker frames.",
+    )
+    parser.add_argument(
+        "--recovery-healthy-frames",
+        type=_positive_int,
+        default=10,
+        help="Number of consecutive fault-free control frames required before auto recovery starts.",
+    )
+    parser.add_argument(
+        "--recovery-ramp-sec",
+        type=_positive_float,
+        default=1.0,
+        help="Absolute-control recovery ramp duration.",
+    )
+    parser.add_argument(
         "--disable-dual-arm-collision-avoidance",
         action="store_true",
         help="Disable the joint-space dual-arm collision-aware retargeter.",
@@ -301,6 +337,13 @@ def parse_args() -> argparse.Namespace:
         help="JSON config for RealSense RGB cameras.",
     )
     parser.add_argument("--no-camera", action="store_true", help="Disable camera startup and video export.")
+    parser.add_argument(
+        "--vis_cam",
+        "--vis-cam",
+        dest="vis_cam",
+        action="store_true",
+        help="Show live RealSense RGB frames at the same resolution used for collection.",
+    )
     parser.add_argument("--write-video", dest="write_video", action="store_true")
     parser.add_argument("--no-video", dest="write_video", action="store_false")
     parser.set_defaults(write_video=True)
@@ -324,7 +367,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite.")
     parser.add_argument("--status-sec", type=_positive_float, default=2.0, help="Status print interval in seconds.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.no_camera):
+        if bool(args.vis_cam):
+            parser.error("--vis_cam requires cameras; remove --no-camera.")
+        args.write_video = False
+    return args
 
 
 @dataclass(frozen=True)
@@ -334,6 +382,7 @@ class CollectApp:
     calibration: TeleopCalibration
     camera_sources: dict[str, RealSenseRGBSource]
     pose_retargeters: dict[str, PoseToArmRetargeter]
+    hand_retargeters: dict[str, JointsToDexHandRetargeter]
     dual_arm_retargeter: DualArmCollisionAwareRetargeter | None
     unmanaged_backends: dict[str, Any]
     writer: LeRobotV21Writer
@@ -341,6 +390,7 @@ class CollectApp:
     runtime: CollectionRuntime
     control_state: "CollectControlState"
     tactile_visualizer: TactileUVVisualizer | None
+    camera_previewer: CameraPreviewer | None
 
 
 @dataclass
@@ -350,6 +400,14 @@ class CollectControlState:
     active_episode_started_at: float | None = None
     saved_episodes: int = 0
     discarded_episodes: int = 0
+
+
+@dataclass
+class RecoveryPlan:
+    mode: str
+    started_at: float
+    duration_sec: float = 0.0
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 class TerminalKeyController:
@@ -456,6 +514,8 @@ def _build_hand_source(args: argparse.Namespace, active_sides: tuple[str, ...]) 
         baudrate=int(args.hand_reader_baudrate),
         timeout=float(args.hand_reader_timeout),
         show_raw_lines=bool(args.show_hand_raw_lines),
+        exo_hand_calibration=bool(args.exo_hand_calibration),
+        calibration_path=str(args.exo_hand_calibration_path or "") or None,
         critical=False,
         strict_expected=False,
     )
@@ -606,7 +666,10 @@ def _episode_metadata(
         "hand_tactile_regions": list(_parse_hand_tactile_regions(args.hand_tactile_regions))
         if args.with_tactile
         else [],
+        "exo_hand_calibration": bool(args.exo_hand_calibration),
+        "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
         "visualize_tactile": bool(args.visualize_tactile),
+        "vis_cam": bool(args.vis_cam),
         "camera_keys": sorted(camera_sources),
         "camera_config_path": None if args.no_camera else str(args.camera_config),
         "calibration_path": args.load_profile or None,
@@ -616,6 +679,13 @@ def _episode_metadata(
 
 def _log(tag: str, message: str) -> None:
     print(f"[{tag}] {message}", flush=True)
+
+
+def _compact_log_value(value: object, *, max_chars: int = 90) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
 
 
 def _qpos_or_none(value: Any) -> np.ndarray | None:
@@ -712,6 +782,216 @@ def _sync_arm_backends_from_hardware(
         synced[side] = True
     _seed_dual_arm_retargeter_from_backends(app)
     return synced
+
+
+def _build_runtime_hand_command_for_recovery(
+    app: CollectApp,
+    observation: TeleopObservation | None,
+) -> TeleopCommand | None:
+    if observation is None or not app.hand_retargeters:
+        return None
+    commands = [
+        retargeter.retarget(observation, app.calibration)
+        for retargeter in app.hand_retargeters.values()
+    ]
+    merged = merge_teleop_commands(tuple(commands))
+    if not merged.commands:
+        return None
+    return merged
+
+
+def _merge_runtime_hand_command(
+    active_command: TeleopCommand | None,
+    hand_command: TeleopCommand | None,
+) -> TeleopCommand | None:
+    if hand_command is None:
+        return active_command
+    if active_command is None:
+        return None
+    return merge_teleop_commands((active_command, hand_command))
+
+
+def _start_recovery_plan(
+    app: CollectApp,
+    observation: TeleopObservation,
+    *,
+    now: float,
+    control_mode: str,
+    ramp_sec: float,
+) -> tuple[RecoveryPlan | None, TeleopCommand | None, bool]:
+    _seed_dual_arm_retargeter_from_backends(app)
+
+    if control_mode == "delta_clutch":
+        for side in app.active_sides:
+            app.pose_retargeters[side].reanchor_to_current_input(
+                observation,
+                app.calibration,
+                robot_pose_desk=_backend_tcp_pose_desk(app, side=side),
+            )
+        _seed_dual_arm_retargeter_from_backends(app)
+        return None, app.components.session.build_command(observation), True
+
+    if app.dual_arm_retargeter is not None:
+        context = app.dual_arm_retargeter.build_target_context(
+            observation,
+            app.calibration,
+        )
+        return (
+            RecoveryPlan(
+                mode="absolute_ramp_dual",
+                started_at=now,
+                duration_sec=float(ramp_sec),
+                payload={
+                    "context": context,
+                    "start_targets": app.dual_arm_retargeter.current_world_targets(),
+                    "end_targets": {
+                        "left": context.left_target.copy(),
+                        "right": context.right_target.copy(),
+                    },
+                },
+            ),
+            None,
+            False,
+        )
+
+    end_resolutions: dict[str, dict[str, object]] = {}
+    for side in app.active_sides:
+        resolution = app.pose_retargeters[side].resolve_absolute_target_from_observation(
+            observation,
+            app.calibration,
+        )
+        if resolution is None:
+            raise RuntimeError(
+                f"Absolute recovery requires active wrist channel '{side}_wrist_pose' to be valid."
+            )
+        end_resolutions[side] = resolution
+    return (
+        RecoveryPlan(
+            mode="absolute_ramp_independent",
+            started_at=now,
+            duration_sec=float(ramp_sec),
+            payload={
+                "start_targets": {
+                    side: _backend_tcp_pose_desk(app, side=side)
+                    for side in app.active_sides
+                },
+                "end_resolutions": end_resolutions,
+            },
+        ),
+        None,
+        False,
+    )
+
+
+def _advance_recovery_plan(
+    app: CollectApp,
+    observation: TeleopObservation,
+    plan: RecoveryPlan,
+    *,
+    now: float,
+) -> tuple[TeleopCommand, bool]:
+    alpha = 1.0
+    if plan.duration_sec > 1e-6:
+        alpha = float(np.clip((now - plan.started_at) / plan.duration_sec, 0.0, 1.0))
+
+    if plan.mode == "absolute_ramp_dual":
+        if app.dual_arm_retargeter is None:
+            raise RuntimeError(
+                "Dual-arm recovery plan is active but dual retargeter is unavailable."
+            )
+        _seed_dual_arm_retargeter_from_backends(app)
+        context = plan.payload["context"]
+        start_targets = plan.payload["start_targets"]
+        end_targets = plan.payload["end_targets"]
+        command = app.dual_arm_retargeter.build_command_for_context(
+            context,
+            targets=app.dual_arm_retargeter.interpolate_world_targets(
+                start_targets,
+                end_targets,
+                alpha,
+            ),
+        )
+        command.timestamp = observation.timestamp
+        return command, alpha >= 1.0
+
+    if plan.mode == "absolute_ramp_independent":
+        start_targets = plan.payload["start_targets"]
+        end_resolutions = plan.payload["end_resolutions"]
+        commands: list[TeleopCommand] = []
+        for side, resolution in end_resolutions.items():
+            target_pose = interpolate_pose(
+                start_targets[side],
+                resolution["target_pose_desk"],
+                alpha,
+            )
+            commands.append(
+                app.pose_retargeters[side].build_command_from_target_pose_desk(
+                    target_pose_desk=target_pose,
+                    observation=observation,
+                    calibration=app.calibration,
+                    pose_operator=resolution.get("pose_operator"),
+                )
+            )
+        command = merge_teleop_commands(tuple(commands))
+        command.timestamp = observation.timestamp
+        return command, alpha >= 1.0
+
+    raise ValueError(f"Unsupported recovery plan mode: {plan.mode}")
+
+
+def _drive_recovery_step(
+    app: CollectApp,
+    args: argparse.Namespace,
+    result: Any,
+    recovery_plan: RecoveryPlan | None,
+    *,
+    now: float,
+) -> RecoveryPlan | None:
+    if result.state != TeleopRunState.RECOVERING:
+        return None
+
+    observation = result.observation
+    hand_command = _build_runtime_hand_command_for_recovery(app, observation)
+    active_command: TeleopCommand | None = None
+    recovery_done = False
+
+    if observation is None:
+        return recovery_plan
+
+    if recovery_plan is None:
+        recovery_plan, active_command, recovery_done = _start_recovery_plan(
+            app,
+            observation,
+            now=now,
+            control_mode=str(args.control_mode),
+            ramp_sec=float(args.recovery_ramp_sec),
+        )
+        if recovery_plan is None:
+            _log("Recovery", f"direct mode control_mode={args.control_mode}")
+        else:
+            _log(
+                "Recovery",
+                f"start mode={recovery_plan.mode} duration={recovery_plan.duration_sec:.2f}s",
+            )
+    else:
+        active_command, recovery_done = _advance_recovery_plan(
+            app,
+            observation,
+            recovery_plan,
+            now=now,
+        )
+
+    active_command = _merge_runtime_hand_command(active_command, hand_command)
+    if active_command is not None:
+        if app.components.session.rig is None:
+            raise RuntimeError("Recovery requires an active rig.")
+        app.components.session.rig.send_commands(active_command)
+
+    if recovery_done:
+        app.components.session.finish_recovery("recovery completed")
+        _log("Recovery", "completed")
+        return None
+    return recovery_plan
 
 
 def _backend_tcp_pose_desk(
@@ -1025,6 +1305,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
 
     all_backends, rig_backends = _build_backends(args, active_sides)
     tactile_visualizer = _build_tactile_visualizer(args, active_sides)
+    camera_previewer = CameraPreviewer() if bool(args.vis_cam) and camera_sources else None
     rig_backend_names = set(rig_backends)
     for side in hand_retargeters:
         hand_backend = all_backends.get(f"{side}_hand")
@@ -1041,6 +1322,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             mode="collect_real",
             tcp_mode="hand_base",
             record_enabled=False,
+            recovery_healthy_frame_count=max(1, int(args.recovery_healthy_frames)),
         ),
         sources=session_sources,
         retargeters=retargeters,
@@ -1049,6 +1331,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         safety_config=TeleopSafetyConfig(
             freeze_on_fault=True,
             required_channels=tuple(f"{side}_wrist_pose" for side in active_sides),
+            invalid_frame_limit=max(1, int(args.invalid_frame_limit)),
             minimum_control_hz=float(args.minimum_control_hz),
             target_control_hz=float(args.hz),
         ),
@@ -1119,6 +1402,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         calibration=calibration,
         camera_sources=camera_sources,
         pose_retargeters=pose_retargeters,
+        hand_retargeters=hand_retargeters,
         dual_arm_retargeter=dual_arm_retargeter,
         unmanaged_backends={
             name: backend
@@ -1130,7 +1414,35 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         runtime=runtime,
         control_state=control_state,
         tactile_visualizer=tactile_visualizer,
+        camera_previewer=camera_previewer,
     )
+
+
+def _camera_status_text(app: CollectApp) -> str:
+    if not app.camera_sources:
+        return ""
+    bits: list[str] = []
+    if app.camera_previewer is not None and app.camera_previewer.disabled_reason:
+        bits.append(
+            "preview=disabled:"
+            + _compact_log_value(app.camera_previewer.disabled_reason, max_chars=80)
+        )
+    for camera_key, source in sorted(app.camera_sources.items()):
+        try:
+            info = source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            bits.append(f"{camera_key}=status_error:{type(exc).__name__}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        last_error = info.get("last_error")
+        if last_error:
+            bits.append(
+                f"{camera_key}=frames:{frame_count},err:"
+                f"{_compact_log_value(last_error, max_chars=70)}"
+            )
+        else:
+            bits.append(f"{camera_key}=frames:{frame_count}")
+    return "" if not bits else f" camera={';'.join(bits)}"
 
 
 def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None, app: CollectApp) -> str:
@@ -1144,9 +1456,23 @@ def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None
     home = "ready" if app.calibration.metadata.get("home_ready") else "unset"
     episode = control.active_episode_index
     control_hz = 0.0 if result is None else float(result.control_hz)
+    hand_bits: list[str] = []
+    if result is not None:
+        for side in app.active_sides:
+            channel = result.channels.get(f"{side}_hand_q6")
+            if channel is None:
+                continue
+            if channel.valid:
+                hand_bits.append(f"{side}=ok")
+            else:
+                metadata = channel.metadata or {}
+                read_error = str(metadata.get("read_error") or "invalid")
+                hand_bits.append(f"{side}=invalid:{read_error}")
+    hand_status = "" if not hand_bits else f" hand_q6={','.join(hand_bits)}"
     return (
         f"step={step_count} state={state_value} home={home} recording={recording} "
         f"episode={episode} control_hz={control_hz:.2f} submitted={runtime.submitted_samples}"
+        f"{hand_status}{_camera_status_text(app)}"
     )
 
 
@@ -1159,8 +1485,27 @@ def main() -> int:
     last_status_at = 0.0
     loop_period_sec = 1.0 / float(args.hz)
     should_quit = False
+    recovery_plan: RecoveryPlan | None = None
 
     try:
+        if app.camera_sources:
+            _log(
+                "Camera",
+                f"configured cameras={sorted(app.camera_sources)} "
+                f"config={args.camera_config} vis_cam={bool(args.vis_cam)}",
+            )
+            if app.camera_previewer is not None:
+                if app.camera_previewer.ensure_available():
+                    _log(
+                        "Camera",
+                        "--vis_cam display preflight ok; preview windows will open when the main loop starts.",
+                    )
+                else:
+                    _log(
+                        "Camera",
+                        "--vis_cam requested but preview is disabled: "
+                        f"{app.camera_previewer.disabled_reason}",
+                    )
         runtime.start()
         _start_unmanaged_backends(app.unmanaged_backends)
         app.components.session.start()
@@ -1175,6 +1520,10 @@ def main() -> int:
                     for camera_key, source in app.camera_sources.items()
                 },
             )
+            if app.camera_previewer is not None and app.camera_previewer.disabled_reason is None:
+                _log("Camera", f"--vis_cam active for cameras={sorted(app.camera_sources)}")
+        elif args.no_camera:
+            _log("Camera", "--no-camera active; no RealSense config was loaded and no camera sources were started.")
 
         _log("Collect", f"ready -> {args.dataset_root}")
         _log("Keys", "p=calibrate/follow, z=start recording, c=save episode, d=discard recording, h=hold+clear home, q=quit; keys are case-insensitive.")
@@ -1201,6 +1550,13 @@ def main() -> int:
             if app.calibration.metadata.get("home_ready"):
                 result = runtime.step(now=loop_started_at)
                 step_count += 1
+                recovery_plan = _drive_recovery_step(
+                    app,
+                    args,
+                    result,
+                    recovery_plan,
+                    now=loop_started_at,
+                )
             if app.tactile_visualizer is not None:
                 app.tactile_visualizer.update(
                     tactile_by_side_from_backends(
@@ -1208,6 +1564,8 @@ def main() -> int:
                         lambda side: _hand_backend(app, side),
                     )
                 )
+            if app.camera_previewer is not None:
+                app.camera_previewer.update(app.camera_sources)
             if (loop_started_at - last_status_at) >= float(args.status_sec):
                 print(_status_line(step_count, runtime, result, app))
                 last_status_at = loop_started_at
@@ -1229,8 +1587,12 @@ def main() -> int:
                     if app.tactile_visualizer is not None:
                         app.tactile_visualizer.close()
                 finally:
-                    runtime.close()
-                    _close_unmanaged_backends(app.unmanaged_backends)
+                    try:
+                        if app.camera_previewer is not None:
+                            app.camera_previewer.close()
+                    finally:
+                        runtime.close()
+                        _close_unmanaged_backends(app.unmanaged_backends)
 
     print(
         f"done saved_episodes={app.control_state.saved_episodes} "
