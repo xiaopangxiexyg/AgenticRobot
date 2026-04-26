@@ -164,7 +164,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --status-sec 1 \
   --calibration-timeout 15 \
   --calibration-samples 20 \
-  --visualize-tactile
+  --visualize-tactile \
+  --skip-renderer
 ```
 
 检查点：
@@ -208,7 +209,8 @@ python -m teleop_runtime.collection.run_collect \
   --nominal-fps 30 \
   --calibration-timeout 15 \
   --calibration-samples 20 \
-  --status-sec 1
+  --status-sec 1 \
+  --no-camera 
 ```
 
 首次带相机短测可以临时追加：
