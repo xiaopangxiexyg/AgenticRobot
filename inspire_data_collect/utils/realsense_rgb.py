@@ -33,7 +33,8 @@ class RealSenseRGBCameraConfig:
     name: str | None = None
     keep_last: int = 2
     color_space: str = "rgb"
-    wait_timeout_ms: int = 200
+    wait_timeout_ms: int = 1000
+    stale_after_sec: float = 2.0
     auto_exposure_priority: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -51,6 +52,8 @@ class RealSenseRGBCameraConfig:
             raise ValueError("keep_last must be positive.")
         if int(self.wait_timeout_ms) <= 0:
             raise ValueError("wait_timeout_ms must be positive.")
+        if float(self.stale_after_sec) <= 0.0:
+            raise ValueError("stale_after_sec must be positive.")
         self.color_space = str(self.color_space).lower()
         if self.color_space not in {"rgb", "bgr"}:
             raise ValueError("color_space must be either 'rgb' or 'bgr'.")
@@ -68,6 +71,7 @@ class RealSenseRGBCameraConfig:
                     "keep_last": int(self.keep_last),
                     "color_space": self.color_space,
                     "wait_timeout_ms": int(self.wait_timeout_ms),
+                    "stale_after_sec": float(self.stale_after_sec),
                     "auto_exposure_priority": self.auto_exposure_priority,
                     "metadata": dict(self.metadata),
                 }
@@ -104,6 +108,11 @@ class RealSenseRGBSource:
         self._latest_frame: VideoFrame | None = None
         self._frame_counter = 0
         self._last_error: str | None = None
+        self._last_runtime_error: str | None = None
+        self._started_at: float | None = None
+        self._last_frame_receive_timestamp: float | None = None
+        self._timeout_count = 0
+        self._consecutive_timeout_count = 0
         self._device_info: dict[str, Any] = {}
 
     @property
@@ -133,6 +142,7 @@ class RealSenseRGBSource:
         self._pipeline = pipeline
         self._profile = profile
         self._device_info = self._device_info_from_profile(profile)
+        self._started_at = time.time()
         self._running = True
         self._thread = threading.Thread(
             target=self._capture_loop,
@@ -167,6 +177,8 @@ class RealSenseRGBSource:
             "height": int(intr.height),
             "fps": int(self.config.fps),
             "color_space": self.config.color_space,
+            "wait_timeout_ms": int(self.config.wait_timeout_ms),
+            "stale_after_sec": float(self.config.stale_after_sec),
             "intrinsics": {
                 "width": int(intr.width),
                 "height": int(intr.height),
@@ -189,6 +201,31 @@ class RealSenseRGBSource:
             except Exception:  # noqa: BLE001
                 info[key] = None
         return info
+
+    @staticmethod
+    def _is_frame_timeout_error(message: str) -> bool:
+        lowered = str(message).lower()
+        return "frame didn't arrive" in lowered or "frame did not arrive" in lowered
+
+    def _set_transient_or_stale_timeout_error(self, message: str) -> None:
+        now = time.time()
+        stale_after_sec = float(self.config.stale_after_sec)
+        with self._lock:
+            self._timeout_count += 1
+            self._consecutive_timeout_count += 1
+            self._last_runtime_error = str(message)
+            last_frame_at = self._last_frame_receive_timestamp
+            started_at = self._started_at
+            if last_frame_at is not None:
+                is_stale = now - float(last_frame_at) >= stale_after_sec
+            elif started_at is not None:
+                is_stale = now - float(started_at) >= stale_after_sec
+            else:
+                is_stale = True
+            if is_stale:
+                self._last_error = f"frame_timeout_stale: {message}"
+            else:
+                self._last_error = None
 
     def _capture_loop(self) -> None:
         assert self._pipeline is not None
@@ -238,14 +275,23 @@ class RealSenseRGBSource:
                 with self._lock:
                     self._latest_frame = frame
                     self._last_error = None
+                    self._last_runtime_error = None
+                    self._last_frame_receive_timestamp = received_at
+                    self._consecutive_timeout_count = 0
                 self._frame_buffer.push(frame)
             except RuntimeError as exc:
                 if not self._running:
                     break
-                with self._lock:
-                    self._last_error = str(exc)
+                message = str(exc)
+                if self._is_frame_timeout_error(message):
+                    self._set_transient_or_stale_timeout_error(message)
+                else:
+                    with self._lock:
+                        self._last_runtime_error = message
+                        self._last_error = message
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
+                    self._last_runtime_error = f"{type(exc).__name__}: {exc}"
                     self._last_error = f"{type(exc).__name__}: {exc}"
 
     def get_latest_frame(self) -> VideoFrame | None:
@@ -265,10 +311,21 @@ class RealSenseRGBSource:
         return self._frame_buffer
 
     def device_info(self) -> dict[str, Any]:
+        now = time.time()
         with self._lock:
             info = dict(self._device_info)
             info["last_error"] = self._last_error
+            info["last_runtime_error"] = self._last_runtime_error
             info["frame_count"] = int(self._frame_counter)
+            info["timeout_count"] = int(self._timeout_count)
+            info["consecutive_timeout_count"] = int(self._consecutive_timeout_count)
+            info["last_frame_receive_timestamp"] = self._last_frame_receive_timestamp
+            info["last_frame_age_sec"] = (
+                None
+                if self._last_frame_receive_timestamp is None
+                else float(now - float(self._last_frame_receive_timestamp))
+            )
+            info["stale_after_sec"] = float(self.config.stale_after_sec)
         return info
 
     def close(self) -> None:

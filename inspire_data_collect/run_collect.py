@@ -308,7 +308,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-keep-last", type=int, default=4)
     parser.add_argument("--camera-color-space", choices=["rgb", "bgr"], default="rgb")
-    parser.add_argument("--camera-wait-timeout-ms", type=int, default=200)
+    parser.add_argument("--camera-wait-timeout-ms", type=int, default=1000)
+    parser.add_argument(
+        "--camera-stale-after-sec",
+        type=float,
+        default=2.0,
+        help=(
+            "Seconds without a received RealSense frame before transient "
+            "wait_for_frames timeouts are reported as camera errors."
+        ),
+    )
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
     parser.add_argument(
         "--vis_cam",
@@ -395,6 +404,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--camera-fps must be positive.")
         if int(args.camera_keep_last) <= 0:
             raise ValueError("--camera-keep-last must be positive.")
+        if float(args.camera_stale_after_sec) <= 0.0:
+            raise ValueError("--camera-stale-after-sec must be positive.")
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
     for side in active_sides:
@@ -511,6 +522,7 @@ def build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSour
             keep_last=int(args.camera_keep_last),
             color_space=str(args.camera_color_space),
             wait_timeout_ms=int(args.camera_wait_timeout_ms),
+            stale_after_sec=float(args.camera_stale_after_sec),
             auto_exposure_priority=args.camera_auto_exposure_priority,
             metadata={"source": "cli"},
         )

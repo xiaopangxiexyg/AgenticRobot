@@ -302,6 +302,8 @@ source = RealSenseRGBSource(
         height=480,
         fps=30,
         keep_last=4,
+        wait_timeout_ms=1000,
+        stale_after_sec=2.0,
     )
 )
 source.start()
@@ -594,6 +596,8 @@ python -m inspire_data_collect \
     "width": 640,
     "height": 480,
     "fps": 30,
+    "wait_timeout_ms": 1000,
+    "stale_after_sec": 2.0,
     "metadata": {"mount": "front"}
   },
   "wrist": {
@@ -601,6 +605,8 @@ python -m inspire_data_collect \
     "width": 640,
     "height": 480,
     "fps": 30,
+    "wait_timeout_ms": 1000,
+    "stale_after_sec": 2.0,
     "metadata": {"mount": "wrist"}
   }
 }
@@ -620,6 +626,8 @@ python -m inspire_data_collect \
 ```
 
 `--camera-mode multi` 会记录配置文件中的全部相机，每个 `camera_key` 单独写入一个 `videos/observation.images.<camera_key>/...mp4`。`--vis-cam-key` 只控制预览窗口；不传时优先预览 `front`，否则预览配置中按名称排序的第一个相机。
+
+多视角时偶发 `Frame didn't arrive` 通常是某一路 RealSense 在当前 timeout 内没有返回新帧，可能来自 USB 带宽、启动抖动或分辨率/帧率过高。采集端默认用 `wait_timeout_ms=1000`，并且只有连续超过 `stale_after_sec=2.0` 没有收到新帧时才报告相机 error；短暂超时不会反复刷屏，也不会影响已收到帧的预览和写盘。如果仍持续报 `frame_timeout_stale`，优先降低多路相机的 `width/height/fps`，并确认相机分散到足够的 USB 控制器上。
 
 默认启用静默模式，不再持续打印 `[Status] ...`。采集过程中仍会保留开始/保存/丢弃/退出、标定、相机 preview 启停、fault 出现/恢复、相机从 waiting 到 streaming 等状态变化信息。需要恢复周期状态行时追加 `--no-silent` 或 `--verbose-status`，输出间隔由 `--status-sec` 控制。
 

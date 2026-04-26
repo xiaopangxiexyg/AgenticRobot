@@ -4,6 +4,8 @@
     "width": 640,
     "height": 480,
     "fps": 30,
+    "wait_timeout_ms": 1000,
+    "stale_after_sec": 2.0,
     "metadata": {
       "mount": "single_front"
     }
