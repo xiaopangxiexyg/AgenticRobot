@@ -681,6 +681,13 @@ def _log(tag: str, message: str) -> None:
     print(f"[{tag}] {message}", flush=True)
 
 
+def _compact_log_value(value: object, *, max_chars: int = 90) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
 def _qpos_or_none(value: Any) -> np.ndarray | None:
     if value is None:
         return None
@@ -1411,6 +1418,33 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     )
 
 
+def _camera_status_text(app: CollectApp) -> str:
+    if not app.camera_sources:
+        return ""
+    bits: list[str] = []
+    if app.camera_previewer is not None and app.camera_previewer.disabled_reason:
+        bits.append(
+            "preview=disabled:"
+            + _compact_log_value(app.camera_previewer.disabled_reason, max_chars=80)
+        )
+    for camera_key, source in sorted(app.camera_sources.items()):
+        try:
+            info = source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            bits.append(f"{camera_key}=status_error:{type(exc).__name__}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        last_error = info.get("last_error")
+        if last_error:
+            bits.append(
+                f"{camera_key}=frames:{frame_count},err:"
+                f"{_compact_log_value(last_error, max_chars=70)}"
+            )
+        else:
+            bits.append(f"{camera_key}=frames:{frame_count}")
+    return "" if not bits else f" camera={';'.join(bits)}"
+
+
 def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None, app: CollectApp) -> str:
     state_value = (
         result.state.value
@@ -1438,7 +1472,7 @@ def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None
     return (
         f"step={step_count} state={state_value} home={home} recording={recording} "
         f"episode={episode} control_hz={control_hz:.2f} submitted={runtime.submitted_samples}"
-        f"{hand_status}"
+        f"{hand_status}{_camera_status_text(app)}"
     )
 
 
@@ -1454,6 +1488,24 @@ def main() -> int:
     recovery_plan: RecoveryPlan | None = None
 
     try:
+        if app.camera_sources:
+            _log(
+                "Camera",
+                f"configured cameras={sorted(app.camera_sources)} "
+                f"config={args.camera_config} vis_cam={bool(args.vis_cam)}",
+            )
+            if app.camera_previewer is not None:
+                if app.camera_previewer.ensure_available():
+                    _log(
+                        "Camera",
+                        "--vis_cam display preflight ok; preview windows will open when the main loop starts.",
+                    )
+                else:
+                    _log(
+                        "Camera",
+                        "--vis_cam requested but preview is disabled: "
+                        f"{app.camera_previewer.disabled_reason}",
+                    )
         runtime.start()
         _start_unmanaged_backends(app.unmanaged_backends)
         app.components.session.start()
@@ -1468,7 +1520,7 @@ def main() -> int:
                     for camera_key, source in app.camera_sources.items()
                 },
             )
-            if app.camera_previewer is not None:
+            if app.camera_previewer is not None and app.camera_previewer.disabled_reason is None:
                 _log("Camera", f"--vis_cam active for cameras={sorted(app.camera_sources)}")
         elif args.no_camera:
             _log("Camera", "--no-camera active; no RealSense config was loaded and no camera sources were started.")

@@ -105,6 +105,8 @@ hand_state = backend.get_state()
 
 ```bash
 cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate grasp_py310_copy
 ```
 
 先确认 Python 依赖能导入。RealSense 只在启用相机时需要：
@@ -319,7 +321,7 @@ PY
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
 
-正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致。`--vis_cam` 只支持 `--camera-mode single`，无显示环境时不要传该参数。
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致。`--vis_cam` 只支持 `--camera-mode single`。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 
@@ -585,7 +587,7 @@ python -m inspire_data_collect \
   --vis_cam
 ```
 
-如果当前终端没有 `DISPLAY` 或 `WAYLAND_DISPLAY`，删除 `--vis_cam`，不影响相机采集和视频写盘。
+如果当前终端没有 `DISPLAY` 或 `WAYLAND_DISPLAY`，可以删除 `--vis_cam`；即使保留该参数，程序也会禁用预览窗口并继续采集。运行中可看 `[Status] ... camera=front=frames:<N>` 判断 RealSense 是否持续产帧。
 
 手部外骨骼 zero pose：默认读取固定标定；需要重新标定并更新固定值时，在任意采集命令中追加 `--exo-hand-calibration`。也可以用 `--exo-hand-calibration-path PATH` 指定另一份固定标定 JSON。
 

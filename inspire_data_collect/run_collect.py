@@ -326,6 +326,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
     )
     if float(args.hz) <= 0.0:
         raise ValueError("--hz must be positive.")
+    if float(args.status_sec) <= 0.0:
+        raise ValueError("--status-sec must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
     if args.enable_arm:
@@ -534,6 +536,43 @@ def print_standby(next_episode_index: int) -> None:
     print("=" * 100)
 
 
+def compact_log_value(value: object, *, max_chars: int = 90) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def camera_status_text(
+    camera_sources: dict[str, RealSenseRGBSource],
+    camera_previewer: CameraPreviewer | None,
+) -> str:
+    if not camera_sources:
+        return "camera=off"
+    bits: list[str] = []
+    if camera_previewer is not None and camera_previewer.disabled_reason:
+        bits.append(
+            "preview=disabled:"
+            + compact_log_value(camera_previewer.disabled_reason, max_chars=80)
+        )
+    for camera_key, camera_source in sorted(camera_sources.items()):
+        try:
+            info = camera_source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            bits.append(f"{camera_key}=status_error:{type(exc).__name__}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        last_error = info.get("last_error")
+        if last_error:
+            bits.append(
+                f"{camera_key}=frames:{frame_count},err:"
+                f"{compact_log_value(last_error, max_chars=70)}"
+            )
+        else:
+            bits.append(f"{camera_key}=frames:{frame_count}")
+    return "camera=" + ";".join(bits)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspire Tac collection with optional single-arm FR3 teleoperation."
@@ -595,6 +634,7 @@ def main(argv: list[str] | None = None) -> int:
     recording = False
     loop_rate = LoopRate()
     step_count = 0
+    last_status_at = 0.0
 
     def start_episode() -> None:
         nonlocal current_episode, recording
@@ -674,6 +714,23 @@ def main(argv: list[str] | None = None) -> int:
             print_standby(writer.next_episode_index)
 
     try:
+        if camera_sources:
+            print(
+                "[Camera] configured "
+                f"cameras={sorted(camera_sources)} mode={args.camera_mode} "
+                f"vis_cam={bool(args.vis_cam)}"
+            )
+            if camera_previewer is not None:
+                if camera_previewer.ensure_available():
+                    print(
+                        "[Camera] --vis_cam display preflight ok; "
+                        "preview windows will open when the main loop starts."
+                    )
+                else:
+                    print(
+                        "[Camera] --vis_cam requested but preview is disabled: "
+                        f"{camera_previewer.disabled_reason}"
+                    )
         source.start()
         if arm_source is not None:
             arm_source.start()
@@ -699,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
                     for camera_key, source in camera_sources.items()
                 },
             )
-            if camera_previewer is not None:
+            if camera_previewer is not None and camera_previewer.disabled_reason is None:
                 print(f"[Camera] --vis_cam active for cameras={sorted(camera_sources)}")
         if arm_source is not None:
             writer.write_device_config("arm_exo", arm_source.device_info())
@@ -766,6 +823,16 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if camera_previewer is not None:
                     camera_previewer.update(camera_sources)
+
+                if loop_started_at - last_status_at >= float(args.status_sec):
+                    frame_count = int(sample_builder.frame_index)
+                    rec_state = "on" if recording else "off"
+                    print(
+                        f"[Status] step={step_count} hz={control_hz:.2f} "
+                        f"recording={rec_state} episode={current_episode} "
+                        f"frames={frame_count} {camera_status_text(camera_sources, camera_previewer)}"
+                    )
+                    last_status_at = loop_started_at
 
                 if recording and current_episode is not None:
                     sample = sample_builder.build(

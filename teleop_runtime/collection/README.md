@@ -300,6 +300,8 @@ python -m teleop_runtime.collection.run_collect \
   完全禁用相机链路。
 - `--camera-config`
   RealSense 配置 JSON，默认读取 [realsense.json](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/configs/devices/realsense.json)。
+- `--vis_cam`
+  采集时弹出 RealSense RGB 预览窗口；如果当前 OpenCV/显示环境不可用，会在终端打印原因并继续采集。
 - `--no-video`
   禁止视频导出。当前如果同时保留相机但关闭视频，只会保留相机时间相关 metadata，不会保存图像内容。
 - `--no-parquet`
@@ -441,15 +443,25 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 如果还没有按 `p`，collector 等待按键是正常状态，不代表卡死。
 
-### 12.2 只想采 arm，不想采手
+### 12.2 `--vis_cam` 没有窗口
+
+`--vis_cam` 依赖当前 Python 环境的 OpenCV HighGUI 和桌面显示。启动时如果看到 `preview is disabled`，优先检查：
+
+- 当前 shell/IDE 是否能连接 `DISPLAY` 或 `WAYLAND_DISPLAY`
+- `cv2` 是否是可用的 GUI 构建
+- RealSense 是否已经开始产帧，状态行里的 `camera=front=frames:<N>` 是否增长
+
+即使预览窗口禁用，只要相机正常产帧，视频采集仍会继续写入 dataset。
+
+### 12.3 只想采 arm，不想采手
 
 直接不要传任何 `--left-hand-port/--right-hand-port/--left-hand-ip/--right-hand-ip` 即可。
 
-### 12.3 只想采 q6，不接真实 InspireTac
+### 12.4 只想采 q6，不接真实 InspireTac
 
 只传 `--left-hand-port/--right-hand-port`，不要传 hand IP。
 
-### 12.4 为什么 arm observation 不是实时真机反馈
+### 12.5 为什么 arm observation 不是实时真机反馈
 
 这是当前实现的有意选择。原因是：
 
@@ -643,6 +655,7 @@ python -m teleop_runtime.collection.run_collect \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
   --camera-config teleop_runtime/configs/devices/realsense.json \
+  --vis_cam \
   --max-steps 30
 ```
 

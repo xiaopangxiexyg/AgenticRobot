@@ -20,6 +20,7 @@ from ..hand_render import (
     inspire_q6_to_render_qpos,
     open_hand_render_qpos,
 )
+from ..opencv_highgui import probe_opencv_highgui
 from .schema_v21 import camera_video_channel
 
 
@@ -525,9 +526,24 @@ def _build_video_replay(
             missing = ", ".join(f"{key}:{path}" for key, path in sorted(video_paths.items()))
             print(f"[VideoReplay] no existing video files found: {missing}")
         return None
-    if args.video_mode == "auto" and not _has_display():
-        print("[VideoReplay] display not detected; skip collected-video windows in auto mode.")
-        return None
+    if not _has_display():
+        message = "display not detected"
+        if args.video_mode == "auto":
+            print(f"[VideoReplay] {message}; skip collected-video windows in auto mode.")
+            return None
+        raise RuntimeError(f"Collected-video replay requested but {message}.")
+    highgui_probe = probe_opencv_highgui(window_name="teleop_video_replay_probe")
+    if not highgui_probe.ok:
+        if args.video_mode == "auto":
+            print(
+                "[VideoReplay] OpenCV HighGUI unavailable; "
+                f"skip collected-video windows in auto mode: {highgui_probe.reason}"
+            )
+            return None
+        raise RuntimeError(
+            "Collected-video replay requested but OpenCV HighGUI is unavailable: "
+            f"{highgui_probe.reason}"
+        )
     return OpenCVVideoReplay(existing_paths)
 
 
