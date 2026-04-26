@@ -7,7 +7,7 @@
 
 它的目标不是替代所有旧代码，而是把“输入源 / retargeter / backend / rig / session”拆开，后续可以继续接别的输入设备、别的机械臂、别的末端。
 
-更完整的设计背景见 [teleop_runtime/blueprint.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/blueprint.md)。
+更完整的设计背景见 [teleop_runtime/blueprint.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/blueprint.md)。
 
 ## 当前已实现
 
@@ -21,11 +21,11 @@
 - `InspireTacHandBackend`
 - `BimanualRig`
 - 独立数据采集 CLI runner：
-  [teleop_runtime/collection/run_collect.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
+  [teleop_runtime/collection/run_collect.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
 - 数据采集使用说明：
-  [teleop_runtime/collection/README.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/README.md)
+  [teleop_runtime/collection/README.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/README.md)
 - 交互式 calibration debug app：
-  [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py)
+  [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py)
 - 默认录制：`teleop_records/<timestamp>/`
 
 ## 当前未实现
@@ -64,7 +64,7 @@
 
 ## VIVE 发送端
 
-新的发送端在 [hardware/VIVE/mocap/vive_data_sender.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/hardware/VIVE/mocap/vive_data_sender.py)。
+新的发送端在 [hardware/VIVE/mocap/vive_data_sender.py](/home/user/zc/dex_inspire_teleop/hardware/VIVE/mocap/vive_data_sender.py)。
 
 默认 tracker 映射：
 
@@ -89,7 +89,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 当前已经有一个可运行的交互式标定调试入口：
 
-- [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py)
+- [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py)
 
 它当前实现的是：
 
@@ -100,7 +100,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 这套流程的详细动作、按键和质量门槛见：
 
-- [teleop_runtime/CalibrationREADME.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/CalibrationREADME.md)
+- [teleop_runtime/CalibrationREADME.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/CalibrationREADME.md)
 
 当前终端日志默认带 `[HH:MM:SS]` 时间戳，并且优先按“状态变化 / 关键进度 / 异常”输出，不再固定频率重复刷屏。
 如果当前终端支持 ANSI 颜色，关键提示还会用颜色和大写步骤名强调。
@@ -124,7 +124,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 如果你需要完整动作说明，优先看：
 
-- [teleop_runtime/CalibrationREADME.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/CalibrationREADME.md)
+- [teleop_runtime/CalibrationREADME.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/CalibrationREADME.md)
 
 ### 1. 结构层
 
@@ -161,7 +161,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 - `home anchor`
 
-前两项固定标定由 [run_vive_rm65_calibration_debug.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py) 负责；`home anchor` 已经移到 [run_vive_sapien_virtual.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_sapien_virtual.py) 和后续真机部署入口中按 session 重做。
+前两项固定标定由 [run_vive_rm65_calibration_debug.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py) 负责；`home anchor` 已经移到 [run_vive_sapien_virtual.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_sapien_virtual.py) 和后续真机部署入口中按 session 重做。
 
 ## 当前推荐的标定入口
 
@@ -472,7 +472,7 @@ from teleop_runtime import RM65ArmBackendConfig, InspireTacHandBackendConfig
 - 手部输入只影响 SAPIEN 中的手部渲染，不会改变 arm teleop 主链路
 - 手部输入线程和 VIVE 线程解耦，某一侧手部设备掉线不会阻断双臂控制环
 
-- [teleop_runtime/debug/run_vive_sapien_virtual.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_sapien_virtual.py)
+- [teleop_runtime/debug/run_vive_sapien_virtual.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_sapien_virtual.py)
 
 建议启动顺序：
 
@@ -536,14 +536,14 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 手部输入默认是**附加功能**：手部输入异常不会触发 arm teleop 的 `FROZEN`
 - 如果当前机器没有可用渲染设备，可以先用 `--skip-renderer` 验证 teleop 主链是否正常跑通
 - joint-space 双臂碰撞规避依赖 `pinocchio + pink + qpsolvers`
-- 更详细的控制模式说明见 [teleop_runtime/README_control_modes.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/README_control_modes.md)
+- 更详细的控制模式说明见 [teleop_runtime/README_control_modes.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/README_control_modes.md)
 - 如果发现 `+X/+Y` 同时反了，先回 calibration tool 按 `f`，或者在标定入口直接加 `--virtual-desk-post-yaw-deg 180`
 
 ## RM65 真机只读检查
 
 当前也补了一个只读真机状态的检查入口：
 
-- [teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py)
+- [teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py)
 
 它不会发送任何动态指令，只会：
 
@@ -554,13 +554,13 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 更详细的使用方式见：
 
-- [teleop_runtime/debug/rm65_real_debug/README.md](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/README.md)
+- [teleop_runtime/debug/rm65_real_debug/README.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/README.md)
 
 ## RM65 真机遥操作
 
 现在也补了双臂真机遥操作入口，并支持**可选的双手附加控制**：
 
-- [teleop_runtime/debug/run_vive_rm65_real_teleop.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_real_teleop.py)
+- [teleop_runtime/debug/run_vive_rm65_real_teleop.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_real_teleop.py)
 
 推荐启动方式：
 
@@ -581,7 +581,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20 \
-  --load-profile /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_records/calibration_profiles/20260418_194008_vive_rm65_virtual_desk.json \
+  --load-profile /home/user/zc/dex_inspire_teleop/teleop_records/calibration_profiles/20260418_194008_vive_rm65_virtual_desk.json \
   --hz 50 \
   --arm-max-angvel 1.2,1.2,1.2,1.8,1.8,1.8 \
   --left-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \

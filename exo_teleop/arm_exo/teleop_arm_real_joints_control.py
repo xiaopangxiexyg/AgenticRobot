@@ -55,7 +55,7 @@ def safe_clip(robot_q_rad, shrink_deg=10.0, print_if_clip=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", type=str, default="192.168.20.172")
+    ap.add_argument("--host", type=str, default="192.168.50.2")
     ap.add_argument("--port", type=int, default=5558)
     ap.add_argument("--timeout_s", type=float, default=5.0)
 
@@ -71,10 +71,13 @@ def main():
 
     with FR3JointClient(args.host, args.port, timeout_s=args.timeout_s) as fr3, DynamixelDriver(cfg) as driver:
         # warmup
+        driver.set_torque_mode(False)
+        time.sleep(0.05)
+
         for _ in range(3):
-            driver.set_torque_mode(False)
-            _ = driver.get_joints()
-            time.sleep(0.01)
+            q_dev = driver.get_joints()
+            print("[warmup] q_dev =", q_dev)
+            time.sleep(0.02)
 
         # read initial states
         st0 = fr3.get_state()

@@ -35,7 +35,7 @@
 
 主脚本：
 
-- [run_rm65_real_state_viz.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py)
+- [run_rm65_real_state_viz.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py)
 
 推荐启动方式：
 

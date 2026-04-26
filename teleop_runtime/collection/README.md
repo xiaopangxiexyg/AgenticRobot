@@ -12,7 +12,7 @@
 
 当前入口脚本是：
 
-- [run_collect.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
+- [run_collect.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
 
 ## 2. 当前支持范围
 
@@ -73,17 +73,17 @@ VIVE 侧如果沿用当前默认配置，receiver 默认读取：
 如果已经通过 calibration tool 保存过标定 profile，用 `--load-profile` 加载：
 
 ```bash
---load-profile /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_records/calibration_profiles/20260420_150620_vive_rm65_virtual_desk.json
+--load-profile /home/user/zc/dex_inspire_teleop/teleop_records/calibration_profiles/20260420_150620_vive_rm65_virtual_desk.json
 ```
 
 完整位置建议放在 `--active-sides` 后面，示例：
 
 ```bash
 python -m teleop_runtime.collection.run_collect \
-  --dataset-root /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/dataset_collection/demo_bimanual_no_camera \
+  --dataset-root /home/user/zc/dex_inspire_teleop/dataset_collection/demo_bimanual_no_camera \
   --task grasp_demo \
   --active-sides both \
-  --load-profile /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_records/calibration_profiles/20260420_150620_vive_rm65_virtual_desk.json \
+  --load-profile /home/user/zc/dex_inspire_teleop/teleop_records/calibration_profiles/20260420_150620_vive_rm65_virtual_desk.json \
   --host 0.0.0.0 \
   --port 9999 \
   --left-arm-ip 192.168.101.21 \
@@ -299,7 +299,7 @@ python -m teleop_runtime.collection.run_collect \
 - `--no-camera`
   完全禁用相机链路。
 - `--camera-config`
-  RealSense 配置 JSON，默认读取 [realsense.json](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/configs/devices/realsense.json)。
+  RealSense 配置 JSON，默认读取 [realsense.json](/home/user/zc/dex_inspire_teleop/teleop_runtime/configs/devices/realsense.json)。
 - `--no-video`
   禁止视频导出。当前如果同时保留相机但关闭视频，只会保留相机时间相关 metadata，不会保存图像内容。
 - `--no-parquet`
@@ -349,13 +349,13 @@ dataset_root/
 
 ## 10. SAPIEN 数据集回放
 
-采集完成后，可以用 [replay_dataset_sapien.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/replay_dataset_sapien.py) 读取 dataset root + episode，并在 SAPIEN 中按 parquet 里的关节序列复刻动作，同时逐帧打印左右手 tactile sum。
+采集完成后，可以用 [replay_dataset_sapien.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/replay_dataset_sapien.py) 读取 dataset root + episode，并在 SAPIEN 中按 parquet 里的关节序列复刻动作，同时逐帧打印左右手 tactile sum。
 
 推荐命令：
 
 ```bash
 python -m teleop_runtime.collection.replay_dataset_sapien \
-  --dataset-root /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/dataset_collection/demo_bimanual_no_camera \
+  --dataset-root /home/user/zc/dex_inspire_teleop/dataset_collection/demo_bimanual_no_camera \
   --episode 1
 ```
 
@@ -373,7 +373,7 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 ```bash
 python -m teleop_runtime.collection.replay_dataset_sapien \
-  --dataset-root /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/dataset_collection/demo_bimanual_no_camera \
+  --dataset-root /home/user/zc/dex_inspire_teleop/dataset_collection/demo_bimanual_no_camera \
   --episode 1 \
   --skip-renderer \
   --no-sleep
@@ -465,20 +465,20 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 截至当前仓库代码，collector 已经具备下面这些能力：
 
-- [run_collect.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
+- [run_collect.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
   已能直接组装 `VivePoseSource / HandQ6Source / RM65ArmBackend / InspireTacHandBackend / TeleopSession / CollectionRuntime / LeRobotV21Writer`
   并支持按键式 `p/z/c/d/h/q` 采集状态机
-- [sample_assembler.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/sample_assembler.py)
+- [sample_assembler.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/sample_assembler.py)
   已按固定双臂 schema 生成 sample，并把 arm state 固定为 `last_commanded_action`
-- [schema_v21.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/schema_v21.py)
+- [schema_v21.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/schema_v21.py)
   已把 sample 转成 LeRobot 风格 row
-- [writer_v21.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/writer_v21.py)
+- [writer_v21.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/writer_v21.py)
   已支持 async row/video/finalize job、episode parquet、meta 文件、dataset 续写，以及 active episode discard
-- [realsense_rgb.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/sources/camera/realsense_rgb.py)
+- [realsense_rgb.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/sources/camera/realsense_rgb.py)
   已支持 RealSense RGB 后台采集与 nearest-frame buffer
-- [realsense.json](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/configs/devices/realsense.json)
+- [realsense.json](/home/user/zc/dex_inspire_teleop/teleop_runtime/configs/devices/realsense.json)
   已提供默认单相机配置
-- [replay_dataset_sapien.py](/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop/teleop_runtime/collection/replay_dataset_sapien.py)
+- [replay_dataset_sapien.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/replay_dataset_sapien.py)
   已支持读取 LeRobot 风格采集 dataset，并用 SAPIEN 复刻双臂双手动作，同时打印触觉总和
 
 当前还没有完全闭环验证的部分是：

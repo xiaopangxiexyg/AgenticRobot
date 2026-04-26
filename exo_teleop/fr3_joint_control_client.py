@@ -353,7 +353,7 @@ class FR3JointClient:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", type=str, default="192.168.20.172")
+    ap.add_argument("--host", type=str, default="192.168.50.2")
     ap.add_argument("--port", type=int, default=5558)
     ap.add_argument("--timeout_s", type=float, default=2.0)
     args = ap.parse_args()
@@ -390,3 +390,6 @@ def main():
             "server_age =", st1.get("age_s", None),
             "q =", st1.get("q", None)
         )
+
+if __name__ == "__main__":
+    main()

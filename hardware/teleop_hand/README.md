@@ -13,9 +13,9 @@
 
 这个目录里现在有两条最小读取器：
 
-- [teleop_6dof_reader.py](/home/zc/HandMotion/RealRobotExperiments/g1_o6_teleop/minimal_control/teleop_6dof_reader.py)
+- [teleop_6dof_reader.py](/home/user/zc/g1_o6_teleop/minimal_control/teleop_6dof_reader.py)
   作用：外骨骼手臂 `q14` -> 左右手末端 6DoF pose
-- [hand_q6_reader.py](/home/zc/HandMotion/RealRobotExperiments/g1_o6_teleop/minimal_control/hand_q6_reader.py)
+- [hand_q6_reader.py](/home/user/zc/g1_o6_teleop/minimal_control/hand_q6_reader.py)
   作用：手部串口设备 -> 6 个手指关节值
 
 如果你现在只想拿到遥操作的六维信息，最小做法就是：
@@ -34,7 +34,7 @@
 - 串口看起来像 `/dev/ttyACM0`
 - 设备不是 Dynamixel 总线
 
-仓库里手部输入链路对应的是 [drivers/glove_reader.py](/home/zc/HandMotion/RealRobotExperiments/g1_o6_teleop/drivers/glove_reader.py)，默认波特率就是 `115200`，而不是臂部那套 `57600` 的 Dynamixel 总线。
+仓库里手部输入链路对应的是 [drivers/glove_reader.py](/home/user/zc/g1_o6_teleop/drivers/glove_reader.py)，默认波特率就是 `115200`，而不是臂部那套 `57600` 的 Dynamixel 总线。
 
 最小读取命令：
 
@@ -64,8 +64,8 @@ python minimal_control/hand_q6_reader.py \
 
 为什么会同时给 `norm` 和 `norm_swap01`：
 
-- 仓库里的手套链路前两个维度是否需要交换，代码里本来就保留了可配置逻辑，见 [teleop_sim.py](/home/zc/HandMotion/RealRobotExperiments/g1_o6_teleop/teleop_sim.py:84)
-- 当前约定的 `q6` 语义是 `[thumb_yaw, thumb_flex, index, middle, ring, pinky]`，见 [teleop_sim.py](/home/zc/HandMotion/RealRobotExperiments/g1_o6_teleop/teleop_sim.py:63)
+- 仓库里的手套链路前两个维度是否需要交换，代码里本来就保留了可配置逻辑，见 [teleop_sim.py](/home/user/zc/g1_o6_teleop/teleop_sim.py:84)
+- 当前约定的 `q6` 语义是 `[thumb_yaw, thumb_flex, index, middle, ring, pinky]`，见 [teleop_sim.py](/home/user/zc/g1_o6_teleop/teleop_sim.py:63)
 
 如果你想把单手数据发布到 Redis：
 
@@ -443,4 +443,4 @@ q14 = data["q14"]
 - 没有复用那两个脚本的 import，是因为它们会顺带拉起更重的依赖
 - 这里单独做成最小脚本，避免只想读 6DoF 时还接入机器人控制链路
 
-如果后面你希望把这个 6DoF 直接并进现有 `teleop:arm` 数据流，最直接的改法是在 [teleop_arm_only_to_redis.py](/home/zc/HandMotion/RealRobotExperiments/g1_o6_teleop/teleop_arm_only_to_redis.py) 里，`q_exo = read_exo_q14(exo)` 后面插入同样的 FK 计算，再一起 publish。
+如果后面你希望把这个 6DoF 直接并进现有 `teleop:arm` 数据流，最直接的改法是在 [teleop_arm_only_to_redis.py](/home/user/zc/g1_o6_teleop/teleop_arm_only_to_redis.py) 里，`q_exo = read_exo_q14(exo)` 后面插入同样的 FK 计算，再一起 publish。

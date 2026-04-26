@@ -104,7 +104,7 @@ hand_state = backend.get_state()
 以下命令默认在包根目录执行，并假设当前 Python 环境已经安装本包所需依赖：
 
 ```bash
-cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+cd /home/user/zc/dex_inspire_teleop_new
 ```
 
 先确认 Python 依赖能导入。RealSense 只在启用相机时需要：
@@ -133,7 +133,7 @@ ls -l /dev/serial/by-id/
 右手示例；左手把变量和通道名改成 `LEFT_HAND_PORT` / `left_hand_q6`。
 
 ```bash
-export RIGHT_HAND_PORT=/dev/ttyACM0
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
 
 python - <<'PY'
 import os
@@ -171,7 +171,7 @@ PY
 这一步只读关节位置，并把当前关节位置原样发回一次，用于确认读写接口可用。左右手分别测试，避免 IP 或侧别接反。
 
 ```bash
-export RIGHT_HAND_IP=192.168.12.210
+export RIGHT_HAND_IP=192.168.11.210
 
 python - <<'PY'
 import os
@@ -267,7 +267,7 @@ PY
 再用采集包接口取一帧 RGB：
 
 ```bash
-export CAMERA_SERIAL=213222079798
+export CAMERA_SERIAL=135122070754
 
 python - <<'PY'
 import os
@@ -278,8 +278,8 @@ source = RealSenseRGBSource(
     RealSenseRGBCameraConfig(
         serial=os.environ["CAMERA_SERIAL"],
         camera_key="front",
-        width=1280,
-        height=720,
+        width=640,
+        height=480,
         fps=30,
         keep_last=4,
     )
@@ -441,7 +441,7 @@ python -m inspire_data_collect \
 以下命令默认在包根目录执行：
 
 ```bash
-cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+cd /home/user/zc/dex_inspire_teleop_new
 ```
 
 ### 开启触觉可视化采集
@@ -469,8 +469,8 @@ python -m inspire_data_collect \
   --dataset-root ./datasets \
   --task-name right_hand_grasp \
   --active-sides right \
-  --right-hand-port /dev/ttyACM0 \
-  --right-hand-ip 192.168.12.210 \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
   --visualize-tactile
 ```
 
