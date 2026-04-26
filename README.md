@@ -194,7 +194,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --hz 30 \
   --status-sec 1 \
   --calibration-timeout 15 \
-  --calibration-samples 20
+  --calibration-samples 20 \
+  --visualize-tactile
 ```
 
 检查点：

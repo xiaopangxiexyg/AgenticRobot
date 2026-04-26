@@ -128,9 +128,11 @@ class TeleopSession:
         self._transition(TeleopRunState.DEBUG_ONLY, reason)
 
     def freeze(self, reason: str) -> None:
+        print("\033[1;31;40m" + f"[Debug Info] FROZEN triggered due to: {reason}" + "\033[0m")
         self._transition(TeleopRunState.FROZEN, reason)
 
     def fault(self, reason: str) -> None:
+        print("\033[1;31;40m" + f"[Debug Info] FAULT triggered due to: {reason}" + "\033[0m")
         self._transition(TeleopRunState.FAULT, reason)
 
     def build_command(self, observation: TeleopObservation) -> TeleopCommand:
@@ -294,6 +296,7 @@ class TeleopSession:
                 )
             observation = self._build_observation(channels, current_time)
             self._transition(TeleopRunState.RECOVERING, "auto recovery ready")
+            print("\033[1;32;40m" + f"[Debug Info] Auto-recovery triggered" + "\033[0m")
             return SessionStepResult(
                 timestamp=current_time,
                 state=self.state_machine.state,
