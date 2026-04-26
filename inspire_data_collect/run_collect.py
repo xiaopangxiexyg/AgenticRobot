@@ -36,7 +36,7 @@ if __package__ in (None, ""):
         RealSenseRGBSource,
         load_realsense_camera_config_map,
     )
-    from inspire_data_collect.utils.camera_preview import CameraPreviewer
+    from inspire_data_collect.utils.camera_preview import CameraPreviewConfig, CameraPreviewer
     from inspire_data_collect.hand.retargeter import HandRetargeter, HandRetargeterConfig
     from inspire_data_collect.utils.tactile_visualizer import (
         TactileUVVisualizer,
@@ -66,7 +66,7 @@ else:
         RealSenseRGBSource,
         load_realsense_camera_config_map,
     )
-    from .utils.camera_preview import CameraPreviewer
+    from .utils.camera_preview import CameraPreviewConfig, CameraPreviewer
     from .hand.retargeter import HandRetargeter, HandRetargeterConfig
     from .utils.tactile_visualizer import (
         TactileUVVisualizer,
@@ -285,15 +285,21 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
     parser.add_argument(
         "--camera-mode",
-        choices=["none", "single"],
+        choices=["none", "single", "multi"],
         default="none",
-        help="Camera mode. 'single' enables one RealSense RGB camera.",
+        help=(
+            "Camera mode. 'single' enables one RealSense RGB camera; "
+            "'multi' loads and records all cameras from --camera-config."
+        ),
     )
     parser.add_argument(
         "--camera-config",
         type=Path,
         default=DEFAULT_CAMERA_CONFIG_PATH,
-        help="RealSense JSON config. Used when --camera-mode single and --camera-serial is empty.",
+        help=(
+            "RealSense JSON config. Used when --camera-serial is empty; "
+            "--camera-mode multi records every camera in this file."
+        ),
     )
     parser.add_argument("--camera-key", type=str, default="front")
     parser.add_argument("--camera-serial", type=str, default="")
@@ -310,6 +316,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         dest="vis_cam",
         action="store_true",
         help="Show live RealSense RGB frames at the same resolution used for collection.",
+    )
+    parser.add_argument(
+        "--vis-cam-key",
+        "--vis-camera-key",
+        type=str,
+        default="",
+        help=(
+            "Camera key to visualize when --vis_cam is set. "
+            "Empty selects 'front' if present, otherwise the first configured camera."
+        ),
     )
 
     parser.add_argument("--writer-workers", type=int, default=2)
@@ -365,10 +381,13 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--arm-startup-align-duration-s must be non-negative.")
         if float(args.arm_startup_align_threshold_rad) < 0.0:
             raise ValueError("--arm-startup-align-threshold-rad must be non-negative.")
-    if args.camera_mode == "single":
+    if args.camera_mode in {"single", "multi"}:
+        if args.camera_mode == "multi" and args.camera_serial:
+            raise ValueError("--camera-mode multi uses --camera-config; omit --camera-serial.")
         if not args.camera_serial and not Path(args.camera_config).exists():
             raise ValueError(
-                "--camera-mode single requires --camera-serial or an existing --camera-config."
+                f"--camera-mode {args.camera_mode} requires --camera-serial "
+                "or an existing --camera-config."
             )
         if int(args.camera_width) <= 0 or int(args.camera_height) <= 0:
             raise ValueError("--camera-width/--camera-height must be positive.")
@@ -377,7 +396,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         if int(args.camera_keep_last) <= 0:
             raise ValueError("--camera-keep-last must be positive.")
     elif bool(args.vis_cam):
-        raise ValueError("--vis_cam requires --camera-mode single.")
+        raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
     for side in active_sides:
         if not getattr(args, f"{side}_hand_port"):
             raise ValueError(f"--{side}-hand-port is required for active side '{side}'.")
@@ -481,6 +500,8 @@ def build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSour
     if args.camera_mode == "none":
         return {}
     if args.camera_serial:
+        if args.camera_mode != "single":
+            raise ValueError("--camera-serial can only be used with --camera-mode single.")
         config = RealSenseRGBCameraConfig(
             serial=str(args.camera_serial),
             width=int(args.camera_width),
@@ -496,14 +517,32 @@ def build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSour
         return {config.camera_key: RealSenseRGBSource(config)}
 
     camera_configs = load_realsense_camera_config_map(Path(args.camera_config))
-    if len(camera_configs) != 1:
+    if args.camera_mode == "single" and len(camera_configs) != 1:
         raise ValueError(
             f"--camera-mode single expects exactly one camera config, got {len(camera_configs)}."
         )
+    if args.camera_mode == "multi" and not camera_configs:
+        raise ValueError("--camera-mode multi requires at least one camera config.")
     return {
         camera_key: RealSenseRGBSource(config)
         for camera_key, config in camera_configs.items()
     }
+
+
+def select_preview_camera_sources(
+    camera_sources: dict[str, RealSenseRGBSource],
+    requested_key: str,
+) -> dict[str, RealSenseRGBSource]:
+    if not camera_sources:
+        return {}
+    key = str(requested_key or "").strip()
+    if key:
+        if key not in camera_sources:
+            available = ", ".join(sorted(camera_sources))
+            raise ValueError(f"--vis-cam-key {key!r} not found. Available camera keys: {available}")
+        return {key: camera_sources[key]}
+    selected_key = "front" if "front" in camera_sources else sorted(camera_sources)[0]
+    return {selected_key: camera_sources[selected_key]}
 
 
 def hand_state_snapshot(backends: dict[str, InspireTacHandBackend]) -> dict[str, dict[str, Any]]:
@@ -645,7 +684,16 @@ def main(argv: list[str] | None = None) -> int:
     active_sides = validate_args(args)
     dataset_root, task_name, task_id, task_description, dataset_name = resolve_collection_layout(args)
     camera_sources = build_camera_sources(args)
-    camera_previewer = CameraPreviewer() if bool(args.vis_cam) and camera_sources else None
+    preview_camera_sources = (
+        select_preview_camera_sources(camera_sources, str(args.vis_cam_key))
+        if bool(args.vis_cam) and camera_sources
+        else {}
+    )
+    camera_previewer = (
+        CameraPreviewer(CameraPreviewConfig())
+        if bool(args.vis_cam) and preview_camera_sources
+        else None
+    )
 
     writer = HandOnlyLeRobotWriter(
         WriterConfig(
@@ -722,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
             "camera_mode": str(args.camera_mode),
             "camera_keys": sorted(camera_sources),
             "vis_cam": bool(args.vis_cam),
+            "vis_camera_keys": sorted(preview_camera_sources),
             "silent": bool(args.silent),
             "camera_config_path": None
             if args.camera_mode == "none" or args.camera_serial
@@ -784,7 +833,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "[Camera] configured "
                 f"cameras={sorted(camera_sources)} mode={args.camera_mode} "
-                f"vis_cam={bool(args.vis_cam)}"
+                f"vis_cam={bool(args.vis_cam)} "
+                f"vis_camera_keys={sorted(preview_camera_sources)}"
             )
             if camera_previewer is not None:
                 if camera_previewer.ensure_available():
@@ -823,7 +873,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             if camera_previewer is not None and camera_previewer.disabled_reason is None:
-                print(f"[Camera] --vis_cam active for cameras={sorted(camera_sources)}")
+                print(f"[Camera] --vis_cam active for cameras={sorted(preview_camera_sources)}")
         if arm_source is not None:
             writer.write_device_config("arm_exo", arm_source.device_info())
         if arm_backend is not None:
@@ -895,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
                         tactile_by_side_from_backends(active_sides, backends.get)
                     )
                 if camera_previewer is not None:
-                    camera_previewer.update(camera_sources)
+                    camera_previewer.update(preview_camera_sources)
 
                 if camera_sources:
                     camera_signature, camera_text = camera_state_signature_text(

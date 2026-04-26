@@ -118,7 +118,7 @@ try:
     __import__("pyrealsense2")
     print("ok pyrealsense2")
 except ModuleNotFoundError:
-    print("skip pyrealsense2: only required for --camera-mode single")
+    print("skip pyrealsense2: only required for --camera-mode single/multi")
 PY
 ```
 
@@ -321,7 +321,7 @@ PY
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
 
-正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小。`--vis_cam` 只支持 `--camera-mode single`。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 
@@ -585,6 +585,42 @@ python -m inspire_data_collect \
   --vis_cam
 ```
 
+多 RealSense 视角采集，使用一个 JSON 配置所有相机，并选择 `front` 视角预览：
+
+```json
+{
+  "front": {
+    "serial": "135122070754",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "metadata": {"mount": "front"}
+  },
+  "wrist": {
+    "serial": "213222079798",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "metadata": {"mount": "wrist"}
+  }
+}
+```
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name right_hand_multi_camera \
+  --active-sides right \
+  --right-hand-port /dev/ttyACM0 \
+  --right-hand-ip 192.168.12.210 \
+  --camera-mode multi \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --vis-cam-key front
+```
+
+`--camera-mode multi` 会记录配置文件中的全部相机，每个 `camera_key` 单独写入一个 `videos/observation.images.<camera_key>/...mp4`。`--vis-cam-key` 只控制预览窗口；不传时优先预览 `front`，否则预览配置中按名称排序的第一个相机。
+
 默认启用静默模式，不再持续打印 `[Status] ...`。采集过程中仍会保留开始/保存/丢弃/退出、标定、相机 preview 启停、fault 出现/恢复、相机从 waiting 到 streaming 等状态变化信息。需要恢复周期状态行时追加 `--no-silent` 或 `--verbose-status`，输出间隔由 `--status-sec` 控制。
 
 如果当前终端没有 `DISPLAY` 或 `WAYLAND_DISPLAY`，可以删除 `--vis_cam`；即使保留该参数，程序也会禁用预览窗口并继续采集。需要持续观察 RealSense 帧计数时使用 `--no-silent`，运行中可看 `[Status] ... camera=front=frames:<N>`。
@@ -612,7 +648,10 @@ dataset_root/YYYY-MM-DD_task-name/
 dataset_root/YYYY-MM-DD_task-name/
   meta/devices/realsense.json
   videos/observation.images.front/chunk-000/episode_000000.mp4
+  videos/observation.images.wrist/chunk-000/episode_000000.mp4
 ```
+
+单相机时只会生成对应一个 `observation.images.<camera_key>` 目录；多相机时每个配置的 `camera_key` 都会生成独立视频目录。
 
 `action` 和 `observation.state` 均为 19 维：
 
