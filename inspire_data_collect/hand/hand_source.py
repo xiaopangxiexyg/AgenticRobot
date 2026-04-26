@@ -18,6 +18,7 @@ class HandReaderSpec:
     show_raw_lines: bool = False
     exo_hand_calibration: bool = False
     calibration_path: str | None = None
+    silent_status: bool = True
 
 
 class HandQ6Source:
@@ -30,12 +31,17 @@ class HandQ6Source:
         reader_specs: dict[str, HandReaderSpec],
         name: str = "hand_q6_serial",
         critical: bool = False,
+        silent_status: bool = True,
     ):
         if not reader_specs:
             raise ValueError("HandQ6Source requires at least one reader spec.")
         self.reader_specs = dict(reader_specs)
         self.name = str(name)
         self.critical = bool(critical)
+        spec_silent_status = all(
+            bool(getattr(spec, "silent_status", True)) for spec in self.reader_specs.values()
+        )
+        self.silent_status = bool(silent_status) and spec_silent_status
         self._lock = threading.Lock()
         self._latest_channels: dict[str, ObservationChannel] = {}
         self._readers: dict[str, object] = {}
@@ -57,6 +63,7 @@ class HandQ6Source:
         exo_hand_calibration: bool = False,
         calibration_path: str | None = None,
         critical: bool = False,
+        silent_status: bool = True,
     ) -> "HandQ6Source":
         specs: dict[str, HandReaderSpec] = {}
         if left_port:
@@ -68,6 +75,7 @@ class HandQ6Source:
                 show_raw_lines=bool(show_raw_lines),
                 exo_hand_calibration=bool(exo_hand_calibration),
                 calibration_path=calibration_path,
+                silent_status=bool(silent_status),
             )
         if right_port:
             specs["right"] = HandReaderSpec(
@@ -78,8 +86,9 @@ class HandQ6Source:
                 show_raw_lines=bool(show_raw_lines),
                 exo_hand_calibration=bool(exo_hand_calibration),
                 calibration_path=calibration_path,
+                silent_status=bool(silent_status),
             )
-        return cls(reader_specs=specs, critical=critical)
+        return cls(reader_specs=specs, critical=critical, silent_status=bool(silent_status))
 
     def expected_channel_names(self) -> tuple[str, ...]:
         return tuple(f"{side}_hand_q6" for side in ("left", "right") if side in self.reader_specs)
@@ -199,10 +208,12 @@ class HandQ6Source:
             metadata=channel_metadata,
         )
 
-    def _log_reader_error(self, side: str, message: str) -> None:
+    def _log_reader_error(self, side: str, message: str, *, force: bool = False) -> None:
+        if self.silent_status and not force:
+            return
         now = time.time()
         last = float(self._last_error_log_at.get(side, 0.0))
-        if now - last < self._READ_ERROR_LOG_INTERVAL_SEC:
+        if not force and now - last < self._READ_ERROR_LOG_INTERVAL_SEC:
             return
         self._last_error_log_at[side] = now
         print(f"[HandQ6Source:{side}] {message}", flush=True)
@@ -264,6 +275,7 @@ class HandQ6Source:
                 self._log_reader_error(
                     side,
                     f"read failed ({error_text}); attempting serial reopen",
+                    force=consecutive_errors == 1,
                 )
                 reopened, reopen_error = self._reopen_reader_serial(side, reader)
                 if reopened:
@@ -286,6 +298,7 @@ class HandQ6Source:
                 self._log_reader_error(
                     side,
                     f"serial reopen failed ({reopen_error}); retrying",
+                    force=consecutive_errors == 1,
                 )
                 time.sleep(self._READ_ERROR_RETRY_SEC)
                 continue
@@ -295,6 +308,7 @@ class HandQ6Source:
                 self._log_reader_error(
                     side,
                     f"recovered after {consecutive_errors} read error(s)",
+                    force=True,
                 )
             consecutive_errors = 0
             self._reader_error_counts[side] = 0

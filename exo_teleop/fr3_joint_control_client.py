@@ -87,6 +87,7 @@ class FR3JointClient:
         self._poll_stop = threading.Event()
         self._poll_hz: float = 20.0
         self._warn_stale_after_s: float = 0.2
+        self._log_poll_errors = True
 
         # 状态缓存
         self._state_lock = threading.Lock()
@@ -253,11 +254,18 @@ class FR3JointClient:
     # background state poller
     # ---------------------------
 
-    def start_state_poller(self, poll_hz: float = 20.0, warn_stale_after_s: float = 0.2):
+    def start_state_poller(
+        self,
+        poll_hz: float = 20.0,
+        warn_stale_after_s: float = 0.2,
+        *,
+        log_poll_errors: bool = True,
+    ):
         self.connect()
 
         self._poll_hz = float(poll_hz)
         self._warn_stale_after_s = float(warn_stale_after_s)
+        self._log_poll_errors = bool(log_poll_errors)
 
         if self._poll_thread is not None and self._poll_thread.is_alive():
             return
@@ -291,7 +299,7 @@ class FR3JointClient:
                     self._cached_state_recv_mono = recv_t
             except Exception as e:
                 now2 = time.monotonic()
-                if (now2 - self._last_poll_error_t) > 1.0:
+                if self._log_poll_errors and (now2 - self._last_poll_error_t) > 1.0:
                     print(f"[FR3StatePoller] warn: get_state failed: {e}")
                     self._last_poll_error_t = now2
 

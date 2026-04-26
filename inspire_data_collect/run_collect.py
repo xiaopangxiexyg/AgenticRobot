@@ -266,6 +266,22 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--status-sec", type=float, default=2.0)
     parser.add_argument("--max-steps", type=int, default=0, help="0 means run until stopped")
     parser.add_argument("--record-auto-start", action="store_true")
+    parser.add_argument(
+        "--silent",
+        "--quiet",
+        dest="silent",
+        action="store_true",
+        default=True,
+        help="Default mode: suppress continuous status prints and keep operations/state changes.",
+    )
+    parser.add_argument(
+        "--no-silent",
+        "--no-quiet",
+        "--verbose-status",
+        dest="silent",
+        action="store_false",
+        help="Print periodic status lines every --status-sec seconds.",
+    )
 
     parser.add_argument(
         "--camera-mode",
@@ -385,6 +401,7 @@ def build_components(
         exo_hand_calibration=bool(args.exo_hand_calibration),
         calibration_path=str(args.exo_hand_calibration_path or "") or None,
         critical=True,
+        silent_status=bool(args.silent),
     )
 
     retargeters: dict[str, HandRetargeter] = {}
@@ -454,6 +471,7 @@ def build_arm_components(
             startup_align_enabled=not bool(args.disable_arm_startup_align),
             startup_align_duration_s=float(args.arm_startup_align_duration_s),
             startup_align_threshold_rad=float(args.arm_startup_align_threshold_rad),
+            silent_status=bool(args.silent),
         )
     )
     return source, retargeter, backend
@@ -574,6 +592,50 @@ def camera_status_text(
     return "camera=" + ";".join(bits)
 
 
+def fault_signature(faults: list[str]) -> tuple[str, ...]:
+    return tuple(sorted(str(fault).split(":", 1)[0] for fault in faults))
+
+
+def camera_state_signature_text(
+    camera_sources: dict[str, RealSenseRGBSource],
+    camera_previewer: CameraPreviewer | None,
+) -> tuple[tuple[str, ...], str]:
+    if not camera_sources:
+        return (), "camera=off"
+    signature_parts: list[str] = []
+    text_parts: list[str] = []
+    if camera_previewer is not None:
+        disabled_reason = camera_previewer.disabled_reason
+        if disabled_reason:
+            reason_text = compact_log_value(disabled_reason, max_chars=80)
+            signature_parts.append(f"preview:disabled:{reason_text}")
+            text_parts.append(f"preview=disabled:{reason_text}")
+        else:
+            signature_parts.append("preview:active")
+            text_parts.append("preview=active")
+    for camera_key, camera_source in sorted(camera_sources.items()):
+        try:
+            info = camera_source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            state = f"status_error:{type(exc).__name__}"
+            signature_parts.append(f"{camera_key}:{state}")
+            text_parts.append(f"{camera_key}={state}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        last_error = info.get("last_error")
+        if last_error:
+            error_text = compact_log_value(last_error, max_chars=70)
+            signature_parts.append(f"{camera_key}:error:{error_text}")
+            text_parts.append(f"{camera_key}=error:{error_text}")
+        elif frame_count > 0:
+            signature_parts.append(f"{camera_key}:streaming")
+            text_parts.append(f"{camera_key}=streaming")
+        else:
+            signature_parts.append(f"{camera_key}:waiting")
+            text_parts.append(f"{camera_key}=waiting")
+    return tuple(signature_parts), "camera=" + ";".join(text_parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspire Tac collection with optional single-arm FR3 teleoperation."
@@ -636,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
     loop_rate = LoopRate()
     step_count = 0
     last_status_at = 0.0
+    last_fault_signature: tuple[str, ...] | None = None
+    last_camera_state_signature: tuple[str, ...] | None = None
 
     def start_episode() -> None:
         nonlocal current_episode, recording
@@ -658,6 +722,7 @@ def main(argv: list[str] | None = None) -> int:
             "camera_mode": str(args.camera_mode),
             "camera_keys": sorted(camera_sources),
             "vis_cam": bool(args.vis_cam),
+            "silent": bool(args.silent),
             "camera_config_path": None
             if args.camera_mode == "none" or args.camera_serial
             else str(args.camera_config),
@@ -817,6 +882,13 @@ def main(argv: list[str] | None = None) -> int:
                     hand_states=hand_states,
                     arm_state=arm_state,
                 )
+                current_fault_signature = fault_signature(faults)
+                if current_fault_signature != last_fault_signature:
+                    if current_fault_signature:
+                        print("[State] faults active: " + "; ".join(faults))
+                    elif last_fault_signature is not None:
+                        print("[State] faults cleared")
+                    last_fault_signature = current_fault_signature
 
                 if visualizer is not None:
                     visualizer.update(
@@ -825,7 +897,19 @@ def main(argv: list[str] | None = None) -> int:
                 if camera_previewer is not None:
                     camera_previewer.update(camera_sources)
 
-                if loop_started_at - last_status_at >= float(args.status_sec):
+                if camera_sources:
+                    camera_signature, camera_text = camera_state_signature_text(
+                        camera_sources,
+                        camera_previewer,
+                    )
+                    if camera_signature != last_camera_state_signature:
+                        print(f"[Camera] state changed: {camera_text}")
+                        last_camera_state_signature = camera_signature
+
+                if (
+                    not bool(args.silent)
+                    and loop_started_at - last_status_at >= float(args.status_sec)
+                ):
                     frame_count = int(sample_builder.frame_index)
                     rec_state = "on" if recording else "off"
                     print(

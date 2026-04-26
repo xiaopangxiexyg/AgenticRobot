@@ -42,7 +42,7 @@ pip install pyrealsense2
 - `arm/retargeter.py`: 复用 `exo_teleop` 的 `dynamixel_to_robot_arm` 映射，并做 FR3 安全关节裁剪。
 - `arm/fr3_backend.py`: 封装 `FR3JointClient`，后台轮询 FR3 状态缓存，下发关节目标，并在启动阶段做 FR3 当前姿态到外骨骼目标的慢速插值对齐。
 - `utils/writer.py`: LeRobot 风格 parquet/meta/video 导出，手数据完整写入，并支持单臂 7DoF 动作和状态位。
-- `run_collect.py`: 完整采集入口。
+- `run_collect.py`: 完整采集入口，默认启用静默模式，只打印操作信息和状态变化。
 
 ## 代码结构
 
@@ -585,7 +585,9 @@ python -m inspire_data_collect \
   --vis_cam
 ```
 
-如果当前终端没有 `DISPLAY` 或 `WAYLAND_DISPLAY`，可以删除 `--vis_cam`；即使保留该参数，程序也会禁用预览窗口并继续采集。运行中可看 `[Status] ... camera=front=frames:<N>` 判断 RealSense 是否持续产帧。
+默认启用静默模式，不再持续打印 `[Status] ...`。采集过程中仍会保留开始/保存/丢弃/退出、标定、相机 preview 启停、fault 出现/恢复、相机从 waiting 到 streaming 等状态变化信息。需要恢复周期状态行时追加 `--no-silent` 或 `--verbose-status`，输出间隔由 `--status-sec` 控制。
+
+如果当前终端没有 `DISPLAY` 或 `WAYLAND_DISPLAY`，可以删除 `--vis_cam`；即使保留该参数，程序也会禁用预览窗口并继续采集。需要持续观察 RealSense 帧计数时使用 `--no-silent`，运行中可看 `[Status] ... camera=front=frames:<N>`。
 
 手部外骨骼 zero pose：默认读取固定标定；需要重新标定并更新固定值时，在任意采集命令中追加 `--exo-hand-calibration`。也可以用 `--exo-hand-calibration-path PATH` 指定另一份固定标定 JSON。
 

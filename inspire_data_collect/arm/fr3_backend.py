@@ -32,6 +32,7 @@ class FR3ArmBackendConfig:
     startup_align_enabled: bool = True
     startup_align_duration_s: float = 5.0
     startup_align_threshold_rad: float = 0.02
+    silent_status: bool = True
 
     def __post_init__(self) -> None:
         if int(self.port) <= 0:
@@ -98,6 +99,7 @@ class FR3ArmBackend:
             self._client.start_state_poller(
                 poll_hz=float(self.config.state_poll_hz),
                 warn_stale_after_s=float(self.config.max_state_age_s),
+                log_poll_errors=not bool(self.config.silent_status),
             )
             if not self._client.wait_until_state_ready(timeout_s=float(self.config.wait_state_timeout_s)):
                 raise RuntimeError("FR3 state cache did not become ready in time.")
@@ -220,7 +222,11 @@ class FR3ArmBackend:
             self._startup_align_latest_target = raw_target.copy()
             self._startup_align_progress = float(alpha)
             notice_step = min(int(duration), int(elapsed))
-            if self._startup_align_last_notice_step != notice_step and alpha < 1.0:
+            if (
+                not self.config.silent_status
+                and self._startup_align_last_notice_step != notice_step
+                and alpha < 1.0
+            ):
                 remaining = max(0.0, duration - elapsed)
                 print(
                     "[FR3ArmBackend] startup alignment progress: "
@@ -236,7 +242,10 @@ class FR3ArmBackend:
                 self._startup_align_active = False
                 self._startup_align_complete = True
                 self._startup_align_completed_at = float(command_time)
-                if self._startup_align_last_notice_step != int(duration):
+                if (
+                    not self.config.silent_status
+                    and self._startup_align_last_notice_step != int(duration)
+                ):
                     print("[FR3ArmBackend] startup alignment progress: 100%")
                 print(
                     "[FR3ArmBackend] startup alignment complete. "
