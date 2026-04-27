@@ -348,7 +348,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-parquet", dest="write_parquet", action="store_false")
 
     parser.add_argument("--visualize-tactile", action="store_true")
-    parser.add_argument("--tactile-vis-value-scale", type=float, default=0.05)
+    parser.add_argument("--tactile-vis-value-scale", type=float, default=0.02)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
     parser.add_argument(
         "--tactile-vis-window-mode",

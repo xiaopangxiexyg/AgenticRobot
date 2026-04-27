@@ -502,7 +502,7 @@ python -m inspire_data_collect \
 
 ```bash
 --tactile-vis-size 640
---tactile-vis-value-scale 0.05
+--tactile-vis-value-scale 0.02
 --tactile-vis-window-mode resizable
 --hand-tactile-regions all
 ```
