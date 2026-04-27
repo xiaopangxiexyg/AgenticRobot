@@ -233,7 +233,7 @@ PY
 
 ### 3. InspireTac 触觉读取
 
-先用少量区域低频读取，确认链路正常后再在正式采集中用 `--hand-tactile-regions all`。
+先用少量区域低频读取，确认链路正常后再在正式采集中用 `--hand-tactile-regions all`。命令行也支持别名 `--tactile-regions` 和 `--tactile-region`。
 
 ```bash
 export RIGHT_HAND_IP=192.168.12.210
@@ -269,7 +269,7 @@ finally:
 PY
 ```
 
-期望结果：`telemetry_error` 为空，`tactile_len` 非空；如果只需要手关节采集，可以在正式运行中传 `--hand-tactile-regions ""` 关闭触觉读取。
+期望结果：`telemetry_error` 为空，`tactile_len` 非空；如果只需要手关节采集，可以在正式运行中传 `--hand-tactile-regions ""` 或 `--tactile-region ""` 关闭触觉读取。
 
 ### 4. RealSense 单相机
 
@@ -504,7 +504,7 @@ python -m inspire_data_collect \
 --tactile-vis-size 640
 --tactile-vis-value-scale 0.02
 --tactile-vis-window-mode resizable
---hand-tactile-regions all
+--tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm
 ```
 
 默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
@@ -635,7 +635,7 @@ python -m inspire_data_collect \
 
 手部外骨骼 zero pose：默认读取固定标定；需要重新标定并更新固定值时，在任意采集命令中追加 `--exo-hand-calibration`。也可以用 `--exo-hand-calibration-path PATH` 指定另一份固定标定 JSON。
 
-触觉读取：`--hand-tactile-regions all` 表示读取全部触觉区域；传空字符串 `--hand-tactile-regions ""` 表示不读取触觉。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
+触觉读取：`--hand-tactile-regions all`、`--tactile-regions all` 或 `--tactile-region all` 表示读取全部触觉区域；传空字符串 `--tactile-region ""` 表示不读取触觉。也可以传逗号分隔区域，例如 `--tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm`。有效区域名为 `little_1..little_3`、`ring_1..ring_3`、`middle_1..middle_3`、`index_1..index_3`、`thumb_1..thumb_4`、`palm`；非法区域会在启动时直接报错。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
 
 ## 输出
 

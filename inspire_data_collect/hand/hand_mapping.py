@@ -45,4 +45,11 @@ def parse_tactile_regions(value: object) -> tuple[str, ...]:
         parts = [part.strip() for part in str(value).split(",") if part.strip()]
     if "all" in {part.lower() for part in parts}:
         return ALL_TACTILE_REGION_NAMES
+    invalid = [part for part in parts if part not in ALL_TACTILE_REGION_NAMES]
+    if invalid:
+        valid = ", ".join(ALL_TACTILE_REGION_NAMES)
+        raise ValueError(
+            f"Unknown tactile region(s): {', '.join(invalid)}. "
+            f"Valid regions are: {valid}; or use 'all'."
+        )
     return tuple(parts)

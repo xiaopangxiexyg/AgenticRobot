@@ -258,7 +258,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hand-command-alpha", type=float, default=1.0)
     parser.add_argument("--hand-send-threshold", type=float, default=0.002)
     parser.add_argument("--hand-telemetry-hz", type=float, default=10.0)
-    parser.add_argument("--hand-tactile-regions", type=str, default="all")
+    parser.add_argument(
+        "--hand-tactile-regions",
+        "--tactile-regions",
+        "--tactile-region",
+        dest="hand_tactile_regions",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated InspireTac tactile regions to read and visualize, "
+            "or 'all'. Empty string disables tactile reads."
+        ),
+    )
     parser.add_argument("--max-fingertip-force", type=int, default=1200)
 
     parser.add_argument("--hz", type=float, default=30.0, help="Main control loop rate")
@@ -371,6 +382,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--status-sec must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
+    parse_tactile_regions(args.hand_tactile_regions)
     if args.enable_arm:
         if int(args.exo_baudrate) <= 0:
             raise ValueError("--exo-baudrate must be positive.")
