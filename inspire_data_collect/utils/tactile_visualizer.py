@@ -14,7 +14,7 @@ class TactileVisualizerConfig:
     window_name: str = "inspire_hand_tactile_uv"
     image_size: tuple[int, int] = (640, 640)
     resizable_window: bool = True
-    value_scale: float = 0.05
+    value_scale: float = 0.02
     point_radius_min: int = 1
     point_radius_max: int = 6
     panel_gap_px: int = 24
