@@ -447,7 +447,17 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 如果还没有按 `p`，collector 等待按键是正常状态，不代表卡死。
 
-### 12.2 `--vis_cam` 没有窗口
+### 12.2 终端按键没有反应
+
+collector 启动后会打印按键输入来源：
+
+- `keyboard input active source=stdin`：直接读取当前终端。
+- `keyboard input active source=/dev/tty`：当前 `stdin` 不是 TTY，已回退读取控制终端。
+- `keyboard input is disabled`：当前进程没有可读交互终端；需要从真实 terminal 启动，或调整 IDE/launch 配置让程序获得 TTY。
+
+如果开启了 `--vis_cam`，焦点在 OpenCV 预览窗口时也可以直接按 `p/z/c/d/h/q`；焦点在终端时同样可用。
+
+### 12.3 `--vis_cam` 没有窗口
 
 `--vis_cam` 依赖当前 Python 环境的 OpenCV HighGUI 和桌面显示。启动时如果看到 `preview is disabled`，优先检查：
 
@@ -457,15 +467,15 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 即使预览窗口禁用，只要相机正常产帧，视频采集仍会继续写入 dataset。
 
-### 12.3 只想采 arm，不想采手
+### 12.4 只想采 arm，不想采手
 
 直接不要传任何 `--left-hand-port/--right-hand-port/--left-hand-ip/--right-hand-ip` 即可。
 
-### 12.4 只想采 q6，不接真实 InspireTac
+### 12.5 只想采 q6，不接真实 InspireTac
 
 只传 `--left-hand-port/--right-hand-port`，不要传 hand IP。
 
-### 12.5 为什么 arm observation 不是实时真机反馈
+### 12.6 为什么 arm observation 不是实时真机反馈
 
 这是当前实现的有意选择。原因是：
 

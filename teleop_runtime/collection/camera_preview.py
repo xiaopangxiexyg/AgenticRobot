@@ -148,9 +148,9 @@ class CameraPreviewer:
             y += step
         return image
 
-    def update(self, camera_sources: Mapping[str, Any]) -> None:
+    def update(self, camera_sources: Mapping[str, Any]) -> list[str]:
         if self._closed or not self.ensure_available():
-            return
+            return []
         any_window = False
         for camera_key, source in camera_sources.items():
             frame = None
@@ -177,7 +177,14 @@ class CameraPreviewer:
             self._require_cv2().imshow(name, image)
             any_window = True
         if any_window:
-            self._require_cv2().waitKey(1)
+            key_code = self._require_cv2().waitKey(1)
+            if key_code >= 0:
+                key = key_code & 0xFF
+                if key == 3:
+                    raise KeyboardInterrupt
+                if 0 < key < 128:
+                    return [chr(key).lower()]
+        return []
 
     def status_snapshot(self, camera_sources: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         return {

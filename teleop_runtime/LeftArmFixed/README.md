@@ -42,6 +42,39 @@ python -m teleop_runtime.LeftArmFixed.run_collect \
 python -m teleop_runtime.collection.run_collect --left-arm-fixed ...
 ```
 
+
+## 相机可视化
+
+`LeftArmFixed` 两个入口都会直接复用 `teleop_runtime.collection.run_collect` 的相机链路，因此支持：
+
+- `--camera-config`：加载 RealSense 配置。
+- `--vis_cam` / `--vis-cam`：打开实时相机预览窗口。
+- `--vis-cam-key` / `--vis-camera-key`：指定预览哪一路 camera key；不指定时优先预览 `front`，没有 `front` 时预览配置里的第一路。
+- `--no-video`：只预览、不导出视频；保留视频时会继续按双臂 schema 写入数据集。
+
+固定左臂模式带相机预览示例：
+
+```bash
+python -m teleop_runtime.LeftArmFixed.run_collect \
+  --dataset-root /path/to/datasets \
+  --task-name grasp_demo_left_arm_fixed_camera \
+  --active-sides both \
+  --host 0.0.0.0 \
+  --port 9999 \
+  --right-tracker-name tracker_2 \
+  --left-arm-ip 192.168.101.21 \
+  --right-arm-ip 192.168.1.20 \
+  --left-hand-port /dev/ttyUSB0 \
+  --right-hand-port /dev/ttyUSB1 \
+  --left-hand-ip 192.168.12.210 \
+  --right-hand-ip 192.168.11.210 \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --vis_cam \
+  --vis-cam-key front
+```
+
+抖动左臂模式同样支持相机预览，只需要在 `run_collect_jitter` 命令里加入相同的 `--camera-config --vis_cam --vis-cam-key front` 参数。
+
 ## 左臂小范围抖动 + 双臂 IK
 
 这个入口会自动打开 `--left-arm-jitter`：
@@ -64,7 +97,10 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
   --left-arm-jitter-rotation-deg 3 \
   --left-arm-jitter-refresh-sec 1.2 \
   --left-arm-jitter-smoothing-sec 0.45 \
-  --
+  --vis_cam \
+  --vis-cam-key front \
+  --visualize-tactile \
+  --hand-tactile-regions all
 ```
 
 `--dataset-root` 是基础输出目录，实际数据集目录会自动命名为

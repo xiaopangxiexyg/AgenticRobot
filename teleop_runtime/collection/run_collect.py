@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import select
 import sys
@@ -590,46 +591,84 @@ class RecoveryPlan:
 
 class TerminalKeyController:
     def __init__(self) -> None:
-        self.enabled = sys.stdin.isatty()
+        self.enabled = False
+        self.input_source = "disabled"
+        self.disabled_reason: str | None = None
+        self._fd: int | None = None
+        self._owns_fd = False
         self._old_attrs: list[int] | None = None
 
     def start(self) -> None:
-        if not self.enabled:
-            return
+        self.close()
         try:
-            self._old_attrs = termios.tcgetattr(sys.stdin.fileno())
-            tty.setcbreak(sys.stdin.fileno())
-        except (OSError, termios.error):
+            if sys.stdin.isatty():
+                self._fd = sys.stdin.fileno()
+                self._owns_fd = False
+                self.input_source = "stdin"
+            else:
+                self._fd = os.open("/dev/tty", os.O_RDONLY)
+                self._owns_fd = True
+                self.input_source = "/dev/tty"
+            self._old_attrs = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+            self.enabled = True
+            self.disabled_reason = None
+        except (OSError, termios.error) as exc:
             self.enabled = False
+            self.disabled_reason = f"{type(exc).__name__}: {exc}"
+            self.input_source = "disabled"
             self._old_attrs = None
+            if self._owns_fd and self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+            self._fd = None
+            self._owns_fd = False
 
     def close(self) -> None:
-        if self.enabled and self._old_attrs is not None:
+        if self._fd is not None and self._old_attrs is not None:
             try:
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_attrs)
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
             except (OSError, termios.error):
                 pass
-            self._old_attrs = None
+        if self._owns_fd and self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        self.enabled = False
+        self._fd = None
+        self._owns_fd = False
+        self._old_attrs = None
 
     def poll(self) -> list[str]:
-        if not self.enabled:
+        if not self.enabled or self._fd is None:
             return []
         keys: list[str] = []
         while True:
             try:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.0)
-            except OSError:
+                ready, _, _ = select.select([self._fd], [], [], 0.0)
+            except OSError as exc:
                 self.enabled = False
+                self.disabled_reason = f"{type(exc).__name__}: {exc}"
                 self._old_attrs = None
                 return keys
             if not ready:
                 return keys
-            char = sys.stdin.read(1)
-            if not char:
+            try:
+                chunk = os.read(self._fd, 32)
+            except OSError as exc:
+                self.enabled = False
+                self.disabled_reason = f"{type(exc).__name__}: {exc}"
                 return keys
-            if char == "\x03":
-                raise KeyboardInterrupt
-            keys.append(char.lower())
+            if not chunk:
+                return keys
+            text = chunk.decode(errors="ignore")
+            for char in text:
+                if char == "\x03":
+                    raise KeyboardInterrupt
+                keys.append(char.lower())
 
 
 def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
@@ -980,6 +1019,7 @@ def _print_controls() -> None:
     print("  'D' = 丢弃当前片段 / Discard current episode")
     print("  'H' = 暂停随动并清除 home / Hold and clear home")
     print("  'Q' = 退出程序 / Quit program")
+    print("按键焦点 / Key focus: terminal or OpenCV preview window")
     print("=" * 60 + "\n")
 
 
@@ -1611,6 +1651,7 @@ def _run_keyed_home_calibration(app: CollectApp, args: argparse.Namespace) -> No
     if app.control_state.recording_active:
         _log("Keys", "ignore p: recording is active; press c to save or d to discard first.")
         return
+    _log("Keys", "p: calibration requested; holding hardware and syncing arms.")
     app.components.session.hold_hardware("manual calibration requested")
     _clear_runtime_home(app)
     synced = _sync_arm_backends_from_hardware(app, required=True)
@@ -1745,6 +1786,8 @@ def _handle_key(
     args: argparse.Namespace,
     step_count: int,
 ) -> bool:
+    if key in {"", "\n", "\r"}:
+        return False
     if key == "p":
         _run_keyed_home_calibration(app, args)
         return False
@@ -2142,7 +2185,13 @@ def main() -> int:
             print(f"左臂抖动 / Left arm jitter: {','.join(sorted(app.jitter_arm_retargeters))}")
         _print_controls()
         if not key_controller.enabled:
-            _log("Keys", "stdin is not interactive; collector will wait without key events.")
+            _log(
+                "Keys",
+                "keyboard input is disabled; "
+                f"reason={key_controller.disabled_reason or 'no interactive terminal'}",
+            )
+        else:
+            _log("Keys", f"keyboard input active source={key_controller.input_source}")
         _print_standby(app)
         while not should_quit:
             if int(args.max_steps) > 0 and step_count >= int(args.max_steps):
@@ -2186,7 +2235,17 @@ def main() -> int:
                     )
                 )
             if app.camera_previewer is not None:
-                app.camera_previewer.update(app.preview_camera_sources)
+                for key in app.camera_previewer.update(app.preview_camera_sources):
+                    should_quit = _handle_key(
+                        key,
+                        app=app,
+                        args=args,
+                        step_count=step_count,
+                    )
+                    if should_quit:
+                        break
+            if should_quit:
+                break
             if app.camera_sources:
                 camera_signature, camera_text = _camera_state_signature_text(app)
                 if camera_signature != last_camera_state_signature:
