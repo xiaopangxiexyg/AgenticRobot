@@ -1,0 +1,35 @@
+{
+  "front": {
+    "camera_key": "front",
+    "serial": "213222079798",
+    "name": "realsense_rgb_front",
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "color_space": "rgb",
+    "intrinsics": {
+      "width": 1280,
+      "height": 720,
+      "fx": 909.8346557617188,
+      "fy": 907.8324584960938,
+      "ppx": 629.6901245117188,
+      "ppy": 362.22735595703125,
+      "coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "metadata": {
+      "mount": "single_front"
+    },
+    "device_name": "Intel RealSense D435",
+    "product_line": "D400",
+    "serial_number": "213222079798",
+    "firmware_version": "5.12.7.150",
+    "last_error": null,
+    "frame_count": 1243
+  }
+}

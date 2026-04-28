@@ -48,7 +48,7 @@ python -m teleop_runtime.collection.run_collect --left-arm-fixed ...
 
 ```bash
 python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
-  --dataset-root /path/to/datasets \
+  --dataset-root ./test_datasets \
   --task-name grasp_demo_left_arm_jitter \
   --active-sides both \
   --host 0.0.0.0 \
@@ -56,16 +56,14 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
   --right-tracker-name tracker_2 \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20 \
-  --left-hand-port /dev/ttyUSB0 \
-  --right-hand-port /dev/ttyUSB1 \
+  --left-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
+  --right-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00 \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
   --left-arm-jitter-position-m 0.01 \
   --left-arm-jitter-rotation-deg 3 \
   --left-arm-jitter-refresh-sec 1.2 \
-  --left-arm-jitter-smoothing-sec 0.45 \
-  --no-camera \
-  --no-video
+  --left-arm-jitter-smoothing-sec 0.45
 ```
 
 `--dataset-root` 是基础输出目录，实际数据集目录会自动命名为

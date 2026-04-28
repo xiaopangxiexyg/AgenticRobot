@@ -34,8 +34,8 @@ conda activate grasp_py310_copy
 推荐先设置这些变量，后面命令直接复用：
 
 ```bash
-export REPO=/home/user/zc/dex_inspire_teleop_new
-export PROFILE=$REPO/teleop_records/calibration_profiles/20260423_164018_vive_rm65_virtual_desk.json
+export REPO=/home/ai/Desktop/DexTeleop
+export PROFILE=$REPO/teleop_records/calibration_profiles/20260425_194717_vive_rm65_virtual_desk.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/dataset_collection/demo_bimanual_single_camera
 export VIVE_TARGET_HOST=192.168.20.90
