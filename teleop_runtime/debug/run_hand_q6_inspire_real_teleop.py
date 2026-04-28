@@ -10,7 +10,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..backends.hands import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ..configs import ANNOTATED_DUAL_RM65_BASE_DISTANCE_M
 from ..hand_mapping import (
     DEFAULT_INSPIRE_HAND_JOINT_ORDER,
@@ -218,10 +222,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
         "--max-fingertip-force",
-        type=int,
-        default=800,
-        help="Max fingertip force passed to InspireTac hand backends on startup.",
+        dest="max_fingertip_force",
+        type=_non_negative_int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
     )
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control/update rate.")
     parser.add_argument(

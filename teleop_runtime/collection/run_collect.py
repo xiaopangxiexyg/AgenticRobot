@@ -18,7 +18,11 @@ import numpy as np
 from rm65_inspire_tac.paths import require_asset_path
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
-from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..backends.hands import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ..calibration import TeleopCalibration
 from ..configs import build_annotated_dual_rm65_calibration
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
@@ -418,7 +422,15 @@ def parse_args() -> argparse.Namespace:
         default=640,
         help="Per-hand tactile visualizer panel size in pixels.",
     )
-    parser.add_argument("--max-fingertip-force", type=int, default=800, help="InspireTac max fingertip force.")
+    parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
+        "--max-fingertip-force",
+        dest="max_fingertip_force",
+        type=_non_negative_int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
+    )
     parser.add_argument(
         "--control-mode",
         choices=["absolute", "delta_clutch"],
@@ -990,6 +1002,7 @@ def _episode_metadata(
         "right_hand_ip": args.right_hand_ip or None,
         "left_hand_port": args.left_hand_port or None,
         "right_hand_port": args.right_hand_port or None,
+        "max_fingertip_force": int(args.max_fingertip_force),
         "hand_tactile_regions": list(_parse_hand_tactile_regions(args.hand_tactile_regions))
         if args.with_tactile
         else [],

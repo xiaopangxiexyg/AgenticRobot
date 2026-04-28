@@ -13,7 +13,11 @@ from typing import Any, Mapping
 import numpy as np
 
 from ..common import ALL_SIDES, parse_active_sides
-from ..hand.hand_backend import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..hand.hand_backend import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ..hand.hand_mapping import parse_tactile_regions
 from ..utils.camera_preview import CameraPreviewConfig, CameraPreviewer
 from ..utils.realsense_rgb import (
@@ -205,7 +209,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="all",
     )
-    parser.add_argument("--max-fingertip-force", type=int, default=400)
+    parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
+        "--max-fingertip-force",
+        dest="max_fingertip_force",
+        type=int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
+    )
 
     parser.add_argument("--enable-arm", action="store_true")
     parser.add_argument("--arm-side", choices=["right", "left"], default="right")
@@ -288,6 +300,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--status-sec must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
+    if int(args.max_fingertip_force) < 0:
+        raise ValueError("--inspire-hand-max-force/--max-force must be non-negative.")
     if int(args.min_action_queue) < 0:
         raise ValueError("--min-action-queue must be non-negative.")
     replay_dataset = getattr(args, "debug_replay_dataset", None)

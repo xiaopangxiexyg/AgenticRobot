@@ -12,7 +12,11 @@ from pathlib import Path
 import numpy as np
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
-from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..backends.hands import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ..calibration import TeleopCalibration
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
@@ -237,10 +241,13 @@ def parse_args() -> argparse.Namespace:
         help="Per-hand tactile visualizer panel size in pixels.",
     )
     parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
         "--max-fingertip-force",
-        type=int,
-        default=800,
-        help="Max fingertip force passed to InspireTac hand backends on startup.",
+        dest="max_fingertip_force",
+        type=_non_negative_int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
     )
     parser.add_argument(
         "--teleop-hardware-ip",
@@ -738,7 +745,9 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "hand_send_threshold": float(getattr(args, "hand_send_threshold", 0.002)),
             "hand_telemetry_hz": float(getattr(args, "hand_telemetry_hz", 30.0)),
             "hand_tactile_regions": list(_parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", ()))),
-            "max_fingertip_force": int(getattr(args, "max_fingertip_force", 800)),
+            "max_fingertip_force": int(
+                getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
+            ),
             "teleop_hardware_ip": args.teleop_hardware_ip,
             "teleop_hardware_port": int(args.teleop_hardware_port),
             "swap_arm_sides": bool(args.swap_arm_sides),
@@ -931,7 +940,9 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 hand_ip=args.left_hand_ip or "0.0.0.0",
                 side="left",
                 connect_hardware=bool(args.left_hand_ip),
-                max_fingertip_force=int(getattr(args, "max_fingertip_force", 800)),
+                max_fingertip_force=int(
+                    getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
+                ),
                 send_threshold=float(getattr(args, "hand_send_threshold", 0.002)),
                 enable_telemetry=bool(args.left_hand_ip),
                 telemetry_hz=hand_telemetry_hz,
@@ -945,7 +956,9 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 hand_ip=args.right_hand_ip or "0.0.0.0",
                 side="right",
                 connect_hardware=bool(args.right_hand_ip),
-                max_fingertip_force=int(getattr(args, "max_fingertip_force", 800)),
+                max_fingertip_force=int(
+                    getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
+                ),
                 send_threshold=float(getattr(args, "hand_send_threshold", 0.002)),
                 enable_telemetry=bool(args.right_hand_ip),
                 telemetry_hz=hand_telemetry_hz,

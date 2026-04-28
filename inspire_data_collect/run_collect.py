@@ -23,6 +23,7 @@ if __package__ in (None, ""):
         parse_active_sides,
     )
     from inspire_data_collect.hand.hand_backend import (
+        DEFAULT_INSPIRE_HAND_MAX_FORCE,
         InspireTacHandBackend,
         InspireTacHandBackendConfig,
     )
@@ -58,7 +59,11 @@ else:
     from .arm.retargeter import FR3ArmRetargeter, FR3ArmRetargeterConfig
     from .async_writer import AsyncWriterConfig, AsyncWriterPool
     from .common import ALL_SIDES, assert_inactive_side_config_empty, parse_active_sides
-    from .hand.hand_backend import InspireTacHandBackend, InspireTacHandBackendConfig
+    from .hand.hand_backend import (
+        DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        InspireTacHandBackend,
+        InspireTacHandBackendConfig,
+    )
     from .hand.hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
     from .hand.hand_source import HandQ6Source
     from .utils.realsense_rgb import (
@@ -270,7 +275,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "or 'all'. Empty string disables tactile reads."
         ),
     )
-    parser.add_argument("--max-fingertip-force", type=int, default=1200)
+    parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
+        "--max-fingertip-force",
+        dest="max_fingertip_force",
+        type=int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
+    )
 
     parser.add_argument("--hz", type=float, default=30.0, help="Main control loop rate")
     parser.add_argument("--minimum-control-hz", type=float, default=0.0)
@@ -382,6 +395,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--status-sec must be positive.")
     if float(args.hand_telemetry_hz) <= 0.0:
         raise ValueError("--hand-telemetry-hz must be positive.")
+    if int(args.max_fingertip_force) < 0:
+        raise ValueError("--inspire-hand-max-force/--max-force must be non-negative.")
     parse_tactile_regions(args.hand_tactile_regions)
     if args.enable_arm:
         if int(args.exo_baudrate) <= 0:
@@ -469,8 +484,7 @@ def build_components(
                 side=side,
                 effector_name=effector_name,
                 connect_hardware=bool(hand_ip),
-                # max_fingertip_force=int(args.max_fingertip_force),
-                max_fingertip_force = 400,
+                max_fingertip_force=int(args.max_fingertip_force),
                 send_threshold=float(args.hand_send_threshold),
                 enable_telemetry=bool(hand_ip),
                 telemetry_hz=float(args.hand_telemetry_hz),
@@ -787,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
             "hand_dof_per_side": HAND_DOF,
             "hand_vector_order": list(HAND_VECTOR_ORDER),
             "joint_order": list(args.hand_joint_order),
+            "max_fingertip_force": int(args.max_fingertip_force),
             "hand_invert": bool(args.hand_invert),
             "exo_hand_calibration": bool(args.exo_hand_calibration),
             "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
