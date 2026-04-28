@@ -303,7 +303,9 @@ python -m teleop_runtime.collection.run_collect \
 - `--camera-config`
   RealSense 配置 JSON，默认读取 [realsense.json](/home/user/zc/dex_inspire_teleop/teleop_runtime/configs/devices/realsense.json)。
 - `--vis_cam`
-  采集时弹出 RealSense RGB 预览窗口；如果当前 OpenCV/显示环境不可用，会在终端打印原因并继续采集。
+  采集时弹出 RealSense RGB 预览窗口；默认预览 `front`，没有 `front` 时预览配置里的第一路。如果当前 OpenCV/显示环境不可用，会在终端打印原因并继续采集。
+- `--vis-cam-key`
+  指定 `--vis_cam` 要预览的 camera key，例如 `front`、`wrist`。
 - `--no-video`
   禁止视频导出。当前如果同时保留相机但关闭视频，只会保留相机时间相关 metadata，不会保存图像内容。
 - `--no-parquet`
@@ -658,6 +660,7 @@ python -m teleop_runtime.collection.run_collect \
   --right-hand-ip 192.168.11.210 \
   --camera-config teleop_runtime/configs/devices/realsense.json \
   --vis_cam \
+  --vis-cam-key front \
   --max-steps 30
 ```
 

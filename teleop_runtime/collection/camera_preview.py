@@ -13,6 +13,7 @@ class CameraPreviewConfig:
     window_prefix: str = "realsense"
     preflight_highgui: bool = True
     preflight_timeout_sec: float = 3.0
+    resizable_window: bool = True
 
 
 class CameraPreviewer:
@@ -63,7 +64,8 @@ class CameraPreviewer:
         if name in self._window_names:
             return
         cv2 = self._require_cv2()
-        cv2.namedWindow(name, cv2.WINDOW_AUTOSIZE)
+        flag = cv2.WINDOW_NORMAL if self.config.resizable_window else cv2.WINDOW_AUTOSIZE
+        cv2.namedWindow(name, flag)
         self._window_names.add(name)
 
     def _display_image(self, frame: Any) -> np.ndarray:
@@ -153,11 +155,16 @@ class CameraPreviewer:
         for camera_key, source in camera_sources.items():
             frame = None
             extra_status = None
+            status = self._camera_status(source)
+            last_error = status.get("last_error")
+            stale = bool(last_error) and str(last_error).startswith("frame_timeout_stale")
             try:
                 frame = source.get_latest_frame()
             except Exception as exc:  # noqa: BLE001
                 extra_status = f"get_latest_frame_failed:{type(exc).__name__}:{exc}"
-            if frame is None:
+            if stale:
+                extra_status = self._short_text(last_error)
+            if frame is None or stale:
                 image = self._placeholder_image(
                     camera_key=str(camera_key),
                     source=source,

@@ -730,6 +730,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     self._last_safe_full_q = active_q.copy()
 
         left_qpos, right_qpos = self._split_solution(active_q)
+        left_inactive_jitter_hold = self._inactive_jitter_hold_qpos(context.left_cartesian)
+        if left_inactive_jitter_hold is not None:
+            left_qpos = left_inactive_jitter_hold
+            active_q = self._embed_arm_qpos(
+                current_full_q=active_q,
+                left_qpos=left_qpos,
+                right_qpos=right_qpos,
+            )
+            self.ik_solver.set_configuration_q(active_q)
+            self._last_safe_full_q = active_q.copy()
         if profile is not None:
             profile["frame_total_ms"] = (time.perf_counter() - frame_start) * 1000.0
         command.metadata.update(
@@ -749,6 +759,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "ik_jump_gate_hold_frames": jump_gate_hold_frames,
                 "ik_jump_gate_metrics": jump_gate_metrics,
                 "execution_step_metadata": dict(execution_step_metadata),
+                "left_inactive_jitter_hold": left_inactive_jitter_hold is not None,
             }
         )
         command.add_command(
@@ -784,6 +795,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "ik_jump_gate_hold_frames": jump_gate_hold_frames,
                     "ik_jump_gate_metrics": dict(jump_gate_metrics.get("left", {})),
                     "execution_step_metadata": dict(execution_step_metadata),
+                    "inactive_jitter_hold": left_inactive_jitter_hold is not None,
                 },
             )
         )
@@ -882,6 +894,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             command=command,
             fallback_frame_name=fallback_frame_name,
         )
+
+    def _inactive_jitter_hold_qpos(self, command: EffectorCommand | None) -> np.ndarray | None:
+        if command is None:
+            return None
+        metadata = command.metadata or {}
+        if not bool(metadata.get("jitter_arm")):
+            return None
+        if bool(metadata.get("jitter_active", True)):
+            return None
+        hold_qpos = metadata.get("hold_qpos")
+        if hold_qpos is None:
+            return None
+        qpos = np.asarray(hold_qpos, dtype=float).reshape(-1)
+        if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
+            return None
+        return qpos.copy()
 
     def _solver_frame_target_pose(
         self,

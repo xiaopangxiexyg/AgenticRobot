@@ -74,6 +74,7 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
 抖动模式行为：
 
 - 左臂：按 `p` 时记录当前 TCP pose 作为 anchor，之后生成围绕 anchor 的随机平滑 cartesian target。
+- 抖动启停：只有按 `z` 开始录制后才推进随机抖动；录制前以及按 `c`/`d` 结束后，左臂保持静止。`c`/`d` 会把左臂停在当时当前位置，不会拉回 `p` 时的 anchor。
 - 双臂 IK：左臂 jitter target 和右臂 wrist target 一起输入 `DualArmCollisionAwareRetargeter`，输出左右 arm joint command。
 - 左手：继续用左 q6 控制左 InspireTac hand。
 - 右臂：继续用右 wrist tracker 遥操作。

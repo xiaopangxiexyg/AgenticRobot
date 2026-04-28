@@ -204,6 +204,8 @@ class SmoothJitterArmRetargeter(Retargeter):
         self._target_rotvec = np.zeros(3, dtype=float)
         self._last_update_at: float | None = None
         self._next_target_at: float | None = None
+        self._jitter_enabled = False
+        self._hold_qpos: np.ndarray | None = None
 
     @property
     def name(self) -> str:
@@ -213,6 +215,14 @@ class SmoothJitterArmRetargeter(Retargeter):
     def anchor_state(self) -> FixedArmState | None:
         return FixedArmRetargeter._copy_state(self._anchor_state)
 
+    @property
+    def jitter_enabled(self) -> bool:
+        return bool(self._jitter_enabled)
+
+    @property
+    def hold_qpos(self) -> np.ndarray | None:
+        return None if self._hold_qpos is None else self._hold_qpos.copy()
+
     def clear_anchor_state(self) -> None:
         self._anchor_state = None
         self._current_translation = np.zeros(3, dtype=float)
@@ -221,6 +231,8 @@ class SmoothJitterArmRetargeter(Retargeter):
         self._target_rotvec = np.zeros(3, dtype=float)
         self._last_update_at = None
         self._next_target_at = None
+        self._jitter_enabled = False
+        self._hold_qpos = None
 
     def set_anchor_state(
         self,
@@ -238,12 +250,58 @@ class SmoothJitterArmRetargeter(Retargeter):
             captured_at=captured_at,
             source=str(source),
         )
+        self._hold_qpos = self._anchor_state.qpos.copy()
         self._current_translation = np.zeros(3, dtype=float)
         self._target_translation = np.zeros(3, dtype=float)
         self._current_rotvec = np.zeros(3, dtype=float)
         self._target_rotvec = np.zeros(3, dtype=float)
         self._last_update_at = None
         self._next_target_at = None
+        self._jitter_enabled = False
+
+    def set_jitter_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._jitter_enabled:
+            return
+        self._jitter_enabled = enabled
+        self._last_update_at = None
+        self._next_target_at = None
+
+    def freeze_at_pose(
+        self,
+        *,
+        qpos: Sequence[float] | np.ndarray | None = None,
+        target_pose_base: Any | None = None,
+        target_pose_desk: Any | None = None,
+        calibration: TeleopCalibration | None = None,
+    ) -> bool:
+        state = self._anchor_state
+        if state is None:
+            self.set_jitter_enabled(False)
+            return False
+        anchor_pose_desk = self._anchor_pose_desk(state, calibration)
+        if target_pose_desk is not None:
+            hold_pose_desk = as_pose_matrix(target_pose_desk)
+        elif target_pose_base is not None and calibration is not None:
+            arm = calibration.get_arm_for_side(self.config.side)
+            if arm.T_D_B is not None:
+                hold_pose_desk = arm.T_D_B @ as_pose_matrix(target_pose_base)
+            else:
+                hold_pose_desk = as_pose_matrix(target_pose_base)
+        elif target_pose_base is not None:
+            hold_pose_desk = as_pose_matrix(target_pose_base)
+        else:
+            hold_pose_desk = self._apply_offsets(anchor_pose_desk)
+
+        self._current_translation = hold_pose_desk[:3, 3] - anchor_pose_desk[:3, 3]
+        self._target_translation = self._current_translation.copy()
+        relative_rotation = anchor_pose_desk[:3, :3].T @ hold_pose_desk[:3, :3]
+        self._current_rotvec = R.from_matrix(relative_rotation).as_rotvec()
+        self._target_rotvec = self._current_rotvec.copy()
+        if qpos is not None:
+            self._hold_qpos = _qpos6(qpos)
+        self.set_jitter_enabled(False)
+        return True
 
     def retarget(
         self,
@@ -266,12 +324,18 @@ class SmoothJitterArmRetargeter(Retargeter):
         metadata = {
             "controller": self.name,
             "jitter_arm": True,
+            "jitter_active": bool(self._jitter_enabled),
             "fixed_side": self.config.side,
             "hold_source": state.source,
             "captured_at": state.captured_at,
             "tcp_mode": HAND_BASE_TCP_FRAME,
             "tcp_frame": self.config.tcp_frame,
-            "source_command_type": "smooth_random_cartesian_jitter",
+            "source_command_type": (
+                "smooth_random_cartesian_jitter"
+                if self._jitter_enabled
+                else "paused_cartesian_hold"
+            ),
+            "hold_qpos": None if self._hold_qpos is None else self._hold_qpos.copy(),
             "anchor_qpos": state.qpos.copy(),
             "anchor_pose_base": state.target_pose_base.copy(),
             "anchor_pose_desk": None
@@ -297,6 +361,10 @@ class SmoothJitterArmRetargeter(Retargeter):
                 "jitter_arm_sides": [self.config.side],
                 "jitter_arm_states": {
                     self.config.side: {
+                        "jitter_active": bool(self._jitter_enabled),
+                        "hold_qpos": None
+                        if self._hold_qpos is None
+                        else self._hold_qpos.copy(),
                         "anchor_qpos": state.qpos.copy(),
                         "anchor_pose_base": state.target_pose_base.copy(),
                         "anchor_pose_desk": None
@@ -329,17 +397,24 @@ class SmoothJitterArmRetargeter(Retargeter):
         now: float,
         calibration: TeleopCalibration | None,
     ) -> np.ndarray:
+        anchor_pose_desk = self._anchor_pose_desk(state, calibration)
+        if self._jitter_enabled:
+            self._advance_offsets(now)
+        return self._apply_offsets(anchor_pose_desk)
+
+    def _anchor_pose_desk(
+        self,
+        state: FixedArmState,
+        calibration: TeleopCalibration | None,
+    ) -> np.ndarray:
         if state.target_pose_desk is not None:
-            anchor_pose_desk = state.target_pose_desk.copy()
-        elif calibration is not None:
+            return state.target_pose_desk.copy()
+        if calibration is not None:
             arm = calibration.get_arm_for_side(self.config.side)
             if arm.T_D_B is None:
                 raise RuntimeError(f"Arm calibration for side '{self.config.side}' is missing T_D_B.")
-            anchor_pose_desk = arm.T_D_B @ state.target_pose_base
-        else:
-            anchor_pose_desk = state.target_pose_base.copy()
-        self._advance_offsets(now)
-        return self._apply_offsets(anchor_pose_desk)
+            return arm.T_D_B @ state.target_pose_base
+        return state.target_pose_base.copy()
 
     def _advance_offsets(self, now: float) -> None:
         if self._last_update_at is None:

@@ -58,7 +58,7 @@ from ..tactile_visualizer import (
 from ..transforms import as_pose_matrix, interpolate_pose
 from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
-from .camera_preview import CameraPreviewer
+from .camera_preview import CameraPreviewConfig, CameraPreviewer
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
 from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
@@ -492,6 +492,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show live RealSense RGB frames at the same resolution used for collection.",
     )
+    parser.add_argument(
+        "--vis-cam-key",
+        "--vis-camera-key",
+        type=str,
+        default="",
+        help=(
+            "Camera key to visualize when --vis_cam is set. "
+            "Defaults to 'front' when present, otherwise the first configured camera."
+        ),
+    )
     parser.add_argument("--write-video", dest="write_video", action="store_true")
     parser.add_argument("--no-video", dest="write_video", action="store_false")
     parser.set_defaults(write_video=True)
@@ -546,6 +556,7 @@ class CollectApp:
     components: CollectorComponents
     calibration: TeleopCalibration
     camera_sources: dict[str, RealSenseRGBSource]
+    preview_camera_sources: dict[str, RealSenseRGBSource]
     pose_retargeters: dict[str, PoseToArmRetargeter]
     fixed_arm_retargeters: dict[str, FixedArmRetargeter]
     jitter_arm_retargeters: dict[str, SmoothJitterArmRetargeter]
@@ -680,6 +691,24 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
         camera_key: RealSenseRGBSource(config)
         for camera_key, config in camera_configs.items()
     }
+
+
+def _select_preview_camera_sources(
+    camera_sources: dict[str, RealSenseRGBSource],
+    requested_key: str,
+) -> dict[str, RealSenseRGBSource]:
+    if not camera_sources:
+        return {}
+    key = str(requested_key or "").strip()
+    if key:
+        if key not in camera_sources:
+            available = ", ".join(sorted(camera_sources))
+            raise ValueError(
+                f"--vis-cam-key {key!r} not found. Available camera keys: {available}"
+            )
+        return {key: camera_sources[key]}
+    selected_key = "front" if "front" in camera_sources else sorted(camera_sources)[0]
+    return {selected_key: camera_sources[selected_key]}
 
 
 def _build_hand_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> HandQ6Source | None:
@@ -883,6 +912,7 @@ def _episode_metadata(
     active_sides: tuple[str, ...],
     calibration: TeleopCalibration,
     camera_sources: dict[str, RealSenseRGBSource],
+    preview_camera_sources: dict[str, RealSenseRGBSource],
 ) -> dict[str, Any]:
     fixed_sides = _fixed_arm_sides(args, active_sides)
     jitter_sides = _jitter_arm_sides(args, active_sides)
@@ -928,6 +958,7 @@ def _episode_metadata(
         "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
         "visualize_tactile": bool(args.visualize_tactile),
         "vis_cam": bool(args.vis_cam),
+        "vis_camera_keys": sorted(preview_camera_sources),
         "camera_keys": sorted(camera_sources),
         "camera_config_path": None if args.no_camera else str(args.camera_config),
         "calibration_path": args.load_profile or None,
@@ -1109,6 +1140,47 @@ def _set_jitter_arm_anchor_from_backend(
         captured_at=captured_at,
     )
     return qpos, pose_base, pose_desk
+
+
+def _set_jitter_randomization_enabled(app: CollectApp, enabled: bool) -> None:
+    for retargeter in app.jitter_arm_retargeters.values():
+        retargeter.set_jitter_enabled(bool(enabled))
+
+
+def _freeze_jitter_arms_at_current_pose(app: CollectApp) -> None:
+    if not app.jitter_arm_retargeters:
+        return
+    for side, retargeter in app.jitter_arm_retargeters.items():
+        backend = _arm_backend(app, side)
+        if backend is None:
+            retargeter.set_jitter_enabled(False)
+            continue
+        try:
+            state = backend.refresh_state_from_hardware()
+        except Exception:
+            state = backend.get_state()
+        qpos = _qpos_or_none(state.get("current_qpos"))
+        if qpos is not None:
+            backend.set_local_qpos(qpos)
+        try:
+            pose_base = backend.compute_tcp_pose()
+        except Exception:
+            pose_base = None
+        pose_desk = None
+        if pose_base is not None:
+            arm_calibration = app.calibration.get_arm_for_side(side)
+            pose_desk = (
+                None
+                if arm_calibration.T_D_B is None
+                else arm_calibration.T_D_B @ pose_base
+            )
+        retargeter.freeze_at_pose(
+            qpos=qpos,
+            target_pose_base=pose_base,
+            target_pose_desk=pose_desk,
+            calibration=app.calibration,
+        )
+    _seed_dual_arm_retargeter_from_backends(app)
 
 
 def _build_runtime_fixed_arm_command(
@@ -1565,9 +1637,16 @@ def _start_recording_episode(app: CollectApp, args: argparse.Namespace) -> None:
         _log("Episode", "ignore z: press p to calibrate home before recording.")
         return
     episode_index = app.writer.start_episode(
-        metadata=_episode_metadata(args, app.active_sides, app.calibration, app.camera_sources)
+        metadata=_episode_metadata(
+            args,
+            app.active_sides,
+            app.calibration,
+            app.camera_sources,
+            app.preview_camera_sources,
+        )
     )
     app.sample_builder.set_episode(episode_index)
+    _set_jitter_randomization_enabled(app, True)
     state.recording_active = True
     state.active_episode_index = int(episode_index)
     state.active_episode_started_at = time.time()
@@ -1595,6 +1674,7 @@ def _save_active_episode(
     frame_count = int(app.sample_builder.frame_index)
     print(f"\n录制完成 Recording finished for episode {episode_index}")
     print(f"  数据帧数 Data frames: {frame_count}")
+    _freeze_jitter_arms_at_current_pose(app)
     if frame_count <= 0:
         app.runtime.flush()
         app.writer.discard_episode(episode_index)
@@ -1638,6 +1718,7 @@ def _discard_active_episode(
     frame_count = int(app.sample_builder.frame_index)
     print(f"\n录制完成 Recording finished for episode {episode_index}")
     print(f"  数据帧数 Data frames: {frame_count}")
+    _freeze_jitter_arms_at_current_pose(app)
     app.runtime.flush()
     discarded = app.writer.discard_episode(episode_index)
     state.discarded_episodes += 1
@@ -1695,6 +1776,11 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     calibration = _load_calibration(args)
     calibration.clear_home_state()
     camera_sources = _build_camera_sources(args)
+    preview_camera_sources = (
+        _select_preview_camera_sources(camera_sources, str(args.vis_cam_key))
+        if bool(args.vis_cam) and camera_sources
+        else {}
+    )
     vive_source = _build_vive_source(args, active_sides)
     keyboard_source = KeyboardButtonSource(name="collection_clutch")
     default_clutch_pressed = args.control_mode == "delta_clutch"
@@ -1727,7 +1813,11 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
 
     all_backends, rig_backends = _build_backends(args, active_sides)
     tactile_visualizer = _build_tactile_visualizer(args, active_sides)
-    camera_previewer = CameraPreviewer() if bool(args.vis_cam) and camera_sources else None
+    camera_previewer = (
+        CameraPreviewer(CameraPreviewConfig())
+        if bool(args.vis_cam) and preview_camera_sources
+        else None
+    )
     rig_backend_names = set(rig_backends)
     for side in hand_retargeters:
         hand_backend = all_backends.get(f"{side}_hand")
@@ -1834,6 +1924,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         components=components,
         calibration=calibration,
         camera_sources=camera_sources,
+        preview_camera_sources=preview_camera_sources,
         pose_retargeters=pose_retargeters,
         fixed_arm_retargeters=fixed_arm_retargeters,
         jitter_arm_retargeters=jitter_arm_retargeters,
@@ -1997,7 +2088,8 @@ def main() -> int:
             _log(
                 "Camera",
                 f"configured cameras={sorted(app.camera_sources)} "
-                f"config={args.camera_config} vis_cam={bool(args.vis_cam)}",
+                f"config={args.camera_config} vis_cam={bool(args.vis_cam)} "
+                f"vis_camera_keys={sorted(app.preview_camera_sources)}",
             )
             if app.camera_previewer is not None:
                 if app.camera_previewer.ensure_available():
@@ -2026,7 +2118,7 @@ def main() -> int:
                 },
             )
             if app.camera_previewer is not None and app.camera_previewer.disabled_reason is None:
-                _log("Camera", f"--vis_cam active for cameras={sorted(app.camera_sources)}")
+                _log("Camera", f"--vis_cam active for cameras={sorted(app.preview_camera_sources)}")
         elif args.no_camera:
             _log("Camera", "--no-camera active; no RealSense config was loaded and no camera sources were started.")
 
@@ -2094,7 +2186,7 @@ def main() -> int:
                     )
                 )
             if app.camera_previewer is not None:
-                app.camera_previewer.update(app.camera_sources)
+                app.camera_previewer.update(app.preview_camera_sources)
             if app.camera_sources:
                 camera_signature, camera_text = _camera_state_signature_text(app)
                 if camera_signature != last_camera_state_signature:
