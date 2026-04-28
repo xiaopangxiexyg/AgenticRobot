@@ -285,7 +285,9 @@ python -m teleop_runtime.collection.run_collect \
 最常用的参数是：
 
 - `--dataset-root`
-  采集输出目录，必填。
+  基础输出目录，必填；实际数据集目录会自动命名为 `<dataset-root>/<YYYY-MM-DD>_<task-name>`。
+- `--task-name`
+  任务名称，用于数据集目录命名和 episode metadata。旧的 `--task` 仍兼容，会在未提供 `--task-name` 时作为任务名和 task id。
 - `--active-sides left|right|both`
   启用哪些 arm side。
 - `--load-profile`

@@ -503,6 +503,11 @@ def hand_sample_to_row(
         row[f"observation.hand.{side}.tactile_regions"] = list(
             hand_state.get("tactile_regions", ())
         )
+        row[f"observation.hand.{side}.tactile_dict_json"] = json.dumps(
+            to_serializable(hand_state.get("tactile_dict")),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
         row[f"action.replay.{side}_hand_joint_target"] = vector_list(
             hand_state.get("last_sent_command"),
             length=HAND_DOF,
@@ -760,6 +765,8 @@ class HandOnlyLeRobotWriter:
                     "action.left_hand.joint_target": {"shape": [HAND_DOF], "dtype": "float32"},
                     "observation.right_hand.qpos": {"shape": [HAND_DOF], "dtype": "float32"},
                     "observation.left_hand.qpos": {"shape": [HAND_DOF], "dtype": "float32"},
+                    "observation.hand.right.tactile": {"shape": [1062], "dtype": "float32"},
+                    "observation.hand.left.tactile": {"shape": [1062], "dtype": "float32"},
                 },
             },
         )

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import re
 import select
 import sys
 import termios
 import time
 import tty
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -20,6 +22,12 @@ from ..calibration import TeleopCalibration
 from ..configs import build_annotated_dual_rm65_calibration
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
 from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
+from ..LeftArmFixed import (
+    FixedArmRetargeter,
+    FixedArmRetargeterConfig,
+    SmoothJitterArmRetargeter,
+    SmoothJitterArmRetargeterConfig,
+)
 from ..retargeters import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
@@ -134,6 +142,53 @@ def _parse_active_sides(text: str) -> tuple[str, ...]:
     raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
 
 
+def _sanitize_task_name_for_path(task_name: str) -> str:
+    text = str(task_name).strip()
+    if not text:
+        return "task"
+    text = re.sub(r"[\\/]+", "-", text)
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    text = text.strip("._-")
+    return text or "task"
+
+
+def _default_task_id_from_name(task_name: str) -> str:
+    slug = _sanitize_task_name_for_path(task_name).lower()
+    slug = re.sub(r"[^0-9a-z_-]+", "_", slug)
+    slug = re.sub(r"_+", "_", slug).strip("._-")
+    return slug or "task"
+
+
+def _resolve_collection_layout(args: argparse.Namespace) -> tuple[Path, str, str, str, str]:
+    legacy_task = str(getattr(args, "task", "")).strip()
+    task_name = str(getattr(args, "task_name", "")).strip() or legacy_task or "default"
+    task_id = (
+        str(getattr(args, "task_id", "")).strip()
+        or legacy_task
+        or _default_task_id_from_name(task_name)
+    )
+    task_description = str(getattr(args, "task_description", "")).strip() or task_name
+    date_prefix = datetime.now().strftime("%Y-%m-%d")
+    dataset_dir_name = f"{date_prefix}_{_sanitize_task_name_for_path(task_name)}"
+    dataset_root = Path(args.dataset_root).expanduser() / dataset_dir_name
+    dataset_name = str(getattr(args, "dataset_name", "")).strip() or dataset_dir_name
+    return dataset_root, task_name, task_id, task_description, dataset_name
+
+
+def _apply_collection_layout(args: argparse.Namespace) -> None:
+    dataset_base_root = Path(args.dataset_root).expanduser()
+    dataset_root, task_name, task_id, task_description, dataset_name = _resolve_collection_layout(args)
+    args.dataset_base_root = str(dataset_base_root)
+    args.dataset_root = str(dataset_root)
+    args.dataset_dir_name = dataset_root.name
+    args.task_name = task_name
+    args.task_id = task_id
+    args.task = task_id
+    args.task_description = task_description
+    args.dataset_name = dataset_name
+
+
 def _active_side_value(args: argparse.Namespace, side: str, suffix: str) -> str:
     return str(getattr(args, f"{side}_{suffix}"))
 
@@ -183,13 +238,60 @@ def _assert_tactile_visualization_config(
         )
 
 
+def _fixed_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
+    if not bool(getattr(args, "left_arm_fixed", False)):
+        return ()
+    if bool(getattr(args, "left_arm_jitter", False)):
+        raise ValueError("--left-arm-fixed and --left-arm-jitter are mutually exclusive.")
+    if set(active_sides) != {"left", "right"}:
+        raise ValueError("--left-arm-fixed requires --active-sides both.")
+    return ("left",)
+
+
+def _jitter_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
+    if not bool(getattr(args, "left_arm_jitter", False)):
+        return ()
+    if bool(getattr(args, "left_arm_fixed", False)):
+        raise ValueError("--left-arm-fixed and --left-arm-jitter are mutually exclusive.")
+    if set(active_sides) != {"left", "right"}:
+        raise ValueError("--left-arm-jitter requires --active-sides both.")
+    if bool(getattr(args, "disable_dual_arm_collision_avoidance", False)):
+        raise ValueError("--left-arm-jitter requires dual-arm IK; remove --disable-dual-arm-collision-avoidance.")
+    return ("left",)
+
+
+def _moving_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
+    non_operator = set(_fixed_arm_sides(args, active_sides)) | set(
+        _jitter_arm_sides(args, active_sides)
+    )
+    return tuple(side for side in active_sides if side not in non_operator)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect LeRobot-style teleop episodes from real RM65/Inspire hardware."
     )
-    parser.add_argument("--task", type=str, default="default", help="Task identifier written into dataset meta.")
+    parser.add_argument(
+        "--dataset-root",
+        type=str,
+        required=True,
+        help="Base output directory. Actual dataset path is <dataset-root>/<YYYY-MM-DD>_<task-name>.",
+    )
+    parser.add_argument(
+        "--task-name",
+        type=str,
+        default="",
+        help="Task name used for dataset folder naming and metadata. Defaults to --task, then 'default'.",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="",
+        help="Legacy task id/name. Used as task id and as task name when --task-name is omitted.",
+    )
+    parser.add_argument("--task-id", type=str, default="", help="Optional task id; defaults to a slug from task name.")
     parser.add_argument("--task-description", type=str, default="", help="Optional task description.")
-    parser.add_argument("--dataset-root", type=str, required=True, help="Dataset output root.")
+    parser.add_argument("--dataset-name", type=str, default="", help="Optional dataset name written into meta/info.json.")
     parser.add_argument(
         "--active-sides",
         type=_parse_active_sides,
@@ -203,6 +305,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-tracker-name", type=str, default="tracker_2", help="Right wrist tracker name.")
     parser.add_argument("--left-arm-ip", type=str, default="", help="Left RM65 IP.")
     parser.add_argument("--right-arm-ip", type=str, default="", help="Right RM65 IP.")
+    parser.add_argument(
+        "--left-arm-fixed",
+        action="store_true",
+        help=(
+            "Keep the left arm fixed at the hardware position captured by p; "
+            "right arm and both hands keep normal teleop, and bimanual dataset fields remain populated."
+        ),
+    )
+    parser.add_argument(
+        "--left-arm-jitter",
+        action="store_true",
+        help=(
+            "Keep the left arm near the hardware position captured by p, but feed a smooth random "
+            "small cartesian jitter target into the dual-arm IK retargeter."
+        ),
+    )
+    parser.add_argument(
+        "--left-arm-jitter-position-m",
+        type=float,
+        default=0.01,
+        help="Maximum left TCP jitter translation radius in desk-frame meters.",
+    )
+    parser.add_argument(
+        "--left-arm-jitter-rotation-deg",
+        type=float,
+        default=3.0,
+        help="Maximum left TCP jitter rotation angle in degrees.",
+    )
+    parser.add_argument(
+        "--left-arm-jitter-refresh-sec",
+        type=_positive_float,
+        default=1.2,
+        help="Seconds between new random left-arm jitter targets.",
+    )
+    parser.add_argument(
+        "--left-arm-jitter-smoothing-sec",
+        type=float,
+        default=0.45,
+        help="First-order smoothing time constant for left-arm jitter; 0 jumps directly to each random target.",
+    )
+    parser.add_argument(
+        "--left-arm-jitter-seed",
+        type=int,
+        default=-1,
+        help="Random seed for left-arm jitter; negative uses OS entropy.",
+    )
     parser.add_argument("--left-hand-ip", type=str, default="", help="Optional left InspireTac IP.")
     parser.add_argument("--right-hand-ip", type=str, default="", help="Optional right InspireTac IP.")
     parser.add_argument("--left-hand-port", type=str, default="", help="Optional left q6 serial port.")
@@ -363,15 +511,32 @@ def parse_args() -> argparse.Namespace:
         "--calibration-samples",
         type=_positive_int,
         default=20,
-        help="Number of valid wrist frames to average per active side during runtime home calibration.",
+        help="Number of valid wrist frames to average per moving arm side during runtime home calibration.",
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite.")
     parser.add_argument("--status-sec", type=_positive_float, default=2.0, help="Status print interval in seconds.")
+    parser.add_argument(
+        "--silent",
+        "--quiet",
+        dest="silent",
+        action="store_true",
+        default=True,
+        help="Suppress periodic status lines; key events and warnings are still printed. Default.",
+    )
+    parser.add_argument(
+        "--no-silent",
+        "--no-quiet",
+        "--verbose-status",
+        dest="silent",
+        action="store_false",
+        help="Print periodic status lines every --status-sec seconds.",
+    )
     args = parser.parse_args()
     if bool(args.no_camera):
         if bool(args.vis_cam):
             parser.error("--vis_cam requires cameras; remove --no-camera.")
         args.write_video = False
+    _apply_collection_layout(args)
     return args
 
 
@@ -382,6 +547,8 @@ class CollectApp:
     calibration: TeleopCalibration
     camera_sources: dict[str, RealSenseRGBSource]
     pose_retargeters: dict[str, PoseToArmRetargeter]
+    fixed_arm_retargeters: dict[str, FixedArmRetargeter]
+    jitter_arm_retargeters: dict[str, SmoothJitterArmRetargeter]
     hand_retargeters: dict[str, JointsToDexHandRetargeter]
     dual_arm_retargeter: DualArmCollisionAwareRetargeter | None
     unmanaged_backends: dict[str, Any]
@@ -465,8 +632,10 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
 
 
 def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> VivePoseSource:
+    moving_sides = _moving_arm_sides(args, active_sides)
+    non_operator_sides = tuple(side for side in active_sides if side not in moving_sides)
     tracker_configs: list[ViveTrackerConfig] = []
-    if "left" in active_sides:
+    if "left" in moving_sides:
         tracker_configs.append(
             ViveTrackerConfig(
                 name=args.left_tracker_name,
@@ -475,7 +644,17 @@ def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) 
                 channel_name="left_wrist_pose",
             )
         )
-    if "right" in active_sides:
+    if "left" in non_operator_sides:
+        tracker_configs.append(
+            ViveTrackerConfig(
+                name=args.left_tracker_name,
+                side="left",
+                role="left_wrist",
+                channel_name="left_wrist_pose",
+                critical=False,
+            )
+        )
+    if "right" in moving_sides:
         tracker_configs.append(
             ViveTrackerConfig(
                 name=args.right_tracker_name,
@@ -527,10 +706,39 @@ def _build_arm_retargeters(
 ) -> tuple[
     list[object],
     dict[str, PoseToArmRetargeter],
+    dict[str, FixedArmRetargeter],
+    dict[str, SmoothJitterArmRetargeter],
     DualArmCollisionAwareRetargeter | None,
 ]:
+    fixed_sides = _fixed_arm_sides(args, active_sides)
+    jitter_sides = _jitter_arm_sides(args, active_sides)
+    moving_sides = _moving_arm_sides(args, active_sides)
+    fixed_retargeters = {
+        side: FixedArmRetargeter(
+            FixedArmRetargeterConfig(
+                side=side,
+                effector_name=f"{side}_arm",
+            )
+        )
+        for side in fixed_sides
+    }
+    jitter_seed = None if int(args.left_arm_jitter_seed) < 0 else int(args.left_arm_jitter_seed)
+    jitter_retargeters = {
+        side: SmoothJitterArmRetargeter(
+            SmoothJitterArmRetargeterConfig(
+                side=side,
+                effector_name=f"{side}_arm",
+                max_translation_m=float(args.left_arm_jitter_position_m),
+                max_rotation_deg=float(args.left_arm_jitter_rotation_deg),
+                target_refresh_sec=float(args.left_arm_jitter_refresh_sec),
+                smoothing_time_constant_sec=float(args.left_arm_jitter_smoothing_sec),
+                seed=jitter_seed,
+            )
+        )
+        for side in jitter_sides
+    }
     pose_retargeters: dict[str, PoseToArmRetargeter] = {}
-    for side in active_sides:
+    for side in moving_sides:
         pose_retargeters[side] = PoseToArmRetargeter(
             PoseToArmRetargeterConfig(
                 side=side,
@@ -542,7 +750,16 @@ def _build_arm_retargeters(
             )
         )
 
-    if set(active_sides) == {"left", "right"} and not bool(args.disable_dual_arm_collision_avoidance):
+    if (
+        not fixed_sides
+        and set(active_sides) == {"left", "right"}
+        and not bool(args.disable_dual_arm_collision_avoidance)
+    ):
+        left_pose_retargeter = (
+            jitter_retargeters["left"]
+            if "left" in jitter_retargeters
+            else pose_retargeters["left"]
+        )
         dual = DualArmCollisionAwareRetargeter(
             DualArmCollisionAwareRetargeterConfig(
                 control_mode=str(args.control_mode),
@@ -551,11 +768,18 @@ def _build_arm_retargeters(
                 contact_mode=str(args.collision_avoidance_mode),
                 solver_frequency=float(args.hz),
             ),
-            left_pose_retargeter=pose_retargeters["left"],
+            left_pose_retargeter=left_pose_retargeter,
             right_pose_retargeter=pose_retargeters["right"],
         )
-        return [dual], pose_retargeters, dual
-    return [pose_retargeters[side] for side in active_sides], pose_retargeters, None
+        return [dual], pose_retargeters, fixed_retargeters, jitter_retargeters, dual
+    return (
+        [fixed_retargeters[side] for side in fixed_sides]
+        + [pose_retargeters[side] for side in moving_sides],
+        pose_retargeters,
+        fixed_retargeters,
+        jitter_retargeters,
+        None,
+    )
 
 
 def _build_hand_retargeters(
@@ -642,17 +866,51 @@ def _build_tactile_visualizer(
     )
 
 
+def _source_entrypoint_for_modes(
+    *,
+    fixed_sides: tuple[str, ...],
+    jitter_sides: tuple[str, ...],
+) -> str:
+    if jitter_sides:
+        return "teleop_runtime.LeftArmFixed.run_collect_jitter"
+    if fixed_sides:
+        return "teleop_runtime.LeftArmFixed.run_collect"
+    return "teleop_runtime.collection.run_collect"
+
+
 def _episode_metadata(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
     calibration: TeleopCalibration,
     camera_sources: dict[str, RealSenseRGBSource],
 ) -> dict[str, Any]:
+    fixed_sides = _fixed_arm_sides(args, active_sides)
+    jitter_sides = _jitter_arm_sides(args, active_sides)
+    moving_sides = _moving_arm_sides(args, active_sides)
     return {
-        "source_entrypoint": "teleop_runtime.collection.run_collect",
-        "task_id": str(args.task),
+        "source_entrypoint": _source_entrypoint_for_modes(
+            fixed_sides=fixed_sides,
+            jitter_sides=jitter_sides,
+        ),
+        "task_name": str(args.task_name),
+        "task_id": str(args.task_id),
         "task_description": str(args.task_description),
+        "dataset_name": str(args.dataset_name),
+        "dataset_base_root": str(getattr(args, "dataset_base_root", "")),
+        "dataset_dir_name": str(getattr(args, "dataset_dir_name", "")),
         "active_sides": list(active_sides),
+        "moving_arm_sides": list(moving_sides),
+        "fixed_arm_sides": list(fixed_sides),
+        "jitter_arm_sides": list(jitter_sides),
+        "left_arm_fixed": bool(fixed_sides),
+        "left_arm_jitter": bool(jitter_sides),
+        "left_arm_jitter_position_m": float(args.left_arm_jitter_position_m),
+        "left_arm_jitter_rotation_deg": float(args.left_arm_jitter_rotation_deg),
+        "left_arm_jitter_refresh_sec": float(args.left_arm_jitter_refresh_sec),
+        "left_arm_jitter_smoothing_sec": float(args.left_arm_jitter_smoothing_sec),
+        "left_arm_jitter_seed": None
+        if int(args.left_arm_jitter_seed) < 0
+        else int(args.left_arm_jitter_seed),
         "runtime_arm_state_source": "last_commanded_action",
         "control_mode": str(args.control_mode),
         "hz": float(args.hz),
@@ -679,6 +937,27 @@ def _episode_metadata(
 
 def _log(tag: str, message: str) -> None:
     print(f"[{tag}] {message}", flush=True)
+
+
+def _print_controls() -> None:
+    print("\n" + "=" * 60)
+    print("数据采集循环已启动 / Starting data collection loop...")
+    print("控制说明 / Controls:")
+    print("  'P' = 标定 home 并开始随动 / Calibrate home and enable following")
+    print("  'Z' = 开始录制 / Start episode")
+    print("  'C' = 保存当前片段 / Save current episode")
+    print("  'D' = 丢弃当前片段 / Discard current episode")
+    print("  'H' = 暂停随动并清除 home / Hold and clear home")
+    print("  'Q' = 退出程序 / Quit program")
+    print("=" * 60 + "\n")
+
+
+def _print_standby(app: CollectApp) -> None:
+    home = "ready" if app.calibration.metadata.get("home_ready") else "unset, press P"
+    print("Standby, Ready to start data collection...")
+    print(f"  home: {home}")
+    print(f"  下一个片段编号 Next episode ID: {app.writer.next_episode_index}\n")
+    print("=" * 100)
 
 
 def _compact_log_value(value: object, *, max_chars: int = 90) -> str:
@@ -784,6 +1063,70 @@ def _sync_arm_backends_from_hardware(
     return synced
 
 
+def _set_fixed_arm_state_from_backend(
+    app: CollectApp,
+    *,
+    side: str,
+    captured_at: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    backend = _arm_backend(app, side)
+    if backend is None:
+        raise KeyError(f"Missing arm backend for fixed side '{side}'.")
+    qpos = _qpos_or_none(backend.get_state().get("current_qpos"))
+    if qpos is None:
+        raise RuntimeError(f"Cannot fix {side}_arm without a valid current_qpos.")
+    pose_base = backend.compute_tcp_pose()
+    arm_calibration = app.calibration.get_arm_for_side(side)
+    pose_desk = None if arm_calibration.T_D_B is None else arm_calibration.T_D_B @ pose_base
+    app.fixed_arm_retargeters[side].set_fixed_state(
+        qpos=qpos,
+        target_pose_base=pose_base,
+        target_pose_desk=pose_desk,
+        captured_at=captured_at,
+    )
+    return qpos, pose_base, pose_desk
+
+
+def _set_jitter_arm_anchor_from_backend(
+    app: CollectApp,
+    *,
+    side: str,
+    captured_at: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    backend = _arm_backend(app, side)
+    if backend is None:
+        raise KeyError(f"Missing arm backend for jitter side '{side}'.")
+    qpos = _qpos_or_none(backend.get_state().get("current_qpos"))
+    if qpos is None:
+        raise RuntimeError(f"Cannot set jitter anchor for {side}_arm without a valid current_qpos.")
+    pose_base = backend.compute_tcp_pose()
+    arm_calibration = app.calibration.get_arm_for_side(side)
+    pose_desk = None if arm_calibration.T_D_B is None else arm_calibration.T_D_B @ pose_base
+    app.jitter_arm_retargeters[side].set_anchor_state(
+        qpos=qpos,
+        target_pose_base=pose_base,
+        target_pose_desk=pose_desk,
+        captured_at=captured_at,
+    )
+    return qpos, pose_base, pose_desk
+
+
+def _build_runtime_fixed_arm_command(
+    app: CollectApp,
+    observation: TeleopObservation | None,
+) -> TeleopCommand | None:
+    if observation is None or not app.fixed_arm_retargeters:
+        return None
+    commands = [
+        retargeter.retarget(observation, app.calibration)
+        for retargeter in app.fixed_arm_retargeters.values()
+    ]
+    merged = merge_teleop_commands(tuple(commands))
+    if not merged.commands:
+        return None
+    return merged
+
+
 def _build_runtime_hand_command_for_recovery(
     app: CollectApp,
     observation: TeleopObservation | None,
@@ -820,9 +1163,14 @@ def _start_recovery_plan(
     ramp_sec: float,
 ) -> tuple[RecoveryPlan | None, TeleopCommand | None, bool]:
     _seed_dual_arm_retargeter_from_backends(app)
+    moving_sides = tuple(
+        side
+        for side in app.active_sides
+        if side not in app.fixed_arm_retargeters and side not in app.jitter_arm_retargeters
+    )
 
     if control_mode == "delta_clutch":
-        for side in app.active_sides:
+        for side in moving_sides:
             app.pose_retargeters[side].reanchor_to_current_input(
                 observation,
                 app.calibration,
@@ -855,7 +1203,7 @@ def _start_recovery_plan(
         )
 
     end_resolutions: dict[str, dict[str, object]] = {}
-    for side in app.active_sides:
+    for side in moving_sides:
         resolution = app.pose_retargeters[side].resolve_absolute_target_from_observation(
             observation,
             app.calibration,
@@ -873,7 +1221,7 @@ def _start_recovery_plan(
             payload={
                 "start_targets": {
                     side: _backend_tcp_pose_desk(app, side=side)
-                    for side in app.active_sides
+                    for side in moving_sides
                 },
                 "end_resolutions": end_resolutions,
             },
@@ -951,6 +1299,7 @@ def _drive_recovery_step(
         return None
 
     observation = result.observation
+    fixed_command = _build_runtime_fixed_arm_command(app, observation)
     hand_command = _build_runtime_hand_command_for_recovery(app, observation)
     active_command: TeleopCommand | None = None
     recovery_done = False
@@ -981,6 +1330,12 @@ def _drive_recovery_step(
             now=now,
         )
 
+    if fixed_command is not None:
+        active_command = (
+            fixed_command
+            if active_command is None
+            else merge_teleop_commands((active_command, fixed_command))
+        )
     active_command = _merge_runtime_hand_command(active_command, hand_command)
     if active_command is not None:
         if app.components.session.rig is None:
@@ -1046,29 +1401,37 @@ def _runtime_home_calibration(
     if not app.active_sides:
         return
     calibration = app.calibration
+    fixed_sides = tuple(app.fixed_arm_retargeters)
+    jitter_sides = tuple(app.jitter_arm_retargeters)
+    moving_sides = tuple(
+        side
+        for side in app.active_sides
+        if side not in app.fixed_arm_retargeters and side not in app.jitter_arm_retargeters
+    )
     _log(
         "Calibration",
         "capturing runtime home for "
-        f"active_sides={list(app.active_sides)} with {num_samples} valid tracker frames per side; "
+        f"moving_arm_sides={list(moving_sides)} with {num_samples} valid tracker frames per side; "
+        f"fixed_arm_sides={list(fixed_sides)} jitter_arm_sides={list(jitter_sides)}; "
         "keep wrist trackers steady.",
     )
     start_time = time.time()
-    samples = {side: [] for side in app.active_sides}
+    samples = {side: [] for side in moving_sides}
     observed_channels: set[str] = set()
     progress_markers = sorted({1, max(1, num_samples // 2), num_samples})
-    reported_markers = {side: set() for side in app.active_sides}
+    reported_markers = {side: set() for side in moving_sides}
 
-    while any(len(samples[side]) < num_samples for side in app.active_sides):
+    while any(len(samples[side]) < num_samples for side in moving_sides):
         now = time.time()
         if now - start_time > timeout_sec:
-            counts = {side: len(samples[side]) for side in app.active_sides}
+            counts = {side: len(samples[side]) for side in moving_sides}
             raise TimeoutError(
                 "Timed out waiting for runtime home calibration frames. "
                 f"sample_counts={counts}. "
                 "Verify VIVE sender tracker_role values and receiver tracker-name arguments."
             )
         channels, _ = app.components.session.poll_sources(now)
-        for side in app.active_sides:
+        for side in moving_sides:
             channel_name = f"{side}_wrist_pose"
             channel = channels.get(channel_name)
             if channel is None:
@@ -1093,7 +1456,7 @@ def _runtime_home_calibration(
                 if len(samples[side]) >= marker and marker not in reported_markers[side]:
                     reported_markers[side].add(marker)
                     _log("Calibration", f"{side} progress {len(samples[side])}/{num_samples}")
-        if any(len(samples[side]) < num_samples for side in app.active_sides):
+        if any(len(samples[side]) < num_samples for side in moving_sides):
             time.sleep(0.01)
 
     synced = _sync_arm_backends_from_hardware(app, required=True)
@@ -1105,25 +1468,56 @@ def _runtime_home_calibration(
         "timestamp": time.time(),
         "num_samples": int(num_samples),
         "sides": list(app.active_sides),
-        "sample_counts": {side: len(samples[side]) for side in app.active_sides},
+        "moving_arm_sides": list(moving_sides),
+        "fixed_arm_sides": list(fixed_sides),
+        "jitter_arm_sides": list(jitter_sides),
+        "sample_counts": {side: len(samples[side]) for side in moving_sides},
     }
     for side in app.active_sides:
-        human_home = _mean_pose(samples[side])
         robot_home_desk, qpos = _resolve_robot_home_for_side(app, side=side)
-        app.pose_retargeters[side].set_home_anchors(
-            human_pose_desk=human_home,
-            robot_pose_desk=robot_home_desk,
-        )
         calibration.capture_home_pose(f"{side}_arm", robot_home_desk)
         if qpos is not None:
             calibration.capture_home_qpos(f"{side}_arm", qpos)
+        if side in app.fixed_arm_retargeters:
+            fixed_qpos, fixed_pose_base, _ = _set_fixed_arm_state_from_backend(
+                app,
+                side=side,
+                captured_at=float(capture_summary["timestamp"]),
+            )
+            qpos = fixed_qpos
+            fixed_mode = True
+            jitter_mode = False
+        elif side in app.jitter_arm_retargeters:
+            jitter_qpos, fixed_pose_base, _ = _set_jitter_arm_anchor_from_backend(
+                app,
+                side=side,
+                captured_at=float(capture_summary["timestamp"]),
+            )
+            qpos = jitter_qpos
+            fixed_mode = False
+            jitter_mode = True
+        else:
+            human_home = _mean_pose(samples[side])
+            app.pose_retargeters[side].set_home_anchors(
+                human_pose_desk=human_home,
+                robot_pose_desk=robot_home_desk,
+            )
+            fixed_pose_base = None
+            fixed_mode = False
+            jitter_mode = False
         capture_summary[side] = {
+            "fixed_arm": fixed_mode,
+            "jitter_arm": jitter_mode,
             "robot_home_xyz_m": np.round(robot_home_desk[:3, 3], 4).tolist(),
             "home_qpos_rad": None if qpos is None else np.round(qpos, 4).tolist(),
+            "fixed_pose_base_xyz_m": None
+            if fixed_pose_base is None
+            else np.round(fixed_pose_base[:3, 3], 4).tolist(),
         }
         _log(
             "Calibration",
-            f"{side} robot_home_xyz={capture_summary[side]['robot_home_xyz_m']} "
+            f"{side} fixed={fixed_mode} jitter={jitter_mode} "
+            f"robot_home_xyz={capture_summary[side]['robot_home_xyz_m']} "
             f"qpos={capture_summary[side]['home_qpos_rad']}",
         )
     calibration.metadata["home_capture"] = capture_summary
@@ -1135,6 +1529,10 @@ def _clear_runtime_home(app: CollectApp) -> None:
     app.calibration.clear_home_state()
     for retargeter in app.pose_retargeters.values():
         retargeter.clear_home_anchors()
+    for retargeter in app.fixed_arm_retargeters.values():
+        retargeter.clear_fixed_state()
+    for retargeter in app.jitter_arm_retargeters.values():
+        retargeter.clear_anchor_state()
 
 
 def _run_keyed_home_calibration(app: CollectApp, args: argparse.Namespace) -> None:
@@ -1155,6 +1553,7 @@ def _run_keyed_home_calibration(app: CollectApp, args: argparse.Namespace) -> No
     app.components.session.mark_debug_passed()
     app.components.session.arm_hardware()
     _log("Keys", "p: runtime home captured; arm following is enabled.")
+    _print_standby(app)
 
 
 def _start_recording_episode(app: CollectApp, args: argparse.Namespace) -> None:
@@ -1172,7 +1571,7 @@ def _start_recording_episode(app: CollectApp, args: argparse.Namespace) -> None:
     state.recording_active = True
     state.active_episode_index = int(episode_index)
     state.active_episode_started_at = time.time()
-    _log("Episode", f"z: recording started episode_index={episode_index}")
+    print(f"\n开始录制片段 Start recording episode: {episode_index}", flush=True)
 
 
 def _reset_recording_state(state: CollectControlState) -> None:
@@ -1186,6 +1585,7 @@ def _save_active_episode(
     *,
     step_count: int,
     reason: str,
+    show_standby: bool = True,
 ) -> bool:
     state = app.control_state
     if not state.recording_active or state.active_episode_index is None:
@@ -1193,13 +1593,18 @@ def _save_active_episode(
         return False
     episode_index = int(state.active_episode_index)
     frame_count = int(app.sample_builder.frame_index)
+    print(f"\n录制完成 Recording finished for episode {episode_index}")
+    print(f"  数据帧数 Data frames: {frame_count}")
     if frame_count <= 0:
         app.runtime.flush()
         app.writer.discard_episode(episode_index)
         state.discarded_episodes += 1
         _reset_recording_state(state)
-        _log("Episode", f"{reason}: episode {episode_index} had no samples; discarded.")
+        print(f"  丢弃片段 Discarding episode {episode_index}: no samples")
+        if show_standby:
+            _print_standby(app)
         return False
+    print(f"  正在保存片段 Saving episode {episode_index}...")
     for job in app.writer.plan_finalize_episode(
         episode_index,
         summary={
@@ -1213,35 +1618,43 @@ def _save_active_episode(
     app.runtime.flush()
     state.saved_episodes += 1
     _reset_recording_state(state)
-    _log("Episode", f"{reason}: saved episode_index={episode_index} frames={frame_count}")
+    print(f"  已保存片段 Episode saved {episode_index}")
+    if show_standby:
+        _print_standby(app)
     return True
 
 
-def _discard_active_episode(app: CollectApp, *, reason: str) -> bool:
+def _discard_active_episode(
+    app: CollectApp,
+    *,
+    reason: str,
+    show_standby: bool = True,
+) -> bool:
     state = app.control_state
     if not state.recording_active or state.active_episode_index is None:
         _log("Episode", "ignore d: no active recording.")
         return False
     episode_index = int(state.active_episode_index)
     frame_count = int(app.sample_builder.frame_index)
+    print(f"\n录制完成 Recording finished for episode {episode_index}")
+    print(f"  数据帧数 Data frames: {frame_count}")
     app.runtime.flush()
     discarded = app.writer.discard_episode(episode_index)
     state.discarded_episodes += 1
     _reset_recording_state(state)
-    _log(
-        "Episode",
-        f"{reason}: discarded episode_index={episode_index} frames={frame_count} "
-        f"discarded={discarded}",
-    )
+    print(f"  丢弃片段 Discarding episode {episode_index} discarded={discarded}")
+    if show_standby:
+        _print_standby(app)
     return True
 
 
 def _hold_and_clear_home(app: CollectApp) -> None:
     if app.control_state.recording_active:
-        _discard_active_episode(app, reason="h/manual_hold")
+        _discard_active_episode(app, reason="h/manual_hold", show_standby=False)
     app.components.session.hold_hardware("manual hold; runtime home cleared")
     _clear_runtime_home(app)
     _log("Keys", "h: arm following locked; previous p home calibration cleared.")
+    _print_standby(app)
 
 
 def _handle_key(
@@ -1267,7 +1680,7 @@ def _handle_key(
         _hold_and_clear_home(app)
         return False
     if key == "q":
-        _log("Keys", "q: quit requested.")
+        print("\n正在退出数据采集 Quitting the data collection...\n", flush=True)
         return True
     return False
 
@@ -1276,6 +1689,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     active_sides = tuple(args.active_sides)
     _assert_side_config_consistency(args, active_sides)
     _assert_tactile_visualization_config(args, active_sides)
+    fixed_sides = _fixed_arm_sides(args, active_sides)
+    jitter_sides = _jitter_arm_sides(args, active_sides)
+    moving_sides = _moving_arm_sides(args, active_sides)
     calibration = _load_calibration(args)
     calibration.clear_home_state()
     camera_sources = _build_camera_sources(args)
@@ -1296,7 +1712,13 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         session_sources.append(hand_source)
     session_sources.extend(camera_sources.values())
 
-    arm_retargeters, pose_retargeters, dual_arm_retargeter = _build_arm_retargeters(
+    (
+        arm_retargeters,
+        pose_retargeters,
+        fixed_arm_retargeters,
+        jitter_arm_retargeters,
+        dual_arm_retargeter,
+    ) = _build_arm_retargeters(
         args,
         active_sides,
     )
@@ -1330,7 +1752,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         calibration=calibration,
         safety_config=TeleopSafetyConfig(
             freeze_on_fault=True,
-            required_channels=tuple(f"{side}_wrist_pose" for side in active_sides),
+            required_channels=tuple(f"{side}_wrist_pose" for side in moving_sides),
             invalid_frame_limit=max(1, int(args.invalid_frame_limit)),
             minimum_control_hz=float(args.minimum_control_hz),
             target_control_hz=float(args.hz),
@@ -1343,8 +1765,18 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         backends=all_backends,
         rig=rig,
         metadata={
-            "source_entrypoint": "teleop_runtime.collection.run_collect",
+            "source_entrypoint": _source_entrypoint_for_modes(
+                fixed_sides=fixed_sides,
+                jitter_sides=jitter_sides,
+            ),
+            "task_name": str(args.task_name),
+            "task_id": str(args.task_id),
+            "task_description": str(args.task_description),
+            "dataset_name": str(args.dataset_name),
             "active_sides": list(active_sides),
+            "moving_arm_sides": list(moving_sides),
+            "fixed_arm_sides": list(fixed_sides),
+            "jitter_arm_sides": list(jitter_sides),
             "runtime_arm_state_source": "last_commanded_action",
         },
     )
@@ -1353,8 +1785,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         LeRobotV21WriterConfig(
             root_dir=args.dataset_root,
             nominal_fps=float(args.nominal_fps),
-            task_id=str(args.task),
+            task_id=str(args.task_id),
             task_description=str(args.task_description),
+            dataset_name=str(args.dataset_name),
             write_parquet=bool(args.write_parquet),
             write_video=bool(args.write_video and not args.no_camera),
         )
@@ -1402,6 +1835,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         calibration=calibration,
         camera_sources=camera_sources,
         pose_retargeters=pose_retargeters,
+        fixed_arm_retargeters=fixed_arm_retargeters,
+        jitter_arm_retargeters=jitter_arm_retargeters,
         hand_retargeters=hand_retargeters,
         dual_arm_retargeter=dual_arm_retargeter,
         unmanaged_backends={
@@ -1420,7 +1855,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
 
 def _camera_status_text(app: CollectApp) -> str:
     if not app.camera_sources:
-        return ""
+        return " camera=off"
     bits: list[str] = []
     if app.camera_previewer is not None and app.camera_previewer.disabled_reason:
         bits.append(
@@ -1443,6 +1878,64 @@ def _camera_status_text(app: CollectApp) -> str:
         else:
             bits.append(f"{camera_key}=frames:{frame_count}")
     return "" if not bits else f" camera={';'.join(bits)}"
+
+
+def _camera_state_signature_text(app: CollectApp) -> tuple[tuple[str, ...], str]:
+    if not app.camera_sources:
+        return (), "camera=off"
+    signature_parts: list[str] = []
+    text_parts: list[str] = []
+    if app.camera_previewer is not None:
+        disabled_reason = app.camera_previewer.disabled_reason
+        if disabled_reason:
+            reason_text = _compact_log_value(disabled_reason, max_chars=80)
+            signature_parts.append(f"preview:disabled:{reason_text}")
+            text_parts.append(f"preview=disabled:{reason_text}")
+        else:
+            signature_parts.append("preview:active")
+            text_parts.append("preview=active")
+    for camera_key, source in sorted(app.camera_sources.items()):
+        try:
+            info = source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            state = f"status_error:{type(exc).__name__}"
+            signature_parts.append(f"{camera_key}:{state}")
+            text_parts.append(f"{camera_key}={state}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        last_error = info.get("last_error")
+        if last_error:
+            error_text = _compact_log_value(last_error, max_chars=70)
+            signature_parts.append(f"{camera_key}:error:{error_text}")
+            text_parts.append(f"{camera_key}=error:{error_text}")
+        elif frame_count > 0:
+            signature_parts.append(f"{camera_key}:streaming")
+            text_parts.append(f"{camera_key}=streaming")
+        else:
+            signature_parts.append(f"{camera_key}:waiting")
+            text_parts.append(f"{camera_key}=waiting")
+    return tuple(signature_parts), "camera=" + ";".join(text_parts)
+
+
+def _fault_signature(faults: list[Any]) -> tuple[str, ...]:
+    parts: list[str] = []
+    for fault in faults:
+        code = str(getattr(fault, "code", fault))
+        channel_name = getattr(fault, "channel_name", None)
+        parts.append(f"{code}:{channel_name}" if channel_name else code)
+    return tuple(sorted(parts))
+
+
+def _fault_status_text(faults: list[Any]) -> str:
+    bits: list[str] = []
+    for fault in faults:
+        code = str(getattr(fault, "code", fault))
+        channel_name = getattr(fault, "channel_name", None)
+        message = str(getattr(fault, "message", "") or "")
+        if channel_name:
+            code = f"{code}:{channel_name}"
+        bits.append(code if not message else f"{code}({_compact_log_value(message, max_chars=70)})")
+    return "; ".join(bits)
 
 
 def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None, app: CollectApp) -> str:
@@ -1469,10 +1962,20 @@ def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None
                 read_error = str(metadata.get("read_error") or "invalid")
                 hand_bits.append(f"{side}=invalid:{read_error}")
     hand_status = "" if not hand_bits else f" hand_q6={','.join(hand_bits)}"
+    fixed_status = (
+        ""
+        if not app.fixed_arm_retargeters
+        else f" fixed_arm={','.join(sorted(app.fixed_arm_retargeters))}"
+    )
+    jitter_status = (
+        ""
+        if not app.jitter_arm_retargeters
+        else f" jitter_arm={','.join(sorted(app.jitter_arm_retargeters))}"
+    )
     return (
         f"step={step_count} state={state_value} home={home} recording={recording} "
         f"episode={episode} control_hz={control_hz:.2f} submitted={runtime.submitted_samples}"
-        f"{hand_status}{_camera_status_text(app)}"
+        f"{fixed_status}{jitter_status}{hand_status}{_camera_status_text(app)}"
     )
 
 
@@ -1483,6 +1986,8 @@ def main() -> int:
     key_controller = TerminalKeyController()
     step_count = 0
     last_status_at = 0.0
+    last_fault_signature: tuple[str, ...] | None = None
+    last_camera_state_signature: tuple[str, ...] | None = None
     loop_period_sec = 1.0 / float(args.hz)
     should_quit = False
     recovery_plan: RecoveryPlan | None = None
@@ -1525,11 +2030,28 @@ def main() -> int:
         elif args.no_camera:
             _log("Camera", "--no-camera active; no RealSense config was loaded and no camera sources were started.")
 
-        _log("Collect", f"ready -> {args.dataset_root}")
-        _log("Keys", "p=calibrate/follow, z=start recording, c=save episode, d=discard recording, h=hold+clear home, q=quit; keys are case-insensitive.")
+        if app.fixed_arm_retargeters:
+            _log(
+                "LeftArmFixed",
+                "enabled; left_arm will hold the qpos captured by p, right_wrist_pose drives right_arm.",
+            )
+        if app.jitter_arm_retargeters:
+            _log(
+                "LeftArmJitter",
+                "enabled; left_arm jitter target is solved together with right_arm by dual-arm IK.",
+            )
+        print(f"数据集目录 / Dataset directory: {args.dataset_root}")
+        print(f"任务名称 / Task name: {args.task_name}")
+        print(f"任务 ID / Task ID: {args.task_id}")
+        print(f"活动侧 / Active sides: {','.join(app.active_sides)}")
+        if app.fixed_arm_retargeters:
+            print(f"左臂固定 / Left arm fixed: {','.join(sorted(app.fixed_arm_retargeters))}")
+        if app.jitter_arm_retargeters:
+            print(f"左臂抖动 / Left arm jitter: {','.join(sorted(app.jitter_arm_retargeters))}")
+        _print_controls()
         if not key_controller.enabled:
             _log("Keys", "stdin is not interactive; collector will wait without key events.")
-        print(f"collecting -> {args.dataset_root}")
+        _print_standby(app)
         while not should_quit:
             if int(args.max_steps) > 0 and step_count >= int(args.max_steps):
                 break
@@ -1557,6 +2079,13 @@ def main() -> int:
                     recovery_plan,
                     now=loop_started_at,
                 )
+                current_fault_signature = _fault_signature(result.faults)
+                if current_fault_signature != last_fault_signature:
+                    if current_fault_signature:
+                        _log("State", "faults active: " + _fault_status_text(result.faults))
+                    elif last_fault_signature is not None:
+                        _log("State", "faults cleared")
+                    last_fault_signature = current_fault_signature
             if app.tactile_visualizer is not None:
                 app.tactile_visualizer.update(
                     tactile_by_side_from_backends(
@@ -1566,7 +2095,15 @@ def main() -> int:
                 )
             if app.camera_previewer is not None:
                 app.camera_previewer.update(app.camera_sources)
-            if (loop_started_at - last_status_at) >= float(args.status_sec):
+            if app.camera_sources:
+                camera_signature, camera_text = _camera_state_signature_text(app)
+                if camera_signature != last_camera_state_signature:
+                    _log("Camera", f"state changed: {camera_text}")
+                    last_camera_state_signature = camera_signature
+            if (
+                not bool(args.silent)
+                and (loop_started_at - last_status_at) >= float(args.status_sec)
+            ):
                 print(_status_line(step_count, runtime, result, app))
                 last_status_at = loop_started_at
             elapsed = time.time() - loop_started_at
@@ -1574,11 +2111,16 @@ def main() -> int:
             if remaining > 0.0:
                 time.sleep(remaining)
     except KeyboardInterrupt:
-        print("keyboard interrupt, stopping collection")
+        print("\n键盘中断，停止采集 Keyboard interrupt, stopping collection\n", flush=True)
     finally:
         try:
             if app.control_state.recording_active:
-                _save_active_episode(app, step_count=step_count, reason="shutdown/save_active")
+                _save_active_episode(
+                    app,
+                    step_count=step_count,
+                    reason="shutdown/save_active",
+                    show_standby=False,
+                )
         finally:
             try:
                 key_controller.close()
@@ -1595,7 +2137,8 @@ def main() -> int:
                         _close_unmanaged_backends(app.unmanaged_backends)
 
     print(
-        f"done saved_episodes={app.control_state.saved_episodes} "
+        "采集结束 / Collection done: "
+        f"saved_episodes={app.control_state.saved_episodes} "
         f"discarded_episodes={app.control_state.discarded_episodes} "
         f"samples={runtime.submitted_samples} root={args.dataset_root}"
     )

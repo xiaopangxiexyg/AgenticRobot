@@ -678,6 +678,10 @@ dataset_root/YYYY-MM-DD_task-name/
 - `action.right_hand.joint_target`、`action.left_hand.joint_target`。
 - `observation.right_hand.qpos`、`observation.left_hand.qpos`。
 - `observation.hand.<side>.tactile`: 1062 维触觉向量。
+- `observation.hand.<side>.tactile_timestamp`: 本帧触觉读取请求时间。
+- `observation.hand.<side>.telemetry_timestamp`: 手部 telemetry 最新更新时间。
+- `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名。
+- `observation.hand.<side>.tactile_dict_json`: 选中触觉区域的矩阵数据 JSON。
 - `teleop.action_source.arm_exo_qpos`: 外骨骼原始 7DoF 关节角。
 - `teleop.action_source.arm_preclip_joint_target`: 外骨骼映射到 FR3 后、裁剪前的 7DoF 目标。
 - `teleop.action_source.arm_clip_mask`: 每个 FR3 关节是否被安全限位裁剪。
