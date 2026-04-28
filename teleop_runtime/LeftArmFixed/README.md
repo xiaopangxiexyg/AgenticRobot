@@ -63,7 +63,8 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
   --left-arm-jitter-position-m 0.01 \
   --left-arm-jitter-rotation-deg 3 \
   --left-arm-jitter-refresh-sec 1.2 \
-  --left-arm-jitter-smoothing-sec 0.45
+  --left-arm-jitter-smoothing-sec 0.45 \
+  --
 ```
 
 `--dataset-root` 是基础输出目录，实际数据集目录会自动命名为
