@@ -1431,6 +1431,59 @@ class TeleopRecoveryTests(unittest.TestCase):
             atol=1e-9,
         )
 
+    def test_pose_to_arm_applies_tracker_local_translation_offset(self) -> None:
+        calibration = build_annotated_dual_rm65_calibration()
+        input_pose = identity_pose()
+        input_pose[:3, :3] = R.from_euler("y", 90.0, degrees=True).as_matrix()
+        input_pose[:3, 3] = np.asarray([0.2, 0.0, 0.5], dtype=float)
+        local_offset = np.asarray([0.0, 0.0, -0.04], dtype=float)
+        retargeter = PoseToArmRetargeter(
+            PoseToArmRetargeterConfig(
+                side="left",
+                input_channel_name="left_wrist_pose",
+                effector_name="left_arm",
+                control_mode="absolute",
+                workspace_clip=False,
+                input_local_translation_offset=local_offset,
+            )
+        )
+        observation = TeleopObservation(
+            channels={
+                "left_wrist_pose": ObservationChannel(
+                    channel_name="left_wrist_pose",
+                    capability="pose",
+                    side="left",
+                    value=input_pose,
+                    frame_name="desk",
+                    timestamp=0.0,
+                    source_name="test",
+                    metadata={"tracker_role": "left_wrist"},
+                )
+            },
+            timestamp=0.0,
+        )
+
+        command = retargeter.retarget(observation, calibration)
+        target_pose_desk = np.asarray(
+            command.commands["left_arm"].metadata["target_pose_desk"],
+            dtype=float,
+        )
+        expected_pose = input_pose.copy()
+        expected_pose[:3, 3] = input_pose[:3, 3] + input_pose[:3, :3] @ local_offset
+        np.testing.assert_allclose(target_pose_desk, expected_pose, atol=1e-9)
+
+        robot_home = _pose(tx=-0.28, yaw_deg=-70.0)
+        retargeter.set_home_anchors(
+            human_pose_desk=input_pose,
+            robot_pose_desk=robot_home,
+        )
+        command = retargeter.retarget(observation, calibration)
+        target_pose_desk = np.asarray(
+            command.commands["left_arm"].metadata["target_pose_desk"],
+            dtype=float,
+        )
+        np.testing.assert_allclose(target_pose_desk, robot_home, atol=1e-9)
+
     def test_session_auto_recovery_enters_recovering_after_healthy_frames(self) -> None:
         source = StubPoseSource()
         session = TeleopSession(

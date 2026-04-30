@@ -26,7 +26,11 @@ from ..backends.hands import (
 from ..calibration import TeleopCalibration
 from ..configs import build_annotated_dual_rm65_calibration
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
-from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
+from ..hand_tcp_alignment import (
+    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    tracker_hand_to_rm65_tcp_rotation,
+    vive_tracker_height_correction_offset,
+)
 from ..LeftArmFixed import (
     FixedArmRetargeter,
     FixedArmRetargeterConfig,
@@ -438,6 +442,25 @@ def parse_args() -> argparse.Namespace:
         help="Arm retargeting mode.",
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Desk-frame translation scale.")
+    parser.add_argument(
+        "--vive-tracker-height-correction",
+        dest="vive_tracker_height_correction",
+        action="store_true",
+        help="Shift wrist tracker input by -Z in the tracker local frame before arm IK. Default.",
+    )
+    parser.add_argument(
+        "--no-vive-tracker-height-correction",
+        dest="vive_tracker_height_correction",
+        action="store_false",
+        help="Disable the 4cm VIVE tracker local -Z position correction.",
+    )
+    parser.add_argument(
+        "--vive-tracker-height-correction-m",
+        type=float,
+        default=DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+        help="VIVE tracker height correction distance in meters; applied as local [0, 0, -value].",
+    )
+    parser.set_defaults(vive_tracker_height_correction=True)
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control rate.")
     parser.add_argument(
         "--arm-max-angvel",
@@ -690,7 +713,34 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
         calibration = build_annotated_dual_rm65_calibration()
     calibration.metadata["left_tracker_name"] = str(args.left_tracker_name)
     calibration.metadata["right_tracker_name"] = str(args.right_tracker_name)
+    offset = _vive_tracker_local_translation_offset(args)
+    calibration.metadata["vive_tracker_height_correction_enabled"] = offset is not None
+    calibration.metadata["vive_tracker_height_correction_m"] = float(
+        getattr(
+            args,
+            "vive_tracker_height_correction_m",
+            DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+        )
+    )
+    calibration.metadata["vive_tracker_local_translation_offset_m"] = (
+        None if offset is None else offset.tolist()
+    )
     return calibration
+
+
+def _vive_tracker_local_translation_offset(args: argparse.Namespace) -> np.ndarray | None:
+    if not bool(getattr(args, "vive_tracker_height_correction", True)):
+        return None
+    height_m = float(
+        getattr(
+            args,
+            "vive_tracker_height_correction_m",
+            DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+        )
+    )
+    if height_m < 0.0:
+        raise ValueError("--vive-tracker-height-correction-m must be >= 0.")
+    return vive_tracker_height_correction_offset(height_m)
 
 
 def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> VivePoseSource:
@@ -818,6 +868,7 @@ def _build_arm_retargeters(
         for side in jitter_sides
     }
     pose_retargeters: dict[str, PoseToArmRetargeter] = {}
+    tracker_translation_offset = _vive_tracker_local_translation_offset(args)
     for side in moving_sides:
         pose_retargeters[side] = PoseToArmRetargeter(
             PoseToArmRetargeterConfig(
@@ -826,6 +877,7 @@ def _build_arm_retargeters(
                 effector_name=f"{side}_arm",
                 control_mode=str(args.control_mode),
                 translation_scale=float(args.translation_scale),
+                input_local_translation_offset=tracker_translation_offset,
                 input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
             )
         )

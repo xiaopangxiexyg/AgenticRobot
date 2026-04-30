@@ -40,6 +40,7 @@ class PoseToArmRetargeterConfig:
     translation_scale: float = 1.0
     workspace_clip: bool = True
     output_frame_name: str = "arm_base"
+    input_local_translation_offset: np.ndarray | Sequence[float] | None = None
     input_local_rotation_offset: np.ndarray | Sequence[float] | None = None
 
     def __post_init__(self) -> None:
@@ -47,6 +48,14 @@ class PoseToArmRetargeterConfig:
             self.effector_name = f"{self.side}_arm"
         if not self.clutch_channel_names:
             self.clutch_channel_names = (f"{self.side}_clutch_button", "clutch_button")
+        if self.input_local_translation_offset is not None:
+            translation = np.asarray(
+                self.input_local_translation_offset,
+                dtype=float,
+            ).reshape(3)
+            if not np.all(np.isfinite(translation)):
+                raise ValueError("input_local_translation_offset must contain finite values.")
+            self.input_local_translation_offset = translation.copy()
         if self.input_local_rotation_offset is not None:
             rotation = np.asarray(self.input_local_rotation_offset, dtype=float).reshape(3, 3)
             if not rotation_is_orthonormal(rotation):
@@ -80,18 +89,27 @@ class PoseToArmRetargeter(Retargeter):
         self._last_target_pose_desk: np.ndarray | None = None
         self._home_human_pose_desk: np.ndarray | None = None
         self._home_robot_pose_desk: np.ndarray | None = None
-        self._input_local_rotation_offset = (
-            None
-            if self.config.input_local_rotation_offset is None
-            else np.asarray(self.config.input_local_rotation_offset, dtype=float).reshape(3, 3).copy()
-        )
+        if self.config.input_local_translation_offset is None:
+            self._input_local_translation_offset = None
+        else:
+            self._input_local_translation_offset = np.asarray(
+                self.config.input_local_translation_offset,
+                dtype=float,
+            ).reshape(3).copy()
+        if self.config.input_local_rotation_offset is None:
+            self._input_local_rotation_offset = None
+        else:
+            self._input_local_rotation_offset = np.asarray(
+                self.config.input_local_rotation_offset,
+                dtype=float,
+            ).reshape(3, 3).copy()
 
     @property
     def name(self) -> str:
         return f"pose_to_arm_{self.config.side}"
 
     def set_home_anchors(self, *, human_pose_desk: np.ndarray, robot_pose_desk: np.ndarray) -> None:
-        self._home_human_pose_desk = self._apply_input_local_rotation(human_pose_desk)
+        self._home_human_pose_desk = self.prepare_input_pose_desk(human_pose_desk)
         self._home_robot_pose_desk = as_pose_matrix(robot_pose_desk)
         self._last_target_pose_desk = self._home_robot_pose_desk.copy()
 
@@ -209,6 +227,9 @@ class PoseToArmRetargeter(Retargeter):
                     if pose_operator is None
                     else as_pose_matrix(pose_operator),
                     "target_pose_desk": target_pose,
+                    "input_local_translation_offset_m": None
+                    if self._input_local_translation_offset is None
+                    else self._input_local_translation_offset.copy(),
                 },
             )
         )
@@ -304,15 +325,15 @@ class PoseToArmRetargeter(Retargeter):
             pose_operator = calibration.world_to_operator(pose, tracker_role=tracker_role)
             pose_desk = calibration.operator_to_desk(pose_operator)
             return (
-                self._apply_input_local_rotation(pose_desk),
-                self._apply_input_local_rotation(pose_operator),
+                self.prepare_input_pose_desk(pose_desk),
+                self._apply_input_pose_adjustments(pose_operator),
             )
         if frame_name.endswith("_operator") or frame_name == "operator":
             pose_operator = pose
             pose_desk = calibration.operator_to_desk(pose_operator)
             return (
-                self._apply_input_local_rotation(pose_desk),
-                self._apply_input_local_rotation(pose_operator),
+                self.prepare_input_pose_desk(pose_desk),
+                self._apply_input_pose_adjustments(pose_operator),
             )
         if frame_name in {calibration.desk_frame.name, "desk"}:
             pose_desk = pose
@@ -320,12 +341,29 @@ class PoseToArmRetargeter(Retargeter):
                 raise RuntimeError("Cannot recover operator-frame pose without T_O_D calibration.")
             pose_operator = calibration.T_O_D @ pose_desk
             return (
-                self._apply_input_local_rotation(pose_desk),
-                self._apply_input_local_rotation(pose_operator),
+                self.prepare_input_pose_desk(pose_desk),
+                self._apply_input_pose_adjustments(pose_operator),
             )
         raise ValueError(
             f"{self.name} does not know how to map input frame '{frame_name or '<none>'}' to desk."
         )
+
+    def prepare_input_pose_desk(self, pose_desk: np.ndarray) -> np.ndarray:
+        return self._apply_input_pose_adjustments(pose_desk)
+
+    def _apply_input_pose_adjustments(self, pose: np.ndarray) -> np.ndarray:
+        corrected = self._apply_input_local_translation(pose)
+        return self._apply_input_local_rotation(corrected)
+
+    def _apply_input_local_translation(self, pose: np.ndarray) -> np.ndarray:
+        pose_matrix = as_pose_matrix(pose)
+        if self._input_local_translation_offset is None:
+            return pose_matrix
+        corrected = pose_matrix.copy()
+        corrected[:3, 3] = (
+            corrected[:3, 3] + corrected[:3, :3] @ self._input_local_translation_offset
+        )
+        return corrected
 
     def _apply_input_local_rotation(self, pose: np.ndarray) -> np.ndarray:
         if self._input_local_rotation_offset is None:
