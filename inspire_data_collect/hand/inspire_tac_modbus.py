@@ -8,6 +8,17 @@ import numpy as np
 DEFAULT_MODBUS_TIMEOUT_SEC = 0.5
 
 
+def _normalize_force_vector(force: Sequence[float]) -> np.ndarray:
+    data = np.asarray(force, dtype=float).reshape(-1)
+    if data.shape != (6,):
+        raise ValueError(f"InspireTac force expects 6 values, got shape {data.shape}.")
+    if not np.all(np.isfinite(data)):
+        raise ValueError("InspireTac force values must be finite.")
+    if np.any(data < 0):
+        raise ValueError("InspireTac force values must be non-negative.")
+    return data.astype(int)
+
+
 def _response_is_error(response: object) -> bool:
     if response is None:
         return True
@@ -71,7 +82,11 @@ class InspireTacModbus:
         self.ip = str(ip)
         self.port = int(port)
         self.timeout = float(timeout)
+        self.max_fingertip_force = int(max_fingertip_force)
+        if self.max_fingertip_force < 0:
+            raise ValueError("max_fingertip_force must be non-negative.")
         self.client = open_modbus(self.ip, self.port, timeout=self.timeout)
+        self.last_force_command: np.ndarray | None = None
         self.regdict = {
             "ID": 1000,
             "baudrate": 1001,
@@ -163,7 +178,8 @@ class InspireTacModbus:
             self.region_to_chunks[name] = chunk_indices
 
         self.get_default_speed_force()
-        self.set_force([int(max_fingertip_force)] * 6)
+        self.set_force([self.max_fingertip_force] * 6)
+        print("Startup force set:", self.last_force_command.tolist())
 
     def get_default_speed_force(self) -> tuple[list[int], list[int]]:
         speed = read6(self.client, self.regdict["defaultSpeedSet"], n_short=6, use_byte=False)
@@ -223,8 +239,9 @@ class InspireTacModbus:
         write6(self.client, self.regdict["angleSet"], data.tolist())
 
     def set_force(self, force: Sequence[float]) -> None:
-        data = np.asarray(force, dtype=float).astype(int)
+        data = _normalize_force_vector(force)
         write6(self.client, self.regdict["forceSet"], data.tolist())
+        self.last_force_command = data.copy()
 
     def close(self) -> None:
         self.client.close()

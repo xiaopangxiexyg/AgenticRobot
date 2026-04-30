@@ -637,7 +637,7 @@ python -m inspire_data_collect \
 
 触觉读取：`--hand-tactile-regions all`、`--tactile-regions all` 或 `--tactile-region all` 表示读取全部触觉区域；传空字符串 `--tactile-region ""` 表示不读取触觉。也可以传逗号分隔区域，例如 `--tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm`。有效区域名为 `little_1..little_3`、`ring_1..ring_3`、`middle_1..middle_3`、`index_1..index_3`、`thumb_1..thumb_4`、`palm`；非法区域会在启动时直接报错。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
 
-InspireTac max force：`--inspire-hand-max-force N` 会在手 backend 连接时把 `N` 写到每个手指的 force，默认 `1000`；兼容旧参数 `--max-fingertip-force`，也可用简写 `--max-force`。
+InspireTac max force：`--inspire-hand-max-force N` 会在手 backend 连接时把 `N` 写到每个手指的 force，默认 `800`；兼容旧参数 `--max-fingertip-force`，也可用简写 `--max-force`。
 
 ## 输出
 

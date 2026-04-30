@@ -1,10 +1,20 @@
-from pymodbus.client.sync import ModbusTcpClient #pip3 install pymodbus==2.5.3
 import time
 import cv2
 import numpy as np
 
 
 DEFAULT_MODBUS_TIMEOUT_SEC = 0.5
+
+
+def _normalize_force_vector(force):
+    data = np.asarray(force, dtype=float).reshape(-1)
+    if data.shape != (6,):
+        raise ValueError(f"InspireTac force expects 6 values, got shape {data.shape}.")
+    if not np.all(np.isfinite(data)):
+        raise ValueError("InspireTac force values must be finite.")
+    if np.any(data < 0):
+        raise ValueError("InspireTac force values must be non-negative.")
+    return data.astype(int)
 
 
 def _response_is_error(response):
@@ -15,6 +25,8 @@ def _response_is_error(response):
 
 
 def open_modbus(ip, port, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+    from pymodbus.client.sync import ModbusTcpClient #pip3 install pymodbus==2.5.3
+
     client = ModbusTcpClient(ip, port, timeout=float(timeout))
     if not client.connect():
         client.close()
@@ -65,7 +77,11 @@ class InspireTacModbus:
         self.ip = ip
         self.port = port
         self.timeout = float(timeout)
+        self.max_fingertip_force = int(max_fingertip_force)
+        if self.max_fingertip_force < 0:
+            raise ValueError("max_fingertip_force must be non-negative.")
         self.client = open_modbus(ip, port, timeout=self.timeout)
+        self.last_force_command = None
 
         # 寄存器地址
         self.regdict = {
@@ -135,7 +151,8 @@ class InspireTacModbus:
 
         # initialize
         self.get_default_speed_force()
-        self.set_force([max_fingertip_force]*6)
+        self.set_force([self.max_fingertip_force]*6)
+        print('Startup force set:', self.last_force_command.tolist())
 
     def get_ID(self):
         ret = read_register(self.client, self.regdict['ID'], 1)[0]
@@ -243,8 +260,9 @@ class InspireTacModbus:
         Set max force for the six joints
         force: (6,), range [0,3000] (g)
         '''
-        data = np.asarray(force).astype(int)
-        write6(self.client, self.regdict['forceSet'], data)
+        data = _normalize_force_vector(force)
+        write6(self.client, self.regdict['forceSet'], data.tolist())
+        self.last_force_command = data.copy()
         
     def close(self):
         self.client.close()

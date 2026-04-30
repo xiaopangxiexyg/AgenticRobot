@@ -79,4 +79,4 @@ python -m teleop_runtime.deploy.run_policy \
 - arm joint target 每 tick 默认限速：`--max-arm-joint-step-rad 0.08`。
 - hand q6 会 clip 到 `[0, 1]`，并由 `--max-hand-step` 限速。
 - `--require-ready-observation` 会在 active state 或图像缺失时跳过策略和下发。
-- `--inspire-hand-max-force` 默认继承 `teleop_runtime` 的 `400`。
+- `--inspire-hand-max-force` 默认继承 `teleop_runtime` 的 `800`。
