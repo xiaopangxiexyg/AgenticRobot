@@ -972,7 +972,7 @@ def _build_backends(
                 hand_ip=hand_ip or "0.0.0.0",
                 side=side,
                 connect_hardware=bool(hand_ip),
-                max_fingertip_force=int(1000),
+                max_fingertip_force=int(args.max_fingertip_force),
                 send_threshold=float(args.hand_send_threshold),
                 enable_telemetry=bool(hand_ip),
                 telemetry_hz=float(args.hand_telemetry_hz),
