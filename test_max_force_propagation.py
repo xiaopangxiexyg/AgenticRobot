@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -91,6 +93,55 @@ class MaxForcePropagationTests(unittest.TestCase):
         self.assertEqual(backend.get_state()["max_fingertip_force"], 2345)
         self.assertEqual(hand.max_fingertip_force, 2345)
         self.assertEqual(writes, [(1498, [2345] * 6)])
+
+    def test_teleop_collect_right_hand_backend_uses_cli_max_force(self) -> None:
+        from teleop_runtime.collection import run_collect
+
+        args = SimpleNamespace(
+            hz=30.0,
+            right_arm_ip="192.0.2.20",
+            arm_max_angvel=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5),
+            right_hand_ip="192.0.2.12",
+            right_hand_port="",
+            with_tactile=False,
+            hand_tactile_regions="",
+            max_fingertip_force=2345,
+            hand_send_threshold=0.002,
+            hand_telemetry_hz=10.0,
+        )
+
+        with patch.object(run_collect, "require_asset_path", return_value="rm65_arm.urdf"), patch.object(
+            run_collect,
+            "RM65ArmBackend",
+            side_effect=lambda config: SimpleNamespace(config=config),
+        ):
+            all_backends, _rig_backends = run_collect._build_backends(args, ("right",))
+
+        self.assertEqual(all_backends["right_hand"].config.max_fingertip_force, 2345)
+
+    def test_teleop_collect_parse_args_accepts_max_force_alias_for_right_side(self) -> None:
+        from teleop_runtime.collection import run_collect
+
+        argv = [
+            "prog",
+            "--dataset-root",
+            "/tmp/max_force_test",
+            "--active-sides",
+            "right",
+            "--right-arm-ip",
+            "192.0.2.20",
+            "--right-hand-ip",
+            "192.0.2.12",
+            "--max-force",
+            "2345",
+            "--no-camera",
+            "--no-video",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = run_collect.parse_args()
+
+        self.assertEqual(args.active_sides, ("right",))
+        self.assertEqual(args.max_fingertip_force, 2345)
 
     def test_inspire_data_collect_backend_passes_force_to_modbus(self) -> None:
         from inspire_data_collect.hand import inspire_tac_modbus as modbus

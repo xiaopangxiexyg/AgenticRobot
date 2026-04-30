@@ -76,6 +76,42 @@ from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 DEFAULT_CAMERA_CONFIG_PATH = (
     Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
 )
+DEFAULT_CALIBRATION_PROFILE_DIR = (
+    Path(__file__).resolve().parents[2] / "teleop_records" / "calibration_profiles"
+)
+_CALIBRATION_PROFILE_TIMESTAMP_RE = re.compile(r"^(\d{8})_(\d{6})")
+
+
+def _calibration_profile_timestamp(path: Path) -> float | None:
+    match = _CALIBRATION_PROFILE_TIMESTAMP_RE.match(path.name)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime("_".join(match.groups()), "%Y%m%d_%H%M%S").timestamp()
+    except ValueError:
+        return None
+
+
+def _latest_calibration_profile_path(
+    profile_dir: Path = DEFAULT_CALIBRATION_PROFILE_DIR,
+) -> Path | None:
+    if not profile_dir.exists():
+        return None
+    candidates = [path for path in profile_dir.glob("*.json") if path.is_file()]
+    if not candidates:
+        return None
+
+    def sort_key(path: Path) -> tuple[int, float, float, str]:
+        name_timestamp = _calibration_profile_timestamp(path)
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            modified_at = 0.0
+        if name_timestamp is not None:
+            return (1, float(name_timestamp), float(modified_at), path.name)
+        return (0, float(modified_at), float(modified_at), path.name)
+
+    return max(candidates, key=sort_key)
 
 
 def _positive_float(text: str) -> float:
@@ -307,7 +343,15 @@ def parse_args() -> argparse.Namespace:
         default=("left", "right"),
         help="One of: left, right, both.",
     )
-    parser.add_argument("--load-profile", type=str, default="", help="Path to a TeleopCalibration JSON profile.")
+    parser.add_argument(
+        "--load-profile",
+        type=str,
+        default="",
+        help=(
+            "Path to a TeleopCalibration JSON profile. If omitted, the newest "
+            f"profile in {DEFAULT_CALIBRATION_PROFILE_DIR} is loaded when available."
+        ),
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver.")
     parser.add_argument("--port", type=int, default=9999, help="UDP bind port for the VIVE receiver.")
     parser.add_argument("--left-tracker-name", type=str, default="tracker_1", help="Left wrist tracker name.")
@@ -707,10 +751,31 @@ class TerminalKeyController:
 
 
 def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
-    if args.load_profile:
-        calibration = TeleopCalibration.load_json(args.load_profile)
+    requested_profile = str(args.load_profile or "").strip()
+    profile_path: Path | None = Path(requested_profile) if requested_profile else None
+    auto_selected_profile = False
+    if profile_path is None:
+        profile_path = _latest_calibration_profile_path()
+        if profile_path is not None:
+            auto_selected_profile = True
+            args.load_profile = str(profile_path)
+
+    if profile_path is not None:
+        calibration = TeleopCalibration.load_json(profile_path)
+        if auto_selected_profile:
+            _log("Calibration", f"auto-loaded latest profile {profile_path}")
+        else:
+            _log("Calibration", f"loaded profile {profile_path}")
     else:
         calibration = build_annotated_dual_rm65_calibration()
+        _log(
+            "Calibration",
+            f"no --load-profile and no JSON profile found in {DEFAULT_CALIBRATION_PROFILE_DIR}; using preset calibration",
+        )
+    calibration.metadata["calibration_profile_path"] = (
+        None if profile_path is None else str(profile_path)
+    )
+    calibration.metadata["calibration_profile_auto_selected"] = bool(auto_selected_profile)
     calibration.metadata["left_tracker_name"] = str(args.left_tracker_name)
     calibration.metadata["right_tracker_name"] = str(args.right_tracker_name)
     offset = _vive_tracker_local_translation_offset(args)
