@@ -12,7 +12,7 @@ from ...registry import register_backend
 from ...schemas import EffectorCommand
 
 
-DEFAULT_INSPIRE_HAND_MAX_FORCE = 400
+DEFAULT_INSPIRE_HAND_MAX_FORCE = 800
 
 
 @dataclass
@@ -75,7 +75,7 @@ class InspireTacHandBackend(EffectorBackend):
         return InspireTacModbus(
             ip=self.config.hand_ip,
             port=self.config.port,
-            max_fingertip_force=self.config.max_fingertip_force,
+            max_fingertip_force=int(self.config.max_fingertip_force),
             timeout=self.config.modbus_timeout_sec,
         )
 
@@ -306,6 +306,7 @@ class InspireTacHandBackend(EffectorBackend):
             "connect_hardware": bool(self.config.connect_hardware),
             "is_connected": self.hand is not None,
             "reconnect_count": int(self._reconnect_count),
+            "max_fingertip_force": int(self.config.max_fingertip_force),
         }
 
     def close(self) -> None:

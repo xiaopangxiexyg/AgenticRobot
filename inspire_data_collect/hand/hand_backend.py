@@ -11,7 +11,7 @@ from ..common import EffectorCommand
 from .hand_mapping import parse_tactile_regions
 
 
-DEFAULT_INSPIRE_HAND_MAX_FORCE = 1000
+DEFAULT_INSPIRE_HAND_MAX_FORCE = 800
 
 
 @dataclass
@@ -291,6 +291,7 @@ class InspireTacHandBackend:
             "connect_hardware": bool(self.config.connect_hardware),
             "is_connected": self.hand is not None,
             "reconnect_count": int(self._reconnect_count),
+            "max_fingertip_force": int(self.config.max_fingertip_force),
         }
 
     def close(self) -> None:

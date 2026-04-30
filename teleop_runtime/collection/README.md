@@ -136,7 +136,7 @@ python -m teleop_runtime.collection.run_collect \
 
 - `--left-hand-port/--right-hand-port` 决定是否读取 q6，并决定是否生成 hand retargeting command。
 - `--left-hand-ip/--right-hand-ip` 决定是否真的连接 InspireTac hand 并记录 hand telemetry/tactile。
-- `--inspire-hand-max-force N` 设置 InspireTac 启动时写入每个手指的 force，默认 `400`；兼容旧参数 `--max-fingertip-force`，也可用简写 `--max-force`。
+- `--inspire-hand-max-force N` 设置 InspireTac 启动时写入每个手指的 force，默认 `800`；兼容旧参数 `--max-fingertip-force`，也可用简写 `--max-force`。
 - `--no-camera` 后，视频链路完全不启动。
 
 ### 5.2 双臂，无真实手，只采 q6

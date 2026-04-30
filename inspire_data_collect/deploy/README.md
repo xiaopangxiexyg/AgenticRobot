@@ -152,7 +152,7 @@ python -m inspire_data_collect.deploy.run_policy \
 - 默认 dry-run，不会向硬件发动作。
 - `--send-actions` 只打开下发能力；默认仍需按 `g`，除非传 `--auto-start`。
 - 手部动作会 clip 到 `[0, 1]`。
-- InspireTac 启动 force 通过 `--inspire-hand-max-force N` 配置，默认 `1000`；兼容 `--max-fingertip-force`，也可用简写 `--max-force`。
+- InspireTac 启动 force 通过 `--inspire-hand-max-force N` 配置，默认 `800`；兼容 `--max-fingertip-force`，也可用简写 `--max-force`。
 - FR3 动作会按采集代码相同的安全关节范围和 `--arm-shrink-deg` 裁剪。
 - `--max-arm-step-rad` 和 `--max-hand-step` 默认启用逐 tick 限速。
 - FR3 backend 默认保留 startup alignment，从当前 qpos 缓慢对齐到第一个策略目标。

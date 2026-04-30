@@ -621,7 +621,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 - 如果只给 `--left/right-hand-ip`，则只读手部遥测并渲染当前真手状态，不会有 hand teleop 输入
 - `--hand-telemetry-hz` 控制每只手后台 telemetry 线程的轮询频率；这个线程会读取 `joint_pos`，如果 `--hand-tactile-regions` 非空，还会顺带读取对应触觉区块
 - `--hand-tactile-regions` 为空时，默认只做手部关节遥测，不读 tactile，延迟最低；一旦非空，就会开启 tactile 读取；传 `all` 等价于读取全部 17 个区域
-- `--inspire-hand-max-force N` 控制启动时写入 InspireTac 的每指 force，默认 `400`；旧参数 `--max-fingertip-force` 仍可用，`--max-force` 是简写
+- `--inspire-hand-max-force N` 控制启动时写入 InspireTac 的每指 force，默认 `800`；旧参数 `--max-fingertip-force` 仍可用，`--max-force` 是简写
 - 目前每只手只保留一个 Modbus 连接，所以同一只手的 `set_joint_pos`、`read_joint_pos`、`read_tac_data` 会在该手内部串行，但左右手之间仍然并行
 - 建议的频率排查顺序是：
   1. 先不加 `--hand-tactile-regions`，确认 arm + hand command 的基线频率
