@@ -34,7 +34,7 @@ conda activate grasp_py310_copy
 推荐先设置这些变量，后面命令直接复用：
 
 ```bash
-export REPO=/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+export REPO=/home/ai/Desktop/DexTeleop
 export PROFILE=$REPO/teleop_records/calibration_profiles/20260428_133219_vive_rm65_virtual_desk.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/dataset_collection/demo_bimanual_single_camera
@@ -232,7 +232,7 @@ python -m teleop_runtime.collection.run_collect \
   --left-hand-ip "$LEFT_HAND_IP" \
   --right-hand-ip "$RIGHT_HAND_IP" \
   --hand-telemetry-hz 10 \
-  --hand-tactile-regions thumb_1,index_1,middle_1,ring_1,little_1,palm \
+  --hand-tactile-regions all \
   --visualize-tactile \
   --tactile-vis-value-scale 0.02 \
   --camera-config "$CAMERA_CONFIG" \
@@ -243,7 +243,8 @@ python -m teleop_runtime.collection.run_collect \
   --calibration-timeout 15 \
   --calibration-samples 20 \
   --status-sec 1 \
-  --no-camera 
+  --vis_cam \
+  --vis-cam-key front
 ```
 
 首次带相机短测可以临时追加：

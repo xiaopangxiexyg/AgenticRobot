@@ -81,11 +81,12 @@ python -m teleop_runtime.LeftArmFixed.run_collect \
 
 ```bash
 python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
-  --dataset-root ./test_datasets \
+  --dataset-root ./test_left_fix_datasets \
   --task-name grasp_demo_left_arm_jitter \
   --active-sides both \
   --host 0.0.0.0 \
   --port 9999 \
+  --load-profile "$PROFILE" \
   --right-tracker-name tracker_2 \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20 \
@@ -94,7 +95,7 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
   --left-arm-jitter-position-m 0.01 \
-  --left-arm-jitter-rotation-deg 3 \
+  --left-arm-jitter-rotation-deg 2 \
   --left-arm-jitter-refresh-sec 1.2 \
   --left-arm-jitter-smoothing-sec 0.45 \
   --vis_cam \
