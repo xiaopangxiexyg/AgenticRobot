@@ -15,7 +15,7 @@
 从仓库根目录运行，或把仓库根目录放进 `PYTHONPATH`：
 
 ```bash
-export REPO=/home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+export REPO=$(pwd)
 cd "$REPO"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 ```

@@ -29,6 +29,8 @@ hand_camera_dataset
 .tmp_collect_probe/
 .tmp_collect_probe2/
 
+local_paths.json
+
 dataset_collection
 datasets
 
@@ -59,4 +61,3 @@ UV_conversion
 paper_fold_datasets/
 test_left_fix_datasets/
 test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/
-

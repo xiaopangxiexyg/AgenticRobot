@@ -5,6 +5,7 @@ import argparse
 import json
 import pickle
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -16,6 +17,14 @@ try:
     import redis
 except Exception:
     redis = None
+
+try:
+    from project_paths import hand_zero_pose_calibrations_dir
+except ModuleNotFoundError:
+    _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+    from project_paths import hand_zero_pose_calibrations_dir
 
 
 ANGLE_RE = re.compile(r"=\s*([-+]?\d+(?:\.\d+)?)")
@@ -35,7 +44,7 @@ SIM_Q6_LOWER_RAD = np.zeros(6, dtype=np.float32)
 
 
 def _default_zero_pose_record_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "teleop_records" / "hand_zero_pose_calibrations"
+    return hand_zero_pose_calibrations_dir()
 
 
 def _default_exo_hand_calibration_path() -> Path:

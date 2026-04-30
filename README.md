@@ -5,18 +5,37 @@
 默认假设在采集电脑上执行，工作目录固定为：
 
 ```bash
-cd /home/user/zc/dex_inspire_teleop
+cd /path/to/dex_inspire_teleop_new
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 ```
 
-## 0. 下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
+## 0. 本地路径配置
+
+机器相关路径集中放在仓库根目录的 `local_paths.json`，该文件已被 `.gitignore` 忽略。没有该文件时，代码默认使用仓库内的 `datasets/` 和 `teleop_records/`。
+
+```bash
+cp local_paths.example.json local_paths.json
+```
+
+`local_paths.json` 支持相对仓库根目录的路径，也支持绝对路径。常用键：
+
+```json
+{
+  "dataset_root": "datasets",
+  "teleop_records_root": "teleop_records",
+  "real_robot_dataset_root": "../real_robot_dataset/datasets",
+  "concat_video_input_dir": "../real_robot_dataset/datasets/2026-04-27_chips_changed/videos/observation.images.front/chunk-000"
+}
+```
+
+## 1. 下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
 文件名：assets.zip
 有效期限：2026-06-08 14:10
 提取码：YIlq
 
 
-## 1. 固定设备配置
+## 2. 固定设备配置
 
 当前 README 中使用的设备配置如下：
 
@@ -34,10 +53,10 @@ conda activate grasp_py310_copy
 推荐先设置这些变量，后面命令直接复用：
 
 ```bash
-export REPO=/home/ai/Desktop/DexTeleop
+export REPO=$(pwd)
 export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_172117_vive_rm65_virtual_desk.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
-export DATASET_ROOT=$REPO/dataset_collection/demo_bimanual_single_camera
+export DATASET_ROOT=$REPO/datasets
 export VIVE_TARGET_HOST=192.168.20.90
 
 export LEFT_ARM_IP=192.168.101.21
@@ -77,7 +96,7 @@ python hardware/teleop_hand/check_zero_pose_calibration.py \
 
 如果只想多次检查稳定性而不更新固定值，去掉 `--exo-hand-calibration`，并把 `--rounds` 调大即可。
 
-## 2. 单摄像头配置
+## 3. 单摄像头配置
 
 默认单相机配置文件已经固定到：
 
@@ -120,7 +139,7 @@ for dev in ctx.query_devices():
 PY
 ```
 
-## 3. 启动 VIVE Sender
+## 4. 启动 VIVE Sender
 
 在 VIVE 机器或同一台采集电脑的独立终端(Windows)启动 sender：
 
@@ -141,7 +160,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 
 
-## 4. Virtual SAPIEN 验证
+## 5. Virtual SAPIEN 验证
 
 这一步只验证 VIVE profile、左右 wrist 映射、q6 手部映射和双臂 SAPIEN preview，不向真机发送运动。
 
@@ -170,7 +189,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - q6 控制的 SAPIEN 手部开合方向正确。
 - 如果渲染设备不可用，先加 `--skip-renderer` 验证主链路日志。
 
-## 5. Real Teleop 真机短测
+## 6. Real Teleop 真机短测
 
 这一步接入双臂双手真机，但还不采集 LeRobot dataset。先做短时 teleop 验证，确认随动、触觉读取和频率稳定。
 
@@ -208,7 +227,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 - 手部 q6 能下发到 InspireTac。
 - 触觉读取不要一开始就全 17 区域高频压力测试；先用上面少量区域和 `10Hz`。
 
-## 6. 带单相机采集数据
+## 7. 带单相机采集数据
 
 确认上面两步稳定后，再启动正式采集。关键点是不要传 `--no-camera`，并显式传入单相机配置。
 
@@ -317,7 +336,7 @@ data/chunk-000/episode_000000.parquet
 videos/observation.images.front/chunk-000/episode_000000.mp4
 ```
 
-## 7. 回放采集数据
+## 8. 回放采集数据
 
 SAPIEN 复刻动作、同步播放采集视频，并逐帧打印左右手 tactile sum：
 
@@ -369,7 +388,7 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 [Tactile] replay_i=000000 frame=000000 t=0.000s left_sum=0.022 right_sum=0.242 total=0.264
 ```
 
-## 8. 常见阻塞点
+## 9. 常见阻塞点
 
 | 现象 | 优先检查 |
 | --- | --- |
@@ -383,7 +402,7 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 | 回放没有视频窗口 | 使用 `--video-mode window`，并确认当前终端有 `DISPLAY` 或 `WAYLAND_DISPLAY` |
 | 采集频率下降 | 降低 tactile 区域/频率，先用 `--hand-telemetry-hz 10`，相机长测前先做短测 |
 
-## 9. 当前实现状态
+## 10. 当前实现状态
 
 已接入：
 

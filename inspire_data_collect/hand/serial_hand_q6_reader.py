@@ -8,6 +8,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from project_paths import hand_zero_pose_calibrations_dir, repo_path
+
 ANGLE_RE = re.compile(r"=\s*([-+]?\d+(?:\.\d+)?)")
 OFFSET = [40.0, -70.0, 60.0, 60.0, 60.0, 60.0]
 Q6_ORDER = (
@@ -24,11 +26,11 @@ SIM_Q6_LOWER_RAD = np.zeros(6, dtype=np.float32)
 
 
 def _default_zero_pose_record_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "teleop_records" / "hand_zero_pose_calibrations"
+    return hand_zero_pose_calibrations_dir()
 
 
 def _default_exo_hand_calibration_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "hardware" / "teleop_hand" / "exo_hand_zero_pose.json"
+    return repo_path("hardware", "teleop_hand", "exo_hand_zero_pose.json")
 
 
 def _safe_name(text: object) -> str:

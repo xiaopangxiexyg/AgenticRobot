@@ -11,6 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    from project_paths import default_dataset_root
+except ModuleNotFoundError:
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.append(str(_PROJECT_ROOT))
+    from project_paths import default_dataset_root
+
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from inspire_data_collect.arm.exo_joint_source import ExoJointSource, ExoJointSourceConfig
@@ -90,6 +98,7 @@ else:
 
 
 DEFAULT_CAMERA_CONFIG_PATH = Path(__file__).resolve().parent / "realsense.json"
+DEFAULT_DATASET_ROOT = default_dataset_root()
 
 
 def parse_joint_order(text: str) -> tuple[int, ...]:
@@ -170,7 +179,7 @@ def resolve_collection_layout(
     task_description = str(getattr(args, "task_description", "")).strip() or task_name
     date_prefix = datetime.now().strftime("%Y-%m-%d")
     dataset_dir_name = f"{date_prefix}_{_sanitize_task_name_for_path(task_name)}"
-    dataset_root = Path(args.dataset_root) / dataset_dir_name
+    dataset_root = Path(args.dataset_root).expanduser() / dataset_dir_name
     dataset_name = str(getattr(args, "dataset_name", "")).strip() or dataset_dir_name
     return dataset_root, task_name, task_id, task_description, dataset_name
 
@@ -179,8 +188,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        required=True,
-        help="Base output directory. Actual dataset path is <dataset-root>/<YYYY-MM-DD>_<task-name>.",
+        default=DEFAULT_DATASET_ROOT,
+        help=(
+            "Base output directory. Actual dataset path is "
+            f"<dataset-root>/<YYYY-MM-DD>_<task-name>. Default: {DEFAULT_DATASET_ROOT}."
+        ),
     )
     parser.add_argument(
         "--task-name",

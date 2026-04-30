@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from project_paths import calibration_profiles_dir, default_dataset_root
 from rm65_inspire_tac.paths import require_asset_path
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
@@ -76,9 +77,8 @@ from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 DEFAULT_CAMERA_CONFIG_PATH = (
     Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
 )
-DEFAULT_CALIBRATION_PROFILE_DIR = (
-    Path(__file__).resolve().parents[2] / "teleop_records" / "calibration_profiles"
-)
+DEFAULT_DATASET_ROOT = default_dataset_root()
+DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
 _CALIBRATION_PROFILE_TIMESTAMP_RE = re.compile(r"^(\d{8})_(\d{6})")
 
 
@@ -319,8 +319,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root",
         type=str,
-        required=True,
-        help="Base output directory. Actual dataset path is <dataset-root>/<YYYY-MM-DD>_<task-name>.",
+        default=str(DEFAULT_DATASET_ROOT),
+        help=(
+            "Base output directory. Actual dataset path is "
+            f"<dataset-root>/<YYYY-MM-DD>_<task-name>. Default: {DEFAULT_DATASET_ROOT}."
+        ),
     )
     parser.add_argument(
         "--task-name",

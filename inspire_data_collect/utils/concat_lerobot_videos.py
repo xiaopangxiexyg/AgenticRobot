@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+try:
+    from project_paths import optional_local_path
+except ModuleNotFoundError:
+    _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+    from project_paths import optional_local_path
 
-DEFAULT_INPUT_DIR = Path(
-    "/home/zc/HandMotion/real_robot_dataset/datasets/2026-04-27_chips_changed/"
-    "videos/observation.images.front/chunk-000"
-)
+DEFAULT_INPUT_DIR = optional_local_path("concat_video_input_dir")
 
 
 def natural_key(path: Path) -> tuple[object, ...]:
@@ -158,11 +163,18 @@ def concat_videos(
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=DEFAULT_INPUT_DIR,
+        required=DEFAULT_INPUT_DIR is None,
+        help="Directory containing episode videos. Can default from local_paths.json: concat_video_input_dir.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_INPUT_DIR / "chunk-000_concat_with_source.mp4",
+        default=None,
+        help="Output mp4 path. Default: <input-dir>/chunk-000_concat_with_source.mp4.",
     )
     parser.add_argument("--pattern", type=str, default="*.mp4")
     parser.add_argument("--fps", type=float, default=None, help="Default uses the first video's FPS.")
@@ -178,9 +190,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_args(parser)
     args = parser.parse_args(argv)
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    output_path = (
+        input_dir / "chunk-000_concat_with_source.mp4"
+        if args.output is None
+        else Path(args.output).expanduser().resolve()
+    )
     concat_videos(
-        input_dir=Path(args.input_dir).expanduser().resolve(),
-        output_path=Path(args.output).expanduser().resolve(),
+        input_dir=input_dir,
+        output_path=output_path,
         pattern=str(args.pattern),
         fps=args.fps,
         codec=str(args.codec),

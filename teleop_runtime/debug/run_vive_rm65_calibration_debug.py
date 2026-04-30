@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from project_paths import calibration_profiles_dir
+
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..calibration import TeleopCalibration
 from ..configs import (
@@ -42,6 +44,7 @@ from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
 from rm65_inspire_tac.rendering import SapienArmHandRenderer
 
+DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
 _VIRTUAL_DESK_SWEEP_CONVENTION_VERSION = 2
 
 
@@ -277,7 +280,10 @@ def parse_args() -> argparse.Namespace:
         "--output-path",
         type=str,
         default="",
-        help="Optional calibration profile output path. Defaults to teleop_records/calibration_profiles/<timestamp>.json",
+        help=(
+            "Optional calibration profile output path. Defaults to "
+            f"{DEFAULT_CALIBRATION_PROFILE_DIR}/<timestamp>.json"
+        ),
     )
     parser.add_argument(
         "--load-profile",
@@ -1536,9 +1542,11 @@ class CalibrationApp:
 
     def _save_profile(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path(self.args.output_path) if self.args.output_path else Path(
-            "teleop_records/calibration_profiles"
-        ) / f"{timestamp}_vive_rm65_virtual_desk.json"
+        output_path = (
+            Path(self.args.output_path)
+            if self.args.output_path
+            else DEFAULT_CALIBRATION_PROFILE_DIR / f"{timestamp}_vive_rm65_virtual_desk.json"
+        )
         self.components.calibration.clear_home_state()
         self.components.calibration.metadata["profile_scope"] = "tracker_station_only"
         self.components.calibration.metadata["saved_at"] = datetime.now().isoformat(timespec="seconds")

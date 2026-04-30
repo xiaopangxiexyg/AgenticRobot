@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -122,23 +123,24 @@ class MaxForcePropagationTests(unittest.TestCase):
     def test_teleop_collect_parse_args_accepts_max_force_alias_for_right_side(self) -> None:
         from teleop_runtime.collection import run_collect
 
-        argv = [
-            "prog",
-            "--dataset-root",
-            "/tmp/max_force_test",
-            "--active-sides",
-            "right",
-            "--right-arm-ip",
-            "192.0.2.20",
-            "--right-hand-ip",
-            "192.0.2.12",
-            "--max-force",
-            "2345",
-            "--no-camera",
-            "--no-video",
-        ]
-        with patch.object(sys, "argv", argv):
-            args = run_collect.parse_args()
+        with tempfile.TemporaryDirectory(prefix="max_force_test_") as dataset_root:
+            argv = [
+                "prog",
+                "--dataset-root",
+                dataset_root,
+                "--active-sides",
+                "right",
+                "--right-arm-ip",
+                "192.0.2.20",
+                "--right-hand-ip",
+                "192.0.2.12",
+                "--max-force",
+                "2345",
+                "--no-camera",
+                "--no-video",
+            ]
+            with patch.object(sys, "argv", argv):
+                args = run_collect.parse_args()
 
         self.assertEqual(args.active_sides, ("right",))
         self.assertEqual(args.max_fingertip_force, 2345)

@@ -9,6 +9,8 @@ from typing import Any, TextIO
 
 import numpy as np
 
+from project_paths import teleop_records_root
+
 
 @dataclass
 class RecordingConfig:
@@ -42,7 +44,7 @@ class SessionRecorder:
         self.config = config if config is not None else RecordingConfig()
         if root_dir is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            root_dir = Path("teleop_records") / stamp
+            root_dir = teleop_records_root() / stamp
         self.root_dir = Path(root_dir)
         self._handles: dict[str, TextIO] = {}
         if self.config.enabled:
