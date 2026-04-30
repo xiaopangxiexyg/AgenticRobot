@@ -14,7 +14,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from ...backends.arms import RM65ArmBackend, RM65ArmBackendConfig
-from ...backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ...backends.hands import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ...calibration import TeleopCalibration
 from ...configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
@@ -156,6 +160,15 @@ def parse_args() -> argparse.Namespace:
         default=0.08,
         help="Axis length for desk/base/tcp debug frames.",
     )
+    parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
+        "--max-fingertip-force",
+        dest="max_fingertip_force",
+        type=_non_negative_int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
+    )
     parser.add_argument("--headless", action="store_true", help="Disable the SAPIEN viewer window.")
     parser.add_argument("--skip-renderer", action="store_true", help="Skip SAPIEN renderer creation.")
     parser.add_argument(
@@ -278,6 +291,7 @@ def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
                 hand_ip=args.left_hand_ip,
                 side="left",
                 connect_hardware=True,
+                max_fingertip_force=int(args.max_fingertip_force),
                 enable_telemetry=True,
                 telemetry_hz=max(float(args.hz), 10.0),
             )
@@ -289,6 +303,7 @@ def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
                 hand_ip=args.right_hand_ip,
                 side="right",
                 connect_hardware=True,
+                max_fingertip_force=int(args.max_fingertip_force),
                 enable_telemetry=True,
                 telemetry_hz=max(float(args.hz), 10.0),
             )

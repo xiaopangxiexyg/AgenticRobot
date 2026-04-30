@@ -7,7 +7,11 @@ import numpy as np
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from ..calibration import TeleopCalibration
-from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
+from ..hand_tcp_alignment import (
+    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    tracker_hand_to_rm65_tcp_rotation,
+    vive_tracker_height_correction_offset,
+)
 from ..rigs import BimanualRig
 from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.hand import HandQ6Source
@@ -74,6 +78,8 @@ def build_bimanual_session(
     keyboard_source: KeyboardButtonSource | None = None,
     enable_dual_arm_collision_avoidance: bool = True,
     dual_arm_collision_config: DualArmCollisionAwareRetargeterConfig | None = None,
+    vive_tracker_height_correction: bool = True,
+    vive_tracker_height_correction_m: float = DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
 ) -> TeleopSession:
     sources = []
     retargeters = []
@@ -91,11 +97,19 @@ def build_bimanual_session(
     both_arm_backends_present = (
         left_arm_backend_config is not None and right_arm_backend_config is not None
     )
+    if float(vive_tracker_height_correction_m) < 0.0:
+        raise ValueError("vive_tracker_height_correction_m must be >= 0.")
+    tracker_translation_offset = (
+        vive_tracker_height_correction_offset(vive_tracker_height_correction_m)
+        if bool(vive_tracker_height_correction)
+        else None
+    )
     left_pose_retargeter = PoseToArmRetargeter(
         PoseToArmRetargeterConfig(
             side="left",
             input_channel_name="left_wrist_pose",
             effector_name="left_arm",
+            input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
@@ -104,6 +118,7 @@ def build_bimanual_session(
             side="right",
             input_channel_name="right_wrist_pose",
             effector_name="right_arm",
+            input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )

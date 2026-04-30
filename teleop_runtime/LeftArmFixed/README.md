@@ -115,6 +115,7 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
 - 左手：继续用左 q6 控制左 InspireTac hand。
 - 右臂：继续用右 wrist tracker 遥操作。
 - 右手：继续用右 q6 控制右 InspireTac hand。
+- InspireTac 启动 force：继承 collector 参数 `--inspire-hand-max-force N`，默认 `400`；兼容 `--max-fingertip-force` 和 `--max-force`。
 - 数据：仍是双臂双手 schema，左臂 action/observation/replay joint target 来自双臂 IK 后的左臂命令和 backend 状态。
 
 抖动参数：

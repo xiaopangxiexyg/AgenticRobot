@@ -12,6 +12,9 @@ from ...registry import register_backend
 from ...schemas import EffectorCommand
 
 
+DEFAULT_INSPIRE_HAND_MAX_FORCE = 400
+
+
 @dataclass
 class InspireTacHandBackendConfig:
     hand_ip: str
@@ -19,7 +22,7 @@ class InspireTacHandBackendConfig:
     effector_name: str | None = None
     port: int = 6000
     connect_hardware: bool = True
-    max_fingertip_force: int = 800
+    max_fingertip_force: int = DEFAULT_INSPIRE_HAND_MAX_FORCE
     send_threshold: float = 0.002
     enable_telemetry: bool = False
     telemetry_hz: float = 10.0
@@ -31,6 +34,8 @@ class InspireTacHandBackendConfig:
     def __post_init__(self) -> None:
         if self.effector_name is None:
             self.effector_name = f"{self.side}_hand"
+        if int(self.max_fingertip_force) < 0:
+            raise ValueError("max_fingertip_force must be non-negative.")
         if self.telemetry_hz <= 0.0:
             raise ValueError("telemetry_hz must be positive.")
         if self.modbus_timeout_sec <= 0.0:

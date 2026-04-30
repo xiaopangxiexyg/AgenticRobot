@@ -12,7 +12,11 @@ from pathlib import Path
 import numpy as np
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
-from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..backends.hands import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ..calibration import TeleopCalibration
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
@@ -29,7 +33,10 @@ from ..hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
     RIGHT_HAND_RENDER_JOINT_NAMES,
 )
-from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
+from ..hand_tcp_alignment import (
+    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    tracker_hand_to_rm65_tcp_rotation,
+)
 from ..initial_alignment import TeleopInitialAlignment
 from ..retargeters import (
     DualArmCollisionAwareRetargeter,
@@ -82,6 +89,7 @@ from .run_vive_sapien_virtual import (
     _state_qpos,
     _sync_dual_arm_retargeter_from_preview,
     _hand_render_qpos,
+    _vive_tracker_local_translation_offset,
     _wait_for_calibration_start,
 )
 from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
@@ -237,10 +245,13 @@ def parse_args() -> argparse.Namespace:
         help="Per-hand tactile visualizer panel size in pixels.",
     )
     parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
         "--max-fingertip-force",
-        type=int,
-        default=800,
-        help="Max fingertip force passed to InspireTac hand backends on startup.",
+        dest="max_fingertip_force",
+        type=_non_negative_int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
     )
     parser.add_argument(
         "--teleop-hardware-ip",
@@ -275,6 +286,25 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Scale applied to desk-frame translation")
+    parser.add_argument(
+        "--vive-tracker-height-correction",
+        dest="vive_tracker_height_correction",
+        action="store_true",
+        help="Shift wrist tracker input by -Z in the tracker local frame before arm IK. Default.",
+    )
+    parser.add_argument(
+        "--no-vive-tracker-height-correction",
+        dest="vive_tracker_height_correction",
+        action="store_false",
+        help="Disable the 4cm VIVE tracker local -Z position correction.",
+    )
+    parser.add_argument(
+        "--vive-tracker-height-correction-m",
+        type=float,
+        default=DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+        help="VIVE tracker height correction distance in meters; applied as local [0, 0, -value].",
+    )
+    parser.set_defaults(vive_tracker_height_correction=True)
     parser.add_argument(
         "--no-collision",
         "--disable-collision-avoidance",
@@ -715,6 +745,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         calibration = build_annotated_dual_rm65_calibration(
             left_right_base_distance=args.left_right_base_distance
         )
+    tracker_translation_offset = _vive_tracker_local_translation_offset(args)
     calibration.metadata.update(
         {
             "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
@@ -738,7 +769,9 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "hand_send_threshold": float(getattr(args, "hand_send_threshold", 0.002)),
             "hand_telemetry_hz": float(getattr(args, "hand_telemetry_hz", 30.0)),
             "hand_tactile_regions": list(_parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", ()))),
-            "max_fingertip_force": int(getattr(args, "max_fingertip_force", 800)),
+            "max_fingertip_force": int(
+                getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
+            ),
             "teleop_hardware_ip": args.teleop_hardware_ip,
             "teleop_hardware_port": int(args.teleop_hardware_port),
             "swap_arm_sides": bool(args.swap_arm_sides),
@@ -754,6 +787,17 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "ik_tuning_source": ik_tuning.source_path,
             "ik_objective_mode": ik_tuning.ik_objective_mode,
             "initial_alignment_source": args.load_initial_alignment,
+            "vive_tracker_height_correction_enabled": tracker_translation_offset is not None,
+            "vive_tracker_height_correction_m": float(
+                getattr(
+                    args,
+                    "vive_tracker_height_correction_m",
+                    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+                )
+            ),
+            "vive_tracker_local_translation_offset_m": None
+            if tracker_translation_offset is None
+            else tracker_translation_offset.tolist(),
         }
     )
 
@@ -812,6 +856,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             effector_name="left_arm",
             control_mode=args.control_mode,
             translation_scale=args.translation_scale,
+            input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
@@ -822,6 +867,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             effector_name="right_arm",
             control_mode=args.control_mode,
             translation_scale=args.translation_scale,
+            input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
@@ -931,7 +977,9 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 hand_ip=args.left_hand_ip or "0.0.0.0",
                 side="left",
                 connect_hardware=bool(args.left_hand_ip),
-                max_fingertip_force=int(getattr(args, "max_fingertip_force", 800)),
+                max_fingertip_force=int(
+                    getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
+                ),
                 send_threshold=float(getattr(args, "hand_send_threshold", 0.002)),
                 enable_telemetry=bool(args.left_hand_ip),
                 telemetry_hz=hand_telemetry_hz,
@@ -945,7 +993,9 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 hand_ip=args.right_hand_ip or "0.0.0.0",
                 side="right",
                 connect_hardware=bool(args.right_hand_ip),
-                max_fingertip_force=int(getattr(args, "max_fingertip_force", 800)),
+                max_fingertip_force=int(
+                    getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
+                ),
                 send_threshold=float(getattr(args, "hand_send_threshold", 0.002)),
                 enable_telemetry=bool(args.right_hand_ip),
                 telemetry_hz=hand_telemetry_hz,
