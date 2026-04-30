@@ -35,7 +35,7 @@ conda activate grasp_py310_copy
 
 ```bash
 export REPO=/home/ai/Desktop/DexTeleop
-export PROFILE=$REPO/teleop_records/calibration_profiles/20260428_133219_vive_rm65_virtual_desk.json
+export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_172117_vive_rm65_virtual_desk.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/dataset_collection/demo_bimanual_single_camera
 export VIVE_TARGET_HOST=192.168.20.90
@@ -219,7 +219,7 @@ conda activate grasp_py310_copy
 
 python -m teleop_runtime.collection.run_collect \
   --dataset-root "$DATASET_ROOT" \
-  --task grasp_demo_camera \
+  --task right_arm_test \
   --task-description "bimanual InspireTac teleop with single RealSense front camera" \
   --active-sides both \
   --load-profile "$PROFILE" \
@@ -245,6 +245,39 @@ python -m teleop_runtime.collection.run_collect \
   --status-sec 1 \
   --vis_cam \
   --vis-cam-key front
+```
+
+```bash
+cd "$REPO"
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate grasp_py310_copy
+
+python -m teleop_runtime.collection.run_collect \
+  --dataset-root "$DATASET_ROOT" \
+  --task right_arm_test \
+  --task-description "bimanual InspireTac teleop with single RealSense front camera" \
+  --active-sides right \
+  --load-profile "$PROFILE" \
+  --host 0.0.0.0 \
+  --port 9999 \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --hand-telemetry-hz 10 \
+  --hand-tactile-regions all \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.02 \
+  --camera-config "$CAMERA_CONFIG" \
+  --vis_cam \
+  --write-video \
+  --hz 30 \
+  --nominal-fps 30 \
+  --calibration-timeout 15 \
+  --calibration-samples 20 \
+  --status-sec 1 \
+  --vis_cam \
+  --vis-cam-key front \
+  --max-force 200
 ```
 
 首次带相机短测可以临时追加：

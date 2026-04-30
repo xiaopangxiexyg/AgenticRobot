@@ -73,7 +73,7 @@ def read6(client, reg, n_short=6, use_byte=False): # 1 short = 2 bytes
 
 
 class InspireTacModbus:
-    def __init__(self, ip = '192.168.12.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
         self.ip = ip
         self.port = port
         self.timeout = float(timeout)
@@ -538,16 +538,18 @@ class TactileVisualizer:
 if __name__ == '__main__':
     from tqdm import trange
     import numpy as np
-    test = InspireTacModbus(max_fingertip_force=800)
+    test = InspireTacModbus(max_fingertip_force=200)
     # test.set_joint_pos([1, 1, 1, 1, 1, 1])
     
     
     # test.set_joint_pos(np.ones(6))
     # time.sleep(5.0)
-    # time.sleep(1)
-
-    test.set_joint_pos([1, 1, 1, 1, 1, 0])
-    time.sleep(1.0)
+    test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    time.sleep(1)
+    while True:
+        test.set_joint_pos([0, 0, 0, 0, 1, 1])
+        time.sleep(0.1)
+    time.sleep(20.0)
     joint_pos = test.read_joint_pos()
     tac_vec, tac_dict = test.read_tac_data()
     test.set_joint_pos([1, 1, 1, 1, 1, 1])
