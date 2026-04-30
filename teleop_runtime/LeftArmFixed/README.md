@@ -101,8 +101,11 @@ python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
   --vis_cam \
   --vis-cam-key front \
   --visualize-tactile \
-  --hand-tactile-regions all
+  --hand-tactile-regions all \
+  --max-force 200
 ```
+
+折纸 max force 1000, 薯片 400, 轻重 200
 
 `--dataset-root` 是基础输出目录，实际数据集目录会自动命名为
 `<dataset-root>/<YYYY-MM-DD>_<task-name>`；旧的 `--task` 仍可用作兼容入口。
