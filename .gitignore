@@ -56,3 +56,7 @@ teleop_records/*
 *.mp4
 
 UV_conversion
+paper_fold_datasets/
+test_left_fix_datasets/
+test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/
+
