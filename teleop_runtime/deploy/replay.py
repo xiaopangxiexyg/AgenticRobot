@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -38,6 +38,148 @@ def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
         return {}
     payload = json.loads(info_path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else {}
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return float(number)
+
+
+def _positive_float_or_none(value: Any) -> float | None:
+    number = _float_or_none(value)
+    if number is None or number <= 0.0:
+        return None
+    return float(number)
+
+
+def _episode_stats_record(dataset_root: Path, episode_index: int) -> dict[str, Any]:
+    for row in _read_jsonl(dataset_root / "meta" / "episodes_stats.jsonl"):
+        try:
+            row_episode_index = int(row.get("episode_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if row_episode_index == int(episode_index):
+            return row
+    return {}
+
+
+def _estimate_hz_from_timestamps(values: Sequence[Any]) -> dict[str, Any] | None:
+    timestamps = np.asarray(
+        [float(value) for value in values if _float_or_none(value) is not None],
+        dtype=float,
+    )
+    if timestamps.shape[0] < 2:
+        return None
+    dts = np.diff(timestamps)
+    dts = dts[np.isfinite(dts) & (dts > 1e-9)]
+    if dts.size <= 0:
+        return None
+    median_dt = float(np.median(dts))
+    if median_dt <= 0.0:
+        return None
+    return {
+        "hz": float(1.0 / median_dt),
+        "source": "parquet_timestamp_median",
+        "sample_count": int(timestamps.shape[0]),
+        "interval_count": int(dts.size),
+        "median_dt_sec": median_dt,
+        "mean_dt_sec": float(np.mean(dts)),
+        "min_dt_sec": float(np.min(dts)),
+        "max_dt_sec": float(np.max(dts)),
+    }
+
+
+def _estimate_hz_from_control_hz(values: Sequence[Any]) -> dict[str, Any] | None:
+    hz_values = np.asarray(
+        [float(value) for value in values if _positive_float_or_none(value) is not None],
+        dtype=float,
+    )
+    hz_values = hz_values[np.isfinite(hz_values) & (hz_values > 0.0)]
+    if hz_values.size <= 0:
+        return None
+    return {
+        "hz": float(np.median(hz_values)),
+        "source": "parquet_control_hz_median",
+        "sample_count": int(hz_values.size),
+        "mean_hz": float(np.mean(hz_values)),
+        "min_hz": float(np.min(hz_values)),
+        "max_hz": float(np.max(hz_values)),
+    }
+
+
+def _estimate_hz_from_duration(frame_count: Any, duration_sec: Any, *, source: str) -> dict[str, Any] | None:
+    count = _float_or_none(frame_count)
+    duration = _positive_float_or_none(duration_sec)
+    if count is None or count < 2.0 or duration is None:
+        return None
+    hz = float((count - 1.0) / duration)
+    if hz <= 0.0 or not np.isfinite(hz):
+        return None
+    return {
+        "hz": hz,
+        "source": source,
+        "frame_count": int(count),
+        "duration_sec": float(duration),
+    }
+
+
+def _estimate_hz_from_dataset_metadata(
+    *,
+    dataset_root: str | Path | None,
+    episode_index: int,
+    resolved_metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    root = Path(dataset_root).expanduser().resolve() if dataset_root is not None and str(dataset_root) else None
+    stats = _episode_stats_record(root, int(episode_index)) if root is not None and root.exists() else {}
+
+    for key in ("average_hz", "nominal_fps", "mean_control_hz"):
+        value = _positive_float_or_none(stats.get(key))
+        if value is not None:
+            return {
+                "hz": value,
+                "source": f"episodes_stats.{key}",
+                "episode_index": int(episode_index),
+            }
+
+    estimate = _estimate_hz_from_duration(
+        resolved_metadata.get("frame_count"),
+        resolved_metadata.get("duration_sec"),
+        source="episodes.duration_sec",
+    )
+    if estimate is not None:
+        estimate["episode_index"] = int(episode_index)
+        return estimate
+
+    episode_metadata = resolved_metadata.get("episode_metadata")
+    if isinstance(episode_metadata, Mapping):
+        for key in ("hz", "nominal_fps"):
+            value = _positive_float_or_none(episode_metadata.get(key))
+            if value is not None:
+                return {
+                    "hz": value,
+                    "source": f"episodes.metadata.{key}",
+                    "episode_index": int(episode_index),
+                }
+
+    dataset_info = resolved_metadata.get("dataset_info")
+    if not isinstance(dataset_info, Mapping) and root is not None and root.exists():
+        dataset_info = _load_dataset_info(root)
+    if isinstance(dataset_info, Mapping):
+        value = _positive_float_or_none(dataset_info.get("nominal_fps"))
+        if value is not None:
+            return {
+                "hz": value,
+                "source": "info.nominal_fps",
+                "episode_index": int(episode_index),
+            }
+    return None
 
 
 def resolve_replay_parquet_path(
@@ -223,6 +365,80 @@ def load_replay_actions_from_parquet(
     return np.stack(actions, axis=0).astype(np.float32, copy=False)
 
 
+def infer_replay_action_hz(
+    *,
+    parquet_path: str | Path,
+    dataset_root: str | Path | None = None,
+    episode_index: int = 0,
+    start_index: int = 0,
+    end_index: int | None = None,
+    resolved_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = {} if resolved_metadata is None else dict(resolved_metadata)
+    estimate = _estimate_hz_from_dataset_metadata(
+        dataset_root=dataset_root,
+        episode_index=int(episode_index),
+        resolved_metadata=metadata,
+    )
+
+    path = Path(parquet_path).expanduser().resolve()
+    try:
+        pq = _require_pyarrow_parquet()
+    except ModuleNotFoundError:
+        if estimate is not None:
+            estimate = dict(estimate)
+            estimate["timestamp_scan_skipped"] = "pyarrow_unavailable"
+            return estimate
+        raise
+    schema = pq.read_schema(path)
+    available_columns = set(schema.names)
+    timing_columns = [column for column in ("control_hz", "timestamp") if column in available_columns]
+    if not timing_columns:
+        if estimate is not None:
+            return estimate
+        raise ValueError(
+            f"Replay parquet {path} does not contain 'control_hz' or 'timestamp', "
+            "and no metadata-derived action hz was available."
+        )
+
+    rows = pq.read_table(path, columns=timing_columns).to_pylist()
+    if not rows:
+        raise ValueError(f"Replay parquet contains no rows: {path}")
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay frame range is empty for hz inference: start_index={start}, end_index={end_index}, "
+            f"row_count={len(rows)}."
+        )
+    selected_rows = rows[start:stop]
+    timestamp_estimate = (
+        _estimate_hz_from_timestamps([row.get("timestamp") for row in selected_rows])
+        if "timestamp" in timing_columns
+        else None
+    )
+    if timestamp_estimate is not None:
+        timestamp_estimate["episode_index"] = int(episode_index)
+        timestamp_estimate["frame_range"] = [int(start), int(stop)]
+        return timestamp_estimate
+    control_hz_estimate = (
+        _estimate_hz_from_control_hz([row.get("control_hz") for row in selected_rows])
+        if "control_hz" in timing_columns
+        else None
+    )
+    if control_hz_estimate is not None:
+        control_hz_estimate["episode_index"] = int(episode_index)
+        control_hz_estimate["frame_range"] = [int(start), int(stop)]
+        return control_hz_estimate
+    if estimate is not None:
+        estimate = dict(estimate)
+        estimate["frame_range"] = [int(start), int(stop)]
+        return estimate
+    raise ValueError(
+        f"Replay parquet {path} does not contain enough valid timestamps to infer action hz."
+    )
+
+
 @dataclass
 class DatasetReplayPolicy:
     actions: np.ndarray
@@ -315,12 +531,20 @@ def load_dataset_replay_policy(
         start_index=int(start_index),
         end_index=end_index,
     )
+    action_hz_estimate = infer_replay_action_hz(
+        parquet_path=path,
+        dataset_root=dataset_root,
+        episode_index=int(episode_index),
+        start_index=int(start_index),
+        end_index=end_index,
+        resolved_metadata=metadata,
+    )
     policy = DatasetReplayPolicy(
         actions=actions,
         source_path=path,
         chunk_size=int(chunk_size),
         loop=bool(loop),
-        metadata=dict(metadata),
+        metadata={**dict(metadata), "action_hz_estimate": dict(action_hz_estimate)},
     )
     return LoadedPolicy(
         policy=policy,
@@ -331,6 +555,9 @@ def load_dataset_replay_policy(
             "source_path": str(path),
             "frame_count": int(actions.shape[0]),
             "action_column": str(action_column or "action"),
+            "action_hz": float(action_hz_estimate["hz"]),
+            "action_hz_source": str(action_hz_estimate.get("source", "unknown")),
+            "action_hz_estimate": dict(action_hz_estimate),
             **dict(metadata),
         },
     )

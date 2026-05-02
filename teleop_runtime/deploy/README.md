@@ -2,6 +2,13 @@
 
 `teleop_runtime.deploy` 是独立于采集主循环和 `LeftArmFixed` 的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`。
 
+部署频率兼容旧接口：
+
+- 默认仍可用 `--hz` 指定控制/发送频率。
+- 如果提供 `--debug-replay-dataset` / `--debug-replay-parquet`，且没有显式传 `--action-hz`，部署器会优先从数据集实际记录的 action 行间 `timestamp` / episode stats / `control_hz` 推断真实 action 执行频率，并按该频率发送 action。
+- 也可以用 `--action-hz-dataset` 单独指定一个参考数据集来推断发送频率，而不进入 replay 模式。
+- `--policy-hz` 可以省略；省略时，普通部署保持历史默认 `10Hz`，而 replay / 参考数据集频率模式会默认跟随推断出的 action 频率。
+
 ## Action / Observation Layout
 
 部署器兼容 `teleop_runtime.collection` 的数据布局：
@@ -70,6 +77,21 @@ python -m teleop_runtime.deploy.run_policy \
   --left-arm-ip "$LEFT_ARM_IP" \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --auto-start
+```
+
+上面命令在未显式传 `--action-hz` 时，会自动读取该 episode 的真实频率并按接近真机的节奏发送/消费 action。
+
+## 用真机数据集校准部署频率
+
+```bash
+python -m teleop_runtime.deploy.run_policy \
+  --policy /abs/path/my_policy.py:Policy \
+  --policy-kwargs-json '{"checkpoint": "/abs/path/model.pt"}' \
+  --active-sides right \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --action-hz-dataset /abs/path/to/real_dataset \
+  --action-hz-episode 12 \
+  --send-actions
 ```
 
 ## 安全边界

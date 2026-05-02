@@ -41,7 +41,7 @@ from .actions import (
 )
 from .observation import build_deployment_observation
 from .policy import load_policy
-from .replay import load_dataset_replay_policy
+from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
 from .schema import ACTION_DIM, ALL_SIDES
 
 
@@ -163,6 +163,13 @@ def _parse_float_tuple(text: str, *, length: int, name: str) -> tuple[float, ...
     return values
 
 
+def _non_negative_float(text: str) -> float:
+    value = float(text)
+    if value < 0.0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return value
+
+
 def _parse_vector3(text: str) -> tuple[float, float, float]:
     values = _parse_float_tuple(text, length=3, name="vector3")
     return (values[0], values[1], values[2])
@@ -201,7 +208,29 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy-kwargs-json", type=str, default="{}")
     parser.add_argument("--active-sides", type=_parse_active_sides, default=("left", "right"))
     parser.add_argument("--hz", type=_positive_float, default=30.0)
-    parser.add_argument("--policy-hz", type=_positive_float, default=10.0)
+    parser.add_argument(
+        "--action-hz",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Action send/control rate. 0 keeps backward-compatible --hz unless a replay/reference "
+            "dataset is provided, in which case the real dataset rate is inferred."
+        ),
+    )
+    parser.add_argument("--action-hz-dataset", type=Path, default=None)
+    parser.add_argument("--action-hz-parquet", type=Path, default=None)
+    parser.add_argument("--action-hz-episode", type=_non_negative_int, default=None)
+    parser.add_argument("--action-hz-start-index", type=_non_negative_int, default=None)
+    parser.add_argument("--action-hz-end-index", type=int, default=None)
+    parser.add_argument(
+        "--policy-hz",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Policy inference rate. Omit to keep the historical 10Hz default, or to match "
+            "the inferred action rate when --action-hz/--action-hz-dataset/replay is used."
+        ),
+    )
     parser.add_argument("--min-action-queue", type=_non_negative_int, default=0)
     parser.add_argument("--append-action-chunks", action="store_true")
     parser.add_argument("--max-steps", type=_non_negative_int, default=0)
@@ -304,8 +333,14 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--debug-replay-chunk-size must be positive.")
     if args.debug_replay_end_index is not None and int(args.debug_replay_end_index) <= int(args.debug_replay_start_index):
         raise ValueError("--debug-replay-end-index must be greater than --debug-replay-start-index.")
+    action_hz_start = args.debug_replay_start_index if args.action_hz_start_index is None else args.action_hz_start_index
+    action_hz_end = args.debug_replay_end_index if args.action_hz_end_index is None else args.action_hz_end_index
+    if action_hz_end is not None and int(action_hz_end) <= int(action_hz_start):
+        raise ValueError("--action-hz-end-index must be greater than --action-hz-start-index.")
     if args.debug_replay_dataset and args.debug_replay_parquet:
         raise ValueError("Use only one of --debug-replay-dataset or --debug-replay-parquet.")
+    if args.action_hz_dataset and args.action_hz_parquet:
+        raise ValueError("Use only one of --action-hz-dataset or --action-hz-parquet.")
     if (args.debug_replay_dataset or args.debug_replay_parquet) and str(args.policy_spec or "hold").strip().lower() not in {"", "hold", "builtin:hold"}:
         raise ValueError("--debug-replay-* replaces --policy; omit --policy in replay mode.")
     parse_tactile_regions(args.hand_tactile_regions)
@@ -343,11 +378,77 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
     return active_sides
 
 
-def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...]) -> dict[str, RM65ArmBackend]:
+def _action_hz_reference(args: argparse.Namespace) -> tuple[Path | None, Path | None, int, int, int | None]:
+    dataset = args.action_hz_dataset or args.debug_replay_dataset
+    parquet = args.action_hz_parquet or args.debug_replay_parquet
+    episode = (
+        int(args.action_hz_episode)
+        if args.action_hz_episode is not None
+        else int(args.debug_replay_episode)
+    )
+    start_index = (
+        int(args.action_hz_start_index)
+        if args.action_hz_start_index is not None
+        else int(args.debug_replay_start_index)
+    )
+    end_index = (
+        int(args.action_hz_end_index)
+        if args.action_hz_end_index is not None
+        else args.debug_replay_end_index
+    )
+    return dataset, parquet, episode, start_index, end_index
+
+
+def resolve_effective_action_hz(args: argparse.Namespace, policy: Any | None = None) -> tuple[float, dict[str, Any]]:
+    explicit = float(args.action_hz)
+    if explicit > 0.0:
+        return explicit, {"source": "cli.action_hz", "hz": explicit}
+
+    if policy is not None:
+        estimate = getattr(policy, "metadata", {}).get("action_hz_estimate")
+        if isinstance(estimate, Mapping):
+            hz = float(estimate.get("hz", 0.0) or 0.0)
+            if hz > 0.0:
+                return hz, dict(estimate)
+
+    dataset, parquet, episode, start_index, end_index = _action_hz_reference(args)
+    if dataset or parquet:
+        path, metadata = resolve_replay_parquet_path(
+            dataset_root=dataset,
+            parquet_path=parquet,
+            episode_index=int(episode),
+        )
+        estimate = infer_replay_action_hz(
+            parquet_path=path,
+            dataset_root=dataset,
+            episode_index=int(episode),
+            start_index=int(start_index),
+            end_index=end_index,
+            resolved_metadata=metadata,
+        )
+        hz = float(estimate.get("hz", 0.0) or 0.0)
+        if hz > 0.0:
+            estimate = dict(estimate)
+            estimate["source_path"] = str(path)
+            return hz, estimate
+
+    default_hz = float(args.hz)
+    return default_hz, {"source": "cli.hz", "hz": default_hz}
+
+
+def resolve_effective_policy_hz(args: argparse.Namespace, *, action_hz: float, action_hz_source: str) -> tuple[float, str]:
+    if args.policy_hz is not None:
+        return float(args.policy_hz), "cli.policy_hz"
+    if action_hz_source != "cli.hz":
+        return float(action_hz), "action_hz"
+    return 10.0, "legacy_default"
+
+
+def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...], *, control_hz: float) -> dict[str, RM65ArmBackend]:
     if not bool(args.arms_enabled):
         return {}
     arm_urdf_path = str(args.arm_urdf_path or require_asset_path("rm65_arm.urdf"))
-    control_dt = 1.0 / float(args.hz)
+    control_dt = 1.0 / float(control_hz)
     backends: dict[str, RM65ArmBackend] = {}
     for side in active_sides:
         arm_ip = str(getattr(args, f"{side}_arm_ip") or "")
@@ -364,7 +465,7 @@ def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...]) 
                 hardware_read_retry_delay_sec=float(args.rm65_hardware_read_retry_delay_sec),
                 initial_qpos=getattr(args, f"{side}_initial_qpos"),
                 background_streaming_enabled=bool(arm_ip),
-                background_streaming_hz=float(args.hz),
+                background_streaming_hz=float(control_hz),
             )
         )
     return backends
@@ -554,7 +655,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         policy = load_policy(args.policy_spec, kwargs=parse_policy_kwargs(args.policy_kwargs_json))
 
-    arm_backends = build_arm_backends(args, active_sides)
+    effective_action_hz, action_hz_info = resolve_effective_action_hz(args, policy)
+    effective_policy_hz, policy_hz_source = resolve_effective_policy_hz(
+        args,
+        action_hz=float(effective_action_hz),
+        action_hz_source=str(action_hz_info.get("source", "")),
+    )
+
+    arm_backends = build_arm_backends(args, active_sides, control_hz=float(effective_action_hz))
     hand_backends = build_hand_backends(args, active_sides)
     arm_reader = ArmStateReader(
         arm_backends,
@@ -609,13 +717,21 @@ def main(argv: list[str] | None = None) -> int:
             "[Deploy] policy="
             f"{policy.name} active_sides={active_sides} "
             f"arms={bool(args.arms_enabled)} hands={hands_enabled} "
-            f"hz={float(args.hz):.2f} policy_hz={float(args.policy_hz):.2f}"
+            f"hz={float(effective_action_hz):.2f} "
+            f"policy_hz={float(effective_policy_hz):.2f}"
         )
+        if action_hz_info.get("source") != "cli.hz":
+            print(
+                "[Deploy] action_hz="
+                f"{float(effective_action_hz):.3f} source={action_hz_info.get('source')} "
+                f"policy_hz_source={policy_hz_source}"
+            )
         if policy.metadata.get("debug_replay"):
             print(
                 "[Replay] source="
                 f"{policy.metadata.get('source_path')} frames={policy.metadata.get('frame_count')} "
-                f"chunk_size={int(args.debug_replay_chunk_size)} loop={bool(args.debug_replay_loop)}"
+                f"chunk_size={int(args.debug_replay_chunk_size)} loop={bool(args.debug_replay_loop)} "
+                f"action_hz={policy.metadata.get('action_hz')}"
             )
         if not send_actions:
             print("[Deploy] dry-run: actions are filtered and logged but not sent to hardware.")
@@ -699,7 +815,7 @@ def main(argv: list[str] | None = None) -> int:
                     if can_run_policy and _policy_should_run(
                         now=loop_started_at,
                         last_policy_at=last_policy_at,
-                        policy_interval_s=1.0 / float(args.policy_hz),
+                        policy_interval_s=1.0 / float(effective_policy_hz),
                         chunk_buffer=chunk_buffer,
                         min_action_queue=int(args.min_action_queue),
                     ):
@@ -767,7 +883,7 @@ def main(argv: list[str] | None = None) -> int:
                 step_index += 1
                 if int(args.max_steps) > 0 and step_index >= int(args.max_steps):
                     break
-                sleep_time = (1.0 / float(args.hz)) - (time.time() - loop_started_at)
+                sleep_time = (1.0 / float(effective_action_hz)) - (time.time() - loop_started_at)
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)
     except KeyboardInterrupt:

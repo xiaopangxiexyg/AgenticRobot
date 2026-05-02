@@ -73,7 +73,7 @@ def read6(client, reg, n_short=6, use_byte=False): # 1 short = 2 bytes
 
 
 class InspireTacModbus:
-    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+    def __init__(self, ip = '192.168.12.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
         self.ip = ip
         self.port = port
         self.timeout = float(timeout)
@@ -548,7 +548,9 @@ if __name__ == '__main__':
     time.sleep(1)
     while True:
         test.set_joint_pos([0, 0, 0, 0, 1, 1])
-        time.sleep(0.1)
+        time.sleep(0.2)
+        test.set_joint_pos([1, 1, 1, 1, 1, 1])
+        time.sleep(0.2)
     time.sleep(20.0)
     joint_pos = test.read_joint_pos()
     tac_vec, tac_dict = test.read_tac_data()
