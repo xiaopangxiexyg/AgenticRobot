@@ -61,3 +61,6 @@ UV_conversion
 paper_fold_datasets/
 test_left_fix_datasets/
 test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/
+
+heavy_light_wasted/
+2026-04-30_heavy_light/
