@@ -43,6 +43,7 @@ from .observation import build_deployment_observation
 from .policy import load_policy
 from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
 from .schema import ACTION_DIM, ALL_SIDES
+from .startup_init import StartupInitializer, resolve_startup_init_action
 
 
 DEFAULT_CAMERA_CONFIG_PATH = (
@@ -244,6 +245,26 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--debug-replay-end-index", type=int, default=None)
     parser.add_argument("--debug-replay-chunk-size", type=_non_negative_int, default=32)
     parser.add_argument("--debug-replay-loop", action="store_true")
+    parser.add_argument(
+        "--init-time-s",
+        type=float,
+        default=5.0,
+        help="Seconds used to smoothly move to the selected initial target before execution.",
+    )
+    parser.add_argument(
+        "--init-source",
+        choices=["auto", "current", "dataset", "replay", "none"],
+        default="auto",
+        help=(
+            "Initial target source. auto uses replay first frame in replay mode, "
+            "an explicit init dataset when provided, otherwise current robot state."
+        ),
+    )
+    parser.add_argument("--init-dataset", type=Path, default=None)
+    parser.add_argument("--init-parquet", type=Path, default=None)
+    parser.add_argument("--init-episode", type=_non_negative_int, default=0)
+    parser.add_argument("--init-frame", type=_non_negative_int, default=0)
+    parser.add_argument("--init-action-column", type=str, default="action")
     parser.add_argument("--require-ready-observation", action="store_true")
     parser.add_argument("--pause-on-policy-error", dest="pause_on_policy_error", action="store_true", default=True)
     parser.add_argument("--no-pause-on-policy-error", dest="pause_on_policy_error", action="store_false")
@@ -331,6 +352,10 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("Enable at least one actuator family: arms or hands.")
     if int(args.debug_replay_chunk_size) <= 0:
         raise ValueError("--debug-replay-chunk-size must be positive.")
+    if float(args.init_time_s) < 0.0:
+        raise ValueError("--init-time-s must be non-negative.")
+    if args.init_dataset and args.init_parquet:
+        raise ValueError("Use only one of --init-dataset or --init-parquet.")
     if args.debug_replay_end_index is not None and int(args.debug_replay_end_index) <= int(args.debug_replay_start_index):
         raise ValueError("--debug-replay-end-index must be greater than --debug-replay-start-index.")
     action_hz_start = args.debug_replay_start_index if args.action_hz_start_index is None else args.action_hz_start_index
@@ -701,6 +726,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     chunk_buffer = ActionChunkBuffer()
+    startup_initializer = StartupInitializer(
+        duration_s=float(args.init_time_s),
+        source=startup_init_source,
+        target_action=startup_init_action,
+        active_sides=active_sides,
+        arms_enabled=bool(args.arms_enabled),
+        hands_enabled=bool(hands_enabled),
+    )
+    startup_initializer.reset()
 
     policy_active = bool(args.auto_start)
     send_actions = bool(args.send_actions)
@@ -772,6 +806,7 @@ def main(argv: list[str] | None = None) -> int:
                 if key == "g":
                     policy.reset()
                     chunk_buffer.clear()
+                    startup_initializer.reset()
                     last_policy_at = None
                     policy_active = True
                     print("[Deploy] policy active")
@@ -812,6 +847,33 @@ def main(argv: list[str] | None = None) -> int:
 
                 if policy_active:
                     can_run_policy = not (bool(args.require_ready_observation) and faults)
+                    if startup_initializer.enabled and not startup_initializer.completed:
+                        if can_run_policy:
+                            init_action, init_faults, init_ready = startup_initializer.next_action(
+                                observation,
+                                now=loop_started_at,
+                            )
+                            faults.extend(init_faults)
+                            if init_action is not None:
+                                deployment_action = safety_filter.filter(
+                                    init_action,
+                                    observation,
+                                    policy_name="startup_init",
+                                )
+                                faults.extend(deployment_action.faults)
+                                if deployment_action.commands:
+                                    if send_actions:
+                                        _send_commands(
+                                            deployment_action.commands,
+                                            arm_backends=arm_backends,
+                                            hand_backends=hand_backends,
+                                        )
+                                    last_action = deployment_action.vector.astype(np.float32, copy=True)
+                                if init_ready and not deployment_action.faults:
+                                    startup_initializer.mark_complete()
+                                    chunk_buffer.clear()
+                                    last_policy_at = None
+                        can_run_policy = False
                     if can_run_policy and _policy_should_run(
                         now=loop_started_at,
                         last_policy_at=last_policy_at,
@@ -867,7 +929,12 @@ def main(argv: list[str] | None = None) -> int:
 
                 if loop_started_at - last_status_at >= float(args.status_sec):
                     policy_status = _policy_status_text(policy)
-                    suffix = f" {policy_status}" if policy_status else ""
+                    status_parts = [
+                        text
+                        for text in (startup_initializer.status_text, policy_status)
+                        if text
+                    ]
+                    suffix = f" {' '.join(status_parts)}" if status_parts else ""
                     print(
                         "[Status] "
                         f"step={step_index} hz={control_hz:.2f} "
