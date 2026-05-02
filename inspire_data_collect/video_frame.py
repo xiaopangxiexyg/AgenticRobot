@@ -41,6 +41,10 @@ class NearestFrameBuffer:
                 key=lambda frame: abs(float(frame.source_timestamp) - float(timestamp)),
             )
 
+    def clear(self) -> None:
+        with self._lock:
+            self._frames.clear()
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._frames)

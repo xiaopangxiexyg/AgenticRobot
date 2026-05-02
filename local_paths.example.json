@@ -1,0 +1,6 @@
+{
+  "dataset_root": "datasets",
+  "teleop_records_root": "teleop_records",
+  "real_robot_dataset_root": "../real_robot_dataset/datasets",
+  "concat_video_input_dir": "../real_robot_dataset/datasets/2026-04-27_chips_changed/videos/observation.images.front/chunk-000"
+}

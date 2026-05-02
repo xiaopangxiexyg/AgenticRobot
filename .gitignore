@@ -29,6 +29,8 @@ hand_camera_dataset
 .tmp_collect_probe/
 .tmp_collect_probe2/
 
+local_paths.json
+
 dataset_collection
 datasets
 

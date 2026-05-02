@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from project_paths import initial_alignment_states_dir
+
 from ...backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ...backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
@@ -37,6 +39,8 @@ from ..log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event, log_st
 from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.rendering import SapienArmHandRenderer
 from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+
+DEFAULT_INITIAL_ALIGNMENT_STATES_DIR = initial_alignment_states_dir()
 
 
 def _positive_float(text: str) -> float:
@@ -476,7 +480,7 @@ def _build_debug_frames(components: RM65RealDebugComponents, tcp_mode: str) -> d
 
 def _default_alignment_output_path() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("teleop_records/initial_alignment_states") / f"{timestamp}_rm65_initial_alignment.json"
+    return DEFAULT_INITIAL_ALIGNMENT_STATES_DIR / f"{timestamp}_rm65_initial_alignment.json"
 
 
 def _resolve_alignment_output_path(requested: str) -> Path:
