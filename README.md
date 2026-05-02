@@ -35,7 +35,7 @@ conda activate grasp_py310_copy
 
 ```bash
 export REPO=/home/ai/Desktop/DexTeleop
-export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_172117_vive_rm65_virtual_desk.json
+export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_205101_vive_rm65_virtual_desk.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/dataset_collection/demo_bimanual_single_camera
 export VIVE_TARGET_HOST=192.168.20.90
@@ -277,7 +277,7 @@ python -m teleop_runtime.collection.run_collect \
   --status-sec 1 \
   --vis_cam \
   --vis-cam-key front \
-  --max-force 200
+  --max-force 600
 ```
 
 首次带相机短测可以临时追加：
