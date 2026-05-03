@@ -7,9 +7,11 @@ from typing import Any, Mapping
 import numpy as np
 
 from dataset_source import DatasetObservationSource
+from image_transport import maybe_resize_payload_image
 from live_source import HardwareActionExecutor, LiveObservationSource, LiveSnapshot, add_live_args
 from paths import ensure_import_paths
 from profiles import DeploymentProfile
+from startup_replay import add_startup_replay_args, run_startup_replay, wait_for_startup_key
 
 
 ensure_import_paths()
@@ -39,8 +41,10 @@ def add_common_args(parser: argparse.ArgumentParser, profile: DeploymentProfile)
     parser.add_argument("--print-every", type=int, default=1)
     parser.add_argument("--fallback-image-height", type=int, default=480)
     parser.add_argument("--fallback-image-width", type=int, default=640)
+    parser.add_argument("--transport-image-size", type=int, default=224)
     parser.add_argument("--no-rtc", dest="use_rtc", action="store_false", default=True)
     add_live_args(parser)
+    add_startup_replay_args(parser)
 
 
 def make_client(args: argparse.Namespace):
@@ -140,11 +144,18 @@ def run_profile(profile: DeploymentProfile, argv: list[str] | None = None) -> in
     args = parser.parse_args(argv)
 
     previous_result: dict[str, Any] | None = None
-    client = make_client(args)
-    request_id = 0
 
     print(f"[Client] profile={profile.data_config_name} source={args.source} target={args.host}:{args.port}")
     print(f"[Client] HISTORY_SIZE={args.history_size} HISTORY_STRIDE={args.history_stride} inference_delay={args.inference_delay}")
+
+    startup_mode = wait_for_startup_key(args)
+    if startup_mode is not None:
+        replay_status = run_startup_replay(profile, args, startup_mode)
+        if startup_mode == "r":
+            return replay_status
+
+    client = make_client(args)
+    request_id = 0
 
     action_executor = HardwareActionExecutor(profile, args) if args.source == "dataset" and args.send_actions else None
 
@@ -200,6 +211,7 @@ def _run_loop(
             payload["prev_chunk"] = np.asarray(previous_result["action_unified"], dtype=np.float32)
         if observation is not None and np.all(np.isfinite(observation.last_action)):
             payload["last_executed_action"] = observation.last_action.astype(np.float32)
+        maybe_resize_payload_image(payload, int(args.transport_image_size))
 
         if args.print_every > 0 and request_id % args.print_every == 0:
             if dataset_row_index is None:

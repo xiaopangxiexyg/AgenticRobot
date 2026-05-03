@@ -53,13 +53,8 @@ cp local_paths.example.json local_paths.json
 推荐先设置这些变量，后面命令直接复用：
 
 ```bash
-<<<<<<< HEAD
-export REPO=/home/ai/Desktop/DexTeleop
-export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_205101_vive_rm65_virtual_desk.json
-=======
 export REPO=$(pwd)
 export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_172117_vive_rm65_virtual_desk.json
->>>>>>> 08116db6b4d575a24193be3e034fa35dab428dce
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/datasets
 export VIVE_TARGET_HOST=192.168.20.90
@@ -425,3 +420,11 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 - 长时间带相机真机采集压力测试
 - 全 17 tactile 区域高频读取压力测试
 - 多相机同步采集
+
+
+
+
+## 11. Being-H-Tac 真机部署
+
+```DexTeleop/teleop_runtime/deploy```里面写的是deploy原始所需的文件和部署脚本。
+
