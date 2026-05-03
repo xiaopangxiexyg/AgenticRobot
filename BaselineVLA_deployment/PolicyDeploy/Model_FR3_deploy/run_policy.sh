@@ -6,7 +6,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../Scripts/load_local_env.sh"
 PROJECT_ROOT="${PROJECT_ROOT:-$MANIPREP_PROJECT_ROOT}"
 DEPLOY_PACKAGE_ROOT="${DEPLOY_PACKAGE_ROOT:-${MANIPREP_DEPLOY_PACKAGE_ROOT:-}}"
-CONDA_ENV="${CONDA_ENV:-ManipRep_310}"
+if [[ -z "${CONDA_ENV:-}" ]]; then
+  echo "Set CONDA_ENV in ${MANIPREP_LOCAL_ENV_FILE:-${PROJECT_ROOT}/local_paths.env}" >&2
+  exit 2
+fi
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 DEPLOY_MODE="${DEPLOY_MODE:-${FR3_DEPLOY_MODE:-model}}"
@@ -67,14 +70,21 @@ FR3_HOST="${FR3_HOST:-192.168.20.172}"
 FR3_PORT="${FR3_PORT:-5558}"
 CAMERA_KEY="${CAMERA_KEY:-front}"
 CAMERA_MODE="${CAMERA_MODE:-$DEFAULT_CAMERA_MODE}"
+DEFAULT_CAMERA_CONFIG="${DEPLOY_PACKAGE_ROOT}/inspire_data_collect/realsense.json"
 CAMERA_CONFIG="${CAMERA_CONFIG:-}"
-CAMERA_SERIAL="${CAMERA_SERIAL:-}"
-HZ="${HZ:-30}"
-POLICY_HZ="${POLICY_HZ:-$DEFAULT_POLICY_HZ}"
+CAMERA_SERIAL="${CAMERA_SERIAL:-${REALSENSE_ID:-${REALSENSE_SERIAL:-${CAMERA_ID:-}}}}"
+HZ="${HZ:-13}"
+POLICY_HZ="${POLICY_HZ:-}"
+ACTION_HZ="${ACTION_HZ:-}"
+ACTION_HZ_DATASET="${ACTION_HZ_DATASET:-${ACTION_HZ_REFERENCE_DATASET:-}}"
+ACTION_HZ_PARQUET="${ACTION_HZ_PARQUET:-${ACTION_HZ_REFERENCE_PARQUET:-}}"
+ACTION_HZ_EPISODE="${ACTION_HZ_EPISODE:-}"
+ACTION_HZ_START_INDEX="${ACTION_HZ_START_INDEX:-}"
+ACTION_HZ_END_INDEX="${ACTION_HZ_END_INDEX:-}"
 MIN_ACTION_QUEUE="${MIN_ACTION_QUEUE:-$DEFAULT_MIN_ACTION_QUEUE}"
 MAX_STEPS="${MAX_STEPS:-0}"
-MAX_ARM_STEP_RAD="${MAX_ARM_STEP_RAD:-0.02}"
-MAX_HAND_STEP="${MAX_HAND_STEP:-0.03}"
+MAX_ARM_STEP_RAD="${MAX_ARM_STEP_RAD:-0.10}"
+MAX_HAND_STEP="${MAX_HAND_STEP:-0.0}"
 MAX_FINGERTIP_FORCE="${MAX_FINGERTIP_FORCE:-${INSPIRE_HAND_MAX_FORCE:-${MAX_FORCE:-1000}}}"
 if [[ -z "${HAND_TACTILE_REGIONS+x}" ]]; then
   HAND_TACTILE_REGIONS="${HAND_TACTILE_REGIONS_DEFAULT-all}"
@@ -131,6 +141,25 @@ fi
 if [[ "$DEPLOY_MODE" == "replay" && -z "$DEBUG_REPLAY_DATASET" && -z "$DEBUG_REPLAY_PARQUET" ]]; then
   echo "DEPLOY_MODE=replay requires DEBUG_REPLAY_DATASET/REPLAY_DATASET or DEBUG_REPLAY_PARQUET/REPLAY_PARQUET" >&2
   exit 2
+fi
+if [[ "$CAMERA_MODE" != "none" && -z "$CAMERA_SERIAL" && -z "$CAMERA_CONFIG" && -f "$DEFAULT_CAMERA_CONFIG" ]]; then
+  CAMERA_CONFIG="$DEFAULT_CAMERA_CONFIG"
+fi
+if [[ -z "$ACTION_HZ" && -z "$ACTION_HZ_DATASET" && -z "$ACTION_HZ_PARQUET" ]]; then
+  if [[ -n "$DEBUG_REPLAY_DATASET" || -n "$DEBUG_REPLAY_PARQUET" ]]; then
+    ACTION_HZ_DATASET="$DEBUG_REPLAY_DATASET"
+    ACTION_HZ_PARQUET="$DEBUG_REPLAY_PARQUET"
+    ACTION_HZ_EPISODE="${ACTION_HZ_EPISODE:-$DEBUG_REPLAY_EPISODE}"
+    ACTION_HZ_START_INDEX="${ACTION_HZ_START_INDEX:-$DEBUG_REPLAY_START_INDEX}"
+    ACTION_HZ_END_INDEX="${ACTION_HZ_END_INDEX:-$DEBUG_REPLAY_END_INDEX}"
+  elif [[ -n "$INIT_DATASET" || -n "$INIT_PARQUET" ]]; then
+    ACTION_HZ_DATASET="$INIT_DATASET"
+    ACTION_HZ_PARQUET="$INIT_PARQUET"
+    ACTION_HZ_EPISODE="${ACTION_HZ_EPISODE:-$INIT_EPISODE}"
+    ACTION_HZ_START_INDEX="${ACTION_HZ_START_INDEX:-$INIT_FRAME}"
+  else
+    ACTION_HZ="13"
+  fi
 fi
 
 is_true() {
@@ -200,6 +229,28 @@ fi
 if [[ -n "$INIT_PARQUET" ]]; then
   extra_args+=(--init-parquet "$INIT_PARQUET")
 fi
+if [[ -n "$ACTION_HZ" ]]; then
+  extra_args+=(--action-hz "$ACTION_HZ")
+else
+  if [[ -n "$ACTION_HZ_DATASET" ]]; then
+    extra_args+=(--action-hz-dataset "$ACTION_HZ_DATASET")
+  fi
+  if [[ -n "$ACTION_HZ_PARQUET" ]]; then
+    extra_args+=(--action-hz-parquet "$ACTION_HZ_PARQUET")
+  fi
+  if [[ -n "$ACTION_HZ_EPISODE" ]]; then
+    extra_args+=(--action-hz-episode "$ACTION_HZ_EPISODE")
+  fi
+  if [[ -n "$ACTION_HZ_START_INDEX" ]]; then
+    extra_args+=(--action-hz-start-index "$ACTION_HZ_START_INDEX")
+  fi
+  if [[ -n "$ACTION_HZ_END_INDEX" ]]; then
+    extra_args+=(--action-hz-end-index "$ACTION_HZ_END_INDEX")
+  fi
+fi
+if [[ -n "$POLICY_HZ" ]]; then
+  extra_args+=(--policy-hz "$POLICY_HZ")
+fi
 
 policy_args=()
 case "$DEPLOY_MODE" in
@@ -244,7 +295,6 @@ esac
   --hand-tactile-regions "$HAND_TACTILE_REGIONS" \
   --inspire-hand-max-force "$MAX_FINGERTIP_FORCE" \
   --hz "$HZ" \
-  --policy-hz "$POLICY_HZ" \
   --min-action-queue "$MIN_ACTION_QUEUE" \
   --max-arm-step-rad "$MAX_ARM_STEP_RAD" \
   --max-hand-step "$MAX_HAND_STEP" \

@@ -49,12 +49,13 @@ hardware sending are handled by the runtime under `MANIPREP_DEPLOY_PACKAGE_ROOT`
 - `startup_init.py` loads the selected initial frame and uses smoothstep linear
   interpolation from the current hold action to that target.
 - `replay.py` loads full 19-D actions from parquet, or reconstructs them from
-  supported component columns. Replay pops one action per control-loop tick, so
-  the replay frequency is `HZ`; parquet timestamps are not resampled.
+  supported component columns. Replay and startup can infer the real action
+  frequency from parquet timestamps / `control_hz` / dataset metadata; if no
+  reference timing exists, deployment falls back to `13 Hz`.
 - `actions.py` normalizes policy/replay outputs to the 19-D FR3 action vector
   and applies safety filters before hardware commands are sent. The FR3 arm is
   joint-space qpos with safe clipping and `MAX_ARM_STEP_RAD`; hand q6 commands
-  are clipped to `[0, 1]` and rate-limited by `MAX_HAND_STEP`.
+  are clipped to `[0, 1]` and sent directly without an extra rate limit.
 
 For all hardware runs, first omit `--send-actions` or keep `SEND_ACTIONS=0`.
 Only enable real command sending after dry-run status is stable and the target
@@ -98,7 +99,7 @@ Run direct runtime commands from the ManipRep repo root:
 
 ```bash
 source Scripts/load_local_env.sh
-maniprep_activate_conda "${CONDA_ENV:-ManipRep_310}"
+maniprep_activate_conda "$CONDA_ENV"
 export PYTHONPATH="${MANIPREP_DEPLOY_PACKAGE_ROOT}:${PWD}:${PYTHONPATH:-}"
 ```
 
@@ -116,6 +117,7 @@ INIT_DATASET=/abs/path/to/dataset \
 INIT_EPISODE=3 \
 INIT_FRAME=120 \
 INIT_TIME_S=5.0 \
+ACTION_HZ=13 \
 RIGHT_HAND_IP="$RIGHT_HAND_IP" \
 FR3_HOST="$FR3_HOST" \
 AUTO_START=1 \
@@ -141,7 +143,8 @@ python -m inspire_data_collect.deploy.run_policy \
   --init-episode 3 \
   --init-frame 120 \
   --init-time-s 5.0 \
-  --hz 30 \
+  --hz 13 \
+  --action-hz 13 \
   --auto-start \
   --send-actions
 ```
@@ -159,10 +162,10 @@ For both hands, change `--active-sides right` to `--active-sides both` and add
 ### 2. Smoothly Move to the First Frame, Then Replay at Real Frequency
 
 Use runtime debug replay. `--init-source replay` makes startup init target the
-first loaded replay action. Set `--hz` to the data collection frequency,
-usually `30`; this is what makes replay run at the real frequency. Replay uses
-append queueing by default in the wrapper/runtime, so prefetched chunks are not
-dropped.
+first loaded replay action. Replay/action frequency is inferred from the replay
+reference dataset/parquet when available; if timing metadata is missing, the
+runtime falls back to `13 Hz`. Replay uses append queueing by default in the
+wrapper/runtime, so prefetched chunks are not dropped.
 
 Wrapper FR3 arm plus right hand:
 
@@ -173,8 +176,7 @@ DEBUG_REPLAY_EPISODE=3 \
 DEBUG_REPLAY_START_INDEX=0 \
 DEBUG_REPLAY_CHUNK_SIZE=32 \
 INIT_TIME_S=5.0 \
-HZ=30 \
-POLICY_HZ=10 \
+HZ=13 \
 MIN_ACTION_QUEUE=8 \
 RIGHT_HAND_IP="$RIGHT_HAND_IP" \
 FR3_HOST="$FR3_HOST" \
@@ -201,8 +203,7 @@ python -m inspire_data_collect.deploy.run_policy \
   --require-ready-observation \
   --init-source replay \
   --init-time-s 5.0 \
-  --hz 30 \
-  --policy-hz 10 \
+  --hz 13 \
   --min-action-queue 8 \
   --action-queue-policy append \
   --auto-start \
@@ -232,7 +233,6 @@ Tactile checkpoint:
 
 ```bash
 CHECKPOINT=/abs/path/to/checkpoints/epoch_XXXX.pt \
-CONDA_ENV=ManipRep_310 \
 DEPLOY_MODE=model \
 INIT_SOURCE=dataset \
 INIT_DATASET=/abs/path/to/dataset \
@@ -250,7 +250,6 @@ No-tactile checkpoint:
 
 ```bash
 CHECKPOINT=/abs/path/to/best.pt \
-CONDA_ENV=ManipRep_310 \
 DEPLOY_MODE=model \
 INIT_SOURCE=dataset \
 INIT_DATASET=/abs/path/to/dataset \
@@ -285,15 +284,20 @@ Both `run_tactile_policy.sh` and `run_notactile_policy.sh` are configured throug
 | `DEVICE` | `cuda` | Torch device passed to the policy. |
 | `FR3_HOST` | `192.168.20.172` | FR3 host. |
 | `CAMERA_KEY` | `front` | Camera key used by the policy and deploy loop. |
-| `HZ` | `30` | Deploy control loop rate. |
-| `POLICY_HZ` | `5` | Max policy query rate. |
+| `REALSENSE_ID` / `CAMERA_SERIAL` | empty | RealSense serial/id for `CAMERA_MODE=single`. `REALSENSE_ID`, `REALSENSE_SERIAL`, and `CAMERA_ID` are aliases for `CAMERA_SERIAL`. |
+| `CAMERA_CONFIG` | auto | Camera config path. If camera mode is enabled and no serial/config is given, the wrapper falls back to `inspire_data_collect/realsense.json` when it exists. |
+| `HZ` | `13` | Fallback control loop rate. When replay/reference timing is available, actual execution follows the inferred dataset frequency unless `ACTION_HZ` is set explicitly. |
+| `ACTION_HZ` | auto | Explicit action send/control rate. Empty means infer from replay/reference dataset or parquet, otherwise fall back to `HZ`. |
+| `ACTION_HZ_DATASET` / `ACTION_HZ_PARQUET` | auto | Optional reference dataset/parquet used only for frequency inference. |
+| `ACTION_HZ_EPISODE` / `ACTION_HZ_START_INDEX` / `ACTION_HZ_END_INDEX` | auto | Optional frame range used for frequency inference. Defaults follow replay settings or init frame. |
+| `POLICY_HZ` | auto | Max policy query rate. Empty means follow the effective action/control rate. |
 | `MIN_ACTION_QUEUE` | `8` | Query policy when queued actions are at or below this length. |
 | `ACTION_CHUNK_SIZE` | `all` | `all`/`0` uses the full model action chunk; a positive integer returns only the first N actions from each inference. |
 | `APPEND_ACTION_CHUNKS` | `0` | `1` appends new chunks; default replaces the pending queue. |
 | `ACTION_QUEUE_POLICY` | runtime default | Optional explicit `auto`, `replace`, or `append`. `auto` appends replay chunks and replaces normal model chunks. |
 | `MAX_FORCE` | `1000` | InspireTac startup max fingertip force. Aliases: `INSPIRE_HAND_MAX_FORCE`, `MAX_FINGERTIP_FORCE`. |
-| `MAX_HAND_STEP` | `0.03` | Per-control-tick hand rate limit. `<=0` disables. |
-| `MAX_ARM_STEP_RAD` | `0.02` | Per-control-tick FR3 joint rate limit. `<=0` disables. |
+| `MAX_HAND_STEP` | `0.0` | Compatibility knob; hand commands are sent directly and this should stay `0`. |
+| `MAX_ARM_STEP_RAD` | `0.10` | Per-control-tick FR3 joint rate limit outside startup init. `<=0` disables. |
 | `HAND_TACTILE_REGIONS` | `all` for tactile, empty for no-tactile | Tactile regions requested from the hand backend. |
 | `REQUIRE_TACTILE` | `1` for tactile, `0` for no-tactile | Whether a tactile checkpoint errors when tactile is missing. |
 | `REQUIRE_IMAGE` | `1` | Whether the policy errors when the configured camera image is missing. |
@@ -336,12 +340,12 @@ python -m inspire_data_collect.deploy.run_policy \
   --enable-arm \
   --fr3-host "$FR3_HOST" \
   --camera-mode single \
+  --camera-id 135122070754 \
   --camera-key front \
   --inspire-hand-max-force 800 \
   --require-camera-frame \
   --require-ready-observation \
-  --hz 30 \
-  --policy-hz 5 \
+  --hz 13 \
   --min-action-queue 8
 ```
 
