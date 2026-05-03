@@ -41,6 +41,10 @@ datasets
 teleop_records/*
 !teleop_records/calibration_profiles/
 !teleop_records/hand_zero_pose_calibrations/
+BaselineVLA_deployment/local_paths.env
+BaselineVLA_deployment/ThirdParty
+BaselineVLA_deployment/Data
+BaselineVLA_deployment/Outputs
 *.egg-info/
 *.whl
 

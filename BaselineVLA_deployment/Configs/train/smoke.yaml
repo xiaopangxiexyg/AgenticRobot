@@ -1,0 +1,27 @@
+run_name: null
+epochs: 2
+learning_rate: 0.001
+weight_decay: 0.0
+device: cuda
+validation_ratio: 1.0
+validation_seed: null
+# legacy fallback, superseded by train.progress.postfix_update_interval
+log_every_n_steps: 5
+progress:
+  enabled: true
+  leave: false
+  mininterval: 0.2
+  postfix_update_interval: 5
+local_tracking:
+  enabled: true
+  epoch_metrics_filename: epoch_metrics.jsonl
+save_last_checkpoint: true
+save_best_checkpoint: true
+wandb:
+  enabled: true
+  project: ManipRep
+  entity: null
+  mode: offline
+  group: null
+  job_type: train
+  tags: []

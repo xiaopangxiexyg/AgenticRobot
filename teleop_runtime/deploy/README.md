@@ -68,6 +68,9 @@ python -m teleop_runtime.deploy.run_policy \
 ## Dataset Replay Debug
 
 可以直接 replay `teleop_runtime.collection` 采集出的 action。默认仍是 dry-run；真实下发仍需 `--send-actions`。
+debug replay 在 `--action-queue-policy auto` 下会自动 append 预取的 action
+chunk，避免按 `--min-action-queue` 补队列时跳过轨迹尾部；普通模型 policy 仍默认
+replace pending queue。
 
 ```bash
 python -m teleop_runtime.deploy.run_policy \

@@ -1,0 +1,5 @@
+name: fulltrain
+input_adapter: fulltrain
+loss_weights:
+  action: 1.0
+  med: 0.5
