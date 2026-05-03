@@ -30,6 +30,7 @@ from teleop_runtime.deploy.run_policy import (  # noqa: E402
     build_camera_sources,
     build_hand_backends,
     hand_state_snapshot,
+    select_preview_camera_sources,
 )
 from teleop_runtime.deploy.schema import (  # noqa: E402
     ACTION_HAND_SLICES,
@@ -38,6 +39,8 @@ from teleop_runtime.deploy.schema import (  # noqa: E402
     STATE_ARM_POSE_SLICES,
     STATE_HAND_SLICES,
 )
+from teleop_runtime.schemas import EffectorCommand  # noqa: E402
+from teleop_runtime.collection.camera_preview import CameraPreviewConfig, CameraPreviewer  # noqa: E402
 
 
 def add_live_args(parser: argparse.ArgumentParser) -> None:
@@ -82,6 +85,9 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-wait-timeout-ms", type=int, default=1000)
     parser.add_argument("--camera-stale-after-sec", type=float, default=2.0)
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
+    parser.add_argument("--live-camera-preview", dest="live_camera_preview", action="store_true", default=True)
+    parser.add_argument("--no-live-camera-preview", dest="live_camera_preview", action="store_false")
+    parser.add_argument("--vis-cam-key", "--vis_camera_key", dest="vis_cam_key", type=str, default="")
     parser.add_argument("--arm-workspace-min", type=str, default="-0.60,-0.80,0.00")
     parser.add_argument("--arm-workspace-max", type=str, default="0.60,0.80,0.90")
     parser.add_argument("--max-arm-xyz-step-m", type=float, default=0.03)
@@ -299,9 +305,14 @@ class TimedActionDispatcher:
     def submit_result(self, result: Mapping[str, Any]) -> list[str]:
         output: Mapping[str, Any] | dict[str, np.ndarray] = server_result_for_deploy(result)
         if not output:
-            if "action_raw" not in result:
+            if any(key in result for key in ("action", "actions", "action_chunk")):
+                output = result
+            elif "action_raw" in result:
+                output = {"action": np.asarray(result["action_raw"], dtype=np.float32)}
+            elif "action_unified" in result:
+                output = {"action": np.asarray(result["action_unified"], dtype=np.float32)}
+            else:
                 return ["missing_action"]
-            output = {"action": np.asarray(result["action_raw"], dtype=np.float32)}
 
         observation = self.get_observation()
         actions = normalize_policy_output(
@@ -341,6 +352,40 @@ class TimedActionDispatcher:
     def _queue_len(self) -> int:
         with self._lock:
             return len(self._queue)
+
+    @property
+    def sent_actions(self) -> int:
+        return int(self._sent_actions)
+
+    def wait_until_idle(self, timeout_s: float | None = None, poll_s: float = 0.01) -> bool:
+        deadline = None if timeout_s is None else time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            if self._queue_len() == 0:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(max(1e-3, float(poll_s)))
+
+    def wait_until_sent(
+        self,
+        target_sent: int,
+        timeout_s: float | None = None,
+        poll_s: float = 0.01,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        target = max(0, int(target_sent))
+        deadline = None if timeout_s is None else time.monotonic() + max(0.0, float(timeout_s))
+        last_reported = -1
+        while True:
+            sent = self.sent_actions
+            if progress is not None and sent != last_reported:
+                progress(min(sent, target), target)
+                last_reported = sent
+            if sent >= target:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(max(1e-3, float(poll_s)))
 
     def _loop(self) -> None:
         period_s = 1.0 / self.action_hz
@@ -421,7 +466,11 @@ class LiveObservationSource:
                 f"{profile.data_config_name} live mode requires hardware hand IP for: {', '.join(missing_hands)}. "
                 f"Set {flags}, or pass --allow-hand-connect-failure for dry-run debugging."
             )
-        self.arm_backends = build_arm_backends(self.args, self.active_sides)
+        self.arm_backends = build_arm_backends(
+            self.args,
+            self.active_sides,
+            control_hz=float(self.args.action_hz),
+        )
         self.hand_backends = build_hand_backends(self.args, self.active_sides)
         self.arm_reader = ArmStateReader(
             self.arm_backends,
@@ -429,6 +478,16 @@ class LiveObservationSource:
             compute_tcp_pose=True,
         )
         self.camera_sources = build_camera_sources(self.args)
+        self.preview_camera_sources = (
+            select_preview_camera_sources(self.camera_sources, str(getattr(self.args, "vis_cam_key", "")))
+            if bool(getattr(self.args, "live_camera_preview", True)) and self.camera_sources
+            else {}
+        )
+        self.camera_previewer = (
+            CameraPreviewer(CameraPreviewConfig(window_prefix="beingh_live"))
+            if self.preview_camera_sources
+            else None
+        )
         self.history = TactileHistory(history_size, history_stride)
         self.last_action = np.full(26, np.nan, dtype=np.float32)
         self.step_index = 0
@@ -473,12 +532,19 @@ class LiveObservationSource:
                 raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
         for source in self.camera_sources.values():
             source.start()
+        if self.camera_previewer is not None:
+            if self.camera_previewer.ensure_available():
+                print(f"[Camera] live preview active for cameras={sorted(self.preview_camera_sources)}")
+            else:
+                print(f"WARNING: live camera preview disabled: {self.camera_previewer.disabled_reason}")
         self._wait_until_ready()
         self.dispatcher.start()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.dispatcher.stop()
+        if self.camera_previewer is not None:
+            self.camera_previewer.close()
         for backend in self.arm_backends.values():
             backend.close()
         for backend in self.hand_backends.values():
@@ -654,6 +720,8 @@ class LiveObservationSource:
 
     def next_payload_base(self) -> LiveSnapshot:
         observation = self._wait_for_next_ready_observation()
+        if self.camera_previewer is not None:
+            self.camera_previewer.update(self.preview_camera_sources)
         for side in ("left", "right"):
             tactile = observation.tactile_by_side.get(side)
             if tactile is not None and np.asarray(tactile).size:
@@ -709,7 +777,11 @@ class HardwareActionExecutor:
                 f"Set {flags} or export {', '.join(f'{side.upper()}_HAND_IP' for side in missing_hands)}."
             )
 
-        self.arm_backends = build_arm_backends(self.args, self.active_sides)
+        self.arm_backends = build_arm_backends(
+            self.args,
+            self.active_sides,
+            control_hz=float(self.args.action_hz),
+        )
         self.hand_backends = build_hand_backends(self.args, self.active_sides)
         self.arm_reader = ArmStateReader(
             self.arm_backends,
@@ -821,3 +893,82 @@ class HardwareActionExecutor:
 
     def consume_server_result(self, result: Mapping[str, Any]) -> list[str]:
         return self.dispatcher.submit_result(result)
+
+    def send_direct_joint_targets(
+        self,
+        *,
+        arm_qpos: Mapping[str, Any] | None = None,
+        hand_qpos: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        statuses: list[str] = []
+        arm_qpos = {} if arm_qpos is None else dict(arm_qpos)
+        hand_qpos = {} if hand_qpos is None else dict(hand_qpos)
+
+        for side, value in arm_qpos.items():
+            if side not in self.arm_backends:
+                statuses.append(f"{side}_arm_unavailable")
+                continue
+            target = np.asarray(value, dtype=np.float32).reshape(-1)
+            if target.shape != (6,) or not np.all(np.isfinite(target)):
+                statuses.append(f"{side}_arm_direct_qpos_invalid")
+                continue
+            backend = self.arm_backends[side]
+            arm = getattr(backend, "arm", None)
+            if arm is not None:
+                arm.Movej_CANFD(np.asarray(target, dtype=float) / np.pi * 180.0, False)
+                backend.set_local_qpos(target)
+                statuses.append(f"{side}_arm_direct_sent")
+            else:
+                backend.send_command(
+                    EffectorCommand(
+                        effector_name=f"{side}_arm",
+                        side=side,
+                        command_type="joint_vector",
+                        value=target,
+                        frame_name=None,
+                        metadata={"source": "startup_direct_init"},
+                    )
+                )
+                statuses.append(f"{side}_arm_direct_dry_run")
+
+        for side, value in hand_qpos.items():
+            if side not in self.hand_backends:
+                statuses.append(f"{side}_hand_unavailable")
+                continue
+            target = np.asarray(value, dtype=np.float32).reshape(-1)
+            if target.shape != (6,) or not np.all(np.isfinite(target)):
+                statuses.append(f"{side}_hand_direct_qpos_invalid")
+                continue
+            self.hand_backends[side].send_command(
+                EffectorCommand(
+                    effector_name=f"{side}_hand",
+                    side=side,
+                    command_type="joint_vector",
+                    value=np.clip(target, 0.0, 1.0),
+                    frame_name=None,
+                    metadata={"source": "startup_direct_init"},
+                )
+            )
+            statuses.append(f"{side}_hand_direct_sent")
+        return statuses
+
+    def wait_until_idle(self, timeout_s: float | None = None, poll_s: float = 0.01) -> bool:
+        return self.dispatcher.wait_until_idle(timeout_s=timeout_s, poll_s=poll_s)
+
+    @property
+    def sent_actions(self) -> int:
+        return self.dispatcher.sent_actions
+
+    def wait_until_sent(
+        self,
+        target_sent: int,
+        timeout_s: float | None = None,
+        poll_s: float = 0.01,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        return self.dispatcher.wait_until_sent(
+            target_sent=target_sent,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            progress=progress,
+        )

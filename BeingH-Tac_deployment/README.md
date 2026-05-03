@@ -42,6 +42,15 @@ Important inference hyperparameters:
   previous `action_unified` as `prev_chunk` so the server can reuse the delayed
   prefix.
 
+Image transport notes:
+
+- Being-H-Tac inference uses the eval vision transform
+  `Resize(force_image_size) -> CenterCrop(force_image_size)`.
+- This client now applies the same resize/crop logic before sending images to
+  the server, controlled by `--transport-image-size` and defaulting to `224`.
+- Set `--transport-image-size 448` for 448px checkpoints, or
+  `--transport-image-size 0` to disable client-side resizing.
+
 ## DexTeleop Live Communication Summary
 
 `teleop_runtime.deploy` builds observations from RM65 arm backends, InspireTac
@@ -88,7 +97,10 @@ python run_client_realman20.py \
   --max-requests 100 \
   --dataset-frame-stride 24 \
   --action-hz 12.0 \
-  --send-actions
+  --send-actions \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --transport-image-size 224
 ```
 
 In this mode, observations still come from the dataset, but the returned actions
@@ -108,6 +120,25 @@ open-loop playback with growing latency. If the queue runs dry before the next
 inference result arrives, the dispatcher holds the last target and prints an
 underrun warning.
 
+## Startup Dataset Replay Gate
+
+By default, every `run_client_*` waits before opening the server-client
+inference loop:
+
+- Press `r` to randomly choose one parquet episode from `--dataset-path`, replay
+  all dataset actions to the robot at `--action-hz`, then exit.
+- Press `i` to randomly choose one parquet episode, read its first
+  `action.replay.*_arm_joint_target` / `action.replay.*_hand_joint_target`, send
+  that startup target directly to the robot without the normal replay queue
+  rate-limiter, sleep `--startup-init-sleep-s` seconds, then continue into the
+  requested `--source dataset` or `--source live` inference mode.
+
+This startup gate uses the dataset action columns directly; it does not query
+the Being-H-Tac server. Add `--no-startup-key-wait` for non-interactive tests.
+Use `--startup-replay-seed` for repeatable random episode selection and
+`--startup-replay-start-frame` if the replay should start from a frame other
+than 0.
+
 Live Realman20 with RealSense RGB and sending actions:
 
 ```bash
@@ -119,11 +150,16 @@ python run_client_realman20.py \
   --active-sides right \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --enable-hands \
+  --action-hz 12.0 \
   --right-hand-ip "$RIGHT_HAND_IP" \
   --hand-tactile-regions all \
   --auto-start \
+  --transport-image-size 224 \
   --send-actions
 ```
+
+In live mode, RealSense preview opens in a separate window by default. Disable
+it with `--no-live-camera-preview`.
 
 Live Realman22 dry-run, without sending actions:
 
