@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from project_paths import teleop_records_root
 from rm65_inspire_tac.ik_tuning import weighted_joint_distance_score
 
 from .recording import _to_serializable
@@ -346,7 +347,7 @@ class EpisodeRecorder:
     def _ensure_root_dir(self) -> Path:
         if self.root_dir is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            self.root_dir = Path("teleop_records") / stamp / "trajectories"
+            self.root_dir = teleop_records_root() / stamp / "trajectories"
         self.root_dir.mkdir(parents=True, exist_ok=True)
         return self.root_dir
 
@@ -508,4 +509,3 @@ class EpisodeRecorder:
         if self.is_recording:
             self.stop_episode(end_reason="recorder_closed")
         self._close_handles()
-

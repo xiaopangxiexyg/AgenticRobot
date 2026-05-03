@@ -29,6 +29,8 @@ hand_camera_dataset
 .tmp_collect_probe/
 .tmp_collect_probe2/
 
+local_paths.json
+
 dataset_collection
 datasets
 
@@ -39,6 +41,10 @@ datasets
 teleop_records/*
 !teleop_records/calibration_profiles/
 !teleop_records/hand_zero_pose_calibrations/
+BaselineVLA_deployment/local_paths.env
+BaselineVLA_deployment/ThirdParty
+BaselineVLA_deployment/Data
+BaselineVLA_deployment/Outputs
 *.egg-info/
 *.whl
 
@@ -56,3 +62,9 @@ teleop_records/*
 *.mp4
 
 UV_conversion
+paper_fold_datasets/
+test_left_fix_datasets/
+test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/
+
+heavy_light_wasted/
+2026-04-30_heavy_light/

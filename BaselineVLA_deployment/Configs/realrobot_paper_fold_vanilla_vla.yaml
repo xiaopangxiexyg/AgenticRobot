@@ -1,0 +1,38 @@
+defaults:
+  - data: realrobot_paper_fold
+  - model: basic_vla
+  - train: realrobot_vla
+  - experiment: vanilla
+  - _self_
+
+project:
+  name: ManipRep
+  seed: 7
+
+paths:
+  output_root: Outputs
+
+data:
+  raw:
+    sequence:
+      tactile:
+        enabled: false
+
+model:
+  tactile:
+    enabled: false
+
+train:
+  wandb:
+    group: realrobot_paper_fold
+    tags:
+      - realrobot
+      - paper_fold
+      - vanilla_vla
+      - no_tactile
+
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false

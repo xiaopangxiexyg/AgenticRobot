@@ -23,7 +23,11 @@ from ..configs import (
 from ..diagnostics import TeleopRunState
 from ..episodes import EpisodeRecorder, EpisodeRecorderConfig
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, TARGET_INSPIRE_HAND_Q6_ORDER
-from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
+from ..hand_tcp_alignment import (
+    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    tracker_hand_to_rm65_tcp_rotation,
+    vive_tracker_height_correction_offset,
+)
 from ..hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
     RIGHT_HAND_RENDER_JOINT_NAMES,
@@ -57,6 +61,12 @@ from rm65_inspire_tac.pipeline import (
     build_dual_arm_scene_profile,
 )
 from rm65_inspire_tac.rendering import DebugBoxOverlay, DebugBoxTemplate, SapienArmHandRenderer
+
+
+_TRACKER_BEFORE_CORRECTION_MARKER_SIZE_M = (0.018, 0.018, 0.018)
+_TRACKER_AFTER_CORRECTION_MARKER_SIZE_M = (0.024, 0.024, 0.024)
+_TRACKER_BEFORE_CORRECTION_COLOR_RGBA = (1.0, 0.55, 0.05, 1.0)
+_TRACKER_AFTER_CORRECTION_COLOR_RGBA = (0.05, 0.75, 1.0, 1.0)
 
 
 def _positive_float(text: str) -> float:
@@ -417,6 +427,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Scale applied to desk-frame translation")
     parser.add_argument(
+        "--vive-tracker-height-correction",
+        dest="vive_tracker_height_correction",
+        action="store_true",
+        help="Shift wrist tracker input by -Z in the tracker local frame before arm IK. Default.",
+    )
+    parser.add_argument(
+        "--no-vive-tracker-height-correction",
+        dest="vive_tracker_height_correction",
+        action="store_false",
+        help="Disable the 4cm VIVE tracker local -Z position correction.",
+    )
+    parser.add_argument(
+        "--vive-tracker-height-correction-m",
+        type=float,
+        default=DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+        help="VIVE tracker height correction distance in meters; applied as local [0, 0, -value].",
+    )
+    parser.set_defaults(vive_tracker_height_correction=True)
+    parser.add_argument(
         "--no-collision",
         "--disable-collision-avoidance",
         "--disable-dual-arm-collision-avoidance",
@@ -557,6 +586,21 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _vive_tracker_local_translation_offset(args: argparse.Namespace) -> np.ndarray | None:
+    if not bool(getattr(args, "vive_tracker_height_correction", True)):
+        return None
+    height_m = float(
+        getattr(
+            args,
+            "vive_tracker_height_correction_m",
+            DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+        )
+    )
+    if height_m < 0.0:
+        raise ValueError("--vive-tracker-height-correction-m must be >= 0.")
+    return vive_tracker_height_correction_offset(height_m)
+
+
 def build_components(args: argparse.Namespace) -> VirtualRunComponents:
     active_sides = _active_sides_from_args(args)
     _assert_inactive_side_config_empty(
@@ -588,6 +632,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         calibration = build_annotated_dual_rm65_calibration(
             left_right_base_distance=args.left_right_base_distance
         )
+    tracker_translation_offset = _vive_tracker_local_translation_offset(args)
     calibration.metadata.update(
         {
             "left_tracker_name": args.left_tracker_name,
@@ -612,6 +657,17 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             "ik_tuning_source": ik_tuning.source_path,
             "ik_objective_mode": ik_tuning.ik_objective_mode,
             "initial_alignment_source": args.load_initial_alignment,
+            "vive_tracker_height_correction_enabled": tracker_translation_offset is not None,
+            "vive_tracker_height_correction_m": float(
+                getattr(
+                    args,
+                    "vive_tracker_height_correction_m",
+                    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+                )
+            ),
+            "vive_tracker_local_translation_offset_m": None
+            if tracker_translation_offset is None
+            else tracker_translation_offset.tolist(),
         }
     )
     keyboard_source = KeyboardButtonSource(name="terminal_clutch")
@@ -669,6 +725,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             effector_name="left_arm",
             control_mode=args.control_mode,
             translation_scale=args.translation_scale,
+            input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
@@ -679,6 +736,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             effector_name="right_arm",
             control_mode=args.control_mode,
             translation_scale=args.translation_scale,
+            input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
         )
     )
@@ -913,6 +971,10 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
                 "right_arm_base",
                 "left_tracker",
                 "right_tracker",
+                "left_tracker_before_correction",
+                "right_tracker_before_correction",
+                "left_tracker_after_correction",
+                "right_tracker_after_correction",
                 "left_hand_home",
                 "right_hand_home",
                 "left_robot_home",
@@ -923,7 +985,19 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
                 "right_tcp_target",
             )
         )
-        renderer.reserve_debug_boxes(_collision_debug_box_templates(collision_scene_profile))
+        debug_box_templates = _collision_debug_box_templates(collision_scene_profile)
+        debug_box_templates.update(_tracker_correction_debug_box_templates(active_sides))
+        renderer.reserve_debug_boxes(debug_box_templates)
+        correction_label = (
+            "disabled; before/after markers overlap"
+            if tracker_translation_offset is None
+            else f"offset_m={np.round(tracker_translation_offset, 4).tolist()}"
+        )
+        _log(
+            "TrackerCorrectionViz",
+            "orange marker/frame=before VIVE height correction; "
+            f"cyan marker/frame=after local -Z height correction ({correction_label}).",
+        )
     if dual_arm_retargeter is not None:
         dual_arm_retargeter.set_current_qpos_pair(
             left_qpos=_state_qpos(left_preview_backend, DEFAULT_LEFT_ARM_QPOS),
@@ -1105,6 +1179,43 @@ def _resolve_robot_home_for_side(
     return _preview_tcp_pose_desk(components, side=side), qpos, "preview_current_state"
 
 
+def _tracker_after_height_correction_visual_pose(
+    retargeter: PoseToArmRetargeter,
+    tracker_pose_desk: np.ndarray,
+) -> np.ndarray:
+    corrected = retargeter.prepare_input_pose_desk(tracker_pose_desk)
+    visual_pose = corrected.copy()
+    visual_pose[:3, :3] = tracker_pose_desk[:3, :3]
+    return visual_pose
+
+
+def _debug_marker_pose_at_origin(pose: np.ndarray) -> np.ndarray:
+    marker_pose = identity_pose()
+    marker_pose[:3, 3] = as_pose_matrix(pose)[:3, 3]
+    return marker_pose
+
+
+def _tracker_correction_visual_poses(
+    components: VirtualRunComponents,
+    *,
+    side: str,
+    channels: dict[str, object] | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not channels:
+        return None
+    calibration = components.session.calibration
+    assert calibration is not None
+    channel = channels.get(f"{side}_wrist_pose")
+    if channel is None or not channel.valid:
+        return None
+    before_pose = _channel_pose_in_desk(channel, calibration)
+    after_pose = _tracker_after_height_correction_visual_pose(
+        _side_retargeter(components, side),
+        before_pose,
+    )
+    return before_pose, after_pose
+
+
 def _build_renderer_debug_frames(
     components: VirtualRunComponents,
     *,
@@ -1125,16 +1236,37 @@ def _build_renderer_debug_frames(
             frames[f"{side}_hand_home"] = retargeter.home_human_pose_desk
         if retargeter.home_robot_pose_desk is not None:
             frames[f"{side}_robot_home"] = retargeter.home_robot_pose_desk
-        if not channels:
-            continue
-        channel = channels.get(f"{side}_wrist_pose")
-        if channel is None or not channel.valid:
-            continue
         try:
-            frames[f"{side}_tracker"] = _channel_pose_in_desk(channel, calibration)
+            tracker_poses = _tracker_correction_visual_poses(
+                components,
+                side=side,
+                channels=channels,
+            )
         except Exception:
             continue
+        if tracker_poses is None:
+            continue
+        before_pose, after_pose = tracker_poses
+        frames[f"{side}_tracker_before_correction"] = before_pose
+        frames[f"{side}_tracker_after_correction"] = after_pose
+        frames[f"{side}_tracker"] = after_pose
     return frames
+
+
+def _tracker_correction_debug_box_templates(
+    active_sides: tuple[str, ...],
+) -> dict[str, DebugBoxTemplate]:
+    boxes: dict[str, DebugBoxTemplate] = {}
+    for side in active_sides:
+        boxes[f"{side}_tracker_before_correction_marker"] = DebugBoxTemplate(
+            size_xyz=_TRACKER_BEFORE_CORRECTION_MARKER_SIZE_M,
+            color_rgba=_TRACKER_BEFORE_CORRECTION_COLOR_RGBA,
+        )
+        boxes[f"{side}_tracker_after_correction_marker"] = DebugBoxTemplate(
+            size_xyz=_TRACKER_AFTER_CORRECTION_MARKER_SIZE_M,
+            color_rgba=_TRACKER_AFTER_CORRECTION_COLOR_RGBA,
+        )
+    return boxes
 
 
 def _collision_debug_box_templates(
@@ -1161,6 +1293,8 @@ def _collision_debug_box_templates(
 
 def _build_renderer_debug_boxes(
     components: VirtualRunComponents,
+    *,
+    channels: dict[str, object] | None = None,
 ) -> dict[str, DebugBoxOverlay]:
     profile = components.collision_scene_profile
     boxes = {
@@ -1182,6 +1316,28 @@ def _build_renderer_debug_boxes(
             for spec in profile.fixed_scene_boxes
         }
     )
+    for side in components.active_sides:
+        try:
+            tracker_poses = _tracker_correction_visual_poses(
+                components,
+                side=side,
+                channels=channels,
+            )
+        except Exception:
+            continue
+        if tracker_poses is None:
+            continue
+        before_pose, after_pose = tracker_poses
+        boxes[f"{side}_tracker_before_correction_marker"] = DebugBoxOverlay(
+            pose_matrix=_debug_marker_pose_at_origin(before_pose),
+            size_xyz=_TRACKER_BEFORE_CORRECTION_MARKER_SIZE_M,
+            color_rgba=_TRACKER_BEFORE_CORRECTION_COLOR_RGBA,
+        )
+        boxes[f"{side}_tracker_after_correction_marker"] = DebugBoxOverlay(
+            pose_matrix=_debug_marker_pose_at_origin(after_pose),
+            size_xyz=_TRACKER_AFTER_CORRECTION_MARKER_SIZE_M,
+            color_rgba=_TRACKER_AFTER_CORRECTION_COLOR_RGBA,
+        )
     return boxes
 
 
@@ -1497,7 +1653,12 @@ def _runtime_home_calibration(
                     channels=channels,
                 )
             )
-            components.renderer.set_debug_boxes(_build_renderer_debug_boxes(components))
+            components.renderer.set_debug_boxes(
+                _build_renderer_debug_boxes(
+                    components,
+                    channels=channels,
+                )
+            )
             components.renderer.render_data(
                 left_qpos_arm=left_qpos,
                 left_qpos_hand=_hand_render_qpos(components.left_hand_backend, "left"),
@@ -1622,7 +1783,12 @@ def _wait_for_calibration_start(
                     channels=channels,
                 )
             )
-            components.renderer.set_debug_boxes(_build_renderer_debug_boxes(components))
+            components.renderer.set_debug_boxes(
+                _build_renderer_debug_boxes(
+                    components,
+                    channels=channels,
+                )
+            )
             components.renderer.render_data(
                 left_qpos_arm=left_qpos,
                 left_qpos_hand=_hand_render_qpos(components.left_hand_backend, "left"),
@@ -2425,7 +2591,12 @@ def main() -> None:
                         channels=step_result.channels,
                     )
                 )
-                components.renderer.set_debug_boxes(_build_renderer_debug_boxes(components))
+                components.renderer.set_debug_boxes(
+                    _build_renderer_debug_boxes(
+                        components,
+                        channels=step_result.channels,
+                    )
+                )
                 components.renderer.render_data(
                     left_qpos_arm=left_qpos,
                     left_qpos_hand=_hand_render_qpos(components.left_hand_backend, "left"),

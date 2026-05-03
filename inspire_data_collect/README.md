@@ -637,6 +637,8 @@ python -m inspire_data_collect \
 
 触觉读取：`--hand-tactile-regions all`、`--tactile-regions all` 或 `--tactile-region all` 表示读取全部触觉区域；传空字符串 `--tactile-region ""` 表示不读取触觉。也可以传逗号分隔区域，例如 `--tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm`。有效区域名为 `little_1..little_3`、`ring_1..ring_3`、`middle_1..middle_3`、`index_1..index_3`、`thumb_1..thumb_4`、`palm`；非法区域会在启动时直接报错。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
 
+InspireTac max force：`--inspire-hand-max-force N` 会在手 backend 连接时把 `N` 写到每个手指的 force，默认 `800`；兼容旧参数 `--max-fingertip-force`，也可用简写 `--max-force`。
+
 ## 输出
 
 目录结构：
@@ -678,6 +680,10 @@ dataset_root/YYYY-MM-DD_task-name/
 - `action.right_hand.joint_target`、`action.left_hand.joint_target`。
 - `observation.right_hand.qpos`、`observation.left_hand.qpos`。
 - `observation.hand.<side>.tactile`: 1062 维触觉向量。
+- `observation.hand.<side>.tactile_timestamp`: 本帧触觉读取请求时间。
+- `observation.hand.<side>.telemetry_timestamp`: 手部 telemetry 最新更新时间。
+- `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名。
+- `observation.hand.<side>.tactile_dict_json`: 选中触觉区域的矩阵数据 JSON。
 - `teleop.action_source.arm_exo_qpos`: 外骨骼原始 7DoF 关节角。
 - `teleop.action_source.arm_preclip_joint_target`: 外骨骼映射到 FR3 后、裁剪前的 7DoF 目标。
 - `teleop.action_source.arm_clip_mask`: 每个 FR3 关节是否被安全限位裁剪。

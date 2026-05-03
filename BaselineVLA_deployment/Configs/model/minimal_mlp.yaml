@@ -1,0 +1,31 @@
+name: Minimal_MLP
+family: mlp
+activation: relu
+dropout: 0.0
+state_feature_dim: 64
+med_feature_dim: 32
+med_branch:
+  projector:
+    type: auto
+  predictor:
+    type: auto
+  pointnet_hidden_dims:
+    - 64
+    - 128
+  point_query_dim: 64
+task:
+  enabled: false
+  num_embeddings: 128
+  id_embedding_dim: 32
+  feature_dim: 32
+  id_encoder_hidden_dims: []
+state_encoder_hidden_dims:
+  - 64
+  - 64
+med_projector_hidden_dims:
+  - 32
+med_predictor_hidden_dims:
+  - 64
+action_head_hidden_dims:
+  - 64
+  - 64

@@ -1,0 +1,37 @@
+defaults:
+  - data: realrobot_chips_med
+  - model: basic_vla
+  - train: realrobot_vla
+  - experiment: vanilla
+  - _self_
+
+project:
+  name: ManipRep
+  seed: 7
+
+paths:
+  output_root: Outputs
+
+data:
+  raw:
+    sequence:
+      tactile:
+        enabled: false
+
+model:
+  tactile:
+    enabled: false
+
+train:
+  wandb:
+    tags:
+      - realrobot
+      - chips_med
+      - vanilla_vla
+      - no_tactile
+
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false

@@ -1,0 +1,119 @@
+{
+  "suite_name": "future_tactile_smoke",
+  "description": "Tiny end-to-end smoke for future tactile GTMed-vs-Vanilla comparisons on both DeskTaskTac datasets.",
+  "entrypoint": "Training/train.py",
+  "base_config": "train_runner",
+  "analysis_target": "best_val_action_loss",
+  "runner": {
+    "skip_existing": true,
+    "fail_fast": false,
+    "retry_on_resource_failure": true,
+    "subprocess_timeout_sec": 1800,
+    "sleep_between_attempts_sec": 3.0,
+    "limit_cpu_thread_env": true
+  },
+  "defaults": {
+    "data_config": "desktasktac_real",
+    "train_config": "real_debug",
+    "shared_overrides": [
+      "project.seed=7",
+      "data.raw.derived_val_ratio=0.3",
+      "data.raw.limits.max_episodes_per_dataset=6",
+      "data.raw.limits.max_frames_per_episode=3",
+      "data.raw.limits.max_total_samples=24",
+      "data.raw.loader.batch_size=2",
+      "data.raw.sequence.action_chunk=8",
+      "data.raw.sequence.med_stride=1",
+      "data.raw.video.enabled=true",
+      "train.epochs=1",
+      "train.wandb.enabled=false",
+      "train.device=cuda:0"
+    ]
+  },
+  "seeds": [
+    7
+  ],
+  "datasets": [
+    {
+      "id": "rawhand",
+      "label": "DeskTaskTacRawHand",
+      "root_dir": "Data/RawData/Human/DeskTaskTacRawHand",
+      "dataset_name_filter": "DeskTaskTacRawHand",
+      "extra_overrides": []
+    },
+    {
+      "id": "apriltag",
+      "label": "DeskTaskAprilTag",
+      "root_dir": "Data/RawData/Human/DeskTaskAprilTag",
+      "dataset_name_filter": "DeskTaskTacAprilTag",
+      "extra_overrides": []
+    }
+  ],
+  "vanilla_methods": [
+    {
+      "id": "mlp",
+      "label": "Vanilla-MLP",
+      "experiment": "vanilla",
+      "model": "minimal_mlp",
+      "family": "mlp",
+      "task_enabled": true,
+      "extra_overrides": []
+    },
+    {
+      "id": "vla",
+      "label": "Vanilla-VLA",
+      "experiment": "vanilla",
+      "model": "basic_vla",
+      "family": "vla",
+      "task_enabled": true,
+      "extra_overrides": []
+    },
+    {
+      "id": "dp",
+      "label": "Vanilla-DP",
+      "experiment": "vanilla",
+      "model": "basic_diffusion",
+      "family": "diffusion",
+      "task_enabled": true,
+      "extra_overrides": []
+    }
+  ],
+  "gtmed_methods": [
+    {
+      "id": "mlp",
+      "label": "GTMed-MLP",
+      "experiment": "gtmed",
+      "model": "minimal_mlp",
+      "family": "mlp",
+      "task_enabled": true,
+      "extra_overrides": []
+    },
+    {
+      "id": "vla",
+      "label": "GTMed-VLA",
+      "experiment": "gtmed",
+      "model": "basic_vla",
+      "family": "vla",
+      "task_enabled": true,
+      "extra_overrides": []
+    },
+    {
+      "id": "dp",
+      "label": "GTMed-DP",
+      "experiment": "gtmed",
+      "model": "basic_diffusion",
+      "family": "diffusion",
+      "task_enabled": true,
+      "extra_overrides": []
+    }
+  ],
+  "med_windows": [
+    {
+      "id": "f1_4",
+      "label": "future[1,4]",
+      "med_future_start": 1,
+      "med_future_end": 4,
+      "med_stride": 1
+    }
+  ]
+}

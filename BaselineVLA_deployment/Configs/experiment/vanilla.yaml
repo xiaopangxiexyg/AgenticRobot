@@ -1,0 +1,5 @@
+name: vanilla
+input_adapter: vanilla
+loss_weights:
+  action: 1.0
+  med: 0.0

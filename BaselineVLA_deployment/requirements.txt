@@ -1,0 +1,15 @@
+numpy
+pyarrow
+pandas
+pyyaml
+hydra-core
+omegaconf
+tqdm
+ffmpeg
+wandb
+opencv
+matplotlib
+pillow
+scipy
+transformers
+sentencepiece

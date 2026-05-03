@@ -13,8 +13,14 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from project_paths import initial_alignment_states_dir
+
 from ...backends.arms import RM65ArmBackend, RM65ArmBackendConfig
-from ...backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ...backends.hands import (
+    DEFAULT_INSPIRE_HAND_MAX_FORCE,
+    InspireTacHandBackend,
+    InspireTacHandBackendConfig,
+)
 from ...calibration import TeleopCalibration
 from ...configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
@@ -33,6 +39,8 @@ from ..log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event, log_st
 from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.rendering import SapienArmHandRenderer
 from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+
+DEFAULT_INITIAL_ALIGNMENT_STATES_DIR = initial_alignment_states_dir()
 
 
 def _positive_float(text: str) -> float:
@@ -156,6 +164,15 @@ def parse_args() -> argparse.Namespace:
         default=0.08,
         help="Axis length for desk/base/tcp debug frames.",
     )
+    parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
+        "--max-fingertip-force",
+        dest="max_fingertip_force",
+        type=_non_negative_int,
+        default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help="Max force value written to every InspireTac finger on startup.",
+    )
     parser.add_argument("--headless", action="store_true", help="Disable the SAPIEN viewer window.")
     parser.add_argument("--skip-renderer", action="store_true", help="Skip SAPIEN renderer creation.")
     parser.add_argument(
@@ -278,6 +295,7 @@ def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
                 hand_ip=args.left_hand_ip,
                 side="left",
                 connect_hardware=True,
+                max_fingertip_force=int(args.max_fingertip_force),
                 enable_telemetry=True,
                 telemetry_hz=max(float(args.hz), 10.0),
             )
@@ -289,6 +307,7 @@ def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
                 hand_ip=args.right_hand_ip,
                 side="right",
                 connect_hardware=True,
+                max_fingertip_force=int(args.max_fingertip_force),
                 enable_telemetry=True,
                 telemetry_hz=max(float(args.hz), 10.0),
             )
@@ -461,7 +480,7 @@ def _build_debug_frames(components: RM65RealDebugComponents, tcp_mode: str) -> d
 
 def _default_alignment_output_path() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("teleop_records/initial_alignment_states") / f"{timestamp}_rm65_initial_alignment.json"
+    return DEFAULT_INITIAL_ALIGNMENT_STATES_DIR / f"{timestamp}_rm65_initial_alignment.json"
 
 
 def _resolve_alignment_output_path(requested: str) -> Path:
