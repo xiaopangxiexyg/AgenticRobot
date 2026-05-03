@@ -39,10 +39,13 @@ hardware sending are handled by the runtime under `MANIPREP_DEPLOY_PACKAGE_ROOT`
   state/image/tactile inputs, and returns `{"action_chunk": ...}`.
 - `build_policy_kwargs.py` converts wrapper environment variables into policy
   constructor kwargs.
-- `run_tactile_policy.sh` and `run_notactile_policy.sh` activate the conda env,
-  export `PYTHONPATH=${MANIPREP_DEPLOY_PACKAGE_ROOT}:${MANIPREP_PROJECT_ROOT}`,
-  build policy kwargs JSON, and call
-  `python -m inspire_data_collect.deploy.run_policy`.
+- `run_policy.sh` activates the conda env, exports
+  `PYTHONPATH=${MANIPREP_DEPLOY_PACKAGE_ROOT}:${MANIPREP_PROJECT_ROOT}`, and
+  calls `python -m inspire_data_collect.deploy.run_policy`. `DEPLOY_MODE=model`
+  builds ManipRep policy kwargs; `DEPLOY_MODE=move_frame` uses the built-in
+  hold policy; `DEPLOY_MODE=replay` uses runtime dataset replay.
+- `run_tactile_policy.sh` and `run_notactile_policy.sh` keep the old entry names
+  and set tactile/no-tactile defaults before forwarding to `run_policy.sh`.
 - `startup_init.py` loads the selected initial frame and uses smoothstep linear
   interpolation from the current hold action to that target.
 - `replay.py` loads full 19-D actions from parquet, or reconstructs them from
@@ -77,10 +80,19 @@ controls which InspireTac hands are active; it is `right` for the current
 `chips_med` setup. FR3 dual-arm deployment is not implemented in this runtime;
 `--active-sides both` means one FR3 arm plus both hands.
 
-### Common Direct Runtime Setup
+### Wrapper Modes and Direct Runtime Setup
 
-Pure frame movement and dataset replay use the runtime entry directly, because
-the ManipRep wrappers always pass a model policy and require `CHECKPOINT`.
+The FR3 wrappers support all three deployment flows:
+
+- `DEPLOY_MODE=move_frame`: smoothly move to one selected dataset/parquet frame,
+  then hold the observed state.
+- `DEPLOY_MODE=replay`: smoothly move to the replay first frame, then replay the
+  trajectory at `HZ`.
+- `DEPLOY_MODE=model`: smoothly move to the selected first frame, then start the
+  ManipRep checkpoint.
+
+The direct runtime commands below remain useful for debugging lower-level
+`inspire_data_collect.deploy` behavior without the wrapper.
 
 Run direct runtime commands from the ManipRep repo root:
 
@@ -95,6 +107,21 @@ export PYTHONPATH="${MANIPREP_DEPLOY_PACKAGE_ROOT}:${PWD}:${PYTHONPATH:-}"
 Use the built-in `hold` policy plus `--init-source dataset`. After startup init
 finishes, the hold policy keeps sending the observed current state. Press `q` to
 exit, or add a conservative `--max-steps` budget.
+
+Wrapper FR3 arm plus right hand:
+
+```bash
+DEPLOY_MODE=move_frame \
+INIT_DATASET=/abs/path/to/dataset \
+INIT_EPISODE=3 \
+INIT_FRAME=120 \
+INIT_TIME_S=5.0 \
+RIGHT_HAND_IP="$RIGHT_HAND_IP" \
+FR3_HOST="$FR3_HOST" \
+AUTO_START=1 \
+SEND_ACTIONS=1 \
+bash PolicyDeploy/Model_FR3_deploy/run_notactile_policy.sh
+```
 
 FR3 arm plus right hand:
 
@@ -133,7 +160,28 @@ For both hands, change `--active-sides right` to `--active-sides both` and add
 
 Use runtime debug replay. `--init-source replay` makes startup init target the
 first loaded replay action. Set `--hz` to the data collection frequency,
-usually `30`; this is what makes replay run at the real frequency.
+usually `30`; this is what makes replay run at the real frequency. Replay uses
+append queueing by default in the wrapper/runtime, so prefetched chunks are not
+dropped.
+
+Wrapper FR3 arm plus right hand:
+
+```bash
+DEPLOY_MODE=replay \
+DEBUG_REPLAY_DATASET=/abs/path/to/dataset \
+DEBUG_REPLAY_EPISODE=3 \
+DEBUG_REPLAY_START_INDEX=0 \
+DEBUG_REPLAY_CHUNK_SIZE=32 \
+INIT_TIME_S=5.0 \
+HZ=30 \
+POLICY_HZ=10 \
+MIN_ACTION_QUEUE=8 \
+RIGHT_HAND_IP="$RIGHT_HAND_IP" \
+FR3_HOST="$FR3_HOST" \
+AUTO_START=1 \
+SEND_ACTIONS=1 \
+bash PolicyDeploy/Model_FR3_deploy/run_notactile_policy.sh
+```
 
 FR3 arm plus right hand:
 
@@ -156,6 +204,7 @@ python -m inspire_data_collect.deploy.run_policy \
   --hz 30 \
   --policy-hz 10 \
   --min-action-queue 8 \
+  --action-queue-policy append \
   --auto-start \
   --send-actions
 ```
@@ -184,6 +233,7 @@ Tactile checkpoint:
 ```bash
 CHECKPOINT=/abs/path/to/checkpoints/epoch_XXXX.pt \
 CONDA_ENV=ManipRep_310 \
+DEPLOY_MODE=model \
 INIT_SOURCE=dataset \
 INIT_DATASET=/abs/path/to/dataset \
 INIT_EPISODE=3 \
@@ -201,6 +251,7 @@ No-tactile checkpoint:
 ```bash
 CHECKPOINT=/abs/path/to/best.pt \
 CONDA_ENV=ManipRep_310 \
+DEPLOY_MODE=model \
 INIT_SOURCE=dataset \
 INIT_DATASET=/abs/path/to/dataset \
 INIT_EPISODE=3 \
@@ -227,9 +278,11 @@ Both `run_tactile_policy.sh` and `run_notactile_policy.sh` are configured throug
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
+| `DEPLOY_MODE` | `model` | `move_frame`, `replay`, or `model`. Existing tactile/no-tactile script names still work. |
 | `CHECKPOINT` | required | Model checkpoint path. Aliases: `CKPT`, `MODEL_CKPT`. A checkpoint directory resolves to `last.pt`. |
+| `ACTIVE_SIDES` | `right` | `right`, `left`, or `both`; controls active InspireTac hands. |
+| `LEFT_HAND_IP` / `RIGHT_HAND_IP` | empty | InspireTac hand IPs for active sides. |
 | `DEVICE` | `cuda` | Torch device passed to the policy. |
-| `RIGHT_HAND_IP` | empty | InspireTac right-hand IP. Required for real action sending. |
 | `FR3_HOST` | `192.168.20.172` | FR3 host. |
 | `CAMERA_KEY` | `front` | Camera key used by the policy and deploy loop. |
 | `HZ` | `30` | Deploy control loop rate. |
@@ -237,6 +290,7 @@ Both `run_tactile_policy.sh` and `run_notactile_policy.sh` are configured throug
 | `MIN_ACTION_QUEUE` | `8` | Query policy when queued actions are at or below this length. |
 | `ACTION_CHUNK_SIZE` | `all` | `all`/`0` uses the full model action chunk; a positive integer returns only the first N actions from each inference. |
 | `APPEND_ACTION_CHUNKS` | `0` | `1` appends new chunks; default replaces the pending queue. |
+| `ACTION_QUEUE_POLICY` | runtime default | Optional explicit `auto`, `replace`, or `append`. `auto` appends replay chunks and replaces normal model chunks. |
 | `MAX_FORCE` | `1000` | InspireTac startup max fingertip force. Aliases: `INSPIRE_HAND_MAX_FORCE`, `MAX_FINGERTIP_FORCE`. |
 | `MAX_HAND_STEP` | `0.03` | Per-control-tick hand rate limit. `<=0` disables. |
 | `MAX_ARM_STEP_RAD` | `0.02` | Per-control-tick FR3 joint rate limit. `<=0` disables. |
@@ -252,6 +306,9 @@ Both `run_tactile_policy.sh` and `run_notactile_policy.sh` are configured throug
 | `INIT_DATASET` / `INIT_PARQUET` | empty | Optional dataset root or episode parquet for deploy initialization from a recorded frame. |
 | `INIT_EPISODE` / `INIT_FRAME` | `0` / `0` | Dataset episode and frame used when `INIT_SOURCE=dataset` or `INIT_SOURCE=auto` with `INIT_DATASET`/`INIT_PARQUET`. |
 | `INIT_ACTION_COLUMN` | `action` | Full action column used for init/replay parquet loading. |
+| `DEBUG_REPLAY_DATASET` / `DEBUG_REPLAY_PARQUET` | empty | Dataset root or direct parquet for `DEPLOY_MODE=replay`. Aliases: `REPLAY_DATASET`, `REPLAY_PARQUET`. |
+| `DEBUG_REPLAY_EPISODE` / `DEBUG_REPLAY_START_INDEX` | `INIT_EPISODE` / `0` | Replay episode and first frame for `DEPLOY_MODE=replay`. |
+| `DEBUG_REPLAY_CHUNK_SIZE` | `32` | Number of replay actions prefetched per policy query. |
 
 To execute the full returned model chunk before querying again, use `ACTION_CHUNK_SIZE=all MIN_ACTION_QUEUE=0`.
 To deliberately use only the first few model outputs, set `ACTION_CHUNK_SIZE=N`; keep `MIN_ACTION_QUEUE` lower than `N`, or set `APPEND_ACTION_CHUNKS=1` if you want to prefetch without discarding the tail of the current queue.
