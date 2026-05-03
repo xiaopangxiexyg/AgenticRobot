@@ -68,7 +68,14 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hand-send-threshold", type=float, default=0.002)
     parser.add_argument("--hand-telemetry-hz", type=float, default=20.0)
     parser.add_argument("--hand-tactile-regions", "--tactile-regions", dest="hand_tactile_regions", type=str, default="all")
-    parser.add_argument("--inspire-hand-max-force", "--max-force", dest="max_fingertip_force", type=int, default=800)
+    parser.add_argument(
+        "--inspire-hand-max-force",
+        "--max-force",
+        "--max-fingertip-force",
+        dest="max_fingertip_force",
+        type=int,
+        default=800,
+    )
     parser.add_argument("--camera-mode", choices=["none", "single", "multi"], default="none")
     parser.add_argument(
         "--camera-config",

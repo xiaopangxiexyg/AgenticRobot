@@ -11,7 +11,7 @@ from image_transport import maybe_resize_payload_image
 from live_source import HardwareActionExecutor, LiveObservationSource, LiveSnapshot, add_live_args
 from paths import ensure_import_paths
 from profiles import DeploymentProfile
-from startup_replay import add_startup_replay_args, run_startup_replay, wait_for_startup_key
+from startup_replay import add_startup_replay_args, bind_selected_episode, choose_episode, run_startup_replay, wait_for_startup_key
 
 
 ensure_import_paths()
@@ -153,6 +153,9 @@ def run_profile(profile: DeploymentProfile, argv: list[str] | None = None) -> in
         replay_status = run_startup_replay(profile, args, startup_mode)
         if startup_mode == "r":
             return replay_status
+    elif args.source == "dataset" and args.which_episode is not None:
+        bind_selected_episode(args, choose_episode(args))
+        print(f"[Dataset] selected episode from --which-episode: {args.parquet_path}")
 
     client = make_client(args)
     request_id = 0

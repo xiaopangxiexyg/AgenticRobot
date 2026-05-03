@@ -100,6 +100,20 @@ python run_client_realman20.py \
   --send-actions \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --right-hand-ip "$RIGHT_HAND_IP" \
+  --which-episode 5 \
+  --transport-image-size 224
+
+
+python run_client_realman22.py \
+  --host 127.0.0.1 \
+  --source dataset \
+  --dataset-path /home/ai/Desktop/Being-H-series/2026-04-28_large_brown_paper_fold_conerted \
+  --max-requests 100 \
+  --dataset-frame-stride 24 \
+  --action-hz 12.0 \
+  --send-actions \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
   --transport-image-size 224
 ```
 
@@ -129,15 +143,19 @@ inference loop:
   all dataset actions to the robot at `--action-hz`, then exit.
 - Press `i` to randomly choose one parquet episode, read its first
   `action.replay.*_arm_joint_target` / `action.replay.*_hand_joint_target`, send
-  that startup target directly to the robot without the normal replay queue
-  rate-limiter, sleep `--startup-init-sleep-s` seconds, then continue into the
-  requested `--source dataset` or `--source live` inference mode.
+  that startup target to the robot through a short joint-space interpolation,
+  sleep `--startup-init-sleep-s` seconds, then continue into the requested
+  `--source dataset` or `--source live` inference mode. Tune the initialization
+  motion with `--startup-init-steps` and `--startup-init-hz`.
 
 This startup gate uses the dataset action columns directly; it does not query
 the Being-H-Tac server. Add `--no-startup-key-wait` for non-interactive tests.
 Use `--startup-replay-seed` for repeatable random episode selection and
 `--startup-replay-start-frame` if the replay should start from a frame other
-than 0.
+than 0. Use `--which-episode k` to select the k-th sorted parquet episode
+explicitly; otherwise startup replay chooses one at random. If `i` is used in
+dataset mode, the subsequent server-client dataset replay is bound to the same
+episode selected for initialization.
 
 Live Realman20 with RealSense RGB and sending actions:
 
@@ -155,13 +173,34 @@ python run_client_realman20.py \
   --hand-tactile-regions all \
   --auto-start \
   --transport-image-size 224 \
+  --max-fingertip-force 600 \
+  --send-actions
+
+
+python run_client_realman22.py \
+  --host 127.0.0.1 \
+  --source live \
+  --camera-mode single \
+  --camera-serial 213222079798 \
+  --active-sides both \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --max-fingertip-force 800 \
+  --which-episode 152 \
   --send-actions
 ```
 
 In live mode, RealSense preview opens in a separate window by default. Disable
 it with `--no-live-camera-preview`.
 
-Live Realman22 dry-run, without sending actions:
+~~Live Realman22 dry-run, without sending actions:~~
 
 ```bash
 python run_client_realman22.py \
