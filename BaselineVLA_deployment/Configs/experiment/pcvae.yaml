@@ -1,0 +1,4 @@
+name: pcvae
+input_adapter: genmed
+loss_weights:
+  med: 1.0

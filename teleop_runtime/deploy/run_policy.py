@@ -204,7 +204,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hz", type=_positive_float, default=30.0)
     parser.add_argument("--policy-hz", type=_positive_float, default=10.0)
     parser.add_argument("--min-action-queue", type=_non_negative_int, default=0)
-    parser.add_argument("--append-action-chunks", action="store_true")
+    parser.add_argument(
+        "--action-queue-policy",
+        choices=["auto", "replace", "append"],
+        default="auto",
+        help=(
+            "How newly predicted chunks update the pending action queue. "
+            "auto preserves replace for normal policies and uses append for debug replay."
+        ),
+    )
+    parser.add_argument(
+        "--append-action-chunks",
+        action="store_true",
+        help="Compatibility alias for --action-queue-policy append.",
+    )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0)
     parser.add_argument("--status-sec", type=_positive_float, default=1.0)
     parser.add_argument("--startup-warmup-sec", type=float, default=1.0)
@@ -516,6 +529,17 @@ def _policy_should_run(
     return now - float(last_policy_at) >= float(policy_interval_s)
 
 
+def _resolve_action_queue_policy(args: argparse.Namespace, *, debug_replay: bool) -> str:
+    if bool(getattr(args, "append_action_chunks", False)):
+        return "append"
+    policy = str(getattr(args, "action_queue_policy", "auto") or "auto").strip().lower()
+    if policy == "auto":
+        return "append" if bool(debug_replay) else "replace"
+    if policy not in {"replace", "append"}:
+        raise ValueError(f"Unsupported action queue policy: {policy!r}.")
+    return policy
+
+
 def _send_commands(
     commands: Mapping[str, Any],
     *,
@@ -565,7 +589,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     active_sides = validate_args(args)
     hands_enabled = _hands_enabled(args)
-    if args.debug_replay_dataset or args.debug_replay_parquet:
+    debug_replay = bool(args.debug_replay_dataset or args.debug_replay_parquet)
+    if debug_replay:
         policy = load_dataset_replay_policy(
             dataset_root=args.debug_replay_dataset,
             parquet_path=args.debug_replay_parquet,
@@ -578,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         policy = load_policy(args.policy_spec, kwargs=parse_policy_kwargs(args.policy_kwargs_json))
+    action_queue_policy = _resolve_action_queue_policy(args, debug_replay=debug_replay)
     startup_init_action, startup_init_source = resolve_startup_init_action(args, policy)
 
     arm_backends = build_arm_backends(args, active_sides)
@@ -644,7 +670,8 @@ def main(argv: list[str] | None = None) -> int:
             "[Deploy] policy="
             f"{policy.name} active_sides={active_sides} "
             f"arms={bool(args.arms_enabled)} hands={hands_enabled} "
-            f"hz={float(args.hz):.2f} policy_hz={float(args.policy_hz):.2f}"
+            f"hz={float(args.hz):.2f} policy_hz={float(args.policy_hz):.2f} "
+            f"queue_policy={action_queue_policy}"
         )
         if startup_initializer.enabled:
             print(
@@ -783,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
                                 hands_enabled=hands_enabled,
                             )
                             if actions:
-                                if args.append_action_chunks:
+                                if action_queue_policy == "append":
                                     chunk_buffer.append(actions)
                                 else:
                                     chunk_buffer.replace(actions)
