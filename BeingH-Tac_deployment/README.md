@@ -193,8 +193,8 @@ python run_client_realman22.py \
   --auto-start \
   --transport-image-size 224 \
   --max-fingertip-force 800 \
-  --which-episode 152 \
-  --send-actions
+  --send-actions \
+  --which-episode 152
 ```
 
 In live mode, RealSense preview opens in a separate window by default. Disable
