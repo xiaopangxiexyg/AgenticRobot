@@ -114,7 +114,24 @@ python run_client_realman22.py \
   --send-actions \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --right-hand-ip "$RIGHT_HAND_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
   --transport-image-size 224
+
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source dataset \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/real_dataset/2026-04-27_chips_single_converted \
+  --max-requests 100 \
+  --dataset-frame-stride 24 \
+  --action-hz 12.0 \
+  --send-actions \
+  --right-arm-ip "192.168.20.172" \
+  --right-hand-ip "192.168.11.210" \
+  --transport-image-size 224 \
+  --startup-init-steps 240
+
 ```
 
 In this mode, observations still come from the dataset, but the returned actions
@@ -195,7 +212,33 @@ python run_client_realman22.py \
   --max-fingertip-force 800 \
   --which-episode 152 \
   --send-actions
+
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source live \
+  --camera-mode single \
+  --camera-serial 135122070754 \
+  --active-sides right \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --max-fingertip-force 800 \
+  --send-actions
 ```
+
+
+
+
+
+
+
+
+
 
 In live mode, RealSense preview opens in a separate window by default. Disable
 it with `--no-live-camera-preview`.

@@ -73,7 +73,7 @@ def read6(client, reg, n_short=6, use_byte=False): # 1 short = 2 bytes
 
 
 class InspireTacModbus:
-    def __init__(self, ip = '192.168.12.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
         self.ip = ip
         self.port = port
         self.timeout = float(timeout)
@@ -270,7 +270,7 @@ class InspireTacModbus:
 
 
 class InspireSimulatedForceControl:
-    def __init__(self, ip='192.168.12.210', max_force_rating=3000, kp=2000, min_force_threshold=300):
+    def __init__(self, ip='192.168.11.210', max_force_rating=3000, kp=2000, min_force_threshold=300):
         """
         初始化灵巧手拟力控接口
         :param ip: 灵巧手IP
