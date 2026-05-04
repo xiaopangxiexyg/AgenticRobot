@@ -374,10 +374,10 @@ class ActionSafetyFilterConfig:
     hands_enabled: bool = False
     workspace_min: tuple[float, float, float] = (-0.60, -0.80, 0.00)
     workspace_max: tuple[float, float, float] = (0.60, 0.80, 0.90)
-    max_arm_xyz_step_m: float = 0.03
-    max_arm_rot_step_deg: float = 8.0
-    max_arm_joint_step_rad: float = 0.08
-    max_hand_step: float = 0.08
+    max_arm_xyz_step_m: float = 0.08
+    max_arm_rot_step_deg: float = 20.0
+    max_arm_joint_step_rad: float = 0.20
+    max_hand_step: float = 0.0
 
 
 class ActionSafetyFilter:
@@ -419,6 +419,8 @@ class ActionSafetyFilter:
         target: np.ndarray,
         observation: DeploymentObservation,
         raw: np.ndarray,
+        max_arm_xyz_step_m: float,
+        max_arm_rot_step_deg: float,
     ) -> tuple[np.ndarray, EffectorCommand | None, list[str], dict[str, Any]]:
         faults: list[str] = []
         metadata: dict[str, Any] = {
@@ -439,13 +441,13 @@ class ActionSafetyFilter:
 
         fallback = np.asarray(observation.state[STATE_ARM_POSE_SLICES[side]], dtype=np.float32)
         reference = self._reference_action_slice(observation, ACTION_ARM_POSE_SLICES[side], fallback)
-        if float(self.config.max_arm_xyz_step_m) > 0.0 and not np.all(np.isfinite(reference[:3])):
+        if float(max_arm_xyz_step_m) > 0.0 and not np.all(np.isfinite(reference[:3])):
             faults.append(f"{side}_arm_pose_reference_unavailable")
         else:
             pose[:3], limited = self._rate_limit_vector(
                 pose[:3],
                 reference[:3],
-                max_step=float(self.config.max_arm_xyz_step_m),
+                max_step=float(max_arm_xyz_step_m),
             )
             metadata["xyz_rate_limited"] = bool(limited)
 
@@ -455,7 +457,7 @@ class ActionSafetyFilter:
             return target, None, [f"{side}_arm_quat_invalid"], metadata
         pose[3:7] = (quat / quat_norm).astype(np.float32)
         if (
-            float(self.config.max_arm_rot_step_deg) > 0.0
+            float(max_arm_rot_step_deg) > 0.0
             and np.all(np.isfinite(reference[3:7]))
             and np.linalg.norm(reference[3:7]) > 1e-12
         ):
@@ -463,7 +465,7 @@ class ActionSafetyFilter:
             target_rot = R.from_quat(np.asarray(pose[3:7], dtype=float))
             delta = target_rot * ref_rot.inv()
             angle = float(delta.magnitude())
-            max_angle = np.deg2rad(float(self.config.max_arm_rot_step_deg))
+            max_angle = np.deg2rad(float(max_arm_rot_step_deg))
             if angle > max_angle > 0.0:
                 limited_delta = R.from_rotvec(delta.as_rotvec() / angle * max_angle)
                 pose[3:7] = (limited_delta * ref_rot).as_quat().astype(np.float32)
@@ -493,6 +495,7 @@ class ActionSafetyFilter:
         side: str,
         target: np.ndarray,
         observation: DeploymentObservation,
+        max_arm_joint_step_rad: float,
     ) -> tuple[np.ndarray, EffectorCommand | None, list[str], dict[str, Any]]:
         faults: list[str] = []
         metadata = {"joint_rate_limited": False}
@@ -500,13 +503,13 @@ class ActionSafetyFilter:
         if qpos is None:
             return target, None, [f"{side}_arm_qpos_invalid"], metadata
         reference = np.asarray(observation.state[STATE_ARM_QPOS_SLICES[side]], dtype=np.float32)
-        if float(self.config.max_arm_joint_step_rad) > 0.0 and not np.all(np.isfinite(reference)):
+        if float(max_arm_joint_step_rad) > 0.0 and not np.all(np.isfinite(reference)):
             faults.append(f"{side}_arm_qpos_reference_unavailable")
         else:
             qpos, limited = self._rate_limit_vector(
                 qpos,
                 reference,
-                max_step=float(self.config.max_arm_joint_step_rad),
+                max_step=float(max_arm_joint_step_rad),
             )
             metadata["joint_rate_limited"] = bool(limited)
         command = EffectorCommand(
@@ -542,6 +545,23 @@ class ActionSafetyFilter:
         filtered = raw.astype(np.float32, copy=True)
         faults: list[str] = []
         commands: dict[str, EffectorCommand] = {}
+        override_config = {}
+        if isinstance(normalized.metadata, Mapping):
+            raw_overrides = normalized.metadata.get("safety_overrides", {})
+            if isinstance(raw_overrides, Mapping):
+                override_config = dict(raw_overrides)
+
+        def _override_float(name: str, default: float) -> float:
+            if name not in override_config:
+                return float(default)
+            try:
+                return float(override_config[name])
+            except (TypeError, ValueError):
+                return float(default)
+
+        max_arm_xyz_step_m = _override_float("max_arm_xyz_step_m", self.config.max_arm_xyz_step_m)
+        max_arm_rot_step_deg = _override_float("max_arm_rot_step_deg", self.config.max_arm_rot_step_deg)
+        max_arm_joint_step_rad = _override_float("max_arm_joint_step_rad", self.config.max_arm_joint_step_rad)
         safety_metadata: dict[str, Any] = {
             "policy_name": policy_name,
             "arm": {},
@@ -558,6 +578,7 @@ class ActionSafetyFilter:
                         side=side,
                         target=np.asarray(normalized.arm_joint_targets[side], dtype=np.float32),
                         observation=observation,
+                        max_arm_joint_step_rad=max_arm_joint_step_rad,
                     )
                 else:
                     pose, command, arm_faults, metadata = self._filter_arm_pose(
@@ -565,6 +586,8 @@ class ActionSafetyFilter:
                         target=filtered[ACTION_ARM_POSE_SLICES[side]],
                         observation=observation,
                         raw=raw,
+                        max_arm_xyz_step_m=max_arm_xyz_step_m,
+                        max_arm_rot_step_deg=max_arm_rot_step_deg,
                     )
                     filtered[ACTION_ARM_POSE_SLICES[side]] = pose
                 faults.extend(arm_faults)
@@ -583,21 +606,8 @@ class ActionSafetyFilter:
                     faults.append(f"{side}_hand_action_invalid")
                     continue
                 clipped = np.clip(hand_target, 0.0, 1.0)
-                reference = self._reference_action_slice(
-                    observation,
-                    target_slice,
-                    np.asarray(observation.state[STATE_HAND_SLICES[side]], dtype=np.float32),
-                )
-                if float(self.config.max_hand_step) > 0.0 and not np.all(np.isfinite(reference)):
-                    faults.append(f"{side}_hand_reference_unavailable")
-                    continue
-                clipped, limited = self._rate_limit_vector(
-                    clipped,
-                    reference,
-                    max_step=float(self.config.max_hand_step),
-                )
                 filtered[target_slice] = clipped
-                safety_metadata["hand_rate_limited"][side] = bool(limited)
+                safety_metadata["hand_rate_limited"][side] = False
                 commands[f"{side}_hand"] = EffectorCommand(
                     effector_name=f"{side}_hand",
                     side=side,
@@ -610,8 +620,8 @@ class ActionSafetyFilter:
                         "raw_action": raw[target_slice].copy(),
                         "safety": {
                             "clip_range": [0.0, 1.0],
-                            "rate_limited": bool(limited),
-                            "max_step": float(self.config.max_hand_step),
+                            "rate_limited": False,
+                            "max_step": 0.0,
                         },
                     },
                 )

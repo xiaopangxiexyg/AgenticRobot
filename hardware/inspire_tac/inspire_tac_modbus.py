@@ -270,7 +270,7 @@ class InspireTacModbus:
 
 
 class InspireSimulatedForceControl:
-    def __init__(self, ip='192.168.11.210', max_force_rating=3000, kp=2000, min_force_threshold=300):
+    def __init__(self, ip='', max_force_rating=3000, kp=2000, min_force_threshold=300):
         """
         初始化灵巧手拟力控接口
         :param ip: 灵巧手IP

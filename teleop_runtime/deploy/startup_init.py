@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from .actions import NormalizedAction
 from .observation import DeploymentObservation
@@ -16,7 +17,11 @@ from .schema import (
     ACTION_HAND_SLICES,
     ALL_SIDES,
     HAND_VECTOR_ORDER,
+    STATE_ARM_POSE_SLICES,
 )
+
+_STARTUP_ARM_POSITION_TOLERANCE_M = 0.01
+_STARTUP_ARM_ROTATION_TOLERANCE_DEG = 5.0
 
 
 def _action_vector(value: Any, *, label: str) -> np.ndarray:
@@ -116,6 +121,33 @@ def _smoothstep(alpha: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
+def _quat_distance_deg(current: np.ndarray, target: np.ndarray) -> float:
+    first = np.asarray(current, dtype=float).reshape(4)
+    second = np.asarray(target, dtype=float).reshape(4)
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if first_norm <= 1e-12 or second_norm <= 1e-12:
+        return float("inf")
+    current_rot = R.from_quat(first / first_norm)
+    target_rot = R.from_quat(second / second_norm)
+    return float(np.rad2deg((target_rot * current_rot.inv()).magnitude()))
+
+
+def _hardware_pose_xyzquat(observation: DeploymentObservation, side: str) -> np.ndarray | None:
+    state = dict(observation.arm_states.get(side) or {})
+    pose_6d = state.get("hardware_pose_6d")
+    if pose_6d is None:
+        return None
+    try:
+        pose = np.asarray(pose_6d, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        return None
+    quat = R.from_euler("xyz", np.asarray(pose[3:6], dtype=float)).as_quat().astype(np.float32)
+    return np.concatenate((pose[:3], quat), dtype=np.float32)
+
+
 def _slerp_quat(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
     first = np.asarray(q0, dtype=np.float64).reshape(4)
     second = np.asarray(q1, dtype=np.float64).reshape(4)
@@ -154,9 +186,12 @@ def _interpolate_action(
     arms_enabled: bool,
 ) -> np.ndarray:
     action = (start + (target - start) * float(alpha)).astype(np.float32, copy=True)
+    active = set(active_sides)
+    for side in HAND_VECTOR_ORDER:
+        if side in active:
+            action[ACTION_HAND_SLICES[side]] = target[ACTION_HAND_SLICES[side]]
     if not arms_enabled:
         return action
-    active = set(active_sides)
     for side in ALL_SIDES:
         if side not in active:
             continue
@@ -174,6 +209,17 @@ def _interpolate_action(
             alpha,
         )
     return action
+
+
+def _startup_action_metadata() -> dict[str, Any]:
+    return {
+        "safety_overrides": {
+            "max_arm_xyz_step_m": 0.0,
+            "max_arm_rot_step_deg": 0.0,
+            "max_arm_joint_step_rad": 0.0,
+            "max_hand_step": 0.0,
+        }
+    }
 
 
 @dataclass
@@ -253,7 +299,14 @@ class StartupInitializer:
         alpha = _smoothstep(raw_alpha)
         self.progress = float(raw_alpha)
         if raw_alpha >= 1.0:
-            return NormalizedAction(vector=self.resolved_target_action.copy()), [], True
+            return (
+                NormalizedAction(
+                    vector=self.resolved_target_action.copy(),
+                    metadata=_startup_action_metadata(),
+                ),
+                [],
+                self._target_reached(observation),
+            )
         action = _interpolate_action(
             self.start_action,
             self.resolved_target_action,
@@ -261,7 +314,39 @@ class StartupInitializer:
             active_sides=self.active_sides,
             arms_enabled=bool(self.arms_enabled),
         )
-        return NormalizedAction(vector=action), [], False
+        if not bool(self.arms_enabled):
+            return NormalizedAction(vector=action, metadata=_startup_action_metadata()), [], True
+        return NormalizedAction(vector=action, metadata=_startup_action_metadata()), [], False
+
+    def _target_reached(self, observation: DeploymentObservation) -> bool:
+        assert self.resolved_target_action is not None
+        target = self.resolved_target_action
+        state = np.asarray(observation.state, dtype=np.float32).reshape(-1)
+        active = set(self.active_sides)
+        if bool(self.arms_enabled):
+            for side in ALL_SIDES:
+                if side not in active:
+                    continue
+                target_pose = target[ACTION_ARM_POSE_SLICES[side]]
+                current_pose = _hardware_pose_xyzquat(observation, side)
+                pose_source = "hardware"
+                if current_pose is None:
+                    current_pose = state[STATE_ARM_POSE_SLICES[side]]
+                    pose_source = "state"
+                if not (np.all(np.isfinite(target_pose)) and np.all(np.isfinite(current_pose))):
+                    return False
+                position_error = float(np.linalg.norm(current_pose[:3] - target_pose[:3]))
+                rotation_error_deg = _quat_distance_deg(current_pose[3:7], target_pose[3:7])
+                if position_error > _STARTUP_ARM_POSITION_TOLERANCE_M:
+                    return False
+                if rotation_error_deg > _STARTUP_ARM_ROTATION_TOLERANCE_DEG:
+                    return False
+                print(
+                    "[StartupInit] arm reached target "
+                    f"side={side} source={pose_source} "
+                    f"pos_err_mm={position_error * 1000.0:.2f} rot_err_deg={rotation_error_deg:.2f}"
+                )
+        return True
 
     def mark_complete(self) -> None:
         if not self.completed:

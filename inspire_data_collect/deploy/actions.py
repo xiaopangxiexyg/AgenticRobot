@@ -283,8 +283,8 @@ class ActionSafetyFilterConfig:
     active_sides: tuple[str, ...]
     arm_enabled: bool = False
     arm_shrink_deg: float = 10.0
-    max_arm_step_rad: float = 0.05
-    max_hand_step: float = 0.08
+    max_arm_step_rad: float = 0.10
+    max_hand_step: float = 0.0
 
 
 class ActionSafetyFilter:
@@ -352,6 +352,8 @@ class ActionSafetyFilter:
         filtered = raw.astype(np.float32, copy=True)
         faults: list[str] = []
         commands: dict[str, EffectorCommand] = {}
+        startup_mode = policy_name == "startup_init"
+        max_arm_step_rad = 0.0 if startup_mode else float(self.config.max_arm_step_rad)
         safety_metadata: dict[str, Any] = {
             "policy_name": policy_name,
             "arm_clipped": False,
@@ -370,7 +372,7 @@ class ActionSafetyFilter:
                 )
                 reference = self._reference_for_slice(observation, _ARM_SLICE)
                 if (
-                    float(self.config.max_arm_step_rad) > 0.0
+                    float(max_arm_step_rad) > 0.0
                     and not np.all(np.isfinite(reference))
                 ):
                     faults.append("arm_reference_unavailable")
@@ -378,7 +380,7 @@ class ActionSafetyFilter:
                     arm_target, arm_limited = self._rate_limit(
                         arm_target,
                         reference,
-                        max_step=float(self.config.max_arm_step_rad),
+                        max_step=float(max_arm_step_rad),
                     )
                     filtered[_ARM_SLICE] = arm_target
                     safety_metadata["arm_clipped"] = bool(arm_clipped)
@@ -395,7 +397,7 @@ class ActionSafetyFilter:
                             "safety": {
                                 "safe_clip": bool(arm_clipped),
                                 "rate_limited": bool(arm_limited),
-                                "max_step_rad": float(self.config.max_arm_step_rad),
+                                "max_step_rad": float(max_arm_step_rad),
                                 "shrink_deg": float(self.config.arm_shrink_deg),
                             },
                         },
@@ -411,17 +413,8 @@ class ActionSafetyFilter:
                 faults.append(f"{side}_hand_action_invalid")
                 continue
             clipped = np.clip(hand_target, 0.0, 1.0)
-            reference = self._reference_for_slice(observation, target_slice)
-            if float(self.config.max_hand_step) > 0.0 and not np.all(np.isfinite(reference)):
-                faults.append(f"{side}_hand_reference_unavailable")
-                continue
-            clipped, limited = self._rate_limit(
-                clipped,
-                reference,
-                max_step=float(self.config.max_hand_step),
-            )
             filtered[target_slice] = clipped
-            safety_metadata["hand_rate_limited"][side] = bool(limited)
+            safety_metadata["hand_rate_limited"][side] = False
             commands[f"{side}_hand"] = EffectorCommand(
                 effector_name=f"{side}_hand",
                 side=side,
@@ -433,8 +426,8 @@ class ActionSafetyFilter:
                     "raw_action": raw[target_slice].copy(),
                     "safety": {
                         "clip_range": [0.0, 1.0],
-                        "rate_limited": bool(limited),
-                        "max_step": float(self.config.max_hand_step),
+                        "rate_limited": False,
+                        "max_step": 0.0,
                     },
                 },
             )

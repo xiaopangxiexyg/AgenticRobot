@@ -40,6 +40,7 @@ InspireTacHandBackend - hand/tactile ---/                                      |
 ## Dataset Replay Debug 模式
 
 部署器可以不加载模型，而是从采集好的 dataset 里读取某个 episode 的 `action` 轨迹并按部署控制链路 replay。Replay 仍然经过 `ActionSafetyFilter`，默认仍是 dry-run；真实下发硬件仍需显式加 `--send-actions`，并且未设置 `--auto-start` 时仍需按 `g` 开始。
+`--action-queue-policy auto` 会在 debug replay 模式自动 append 预取的 action chunk，避免按 `--min-action-queue` 补队列时跳过未执行轨迹；普通模型 policy 仍默认 replace pending queue。旧的 `--append-action-chunks` 仍可用，并等价于 `--action-queue-policy append`。
 
 直接从 dataset root 读取第 0 个 episode：
 
@@ -71,6 +72,7 @@ python -m inspire_data_collect.deploy.run_policy \
 - `--debug-replay-loop`：轨迹结束后循环；默认结束后保持最后一个 action。
 - `--debug-replay-chunk-size 32`：每次策略查询预取的 action 数。
 - `--debug-replay-action-column action`：默认读取 19 维 `action` 列；若该列不存在，会自动尝试用 `action.arm.joint_target`、`action.right_hand.joint_target`、`action.left_hand.joint_target` 拼回完整 action。
+- `--action-queue-policy auto|replace|append`：默认 `auto`；replay 自动 append，普通 policy 自动 replace。
 
 ## 策略加载约定
 
