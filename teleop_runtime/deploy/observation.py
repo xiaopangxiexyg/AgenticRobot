@@ -87,6 +87,9 @@ class DeploymentObservation:
 
     def hold_action(self) -> np.ndarray:
         action = nan_vector(ACTION_DIM)
+        last = np.asarray(self.last_action, dtype=np.float32).reshape(-1)
+        if last.shape != (ACTION_DIM,):
+            last = nan_vector(ACTION_DIM)
         for side in ALL_SIDES:
             pose = vector_or_none(
                 self.state[STATE_ARM_POSE_SLICES[side]],
@@ -94,13 +97,13 @@ class DeploymentObservation:
             )
             if pose is not None:
                 action[ACTION_ARM_POSE_SLICES[side]] = pose
-            hand = vector_or_none(self.state[STATE_HAND_SLICES[side]], length=HAND_DOF)
+            hand = vector_or_none(last[ACTION_HAND_SLICES[side]], length=HAND_DOF)
+            if hand is None:
+                hand = vector_or_none(self.state[STATE_HAND_SLICES[side]], length=HAND_DOF)
             if hand is not None:
                 action[ACTION_HAND_SLICES[side]] = hand
-        last = vector_or_none(self.last_action, length=ACTION_DIM)
-        if last is not None:
-            missing = ~np.isfinite(action)
-            action[missing] = last[missing]
+        missing = ~np.isfinite(action)
+        action[missing] = last[missing]
         return action.astype(np.float32, copy=False)
 
 

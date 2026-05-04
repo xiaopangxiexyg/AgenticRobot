@@ -478,6 +478,15 @@ class DatasetReplayPolicy:
         self.cursor = 0
         self.finished = False
 
+    def skip_startup_frames(self, count: int = 1) -> int:
+        skipped = min(max(0, int(count)), max(0, self.frame_count - int(self.cursor)))
+        if skipped <= 0:
+            return 0
+        self.cursor += skipped
+        if self.cursor >= self.frame_count:
+            self.finished = not self.loop
+        return int(skipped)
+
     def _next_action_chunk(self) -> np.ndarray:
         if self.cursor >= self.frame_count:
             if self.loop:

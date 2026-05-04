@@ -293,7 +293,11 @@ class InspireTacHandBackend(EffectorBackend):
             if self._last_sent_command is None
             else self._last_sent_command.copy(),
             "last_sent_command_timestamp": self._last_sent_command_timestamp,
+            "commanded_joint_pos": None
+            if self._last_sent_command is None
+            else self._last_sent_command.copy(),
             "joint_pos": None if self._latest_joint_pos is None else self._latest_joint_pos.copy(),
+            "measured_joint_pos": None if self._latest_joint_pos is None else self._latest_joint_pos.copy(),
             "joint_timestamp": self._latest_joint_timestamp,
             "tactile": None if self._latest_tactile is None else self._latest_tactile.copy(),
             "tactile_timestamp": self._latest_tactile_timestamp,

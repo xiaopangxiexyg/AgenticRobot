@@ -70,6 +70,11 @@ class DeploymentObservation:
         action = self.state.astype(np.float32, copy=True)
         last = np.asarray(self.last_action, dtype=np.float32).reshape(-1)
         if last.shape == (ACTION_DIM,):
+            slices = _state_slices()
+            for side in HAND_VECTOR_ORDER:
+                target_slice = slices[f"{side}_hand"]
+                if np.all(np.isfinite(last[target_slice])):
+                    action[target_slice] = last[target_slice]
             missing = ~np.isfinite(action)
             action[missing] = last[missing]
         return action
