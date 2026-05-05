@@ -2,6 +2,10 @@
 
 Inspire Tac 手数据采集便携包，已接入可选的外骨骼单臂 FR3 随动与记录，不依赖 `teleop_runtime`。保留原工程的 `assets` 不复制；运行时只需要本目录、硬件可访问、以及 Python 依赖。
 
+realsense_gui:conda activate tactile_grasp
+python -m inspire_data_collect.utils.realsense_gui --view-mode overlay
+
+
 ## 首先下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
 文件名：assets.zip
 有效期限：2026-06-08 14:10
