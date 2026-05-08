@@ -26,6 +26,7 @@ from ...configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     build_annotated_dual_rm65_calibration,
 )
+from ...hand_mapping import parse_tactile_regions
 from ...hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
     RIGHT_HAND_RENDER_JOINT_NAMES,
@@ -173,6 +174,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
         help="Max force value written to every InspireTac finger on startup.",
     )
+    parser.add_argument(
+        "--hand-tactile-regions",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated tactile regions to poll, or 'all'. "
+            "Defaults to all; pass an empty string to disable tactile reads."
+        ),
+    )
     parser.add_argument("--headless", action="store_true", help="Disable the SAPIEN viewer window.")
     parser.add_argument("--skip-renderer", action="store_true", help="Skip SAPIEN renderer creation.")
     parser.add_argument(
@@ -228,6 +238,7 @@ def _resolve_logical_side_assignments(args: argparse.Namespace) -> dict[str, tup
 
 
 def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
+    hand_tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
     if args.load_profile:
         calibration = TeleopCalibration.load_json(args.load_profile)
     else:
@@ -298,6 +309,7 @@ def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
                 max_fingertip_force=int(args.max_fingertip_force),
                 enable_telemetry=True,
                 telemetry_hz=max(float(args.hz), 10.0),
+                tactile_regions=hand_tactile_regions,
             )
         )
     right_hand_backend = None
@@ -310,6 +322,7 @@ def build_components(args: argparse.Namespace) -> RM65RealDebugComponents:
                 max_fingertip_force=int(args.max_fingertip_force),
                 enable_telemetry=True,
                 telemetry_hz=max(float(args.hz), 10.0),
+                tactile_regions=hand_tactile_regions,
             )
         )
 

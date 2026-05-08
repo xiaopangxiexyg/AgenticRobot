@@ -25,7 +25,7 @@ class InspireTacHandBackendConfig:
     send_threshold: float = 0.002
     enable_telemetry: bool = False
     telemetry_hz: float = 10.0
-    tactile_regions: tuple[str, ...] = ()
+    tactile_regions: tuple[str, ...] = ("all",)
     modbus_timeout_sec: float = 0.5
     reconnect_on_error: bool = True
     reconnect_cooldown_sec: float = 1.0

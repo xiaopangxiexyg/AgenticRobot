@@ -213,10 +213,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hand-tactile-regions",
         type=str,
-        default="",
+        default="all",
         help=(
-            "Optional comma-separated tactile regions to poll, for example "
-            "'thumb_1,index_1,palm' or 'all'. Empty means skip tactile reads for lower latency."
+            "Comma-separated tactile regions to poll, for example "
+            "'thumb_1,index_1,palm' or 'all'. Defaults to all; pass an empty string to skip tactile reads."
         ),
     )
     parser.add_argument(
@@ -634,7 +634,7 @@ def _build_episode_metadata(
         "hand_command_alpha": float(getattr(args, "hand_command_alpha", 1.0)),
         "hand_send_threshold": float(getattr(args, "hand_send_threshold", 0.002)),
         "hand_telemetry_hz": float(getattr(args, "hand_telemetry_hz", 30.0)),
-        "hand_tactile_regions": list(_parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", ()))),
+        "hand_tactile_regions": list(_parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", "all"))),
         "teleop_hardware_ip": args.teleop_hardware_ip or None,
         "teleop_hardware_port": int(args.teleop_hardware_port) if args.teleop_hardware_port else None,
         "swap_arm_sides": bool(args.swap_arm_sides),
@@ -768,7 +768,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "hand_command_alpha": float(getattr(args, "hand_command_alpha", 1.0)),
             "hand_send_threshold": float(getattr(args, "hand_send_threshold", 0.002)),
             "hand_telemetry_hz": float(getattr(args, "hand_telemetry_hz", 30.0)),
-            "hand_tactile_regions": list(_parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", ()))),
+            "hand_tactile_regions": list(_parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", "all"))),
             "max_fingertip_force": int(
                 getattr(args, "max_fingertip_force", DEFAULT_INSPIRE_HAND_MAX_FORCE)
             ),
@@ -967,7 +967,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     if right_hand_retargeter is not None:
         retargeters.append(right_hand_retargeter)
 
-    hand_tactile_regions = _parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", ()))
+    hand_tactile_regions = _parse_hand_tactile_regions(getattr(args, "hand_tactile_regions", "all"))
     hand_telemetry_hz = float(getattr(args, "hand_telemetry_hz", max(float(args.hz), 10.0)))
 
     left_hand_backend = None
@@ -1574,7 +1574,7 @@ def main() -> None:
         _log(
             "TactileVis",
             f"enabled mode={tactile_vis_mode} active_sides={list(components.active_sides)} "
-            f"regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', ())))}",
+            f"regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', 'all')))}",
         )
     clutch_input = TerminalClutchInput(components.keyboard_source)
     episode_recorder = EpisodeRecorder(
@@ -1623,7 +1623,7 @@ def main() -> None:
                 f"invert={bool(getattr(args, 'hand_invert', True))} "
                 f"alpha={float(getattr(args, 'hand_command_alpha', 1.0)):.3f} "
                 f"telemetry_hz={float(getattr(args, 'hand_telemetry_hz', 30.0)):.1f} "
-                f"tactile_regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', ()))) or []} "
+                f"tactile_regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', 'all'))) or []} "
                 f"dispatch=rig_parallel",
             )
         elif components.left_hand_backend is not None or components.right_hand_backend is not None:
@@ -1633,7 +1633,7 @@ def main() -> None:
                 f"left_hand_ip={args.left_hand_ip or None} "
                 f"right_hand_ip={args.right_hand_ip or None} "
                 f"telemetry_hz={float(getattr(args, 'hand_telemetry_hz', 30.0)):.1f} "
-                f"tactile_regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', ()))) or []}",
+                f"tactile_regions={list(_parse_hand_tactile_regions(getattr(args, 'hand_tactile_regions', 'all'))) or []}",
             )
         else:
             _log("HandTeleop", "disabled; arm teleop path remains unchanged.")

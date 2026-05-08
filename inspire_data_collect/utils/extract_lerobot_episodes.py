@@ -4,13 +4,21 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..common import to_serializable
-from .writer import chunk_id_from_episode_index, episode_id_from_index
+if __package__ in (None, ""):
+    _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.append(str(_PROJECT_ROOT))
+    from inspire_data_collect.common import to_serializable
+    from inspire_data_collect.utils.writer import chunk_id_from_episode_index, episode_id_from_index
+else:
+    from ..common import to_serializable
+    from .writer import chunk_id_from_episode_index, episode_id_from_index
 
 
 MANIFEST_FILENAMES = {"info.json", "episodes.jsonl", "episodes_stats.jsonl"}

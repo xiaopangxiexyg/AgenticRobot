@@ -215,10 +215,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hand-tactile-regions",
         type=str,
-        default="",
+        default="all",
         help=(
-            "Optional comma-separated tactile regions to poll, for example "
-            "'thumb_1,index_1,palm' or 'all'. Empty means skip tactile reads for lower latency."
+            "Comma-separated tactile regions to poll, for example "
+            "'thumb_1,index_1,palm' or 'all'. Defaults to all; pass an empty string to skip tactile reads."
         ),
     )
     parser.add_argument(

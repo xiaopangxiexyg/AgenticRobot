@@ -54,7 +54,7 @@ cp local_paths.example.json local_paths.json
 
 ```bash
 export REPO=$(pwd)
-export PROFILE=$REPO/teleop_records/calibration_profiles/20260430_172117_vive_rm65_virtual_desk.json
+export PROFILE=/home/ai/Desktop/DexTeleop/teleop_records/calibration_profiles/20260506_122501_vive_rm65_virtual_desk.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/datasets
 export VIVE_TARGET_HOST=192.168.20.90
@@ -238,7 +238,7 @@ conda activate grasp_py310_copy
 
 python -m teleop_runtime.collection.run_collect \
   --dataset-root "$DATASET_ROOT" \
-  --task right_arm_test \
+  --task right_arm_dual_data \
   --task-description "bimanual InspireTac teleop with single RealSense front camera" \
   --active-sides both \
   --load-profile "$PROFILE" \
@@ -273,8 +273,8 @@ conda activate grasp_py310_copy
 
 python -m teleop_runtime.collection.run_collect \
   --dataset-root "$DATASET_ROOT" \
-  --task right_arm_test \
-  --task-description "bimanual InspireTac teleop with single RealSense front camera" \
+  --task right_arm_dual_data_soft_hard \
+  --task-description "right InspireTac teleop with single RealSense front camera" \
   --active-sides right \
   --load-profile "$PROFILE" \
   --host 0.0.0.0 \
@@ -296,7 +296,10 @@ python -m teleop_runtime.collection.run_collect \
   --status-sec 1 \
   --vis_cam \
   --vis-cam-key front \
-  --max-force 600
+  --max-force 500 \
+  --return-right-qpos-deg "-25.67,54.27,76.92,-110.70,75.83,139.68" \
+  --hand-tactile-regions all
+
 ```
 
 首次带相机短测可以临时追加：

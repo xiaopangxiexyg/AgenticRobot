@@ -184,12 +184,18 @@ def _interpolate_action(
     alpha: float,
     active_sides: tuple[str, ...],
     arms_enabled: bool,
+    hands_enabled: bool,
 ) -> np.ndarray:
     action = (start + (target - start) * float(alpha)).astype(np.float32, copy=True)
     active = set(active_sides)
-    for side in HAND_VECTOR_ORDER:
-        if side in active:
-            action[ACTION_HAND_SLICES[side]] = target[ACTION_HAND_SLICES[side]]
+    if hands_enabled:
+        for side in HAND_VECTOR_ORDER:
+            if side in active:
+                action[ACTION_HAND_SLICES[side]] = target[ACTION_HAND_SLICES[side]]
+    else:
+        for side in HAND_VECTOR_ORDER:
+            if side in active:
+                action[ACTION_HAND_SLICES[side]] = start[ACTION_HAND_SLICES[side]]
     if not arms_enabled:
         return action
     for side in ALL_SIDES:
@@ -313,6 +319,7 @@ class StartupInitializer:
             alpha=alpha,
             active_sides=self.active_sides,
             arms_enabled=bool(self.arms_enabled),
+            hands_enabled=bool(self.hands_enabled),
         )
         if not bool(self.arms_enabled):
             return NormalizedAction(vector=action, metadata=_startup_action_metadata()), [], True
