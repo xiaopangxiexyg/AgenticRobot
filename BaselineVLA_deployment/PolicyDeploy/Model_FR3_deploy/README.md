@@ -113,13 +113,13 @@ Wrapper FR3 arm plus right hand:
 
 ```bash
 DEPLOY_MODE=move_frame \
-INIT_DATASET=/abs/path/to/dataset \
+INIT_DATASET=/home/user/zc/dex_inspire_teleop_new/datasets/2026-04-27_chips_single \
 INIT_EPISODE=3 \
 INIT_FRAME=120 \
 INIT_TIME_S=5.0 \
 ACTION_HZ=13 \
-RIGHT_HAND_IP="$RIGHT_HAND_IP" \
-FR3_HOST="$FR3_HOST" \
+RIGHT_HAND_IP="192.168.11.210" \
+FR3_HOST="192.168.20.172" \
 AUTO_START=1 \
 SEND_ACTIONS=1 \
 bash PolicyDeploy/Model_FR3_deploy/run_notactile_policy.sh
@@ -171,15 +171,15 @@ Wrapper FR3 arm plus right hand:
 
 ```bash
 DEPLOY_MODE=replay \
-DEBUG_REPLAY_DATASET=/abs/path/to/dataset \
+DEBUG_REPLAY_DATASET=/home/user/zc/dex_inspire_teleop_new/datasets/2026-04-27_chips_single \
 DEBUG_REPLAY_EPISODE=3 \
 DEBUG_REPLAY_START_INDEX=0 \
 DEBUG_REPLAY_CHUNK_SIZE=32 \
 INIT_TIME_S=5.0 \
 HZ=13 \
 MIN_ACTION_QUEUE=8 \
-RIGHT_HAND_IP="$RIGHT_HAND_IP" \
-FR3_HOST="$FR3_HOST" \
+RIGHT_HAND_IP="192.168.11.210" \
+FR3_HOST="192.168.20.172" \
 AUTO_START=1 \
 SEND_ACTIONS=1 \
 bash PolicyDeploy/Model_FR3_deploy/run_notactile_policy.sh

@@ -8,7 +8,14 @@ import numpy as np
 
 from dataset_source import DatasetObservationSource
 from image_transport import maybe_resize_payload_image
-from live_source import HardwareActionExecutor, LiveObservationSource, LiveSnapshot, add_live_args
+from live_source import (
+    HardwareActionExecutor,
+    LiveObservationSource,
+    LiveSnapshot,
+    add_live_args,
+    format_fr3_dataset_gt_debug,
+    format_fr3_policy_debug,
+)
 from paths import ensure_import_paths
 from profiles import DeploymentProfile
 from startup_replay import add_startup_replay_args, bind_selected_episode, choose_episode, run_startup_replay, wait_for_startup_key
@@ -142,6 +149,10 @@ def run_profile(profile: DeploymentProfile, argv: list[str] | None = None) -> in
     parser = argparse.ArgumentParser(description=f"Being-H-Tac client for {profile.data_config_name}.")
     add_common_args(parser, profile)
     args = parser.parse_args(argv)
+    if profile.data_config_name == "franka" and args.source == "dataset" and args.send_actions:
+        setattr(args, "debug_fr3_actions", True)
+    else:
+        setattr(args, "debug_fr3_actions", False)
 
     previous_result: dict[str, Any] | None = None
 
@@ -207,6 +218,7 @@ def _run_loop(
         else:
             payload = item
         dataset_row_index = payload.pop("__dataset_row_index", None)
+        dataset_gt_action = payload.pop("__dataset_gt_action", None)
         payload["language"] = args.instruction
         payload["inference_delay"] = int(args.inference_delay)
         payload["__client_send_ts"] = time.time()
@@ -231,6 +243,11 @@ def _run_loop(
             if dataset_row_index is not None:
                 request_label += f" dataset_row={dataset_row_index}"
             print(f"[Client] {request_label} ok | {action_summary(previous_result)} | {timing_summary(previous_result, round_trip_s)}")
+            if bool(getattr(args, "debug_fr3_actions", False)):
+                for line in format_fr3_policy_debug(previous_result):
+                    print(line)
+                for line in format_fr3_dataset_gt_debug(dataset_gt_action):
+                    print(line)
             if args.source == "live":
                 faults = source.consume_server_result(previous_result)
                 if faults:

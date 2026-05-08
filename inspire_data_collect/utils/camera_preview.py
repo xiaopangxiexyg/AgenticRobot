@@ -148,14 +148,15 @@ class CameraPreviewer:
             y += step
         return image
 
-    def update(self, camera_sources: Mapping[str, Any]) -> None:
+    def update(self, camera_sources: Mapping[str, Any]) -> int | None:
         if self._closed or not self.ensure_available():
-            return
+            return None
         any_window = False
         for camera_key, source in camera_sources.items():
             frame = None
             extra_status = None
             status = self._camera_status(source)
+            serial_text = status.get("serial_number") or status.get("serial") or ""
             last_error = status.get("last_error")
             stale = bool(last_error) and str(last_error).startswith("frame_timeout_stale")
             try:
@@ -172,12 +173,25 @@ class CameraPreviewer:
                 )
             else:
                 image = self._display_image(frame)
+                if serial_text:
+                    cv2 = self._require_cv2()
+                    cv2.putText(
+                        image,
+                        f"{camera_key} serial={serial_text}",
+                        (16, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (20, 240, 20),
+                        2,
+                        cv2.LINE_AA,
+                    )
             name = self._window_name(str(camera_key))
             self._ensure_window(name)
             self._require_cv2().imshow(name, image)
             any_window = True
         if any_window:
-            self._require_cv2().waitKey(1)
+            return int(self._require_cv2().waitKey(1))
+        return None
 
     def status_snapshot(self, camera_sources: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         return {

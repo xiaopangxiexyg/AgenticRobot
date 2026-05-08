@@ -130,10 +130,10 @@ python run_client_franka.py \
   --right-arm-ip "192.168.20.172" \
   --right-hand-ip "192.168.11.210" \
   --transport-image-size 224 \
-  --startup-init-steps 240
+  --startup-init-steps 48 \
+  --which-episode 106
 
 ```
-
 In this mode, observations still come from the dataset, but the returned actions
 are safety-filtered against current live RM65/InspireTac state before they are
 sent to hardware. By default dataset observations are read frame-by-frame
@@ -219,17 +219,18 @@ python run_client_franka.py \
   --host 127.0.0.1 \
   --source live \
   --camera-mode single \
-  --camera-serial 135122070754 \
+  --camera-serial 135122074814 \
   --active-sides right \
-  --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-arm-ip "192.168.20.172" \
   --enable-hands \
   --action-hz 12.0 \
-  --right-hand-ip "$RIGHT_HAND_IP" \
+  --right-hand-ip "192.168.11.210" \
   --hand-tactile-regions all \
   --auto-start \
   --transport-image-size 224 \
-  --max-fingertip-force 800 \
-  --send-actions
+  --max-fingertip-force 400 \
+  --send-actions \
+  --which-episode 110
 ```
 
 

@@ -38,6 +38,8 @@ class RealSenseRGBCameraConfig:
     restart_on_stale_timeout: bool = True
     restart_after_timeouts: int = 3
     restart_cooldown_sec: float = 0.5
+    start_retry_attempts: int = 8
+    start_retry_delay_sec: float = 0.5
     auto_exposure_priority: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -61,6 +63,10 @@ class RealSenseRGBCameraConfig:
             raise ValueError("restart_after_timeouts must be positive.")
         if float(self.restart_cooldown_sec) < 0.0:
             raise ValueError("restart_cooldown_sec must be >= 0.")
+        if int(self.start_retry_attempts) <= 0:
+            raise ValueError("start_retry_attempts must be positive.")
+        if float(self.start_retry_delay_sec) < 0.0:
+            raise ValueError("start_retry_delay_sec must be >= 0.")
         self.color_space = str(self.color_space).lower()
         if self.color_space not in {"rgb", "bgr"}:
             raise ValueError("color_space must be either 'rgb' or 'bgr'.")
@@ -82,6 +88,8 @@ class RealSenseRGBCameraConfig:
                     "restart_on_stale_timeout": bool(self.restart_on_stale_timeout),
                     "restart_after_timeouts": int(self.restart_after_timeouts),
                     "restart_cooldown_sec": float(self.restart_cooldown_sec),
+                    "start_retry_attempts": int(self.start_retry_attempts),
+                    "start_retry_delay_sec": float(self.start_retry_delay_sec),
                     "auto_exposure_priority": self.auto_exposure_priority,
                     "metadata": dict(self.metadata),
                 }
@@ -168,19 +176,50 @@ class RealSenseRGBSource:
         self._thread.start()
 
     def _start_pipeline(self, rs: Any) -> tuple[Any, Any]:
-        pipeline = rs.pipeline()
-        stream_config = rs.config()
-        stream_config.enable_device(self.config.serial)
-        stream_config.enable_stream(
-            rs.stream.color,
-            int(self.config.width),
-            int(self.config.height),
-            rs.format.bgr8,
-            int(self.config.fps),
+        last_error: RuntimeError | None = None
+        attempts = max(1, int(self.config.start_retry_attempts))
+        for attempt in range(1, attempts + 1):
+            pipeline = rs.pipeline()
+            stream_config = rs.config()
+            stream_config.enable_device(self.config.serial)
+            stream_config.enable_stream(
+                rs.stream.color,
+                int(self.config.width),
+                int(self.config.height),
+                rs.format.bgr8,
+                int(self.config.fps),
+            )
+            try:
+                profile = pipeline.start(stream_config)
+                self._configure_sensor_options(profile)
+                return pipeline, profile
+            except RuntimeError as exc:
+                last_error = exc
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                if not self._is_device_busy_error(str(exc)) or attempt >= attempts:
+                    raise
+                delay = float(self.config.start_retry_delay_sec)
+                with self._lock:
+                    self._last_runtime_error = str(exc)
+                    self._last_error = (
+                        f"pipeline_start_busy_retry:{attempt}/{attempts}: {exc}"
+                    )
+                if delay > 0.0:
+                    time.sleep(delay)
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _is_device_busy_error(message: str) -> bool:
+        lowered = str(message).lower()
+        return (
+            "device or resource busy" in lowered
+            or "errno=16" in lowered
+            or "vidioc_s_fmt" in lowered
         )
-        profile = pipeline.start(stream_config)
-        self._configure_sensor_options(profile)
-        return pipeline, profile
 
     def _configure_sensor_options(self, profile: Any) -> None:
         rs = _load_pyrealsense2()
@@ -234,6 +273,10 @@ class RealSenseRGBSource:
                 info[key] = device.get_info(info_name)
             except Exception:  # noqa: BLE001
                 info[key] = None
+        actual_serial = str(info.get("serial_number") or "").strip()
+        requested_serial = str(self.config.serial or "").strip()
+        info["requested_serial"] = requested_serial
+        info["serial_match"] = (actual_serial == requested_serial) if requested_serial else None
         return info
 
     @staticmethod

@@ -12,6 +12,7 @@ class DeploymentProfile:
     default_instruction: str
     required_arms: tuple[str, ...]
     required_hands: tuple[str, ...]
+    arm_backend: str = "rm65"
     supports_live_rm65: bool = True
 
 
@@ -23,6 +24,7 @@ FRANKA_PROFILE = DeploymentProfile(
     default_instruction="Pick and place the potato chips.",
     required_arms=("right",),
     required_hands=("right",),
+    arm_backend="fr3",
     supports_live_rm65=False,
 )
 
@@ -34,6 +36,8 @@ REALMAN20_PROFILE = DeploymentProfile(
     default_instruction="Sort the heavy and light objects.",
     required_arms=("right",),
     required_hands=("right",),
+    arm_backend="rm65",
+    supports_live_rm65=True,
 )
 
 REALMAN21_PROFILE = DeploymentProfile(
@@ -44,6 +48,8 @@ REALMAN21_PROFILE = DeploymentProfile(
     default_instruction="Run the Realman right-arm dual-hand task.",
     required_arms=("right",),
     required_hands=("left", "right"),
+    arm_backend="rm65",
+    supports_live_rm65=True,
 )
 
 REALMAN22_PROFILE = DeploymentProfile(
@@ -54,6 +60,8 @@ REALMAN22_PROFILE = DeploymentProfile(
     default_instruction="Fold the large brown paper.",
     required_arms=("left", "right"),
     required_hands=("left", "right"),
+    arm_backend="rm65",
+    supports_live_rm65=True,
 )
 
 
@@ -63,4 +71,3 @@ PROFILES = {
     "realman21": REALMAN21_PROFILE,
     "realman22": REALMAN22_PROFILE,
 }
-
