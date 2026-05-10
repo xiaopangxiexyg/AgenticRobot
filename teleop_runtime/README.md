@@ -584,7 +584,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20 \
-  --load-profile /home/user/zc/dex_inspire_teleop/teleop_records/calibration_profiles/20260418_194008_vive_rm65_virtual_desk.json \
+  --load-profile /home/ai/Desktop/DexTeleop/teleop_records/calibration_profiles/20260506_122501_vive_rm65_virtual_desk.json \
   --hz 50 \
   --arm-max-angvel 1.2,1.2,1.2,1.8,1.8,1.8 \
   --left-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
@@ -592,14 +592,14 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
   --hand-telemetry-hz 10 \
-  --hand-tactile-regions thumb_1,index_1,middle_1,ring_1,little_1,palm \
+  --hand-tactile-regions all \
   --status-sec 1
 ```
 
-如果需要直接读取全区 tactile，可以简写成：
+`--hand-tactile-regions` 默认就是 `all`，所以上面这一行也可以省略；保留它可以让采集命令更显式。如果只是排查控制链路、需要临时关闭触觉读取：
 
 ```bash
---hand-tactile-regions all
+--hand-tactile-regions ""
 ```
 
 如果希望在开始前先验证当前真机起始关节和某份对齐状态是否足够接近：
@@ -619,15 +619,15 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 - 默认手部映射顺序仍是 `5,4,3,2,0,1`，对应 reader `q6=[thumb_yaw, thumb_flex, index, middle, ring, pinky] -> InspireTac q6=[pinky, ring, middle, index, thumb_yaw, thumb_flex]`
 - 如果只给 `--left/right-hand-port`，则只做 hand preview，不会连接真手
 - 如果只给 `--left/right-hand-ip`，则只读手部遥测并渲染当前真手状态，不会有 hand teleop 输入
-- `--hand-telemetry-hz` 控制每只手后台 telemetry 线程的轮询频率；这个线程会读取 `joint_pos`，如果 `--hand-tactile-regions` 非空，还会顺带读取对应触觉区块
-- `--hand-tactile-regions` 为空时，默认只做手部关节遥测，不读 tactile，延迟最低；一旦非空，就会开启 tactile 读取；传 `all` 等价于读取全部 17 个区域
+- `--hand-telemetry-hz` 控制每只手后台 telemetry 线程的轮询频率；这个线程会读取 `joint_pos`，默认还会读取全 17 区域 tactile
+- `--hand-tactile-regions` 默认是 `all`，等价于读取全部 17 个区域；传空字符串 `--hand-tactile-regions ""` 才会只做手部关节遥测、不读 tactile
 - `--inspire-hand-max-force N` 控制启动时写入 InspireTac 的每指 force，默认 `800`；旧参数 `--max-fingertip-force` 仍可用，`--max-force` 是简写
 - 目前每只手只保留一个 Modbus 连接，所以同一只手的 `set_joint_pos`、`read_joint_pos`、`read_tac_data` 会在该手内部串行，但左右手之间仍然并行
 - 建议的频率排查顺序是：
-  1. 先不加 `--hand-tactile-regions`，确认 arm + hand command 的基线频率
-  2. 再加少量区域，例如 `thumb_1,index_1,middle_1,ring_1,little_1,palm`，并把 `--hand-telemetry-hz` 先设为 `10`
-  3. 如果频率和跟手性仍稳定，再逐步升到 `15` 或 `20`
-  4. 不建议一开始就在 live teleop 中读全 17 个区域并把 `--hand-telemetry-hz` 直接拉到 `50`；那更适合作为压力测试，而不是默认工作配置
+  1. 默认采集使用 `--hand-tactile-regions all`，先把 `--hand-telemetry-hz` 设为 `10` 确认全区 tactile 链路稳定
+  2. 如果频率和跟手性仍稳定，再逐步升到 `15` 或 `20`
+  3. 只有在隔离排查控制链路延迟时，才临时传 `--hand-tactile-regions ""` 关闭 tactile
+  4. 不建议把 `--hand-telemetry-hz` 直接拉到 `50`；那更适合作为压力测试，而不是默认工作配置
 - 如果只是想单独看手部 teleop + tactile 对频率的影响，优先用 `teleop_runtime.debug.run_hand_q6_inspire_real_teleop` 做隔离测试；这样更容易把 arm 链路和 hand/tactile 链路分开看
 - 手部控制链是附加子链：手部输入掉线或无效不会阻断 arm teleop；arm 的 `FROZEN -> RECOVERING` 逻辑保持原样
 - `--swap-arm-sides` 仍然只影响 arm 逻辑侧映射；`--teleop-hardware-ip` / `--teleop-hardware-port` 继续保留但当前仍未启用

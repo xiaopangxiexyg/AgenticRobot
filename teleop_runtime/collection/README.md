@@ -215,6 +215,171 @@ python -m teleop_runtime.collection.run_collect \
 - `q`
   退出 collector。如果退出时仍有 active recording，会先保存当前 episode。
 
+### 6.1 预录轨迹回放采集
+
+如果已经有一条 LeRobot 风格数据集或单个 parquet，可以让 collector 不再读取 VIVE 轨迹，而是按预录 `action` 自动执行，并继续使用当前 RealSense/telemetry writer 采集新的实时观测。
+
+示例：
+
+```bash
+python -m teleop_runtime.collection.run_collect \
+  --dataset-root /path/to/new_datasets/replay_collect \
+  --task-name replay_collect_demo \
+  --active-sides both \
+  --left-arm-ip 192.168.101.21 \
+  --right-arm-ip 192.168.1.20 \
+  --left-hand-ip 192.168.12.210 \
+  --right-hand-ip 192.168.11.210 \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --replay-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard \
+  --replay-group a:0-8 \
+  --replay-group d:9-17 \
+  --replay-episode 0 \
+  --replay-init-time 1.0 \
+  --replay-randomize \
+  --replay-random-xyz-m 0.01 \
+  --replay-random-rot-deg 2.0
+```
+
+```bash
+python -m teleop_runtime.collection.run_collect \
+  --dataset-root /path/to/new_datasets/replay_collect \
+  --task-name replay_collect_demo_right \
+  --active-sides both \
+  --right-arm-ip 192.168.1.20 \
+  --right-hand-ip 192.168.11.210 \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --replay-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard \
+  --replay-group a:0-8 \
+  --replay-group d:9-17 \
+  --replay-init-time 1.0 \
+  --replay-randomize \
+  --replay-random-xyz-m 0.01 \
+  --replay-random-rot-deg 2.0
+```
+
+
+默认按键分组：
+
+- `a`: 轮转执行数据集中全部 source episode 的完整轨迹。
+- `x`: 中止当前自动轨迹并丢弃本 episode。
+
+也可以手动定义更多组：
+
+```bash
+--replay-group a:0-49 \
+--replay-group s:50-99 \
+--replay-group d:100-149
+```
+
+每个组绑定源数据集里的 episode index 范围，并完整执行被抽到的 source episode：
+
+```bash
+--replay-group a:0-49 \
+--replay-group d:50-99
+```
+
+这里 `a:0-49` 表示：
+
+- 按 `a` 启动。
+- 只在源数据集 `episode_index=0..49` 之间 round-robin 轮转。
+- 每次抽到某个 source episode 后，从该 episode 第一帧执行到最后一帧。
+
+episode 范围支持：
+
+- `all` 或省略：使用可用源 episode 全部范围。
+- `x-y`：闭区间，例如 `10-29`。
+- `x..y`：同样是闭区间。
+- `x,y,z`：显式 episode 列表。
+
+回放模式行为：
+
+- 按轨迹组键后自动开始一个新 episode。
+- 如果使用 `--replay-dataset`，默认会在该数据集的全部 source episode 间按 round-robin 轮转，尽量保证每条轨迹被均等抽到；不追求严格随机。
+- 如果只想固定使用一条源轨迹，可以加 `--replay-single-episode --replay-episode N`。
+- 先用 `--replay-init-time`，默认 `1.0s`，从当前硬件状态缓慢插值到该轨迹组第一帧 action；这段也会写入新 episode。
+- 初始移动完成后按源轨迹推断的 action Hz 逐帧发送动作。
+- 轨迹段结束后自动保存 episode。
+- 相机仍然实时采集；新 dataset 保存的是当前执行过程中的实时相机帧，不是源数据集的视频。
+
+轨迹随机化：
+
+- `--replay-randomize` 只随机 arm pose，不随机手部关节。
+- 默认 `--replay-random-mode both`，会叠加 episode 级固定偏移和低频平滑扰动；不会逐帧加白噪声。
+- `--replay-random-xyz-m` 和 `--replay-random-rot-deg` 控制 episode 级最大偏移，建议先从 `0.005~0.01m` 和 `1~2deg` 开始。
+- smooth noise 默认使用一半幅度；也可以显式设置 `--replay-random-noise-xyz-m` 和 `--replay-random-noise-rot-deg`。
+- `--replay-random-seed N` 可复现随机化；默认负数使用系统随机数。
+- 随机化后的第一帧会作为 `--replay-init-time` 的目标，因此 init 段和 replay 段不会在开始处跳变。
+- 每条 episode metadata 会写入随机种子、幅度和 episode 级偏移；每帧 sample metadata 会写入当前随机偏移。
+
+init_episode 预备模式：
+
+如果每次正式录制 A/D 前，需要先无录制地执行一条固定准备轨迹 `T`，可以加 `--replay-init-episode`。
+
+`T` 可以来自主 `--replay-dataset`，也可以用 `--replay-init-dataset` 或 `--replay-init-parquet` 单独指定。这样 A/D 正式采集轨迹和 H 预备轨迹可以来自不同数据集。
+
+```bash
+python -m teleop_runtime.collection.run_collect \
+  --dataset-root /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard_extend \
+  --task-name replay_collect_demo_right \
+  --active-sides right \
+  --right-arm-ip 192.168.1.20 \
+  --right-hand-ip 192.168.11.210 \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --replay-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard \
+  --replay-init-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_fixed_flip_hand \
+  --replay-init-episode 0:0:end \
+  --replay-init-episode-move-time 3.0 \
+  --replay-init-episode-to-record-time 1.0 \
+  --replay-group a:0-8 \
+  --replay-group d:9-17 \
+  --replay-randomize \
+  --replay-random-mode both \
+  --replay-random-xyz-m 0.03 \
+  --replay-random-rot-deg 3.0
+```
+
+按键流程：
+
+1. 按 `h`：机械臂按照 `T` 第一帧的 arm qpos 归位，保证和源轨迹初始关节状态严格一致；同时发送 `T` 第一帧对应的手部目标位置。这段不录制。
+2. 再按 `h`：按 `T` 的原始 action Hz 逐帧执行完整 `T`，不录制；arm 和 hand 都直接按 `T` 的原始轨迹发送。
+3. 按 `a` 或 `d`：先用 `--replay-init-episode-to-record-time`，默认 `1s`，无录制移动到所选 A/D 轨迹第一帧；这一步会把 arm 对齐到首帧，同时发送对应 hand 目标。
+4. 然后自动开始真正录制，并按所选 A/D source episode 的原始 action Hz 执行 replay + 随机化逻辑。
+5. A/D 轨迹结束后自动停止录制并保存。
+6. 下一轮再次从按 `h` 开始。
+
+`--replay-init-episode` 格式：
+
+- `N`：使用源数据集 `episode_index=N` 的完整轨迹作为 `T`。
+- `N:start:end`：只使用该 episode 的 `[start, end)` 帧作为 `T`。注意：这是 `init_episode` 自己的帧切片语法，和 `--replay-group` 的 episode index 分组语法不同。
+
+init 轨迹来源：
+
+- 不写 `--replay-init-dataset/--replay-init-parquet`：`T` 默认从主 `--replay-dataset` 或 `--replay-parquet` 读取。
+- `--replay-init-dataset /path/to/init_dataset --replay-init-episode 3:20:180`：从指定 init 数据集读取 `episode_index=3` 的第 `20..179` 帧作为 `T`。
+- `--replay-init-parquet /path/to/episode_000003.parquet --replay-init-episode 0:20:180`：从指定 parquet 读取指定帧段。单 parquet 模式下 episode index 主要用于 metadata 和解析路径兼容，通常写 `0` 即可。
+
+时间参数含义：
+
+- `--replay-init-episode-move-time`
+  历史上用于第一次按 `h` 的末端插值时间。当前第一次 `h` 已改为 qpos 严格归位，不再使用末端插值；实际速度主要由 `--replay-arm-max-angvel` 和 RM65 后端跟踪能力决定。这段不录制，也不消耗 `T` 的帧。
+- `--replay-init-episode-to-record-time`
+  只作用于按 `a/d` 后、正式录制前。它控制机械臂从执行完 `T` 后的位置，无录制移动到所选 A/D 轨迹第一帧 arm pose 的时间；这段会持续发送 A/D 第一帧 hand action，但不会写入新 episode。移动完成后才开始 writer episode。
+
+qpos 数据要求：
+
+- 第一次 `h` 需要源 init episode parquet 中包含 `action.replay.<side>_arm_joint_target`，例如 `action.replay.right_arm_joint_target`。该列记录采集源轨迹时实际发送给 RM65 的 6 维关节目标，用于严格复刻 `T` 的初始关节状态。
+- 这个 qpos 要求只针对 `--replay-init-episode` 的第一次 `h`。普通 A/D replay group 如果没有这些列，仍会按 arm pose replay 执行。
+
+固定轨迹执行速度：
+
+- 第二次 `h` 执行 `T` 时，直接使用 `T` 的原始 action Hz，不受 `--replay-init-episode-move-time` 影响。
+- A/D 正式 replay 轨迹执行时，也直接使用被抽到 source episode 的原始 action Hz。
+- `--replay-max-arm-xyz-step-m` 和 `--replay-max-arm-rot-step-deg` 不会限制这些固定轨迹执行段；它们只保留给非固定轨迹安全调试场景。
+- 固定轨迹执行期间，RM65 backend 会临时使用 `--replay-arm-max-angvel`（默认约 `3/3/3/4/4/4 rad/s`）提高跟踪速度，结束后恢复普通 teleop/return-home 的配置。
+
+默认 `--replay-init-episode-require-ready` 会要求完成 `H -> H` 后才能按 A/D 开始正式录制；如果调试时想跳过，可以加 `--no-replay-init-episode-require-ready`。
+
 启动顺序：
 
 1. 启动 sources、rig、writer pool
