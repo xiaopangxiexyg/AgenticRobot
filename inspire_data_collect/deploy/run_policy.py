@@ -342,10 +342,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--vis_cam", "--vis-cam", dest="vis_cam", action="store_true")
     parser.add_argument("--vis-cam-key", "--vis-camera-key", type=str, default="")
+    parser.add_argument(
+        "--vis-cam-window-mode",
+        choices=["resizable", "autosize"],
+        default="resizable",
+    )
+    parser.add_argument("--vis-cam-render-scale", type=float, default=2.0)
 
     parser.add_argument("--visualize-tactile", action="store_true")
     parser.add_argument("--tactile-vis-value-scale", type=float, default=0.02)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
+    parser.add_argument("--tactile-vis-render-scale", type=float, default=2.0)
     parser.add_argument(
         "--tactile-vis-window-mode",
         choices=["resizable", "autosize"],
@@ -451,8 +458,12 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--camera-fps must be positive.")
         if int(args.camera_keep_last) <= 0:
             raise ValueError("--camera-keep-last must be positive.")
+        if float(args.vis_cam_render_scale) <= 0.0:
+            raise ValueError("--vis-cam-render-scale must be positive.")
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
+    if float(args.tactile_vis_render_scale) <= 0.0:
+        raise ValueError("--tactile-vis-render-scale must be positive.")
     return active_sides
 
 
@@ -829,7 +840,12 @@ def main(argv: list[str] | None = None) -> int:
         else {}
     )
     camera_previewer = (
-        CameraPreviewer(CameraPreviewConfig())
+        CameraPreviewer(
+            CameraPreviewConfig(
+                resizable_window=str(args.vis_cam_window_mode) == "resizable",
+                render_scale=float(args.vis_cam_render_scale),
+            )
+        )
         if bool(args.vis_cam) and preview_camera_sources
         else None
     )
@@ -840,6 +856,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
                 value_scale=float(args.tactile_vis_value_scale),
                 resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                render_scale=float(args.tactile_vis_render_scale),
             )
         )
         if args.visualize_tactile

@@ -357,6 +357,25 @@ def _finite_6(value: Any) -> np.ndarray | None:
     return arr.astype(np.float32, copy=True)
 
 
+def _fixed_hand_from_args(args: argparse.Namespace) -> np.ndarray | None:
+    return _finite_6(getattr(args, "fixed_hand", None))
+
+
+def _apply_fixed_hand_targets(
+    hand_targets: Mapping[str, np.ndarray],
+    *,
+    args: argparse.Namespace,
+    profile: DeploymentProfile,
+) -> dict[str, np.ndarray]:
+    fixed_hand = _fixed_hand_from_args(args)
+    if fixed_hand is None or not _is_fr3_profile(profile):
+        return {str(side): np.asarray(value, dtype=np.float32).reshape(6) for side, value in hand_targets.items()}
+    sides = tuple(str(side) for side in profile.required_hands)
+    if not sides:
+        return {str(side): np.asarray(value, dtype=np.float32).reshape(6) for side, value in hand_targets.items()}
+    return {side: fixed_hand.copy() for side in sides}
+
+
 def _finite_vector(value: Any, width: int) -> np.ndarray | None:
     if value is None:
         return None
@@ -554,10 +573,14 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
         return 0
     if mode == "i":
         path, arm_targets, hand_targets = load_startup_direct_targets(args, profile)
+        hand_targets = _apply_fixed_hand_targets(hand_targets, args=args, profile=profile)
         print(
             f"[Startup] selected {path} | mode=first action direct init | "
             f"arms={sorted(arm_targets)} hands={sorted(hand_targets)}"
         )
+        fixed_hand = _fixed_hand_from_args(args)
+        if fixed_hand is not None and _is_fr3_profile(profile):
+            print(f"[Startup] fixed hand override active: {_format_target_vector(fixed_hand)}")
         executor_cm = HardwareActionExecutor(profile, args)
         executor_cm.start_dispatcher = False
         with executor_cm as executor:
@@ -569,7 +592,11 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
             for step in range(1, steps + 1):
                 alpha = _smoothstep(float(step) / float(steps))
                 arm_waypoint = _lerp_targets(start_arms, arm_targets, alpha)
-                hand_waypoint = _lerp_targets(start_hands, hand_targets, alpha)
+                hand_waypoint = (
+                    {side: value.copy() for side, value in hand_targets.items()}
+                    if fixed_hand is not None and _is_fr3_profile(profile)
+                    else _lerp_targets(start_hands, hand_targets, alpha)
+                )
                 statuses = executor.send_direct_joint_targets(arm_qpos=arm_waypoint, hand_qpos=hand_waypoint)
                 if step == 1 or step == steps:
                     print(f"[Startup] direct init status: {';'.join(statuses[:8])}")

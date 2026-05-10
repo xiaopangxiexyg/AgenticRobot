@@ -240,7 +240,7 @@ PY
 先用少量区域低频读取，确认链路正常后再在正式采集中用 `--hand-tactile-regions all`。命令行也支持别名 `--tactile-regions` 和 `--tactile-region`。
 
 ```bash
-export RIGHT_HAND_IP=192.168.12.210
+export RIGHT_HAND_IP=192.168.11.210
 
 python - <<'PY'
 import os
@@ -327,7 +327,7 @@ PY
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
 
-正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小；如果 OpenCV 后端限制窗口不能大于图像尺寸，默认 `--vis-cam-render-scale 2.0` 会把预览 backing image 放大到 2 倍，不够时可调到 `3.0` 或更高。如果希望窗口严格等于图像尺寸，传 `--vis-cam-window-mode autosize`。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 
@@ -495,7 +495,7 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name right_hand_grasp \
+  --task-name right_hand_grasp_test \
   --active-sides right \
   --right-hand-port "$RIGHT_HAND_PORT" \
   --right-hand-ip "$RIGHT_HAND_IP" \
@@ -507,11 +507,12 @@ python -m inspire_data_collect \
 ```bash
 --tactile-vis-size 640
 --tactile-vis-value-scale 0.02
+--tactile-vis-render-scale 2.0
 --tactile-vis-window-mode resizable
 --tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm
 ```
 
-默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
+默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口，`--tactile-vis-render-scale 2.0` 会把触觉 backing canvas 放大到 2 倍，避免部分 OpenCV 后端限制窗口不能大于原始图像；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
 
 按键：`z` 开始 episode，`c` 保存当前 episode，`d` 丢弃当前 episode，`q` 退出。加 `--record-auto-start` 可启动后直接采集。
 
@@ -542,20 +543,30 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name right_hand_fr3_exo \
+  --task-name beer_bottle_open \
   --active-sides right \
-  --right-hand-port /dev/ttyACM0 \
-  --right-hand-ip 192.168.12.210 \
+  --right-hand-port "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00" \
+  --right-hand-ip 192.168.11.210 \
   --enable-arm \
   --arm-side right \
   --exo-port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0 \
   --exo-baudrate 57600 \
   --fr3-host 192.168.20.172 \
   --fr3-port 5558 \
-  --fr3-state-poll-hz 20 \
+  --fr3-state-poll-hz 30 \
   --arm-startup-align-duration-s 5.0 \
-  --arm-shrink-deg 10
+  --arm-shrink-deg 10 \
+  --camera-mode multi \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --vis-cam-window-mode resizable \
+  --tactile-vis-window-mode resizable \
+  --record-hand-only \
+  --record-hand-fixed-pos "0.096,0.057,0.022,0.056,0.495,0.0"
 ```
+
+如果只想采集 Inspire 手的 action/state/tactile，但不向 Inspire 手下发遥操作动作，在采集命令中追加 `--record-hand-only`。该模式仍会读取遥操作手串口、计算并记录 `action.<side>_hand.joint_target`，也会连接 Inspire 手读取关节状态和触觉；主循环里的手部 `set_joint_pos` 下发会关闭。作为采集间复位，程序会在脚本启动后、以及每次 episode 成功保存后，向 active hands 下发一次固定 q6，默认 `--record-hand-fixed-pos "0.096,0.057,0.022,0.056,0.495,0.0"`，可按需要覆盖。FR3 手臂、相机和其他设备流程保持不变。
 
 外骨骼到 FR3 是直接关节映射，程序刚启动时 FR3 当前关节和外骨骼映射目标通常不一致。默认启用启动对齐：FR3 后端第一次收到 arm 指令时，会以 FR3 当前 `qpos` 为起点，在 `--arm-startup-align-duration-s` 秒内线性插值到外骨骼当前目标；最大关节差低于 `--arm-startup-align-threshold-rad` 时会跳过插值。启动对齐期间操作者应尽量保持外骨骼不动，等插值结束后再进入正常随动。确认二者已经物理对齐且需要完全直接随动时，才使用 `--disable-arm-startup-align`。
 
@@ -564,13 +575,14 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name hand_camera \
+  --task-name hand_camera_test \
   --active-sides right\
   --right-hand-port "$RIGHT_HAND_PORT" \
   --right-hand-ip 192.168.11.210 \
   --camera-mode single \
   --camera-config inspire_data_collect/realsense.json \
-  --vis_cam
+  --vis_cam \
+  --visualize-tactile
 ```
 
 单 RealSense 相机，直接用序列号配置：

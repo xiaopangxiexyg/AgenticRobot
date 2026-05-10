@@ -820,6 +820,58 @@ def _send_commands(
             hand_backends[side].send_command(hand_command)
 
 
+def _fixed_hand_vector(args: argparse.Namespace) -> np.ndarray | None:
+    value = getattr(args, "fixed_hand", None)
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if arr.shape != (6,) or not np.all(np.isfinite(arr)):
+        raise ValueError(f"--fixed-hand must be a finite 6-D vector, got shape {arr.shape}.")
+    return arr.astype(np.float32, copy=True)
+
+
+def _override_fr3_hand_commands(
+    deployment_action: Any,
+    *,
+    active_sides: tuple[str, ...],
+    fixed_hand: np.ndarray,
+) -> Any:
+    commands = dict(deployment_action.commands)
+    vector = np.asarray(deployment_action.vector, dtype=np.float32).reshape(-1).copy()
+    timestamp = time.time()
+    overridden_sides = []
+    for side, target_slice in (("right", slice(7, 13)), ("left", slice(13, 19))):
+        if side not in set(active_sides):
+            continue
+        name = f"{side}_hand"
+        existing = commands.get(name)
+        overridden_sides.append(side)
+        if vector.shape[0] >= target_slice.stop:
+            vector[target_slice] = fixed_hand
+        metadata = {} if getattr(existing, "metadata", None) is None else dict(existing.metadata)
+        metadata["fixed_hand_override"] = True
+        if existing is not None:
+            metadata["fixed_hand_raw_policy_action"] = np.asarray(existing.value, dtype=np.float32).copy()
+        commands[name] = FR3EffectorCommand(
+            effector_name=name,
+            side=side,
+            value=fixed_hand.copy(),
+            timestamp=timestamp,
+            metadata=metadata,
+        )
+
+    if not overridden_sides:
+        return deployment_action
+    metadata = dict(getattr(deployment_action, "metadata", {}) or {})
+    metadata["fixed_hand_override"] = {side: fixed_hand.copy() for side in overridden_sides}
+    return type(deployment_action)(
+        vector=vector,
+        commands=commands,
+        faults=list(getattr(deployment_action, "faults", [])),
+        metadata=metadata,
+    )
+
+
 class TimedActionDispatcher:
     """Consume model action chunks at a fixed robot-control frequency."""
 
@@ -853,6 +905,7 @@ class TimedActionDispatcher:
         self.policy_name = str(policy_name)
         self.send_actions = bool(send_actions)
         self.backend_kind = str(backend_kind)
+        self.fixed_hand = _fixed_hand_vector(args) if self.backend_kind == "fr3" else None
         self.action_hz = max(1e-6, float(getattr(args, "action_hz", 12.0)))
         self.queue_policy = str(getattr(args, "action_queue_policy", "replace"))
         self.underrun_log_sec = max(0.0, float(getattr(args, "action_underrun_log_sec", 2.0)))
@@ -867,6 +920,7 @@ class TimedActionDispatcher:
         self._started_at = 0.0
         self._debug_submitted_chunks = 0
         self._debug_sent_actions = 0
+        self._policy_request_in_flight = False
 
     def _debug_enabled(self) -> bool:
         return bool(getattr(self.args, "debug_fr3_actions", False)) and self.backend_kind == "fr3"
@@ -957,6 +1011,14 @@ class TimedActionDispatcher:
             status.append(f"discarded_old={replaced}")
         return status
 
+    def set_policy_request_in_flight(self, in_flight: bool) -> None:
+        with self._lock:
+            self._policy_request_in_flight = bool(in_flight)
+
+    def _is_policy_request_in_flight(self) -> bool:
+        with self._lock:
+            return bool(self._policy_request_in_flight)
+
     def _pop_action(self) -> Any | None:
         with self._lock:
             if not self._queue:
@@ -1031,6 +1093,12 @@ class TimedActionDispatcher:
                         observation,
                         policy_name=self.policy_name,
                     )
+                if self.fixed_hand is not None:
+                    deployment_action = _override_fr3_hand_commands(
+                        deployment_action,
+                        active_sides=self.active_sides,
+                        fixed_hand=self.fixed_hand,
+                    )
                 if self.send_actions:
                     _send_commands(
                         deployment_action.commands,
@@ -1094,6 +1162,8 @@ class TimedActionDispatcher:
 
     def _handle_underrun(self) -> None:
         self._underrun_count += 1
+        if self._is_policy_request_in_flight():
+            return
         if self.underrun_log_sec <= 0.0:
             return
         now = time.monotonic()
@@ -1648,6 +1718,9 @@ class HardwareActionExecutor:
 
     def consume_server_result(self, result: Mapping[str, Any]) -> list[str]:
         return self.dispatcher.submit_result(result)
+
+    def set_policy_request_in_flight(self, in_flight: bool) -> None:
+        self.dispatcher.set_policy_request_in_flight(in_flight)
 
     def send_direct_joint_targets(
         self,

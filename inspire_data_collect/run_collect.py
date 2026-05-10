@@ -99,6 +99,7 @@ else:
 
 DEFAULT_CAMERA_CONFIG_PATH = Path(__file__).resolve().parent / "realsense.json"
 DEFAULT_DATASET_ROOT = default_dataset_root()
+DEFAULT_RECORD_HAND_FIXED_POS = (0.096, 0.057, 0.022, 0.056, 0.495, 0.0)
 
 
 def parse_joint_order(text: str) -> tuple[int, ...]:
@@ -112,6 +113,19 @@ def parse_joint_order(text: str) -> tuple[int, ...]:
     if sorted(order) != list(range(HAND_DOF)):
         raise argparse.ArgumentTypeError("joint order must be a permutation of 0,1,2,3,4,5")
     return order
+
+
+def parse_hand_q6(text: str) -> tuple[float, ...]:
+    values = [item.strip() for item in str(text).replace("[", "").replace("]", "").split(",") if item.strip()]
+    if len(values) != HAND_DOF:
+        raise argparse.ArgumentTypeError("hand q6 must contain exactly 6 comma-separated numbers")
+    try:
+        q6 = tuple(float(item) for item in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("hand q6 values must be numbers") from exc
+    if any(value < 0.0 or value > 1.0 for value in q6):
+        raise argparse.ArgumentTypeError("hand q6 values must be in [0, 1]")
+    return q6
 
 
 class NonBlockingKeyboard:
@@ -263,6 +277,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--show-hand-raw-lines", action="store_true")
     parser.add_argument("--allow-hand-connect-failure", action="store_true")
+    parser.add_argument(
+        "--record-hand-only",
+        action="store_true",
+        help="Record Inspire hand action/state/tactile without sending hand commands.",
+    )
+    parser.add_argument(
+        "--record-hand-fixed-pos",
+        type=parse_hand_q6,
+        default=DEFAULT_RECORD_HAND_FIXED_POS,
+        help=(
+            "Fixed Inspire hand q6 applied at startup and after saved episodes in "
+            "--record-hand-only mode."
+        ),
+    )
 
     parser.add_argument(
         "--hand-joint-order",
@@ -372,6 +400,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "Empty selects 'front' if present, otherwise the first configured camera."
         ),
     )
+    parser.add_argument(
+        "--vis-cam-window-mode",
+        choices=["resizable", "autosize"],
+        default="resizable",
+        help="'resizable' lets the camera preview window be resized by dragging.",
+    )
+    parser.add_argument(
+        "--vis-cam-render-scale",
+        type=float,
+        default=2.0,
+        help="Upscale the camera preview backing image in resizable mode.",
+    )
 
     parser.add_argument("--writer-workers", type=int, default=2)
     parser.add_argument("--writer-queue-size", type=int, default=256)
@@ -386,6 +426,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--visualize-tactile", action="store_true")
     parser.add_argument("--tactile-vis-value-scale", type=float, default=0.02)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
+    parser.add_argument(
+        "--tactile-vis-render-scale",
+        type=float,
+        default=2.0,
+        help="Upscale the tactile preview backing image in resizable mode.",
+    )
     parser.add_argument(
         "--tactile-vis-window-mode",
         choices=["resizable", "autosize"],
@@ -445,8 +491,12 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--camera-keep-last must be positive.")
         if float(args.camera_stale_after_sec) <= 0.0:
             raise ValueError("--camera-stale-after-sec must be positive.")
+        if float(args.vis_cam_render_scale) <= 0.0:
+            raise ValueError("--vis-cam-render-scale must be positive.")
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
+    if float(args.tactile_vis_render_scale) <= 0.0:
+        raise ValueError("--tactile-vis-render-scale must be positive.")
     for side in active_sides:
         if not getattr(args, f"{side}_hand_port"):
             raise ValueError(f"--{side}-hand-port is required for active side '{side}'.")
@@ -496,6 +546,7 @@ def build_components(
                 side=side,
                 effector_name=effector_name,
                 connect_hardware=bool(hand_ip),
+                send_commands=not bool(args.record_hand_only),
                 max_fingertip_force=int(args.max_fingertip_force),
                 send_threshold=float(args.hand_send_threshold),
                 enable_telemetry=bool(hand_ip),
@@ -603,6 +654,24 @@ def arm_state_snapshot(backend: FR3ArmBackend | None) -> dict[str, Any]:
     if backend is None:
         return {}
     return backend.get_state()
+
+
+def apply_record_hand_fixed_pos(
+    backends: dict[str, InspireTacHandBackend],
+    fixed_pos: tuple[float, ...],
+    *,
+    reason: str,
+) -> None:
+    target = tuple(float(value) for value in fixed_pos)
+    for side, backend in backends.items():
+        before_error = backend.get_state().get("telemetry_error")
+        backend.send_fixed_joint_pos(target)
+        after_state = backend.get_state()
+        after_error = after_state.get("telemetry_error")
+        if after_error and after_error != before_error:
+            print(f"[Hand] fixed pos {reason} failed for {side}: {after_error}")
+        elif after_state.get("last_sent_command_timestamp") is not None:
+            print(f"[Hand] fixed pos {reason} applied for {side}: {list(target)}")
 
 
 def collect_faults(
@@ -740,7 +809,12 @@ def main(argv: list[str] | None = None) -> int:
         else {}
     )
     camera_previewer = (
-        CameraPreviewer(CameraPreviewConfig())
+        CameraPreviewer(
+            CameraPreviewConfig(
+                resizable_window=str(args.vis_cam_window_mode) == "resizable",
+                render_scale=float(args.vis_cam_render_scale),
+            )
+        )
         if bool(args.vis_cam) and preview_camera_sources
         else None
     )
@@ -785,6 +859,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
                 value_scale=float(args.tactile_vis_value_scale),
                 resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                render_scale=float(args.tactile_vis_render_scale),
             )
         )
         if args.visualize_tactile
@@ -818,11 +893,16 @@ def main(argv: list[str] | None = None) -> int:
             "exo_hand_calibration": bool(args.exo_hand_calibration),
             "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
             "tactile_regions": list(parse_tactile_regions(args.hand_tactile_regions)),
+            "record_hand_fixed_pos": list(args.record_hand_fixed_pos),
             "camera_mode": str(args.camera_mode),
             "camera_keys": sorted(camera_sources),
             "vis_cam": bool(args.vis_cam),
             "vis_camera_keys": sorted(preview_camera_sources),
+            "vis_cam_window_mode": str(args.vis_cam_window_mode),
+            "vis_cam_render_scale": float(args.vis_cam_render_scale),
+            "tactile_vis_render_scale": float(args.tactile_vis_render_scale),
             "silent": bool(args.silent),
+            "record_hand_only": bool(args.record_hand_only),
             "camera_config_path": None
             if args.camera_mode == "none" or args.camera_serial
             else str(args.camera_config),
@@ -871,6 +951,12 @@ def main(argv: list[str] | None = None) -> int:
                 writer_pool.submit(job)
             writer_pool.join()
             print(f"  已保存片段 Episode saved {episode_index}")
+            if bool(args.record_hand_only):
+                apply_record_hand_fixed_pos(
+                    backends,
+                    tuple(args.record_hand_fixed_pos),
+                    reason="after_save",
+                )
         else:
             writer.discard_episode(episode_index)
             print(f"  丢弃片段 Discarding episode {episode_index}")
@@ -907,6 +993,12 @@ def main(argv: list[str] | None = None) -> int:
             backend.start()
             if not backend.is_ready() and not args.allow_hand_connect_failure:
                 raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
+        if bool(args.record_hand_only):
+            apply_record_hand_fixed_pos(
+                backends,
+                tuple(args.record_hand_fixed_pos),
+                reason="startup",
+            )
         if arm_backend is not None:
             arm_backend.start()
             if not arm_backend.is_ready():
@@ -931,6 +1023,11 @@ def main(argv: list[str] | None = None) -> int:
             writer.write_device_config("fr3", arm_backend.device_info())
         print(f"数据集目录 / Dataset directory: {dataset_root}")
         print(f"任务名称 / Task name: {task_name}")
+        if bool(args.record_hand_only):
+            print(
+                "[Hand] record-only mode active: teleop hand commands will not be sent; "
+                f"fixed_pos={list(args.record_hand_fixed_pos)}"
+            )
         if args.enable_arm:
             print(
                 "单臂 FR3 随动 / Single-arm FR3 follow: "

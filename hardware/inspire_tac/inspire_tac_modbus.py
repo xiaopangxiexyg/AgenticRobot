@@ -538,22 +538,50 @@ class TactileVisualizer:
 if __name__ == '__main__':
     from tqdm import trange
     import numpy as np
-    test = InspireTacModbus(max_fingertip_force=800)
+    test = InspireTacModbus(max_fingertip_force=1500)
     # test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    # Current joint pos: [0.096 0.046 0.022 0.056 0.495 0.   ]
     current_joint_pos = test.read_joint_pos()
     print('Current joint pos:', current_joint_pos)
-    
-    test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    visualizer = TactileVisualizer()
+    test.set_joint_pos([0.096, 0.057, 0.022, 0.056, 0.495, 0.   ])
+    # test.set_joint_pos([1., 1., 1., 1., 1., 1.])
+    # while True:
+
+    while True:
+        current_joint_pos = test.read_joint_pos()
+        tac_vec, tac_dict = test.read_tac_data()
+        visualizer.update(tac_dict)
+        print('Current joint pos:', current_joint_pos)
+        # test.set_joint_pos([0,0,0,0,0,0])
+
+    time.sleep(3)
+    test.set_joint_pos([1, 1, 1, 1, 1, 0.5])
     time.sleep(10)
-    for _ in trange(20):
-        test.set_joint_pos(current_joint_pos)
+    # for _ in trange(20):
+    #     test.set_joint_pos(current_joint_pos)
+    #     time.sleep(0.2)
+    # breakpoint()
+    test.set_joint_pos([0, 0, 0, 0, 1, 0.5])
+    time.sleep(3)
+    test.set_joint_pos([0, 0, 0, 0, 1, 0])
+    time.sleep(2)
+    test.set_joint_pos([0, 0, 0, 0, 0, 0])
+    while True:
+        current_joint_pos = test.read_joint_pos()
+        tac_vec, tac_dict = test.read_tac_data()
+        visualizer.update(tac_dict)
+        print('Current joint pos:', current_joint_pos)
+        # Current joint pos: [0.111 0.11  0.079 0.078 0.642 0.   ]
         time.sleep(0.2)
     breakpoint()
+
     while True:
         test.set_joint_pos([0, 0, 0, 0, 1, 1])
         time.sleep(0.2)
         test.set_joint_pos([1, 1, 1, 1, 1, 1])
         time.sleep(0.2)
+    
     time.sleep(20.0)
     joint_pos = test.read_joint_pos()
     tac_vec, tac_dict = test.read_tac_data()
@@ -562,7 +590,6 @@ if __name__ == '__main__':
     # test.set_joint_pos([0, 0, 0, 0, 1, 1])
 
     # #test.get_default_speed_force()
-    # visualizer = TactileVisualizer()
     # last_time = time.time()
     # while True:
     print('Joint pos:', np.round(joint_pos, 3))

@@ -14,6 +14,7 @@ class TactileVisualizerConfig:
     window_name: str = "inspire_hand_tactile_uv"
     image_size: tuple[int, int] = (640, 640)
     resizable_window: bool = True
+    render_scale: float = 2.0
     value_scale: float = 0.02
     point_radius_min: int = 1
     point_radius_max: int = 6
@@ -31,6 +32,8 @@ class TactileVisualizerConfig:
     def __post_init__(self) -> None:
         if self.value_scale <= 0.0:
             raise ValueError("value_scale must be positive")
+        if self.render_scale <= 0.0:
+            raise ValueError("render_scale must be positive")
         if self.point_radius_min <= 0 or self.point_radius_max <= 0:
             raise ValueError("point radii must be positive")
         if self.point_radius_min > self.point_radius_max:
@@ -231,16 +234,24 @@ class TactileUVVisualizer:
     def _ensure_window(self, canvas: np.ndarray) -> None:
         if self._window_created:
             return
-        flag = (
-            self._cv2.WINDOW_NORMAL
-            if self.config.resizable_window
-            else self._cv2.WINDOW_AUTOSIZE
-        )
+        if self.config.resizable_window:
+            flag = self._cv2.WINDOW_NORMAL | getattr(self._cv2, "WINDOW_FREERATIO", 0)
+        else:
+            flag = self._cv2.WINDOW_AUTOSIZE
         self._cv2.namedWindow(self.config.window_name, flag)
         if self.config.resizable_window:
             height, width = canvas.shape[:2]
             self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
         self._window_created = True
+
+    def _scaled_canvas(self, canvas: np.ndarray) -> np.ndarray:
+        scale = float(self.config.render_scale) if self.config.resizable_window else 1.0
+        if scale <= 1.0:
+            return canvas
+        height, width = canvas.shape[:2]
+        target_w = max(1, int(round(width * scale)))
+        target_h = max(1, int(round(height * scale)))
+        return self._cv2.resize(canvas, (target_w, target_h), interpolation=self._cv2.INTER_LINEAR)
 
     def update(self, tactile_by_side: dict[str, np.ndarray | None]) -> None:
         if self._closed:
@@ -266,7 +277,7 @@ class TactileUVVisualizer:
                 self._cv2.LINE_AA,
             )
         self._ensure_window(canvas)
-        self._cv2.imshow(self.config.window_name, canvas)
+        self._cv2.imshow(self.config.window_name, self._scaled_canvas(canvas))
         self._cv2.waitKey(1)
 
     def close(self) -> None:
