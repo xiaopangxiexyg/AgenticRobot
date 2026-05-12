@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -122,6 +123,53 @@ class InspireArmIntegrationTests(unittest.TestCase):
         self.assertFalse(state["startup_alignment_active"])
         self.assertTrue(state["startup_alignment_complete"])
         self.assertEqual(state["startup_alignment_progress"], 1.0)
+
+    def test_fr3_backend_start_primes_state_before_poller_wait(self) -> None:
+        class FakeFR3Client:
+            def __init__(self) -> None:
+                self.cached_ready = False
+                self.closed = False
+                self.poller_started = False
+
+            def connect(self) -> None:
+                return None
+
+            def get_state_cached(self, *, max_age_s=None, fallback_to_sync=False):
+                self.cached_ready = bool(fallback_to_sync)
+                return {
+                    "ok": True,
+                    "q": np.arange(ARM_DOF, dtype=np.float32).tolist(),
+                    "dq": np.zeros(ARM_DOF, dtype=np.float32).tolist(),
+                    "t": 12.0,
+                    "age_s": 0.01,
+                }, 0.0
+
+            def start_state_poller(self, *args, **kwargs) -> None:
+                self.poller_started = True
+
+            def wait_until_state_ready(self, timeout_s: float = 2.0) -> bool:
+                return self.cached_ready
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake_client = FakeFR3Client()
+        with patch("inspire_data_collect.arm.fr3_backend.FR3JointClient", return_value=fake_client):
+            backend = FR3ArmBackend(
+                FR3ArmBackendConfig(
+                    host="127.0.0.1",
+                    connect_hardware=True,
+                    wait_state_timeout_s=0.01,
+                )
+            )
+            backend.start()
+
+        self.assertTrue(backend.is_ready())
+        self.assertTrue(fake_client.poller_started)
+        self.assertFalse(fake_client.closed)
+        state = backend.get_state()
+        np.testing.assert_allclose(state["qpos"], np.arange(ARM_DOF, dtype=np.float32))
+        self.assertIsNone(backend.device_info()["startup_error"])
 
     def test_writer_rows_fill_arm_vector_when_command_and_state_exist(self) -> None:
         arm_target = np.linspace(0.1, 0.7, ARM_DOF, dtype=np.float32)

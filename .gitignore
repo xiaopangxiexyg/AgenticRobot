@@ -38,6 +38,8 @@ datasets
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+datasets_debug
 teleop_records/*
 !teleop_records/calibration_profiles/
 !teleop_records/hand_zero_pose_calibrations/

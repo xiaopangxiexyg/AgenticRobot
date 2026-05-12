@@ -287,6 +287,26 @@ python run_client_franka.py \
   --send-actions \
   --fixed-hand "(0.096, 0.057, 0.022, 0.056, 0.495, 0.0)" \
   --which-episode 110
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/datasets/2026-05-08_waping_random \
+  --camera-mode single \
+  --camera-serial 135122074814 \
+  --active-sides right \
+  --right-arm-ip "192.168.20.172" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "192.168.11.210" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --max-fingertip-force 400 \
+  --send-actions \
+  --which-episode 110
+
+
 ```
 
 

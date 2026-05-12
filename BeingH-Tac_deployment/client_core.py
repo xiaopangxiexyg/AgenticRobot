@@ -212,6 +212,61 @@ def set_policy_request_in_flight(target: Any, in_flight: bool) -> None:
             pass
 
 
+def _sent_action_count(target: Any) -> int | None:
+    value = getattr(target, "sent_actions", None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _accepted_action_chunk_len(status: list[str]) -> int:
+    for item in status:
+        text = str(item)
+        if not text.startswith("chunk="):
+            continue
+        try:
+            return max(0, int(text.split("=", 1)[1]))
+        except ValueError:
+            return 0
+    return 0
+
+
+def wait_for_submitted_actions(target: Any, sent_before: int | None, status: list[str], args: argparse.Namespace) -> None:
+    chunk_len = _accepted_action_chunk_len(status)
+    if chunk_len <= 0:
+        return
+    if not bool(getattr(args, "auto_start", False)):
+        return
+
+    wait_until_sent = getattr(target, "wait_until_sent", None)
+    if callable(wait_until_sent) and sent_before is not None:
+        target_sent = sent_before + chunk_len
+        timeout_s = (chunk_len / max(1e-6, float(getattr(args, "action_hz", 12.0)))) + max(
+            2.0,
+            float(getattr(args, "action_underrun_log_sec", 2.0)),
+        )
+        ok = wait_until_sent(target_sent, timeout_s=timeout_s)
+        if not ok:
+            print(
+                "[Action] timed out waiting for submitted chunk to finish "
+                f"(target_sent={target_sent}, chunk={chunk_len})"
+            )
+        return
+
+    wait_until_idle = getattr(target, "wait_until_idle", None)
+    if callable(wait_until_idle):
+        timeout_s = (chunk_len / max(1e-6, float(getattr(args, "action_hz", 12.0)))) + max(
+            2.0,
+            float(getattr(args, "action_underrun_log_sec", 2.0)),
+        )
+        ok = wait_until_idle(timeout_s=timeout_s)
+        if not ok:
+            print(f"[Action] timed out waiting for submitted chunk queue to drain (chunk={chunk_len})")
+
+
 def compact_shape(value: Any) -> str:
     if isinstance(value, np.ndarray):
         return f"shape={value.shape}, dtype={value.dtype}"
@@ -404,14 +459,17 @@ def _run_loop(
                     print(line)
                 for line in format_fr3_dataset_gt_debug(dataset_gt_action):
                     print(line)
+            sent_before = _sent_action_count(source if args.source == "live" else executor)
             if args.source == "live":
                 faults = source.consume_server_result(previous_result)
                 if faults:
                     print(f"[Client] action faults/status: {';'.join(faults[:6])}")
+                wait_for_submitted_actions(source, sent_before, faults, args)
             elif executor is not None:
                 faults = executor.consume_server_result(previous_result)
                 if faults:
                     print(f"[Action] faults/status: {';'.join(faults[:6])}")
+                wait_for_submitted_actions(executor, sent_before, faults, args)
         except KeyboardInterrupt:
             raise
         except Exception as exc:

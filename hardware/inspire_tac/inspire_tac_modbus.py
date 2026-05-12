@@ -538,8 +538,10 @@ class TactileVisualizer:
 if __name__ == '__main__':
     from tqdm import trange
     import numpy as np
-    test = InspireTacModbus(max_fingertip_force=1500)
-    # test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    test = InspireTacModbus(max_fingertip_force=800)
+    # test.set_joint_pos([1, 1, 1, 1, 1, 0])
+    test.set_joint_pos([0.2, 0.2, 0.2, 0.2, 1, 0])
+    time.sleep(30)
     # Current joint pos: [0.096 0.046 0.022 0.056 0.495 0.   ]
     current_joint_pos = test.read_joint_pos()
     print('Current joint pos:', current_joint_pos)

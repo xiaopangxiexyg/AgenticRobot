@@ -1553,6 +1553,27 @@ class LiveObservationSource:
     def remember_observation(self, observation: Any) -> None:
         self._last_observation = observation
 
+    def wait_until_idle(self, timeout_s: float | None = None, poll_s: float = 0.01) -> bool:
+        return self.dispatcher.wait_until_idle(timeout_s=timeout_s, poll_s=poll_s)
+
+    @property
+    def sent_actions(self) -> int:
+        return self.dispatcher.sent_actions
+
+    def wait_until_sent(
+        self,
+        target_sent: int,
+        timeout_s: float | None = None,
+        poll_s: float = 0.01,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        return self.dispatcher.wait_until_sent(
+            target_sent=target_sent,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            progress=progress,
+        )
+
 
 class HardwareActionExecutor:
     """Send server actions to live hardware while observations come from a dataset."""
