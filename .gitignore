@@ -45,6 +45,8 @@ BaselineVLA_deployment/local_paths.env
 BaselineVLA_deployment/ThirdParty
 BaselineVLA_deployment/Data
 BaselineVLA_deployment/Outputs
+BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs
+BaselineVLA_deployment/ServerClientDeploy/Pi
 *.egg-info/
 *.whl
 

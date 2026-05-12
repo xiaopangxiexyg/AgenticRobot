@@ -701,6 +701,93 @@ dataset_root/YYYY-MM-DD_task-name/
 - `observation.images.<camera_key>.video_frame_index`: 写入 mp4 后的视频帧序号。
 - `observation.images.<camera_key>.path`: 相对 dataset root 的视频路径。
 
+### 拆分 LeRobot episode 数据集
+
+`utils/extract_lerobot_episodes.py` 用于把已有 LeRobot 风格数据集中的指定 episode 拆到一个新数据集，同时把原数据集改写为只包含剩余 episode。脚本会重写 `meta/*.jsonl/json`、parquet 里的 `index/episode_index/frame_index`，并复制对应视频文件；不要手动复制 `data/` 和 `videos/` 目录来替代该脚本。
+
+依赖：
+
+```bash
+pip install pyarrow
+```
+
+先 dry-run 查看计划，不会改动数据：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_wasted \
+  --episodes 44,46,99
+```
+
+确认 `extracted` 和 `remaining source` 数量正确后，加 `--yes` 正式执行：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_wasted \
+  --episodes 44,46,99 \
+  --yes
+```
+
+`--episodes` 支持逗号和闭区间：
+
+```bash
+--episodes 0
+--episodes 0,2,5
+--episodes 0-3,8
+```
+
+常用参数：
+
+- `--dataset-root`: 被拆分的原数据集目录，必须包含 `meta/episodes.jsonl`。
+- `--output-root`: 拆出的 episode 写入的新数据集目录，不能等于或嵌套在 `--dataset-root` 中。
+- `--overwrite-output`: 如果 `--output-root` 已存在，允许先删除再写入。
+- `--output-dataset-name`: 写入拆出数据集 `meta/info.json` 的 `dataset_name`；默认使用 `--output-root` 目录名。
+- `--remaining-dataset-name`: 写回剩余原数据集的 `dataset_name`；默认保留原 `info.json`。
+- `--allow-missing-videos`: `meta/episodes.jsonl` 中记录的视频不存在时跳过视频复制，否则默认报错。
+- `--no-backup`: 成功拆分后删除原始数据集备份；不建议首次使用时开启。
+- `--parquet-compression`: 重写 parquet 时使用的压缩格式，默认 `zstd`。
+
+执行成功后会得到：
+
+```text
+--output-root                         # 指定 episodes 组成的新数据集
+--dataset-root                        # 原路径被改写为剩余 episodes 数据集
+--dataset-root 的同级隐藏 backup        # 默认保留拆分前的完整原始数据集
+```
+
+backup 目录名类似：
+
+```text
+.2026-05-06_soft_hard.before_extract-<timestamp>-<pid>
+```
+
+如果需要恢复到拆分前的原样数据，优先使用这个 backup；它比重新合并两个已重编号的数据集更可靠。
+
+同一个脚本也支持把两个数据类型一致的 LeRobot 数据集合并到一个新目录。合并不会修改两个输入数据集，会按 `--dataset-root` 的 episode 在前、`--merge-root` 的 episode 在后的顺序重新编号，并重写 parquet/meta/video 路径。
+
+先 dry-run：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --merge-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_random \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_merged
+```
+
+确认计划后正式合并：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --merge-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_random \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_merged \
+  --yes
+```
+
+合并模式会校验两个输入的 `meta/info.json` 关键结构、视频 camera key 和首个 parquet schema。若输出目录已存在，需要显式加 `--overwrite-output`。如果视频文件缺失但仍想保留 parquet/meta 合并，可加 `--allow-missing-videos`。
+
 导出的最小示例：
 
 ```python
