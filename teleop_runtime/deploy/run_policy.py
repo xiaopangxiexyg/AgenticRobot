@@ -208,7 +208,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--policy-kwargs-json", type=str, default="{}")
     parser.add_argument("--active-sides", type=_parse_active_sides, default=("left", "right"))
-    parser.add_argument("--hz", type=_positive_float, default=30.0)
+    parser.add_argument("--hz", type=_positive_float, default=13.0)
     parser.add_argument(
         "--action-hz",
         type=_non_negative_float,
@@ -228,8 +228,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_float,
         default=None,
         help=(
-            "Policy inference rate. Omit to keep the historical 10Hz default, or to match "
-            "the inferred action rate when --action-hz/--action-hz-dataset/replay is used."
+            "Policy inference rate. Omit to match the effective action/control rate."
         ),
     )
     parser.add_argument("--min-action-queue", type=_non_negative_int, default=0)
@@ -324,7 +323,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-mode", choices=["none", "single", "multi"], default="none")
     parser.add_argument("--camera-config", type=Path, default=DEFAULT_CAMERA_CONFIG_PATH)
     parser.add_argument("--camera-key", type=str, default="front")
-    parser.add_argument("--camera-serial", type=str, default="")
+    parser.add_argument("--camera-serial", "--camera-id", dest="camera_serial", type=str, default="")
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
     parser.add_argument("--camera-fps", type=int, default=30)
@@ -477,9 +476,7 @@ def resolve_effective_action_hz(args: argparse.Namespace, policy: Any | None = N
 def resolve_effective_policy_hz(args: argparse.Namespace, *, action_hz: float, action_hz_source: str) -> tuple[float, str]:
     if args.policy_hz is not None:
         return float(args.policy_hz), "cli.policy_hz"
-    if action_hz_source != "cli.hz":
-        return float(action_hz), "action_hz"
-    return 10.0, "legacy_default"
+    return float(action_hz), "action_hz"
 
 
 def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...], *, control_hz: float) -> dict[str, RM65ArmBackend]:
@@ -678,6 +675,14 @@ def _policy_status_text(policy: Any) -> str:
     return ""
 
 
+def _skip_startup_replay_frames(policy: Any, count: int = 1) -> int:
+    wrapped_policy = getattr(policy, "policy", policy)
+    skip = getattr(wrapped_policy, "skip_startup_frames", None)
+    if not callable(skip):
+        return 0
+    return int(skip(count))
+
+
 def _default_action(observation: Any) -> NormalizedAction:
     return NormalizedAction(vector=observation.hold_action())
 
@@ -705,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         policy = load_policy(args.policy_spec, kwargs=parse_policy_kwargs(args.policy_kwargs_json))
     action_queue_policy = _resolve_action_queue_policy(args, debug_replay=debug_replay)
+    startup_init_action, startup_init_source = resolve_startup_init_action(args, policy)
 
     effective_action_hz, action_hz_info = resolve_effective_action_hz(args, policy)
     effective_policy_hz, policy_hz_source = resolve_effective_policy_hz(
@@ -898,6 +904,13 @@ def main(argv: list[str] | None = None) -> int:
                                     last_action = deployment_action.vector.astype(np.float32, copy=True)
                                 if init_ready and not deployment_action.faults:
                                     startup_initializer.mark_complete()
+                                    if startup_initializer.source == "replay:first_frame":
+                                        skipped = _skip_startup_replay_frames(policy, count=1)
+                                        if skipped:
+                                            print(
+                                                "[StartupInit] replay startup target consumed; "
+                                                f"skipped {skipped} replay frame(s)."
+                                            )
                                     chunk_buffer.clear()
                                     last_policy_at = None
                         can_run_policy = False

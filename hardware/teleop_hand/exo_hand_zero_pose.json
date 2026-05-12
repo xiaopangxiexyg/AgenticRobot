@@ -28,20 +28,20 @@
     },
     "right": {
       "deg_at_0": [
-        63.53022215101454,
-        175.52350362141928,
-        157.75999450683594,
-        183.77999877929688,
-        163.53466627332898,
-        188.66950141059027
+        172.17999267578125,
+        182.99000549316406,
+        176.22000122070312,
+        180.77650451660156,
+        181.6699981689453,
+        181.92999267578125
       ],
       "deg_at_1": [
-        103.53022215101454,
-        105.52350362141928,
-        217.75999450683594,
-        243.77999877929688,
-        223.53466627332898,
-        248.66950141059027
+        212.17999267578125,
+        112.99000549316406,
+        236.22000122070312,
+        240.77650451660156,
+        241.6699981689453,
+        241.92999267578125
       ],
       "offset": [
         40.0,
@@ -53,6 +53,130 @@
       ]
     }
   },
+  "last_update": {
+    "baudrate": 115200,
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+    "record_path": "/home/user/zc/dex_inspire_teleop_new/teleop_records/hand_zero_pose_calibrations/20260426_223802_144_right_dev_serial_by-id_usb-1a86_USB_Single_Serial_5ABA130699-if00.json",
+    "side": "right"
+  },
+  "port_calibrations": {
+    "right": {
+      "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00": {
+        "baudrate": 115200,
+        "deg_at_0": [
+          172.17999267578125,
+          182.99000549316406,
+          176.22000122070312,
+          180.77650451660156,
+          181.6699981689453,
+          181.92999267578125
+        ],
+        "deg_at_1": [
+          212.17999267578125,
+          112.99000549316406,
+          236.22000122070312,
+          240.77650451660156,
+          241.6699981689453,
+          241.92999267578125
+        ],
+        "offset": [
+          40.0,
+          -70.0,
+          60.0,
+          60.0,
+          60.0,
+          60.0
+        ],
+        "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+        "port_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+          "/dev/ttyACM0",
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:1.3:1.0"
+        ],
+        "port_realpath": "/dev/ttyACM0",
+        "record_path": "/home/user/zc/dex_inspire_teleop_new/teleop_records/hand_zero_pose_calibrations/20260426_223802_144_right_dev_serial_by-id_usb-1a86_USB_Single_Serial_5ABA130699-if00.json",
+        "side": "right",
+        "updated_at": 1777217728.4696882,
+        "updated_at_local": "2026-04-26 23:35:28"
+      },
+      "/dev/serial/by-path/pci-0000:10:00.4-usb-0:1.3:1.0": {
+        "baudrate": 115200,
+        "deg_at_0": [
+          172.17999267578125,
+          182.99000549316406,
+          176.22000122070312,
+          180.77650451660156,
+          181.6699981689453,
+          181.92999267578125
+        ],
+        "deg_at_1": [
+          212.17999267578125,
+          112.99000549316406,
+          236.22000122070312,
+          240.77650451660156,
+          241.6699981689453,
+          241.92999267578125
+        ],
+        "offset": [
+          40.0,
+          -70.0,
+          60.0,
+          60.0,
+          60.0,
+          60.0
+        ],
+        "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+        "port_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+          "/dev/ttyACM0",
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:1.3:1.0"
+        ],
+        "port_realpath": "/dev/ttyACM0",
+        "record_path": "/home/user/zc/dex_inspire_teleop_new/teleop_records/hand_zero_pose_calibrations/20260426_223802_144_right_dev_serial_by-id_usb-1a86_USB_Single_Serial_5ABA130699-if00.json",
+        "side": "right",
+        "updated_at": 1777217728.4696882,
+        "updated_at_local": "2026-04-26 23:35:28"
+      },
+      "/dev/ttyACM0": {
+        "baudrate": 115200,
+        "deg_at_0": [
+          172.17999267578125,
+          182.99000549316406,
+          176.22000122070312,
+          180.77650451660156,
+          181.6699981689453,
+          181.92999267578125
+        ],
+        "deg_at_1": [
+          212.17999267578125,
+          112.99000549316406,
+          236.22000122070312,
+          240.77650451660156,
+          241.6699981689453,
+          241.92999267578125
+        ],
+        "offset": [
+          40.0,
+          -70.0,
+          60.0,
+          60.0,
+          60.0,
+          60.0
+        ],
+        "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+        "port_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00",
+          "/dev/ttyACM0",
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:1.3:1.0"
+        ],
+        "port_realpath": "/dev/ttyACM0",
+        "record_path": "/home/user/zc/dex_inspire_teleop_new/teleop_records/hand_zero_pose_calibrations/20260426_223802_144_right_dev_serial_by-id_usb-1a86_USB_Single_Serial_5ABA130699-if00.json",
+        "side": "right",
+        "updated_at": 1777217728.4696882,
+        "updated_at_local": "2026-04-26 23:35:28"
+      }
+    }
+  },
   "source": {
     "record_dir": "teleop_records/hand_zero_pose_calibrations",
     "records_count": 18,
@@ -61,5 +185,6 @@
       "right_max_span_deg": 0.2700042724609375
     }
   },
-  "updated_at_local": "2026-04-25 22:40:00"
+  "updated_at": 1777217728.4696882,
+  "updated_at_local": "2026-04-26 23:35:28"
 }

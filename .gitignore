@@ -38,6 +38,8 @@ datasets
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+datasets_debug
 teleop_records/*
 !teleop_records/calibration_profiles/
 !teleop_records/hand_zero_pose_calibrations/
@@ -70,3 +72,5 @@ test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/
 
 heavy_light_wasted/
 2026-04-30_heavy_light/
+real_dataset/
+

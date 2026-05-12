@@ -15,6 +15,7 @@ from .schema import (
     ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
     ACTION_HAND_SLICES,
+    ARM_JOINT_DOF,
     ARM_POSE_DOF,
     HAND_DOF,
     nan_vector,
@@ -365,6 +366,84 @@ def load_replay_actions_from_parquet(
     return np.stack(actions, axis=0).astype(np.float32, copy=False)
 
 
+def load_replay_arm_joint_targets_from_parquet(
+    parquet_path: str | Path,
+    *,
+    active_sides: Sequence[str],
+    start_index: int = 0,
+    end_index: int | None = None,
+    required: bool = True,
+) -> dict[str, np.ndarray]:
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    requested_columns = [
+        f"action.replay.{side}_arm_joint_target"
+        for side in ("left", "right")
+        if side in set(active_sides)
+    ]
+    schema = pq.read_schema(path)
+    available_columns = set(schema.names)
+    missing = [column for column in requested_columns if column not in available_columns]
+    if missing:
+        if not required:
+            columns = [column for column in requested_columns if column in available_columns]
+            if not columns:
+                return {}
+        else:
+            raise ValueError(
+                f"Replay parquet {path} is missing required arm joint target column(s): {missing}"
+            )
+    else:
+        columns = requested_columns
+    if not columns:
+        if required:
+            raise ValueError(
+                f"Replay parquet {path} has no active-side arm joint target columns."
+            )
+        return {}
+
+    loaded_sides = [
+        side
+        for side in active_sides
+        if f"action.replay.{side}_arm_joint_target" in columns
+    ]
+    if required and set(loaded_sides) != set(active_sides):
+        raise ValueError(
+            f"Replay parquet {path} is missing required arm joint targets for "
+            f"{sorted(set(active_sides) - set(loaded_sides))}."
+        )
+    rows = pq.read_table(path, columns=columns).to_pylist()
+    if not rows:
+        raise ValueError(f"Replay parquet contains no rows: {path}")
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay frame range is empty: start_index={start}, end_index={end_index}, "
+            f"row_count={len(rows)}."
+        )
+    targets_by_side: dict[str, list[np.ndarray]] = {side: [] for side in loaded_sides}
+    for row_index, row in enumerate(rows[start:stop], start=start):
+        for side in loaded_sides:
+            key = f"action.replay.{side}_arm_joint_target"
+            value = row.get(key)
+            if value is None:
+                raise ValueError(
+                    f"Replay row {row_index} column {key!r} is missing; cannot use qpos init."
+                )
+            vector = np.asarray(value, dtype=np.float32).reshape(-1)
+            if vector.shape != (ARM_JOINT_DOF,) or not np.all(np.isfinite(vector)):
+                raise ValueError(
+                    f"Replay row {row_index} column {key!r} must be finite shape ({ARM_JOINT_DOF},), "
+                    f"got {vector.shape}."
+                )
+            targets_by_side[side].append(vector.astype(np.float32, copy=True))
+    return {
+        side: np.stack(values, axis=0).astype(np.float32, copy=False)
+        for side, values in targets_by_side.items()
+    }
+
+
 def infer_replay_action_hz(
     *,
     parquet_path: str | Path,
@@ -477,6 +556,15 @@ class DatasetReplayPolicy:
     def reset(self) -> None:
         self.cursor = 0
         self.finished = False
+
+    def skip_startup_frames(self, count: int = 1) -> int:
+        skipped = min(max(0, int(count)), max(0, self.frame_count - int(self.cursor)))
+        if skipped <= 0:
+            return 0
+        self.cursor += skipped
+        if self.cursor >= self.frame_count:
+            self.finished = not self.loop
+        return int(skipped)
 
     def _next_action_chunk(self) -> np.ndarray:
         if self.cursor >= self.frame_count:

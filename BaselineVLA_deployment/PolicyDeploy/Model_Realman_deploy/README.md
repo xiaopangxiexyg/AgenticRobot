@@ -46,7 +46,6 @@ path is never hard-coded.
 
 ```bash
 CHECKPOINT=/abs/path/to/best.pt \
-CONDA_ENV=grasp_py310_copy \
 RIGHT_ARM_IP="$RIGHT_ARM_IP" \
 RIGHT_HAND_IP="$RIGHT_HAND_IP" \
 bash PolicyDeploy/Model_Realman_deploy/run_right_policy.sh
@@ -59,7 +58,6 @@ only when you do not want to press `g` manually.
 
 ```bash
 CHECKPOINT=/abs/path/to/best.pt \
-CONDA_ENV=grasp_py310_copy \
 LEFT_ARM_IP="$LEFT_ARM_IP" \
 RIGHT_ARM_IP="$RIGHT_ARM_IP" \
 LEFT_HAND_IP="$LEFT_HAND_IP" \
@@ -131,7 +129,7 @@ The Realman wrappers support all three deployment flows:
 - `DEPLOY_MODE=move_frame`: smoothly move to one selected dataset/parquet frame,
   then hold the observed state.
 - `DEPLOY_MODE=replay`: smoothly move to the replay first frame, then replay the
-  trajectory at `HZ`.
+  trajectory at the reference episode frequency.
 - `DEPLOY_MODE=model`: smoothly move to the selected first frame, then start the
   ManipRep checkpoint.
 
@@ -142,7 +140,7 @@ Run direct runtime commands from the ManipRep repo root:
 
 ```bash
 source Scripts/load_local_env.sh
-maniprep_activate_conda "${REALMAN_CONDA_ENV:-grasp_py310_copy}"
+maniprep_activate_conda "$CONDA_ENV"
 export PYTHONPATH="${MANIPREP_DEPLOY_PACKAGE_ROOT}:${PWD}:${PYTHONPATH:-}"
 ```
 
@@ -157,7 +155,7 @@ Wrapper right-arm/right-hand:
 ```bash
 DEPLOY_MODE=move_frame \
 ACTIVE_SIDES=right \
-INIT_DATASET=/abs/path/to/dataset \
+INIT_DATASET=/home/ai/Desktop/DexTeleop/real_datasets/2026-04-30_heavy_light \
 INIT_EPISODE=2 \
 INIT_FRAME=120 \
 INIT_TIME_S=5.0 \
@@ -173,9 +171,9 @@ Wrapper bimanual:
 ```bash
 DEPLOY_MODE=move_frame \
 ACTIVE_SIDES=both \
-INIT_DATASET=/abs/path/to/dataset \
+INIT_DATASET=/home/ai/Desktop/DexTeleop/real_datasets/paper_fold_datasets/large_brown_paper_fold \
 INIT_EPISODE=2 \
-INIT_FRAME=120 \
+INIT_FRAME=0 \
 INIT_TIME_S=5.0 \
 LEFT_ARM_IP="$LEFT_ARM_IP" \
 RIGHT_ARM_IP="$RIGHT_ARM_IP" \
@@ -241,23 +239,21 @@ To use one parquet directly, replace `--init-dataset /abs/path/to/dataset` and
 
 Use runtime debug replay. `--init-source replay` makes startup init target the
 first loaded replay action. `--debug-replay-start-index 0` means the trajectory
-starts from the dataset first frame. Set `--hz` to the data collection
-frequency, usually `30`; this is what makes replay run at the real frequency.
-Replay uses append queueing by default in the wrapper/runtime, so prefetched
-chunks are not dropped.
+starts from the dataset first frame. The wrapper infers the action/control
+frequency from the replay dataset/parquet reference, and falls back to `13Hz`
+only when no reference is available. Replay uses append queueing by default in
+the wrapper/runtime, so prefetched chunks are not dropped.
 
 Wrapper right-arm/right-hand:
 
 ```bash
 DEPLOY_MODE=replay \
 ACTIVE_SIDES=right \
-DEBUG_REPLAY_DATASET=/abs/path/to/dataset \
+DEBUG_REPLAY_DATASET=/home/ai/Desktop/DexTeleop/real_datasets/2026-04-30_heavy_light \
 DEBUG_REPLAY_EPISODE=2 \
 DEBUG_REPLAY_START_INDEX=0 \
 DEBUG_REPLAY_CHUNK_SIZE=32 \
 INIT_TIME_S=5.0 \
-HZ=30 \
-POLICY_HZ=10 \
 MIN_ACTION_QUEUE=8 \
 RIGHT_ARM_IP="$RIGHT_ARM_IP" \
 RIGHT_HAND_IP="$RIGHT_HAND_IP" \
@@ -269,11 +265,29 @@ bash PolicyDeploy/Model_Realman_deploy/run_right_policy.sh
 Wrapper bimanual uses the same variables with `ACTIVE_SIDES=both` plus both
 left/right arm and hand IPs, then calls `run_bimanual_policy.sh`.
 
+```bash
+DEPLOY_MODE=replay \
+ACTIVE_SIDES=both \
+DEBUG_REPLAY_DATASET=/home/ai/Desktop/DexTeleop/real_datasets/paper_fold_datasets/large_brown_paper_fold \
+DEBUG_REPLAY_EPISODE=10 \
+DEBUG_REPLAY_START_INDEX=0 \
+DEBUG_REPLAY_CHUNK_SIZE=32 \
+INIT_TIME_S=5.0 \
+MIN_ACTION_QUEUE=8 \
+RIGHT_ARM_IP="$RIGHT_ARM_IP" \
+RIGHT_HAND_IP="$RIGHT_HAND_IP" \
+LEFT_ARM_IP="$LEFT_ARM_IP" \
+LEFT_HAND_IP="$LEFT_HAND_IP" \
+AUTO_START=1 \
+SEND_ACTIONS=1 \
+bash PolicyDeploy/Model_Realman_deploy/run_bimanual_policy.sh
+```
+
 Right-arm/right-hand:
 
 ```bash
 python -m teleop_runtime.deploy.run_policy \
-  --debug-replay-dataset /abs/path/to/dataset \
+  --debug-replay-dataset /home/ai/Desktop/DexTeleop/real_datasets/2026-04-30_heavy_light \
   --debug-replay-episode 2 \
   --debug-replay-start-index 0 \
   --debug-replay-chunk-size 32 \
@@ -285,8 +299,6 @@ python -m teleop_runtime.deploy.run_policy \
   --require-ready-observation \
   --init-source replay \
   --init-time-s 5.0 \
-  --hz 30 \
-  --policy-hz 10 \
   --min-action-queue 8 \
   --action-queue-policy append \
   --auto-start \
@@ -297,7 +309,7 @@ Bimanual:
 
 ```bash
 python -m teleop_runtime.deploy.run_policy \
-  --debug-replay-dataset /abs/path/to/dataset \
+  --debug-replay-dataset /home/ai/Desktop/DexTeleop/real_datasets/paper_fold_datasets/large_brown_paper_fold \
   --debug-replay-episode 2 \
   --debug-replay-start-index 0 \
   --debug-replay-chunk-size 32 \
@@ -311,8 +323,6 @@ python -m teleop_runtime.deploy.run_policy \
   --require-ready-observation \
   --init-source replay \
   --init-time-s 5.0 \
-  --hz 30 \
-  --policy-hz 10 \
   --min-action-queue 8 \
   --action-queue-policy append \
   --auto-start \
@@ -340,16 +350,16 @@ Right-arm model:
 
 ```bash
 CHECKPOINT=/abs/path/to/best.pt \
-CONDA_ENV=grasp_py310_copy \
 DEPLOY_MODE=model \
 ACTIVE_SIDES=right \
 INIT_SOURCE=dataset \
-INIT_DATASET=/abs/path/to/dataset \
+INIT_DATASET=/home/ai/Desktop/DexTeleop/real_datasets/2026-04-30_heavy_light \
 INIT_EPISODE=2 \
 INIT_FRAME=0 \
 INIT_TIME_S=5.0 \
 RIGHT_ARM_IP="$RIGHT_ARM_IP" \
 RIGHT_HAND_IP="$RIGHT_HAND_IP" \
+REALSENSE_ID=213222079798 \
 SEND_ACTIONS=1 \
 AUTO_START=1 \
 bash PolicyDeploy/Model_Realman_deploy/run_right_policy.sh
@@ -358,12 +368,11 @@ bash PolicyDeploy/Model_Realman_deploy/run_right_policy.sh
 Bimanual model:
 
 ```bash
-CHECKPOINT=/abs/path/to/best.pt \
-CONDA_ENV=grasp_py310_copy \
+CHECKPOINT=/home/ai/Desktop/DexTeleop/BaselineVLA_deployment/Outputs/server_paper_fold/vanilla/realrobot_paper_fold_vtactile_vla_ac16_nohis_vis_imgaug_tacnorm/last.pt \
 DEPLOY_MODE=model \
 ACTIVE_SIDES=both \
 INIT_SOURCE=dataset \
-INIT_DATASET=/abs/path/to/dataset \
+INIT_DATASET=/home/ai/Desktop/DexTeleop/real_datasets/paper_fold_datasets/large_brown_paper_fold \
 INIT_EPISODE=2 \
 INIT_FRAME=0 \
 INIT_TIME_S=5.0 \
@@ -371,6 +380,7 @@ LEFT_ARM_IP="$LEFT_ARM_IP" \
 RIGHT_ARM_IP="$RIGHT_ARM_IP" \
 LEFT_HAND_IP="$LEFT_HAND_IP" \
 RIGHT_HAND_IP="$RIGHT_HAND_IP" \
+REALSENSE_ID=213222079798 \
 SEND_ACTIONS=1 \
 AUTO_START=1 \
 bash PolicyDeploy/Model_Realman_deploy/run_bimanual_policy.sh
@@ -390,7 +400,7 @@ with `INIT_DATASET` unset.
 | --- | --- | --- |
 | `DEPLOY_MODE` | `model` | `move_frame`, `replay`, or `model`. `run_right_policy.sh` and `run_bimanual_policy.sh` both use this mode switch. |
 | `CHECKPOINT` | required | Checkpoint path. Aliases: `CKPT`, `MODEL_CKPT`. A directory resolves to `last.pt`. |
-| `CONDA_ENV` | `grasp_py310_copy` | Runtime conda env. Override if the machine uses another name. |
+| `CONDA_ENV` | from `local_paths.env` | Runtime conda env. Set this in `BaselineVLA_deployment/local_paths.env`; wrapper commands do not override it. |
 | `DEVICE` | `cuda` | Torch device passed to the policy. |
 | `ACTIVE_SIDES` | `right` or wrapper default | `right`, `left`, or `both`; right wrapper uses `right`, bimanual wrapper uses `both`. |
 | `ACTION_LAYOUT` | `auto` | Keep `auto` for native 26-D Realman checkpoints. |
@@ -400,6 +410,8 @@ with `INIT_DATASET` unset.
 | `ENABLE_HANDS` | `1` | Passes `--enable-hands` or `--no-hands`. |
 | `CAMERA_MODE` | `single` | `none`, `single`, or `multi`. |
 | `CAMERA_KEY` | `front` | Camera key used by both policy and runtime. |
+| `REALSENSE_ID` / `CAMERA_SERIAL` | empty | RealSense serial/id for `CAMERA_MODE=single`. `REALSENSE_ID`, `REALSENSE_SERIAL`, and `CAMERA_ID` are aliases for `CAMERA_SERIAL`. |
+| `CAMERA_CONFIG` | repo default when present | RealSense JSON config. Used when `CAMERA_SERIAL` is empty; required for `CAMERA_MODE=multi`. |
 | `ACTION_CHUNK_SIZE` | `all` | `all`/`0` uses full model horizon; positive N keeps first N actions. |
 | `MIN_ACTION_QUEUE` | `8` | Query policy when queued actions are at or below this length. |
 | `REQUIRE_TACTILE` | `1` | Tactile checkpoint errors if the right tactile vector is missing. |

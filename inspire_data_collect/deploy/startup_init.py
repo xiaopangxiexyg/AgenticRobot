@@ -17,6 +17,7 @@ _HAND_SLICES = {
     "right": slice(ARM_DOF, ARM_DOF + HAND_DOF),
     "left": slice(ARM_DOF + HAND_DOF, ACTION_DIM),
 }
+_STARTUP_ARM_TOLERANCE_RAD = 0.05
 
 
 def _action_vector(value: Any, *, label: str) -> np.ndarray:
@@ -183,9 +184,29 @@ class StartupInitializer:
         alpha = _smoothstep(raw_alpha)
         self.progress = float(raw_alpha)
         if raw_alpha >= 1.0:
-            return self.resolved_target_action.copy(), [], True
+            return self.resolved_target_action.copy(), [], self._target_reached(observation)
         action = self.start_action + (self.resolved_target_action - self.start_action) * alpha
+        active = set(self.active_sides)
+        for side in HAND_VECTOR_ORDER:
+            if side in active:
+                action[_HAND_SLICES[side]] = self.resolved_target_action[_HAND_SLICES[side]]
+        if not bool(self.arm_enabled):
+            return action.astype(np.float32, copy=True), [], True
         return action.astype(np.float32, copy=True), [], False
+
+    def _target_reached(self, observation: DeploymentObservation) -> bool:
+        assert self.resolved_target_action is not None
+        target = self.resolved_target_action
+        current = np.asarray(observation.state, dtype=np.float32).reshape(-1)
+        required = [("arm", _ARM_SLICE)] if bool(self.arm_enabled) else []
+        for name, target_slice in required:
+            target_value = target[target_slice]
+            current_value = current[target_slice]
+            if not (np.all(np.isfinite(target_value)) and np.all(np.isfinite(current_value))):
+                return False
+            if float(np.max(np.abs(current_value - target_value))) > _STARTUP_ARM_TOLERANCE_RAD:
+                return False
+        return True
 
     def mark_complete(self) -> None:
         if not self.completed:

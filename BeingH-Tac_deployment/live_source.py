@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -17,30 +18,90 @@ from tactile import TactileHistory
 
 ensure_import_paths()
 
-from teleop_runtime.deploy.actions import (  # noqa: E402
-    ActionChunkBuffer,
-    ActionSafetyFilter,
-    ActionSafetyFilterConfig,
-    normalize_policy_output,
+from inspire_data_collect.common import EffectorCommand as FR3EffectorCommand  # noqa: E402
+from inspire_data_collect.arm.fr3_backend import FR3ArmBackend, FR3ArmBackendConfig  # noqa: E402
+from inspire_data_collect.hand.hand_backend import (  # noqa: E402
+    InspireTacHandBackend as FR3InspireTacHandBackend,
+    InspireTacHandBackendConfig as FR3InspireTacHandBackendConfig,
 )
-from teleop_runtime.deploy.observation import build_deployment_observation  # noqa: E402
-from teleop_runtime.deploy.run_policy import (  # noqa: E402
-    ArmStateReader,
-    build_arm_backends,
-    build_camera_sources,
-    build_hand_backends,
-    hand_state_snapshot,
-    select_preview_camera_sources,
+from inspire_data_collect.deploy.actions import (  # noqa: E402
+    ActionSafetyFilter as FR3ActionSafetyFilter,
+    ActionSafetyFilterConfig as FR3ActionSafetyFilterConfig,
+    normalize_policy_output as normalize_fr3_policy_output,
 )
-from teleop_runtime.deploy.schema import (  # noqa: E402
-    ACTION_HAND_SLICES,
-    ACTION_ARM_POSE_SLICES,
-    ALL_SIDES,
-    STATE_ARM_POSE_SLICES,
-    STATE_HAND_SLICES,
+from inspire_data_collect.deploy.observation import (  # noqa: E402
+    build_deployment_observation as build_fr3_deployment_observation,
 )
-from teleop_runtime.schemas import EffectorCommand  # noqa: E402
-from teleop_runtime.collection.camera_preview import CameraPreviewConfig, CameraPreviewer  # noqa: E402
+from inspire_data_collect.utils.camera_preview import (  # noqa: E402
+    CameraPreviewConfig as FR3CameraPreviewConfig,
+    CameraPreviewer as FR3CameraPreviewer,
+)
+from inspire_data_collect.utils.realsense_rgb import (  # noqa: E402
+    RealSenseRGBCameraConfig as FR3RealSenseRGBCameraConfig,
+    RealSenseRGBSource as FR3RealSenseRGBSource,
+    load_realsense_camera_config_map as load_fr3_realsense_camera_config_map,
+)
+
+
+ALL_SIDES = ("left", "right")
+STATE_ARM_POSE_SLICES = {"left": slice(6, 13), "right": slice(25, 32)}
+STATE_HAND_SLICES = {"left": slice(13, 19), "right": slice(32, 38)}
+ActionSafetyFilter = None
+ActionSafetyFilterConfig = None
+CameraPreviewConfig = None
+CameraPreviewer = None
+build_arm_backends = None
+build_camera_sources = None
+build_deployment_observation = None
+build_hand_backends = None
+normalize_policy_output = None
+select_preview_camera_sources = None
+EffectorCommand = None
+
+
+def _ensure_rm65_imports() -> None:
+    global ActionSafetyFilter
+    global ActionSafetyFilterConfig
+    global CameraPreviewConfig
+    global CameraPreviewer
+    global EffectorCommand
+    global build_arm_backends
+    global build_camera_sources
+    global build_deployment_observation
+    global build_hand_backends
+    global normalize_policy_output
+    global select_preview_camera_sources
+    if build_arm_backends is not None:
+        return
+    from teleop_runtime.collection.camera_preview import (  # noqa: E402
+        CameraPreviewConfig as _CameraPreviewConfig,
+        CameraPreviewer as _CameraPreviewer,
+    )
+    from teleop_runtime.deploy.actions import (  # noqa: E402
+        ActionSafetyFilter as _ActionSafetyFilter,
+        ActionSafetyFilterConfig as _ActionSafetyFilterConfig,
+        normalize_policy_output as _normalize_policy_output,
+    )
+    from teleop_runtime.deploy.observation import build_deployment_observation as _build_deployment_observation  # noqa: E402
+    from teleop_runtime.deploy.run_policy import (  # noqa: E402
+        build_arm_backends as _build_arm_backends,
+        build_camera_sources as _build_camera_sources,
+        build_hand_backends as _build_hand_backends,
+        select_preview_camera_sources as _select_preview_camera_sources,
+    )
+    from teleop_runtime.schemas import EffectorCommand as _EffectorCommand  # noqa: E402
+
+    ActionSafetyFilter = _ActionSafetyFilter
+    ActionSafetyFilterConfig = _ActionSafetyFilterConfig
+    CameraPreviewConfig = _CameraPreviewConfig
+    CameraPreviewer = _CameraPreviewer
+    EffectorCommand = _EffectorCommand
+    build_arm_backends = _build_arm_backends
+    build_camera_sources = _build_camera_sources
+    build_deployment_observation = _build_deployment_observation
+    build_hand_backends = _build_hand_backends
+    normalize_policy_output = _normalize_policy_output
+    select_preview_camera_sources = _select_preview_camera_sources
 
 
 def add_live_args(parser: argparse.ArgumentParser) -> None:
@@ -91,6 +152,8 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-color-space", choices=["rgb", "bgr"], default="rgb")
     parser.add_argument("--camera-wait-timeout-ms", type=int, default=1000)
     parser.add_argument("--camera-stale-after-sec", type=float, default=2.0)
+    parser.add_argument("--camera-start-retry-attempts", type=int, default=8)
+    parser.add_argument("--camera-start-retry-delay-sec", type=float, default=0.5)
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
     parser.add_argument("--live-camera-preview", dest="live_camera_preview", action="store_true", default=True)
     parser.add_argument("--no-live-camera-preview", dest="live_camera_preview", action="store_false")
@@ -206,6 +269,263 @@ def _required_missing_endpoints(profile: DeploymentProfile, args: argparse.Names
     return missing_arms, missing_hands
 
 
+def _is_fr3_profile(profile: DeploymentProfile) -> bool:
+    return str(getattr(profile, "arm_backend", "rm65")).lower() == "fr3"
+
+
+def _fr3_host_for_side(args: argparse.Namespace, side: str) -> str:
+    return _normalize_endpoint_text(getattr(args, f"{side}_arm_ip", ""))
+
+
+class GenericArmStateReader:
+    def __init__(
+        self,
+        backends: Mapping[str, Any],
+        *,
+        refresh_hz: float,
+        compute_tcp_pose: bool = True,
+    ):
+        self.backends = dict(backends)
+        self.refresh_hz = float(refresh_hz)
+        self.compute_tcp_pose = bool(compute_tcp_pose)
+        self._last_refresh_at = {side: 0.0 for side in self.backends}
+
+    def snapshot(self, now: float) -> dict[str, dict[str, Any]]:
+        states: dict[str, dict[str, Any]] = {}
+        refresh_period = 0.0 if self.refresh_hz <= 0.0 else 1.0 / self.refresh_hz
+        for side, backend in self.backends.items():
+            state: dict[str, Any]
+            if isinstance(backend, FR3ArmBackend):
+                raw = backend.get_state()
+                qpos = raw.get("qpos")
+                raw_state = raw.get("raw_state") or {}
+                current_qpos = None if qpos is None else np.asarray(qpos, dtype=np.float32).reshape(-1)
+                state = {
+                    "qpos": None
+                    if current_qpos is None or current_qpos.shape != (7,)
+                    else current_qpos.astype(np.float32, copy=True),
+                    "current_qpos": None
+                    if current_qpos is None or current_qpos.shape != (7,)
+                    else current_qpos.astype(np.float32, copy=True),
+                    "current_tcp_pose": None,
+                    "last_command": None,
+                    "state_error": raw.get("state_error"),
+                    "hardware_result_code": 0 if backend.is_ready() else -1,
+                    "hardware_result_text": "ready" if backend.is_ready() else str(raw.get("state_error") or "not_ready"),
+                    "raw_state": dict(raw_state) if isinstance(raw_state, Mapping) else {},
+                    "startup_alignment_enabled": raw.get("startup_alignment_enabled"),
+                    "startup_alignment_active": raw.get("startup_alignment_active"),
+                    "startup_alignment_complete": raw.get("startup_alignment_complete"),
+                    "startup_alignment_progress": raw.get("startup_alignment_progress"),
+                    "controller_timestamp": raw.get("controller_timestamp"),
+                    "state_receive_timestamp": raw.get("state_receive_timestamp"),
+                    "state_age_sec": raw.get("state_age_sec"),
+                    "server_age_s": raw.get("server_age_s"),
+                }
+                ee_pos = raw_state.get("ee_pos")
+                ee_quat = raw_state.get("ee_quat")
+                if ee_pos is not None and ee_quat is not None:
+                    pose = np.concatenate(
+                        [
+                            np.asarray(ee_pos, dtype=np.float32).reshape(-1)[:3],
+                            np.asarray(ee_quat, dtype=np.float32).reshape(-1)[:4],
+                        ],
+                        axis=0,
+                    )
+                    if pose.shape == (7,) and np.all(np.isfinite(pose)):
+                        state["current_tcp_pose"] = np.asarray(pose, dtype=np.float32).copy()
+                states[side] = state
+                continue
+
+            if (
+                refresh_period > 0.0
+                and hasattr(backend, "is_ready")
+                and backend.is_ready()
+                and now - self._last_refresh_at.get(side, 0.0) >= refresh_period
+            ):
+                try:
+                    backend.refresh_state_from_hardware()
+                except Exception as exc:
+                    state = backend.get_state()
+                    state["state_error"] = f"refresh_failed:{type(exc).__name__}:{exc}"
+                    states[side] = state
+                    continue
+                self._last_refresh_at[side] = now
+            state = backend.get_state()
+            if self.compute_tcp_pose:
+                try:
+                    state["current_tcp_pose"] = backend.compute_tcp_pose()
+                except Exception as exc:
+                    state.setdefault("pose_error", f"compute_tcp_pose_failed:{type(exc).__name__}:{exc}")
+            states[side] = state
+        return states
+
+
+def build_profile_arm_backends(
+    profile: DeploymentProfile,
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+    *,
+    control_hz: float,
+) -> dict[str, Any]:
+    if _is_fr3_profile(profile):
+        backends: dict[str, Any] = {}
+        for side in active_sides:
+            host = _fr3_host_for_side(args, side)
+            backends[side] = FR3ArmBackend(
+                FR3ArmBackendConfig(
+                    host=host or "0.0.0.0",
+                    port=5558,
+                    timeout_s=5.0,
+                    side=side,
+                    effector_name="arm",
+                    connect_hardware=bool(host),
+                    state_poll_hz=float(getattr(args, "arm_state_refresh_hz", 20.0)),
+                    max_state_age_s=0.5,
+                    wait_state_timeout_s=max(0.1, float(getattr(args, "live_ready_timeout_s", 5.0))),
+                    startup_align_enabled=False,
+                    silent_status=True,
+                )
+            )
+        return backends
+    _ensure_rm65_imports()
+    return build_arm_backends(args, active_sides, control_hz=float(control_hz))
+
+
+def build_profile_hand_backends(
+    profile: DeploymentProfile,
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> dict[str, Any]:
+    if _is_fr3_profile(profile):
+        tactile_regions = tuple(str(x).strip() for x in str(args.hand_tactile_regions).split(",") if str(x).strip())
+        if not tactile_regions:
+            tactile_regions = ("all",)
+        backends: dict[str, Any] = {}
+        for side in active_sides:
+            hand_ip = str(getattr(args, f"{side}_hand_ip") or "")
+            backends[side] = FR3InspireTacHandBackend(
+                FR3InspireTacHandBackendConfig(
+                    hand_ip=hand_ip or "0.0.0.0",
+                    side=side,
+                    effector_name=f"{side}_hand",
+                    port=int(args.hand_modbus_port),
+                    connect_hardware=bool(hand_ip),
+                    max_fingertip_force=int(args.max_fingertip_force),
+                    send_threshold=float(args.hand_send_threshold),
+                    enable_telemetry=bool(hand_ip),
+                    telemetry_hz=float(args.hand_telemetry_hz),
+                    tactile_regions=tactile_regions,
+                )
+            )
+        return backends
+    _ensure_rm65_imports()
+    return build_hand_backends(args, active_sides)
+
+
+def build_profile_camera_sources(profile: DeploymentProfile, args: argparse.Namespace) -> dict[str, Any]:
+    if _is_fr3_profile(profile):
+        if args.camera_mode == "none":
+            return {}
+        if args.camera_serial:
+            if args.camera_mode != "single":
+                raise ValueError("--camera-serial can only be used with --camera-mode single.")
+            config = FR3RealSenseRGBCameraConfig(
+                serial=str(args.camera_serial),
+                width=int(args.camera_width),
+                height=int(args.camera_height),
+                fps=int(args.camera_fps),
+                camera_key=str(args.camera_key),
+                keep_last=int(args.camera_keep_last),
+                color_space=str(args.camera_color_space),
+                wait_timeout_ms=int(args.camera_wait_timeout_ms),
+                stale_after_sec=float(args.camera_stale_after_sec),
+                start_retry_attempts=int(args.camera_start_retry_attempts),
+                start_retry_delay_sec=float(args.camera_start_retry_delay_sec),
+                auto_exposure_priority=args.camera_auto_exposure_priority,
+                metadata={"source": "beingh_tac_fr3_live_client"},
+            )
+            return {config.camera_key: FR3RealSenseRGBSource(config)}
+        camera_configs = load_fr3_realsense_camera_config_map(args.camera_config)
+        if args.camera_mode == "single" and len(camera_configs) != 1:
+            raise ValueError(f"--camera-mode single expects exactly one camera config, got {len(camera_configs)}.")
+        if args.camera_mode == "multi" and not camera_configs:
+            raise ValueError("--camera-mode multi requires at least one camera config.")
+        return {key: FR3RealSenseRGBSource(config) for key, config in camera_configs.items()}
+    _ensure_rm65_imports()
+    return build_camera_sources(args)
+
+
+def select_profile_preview_camera_sources(profile: DeploymentProfile, camera_sources: dict[str, Any], requested_key: str) -> dict[str, Any]:
+    if not camera_sources:
+        return {}
+    if not _is_fr3_profile(profile):
+        _ensure_rm65_imports()
+        return select_preview_camera_sources(camera_sources, requested_key)
+    key = str(requested_key or "").strip()
+    if key:
+        if key not in camera_sources:
+            available = ", ".join(sorted(camera_sources))
+            raise ValueError(f"--vis-cam-key {key!r} not found. Available camera keys: {available}")
+        return {key: camera_sources[key]}
+    selected_key = "front" if "front" in camera_sources else sorted(camera_sources)[0]
+    return {selected_key: camera_sources[selected_key]}
+
+
+def build_profile_observation(
+    profile: DeploymentProfile,
+    *,
+    active_sides: tuple[str, ...],
+    arms_enabled: bool,
+    hands_enabled: bool,
+    step_index: int,
+    arm_states: Mapping[str, Mapping[str, Any] | None],
+    hand_states: Mapping[str, Mapping[str, Any] | None],
+    camera_sources: Mapping[str, Any] | None = None,
+    last_action: np.ndarray | None = None,
+    timestamp: float | None = None,
+    require_images: bool = False,
+    metadata: Mapping[str, Any] | None = None,
+) -> Any:
+    if _is_fr3_profile(profile):
+        active = tuple(side for side in active_sides if side in ALL_SIDES)
+        arm_side = active[0] if active else "right"
+        return build_fr3_deployment_observation(
+            active_sides=active,
+            arm_enabled=bool(arms_enabled),
+            step_index=step_index,
+            arm_state=arm_states.get(arm_side),
+            hand_states=hand_states,
+            camera_sources=camera_sources,
+            last_action=last_action,
+            timestamp=timestamp,
+            require_images=require_images,
+            metadata=metadata,
+        )
+    _ensure_rm65_imports()
+    return build_deployment_observation(
+        active_sides=active_sides,
+        arms_enabled=bool(arms_enabled),
+        hands_enabled=bool(hands_enabled),
+        step_index=step_index,
+        arm_states=arm_states,
+        hand_states=hand_states,
+        camera_sources=camera_sources,
+        last_action=last_action,
+        timestamp=timestamp,
+        require_images=require_images,
+        metadata=metadata,
+    )
+
+
+def hand_state_snapshot_for_backends(hand_backends: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    states: dict[str, dict[str, Any]] = {}
+    for side, backend in hand_backends.items():
+        if hasattr(backend, "get_state"):
+            states[side] = dict(backend.get_state())
+    return states
+
+
 @dataclass
 class LiveSnapshot:
     payload_base: dict[str, Any]
@@ -226,12 +546,271 @@ def server_result_for_deploy(result: Mapping[str, Any]) -> dict[str, Any]:
     return output
 
 
+def fr3_server_result_for_deploy(result: Mapping[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    aliases = {
+        "action.arm.joint_target": "arm_joint_target",
+        "action.replay.arm_joint_target": "arm_joint_target",
+        "action.right_hand.joint_target": "right_hand_joint_target",
+        "action.left_hand.joint_target": "left_hand_joint_target",
+    }
+    for src, dst in aliases.items():
+        if src in result:
+            output[dst] = result[src]
+    return output
+
+
+class _FR3PoseIK:
+    def __init__(self) -> None:
+        try:
+            import pinocchio as pin
+        except Exception as exc:
+            raise RuntimeError("Converting Franka EEF pose actions to joints requires pinocchio.") from exc
+
+        self.pin = pin
+        urdf = Path(
+            os.environ.get(
+                "FR3_IK_URDF",
+                "/home/user/zc/fr3_handeye/assets/franka_description/fr3.urdf",
+            )
+        ).expanduser()
+        if not urdf.exists():
+            raise FileNotFoundError(f"FR3 IK URDF not found: {urdf}")
+        ee_link = os.environ.get("FR3_IK_EE_LINK", "fr3_link8")
+        self.model = pin.buildModelFromUrdf(str(urdf))
+        self.data = self.model.createData()
+        self.ee_frame_id = self.model.getFrameId(ee_link)
+        self.arm_dof = 7
+        self.q_min = np.asarray(self.model.lowerPositionLimit[: self.arm_dof], dtype=np.float64)
+        self.q_max = np.asarray(self.model.upperPositionLimit[: self.arm_dof], dtype=np.float64)
+
+    def solve_pose(
+        self,
+        pose: Any,
+        q_seed: Any,
+        *,
+        max_iter: int = 100,
+        tol: float = 1e-4,
+        damping: float = 1e-4,
+        max_step_rad: float = 0.03,
+    ) -> np.ndarray:
+        pin = self.pin
+        target = np.asarray(pose, dtype=np.float64).reshape(-1)
+        if target.shape != (7,) or not np.all(np.isfinite(target)):
+            raise ValueError(f"FR3 IK target pose must be finite pose7, got {target.shape}.")
+        quat = target[3:7].copy()
+        quat_norm = float(np.linalg.norm(quat))
+        if quat_norm <= 1e-9:
+            raise ValueError("FR3 IK target quaternion has zero norm.")
+        quat /= quat_norm
+        o_m_des = pin.SE3(pin.Quaternion(quat[3], quat[0], quat[1], quat[2]).matrix(), target[:3])
+
+        q_seed_arr = np.asarray(q_seed, dtype=np.float64).reshape(-1)
+        if q_seed_arr.shape[0] < self.arm_dof or not np.all(np.isfinite(q_seed_arr[: self.arm_dof])):
+            q_arm = np.zeros((self.arm_dof,), dtype=np.float64)
+        else:
+            q_arm = np.clip(q_seed_arr[: self.arm_dof], self.q_min, self.q_max)
+        q = np.concatenate([q_arm, np.zeros(max(0, self.model.nq - self.arm_dof), dtype=np.float64)])
+
+        for _ in range(max(1, int(max_iter))):
+            pin.forwardKinematics(self.model, self.data, q)
+            pin.updateFramePlacements(self.model, self.data)
+            current = self.data.oMf[self.ee_frame_id]
+            err = pin.log(o_m_des.actInv(current)).vector
+            if float(np.linalg.norm(err)) < float(tol):
+                break
+            jac = pin.computeFrameJacobian(
+                self.model,
+                self.data,
+                q,
+                self.ee_frame_id,
+                pin.ReferenceFrame.LOCAL,
+            )[:, : self.arm_dof]
+            delta = -jac.T.dot(np.linalg.solve(jac.dot(jac.T) + float(damping) * np.eye(6), err))
+            delta = np.clip(delta, -float(max_step_rad), float(max_step_rad))
+            q[: self.arm_dof] = np.clip(q[: self.arm_dof] + delta, self.q_min, self.q_max)
+        return q[: self.arm_dof].astype(np.float32, copy=True)
+
+
+_FR3_POSE_IK: _FR3PoseIK | None = None
+
+
+def _fr3_pose_ik() -> _FR3PoseIK:
+    global _FR3_POSE_IK
+    if _FR3_POSE_IK is None:
+        _FR3_POSE_IK = _FR3PoseIK()
+    return _FR3_POSE_IK
+
+
+def _fr3_pose_chunk_to_joint_chunk(value: Any, observation: Any) -> np.ndarray:
+    poses = np.asarray(value, dtype=np.float32)
+    one_dim = poses.ndim == 1
+    if one_dim:
+        poses = poses.reshape(1, -1)
+    if poses.ndim != 2 or poses.shape[1] != 7:
+        raise ValueError(f"FR3 arm pose action must have shape (7,) or (N,7), got {poses.shape}.")
+    solver = _fr3_pose_ik()
+    seed = np.asarray(getattr(observation, "state", np.zeros(19, dtype=np.float32))[:7], dtype=np.float32)
+    outputs = []
+    for pose in poses:
+        seed = solver.solve_pose(pose, seed)
+        outputs.append(seed.astype(np.float32, copy=True))
+    chunk = np.stack(outputs, axis=0).astype(np.float32)
+    return chunk[0] if one_dim else chunk
+
+
+def _fr3_expand_compact_13_action(arr: np.ndarray) -> np.ndarray:
+    """Expand Franka compact [arm(7), right_hand(6)] action to full 19-D layout."""
+    if arr.ndim == 1:
+        full = np.full((19,), np.nan, dtype=np.float32)
+        full[:7] = arr[:7]
+        full[7:13] = arr[7:13]
+        return full
+    full = np.full((arr.shape[0], 19), np.nan, dtype=np.float32)
+    full[:, :7] = arr[:, :7]
+    full[:, 7:13] = arr[:, 7:13]
+    return full
+
+
+def _coerce_fr3_result_action(result: Mapping[str, Any], observation: Any) -> Mapping[str, Any] | dict[str, Any]:
+    arm_pose = result.get("action.arm.pose")
+    action_raw_format = str(result.get("action_raw_format", "")).lower()
+    raw_arr = None
+    if "action_raw" in result:
+        raw_arr = np.asarray(result["action_raw"], dtype=np.float32)
+    if arm_pose is None and raw_arr is not None and raw_arr.ndim in (1, 2):
+        raw_width = raw_arr.shape[0] if raw_arr.ndim == 1 else raw_arr.shape[1]
+        if raw_width == 13 and "arm_pose" in action_raw_format:
+            arm_pose = raw_arr[:7] if raw_arr.ndim == 1 else raw_arr[:, :7]
+    if arm_pose is not None:
+        output: dict[str, Any] = {
+            "arm_joint_target": _fr3_pose_chunk_to_joint_chunk(arm_pose, observation),
+        }
+        if "action.right_hand.joint_target" in result:
+            output["right_hand_joint_target"] = result["action.right_hand.joint_target"]
+        elif raw_arr is not None:
+            raw_width = raw_arr.shape[0] if raw_arr.ndim == 1 else raw_arr.shape[1]
+            if raw_width >= 13:
+                output["right_hand_joint_target"] = raw_arr[7:13] if raw_arr.ndim == 1 else raw_arr[:, 7:13]
+        return output
+
+    output = fr3_server_result_for_deploy(result)
+    if output:
+        return output
+    for key in ("action", "actions", "action_chunk"):
+        if key in result:
+            return {key: result[key]}
+    for key in ("action_raw", "action_unified"):
+        if key not in result:
+            continue
+        arr = np.asarray(result[key], dtype=np.float32)
+        if arr.ndim == 1:
+            width = int(arr.shape[0])
+        elif arr.ndim == 2:
+            width = int(arr.shape[1])
+        else:
+            continue
+        if width == 19:
+            return {"action": arr}
+        if width == 13:
+            return {"action": _fr3_expand_compact_13_action(arr)}
+        if width == 7:
+            return {"arm_joint_target": arr}
+        if width == 6:
+            return {"right_hand_joint_target": arr}
+    return {}
+
+
+def _format_action_vector(value: Any, *, precision: int = 4) -> str:
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    return np.array2string(arr, precision=precision, separator=", ", suppress_small=False)
+
+
+def _format_fr3_split(prefix: str, vector: Any) -> str:
+    arr = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if arr.shape[0] < 19:
+        padded = np.full((19,), np.nan, dtype=np.float32)
+        padded[: min(arr.shape[0], 19)] = arr[:19]
+        arr = padded
+    return (
+        f"{prefix} arm={_format_action_vector(arr[:7])} "
+        f"right_hand={_format_action_vector(arr[7:13])} "
+        f"left_hand={_format_action_vector(arr[13:19])}"
+    )
+
+
+def _first_action_row(value: Any) -> np.ndarray | None:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr.reshape(-1)
+    if arr.ndim == 2 and arr.shape[0] > 0:
+        return arr[0].reshape(-1)
+    return None
+
+
+def _action_rows(value: Any) -> np.ndarray | None:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    if arr.ndim == 2 and arr.shape[0] > 0:
+        return arr
+    return None
+
+
+def _format_minmax(label: str, value: Any) -> str:
+    arr = np.asarray(value, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return f"{label}=all_nan"
+    return f"{label}=[{float(finite.min()):.4f}, {float(finite.max()):.4f}]"
+
+
+def format_fr3_policy_debug(result: Mapping[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key in ("action_unified", "action_raw", "action", "actions", "action_chunk"):
+        if key not in result:
+            continue
+        arr = np.asarray(result[key], dtype=np.float32)
+        first = _first_action_row(arr)
+        rows = _action_rows(arr)
+        if first is None:
+            lines.append(f"[ActionDebug] policy {key}: shape={arr.shape}")
+            continue
+        preview_width = min(first.shape[0], 32)
+        summary = f"[ActionDebug] policy {key}: shape={arr.shape} first{preview_width}={_format_action_vector(first[:preview_width])}"
+        if rows is not None and rows.shape[1] >= 13:
+            summary += (
+                f" {_format_minmax('arm0', rows[:, 0])}"
+                f" {_format_minmax('arm6', rows[:, 6])}"
+                f" {_format_minmax('hand0', rows[:, 7])}"
+                f" {_format_minmax('hand5', rows[:, 12])}"
+            )
+        lines.append(summary)
+    return lines
+
+
+def format_fr3_dataset_gt_debug(gt_action: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(gt_action, Mapping):
+        return []
+    source = str(gt_action.get("source", "unknown"))
+    full = gt_action.get("full")
+    if full is None:
+        return [f"[ActionDebug] dataset_gt source={source} missing"]
+    return [f"[ActionDebug] dataset_gt source={source} {_format_fr3_split('gt', full)}"]
+
+
 def _send_commands(
     commands: Mapping[str, Any],
     *,
     arm_backends: Mapping[str, Any],
     hand_backends: Mapping[str, Any],
 ) -> None:
+    arm_command = commands.get("arm")
+    if arm_command is not None:
+        side = str(getattr(arm_command, "side", "") or "")
+        backend = arm_backends.get(side)
+        if backend is not None:
+            backend.send_command(arm_command)
     for side in ALL_SIDES:
         arm_command = commands.get(f"{side}_arm")
         if arm_command is not None and side in arm_backends:
@@ -239,6 +818,58 @@ def _send_commands(
         hand_command = commands.get(f"{side}_hand")
         if hand_command is not None and side in hand_backends:
             hand_backends[side].send_command(hand_command)
+
+
+def _fixed_hand_vector(args: argparse.Namespace) -> np.ndarray | None:
+    value = getattr(args, "fixed_hand", None)
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if arr.shape != (6,) or not np.all(np.isfinite(arr)):
+        raise ValueError(f"--fixed-hand must be a finite 6-D vector, got shape {arr.shape}.")
+    return arr.astype(np.float32, copy=True)
+
+
+def _override_fr3_hand_commands(
+    deployment_action: Any,
+    *,
+    active_sides: tuple[str, ...],
+    fixed_hand: np.ndarray,
+) -> Any:
+    commands = dict(deployment_action.commands)
+    vector = np.asarray(deployment_action.vector, dtype=np.float32).reshape(-1).copy()
+    timestamp = time.time()
+    overridden_sides = []
+    for side, target_slice in (("right", slice(7, 13)), ("left", slice(13, 19))):
+        if side not in set(active_sides):
+            continue
+        name = f"{side}_hand"
+        existing = commands.get(name)
+        overridden_sides.append(side)
+        if vector.shape[0] >= target_slice.stop:
+            vector[target_slice] = fixed_hand
+        metadata = {} if getattr(existing, "metadata", None) is None else dict(existing.metadata)
+        metadata["fixed_hand_override"] = True
+        if existing is not None:
+            metadata["fixed_hand_raw_policy_action"] = np.asarray(existing.value, dtype=np.float32).copy()
+        commands[name] = FR3EffectorCommand(
+            effector_name=name,
+            side=side,
+            value=fixed_hand.copy(),
+            timestamp=timestamp,
+            metadata=metadata,
+        )
+
+    if not overridden_sides:
+        return deployment_action
+    metadata = dict(getattr(deployment_action, "metadata", {}) or {})
+    metadata["fixed_hand_override"] = {side: fixed_hand.copy() for side in overridden_sides}
+    return type(deployment_action)(
+        vector=vector,
+        commands=commands,
+        faults=list(getattr(deployment_action, "faults", [])),
+        metadata=metadata,
+    )
 
 
 class TimedActionDispatcher:
@@ -259,6 +890,7 @@ class TimedActionDispatcher:
         set_last_action: Callable[[np.ndarray], None],
         policy_name: str,
         send_actions: bool,
+        backend_kind: str = "rm65",
     ):
         self.args = args
         self.active_sides = active_sides
@@ -272,6 +904,8 @@ class TimedActionDispatcher:
         self.set_last_action = set_last_action
         self.policy_name = str(policy_name)
         self.send_actions = bool(send_actions)
+        self.backend_kind = str(backend_kind)
+        self.fixed_hand = _fixed_hand_vector(args) if self.backend_kind == "fr3" else None
         self.action_hz = max(1e-6, float(getattr(args, "action_hz", 12.0)))
         self.queue_policy = str(getattr(args, "action_queue_policy", "replace"))
         self.underrun_log_sec = max(0.0, float(getattr(args, "action_underrun_log_sec", 2.0)))
@@ -284,6 +918,12 @@ class TimedActionDispatcher:
         self._submitted_chunks = 0
         self._sent_actions = 0
         self._started_at = 0.0
+        self._debug_submitted_chunks = 0
+        self._debug_sent_actions = 0
+        self._policy_request_in_flight = False
+
+    def _debug_enabled(self) -> bool:
+        return bool(getattr(self.args, "debug_fr3_actions", False)) and self.backend_kind == "fr3"
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -310,27 +950,48 @@ class TimedActionDispatcher:
             self._queue.clear()
 
     def submit_result(self, result: Mapping[str, Any]) -> list[str]:
-        output: Mapping[str, Any] | dict[str, np.ndarray] = server_result_for_deploy(result)
-        if not output:
-            if any(key in result for key in ("action", "actions", "action_chunk")):
-                output = result
-            elif "action_raw" in result:
-                output = {"action": np.asarray(result["action_raw"], dtype=np.float32)}
-            elif "action_unified" in result:
-                output = {"action": np.asarray(result["action_unified"], dtype=np.float32)}
-            else:
-                return ["missing_action"]
-
         observation = self.get_observation()
-        actions = normalize_policy_output(
-            output,
-            observation,
-            active_sides=self.active_sides,
-            arms_enabled=self.arms_enabled,
-            hands_enabled=self.hands_enabled,
-        )
+        if self.backend_kind == "fr3":
+            output = _coerce_fr3_result_action(result, observation)
+            if not output:
+                return ["missing_action"]
+            actions = normalize_fr3_policy_output(
+                output,
+                observation,
+                active_sides=self.active_sides,
+                arm_enabled=self.arms_enabled,
+            )
+        else:
+            _ensure_rm65_imports()
+            output: Mapping[str, Any] | dict[str, np.ndarray] = server_result_for_deploy(result)
+            if not output:
+                if any(key in result for key in ("action", "actions", "action_chunk")):
+                    output = result
+                elif "action_raw" in result:
+                    output = {"action": np.asarray(result["action_raw"], dtype=np.float32)}
+                elif "action_unified" in result:
+                    output = {"action": np.asarray(result["action_unified"], dtype=np.float32)}
+                else:
+                    return ["missing_action"]
+            actions = normalize_policy_output(
+                output,
+                observation,
+                active_sides=self.active_sides,
+                arms_enabled=self.arms_enabled,
+                hands_enabled=self.hands_enabled,
+            )
         if not actions:
             return ["empty_action_chunk"]
+
+        if self._debug_enabled():
+            first = np.asarray(actions[0], dtype=np.float32).reshape(-1)
+            rows = np.asarray(actions, dtype=np.float32).reshape(len(actions), -1)
+            print(
+                f"[ActionDebug] normalized_chunk index={self._debug_submitted_chunks} "
+                f"len={len(actions)} {_format_fr3_split('normalized0', first)} "
+                f"{_format_minmax('arm0', rows[:, 0])} {_format_minmax('arm6', rows[:, 6])}"
+            )
+            self._debug_submitted_chunks += 1
 
         with self._lock:
             remaining = len(self._queue)
@@ -349,6 +1010,14 @@ class TimedActionDispatcher:
         if replaced:
             status.append(f"discarded_old={replaced}")
         return status
+
+    def set_policy_request_in_flight(self, in_flight: bool) -> None:
+        with self._lock:
+            self._policy_request_in_flight = bool(in_flight)
+
+    def _is_policy_request_in_flight(self) -> bool:
+        with self._lock:
+            return bool(self._policy_request_in_flight)
 
     def _pop_action(self) -> Any | None:
         with self._lock:
@@ -411,17 +1080,76 @@ class TimedActionDispatcher:
 
             try:
                 observation = self.get_observation()
-                deployment_action = self.safety_filter.filter(
-                    action,
-                    observation,
-                    policy_name=self.policy_name,
-                )
+                if self.backend_kind == "fr3":
+                    deployment_action = self.safety_filter.filter(
+                        action,
+                        observation,
+                        timestamp=time.time(),
+                        policy_name=self.policy_name,
+                    )
+                else:
+                    deployment_action = self.safety_filter.filter(
+                        action,
+                        observation,
+                        policy_name=self.policy_name,
+                    )
+                if self.fixed_hand is not None:
+                    deployment_action = _override_fr3_hand_commands(
+                        deployment_action,
+                        active_sides=self.active_sides,
+                        fixed_hand=self.fixed_hand,
+                    )
                 if self.send_actions:
                     _send_commands(
                         deployment_action.commands,
                         arm_backends=self.arm_backends,
                         hand_backends=self.hand_backends,
                     )
+                if self._debug_enabled():
+                    command_parts: list[str] = []
+                    arm_command = deployment_action.commands.get("arm")
+                    if arm_command is not None:
+                        raw_arm = None
+                        safety = None
+                        metadata = getattr(arm_command, "metadata", None)
+                        if isinstance(metadata, Mapping):
+                            raw_arm = metadata.get("raw_action")
+                            safety = metadata.get("safety")
+                        command_parts.append(f"cmd_arm={_format_action_vector(arm_command.value)}")
+                        if raw_arm is not None:
+                            command_parts.append(f"raw_arm={_format_action_vector(raw_arm)}")
+                        if isinstance(safety, Mapping):
+                            command_parts.append(
+                                "arm_safety="
+                                f"clip={bool(safety.get('safe_clip', False))},"
+                                f"rate_limit={bool(safety.get('rate_limited', False))},"
+                                f"max_step={float(safety.get('max_step_rad', 0.0)):.4f}"
+                            )
+                    for name in ("right_hand", "left_hand"):
+                        command = deployment_action.commands.get(name)
+                        if command is not None:
+                            command_parts.append(f"cmd_{name}={_format_action_vector(command.value)}")
+                    if self.active_sides:
+                        side = self.active_sides[0]
+                        backend = self.arm_backends.get(side)
+                        if backend is not None and hasattr(backend, "get_state"):
+                            try:
+                                state = backend.get_state()
+                            except Exception:
+                                state = {}
+                            if isinstance(state, Mapping):
+                                measured_qpos = state.get("qpos")
+                                last_sent_command = state.get("last_sent_command")
+                                if measured_qpos is not None:
+                                    command_parts.append(f"measured_qpos={_format_action_vector(measured_qpos)}")
+                                if last_sent_command is not None:
+                                    command_parts.append(f"backend_last_sent={_format_action_vector(last_sent_command)}")
+                    commands_text = " ".join(command_parts) if command_parts else "commands=none"
+                    print(
+                        f"[ActionDebug] dispatched index={self._debug_sent_actions} "
+                        f"{_format_fr3_split('filtered', deployment_action.vector)} {commands_text}"
+                    )
+                    self._debug_sent_actions += 1
                 self.set_last_action(deployment_action.vector.astype(np.float32, copy=True))
                 self._sent_actions += 1
                 if deployment_action.faults:
@@ -434,6 +1162,8 @@ class TimedActionDispatcher:
 
     def _handle_underrun(self) -> None:
         self._underrun_count += 1
+        if self._is_policy_request_in_flight():
+            return
         if self.underrun_log_sec <= 0.0:
             return
         now = time.monotonic()
@@ -449,9 +1179,8 @@ class TimedActionDispatcher:
 
 class LiveObservationSource:
     def __init__(self, profile: DeploymentProfile, args: argparse.Namespace, history_size: int, history_stride: int):
-        if not profile.supports_live_rm65:
-            raise ValueError(f"{profile.data_config_name} live mode is not supported by DexTeleop RM65 backends.")
         self.profile = profile
+        self.backend_kind = "fr3" if _is_fr3_profile(profile) else "rm65"
         self.args = _coerce_builder_args(args)
         self.active_sides = tuple(side for side in ALL_SIDES if side in set(self.args.active_sides))
         required = set(profile.required_arms) | set(profile.required_hands)
@@ -473,46 +1202,58 @@ class LiveObservationSource:
                 f"{profile.data_config_name} live mode requires hardware hand IP for: {', '.join(missing_hands)}. "
                 f"Set {flags}, or pass --allow-hand-connect-failure for dry-run debugging."
             )
-        self.arm_backends = build_arm_backends(
+        self.arm_backends = build_profile_arm_backends(
+            profile,
             self.args,
             self.active_sides,
             control_hz=float(self.args.action_hz),
         )
-        self.hand_backends = build_hand_backends(self.args, self.active_sides)
-        self.arm_reader = ArmStateReader(
+        self.hand_backends = build_profile_hand_backends(profile, self.args, self.active_sides)
+        self.arm_reader = GenericArmStateReader(
             self.arm_backends,
             refresh_hz=float(self.args.arm_state_refresh_hz),
             compute_tcp_pose=True,
         )
-        self.camera_sources = build_camera_sources(self.args)
+        self.camera_sources = build_profile_camera_sources(profile, self.args)
         self.preview_camera_sources = (
-            select_preview_camera_sources(self.camera_sources, str(getattr(self.args, "vis_cam_key", "")))
+            select_profile_preview_camera_sources(profile, self.camera_sources, str(getattr(self.args, "vis_cam_key", "")))
             if bool(getattr(self.args, "live_camera_preview", True)) and self.camera_sources
             else {}
         )
         self.camera_previewer = (
-            CameraPreviewer(CameraPreviewConfig(window_prefix="beingh_live"))
+            (FR3CameraPreviewer(FR3CameraPreviewConfig(window_prefix="beingh_live")) if self.backend_kind == "fr3" else CameraPreviewer(CameraPreviewConfig(window_prefix="beingh_live")))
             if self.preview_camera_sources
             else None
         )
         self.history = TactileHistory(history_size, history_stride)
-        self.last_action = np.full(26, np.nan, dtype=np.float32)
+        self.last_action = np.full(19 if self.backend_kind == "fr3" else 26, np.nan, dtype=np.float32)
         self.step_index = 0
         self.target_image_height = int(getattr(args, "fallback_image_height", 480))
         self.target_image_width = int(getattr(args, "fallback_image_width", 640))
-        self.safety_filter = ActionSafetyFilter(
-            ActionSafetyFilterConfig(
-                active_sides=self.active_sides,
-                arms_enabled=True,
-                hands_enabled=self.hands_enabled,
-                workspace_min=self.args.arm_workspace_min,
-                workspace_max=self.args.arm_workspace_max,
-                max_arm_xyz_step_m=float(self.args.max_arm_xyz_step_m),
-                max_arm_rot_step_deg=float(self.args.max_arm_rot_step_deg),
-                max_arm_joint_step_rad=float(self.args.max_arm_joint_step_rad),
-                max_hand_step=float(self.args.max_hand_step),
+        if self.backend_kind == "fr3":
+            self.safety_filter = FR3ActionSafetyFilter(
+                FR3ActionSafetyFilterConfig(
+                    active_sides=self.active_sides,
+                    arm_enabled=True,
+                    max_arm_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_hand_step=float(self.args.max_hand_step),
+                )
             )
-        )
+        else:
+            _ensure_rm65_imports()
+            self.safety_filter = ActionSafetyFilter(
+                ActionSafetyFilterConfig(
+                    active_sides=self.active_sides,
+                    arms_enabled=True,
+                    hands_enabled=self.hands_enabled,
+                    workspace_min=self.args.arm_workspace_min,
+                    workspace_max=self.args.arm_workspace_max,
+                    max_arm_xyz_step_m=float(self.args.max_arm_xyz_step_m),
+                    max_arm_rot_step_deg=float(self.args.max_arm_rot_step_deg),
+                    max_arm_joint_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_hand_step=float(self.args.max_hand_step),
+                )
+            )
         self.dispatcher = TimedActionDispatcher(
             args=self.args,
             active_sides=self.active_sides,
@@ -526,27 +1267,52 @@ class LiveObservationSource:
             set_last_action=self._set_last_action,
             policy_name="BeingH-Tac-live",
             send_actions=bool(self.args.send_actions),
+            backend_kind=self.backend_kind,
         )
 
     def __enter__(self):
-        for side, backend in self.arm_backends.items():
-            backend.start()
-            if not backend.is_ready() and not bool(self.args.allow_arm_connect_failure):
-                raise RuntimeError(f"{side} arm backend is not ready: {backend.get_state()}")
-        for side, backend in self.hand_backends.items():
-            backend.start()
-            if not backend.is_ready() and not bool(self.args.allow_hand_connect_failure):
-                raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
-        for source in self.camera_sources.values():
-            source.start()
-        if self.camera_previewer is not None:
-            if self.camera_previewer.ensure_available():
-                print(f"[Camera] live preview active for cameras={sorted(self.preview_camera_sources)}")
-            else:
-                print(f"WARNING: live camera preview disabled: {self.camera_previewer.disabled_reason}")
-        self._wait_until_ready()
-        self.dispatcher.start()
-        return self
+        try:
+            for side, backend in self.arm_backends.items():
+                backend.start()
+                if not backend.is_ready() and not bool(self.args.allow_arm_connect_failure):
+                    raise RuntimeError(f"{side} arm backend is not ready: {backend.get_state()}")
+            for side, backend in self.hand_backends.items():
+                backend.start()
+                if not backend.is_ready() and not bool(self.args.allow_hand_connect_failure):
+                    raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
+            for source in self.camera_sources.values():
+                source.start()
+            for camera_key, source in sorted(self.camera_sources.items()):
+                info = {}
+                device_info = getattr(source, "device_info", None)
+                if callable(device_info):
+                    try:
+                        info = dict(device_info())
+                    except Exception:
+                        info = {}
+                requested = str(info.get("requested_serial") or getattr(getattr(source, "config", None), "serial", "") or "")
+                actual = str(info.get("serial_number") or info.get("serial") or "")
+                serial_match = info.get("serial_match")
+                print(
+                    f"[Camera] {camera_key}: requested_serial={requested} actual_serial={actual} "
+                    f"match={serial_match}"
+                )
+                if requested and actual and actual != requested:
+                    raise RuntimeError(
+                        f"Camera {camera_key!r} opened wrong RealSense device: "
+                        f"requested serial {requested}, actual serial {actual}."
+                    )
+            if self.camera_previewer is not None:
+                if self.camera_previewer.ensure_available():
+                    print(f"[Camera] live preview active for cameras={sorted(self.preview_camera_sources)}")
+                else:
+                    print(f"WARNING: live camera preview disabled: {self.camera_previewer.disabled_reason}")
+            self._wait_until_ready()
+            self.dispatcher.start()
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.dispatcher.stop()
@@ -582,8 +1348,9 @@ class LiveObservationSource:
 
     def _build_observation(self, now: float) -> Any:
         arm_states = self.arm_reader.snapshot(now)
-        hand_states = hand_state_snapshot(self.hand_backends)
-        return build_deployment_observation(
+        hand_states = hand_state_snapshot_for_backends(self.hand_backends)
+        return build_profile_observation(
+            self.profile,
             active_sides=self.active_sides,
             arms_enabled=True,
             hands_enabled=self.hands_enabled,
@@ -605,6 +1372,11 @@ class LiveObservationSource:
     def _is_required_state_ready(self, observation: Any) -> bool:
         if not self._is_camera_ready(observation):
             return False
+        if self.profile.data_config_name == "franka":
+            return (
+                np.all(np.isfinite(observation.state[:7]))
+                and np.all(np.isfinite(observation.state[7:13]))
+            )
         if self.profile.data_config_name == "realman20":
             return (
                 np.all(np.isfinite(observation.state[STATE_ARM_POSE_SLICES["right"]]))
@@ -672,6 +1444,13 @@ class LiveObservationSource:
                 key: {
                     "has_image": key in last_observation.images,
                     "timestamp": last_observation.image_timestamps.get(key),
+                    "source_serial": (
+                        (lambda info: info.get("serial_number") or info.get("serial"))(
+                            dict(self.camera_sources[key].device_info()) if hasattr(self.camera_sources[key], "device_info") else {}
+                        )
+                        if key in self.camera_sources
+                        else None
+                    ),
                 }
                 for key in self.camera_sources
             }
@@ -702,6 +1481,24 @@ class LiveObservationSource:
 
     def _state_for_profile(self, observation: Any) -> dict[str, np.ndarray]:
         state = observation.state
+        if self.profile.data_config_name == "franka":
+            arm_state = observation.arm_state
+            raw_state = arm_state.get("raw_state") if isinstance(arm_state, Mapping) else None
+            if isinstance(raw_state, Mapping) and raw_state.get("ee_pos") is not None and raw_state.get("ee_quat") is not None:
+                eef_pose = np.concatenate(
+                    [
+                        _finite_vector(raw_state.get("ee_pos"), 3, "eef_pos"),
+                        _finite_vector(raw_state.get("ee_quat"), 4, "eef_quat"),
+                    ],
+                    axis=0,
+                ).astype(np.float32)
+            else:
+                eef_pose = np.zeros(7, dtype=np.float32)
+            return {
+                "eef_pose": eef_pose,
+                "arm_qpos": _finite_vector(state[:7], 7, "arm_qpos"),
+                "right_hand_qpos": _finite_vector(state[7:13], 6, "right_hand_qpos"),
+            }
         if self.profile.data_config_name == "realman20":
             return {
                 "right_arm_pose": _finite_vector(state[STATE_ARM_POSE_SLICES["right"]], 7, "right_arm_pose"),
@@ -723,7 +1520,8 @@ class LiveObservationSource:
         raise ValueError(f"Unsupported live profile {self.profile.data_config_name}.")
 
     def _set_last_action(self, action: np.ndarray) -> None:
-        self.last_action = np.asarray(action, dtype=np.float32).reshape(26)
+        width = 19 if self.backend_kind == "fr3" else 26
+        self.last_action = np.asarray(action, dtype=np.float32).reshape(width)
 
     def next_payload_base(self) -> LiveSnapshot:
         observation = self._wait_for_next_ready_observation()
@@ -755,14 +1553,34 @@ class LiveObservationSource:
     def remember_observation(self, observation: Any) -> None:
         self._last_observation = observation
 
+    def wait_until_idle(self, timeout_s: float | None = None, poll_s: float = 0.01) -> bool:
+        return self.dispatcher.wait_until_idle(timeout_s=timeout_s, poll_s=poll_s)
+
+    @property
+    def sent_actions(self) -> int:
+        return self.dispatcher.sent_actions
+
+    def wait_until_sent(
+        self,
+        target_sent: int,
+        timeout_s: float | None = None,
+        poll_s: float = 0.01,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        return self.dispatcher.wait_until_sent(
+            target_sent=target_sent,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            progress=progress,
+        )
+
 
 class HardwareActionExecutor:
     """Send server actions to live hardware while observations come from a dataset."""
 
     def __init__(self, profile: DeploymentProfile, args: argparse.Namespace):
-        if not profile.supports_live_rm65:
-            raise ValueError(f"{profile.data_config_name} action execution is not supported by DexTeleop RM65 backends.")
         self.profile = profile
+        self.backend_kind = "fr3" if _is_fr3_profile(profile) else "rm65"
         self.args = _coerce_builder_args(args)
         required_sides = set(profile.required_arms) | set(profile.required_hands)
         self.active_sides = tuple(side for side in ALL_SIDES if side in required_sides)
@@ -784,32 +1602,45 @@ class HardwareActionExecutor:
                 f"Set {flags} or export {', '.join(f'{side.upper()}_HAND_IP' for side in missing_hands)}."
             )
 
-        self.arm_backends = build_arm_backends(
+        self.arm_backends = build_profile_arm_backends(
+            profile,
             self.args,
             self.active_sides,
             control_hz=float(self.args.action_hz),
         )
-        self.hand_backends = build_hand_backends(self.args, self.active_sides)
-        self.arm_reader = ArmStateReader(
+        self.hand_backends = build_profile_hand_backends(profile, self.args, self.active_sides)
+        self.arm_reader = GenericArmStateReader(
             self.arm_backends,
             refresh_hz=float(self.args.arm_state_refresh_hz),
             compute_tcp_pose=True,
         )
-        self.last_action = np.full(26, np.nan, dtype=np.float32)
+        self.last_action = np.full(19 if self.backend_kind == "fr3" else 26, np.nan, dtype=np.float32)
         self.step_index = 0
-        self.safety_filter = ActionSafetyFilter(
-            ActionSafetyFilterConfig(
-                active_sides=self.active_sides,
-                arms_enabled=True,
-                hands_enabled=self.hands_enabled,
-                workspace_min=self.args.arm_workspace_min,
-                workspace_max=self.args.arm_workspace_max,
-                max_arm_xyz_step_m=float(self.args.max_arm_xyz_step_m),
-                max_arm_rot_step_deg=float(self.args.max_arm_rot_step_deg),
-                max_arm_joint_step_rad=float(self.args.max_arm_joint_step_rad),
-                max_hand_step=float(self.args.max_hand_step),
+        self.start_dispatcher = True
+        if self.backend_kind == "fr3":
+            self.safety_filter = FR3ActionSafetyFilter(
+                FR3ActionSafetyFilterConfig(
+                    active_sides=self.active_sides,
+                    arm_enabled=True,
+                    max_arm_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_hand_step=float(self.args.max_hand_step),
+                )
             )
-        )
+        else:
+            _ensure_rm65_imports()
+            self.safety_filter = ActionSafetyFilter(
+                ActionSafetyFilterConfig(
+                    active_sides=self.active_sides,
+                    arms_enabled=True,
+                    hands_enabled=self.hands_enabled,
+                    workspace_min=self.args.arm_workspace_min,
+                    workspace_max=self.args.arm_workspace_max,
+                    max_arm_xyz_step_m=float(self.args.max_arm_xyz_step_m),
+                    max_arm_rot_step_deg=float(self.args.max_arm_rot_step_deg),
+                    max_arm_joint_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_hand_step=float(self.args.max_hand_step),
+                )
+            )
         self.dispatcher = TimedActionDispatcher(
             args=self.args,
             active_sides=self.active_sides,
@@ -823,6 +1654,7 @@ class HardwareActionExecutor:
             set_last_action=self._set_last_action,
             policy_name="BeingH-Tac-dataset",
             send_actions=True,
+            backend_kind=self.backend_kind,
         )
 
     def __enter__(self) -> "HardwareActionExecutor":
@@ -835,8 +1667,11 @@ class HardwareActionExecutor:
             if not backend.is_ready() and not bool(self.args.allow_hand_connect_failure):
                 raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
         self._wait_until_ready()
-        self.dispatcher.start()
-        print(f"[Action] dataset --send-actions enabled for sides={self.active_sides}")
+        if self.start_dispatcher:
+            self.dispatcher.start()
+            print(f"[Action] dataset --send-actions enabled for sides={self.active_sides}")
+        else:
+            print(f"[Action] direct joint target mode enabled for sides={self.active_sides}")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -849,8 +1684,9 @@ class HardwareActionExecutor:
     def _build_observation(self) -> Any:
         now = time.time()
         arm_states = self.arm_reader.snapshot(now)
-        hand_states = hand_state_snapshot(self.hand_backends)
-        observation = build_deployment_observation(
+        hand_states = hand_state_snapshot_for_backends(self.hand_backends)
+        observation = build_profile_observation(
+            self.profile,
             active_sides=self.active_sides,
             arms_enabled=True,
             hands_enabled=self.hands_enabled,
@@ -867,6 +1703,8 @@ class HardwareActionExecutor:
         return observation
 
     def _is_ready(self, observation: Any) -> bool:
+        if self.backend_kind == "fr3":
+            return bool(np.all(np.isfinite(observation.state[:13])))
         ready = True
         for side in self.profile.required_arms:
             ready = ready and np.all(np.isfinite(observation.state[STATE_ARM_POSE_SLICES[side]]))
@@ -896,10 +1734,14 @@ class HardwareActionExecutor:
         raise RuntimeError(f"Action executor hardware state is not ready. faults={faults}")
 
     def _set_last_action(self, action: np.ndarray) -> None:
-        self.last_action = np.asarray(action, dtype=np.float32).reshape(26)
+        width = 19 if self.backend_kind == "fr3" else 26
+        self.last_action = np.asarray(action, dtype=np.float32).reshape(width)
 
     def consume_server_result(self, result: Mapping[str, Any]) -> list[str]:
         return self.dispatcher.submit_result(result)
+
+    def set_policy_request_in_flight(self, in_flight: bool) -> None:
+        self.dispatcher.set_policy_request_in_flight(in_flight)
 
     def send_direct_joint_targets(
         self,
@@ -916,7 +1758,8 @@ class HardwareActionExecutor:
                 statuses.append(f"{side}_arm_unavailable")
                 continue
             target = np.asarray(value, dtype=np.float32).reshape(-1)
-            if target.shape != (6,) or not np.all(np.isfinite(target)):
+            expected_width = 7 if self.backend_kind == "fr3" else 6
+            if target.shape != (expected_width,) or not np.all(np.isfinite(target)):
                 statuses.append(f"{side}_arm_direct_qpos_invalid")
                 continue
             backend = self.arm_backends[side]
@@ -926,16 +1769,25 @@ class HardwareActionExecutor:
                 backend.set_local_qpos(target)
                 statuses.append(f"{side}_arm_direct_sent")
             else:
-                backend.send_command(
-                    EffectorCommand(
+                if self.backend_kind == "fr3":
+                    command = FR3EffectorCommand(
+                        effector_name="arm",
+                        side=side,
+                        value=target,
+                        timestamp=time.time(),
+                        metadata={"source": "startup_direct_init"},
+                    )
+                else:
+                    _ensure_rm65_imports()
+                    command = EffectorCommand(
                         effector_name=f"{side}_arm",
                         side=side,
-                        command_type="joint_vector",
                         value=target,
+                        command_type="joint_vector",
                         frame_name=None,
                         metadata={"source": "startup_direct_init"},
                     )
-                )
+                backend.send_command(command)
                 statuses.append(f"{side}_arm_direct_dry_run")
 
         for side, value in hand_qpos.items():
@@ -946,16 +1798,26 @@ class HardwareActionExecutor:
             if target.shape != (6,) or not np.all(np.isfinite(target)):
                 statuses.append(f"{side}_hand_direct_qpos_invalid")
                 continue
-            self.hand_backends[side].send_command(
-                EffectorCommand(
+            clipped = np.clip(target, 0.0, 1.0)
+            if self.backend_kind == "fr3":
+                command = FR3EffectorCommand(
                     effector_name=f"{side}_hand",
                     side=side,
+                    value=clipped,
+                    timestamp=time.time(),
+                    metadata={"source": "startup_direct_init"},
+                )
+            else:
+                _ensure_rm65_imports()
+                command = EffectorCommand(
+                    effector_name=f"{side}_hand",
+                    side=side,
+                    value=clipped,
                     command_type="joint_vector",
-                    value=np.clip(target, 0.0, 1.0),
                     frame_name=None,
                     metadata={"source": "startup_direct_init"},
                 )
-            )
+            self.hand_backends[side].send_command(command)
             statuses.append(f"{side}_hand_direct_sent")
         return statuses
 

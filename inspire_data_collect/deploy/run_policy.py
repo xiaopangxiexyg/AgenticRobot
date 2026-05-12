@@ -39,7 +39,7 @@ from .actions import (
 )
 from .observation import build_deployment_observation
 from .policy import load_policy
-from .replay import load_dataset_replay_policy
+from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
 from .startup_init import StartupInitializer, resolve_startup_init_action
 
 
@@ -85,6 +85,27 @@ class LoopRate:
         return float(self.hz)
 
 
+def _positive_float(text: str) -> float:
+    value = float(text)
+    if value <= 0.0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
+def _non_negative_float(text: str) -> float:
+    value = float(text)
+    if value < 0.0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return value
+
+
+def _non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return value
+
+
 def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--policy",
@@ -104,8 +125,27 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="JSON object passed to Policy/create_policy constructors.",
     )
     parser.add_argument("--active-sides", type=parse_active_sides, default=ALL_SIDES)
-    parser.add_argument("--hz", type=float, default=30.0, help="Control loop rate.")
-    parser.add_argument("--policy-hz", type=float, default=10.0, help="Max synchronous policy query rate.")
+    parser.add_argument("--hz", type=_positive_float, default=13.0, help="Fallback control loop rate.")
+    parser.add_argument(
+        "--action-hz",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Action send/control rate. 0 keeps backward-compatible --hz unless a replay/reference "
+            "dataset is provided, in which case the real dataset rate is inferred."
+        ),
+    )
+    parser.add_argument("--action-hz-dataset", type=Path, default=None)
+    parser.add_argument("--action-hz-parquet", type=Path, default=None)
+    parser.add_argument("--action-hz-episode", type=_non_negative_int, default=None)
+    parser.add_argument("--action-hz-start-index", type=_non_negative_int, default=None)
+    parser.add_argument("--action-hz-end-index", type=int, default=None)
+    parser.add_argument(
+        "--policy-hz",
+        type=_positive_float,
+        default=None,
+        help="Max synchronous policy query rate. Omit to match the effective action/control rate.",
+    )
     parser.add_argument(
         "--min-action-queue",
         type=int,
@@ -276,7 +316,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--max-hand-step",
         type=float,
         default=0.08,
-        help="Per-control-tick hand q6 action rate limit. <=0 disables.",
+        help="Compatibility option; hand q6 targets are clipped to [0, 1] and sent directly.",
     )
 
     parser.add_argument(
@@ -286,7 +326,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--camera-config", type=Path, default=DEFAULT_CAMERA_CONFIG_PATH)
     parser.add_argument("--camera-key", type=str, default="front")
-    parser.add_argument("--camera-serial", type=str, default="")
+    parser.add_argument("--camera-serial", "--camera-id", dest="camera_serial", type=str, default="")
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
     parser.add_argument("--camera-fps", type=int, default=30)
@@ -302,10 +342,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--vis_cam", "--vis-cam", dest="vis_cam", action="store_true")
     parser.add_argument("--vis-cam-key", "--vis-camera-key", type=str, default="")
+    parser.add_argument(
+        "--vis-cam-window-mode",
+        choices=["resizable", "autosize"],
+        default="resizable",
+    )
+    parser.add_argument("--vis-cam-render-scale", type=float, default=2.0)
 
     parser.add_argument("--visualize-tactile", action="store_true")
     parser.add_argument("--tactile-vis-value-scale", type=float, default=0.02)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
+    parser.add_argument("--tactile-vis-render-scale", type=float, default=2.0)
     parser.add_argument(
         "--tactile-vis-window-mode",
         choices=["resizable", "autosize"],
@@ -324,7 +371,9 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
     active_sides = tuple(args.active_sides)
     if float(args.hz) <= 0.0:
         raise ValueError("--hz must be positive.")
-    if float(args.policy_hz) <= 0.0:
+    if float(args.action_hz) < 0.0:
+        raise ValueError("--action-hz must be non-negative.")
+    if args.policy_hz is not None and float(args.policy_hz) <= 0.0:
         raise ValueError("--policy-hz must be positive.")
     if float(args.status_sec) <= 0.0:
         raise ValueError("--status-sec must be positive.")
@@ -363,6 +412,14 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--debug-replay-end-index must be greater than --debug-replay-start-index.")
         if int(args.debug_replay_chunk_size) <= 0:
             raise ValueError("--debug-replay-chunk-size must be positive.")
+    action_hz_start = args.debug_replay_start_index if args.action_hz_start_index is None else args.action_hz_start_index
+    action_hz_end = args.debug_replay_end_index if args.action_hz_end_index is None else args.action_hz_end_index
+    if action_hz_end is not None and int(action_hz_end) < 0:
+        raise ValueError("--action-hz-end-index must be non-negative.")
+    if action_hz_end is not None and int(action_hz_end) <= int(action_hz_start):
+        raise ValueError("--action-hz-end-index must be greater than --action-hz-start-index.")
+    if args.action_hz_dataset and args.action_hz_parquet:
+        raise ValueError("Use only one of --action-hz-dataset or --action-hz-parquet.")
     parse_tactile_regions(args.hand_tactile_regions)
     if args.send_actions:
         for side in active_sides:
@@ -401,9 +458,84 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--camera-fps must be positive.")
         if int(args.camera_keep_last) <= 0:
             raise ValueError("--camera-keep-last must be positive.")
+        if float(args.vis_cam_render_scale) <= 0.0:
+            raise ValueError("--vis-cam-render-scale must be positive.")
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
+    if float(args.tactile_vis_render_scale) <= 0.0:
+        raise ValueError("--tactile-vis-render-scale must be positive.")
     return active_sides
+
+
+def _action_hz_reference(args: argparse.Namespace) -> tuple[Path | None, Path | None, int, int, int | None]:
+    dataset = args.action_hz_dataset or args.debug_replay_dataset
+    parquet = args.action_hz_parquet or args.debug_replay_parquet
+    episode = (
+        int(args.action_hz_episode)
+        if args.action_hz_episode is not None
+        else int(args.debug_replay_episode)
+    )
+    start_index = (
+        int(args.action_hz_start_index)
+        if args.action_hz_start_index is not None
+        else int(args.debug_replay_start_index)
+    )
+    end_index = (
+        int(args.action_hz_end_index)
+        if args.action_hz_end_index is not None
+        else args.debug_replay_end_index
+    )
+    return dataset, parquet, episode, start_index, end_index
+
+
+def resolve_effective_action_hz(args: argparse.Namespace, policy: Any | None = None) -> tuple[float, dict[str, Any]]:
+    explicit = float(args.action_hz)
+    if explicit > 0.0:
+        return explicit, {"source": "cli.action_hz", "hz": explicit}
+
+    if policy is not None:
+        estimate = getattr(policy, "metadata", {}).get("action_hz_estimate")
+        if isinstance(estimate, Mapping):
+            hz = float(estimate.get("hz", 0.0) or 0.0)
+            if hz > 0.0:
+                return hz, dict(estimate)
+
+    dataset, parquet, episode, start_index, end_index = _action_hz_reference(args)
+    if dataset or parquet:
+        path, metadata = resolve_replay_parquet_path(
+            dataset_root=dataset,
+            parquet_path=parquet,
+            episode_index=int(episode),
+        )
+        try:
+            estimate = infer_replay_action_hz(
+                parquet_path=path,
+                dataset_root=dataset,
+                episode_index=int(episode),
+                start_index=int(start_index),
+                end_index=end_index,
+                resolved_metadata=metadata,
+            )
+        except ValueError as exc:
+            estimate = {
+                "hz": float(args.hz),
+                "source": "cli.hz_after_inference_failed",
+                "warning": str(exc),
+            }
+        hz = float(estimate.get("hz", 0.0) or 0.0)
+        if hz > 0.0:
+            estimate = dict(estimate)
+            estimate["source_path"] = str(path)
+            return hz, estimate
+
+    fallback_hz = float(args.hz)
+    return fallback_hz, {"source": "cli.hz", "hz": fallback_hz}
+
+
+def resolve_effective_policy_hz(args: argparse.Namespace, *, action_hz: float) -> tuple[float, str]:
+    if args.policy_hz is not None:
+        return float(args.policy_hz), "cli.policy_hz"
+    return float(action_hz), "action_hz"
 
 
 def build_hand_backends(
@@ -661,6 +793,14 @@ def _policy_status_text(policy: Any) -> str:
     return ""
 
 
+def _skip_startup_replay_frames(policy: Any, count: int = 1) -> int:
+    wrapped_policy = getattr(policy, "policy", policy)
+    skip = getattr(wrapped_policy, "skip_startup_frames", None)
+    if not callable(skip):
+        return 0
+    return int(skip(count))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Deploy a policy on InspireTac hands, optional FR3 arm, tactile, and RealSense."
@@ -685,6 +825,11 @@ def main(argv: list[str] | None = None) -> int:
         policy = load_policy(args.policy_spec, kwargs=policy_kwargs)
     action_queue_policy = _resolve_action_queue_policy(args, debug_replay=debug_replay)
     startup_init_action, startup_init_source = resolve_startup_init_action(args, policy)
+    effective_action_hz, action_hz_info = resolve_effective_action_hz(args, policy)
+    effective_policy_hz, policy_hz_source = resolve_effective_policy_hz(
+        args,
+        action_hz=float(effective_action_hz),
+    )
 
     hand_backends = build_hand_backends(args, active_sides)
     arm_backend = build_arm_backend(args)
@@ -695,7 +840,12 @@ def main(argv: list[str] | None = None) -> int:
         else {}
     )
     camera_previewer = (
-        CameraPreviewer(CameraPreviewConfig())
+        CameraPreviewer(
+            CameraPreviewConfig(
+                resizable_window=str(args.vis_cam_window_mode) == "resizable",
+                render_scale=float(args.vis_cam_render_scale),
+            )
+        )
         if bool(args.vis_cam) and preview_camera_sources
         else None
     )
@@ -706,6 +856,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
                 value_scale=float(args.tactile_vis_value_scale),
                 resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                render_scale=float(args.tactile_vis_render_scale),
             )
         )
         if args.visualize_tactile
@@ -745,9 +896,15 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "[Deploy] policy="
             f"{policy.name} active_sides={active_sides} arm={bool(args.enable_arm)} "
-            f"hz={float(args.hz):.2f} policy_hz={float(args.policy_hz):.2f} "
+            f"hz={float(effective_action_hz):.2f} policy_hz={float(effective_policy_hz):.2f} "
             f"queue_policy={action_queue_policy}"
         )
+        if action_hz_info.get("source") != "cli.hz":
+            print(
+                "[Deploy] action_hz="
+                f"{float(effective_action_hz):.3f} source={action_hz_info.get('source')} "
+                f"policy_hz_source={policy_hz_source}"
+            )
         if startup_initializer.enabled:
             print(
                 "[StartupInit] enabled "
@@ -761,7 +918,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"{policy.metadata.get('source_path')} frames={policy.metadata.get('frame_count')} "
                 f"chunk_size={int(args.debug_replay_chunk_size)} "
                 f"loop={bool(args.debug_replay_loop)} "
-                f"episode={policy.metadata.get('episode_index', 'direct')}"
+                f"episode={policy.metadata.get('episode_index', 'direct')} "
+                f"action_hz={policy.metadata.get('action_hz')}"
             )
         if not send_actions:
             print("[Deploy] dry-run: actions are filtered and logged but not sent to hardware.")
@@ -880,13 +1038,20 @@ def main(argv: list[str] | None = None) -> int:
                                     last_action = deployment_action.vector.astype(np.float32, copy=True)
                                 if init_ready and not deployment_action.faults:
                                     startup_initializer.mark_complete()
+                                    if startup_initializer.source == "replay:first_frame":
+                                        skipped = _skip_startup_replay_frames(policy, count=1)
+                                        if skipped:
+                                            print(
+                                                "[StartupInit] replay startup target consumed; "
+                                                f"skipped {skipped} replay frame(s)."
+                                            )
                                     chunk_buffer.clear()
                                     last_policy_at = None
                         can_run_policy = False
                     if can_run_policy and _policy_should_run(
                         now=loop_started_at,
                         last_policy_at=last_policy_at,
-                        policy_interval_s=1.0 / float(args.policy_hz),
+                        policy_interval_s=1.0 / float(effective_policy_hz),
                         chunk_buffer=chunk_buffer,
                         min_action_queue=int(args.min_action_queue),
                     ):
@@ -962,7 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
                 step_index += 1
                 if int(args.max_steps) > 0 and step_index >= int(args.max_steps):
                     break
-                sleep_time = (1.0 / float(args.hz)) - (time.time() - loop_started_at)
+                sleep_time = (1.0 / float(effective_action_hz)) - (time.time() - loop_started_at)
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)
     except KeyboardInterrupt:

@@ -78,11 +78,13 @@ class InspireTacModbus:
         port: int = 6000,
         max_fingertip_force: int = 800,
         timeout: float = DEFAULT_MODBUS_TIMEOUT_SEC,
+        configure_startup_force: bool = True,
     ):
         self.ip = str(ip)
         self.port = int(port)
         self.timeout = float(timeout)
         self.max_fingertip_force = int(max_fingertip_force)
+        self.configure_startup_force = bool(configure_startup_force)
         if self.max_fingertip_force < 0:
             raise ValueError("max_fingertip_force must be non-negative.")
         self.client = open_modbus(self.ip, self.port, timeout=self.timeout)
@@ -178,8 +180,9 @@ class InspireTacModbus:
             self.region_to_chunks[name] = chunk_indices
 
         self.get_default_speed_force()
-        self.set_force([self.max_fingertip_force] * 6)
-        print("Startup force set:", self.last_force_command.tolist())
+        if self.configure_startup_force:
+            self.set_force([self.max_fingertip_force] * 6)
+            print("Startup force set:", self.last_force_command.tolist())
 
     def get_default_speed_force(self) -> tuple[list[int], list[int]]:
         speed = read6(self.client, self.regdict["defaultSpeedSet"], n_short=6, use_byte=False)

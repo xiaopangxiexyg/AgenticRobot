@@ -14,6 +14,7 @@ class CameraPreviewConfig:
     preflight_highgui: bool = True
     preflight_timeout_sec: float = 3.0
     resizable_window: bool = True
+    render_scale: float = 2.0
 
 
 class CameraPreviewer:
@@ -64,9 +65,24 @@ class CameraPreviewer:
         if name in self._window_names:
             return
         cv2 = self._require_cv2()
-        flag = cv2.WINDOW_NORMAL if self.config.resizable_window else cv2.WINDOW_AUTOSIZE
+        if self.config.resizable_window:
+            flag = cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_FREERATIO", 0)
+        else:
+            flag = cv2.WINDOW_AUTOSIZE
         cv2.namedWindow(name, flag)
+        if self.config.resizable_window:
+            cv2.resizeWindow(name, 640, 480)
         self._window_names.add(name)
+
+    def _scaled_preview_image(self, image: np.ndarray) -> np.ndarray:
+        scale = float(self.config.render_scale) if self.config.resizable_window else 1.0
+        if scale <= 1.0:
+            return image
+        height, width = image.shape[:2]
+        target_w = max(1, int(round(width * scale)))
+        target_h = max(1, int(round(height * scale)))
+        cv2 = self._require_cv2()
+        return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
     def _display_image(self, frame: Any) -> np.ndarray:
         cv2 = self._require_cv2()
@@ -148,14 +164,15 @@ class CameraPreviewer:
             y += step
         return image
 
-    def update(self, camera_sources: Mapping[str, Any]) -> None:
+    def update(self, camera_sources: Mapping[str, Any]) -> int | None:
         if self._closed or not self.ensure_available():
-            return
+            return None
         any_window = False
         for camera_key, source in camera_sources.items():
             frame = None
             extra_status = None
             status = self._camera_status(source)
+            serial_text = status.get("serial_number") or status.get("serial") or ""
             last_error = status.get("last_error")
             stale = bool(last_error) and str(last_error).startswith("frame_timeout_stale")
             try:
@@ -172,12 +189,25 @@ class CameraPreviewer:
                 )
             else:
                 image = self._display_image(frame)
+                if serial_text:
+                    cv2 = self._require_cv2()
+                    cv2.putText(
+                        image,
+                        f"{camera_key} serial={serial_text}",
+                        (16, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (20, 240, 20),
+                        2,
+                        cv2.LINE_AA,
+                    )
             name = self._window_name(str(camera_key))
             self._ensure_window(name)
-            self._require_cv2().imshow(name, image)
+            self._require_cv2().imshow(name, self._scaled_preview_image(image))
             any_window = True
         if any_window:
-            self._require_cv2().waitKey(1)
+            return int(self._require_cv2().waitKey(1))
+        return None
 
     def status_snapshot(self, camera_sources: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         return {

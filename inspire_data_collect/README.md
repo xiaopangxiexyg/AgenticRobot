@@ -2,6 +2,10 @@
 
 Inspire Tac 手数据采集便携包，已接入可选的外骨骼单臂 FR3 随动与记录，不依赖 `teleop_runtime`。保留原工程的 `assets` 不复制；运行时只需要本目录、硬件可访问、以及 Python 依赖。
 
+realsense_gui:conda activate tactile_grasp
+python -m inspire_data_collect.utils.realsense_gui --view-mode overlay
+
+
 ## 首先下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
 文件名：assets.zip
 有效期限：2026-06-08 14:10
@@ -86,7 +90,7 @@ backend = InspireTacHandBackend(
         side="right",
         hand_ip="192.168.12.210",
         enable_telemetry=True,
-        tactile_regions=("all",),  # "all" reads all tactile regions; () disables tactile reads
+        # tactile_regions defaults to ("all",); pass () only when you need to disable tactile reads.
     )
 )
 
@@ -233,10 +237,10 @@ PY
 
 ### 3. InspireTac 触觉读取
 
-先用少量区域低频读取，确认链路正常后再在正式采集中用 `--hand-tactile-regions all`。命令行也支持别名 `--tactile-regions` 和 `--tactile-region`。
+默认会读取全部触觉区域；建议先用较低 `telemetry_hz` 确认链路正常。命令行也支持别名 `--tactile-regions` 和 `--tactile-region`。
 
 ```bash
-export RIGHT_HAND_IP=192.168.12.210
+export RIGHT_HAND_IP=192.168.11.210
 
 python - <<'PY'
 import os
@@ -251,7 +255,7 @@ backend = InspireTacHandBackend(
         connect_hardware=True,
         enable_telemetry=True,
         telemetry_hz=5.0,
-        tactile_regions=("thumb_1", "index_1", "palm"),
+        tactile_regions=("all",),
     )
 )
 backend.start()
@@ -323,7 +327,7 @@ PY
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
 
-正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小；如果 OpenCV 后端限制窗口不能大于图像尺寸，默认 `--vis-cam-render-scale 2.0` 会把预览 backing image 放大到 2 倍，不够时可调到 `3.0` 或更高。如果希望窗口严格等于图像尺寸，传 `--vis-cam-window-mode autosize`。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 
@@ -491,7 +495,7 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name right_hand_grasp \
+  --task-name right_hand_grasp_test \
   --active-sides right \
   --right-hand-port "$RIGHT_HAND_PORT" \
   --right-hand-ip "$RIGHT_HAND_IP" \
@@ -503,11 +507,12 @@ python -m inspire_data_collect \
 ```bash
 --tactile-vis-size 640
 --tactile-vis-value-scale 0.02
+--tactile-vis-render-scale 2.0
 --tactile-vis-window-mode resizable
 --tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm
 ```
 
-默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
+默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口，`--tactile-vis-render-scale 2.0` 会把触觉 backing canvas 放大到 2 倍，避免部分 OpenCV 后端限制窗口不能大于原始图像；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
 
 按键：`z` 开始 episode，`c` 保存当前 episode，`d` 丢弃当前 episode，`q` 退出。加 `--record-auto-start` 可启动后直接采集。
 
@@ -538,19 +543,244 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name right_hand_fr3_exo \
+  --task-name beer_bottle_open \
   --active-sides right \
-  --right-hand-port /dev/ttyACM0 \
-  --right-hand-ip 192.168.12.210 \
+  --right-hand-port "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00" \
+  --right-hand-ip 192.168.11.210 \
   --enable-arm \
   --arm-side right \
   --exo-port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0 \
   --exo-baudrate 57600 \
   --fr3-host 192.168.20.172 \
   --fr3-port 5558 \
-  --fr3-state-poll-hz 20 \
+  --fr3-state-poll-hz 30 \
   --arm-startup-align-duration-s 5.0 \
-  --arm-shrink-deg 10
+  --arm-shrink-deg 10 \
+  --camera-mode multi \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --vis-cam-window-mode resizable \
+  --tactile-vis-window-mode resizable \
+  --record-hand-only \
+  --record-hand-fixed-pos "0.096,0.057,0.022,0.056,0.495,0.0"
+```
+
+如果只想采集 Inspire 手的 action/state/tactile，但不向 Inspire 手下发遥操作动作，在采集命令中追加 `--record-hand-only`。该模式仍会读取遥操作手串口、计算并记录 `action.<side>_hand.joint_target`，也会连接 Inspire 手读取关节状态和触觉；主循环里的手部 `set_joint_pos` 下发会关闭。作为采集间复位，程序会在脚本启动后、以及每次 episode 成功保存后，向 active hands 下发一次固定 q6，默认 `--record-hand-fixed-pos "0.096,0.057,0.022,0.056,0.495,0.0"`，可按需要覆盖。FR3 手臂、相机和其他设备流程保持不变。
+
+### DMTAC gripper collect mode
+
+`--collect-mode gripper` 使用 `hardware/DMTAC_gripper` 内的夹爪和 DM-Tac 触觉代码。遥操作输入仍然读取外骨骼手的 6DoF 串口，但只使用第二维，也就是 q6 index `1`，作为夹爪开合动作。为保持当前 LeRobot writer 和下游 action shape 不变，夹爪 action/state 仍写在对应 side 的 6 维 hand slot 中，只有 index `1` 有意义，其余维度为 0。
+
+触觉不再读取 InspireTac Modbus 的 1062 维区域数据，而是读取 DM-Tac SDK `getDistributeForce()`，每个传感器原始帧为 `(288, 384, 3)` dense force。保存端会对最终触觉帧做 `kernel_size=2, stride=2` 的空间 mean pooling，写盘形状变为 `(144, 192, 3)`，再按传感器顺序 flatten 后写入 `observation.hand.<side>.tactile`。`observation.hand.<side>.tactile_dict_json` 只保存每个传感器已压缩 force array 的 shape/dtype，避免把 dense force 数据重复写进 JSON。
+
+夹爪 action 有硬保护：`--gripper-max-action` 默认 `0.9`，命令行不允许设置超过 `0.9`，后端在下发 `move()` 前也会再次裁剪到 `[0, 0.9]`。不要用底层脚本直接执行 `move 1.0`；超过 `0.9` 可能损坏夹爪。
+
+夹爪模式下 `--visualize-tactile` 会打开 DM-Tac `getDistributeForce()` 可视化窗口。热图显示 XY force magnitude，箭头显示每个区域的 `(Fx, Fy)` 方向，底部显示 mean/max/dXYmax。常用缩放参数仍是 `--tactile-vis-value-scale`，数值越小颜色和箭头越敏感。
+
+### DMTAC gripper startup testing
+
+以下步骤从单设备到完整采集逐步增加硬件，默认在项目根目录执行：
+
+```bash
+cd /home/user/zc/dex_inspire_teleop_new
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
+export EXO_PORT=/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
+export FR3_HOST=192.168.20.172
+export FR3_PORT=5558
+export GRIPPER_PORT="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+export DMTAC_IDS="L25480055 L25480053"
+```
+
+1. 检查夹爪串口和 DM-Tac 设备枚举：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py list-ports
+python hardware/DMTAC_gripper/run_gripper.py list-tactile
+```
+
+2. 只读夹爪状态，不运动：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py verify-gripper \
+  --port "$GRIPPER_PORT" \
+  --id 1
+```
+
+3. 低速低力矩做小行程动作测试。这里最多只移动到 `0.2`，不要测试 `1.0`：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py set-speed 0.2 --port "$GRIPPER_PORT" --id 1
+python hardware/DMTAC_gripper/run_gripper.py set-torque 0.2 --port "$GRIPPER_PORT" --id 1
+python hardware/DMTAC_gripper/run_gripper.py open --port "$GRIPPER_PORT" --id 1 --wait
+python hardware/DMTAC_gripper/run_gripper.py move 0.2 --port "$GRIPPER_PORT" --id 1 --speed 0.2 --torque 0.2 --wait
+python hardware/DMTAC_gripper/run_gripper.py stop --port "$GRIPPER_PORT" --id 1
+```
+
+4. 只读 `getDistributeForce()`，确认两个触觉传感器都有帧：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py verify-tactile \
+  --tactile_ids $DMTAC_IDS \
+  --backend cpu \
+  --count 10
+```
+
+5. 单独打开 DM-Tac force 可视化。启动和 baseline 期间保持两个传感器无接触：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py visualize-force \
+  --tactile_ids $DMTAC_IDS \
+  --backend cpu \
+  --reset_tactile \
+  --warmup_frames 30 \
+  --viz_mode delta \
+  --baseline_frames 20 \
+  --fixed_ref 0.0005 \
+  --deadband_abs 5e-5 \
+  --temporal_alpha 0.35 \
+  --spatial_blur_ksize 5 \
+  --arrow_pool 16 \
+  --stride 12 \
+  --scale 2 \
+  --max_hz 30
+```
+
+6. 检查外骨骼手 q6，并重点观察第二维 `q6[1]`。夹爪采集只使用这一维：
+
+```bash
+python - <<'PY'
+import os
+import time
+import numpy as np
+from inspire_data_collect.hand.hand_source import HandQ6Source
+
+source = HandQ6Source.from_ports(
+    right_port=os.environ["RIGHT_HAND_PORT"],
+    baudrate=115200,
+    timeout=0.05,
+    critical=True,
+)
+source.start()
+try:
+    for _ in range(120):
+        ch = source.get_latest_channels().get("right_hand_q6")
+        if ch is not None and ch.valid:
+            q6 = np.asarray(ch.value, dtype=float)
+            print("right_hand_q6", np.round(q6, 3).tolist(), "gripper_dim_1", round(float(q6[1]), 3))
+        time.sleep(0.05)
+finally:
+    source.close()
+PY
+```
+
+7. 不连接夹爪、不连接触觉，先跑采集管线和 writer：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name gripper_smoke_no_hw \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-no-hardware \
+  --gripper-no-tactile \
+  --gripper-max-action 0.9 \
+  --hz 10 \
+  --max-steps 100 \
+  --no-parquet \
+  --no-video
+```
+
+8. 只连接外骨骼手、夹爪和触觉，打开采集内置的 gripper tactile visualizer，不连接 FR3 或相机：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name gripper_tactile_smoke \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-port "$GRIPPER_PORT" \
+  --gripper-id 1 \
+  --gripper-speed 0.2 \
+  --gripper-torque 0.2 \
+  --gripper-max-action 0.9 \
+  --gripper-tactile-ids $DMTAC_IDS \
+  --gripper-tactile-backend cpu \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.0005 \
+  --hz 10 \
+  --max-steps 200 \
+  --no-parquet \
+  --no-video
+```
+
+9. 上面全部通过后，再接入 FR3 和相机做完整短测：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name gripper_full_smoke \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-port "$GRIPPER_PORT" \
+  --gripper-id 1 \
+  --gripper-speed 0.2 \
+  --gripper-torque 0.2 \
+  --gripper-max-action 0.9 \
+  --gripper-tactile-ids $DMTAC_IDS \
+  --gripper-tactile-backend cpu \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --arm-startup-align-duration-s 5.0 \
+  --vis_cam \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.0005 \
+  --hz 10 \
+  --max-steps 200
+```
+
+单右侧夹爪 + FR3 + 多相机示例：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name gripper_collect_peeling \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-port "$GRIPPER_PORT" \
+  --gripper-id 1 \
+  --gripper-speed 0.7 \
+  --gripper-torque 1.0 \
+  --gripper-max-action 0.9 \
+  --gripper-tactile-ids L25480055 L25480053 \
+  --gripper-tactile-backend cpu \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.0005 \
+  --hz 10
+```
+
+如果只想先检查采集管线和数据写出，不连接夹爪或 DM-Tac 触觉，可加：
+
+```bash
+--gripper-no-hardware --gripper-no-tactile
 ```
 
 外骨骼到 FR3 是直接关节映射，程序刚启动时 FR3 当前关节和外骨骼映射目标通常不一致。默认启用启动对齐：FR3 后端第一次收到 arm 指令时，会以 FR3 当前 `qpos` 为起点，在 `--arm-startup-align-duration-s` 秒内线性插值到外骨骼当前目标；最大关节差低于 `--arm-startup-align-threshold-rad` 时会跳过插值。启动对齐期间操作者应尽量保持外骨骼不动，等插值结束后再进入正常随动。确认二者已经物理对齐且需要完全直接随动时，才使用 `--disable-arm-startup-align`。
@@ -560,13 +790,14 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name hand_camera \
+  --task-name hand_camera_test \
   --active-sides right\
   --right-hand-port "$RIGHT_HAND_PORT" \
   --right-hand-ip 192.168.11.210 \
   --camera-mode single \
   --camera-config inspire_data_collect/realsense.json \
-  --vis_cam
+  --vis_cam \
+  --visualize-tactile
 ```
 
 单 RealSense 相机，直接用序列号配置：
@@ -625,6 +856,33 @@ python -m inspire_data_collect \
   --vis-cam-key front
 ```
 
+```bash
+export FR3_HOST=192.168.20.172
+export FR3_PORT=5558
+
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name chips_addtion \
+  --active-sides right \
+  --right-hand-port "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00" \
+  --right-hand-ip 192.168.11.210 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --enable-arm \
+  --tactile-vis-value-scale 0.002 \
+  --tactile-regions all \
+  --arm-side right \
+  --exo-port "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --hz 20 \
+  --max-force 600
+```
+
+
 `--camera-mode multi` 会记录配置文件中的全部相机，每个 `camera_key` 单独写入一个 `videos/observation.images.<camera_key>/...mp4`。`--vis-cam-key` 只控制预览窗口；不传时优先预览 `front`，否则预览配置中按名称排序的第一个相机。
 
 多视角时偶发 `Frame didn't arrive` 通常是某一路 RealSense 在当前 timeout 内没有返回新帧，可能来自 USB 带宽、启动抖动或分辨率/帧率过高。采集端默认用 `wait_timeout_ms=1000`，并且只有连续超过 `stale_after_sec=2.0` 没有收到新帧时才报告相机 error；短暂超时不会反复刷屏，也不会影响已收到帧的预览和写盘。如果仍持续报 `frame_timeout_stale`，优先降低多路相机的 `width/height/fps`，并确认相机分散到足够的 USB 控制器上。
@@ -635,7 +893,7 @@ python -m inspire_data_collect \
 
 手部外骨骼 zero pose：默认读取固定标定；需要重新标定并更新固定值时，在任意采集命令中追加 `--exo-hand-calibration`。也可以用 `--exo-hand-calibration-path PATH` 指定另一份固定标定 JSON。
 
-触觉读取：`--hand-tactile-regions all`、`--tactile-regions all` 或 `--tactile-region all` 表示读取全部触觉区域；传空字符串 `--tactile-region ""` 表示不读取触觉。也可以传逗号分隔区域，例如 `--tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm`。有效区域名为 `little_1..little_3`、`ring_1..ring_3`、`middle_1..middle_3`、`index_1..index_3`、`thumb_1..thumb_4`、`palm`；非法区域会在启动时直接报错。Python API 中同理，`tactile_regions=("all",)` 读全部，`tactile_regions=()` 不读触觉。
+触觉读取：默认就是 `--hand-tactile-regions all`，也可以显式传 `--tactile-regions all` 或 `--tactile-region all` 表示读取全部触觉区域；传空字符串 `--tactile-region ""` 表示不读取触觉。也可以传逗号分隔区域，例如 `--tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm`。有效区域名为 `little_1..little_3`、`ring_1..ring_3`、`middle_1..middle_3`、`index_1..index_3`、`thumb_1..thumb_4`、`palm`；非法区域会在启动时直接报错。Python API 中同理，`tactile_regions` 默认读全部，`tactile_regions=()` 不读触觉。
 
 InspireTac max force：`--inspire-hand-max-force N` 会在手 backend 连接时把 `N` 写到每个手指的 force，默认 `800`；兼容旧参数 `--max-fingertip-force`，也可用简写 `--max-force`。
 
@@ -679,11 +937,11 @@ dataset_root/YYYY-MM-DD_task-name/
 - `observation.arm.startup_alignment_*`: FR3 启动对齐插值状态、进度、起点和目标。
 - `action.right_hand.joint_target`、`action.left_hand.joint_target`。
 - `observation.right_hand.qpos`、`observation.left_hand.qpos`。
-- `observation.hand.<side>.tactile`: 1062 维触觉向量。
+- `observation.hand.<side>.tactile`: InspireTac 手模式下是 1062 维触觉向量；gripper 模式下是 DM-Tac `getDistributeForce()` 原始 `(288, 384, 3)` force 经保存端 `kernel_size=2, stride=2` mean pooling 后的 `(144, 192, 3)` flatten 向量，默认两个传感器时为 `2 * 144 * 192 * 3 = 165888` 维。
 - `observation.hand.<side>.tactile_timestamp`: 本帧触觉读取请求时间。
 - `observation.hand.<side>.telemetry_timestamp`: 手部 telemetry 最新更新时间。
 - `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名。
-- `observation.hand.<side>.tactile_dict_json`: 选中触觉区域的矩阵数据 JSON。
+- `observation.hand.<side>.tactile_dict_json`: InspireTac 手模式下是选中触觉区域的矩阵数据 JSON；gripper 模式下只记录每个 DM-Tac 传感器的 shape/dtype。
 - `teleop.action_source.arm_exo_qpos`: 外骨骼原始 7DoF 关节角。
 - `teleop.action_source.arm_preclip_joint_target`: 外骨骼映射到 FR3 后、裁剪前的 7DoF 目标。
 - `teleop.action_source.arm_clip_mask`: 每个 FR3 关节是否被安全限位裁剪。
