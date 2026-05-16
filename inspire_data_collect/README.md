@@ -790,15 +790,16 @@ python -m inspire_data_collect \
 
 - 数据集逻辑槽位固定为 `right_hand`，即必须使用 `--active-sides right`。
 - 物理硬件固定为左手 DexHand，即 `--dexhand-hardware-hand left`。
-- 保存和对外暴露的 6DoF 顺序沿用现有外骨骼手 reader：`[thumb_yaw, thumb_flex, index, middle, ring, pinky]`。
+- 保存和对外暴露的 6DoF 顺序按 DexHand 控制语义解释为：`[thumb_flex, thumb_yaw, index, middle, ring, pinky]`。
 - deploy/replay 也读取 `right_hand` 槽位，但实际发送给左手 DexHand。
+- 该模式默认在启动时把当前外骨骼手张开姿态作为 q6 零位，并使用 `absolute` 缩放，行为和 `run_q6_to_dexhand.py` 默认串口模式一致；启动命令后请保持外骨骼手完全张开且静止，直到看到 `[Zero:right] finished`。如果要回到固定 JSON 标定，可追加 `--hand-no-runtime-zero-on-start`。
 
 注意这里有两条完全不同的硬件链路：
 
 - `--right-hand-port` / `RIGHT_HAND_PORT` 是外骨骼 `hand_q6` 设备的 USB 串口，用来读取遥操作 6DoF 输入；它不是 DexHand 的控制口。
 - DexHand 真机仍然通过 ZLG USBCANFD 适配器走 CANFD，不使用 `/dev/serial/by-id/...` 串口路径。DexHand 侧只配置 `--dexhand-device-type`、`--dexhand-device-index` 和 `hardware/pyzlg_dexhand/config/config.yaml` 里的 CAN channel / `ZCANDeviceType`。USBCANFD 是 USB 接入电脑的 CAN 适配器，所以文档中会提到 USB 权限，但程序打开的是 ZCAN 设备类型和 index，不是串口 port。
 
-后端内部会把上述 q6 转成 DexHand 12 关节命令。写入 observation 时不会直接保存最后一次命令，而是从 DexHand 实测关节反馈反算回 q6：`thumb_yaw` 来自 `th_rot`，`thumb_flex` 取 `th_dip/th_mcp` 平均；四指分别用 DIP 直接估计值和 MCP 按 profile 比例换算后的估计值取平均，因此最后两组耦合关节不一致时会得到一个折中 q6。
+后端内部会把上述 q6 转成 DexHand 12 关节命令：`thumb_flex` 控制 `th_dip/th_mcp`，`thumb_yaw` 控制 `th_rot`。写入 observation 时不会直接保存最后一次命令，而是从 DexHand 实测关节反馈反算回 q6：`thumb_flex` 取 `th_dip/th_mcp` 平均，`thumb_yaw` 来自 `th_rot`；四指分别用 DIP 直接估计值和 MCP 按 profile 比例换算后的估计值取平均，因此最后两组耦合关节不一致时会得到一个折中 q6。
 
 DexHand 触觉保存为 15 维 fingertip xyz force，排列维持后端现状：
 
@@ -855,26 +856,7 @@ cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
 
 如果当前 shell 没有继承新组权限，重新登录一次再继续。`hardware/pyzlg_dexhand/config/config.yaml` 里的 `left_hand.channel` 和 `ZCANDeviceType` 也要和现场接线一致。
 
-
-1. 不连接 DexHand，只验证右手槽位外骨骼 q6 reader 和 writer：
-
-```bash
-python -m inspire_data_collect \
-  --dataset-root ./datasets_debug \
-  --task-name dexhand_probe_serial \
-  --collect-mode dexhand_q6 \
-  --active-sides right \
-  --right-hand-port "$RIGHT_HAND_PORT" \
-  --dexhand-no-hardware \
-  --record-hand-only \
-  --record-auto-start \
-  --max-steps 200 \
-  --no-silent
-```
-
-确认 `right_hand_q6` 有效，并且 `action.right_hand.joint_target` 已写入 q6。这里不连接 USBCANFD，也不会驱动 DexHand 真机。
-
-2. 在采集框架外单独验证 DexHand 左手硬件控制。注意串口源仍是 `--side right`，真机是 `--hand left`：
+1. 在采集框架外单独验证 DexHand 左手硬件控制。注意串口源仍是 `--side right`，真机是 `--hand left`：
 
 ```bash
 python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
@@ -883,7 +865,7 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --hand left \
   --device-type "$DEXHAND_DEVICE_TYPE" \
   --device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 30 \
+  --hz 10 \
   --print-hz 5
 ```
 
@@ -893,52 +875,7 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
 --visualize-tactile --tactile-viewer-hz 20
 ```
 
-关于低频跟手测试：`run_q6_to_dexhand.py` 现在会在每个控制周期主动清空串口 backlog，只使用最新完整 `ANGLES` 帧；因此把 `--hz` 从 `30/50` 降到 `10` 时，预期只会看到更新频率下降，不应再出现 `2-3s` 的异常历史帧延迟。建议用下面两条命令做回归：
-
-```bash
-# 基线：高频
-python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
-  --port "$RIGHT_HAND_PORT" \
-  --side right \
-  --hand left \
-  --device-type "$DEXHAND_DEVICE_TYPE" \
-  --device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 50 \
-  --print-hz 5
-
-# 低频回归：更新率会降低，但不该再出现秒级滞后
-python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
-  --port "$RIGHT_HAND_PORT" \
-  --side right \
-  --hand left \
-  --device-type "$DEXHAND_DEVICE_TYPE" \
-  --device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 10 \
-  --print-hz 5
-```
-
-
-3. 不连接 DexHand，只跑采集主循环和 retarget/writer 流程，确认数采框架本身没问题：
-
-```bash
-python -m inspire_data_collect \
-  --dataset-root ./datasets_debug \
-  --task-name dexhand_smoke_no_hw \
-  --collect-mode dexhand_q6 \
-  --active-sides right \
-  --right-hand-port "$RIGHT_HAND_PORT" \
-  --dexhand-no-hardware \
-  --record-auto-start \
-  --hz 10 \
-  --max-steps 100 \
-  --no-parquet \
-  --no-video \
-  --no-silent
-```
-
-这一步应该能稳定产生 `action.right_hand.joint_target`，但不会连接 USBCANFD，也不会读取真实 DexHand 反馈。
-
-4. 连接 DexHand，先用 record-only 短测 telemetry、q6 反算和 15 维触觉写盘。注意这一步**不会**让 DexHand 跟随 6DoF 遥操；`--record-hand-only` 会关闭实时手部动作下发，只保留状态/触觉读取和数据写盘，启动时只会额外执行一次固定 `record_hand_fixed_pos`：
+2. 连接 DexHand，先用 record-only 短测 telemetry、q6 反算和 15 维触觉写盘。注意这一步**不会**让 DexHand 跟随 6DoF 遥操；`--record-hand-only` 会关闭实时手部动作下发，只保留状态/触觉读取和数据写盘，启动时只会额外执行一次固定 `record_hand_fixed_pos`：
 
 ```bash
 python -m inspire_data_collect \
@@ -974,44 +911,6 @@ python -m inspire_data_collect \
   --no-silent
 ```
 
-这一步里 DexHand 应该和 step 2 一样实时跟随 6DoF，只是控制链路已经换成采集框架内部的 retargeter/backend/writer。
-
-如果 step 2 的 standalone 已经流畅，但这一步进入采集框架后又明显变慢，建议继续做下面两组对照：
-
-```bash
-# E. 采集框架内 baseline：先用 30Hz 主循环
-python -m inspire_data_collect \
-  --dataset-root ./datasets_debug \
-  --task-name dexhand_follow_smoke_hz30 \
-  --collect-mode dexhand_q6 \
-  --active-sides right \
-  --right-hand-port "$RIGHT_HAND_PORT" \
-  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
-  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 30 \
-  --hand-telemetry-hz 10 \
-  --record-auto-start \
-  --max-steps 200 \
-  --no-silent
-
-# F. 降低 DexHand telemetry 读取频率，观察是否改善跟手
-python -m inspire_data_collect \
-  --dataset-root ./datasets_debug \
-  --task-name dexhand_follow_smoke_lowtele \
-  --collect-mode dexhand_q6 \
-  --active-sides right \
-  --right-hand-port "$RIGHT_HAND_PORT" \
-  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
-  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 30 \
-  --hand-telemetry-hz 2 \
-  --record-auto-start \
-  --max-steps 200 \
-  --no-silent
-```
-
-如果 `F` 比 `E` 明显更顺，说明主要瓶颈在采集框架里后台 telemetry 线程和发送线程共用 DexHand 连接；后续可再考虑继续下调 telemetry 频率，或把 send/read 做更细的解耦。
-
 6. 上面都通过后，做正式单手 DexHand 数采。手动用 `z/c/d/q` 控制 episode：
 
 ```bash
@@ -1023,7 +922,7 @@ python -m inspire_data_collect \
   --right-hand-port "$RIGHT_HAND_PORT" \
   --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
   --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 30 \
+  --hz 10 \
   --no-silent
 ```
 
@@ -1047,11 +946,11 @@ python -m inspire_data_collect \
   --camera-mode single \
   --camera-config inspire_data_collect/realsense.json \
   --vis_cam \
-  --hz 30 \
+  --hz 10 \
   --no-silent
 ```
 
-8. 正式带 FR3 + 多相机的 DexHand 数采示例：
+8. 带 FR3 + 多相机的 DexHand 数采示例：
 
 ```bash
 python -m inspire_data_collect \

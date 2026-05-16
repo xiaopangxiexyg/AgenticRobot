@@ -148,6 +148,7 @@ else:
 DEFAULT_CAMERA_CONFIG_PATH = Path(__file__).resolve().parent / "realsense.json"
 DEFAULT_DATASET_ROOT = default_dataset_root()
 DEFAULT_RECORD_HAND_FIXED_POS = (0.096, 0.057, 0.022, 0.056, 0.495, 0.0)
+DEXHAND_DEFAULT_RUNTIME_ZERO_ON_START = True
 DMTAC_DISTRIBUTED_FORCE_SHAPE = (288, 384, 3)
 DMTAC_DISTRIBUTED_FORCE_DIM = (
     DMTAC_DISTRIBUTED_FORCE_SHAPE[0]
@@ -219,6 +220,16 @@ def normalize_tactile_ids(value: object) -> tuple[str | int, ...]:
                 parsed.extend(parse_tactile_ids(str(item)))
         return tuple(parsed)
     return parse_tactile_ids(str(value))
+
+
+def hand_runtime_zero_on_start(args: argparse.Namespace) -> bool:
+    value = getattr(args, "hand_runtime_zero_on_start", None)
+    if value is None:
+        return (
+            str(getattr(args, "collect_mode", "inspire_hand")) == "dexhand_q6"
+            and bool(DEXHAND_DEFAULT_RUNTIME_ZERO_ON_START)
+        )
+    return bool(value)
 
 
 class NonBlockingKeyboard:
@@ -379,6 +390,35 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default="",
         help="Optional fixed exoskeleton hand zero-pose calibration JSON path.",
     )
+    parser.add_argument(
+        "--hand-runtime-zero-on-start",
+        dest="hand_runtime_zero_on_start",
+        action="store_true",
+        default=None,
+        help=(
+            "Use the current open hand pose as the q6 zero on startup. "
+            "Default is enabled for --collect-mode dexhand_q6 and disabled otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--hand-no-runtime-zero-on-start",
+        dest="hand_runtime_zero_on_start",
+        action="store_false",
+        help="Use the fixed exoskeleton hand calibration JSON instead of startup runtime zero.",
+    )
+    parser.add_argument(
+        "--hand-runtime-zero-scale",
+        choices=["absolute", "signed"],
+        default="absolute",
+        help=(
+            "Runtime zero scaling. 'absolute' treats motion away from the open zero "
+            "as closing; 'signed' uses the side-specific calibration sign."
+        ),
+    )
+    parser.add_argument("--hand-runtime-zero-max-samples", type=int, default=200)
+    parser.add_argument("--hand-runtime-zero-min-samples", type=int, default=30)
+    parser.add_argument("--hand-runtime-zero-stable-window", type=int, default=20)
+    parser.add_argument("--hand-runtime-zero-stable-eps", type=float, default=0.5)
     parser.add_argument("--show-hand-raw-lines", action="store_true")
     parser.add_argument("--allow-hand-connect-failure", action="store_true")
     parser.add_argument(
@@ -618,6 +658,16 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--hand-telemetry-hz must be positive.")
     if int(args.max_fingertip_force) < 0:
         raise ValueError("--inspire-hand-max-force/--max-force must be non-negative.")
+    if int(args.hand_runtime_zero_max_samples) <= 0:
+        raise ValueError("--hand-runtime-zero-max-samples must be positive.")
+    if int(args.hand_runtime_zero_min_samples) <= 0:
+        raise ValueError("--hand-runtime-zero-min-samples must be positive.")
+    if int(args.hand_runtime_zero_stable_window) <= 0:
+        raise ValueError("--hand-runtime-zero-stable-window must be positive.")
+    if float(args.hand_runtime_zero_stable_eps) <= 0.0:
+        raise ValueError("--hand-runtime-zero-stable-eps must be positive.")
+    if int(args.hand_runtime_zero_min_samples) > int(args.hand_runtime_zero_max_samples):
+        raise ValueError("--hand-runtime-zero-min-samples cannot exceed --hand-runtime-zero-max-samples.")
     parse_tactile_regions(args.hand_tactile_regions)
     if args.enable_arm:
         if int(args.exo_baudrate) <= 0:
@@ -742,6 +792,7 @@ def build_components(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> tuple[HandQ6Source, dict[str, Any], dict[str, Any]]:
+    collect_mode = str(getattr(args, "collect_mode", "inspire_hand"))
     source = HandQ6Source.from_ports(
         left_port=args.left_hand_port if "left" in active_sides else None,
         right_port=args.right_hand_port if "right" in active_sides else None,
@@ -750,13 +801,19 @@ def build_components(
         show_raw_lines=bool(args.show_hand_raw_lines),
         exo_hand_calibration=bool(args.exo_hand_calibration),
         calibration_path=str(args.exo_hand_calibration_path or "") or None,
+        runtime_zero_on_start=hand_runtime_zero_on_start(args),
+        runtime_zero_scale=str(getattr(args, "hand_runtime_zero_scale", "absolute")),
+        runtime_zero_max_samples=int(getattr(args, "hand_runtime_zero_max_samples", 200)),
+        runtime_zero_min_samples=int(getattr(args, "hand_runtime_zero_min_samples", 30)),
+        runtime_zero_stable_window=int(getattr(args, "hand_runtime_zero_stable_window", 20)),
+        runtime_zero_stable_eps=float(getattr(args, "hand_runtime_zero_stable_eps", 0.5)),
         critical=True,
         silent_status=bool(args.silent),
     )
 
     retargeters: dict[str, Any] = {}
     backends: dict[str, Any] = {}
-    if str(args.collect_mode) == "gripper":
+    if collect_mode == "gripper":
         side = active_sides[0]
         effector_name = f"{side}_hand"
         retargeters[side] = GripperRetargeter(
@@ -810,7 +867,7 @@ def build_components(
             )
         )
         return source, retargeters, backends
-    if str(args.collect_mode) == "dexhand_q6":
+    if collect_mode == "dexhand_q6":
         side = "right"
         effector_name = f"{side}_hand"
         retargeters[side] = HandRetargeter(
@@ -1246,6 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
             else False,
             "exo_hand_calibration": bool(args.exo_hand_calibration),
             "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
+            "hand_runtime_zero_on_start": hand_runtime_zero_on_start(args),
+            "hand_runtime_zero_scale": str(args.hand_runtime_zero_scale),
             "tactile_regions": list(parse_tactile_regions(args.hand_tactile_regions)),
             "record_hand_fixed_pos": list(args.record_hand_fixed_pos),
             "camera_mode": str(args.camera_mode),
@@ -1329,8 +1388,8 @@ def main(argv: list[str] | None = None) -> int:
                     "dexhand_connect_hardware": bool(args.dexhand_connect_hardware),
                     "dexhand_mock": bool(args.dexhand_mock),
                     "dexhand_q6_order": [
-                        "thumb_yaw",
                         "thumb_flex",
+                        "thumb_yaw",
                         "index",
                         "middle",
                         "ring",
@@ -1499,8 +1558,8 @@ def main(argv: list[str] | None = None) -> int:
                         "tactile_fingers": list(DEXHAND_TACTILE_FINGER_ORDER),
                         "tactile_axes": list(DEXHAND_TACTILE_AXIS_ORDER),
                         "saved_q6_order": [
-                            "thumb_yaw",
                             "thumb_flex",
+                            "thumb_yaw",
                             "index",
                             "middle",
                             "ring",
@@ -1524,7 +1583,9 @@ def main(argv: list[str] | None = None) -> int:
                 "[DexHand] collect mode active: "
                 "dataset_slot=right hardware_hand="
                 f"{args.dexhand_hardware_hand}, device_type={args.dexhand_device_type}, "
-                f"tactile_dim={int(DEXHAND_TACTILE_DIM)}"
+                f"tactile_dim={int(DEXHAND_TACTILE_DIM)}, "
+                f"runtime_zero={hand_runtime_zero_on_start(args)}:"
+                f"{args.hand_runtime_zero_scale}"
             )
         if bool(args.record_hand_only):
             print(

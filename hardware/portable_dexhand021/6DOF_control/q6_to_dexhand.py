@@ -35,8 +35,8 @@ INTERNAL_Q6_ORDER = (
 )
 
 TELEOP_READER_Q6_ORDER = (
-    "thumb_rot",
     "thumb_flex",
+    "thumb_rot",
     "index",
     "middle",
     "ring",
@@ -86,8 +86,8 @@ def parse_float_vector(text: str, length: int, name: str) -> Tuple[float, ...]:
 def reorder_q6(q6: Sequence[float], source_order: str = "internal") -> Tuple[float, ...]:
     """Return q6 in the internal order.
 
-    ``teleop`` means the order produced by ``teleop_hand/hand_q6_reader.py``:
-    ``[thumb_rot, thumb_flex, index, middle, ring, little]``.
+    ``teleop`` means the order produced by the hand q6 reader:
+    ``[thumb_flex, thumb_rot, index, middle, ring, little]``.
     """
     values = tuple(float(v) for v in q6)
     if len(values) != 6:
@@ -96,7 +96,7 @@ def reorder_q6(q6: Sequence[float], source_order: str = "internal") -> Tuple[flo
     if source_order == "internal":
         return values
     if source_order == "teleop":
-        return (values[1], values[0], values[2], values[3], values[4], values[5])
+        return values
     raise ValueError("source_order must be 'internal' or 'teleop'")
 
 

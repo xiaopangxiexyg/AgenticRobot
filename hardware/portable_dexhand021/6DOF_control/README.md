@@ -91,10 +91,10 @@ ff_spr 固定为 0，不控制伸展/侧展维度
 `teleop_hand/hand_q6_reader.py` 当前输出顺序是：
 
 ```text
-[thumb_yaw, thumb_flex, index, middle, ring, pinky]
+[thumb_flex, thumb_yaw, index, middle, ring, pinky]
 ```
 
-本包装要求大拇指收缩是第 1 维、大拇指旋转是第 2 维，所以桥接串口 reader 时默认使用 `--source-order auto`，会按 `teleop` 顺序自动交换前两维。
+本包装要求大拇指收缩是第 1 维、大拇指旋转是第 2 维；桥接串口 reader 时默认使用 `--source-order auto`，会按 `teleop` 顺序直接解释这两维。
 
 如果你直接传入本包装约定的 6 维动作，用 `--q6` 即可。
 

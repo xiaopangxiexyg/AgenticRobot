@@ -98,6 +98,7 @@ class InspireDataCollectRecordOnlyTests(unittest.TestCase):
 
     def test_build_components_uses_record_only_mode_for_hand_backends(self) -> None:
         args = SimpleNamespace(
+            collect_mode="inspire_hand",
             left_hand_port="",
             right_hand_port="/dev/ttyACM0",
             left_hand_ip="",
@@ -125,6 +126,38 @@ class InspireDataCollectRecordOnlyTests(unittest.TestCase):
             _source, _retargeters, backends = build_components(args, ("right",))
 
         self.assertFalse(backends["right"].config.send_commands)
+
+    def test_dexhand_q6_defaults_to_runtime_zero_reader(self) -> None:
+        args = SimpleNamespace(
+            collect_mode="dexhand_q6",
+            left_hand_port="",
+            right_hand_port="/dev/ttyACM0",
+            hand_reader_baudrate=115200,
+            hand_reader_timeout=0.05,
+            show_hand_raw_lines=False,
+            exo_hand_calibration=False,
+            exo_hand_calibration_path="",
+            silent=True,
+            record_hand_only=False,
+            dexhand_command_alpha=1.0,
+            dexhand_hardware_hand="left",
+            dexhand_connect_hardware=False,
+            dexhand_send_threshold=0.002,
+            hand_telemetry_hz=10.0,
+            dexhand_device_type="auto",
+            dexhand_device_index=0,
+            dexhand_tactile_period_ms=20,
+            dexhand_mock=False,
+            dexhand_clear_errors_on_start=True,
+            dexhand_clear_errors_on_fault=True,
+        )
+
+        with patch("inspire_data_collect.run_collect.HandQ6Source.from_ports") as from_ports:
+            from_ports.return_value = SimpleNamespace()
+            _source, _retargeters, _backends = build_components(args, ("right",))
+
+        self.assertTrue(from_ports.call_args.kwargs["runtime_zero_on_start"])
+        self.assertEqual(from_ports.call_args.kwargs["runtime_zero_scale"], "absolute")
 
     def test_parse_hand_q6_accepts_default_text(self) -> None:
         parsed = parse_hand_q6("[0.096, 0.057, 0.022, 0.056, 0.495, 0.]")

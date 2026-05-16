@@ -506,15 +506,86 @@ def auto_calibrate(
     return {"deg_at_0": deg_at_0, "deg_at_1": deg_at_1}
 
 
+def calibrate_runtime_zero(
+    line_reader: BufferedSerialLineReader,
+    *,
+    side: str,
+    max_samples: int = 200,
+    min_samples: int = 30,
+    stable_window: int = 20,
+    stable_eps: float = 0.5,
+    zero_scale: str = "absolute",
+) -> dict[str, Any]:
+    if zero_scale not in {"absolute", "signed"}:
+        raise ValueError("zero_scale must be 'absolute' or 'signed'")
+    max_samples = max(1, int(max_samples))
+    min_samples = max(1, int(min_samples))
+    stable_window = max(1, int(stable_window))
+    print(f"[Zero:{side}] keep hand_q6 fully open; waiting for a stable zero pose...")
+    samples: list[list[float]] = []
+    stabilized = False
+
+    while len(samples) < max_samples:
+        samples.append(line_reader.read_latest_parsed(parse_angles_line))
+        if len(samples) < stable_window or len(samples) < min_samples:
+            continue
+
+        window = samples[-stable_window:]
+        ranges = [
+            max(sample[index] for sample in window)
+            - min(sample[index] for sample in window)
+            for index in range(6)
+        ]
+        if max(ranges) < stable_eps:
+            stabilized = True
+            break
+
+    if not stabilized:
+        raise RuntimeError(
+            f"Runtime zero calibration failed: ANGLES did not stabilize in {len(samples)} samples. "
+            "Keep the hand fully open and still, or disable runtime zero calibration."
+        )
+
+    used = samples[-stable_window:] if len(samples) >= stable_window else samples
+    deg_at_0 = np.asarray(
+        [sum(sample[index] for sample in used) / len(used) for index in range(6)],
+        dtype=np.float32,
+    )
+    offset = _offset_for_side(side)
+    deg_at_1 = deg_at_0 + offset
+    used_array = np.asarray(used, dtype=np.float32)
+    ranges = np.ptp(used_array, axis=0) if used_array.size else np.zeros(6, dtype=np.float32)
+    print(f"[Zero:{side}] finished with {len(samples)} samples, used {len(used)}")
+    print(f"[Zero:{side}] deg_at_0={[round(float(v), 3) for v in deg_at_0]}")
+    print(
+        f"[Zero:{side}] used_range_deg={[round(float(v), 3) for v in ranges]}, "
+        f"scale={zero_scale}"
+    )
+    return {
+        "deg_at_0": deg_at_0,
+        "deg_at_1": deg_at_1,
+        "absolute_delta": zero_scale == "absolute",
+        "runtime_zero_on_start": True,
+        "zero_scale": zero_scale,
+    }
+
+
 def map_angles_to_norm(
     angles_deg: Sequence[float],
     deg_at_0: np.ndarray,
     deg_at_1: np.ndarray,
+    *,
+    absolute_delta: bool = False,
 ) -> np.ndarray:
     angles = np.asarray(angles_deg, dtype=np.float32)
-    denom = deg_at_1 - deg_at_0
+    low = np.asarray(deg_at_0, dtype=np.float32)
+    high = np.asarray(deg_at_1, dtype=np.float32)
+    denom = high - low
+    if bool(absolute_delta):
+        denom = np.where(np.abs(denom) < 1e-6, 1.0, np.abs(denom))
+        return np.clip(np.abs(angles - low) / denom, 0.0, 1.0)
     denom = np.where(np.abs(denom) < 1e-6, 1.0, denom)
-    return np.clip((angles - deg_at_0) / denom, 0.0, 1.0)
+    return np.clip((angles - low) / denom, 0.0, 1.0)
 
 
 def build_hand_packet(
@@ -523,7 +594,7 @@ def build_hand_packet(
     side: str,
     port: str,
     baudrate: int,
-    calib: dict[str, np.ndarray] | None,
+    calib: dict[str, Any] | None,
 ) -> dict[str, object]:
     angles = np.asarray(angles_deg, dtype=np.float32)
     packet: dict[str, object] = {
@@ -536,16 +607,20 @@ def build_hand_packet(
     if calib is None:
         return packet
 
+    deg_at_0 = np.asarray(calib["deg_at_0"], dtype=np.float32)
+    deg_at_1 = np.asarray(calib["deg_at_1"], dtype=np.float32)
     norm = map_angles_to_norm(
         angles_deg=angles,
-        deg_at_0=calib["deg_at_0"],
-        deg_at_1=calib["deg_at_1"],
+        deg_at_0=deg_at_0,
+        deg_at_1=deg_at_1,
+        absolute_delta=bool(calib.get("absolute_delta", False)),
     ).astype(np.float32)
     norm_swap = swap01(norm).astype(np.float32)
     packet.update(
         {
-            "deg_at_0": calib["deg_at_0"].astype(np.float32),
-            "deg_at_1": calib["deg_at_1"].astype(np.float32),
+            "deg_at_0": deg_at_0,
+            "deg_at_1": deg_at_1,
+            "absolute_delta": bool(calib.get("absolute_delta", False)),
             "norm": norm,
             "dexhand_norm": norm,
             "norm_raw": norm,
@@ -556,6 +631,9 @@ def build_hand_packet(
             "q6_rad_raw": norm6_to_q6_rad(norm).astype(np.float32),
         }
     )
+    for key in ("runtime_zero_on_start", "zero_scale"):
+        if key in calib:
+            packet[key] = calib[key]
     return packet
 
 
@@ -571,6 +649,12 @@ class SingleHandQ6Reader:
         show_raw_lines: bool = False,
         exo_hand_calibration: bool = False,
         calibration_path: str | Path | None = None,
+        runtime_zero_on_start: bool = False,
+        runtime_zero_scale: str = "absolute",
+        runtime_zero_max_samples: int = 200,
+        runtime_zero_min_samples: int = 30,
+        runtime_zero_stable_window: int = 20,
+        runtime_zero_stable_eps: float = 0.5,
     ):
         import serial
 
@@ -582,6 +666,8 @@ class SingleHandQ6Reader:
         self.show_raw_lines = bool(show_raw_lines)
         self.exo_hand_calibration = bool(exo_hand_calibration)
         self.calibration_path = calibration_path
+        self.runtime_zero_on_start = bool(runtime_zero_on_start)
+        self.runtime_zero_scale = str(runtime_zero_scale)
 
         print(
             f"[Open:{self.side}] port={self.port} baudrate={self.baudrate} "
@@ -604,6 +690,16 @@ class SingleHandQ6Reader:
                 show_raw_lines=self.show_raw_lines,
                 update_fixed=True,
                 calibration_path=self.calibration_path,
+            )
+        elif self.runtime_zero_on_start:
+            self.calib = calibrate_runtime_zero(
+                self._line_reader,
+                side=self.side,
+                max_samples=int(runtime_zero_max_samples),
+                min_samples=int(runtime_zero_min_samples),
+                stable_window=int(runtime_zero_stable_window),
+                stable_eps=float(runtime_zero_stable_eps),
+                zero_scale=self.runtime_zero_scale,
             )
         else:
             try:

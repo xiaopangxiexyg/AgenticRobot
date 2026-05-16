@@ -13,8 +13,8 @@ from ..common import EffectorCommand
 
 
 DEXHAND_TELEOP_Q6_ORDER = (
-    "thumb_yaw",
     "thumb_flex",
+    "thumb_yaw",
     "index",
     "middle",
     "ring",
@@ -199,17 +199,11 @@ class DexHandQ6Backend:
 
     @staticmethod
     def _teleop_q6_to_internal_q6(q6: np.ndarray) -> np.ndarray:
-        return np.asarray(
-            [q6[1], q6[0], q6[2], q6[3], q6[4], q6[5]],
-            dtype=np.float32,
-        )
+        return np.asarray(q6, dtype=np.float32)
 
     @staticmethod
     def _internal_q6_to_teleop_q6(q6: np.ndarray) -> np.ndarray:
-        return np.asarray(
-            [q6[1], q6[0], q6[2], q6[3], q6[4], q6[5]],
-            dtype=np.float32,
-        )
+        return np.asarray(q6, dtype=np.float32)
 
     def _joint_angle_to_unit(self, angle_deg: float, low: float, high: float) -> float | None:
         if not np.isfinite(angle_deg):
