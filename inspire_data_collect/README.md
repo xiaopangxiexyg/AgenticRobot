@@ -818,25 +818,15 @@ finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", 
 
 ```bash
 cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
-export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00  # 外骨骼 hand_q6 串口，不是 DexHand CAN 口
-export EXO_PORT=/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_XXXXXXXX-if00-port0
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00  # 外骨骼 hand_q6 串口，不是 DexHand CAN 口
+# export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
+export EXO_PORT=/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
 export FR3_HOST=192.168.20.172
 export FR3_PORT=5558
 export DEXHAND_DEVICE_TYPE=auto
 export DEXHAND_DEVICE_INDEX=0
 ```
 
-0. 新机器第一次使用 USBCANFD 时，先配置权限并重新加入 `canbus` 组：
-
-```bash
-cd hardware/pyzlg_dexhand
-sudo ./tools/setup_usb_can.sh
-newgrp canbus
-lsusb | grep -E 'USBCANFD-100U|USBCANFD-200U'
-cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
-```
-
-如果当前 shell 没有继承新组权限，重新登录一次再继续。`hardware/pyzlg_dexhand/config/config.yaml` 里的 `left_hand.channel` 和 `ZCANDeviceType` 也要和现场接线一致。
 
 ## 安装
 
@@ -852,23 +842,18 @@ cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
    pip install -e .
    ```
 
-3. 配置 USB 权限：
 
-   ```bash
-   sudo ./tools/setup_usb_can.sh
-   ```
+0. 新机器第一次使用 USBCANFD 时，先配置权限并重新加入 `canbus` 组：
 
-   设置脚本将：
+```bash
+cd hardware/pyzlg_dexhand
+sudo ./tools/setup_usb_can.sh
+newgrp canbus
+lsusb | grep -E 'USBCANFD-100U|USBCANFD-200U'
+cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+```
 
-   - 创建 canbus 用户组
-   - 将你的用户添加到该组
-   - 设置 USBCANFD 适配器的 udev 规则
-   - 配置适当的权限
-
-   **你可能需要注销并重新登录才能使更改生效。**
-
-4. 编辑 `config/config.yaml` 以匹配你的硬件设置，特别是**通道和 ZCAN 设备类型**。
-
+如果当前 shell 没有继承新组权限，重新登录一次再继续。`hardware/pyzlg_dexhand/config/config.yaml` 里的 `left_hand.channel` 和 `ZCANDeviceType` 也要和现场接线一致。
 
 
 1. 不连接 DexHand，只验证右手槽位外骨骼 q6 reader 和 writer：
@@ -898,7 +883,7 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --hand left \
   --device-type "$DEXHAND_DEVICE_TYPE" \
   --device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 30 \
+  --hz 10 \
   --print-hz 5
 ```
 
@@ -979,7 +964,7 @@ python -m inspire_data_collect \
   --right-hand-port "$RIGHT_HAND_PORT" \
   --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
   --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 30 \
+  --hz 10 \
   --no-silent
 ```
 
@@ -1004,7 +989,6 @@ python -m inspire_data_collect \
   --camera-config inspire_data_collect/realsense.json \
   --vis_cam \
   --hz 10 \
-  --max-steps 200 \
   --no-silent
 ```
 
@@ -1029,7 +1013,7 @@ python -m inspire_data_collect \
   --camera-config inspire_data_collect/realsense.json \
   --vis_cam \
   --vis-cam-key front \
-  --hz 30 \
+  --hz 10 \
   --no-silent
 ```
 
