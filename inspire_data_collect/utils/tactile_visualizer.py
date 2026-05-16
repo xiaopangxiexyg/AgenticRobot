@@ -1,12 +1,10 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
-
-from ..hand.hand_backend import InspireTacHandBackend
-
 
 @dataclass(frozen=True)
 class TactileVisualizerConfig:
@@ -291,6 +289,327 @@ class TactileUVVisualizer:
 
 
 @dataclass(frozen=True)
+class DexHandForceVisualizerConfig:
+    enabled_sides: tuple[str, ...] = ("right",)
+    window_name: str = "dexhand_fingertip_force"
+    image_size: tuple[int, int] = (640, 640)
+    resizable_window: bool = True
+    render_scale: float = 1.5
+    value_scale: float = 0.02
+    panel_gap_px: int = 24
+    panel_padding_px: int = 20
+    circle_radius_min: int = 10
+    circle_radius_max: int = 46
+    arrow_length_min: float = 12.0
+    arrow_length_max: float = 68.0
+    line_color: tuple[int, int, int] = (112, 124, 136)
+    outline_color: tuple[int, int, int] = (148, 162, 176)
+    background_color: tuple[int, int, int] = (18, 21, 26)
+    detail_background_color: tuple[int, int, int] = (26, 31, 38)
+
+    def __post_init__(self) -> None:
+        if self.value_scale <= 0.0:
+            raise ValueError("value_scale must be positive")
+        if self.render_scale <= 0.0:
+            raise ValueError("render_scale must be positive")
+        if self.circle_radius_min <= 0 or self.circle_radius_max <= 0:
+            raise ValueError("circle radii must be positive")
+        if self.circle_radius_min > self.circle_radius_max:
+            raise ValueError("circle_radius_min cannot exceed circle_radius_max")
+        if self.arrow_length_min < 0.0 or self.arrow_length_max < 0.0:
+            raise ValueError("arrow lengths must be non-negative")
+        if self.arrow_length_min > self.arrow_length_max:
+            raise ValueError("arrow_length_min cannot exceed arrow_length_max")
+        sides = tuple(str(side) for side in self.enabled_sides)
+        invalid = [side for side in sides if side not in {"left", "right"}]
+        if invalid:
+            raise ValueError(f"unsupported DexHand visualizer side(s): {invalid}")
+
+
+class DexHandForceVisualizer:
+    _FINGER_ORDER: tuple[str, ...] = ("th", "ff", "mf", "rf", "lf")
+    _FINGER_LABELS: dict[str, str] = {
+        "th": "thumb",
+        "ff": "index",
+        "mf": "middle",
+        "rf": "ring",
+        "lf": "little",
+    }
+    _RIGHT_FINGER_LAYOUT: dict[str, tuple[float, float]] = {
+        "th": (0.18, 0.56),
+        "ff": (0.37, 0.33),
+        "mf": (0.52, 0.26),
+        "rf": (0.67, 0.33),
+        "lf": (0.82, 0.47),
+    }
+    _TACTILE_DIM = 15
+
+    def __init__(self, config: DexHandForceVisualizerConfig):
+        self.config = config
+        self._cv2 = TactileUVVisualizer._import_cv2()
+        self._window_created = False
+        self._closed = False
+        self._color_lut = self._cv2.applyColorMap(
+            np.arange(256, dtype=np.uint8).reshape(256, 1),
+            getattr(self._cv2, "COLORMAP_TURBO", self._cv2.COLORMAP_JET),
+        ).reshape(256, 3)
+
+    def _put_text(
+        self,
+        image: np.ndarray,
+        text: str,
+        org: tuple[int, int],
+        *,
+        scale: float = 0.5,
+        color: tuple[int, int, int] = (235, 239, 244),
+    ) -> None:
+        self._cv2.putText(
+            image,
+            text,
+            org,
+            self._cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (0, 0, 0),
+            3,
+            self._cv2.LINE_AA,
+        )
+        self._cv2.putText(
+            image,
+            text,
+            org,
+            self._cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            1,
+            self._cv2.LINE_AA,
+        )
+
+    def _panel_background(self) -> np.ndarray:
+        width, height = self.config.image_size
+        panel = np.zeros((height, width, 3), dtype=np.uint8)
+        panel[...] = np.array(self.config.background_color, dtype=np.uint8)
+        detail_top = int(round(height * 0.70))
+        self._cv2.rectangle(
+            panel,
+            (0, detail_top),
+            (width - 1, height - 1),
+            tuple(int(v) for v in self.config.detail_background_color),
+            thickness=-1,
+        )
+        return panel
+
+    def _finger_center(self, side: str, finger: str, width: int, height: int) -> tuple[int, int]:
+        nx, ny = self._RIGHT_FINGER_LAYOUT[finger]
+        if side == "left":
+            nx = 1.0 - nx
+        x = int(round(nx * (width - 1)))
+        y = int(round(ny * (height - 1)))
+        return x, y
+
+    def _strength(self, value: float) -> float:
+        safe = max(float(value), 0.0)
+        ref = max(float(self.config.value_scale), 1e-6)
+        return float(np.clip(np.log1p(safe / ref) / np.log1p(10.0), 0.0, 1.0))
+
+    def _color(self, strength: float) -> tuple[int, int, int]:
+        idx = int(round(np.clip(float(strength), 0.0, 1.0) * 255.0))
+        return tuple(int(v) for v in self._color_lut[idx].tolist())
+
+    def _detail_rows(self, panel: np.ndarray, forces: np.ndarray) -> None:
+        height, width = panel.shape[:2]
+        top = int(round(height * 0.74))
+        row_h = max(22, int(round((height - top - 14) / max(len(self._FINGER_ORDER), 1))))
+        self._put_text(
+            panel,
+            "finger      Fx (N)      Fy (N)      Fz (N)      |Fxy|",
+            (16, top - 10),
+            scale=0.42,
+            color=(191, 201, 214),
+        )
+        for row_index, finger in enumerate(self._FINGER_ORDER):
+            fx, fy, fz = [float(v) for v in forces[row_index]]
+            fxy = math.hypot(fx, fy)
+            text = (
+                f"{finger:<2} {self._FINGER_LABELS[finger]:<6} "
+                f"{fx:>8.3f}   {fy:>8.3f}   {fz:>8.3f}   {fxy:>8.3f}"
+            )
+            y = top + row_index * row_h + 18
+            self._put_text(panel, text, (16, y), scale=0.45)
+        self._put_text(
+            panel,
+            f"scale={float(self.config.value_scale):.3g}N  mapping: circle=Fz, arrow=Fx/Fy",
+            (16, height - 12),
+            scale=0.42,
+            color=(191, 201, 214),
+        )
+
+    def _draw_hand_outline(self, panel: np.ndarray, side: str) -> None:
+        height, width = panel.shape[:2]
+        hand_height = int(round(height * 0.72))
+
+        def mirror_x(nx: float) -> float:
+            return 1.0 - nx if side == "left" else nx
+
+        points = [self._finger_center(side, finger, width, hand_height) for finger in self._FINGER_ORDER]
+        palm_points = np.array(
+            [
+                points[0],
+                (int(round(mirror_x(0.34) * (width - 1))), int(round(height * 0.64))),
+                (int(round(mirror_x(0.52) * (width - 1))), int(round(height * 0.70))),
+                (int(round(mirror_x(0.70) * (width - 1))), int(round(height * 0.64))),
+                points[-1],
+            ],
+            dtype=np.int32,
+        )
+        self._cv2.polylines(
+            panel,
+            [palm_points.reshape(-1, 1, 2)],
+            isClosed=False,
+            color=tuple(int(v) for v in self.config.line_color),
+            thickness=10,
+            lineType=self._cv2.LINE_AA,
+        )
+
+    def _draw_panel(self, *, side: str, tactile_vec: np.ndarray | None) -> np.ndarray:
+        panel = self._panel_background()
+        height, width = panel.shape[:2]
+        self._put_text(panel, f"{side} hand DexHand tactile", (16, 28), scale=0.7)
+        self._draw_hand_outline(panel, side)
+
+        if tactile_vec is None:
+            self._put_text(panel, "no tactile", (16, 60), scale=0.52, color=(180, 180, 180))
+            return panel
+
+        values = np.asarray(tactile_vec, dtype=np.float32).reshape(-1)
+        if values.shape[0] != self._TACTILE_DIM:
+            self._put_text(panel, "invalid tactile shape", (16, 60), scale=0.52, color=(60, 90, 240))
+            return panel
+
+        safe = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).reshape(len(self._FINGER_ORDER), 3)
+        for finger_index, finger in enumerate(self._FINGER_ORDER):
+            cx, cy = self._finger_center(side, finger, width, int(round(height * 0.72)))
+            fx, fy, fz = [float(v) for v in safe[finger_index]]
+            fxy = math.hypot(fx, fy)
+            fz_strength = self._strength(abs(fz))
+            fxy_strength = self._strength(fxy)
+
+            outline_radius = max(22, int(round(min(width, height) * 0.075)))
+            fill_radius = int(
+                round(
+                    self.config.circle_radius_min
+                    + math.sqrt(max(fz_strength, 0.0))
+                    * (self.config.circle_radius_max - self.config.circle_radius_min)
+                )
+            )
+            self._cv2.circle(
+                panel,
+                (cx, cy),
+                outline_radius,
+                tuple(int(v) for v in self.config.outline_color),
+                thickness=2,
+                lineType=self._cv2.LINE_AA,
+            )
+            self._cv2.circle(
+                panel,
+                (cx, cy),
+                fill_radius,
+                self._color(fz_strength),
+                thickness=-1,
+                lineType=self._cv2.LINE_AA,
+            )
+            if fxy > 1e-8:
+                arrow_len = (
+                    float(self.config.arrow_length_min)
+                    + fxy_strength * (float(self.config.arrow_length_max) - float(self.config.arrow_length_min))
+                )
+                end_x = cx + (fx / fxy) * arrow_len
+                end_y = cy - (fy / fxy) * arrow_len
+                end_pt = (int(round(end_x)), int(round(end_y)))
+                self._cv2.arrowedLine(
+                    panel,
+                    (cx, cy),
+                    end_pt,
+                    (0, 0, 0),
+                    3,
+                    self._cv2.LINE_AA,
+                    tipLength=0.25,
+                )
+                self._cv2.arrowedLine(
+                    panel,
+                    (cx, cy),
+                    end_pt,
+                    (240, 244, 248),
+                    1,
+                    self._cv2.LINE_AA,
+                    tipLength=0.25,
+                )
+
+            self._put_text(
+                panel,
+                self._FINGER_LABELS[finger],
+                (cx - 34, max(18, cy - outline_radius - 14)),
+                scale=0.45,
+                color=(206, 216, 228),
+            )
+            self._put_text(
+                panel,
+                f"Fz {fz:.2f}  Fxy {fxy:.2f}",
+                (cx - 54, min(int(round(height * 0.69)), cy + outline_radius + 28)),
+                scale=0.42,
+                color=(206, 216, 228),
+            )
+
+        self._detail_rows(panel, safe)
+        return panel
+
+    def _ensure_window(self, image: np.ndarray) -> None:
+        if self._window_created:
+            return
+        if self.config.resizable_window:
+            flag = self._cv2.WINDOW_NORMAL | getattr(self._cv2, "WINDOW_FREERATIO", 0)
+        else:
+            flag = self._cv2.WINDOW_AUTOSIZE
+        self._cv2.namedWindow(self.config.window_name, flag)
+        if self.config.resizable_window:
+            height, width = image.shape[:2]
+            self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
+        self._window_created = True
+
+    def update(self, tactile_by_side: dict[str, np.ndarray | None]) -> None:
+        if self._closed:
+            return
+        panels = [
+            self._draw_panel(side=side, tactile_vec=tactile_by_side.get(side))
+            for side in tuple(self.config.enabled_sides)
+        ]
+        if not panels:
+            panels = [self._draw_panel(side="right", tactile_vec=None)]
+        image = np.concatenate(panels, axis=1) if len(panels) > 1 else panels[0]
+        scale = float(self.config.render_scale) if self.config.resizable_window else 1.0
+        if scale > 1.0:
+            image = self._cv2.resize(
+                image,
+                (
+                    max(1, int(round(image.shape[1] * scale))),
+                    max(1, int(round(image.shape[0] * scale))),
+                ),
+                interpolation=self._cv2.INTER_LINEAR,
+            )
+        self._ensure_window(image)
+        self._cv2.imshow(self.config.window_name, image)
+        self._cv2.waitKey(1)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._cv2.destroyWindow(self.config.window_name)
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
 class DMTacForceVisualizerConfig:
     enabled_sides: tuple[str, ...] = ("right",)
     window_name: str = "dmtac_gripper_distributed_force"
@@ -518,7 +837,7 @@ class DMTacForceVisualizer:
 
 def tactile_by_side_from_backends(
     active_sides: object,
-    backend_for_side: Callable[[str], InspireTacHandBackend | None],
+    backend_for_side: Callable[[str], Any | None],
 ) -> dict[str, np.ndarray | None]:
     tactile_by_side: dict[str, np.ndarray | None] = {"left": None, "right": None}
     for side in tuple(str(side) for side in active_sides):

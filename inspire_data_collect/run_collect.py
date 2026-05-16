@@ -67,6 +67,8 @@ if __package__ in (None, ""):
     from inspire_data_collect.utils.camera_preview import CameraPreviewConfig, CameraPreviewer
     from inspire_data_collect.hand.retargeter import HandRetargeter, HandRetargeterConfig
     from inspire_data_collect.utils.tactile_visualizer import (
+        DexHandForceVisualizer,
+        DexHandForceVisualizerConfig,
         DMTacForceVisualizer,
         DMTacForceVisualizerConfig,
         TactileUVVisualizer,
@@ -123,6 +125,8 @@ else:
     from .utils.camera_preview import CameraPreviewConfig, CameraPreviewer
     from .hand.retargeter import HandRetargeter, HandRetargeterConfig
     from .utils.tactile_visualizer import (
+        DexHandForceVisualizer,
+        DexHandForceVisualizerConfig,
         DMTacForceVisualizer,
         DMTacForceVisualizerConfig,
         TactileUVVisualizer,
@@ -1191,7 +1195,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif str(args.collect_mode) == "dexhand_q6":
-            visualizer = None
+            visualizer = DexHandForceVisualizer(
+                DexHandForceVisualizerConfig(
+                    enabled_sides=active_sides,
+                    image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+                    value_scale=float(args.tactile_vis_value_scale),
+                    resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                    render_scale=float(args.tactile_vis_render_scale),
+                )
+            )
         else:
             visualizer = TactileUVVisualizer(
                 TactileVisualizerConfig(

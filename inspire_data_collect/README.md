@@ -810,7 +810,7 @@ DexHand 触觉保存为 15 维 fingertip xyz force，排列维持后端现状：
  lf_fx, lf_fy, lf_fz]
 ```
 
-finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", "force_y", "force_z"]`。采集和 deploy 的内置 tactile 可视化暂未接入 DexHand；调试触觉时使用 `hardware/portable_dexhand021` 自带工具。
+finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", "force_y", "force_z"]`。采集和 deploy 现已接入现有 `--visualize-tactile` 框架，会把 15 维 fingertip xyz 画成 5 个指尖的 `Fz` 圆点和 `Fx/Fy` 箭头；如果还想看温度、proximity、raw delta 等更细字段，仍可用 `hardware/portable_dexhand021` 自带工具。
 
 #### DexHand Q6 完整数采流程
 
@@ -893,7 +893,66 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
 --visualize-tactile --tactile-viewer-hz 20
 ```
 
-不要再额外启动第二个 Python 进程去占用同一个 USBCANFD。
+
+如果这里主观感觉“明显跟手慢”:
+
+```bash
+# A. 先看正常手感基线：不改其他参数，只把控制频率拉到 50Hz
+python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
+  --port "$RIGHT_HAND_PORT" \
+  --side right \
+  --hand left \
+  --device-type "$DEXHAND_DEVICE_TYPE" \
+  --device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 50 \
+  --print-hz 5
+
+# B. 复现“低频导致的迟滞”对照组：10Hz 往往就会感觉很慢
+python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
+  --port "$RIGHT_HAND_PORT" \
+  --side right \
+  --hand left \
+  --device-type "$DEXHAND_DEVICE_TYPE" \
+  --device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 10 \
+  --print-hz 5
+```
+
+如果 `50 Hz` 明显正常、`10 Hz` 明显发黏，问题主要就是控制频率设置，不是外骨骼串口。
+
+如果 `50 Hz` 仍然明显迟滞，再继续做“去掉反馈负载”的隔离测试：
+
+```bash
+# C. 关闭启动时周期触觉反馈，并关闭运行期 error check，尽量只保留发命令
+python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
+  --port "$RIGHT_HAND_PORT" \
+  --side right \
+  --hand left \
+  --device-type "$DEXHAND_DEVICE_TYPE" \
+  --device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 50 \
+  --print-hz 5 \
+  --no-configure-tactile \
+  --error-check-hz 0
+```
+
+这一步如果明显变流畅，说明延迟更可能来自 DexHand 反馈/触觉相关 CAN 流量，而不是 q6 串口输入本身。
+
+如果还想先完全排除 DexHand 真机和 USBCANFD，只看“串口读取 + q6 映射”是否跟得上，可做 dry-run：
+
+```bash
+# D. 不连接 DexHand，只跑 reader + q6 mapper
+python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
+  --port "$RIGHT_HAND_PORT" \
+  --side right \
+  --dry-run \
+  --hz 50 \
+  --print-hz 20 \
+  --frames 200
+```
+
+这里应当看到打印出来的 `q6=` 很快响应手部动作变化；如果 dry-run 已经发慢，再回头查串口设备、校准和原始 ANGLES 输出。
+
 
 3. 不连接 DexHand，只跑采集主循环和 retarget/writer 流程，确认数采框架本身没问题：
 
@@ -932,7 +991,7 @@ python -m inspire_data_collect \
   --no-silent
 ```
 
-重点检查 `observation.right_hand.qpos`、`observation.hand.right.tactile` 长度 15，以及 `observation.hand.right.tactile_dict_json` 中的 fingertip xyz。
+重点检查 `observation.right_hand.qpos`、`observation.hand.right.tactile` 长度 15，以及 `observation.hand.right.tactile_dict_json` 中的 fingertip xyz。若想同时看内置 5 指触觉可视化，可追加 `--visualize-tactile`；觉得太敏感时把 `--tactile-vis-value-scale` 调大一些，例如 `0.2` 或 `0.5`。
 
 5. 如需验证在采集框架内也能真实跟随 6DoF，请去掉 `--record-hand-only` 做完整短测：
 
@@ -946,12 +1005,48 @@ python -m inspire_data_collect \
   --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
   --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
   --record-auto-start \
-  --hz 10 \
+  --hz 30 \
   --max-steps 200 \
   --no-silent
 ```
 
 这一步里 DexHand 应该和 step 2 一样实时跟随 6DoF，只是控制链路已经换成采集框架内部的 retargeter/backend/writer。
+
+如果 step 2 的 standalone 已经流畅，但这一步进入采集框架后又明显变慢，建议继续做下面两组对照：
+
+```bash
+# E. 采集框架内 baseline：先用 30Hz 主循环
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_follow_smoke_hz30 \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 30 \
+  --hand-telemetry-hz 10 \
+  --record-auto-start \
+  --max-steps 200 \
+  --no-silent
+
+# F. 降低 DexHand telemetry 读取频率，观察是否改善跟手
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_follow_smoke_lowtele \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 30 \
+  --hand-telemetry-hz 2 \
+  --record-auto-start \
+  --max-steps 200 \
+  --no-silent
+```
+
+如果 `F` 比 `E` 明显更顺，说明主要瓶颈在采集框架里后台 telemetry 线程和发送线程共用 DexHand 连接；后续可再考虑继续下调 telemetry 频率，或把 send/read 做更细的解耦。
 
 6. 上面都通过后，做正式单手 DexHand 数采。手动用 `z/c/d/q` 控制 episode：
 
