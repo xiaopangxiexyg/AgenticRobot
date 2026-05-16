@@ -783,6 +783,122 @@ python -m inspire_data_collect \
 --gripper-no-hardware --gripper-no-tactile
 ```
 
+### DexHand Q6 right-slot collect mode
+
+`--collect-mode dexhand_q6` 是一个 DexHand 左手真机接入的单手本体补充。它只支持当前约定：
+
+- 数据集逻辑槽位固定为 `right_hand`，即必须使用 `--active-sides right`。
+- 物理硬件固定为左手 DexHand，即 `--dexhand-hardware-hand left`。
+- 保存和对外暴露的 6DoF 顺序沿用现有外骨骼手 reader：`[thumb_yaw, thumb_flex, index, middle, ring, pinky]`。
+- deploy/replay 也读取 `right_hand` 槽位，但实际发送给左手 DexHand。
+
+后端内部会把上述 q6 转成 DexHand 12 关节命令。写入 observation 时不会直接保存最后一次命令，而是从 DexHand 实测关节反馈反算回 q6：`thumb_yaw` 来自 `th_rot`，`thumb_flex` 取 `th_dip/th_mcp` 平均；四指分别用 DIP 直接估计值和 MCP 按 profile 比例换算后的估计值取平均，因此最后两组耦合关节不一致时会得到一个折中 q6。
+
+DexHand 触觉保存为 15 维 fingertip xyz force，排列维持后端现状：
+
+```text
+[th_fx, th_fy, th_fz,
+ ff_fx, ff_fy, ff_fz,
+ mf_fx, mf_fy, mf_fz,
+ rf_fx, rf_fy, rf_fz,
+ lf_fx, lf_fy, lf_fz]
+```
+
+finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", "force_y", "force_z"]`。采集和 deploy 的内置 tactile 可视化暂未接入 DexHand；调试触觉时使用 `hardware/portable_dexhand021` 自带工具。
+
+#### DexHand Q6 startup testing
+
+以下步骤从 q6 串口、DexHand 单体控制到完整采集逐步增加硬件：
+
+```bash
+cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_XXXXXXXX-if00
+```
+
+1. 不连接 DexHand，只验证右手槽位外骨骼 q6 reader 和 writer：
+
+```bash
+python inspire_data_collect/run_collect.py \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_probe_serial \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-no-hardware \
+  --record-hand-only \
+  --record-auto-start \
+  --max-steps 200 \
+  --no-silent
+```
+
+确认 `right_hand_q6` 有效，并且 `action.right_hand.joint_target` 已写入 q6。
+
+2. 在采集框架外单独验证 DexHand 左手硬件控制。注意串口源仍是 `--side right`，真机是 `--hand left`：
+
+```bash
+python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
+  --port "$RIGHT_HAND_PORT" \
+  --side right \
+  --hand left \
+  --hz 30 \
+  --print-hz 5
+```
+
+确认开合方向正确、动作幅度安全。触觉可单独用 portable DexHand 工具查看。
+
+3. 连接 DexHand，先用 record-only 短测 telemetry、q6 反算和 15 维触觉写盘：
+
+```bash
+python inspire_data_collect/run_collect.py \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_record_only \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --record-hand-only \
+  --record-auto-start \
+  --max-steps 300 \
+  --no-silent
+```
+
+重点检查 `observation.right_hand.qpos`、`observation.hand.right.tactile` 长度 15，以及 `observation.hand.right.tactile_dict_json` 中的 fingertip xyz。
+
+4. 完整采集短测：
+
+```bash
+python inspire_data_collect/run_collect.py \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_collect \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --record-auto-start \
+  --no-silent
+```
+
+5. 对同一 right-slot 数据做 deploy/replay，实际仍执行到左手 DexHand：
+
+```bash
+python -m inspire_data_collect.deploy.run_policy \
+  --hand-mode dexhand_q6 \
+  --active-sides right \
+  --send-actions \
+  --auto-start \
+  --debug-replay-dataset /path/to/dataset_root \
+  --debug-replay-episode 0
+```
+
+deploy 特殊处理和采集保持一致：replay 读取 `action.right_hand.joint_target`，startup init 也使用 right-slot action vector，然后由 DexHand backend 发给左手真机。
+
+常用 DexHand 参数：
+
+- `--dexhand-hardware-hand left`: 物理 DexHand 侧，目前仅支持 left。
+- `--dexhand-device-type auto|config|100U|200U`: USBCANFD 类型选择。
+- `--dexhand-device-index N`: USBCANFD 设备序号。
+- `--dexhand-tactile-period-ms 20`: 周期反馈/触觉请求周期。
+- `--dexhand-no-hardware`: 只跑 reader/writer，不连接 DexHand。
+- `--dexhand-mock`: 使用 portable DexHand mock 后端。
+
 外骨骼到 FR3 是直接关节映射，程序刚启动时 FR3 当前关节和外骨骼映射目标通常不一致。默认启用启动对齐：FR3 后端第一次收到 arm 指令时，会以 FR3 当前 `qpos` 为起点，在 `--arm-startup-align-duration-s` 秒内线性插值到外骨骼当前目标；最大关节差低于 `--arm-startup-align-threshold-rad` 时会跳过插值。启动对齐期间操作者应尽量保持外骨骼不动，等插值结束后再进入正常随动。确认二者已经物理对齐且需要完全直接随动时，才使用 `--disable-arm-startup-align`。
 
 单 RealSense 相机，使用包内 `realsense.json`：
@@ -937,17 +1053,19 @@ dataset_root/YYYY-MM-DD_task-name/
 - `observation.arm.startup_alignment_*`: FR3 启动对齐插值状态、进度、起点和目标。
 - `action.right_hand.joint_target`、`action.left_hand.joint_target`。
 - `observation.right_hand.qpos`、`observation.left_hand.qpos`。
-- `observation.hand.<side>.tactile`: InspireTac 手模式下是 1062 维触觉向量；gripper 模式下是 DM-Tac `getDistributeForce()` 原始 `(288, 384, 3)` force 经保存端 `kernel_size=2, stride=2` mean pooling 后的 `(144, 192, 3)` flatten 向量，默认两个传感器时为 `2 * 144 * 192 * 3 = 165888` 维。
+- `observation.hand.<side>.tactile`: InspireTac 手模式下是 1062 维触觉向量；gripper 模式下是 DM-Tac `getDistributeForce()` 原始 `(288, 384, 3)` force 经保存端 `kernel_size=2, stride=2` mean pooling 后的 `(144, 192, 3)` flatten 向量，默认两个传感器时为 `2 * 144 * 192 * 3 = 165888` 维；DexHand Q6 模式下只写 `observation.hand.right.tactile`，为 15 维 `[th_xyz, ff_xyz, mf_xyz, rf_xyz, lf_xyz]` fingertip force。
 - `observation.hand.<side>.tactile_timestamp`: 本帧触觉读取请求时间。
 - `observation.hand.<side>.telemetry_timestamp`: 手部 telemetry 最新更新时间。
-- `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名。
-- `observation.hand.<side>.tactile_dict_json`: InspireTac 手模式下是选中触觉区域的矩阵数据 JSON；gripper 模式下只记录每个 DM-Tac 传感器的 shape/dtype。
+- `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名；DexHand Q6 模式下为 `("th", "ff", "mf", "rf", "lf")`。
+- `observation.hand.<side>.tactile_dict_json`: InspireTac 手模式下是选中触觉区域的矩阵数据 JSON；gripper 模式下只记录每个 DM-Tac 传感器的 shape/dtype；DexHand Q6 模式下记录 finger order、axis order、每个指尖的 `force_x/force_y/force_z`，以及底层 raw tactile 摘要。
 - `teleop.action_source.arm_exo_qpos`: 外骨骼原始 7DoF 关节角。
 - `teleop.action_source.arm_preclip_joint_target`: 外骨骼映射到 FR3 后、裁剪前的 7DoF 目标。
 - `teleop.action_source.arm_clip_mask`: 每个 FR3 关节是否被安全限位裁剪。
 - `teleop.action_source.<side>_hand_q6`: 遥操作源手 6DoF。
 
 `meta/info.json` 中的 `reserved_spaces` 明确记录单臂 7DoF 的 shape 和 slice；当前 writer 会在启用 arm 时直接填充前 7 维。
+
+DexHand Q6 模式还会在 episode metadata 中写入 `logical_hand_side="right"`、`hardware_hand_side="left"`、`dexhand_q6_order`、`dexhand_joint_feedback_saved_as_q6=true`、`dexhand_tactile_format="fingertip_xyz"`、`dexhand_tactile_fingers`、`dexhand_tactile_axes`、`dexhand_tactile_dim=15`。设备配置另存为 `meta/devices/dexhand_q6.json`，用于记录 right-slot 到 left hardware 的映射。
 
 启用相机后，每帧还会写出：
 
