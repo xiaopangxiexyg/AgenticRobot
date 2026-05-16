@@ -1516,7 +1516,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if bool(args.record_hand_only):
             print(
-                "[Hand] record-only mode active: teleop hand commands will not be sent; "
+                "[Hand] record-only mode active: live teleop hand following is disabled; "
+                "hand commands will not be sent except the startup/after-save fixed pose. "
                 f"fixed_pos={list(args.record_hand_fixed_pos)}"
             )
         if args.enable_arm:
