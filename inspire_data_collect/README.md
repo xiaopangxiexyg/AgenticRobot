@@ -793,6 +793,11 @@ python -m inspire_data_collect \
 - 保存和对外暴露的 6DoF 顺序沿用现有外骨骼手 reader：`[thumb_yaw, thumb_flex, index, middle, ring, pinky]`。
 - deploy/replay 也读取 `right_hand` 槽位，但实际发送给左手 DexHand。
 
+注意这里有两条完全不同的硬件链路：
+
+- `--right-hand-port` / `RIGHT_HAND_PORT` 是外骨骼 `hand_q6` 设备的 USB 串口，用来读取遥操作 6DoF 输入；它不是 DexHand 的控制口。
+- DexHand 真机仍然通过 ZLG USBCANFD 适配器走 CANFD，不使用 `/dev/serial/by-id/...` 串口路径。DexHand 侧只配置 `--dexhand-device-type`、`--dexhand-device-index` 和 `hardware/pyzlg_dexhand/config/config.yaml` 里的 CAN channel / `ZCANDeviceType`。USBCANFD 是 USB 接入电脑的 CAN 适配器，所以文档中会提到 USB 权限，但程序打开的是 ZCAN 设备类型和 index，不是串口 port。
+
 后端内部会把上述 q6 转成 DexHand 12 关节命令。写入 observation 时不会直接保存最后一次命令，而是从 DexHand 实测关节反馈反算回 q6：`thumb_yaw` 来自 `th_rot`，`thumb_flex` 取 `th_dip/th_mcp` 平均；四指分别用 DIP 直接估计值和 MCP 按 profile 比例换算后的估计值取平均，因此最后两组耦合关节不一致时会得到一个折中 q6。
 
 DexHand 触觉保存为 15 维 fingertip xyz force，排列维持后端现状：
@@ -807,14 +812,31 @@ DexHand 触觉保存为 15 维 fingertip xyz force，排列维持后端现状：
 
 finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", "force_y", "force_z"]`。采集和 deploy 的内置 tactile 可视化暂未接入 DexHand；调试触觉时使用 `hardware/portable_dexhand021` 自带工具。
 
-#### DexHand Q6 startup testing
+#### DexHand Q6 完整数采流程
 
-以下步骤从 q6 串口、DexHand 单体控制到完整采集逐步增加硬件：
+以下流程从新机器初始化、q6 串口检查、DexHand 单体跟随、采集框架 smoke test，一直到正式数采与 replay。默认在项目根目录执行。
 
 ```bash
 cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
-export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00  # 外骨骼 hand_q6 串口，不是 DexHand CAN 口
+export EXO_PORT=/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_XXXXXXXX-if00-port0
+export FR3_HOST=192.168.20.172
+export FR3_PORT=5558
+export DEXHAND_DEVICE_TYPE=auto
+export DEXHAND_DEVICE_INDEX=0
 ```
+
+0. 新机器第一次使用 USBCANFD 时，先配置权限并重新加入 `canbus` 组：
+
+```bash
+cd hardware/pyzlg_dexhand
+sudo ./tools/setup_usb_can.sh
+newgrp canbus
+lsusb | grep -E 'USBCANFD-100U|USBCANFD-200U'
+cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+```
+
+如果当前 shell 没有继承新组权限，重新登录一次再继续。`hardware/pyzlg_dexhand/config/config.yaml` 里的 `left_hand.channel` 和 `ZCANDeviceType` 也要和现场接线一致。
 
 ## 安装
 
@@ -852,7 +874,7 @@ export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-i
 1. 不连接 DexHand，只验证右手槽位外骨骼 q6 reader 和 writer：
 
 ```bash
-python inspire_data_collect/run_collect.py \
+python -m inspire_data_collect \
   --dataset-root ./datasets_debug \
   --task-name dexhand_probe_serial \
   --collect-mode dexhand_q6 \
@@ -865,7 +887,7 @@ python inspire_data_collect/run_collect.py \
   --no-silent
 ```
 
-确认 `right_hand_q6` 有效，并且 `action.right_hand.joint_target` 已写入 q6。
+确认 `right_hand_q6` 有效，并且 `action.right_hand.joint_target` 已写入 q6。这里不连接 USBCANFD，也不会驱动 DexHand 真机。
 
 2. 在采集框架外单独验证 DexHand 左手硬件控制。注意串口源仍是 `--side right`，真机是 `--hand left`：
 
@@ -874,21 +896,51 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --port "$RIGHT_HAND_PORT" \
   --side right \
   --hand left \
+  --device-type "$DEXHAND_DEVICE_TYPE" \
+  --device-index "$DEXHAND_DEVICE_INDEX" \
   --hz 30 \
   --print-hz 5
 ```
 
-确认开合方向正确、动作幅度安全。触觉可单独用 portable DexHand 工具查看。
-
-3. 连接 DexHand，先用 record-only 短测 telemetry、q6 反算和 15 维触觉写盘：
+确认开合方向正确、动作幅度安全。若需要在同一进程里一起看 5 指触觉，可追加：
 
 ```bash
-python inspire_data_collect/run_collect.py \
+--visualize-tactile --tactile-viewer-hz 20
+```
+
+不要再额外启动第二个 Python 进程去占用同一个 USBCANFD。
+
+3. 不连接 DexHand，只跑采集主循环和 retarget/writer 流程，确认数采框架本身没问题：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_smoke_no_hw \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-no-hardware \
+  --record-auto-start \
+  --hz 10 \
+  --max-steps 100 \
+  --no-parquet \
+  --no-video \
+  --no-silent
+```
+
+这一步应该能稳定产生 `action.right_hand.joint_target`，但不会连接 USBCANFD，也不会读取真实 DexHand 反馈。
+
+4. 连接 DexHand，先用 record-only 短测 telemetry、q6 反算和 15 维触觉写盘。注意这一步**不会**让 DexHand 跟随 6DoF 遥操；`--record-hand-only` 会关闭实时手部动作下发，只保留状态/触觉读取和数据写盘，启动时只会额外执行一次固定 `record_hand_fixed_pos`：
+
+```bash
+python -m inspire_data_collect \
   --dataset-root ./datasets_debug \
   --task-name dexhand_record_only \
   --collect-mode dexhand_q6 \
   --active-sides right \
   --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
   --record-hand-only \
   --record-auto-start \
   --max-steps 300 \
@@ -897,25 +949,98 @@ python inspire_data_collect/run_collect.py \
 
 重点检查 `observation.right_hand.qpos`、`observation.hand.right.tactile` 长度 15，以及 `observation.hand.right.tactile_dict_json` 中的 fingertip xyz。
 
-4. 完整采集短测：
+5. 如需验证在采集框架内也能真实跟随 6DoF，请去掉 `--record-hand-only` 做完整短测：
 
 ```bash
-python inspire_data_collect/run_collect.py \
+python -m inspire_data_collect \
   --dataset-root ./datasets_debug \
-  --task-name dexhand_collect \
+  --task-name dexhand_follow_smoke \
   --collect-mode dexhand_q6 \
   --active-sides right \
   --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
   --record-auto-start \
+  --hz 10 \
+  --max-steps 200 \
   --no-silent
 ```
 
-5. 对同一 right-slot 数据做 deploy/replay，实际仍执行到左手 DexHand：
+这一步里 DexHand 应该和 step 2 一样实时跟随 6DoF，只是控制链路已经换成采集框架内部的 retargeter/backend/writer。
+
+6. 上面都通过后，做正式单手 DexHand 数采。手动用 `z/c/d/q` 控制 episode：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name dexhand_collect_peeling \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 30 \
+  --no-silent
+```
+
+7. 加上 FR3 和单相机做完整短测：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_fr3_single_cam_smoke \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --hz 10 \
+  --max-steps 200 \
+  --no-silent
+```
+
+8. 正式带 FR3 + 多相机的 DexHand 数采示例：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name dexhand_collect_multi_cam \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --camera-mode multi \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --vis-cam-key front \
+  --hz 30 \
+  --no-silent
+```
+
+9. 对同一 right-slot 数据做 deploy/replay，实际仍执行到左手 DexHand：
 
 ```bash
 python -m inspire_data_collect.deploy.run_policy \
   --hand-mode dexhand_q6 \
   --active-sides right \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
   --send-actions \
   --auto-start \
   --debug-replay-dataset /home/user/zc/dex_inspire_teleop_new/datasets_debug/2026-05-16_dexhand_collect \
@@ -932,6 +1057,9 @@ deploy 特殊处理和采集保持一致：replay 读取 `action.right_hand.join
 - `--dexhand-tactile-period-ms 20`: 周期反馈/触觉请求周期。
 - `--dexhand-no-hardware`: 只跑 reader/writer，不连接 DexHand。
 - `--dexhand-mock`: 使用 portable DexHand mock 后端。
+- `--record-hand-only`: 只读状态/触觉并写盘，不实时下发 DexHand 跟随命令。
+
+DexHand CAN 通道来自 `hardware/pyzlg_dexhand/config/config.yaml`，例如当前 `left_hand.channel` 和 `ZCANDeviceType`。如果使用 `--dexhand-device-type config`，会严格按该配置打开；默认 `auto` 会优先尝试配置里的设备类型，再尝试 100U/200U。
 
 外骨骼到 FR3 是直接关节映射，程序刚启动时 FR3 当前关节和外骨骼映射目标通常不一致。默认启用启动对齐：FR3 后端第一次收到 arm 指令时，会以 FR3 当前 `qpos` 为起点，在 `--arm-startup-align-duration-s` 秒内线性插值到外骨骼当前目标；最大关节差低于 `--arm-startup-align-threshold-rad` 时会跳过插值。启动对齐期间操作者应尽量保持外骨骼不动，等插值结束后再进入正常随动。确认二者已经物理对齐且需要完全直接随动时，才使用 `--disable-arm-startup-align`。
 
