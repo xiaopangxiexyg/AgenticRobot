@@ -4,13 +4,14 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence, TypeVar
 
 import numpy as np
 
 from project_paths import hand_zero_pose_calibrations_dir, repo_path
 
 ANGLE_RE = re.compile(r"=\s*([-+]?\d+(?:\.\d+)?)")
+_ParsedT = TypeVar("_ParsedT")
 OFFSET = [40.0, -70.0, 60.0, 60.0, 60.0, 60.0]
 Q6_ORDER = (
     "thumb_yaw",
@@ -341,6 +342,79 @@ def parse_angles_line(line: str) -> list[float] | None:
         return None
 
 
+class BufferedSerialLineReader:
+    """Read complete serial lines while dropping stale backlog.
+
+    The hand-q6 source can publish faster than some control loops consume. If we
+    call ``readline()`` only once per control tick, low-Hz loops end up acting on
+    the oldest buffered frame instead of the most recent pose. This helper keeps
+    an internal byte buffer, drains all complete lines currently waiting on the
+    serial port, and returns the latest parsed frame.
+    """
+
+    def __init__(
+        self,
+        ser: Any,
+        *,
+        show_raw_lines: bool = False,
+        raw_prefix: str = "",
+    ) -> None:
+        self.ser = ser
+        self.show_raw_lines = bool(show_raw_lines)
+        self.raw_prefix = str(raw_prefix)
+        self._pending = bytearray()
+
+    def _read_chunk(self, size: int) -> bytes:
+        chunk = self.ser.read(max(1, int(size)))
+        return chunk if isinstance(chunk, (bytes, bytearray)) else bytes(chunk or b"")
+
+    def _read_some_blocking(self) -> None:
+        waiting = int(getattr(self.ser, "in_waiting", 0) or 0)
+        self._pending.extend(self._read_chunk(waiting if waiting > 0 else 1))
+
+    def _drain_immediately_available(self) -> None:
+        while True:
+            waiting = int(getattr(self.ser, "in_waiting", 0) or 0)
+            if waiting <= 0:
+                return
+            chunk = self._read_chunk(waiting)
+            if not chunk:
+                return
+            self._pending.extend(chunk)
+
+    def _consume_complete_lines(
+        self,
+        parse_line: Callable[[str], _ParsedT | None],
+    ) -> _ParsedT | None:
+        latest: _ParsedT | None = None
+        while True:
+            newline_index = self._pending.find(b"\n")
+            if newline_index < 0:
+                return latest
+            raw = bytes(self._pending[: newline_index + 1])
+            del self._pending[: newline_index + 1]
+            text = raw.decode("utf-8", errors="ignore").strip()
+            if self.show_raw_lines and text:
+                print(f"{self.raw_prefix}{text}")
+            parsed = parse_line(text)
+            if parsed is not None:
+                latest = parsed
+
+    def read_latest_parsed(
+        self,
+        parse_line: Callable[[str], _ParsedT | None],
+    ) -> _ParsedT:
+        latest: _ParsedT | None = None
+        while latest is None:
+            latest = self._consume_complete_lines(parse_line)
+            if latest is not None:
+                break
+            self._read_some_blocking()
+        self._drain_immediately_available()
+        drained_latest = self._consume_complete_lines(parse_line)
+        return latest if drained_latest is None else drained_latest
+
+
 def swap01(x6: Sequence[float]) -> np.ndarray:
     values = np.asarray(x6, dtype=np.float32).copy()
     values[0], values[1] = values[1], values[0]
@@ -514,6 +588,11 @@ class SingleHandQ6Reader:
             "(for ttyACM USB CDC devices, baudrate may be nominal)"
         )
         self.ser = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=self.timeout)
+        self._line_reader = BufferedSerialLineReader(
+            self.ser,
+            show_raw_lines=self.show_raw_lines,
+            raw_prefix=f"[RAW:{self.side}] ",
+        )
         if self.raw_only:
             self.calib = None
         elif self.exo_hand_calibration:
@@ -550,20 +629,14 @@ class SingleHandQ6Reader:
                 )
 
     def read_frame(self) -> dict[str, object]:
-        while True:
-            line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-            if self.show_raw_lines and line:
-                print(f"[RAW:{self.side}] {line}")
-            angles = parse_angles_line(line)
-            if angles is None:
-                continue
-            return build_hand_packet(
-                angles_deg=angles,
-                side=self.side,
-                port=self.port,
-                baudrate=self.baudrate,
-                calib=self.calib,
-            )
+        angles = self._line_reader.read_latest_parsed(parse_angles_line)
+        return build_hand_packet(
+            angles_deg=angles,
+            side=self.side,
+            port=self.port,
+            baudrate=self.baudrate,
+            calib=self.calib,
+        )
 
     def get_norm_values(self) -> np.ndarray:
         packet = self.read_frame()

@@ -13,12 +13,17 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HARDWARE_ROOT = Path(__file__).resolve().parents[2]
+if str(HARDWARE_ROOT) not in sys.path:
+    sys.path.insert(0, str(HARDWARE_ROOT))
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from portable_dexhand021 import DexHandController
 from portable_dexhand021.tactile_viewer import run_viewer
+from inspire_data_collect.hand.serial_hand_q6_reader import BufferedSerialLineReader
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -29,7 +34,7 @@ from q6_to_dexhand import DEFAULT_FINGER_PROFILE_PATH, DexHandQ6Mapper, parse_fl
 
 ANGLE_RE = re.compile(r"=\s*([-+]?\d+(?:\.\d+)?)")
 TELEOP_OFFSET = (40.0, -70.0, 60.0, 60.0, 60.0, 60.0)
-DEFAULT_CALIBRATION_PATH = ROOT / "teleop_hand" / "exo_hand_zero_pose.json"
+DEFAULT_CALIBRATION_PATH = HARDWARE_ROOT / "teleop_hand" / "exo_hand_zero_pose.json"
 
 
 def parse_q6(text: str) -> Tuple[float, ...]:
@@ -226,6 +231,11 @@ class SerialQ6Reader:
         self.side = side
         self.show_raw_lines = show_raw_lines
         self.ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
+        self._line_reader = BufferedSerialLineReader(
+            self.ser,
+            show_raw_lines=self.show_raw_lines,
+            raw_prefix=f"[RAW:{self.side}] ",
+        )
         if zero_on_start:
             self.calib = self._calibrate_zero_on_start(
                 max_samples=zero_max_samples,
@@ -238,13 +248,8 @@ class SerialQ6Reader:
             self.calib = load_calibration(calibration, side)
 
     def _read_angles(self) -> Tuple[float, ...]:
-        while True:
-            line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-            if self.show_raw_lines and line:
-                print(f"[RAW:{self.side}] {line}")
-            angles = parse_angles_line(line)
-            if angles is not None:
-                return angles
+        angles = self._line_reader.read_latest_parsed(parse_angles_line)
+        return tuple(float(value) for value in angles)
 
     def _calibrate_zero_on_start(
         self,
