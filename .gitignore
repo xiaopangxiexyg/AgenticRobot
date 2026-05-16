@@ -47,6 +47,8 @@ BaselineVLA_deployment/local_paths.env
 BaselineVLA_deployment/ThirdParty
 BaselineVLA_deployment/Data
 BaselineVLA_deployment/Outputs
+BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs
+BaselineVLA_deployment/ServerClientDeploy/Pi
 *.egg-info/
 *.whl
 
@@ -71,4 +73,4 @@ test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/
 heavy_light_wasted/
 2026-04-30_heavy_light/
 real_dataset/
-
+portable_rm_right_arm/

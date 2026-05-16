@@ -1,0 +1,212 @@
+{
+  "saved_at": 1778568768.4578373,
+  "hand": "left",
+  "joint_order": [
+    "th_dip",
+    "th_mcp",
+    "th_rot",
+    "ff_spr",
+    "ff_dip",
+    "ff_mcp",
+    "mf_dip",
+    "mf_mcp",
+    "rf_dip",
+    "rf_mcp",
+    "lf_dip",
+    "lf_mcp"
+  ],
+  "angles_deg": {
+    "th_dip": 18.54,
+    "th_mcp": 42.0,
+    "th_rot": 107.32,
+    "ff_spr": 0.41,
+    "ff_dip": 60.0,
+    "ff_mcp": 72.54,
+    "mf_dip": 61.63,
+    "mf_mcp": 73.63,
+    "rf_dip": 63.27,
+    "rf_mcp": 73.63,
+    "lf_dip": 69.27,
+    "lf_mcp": 44.18
+  },
+  "angles_deg_ordered": [
+    18.54,
+    42.0,
+    107.32,
+    0.41,
+    60.0,
+    72.54,
+    61.63,
+    73.63,
+    63.27,
+    73.63,
+    69.27,
+    44.18
+  ],
+  "raw_state": {
+    "timestamp": 1778568768.4568253,
+    "hand": "left",
+    "joints": {
+      "th_dip": {
+        "timestamp": 1778568768.457779,
+        "angle": 18.54,
+        "encoder_position": 472,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "th_mcp": {
+        "timestamp": 1778568768.457779,
+        "angle": 42.0,
+        "encoder_position": 403,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "th_rot": {
+        "timestamp": 1778568768.4577925,
+        "angle": 107.32,
+        "encoder_position": 995,
+        "current": 6,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "ff_spr": {
+        "timestamp": 1778568768.4577925,
+        "angle": 0.41,
+        "encoder_position": 12,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "ff_dip": {
+        "timestamp": 1778568768.4577956,
+        "angle": 60.0,
+        "encoder_position": 796,
+        "current": 4,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "ff_mcp": {
+        "timestamp": 1778568768.4577956,
+        "angle": 72.54,
+        "encoder_position": 867,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "mf_dip": {
+        "timestamp": 1778568768.4577992,
+        "angle": 61.63,
+        "encoder_position": 726,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "mf_mcp": {
+        "timestamp": 1778568768.4577992,
+        "angle": 73.63,
+        "encoder_position": 927,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "rf_dip": {
+        "timestamp": 1778568768.4578018,
+        "angle": 63.27,
+        "encoder_position": 857,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "rf_mcp": {
+        "timestamp": 1778568768.4578018,
+        "angle": 73.63,
+        "encoder_position": 915,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "lf_dip": {
+        "timestamp": 1778568768.457804,
+        "angle": 69.27,
+        "encoder_position": 859,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      },
+      "lf_mcp": {
+        "timestamp": 1778568768.457804,
+        "angle": 44.18,
+        "encoder_position": 459,
+        "current": 0,
+        "velocity": 0,
+        "error_code": 0,
+        "impedance": 0.0
+      }
+    },
+    "tactile": {
+      "th": {
+        "timestamp": 1778568768.4577878,
+        "normal_force": 0.0,
+        "normal_force_delta": 0,
+        "tangential_force": 0.0,
+        "tangential_force_delta": 0,
+        "direction": null,
+        "proximity": 31506,
+        "temperature": 38
+      },
+      "ff": {
+        "timestamp": 1778568768.457798,
+        "normal_force": 0.26839500665664673,
+        "normal_force_delta": 149951,
+        "tangential_force": 0.5177767276763916,
+        "tangential_force_delta": 38701,
+        "direction": 2,
+        "proximity": 10539,
+        "temperature": 37
+      },
+      "mf": {
+        "timestamp": 1778568768.4578006,
+        "normal_force": 1.7955759763717651,
+        "normal_force_delta": 1454446,
+        "tangential_force": 0.6668453812599182,
+        "tangential_force_delta": 0,
+        "direction": 26,
+        "proximity": 2523558,
+        "temperature": 37
+      },
+      "rf": {
+        "timestamp": 1778568768.4578032,
+        "normal_force": 1.30263090133667,
+        "normal_force_delta": 1005381,
+        "tangential_force": 0.12989480793476105,
+        "tangential_force_delta": 44681,
+        "direction": 312,
+        "proximity": 1025108,
+        "temperature": 36
+      },
+      "lf": {
+        "timestamp": 1778568768.4578056,
+        "normal_force": 4.176667213439941,
+        "normal_force_delta": 3405634,
+        "tangential_force": 5.373658657073975,
+        "tangential_force_delta": 497437,
+        "direction": 10,
+        "proximity": 4234927,
+        "temperature": 36
+      }
+    }
+  }
+}

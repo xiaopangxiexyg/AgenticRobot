@@ -18,6 +18,13 @@ from ..hand.hand_backend import (
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
 )
+from ..hand.dexhand_q6_backend import (
+    DEXHAND_TACTILE_AXIS_ORDER,
+    DEXHAND_TACTILE_DIM,
+    DEXHAND_TACTILE_FINGER_ORDER,
+    DexHandQ6Backend,
+    DexHandQ6BackendConfig,
+)
 from ..hand.hand_mapping import parse_tactile_regions
 from ..utils.camera_preview import CameraPreviewConfig, CameraPreviewer
 from ..utils.realsense_rgb import (
@@ -125,6 +132,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="JSON object passed to Policy/create_policy constructors.",
     )
     parser.add_argument("--active-sides", type=parse_active_sides, default=ALL_SIDES)
+    parser.add_argument(
+        "--hand-mode",
+        choices=["inspire_hand", "dexhand_q6"],
+        default="inspire_hand",
+        help=(
+            "Hardware backend used for hand commands. 'dexhand_q6' keeps the dataset/deploy "
+            "action slot on the right hand while controlling one left DexHand hardware hand."
+        ),
+    )
     parser.add_argument("--hz", type=_positive_float, default=13.0, help="Fallback control loop rate.")
     parser.add_argument(
         "--action-hz",
@@ -288,6 +304,19 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
         help="Max force value written to every InspireTac finger on startup.",
     )
+    parser.add_argument(
+        "--dexhand-hardware-hand",
+        choices=["left", "right"],
+        default="left",
+        help="Physical DexHand side connected to the controller. Current supported dataset mapping expects left hardware.",
+    )
+    parser.add_argument("--dexhand-device-type", choices=["auto", "config", "100U", "200U"], default="auto")
+    parser.add_argument("--dexhand-device-index", type=int, default=0)
+    parser.add_argument("--dexhand-tactile-period-ms", type=int, default=20)
+    parser.add_argument("--dexhand-send-threshold", type=float, default=0.002)
+    parser.add_argument("--dexhand-mock", action="store_true")
+    parser.add_argument("--no-dexhand-clear-errors-on-start", dest="dexhand_clear_errors_on_start", action="store_false", default=True)
+    parser.add_argument("--no-dexhand-clear-errors-on-fault", dest="dexhand_clear_errors_on_fault", action="store_false", default=True)
 
     parser.add_argument("--enable-arm", action="store_true")
     parser.add_argument("--arm-side", choices=["right", "left"], default="right")
@@ -421,18 +450,33 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
     if args.action_hz_dataset and args.action_hz_parquet:
         raise ValueError("Use only one of --action-hz-dataset or --action-hz-parquet.")
     parse_tactile_regions(args.hand_tactile_regions)
-    if args.send_actions:
-        for side in active_sides:
-            if not getattr(args, f"{side}_hand_ip"):
-                raise ValueError(
-                    f"--send-actions requires --{side}-hand-ip for active side '{side}'."
-                )
-    if args.visualize_tactile:
-        for side in active_sides:
-            if not getattr(args, f"{side}_hand_ip"):
-                raise ValueError(
-                    f"--visualize-tactile requires --{side}-hand-ip for active side '{side}'."
-                )
+    if str(args.hand_mode) == "inspire_hand":
+        if args.send_actions:
+            for side in active_sides:
+                if not getattr(args, f"{side}_hand_ip"):
+                    raise ValueError(
+                        f"--send-actions requires --{side}-hand-ip for active side '{side}'."
+                    )
+        if args.visualize_tactile:
+            for side in active_sides:
+                if not getattr(args, f"{side}_hand_ip"):
+                    raise ValueError(
+                        f"--visualize-tactile requires --{side}-hand-ip for active side '{side}'."
+                    )
+    else:
+        if active_sides != ("right",):
+            raise ValueError("--hand-mode dexhand_q6 currently requires --active-sides right.")
+        if str(args.dexhand_hardware_hand) != "left":
+            raise ValueError("--hand-mode dexhand_q6 currently only supports --dexhand-hardware-hand left.")
+        if int(args.dexhand_tactile_period_ms) < 0:
+            raise ValueError("--dexhand-tactile-period-ms must be non-negative.")
+        if float(args.dexhand_send_threshold) < 0.0:
+            raise ValueError("--dexhand-send-threshold must be non-negative.")
+        if args.visualize_tactile:
+            raise ValueError(
+                "--visualize-tactile is not wired into deploy UI for dexhand_q6 yet; "
+                "use hardware/portable_dexhand021/tactile_viewer.py during debugging."
+            )
     if args.enable_arm:
         if int(args.fr3_port) <= 0:
             raise ValueError("--fr3-port must be positive.")
@@ -541,9 +585,31 @@ def resolve_effective_policy_hz(args: argparse.Namespace, *, action_hz: float) -
 def build_hand_backends(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
-) -> dict[str, InspireTacHandBackend]:
+) -> dict[str, Any]:
+    if str(args.hand_mode) == "dexhand_q6":
+        return {
+            "right": DexHandQ6Backend(
+                DexHandQ6BackendConfig(
+                    side="right",
+                    hardware_hand=str(args.dexhand_hardware_hand),
+                    effector_name="right_hand",
+                    connect_hardware=bool(args.send_actions),
+                    send_commands=bool(args.send_actions),
+                    send_threshold=float(args.dexhand_send_threshold),
+                    enable_telemetry=True,
+                    telemetry_hz=float(args.hand_telemetry_hz),
+                    device_type=str(args.dexhand_device_type),
+                    device_index=int(args.dexhand_device_index),
+                    tactile_period_ms=int(args.dexhand_tactile_period_ms),
+                    mock=bool(args.dexhand_mock),
+                    clear_errors_on_start=bool(args.dexhand_clear_errors_on_start),
+                    clear_errors_on_fault=bool(args.dexhand_clear_errors_on_fault),
+                )
+            )
+        }
+
     tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
-    backends: dict[str, InspireTacHandBackend] = {}
+    backends: dict[str, Any] = {}
     for side in active_sides:
         hand_ip = str(getattr(args, f"{side}_hand_ip") or "")
         backends[side] = InspireTacHandBackend(
@@ -859,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
                 render_scale=float(args.tactile_vis_render_scale),
             )
         )
-        if args.visualize_tactile
+        if args.visualize_tactile and str(args.hand_mode) == "inspire_hand"
         else None
     )
     safety_filter = ActionSafetyFilter(
@@ -895,10 +961,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(
             "[Deploy] policy="
-            f"{policy.name} active_sides={active_sides} arm={bool(args.enable_arm)} "
+            f"{policy.name} active_sides={active_sides} hand_mode={args.hand_mode} arm={bool(args.enable_arm)} "
             f"hz={float(effective_action_hz):.2f} policy_hz={float(effective_policy_hz):.2f} "
             f"queue_policy={action_queue_policy}"
         )
+        if str(args.hand_mode) == "dexhand_q6":
+            print(
+                "[DexHand] deployment active: dataset_slot=right "
+                f"hardware_hand={args.dexhand_hardware_hand} tactile_dim={int(DEXHAND_TACTILE_DIM)} "
+                f"tactile_layout={list(DEXHAND_TACTILE_FINGER_ORDER)}x{list(DEXHAND_TACTILE_AXIS_ORDER)}"
+            )
         if action_hz_info.get("source") != "cli.hz":
             print(
                 "[Deploy] action_hz="

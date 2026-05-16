@@ -43,6 +43,13 @@ if __package__ in (None, ""):
         DMTacGripperBackendConfig,
         GRIPPER_ACTION_MAX,
     )
+    from inspire_data_collect.hand.dexhand_q6_backend import (
+        DEXHAND_TACTILE_AXIS_ORDER,
+        DEXHAND_TACTILE_DIM,
+        DEXHAND_TACTILE_FINGER_ORDER,
+        DexHandQ6Backend,
+        DexHandQ6BackendConfig,
+    )
     from inspire_data_collect.hand.hand_mapping import (
         DEFAULT_INSPIRE_HAND_JOINT_ORDER,
         parse_tactile_regions,
@@ -94,6 +101,13 @@ else:
         DMTacGripperBackend,
         DMTacGripperBackendConfig,
         GRIPPER_ACTION_MAX,
+    )
+    from .hand.dexhand_q6_backend import (
+        DEXHAND_TACTILE_AXIS_ORDER,
+        DEXHAND_TACTILE_DIM,
+        DEXHAND_TACTILE_FINGER_ORDER,
+        DexHandQ6Backend,
+        DexHandQ6BackendConfig,
     )
     from .hand.hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
     from .hand.hand_source import HandQ6Source
@@ -295,11 +309,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--active-sides", type=parse_active_sides, default=ALL_SIDES)
     parser.add_argument(
         "--collect-mode",
-        choices=["inspire_hand", "gripper"],
+        choices=["inspire_hand", "gripper", "dexhand_q6"],
         default="inspire_hand",
         help=(
             "Effector collection mode. 'gripper' uses the DMTAC gripper backend "
-            "and maps one configurable exo hand q6 dim to gripper close/open."
+            "and maps one configurable exo hand q6 dim to gripper close/open. "
+            "'dexhand_q6' controls one left DexHand hardware hand while still saving "
+            "into the right-hand dataset slot."
         ),
     )
 
@@ -451,6 +467,22 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gripper-tactile-deadband-abs", type=float, default=5e-5)
     parser.add_argument("--gripper-tactile-temporal-alpha", type=float, default=0.35)
     parser.add_argument("--gripper-tactile-spatial-blur-ksize", type=int, default=5)
+
+    parser.add_argument(
+        "--dexhand-hardware-hand",
+        choices=["left", "right"],
+        default="left",
+        help="Physical DexHand side connected to the controller. Current supported dataset mapping expects left hardware.",
+    )
+    parser.add_argument("--dexhand-device-type", choices=["auto", "config", "100U", "200U"], default="auto")
+    parser.add_argument("--dexhand-device-index", type=int, default=0)
+    parser.add_argument("--dexhand-tactile-period-ms", type=int, default=20)
+    parser.add_argument("--dexhand-send-threshold", type=float, default=0.002)
+    parser.add_argument("--dexhand-command-alpha", type=float, default=1.0)
+    parser.add_argument("--dexhand-no-hardware", dest="dexhand_connect_hardware", action="store_false", default=True)
+    parser.add_argument("--dexhand-mock", action="store_true")
+    parser.add_argument("--no-dexhand-clear-errors-on-start", dest="dexhand_clear_errors_on_start", action="store_false", default=True)
+    parser.add_argument("--no-dexhand-clear-errors-on-fault", dest="dexhand_clear_errors_on_fault", action="store_false", default=True)
 
     parser.add_argument("--hz", type=float, default=30.0, help="Main control loop rate")
     parser.add_argument("--minimum-control-hz", type=float, default=0.0)
@@ -683,6 +715,22 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--gripper-tactile-temporal-alpha must be in [0, 1].")
         if int(args.gripper_tactile_spatial_blur_ksize) < 0:
             raise ValueError("--gripper-tactile-spatial-blur-ksize must be non-negative.")
+    if str(args.collect_mode) == "dexhand_q6":
+        if active_sides != ("right",):
+            raise ValueError("--collect-mode dexhand_q6 currently requires --active-sides right.")
+        if str(args.dexhand_hardware_hand) != "left":
+            raise ValueError("--collect-mode dexhand_q6 currently only supports --dexhand-hardware-hand left.")
+        if int(args.dexhand_tactile_period_ms) < 0:
+            raise ValueError("--dexhand-tactile-period-ms must be non-negative.")
+        if float(args.dexhand_send_threshold) < 0.0:
+            raise ValueError("--dexhand-send-threshold must be non-negative.")
+        if not 0.0 < float(args.dexhand_command_alpha) <= 1.0:
+            raise ValueError("--dexhand-command-alpha must be in (0, 1].")
+        if bool(args.visualize_tactile):
+            raise ValueError(
+                "--visualize-tactile is not wired into the collection UI for dexhand_q6 yet; "
+                "use hardware/portable_dexhand021/tactile_viewer.py during debugging."
+            )
     return active_sides
 
 
@@ -755,6 +803,38 @@ def build_components(
                 tactile_deadband_abs=float(args.gripper_tactile_deadband_abs),
                 tactile_temporal_alpha=float(args.gripper_tactile_temporal_alpha),
                 tactile_spatial_blur_ksize=int(args.gripper_tactile_spatial_blur_ksize),
+            )
+        )
+        return source, retargeters, backends
+    if str(args.collect_mode) == "dexhand_q6":
+        side = "right"
+        effector_name = f"{side}_hand"
+        retargeters[side] = HandRetargeter(
+            HandRetargeterConfig(
+                side=side,
+                input_channel_name=f"{side}_hand_q6",
+                effector_name=effector_name,
+                joint_order=(0, 1, 2, 3, 4, 5),
+                invert=False,
+                alpha=float(args.dexhand_command_alpha),
+            )
+        )
+        backends[side] = DexHandQ6Backend(
+            DexHandQ6BackendConfig(
+                side=side,
+                hardware_hand=str(args.dexhand_hardware_hand),
+                effector_name=effector_name,
+                connect_hardware=bool(args.dexhand_connect_hardware),
+                send_commands=not bool(args.record_hand_only),
+                send_threshold=float(args.dexhand_send_threshold),
+                enable_telemetry=bool(args.dexhand_connect_hardware),
+                telemetry_hz=float(args.hand_telemetry_hz),
+                device_type=str(args.dexhand_device_type),
+                device_index=int(args.dexhand_device_index),
+                tactile_period_ms=int(args.dexhand_tactile_period_ms),
+                mock=bool(args.dexhand_mock),
+                clear_errors_on_start=bool(args.dexhand_clear_errors_on_start),
+                clear_errors_on_fault=bool(args.dexhand_clear_errors_on_fault),
             )
         )
         return source, retargeters, backends
@@ -1034,6 +1114,8 @@ def collect_mode_tactile_dim(args: argparse.Namespace) -> int:
             return 0
         tactile_count = len(tuple(args.gripper_tactile_ids)) or 2
         return int(tactile_count * DMTAC_DISTRIBUTED_FORCE_SAVE_DIM)
+    if str(args.collect_mode) == "dexhand_q6":
+        return int(DEXHAND_TACTILE_DIM)
     return 1062
 
 
@@ -1108,6 +1190,8 @@ def main(argv: list[str] | None = None) -> int:
                     render_scale=float(args.tactile_vis_render_scale),
                 )
             )
+        elif str(args.collect_mode) == "dexhand_q6":
+            visualizer = None
         else:
             visualizer = TactileUVVisualizer(
                 TactileVisualizerConfig(
@@ -1141,9 +1225,13 @@ def main(argv: list[str] | None = None) -> int:
             "action_dim": ACTION_DIM,
             "hand_dof_per_side": HAND_DOF,
             "hand_vector_order": list(HAND_VECTOR_ORDER),
-            "joint_order": list(args.hand_joint_order),
+            "joint_order": list(args.hand_joint_order)
+            if str(args.collect_mode) != "dexhand_q6"
+            else [0, 1, 2, 3, 4, 5],
             "max_fingertip_force": int(args.max_fingertip_force),
-            "hand_invert": bool(args.hand_invert),
+            "hand_invert": bool(args.hand_invert)
+            if str(args.collect_mode) != "dexhand_q6"
+            else False,
             "exo_hand_calibration": bool(args.exo_hand_calibration),
             "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
             "tactile_regions": list(parse_tactile_regions(args.hand_tactile_regions)),
@@ -1216,6 +1304,35 @@ def main(argv: list[str] | None = None) -> int:
                     "gripper_tactile_denoise": bool(args.gripper_tactile_denoise),
                     "gripper_tactile_denoise_mode": str(args.gripper_tactile_denoise_mode),
                     "gripper_tactile_dim": collect_mode_tactile_dim(args),
+                }
+            )
+        elif str(args.collect_mode) == "dexhand_q6":
+            metadata.update(
+                {
+                    "logical_hand_side": "right",
+                    "hardware_hand_side": str(args.dexhand_hardware_hand),
+                    "dexhand_device_type": str(args.dexhand_device_type),
+                    "dexhand_device_index": int(args.dexhand_device_index),
+                    "dexhand_tactile_period_ms": int(args.dexhand_tactile_period_ms),
+                    "dexhand_connect_hardware": bool(args.dexhand_connect_hardware),
+                    "dexhand_mock": bool(args.dexhand_mock),
+                    "dexhand_q6_order": [
+                        "thumb_yaw",
+                        "thumb_flex",
+                        "index",
+                        "middle",
+                        "ring",
+                        "pinky",
+                    ],
+                    "dexhand_joint_feedback_saved_as_q6": True,
+                    "dexhand_q6_inversion_note": (
+                        "thumb uses th_dip/th_mcp average; each four-finger q6 uses "
+                        "DIP and MCP/ratio estimates averaged when both are available."
+                    ),
+                    "dexhand_tactile_format": "fingertip_xyz",
+                    "dexhand_tactile_fingers": list(DEXHAND_TACTILE_FINGER_ORDER),
+                    "dexhand_tactile_axes": list(DEXHAND_TACTILE_AXIS_ORDER),
+                    "dexhand_tactile_dim": int(DEXHAND_TACTILE_DIM),
                 }
             )
         current_episode = writer.start_episode(metadata=metadata)
@@ -1353,6 +1470,33 @@ def main(argv: list[str] | None = None) -> int:
                     for side in active_sides
                 },
             )
+        elif str(args.collect_mode) == "dexhand_q6":
+            writer.write_device_config(
+                "dexhand_q6",
+                {
+                    "right": {
+                        "backend_type": "dexhand_q6",
+                        "logical_side": "right",
+                        "hardware_hand": str(args.dexhand_hardware_hand),
+                        "device_type": str(args.dexhand_device_type),
+                        "device_index": int(args.dexhand_device_index),
+                        "tactile_period_ms": int(args.dexhand_tactile_period_ms),
+                        "connect_hardware": bool(args.dexhand_connect_hardware),
+                        "mock": bool(args.dexhand_mock),
+                        "tactile_dim": int(DEXHAND_TACTILE_DIM),
+                        "tactile_fingers": list(DEXHAND_TACTILE_FINGER_ORDER),
+                        "tactile_axes": list(DEXHAND_TACTILE_AXIS_ORDER),
+                        "saved_q6_order": [
+                            "thumb_yaw",
+                            "thumb_flex",
+                            "index",
+                            "middle",
+                            "ring",
+                            "pinky",
+                        ],
+                    }
+                },
+            )
         print(f"数据集目录 / Dataset directory: {dataset_root}")
         print(f"任务名称 / Task name: {task_name}")
         if str(args.collect_mode) == "gripper":
@@ -1362,6 +1506,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"exo_dim={args.gripper_exo_dim}, output_dim={args.gripper_output_dim}, "
                 f"max_action={float(args.gripper_max_action):.3f}, "
                 f"tactile={'on' if args.gripper_connect_tactile else 'off'}"
+            )
+        elif str(args.collect_mode) == "dexhand_q6":
+            print(
+                "[DexHand] collect mode active: "
+                "dataset_slot=right hardware_hand="
+                f"{args.dexhand_hardware_hand}, device_type={args.dexhand_device_type}, "
+                f"tactile_dim={int(DEXHAND_TACTILE_DIM)}"
             )
         if bool(args.record_hand_only):
             print(
