@@ -883,7 +883,7 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --hand left \
   --device-type "$DEXHAND_DEVICE_TYPE" \
   --device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 10 \
+  --hz 30 \
   --print-hz 5
 ```
 
@@ -1059,7 +1059,7 @@ python -m inspire_data_collect \
   --right-hand-port "$RIGHT_HAND_PORT" \
   --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
   --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 10 \
+  --hz 30 \
   --no-silent
 ```
 
@@ -1083,7 +1083,7 @@ python -m inspire_data_collect \
   --camera-mode single \
   --camera-config inspire_data_collect/realsense.json \
   --vis_cam \
-  --hz 10 \
+  --hz 30 \
   --no-silent
 ```
 
