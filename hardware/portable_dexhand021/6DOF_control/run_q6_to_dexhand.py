@@ -125,6 +125,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-type", choices=["auto", "config", "100U", "200U"], default="auto")
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--no-configure-tactile",
+        action="store_true",
+        help=(
+            "Skip the startup periodic tactile-feedback configuration. "
+            "Useful for isolating CAN transmit issues when motion control is being debugged."
+        ),
+    )
     parser.add_argument("--visualize-tactile", action="store_true", help="Open tactile viewer while controlling, sharing the same DexHand connection")
     parser.add_argument("--state-print-hz", type=nonnegative_float, default=0.0, help="Print compact DexHand state at this rate. 0 disables state printing.")
     parser.add_argument("--tactile-viewer-hz", type=positive_float, default=20.0)
@@ -445,6 +453,7 @@ def main() -> int:
                 device_index=args.device_index,
                 device_type=args.device_type,
                 mock=args.mock,
+                configure_tactile=not args.no_configure_tactile,
             ).connect()
             if args.clear_errors_on_start:
                 print("[DexHand] clearing board errors on start")

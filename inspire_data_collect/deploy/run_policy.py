@@ -33,6 +33,8 @@ from ..utils.realsense_rgb import (
     load_realsense_camera_config_map,
 )
 from ..utils.tactile_visualizer import (
+    DexHandForceVisualizer,
+    DexHandForceVisualizerConfig,
     TactileUVVisualizer,
     TactileVisualizerConfig,
     tactile_by_side_from_backends,
@@ -472,11 +474,6 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--dexhand-tactile-period-ms must be non-negative.")
         if float(args.dexhand_send_threshold) < 0.0:
             raise ValueError("--dexhand-send-threshold must be non-negative.")
-        if args.visualize_tactile:
-            raise ValueError(
-                "--visualize-tactile is not wired into deploy UI for dexhand_q6 yet; "
-                "use hardware/portable_dexhand021/tactile_viewer.py during debugging."
-            )
     if args.enable_arm:
         if int(args.fr3_port) <= 0:
             raise ValueError("--fr3-port must be positive.")
@@ -915,19 +912,28 @@ def main(argv: list[str] | None = None) -> int:
         if bool(args.vis_cam) and preview_camera_sources
         else None
     )
-    visualizer = (
-        TactileUVVisualizer(
-            TactileVisualizerConfig(
-                enabled_sides=active_sides,
-                image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
-                value_scale=float(args.tactile_vis_value_scale),
-                resizable_window=str(args.tactile_vis_window_mode) == "resizable",
-                render_scale=float(args.tactile_vis_render_scale),
+    visualizer = None
+    if args.visualize_tactile:
+        if str(args.hand_mode) == "dexhand_q6":
+            visualizer = DexHandForceVisualizer(
+                DexHandForceVisualizerConfig(
+                    enabled_sides=active_sides,
+                    image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+                    value_scale=float(args.tactile_vis_value_scale),
+                    resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                    render_scale=float(args.tactile_vis_render_scale),
+                )
             )
-        )
-        if args.visualize_tactile and str(args.hand_mode) == "inspire_hand"
-        else None
-    )
+        else:
+            visualizer = TactileUVVisualizer(
+                TactileVisualizerConfig(
+                    enabled_sides=active_sides,
+                    image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+                    value_scale=float(args.tactile_vis_value_scale),
+                    resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                    render_scale=float(args.tactile_vis_render_scale),
+                )
+            )
     safety_filter = ActionSafetyFilter(
         ActionSafetyFilterConfig(
             active_sides=active_sides,
