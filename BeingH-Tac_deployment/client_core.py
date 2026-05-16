@@ -41,7 +41,7 @@ def add_common_args(parser: argparse.ArgumentParser, profile: DeploymentProfile)
     parser.add_argument("--parquet-path", type=str, default="")
     parser.add_argument("--episode-index", type=int, default=-1)
     parser.add_argument("--start-frame", type=int, default=0)
-    parser.add_argument("--dataset-frame-stride", type=int, default=1)
+    parser.add_argument("--dataset-frame-stride", type=int, default=int(getattr(profile, "default_dataset_frame_stride", 1)))
     parser.add_argument("--dataset-loop", action="store_true")
     parser.add_argument("--instruction", type=str, default=profile.default_instruction)
     parser.add_argument("--history-size", type=int, default=HISTORY_SIZE)
@@ -340,7 +340,15 @@ def format_request_error(exc: Exception, args: argparse.Namespace) -> str:
             )
     except Exception:
         pass
-    return f"{type(exc).__name__}: {exc}"
+    text = f"{type(exc).__name__}: {exc}"
+    if "Input type (float) and bias type (c10::BFloat16)" in text:
+        return (
+            text
+            + " | server-side dtype mismatch in gripper_DM vision-tactile model. "
+            "Restart run_server_gripper_DM.py after patching the model path that feeds Conv2d "
+            "so image tensors are cast to the layer weight dtype before convolution."
+        )
+    return text
 
 
 def run_profile(profile: DeploymentProfile, argv: list[str] | None = None) -> int:

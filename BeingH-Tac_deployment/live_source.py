@@ -13,7 +13,7 @@ import numpy as np
 
 from paths import ensure_import_paths
 from profiles import DeploymentProfile
-from tactile import TactileHistory
+from tactile import DMTacTactileHistory, TactileHistory
 
 
 ensure_import_paths()
@@ -23,6 +23,14 @@ from inspire_data_collect.arm.fr3_backend import FR3ArmBackend, FR3ArmBackendCon
 from inspire_data_collect.hand.hand_backend import (  # noqa: E402
     InspireTacHandBackend as FR3InspireTacHandBackend,
     InspireTacHandBackendConfig as FR3InspireTacHandBackendConfig,
+)
+from inspire_data_collect.hand.dmtac_gripper_backend import (  # noqa: E402
+    DEFAULT_DMTAC_GRIPPER_PORT as FR3_DEFAULT_DMTAC_GRIPPER_PORT,
+    DEFAULT_DMTAC_GRIPPER_SPEED as FR3_DEFAULT_DMTAC_GRIPPER_SPEED,
+    DEFAULT_DMTAC_GRIPPER_TORQUE as FR3_DEFAULT_DMTAC_GRIPPER_TORQUE,
+    DMTacGripperBackend as FR3DMTacGripperBackend,
+    DMTacGripperBackendConfig as FR3DMTacGripperBackendConfig,
+    GRIPPER_ACTION_MAX as FR3_GRIPPER_ACTION_MAX,
 )
 from inspire_data_collect.deploy.actions import (  # noqa: E402
     ActionSafetyFilter as FR3ActionSafetyFilter,
@@ -162,13 +170,68 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arm-workspace-max", type=str, default="0.60,0.80,0.90")
     parser.add_argument("--max-arm-xyz-step-m", type=float, default=0.03)
     parser.add_argument("--max-arm-rot-step-deg", type=float, default=8.0)
-    parser.add_argument("--max-arm-joint-step-rad", type=float, default=0.08)
+    parser.add_argument("--max-arm-joint-step-rad", type=float, default=None)
     parser.add_argument("--max-hand-step", type=float, default=0.08)
     parser.add_argument("--live-ready-timeout-s", type=float, default=5.0)
     parser.add_argument("--live-ready-poll-s", type=float, default=0.05)
     parser.add_argument("--action-hz", type=float, default=12.0)
     parser.add_argument("--action-queue-policy", choices=["replace", "append"], default="replace")
     parser.add_argument("--action-underrun-log-sec", type=float, default=2.0)
+    parser.add_argument("--gripper-port", type=str, default=FR3_DEFAULT_DMTAC_GRIPPER_PORT)
+    parser.add_argument("--gripper-id", type=int, default=1)
+    parser.add_argument("--gripper-baudrate", type=int, default=115200)
+    parser.add_argument("--gripper-timeout", type=float, default=0.03)
+    parser.add_argument("--gripper-max-open-mm", type=float, default=70.0)
+    parser.add_argument("--gripper-max-action", type=float, default=FR3_GRIPPER_ACTION_MAX)
+    parser.add_argument("--gripper-speed", type=float, default=FR3_DEFAULT_DMTAC_GRIPPER_SPEED)
+    parser.add_argument("--gripper-torque", type=float, default=FR3_DEFAULT_DMTAC_GRIPPER_TORQUE)
+    parser.add_argument("--gripper-send-threshold", type=float, default=0.002)
+    parser.add_argument("--gripper-continuous", action="store_true")
+    parser.add_argument("--gripper-open-on-start", action="store_true")
+    parser.add_argument("--no-gripper-clear-fault", dest="gripper_clear_fault", action="store_false", default=True)
+    parser.add_argument("--gripper-no-hardware", dest="gripper_connect_hardware", action="store_false", default=True)
+    parser.add_argument("--gripper-no-tactile", dest="gripper_connect_tactile", action="store_false", default=True)
+    parser.add_argument("--gripper-tactile-ids", nargs="*", type=_parse_tactile_ids, default=())
+    parser.add_argument("--gripper-tactile-backend", choices=["cpu", "cuda", "Flux", "flux"], default="cpu")
+    parser.add_argument("--gripper-tactile-mode", choices=["standard", "high"], default="standard")
+    parser.add_argument("--gripper-tactile-max-fps", type=int, default=120)
+    parser.add_argument("--gripper-tactile-timeout-ms", type=int, default=100)
+    parser.add_argument("--gripper-tactile-ready-timeout-s", type=float, default=10.0)
+    parser.add_argument("--gripper-tactile-reset-on-start", action="store_true")
+    parser.add_argument("--gripper-tactile-warmup-frames", type=int, default=30)
+    parser.add_argument("--gripper-tactile-no-denoise", dest="gripper_tactile_denoise", action="store_false", default=True)
+    parser.add_argument("--gripper-tactile-denoise-mode", choices=["delta", "absolute", "frame_delta"], default="delta")
+    parser.add_argument("--gripper-tactile-baseline-frames", type=int, default=20)
+    parser.add_argument("--gripper-tactile-deadband-abs", type=float, default=5e-5)
+    parser.add_argument("--gripper-tactile-temporal-alpha", type=float, default=0.35)
+    parser.add_argument("--gripper-tactile-spatial-blur-ksize", type=int, default=5)
+
+
+def _parse_tactile_ids(text: str) -> tuple[str | int, ...]:
+    values = [item.strip() for item in str(text).replace(",", " ").split() if item.strip()]
+    parsed: list[str | int] = []
+    for value in values:
+        try:
+            parsed.append(int(value))
+        except ValueError:
+            parsed.append(value)
+    return tuple(parsed)
+
+
+def _normalize_tactile_ids(value: object) -> tuple[str | int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return _parse_tactile_ids(value)
+    if isinstance(value, (tuple, list)):
+        parsed: list[str | int] = []
+        for item in value:
+            if isinstance(item, (tuple, list)):
+                parsed.extend(_normalize_tactile_ids(item))
+            else:
+                parsed.extend(_parse_tactile_ids(str(item)))
+        return tuple(parsed)
+    return _parse_tactile_ids(str(value))
 
 
 def _parse_sides(value: str) -> tuple[str, ...]:
@@ -255,6 +318,16 @@ def _coerce_builder_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(**payload)
 
 
+def profile_max_arm_joint_step_rad(profile: DeploymentProfile, args: argparse.Namespace) -> float:
+    value = getattr(args, "max_arm_joint_step_rad", None)
+    if value is not None:
+        return float(value)
+    profile_default = getattr(profile, "default_max_arm_joint_step_rad", None)
+    if profile_default is not None:
+        return float(profile_default)
+    return 0.08
+
+
 def _required_missing_endpoints(profile: DeploymentProfile, args: argparse.Namespace) -> tuple[list[str], list[str]]:
     missing_arms = [
         side
@@ -271,6 +344,12 @@ def _required_missing_endpoints(profile: DeploymentProfile, args: argparse.Names
 
 def _is_fr3_profile(profile: DeploymentProfile) -> bool:
     return str(getattr(profile, "arm_backend", "rm65")).lower() == "fr3"
+
+
+def _uses_dmtac_gripper(profile: DeploymentProfile) -> bool:
+    if profile is None:
+        return False
+    return str(getattr(profile, "hand_backend", "")).lower() == "dmtac_gripper"
 
 
 def _fr3_host_for_side(args: argparse.Namespace, side: str) -> str:
@@ -398,6 +477,47 @@ def build_profile_hand_backends(
     active_sides: tuple[str, ...],
 ) -> dict[str, Any]:
     if _is_fr3_profile(profile):
+        if _uses_dmtac_gripper(profile):
+            backends: dict[str, Any] = {}
+            for side in active_sides:
+                backends[side] = FR3DMTacGripperBackend(
+                    FR3DMTacGripperBackendConfig(
+                        side=side,
+                        effector_name=f"{side}_hand",
+                        gripper_port=str(args.gripper_port),
+                        gripper_id=int(args.gripper_id),
+                        gripper_baudrate=int(args.gripper_baudrate),
+                        gripper_timeout=float(args.gripper_timeout),
+                        max_open_mm=float(args.gripper_max_open_mm),
+                        connect_hardware=bool(args.gripper_connect_hardware),
+                        send_commands=True,
+                        send_threshold=float(args.gripper_send_threshold),
+                        max_action=float(args.gripper_max_action),
+                        speed=float(args.gripper_speed),
+                        torque=float(args.gripper_torque),
+                        continuous_grasp=bool(args.gripper_continuous),
+                        clear_fault_on_start=bool(args.gripper_clear_fault),
+                        open_on_start=bool(args.gripper_open_on_start),
+                        enable_telemetry=bool(args.gripper_connect_hardware) or bool(args.gripper_connect_tactile),
+                        telemetry_hz=float(args.hand_telemetry_hz),
+                        connect_tactile=bool(args.gripper_connect_tactile),
+                        tactile_ids=_normalize_tactile_ids(args.gripper_tactile_ids),
+                        tactile_backend=str(args.gripper_tactile_backend),
+                        tactile_mode=str(args.gripper_tactile_mode),
+                        tactile_max_fps=int(args.gripper_tactile_max_fps),
+                        tactile_timeout_ms=int(args.gripper_tactile_timeout_ms),
+                        tactile_ready_timeout_s=float(args.gripper_tactile_ready_timeout_s),
+                        tactile_reset_on_start=bool(args.gripper_tactile_reset_on_start),
+                        tactile_warmup_frames=int(args.gripper_tactile_warmup_frames),
+                        tactile_denoise=bool(args.gripper_tactile_denoise),
+                        tactile_denoise_mode=str(args.gripper_tactile_denoise_mode),
+                        tactile_baseline_frames=int(args.gripper_tactile_baseline_frames),
+                        tactile_deadband_abs=float(args.gripper_tactile_deadband_abs),
+                        tactile_temporal_alpha=float(args.gripper_tactile_temporal_alpha),
+                        tactile_spatial_blur_ksize=int(args.gripper_tactile_spatial_blur_ksize),
+                    )
+                )
+            return backends
         tactile_regions = tuple(str(x).strip() for x in str(args.hand_tactile_regions).split(",") if str(x).strip())
         if not tactile_regions:
             tactile_regions = ("all",)
@@ -721,6 +841,34 @@ def _coerce_fr3_result_action(result: Mapping[str, Any], observation: Any) -> Ma
     return {}
 
 
+def _coerce_gripper_dm_result_action(result: Mapping[str, Any], observation: Any) -> Mapping[str, Any] | dict[str, Any]:
+    output = fr3_server_result_for_deploy(result)
+    if output:
+        return output
+    for key in ("action", "actions", "action_chunk"):
+        if key in result:
+            return {key: result[key]}
+    for key in ("action_raw", "action_unified"):
+        if key not in result:
+            continue
+        arr = np.asarray(result[key], dtype=np.float32)
+        if arr.ndim == 1:
+            width = int(arr.shape[0])
+        elif arr.ndim == 2:
+            width = int(arr.shape[1])
+        else:
+            continue
+        if width == 19:
+            return {"action": arr}
+        if width == 13:
+            return {"action": _fr3_expand_compact_13_action(arr)}
+        if width == 7:
+            return {"arm_joint_target": arr}
+        if width == 6:
+            return {"right_hand_joint_target": arr}
+    return {}
+
+
 def _format_action_vector(value: Any, *, precision: int = 4) -> str:
     arr = np.asarray(value, dtype=np.float32).reshape(-1)
     return np.array2string(arr, precision=precision, separator=", ", suppress_small=False)
@@ -891,6 +1039,7 @@ class TimedActionDispatcher:
         policy_name: str,
         send_actions: bool,
         backend_kind: str = "rm65",
+        profile: DeploymentProfile | None = None,
     ):
         self.args = args
         self.active_sides = active_sides
@@ -905,6 +1054,7 @@ class TimedActionDispatcher:
         self.policy_name = str(policy_name)
         self.send_actions = bool(send_actions)
         self.backend_kind = str(backend_kind)
+        self.profile = profile
         self.fixed_hand = _fixed_hand_vector(args) if self.backend_kind == "fr3" else None
         self.action_hz = max(1e-6, float(getattr(args, "action_hz", 12.0)))
         self.queue_policy = str(getattr(args, "action_queue_policy", "replace"))
@@ -952,7 +1102,11 @@ class TimedActionDispatcher:
     def submit_result(self, result: Mapping[str, Any]) -> list[str]:
         observation = self.get_observation()
         if self.backend_kind == "fr3":
-            output = _coerce_fr3_result_action(result, observation)
+            output = (
+                _coerce_gripper_dm_result_action(result, observation)
+                if _uses_dmtac_gripper(self.profile)
+                else _coerce_fr3_result_action(result, observation)
+            )
             if not output:
                 return ["missing_action"]
             actions = normalize_fr3_policy_output(
@@ -1190,6 +1344,8 @@ class LiveObservationSource:
         self.hands_enabled = bool(_hands_enabled(self.args) or profile.required_hands)
         self.args.hands_enabled = self.hands_enabled
         missing_arms, missing_hands = _required_missing_endpoints(profile, self.args)
+        if _uses_dmtac_gripper(profile):
+            missing_hands = []
         if missing_arms and not bool(self.args.allow_arm_connect_failure):
             flags = ", ".join(f"--{side}-arm-ip" for side in missing_arms)
             raise ValueError(
@@ -1225,7 +1381,11 @@ class LiveObservationSource:
             if self.preview_camera_sources
             else None
         )
-        self.history = TactileHistory(history_size, history_stride)
+        self.history = (
+            DMTacTactileHistory(history_size, history_stride)
+            if _uses_dmtac_gripper(profile)
+            else TactileHistory(history_size, history_stride)
+        )
         self.last_action = np.full(19 if self.backend_kind == "fr3" else 26, np.nan, dtype=np.float32)
         self.step_index = 0
         self.target_image_height = int(getattr(args, "fallback_image_height", 480))
@@ -1235,7 +1395,7 @@ class LiveObservationSource:
                 FR3ActionSafetyFilterConfig(
                     active_sides=self.active_sides,
                     arm_enabled=True,
-                    max_arm_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_arm_step_rad=profile_max_arm_joint_step_rad(self.profile, self.args),
                     max_hand_step=float(self.args.max_hand_step),
                 )
             )
@@ -1250,7 +1410,7 @@ class LiveObservationSource:
                     workspace_max=self.args.arm_workspace_max,
                     max_arm_xyz_step_m=float(self.args.max_arm_xyz_step_m),
                     max_arm_rot_step_deg=float(self.args.max_arm_rot_step_deg),
-                    max_arm_joint_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_arm_joint_step_rad=profile_max_arm_joint_step_rad(self.profile, self.args),
                     max_hand_step=float(self.args.max_hand_step),
                 )
             )
@@ -1268,6 +1428,7 @@ class LiveObservationSource:
             policy_name="BeingH-Tac-live",
             send_actions=bool(self.args.send_actions),
             backend_kind=self.backend_kind,
+            profile=self.profile,
         )
 
     def __enter__(self):
@@ -1373,6 +1534,11 @@ class LiveObservationSource:
         if not self._is_camera_ready(observation):
             return False
         if self.profile.data_config_name == "franka":
+            return (
+                np.all(np.isfinite(observation.state[:7]))
+                and np.all(np.isfinite(observation.state[7:13]))
+            )
+        if self.profile.data_config_name == "gripper_DM":
             return (
                 np.all(np.isfinite(observation.state[:7]))
                 and np.all(np.isfinite(observation.state[7:13]))
@@ -1499,6 +1665,11 @@ class LiveObservationSource:
                 "arm_qpos": _finite_vector(state[:7], 7, "arm_qpos"),
                 "right_hand_qpos": _finite_vector(state[7:13], 6, "right_hand_qpos"),
             }
+        if self.profile.data_config_name == "gripper_DM":
+            return {
+                "arm_qpos": _finite_vector(state[:7], 7, "arm_qpos"),
+                "right_hand_qpos": _finite_vector(state[7:13], 6, "right_hand_qpos"),
+            }
         if self.profile.data_config_name == "realman20":
             return {
                 "right_arm_pose": _finite_vector(state[STATE_ARM_POSE_SLICES["right"]], 7, "right_arm_pose"),
@@ -1531,13 +1702,18 @@ class LiveObservationSource:
             tactile = observation.tactile_by_side.get(side)
             if tactile is not None and np.asarray(tactile).size:
                 self.history.append(side, tactile)
+        tactile_payload = (
+            {"right": self.history.stack("right")}
+            if _uses_dmtac_gripper(self.profile)
+            else {
+                "right": self.history.stack("right"),
+                "left": self.history.stack("left"),
+            }
+        )
         payload = {
             "image": self._front_image(observation.images),
             "state": self._state_for_profile(observation),
-            "tactile": {
-                "right": self.history.stack("right"),
-                "left": self.history.stack("left"),
-            },
+            "tactile": tactile_payload,
         }
         self.step_index += 1
         return LiveSnapshot(payload_base=payload, observation=observation)
@@ -1589,6 +1765,8 @@ class HardwareActionExecutor:
         self.args.hands_enabled = self.hands_enabled
 
         missing_arms, missing_hands = _required_missing_endpoints(profile, self.args)
+        if _uses_dmtac_gripper(profile):
+            missing_hands = []
         if missing_arms and not bool(self.args.allow_arm_connect_failure):
             flags = ", ".join(f"--{side}-arm-ip" for side in missing_arms)
             raise ValueError(
@@ -1622,7 +1800,7 @@ class HardwareActionExecutor:
                 FR3ActionSafetyFilterConfig(
                     active_sides=self.active_sides,
                     arm_enabled=True,
-                    max_arm_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_arm_step_rad=profile_max_arm_joint_step_rad(self.profile, self.args),
                     max_hand_step=float(self.args.max_hand_step),
                 )
             )
@@ -1637,7 +1815,7 @@ class HardwareActionExecutor:
                     workspace_max=self.args.arm_workspace_max,
                     max_arm_xyz_step_m=float(self.args.max_arm_xyz_step_m),
                     max_arm_rot_step_deg=float(self.args.max_arm_rot_step_deg),
-                    max_arm_joint_step_rad=float(self.args.max_arm_joint_step_rad),
+                    max_arm_joint_step_rad=profile_max_arm_joint_step_rad(self.profile, self.args),
                     max_hand_step=float(self.args.max_hand_step),
                 )
             )
@@ -1655,6 +1833,7 @@ class HardwareActionExecutor:
             policy_name="BeingH-Tac-dataset",
             send_actions=True,
             backend_kind=self.backend_kind,
+            profile=self.profile,
         )
 
     def __enter__(self) -> "HardwareActionExecutor":

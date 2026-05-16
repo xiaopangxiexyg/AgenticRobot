@@ -13,7 +13,10 @@ class DeploymentProfile:
     required_arms: tuple[str, ...]
     required_hands: tuple[str, ...]
     arm_backend: str = "rm65"
+    hand_backend: str = "inspire_tac"
     supports_live_rm65: bool = True
+    default_max_arm_joint_step_rad: float | None = None
+    default_dataset_frame_stride: int = 1
 
 
 FRANKA_PROFILE = DeploymentProfile(
@@ -25,7 +28,23 @@ FRANKA_PROFILE = DeploymentProfile(
     required_arms=("right",),
     required_hands=("right",),
     arm_backend="fr3",
+    hand_backend="inspire_tac",
     supports_live_rm65=False,
+)
+
+GRIPPER_DM_PROFILE = DeploymentProfile(
+    name="gripper_DM_peeling_official",
+    data_config_name="gripper_DM",
+    default_port=5559,
+    default_dataset_path="/home/user/zc/dex_inspire_teleop_new/datasets/2026-05-12_gripper_collect_peeling_official",
+    default_instruction="gripper_collect_peeling_official",
+    required_arms=("right",),
+    required_hands=("right",),
+    arm_backend="fr3",
+    hand_backend="dmtac_gripper",
+    supports_live_rm65=False,
+    default_max_arm_joint_step_rad=0.03,
+    default_dataset_frame_stride=24,
 )
 
 REALMAN20_PROFILE = DeploymentProfile(
@@ -67,6 +86,7 @@ REALMAN22_PROFILE = DeploymentProfile(
 
 PROFILES = {
     "franka": FRANKA_PROFILE,
+    "gripper_DM": GRIPPER_DM_PROFILE,
     "realman20": REALMAN20_PROFILE,
     "realman21": REALMAN21_PROFILE,
     "realman22": REALMAN22_PROFILE,

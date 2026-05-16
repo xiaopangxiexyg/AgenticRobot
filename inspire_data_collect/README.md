@@ -610,11 +610,12 @@ python hardware/DMTAC_gripper/run_gripper.py verify-gripper \
 3. 低速低力矩做小行程动作测试。这里最多只移动到 `0.2`，不要测试 `1.0`：
 
 ```bash
-python hardware/DMTAC_gripper/run_gripper.py set-speed 0.2 --port "$GRIPPER_PORT" --id 1
-python hardware/DMTAC_gripper/run_gripper.py set-torque 0.2 --port "$GRIPPER_PORT" --id 1
-python hardware/DMTAC_gripper/run_gripper.py open --port "$GRIPPER_PORT" --id 1 --wait
-python hardware/DMTAC_gripper/run_gripper.py move 0.2 --port "$GRIPPER_PORT" --id 1 --speed 0.2 --torque 0.2 --wait
-python hardware/DMTAC_gripper/run_gripper.py stop --port "$GRIPPER_PORT" --id 1
+# python hardware/DMTAC_gripper/run_gripper.py set-speed 0.2 --port "$GRIPPER_PORT" --id 1
+# python hardware/DMTAC_gripper/run_gripper.py set-torque 0.2 --port "$GRIPPER_PORT" --id 1
+# python hardware/DMTAC_gripper/run_gripper.py open --port "$GRIPPER_PORT" --id 1 --wait
+python hardware/DMTAC_gripper/run_gripper.py move 0.0 --port "$GRIPPER_PORT" --id 1 --speed 0.2 --torque 0.2 --wait 
+# 0.9 closed  0 open
+# python hardware/DMTAC_gripper/run_gripper.py stop --port "$GRIPPER_PORT" --id 1
 ```
 
 4. 只读 `getDistributeForce()`，确认两个触觉传感器都有帧：

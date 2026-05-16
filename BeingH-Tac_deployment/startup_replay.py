@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from live_source import HardwareActionExecutor
+from live_source import HardwareActionExecutor, profile_max_arm_joint_step_rad
 from paths import ensure_import_paths
 from profiles import DeploymentProfile
 
@@ -46,6 +46,21 @@ def add_startup_replay_args(parser: argparse.ArgumentParser) -> None:
 
 def _is_fr3_profile(profile: DeploymentProfile) -> bool:
     return str(getattr(profile, "arm_backend", "rm65")).lower() == "fr3"
+
+
+def _uses_dmtac_gripper(profile: DeploymentProfile) -> bool:
+    return str(getattr(profile, "hand_backend", "")).lower() == "dmtac_gripper"
+
+
+def _startup_hardware_args(args: argparse.Namespace, profile: DeploymentProfile) -> argparse.Namespace:
+    if not _uses_dmtac_gripper(profile):
+        return args
+    payload = vars(args).copy()
+    if bool(payload.get("gripper_connect_tactile", True)):
+        payload["gripper_connect_tactile"] = False
+        payload["gripper_tactile_warmup_frames"] = 0
+        print("[Startup] DM-Tac tactile disabled for temporary startup motion; live inference will reconnect it.")
+    return argparse.Namespace(**payload)
 
 
 def _parquet_reader_pythons() -> list[str]:
@@ -568,6 +583,28 @@ def _smoothstep(alpha: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
+def _direct_init_steps(
+    start_arms: Mapping[str, np.ndarray],
+    arm_targets: Mapping[str, np.ndarray],
+    args: argparse.Namespace,
+    profile: DeploymentProfile,
+) -> int:
+    requested_steps = max(1, int(getattr(args, "startup_init_steps", 24)))
+    max_step = profile_max_arm_joint_step_rad(profile, args)
+    if max_step <= 0.0:
+        return requested_steps
+    max_delta = 0.0
+    for side, target in arm_targets.items():
+        start = start_arms.get(side)
+        if start is None:
+            continue
+        delta = np.asarray(target, dtype=np.float32).reshape(-1) - np.asarray(start, dtype=np.float32).reshape(-1)
+        if delta.size:
+            max_delta = max(max_delta, float(np.max(np.abs(delta))))
+    limited_steps = int(np.ceil(max_delta / max_step)) if max_delta > 0.0 else 1
+    return max(requested_steps, limited_steps)
+
+
 def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mode: str) -> int:
     if mode not in {"r", "i"}:
         return 0
@@ -581,14 +618,18 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
         fixed_hand = _fixed_hand_from_args(args)
         if fixed_hand is not None and _is_fr3_profile(profile):
             print(f"[Startup] fixed hand override active: {_format_target_vector(fixed_hand)}")
-        executor_cm = HardwareActionExecutor(profile, args)
+        startup_args = _startup_hardware_args(args, profile)
+        executor_cm = HardwareActionExecutor(profile, startup_args)
         executor_cm.start_dispatcher = False
         with executor_cm as executor:
             start_arms, start_hands = _current_joint_targets(executor)
-            steps = max(1, int(getattr(args, "startup_init_steps", 24)))
-            hz = max(1e-6, float(getattr(args, "startup_init_hz", 12.0)))
+            steps = _direct_init_steps(start_arms, arm_targets, startup_args, profile)
+            hz = max(1e-6, float(getattr(startup_args, "startup_init_hz", 12.0)))
             _print_direct_init_targets(start_arms, arm_targets)
-            print(f"[Startup] interpolating first action over {steps} step(s) at {hz:.3g}Hz")
+            print(
+                f"[Startup] interpolating first action over {steps} step(s) at {hz:.3g}Hz "
+                f"(max_arm_joint_step={profile_max_arm_joint_step_rad(profile, startup_args):.4f}rad)"
+            )
             for step in range(1, steps + 1):
                 alpha = _smoothstep(float(step) / float(steps))
                 arm_waypoint = _lerp_targets(start_arms, arm_targets, alpha)
@@ -603,7 +644,7 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
                 _print_init_progress(step, steps)
                 if step < steps:
                     time.sleep(1.0 / hz)
-            _wait_for_direct_init_convergence(executor, arm_targets, hand_targets, args, profile)
+            _wait_for_direct_init_convergence(executor, arm_targets, hand_targets, startup_args, profile)
         sleep_s = max(0.0, float(getattr(args, "startup_init_sleep_s", 10.0)))
         print(f"[Startup] first action sent directly; sleeping {sleep_s:.1f}s before server-client inference.")
         _sleep_with_countdown(sleep_s)
@@ -616,11 +657,12 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
         f"actions={actions.shape[0]} | action_hz={float(getattr(args, 'action_hz', 12.0)):.3g}"
     )
 
-    with HardwareActionExecutor(profile, args) as executor:
+    startup_args = _startup_hardware_args(args, profile)
+    with HardwareActionExecutor(profile, startup_args) as executor:
         faults = executor.consume_server_result({"action": actions})
         if faults:
             print(f"[Startup] replay status: {';'.join(faults[:6])}")
-        timeout_s = max(5.0, float(actions.shape[0]) / max(1e-6, float(getattr(args, "action_hz", 12.0))) + 5.0)
+        timeout_s = max(5.0, float(actions.shape[0]) / max(1e-6, float(getattr(startup_args, "action_hz", 12.0))) + 5.0)
         progress = _print_replay_progress if mode == "r" else None
         if not executor.wait_until_sent(
             int(actions.shape[0]),
