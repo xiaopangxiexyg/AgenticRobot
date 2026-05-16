@@ -893,11 +893,10 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
 --visualize-tactile --tactile-viewer-hz 20
 ```
 
-
-如果这里主观感觉“明显跟手慢”:
+关于低频跟手测试：`run_q6_to_dexhand.py` 现在会在每个控制周期主动清空串口 backlog，只使用最新完整 `ANGLES` 帧；因此把 `--hz` 从 `30/50` 降到 `10` 时，预期只会看到更新频率下降，不应再出现 `2-3s` 的异常历史帧延迟。建议用下面两条命令做回归：
 
 ```bash
-# A. 先看正常手感基线：不改其他参数，只把控制频率拉到 50Hz
+# 基线：高频
 python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --port "$RIGHT_HAND_PORT" \
   --side right \
@@ -907,7 +906,7 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --hz 50 \
   --print-hz 5
 
-# B. 复现“低频导致的迟滞”对照组：10Hz 往往就会感觉很慢
+# 低频回归：更新率会降低，但不该再出现秒级滞后
 python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --port "$RIGHT_HAND_PORT" \
   --side right \
@@ -917,41 +916,6 @@ python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
   --hz 10 \
   --print-hz 5
 ```
-
-如果 `50 Hz` 明显正常、`10 Hz` 明显发黏，问题主要就是控制频率设置，不是外骨骼串口。
-
-如果 `50 Hz` 仍然明显迟滞，再继续做“去掉反馈负载”的隔离测试：
-
-```bash
-# C. 关闭启动时周期触觉反馈，并关闭运行期 error check，尽量只保留发命令
-python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
-  --port "$RIGHT_HAND_PORT" \
-  --side right \
-  --hand left \
-  --device-type "$DEXHAND_DEVICE_TYPE" \
-  --device-index "$DEXHAND_DEVICE_INDEX" \
-  --hz 50 \
-  --print-hz 5 \
-  --no-configure-tactile \
-  --error-check-hz 0
-```
-
-这一步如果明显变流畅，说明延迟更可能来自 DexHand 反馈/触觉相关 CAN 流量，而不是 q6 串口输入本身。
-
-如果还想先完全排除 DexHand 真机和 USBCANFD，只看“串口读取 + q6 映射”是否跟得上，可做 dry-run：
-
-```bash
-# D. 不连接 DexHand，只跑 reader + q6 mapper
-python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
-  --port "$RIGHT_HAND_PORT" \
-  --side right \
-  --dry-run \
-  --hz 50 \
-  --print-hz 20 \
-  --frames 200
-```
-
-这里应当看到打印出来的 `q6=` 很快响应手部动作变化；如果 dry-run 已经发慢，再回头查串口设备、校准和原始 ANGLES 输出。
 
 
 3. 不连接 DexHand，只跑采集主循环和 retarget/writer 流程，确认数采框架本身没问题：
@@ -1005,7 +969,7 @@ python -m inspire_data_collect \
   --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
   --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
   --record-auto-start \
-  --hz 30 \
+  --hz 10 \
   --max-steps 200 \
   --no-silent
 ```
