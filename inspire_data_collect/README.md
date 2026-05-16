@@ -813,8 +813,41 @@ finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", 
 
 ```bash
 cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
-export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_XXXXXXXX-if00
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
 ```
+
+## 安装
+
+1. 下载或克隆仓库：
+
+   ```bash
+   cd dex_inspire_teleop_new/hardware/pyzlg_dexhand
+   ```
+
+2. 安装软件包：
+
+   ```bash
+   pip install -e .
+   ```
+
+3. 配置 USB 权限：
+
+   ```bash
+   sudo ./tools/setup_usb_can.sh
+   ```
+
+   设置脚本将：
+
+   - 创建 canbus 用户组
+   - 将你的用户添加到该组
+   - 设置 USBCANFD 适配器的 udev 规则
+   - 配置适当的权限
+
+   **你可能需要注销并重新登录才能使更改生效。**
+
+4. 编辑 `config/config.yaml` 以匹配你的硬件设置，特别是**通道和 ZCAN 设备类型**。
+
+
 
 1. 不连接 DexHand，只验证右手槽位外骨骼 q6 reader 和 writer：
 
@@ -885,7 +918,7 @@ python -m inspire_data_collect.deploy.run_policy \
   --active-sides right \
   --send-actions \
   --auto-start \
-  --debug-replay-dataset /path/to/dataset_root \
+  --debug-replay-dataset /home/user/zc/dex_inspire_teleop_new/datasets_debug/2026-05-16_dexhand_collect \
   --debug-replay-episode 0
 ```
 
