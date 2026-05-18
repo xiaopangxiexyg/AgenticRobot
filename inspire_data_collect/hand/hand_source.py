@@ -18,6 +18,12 @@ class HandReaderSpec:
     show_raw_lines: bool = False
     exo_hand_calibration: bool = False
     calibration_path: str | None = None
+    runtime_zero_on_start: bool = False
+    runtime_zero_scale: str = "absolute"
+    runtime_zero_max_samples: int = 200
+    runtime_zero_min_samples: int = 30
+    runtime_zero_stable_window: int = 20
+    runtime_zero_stable_eps: float = 0.5
     silent_status: bool = True
 
 
@@ -62,6 +68,12 @@ class HandQ6Source:
         show_raw_lines: bool = False,
         exo_hand_calibration: bool = False,
         calibration_path: str | None = None,
+        runtime_zero_on_start: bool = False,
+        runtime_zero_scale: str = "absolute",
+        runtime_zero_max_samples: int = 200,
+        runtime_zero_min_samples: int = 30,
+        runtime_zero_stable_window: int = 20,
+        runtime_zero_stable_eps: float = 0.5,
         critical: bool = False,
         silent_status: bool = True,
     ) -> "HandQ6Source":
@@ -75,6 +87,12 @@ class HandQ6Source:
                 show_raw_lines=bool(show_raw_lines),
                 exo_hand_calibration=bool(exo_hand_calibration),
                 calibration_path=calibration_path,
+                runtime_zero_on_start=bool(runtime_zero_on_start),
+                runtime_zero_scale=str(runtime_zero_scale),
+                runtime_zero_max_samples=int(runtime_zero_max_samples),
+                runtime_zero_min_samples=int(runtime_zero_min_samples),
+                runtime_zero_stable_window=int(runtime_zero_stable_window),
+                runtime_zero_stable_eps=float(runtime_zero_stable_eps),
                 silent_status=bool(silent_status),
             )
         if right_port:
@@ -86,6 +104,12 @@ class HandQ6Source:
                 show_raw_lines=bool(show_raw_lines),
                 exo_hand_calibration=bool(exo_hand_calibration),
                 calibration_path=calibration_path,
+                runtime_zero_on_start=bool(runtime_zero_on_start),
+                runtime_zero_scale=str(runtime_zero_scale),
+                runtime_zero_max_samples=int(runtime_zero_max_samples),
+                runtime_zero_min_samples=int(runtime_zero_min_samples),
+                runtime_zero_stable_window=int(runtime_zero_stable_window),
+                runtime_zero_stable_eps=float(runtime_zero_stable_eps),
                 silent_status=bool(silent_status),
             )
         return cls(reader_specs=specs, critical=critical, silent_status=bool(silent_status))
@@ -114,6 +138,12 @@ class HandQ6Source:
                     show_raw_lines=spec.show_raw_lines,
                     exo_hand_calibration=spec.exo_hand_calibration,
                     calibration_path=spec.calibration_path,
+                    runtime_zero_on_start=spec.runtime_zero_on_start,
+                    runtime_zero_scale=spec.runtime_zero_scale,
+                    runtime_zero_max_samples=spec.runtime_zero_max_samples,
+                    runtime_zero_min_samples=spec.runtime_zero_min_samples,
+                    runtime_zero_stable_window=spec.runtime_zero_stable_window,
+                    runtime_zero_stable_eps=spec.runtime_zero_stable_eps,
                 )
             except Exception as exc:
                 startup_errors[side] = exc
@@ -162,6 +192,9 @@ class HandQ6Source:
         for key in ("deg_at_0", "deg_at_1"):
             if key in packet:
                 metadata[key] = np.asarray(packet[key], dtype=float).reshape(-1).tolist()
+        for key in ("absolute_delta", "runtime_zero_on_start", "zero_scale"):
+            if key in packet:
+                metadata[key] = packet[key]
         if "q6_order" in packet:
             metadata["q6_order"] = list(packet["q6_order"])
         if recovered_after_errors > 0:

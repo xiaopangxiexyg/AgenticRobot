@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from profiles import DeploymentProfile, FRANKA_PROFILE, REALMAN20_PROFILE, REALMAN21_PROFILE, REALMAN22_PROFILE
-from tactile import tactile_to_351
+from profiles import DeploymentProfile, FRANKA_PROFILE, GRIPPER_DM_PROFILE, REALMAN20_PROFILE, REALMAN21_PROFILE, REALMAN22_PROFILE
+from tactile import tactile_to_351, tactile_to_dmtac_history_frame
 
 
 DEFAULT_IMAGE_SHAPE = (480, 640, 3)
@@ -74,7 +74,7 @@ def needed_columns(profile: DeploymentProfile | None = None) -> list[str]:
         "observation.images.front.path",
         "observation.images.front.video_frame_index",
     ]
-    if profile is FRANKA_PROFILE:
+    if profile is FRANKA_PROFILE or profile is GRIPPER_DM_PROFILE:
         columns.extend(
             [
                 "action",
@@ -244,6 +244,18 @@ def tactile_history_from_df(df: Any, row_index: int, column: str, side: str, his
     return np.stack(samples, axis=0).astype(np.float32)
 
 
+def dmtac_tactile_history_from_df(df: Any, row_index: int, column: str, history_size: int, history_stride: int) -> np.ndarray:
+    if column not in df.columns:
+        warning(f"{column} missing; using zero DM-Tac tactile history.")
+        return np.zeros((history_size, 2, 3, 144, 192), dtype=np.float32)
+    base = row_index % len(df)
+    samples = []
+    for offset in range(history_size - 1, -1, -1):
+        idx = max(0, base - offset * history_stride)
+        samples.append(tactile_to_dmtac_history_frame(df.iloc[idx].get(column)))
+    return np.stack(samples, axis=0).astype(np.float32)
+
+
 def franka_pose_from_row(row: Any) -> np.ndarray:
     raw = row.get("observation.arm.raw_state_json")
     if raw:
@@ -369,6 +381,11 @@ class DatasetObservationSource:
                 "arm_qpos": franka_arm_qpos_from_row(row),
                 "right_hand_qpos": safe_array(row.get("observation.right_hand.qpos"), 6, "observation.right_hand.qpos"),
             }
+        elif profile is GRIPPER_DM_PROFILE:
+            state = {
+                "arm_qpos": franka_arm_qpos_from_row(row),
+                "right_hand_qpos": safe_array(row.get("observation.right_hand.qpos"), 6, "observation.right_hand.qpos"),
+            }
         elif profile is REALMAN20_PROFILE:
             state = {
                 "right_arm_pose": safe_array(row.get("observation.right_arm.pose"), 7, "observation.right_arm.pose"),
@@ -390,10 +407,18 @@ class DatasetObservationSource:
         else:
             raise ValueError(f"Unsupported profile: {profile}")
 
-        payload = {
-            "image": load_video_frame(self.df, row, self.fallback_image_height, self.fallback_image_width),
-            "state": state,
-            "tactile": {
+        tactile = (
+            {
+                "right": dmtac_tactile_history_from_df(
+                    self.df,
+                    row_index,
+                    "observation.hand.right.tactile",
+                    self.history_size,
+                    self.history_stride,
+                ),
+            }
+            if profile is GRIPPER_DM_PROFILE
+            else {
                 "right": tactile_history_from_df(
                     self.df,
                     row_index,
@@ -410,10 +435,15 @@ class DatasetObservationSource:
                     self.history_size,
                     self.history_stride,
                 ),
-            },
+            }
+        )
+        payload = {
+            "image": load_video_frame(self.df, row, self.fallback_image_height, self.fallback_image_width),
+            "state": state,
+            "tactile": tactile,
         }
         payload["__dataset_row_index"] = row_index
-        if profile is FRANKA_PROFILE:
+        if profile is FRANKA_PROFILE or profile is GRIPPER_DM_PROFILE:
             payload["__dataset_gt_action"] = franka_gt_action_from_row(row)
         self.row_index = row_index
         self.next_index = row_index + self.frame_stride

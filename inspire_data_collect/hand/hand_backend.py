@@ -21,6 +21,7 @@ class InspireTacHandBackendConfig:
     effector_name: str | None = None
     port: int = 6000
     connect_hardware: bool = True
+    send_commands: bool = True
     max_fingertip_force: int = DEFAULT_INSPIRE_HAND_MAX_FORCE
     send_threshold: float = 0.002
     enable_telemetry: bool = False
@@ -75,6 +76,7 @@ class InspireTacHandBackend:
             port=int(self.config.port),
             max_fingertip_force=int(self.config.max_fingertip_force),
             timeout=float(self.config.modbus_timeout_sec),
+            configure_startup_force=bool(self.config.send_commands),
         )
 
     def _close_hand_locked(self) -> None:
@@ -140,11 +142,25 @@ class InspireTacHandBackend:
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
             raise ValueError(f"{self.name} received command for '{command.effector_name}'.")
-        target = np.asarray(command.value, dtype=np.float32).reshape(-1)
+        self._send_joint_pos(command.value, bypass_send_commands=False, force=False)
+
+    def send_fixed_joint_pos(self, joint_pos: object) -> None:
+        self._send_joint_pos(joint_pos, bypass_send_commands=True, force=True)
+
+    def _send_joint_pos(
+        self,
+        joint_pos: object,
+        *,
+        bypass_send_commands: bool,
+        force: bool,
+    ) -> None:
+        target = np.asarray(joint_pos, dtype=np.float32).reshape(-1)
         if target.shape != (6,):
             raise ValueError(f"{self.name} expects q6 shape (6,), got {target.shape}.")
         target = np.clip(target, 0.0, 1.0)
-        if self._last_sent_command is not None:
+        if not self.config.send_commands and not bool(bypass_send_commands):
+            return
+        if self._last_sent_command is not None and not bool(force):
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < float(self.config.send_threshold):
                 return
@@ -293,6 +309,7 @@ class InspireTacHandBackend:
             "tactile_regions": tuple(self.config.tactile_regions),
             "telemetry_error": self._telemetry_error,
             "connect_hardware": bool(self.config.connect_hardware),
+            "send_commands": bool(self.config.send_commands),
             "is_connected": self.hand is not None,
             "reconnect_count": int(self._reconnect_count),
             "max_fingertip_force": int(self.config.max_fingertip_force),

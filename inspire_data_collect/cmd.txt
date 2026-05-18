@@ -22,3 +22,6 @@ python -m inspire_data_collect \
   --fr3-port "$FR3_PORT" \
   --arm-startup-align-duration-s 5.0 \
   --hz 20
+
+
+python -m inspire_data_collect.utils.realsense_gui --view-mode overlay --camera-mode single --camera-key front --dataset-root /home/user/zc/dex_inspire_teleop_new/datasets/2026-05-07_peeling_white_carrot --dataset-episode 0  --dataset-frame-index 0

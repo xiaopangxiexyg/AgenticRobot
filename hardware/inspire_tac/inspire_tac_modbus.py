@@ -584,7 +584,6 @@ if __name__ == '__main__':
     # test.set_joint_pos([0, 0, 0, 0, 1, 1])
 
     # #test.get_default_speed_force()
-    # visualizer = TactileVisualizer()
     # last_time = time.time()
     # while True:
     print('Joint pos:', np.round(joint_pos, 3))

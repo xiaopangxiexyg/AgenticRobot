@@ -14,6 +14,7 @@ class CameraPreviewConfig:
     preflight_highgui: bool = True
     preflight_timeout_sec: float = 3.0
     resizable_window: bool = True
+    render_scale: float = 2.0
 
 
 class CameraPreviewer:
@@ -64,9 +65,24 @@ class CameraPreviewer:
         if name in self._window_names:
             return
         cv2 = self._require_cv2()
-        flag = cv2.WINDOW_NORMAL if self.config.resizable_window else cv2.WINDOW_AUTOSIZE
+        if self.config.resizable_window:
+            flag = cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_FREERATIO", 0)
+        else:
+            flag = cv2.WINDOW_AUTOSIZE
         cv2.namedWindow(name, flag)
+        if self.config.resizable_window:
+            cv2.resizeWindow(name, 640, 480)
         self._window_names.add(name)
+
+    def _scaled_preview_image(self, image: np.ndarray) -> np.ndarray:
+        scale = float(self.config.render_scale) if self.config.resizable_window else 1.0
+        if scale <= 1.0:
+            return image
+        height, width = image.shape[:2]
+        target_w = max(1, int(round(width * scale)))
+        target_h = max(1, int(round(height * scale)))
+        cv2 = self._require_cv2()
+        return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
     def _display_image(self, frame: Any) -> np.ndarray:
         cv2 = self._require_cv2()
@@ -187,7 +203,7 @@ class CameraPreviewer:
                     )
             name = self._window_name(str(camera_key))
             self._ensure_window(name)
-            self._require_cv2().imshow(name, image)
+            self._require_cv2().imshow(name, self._scaled_preview_image(image))
             any_window = True
         if any_window:
             return int(self._require_cv2().waitKey(1))

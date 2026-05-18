@@ -240,7 +240,7 @@ PY
 默认会读取全部触觉区域；建议先用较低 `telemetry_hz` 确认链路正常。命令行也支持别名 `--tactile-regions` 和 `--tactile-region`。
 
 ```bash
-export RIGHT_HAND_IP=192.168.12.210
+export RIGHT_HAND_IP=192.168.11.210
 
 python - <<'PY'
 import os
@@ -327,7 +327,7 @@ PY
 
 期望结果：能打印 `frame`、图像 shape 和 metadata；如果失败，先确认序列号、USB 连接和是否有其他程序占用相机。
 
-正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
+正式采集时可加 `--vis_cam` 实时显示 RealSense RGB 画面。预览窗口直接使用当前采集帧，因此分辨率和 `--camera-width/--camera-height` 或配置文件一致，并且窗口默认可拖拽调整大小；如果 OpenCV 后端限制窗口不能大于图像尺寸，默认 `--vis-cam-render-scale 2.0` 会把预览 backing image 放大到 2 倍，不够时可调到 `3.0` 或更高。如果希望窗口严格等于图像尺寸，传 `--vis-cam-window-mode autosize`。`--vis_cam` 支持 `--camera-mode single` 和 `--camera-mode multi`；多相机时用 `--vis-cam-key <camera_key>` 选择一个视角预览，不影响其他视角写盘。程序启动时会先做 OpenCV HighGUI 预检；如果显示环境不可用，会在终端打印 `preview is disabled` 并继续采集，视频写盘不受影响。
 
 ### 5. 外骨骼 Dynamixel 读取
 
@@ -495,7 +495,7 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name right_hand_grasp \
+  --task-name right_hand_grasp_test \
   --active-sides right \
   --right-hand-port "$RIGHT_HAND_PORT" \
   --right-hand-ip "$RIGHT_HAND_IP" \
@@ -507,11 +507,12 @@ python -m inspire_data_collect \
 ```bash
 --tactile-vis-size 640
 --tactile-vis-value-scale 0.02
+--tactile-vis-render-scale 2.0
 --tactile-vis-window-mode resizable
 --tactile-region thumb_1,index_1,middle_1,ring_1,little_1,palm
 ```
 
-默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
+默认 `--tactile-vis-window-mode resizable` 会创建可拖拽调整大小的 OpenCV 窗口，`--tactile-vis-render-scale 2.0` 会把触觉 backing canvas 放大到 2 倍，避免部分 OpenCV 后端限制窗口不能大于原始图像；如果希望窗口严格等于渲染图尺寸，传 `--tactile-vis-window-mode autosize`。`--tactile-vis-size` 控制每只手面板的基础渲染分辨率，调大后窗口初始尺寸和细节都会增加。
 
 按键：`z` 开始 episode，`c` 保存当前 episode，`d` 丢弃当前 episode，`q` 退出。加 `--record-auto-start` 可启动后直接采集。
 
@@ -542,20 +543,465 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name right_hand_fr3_exo \
+  --task-name beer_bottle_open \
   --active-sides right \
-  --right-hand-port /dev/ttyACM0 \
-  --right-hand-ip 192.168.12.210 \
+  --right-hand-port "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00" \
+  --right-hand-ip 192.168.11.210 \
   --enable-arm \
   --arm-side right \
   --exo-port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0 \
   --exo-baudrate 57600 \
   --fr3-host 192.168.20.172 \
   --fr3-port 5558 \
-  --fr3-state-poll-hz 20 \
+  --fr3-state-poll-hz 30 \
   --arm-startup-align-duration-s 5.0 \
-  --arm-shrink-deg 10
+  --arm-shrink-deg 10 \
+  --camera-mode multi \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --vis-cam-window-mode resizable \
+  --tactile-vis-window-mode resizable \
+  --record-hand-only \
+  --record-hand-fixed-pos "0.096,0.057,0.022,0.056,0.495,0.0"
 ```
+
+如果只想采集 Inspire 手的 action/state/tactile，但不向 Inspire 手下发遥操作动作，在采集命令中追加 `--record-hand-only`。该模式仍会读取遥操作手串口、计算并记录 `action.<side>_hand.joint_target`，也会连接 Inspire 手读取关节状态和触觉；主循环里的手部 `set_joint_pos` 下发会关闭。作为采集间复位，程序会在脚本启动后、以及每次 episode 成功保存后，向 active hands 下发一次固定 q6，默认 `--record-hand-fixed-pos "0.096,0.057,0.022,0.056,0.495,0.0"`，可按需要覆盖。FR3 手臂、相机和其他设备流程保持不变。
+
+### DMTAC gripper collect mode
+
+`--collect-mode gripper` 使用 `hardware/DMTAC_gripper` 内的夹爪和 DM-Tac 触觉代码。遥操作输入仍然读取外骨骼手的 6DoF 串口，但只使用第二维，也就是 q6 index `1`，作为夹爪开合动作。为保持当前 LeRobot writer 和下游 action shape 不变，夹爪 action/state 仍写在对应 side 的 6 维 hand slot 中，只有 index `1` 有意义，其余维度为 0。
+
+触觉不再读取 InspireTac Modbus 的 1062 维区域数据，而是读取 DM-Tac SDK `getDistributeForce()`，每个传感器原始帧为 `(288, 384, 3)` dense force。保存端会对最终触觉帧做 `kernel_size=2, stride=2` 的空间 mean pooling，写盘形状变为 `(144, 192, 3)`，再按传感器顺序 flatten 后写入 `observation.hand.<side>.tactile`。`observation.hand.<side>.tactile_dict_json` 只保存每个传感器已压缩 force array 的 shape/dtype，避免把 dense force 数据重复写进 JSON。
+
+夹爪 action 有硬保护：`--gripper-max-action` 默认 `0.9`，命令行不允许设置超过 `0.9`，后端在下发 `move()` 前也会再次裁剪到 `[0, 0.9]`。不要用底层脚本直接执行 `move 1.0`；超过 `0.9` 可能损坏夹爪。
+
+夹爪模式下 `--visualize-tactile` 会打开 DM-Tac `getDistributeForce()` 可视化窗口。热图显示 XY force magnitude，箭头显示每个区域的 `(Fx, Fy)` 方向，底部显示 mean/max/dXYmax。常用缩放参数仍是 `--tactile-vis-value-scale`，数值越小颜色和箭头越敏感。
+
+### DMTAC gripper startup testing
+
+以下步骤从单设备到完整采集逐步增加硬件，默认在项目根目录执行：
+
+```bash
+cd /home/user/zc/dex_inspire_teleop_new
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
+export EXO_PORT=/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
+export FR3_HOST=192.168.20.172
+export FR3_PORT=5558
+export GRIPPER_PORT="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+export DMTAC_IDS="L25480055 L25480053"
+```
+
+1. 检查夹爪串口和 DM-Tac 设备枚举：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py list-ports
+python hardware/DMTAC_gripper/run_gripper.py list-tactile
+```
+
+2. 只读夹爪状态，不运动：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py verify-gripper \
+  --port "$GRIPPER_PORT" \
+  --id 1
+```
+
+3. 低速低力矩做小行程动作测试。这里最多只移动到 `0.2`，不要测试 `1.0`：
+
+```bash
+# python hardware/DMTAC_gripper/run_gripper.py set-speed 0.2 --port "$GRIPPER_PORT" --id 1
+# python hardware/DMTAC_gripper/run_gripper.py set-torque 0.2 --port "$GRIPPER_PORT" --id 1
+# python hardware/DMTAC_gripper/run_gripper.py open --port "$GRIPPER_PORT" --id 1 --wait
+python hardware/DMTAC_gripper/run_gripper.py move 0.0 --port "$GRIPPER_PORT" --id 1 --speed 0.2 --torque 0.2 --wait 
+# 0.9 closed  0 open
+# python hardware/DMTAC_gripper/run_gripper.py stop --port "$GRIPPER_PORT" --id 1
+```
+
+4. 只读 `getDistributeForce()`，确认两个触觉传感器都有帧：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py verify-tactile \
+  --tactile_ids $DMTAC_IDS \
+  --backend cpu \
+  --count 10
+```
+
+5. 单独打开 DM-Tac force 可视化。启动和 baseline 期间保持两个传感器无接触：
+
+```bash
+python hardware/DMTAC_gripper/run_gripper.py visualize-force \
+  --tactile_ids $DMTAC_IDS \
+  --backend cpu \
+  --reset_tactile \
+  --warmup_frames 30 \
+  --viz_mode delta \
+  --baseline_frames 20 \
+  --fixed_ref 0.0005 \
+  --deadband_abs 5e-5 \
+  --temporal_alpha 0.35 \
+  --spatial_blur_ksize 5 \
+  --arrow_pool 16 \
+  --stride 12 \
+  --scale 2 \
+  --max_hz 30
+```
+
+6. 检查外骨骼手 q6，并重点观察第二维 `q6[1]`。夹爪采集只使用这一维：
+
+```bash
+python - <<'PY'
+import os
+import time
+import numpy as np
+from inspire_data_collect.hand.hand_source import HandQ6Source
+
+source = HandQ6Source.from_ports(
+    right_port=os.environ["RIGHT_HAND_PORT"],
+    baudrate=115200,
+    timeout=0.05,
+    critical=True,
+)
+source.start()
+try:
+    for _ in range(120):
+        ch = source.get_latest_channels().get("right_hand_q6")
+        if ch is not None and ch.valid:
+            q6 = np.asarray(ch.value, dtype=float)
+            print("right_hand_q6", np.round(q6, 3).tolist(), "gripper_dim_1", round(float(q6[1]), 3))
+        time.sleep(0.05)
+finally:
+    source.close()
+PY
+```
+
+7. 不连接夹爪、不连接触觉，先跑采集管线和 writer：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name gripper_smoke_no_hw \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-no-hardware \
+  --gripper-no-tactile \
+  --gripper-max-action 0.9 \
+  --hz 10 \
+  --max-steps 100 \
+  --no-parquet \
+  --no-video
+```
+
+8. 只连接外骨骼手、夹爪和触觉，打开采集内置的 gripper tactile visualizer，不连接 FR3 或相机：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name gripper_tactile_smoke \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-port "$GRIPPER_PORT" \
+  --gripper-id 1 \
+  --gripper-speed 0.2 \
+  --gripper-torque 0.2 \
+  --gripper-max-action 0.9 \
+  --gripper-tactile-ids $DMTAC_IDS \
+  --gripper-tactile-backend cpu \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.0005 \
+  --hz 10 \
+  --max-steps 200 \
+  --no-parquet \
+  --no-video
+```
+
+9. 上面全部通过后，再接入 FR3 和相机做完整短测：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name gripper_full_smoke \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-port "$GRIPPER_PORT" \
+  --gripper-id 1 \
+  --gripper-speed 0.2 \
+  --gripper-torque 0.2 \
+  --gripper-max-action 0.9 \
+  --gripper-tactile-ids $DMTAC_IDS \
+  --gripper-tactile-backend cpu \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --arm-startup-align-duration-s 5.0 \
+  --vis_cam \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.0005 \
+  --hz 10 \
+  --max-steps 200
+```
+
+单右侧夹爪 + FR3 + 多相机示例：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name gripper_collect_peeling \
+  --collect-mode gripper \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --gripper-port "$GRIPPER_PORT" \
+  --gripper-id 1 \
+  --gripper-speed 0.7 \
+  --gripper-torque 1.0 \
+  --gripper-max-action 0.9 \
+  --gripper-tactile-ids L25480055 L25480053 \
+  --gripper-tactile-backend cpu \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --tactile-vis-value-scale 0.0005 \
+  --hz 10
+```
+
+如果只想先检查采集管线和数据写出，不连接夹爪或 DM-Tac 触觉，可加：
+
+```bash
+--gripper-no-hardware --gripper-no-tactile
+```
+
+### DexHand Q6 right-slot collect mode
+
+`--collect-mode dexhand_q6` 是一个 DexHand 左手真机接入的单手本体补充。它只支持当前约定：
+
+- 数据集逻辑槽位固定为 `right_hand`，即必须使用 `--active-sides right`。
+- 物理硬件固定为左手 DexHand，即 `--dexhand-hardware-hand left`。
+- 保存和对外暴露的 6DoF 顺序按 DexHand 控制语义解释为：`[thumb_flex, thumb_yaw, index, middle, ring, pinky]`。
+- deploy/replay 也读取 `right_hand` 槽位，但实际发送给左手 DexHand。
+- 该模式默认在启动时把当前外骨骼手张开姿态作为 q6 零位，并使用 `absolute` 缩放，行为和 `run_q6_to_dexhand.py` 默认串口模式一致；启动命令后请保持外骨骼手完全张开且静止，直到看到 `[Zero:right] finished`。如果要回到固定 JSON 标定，可追加 `--hand-no-runtime-zero-on-start`。
+
+注意这里有两条完全不同的硬件链路：
+
+- `--right-hand-port` / `RIGHT_HAND_PORT` 是外骨骼 `hand_q6` 设备的 USB 串口，用来读取遥操作 6DoF 输入；它不是 DexHand 的控制口。
+- DexHand 真机仍然通过 ZLG USBCANFD 适配器走 CANFD，不使用 `/dev/serial/by-id/...` 串口路径。DexHand 侧只配置 `--dexhand-device-type`、`--dexhand-device-index` 和 `hardware/pyzlg_dexhand/config/config.yaml` 里的 CAN channel / `ZCANDeviceType`。USBCANFD 是 USB 接入电脑的 CAN 适配器，所以文档中会提到 USB 权限，但程序打开的是 ZCAN 设备类型和 index，不是串口 port。
+
+后端内部会把上述 q6 转成 DexHand 12 关节命令：`thumb_flex` 控制 `th_dip/th_mcp`，`thumb_yaw` 控制 `th_rot`。写入 observation 时不会直接保存最后一次命令，而是从 DexHand 实测关节反馈反算回 q6：`thumb_flex` 取 `th_dip/th_mcp` 平均，`thumb_yaw` 来自 `th_rot`；四指分别用 DIP 直接估计值和 MCP 按 profile 比例换算后的估计值取平均，因此最后两组耦合关节不一致时会得到一个折中 q6。
+
+DexHand 触觉保存为 15 维 fingertip xyz force，排列维持后端现状：
+
+```text
+[th_fx, th_fy, th_fz,
+ ff_fx, ff_fy, ff_fz,
+ mf_fx, mf_fy, mf_fz,
+ rf_fx, rf_fy, rf_fz,
+ lf_fx, lf_fy, lf_fz]
+```
+
+finger order 为 `["th", "ff", "mf", "rf", "lf"]`，axis order 为 `["force_x", "force_y", "force_z"]`。采集和 deploy 现已接入现有 `--visualize-tactile` 框架，会把 15 维 fingertip xyz 画成 5 个指尖的 `Fz` 圆点和 `Fx/Fy` 箭头；如果还想看温度、proximity、raw delta 等更细字段，仍可用 `hardware/portable_dexhand021` 自带工具。
+
+#### DexHand Q6 完整数采流程
+
+以下流程从新机器初始化、q6 串口检查、DexHand 单体跟随、采集框架 smoke test，一直到正式数采与 replay。默认在项目根目录执行。
+
+```bash
+cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00  # 外骨骼 hand_q6 串口，不是 DexHand CAN 口
+# export RIGHT_HAND_PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00
+export EXO_PORT=/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
+export FR3_HOST=192.168.20.172
+export FR3_PORT=5558
+export DEXHAND_DEVICE_TYPE=auto
+export DEXHAND_DEVICE_INDEX=0
+```
+
+
+## 安装
+
+1. 下载或克隆仓库：
+
+   ```bash
+   cd dex_inspire_teleop_new/hardware/pyzlg_dexhand
+   ```
+
+2. 安装软件包：
+
+   ```bash
+   pip install -e .
+   ```
+
+
+0. 新机器第一次使用 USBCANFD 时，先配置权限并重新加入 `canbus` 组：
+
+```bash
+cd hardware/pyzlg_dexhand
+sudo ./tools/setup_usb_can.sh
+newgrp canbus
+lsusb | grep -E 'USBCANFD-100U|USBCANFD-200U'
+cd /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new
+```
+
+如果当前 shell 没有继承新组权限，重新登录一次再继续。`hardware/pyzlg_dexhand/config/config.yaml` 里的 `left_hand.channel` 和 `ZCANDeviceType` 也要和现场接线一致。
+
+1. 在采集框架外单独验证 DexHand 左手硬件控制。注意串口源仍是 `--side right`，真机是 `--hand left`：
+
+```bash
+python hardware/portable_dexhand021/6DOF_control/run_q6_to_dexhand.py \
+  --port "$RIGHT_HAND_PORT" \
+  --side right \
+  --hand left \
+  --device-type "$DEXHAND_DEVICE_TYPE" \
+  --device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 10 \
+  --print-hz 5
+```
+
+确认开合方向正确、动作幅度安全。若需要在同一进程里一起看 5 指触觉，可追加：
+
+```bash
+--visualize-tactile --tactile-viewer-hz 20
+```
+
+2. 连接 DexHand，先用 record-only 短测 telemetry、q6 反算和 15 维触觉写盘。注意这一步**不会**让 DexHand 跟随 6DoF 遥操；`--record-hand-only` 会关闭实时手部动作下发，只保留状态/触觉读取和数据写盘，启动时只会额外执行一次固定 `record_hand_fixed_pos`：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_record_only \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --record-hand-only \
+  --record-auto-start \
+  --max-steps 300 \
+  --no-silent
+```
+
+重点检查 `observation.right_hand.qpos`、`observation.hand.right.tactile` 长度 15，以及 `observation.hand.right.tactile_dict_json` 中的 fingertip xyz。若想同时看内置 5 指触觉可视化，可追加 `--visualize-tactile`；觉得太敏感时把 `--tactile-vis-value-scale` 调大一些，例如 `0.2` 或 `0.5`。
+
+5. 如需验证在采集框架内也能真实跟随 6DoF，请去掉 `--record-hand-only` 做完整短测：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_follow_smoke \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --record-auto-start \
+  --hz 10 \
+  --max-steps 200 \
+  --no-silent
+```
+
+6. 上面都通过后，做正式单手 DexHand 数采。手动用 `z/c/d/q` 控制 episode：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name dexhand_collect_peeling \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --hz 10 \
+  --no-silent
+```
+
+7. 加上 FR3 和单相机做完整短测：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets_debug \
+  --task-name dexhand_fr3_single_cam_smoke \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --hz 10 \
+  --no-silent
+```
+
+8. 带 FR3 + 多相机的 DexHand 数采示例：
+
+```bash
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name dexhand_collect_multi_cam \
+  --collect-mode dexhand_q6 \
+  --active-sides right \
+  --right-hand-port "$RIGHT_HAND_PORT" \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --enable-arm \
+  --arm-side right \
+  --exo-port "$EXO_PORT" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --camera-mode multi \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --vis-cam-key front \
+  --hz 10 \
+  --no-silent
+```
+
+9. 对同一 right-slot 数据做 deploy/replay，实际仍执行到左手 DexHand：
+
+```bash
+python -m inspire_data_collect.deploy.run_policy \
+  --hand-mode dexhand_q6 \
+  --active-sides right \
+  --dexhand-device-type "$DEXHAND_DEVICE_TYPE" \
+  --dexhand-device-index "$DEXHAND_DEVICE_INDEX" \
+  --send-actions \
+  --auto-start \
+  --debug-replay-dataset /home/user/zc/dex_inspire_teleop_new/datasets_debug/2026-05-16_dexhand_collect \
+  --debug-replay-episode 0
+```
+
+deploy 特殊处理和采集保持一致：replay 读取 `action.right_hand.joint_target`，startup init 也使用 right-slot action vector，然后由 DexHand backend 发给左手真机。
+
+常用 DexHand 参数：
+
+- `--dexhand-hardware-hand left`: 物理 DexHand 侧，目前仅支持 left。
+- `--dexhand-device-type auto|config|100U|200U`: USBCANFD 类型选择。
+- `--dexhand-device-index N`: USBCANFD 设备序号。
+- `--dexhand-tactile-period-ms 20`: 周期反馈/触觉请求周期。
+- `--dexhand-no-hardware`: 只跑 reader/writer，不连接 DexHand。
+- `--dexhand-mock`: 使用 portable DexHand mock 后端。
+- `--record-hand-only`: 只读状态/触觉并写盘，不实时下发 DexHand 跟随命令。
+
+DexHand CAN 通道来自 `hardware/pyzlg_dexhand/config/config.yaml`，例如当前 `left_hand.channel` 和 `ZCANDeviceType`。如果使用 `--dexhand-device-type config`，会严格按该配置打开；默认 `auto` 会优先尝试配置里的设备类型，再尝试 100U/200U。
 
 外骨骼到 FR3 是直接关节映射，程序刚启动时 FR3 当前关节和外骨骼映射目标通常不一致。默认启用启动对齐：FR3 后端第一次收到 arm 指令时，会以 FR3 当前 `qpos` 为起点，在 `--arm-startup-align-duration-s` 秒内线性插值到外骨骼当前目标；最大关节差低于 `--arm-startup-align-threshold-rad` 时会跳过插值。启动对齐期间操作者应尽量保持外骨骼不动，等插值结束后再进入正常随动。确认二者已经物理对齐且需要完全直接随动时，才使用 `--disable-arm-startup-align`。
 
@@ -564,13 +1010,14 @@ python -m inspire_data_collect \
 ```bash
 python -m inspire_data_collect \
   --dataset-root ./datasets \
-  --task-name hand_camera \
+  --task-name hand_camera_test \
   --active-sides right\
   --right-hand-port "$RIGHT_HAND_PORT" \
   --right-hand-ip 192.168.11.210 \
   --camera-mode single \
   --camera-config inspire_data_collect/realsense.json \
-  --vis_cam
+  --vis_cam \
+  --visualize-tactile
 ```
 
 单 RealSense 相机，直接用序列号配置：
@@ -629,6 +1076,33 @@ python -m inspire_data_collect \
   --vis-cam-key front
 ```
 
+```bash
+export FR3_HOST=192.168.20.172
+export FR3_PORT=5558
+
+python -m inspire_data_collect \
+  --dataset-root ./datasets \
+  --task-name chips_addtion \
+  --active-sides right \
+  --right-hand-port "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130699-if00" \
+  --right-hand-ip 192.168.11.210 \
+  --camera-mode single \
+  --camera-config inspire_data_collect/realsense.json \
+  --vis_cam \
+  --visualize-tactile \
+  --enable-arm \
+  --tactile-vis-value-scale 0.002 \
+  --tactile-regions all \
+  --arm-side right \
+  --exo-port "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0" \
+  --fr3-host "$FR3_HOST" \
+  --fr3-port "$FR3_PORT" \
+  --arm-startup-align-duration-s 5.0 \
+  --hz 20 \
+  --max-force 600
+```
+
+
 `--camera-mode multi` 会记录配置文件中的全部相机，每个 `camera_key` 单独写入一个 `videos/observation.images.<camera_key>/...mp4`。`--vis-cam-key` 只控制预览窗口；不传时优先预览 `front`，否则预览配置中按名称排序的第一个相机。
 
 多视角时偶发 `Frame didn't arrive` 通常是某一路 RealSense 在当前 timeout 内没有返回新帧，可能来自 USB 带宽、启动抖动或分辨率/帧率过高。采集端默认用 `wait_timeout_ms=1000`，并且只有连续超过 `stale_after_sec=2.0` 没有收到新帧时才报告相机 error；短暂超时不会反复刷屏，也不会影响已收到帧的预览和写盘。如果仍持续报 `frame_timeout_stale`，优先降低多路相机的 `width/height/fps`，并确认相机分散到足够的 USB 控制器上。
@@ -683,17 +1157,19 @@ dataset_root/YYYY-MM-DD_task-name/
 - `observation.arm.startup_alignment_*`: FR3 启动对齐插值状态、进度、起点和目标。
 - `action.right_hand.joint_target`、`action.left_hand.joint_target`。
 - `observation.right_hand.qpos`、`observation.left_hand.qpos`。
-- `observation.hand.<side>.tactile`: 1062 维触觉向量。
+- `observation.hand.<side>.tactile`: InspireTac 手模式下是 1062 维触觉向量；gripper 模式下是 DM-Tac `getDistributeForce()` 原始 `(288, 384, 3)` force 经保存端 `kernel_size=2, stride=2` mean pooling 后的 `(144, 192, 3)` flatten 向量，默认两个传感器时为 `2 * 144 * 192 * 3 = 165888` 维；DexHand Q6 模式下只写 `observation.hand.right.tactile`，为 15 维 `[th_xyz, ff_xyz, mf_xyz, rf_xyz, lf_xyz]` fingertip force。
 - `observation.hand.<side>.tactile_timestamp`: 本帧触觉读取请求时间。
 - `observation.hand.<side>.telemetry_timestamp`: 手部 telemetry 最新更新时间。
-- `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名。
-- `observation.hand.<side>.tactile_dict_json`: 选中触觉区域的矩阵数据 JSON。
+- `observation.hand.<side>.tactile_regions`: 本次采集启用的触觉区域名；DexHand Q6 模式下为 `("th", "ff", "mf", "rf", "lf")`。
+- `observation.hand.<side>.tactile_dict_json`: InspireTac 手模式下是选中触觉区域的矩阵数据 JSON；gripper 模式下只记录每个 DM-Tac 传感器的 shape/dtype；DexHand Q6 模式下记录 finger order、axis order、每个指尖的 `force_x/force_y/force_z`，以及底层 raw tactile 摘要。
 - `teleop.action_source.arm_exo_qpos`: 外骨骼原始 7DoF 关节角。
 - `teleop.action_source.arm_preclip_joint_target`: 外骨骼映射到 FR3 后、裁剪前的 7DoF 目标。
 - `teleop.action_source.arm_clip_mask`: 每个 FR3 关节是否被安全限位裁剪。
 - `teleop.action_source.<side>_hand_q6`: 遥操作源手 6DoF。
 
 `meta/info.json` 中的 `reserved_spaces` 明确记录单臂 7DoF 的 shape 和 slice；当前 writer 会在启用 arm 时直接填充前 7 维。
+
+DexHand Q6 模式还会在 episode metadata 中写入 `logical_hand_side="right"`、`hardware_hand_side="left"`、`dexhand_q6_order`、`dexhand_joint_feedback_saved_as_q6=true`、`dexhand_tactile_format="fingertip_xyz"`、`dexhand_tactile_fingers`、`dexhand_tactile_axes`、`dexhand_tactile_dim=15`。设备配置另存为 `meta/devices/dexhand_q6.json`，用于记录 right-slot 到 left hardware 的映射。
 
 启用相机后，每帧还会写出：
 
@@ -704,6 +1180,93 @@ dataset_root/YYYY-MM-DD_task-name/
 - `observation.images.<camera_key>.source_frame_index`: RealSense 源帧序号。
 - `observation.images.<camera_key>.video_frame_index`: 写入 mp4 后的视频帧序号。
 - `observation.images.<camera_key>.path`: 相对 dataset root 的视频路径。
+
+### 拆分 LeRobot episode 数据集
+
+`utils/extract_lerobot_episodes.py` 用于把已有 LeRobot 风格数据集中的指定 episode 拆到一个新数据集，同时把原数据集改写为只包含剩余 episode。脚本会重写 `meta/*.jsonl/json`、parquet 里的 `index/episode_index/frame_index`，并复制对应视频文件；不要手动复制 `data/` 和 `videos/` 目录来替代该脚本。
+
+依赖：
+
+```bash
+pip install pyarrow
+```
+
+先 dry-run 查看计划，不会改动数据：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_wasted \
+  --episodes 44,46,99
+```
+
+确认 `extracted` 和 `remaining source` 数量正确后，加 `--yes` 正式执行：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_wasted \
+  --episodes 44,46,99 \
+  --yes
+```
+
+`--episodes` 支持逗号和闭区间：
+
+```bash
+--episodes 0
+--episodes 0,2,5
+--episodes 0-3,8
+```
+
+常用参数：
+
+- `--dataset-root`: 被拆分的原数据集目录，必须包含 `meta/episodes.jsonl`。
+- `--output-root`: 拆出的 episode 写入的新数据集目录，不能等于或嵌套在 `--dataset-root` 中。
+- `--overwrite-output`: 如果 `--output-root` 已存在，允许先删除再写入。
+- `--output-dataset-name`: 写入拆出数据集 `meta/info.json` 的 `dataset_name`；默认使用 `--output-root` 目录名。
+- `--remaining-dataset-name`: 写回剩余原数据集的 `dataset_name`；默认保留原 `info.json`。
+- `--allow-missing-videos`: `meta/episodes.jsonl` 中记录的视频不存在时跳过视频复制，否则默认报错。
+- `--no-backup`: 成功拆分后删除原始数据集备份；不建议首次使用时开启。
+- `--parquet-compression`: 重写 parquet 时使用的压缩格式，默认 `zstd`。
+
+执行成功后会得到：
+
+```text
+--output-root                         # 指定 episodes 组成的新数据集
+--dataset-root                        # 原路径被改写为剩余 episodes 数据集
+--dataset-root 的同级隐藏 backup        # 默认保留拆分前的完整原始数据集
+```
+
+backup 目录名类似：
+
+```text
+.2026-05-06_soft_hard.before_extract-<timestamp>-<pid>
+```
+
+如果需要恢复到拆分前的原样数据，优先使用这个 backup；它比重新合并两个已重编号的数据集更可靠。
+
+同一个脚本也支持把两个数据类型一致的 LeRobot 数据集合并到一个新目录。合并不会修改两个输入数据集，会按 `--dataset-root` 的 episode 在前、`--merge-root` 的 episode 在后的顺序重新编号，并重写 parquet/meta/video 路径。
+
+先 dry-run：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --merge-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_random \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_merged
+```
+
+确认计划后正式合并：
+
+```bash
+python /home/zc/HandMotion/RealRobotExperiments/dex_inspire_teleop_new/inspire_data_collect/utils/extract_lerobot_episodes.py \
+  --dataset-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard \
+  --merge-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_random \
+  --output-root /home/zc/HandMotion/real_robot_dataset/datasets/2026-05-06_soft_hard_merged \
+  --yes
+```
+
+合并模式会校验两个输入的 `meta/info.json` 关键结构、视频 camera key 和首个 parquet schema。若输出目录已存在，需要显式加 `--overwrite-output`。如果视频文件缺失但仍想保留 parquet/meta 合并，可加 `--allow-missing-videos`。
 
 导出的最小示例：
 

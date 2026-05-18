@@ -1,0 +1,7 @@
+numpy>=1.20
+pyserial>=3.5
+opencv-python>=4.5
+
+# dmrobotics is intentionally installed separately, for example from the SDK root:
+#   cd /home/zc/HandMotion/DM_Tac_SDK_Publish_1.2.10
+#   python -m pip install -e .

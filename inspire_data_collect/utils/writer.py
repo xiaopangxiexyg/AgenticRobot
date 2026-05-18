@@ -316,7 +316,8 @@ class HandSampleBuilder:
             commands=copied_commands,
             arm_state={} if arm_state is None else dict(to_serializable(dict(arm_state))),
             hand_states={
-                str(side): dict(state or {}) for side, state in hand_states.items()
+                str(side): _compact_hand_state_for_sample(dict(state or {}))
+                for side, state in hand_states.items()
             },
             faults=[] if faults is None else [str(fault) for fault in faults],
             camera_frames=self._camera_matches(
@@ -363,6 +364,64 @@ def _split_observation_state(observation_state: np.ndarray) -> dict[str, list[fl
         start = ARM_DOF + index * HAND_DOF
         result[f"{side}_hand"] = vector[start : start + HAND_DOF].tolist()
     return result
+
+
+def _compact_hand_state_for_sample(hand_state: Mapping[str, Any]) -> dict[str, Any]:
+    compact = dict(hand_state)
+    if _uses_dmtac_gripper_tactile(compact):
+        _apply_dmtac_gripper_tactile_save_pooling(compact)
+    tactile_dict = compact.get("tactile_dict")
+    if isinstance(tactile_dict, Mapping):
+        compact["tactile_dict"] = {
+            str(name): _compact_tactile_dict_value(value)
+            for name, value in dict(tactile_dict).items()
+        }
+    return compact
+
+
+def _uses_dmtac_gripper_tactile(hand_state: Mapping[str, Any]) -> bool:
+    return str(hand_state.get("backend_type") or "") == "dmtac_gripper"
+
+
+def _mean_pool_spatial_2x2(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim < 2:
+        return arr.astype(np.float32, copy=True)
+    pooled_h = int(arr.shape[0]) // 2
+    pooled_w = int(arr.shape[1]) // 2
+    if pooled_h <= 0 or pooled_w <= 0:
+        return arr.astype(np.float32, copy=True)
+    trimmed = arr[: pooled_h * 2, : pooled_w * 2, ...]
+    pooled_shape = (pooled_h, 2, pooled_w, 2, *arr.shape[2:])
+    pooled = trimmed.reshape(pooled_shape).mean(axis=(1, 3), dtype=np.float32)
+    return pooled.astype(np.float32, copy=False)
+
+
+def _apply_dmtac_gripper_tactile_save_pooling(hand_state: dict[str, Any]) -> None:
+    tactile_dict = hand_state.get("tactile_dict")
+    if not isinstance(tactile_dict, Mapping) or not tactile_dict:
+        return
+    pooled_dict: dict[str, np.ndarray] = {
+        str(name): _mean_pool_spatial_2x2(value)
+        for name, value in dict(tactile_dict).items()
+    }
+    pooled_vectors = [value.reshape(-1) for value in pooled_dict.values()]
+    if pooled_vectors:
+        hand_state["tactile"] = np.concatenate(pooled_vectors).astype(
+            np.float32,
+            copy=False,
+        )
+    hand_state["tactile_dict"] = pooled_dict
+
+
+def _compact_tactile_dict_value(value: Any) -> Any:
+    arr = np.asarray(value)
+    if arr.ndim >= 3 or arr.size > 5000:
+        return {
+            "shape": list(arr.shape),
+            "dtype": str(arr.dtype),
+        }
+    return to_serializable(value)
 
 
 def hand_sample_to_row(
@@ -545,6 +604,7 @@ class WriterConfig:
     format_name: str = "hand_only_lerobot_v2.1_style"
     write_parquet: bool = True
     write_video: bool = True
+    hand_tactile_dim: int = 1062
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
@@ -556,6 +616,8 @@ class WriterConfig:
             raise ValueError("chunk_size must be positive.")
         if float(self.nominal_fps) <= 0.0:
             raise ValueError("nominal_fps must be positive.")
+        if int(self.hand_tactile_dim) < 0:
+            raise ValueError("hand_tactile_dim must be non-negative.")
 
 
 @dataclass
@@ -765,8 +827,14 @@ class HandOnlyLeRobotWriter:
                     "action.left_hand.joint_target": {"shape": [HAND_DOF], "dtype": "float32"},
                     "observation.right_hand.qpos": {"shape": [HAND_DOF], "dtype": "float32"},
                     "observation.left_hand.qpos": {"shape": [HAND_DOF], "dtype": "float32"},
-                    "observation.hand.right.tactile": {"shape": [1062], "dtype": "float32"},
-                    "observation.hand.left.tactile": {"shape": [1062], "dtype": "float32"},
+                    "observation.hand.right.tactile": {
+                        "shape": [int(self.config.hand_tactile_dim)],
+                        "dtype": "float32",
+                    },
+                    "observation.hand.left.tactile": {
+                        "shape": [int(self.config.hand_tactile_dim)],
+                        "dtype": "float32",
+                    },
                 },
             },
         )

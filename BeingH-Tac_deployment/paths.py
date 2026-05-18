@@ -25,6 +25,7 @@ DEXTELEOP_ROOT = _path_from_env("DEXTELEOP_ROOT", [REPO_ROOT])
 BEINGH_TAC_ROOT = _path_from_env(
     "BEINGH_TAC_ROOT",
     [
+        Path("/home/user/cpl/Being-H-Tac-visuo-tactile"),
         Path("/home/user/cpl/Being-H-Tac"),
         Path("/home/ai/Desktop/Being-H-series/Being-H-Tac"),
     ],

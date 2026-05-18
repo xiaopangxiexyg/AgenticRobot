@@ -35,11 +35,30 @@ if __package__ in (None, ""):
         InspireTacHandBackend,
         InspireTacHandBackendConfig,
     )
+    from inspire_data_collect.hand.dmtac_gripper_backend import (
+        DEFAULT_DMTAC_GRIPPER_PORT,
+        DEFAULT_DMTAC_GRIPPER_SPEED,
+        DEFAULT_DMTAC_GRIPPER_TORQUE,
+        DMTacGripperBackend,
+        DMTacGripperBackendConfig,
+        GRIPPER_ACTION_MAX,
+    )
+    from inspire_data_collect.hand.dexhand_q6_backend import (
+        DEXHAND_TACTILE_AXIS_ORDER,
+        DEXHAND_TACTILE_DIM,
+        DEXHAND_TACTILE_FINGER_ORDER,
+        DexHandQ6Backend,
+        DexHandQ6BackendConfig,
+    )
     from inspire_data_collect.hand.hand_mapping import (
         DEFAULT_INSPIRE_HAND_JOINT_ORDER,
         parse_tactile_regions,
     )
     from inspire_data_collect.hand.hand_source import HandQ6Source
+    from inspire_data_collect.hand.gripper_retargeter import (
+        GripperRetargeter,
+        GripperRetargeterConfig,
+    )
     from inspire_data_collect.utils.realsense_rgb import (
         RealSenseRGBCameraConfig,
         RealSenseRGBSource,
@@ -48,8 +67,13 @@ if __package__ in (None, ""):
     from inspire_data_collect.utils.camera_preview import CameraPreviewConfig, CameraPreviewer
     from inspire_data_collect.hand.retargeter import HandRetargeter, HandRetargeterConfig
     from inspire_data_collect.utils.tactile_visualizer import (
+        DexHandForceVisualizer,
+        DexHandForceVisualizerConfig,
+        DMTacForceVisualizer,
+        DMTacForceVisualizerConfig,
         TactileUVVisualizer,
         TactileVisualizerConfig,
+        dmtac_force_by_label_from_backends,
         tactile_by_side_from_backends,
     )
     from inspire_data_collect.utils.writer import (
@@ -72,8 +96,27 @@ else:
         InspireTacHandBackend,
         InspireTacHandBackendConfig,
     )
+    from .hand.dmtac_gripper_backend import (
+        DEFAULT_DMTAC_GRIPPER_PORT,
+        DEFAULT_DMTAC_GRIPPER_SPEED,
+        DEFAULT_DMTAC_GRIPPER_TORQUE,
+        DMTacGripperBackend,
+        DMTacGripperBackendConfig,
+        GRIPPER_ACTION_MAX,
+    )
+    from .hand.dexhand_q6_backend import (
+        DEXHAND_TACTILE_AXIS_ORDER,
+        DEXHAND_TACTILE_DIM,
+        DEXHAND_TACTILE_FINGER_ORDER,
+        DexHandQ6Backend,
+        DexHandQ6BackendConfig,
+    )
     from .hand.hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
     from .hand.hand_source import HandQ6Source
+    from .hand.gripper_retargeter import (
+        GripperRetargeter,
+        GripperRetargeterConfig,
+    )
     from .utils.realsense_rgb import (
         RealSenseRGBCameraConfig,
         RealSenseRGBSource,
@@ -82,8 +125,13 @@ else:
     from .utils.camera_preview import CameraPreviewConfig, CameraPreviewer
     from .hand.retargeter import HandRetargeter, HandRetargeterConfig
     from .utils.tactile_visualizer import (
+        DexHandForceVisualizer,
+        DexHandForceVisualizerConfig,
+        DMTacForceVisualizer,
+        DMTacForceVisualizerConfig,
         TactileUVVisualizer,
         TactileVisualizerConfig,
+        dmtac_force_by_label_from_backends,
         tactile_by_side_from_backends,
     )
     from .utils.writer import (
@@ -99,6 +147,26 @@ else:
 
 DEFAULT_CAMERA_CONFIG_PATH = Path(__file__).resolve().parent / "realsense.json"
 DEFAULT_DATASET_ROOT = default_dataset_root()
+DEFAULT_RECORD_HAND_FIXED_POS = (0.096, 0.057, 0.022, 0.056, 0.495, 0.0)
+DEXHAND_DEFAULT_RUNTIME_ZERO_ON_START = True
+DMTAC_DISTRIBUTED_FORCE_SHAPE = (288, 384, 3)
+DMTAC_DISTRIBUTED_FORCE_DIM = (
+    DMTAC_DISTRIBUTED_FORCE_SHAPE[0]
+    * DMTAC_DISTRIBUTED_FORCE_SHAPE[1]
+    * DMTAC_DISTRIBUTED_FORCE_SHAPE[2]
+)
+DMTAC_TACTILE_SAVE_POOL_SIZE = 2
+DMTAC_TACTILE_SAVE_POOL_STRIDE = 2
+DMTAC_DISTRIBUTED_FORCE_SAVE_SHAPE = (
+    DMTAC_DISTRIBUTED_FORCE_SHAPE[0] // DMTAC_TACTILE_SAVE_POOL_STRIDE,
+    DMTAC_DISTRIBUTED_FORCE_SHAPE[1] // DMTAC_TACTILE_SAVE_POOL_STRIDE,
+    DMTAC_DISTRIBUTED_FORCE_SHAPE[2],
+)
+DMTAC_DISTRIBUTED_FORCE_SAVE_DIM = (
+    DMTAC_DISTRIBUTED_FORCE_SAVE_SHAPE[0]
+    * DMTAC_DISTRIBUTED_FORCE_SAVE_SHAPE[1]
+    * DMTAC_DISTRIBUTED_FORCE_SAVE_SHAPE[2]
+)
 
 
 def parse_joint_order(text: str) -> tuple[int, ...]:
@@ -112,6 +180,56 @@ def parse_joint_order(text: str) -> tuple[int, ...]:
     if sorted(order) != list(range(HAND_DOF)):
         raise argparse.ArgumentTypeError("joint order must be a permutation of 0,1,2,3,4,5")
     return order
+
+
+def parse_hand_q6(text: str) -> tuple[float, ...]:
+    values = [item.strip() for item in str(text).replace("[", "").replace("]", "").split(",") if item.strip()]
+    if len(values) != HAND_DOF:
+        raise argparse.ArgumentTypeError("hand q6 must contain exactly 6 comma-separated numbers")
+    try:
+        q6 = tuple(float(item) for item in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("hand q6 values must be numbers") from exc
+    if any(value < 0.0 or value > 1.0 for value in q6):
+        raise argparse.ArgumentTypeError("hand q6 values must be in [0, 1]")
+    return q6
+
+
+def parse_tactile_ids(text: str) -> tuple[str | int, ...]:
+    values = [item.strip() for item in str(text).replace(",", " ").split() if item.strip()]
+    parsed: list[str | int] = []
+    for value in values:
+        try:
+            parsed.append(int(value))
+        except ValueError:
+            parsed.append(value)
+    return tuple(parsed)
+
+
+def normalize_tactile_ids(value: object) -> tuple[str | int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return parse_tactile_ids(value)
+    if isinstance(value, (tuple, list)):
+        parsed: list[str | int] = []
+        for item in value:
+            if isinstance(item, (tuple, list)):
+                parsed.extend(normalize_tactile_ids(item))
+            else:
+                parsed.extend(parse_tactile_ids(str(item)))
+        return tuple(parsed)
+    return parse_tactile_ids(str(value))
+
+
+def hand_runtime_zero_on_start(args: argparse.Namespace) -> bool:
+    value = getattr(args, "hand_runtime_zero_on_start", None)
+    if value is None:
+        return (
+            str(getattr(args, "collect_mode", "inspire_hand")) == "dexhand_q6"
+            and bool(DEXHAND_DEFAULT_RUNTIME_ZERO_ON_START)
+        )
+    return bool(value)
 
 
 class NonBlockingKeyboard:
@@ -204,6 +322,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task-description", type=str, default="")
     parser.add_argument("--dataset-name", type=str, default="")
     parser.add_argument("--active-sides", type=parse_active_sides, default=ALL_SIDES)
+    parser.add_argument(
+        "--collect-mode",
+        choices=["inspire_hand", "gripper", "dexhand_q6"],
+        default="inspire_hand",
+        help=(
+            "Effector collection mode. 'gripper' uses the DMTAC gripper backend "
+            "and maps one configurable exo hand q6 dim to gripper close/open. "
+            "'dexhand_q6' controls one left DexHand hardware hand while still saving "
+            "into the right-hand dataset slot."
+        ),
+    )
 
     parser.add_argument(
         "--enable-arm",
@@ -261,8 +390,51 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default="",
         help="Optional fixed exoskeleton hand zero-pose calibration JSON path.",
     )
+    parser.add_argument(
+        "--hand-runtime-zero-on-start",
+        dest="hand_runtime_zero_on_start",
+        action="store_true",
+        default=None,
+        help=(
+            "Use the current open hand pose as the q6 zero on startup. "
+            "Default is enabled for --collect-mode dexhand_q6 and disabled otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--hand-no-runtime-zero-on-start",
+        dest="hand_runtime_zero_on_start",
+        action="store_false",
+        help="Use the fixed exoskeleton hand calibration JSON instead of startup runtime zero.",
+    )
+    parser.add_argument(
+        "--hand-runtime-zero-scale",
+        choices=["absolute", "signed"],
+        default="absolute",
+        help=(
+            "Runtime zero scaling. 'absolute' treats motion away from the open zero "
+            "as closing; 'signed' uses the side-specific calibration sign."
+        ),
+    )
+    parser.add_argument("--hand-runtime-zero-max-samples", type=int, default=200)
+    parser.add_argument("--hand-runtime-zero-min-samples", type=int, default=30)
+    parser.add_argument("--hand-runtime-zero-stable-window", type=int, default=20)
+    parser.add_argument("--hand-runtime-zero-stable-eps", type=float, default=0.5)
     parser.add_argument("--show-hand-raw-lines", action="store_true")
     parser.add_argument("--allow-hand-connect-failure", action="store_true")
+    parser.add_argument(
+        "--record-hand-only",
+        action="store_true",
+        help="Record Inspire hand action/state/tactile without sending hand commands.",
+    )
+    parser.add_argument(
+        "--record-hand-fixed-pos",
+        type=parse_hand_q6,
+        default=DEFAULT_RECORD_HAND_FIXED_POS,
+        help=(
+            "Fixed Inspire hand q6 applied at startup and after saved episodes in "
+            "--record-hand-only mode."
+        ),
+    )
 
     parser.add_argument(
         "--hand-joint-order",
@@ -296,6 +468,65 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
         help="Max force value written to every InspireTac finger on startup.",
     )
+
+    parser.add_argument("--gripper-port", type=str, default=DEFAULT_DMTAC_GRIPPER_PORT)
+    parser.add_argument("--gripper-id", type=int, default=1)
+    parser.add_argument("--gripper-baudrate", type=int, default=115200)
+    parser.add_argument("--gripper-timeout", type=float, default=0.03)
+    parser.add_argument("--gripper-max-open-mm", type=float, default=70.0)
+    parser.add_argument(
+        "--gripper-max-action",
+        type=float,
+        default=GRIPPER_ACTION_MAX,
+        help=f"Hard upper limit for gripper joint_pos commands. Must be <= {GRIPPER_ACTION_MAX}.",
+    )
+    parser.add_argument("--gripper-speed", type=float, default=DEFAULT_DMTAC_GRIPPER_SPEED)
+    parser.add_argument("--gripper-torque", type=float, default=DEFAULT_DMTAC_GRIPPER_TORQUE)
+    parser.add_argument("--gripper-send-threshold", type=float, default=0.002)
+    parser.add_argument("--gripper-continuous", action="store_true")
+    parser.add_argument("--gripper-open-on-start", action="store_true")
+    parser.add_argument("--no-gripper-clear-fault", dest="gripper_clear_fault", action="store_false", default=True)
+    parser.add_argument("--gripper-exo-dim", type=int, default=1)
+    parser.add_argument("--gripper-output-dim", type=int, default=1)
+    parser.add_argument("--gripper-invert", dest="gripper_invert", action="store_true", default=False)
+    parser.add_argument("--gripper-no-invert", dest="gripper_invert", action="store_false")
+    parser.add_argument("--gripper-command-alpha", type=float, default=1.0)
+    parser.add_argument("--gripper-no-hardware", dest="gripper_connect_hardware", action="store_false", default=True)
+    parser.add_argument("--gripper-no-tactile", dest="gripper_connect_tactile", action="store_false", default=True)
+    parser.add_argument("--gripper-tactile-ids", nargs="*", type=parse_tactile_ids, default=())
+    parser.add_argument("--gripper-tactile-backend", choices=["cpu", "cuda", "Flux", "flux"], default="cpu")
+    parser.add_argument("--gripper-tactile-mode", choices=["standard", "high"], default="standard")
+    parser.add_argument("--gripper-tactile-max-fps", type=int, default=120)
+    parser.add_argument("--gripper-tactile-timeout-ms", type=int, default=100)
+    parser.add_argument("--gripper-tactile-ready-timeout-s", type=float, default=10.0)
+    parser.add_argument("--gripper-tactile-reset-on-start", action="store_true")
+    parser.add_argument("--gripper-tactile-warmup-frames", type=int, default=30)
+    parser.add_argument("--gripper-tactile-no-denoise", dest="gripper_tactile_denoise", action="store_false", default=True)
+    parser.add_argument(
+        "--gripper-tactile-denoise-mode",
+        choices=["delta", "absolute", "frame_delta"],
+        default="delta",
+    )
+    parser.add_argument("--gripper-tactile-baseline-frames", type=int, default=20)
+    parser.add_argument("--gripper-tactile-deadband-abs", type=float, default=5e-5)
+    parser.add_argument("--gripper-tactile-temporal-alpha", type=float, default=0.35)
+    parser.add_argument("--gripper-tactile-spatial-blur-ksize", type=int, default=5)
+
+    parser.add_argument(
+        "--dexhand-hardware-hand",
+        choices=["left", "right"],
+        default="left",
+        help="Physical DexHand side connected to the controller. Current supported dataset mapping expects left hardware.",
+    )
+    parser.add_argument("--dexhand-device-type", choices=["auto", "config", "100U", "200U"], default="auto")
+    parser.add_argument("--dexhand-device-index", type=int, default=0)
+    parser.add_argument("--dexhand-tactile-period-ms", type=int, default=20)
+    parser.add_argument("--dexhand-send-threshold", type=float, default=0.002)
+    parser.add_argument("--dexhand-command-alpha", type=float, default=1.0)
+    parser.add_argument("--dexhand-no-hardware", dest="dexhand_connect_hardware", action="store_false", default=True)
+    parser.add_argument("--dexhand-mock", action="store_true")
+    parser.add_argument("--no-dexhand-clear-errors-on-start", dest="dexhand_clear_errors_on_start", action="store_false", default=True)
+    parser.add_argument("--no-dexhand-clear-errors-on-fault", dest="dexhand_clear_errors_on_fault", action="store_false", default=True)
 
     parser.add_argument("--hz", type=float, default=30.0, help="Main control loop rate")
     parser.add_argument("--minimum-control-hz", type=float, default=0.0)
@@ -372,6 +603,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "Empty selects 'front' if present, otherwise the first configured camera."
         ),
     )
+    parser.add_argument(
+        "--vis-cam-window-mode",
+        choices=["resizable", "autosize"],
+        default="resizable",
+        help="'resizable' lets the camera preview window be resized by dragging.",
+    )
+    parser.add_argument(
+        "--vis-cam-render-scale",
+        type=float,
+        default=2.0,
+        help="Upscale the camera preview backing image in resizable mode.",
+    )
 
     parser.add_argument("--writer-workers", type=int, default=2)
     parser.add_argument("--writer-queue-size", type=int, default=256)
@@ -386,6 +629,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--visualize-tactile", action="store_true")
     parser.add_argument("--tactile-vis-value-scale", type=float, default=0.02)
     parser.add_argument("--tactile-vis-size", type=int, default=640)
+    parser.add_argument(
+        "--tactile-vis-render-scale",
+        type=float,
+        default=2.0,
+        help="Upscale the tactile preview backing image in resizable mode.",
+    )
     parser.add_argument(
         "--tactile-vis-window-mode",
         choices=["resizable", "autosize"],
@@ -409,6 +658,16 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--hand-telemetry-hz must be positive.")
     if int(args.max_fingertip_force) < 0:
         raise ValueError("--inspire-hand-max-force/--max-force must be non-negative.")
+    if int(args.hand_runtime_zero_max_samples) <= 0:
+        raise ValueError("--hand-runtime-zero-max-samples must be positive.")
+    if int(args.hand_runtime_zero_min_samples) <= 0:
+        raise ValueError("--hand-runtime-zero-min-samples must be positive.")
+    if int(args.hand_runtime_zero_stable_window) <= 0:
+        raise ValueError("--hand-runtime-zero-stable-window must be positive.")
+    if float(args.hand_runtime_zero_stable_eps) <= 0.0:
+        raise ValueError("--hand-runtime-zero-stable-eps must be positive.")
+    if int(args.hand_runtime_zero_min_samples) > int(args.hand_runtime_zero_max_samples):
+        raise ValueError("--hand-runtime-zero-min-samples cannot exceed --hand-runtime-zero-max-samples.")
     parse_tactile_regions(args.hand_tactile_regions)
     if args.enable_arm:
         if int(args.exo_baudrate) <= 0:
@@ -445,14 +704,86 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
             raise ValueError("--camera-keep-last must be positive.")
         if float(args.camera_stale_after_sec) <= 0.0:
             raise ValueError("--camera-stale-after-sec must be positive.")
+        if float(args.vis_cam_render_scale) <= 0.0:
+            raise ValueError("--vis-cam-render-scale must be positive.")
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
+    if float(args.tactile_vis_render_scale) <= 0.0:
+        raise ValueError("--tactile-vis-render-scale must be positive.")
     for side in active_sides:
         if not getattr(args, f"{side}_hand_port"):
             raise ValueError(f"--{side}-hand-port is required for active side '{side}'.")
-        if args.visualize_tactile and not getattr(args, f"{side}_hand_ip"):
+        if (
+            str(args.collect_mode) == "inspire_hand"
+            and args.visualize_tactile
+            and not getattr(args, f"{side}_hand_ip")
+        ):
             raise ValueError(
                 f"--{side}-hand-ip is required for tactile visualization on side '{side}'."
+            )
+    if str(args.collect_mode) == "gripper":
+        if len(active_sides) != 1:
+            raise ValueError("--collect-mode gripper requires exactly one active side.")
+        if int(args.gripper_id) <= 0:
+            raise ValueError("--gripper-id must be positive.")
+        if int(args.gripper_baudrate) <= 0:
+            raise ValueError("--gripper-baudrate must be positive.")
+        if float(args.gripper_timeout) <= 0.0:
+            raise ValueError("--gripper-timeout must be positive.")
+        if float(args.gripper_max_open_mm) <= 0.0:
+            raise ValueError("--gripper-max-open-mm must be positive.")
+        if not 0.0 <= float(args.gripper_max_action) <= GRIPPER_ACTION_MAX:
+            raise ValueError(f"--gripper-max-action must be in [0, {GRIPPER_ACTION_MAX}].")
+        if not 0.0 <= float(args.gripper_speed) <= 1.0:
+            raise ValueError("--gripper-speed must be in [0, 1].")
+        if not 0.0 <= float(args.gripper_torque) <= 1.0:
+            raise ValueError("--gripper-torque must be in [0, 1].")
+        if float(args.gripper_send_threshold) < 0.0:
+            raise ValueError("--gripper-send-threshold must be non-negative.")
+        if not 0 <= int(args.gripper_exo_dim) < HAND_DOF:
+            raise ValueError("--gripper-exo-dim must be in [0, 5].")
+        if not 0 <= int(args.gripper_output_dim) < HAND_DOF:
+            raise ValueError("--gripper-output-dim must be in [0, 5].")
+        if int(args.gripper_output_dim) != 1:
+            raise ValueError(
+                "--collect-mode gripper currently stores gripper action only in "
+                "--gripper-output-dim 1."
+            )
+        if not 0.0 < float(args.gripper_command_alpha) <= 1.0:
+            raise ValueError("--gripper-command-alpha must be in (0, 1].")
+        if bool(args.gripper_connect_hardware) and not str(args.gripper_port):
+            raise ValueError("--gripper-port is required in --collect-mode gripper.")
+        if int(args.gripper_tactile_max_fps) <= 0:
+            raise ValueError("--gripper-tactile-max-fps must be positive.")
+        if int(args.gripper_tactile_timeout_ms) <= 0:
+            raise ValueError("--gripper-tactile-timeout-ms must be positive.")
+        if float(args.gripper_tactile_ready_timeout_s) <= 0.0:
+            raise ValueError("--gripper-tactile-ready-timeout-s must be positive.")
+        if int(args.gripper_tactile_warmup_frames) < 0:
+            raise ValueError("--gripper-tactile-warmup-frames must be non-negative.")
+        if int(args.gripper_tactile_baseline_frames) <= 0:
+            raise ValueError("--gripper-tactile-baseline-frames must be positive.")
+        if float(args.gripper_tactile_deadband_abs) < 0.0:
+            raise ValueError("--gripper-tactile-deadband-abs must be non-negative.")
+        if not 0.0 <= float(args.gripper_tactile_temporal_alpha) <= 1.0:
+            raise ValueError("--gripper-tactile-temporal-alpha must be in [0, 1].")
+        if int(args.gripper_tactile_spatial_blur_ksize) < 0:
+            raise ValueError("--gripper-tactile-spatial-blur-ksize must be non-negative.")
+    if str(args.collect_mode) == "dexhand_q6":
+        if active_sides != ("right",):
+            raise ValueError("--collect-mode dexhand_q6 currently requires --active-sides right.")
+        if str(args.dexhand_hardware_hand) != "left":
+            raise ValueError("--collect-mode dexhand_q6 currently only supports --dexhand-hardware-hand left.")
+        if int(args.dexhand_tactile_period_ms) < 0:
+            raise ValueError("--dexhand-tactile-period-ms must be non-negative.")
+        if float(args.dexhand_send_threshold) < 0.0:
+            raise ValueError("--dexhand-send-threshold must be non-negative.")
+        if not 0.0 < float(args.dexhand_command_alpha) <= 1.0:
+            raise ValueError("--dexhand-command-alpha must be in (0, 1].")
+        if bool(args.visualize_tactile):
+            raise ValueError(
+                "--visualize-tactile is not wired into the collection UI for dexhand_q6 yet; "
+                "use hardware/portable_dexhand021/tactile_viewer.py during debugging."
             )
     return active_sides
 
@@ -460,7 +791,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
 def build_components(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
-) -> tuple[HandQ6Source, dict[str, HandRetargeter], dict[str, InspireTacHandBackend]]:
+) -> tuple[HandQ6Source, dict[str, Any], dict[str, Any]]:
+    collect_mode = str(getattr(args, "collect_mode", "inspire_hand"))
     source = HandQ6Source.from_ports(
         left_port=args.left_hand_port if "left" in active_sides else None,
         right_port=args.right_hand_port if "right" in active_sides else None,
@@ -469,12 +801,105 @@ def build_components(
         show_raw_lines=bool(args.show_hand_raw_lines),
         exo_hand_calibration=bool(args.exo_hand_calibration),
         calibration_path=str(args.exo_hand_calibration_path or "") or None,
+        runtime_zero_on_start=hand_runtime_zero_on_start(args),
+        runtime_zero_scale=str(getattr(args, "hand_runtime_zero_scale", "absolute")),
+        runtime_zero_max_samples=int(getattr(args, "hand_runtime_zero_max_samples", 200)),
+        runtime_zero_min_samples=int(getattr(args, "hand_runtime_zero_min_samples", 30)),
+        runtime_zero_stable_window=int(getattr(args, "hand_runtime_zero_stable_window", 20)),
+        runtime_zero_stable_eps=float(getattr(args, "hand_runtime_zero_stable_eps", 0.5)),
         critical=True,
         silent_status=bool(args.silent),
     )
 
-    retargeters: dict[str, HandRetargeter] = {}
-    backends: dict[str, InspireTacHandBackend] = {}
+    retargeters: dict[str, Any] = {}
+    backends: dict[str, Any] = {}
+    if collect_mode == "gripper":
+        side = active_sides[0]
+        effector_name = f"{side}_hand"
+        retargeters[side] = GripperRetargeter(
+            GripperRetargeterConfig(
+                side=side,
+                input_channel_name=f"{side}_hand_q6",
+                effector_name=effector_name,
+                source_dim=int(args.gripper_exo_dim),
+                output_dim=int(args.gripper_output_dim),
+                invert=bool(args.gripper_invert),
+                alpha=float(args.gripper_command_alpha),
+                output_max=float(args.gripper_max_action),
+            )
+        )
+        backends[side] = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side=side,
+                effector_name=effector_name,
+                gripper_port=str(args.gripper_port),
+                gripper_id=int(args.gripper_id),
+                gripper_baudrate=int(args.gripper_baudrate),
+                gripper_timeout=float(args.gripper_timeout),
+                max_open_mm=float(args.gripper_max_open_mm),
+                connect_hardware=bool(args.gripper_connect_hardware),
+                send_commands=not bool(args.record_hand_only),
+                send_threshold=float(args.gripper_send_threshold),
+                max_action=float(args.gripper_max_action),
+                speed=float(args.gripper_speed),
+                torque=float(args.gripper_torque),
+                continuous_grasp=bool(args.gripper_continuous),
+                clear_fault_on_start=bool(args.gripper_clear_fault),
+                open_on_start=bool(args.gripper_open_on_start),
+                enable_telemetry=bool(args.gripper_connect_hardware)
+                or bool(args.gripper_connect_tactile),
+                telemetry_hz=float(args.hand_telemetry_hz),
+                connect_tactile=bool(args.gripper_connect_tactile),
+                tactile_ids=tuple(args.gripper_tactile_ids),
+                tactile_backend=str(args.gripper_tactile_backend),
+                tactile_mode=str(args.gripper_tactile_mode),
+                tactile_max_fps=int(args.gripper_tactile_max_fps),
+                tactile_timeout_ms=int(args.gripper_tactile_timeout_ms),
+                tactile_ready_timeout_s=float(args.gripper_tactile_ready_timeout_s),
+                tactile_reset_on_start=bool(args.gripper_tactile_reset_on_start),
+                tactile_warmup_frames=int(args.gripper_tactile_warmup_frames),
+                tactile_denoise=bool(args.gripper_tactile_denoise),
+                tactile_denoise_mode=str(args.gripper_tactile_denoise_mode),
+                tactile_baseline_frames=int(args.gripper_tactile_baseline_frames),
+                tactile_deadband_abs=float(args.gripper_tactile_deadband_abs),
+                tactile_temporal_alpha=float(args.gripper_tactile_temporal_alpha),
+                tactile_spatial_blur_ksize=int(args.gripper_tactile_spatial_blur_ksize),
+            )
+        )
+        return source, retargeters, backends
+    if collect_mode == "dexhand_q6":
+        side = "right"
+        effector_name = f"{side}_hand"
+        retargeters[side] = HandRetargeter(
+            HandRetargeterConfig(
+                side=side,
+                input_channel_name=f"{side}_hand_q6",
+                effector_name=effector_name,
+                joint_order=(0, 1, 2, 3, 4, 5),
+                invert=False,
+                alpha=float(args.dexhand_command_alpha),
+            )
+        )
+        backends[side] = DexHandQ6Backend(
+            DexHandQ6BackendConfig(
+                side=side,
+                hardware_hand=str(args.dexhand_hardware_hand),
+                effector_name=effector_name,
+                connect_hardware=bool(args.dexhand_connect_hardware),
+                send_commands=not bool(args.record_hand_only),
+                send_threshold=float(args.dexhand_send_threshold),
+                enable_telemetry=bool(args.dexhand_connect_hardware),
+                telemetry_hz=float(args.hand_telemetry_hz),
+                device_type=str(args.dexhand_device_type),
+                device_index=int(args.dexhand_device_index),
+                tactile_period_ms=int(args.dexhand_tactile_period_ms),
+                mock=bool(args.dexhand_mock),
+                clear_errors_on_start=bool(args.dexhand_clear_errors_on_start),
+                clear_errors_on_fault=bool(args.dexhand_clear_errors_on_fault),
+            )
+        )
+        return source, retargeters, backends
+
     tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
     for side in active_sides:
         effector_name = f"{side}_hand"
@@ -496,6 +921,7 @@ def build_components(
                 side=side,
                 effector_name=effector_name,
                 connect_hardware=bool(hand_ip),
+                send_commands=not bool(args.record_hand_only),
                 max_fingertip_force=int(args.max_fingertip_force),
                 send_threshold=float(args.hand_send_threshold),
                 enable_telemetry=bool(hand_ip),
@@ -595,7 +1021,7 @@ def select_preview_camera_sources(
     return {selected_key: camera_sources[selected_key]}
 
 
-def hand_state_snapshot(backends: dict[str, InspireTacHandBackend]) -> dict[str, dict[str, Any]]:
+def hand_state_snapshot(backends: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {side: backend.get_state() for side, backend in backends.items()}
 
 
@@ -603,6 +1029,24 @@ def arm_state_snapshot(backend: FR3ArmBackend | None) -> dict[str, Any]:
     if backend is None:
         return {}
     return backend.get_state()
+
+
+def apply_record_hand_fixed_pos(
+    backends: dict[str, Any],
+    fixed_pos: tuple[float, ...],
+    *,
+    reason: str,
+) -> None:
+    target = tuple(float(value) for value in fixed_pos)
+    for side, backend in backends.items():
+        before_error = backend.get_state().get("telemetry_error")
+        backend.send_fixed_joint_pos(target)
+        after_state = backend.get_state()
+        after_error = after_state.get("telemetry_error")
+        if after_error and after_error != before_error:
+            print(f"[Hand] fixed pos {reason} failed for {side}: {after_error}")
+        elif after_state.get("last_sent_command_timestamp") is not None:
+            print(f"[Hand] fixed pos {reason} applied for {side}: {list(target)}")
 
 
 def collect_faults(
@@ -725,12 +1169,24 @@ def camera_state_signature_text(
     return tuple(signature_parts), "camera=" + ";".join(text_parts)
 
 
+def collect_mode_tactile_dim(args: argparse.Namespace) -> int:
+    if str(args.collect_mode) == "gripper":
+        if not bool(args.gripper_connect_tactile):
+            return 0
+        tactile_count = len(tuple(args.gripper_tactile_ids)) or 2
+        return int(tactile_count * DMTAC_DISTRIBUTED_FORCE_SAVE_DIM)
+    if str(args.collect_mode) == "dexhand_q6":
+        return int(DEXHAND_TACTILE_DIM)
+    return 1062
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspire Tac collection with optional single-arm FR3 teleoperation."
     )
     add_args(parser)
     args = parser.parse_args(argv)
+    args.gripper_tactile_ids = normalize_tactile_ids(args.gripper_tactile_ids)
     active_sides = validate_args(args)
     dataset_root, task_name, task_id, task_description, dataset_name = resolve_collection_layout(args)
     camera_sources = build_camera_sources(args)
@@ -740,7 +1196,12 @@ def main(argv: list[str] | None = None) -> int:
         else {}
     )
     camera_previewer = (
-        CameraPreviewer(CameraPreviewConfig())
+        CameraPreviewer(
+            CameraPreviewConfig(
+                resizable_window=str(args.vis_cam_window_mode) == "resizable",
+                render_scale=float(args.vis_cam_render_scale),
+            )
+        )
         if bool(args.vis_cam) and preview_camera_sources
         else None
     )
@@ -758,6 +1219,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset_name=str(dataset_name),
             write_parquet=bool(args.write_parquet),
             write_video=bool(args.write_video and camera_sources),
+            hand_tactile_dim=collect_mode_tactile_dim(args),
         )
     )
     writer_pool = AsyncWriterPool(
@@ -778,18 +1240,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     source, retargeters, backends = build_components(args, active_sides)
     arm_source, arm_retargeter, arm_backend = build_arm_components(args)
-    visualizer = (
-        TactileUVVisualizer(
-            TactileVisualizerConfig(
-                enabled_sides=active_sides,
-                image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
-                value_scale=float(args.tactile_vis_value_scale),
-                resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+    visualizer = None
+    if args.visualize_tactile:
+        if str(args.collect_mode) == "gripper":
+            visualizer = DMTacForceVisualizer(
+                DMTacForceVisualizerConfig(
+                    enabled_sides=active_sides,
+                    value_scale=float(args.tactile_vis_value_scale),
+                    resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                    render_scale=float(args.tactile_vis_render_scale),
+                )
             )
-        )
-        if args.visualize_tactile
-        else None
-    )
+        elif str(args.collect_mode) == "dexhand_q6":
+            visualizer = DexHandForceVisualizer(
+                DexHandForceVisualizerConfig(
+                    enabled_sides=active_sides,
+                    image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+                    value_scale=float(args.tactile_vis_value_scale),
+                    resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                    render_scale=float(args.tactile_vis_render_scale),
+                )
+            )
+        else:
+            visualizer = TactileUVVisualizer(
+                TactileVisualizerConfig(
+                    enabled_sides=active_sides,
+                    image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
+                    value_scale=float(args.tactile_vis_value_scale),
+                    resizable_window=str(args.tactile_vis_window_mode) == "resizable",
+                    render_scale=float(args.tactile_vis_render_scale),
+                )
+            )
 
     current_episode: int | None = None
     recording = False
@@ -807,22 +1288,34 @@ def main(argv: list[str] | None = None) -> int:
             "task_name": task_name,
             "task_id": task_id,
             "task_description": task_description,
+            "collect_mode": str(args.collect_mode),
             "active_sides": list(active_sides),
             "reserved_single_arm_dof": ARM_DOF,
             "action_dim": ACTION_DIM,
             "hand_dof_per_side": HAND_DOF,
             "hand_vector_order": list(HAND_VECTOR_ORDER),
-            "joint_order": list(args.hand_joint_order),
+            "joint_order": list(args.hand_joint_order)
+            if str(args.collect_mode) != "dexhand_q6"
+            else [0, 1, 2, 3, 4, 5],
             "max_fingertip_force": int(args.max_fingertip_force),
-            "hand_invert": bool(args.hand_invert),
+            "hand_invert": bool(args.hand_invert)
+            if str(args.collect_mode) != "dexhand_q6"
+            else False,
             "exo_hand_calibration": bool(args.exo_hand_calibration),
             "exo_hand_calibration_path": args.exo_hand_calibration_path or None,
+            "hand_runtime_zero_on_start": hand_runtime_zero_on_start(args),
+            "hand_runtime_zero_scale": str(args.hand_runtime_zero_scale),
             "tactile_regions": list(parse_tactile_regions(args.hand_tactile_regions)),
+            "record_hand_fixed_pos": list(args.record_hand_fixed_pos),
             "camera_mode": str(args.camera_mode),
             "camera_keys": sorted(camera_sources),
             "vis_cam": bool(args.vis_cam),
             "vis_camera_keys": sorted(preview_camera_sources),
+            "vis_cam_window_mode": str(args.vis_cam_window_mode),
+            "vis_cam_render_scale": float(args.vis_cam_render_scale),
+            "tactile_vis_render_scale": float(args.tactile_vis_render_scale),
             "silent": bool(args.silent),
+            "record_hand_only": bool(args.record_hand_only),
             "camera_config_path": None
             if args.camera_mode == "none" or args.camera_serial
             else str(args.camera_config),
@@ -843,6 +1336,76 @@ def main(argv: list[str] | None = None) -> int:
             "fr3_host": None if arm_backend is None else arm_backend.device_info().get("host"),
             "fr3_port": None if arm_backend is None else arm_backend.device_info().get("port"),
         }
+        if str(args.collect_mode) == "gripper":
+            metadata.update(
+                {
+                    "gripper_port": str(args.gripper_port),
+                    "gripper_id": int(args.gripper_id),
+                    "gripper_baudrate": int(args.gripper_baudrate),
+                    "gripper_max_open_mm": float(args.gripper_max_open_mm),
+                    "gripper_max_action": float(args.gripper_max_action),
+                    "gripper_speed": float(args.gripper_speed),
+                    "gripper_torque": float(args.gripper_torque),
+                    "gripper_continuous": bool(args.gripper_continuous),
+                    "gripper_connect_hardware": bool(args.gripper_connect_hardware),
+                    "gripper_exo_dim": int(args.gripper_exo_dim),
+                    "gripper_output_dim": int(args.gripper_output_dim),
+                    "gripper_invert": bool(args.gripper_invert),
+                    "gripper_command_alpha": float(args.gripper_command_alpha),
+                    "gripper_tactile_source": "DMTAC getDistributeForce",
+                    "gripper_tactile_shape_per_sensor": list(DMTAC_DISTRIBUTED_FORCE_SHAPE),
+                    "gripper_tactile_saved_shape_per_sensor": list(
+                        DMTAC_DISTRIBUTED_FORCE_SAVE_SHAPE
+                    ),
+                    "gripper_tactile_save_pooling": {
+                        "type": "mean",
+                        "kernel_size": [
+                            DMTAC_TACTILE_SAVE_POOL_SIZE,
+                            DMTAC_TACTILE_SAVE_POOL_SIZE,
+                        ],
+                        "stride": [
+                            DMTAC_TACTILE_SAVE_POOL_STRIDE,
+                            DMTAC_TACTILE_SAVE_POOL_STRIDE,
+                        ],
+                    },
+                    "gripper_tactile_ids": list(args.gripper_tactile_ids),
+                    "gripper_tactile_backend": str(args.gripper_tactile_backend),
+                    "gripper_tactile_mode": str(args.gripper_tactile_mode),
+                    "gripper_tactile_max_fps": int(args.gripper_tactile_max_fps),
+                    "gripper_tactile_denoise": bool(args.gripper_tactile_denoise),
+                    "gripper_tactile_denoise_mode": str(args.gripper_tactile_denoise_mode),
+                    "gripper_tactile_dim": collect_mode_tactile_dim(args),
+                }
+            )
+        elif str(args.collect_mode) == "dexhand_q6":
+            metadata.update(
+                {
+                    "logical_hand_side": "right",
+                    "hardware_hand_side": str(args.dexhand_hardware_hand),
+                    "dexhand_device_type": str(args.dexhand_device_type),
+                    "dexhand_device_index": int(args.dexhand_device_index),
+                    "dexhand_tactile_period_ms": int(args.dexhand_tactile_period_ms),
+                    "dexhand_connect_hardware": bool(args.dexhand_connect_hardware),
+                    "dexhand_mock": bool(args.dexhand_mock),
+                    "dexhand_q6_order": [
+                        "thumb_flex",
+                        "thumb_yaw",
+                        "index",
+                        "middle",
+                        "ring",
+                        "pinky",
+                    ],
+                    "dexhand_joint_feedback_saved_as_q6": True,
+                    "dexhand_q6_inversion_note": (
+                        "thumb uses th_dip/th_mcp average; each four-finger q6 uses "
+                        "DIP and MCP/ratio estimates averaged when both are available."
+                    ),
+                    "dexhand_tactile_format": "fingertip_xyz",
+                    "dexhand_tactile_fingers": list(DEXHAND_TACTILE_FINGER_ORDER),
+                    "dexhand_tactile_axes": list(DEXHAND_TACTILE_AXIS_ORDER),
+                    "dexhand_tactile_dim": int(DEXHAND_TACTILE_DIM),
+                }
+            )
         current_episode = writer.start_episode(metadata=metadata)
         sample_builder.set_episode(current_episode)
         recording = True
@@ -871,6 +1434,12 @@ def main(argv: list[str] | None = None) -> int:
                 writer_pool.submit(job)
             writer_pool.join()
             print(f"  已保存片段 Episode saved {episode_index}")
+            if bool(args.record_hand_only):
+                apply_record_hand_fixed_pos(
+                    backends,
+                    tuple(args.record_hand_fixed_pos),
+                    reason="after_save",
+                )
         else:
             writer.discard_episode(episode_index)
             print(f"  丢弃片段 Discarding episode {episode_index}")
@@ -907,6 +1476,12 @@ def main(argv: list[str] | None = None) -> int:
             backend.start()
             if not backend.is_ready() and not args.allow_hand_connect_failure:
                 raise RuntimeError(f"{side} hand backend is not ready: {backend.get_state()}")
+        if bool(args.record_hand_only):
+            apply_record_hand_fixed_pos(
+                backends,
+                tuple(args.record_hand_fixed_pos),
+                reason="startup",
+            )
         if arm_backend is not None:
             arm_backend.start()
             if not arm_backend.is_ready():
@@ -929,8 +1504,95 @@ def main(argv: list[str] | None = None) -> int:
             writer.write_device_config("arm_exo", arm_source.device_info())
         if arm_backend is not None:
             writer.write_device_config("fr3", arm_backend.device_info())
+        if str(args.collect_mode) == "gripper":
+            writer.write_device_config(
+                "dmtac_gripper",
+                {
+                    side: {
+                        "backend_type": "dmtac_gripper",
+                        "side": side,
+                        "effector_name": f"{side}_hand",
+                        "gripper_port": str(args.gripper_port),
+                        "gripper_id": int(args.gripper_id),
+                        "gripper_baudrate": int(args.gripper_baudrate),
+                        "gripper_max_open_mm": float(args.gripper_max_open_mm),
+                        "gripper_max_action": float(args.gripper_max_action),
+                        "connect_hardware": bool(args.gripper_connect_hardware),
+                        "connect_tactile": bool(args.gripper_connect_tactile),
+                        "tactile_ids": list(args.gripper_tactile_ids),
+                        "tactile_backend": str(args.gripper_tactile_backend),
+                        "tactile_mode": str(args.gripper_tactile_mode),
+                        "tactile_fields": ["distributed_force"],
+                        "tactile_getter": "getDistributeForce",
+                        "tactile_raw_shape_per_sensor": list(DMTAC_DISTRIBUTED_FORCE_SHAPE),
+                        "tactile_saved_shape_per_sensor": list(DMTAC_DISTRIBUTED_FORCE_SAVE_SHAPE),
+                        "tactile_save_pooling": {
+                            "type": "mean",
+                            "kernel_size": [
+                                DMTAC_TACTILE_SAVE_POOL_SIZE,
+                                DMTAC_TACTILE_SAVE_POOL_SIZE,
+                            ],
+                            "stride": [
+                                DMTAC_TACTILE_SAVE_POOL_STRIDE,
+                                DMTAC_TACTILE_SAVE_POOL_STRIDE,
+                            ],
+                        },
+                    }
+                    for side in active_sides
+                },
+            )
+        elif str(args.collect_mode) == "dexhand_q6":
+            writer.write_device_config(
+                "dexhand_q6",
+                {
+                    "right": {
+                        "backend_type": "dexhand_q6",
+                        "logical_side": "right",
+                        "hardware_hand": str(args.dexhand_hardware_hand),
+                        "device_type": str(args.dexhand_device_type),
+                        "device_index": int(args.dexhand_device_index),
+                        "tactile_period_ms": int(args.dexhand_tactile_period_ms),
+                        "connect_hardware": bool(args.dexhand_connect_hardware),
+                        "mock": bool(args.dexhand_mock),
+                        "tactile_dim": int(DEXHAND_TACTILE_DIM),
+                        "tactile_fingers": list(DEXHAND_TACTILE_FINGER_ORDER),
+                        "tactile_axes": list(DEXHAND_TACTILE_AXIS_ORDER),
+                        "saved_q6_order": [
+                            "thumb_flex",
+                            "thumb_yaw",
+                            "index",
+                            "middle",
+                            "ring",
+                            "pinky",
+                        ],
+                    }
+                },
+            )
         print(f"数据集目录 / Dataset directory: {dataset_root}")
         print(f"任务名称 / Task name: {task_name}")
+        if str(args.collect_mode) == "gripper":
+            print(
+                "[Gripper] collect mode active: "
+                f"side={active_sides[0]}, port={args.gripper_port}, "
+                f"exo_dim={args.gripper_exo_dim}, output_dim={args.gripper_output_dim}, "
+                f"max_action={float(args.gripper_max_action):.3f}, "
+                f"tactile={'on' if args.gripper_connect_tactile else 'off'}"
+            )
+        elif str(args.collect_mode) == "dexhand_q6":
+            print(
+                "[DexHand] collect mode active: "
+                "dataset_slot=right hardware_hand="
+                f"{args.dexhand_hardware_hand}, device_type={args.dexhand_device_type}, "
+                f"tactile_dim={int(DEXHAND_TACTILE_DIM)}, "
+                f"runtime_zero={hand_runtime_zero_on_start(args)}:"
+                f"{args.hand_runtime_zero_scale}"
+            )
+        if bool(args.record_hand_only):
+            print(
+                "[Hand] record-only mode active: live teleop hand following is disabled; "
+                "hand commands will not be sent except the startup/after-save fixed pose. "
+                f"fixed_pos={list(args.record_hand_fixed_pos)}"
+            )
         if args.enable_arm:
             print(
                 "单臂 FR3 随动 / Single-arm FR3 follow: "
@@ -992,9 +1654,14 @@ def main(argv: list[str] | None = None) -> int:
                     last_fault_signature = current_fault_signature
 
                 if visualizer is not None:
-                    visualizer.update(
-                        tactile_by_side_from_backends(active_sides, backends.get)
-                    )
+                    if str(args.collect_mode) == "gripper":
+                        visualizer.update(
+                            dmtac_force_by_label_from_backends(active_sides, backends.get)
+                        )
+                    else:
+                        visualizer.update(
+                            tactile_by_side_from_backends(active_sides, backends.get)
+                        )
                 if camera_previewer is not None:
                     camera_previewer.update(preview_camera_sources)
 

@@ -363,6 +363,55 @@ def tactile_to_351(value: Any, side: str) -> np.ndarray:
     return out[0] if squeeze else out.reshape(arr.shape[:-1] + (351,))
 
 
+def tactile_to_dmtac_history_frame(value: Any) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((2, 3, 144, 192), dtype=np.float32)
+    if arr.ndim == 1 and arr.shape[0] in (
+        144 * 192 * 3,
+        2 * 144 * 192 * 3,
+        288 * 384 * 3,
+        2 * 288 * 384 * 3,
+    ):
+        if arr.shape[0] % (288 * 384 * 3) == 0:
+            sensors = arr.shape[0] // (288 * 384 * 3)
+            frame = _dmtac_pool_2x2(arr.reshape(sensors, 288, 384, 3))
+        else:
+            sensors = arr.shape[0] // (144 * 192 * 3)
+            frame = arr.reshape(sensors, 144, 192, 3)
+        return np.moveaxis(frame, -1, -3).astype(np.float32, copy=False)
+    if arr.ndim == 3 and arr.shape == (144, 192, 3):
+        return np.moveaxis(arr[None, ...], -1, -3).astype(np.float32, copy=False)
+    if arr.ndim == 3 and arr.shape == (288, 384, 3):
+        return np.moveaxis(_dmtac_pool_2x2(arr)[None, ...], -1, -3).astype(np.float32, copy=False)
+    if arr.ndim == 4 and arr.shape[-3:] == (144, 192, 3):
+        return np.moveaxis(arr, -1, -3).astype(np.float32, copy=False)
+    if arr.ndim == 4 and arr.shape[-3:] == (288, 384, 3):
+        return np.moveaxis(_dmtac_pool_2x2(arr), -1, -3).astype(np.float32, copy=False)
+    if arr.ndim == 4 and arr.shape[-3:] == (3, 144, 192):
+        return arr.astype(np.float32, copy=True)
+    if arr.ndim == 2 and arr.shape[-1] in (
+        144 * 192 * 3,
+        2 * 144 * 192 * 3,
+        288 * 384 * 3,
+        2 * 288 * 384 * 3,
+    ):
+        return tactile_to_dmtac_history_frame(arr[-1])
+    if arr.ndim == 5 and arr.shape[-3:] in ((144, 192, 3), (3, 144, 192)):
+        return tactile_to_dmtac_history_frame(arr[-1])
+    if arr.ndim == 5 and arr.shape[-3:] == (288, 384, 3):
+        return tactile_to_dmtac_history_frame(arr[-1])
+    raise ValueError(f"DM-Tac tactile expected image-like frame/history, got {arr.shape}.")
+
+
+def _dmtac_pool_2x2(value: np.ndarray) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.shape[-3:-1] != (288, 384):
+        return arr.astype(np.float32, copy=True)
+    new_shape = (*arr.shape[:-3], 144, 2, 192, 2, arr.shape[-1])
+    return arr.reshape(new_shape).mean(axis=(-4, -2), dtype=np.float32).astype(np.float32, copy=False)
+
+
 class TactileHistory:
     def __init__(self, history_size: int, history_stride: int):
         self.history_size = max(1, int(history_size))
@@ -383,6 +432,35 @@ class TactileHistory:
         buf = self._buffers.setdefault(side, [])
         if not buf:
             return np.zeros((self.history_size, 351), dtype=np.float32)
+        samples = []
+        for offset in range(self.history_size - 1, -1, -1):
+            idx = len(buf) - 1 - offset * self.history_stride
+            idx = max(0, min(idx, len(buf) - 1))
+            samples.append(buf[idx])
+        return np.stack(samples, axis=0).astype(np.float32)
+
+
+class DMTacTactileHistory:
+    def __init__(self, history_size: int, history_stride: int, default_sensors: int = 2):
+        self.history_size = max(1, int(history_size))
+        self.history_stride = max(1, int(history_stride))
+        self.default_sensors = max(1, int(default_sensors))
+        self._buffers: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+
+    def append(self, side: str, tactile: Any) -> None:
+        side = str(side).lower()
+        frame = tactile_to_dmtac_history_frame(tactile)
+        buf = self._buffers.setdefault(side, [])
+        buf.append(frame.astype(np.float32, copy=True))
+        keep = self.history_size * self.history_stride + 1
+        if len(buf) > keep:
+            del buf[: len(buf) - keep]
+
+    def stack(self, side: str) -> np.ndarray:
+        side = str(side).lower()
+        buf = self._buffers.setdefault(side, [])
+        if not buf:
+            return np.zeros((self.history_size, self.default_sensors, 3, 144, 192), dtype=np.float32)
         samples = []
         for offset in range(self.history_size - 1, -1, -1):
             idx = len(buf) - 1 - offset * self.history_stride

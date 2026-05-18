@@ -119,6 +119,9 @@ python run_client_realman22.py \
   --transport-image-size 224
 
 
+
+ssh -N -L 5555:127.0.0.1:5555 root@36.103.197.253 -v
+
 python run_client_franka.py \
   --host 127.0.0.1 \
   --source dataset \
@@ -130,8 +133,43 @@ python run_client_franka.py \
   --right-arm-ip "192.168.20.172" \
   --right-hand-ip "192.168.11.210" \
   --transport-image-size 224 \
+  --startup-init-steps 48
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source dataset \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/real_dataset/2026-05-07_peeling_white_carrot_converted \
+  --max-requests 100 \
+  --dataset-frame-stride 24 \
+  --action-hz 12.0 \
+  --send-actions \
+  --right-arm-ip "192.168.20.172" \
+  --right-hand-ip "192.168.11.210" \
+  --transport-image-size 224 \
   --startup-init-steps 48 \
+  --fixed-hand "(0.096, 0.057, 0.022, 0.056, 0.495, 0.0)" \
   --which-episode 106
+
+
+python run_client_gripper_DM.py \
+  --host 127.0.0.1 \
+  --source dataset \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/datasets/2026-05-12_gripper_collect_peeling_official \
+  --max-requests 100 \
+  --dataset-frame-stride 24 \
+  --camera-mode single \
+  --camera-serial 135122074814 \
+  --active-sides right \
+  --right-arm-ip "192.168.20.172" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --auto-start \
+  --transport-image-size 224 \
+  --startup-init-steps 48 \
+  --send-actions \
+  --which-episode 15 \
+  --max-arm-joint-step-rad 0.08
+
 
 ```
 In this mode, observations still come from the dataset, but the returned actions
@@ -234,6 +272,83 @@ python run_client_franka.py \
   --max-fingertip-force 400 \
   --send-actions \
   --which-episode 110
+
+
+
+ssh -N -L 5555:127.0.0.1:5555 root@36.103.197.253 -v
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/real_dataset/2026-04-27_chips_single_converted \
+  --camera-mode single \
+  --camera-serial 135122074814 \
+  --active-sides right \
+  --right-arm-ip "192.168.20.172" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "192.168.11.210" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --max-fingertip-force 400 \
+  --send-actions \
+  --which-episode 110
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/real_dataset/2026-05-07_peeling_white_carrot_converted \
+  --camera-mode single \
+  --camera-serial 135122070754 \
+  --active-sides right \
+  --right-arm-ip "192.168.20.172" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "192.168.11.210" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --max-fingertip-force 400 \
+  --send-actions \
+  --fixed-hand "(0.096, 0.057, 0.022, 0.056, 0.495, 0.0)" \
+  --which-episode 110
+
+python run_client_franka.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/datasets/2026-05-08_waping_random \
+  --camera-mode single \
+  --camera-serial 135122074814 \
+  --active-sides right \
+  --right-arm-ip "192.168.20.172" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "192.168.11.210" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --max-fingertip-force 400 \
+  --send-actions \
+  --which-episode 110
+
+
+python run_client_gripper_DM.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/user/zc/dex_inspire_teleop_new/datasets/2026-05-12_gripper_collect_peeling_official \
+  --camera-mode single \
+  --camera-serial 135122070754 \
+  --active-sides right \
+  --right-arm-ip "192.168.20.172" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --auto-start \
+  --transport-image-size 224 \
+  --send-actions \
+  --which-episode 15
+
+
 ```
 
 

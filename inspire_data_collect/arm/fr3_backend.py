@@ -79,6 +79,7 @@ class FR3ArmBackend:
         self._startup_align_latest_target: np.ndarray | None = None
         self._startup_align_start_max_delta_rad: float | None = None
         self._startup_align_last_notice_step: int | None = None
+        self._startup_stage: str | None = None
 
     @property
     def name(self) -> str:
@@ -87,32 +88,56 @@ class FR3ArmBackend:
     def start(self) -> None:
         if not self.config.connect_hardware or self._client is not None:
             return
-        try:
-            self._client = FR3JointClient(
-                self.config.host,
-                self.config.port,
-                timeout_s=float(self.config.timeout_s),
-                retry_times=int(self.config.retry_times),
-                retry_wait_s=float(self.config.retry_wait_s),
-            )
-            self._client.connect()
-            self._client.start_state_poller(
-                poll_hz=float(self.config.state_poll_hz),
-                warn_stale_after_s=float(self.config.max_state_age_s),
-                log_poll_errors=not bool(self.config.silent_status),
-            )
-            if not self._client.wait_until_state_ready(timeout_s=float(self.config.wait_state_timeout_s)):
-                raise RuntimeError("FR3 state cache did not become ready in time.")
-            self._startup_error = None
-            self._state_error = None
-        except Exception as exc:
-            self._startup_error = str(exc)
-            self._state_error = f"startup_failed: {exc}"
-            if self._client is not None:
-                try:
-                    self._client.close()
-                finally:
-                    self._client = None
+        attempts = max(1, int(self.config.retry_times) + 1)
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            client: FR3JointClient | None = None
+            try:
+                client = FR3JointClient(
+                    self.config.host,
+                    self.config.port,
+                    timeout_s=float(self.config.timeout_s),
+                    retry_times=int(self.config.retry_times),
+                    retry_wait_s=float(self.config.retry_wait_s),
+                )
+                self._startup_stage = "connect"
+                client.connect()
+                self._startup_stage = "prime_state_cache"
+                state, age = client.get_state_cached(
+                    max_age_s=float(self.config.max_state_age_s),
+                    fallback_to_sync=True,
+                )
+                self._apply_state_snapshot(state, age)
+                self._startup_stage = "start_state_poller"
+                client.start_state_poller(
+                    poll_hz=float(self.config.state_poll_hz),
+                    warn_stale_after_s=float(self.config.max_state_age_s),
+                    log_poll_errors=not bool(self.config.silent_status),
+                )
+                self._startup_stage = "wait_state_ready"
+                if not client.wait_until_state_ready(timeout_s=float(self.config.wait_state_timeout_s)):
+                    raise RuntimeError("FR3 state cache did not become ready in time.")
+                self._client = client
+                self._startup_stage = None
+                self._startup_error = None
+                self._state_error = None
+                return
+            except Exception as exc:
+                last_exc = exc
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                self._client = None
+                if attempt + 1 < attempts:
+                    time.sleep(float(self.config.retry_wait_s))
+
+        stage = self._startup_stage or "unknown"
+        detail = str(last_exc) if last_exc is not None else "unknown error"
+        self._startup_error = f"{stage}: {detail}"
+        self._state_error = f"startup_failed: {self._startup_error}"
+        self._startup_stage = None
 
     def is_ready(self) -> bool:
         return (not self.config.connect_hardware) or (
@@ -128,12 +153,36 @@ class FR3ArmBackend:
             "port": int(self.config.port),
             "state_poll_hz": float(self.config.state_poll_hz),
             "max_state_age_s": float(self.config.max_state_age_s),
+            "wait_state_timeout_s": float(self.config.wait_state_timeout_s),
             "startup_align_enabled": bool(self.config.startup_align_enabled),
             "startup_align_duration_s": float(self.config.startup_align_duration_s),
             "startup_align_threshold_rad": float(self.config.startup_align_threshold_rad),
             "ready": bool(self.is_ready()),
             "startup_error": self._startup_error,
         }
+
+    def _apply_state_snapshot(self, state: dict[str, Any], age: float) -> None:
+        q = np.asarray(state.get("q"), dtype=np.float32).reshape(-1)
+        if q.shape != (ARM_DOF,):
+            raise ValueError(f"FR3 state q has invalid shape {q.shape}.")
+        dq_raw = state.get("dq")
+        dq = None
+        if dq_raw is not None:
+            dq_arr = np.asarray(dq_raw, dtype=np.float32).reshape(-1)
+            if dq_arr.shape == (ARM_DOF,):
+                dq = dq_arr
+        receive_timestamp = float(time.time() - max(float(age), 0.0))
+        controller_timestamp = state.get("t")
+        server_age_s = state.get("age_s")
+        with self._state_lock:
+            self._latest_qpos = q.copy()
+            self._latest_dq = None if dq is None else dq.copy()
+            self._latest_state_timestamp = controller_timestamp
+            self._latest_state_receive_timestamp = receive_timestamp
+            self._latest_state_age_sec = float(age)
+            self._latest_server_age_s = None if server_age_s is None else float(server_age_s)
+            self._latest_raw_state = dict(state)
+            self._state_error = None
 
     def _current_qpos_for_startup_alignment(self) -> np.ndarray:
         with self._state_lock:
@@ -283,27 +332,7 @@ class FR3ArmBackend:
             max_age_s=float(self.config.max_state_age_s),
             fallback_to_sync=False,
         )
-        q = np.asarray(state.get("q"), dtype=np.float32).reshape(-1)
-        if q.shape != (ARM_DOF,):
-            raise ValueError(f"FR3 cached state q has invalid shape {q.shape}.")
-        dq_raw = state.get("dq")
-        dq = None
-        if dq_raw is not None:
-            dq_arr = np.asarray(dq_raw, dtype=np.float32).reshape(-1)
-            if dq_arr.shape == (ARM_DOF,):
-                dq = dq_arr
-        receive_timestamp = float(time.time() - max(float(age), 0.0))
-        controller_timestamp = state.get("t")
-        server_age_s = state.get("age_s")
-        with self._state_lock:
-            self._latest_qpos = q.copy()
-            self._latest_dq = None if dq is None else dq.copy()
-            self._latest_state_timestamp = controller_timestamp
-            self._latest_state_receive_timestamp = receive_timestamp
-            self._latest_state_age_sec = float(age)
-            self._latest_server_age_s = None if server_age_s is None else float(server_age_s)
-            self._latest_raw_state = dict(state)
-            self._state_error = None
+        self._apply_state_snapshot(state, age)
 
     def get_state(self) -> dict[str, object]:
         if self._client is not None:
