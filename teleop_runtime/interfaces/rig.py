@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 from ..schemas import TeleopCommand
 
@@ -19,7 +19,11 @@ class Rig(ABC):
         return True
 
     @abstractmethod
-    def send_commands(self, command: TeleopCommand) -> None:
+    def send_commands(
+        self,
+        command: TeleopCommand,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> None:
         raise NotImplementedError
 
     def close(self) -> None:

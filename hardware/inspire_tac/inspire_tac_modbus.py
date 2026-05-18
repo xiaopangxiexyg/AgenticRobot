@@ -73,7 +73,7 @@ def read6(client, reg, n_short=6, use_byte=False): # 1 short = 2 bytes
 
 
 class InspireTacModbus:
-    def __init__(self, ip = '192.168.11.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
+    def __init__(self, ip = '192.168.12.210', port = 6000, max_fingertip_force=800, timeout=DEFAULT_MODBUS_TIMEOUT_SEC):
         self.ip = ip
         self.port = port
         self.timeout = float(timeout)
@@ -538,22 +538,44 @@ class TactileVisualizer:
 if __name__ == '__main__':
     from tqdm import trange
     import numpy as np
-    test = InspireTacModbus(max_fingertip_force=800)
-    # test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    test = InspireTacModbus(max_fingertip_force=1200)
+    # test.set_joint_pos([1, 1, 1, 1, 0, 1])
+    # time.sleep(20.0)
     current_joint_pos = test.read_joint_pos()
     print('Current joint pos:', current_joint_pos)
+    mode = "grasp"
+    test.set_joint_pos([0.903, 0.875, 0.8, 0.8, 0.8, 0])
     
-    test.set_joint_pos([1, 1, 1, 1, 1, 1])
+    # paper fold: Current joint pos: [0.903 0.875 0.412 0.434 0.387 0.   ]
     time.sleep(10)
-    for _ in trange(20):
-        test.set_joint_pos(current_joint_pos)
-        time.sleep(0.2)
-    breakpoint()
-    while True:
-        test.set_joint_pos([0, 0, 0, 0, 1, 1])
-        time.sleep(0.2)
+    test.set_joint_pos([0.903, 0.875, 0.212, 0.234, 0.287, 0])
+    time.sleep(50)
+    
+    if mode == "copy":
+        current_joint_pos = test.read_joint_pos()
+        print('Current joint pos:', current_joint_pos)
+        
         test.set_joint_pos([1, 1, 1, 1, 1, 1])
-        time.sleep(0.2)
+        time.sleep(10)
+        for _ in trange(20):
+            test.set_joint_pos(current_joint_pos)
+            time.sleep(0.2)
+        breakpoint()
+        while True:
+            test.set_joint_pos([0, 0, 0, 0, 1, 1])
+            time.sleep(0.2)
+            test.set_joint_pos([1, 1, 1, 1, 1, 1])
+            time.sleep(0.2)
+    elif mode == "grasp":
+        test.set_joint_pos([1, 1, 1, 1, 1, 1])
+        time.sleep(7.5)
+        test.set_joint_pos([0.3, 0.3, 0.3, 0.3, 1, 1])
+        test.set_joint_pos([0.2, 0.2, 0.2, 0.2, 1, 1])
+        
+    else:
+        exit(0)
+    
+    breakpoint()
     time.sleep(20.0)
     joint_pos = test.read_joint_pos()
     tac_vec, tac_dict = test.read_tac_data()

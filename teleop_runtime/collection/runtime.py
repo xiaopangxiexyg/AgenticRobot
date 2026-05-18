@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -46,15 +47,42 @@ class CollectionRuntime:
             self.components.session.start()
         self._started = True
 
-    def step(self, now: float | None = None) -> SessionStepResult:
+    def step(
+        self,
+        now: float | None = None,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> SessionStepResult:
+        phase_started = time.perf_counter()
+
+        def mark_phase(name: str) -> None:
+            nonlocal phase_started
+            if phase_recorder is None:
+                return
+            current = time.perf_counter()
+            phase_recorder(name, current - phase_started)
+            phase_started = current
+
         if not self._started:
             self.start()
-        result = self.components.session.run_step(now=now)
+            mark_phase("runtime.start")
+        result = self.components.session.run_step(
+            now=now,
+            phase_recorder=phase_recorder,
+        )
+        mark_phase("runtime.session.run_step")
         sample = self.sample_builder(result, self.components)
+        mark_phase("runtime.sample_builder")
         if sample is None:
             return result
-        for job in self.write_planner(sample, self.components):
-            self.writer_pool.submit(job)
+        if phase_recorder is None:
+            for job in self.write_planner(sample, self.components):
+                self.writer_pool.submit(job)
+        else:
+            jobs = list(self.write_planner(sample, self.components))
+            mark_phase("runtime.write_planner")
+            for job in jobs:
+                self.writer_pool.submit(job)
+            mark_phase("runtime.writer_submit")
         self._submitted_samples += 1
         return result
 

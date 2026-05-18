@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from .calibration import TeleopCalibration
 from .diagnostics import FaultEvent, FaultSeverity, RateTracker, TeleopRunState, TeleopStateMachine
@@ -226,18 +226,37 @@ class TeleopSession:
         command.metadata.setdefault("tcp_mode", self.config.tcp_mode)
         return command
 
-    def run_step(self, now: float | None = None) -> SessionStepResult:
+    def run_step(
+        self,
+        now: float | None = None,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> SessionStepResult:
+        phase_started = time.perf_counter()
+
+        def mark_phase(name: str) -> None:
+            nonlocal phase_started
+            if phase_recorder is None:
+                return
+            current = time.perf_counter()
+            phase_recorder(name, current - phase_started)
+            phase_started = current
+
         if not self._started:
             self.start()
+            mark_phase("session.start")
         current_time = time.time() if now is None else float(now)
         control_hz = self.rate_tracker.tick(current_time)
+        mark_phase("session.rate_tracker")
 
         channels, faults = self.poll_sources(current_time)
+        mark_phase("session.poll_sources")
         if self.recorder is not None:
             self.recorder.record_channels(channels, timestamp=current_time)
+            mark_phase("session.record_channels")
 
         for violation in self.safety_monitor.evaluate_channels(channels, current_time):
             faults.append(self._fault_from_violation(violation, current_time))
+        mark_phase("session.evaluate_channels")
 
         if (
             self.state_machine.state == TeleopRunState.RUNNING
@@ -245,16 +264,21 @@ class TeleopSession:
         ):
             for violation in self.safety_monitor.evaluate_control_rate(control_hz):
                 faults.append(self._fault_from_violation(violation, current_time))
+            mark_phase("session.evaluate_control_rate")
 
         for fault in faults:
             if self.recorder is not None:
                 self.recorder.record_fault(fault)
+        if faults and self.recorder is not None:
+            mark_phase("session.record_faults")
 
         freeze_faults = [fault for fault in faults if self._fault_should_freeze(fault)]
+        mark_phase("session.freeze_fault_check")
 
         if freeze_faults and self.safety_monitor.config.freeze_on_fault:
             self._record_freeze_context(freeze_faults)
             self.freeze(freeze_faults[0].code)
+            mark_phase("session.freeze_on_fault")
             return SessionStepResult(
                 timestamp=current_time,
                 state=self.state_machine.state,
@@ -295,7 +319,9 @@ class TeleopSession:
                     faults=faults,
                 )
             observation = self._build_observation(channels, current_time)
+            mark_phase("session.build_observation")
             self._transition(TeleopRunState.RECOVERING, "auto recovery ready")
+            mark_phase("session.transition_recovering")
             print("\033[1;32;40m" + f"[Debug Info] Auto-recovery triggered" + "\033[0m")
             return SessionStepResult(
                 timestamp=current_time,
@@ -308,6 +334,7 @@ class TeleopSession:
 
         if self.state_machine.state == TeleopRunState.RECOVERING:
             observation = self._build_observation(channels, current_time)
+            mark_phase("session.build_observation")
             return SessionStepResult(
                 timestamp=current_time,
                 state=self.state_machine.state,
@@ -318,18 +345,23 @@ class TeleopSession:
             )
 
         observation = self._build_observation(channels, current_time)
+        mark_phase("session.build_observation")
         command = self._build_command(observation)
+        mark_phase("session.build_command")
 
         if self.recorder is not None:
             self.recorder.record_command(command)
+            mark_phase("session.record_command")
 
         if self.rig is not None and self.state_machine.state in {
             TeleopRunState.ARMED,
             TeleopRunState.RUNNING,
         }:
-            self.rig.send_commands(command)
+            self.rig.send_commands(command, phase_recorder=phase_recorder)
+            mark_phase("session.rig.send_commands")
             if self.state_machine.state != TeleopRunState.RUNNING:
                 self._transition(TeleopRunState.RUNNING, "first command dispatched")
+                mark_phase("session.transition_running")
 
         return SessionStepResult(
             timestamp=current_time,

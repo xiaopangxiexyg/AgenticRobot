@@ -320,7 +320,7 @@ init_episode 预备模式：
 
 ```bash
 python -m teleop_runtime.collection.run_collect \
-  --dataset-root /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard_extend \
+  --dataset-root /home/ai/Desktop/DexTeleop/datasets/2026-05-16_right_arm_dual_data_soft_hard_fixed_tactile_addtion \
   --task-name replay_collect_demo_right \
   --active-sides right \
   --right-arm-ip 192.168.1.20 \
@@ -335,8 +335,9 @@ python -m teleop_runtime.collection.run_collect \
   --replay-group d:9-17 \
   --replay-randomize \
   --replay-random-mode both \
-  --replay-random-xyz-m 0.03 \
-  --replay-random-rot-deg 3.0
+  --replay-random-xyz-m 0.05 \
+  --replay-arm-max-angvel 4.5,4.5,4.5,6.0,6.0,8.0 \
+  --replay-random-rot-deg 6.0
 ```
 
 按键流程：

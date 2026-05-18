@@ -134,12 +134,15 @@ class RM65ArmBackend(EffectorBackend):
         self._last_command: EffectorCommand | None = None
         self._last_target_qpos: np.ndarray | None = None
         self._last_command_timestamp: float | None = None
+        self._last_hardware_qpos: np.ndarray | None = None
         self._last_hardware_pose_6d: np.ndarray | None = None
         self._last_hardware_refresh_time: float | None = None
         self._last_hardware_result_code: int | None = None
         self._last_hardware_result_text: str | None = None
         self._last_hardware_arm_err: int | None = None
         self._last_hardware_sys_err: int | None = None
+        self._last_send_result_code: int | None = None
+        self._last_send_result_text: str | None = None
         self._base_control_dt = float(config.control_dt)
         self._base_max_joint_step = np.asarray(config.max_angvel, dtype=float) * self._base_control_dt
         self._last_send_time: float | None = None
@@ -230,7 +233,11 @@ class RM65ArmBackend(EffectorBackend):
             return
 
         if self.arm is not None:
-            self.arm.Movej_CANFD(qpos_target / np.pi * 180.0, False)
+            raw_send_result = self.arm.Movej_CANFD(qpos_target / np.pi * 180.0, False)
+            send_code, send_text = _parse_rm65_result(raw_send_result)
+            with self._state_lock:
+                self._last_send_result_code = send_code
+                self._last_send_result_text = send_text
         self._last_send_time = command_start_time
 
         with self._state_lock:
@@ -383,8 +390,11 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 next_qpos = current_qpos + delta
                 if self.arm is not None and not np.allclose(next_qpos, current_qpos, atol=1e-10):
-                    self.arm.Movej_CANFD(next_qpos / np.pi * 180.0, False)
+                    raw_send_result = self.arm.Movej_CANFD(next_qpos / np.pi * 180.0, False)
+                    send_code, send_text = _parse_rm65_result(raw_send_result)
                     with self._state_lock:
+                        self._last_send_result_code = send_code
+                        self._last_send_result_text = send_text
                         self._current_qpos = next_qpos.copy()
                         self._last_send_time = loop_start
             elapsed = time.time() - loop_start
@@ -538,12 +548,16 @@ class RM65ArmBackend(EffectorBackend):
             if pose_now is not None:
                 self._last_hardware_pose_6d = np.asarray(pose_now, dtype=float)
             if qpos_from_joint_now is not None:
+                self._last_hardware_qpos = qpos_from_joint_now.copy()
                 self._current_qpos = qpos_from_joint_now
         return self.get_state()
 
     def get_state(self) -> dict[str, np.ndarray | EffectorCommand | None | int | float | str]:
         with self._state_lock:
             current_qpos = None if self._current_qpos is None else self._current_qpos.copy()
+            hardware_qpos = (
+                None if self._last_hardware_qpos is None else self._last_hardware_qpos.copy()
+            )
             last_target_qpos = (
                 None if self._last_target_qpos is None else self._last_target_qpos.copy()
             )
@@ -553,6 +567,7 @@ class RM65ArmBackend(EffectorBackend):
             )
         return {
             "current_qpos": current_qpos,
+            "hardware_qpos": hardware_qpos,
             "last_target_qpos": last_target_qpos,
             "last_command": last_command,
             "last_command_timestamp": self._last_command_timestamp,
@@ -563,6 +578,8 @@ class RM65ArmBackend(EffectorBackend):
             "hardware_result_text": self._last_hardware_result_text,
             "hardware_arm_err": self._last_hardware_arm_err,
             "hardware_sys_err": self._last_hardware_sys_err,
+            "send_result_code": self._last_send_result_code,
+            "send_result_text": self._last_send_result_text,
             "effective_control_dt_sec": float(self._last_effective_control_dt),
             "effective_step_scale": float(self._last_effective_step_scale),
             "ik_metadata": dict(self._last_ik_metadata),
@@ -582,14 +599,24 @@ class RM65ArmBackend(EffectorBackend):
             self._jump_hold_anchor_pose = None
             self._jump_hold_frames = 0
 
-    def compute_tcp_pose(self, tcp_frame: str | None = None) -> np.ndarray:
-        with self._state_lock:
-            if self._current_qpos is None:
+    def compute_tcp_pose(
+        self,
+        tcp_frame: str | None = None,
+        *,
+        qpos: Sequence[float] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        if qpos is None:
+            with self._state_lock:
+                if self._current_qpos is None:
+                    raise RuntimeError(f"{self.name} does not have a current joint state yet.")
+                qpos_array = self._current_qpos.copy()
+        else:
+            qpos_array = np.asarray(qpos, dtype=float).reshape(-1)
+            if qpos_array.shape != (6,) or not np.all(np.isfinite(qpos_array)):
                 raise RuntimeError(f"{self.name} does not have a current joint state yet.")
-            qpos = self._current_qpos.copy()
         tcp_frame = canonical_tcp_frame(self.config.default_tcp_frame if tcp_frame is None else tcp_frame)
         solver = self._solver_for_tcp_frame(tcp_frame)
-        return np.asarray(solver.compute_pose(qpos), dtype=float)
+        return np.asarray(solver.compute_pose(qpos_array), dtype=float)
 
     def close(self) -> None:
         if self._stream_thread is not None:

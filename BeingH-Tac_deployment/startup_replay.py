@@ -37,7 +37,7 @@ def add_startup_replay_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--startup-replay-start-frame", type=int, default=0)
     parser.add_argument("--startup-replay-seed", type=int, default=None)
     parser.add_argument("--which-episode", type=int, default=None)
-    parser.add_argument("--startup-init-steps", type=int, default=24)
+    parser.add_argument("--startup-init-steps", type=int, default=60)
     parser.add_argument("--startup-init-hz", type=float, default=12.0)
     parser.add_argument("--startup-init-tolerance-rad", type=float, default=0.02)
     parser.add_argument("--startup-init-settle-timeout-s", type=float, default=10.0)
@@ -79,7 +79,7 @@ def _run_parquet_helper(script: str, *args: str) -> Any:
         except Exception as exc:
             last_error = exc
     raise RuntimeError(
-        "Failed to read Franka startup parquet with helper Python envs. "
+        "Failed to read startup parquet with helper Python envs. "
         "Set PARQUET_READER_PYTHON to a Python executable with working pandas/pyarrow."
     ) from last_error
 
@@ -253,7 +253,7 @@ def _startup_direct_columns(profile: DeploymentProfile) -> tuple[list[str], dict
     return columns, arm_columns_by_side
 
 
-def _load_fr3_direct_target_row_via_helper(path: Path, columns: list[str], frame_index: int) -> dict[str, Any]:
+def _load_direct_target_row_via_helper(path: Path, columns: list[str], frame_index: int) -> dict[str, Any]:
     script = r"""
 import json
 import sys
@@ -282,32 +282,36 @@ print(json.dumps(item))
     return dict(data)
 
 
-def load_startup_direct_targets(args: argparse.Namespace, profile: DeploymentProfile) -> tuple[Path, dict[str, np.ndarray], dict[str, np.ndarray]]:
-    path = choose_episode(args)
-    bind_selected_episode(args, path)
+def _load_startup_direct_targets_from_path(
+    path: Path,
+    args: argparse.Namespace,
+    profile: DeploymentProfile,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     frame_index = max(0, int(getattr(args, "startup_replay_start_frame", 0)))
 
     columns, arm_columns_by_side = _startup_direct_columns(profile)
     if _is_fr3_profile(profile):
-        row = _load_fr3_direct_target_row_via_helper(path, columns, frame_index)
+        row = _load_direct_target_row_via_helper(path, columns, frame_index)
         if not row:
             raise ValueError(f"{path} has no action.replay.* joint target columns for direct startup init.")
     else:
         try:
             import pyarrow.parquet as pq
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError("Direct startup init requires pyarrow in the active environment.") from exc
-
-        schema = pq.read_schema(path)
-        available = set(schema.names)
-        columns = [column for column in columns if column in available]
-        if not columns:
-            raise ValueError(f"{path} has no action.replay.* joint target columns for direct startup init.")
-        table = pq.read_table(path, columns=columns)
-        rows = table.to_pylist()
-        if not rows:
-            raise ValueError(f"Replay parquet contains no rows: {path}")
-        row = rows[min(frame_index, len(rows) - 1)]
+        except ModuleNotFoundError:
+            row = _load_direct_target_row_via_helper(path, columns, frame_index)
+            if not row:
+                raise ValueError(f"{path} has no action.replay.* joint target columns for direct startup init.")
+        else:
+            schema = pq.read_schema(path)
+            available = set(schema.names)
+            columns = [column for column in columns if column in available]
+            if not columns:
+                raise ValueError(f"{path} has no action.replay.* joint target columns for direct startup init.")
+            table = pq.read_table(path, columns=columns)
+            rows = table.to_pylist()
+            if not rows:
+                raise ValueError(f"Replay parquet contains no rows: {path}")
+            row = rows[min(frame_index, len(rows) - 1)]
 
     arm_targets: dict[str, np.ndarray] = {}
     hand_targets: dict[str, np.ndarray] = {}
@@ -326,6 +330,13 @@ def load_startup_direct_targets(args: argparse.Namespace, profile: DeploymentPro
             hand_targets[side] = np.asarray(value, dtype=np.float32).reshape(6)
     if not arm_targets and not hand_targets:
         raise ValueError(f"{path} row {frame_index} has no finite direct startup targets.")
+    return arm_targets, hand_targets
+
+
+def load_startup_direct_targets(args: argparse.Namespace, profile: DeploymentProfile) -> tuple[Path, dict[str, np.ndarray], dict[str, np.ndarray]]:
+    path = choose_episode(args)
+    bind_selected_episode(args, path)
+    arm_targets, hand_targets = _load_startup_direct_targets_from_path(path, args, profile)
     return path, arm_targets, hand_targets
 
 
@@ -340,10 +351,10 @@ def _print_replay_progress(sent: int, total: int) -> None:
         print("")
 
 
-def _sleep_with_countdown(duration_s: float) -> None:
+def _sleep_with_countdown(duration_s: float, *, label: str = "inference starts") -> None:
     remaining = int(np.ceil(max(0.0, float(duration_s))))
     while remaining > 0:
-        print(f"[Startup] inference starts in {remaining}s")
+        print(f"[Startup] {label} in {remaining}s")
         time.sleep(1.0)
         remaining -= 1
 
@@ -470,6 +481,13 @@ def _print_direct_init_targets(
             f"[Startup] {side} arm current={_format_target_vector(start_value)} "
             f"target={_format_target_vector(target_value)} max_delta={delta:.4f}rad"
         )
+        if delta > 0.9:
+            print(
+                f"WARNING: {side} arm target is {delta:.4f}rad away from current position; "
+                "this may cause a sudden jump when sending the first action."
+            )
+            breakpoint()
+            exit(1)
 
 
 def _wait_for_direct_init_convergence(
@@ -549,11 +567,47 @@ def _smoothstep(alpha: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
+def _run_direct_first_frame_init(
+    executor: HardwareActionExecutor,
+    arm_targets: Mapping[str, np.ndarray],
+    hand_targets: Mapping[str, np.ndarray],
+    args: argparse.Namespace,
+    profile: DeploymentProfile,
+) -> None:
+    start_arms, start_hands = _current_joint_targets(executor)
+    steps = max(1, int(getattr(args, "startup_init_steps", 60)))
+    hz = max(1e-6, float(getattr(args, "startup_init_hz", 12.0)))
+    duration_s = float(steps) / hz
+    _print_direct_init_targets(start_arms, arm_targets)
+    print(
+        f"[Startup] interpolating first action over {steps} step(s) "
+        f"at {hz:.3g}Hz (~{duration_s:.1f}s)"
+    )
+    for step in range(1, steps + 1):
+        alpha = _smoothstep(float(step) / float(steps))
+        arm_waypoint = _lerp_targets(start_arms, arm_targets, alpha)
+        hand_waypoint = _lerp_targets(start_hands, hand_targets, alpha)
+        statuses = executor.send_direct_joint_targets(arm_qpos=arm_waypoint, hand_qpos=hand_waypoint)
+        if step == 1 or step == steps:
+            print(f"[Startup] direct init status: {';'.join(statuses[:8])}")
+        _print_init_progress(step, steps)
+        if step < steps:
+            time.sleep(1.0 / hz)
+    _wait_for_direct_init_convergence(executor, arm_targets, hand_targets, args, profile)
+
+
+def _sleep_after_direct_first_frame_init(args: argparse.Namespace, *, label: str) -> None:
+    sleep_s = max(0.0, float(getattr(args, "startup_init_sleep_s", 10.0)))
+    print(f"[Startup] first action reached; sleeping {sleep_s:.1f}s before {label}.")
+    _sleep_with_countdown(sleep_s, label=f"{label} starts")
+
+
 def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mode: str) -> int:
     if mode not in {"r", "i"}:
         return 0
+
+    path, arm_targets, hand_targets = load_startup_direct_targets(args, profile)
     if mode == "i":
-        path, arm_targets, hand_targets = load_startup_direct_targets(args, profile)
         print(
             f"[Startup] selected {path} | mode=first action direct init | "
             f"arms={sorted(arm_targets)} hands={sorted(hand_targets)}"
@@ -561,35 +615,23 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
         executor_cm = HardwareActionExecutor(profile, args)
         executor_cm.start_dispatcher = False
         with executor_cm as executor:
-            start_arms, start_hands = _current_joint_targets(executor)
-            steps = max(1, int(getattr(args, "startup_init_steps", 24)))
-            hz = max(1e-6, float(getattr(args, "startup_init_hz", 12.0)))
-            _print_direct_init_targets(start_arms, arm_targets)
-            print(f"[Startup] interpolating first action over {steps} step(s) at {hz:.3g}Hz")
-            for step in range(1, steps + 1):
-                alpha = _smoothstep(float(step) / float(steps))
-                arm_waypoint = _lerp_targets(start_arms, arm_targets, alpha)
-                hand_waypoint = _lerp_targets(start_hands, hand_targets, alpha)
-                statuses = executor.send_direct_joint_targets(arm_qpos=arm_waypoint, hand_qpos=hand_waypoint)
-                if step == 1 or step == steps:
-                    print(f"[Startup] direct init status: {';'.join(statuses[:8])}")
-                _print_init_progress(step, steps)
-                if step < steps:
-                    time.sleep(1.0 / hz)
-            _wait_for_direct_init_convergence(executor, arm_targets, hand_targets, args, profile)
-        sleep_s = max(0.0, float(getattr(args, "startup_init_sleep_s", 10.0)))
-        print(f"[Startup] first action sent directly; sleeping {sleep_s:.1f}s before server-client inference.")
-        _sleep_with_countdown(sleep_s)
+            _run_direct_first_frame_init(executor, arm_targets, hand_targets, args, profile)
+        _sleep_after_direct_first_frame_init(args, label="server-client inference")
         return 0
 
-    path, actions = load_startup_actions(args, profile, mode)
-    label = "full replay" if mode == "r" else "first action"
+    actions = _load_replay_actions_from_parquet(profile, path, args, mode)
     print(
-        f"[Startup] selected {path} | mode={label} | "
+        f"[Startup] selected {path} | mode=full replay with first-frame direct init | "
+        f"arms={sorted(arm_targets)} hands={sorted(hand_targets)} | "
         f"actions={actions.shape[0]} | action_hz={float(getattr(args, 'action_hz', 12.0)):.3g}"
     )
 
-    with HardwareActionExecutor(profile, args) as executor:
+    executor_cm = HardwareActionExecutor(profile, args)
+    executor_cm.start_dispatcher = False
+    with executor_cm as executor:
+        _run_direct_first_frame_init(executor, arm_targets, hand_targets, args, profile)
+        _sleep_after_direct_first_frame_init(args, label="startup replay")
+        executor.dispatcher.start()
         faults = executor.consume_server_result({"action": actions})
         if faults:
             print(f"[Startup] replay status: {';'.join(faults[:6])}")
@@ -604,10 +646,5 @@ def run_startup_replay(profile: DeploymentProfile, args: argparse.Namespace, mod
         else:
             print(f"[Startup] replay dispatched {int(actions.shape[0])} action(s).")
 
-    if mode == "i":
-        sleep_s = max(0.0, float(getattr(args, "startup_init_sleep_s", 10.0)))
-        print(f"[Startup] first action sent; sleeping {sleep_s:.1f}s before server-client inference.")
-        _sleep_with_countdown(sleep_s)
-    else:
-        print("[Startup] full replay finished; exiting.")
+    print("[Startup] full replay finished; exiting.")
     return 0

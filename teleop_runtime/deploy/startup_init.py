@@ -20,8 +20,8 @@ from .schema import (
     STATE_ARM_POSE_SLICES,
 )
 
-_STARTUP_ARM_POSITION_TOLERANCE_M = 0.01
-_STARTUP_ARM_ROTATION_TOLERANCE_DEG = 5.0
+_STARTUP_ARM_POSITION_TOLERANCE_M = 0.03
+_STARTUP_ARM_ROTATION_TOLERANCE_DEG = 20.0
 
 
 def _action_vector(value: Any, *, label: str) -> np.ndarray:
@@ -40,8 +40,35 @@ def _policy_replay_first_action(policy: Any) -> np.ndarray | None:
     if array.ndim != 2 or array.shape[1] != ACTION_DIM or array.shape[0] <= 0:
         raise ValueError(
             f"Replay startup init actions must have shape (N, {ACTION_DIM}), got {array.shape}."
-        )
+    )
     return array[0].astype(np.float32, copy=True)
+
+
+def _policy_startup_init_action(policy: Any) -> tuple[np.ndarray | None, str]:
+    wrapped = getattr(policy, "policy", policy)
+    getter = getattr(wrapped, "get_startup_init_action", None)
+    if callable(getter):
+        action = getter()
+        if action is not None:
+            source = getattr(wrapped, "startup_init_source", None)
+            return _action_vector(action, label="policy startup init action"), (
+                str(source) if source else "policy:first_frame"
+            )
+    action = getattr(wrapped, "startup_init_action", None)
+    if action is not None:
+        source = getattr(wrapped, "startup_init_source", None)
+        return _action_vector(action, label="policy startup init action"), (
+            str(source) if source else "policy:first_frame"
+        )
+    return None, ""
+
+
+def _policy_disables_auto_startup_init(policy: Any) -> bool:
+    wrapped = getattr(policy, "policy", policy)
+    disabled = getattr(wrapped, "disable_auto_startup_init", False)
+    if callable(disabled):
+        disabled = disabled()
+    return bool(disabled)
 
 
 def _load_dataset_init_action(args: Any) -> tuple[np.ndarray, str]:
@@ -75,10 +102,15 @@ def resolve_startup_init_action(args: Any, policy: Any) -> tuple[np.ndarray | No
         return None, "disabled"
     if source not in {"auto", "current", "dataset", "replay"}:
         raise ValueError("--init-source must be one of: auto, current, dataset, replay, none.")
+    if source == "auto" and _policy_disables_auto_startup_init(policy):
+        return None, "disabled"
 
+    policy_startup_action, policy_startup_source = _policy_startup_init_action(policy)
     replay_first = _policy_replay_first_action(policy)
     has_dataset_init = bool(getattr(args, "init_dataset", None) or getattr(args, "init_parquet", None))
     if source == "auto":
+        if policy_startup_action is not None:
+            return policy_startup_action, policy_startup_source or "policy:first_frame"
         if replay_first is not None:
             return replay_first, "replay:first_frame"
         if has_dataset_init:
@@ -87,6 +119,8 @@ def resolve_startup_init_action(args: Any, policy: Any) -> tuple[np.ndarray | No
     if source == "current":
         return None, "current"
     if source == "replay":
+        if policy_startup_action is not None:
+            return policy_startup_action, policy_startup_source or "policy:first_frame"
         if replay_first is None:
             raise ValueError("--init-source replay requires --debug-replay-dataset or --debug-replay-parquet.")
         return replay_first, "replay:first_frame"
@@ -146,6 +180,12 @@ def _hardware_pose_xyzquat(observation: DeploymentObservation, side: str) -> np.
         return None
     quat = R.from_euler("xyz", np.asarray(pose[3:6], dtype=float)).as_quat().astype(np.float32)
     return np.concatenate((pose[:3], quat), dtype=np.float32)
+
+
+def _pose_error_text(current_pose: np.ndarray, target_pose: np.ndarray) -> tuple[float, float]:
+    position_error = float(np.linalg.norm(current_pose[:3] - target_pose[:3]))
+    rotation_error_deg = _quat_distance_deg(current_pose[3:7], target_pose[3:7])
+    return position_error, rotation_error_deg
 
 
 def _slerp_quat(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -236,11 +276,14 @@ class StartupInitializer:
     active_sides: tuple[str, ...]
     arms_enabled: bool
     hands_enabled: bool
+    arm_position_tolerance_m: float = _STARTUP_ARM_POSITION_TOLERANCE_M
+    arm_rotation_tolerance_deg: float = _STARTUP_ARM_ROTATION_TOLERANCE_DEG
     started_at: float | None = None
     start_action: np.ndarray | None = None
     resolved_target_action: np.ndarray | None = None
     completed: bool = False
     progress: float = 0.0
+    wait_reason: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -252,6 +295,7 @@ class StartupInitializer:
         self.resolved_target_action = None
         self.completed = not self.enabled
         self.progress = 1.0 if self.completed else 0.0
+        self.wait_reason = ""
 
     def _start(self, observation: DeploymentObservation, now: float) -> list[str]:
         start = _action_vector(observation.hold_action(), label="startup init start action")
@@ -271,17 +315,24 @@ class StartupInitializer:
         missing_target = _missing_required(target, required)
         if missing_start or missing_target:
             missing = sorted(set(missing_start + missing_target))
+            self.wait_reason = "missing:" + ",".join(missing)
             return ["startup_init_reference_unavailable:" + ",".join(missing)]
 
         self.started_at = float(now)
         self.start_action = start
         self.resolved_target_action = target
         self.progress = 0.0
+        self.wait_reason = ""
         print(
             "[StartupInit] moving to initial target "
             f"source={self.source} duration={float(self.duration_s):.2f}s"
         )
         return []
+
+    def update_resolved_target_action(self, action: Any) -> None:
+        if self.resolved_target_action is None:
+            return
+        self.resolved_target_action = _action_vector(action, label="startup init resolved target action")
 
     def next_action(
         self,
@@ -335,24 +386,53 @@ class StartupInitializer:
                 if side not in active:
                     continue
                 target_pose = target[ACTION_ARM_POSE_SLICES[side]]
-                current_pose = _hardware_pose_xyzquat(observation, side)
-                pose_source = "hardware"
-                if current_pose is None:
-                    current_pose = state[STATE_ARM_POSE_SLICES[side]]
-                    pose_source = "state"
+                current_pose = state[STATE_ARM_POSE_SLICES[side]]
+                pose_source = str(
+                    (observation.arm_states.get(side) or {}).get("tcp_pose_source") or "state"
+                )
+                if not np.all(np.isfinite(current_pose)):
+                    hardware_pose = _hardware_pose_xyzquat(observation, side)
+                    if hardware_pose is not None:
+                        current_pose = hardware_pose
+                        pose_source = "hardware_pose_6d"
                 if not (np.all(np.isfinite(target_pose)) and np.all(np.isfinite(current_pose))):
+                    self.wait_reason = f"{side}:pose_unavailable"
                     return False
-                position_error = float(np.linalg.norm(current_pose[:3] - target_pose[:3]))
-                rotation_error_deg = _quat_distance_deg(current_pose[3:7], target_pose[3:7])
-                if position_error > _STARTUP_ARM_POSITION_TOLERANCE_M:
+                position_error, rotation_error_deg = _pose_error_text(current_pose, target_pose)
+                hardware_pose = _hardware_pose_xyzquat(observation, side)
+                hardware_suffix = ""
+                if hardware_pose is not None and pose_source != "hardware_pose_6d":
+                    hardware_pos_error, hardware_rot_error_deg = _pose_error_text(
+                        hardware_pose,
+                        target_pose,
+                    )
+                    hardware_suffix = (
+                        f",hw={hardware_pos_error * 1000.0:.1f}mm/"
+                        f"{hardware_rot_error_deg:.1f}deg"
+                    )
+                position_tolerance_m = float(self.arm_position_tolerance_m)
+                rotation_tolerance_deg = float(self.arm_rotation_tolerance_deg)
+                if position_error > position_tolerance_m:
+                    self.wait_reason = (
+                        f"{side}:{pose_source}:pos={position_error * 1000.0:.1f}mm>"
+                        f"{position_tolerance_m * 1000.0:.1f}mm,"
+                        f"rot={rotation_error_deg:.2f}deg"
+                        f"{hardware_suffix}"
+                    )
                     return False
-                if rotation_error_deg > _STARTUP_ARM_ROTATION_TOLERANCE_DEG:
+                if rotation_error_deg > rotation_tolerance_deg:
+                    self.wait_reason = (
+                        f"{side}:{pose_source}:pos={position_error * 1000.0:.1f}mm,"
+                        f"rot={rotation_error_deg:.2f}deg>{rotation_tolerance_deg:.1f}deg"
+                        f"{hardware_suffix}"
+                    )
                     return False
                 print(
                     "[StartupInit] arm reached target "
                     f"side={side} source={pose_source} "
                     f"pos_err_mm={position_error * 1000.0:.2f} rot_err_deg={rotation_error_deg:.2f}"
                 )
+        self.wait_reason = ""
         return True
 
     def mark_complete(self) -> None:
@@ -366,4 +446,5 @@ class StartupInitializer:
         if not self.enabled:
             return ""
         state = "done" if self.completed else ("wait" if self.started_at is None else f"{100.0 * self.progress:.0f}%")
-        return f"init={state}:{self.source}"
+        wait_suffix = "" if self.completed or not self.wait_reason else f",wait={self.wait_reason}"
+        return f"init={state}:{self.source}{wait_suffix}"

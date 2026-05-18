@@ -93,7 +93,7 @@ export RIGHT_HAND_IP=192.168.11.210
 python run_client_realman20.py \
   --host 127.0.0.1 \
   --source dataset \
-  --dataset-path /home/ai/Desktop/Being-H-series/2026-04-30_heavy_light_converted \
+  --dataset-path /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard_fixed_tactile/2026-05-11_replay_collect_demo_right \
   --max-requests 100 \
   --dataset-frame-stride 24 \
   --action-hz 12.0 \
@@ -107,7 +107,7 @@ python run_client_realman20.py \
 python run_client_realman22.py \
   --host 127.0.0.1 \
   --source dataset \
-  --dataset-path /home/ai/Desktop/Being-H-series/2026-04-28_large_brown_paper_fold_conerted \
+  --dataset-path /home/ai/Desktop/DexTeleop/test_left_fix_datasets_waping_fixed/2026-05-09_grasp_demo_left_arm_jitter \
   --max-requests 100 \
   --dataset-frame-stride 24 \
   --action-hz 12.0 \
@@ -180,6 +180,7 @@ Live Realman20 with RealSense RGB and sending actions:
 python run_client_realman20.py \
   --host 127.0.0.1 \
   --source live \
+  --dataset-path /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard_fixed_tactile/2026-05-11_replay_collect_demo_right \
   --camera-mode single \
   --camera-serial 213222079798 \
   --active-sides right \
@@ -191,12 +192,14 @@ python run_client_realman20.py \
   --auto-start \
   --transport-image-size 224 \
   --max-fingertip-force 600 \
-  --send-actions
+  --send-actions \
+  --which-episode 88
 
 
 python run_client_realman22.py \
   --host 127.0.0.1 \
   --source live \
+  --dataset-path /home/ai/Desktop/DexTeleop/test_left_fix_datasets_waping_fixed/2026-05-09_grasp_demo_left_arm_jitter \
   --camera-mode single \
   --camera-serial 213222079798 \
   --active-sides both \

@@ -1092,6 +1092,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite.")
     parser.add_argument("--status-sec", type=_positive_float, default=2.0, help="Status print interval in seconds.")
     parser.add_argument(
+        "--debug-frozen",
+        "--debug_frozen",
+        dest="debug_frozen",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable red stall diagnostics. When active loop/save work exceeds "
+            "--debug-frozen-threshold-sec, print phase timings and device state snapshots."
+        ),
+    )
+    parser.add_argument(
+        "--debug-frozen-threshold-sec",
+        "--debug_frozen_threshold_sec",
+        dest="debug_frozen_threshold_sec",
+        type=_positive_float,
+        default=0.1,
+        help="Stall threshold in seconds for --debug-frozen diagnostics.",
+    )
+    parser.add_argument(
+        "--debug-frozen-report-interval-sec",
+        "--debug_frozen_report_interval_sec",
+        dest="debug_frozen_report_interval_sec",
+        type=_non_negative_float,
+        default=1.0,
+        help="Minimum seconds between repeated --debug-frozen reports; use 0 to print every stall.",
+    )
+    parser.add_argument(
         "--silent",
         "--quiet",
         dest="silent",
@@ -1184,6 +1211,11 @@ class CollectControlState:
     replay_init_at_start: bool = False
     replay_init_ready: bool = False
     return_home_plan: "ReturnHomePlan | None" = None
+    debug_frozen_enabled: bool = False
+    debug_frozen_threshold_sec: float = 0.1
+    debug_frozen_report_interval_sec: float = 1.0
+    debug_frozen_last_report_at: float = 0.0
+    debug_frozen_suppressed_reports: int = 0
 
 
 @dataclass
@@ -2183,6 +2215,243 @@ def _arm_backend(app: CollectApp, side: str) -> RM65ArmBackend | None:
 def _hand_backend(app: CollectApp, side: str) -> InspireTacHandBackend | None:
     backend = app.components.backends.get(f"{side}_hand")
     return backend if isinstance(backend, InspireTacHandBackend) else None
+
+
+_DEBUG_FROZEN_RED = "\033[1;31;40m"
+_DEBUG_FROZEN_RESET = "\033[0m"
+
+
+def _debug_frozen_phase_text(phases: Sequence[tuple[str, float]], *, limit: int = 10) -> str:
+    if not phases:
+        return "phases=none"
+    ordered = sorted(
+        ((str(name), float(elapsed)) for name, elapsed in phases),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return "phases=" + ", ".join(
+        f"{name}:{elapsed * 1000.0:.1f}ms" for name, elapsed in ordered[: max(1, int(limit))]
+    )
+
+
+def _debug_frozen_writer_text(app: CollectApp) -> str:
+    try:
+        stats = app.runtime.writer_pool.stats()
+    except Exception as exc:  # noqa: BLE001
+        return f"writer=status_error:{type(exc).__name__}:{_compact_log_value(exc, max_chars=80)}"
+    return (
+        "writer="
+        f"queued:{stats.queued} submitted:{stats.submitted} completed:{stats.completed} "
+        f"dropped:{stats.dropped} failures:{stats.failures} workers:{stats.worker_count}"
+    )
+
+
+def _debug_frozen_camera_text(app: CollectApp) -> str:
+    if not app.camera_sources:
+        return "camera=off"
+    parts: list[str] = []
+    if app.camera_previewer is not None:
+        disabled_reason = app.camera_previewer.disabled_reason
+        parts.append(
+            "preview=active"
+            if not disabled_reason
+            else f"preview=disabled:{_compact_log_value(disabled_reason, max_chars=80)}"
+        )
+    for camera_key, source in sorted(app.camera_sources.items()):
+        try:
+            info = source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"{camera_key}=status_error:{type(exc).__name__}")
+            continue
+        frame_count = int(info.get("frame_count", 0) or 0)
+        age = info.get("last_frame_age_sec")
+        age_text = "none" if age is None else f"{float(age):.3f}s"
+        last_error = info.get("last_error")
+        error_text = "ok" if not last_error else _compact_log_value(last_error, max_chars=70)
+        parts.append(
+            f"{camera_key}=frames:{frame_count},age:{age_text},"
+            f"timeouts:{int(info.get('timeout_count', 0) or 0)},"
+            f"consecutive:{int(info.get('consecutive_timeout_count', 0) or 0)},"
+            f"restarts:{int(info.get('restart_count', 0) or 0)},err:{error_text}"
+        )
+    return "camera=" + "; ".join(parts)
+
+
+def _debug_frozen_hand_text(app: CollectApp) -> str:
+    parts: list[str] = []
+    now = time.time()
+    for side in app.active_sides:
+        backend = _hand_backend(app, side)
+        if backend is None:
+            continue
+        try:
+            state = backend.get_state()
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"{side}=state_error:{type(exc).__name__}")
+            continue
+        telemetry_at = state.get("telemetry_timestamp")
+        tactile_at = state.get("tactile_timestamp")
+        telemetry_age = "none" if telemetry_at is None else f"{now - float(telemetry_at):.3f}s"
+        tactile_age = "none" if tactile_at is None else f"{now - float(tactile_at):.3f}s"
+        error = state.get("telemetry_error")
+        error_text = "ok" if not error else _compact_log_value(error, max_chars=70)
+        parts.append(
+            f"{side}=connected:{bool(state.get('is_connected'))},"
+            f"telemetry_age:{telemetry_age},tactile_age:{tactile_age},"
+            f"reconnects:{int(state.get('reconnect_count', 0) or 0)},err:{error_text}"
+        )
+    return "hand=none" if not parts else "hand=" + "; ".join(parts)
+
+
+def _debug_frozen_arm_text(app: CollectApp) -> str:
+    parts: list[str] = []
+    now = time.time()
+    for side in app.active_sides:
+        backend = _arm_backend(app, side)
+        if backend is None:
+            continue
+        try:
+            state = backend.get_state()
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"{side}=state_error:{type(exc).__name__}")
+            continue
+        refresh_at = state.get("hardware_refresh_time")
+        refresh_age = "none" if refresh_at is None else f"{now - float(refresh_at):.3f}s"
+        code = state.get("hardware_result_code")
+        code_text = "none" if code is None else str(code)
+        result_text = _compact_log_value(state.get("hardware_result_text", ""), max_chars=50)
+        ik_meta = state.get("ik_metadata")
+        ik_text = ""
+        if isinstance(ik_meta, Mapping) and ik_meta:
+            ik_keys = (
+                "collision_avoidance_status",
+                "collision_avoidance_fallback_reason",
+                "collision_distance_m",
+                "ik_branch_selection",
+                "ik_jump_gate_status",
+                "ik_jump_gate_reason",
+                "ik_jump_gate_hold_frames",
+            )
+            ik_parts = [
+                f"{key}:{_compact_log_value(ik_meta[key], max_chars=40)}"
+                for key in ik_keys
+                if key in ik_meta and ik_meta[key] is not None
+            ]
+            if ik_parts:
+                ik_text = ",ik:{" + ",".join(ik_parts) + "}"
+        parts.append(
+            f"{side}=refresh_age:{refresh_age},code:{code_text},text:{result_text},"
+            f"dt:{float(state.get('effective_control_dt_sec', 0.0) or 0.0):.4f},"
+            f"scale:{float(state.get('effective_step_scale', 0.0) or 0.0):.3f}"
+            f"{ik_text}"
+        )
+    return "arm=none" if not parts else "arm=" + "; ".join(parts)
+
+
+def _debug_frozen_fault_text(result: SessionStepResult | None) -> str:
+    if result is None or not result.faults:
+        return "faults=none"
+    return "faults=" + _fault_status_text(result.faults)
+
+
+def _debug_frozen_mode_text(app: CollectApp, result: SessionStepResult | None) -> str:
+    control = app.control_state
+    session_state = (
+        result.state.value
+        if result is not None
+        else app.components.session.state_machine.state.value
+    )
+    active_replay = control.active_replay_run
+    active_unrecorded = control.active_unrecorded_replay_run
+    replay_text = "none"
+    if active_replay is not None:
+        replay_text = f"recorded:{active_replay.group.label}@{active_replay.group.action_hz:.2f}hz"
+    elif active_unrecorded is not None:
+        replay_text = f"unrecorded:{active_unrecorded.group.label}@{active_unrecorded.group.action_hz:.2f}hz"
+    return (
+        f"state={session_state} recording={control.recording_active} "
+        f"episode={control.active_episode_index} home={bool(app.calibration.metadata.get('home_ready'))} "
+        f"return_home={control.return_home_plan is not None} replay={replay_text} "
+        f"fixed={sorted(app.fixed_arm_retargeters)} jitter={sorted(app.jitter_arm_retargeters)}"
+    )
+
+
+def _debug_frozen_report(
+    app: CollectApp,
+    *,
+    reason: str,
+    elapsed_sec: float,
+    phases: Sequence[tuple[str, float]] = (),
+    step_count: int | None = None,
+    result: SessionStepResult | None = None,
+    force: bool = False,
+) -> None:
+    state = app.control_state
+    if not state.debug_frozen_enabled:
+        return
+    now = time.time()
+    report_interval = max(0.0, float(state.debug_frozen_report_interval_sec))
+    if (
+        not force
+        and report_interval > 0.0
+        and state.debug_frozen_last_report_at > 0.0
+        and (now - state.debug_frozen_last_report_at) < report_interval
+    ):
+        state.debug_frozen_suppressed_reports += 1
+        return
+    suppressed = int(state.debug_frozen_suppressed_reports)
+    state.debug_frozen_suppressed_reports = 0
+    state.debug_frozen_last_report_at = now
+    prefix = (
+        f"[DebugFrozen] stall reason={reason} elapsed={elapsed_sec * 1000.0:.1f}ms "
+        f"active_hz={(1.0 / elapsed_sec) if elapsed_sec > 0.0 else 0.0:.2f} "
+        f"threshold={float(state.debug_frozen_threshold_sec) * 1000.0:.1f}ms"
+    )
+    if step_count is not None:
+        prefix += f" step={int(step_count)}"
+    if result is not None:
+        prefix += f" control_hz={float(result.control_hz):.2f}"
+    if suppressed:
+        prefix += f" suppressed={suppressed}"
+    lines = [
+        prefix,
+        "  " + _debug_frozen_mode_text(app, result),
+        "  " + _debug_frozen_phase_text(phases),
+        "  " + _debug_frozen_writer_text(app),
+        "  " + _debug_frozen_camera_text(app),
+        "  " + _debug_frozen_hand_text(app),
+        "  " + _debug_frozen_arm_text(app),
+        "  " + _debug_frozen_fault_text(result),
+    ]
+    print(
+        _DEBUG_FROZEN_RED + "\n".join(lines) + _DEBUG_FROZEN_RESET,
+        flush=True,
+    )
+
+
+def _debug_frozen_maybe_report(
+    app: CollectApp,
+    *,
+    reason: str,
+    elapsed_sec: float,
+    phases: Sequence[tuple[str, float]] = (),
+    step_count: int | None = None,
+    result: SessionStepResult | None = None,
+    force: bool = False,
+) -> None:
+    if not app.control_state.debug_frozen_enabled:
+        return
+    threshold = float(app.control_state.debug_frozen_threshold_sec)
+    if force or elapsed_sec >= threshold or any(float(duration) >= threshold for _, duration in phases):
+        _debug_frozen_report(
+            app,
+            reason=reason,
+            elapsed_sec=elapsed_sec,
+            phases=phases,
+            step_count=step_count,
+            result=result,
+            force=force,
+        )
 
 
 def _seed_dual_arm_retargeter_from_backends(app: CollectApp) -> None:
@@ -3451,6 +3720,16 @@ def _save_active_episode(
     reason: str,
     show_standby: bool = True,
 ) -> bool:
+    save_started = time.perf_counter()
+    phase_started = save_started
+    phases: list[tuple[str, float]] = []
+
+    def mark_phase(name: str) -> None:
+        nonlocal phase_started
+        now = time.perf_counter()
+        phases.append((name, now - phase_started))
+        phase_started = now
+
     state = app.control_state
     if not state.recording_active or state.active_episode_index is None:
         _log("Episode", "ignore c: no active recording.")
@@ -3459,21 +3738,34 @@ def _save_active_episode(
     frame_count = int(app.sample_builder.frame_index)
     print(f"\n录制完成 Recording finished for episode {episode_index}")
     print(f"  数据帧数 Data frames: {frame_count}")
+    mark_phase("save:announce")
     _freeze_jitter_arms_at_current_pose(app)
+    mark_phase("save:freeze_jitter_arms")
     active_run = state.active_replay_run
     if active_run is not None:
         _restore_replay_arm_speed_override(app, active_run.original_max_angvel_by_side)
+    mark_phase("save:restore_replay_speed")
     if frame_count <= 0:
         app.runtime.flush()
+        mark_phase("save:flush_empty_episode")
         app.writer.discard_episode(episode_index)
+        mark_phase("save:discard_empty_episode")
         state.discarded_episodes += 1
         _reset_recording_state(state)
         print(f"  丢弃片段 Discarding episode {episode_index}: no samples")
         if show_standby:
             _print_standby(app)
+        mark_phase("save:reset_empty_episode")
+        _debug_frozen_maybe_report(
+            app,
+            reason=f"save_empty:{reason}",
+            elapsed_sec=time.perf_counter() - save_started,
+            phases=phases,
+            step_count=step_count,
+        )
         return False
     print(f"  正在保存片段 Saving episode {episode_index}...")
-    for job in app.writer.plan_finalize_episode(
+    finalize_jobs = list(app.writer.plan_finalize_episode(
         episode_index,
         summary={
             "stop_reason": reason,
@@ -3481,14 +3773,26 @@ def _save_active_episode(
             "submitted_samples_total": int(app.runtime.submitted_samples),
             "episode_frame_count": frame_count,
         },
-    ):
+    ))
+    mark_phase("save:plan_finalize_episode")
+    for job in finalize_jobs:
         app.runtime.writer_pool.submit(job)
+    mark_phase("save:submit_finalize_jobs")
     app.runtime.flush()
+    mark_phase("save:flush_writer")
     state.saved_episodes += 1
     _reset_recording_state(state)
     print(f"  已保存片段 Episode saved {episode_index}")
     if show_standby:
         _print_standby(app)
+    mark_phase("save:reset_recording_state")
+    _debug_frozen_maybe_report(
+        app,
+        reason=f"save:{reason}",
+        elapsed_sec=time.perf_counter() - save_started,
+        phases=phases,
+        step_count=step_count,
+    )
     return True
 
 
@@ -3498,6 +3802,16 @@ def _discard_active_episode(
     reason: str,
     show_standby: bool = True,
 ) -> bool:
+    discard_started = time.perf_counter()
+    phase_started = discard_started
+    phases: list[tuple[str, float]] = []
+
+    def mark_phase(name: str) -> None:
+        nonlocal phase_started
+        now = time.perf_counter()
+        phases.append((name, now - phase_started))
+        phase_started = now
+
     state = app.control_state
     if not state.recording_active or state.active_episode_index is None:
         _log("Episode", "ignore d: no active recording.")
@@ -3506,17 +3820,29 @@ def _discard_active_episode(
     frame_count = int(app.sample_builder.frame_index)
     print(f"\n录制完成 Recording finished for episode {episode_index}")
     print(f"  数据帧数 Data frames: {frame_count}")
+    mark_phase("discard:announce")
     _freeze_jitter_arms_at_current_pose(app)
+    mark_phase("discard:freeze_jitter_arms")
     active_run = state.active_replay_run
     if active_run is not None:
         _restore_replay_arm_speed_override(app, active_run.original_max_angvel_by_side)
+    mark_phase("discard:restore_replay_speed")
     app.runtime.flush()
+    mark_phase("discard:flush_writer")
     discarded = app.writer.discard_episode(episode_index)
+    mark_phase("discard:writer_discard")
     state.discarded_episodes += 1
     _reset_recording_state(state)
     print(f"  丢弃片段 Discarding episode {episode_index} discarded={discarded}")
     if show_standby:
         _print_standby(app)
+    mark_phase("discard:reset_recording_state")
+    _debug_frozen_maybe_report(
+        app,
+        reason=f"discard:{reason}",
+        elapsed_sec=time.perf_counter() - discard_started,
+        phases=phases,
+    )
     return True
 
 
@@ -4373,7 +4699,11 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             write_video=bool(args.write_video and not args.no_camera),
         )
     )
-    control_state = CollectControlState()
+    control_state = CollectControlState(
+        debug_frozen_enabled=bool(args.debug_frozen),
+        debug_frozen_threshold_sec=float(args.debug_frozen_threshold_sec),
+        debug_frozen_report_interval_sec=float(args.debug_frozen_report_interval_sec),
+    )
     sample_builder = CollectorSampleBuilder(
         CollectorSampleBuilderConfig(
             active_sides=active_sides,
@@ -4710,11 +5040,31 @@ def main() -> int:
             )
         else:
             _log("Keys", f"keyboard input active source={key_controller.input_source}")
+        if app.control_state.debug_frozen_enabled:
+            _log(
+                "DebugFrozen",
+                "enabled "
+                f"threshold={float(app.control_state.debug_frozen_threshold_sec):.3f}s "
+                f"report_interval={float(app.control_state.debug_frozen_report_interval_sec):.3f}s",
+            )
         _print_standby(app)
         while not should_quit:
             if int(args.max_steps) > 0 and step_count >= int(args.max_steps):
                 break
             loop_started_at = time.time()
+            loop_perf_started = time.perf_counter()
+            phase_started = loop_perf_started
+            phase_timings: list[tuple[str, float]] = []
+
+            def mark_loop_phase(name: str) -> None:
+                nonlocal phase_started
+                now_perf = time.perf_counter()
+                phase_timings.append((name, now_perf - phase_started))
+                phase_started = now_perf
+
+            def record_nested_phase(name: str, elapsed_sec: float) -> None:
+                phase_timings.append((name, float(elapsed_sec)))
+
             for key in key_controller.poll():
                 should_quit = _handle_key(
                     key,
@@ -4724,6 +5074,7 @@ def main() -> int:
                 )
                 if should_quit:
                     break
+            mark_loop_phase("loop.keys")
             if should_quit:
                 break
 
@@ -4736,6 +5087,7 @@ def main() -> int:
                     step_count=step_count,
                 )
                 step_count += 1
+                mark_loop_phase("loop.advance_unrecorded_replay")
             elif app.control_state.active_replay_run is not None:
                 _advance_replay_episode(
                     app,
@@ -4744,12 +5096,20 @@ def main() -> int:
                     step_count=step_count,
                 )
                 step_count += 1
+                mark_loop_phase("loop.advance_replay")
             elif app.control_state.return_home_plan is not None:
                 _advance_return_home(app, now=loop_started_at)
                 step_count += 1
+                mark_loop_phase("loop.advance_return_home")
             elif app.calibration.metadata.get("home_ready"):
-                result = runtime.step(now=loop_started_at)
+                result = runtime.step(
+                    now=loop_started_at,
+                    phase_recorder=record_nested_phase
+                    if app.control_state.debug_frozen_enabled
+                    else None,
+                )
                 step_count += 1
+                mark_loop_phase("loop.runtime_step")
                 recovery_plan = _drive_recovery_step(
                     app,
                     args,
@@ -4757,6 +5117,7 @@ def main() -> int:
                     recovery_plan,
                     now=loop_started_at,
                 )
+                mark_loop_phase("loop.drive_recovery")
                 current_fault_signature = _fault_signature(result.faults)
                 if current_fault_signature != last_fault_signature:
                     if current_fault_signature:
@@ -4764,6 +5125,9 @@ def main() -> int:
                     elif last_fault_signature is not None:
                         _log("State", "faults cleared")
                     last_fault_signature = current_fault_signature
+                mark_loop_phase("loop.fault_logging")
+            else:
+                mark_loop_phase("loop.idle_no_home")
             if app.tactile_visualizer is not None:
                 app.tactile_visualizer.update(
                     tactile_by_side_from_backends(
@@ -4771,6 +5135,7 @@ def main() -> int:
                         lambda side: _hand_backend(app, side),
                     )
                 )
+            mark_loop_phase("loop.tactile_visualizer")
             if app.camera_previewer is not None:
                 for key in app.camera_previewer.update(app.preview_camera_sources):
                     should_quit = _handle_key(
@@ -4781,6 +5146,7 @@ def main() -> int:
                     )
                     if should_quit:
                         break
+            mark_loop_phase("loop.camera_previewer")
             if should_quit:
                 break
             if app.camera_sources:
@@ -4788,13 +5154,24 @@ def main() -> int:
                 if camera_signature != last_camera_state_signature:
                     _log("Camera", f"state changed: {camera_text}")
                     last_camera_state_signature = camera_signature
+            mark_loop_phase("loop.camera_status")
             if (
                 not bool(args.silent)
                 and (loop_started_at - last_status_at) >= float(args.status_sec)
             ):
                 print(_status_line(step_count, runtime, result, app))
                 last_status_at = loop_started_at
+            mark_loop_phase("loop.status_line")
             elapsed = time.time() - loop_started_at
+            active_elapsed_sec = time.perf_counter() - loop_perf_started
+            _debug_frozen_maybe_report(
+                app,
+                reason="main_loop",
+                elapsed_sec=active_elapsed_sec,
+                phases=phase_timings,
+                step_count=step_count,
+                result=result,
+            )
             active_replay = app.control_state.active_replay_run
             active_unrecorded = app.control_state.active_unrecorded_replay_run
             active_period_sec = loop_period_sec

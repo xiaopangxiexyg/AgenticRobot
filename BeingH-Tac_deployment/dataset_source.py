@@ -237,7 +237,10 @@ def tactile_history_from_df(df: Any, row_index: int, column: str, side: str, his
     samples = []
     for offset in range(history_size - 1, -1, -1):
         idx = max(0, base - offset * history_stride)
-        samples.append(tactile_to_351(df.iloc[idx].get(column), side))
+        try:
+            samples.append(tactile_to_351(df.iloc[idx].get(column), side))
+        except Exception:
+            samples.append(np.zeros((351,), dtype=np.float32))
     return np.stack(samples, axis=0).astype(np.float32)
 
 

@@ -123,7 +123,13 @@ class ArmStateReader:
             state = backend.get_state()
             if self.compute_tcp_pose:
                 try:
-                    state["current_tcp_pose"] = backend.compute_tcp_pose()
+                    hardware_qpos = state.get("hardware_qpos")
+                    if hardware_qpos is not None:
+                        state["current_tcp_pose"] = backend.compute_tcp_pose(qpos=hardware_qpos)
+                        state["tcp_pose_source"] = "hardware_qpos_fk"
+                    else:
+                        state["current_tcp_pose"] = backend.compute_tcp_pose()
+                        state["tcp_pose_source"] = "current_qpos_fk"
                 except Exception as exc:  # noqa: BLE001
                     state.setdefault("pose_error", f"compute_tcp_pose_failed:{type(exc).__name__}:{exc}")
             states[side] = state
@@ -144,13 +150,24 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
-def _parse_active_sides(text: str) -> tuple[str, ...]:
-    value = str(text).strip().lower()
-    if value == "both":
+def _parse_active_sides(value: str | list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        parts = [
+            part.strip().lower()
+            for item in value
+            for part in str(item).replace(",", " ").split()
+            if part.strip()
+        ]
+    else:
+        parts = [part.strip().lower() for part in str(value).replace(",", " ").split() if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+    if parts == ["both"]:
         return ("left", "right")
-    if value in set(ALL_SIDES):
-        return (value,)
-    raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+    invalid = sorted(set(parts) - set(ALL_SIDES))
+    if invalid:
+        raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+    return tuple(side for side in ALL_SIDES if side in set(parts))
 
 
 def _parse_float_tuple(text: str, *, length: int, name: str) -> tuple[float, ...]:
@@ -171,8 +188,24 @@ def _non_negative_float(text: str) -> float:
     return value
 
 
-def _parse_vector3(text: str) -> tuple[float, float, float]:
-    values = _parse_float_tuple(text, length=3, name="vector3")
+def _parse_vector3(value: str | list[str] | tuple[object, ...]) -> tuple[float, float, float]:
+    if isinstance(value, (list, tuple)):
+        parts = [
+            part.strip()
+            for item in value
+            for part in str(item).replace(",", " ").split()
+            if part.strip()
+        ]
+        text = " ".join(parts)
+    else:
+        text = str(value)
+        parts = [part.strip() for part in text.replace(",", " ").split() if part.strip()]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("vector3 must contain 3 floats")
+    try:
+        values = tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid vector3: {text}") from exc
     return (values[0], values[1], values[2])
 
 
@@ -207,7 +240,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Policy loader spec: hold, package.module:Policy, or /path/policy.py:Policy.",
     )
     parser.add_argument("--policy-kwargs-json", type=str, default="{}")
-    parser.add_argument("--active-sides", type=_parse_active_sides, default=("left", "right"))
+    parser.add_argument("--active-sides", nargs="+", default=("left", "right"))
     parser.add_argument("--hz", type=_positive_float, default=13.0)
     parser.add_argument(
         "--action-hz",
@@ -264,6 +297,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Seconds used to smoothly move to the selected initial target before execution.",
     )
     parser.add_argument(
+        "--init-arm-position-tolerance-m",
+        type=_positive_float,
+        default=0.03,
+        help="Startup init arm position tolerance in meters before policy execution is released.",
+    )
+    parser.add_argument(
+        "--init-arm-rotation-tolerance-deg",
+        type=_positive_float,
+        default=20.0,
+        help="Startup init arm orientation tolerance in degrees before policy execution is released.",
+    )
+    parser.add_argument(
         "--init-source",
         choices=["auto", "current", "dataset", "replay", "none"],
         default="auto",
@@ -282,6 +327,19 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-pause-on-policy-error", dest="pause_on_policy_error", action="store_false")
     parser.add_argument("--send-actions", action="store_true")
     parser.add_argument("--auto-start", action="store_true")
+    parser.add_argument(
+        "--wait-for-ready-confirm",
+        dest="wait_for_ready_confirm",
+        action="store_true",
+        default=None,
+        help="After startup init reaches ready, wait for A/a before policy inference and action execution.",
+    )
+    parser.add_argument(
+        "--no-wait-for-ready-confirm",
+        dest="wait_for_ready_confirm",
+        action="store_false",
+        help="Start policy immediately after startup init completes.",
+    )
     parser.add_argument("--allow-arm-connect-failure", action="store_true")
     parser.add_argument("--allow-hand-connect-failure", action="store_true")
 
@@ -296,8 +354,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rm65-hardware-read-retry-delay-sec", type=float, default=0.02)
     parser.add_argument("--left-initial-qpos", type=_parse_qpos6, default=None)
     parser.add_argument("--right-initial-qpos", type=_parse_qpos6, default=None)
-    parser.add_argument("--arm-workspace-min", type=_parse_vector3, default=(-0.60, -0.80, 0.00))
-    parser.add_argument("--arm-workspace-max", type=_parse_vector3, default=(0.60, 0.80, 0.90))
+    parser.add_argument(
+        "--arm-workspace-min",
+        nargs="+",
+        default=(-0.60, -0.80, 0.00),
+        help="Arm workspace minimum xyz. Accepts either three values or --arm-workspace-min=x,y,z.",
+    )
+    parser.add_argument(
+        "--arm-workspace-max",
+        nargs="+",
+        default=(0.60, 0.80, 0.90),
+        help="Arm workspace maximum xyz. Accepts either three values or --arm-workspace-max=x,y,z.",
+    )
     parser.add_argument("--max-arm-xyz-step-m", type=float, default=0.03)
     parser.add_argument("--max-arm-rot-step-deg", type=float, default=8.0)
     parser.add_argument("--max-arm-joint-step-rad", type=float, default=0.08)
@@ -312,11 +380,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hand-tactile-regions", "--tactile-regions", "--tactile-region", dest="hand_tactile_regions", type=str, default="all")
     parser.add_argument(
         "--inspire-hand-max-force",
+        "--inspire-tac-max-fingertip-force",
         "--max-force",
         "--max-fingertip-force",
+        "--hand-max-force",
         dest="max_fingertip_force",
         type=_non_negative_int,
         default=DEFAULT_INSPIRE_HAND_MAX_FORCE,
+        help=(
+            "InspireTac startup max_fingertip_force written to all six fingers. "
+            f"Default: {DEFAULT_INSPIRE_HAND_MAX_FORCE}."
+        ),
     )
     parser.add_argument("--max-hand-step", type=float, default=0.08)
 
@@ -358,7 +432,10 @@ def _hands_enabled(args: argparse.Namespace) -> bool:
 
 
 def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
-    active_sides = tuple(args.active_sides)
+    active_sides = _parse_active_sides(args.active_sides)
+    args.active_sides = active_sides
+    args.arm_workspace_min = _parse_vector3(args.arm_workspace_min)
+    args.arm_workspace_max = _parse_vector3(args.arm_workspace_max)
     hands_enabled = _hands_enabled(args)
     if not bool(args.arms_enabled) and not hands_enabled:
         raise ValueError("Enable at least one actuator family: arms or hands.")
@@ -603,12 +680,14 @@ def hand_state_snapshot(backends: Mapping[str, InspireTacHandBackend]) -> dict[s
     return {side: backend.get_state() for side, backend in backends.items()}
 
 
-def print_controls(*, send_actions: bool, auto_start: bool) -> None:
+def print_controls(*, send_actions: bool, auto_start: bool, wait_for_ready_confirm: bool) -> None:
     print("\n" + "=" * 60)
     print("teleop_runtime policy deployment loop started")
     print(f"  send_actions={'on' if send_actions else 'off(dry-run)'}")
     print(f"  initial_policy_state={'active' if auto_start else 'paused'}")
-    print("Controls: g=start/resume, h=pause+clear queue, q=quit")
+    if wait_for_ready_confirm:
+        print("  ready_confirm=on(A/a required after startup init)")
+    print("Controls: g=start/resume, A=confirm ready/start policy, h=pause+clear queue, q=quit")
     print("=" * 60 + "\n")
 
 
@@ -765,11 +844,19 @@ def main(argv: list[str] | None = None) -> int:
         active_sides=active_sides,
         arms_enabled=bool(args.arms_enabled),
         hands_enabled=bool(hands_enabled),
+        arm_position_tolerance_m=float(args.init_arm_position_tolerance_m),
+        arm_rotation_tolerance_deg=float(args.init_arm_rotation_tolerance_deg),
     )
     startup_initializer.reset()
 
     policy_active = bool(args.auto_start)
     send_actions = bool(args.send_actions)
+    wait_for_ready_confirm = (
+        bool(send_actions)
+        if args.wait_for_ready_confirm is None
+        else bool(args.wait_for_ready_confirm)
+    )
+    ready_confirmed = not wait_for_ready_confirm
     last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
     last_policy_at: float | None = None
     step_index = 0
@@ -824,7 +911,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[Camera] preview disabled: {camera_previewer.disabled_reason}")
         for camera_source in camera_sources.values():
             camera_source.start()
-        print_controls(send_actions=send_actions, auto_start=bool(args.auto_start))
+        print_controls(
+            send_actions=send_actions,
+            auto_start=bool(args.auto_start),
+            wait_for_ready_confirm=wait_for_ready_confirm,
+        )
 
         with NonBlockingKeyboard() as keyboard:
             while True:
@@ -841,11 +932,23 @@ def main(argv: list[str] | None = None) -> int:
                     chunk_buffer.clear()
                     startup_initializer.reset()
                     last_policy_at = None
+                    ready_confirmed = not wait_for_ready_confirm
                     policy_active = True
                     print("[Deploy] policy active")
+                elif key == "a":
+                    if not policy_active:
+                        policy_active = True
+                    if startup_initializer.enabled and not startup_initializer.completed:
+                        print("[Deploy] ready confirm ignored: startup init is not complete yet.")
+                    else:
+                        ready_confirmed = True
+                        chunk_buffer.clear()
+                        last_policy_at = None
+                        print("[Deploy] ready confirmed; policy inference/execution may start.")
                 elif key == "h":
                     chunk_buffer.clear()
                     policy_active = False
+                    ready_confirmed = not wait_for_ready_confirm
                     print("[Deploy] policy paused")
                 elif key == "q":
                     print("\n[Deploy] quitting policy deployment loop\n")
@@ -894,6 +997,13 @@ def main(argv: list[str] | None = None) -> int:
                                     policy_name="startup_init",
                                 )
                                 faults.extend(deployment_action.faults)
+                                if (
+                                    startup_initializer.progress >= 1.0
+                                    and not deployment_action.faults
+                                ):
+                                    startup_initializer.update_resolved_target_action(
+                                        deployment_action.vector
+                                    )
                                 if deployment_action.commands:
                                     if send_actions:
                                         _send_commands(
@@ -904,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
                                     last_action = deployment_action.vector.astype(np.float32, copy=True)
                                 if init_ready and not deployment_action.faults:
                                     startup_initializer.mark_complete()
-                                    if startup_initializer.source == "replay:first_frame":
+                                    if startup_initializer.source in {"replay:first_frame", "policy:first_frame"}:
                                         skipped = _skip_startup_replay_frames(policy, count=1)
                                         if skipped:
                                             print(
@@ -913,6 +1023,12 @@ def main(argv: list[str] | None = None) -> int:
                                             )
                                     chunk_buffer.clear()
                                     last_policy_at = None
+                                    if wait_for_ready_confirm and not ready_confirmed:
+                                        print(
+                                            "[StartupInit] ready; press A to start policy inference/execution."
+                                        )
+                        can_run_policy = False
+                    if can_run_policy and wait_for_ready_confirm and not ready_confirmed:
                         can_run_policy = False
                     if can_run_policy and _policy_should_run(
                         now=loop_started_at,
@@ -971,7 +1087,16 @@ def main(argv: list[str] | None = None) -> int:
                     policy_status = _policy_status_text(policy)
                     status_parts = [
                         text
-                        for text in (startup_initializer.status_text, policy_status)
+                        for text in (
+                            startup_initializer.status_text,
+                            "ready=wait:A" if (
+                                wait_for_ready_confirm
+                                and policy_active
+                                and startup_initializer.completed
+                                and not ready_confirmed
+                            ) else "",
+                            policy_status,
+                        )
                         if text
                     ]
                     suffix = f" {' '.join(status_parts)}" if status_parts else ""

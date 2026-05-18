@@ -820,6 +820,88 @@ def _send_commands(
             hand_backends[side].send_command(hand_command)
 
 
+def _send_direct_joint_targets(
+    *,
+    arm_backends: Mapping[str, Any],
+    hand_backends: Mapping[str, Any],
+    backend_kind: str,
+    arm_qpos: Mapping[str, Any] | None = None,
+    hand_qpos: Mapping[str, Any] | None = None,
+) -> list[str]:
+    statuses: list[str] = []
+    arm_qpos = {} if arm_qpos is None else dict(arm_qpos)
+    hand_qpos = {} if hand_qpos is None else dict(hand_qpos)
+
+    for side, value in arm_qpos.items():
+        if side not in arm_backends:
+            statuses.append(f"{side}_arm_unavailable")
+            continue
+        target = np.asarray(value, dtype=np.float32).reshape(-1)
+        expected_width = 7 if backend_kind == "fr3" else 6
+        if target.shape != (expected_width,) or not np.all(np.isfinite(target)):
+            statuses.append(f"{side}_arm_direct_qpos_invalid")
+            continue
+        backend = arm_backends[side]
+        arm = getattr(backend, "arm", None)
+        if arm is not None:
+            arm.Movej_CANFD(np.asarray(target, dtype=float) / np.pi * 180.0, False)
+            if hasattr(backend, "set_local_qpos"):
+                backend.set_local_qpos(target)
+            statuses.append(f"{side}_arm_direct_sent")
+        else:
+            if backend_kind == "fr3":
+                command = FR3EffectorCommand(
+                    effector_name="arm",
+                    side=side,
+                    value=target,
+                    timestamp=time.time(),
+                    metadata={"source": "startup_direct_init"},
+                )
+            else:
+                _ensure_rm65_imports()
+                command = EffectorCommand(
+                    effector_name=f"{side}_arm",
+                    side=side,
+                    value=target,
+                    command_type="joint_vector",
+                    frame_name=None,
+                    metadata={"source": "startup_direct_init"},
+                )
+            backend.send_command(command)
+            statuses.append(f"{side}_arm_direct_dry_run")
+
+    for side, value in hand_qpos.items():
+        if side not in hand_backends:
+            statuses.append(f"{side}_hand_unavailable")
+            continue
+        target = np.asarray(value, dtype=np.float32).reshape(-1)
+        if target.shape != (6,) or not np.all(np.isfinite(target)):
+            statuses.append(f"{side}_hand_direct_qpos_invalid")
+            continue
+        clipped = np.clip(target, 0.0, 1.0)
+        if backend_kind == "fr3":
+            command = FR3EffectorCommand(
+                effector_name=f"{side}_hand",
+                side=side,
+                value=clipped,
+                timestamp=time.time(),
+                metadata={"source": "startup_direct_init"},
+            )
+        else:
+            _ensure_rm65_imports()
+            command = EffectorCommand(
+                effector_name=f"{side}_hand",
+                side=side,
+                value=clipped,
+                command_type="joint_vector",
+                frame_name=None,
+                metadata={"source": "startup_direct_init"},
+            )
+        hand_backends[side].send_command(command)
+        statuses.append(f"{side}_hand_direct_sent")
+    return statuses
+
+
 class TimedActionDispatcher:
     """Consume model action chunks at a fixed robot-control frequency."""
 
@@ -1480,8 +1562,40 @@ class LiveObservationSource:
             return ["policy_paused"]
         return self.dispatcher.submit_result(result)
 
+    def send_direct_joint_targets(
+        self,
+        *,
+        arm_qpos: Mapping[str, Any] | None = None,
+        hand_qpos: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        return _send_direct_joint_targets(
+            arm_backends=self.arm_backends,
+            hand_backends=self.hand_backends,
+            backend_kind=self.backend_kind,
+            arm_qpos=arm_qpos,
+            hand_qpos=hand_qpos,
+        )
+
     def remember_observation(self, observation: Any) -> None:
         self._last_observation = observation
+
+    @property
+    def sent_actions(self) -> int:
+        return self.dispatcher.sent_actions
+
+    def wait_until_sent(
+        self,
+        target_sent: int,
+        timeout_s: float | None = None,
+        poll_s: float = 0.01,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        return self.dispatcher.wait_until_sent(
+            target_sent=target_sent,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            progress=progress,
+        )
 
 
 class HardwareActionExecutor:
@@ -1655,77 +1769,13 @@ class HardwareActionExecutor:
         arm_qpos: Mapping[str, Any] | None = None,
         hand_qpos: Mapping[str, Any] | None = None,
     ) -> list[str]:
-        statuses: list[str] = []
-        arm_qpos = {} if arm_qpos is None else dict(arm_qpos)
-        hand_qpos = {} if hand_qpos is None else dict(hand_qpos)
-
-        for side, value in arm_qpos.items():
-            if side not in self.arm_backends:
-                statuses.append(f"{side}_arm_unavailable")
-                continue
-            target = np.asarray(value, dtype=np.float32).reshape(-1)
-            expected_width = 7 if self.backend_kind == "fr3" else 6
-            if target.shape != (expected_width,) or not np.all(np.isfinite(target)):
-                statuses.append(f"{side}_arm_direct_qpos_invalid")
-                continue
-            backend = self.arm_backends[side]
-            arm = getattr(backend, "arm", None)
-            if arm is not None:
-                arm.Movej_CANFD(np.asarray(target, dtype=float) / np.pi * 180.0, False)
-                backend.set_local_qpos(target)
-                statuses.append(f"{side}_arm_direct_sent")
-            else:
-                if self.backend_kind == "fr3":
-                    command = FR3EffectorCommand(
-                        effector_name="arm",
-                        side=side,
-                        value=target,
-                        timestamp=time.time(),
-                        metadata={"source": "startup_direct_init"},
-                    )
-                else:
-                    _ensure_rm65_imports()
-                    command = EffectorCommand(
-                        effector_name=f"{side}_arm",
-                        side=side,
-                        value=target,
-                        command_type="joint_vector",
-                        frame_name=None,
-                        metadata={"source": "startup_direct_init"},
-                    )
-                backend.send_command(command)
-                statuses.append(f"{side}_arm_direct_dry_run")
-
-        for side, value in hand_qpos.items():
-            if side not in self.hand_backends:
-                statuses.append(f"{side}_hand_unavailable")
-                continue
-            target = np.asarray(value, dtype=np.float32).reshape(-1)
-            if target.shape != (6,) or not np.all(np.isfinite(target)):
-                statuses.append(f"{side}_hand_direct_qpos_invalid")
-                continue
-            clipped = np.clip(target, 0.0, 1.0)
-            if self.backend_kind == "fr3":
-                command = FR3EffectorCommand(
-                    effector_name=f"{side}_hand",
-                    side=side,
-                    value=clipped,
-                    timestamp=time.time(),
-                    metadata={"source": "startup_direct_init"},
-                )
-            else:
-                _ensure_rm65_imports()
-                command = EffectorCommand(
-                    effector_name=f"{side}_hand",
-                    side=side,
-                    value=clipped,
-                    command_type="joint_vector",
-                    frame_name=None,
-                    metadata={"source": "startup_direct_init"},
-                )
-            self.hand_backends[side].send_command(command)
-            statuses.append(f"{side}_hand_direct_sent")
-        return statuses
+        return _send_direct_joint_targets(
+            arm_backends=self.arm_backends,
+            hand_backends=self.hand_backends,
+            backend_kind=self.backend_kind,
+            arm_qpos=arm_qpos,
+            hand_qpos=hand_qpos,
+        )
 
     def wait_until_idle(self, timeout_s: float | None = None, poll_s: float = 0.01) -> bool:
         return self.dispatcher.wait_until_idle(timeout_s=timeout_s, poll_s=poll_s)

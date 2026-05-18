@@ -244,6 +244,9 @@ def observation_faults(
             result_code = state.get("hardware_result_code")
             if result_code not in (None, 0, 9):
                 faults.append(f"{side}_arm_state:{result_code}")
+            send_code = state.get("send_result_code")
+            if send_code not in (None, 0):
+                faults.append(f"{side}_arm_send:{send_code}")
         if hands_enabled:
             if not np.all(state_valid[STATE_HAND_SLICES[side]]):
                 faults.append(f"{side}_hand_state_unavailable")

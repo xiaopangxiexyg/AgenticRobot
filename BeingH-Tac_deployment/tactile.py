@@ -339,8 +339,10 @@ def _converter() -> _LightweightInspireTactileConverter:
 
 
 def tactile_to_351(value: Any, side: str) -> np.ndarray:
+    if value is None:
+        return np.zeros((351,), dtype=np.float32)
     arr = np.asarray(value, dtype=np.float32)
-    if arr.size == 0:
+    if arr.ndim == 0 or arr.size == 0:
         return np.zeros((351,), dtype=np.float32)
     if arr.ndim == 1:
         arr2 = arr[None, :]
