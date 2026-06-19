@@ -32,15 +32,16 @@ FR3_LEFT_HAND_SLICE = slice(FR3_ARM_DOF + FR3_HAND_DOF, FR3_ACTION_DIM)
 
 def add_startup_replay_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-startup-key-wait", dest="startup_key_wait", action="store_false", default=True)
-    parser.add_argument("--startup-init-sleep-s", type=float, default=10.0)
+    parser.add_argument("--startup-i-delay-s", type=float, default=0.0)
+    parser.add_argument("--startup-init-sleep-s", type=float, default=3.0)
     parser.add_argument("--startup-replay-action-column", type=str, default="action")
     parser.add_argument("--startup-replay-start-frame", type=int, default=0)
     parser.add_argument("--startup-replay-seed", type=int, default=None)
     parser.add_argument("--which-episode", type=int, default=None)
     parser.add_argument("--startup-init-steps", type=int, default=60)
     parser.add_argument("--startup-init-hz", type=float, default=12.0)
-    parser.add_argument("--startup-init-tolerance-rad", type=float, default=0.02)
-    parser.add_argument("--startup-init-settle-timeout-s", type=float, default=10.0)
+    parser.add_argument("--startup-init-tolerance-rad", type=float, default=0.04)
+    parser.add_argument("--startup-init-settle-timeout-s", type=float, default=3.0)
     parser.add_argument("--startup-init-settle-log-s", type=float, default=0.5)
 
 
@@ -659,6 +660,7 @@ def _run_direct_first_frame_init(
 
 def _sleep_after_direct_first_frame_init(args: argparse.Namespace, *, label: str) -> None:
     sleep_s = max(0.0, float(getattr(args, "startup_init_sleep_s", 10.0)))
+    sleep_s = 1.0
     print(f"[Startup] first action reached; sleeping {sleep_s:.1f}s before {label}.")
     _sleep_with_countdown(sleep_s, label=f"{label} starts")
 

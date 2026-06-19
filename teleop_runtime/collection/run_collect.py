@@ -2700,6 +2700,46 @@ def _build_joint_target_teleop_command(
     return command
 
 
+def _assert_replay_qpos_init_within_180_deg(
+    app: CollectApp,
+    qpos_by_side: Mapping[str, np.ndarray],
+) -> None:
+    limit_rad = float(np.pi)
+    for side, target in qpos_by_side.items():
+        backend = _arm_backend(app, str(side))
+        if backend is None:
+            raise RuntimeError(f"Cannot verify replay qpos init safety: missing {side}_arm backend.")
+        try:
+            state = backend.refresh_state_from_hardware()
+        except Exception:
+            state = backend.get_state()
+        current = _qpos_or_none(state.get("hardware_qpos"))
+        if current is None:
+            current = _qpos_or_none(state.get("current_qpos"))
+        if current is None:
+            raise RuntimeError(
+                f"Cannot verify replay qpos init safety: {side}_arm current qpos is unavailable."
+            )
+        target_qpos = np.asarray(target, dtype=float).reshape(6)
+        diff = np.abs(target_qpos - current)
+        unsafe = np.flatnonzero(diff > limit_rad)
+        if unsafe.size <= 0:
+            continue
+        details = ", ".join(
+            (
+                f"j{int(index) + 1}:"
+                f"current={np.rad2deg(current[index]):.1f}deg,"
+                f"target={np.rad2deg(target_qpos[index]):.1f}deg,"
+                f"diff={np.rad2deg(diff[index]):.1f}deg"
+            )
+            for index in unsafe
+        )
+        raise RuntimeError(
+            f"Unsafe replay qpos init target for {side}_arm: joint delta exceeds 180deg; "
+            f"{details}. Command was not sent."
+        )
+
+
 def _qpos_targets_reached(
     app: CollectApp,
     qpos_by_side: Mapping[str, np.ndarray],
@@ -4246,6 +4286,7 @@ def _advance_unrecorded_replay_run(
             now=float(now),
         )
         if command.commands:
+            _assert_replay_qpos_init_within_180_deg(app, run.startup_target_qpos_by_side)
             app.components.session.rig.send_commands(command)
         if _qpos_targets_reached(app, run.startup_target_qpos_by_side):
             _restore_replay_arm_speed_override(app, run.original_max_angvel_by_side)

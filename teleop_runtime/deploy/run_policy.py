@@ -39,6 +39,7 @@ from .actions import (
     NormalizedAction,
     normalize_policy_output,
 )
+from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
 from .observation import build_deployment_observation
 from .policy import load_policy
 from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
@@ -322,6 +323,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--init-episode", type=_non_negative_int, default=0)
     parser.add_argument("--init-frame", type=_non_negative_int, default=0)
     parser.add_argument("--init-action-column", type=str, default="action")
+    parser.add_argument("--deploy-fixed-init-dataset", type=Path, default=None)
+    parser.add_argument("--deploy-fixed-init-parquet", type=Path, default=None)
+    parser.add_argument("--deploy-fixed-init-episode", type=str, default="0:0:end")
+    parser.add_argument("--deploy-fixed-init-action-column", type=str, default="action")
+    parser.add_argument(
+        "--deploy-fixed-init-arm-max-angvel",
+        type=_parse_arm_max_angvel,
+        default=(4.5, 4.5, 4.5, 6.0, 6.0, 8.0),
+    )
+    parser.add_argument("--deploy-fixed-init-qpos-tolerance", type=_positive_float, default=0.01)
     parser.add_argument("--require-ready-observation", action="store_true")
     parser.add_argument("--pause-on-policy-error", dest="pause_on_policy_error", action="store_true", default=True)
     parser.add_argument("--no-pause-on-policy-error", dest="pause_on_policy_error", action="store_false")
@@ -445,6 +456,13 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("--init-time-s must be non-negative.")
     if args.init_dataset and args.init_parquet:
         raise ValueError("Use only one of --init-dataset or --init-parquet.")
+    if args.deploy_fixed_init_dataset and args.deploy_fixed_init_parquet:
+        raise ValueError("Use only one of --deploy-fixed-init-dataset or --deploy-fixed-init-parquet.")
+    if args.deploy_fixed_init_dataset or args.deploy_fixed_init_parquet:
+        if active_sides != ("right",):
+            raise ValueError("--deploy-fixed-init-* is currently right-arm/right-hand only; use --active-sides right.")
+        if not bool(args.arms_enabled):
+            raise ValueError("--deploy-fixed-init-* requires arms to be enabled.")
     if args.debug_replay_end_index is not None and int(args.debug_replay_end_index) <= int(args.debug_replay_start_index):
         raise ValueError("--debug-replay-end-index must be greater than --debug-replay-start-index.")
     action_hz_start = args.debug_replay_start_index if args.action_hz_start_index is None else args.action_hz_start_index
@@ -680,14 +698,28 @@ def hand_state_snapshot(backends: Mapping[str, InspireTacHandBackend]) -> dict[s
     return {side: backend.get_state() for side, backend in backends.items()}
 
 
-def print_controls(*, send_actions: bool, auto_start: bool, wait_for_ready_confirm: bool) -> None:
+def print_controls(
+    *,
+    send_actions: bool,
+    auto_start: bool,
+    wait_for_ready_confirm: bool,
+    fixed_init_enabled: bool = False,
+) -> None:
     print("\n" + "=" * 60)
     print("teleop_runtime policy deployment loop started")
     print(f"  send_actions={'on' if send_actions else 'off(dry-run)'}")
-    print(f"  initial_policy_state={'active' if auto_start else 'paused'}")
+    if fixed_init_enabled and auto_start:
+        initial_policy_state = "paused(auto-start after fixed-init)"
+    else:
+        initial_policy_state = "active" if auto_start else "paused"
+    print(f"  initial_policy_state={initial_policy_state}")
     if wait_for_ready_confirm:
         print("  ready_confirm=on(A/a required after startup init)")
-    print("Controls: g=start/resume, A=confirm ready/start policy, h=pause+clear queue, q=quit")
+    if fixed_init_enabled:
+        print("  fixed_init=on(H first-frame qpos, H execute T, then startup init)")
+        print("Controls: H=pause policy or fixed-init step, g=start after fixed-init, A=confirm, q=quit")
+    else:
+        print("Controls: g=start/resume, A=confirm ready/start policy, h=pause+clear queue, q=quit")
     print("=" * 60 + "\n")
 
 
@@ -790,6 +822,13 @@ def main(argv: list[str] | None = None) -> int:
         policy = load_policy(args.policy_spec, kwargs=parse_policy_kwargs(args.policy_kwargs_json))
     action_queue_policy = _resolve_action_queue_policy(args, debug_replay=debug_replay)
     startup_init_action, startup_init_source = resolve_startup_init_action(args, policy)
+    fixed_init_plan = load_deploy_fixed_init_plan(
+        dataset_root=args.deploy_fixed_init_dataset,
+        parquet_path=args.deploy_fixed_init_parquet,
+        episode_spec=str(args.deploy_fixed_init_episode),
+        action_column=str(args.deploy_fixed_init_action_column),
+        active_sides=active_sides,
+    )
 
     effective_action_hz, action_hz_info = resolve_effective_action_hz(args, policy)
     effective_policy_hz, policy_hz_source = resolve_effective_policy_hz(
@@ -798,7 +837,10 @@ def main(argv: list[str] | None = None) -> int:
         action_hz_source=str(action_hz_info.get("source", "")),
     )
 
-    arm_backends = build_arm_backends(args, active_sides, control_hz=float(effective_action_hz))
+    backend_control_hz = float(effective_action_hz)
+    if fixed_init_plan is not None:
+        backend_control_hz = max(backend_control_hz, float(fixed_init_plan.action_hz))
+    arm_backends = build_arm_backends(args, active_sides, control_hz=backend_control_hz)
     hand_backends = build_hand_backends(args, active_sides)
     arm_reader = ArmStateReader(
         arm_backends,
@@ -848,11 +890,20 @@ def main(argv: list[str] | None = None) -> int:
         arm_rotation_tolerance_deg=float(args.init_arm_rotation_tolerance_deg),
     )
     startup_initializer.reset()
+    fixed_init_controller = (
+        None
+        if fixed_init_plan is None
+        else DeployFixedInitController(
+            fixed_init_plan,
+            arm_max_angvel=tuple(float(value) for value in args.deploy_fixed_init_arm_max_angvel),
+            qpos_tolerance=float(args.deploy_fixed_init_qpos_tolerance),
+        )
+    )
 
-    policy_active = bool(args.auto_start)
+    policy_active = bool(args.auto_start) and fixed_init_controller is None
     send_actions = bool(args.send_actions)
     wait_for_ready_confirm = (
-        bool(send_actions)
+        bool(send_actions) and fixed_init_controller is None
         if args.wait_for_ready_confirm is None
         else bool(args.wait_for_ready_confirm)
     )
@@ -872,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
             f"arms={bool(args.arms_enabled)} hands={hands_enabled} "
             f"hz={float(effective_action_hz):.2f} "
             f"policy_hz={float(effective_policy_hz):.2f} "
+            f"backend_hz={backend_control_hz:.2f} "
             f"queue_policy={action_queue_policy}"
         )
         if action_hz_info.get("source") != "cli.hz":
@@ -886,6 +938,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"{policy.metadata.get('source_path')} frames={policy.metadata.get('frame_count')} "
                 f"chunk_size={int(args.debug_replay_chunk_size)} loop={bool(args.debug_replay_loop)} "
                 f"action_hz={policy.metadata.get('action_hz')}"
+            )
+        if fixed_init_plan is not None:
+            print(
+                "[FixedInit] source="
+                f"{fixed_init_plan.source_path} "
+                f"episode={fixed_init_plan.source_episode_index} "
+                f"frames={fixed_init_plan.frame_count} "
+                f"range=[{fixed_init_plan.start_index},{fixed_init_plan.end_index}) "
+                f"hz={fixed_init_plan.action_hz:.3f} "
+                f"after=T_then_startup_init:{startup_init_source}"
             )
         if not send_actions:
             print("[Deploy] dry-run: actions are filtered and logged but not sent to hardware.")
@@ -915,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
             send_actions=send_actions,
             auto_start=bool(args.auto_start),
             wait_for_ready_confirm=wait_for_ready_confirm,
+            fixed_init_enabled=fixed_init_controller is not None,
         )
 
         with NonBlockingKeyboard() as keyboard:
@@ -933,12 +996,18 @@ def main(argv: list[str] | None = None) -> int:
                     startup_initializer.reset()
                     last_policy_at = None
                     ready_confirmed = not wait_for_ready_confirm
-                    policy_active = True
-                    print("[Deploy] policy active")
+                    if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
+                        print("[Deploy] ignore g: complete fixed-init H -> H before starting policy.")
+                    else:
+                        policy_active = True
+                        print("[Deploy] policy active")
                 elif key == "a":
                     if not policy_active:
                         policy_active = True
-                    if startup_initializer.enabled and not startup_initializer.completed:
+                    if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
+                        policy_active = False
+                        print("[Deploy] ready confirm ignored: complete fixed-init H -> H first.")
+                    elif startup_initializer.enabled and not startup_initializer.completed:
                         print("[Deploy] ready confirm ignored: startup init is not complete yet.")
                     else:
                         ready_confirmed = True
@@ -947,9 +1016,22 @@ def main(argv: list[str] | None = None) -> int:
                         print("[Deploy] ready confirmed; policy inference/execution may start.")
                 elif key == "h":
                     chunk_buffer.clear()
-                    policy_active = False
                     ready_confirmed = not wait_for_ready_confirm
-                    print("[Deploy] policy paused")
+                    if policy_active:
+                        policy_active = False
+                        print("[Deploy] policy paused; queue cleared")
+                    elif fixed_init_controller is not None:
+                        message = fixed_init_controller.handle_h(
+                            arm_backends=arm_backends,
+                            now=loop_started_at,
+                        )
+                        if message:
+                            print(message)
+                    else:
+                        policy_active = False
+                        print("[Deploy] policy paused")
+                elif key == "x" and fixed_init_controller is not None and fixed_init_controller.running:
+                    print("[FixedInit] ignore x while fixed trajectory is running.")
                 elif key == "q":
                     print("\n[Deploy] quitting policy deployment loop\n")
                     break
@@ -981,8 +1063,38 @@ def main(argv: list[str] | None = None) -> int:
                 if visualizer is not None:
                     visualizer.update(tactile_by_side_from_backends(active_sides, hand_backends.get))
 
+                fixed_completed_this_step = False
+                if fixed_init_controller is not None:
+                    fixed_result = fixed_init_controller.step(
+                        now=loop_started_at,
+                        send_actions=send_actions,
+                        arm_backends=arm_backends,
+                        hand_backends=hand_backends,
+                    )
+                    if fixed_result.last_action is not None:
+                        last_action = fixed_result.last_action.astype(np.float32, copy=True)
+                    if fixed_result.message:
+                        print(fixed_result.message)
+                    if fixed_result.completed:
+                        policy.reset()
+                        chunk_buffer.clear()
+                        startup_initializer.reset()
+                        last_policy_at = None
+                        ready_confirmed = not wait_for_ready_confirm
+                        if bool(args.auto_start):
+                            policy_active = True
+                            print("[Deploy] fixed-init complete; policy auto-start released.")
+                        else:
+                            policy_active = False
+                            print("[Deploy] fixed-init complete; press g to run startup init/policy.")
+                        fixed_completed_this_step = True
+
                 if policy_active:
                     can_run_policy = not (bool(args.require_ready_observation) and faults)
+                    if fixed_completed_this_step:
+                        can_run_policy = False
+                    if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
+                        can_run_policy = False
                     if startup_initializer.enabled and not startup_initializer.completed:
                         if can_run_policy:
                             init_action, init_faults, init_ready = startup_initializer.next_action(
@@ -1088,6 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
                     status_parts = [
                         text
                         for text in (
+                            fixed_init_controller.status_text if fixed_init_controller is not None else "",
                             startup_initializer.status_text,
                             "ready=wait:A" if (
                                 wait_for_ready_confirm
@@ -1115,12 +1228,17 @@ def main(argv: list[str] | None = None) -> int:
                 step_index += 1
                 if int(args.max_steps) > 0 and step_index >= int(args.max_steps):
                     break
-                sleep_time = (1.0 / float(effective_action_hz)) - (time.time() - loop_started_at)
+                loop_target_hz = float(effective_action_hz)
+                if fixed_init_controller is not None and fixed_init_controller.running:
+                    loop_target_hz = max(loop_target_hz, float(fixed_init_controller.plan.action_hz))
+                sleep_time = (1.0 / loop_target_hz) - (time.time() - loop_started_at)
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)
     except KeyboardInterrupt:
         print("\n[Deploy] keyboard interrupt; stopping\n")
     finally:
+        if fixed_init_controller is not None:
+            fixed_init_controller.restore_speed(arm_backends)
         for backend in arm_backends.values():
             backend.close()
         for backend in hand_backends.values():

@@ -54,6 +54,7 @@ from inspire_data_collect.utils.realsense_rgb import (  # noqa: E402
 ALL_SIDES = ("left", "right")
 STATE_ARM_POSE_SLICES = {"left": slice(6, 13), "right": slice(25, 32)}
 STATE_HAND_SLICES = {"left": slice(13, 19), "right": slice(32, 38)}
+REALMAN20_FIXED_FINGER_Y_RANGE_M = (-0.40, -0.29)
 ActionSafetyFilter = None
 ActionSafetyFilterConfig = None
 CameraPreviewConfig = None
@@ -144,6 +145,20 @@ def add_live_args(parser: argparse.ArgumentParser) -> None:
         dest="max_fingertip_force",
         type=int,
         default=800,
+    )
+    parser.add_argument(
+        "--left-max-fingertip-force",
+        "--left-hand-max-force",
+        dest="left_max_fingertip_force",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--right-max-fingertip-force",
+        "--right-hand-max-force",
+        dest="right_max_fingertip_force",
+        type=int,
+        default=None,
     )
     parser.add_argument("--camera-mode", choices=["none", "single", "multi"], default="none")
     parser.add_argument(
@@ -471,6 +486,34 @@ def build_profile_arm_backends(
     return build_arm_backends(args, active_sides, control_hz=float(control_hz))
 
 
+def _max_fingertip_force_for_side(args: argparse.Namespace, side: str) -> int:
+    side_key = f"{side}_max_fingertip_force"
+    raw_value = getattr(args, side_key, None)
+    flag_name = f"--{side}-max-fingertip-force"
+    if raw_value is None:
+        raw_value = getattr(args, "max_fingertip_force", 800)
+        flag_name = "--max-fingertip-force"
+    value = int(raw_value)
+    if value < 0:
+        raise ValueError(f"{flag_name} must be non-negative.")
+    return value
+
+
+def _build_rm65_hand_backends_with_side_forces(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> dict[str, Any]:
+    if not _hands_enabled(args):
+        return {}
+    backends: dict[str, Any] = {}
+    for side in active_sides:
+        side_args = argparse.Namespace(**vars(args))
+        side_args.max_fingertip_force = _max_fingertip_force_for_side(args, side)
+        side_backends = build_hand_backends(side_args, (side,))
+        backends.update(side_backends)
+    return backends
+
+
 def build_profile_hand_backends(
     profile: DeploymentProfile,
     args: argparse.Namespace,
@@ -531,7 +574,7 @@ def build_profile_hand_backends(
                     effector_name=f"{side}_hand",
                     port=int(args.hand_modbus_port),
                     connect_hardware=bool(hand_ip),
-                    max_fingertip_force=int(args.max_fingertip_force),
+                    max_fingertip_force=_max_fingertip_force_for_side(args, side),
                     send_threshold=float(args.hand_send_threshold),
                     enable_telemetry=bool(hand_ip),
                     telemetry_hz=float(args.hand_telemetry_hz),
@@ -540,7 +583,7 @@ def build_profile_hand_backends(
             )
         return backends
     _ensure_rm65_imports()
-    return build_hand_backends(args, active_sides)
+    return _build_rm65_hand_backends_with_side_forces(args, active_sides)
 
 
 def build_profile_camera_sources(profile: DeploymentProfile, args: argparse.Namespace) -> dict[str, Any]:
@@ -1060,6 +1103,16 @@ def _fixed_hand_vector(args: argparse.Namespace) -> np.ndarray | None:
     return arr.astype(np.float32, copy=True)
 
 
+def _fixed_finger_vector(args: argparse.Namespace) -> np.ndarray | None:
+    value = getattr(args, "fixed_finger", None)
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if arr.shape != (6,) or not np.all(np.isfinite(arr)):
+        raise ValueError(f"--fixed-finger must be a finite 6-D vector, got shape {arr.shape}.")
+    return arr.astype(np.float32, copy=True)
+
+
 def _override_fr3_hand_commands(
     deployment_action: Any,
     *,
@@ -1102,6 +1155,63 @@ def _override_fr3_hand_commands(
     )
 
 
+def _realman20_right_tcp_y(observation: Any) -> float | None:
+    pose = None
+    if hasattr(observation, "state"):
+        try:
+            pose = np.asarray(observation.state[STATE_ARM_POSE_SLICES["right"]], dtype=np.float32).reshape(-1)
+        except Exception:
+            pose = None
+    if pose is None or pose.shape != (7,) or not np.all(np.isfinite(pose[:3])):
+        state_dict = getattr(observation, "state_dict", {})
+        if isinstance(state_dict, Mapping):
+            pose = state_dict.get("right_arm.pose")
+            if pose is None:
+                right_arm = state_dict.get("right_arm")
+                if isinstance(right_arm, Mapping):
+                    pose = right_arm.get("pose")
+            try:
+                pose = np.asarray(pose, dtype=np.float32).reshape(-1)
+            except Exception:
+                pose = None
+    if pose is None or pose.shape[0] < 2 or not np.isfinite(pose[1]):
+        return None
+    # print(f"[Debug] realman20 right trans: {pose} m")
+    return float(pose[0])
+
+
+def _apply_realman20_fixed_finger(action: Any, observation: Any, fixed_finger: np.ndarray) -> Any:
+    tcp_y = _realman20_right_tcp_y(observation)
+    low, high = REALMAN20_FIXED_FINGER_Y_RANGE_M
+    if tcp_y is None or tcp_y < low or tcp_y > high:
+        return action
+
+    if not hasattr(action, "vector"):
+        vector = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+        if vector.shape[0] >= 26:
+            vector[20:26] = fixed_finger
+        return vector
+
+    vector = np.asarray(action.vector, dtype=np.float32).reshape(-1).copy()
+    if vector.shape[0] < 26:
+        return action
+    raw_hand = vector[20:26].copy()
+    vector[20:26] = fixed_finger
+    metadata = dict(getattr(action, "metadata", {}) or {})
+    metadata["fixed_finger_override"] = {
+        "side": "right",
+        "tcp_y_m": tcp_y,
+        "range_m": [float(low), float(high)],
+        "raw_policy_hand": raw_hand,
+        "fixed_finger": fixed_finger.copy(),
+    }
+    return type(action)(
+        vector=vector.astype(np.float32, copy=False),
+        arm_joint_targets=dict(getattr(action, "arm_joint_targets", {}) or {}),
+        metadata=metadata,
+    )
+
+
 class TimedActionDispatcher:
     """Consume model action chunks at a fixed robot-control frequency."""
 
@@ -1138,6 +1248,11 @@ class TimedActionDispatcher:
         self.backend_kind = str(backend_kind)
         self.profile = profile
         self.fixed_hand = _fixed_hand_vector(args) if self.backend_kind == "fr3" else None
+        self.fixed_finger = (
+            _fixed_finger_vector(args)
+            if self.backend_kind == "rm65" and getattr(profile, "data_config_name", "") == "realman20"
+            else None
+        )
         self.action_hz = max(1e-6, float(getattr(args, "action_hz", 12.0)))
         self.queue_policy = str(getattr(args, "action_queue_policy", "replace"))
         self.underrun_log_sec = max(0.0, float(getattr(args, "action_underrun_log_sec", 2.0)))
@@ -1316,6 +1431,8 @@ class TimedActionDispatcher:
 
             try:
                 observation = self.get_observation()
+                if self.fixed_finger is not None:
+                    action = _apply_realman20_fixed_finger(action, observation, self.fixed_finger)
                 if self.backend_kind == "fr3":
                     deployment_action = self.safety_filter.filter(
                         action,

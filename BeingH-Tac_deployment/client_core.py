@@ -103,10 +103,21 @@ def add_common_args(parser: argparse.ArgumentParser, profile: DeploymentProfile)
                 "Accepts comma-separated values or list/tuple/array text."
             ),
         )
+    if profile.data_config_name == "realman20":
+        parser.add_argument(
+            "--fixed-finger",
+            type=parse_fixed_finger,
+            default=None,
+            help=(
+                "When the right TCP y position is in [-0.2, 0.0]m, override the "
+                "realman20 right-hand policy action with this fixed 6-D vector. "
+                "Accepts comma-separated values or list/tuple/array text."
+            ),
+        )
     add_startup_replay_args(parser)
 
 
-def parse_fixed_hand(value: str | None) -> tuple[float, ...] | None:
+def _parse_fixed_6d_vector(value: str | None, *, flag_name: str) -> tuple[float, ...] | None:
     if value is None:
         return None
     text = str(value).strip()
@@ -127,9 +138,17 @@ def parse_fixed_hand(value: str | None) -> tuple[float, ...] | None:
     arr = np.asarray(parsed, dtype=np.float32).reshape(-1)
     if arr.shape != (6,) or not np.all(np.isfinite(arr)):
         raise argparse.ArgumentTypeError(
-            "--fixed-hand must be a finite 6-D vector, for example '0,0,0,0,0,0' or '[0,0,0,0,0,0]'."
+            f"{flag_name} must be a finite 6-D vector, for example '0,0,0,0,0,0' or '[0,0,0,0,0,0]'."
         )
     return tuple(float(x) for x in arr)
+
+
+def parse_fixed_hand(value: str | None) -> tuple[float, ...] | None:
+    return _parse_fixed_6d_vector(value, flag_name="--fixed-hand")
+
+
+def parse_fixed_finger(value: str | None) -> tuple[float, ...] | None:
+    return _parse_fixed_6d_vector(value, flag_name="--fixed-finger")
 
 
 def make_client(args: argparse.Namespace):
@@ -426,6 +445,35 @@ def _action_countdown(label: str, seconds: float, stop_event: threading.Event) -
         remaining -= 1
 
 
+def _wait_after_i_key_delay(
+    args: argparse.Namespace,
+    *,
+    stop_event: threading.Event | None = None,
+    prefix: str = "[Startup]",
+) -> bool:
+    delay_s = max(0.0, float(getattr(args, "startup_i_delay_s", 0.0)))
+    if delay_s <= 0.0:
+        return True
+    print(f"{prefix} i pressed: waiting {delay_s:.3g}s before starting execution.")
+    deadline = time.monotonic() + delay_s
+    last_remaining = -1
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0.0:
+            return True
+        remaining = int(np.ceil(remaining_s))
+        if remaining != last_remaining:
+            print(f"{prefix} i-key delay before execution: {remaining}s")
+            last_remaining = remaining
+        wait_s = min(1.0, remaining_s)
+        if stop_event is None:
+            time.sleep(wait_s)
+        else:
+            stop_event.wait(wait_s)
+
+
 def _finite_vector(value: Any, width: int) -> np.ndarray | None:
     if value is None:
         return None
@@ -687,6 +735,7 @@ def _print_motion_progress(prefix: str, step: int, total: int) -> None:
 
 def _call_startup_loader_allowing_bound_parquet(args: argparse.Namespace, loader: Any, *loader_args: Any) -> Any:
     original_which_episode = getattr(args, "which_episode", None)
+    print(f"> > > > > {original_which_episode=}")
     has_bound_parquet = bool(str(getattr(args, "parquet_path", "") or "").strip())
     if has_bound_parquet and original_which_episode is not None:
         setattr(args, "which_episode", None)
@@ -726,6 +775,8 @@ def run_profile(profile: DeploymentProfile, argv: list[str] | None = None) -> in
         startup_mode = wait_for_startup_key(args)
         if startup_mode is not None:
             if startup_mode == "i":
+                if not _wait_after_i_key_delay(args):
+                    return 0
                 maybe_preflight_server(args)
             replay_status = run_startup_replay(profile, args, startup_mode)
             if startup_mode == "r":
@@ -1025,7 +1076,11 @@ class Realman20ARecoveryController:
                 print(f"\n[Action] realman20 i pressed: running dataset first-frame init (generation={generation}).")
                 completed = False
                 try:
-                    completed = self._run_startup_i_motion()
+                    completed = _wait_after_i_key_delay(
+                        self.args,
+                        stop_event=self._stop_event,
+                        prefix="[Action] realman20",
+                    ) and self._run_startup_i_motion()
                 except Exception as exc:
                     print(f"WARNING: realman20 startup i init failed: {type(exc).__name__}: {exc}")
                 finally:
@@ -1237,6 +1292,7 @@ class Realman20ARecoveryController:
             return False
         self._set_recovery_hand_last_action(hand_targets=hand_targets)
         sleep_s = max(0.0, float(getattr(self.args, "startup_init_sleep_s", 10.0)))
+        sleep_s = 0.2
         if sleep_s > 0.0:
             _action_countdown("startup i hold before inference", sleep_s, self._stop_event)
         return True
@@ -1535,7 +1591,15 @@ def _run_loop(
                 if faults:
                     prefix = "[Client]" if args.source == "live" else "[Action]"
                     print(f"{prefix} action faults/status: {';'.join(faults[:6])}")
-                if recovery_controller.enabled:
+                if args.source == "dataset" and _sync_action_chunks(recovery_controller.profile, action_target):
+                    _wait_for_submitted_chunk(
+                        recovery_controller.profile,
+                        action_target,
+                        faults,
+                        sent_before,
+                        should_interrupt=recovery_controller.should_pause_inference,
+                    )
+                elif recovery_controller.enabled:
                     _wait_for_submitted_chunk(
                         recovery_controller.profile,
                         action_target,

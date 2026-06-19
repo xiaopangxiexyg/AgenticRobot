@@ -114,6 +114,29 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy.py \
   --policy.dir=/home/ai/zc/openpi/checkpoints/pi05_realman_dual_hands_paper_fold_0428_three_2026_04_28_large_brown_paper_fold_2026_04_28_small_brown_paper_fold_tactile_manifest/paper_fold_0428_three_tactile_lora/15000
 ```
 
+soft hard:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy.py \
+  --host=127.0.0.1 \
+  --port=8000 \
+  policy:checkpoint \
+  --policy.dir=/media/ai/KINGSTON/pi05/pi05_realman_right_hand_2026_05_16_replay_collect_demo_right_tactile_manifest/5000
+```
+
+wiping vase:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy.py \
+  --host=127.0.0.1 \
+  --port=8000 \
+  policy:checkpoint \
+  --policy.dir=/media/ai/KINGSTON/pi05/pi05_realman_dual_hands_2026_05_09_dual_arm_waping_vase_tactile_manifest/realman_dual_hand_wiping_tac/60000
+```
+
+# /media/ai/KINGSTON/pi05/pi05_realman_dual_hands_2026_05_09_dual_arm_waping_vase_manifest/60000
+
+
 说明：
 
 - 同机部署时固定使用 `127.0.0.1` 即可。
@@ -171,7 +194,8 @@ python -m teleop_runtime.deploy.run_policy \
   --arm-workspace-max 0.60 0.80 0.90
 ```
 
-paper fold:
+paper fold:  "input_source":"dataset_execute"
+
 
 ```bash
 python -m teleop_runtime.deploy.run_policy \
@@ -181,6 +205,7 @@ python -m teleop_runtime.deploy.run_policy \
     "port":8000,
     "embodiment":"realman_dual_arm_hands",
     "camera_key":"front",
+    "input_source":"live",
     "dataset_root":"/home/ai/zc/datasets/paper_fold_datasets/2026-04-28_black_paper_fold"
   }' \
   --active-sides both \
@@ -197,6 +222,39 @@ python -m teleop_runtime.deploy.run_policy \
   --arm-workspace-max 0.60 0.80 0.90 \
   --send-actions \
   --auto-start \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --inspire-tac-max-fingertip-force 800
+```
+
+wiping the vase:
+
+```bash
+python -m teleop_runtime.deploy.run_policy \
+  --policy /home/ai/Desktop/DexTeleop/openpi05_deployment/policy.py:create_policy \
+  --policy-kwargs-json '{
+    "host":"127.0.0.1",
+    "port":8000,
+    "embodiment":"realman_dual_arm_hands",
+    "camera_key":"front",
+    "input_source":"live",
+    "dataset_root":"/home/ai/Desktop/DexTeleop/test_left_fix_datasets_waping_fixed/2026-05-09_grasp_demo_left_arm_jitter"
+  }' \
+  --active-sides both \
+  --enable-hands \
+  --camera-mode single \
+  --camera-config /home/ai/Desktop/DexTeleop/teleop_runtime/configs/devices/realsense.json \
+  --require-camera-frame \
+  --require-ready-observation \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --init-source auto \
+  --init-time-s 12.0 \
+  --arm-workspace-min -0.60 -0.80 0.00 \
+  --arm-workspace-max 0.60 0.80 0.90 \
+  --send-actions \
   --left-arm-ip "$LEFT_ARM_IP" \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --left-hand-ip "$LEFT_HAND_IP" \
@@ -248,6 +306,72 @@ python -m teleop_runtime.deploy.run_policy \
 ## 6. 数据集驱动的两种调试模式
 
 除了 `input_source="live"`，还支持两种调试模式。
+
+### 右臂右手固定 T 预备后 live policy 测试
+
+如果真机测试前需要复刻采集侧的 `H -> H` 固定准备轨迹，可以在普通 live
+部署命令上额外提供 `--deploy-fixed-init-*`。当前这个模式只支持右臂右手。
+
+这里有两段初始化，语义不要混淆：
+
+- `--deploy-fixed-init-dataset`
+  提供固定准备轨迹 `T`，例如 `2026-05-06_right_fixed_flip_hand`。按 `H` 第一次会用
+  `action.replay.right_arm_joint_target` 严格归位到 `T` 第一帧 qpos；按 `H` 第二次会按
+  `T` 原始 action Hz 执行完整固定轨迹。
+- `--init-source`
+  仍然保留现有 deploy startup init 逻辑。固定 `T` 执行完后，client 会再按
+  `--init-source auto|dataset|replay|current|none` 决定是否慢速插值到策略测试的初始化轨迹开始位姿。
+
+因此推荐把策略初始化轨迹通过现有 `--init-dataset/--init-parquet` 或 policy kwargs 里的
+`dataset_root` 提供，而把固定 `T` 单独放到 `--deploy-fixed-init-dataset`。
+
+示例，右臂右手 live policy，先执行固定 `T`，再慢速插值到 policy dataset 初始状态：
+
+```bash
+python -m teleop_runtime.deploy.run_policy \
+  --policy /home/ai/Desktop/DexTeleop/openpi05_deployment/policy.py:create_policy \
+  --policy-kwargs-json '{
+    "host":"127.0.0.1",
+    "port":8000,
+    "embodiment":"realman_right_arm_right_hand",
+    "camera_key":"front",
+    "input_source":"live",
+    "dataset_root":"/path/to/policy_init_dataset"
+  }' \
+  --active-sides right \
+  --enable-hands \
+  --camera-mode single \
+  --camera-config /home/ai/Desktop/DexTeleop/teleop_runtime/configs/devices/realsense.json \
+  --require-camera-frame \
+  --require-ready-observation \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --init-source auto \
+  --init-time-s 6.0 \
+  --deploy-fixed-init-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_fixed_flip_hand \
+  --deploy-fixed-init-episode 0:0:end \
+  --deploy-fixed-init-arm-max-angvel 4.5,4.5,4.5,6.0,6.0,8.0 \
+  --send-actions \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --inspire-tac-max-fingertip-force 800
+```
+
+运行时按键流程：
+
+1. 静止且 policy 未运行时按 `H`：强制清空 policy queue，并移动到固定 `T` 第一帧 qpos；同时发送第一帧 hand target。
+2. 到位后再次按 `H`：按 `T` 原始 action Hz 执行完整固定轨迹；此时 policy 不会推理。
+3. 固定 `T` 执行完：进入现有 `--init-source` startup init。也就是说如果 `--init-source auto`
+   且 policy kwargs 提供了 `dataset_root`，会再慢速移动到该 dataset 初始状态。
+4. 是否自动开始 policy 由 `--auto-start` 控制。不传 `--auto-start` 时，固定 `T` 和 startup init
+   不会自动启动 policy，需要按 `g` 开始；传了 `--auto-start` 时，固定 `T` 结束后自动进入 startup init，
+   然后开始 policy。
+5. 真机测试过程中按 `H`：优先暂停当前 policy 并清空队列。再次静止按 `H` 才会重新开始下一轮固定
+   `H -> H` 初始化。
+6. 固定轨迹执行期间按 `H` 或 `x` 会被忽略，避免半路打断固定准备轨迹。
+
+固定 `T` 的 qpos 要求和采集侧一致：source parquet 必须包含
+`action.replay.right_arm_joint_target`。普通 policy 初始化轨迹不要求包含这个 qpos 列。
 
 ### `dataset_compare`
 

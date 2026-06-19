@@ -93,7 +93,7 @@ export RIGHT_HAND_IP=192.168.11.210
 python run_client_realman20.py \
   --host 127.0.0.1 \
   --source dataset \
-  --dataset-path /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard_fixed_tactile/2026-05-11_replay_collect_demo_right \
+  --dataset-path /home/ai/Desktop/DexTeleop/datasets/2026-05-16_right_arm_dual_data_soft_hard_fixed_tactile_addtion/2026-05-16_replay_collect_demo_right \
   --max-requests 100 \
   --dataset-frame-stride 24 \
   --action-hz 12.0 \
@@ -117,6 +117,21 @@ python run_client_realman22.py \
   --left-arm-ip "$LEFT_ARM_IP" \
   --left-hand-ip "$LEFT_HAND_IP" \
   --transport-image-size 224
+
+python run_client_realman22.py \
+  --host 127.0.0.1 \
+  --source dataset \
+  --dataset-path /home/ai/Desktop/DexTeleop/real_datasets/paper_fold_datasets/black_paper_fold \
+  --max-requests 100 \
+  --dataset-frame-stride 24 \
+  --action-hz 12.0 \
+  --send-actions \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
+  --transport-image-size 224 \
+  --which-episode 15
 
 
 
@@ -201,7 +216,8 @@ inference loop:
   that startup target to the robot through a short joint-space interpolation,
   sleep `--startup-init-sleep-s` seconds, then continue into the requested
   `--source dataset` or `--source live` inference mode. Tune the initialization
-  motion with `--startup-init-steps` and `--startup-init-hz`.
+  motion with `--startup-init-steps` and `--startup-init-hz`. Set
+  `--startup-i-delay-s` to wait after pressing `i` before any execution starts.
 
 This startup gate uses the dataset action columns directly; it does not query
 the Being-H-Tac server. Add `--no-startup-key-wait` for non-interactive tests.
@@ -214,11 +230,16 @@ episode selected for initialization.
 
 Live Realman20 with RealSense RGB and sending actions:
 
+export LEFT_ARM_IP=192.168.101.21
+export RIGHT_ARM_IP=192.168.1.20
+export LEFT_HAND_IP=192.168.12.210
+export RIGHT_HAND_IP=192.168.11.210
+
 ```bash
 python run_client_realman20.py \
   --host 127.0.0.1 \
   --source live \
-  --dataset-path /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard_fixed_tactile/2026-05-11_replay_collect_demo_right \
+  --dataset-path /home/ai/Desktop/DexTeleop/datasets/2026-05-16_right_arm_dual_data_soft_hard_fixed_tactile_addtion/2026-05-16_replay_collect_demo_right \
   --camera-mode single \
   --camera-serial 213222079798 \
   --active-sides right \
@@ -231,7 +252,8 @@ python run_client_realman20.py \
   --transport-image-size 224 \
   --max-fingertip-force 600 \
   --send-actions \
-  --which-episode 88
+  --fixed-finger "[0.13133317, 0.00833333, 0.0, 0.26166660, 1.0, 0.62699997]" \
+  --which-episode 0
 
 
 python run_client_realman22.py \
@@ -252,8 +274,83 @@ python run_client_realman22.py \
   --transport-image-size 224 \
   --max-fingertip-force 800 \
   --send-actions \
-  --which-episode 152
+  --which-episode 252
+
+
+
+python run_client_realman22.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/ai/Desktop/DexTeleop/real_datasets/paper_fold_datasets/black_paper_fold \
+  --camera-mode single \
+  --camera-serial 213222079798 \
+  --active-sides both \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --right-max-fingertip-force 1800 \
+  --left-max-fingertip-force 1800 \
+  --send-actions \
+  --which-episode 236 \
+  --startup-i-delay-s 0
   
+
+python run_client_realman22.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/ai/zc/datasets/paper_fold_datasets/2026-04-28_large_brown_paper_fold \
+  --camera-mode single \
+  --camera-serial 213222079798 \
+  --active-sides both \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --right-max-fingertip-force 1800 \
+  --left-max-fingertip-force 1800 \
+  --send-actions \
+  --which-episode 65 \
+  --startup-i-delay-s 0
+
+python run_client_realman22.py \
+  --host 127.0.0.1 \
+  --source live \
+  --dataset-path /home/ai/zc/datasets/paper_fold_datasets/2026-04-28_small_brown_paper_fold \
+  --camera-mode single \
+  --camera-serial 213222079798 \
+  --active-sides both \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --enable-hands \
+  --action-hz 12.0 \
+  --right-hand-ip "$RIGHT_HAND_IP" \
+  --left-hand-ip "$LEFT_HAND_IP" \
+  --hand-tactile-regions all \
+  --auto-start \
+  --transport-image-size 224 \
+  --right-max-fingertip-force 1800 \
+  --left-max-fingertip-force 1800 \
+  --send-actions \
+  --which-episode 62 \
+  --startup-i-delay-s 8
+
+
+# for baseline: --left-max-fingertip-force 500 --right-max-fingertip-force 1800
+
+For dual-hand Realman22 runs, `--max-fingertip-force` remains the shared
+fallback. Use `--left-max-fingertip-force` and
+`--right-max-fingertip-force` to override the startup force for each hand.
 
 
 python run_client_franka.py \
