@@ -26,6 +26,7 @@ from ...configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     build_annotated_dual_rm65_calibration,
 )
+from ...arm_frames import TOOL_TCP_FRAME
 from ...hand_mapping import parse_tactile_regions
 from ...hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
@@ -34,9 +35,9 @@ from ...hand_render import (
     open_hand_render_qpos,
 )
 from ...initial_alignment import AlignmentSideState, TeleopInitialAlignment
-from ...tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
+from ...tcp import legacy_tcp_mode_requested
 from ...transforms import identity_pose
-from ..log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event, log_stage
+from ..log_utils import ChangeGate, log_event, log_stage
 from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.rendering import SapienArmHandRenderer
 from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
@@ -48,6 +49,13 @@ def _positive_float(text: str) -> float:
     value = float(text)
     if value <= 0.0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
+def _non_negative_float(text: str) -> float:
+    value = float(text)
+    if value < 0.0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return value
 
 
@@ -137,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tcp-mode",
         type=str,
-        default=HAND_BASE_TCP_FRAME,
+        default=TOOL_TCP_FRAME,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -155,9 +163,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="State polling and render rate.")
     parser.add_argument(
         "--status-sec",
-        type=_positive_float,
-        default=DEFAULT_LOG_HEARTBEAT_SEC,
-        help="Terminal status heartbeat interval in seconds.",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Terminal status heartbeat interval in seconds. "
+            "Use 0 to print only startup lines, state changes, errors, and save events."
+        ),
     )
     parser.add_argument(
         "--debug-frame-axis-length",
@@ -196,8 +207,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N steps, 0 means infinite.")
     args = parser.parse_args()
-    args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
-    args.tcp_mode = HAND_BASE_TCP_FRAME
+    args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
+    args.tcp_mode = TOOL_TCP_FRAME
     return args
 
 
@@ -412,7 +423,7 @@ def _log_side_status(
     tcp_pose_desk: np.ndarray | None,
     *,
     gate: ChangeGate,
-    heartbeat_sec: float,
+    heartbeat_sec: float | None,
     now: float,
 ) -> None:
     qpos = state.get("current_qpos")
@@ -445,7 +456,7 @@ def _log_hand_status(
     backend: InspireTacHandBackend | None,
     *,
     gate: ChangeGate,
-    heartbeat_sec: float,
+    heartbeat_sec: float | None,
     now: float,
 ) -> None:
     if backend is None:
@@ -489,6 +500,13 @@ def _build_debug_frames(components: RM65RealDebugComponents, tcp_mode: str) -> d
         if right_tcp is not None:
             frames["right_tcp_actual"] = right_tcp
     return frames
+
+
+def _status_heartbeat_sec(args: argparse.Namespace) -> float | None:
+    status_sec = float(args.status_sec)
+    if status_sec <= 0.0:
+        return None
+    return status_sec
 
 
 def _default_alignment_output_path() -> Path:
@@ -576,10 +594,12 @@ def main() -> None:
         "READ-ONLY MODE: this tool never sends Movej_CANFD, InspireTac set_joint_pos, or any dynamic motion command.",
     )
     if legacy_tcp_mode_requested(args.requested_tcp_mode):
-        log_event("RM65Real", "legacy --tcp-mode rm_eef was requested; runtime now uses hand_base only.")
+        log_event("RM65Real", "legacy --tcp-mode rm_eef was requested; runtime now uses tool_tcp actions.")
+    status_heartbeat_sec = _status_heartbeat_sec(args)
+    status_text = "changes-only" if status_heartbeat_sec is None else f"every {status_heartbeat_sec:.1f}s"
     log_event(
         "RM65Real",
-        f"arm_mode={args.arm_mode} tcp_mode={args.tcp_mode} status_sec={args.status_sec:.1f} s=save q=quit",
+        f"arm_mode={args.arm_mode} tcp_mode={args.tcp_mode} status={status_text} s=save q=quit",
     )
     log_event("RM65Real", "viewer convention: screen-left = logical left_arm(-Y), screen-right = logical right_arm(+Y)")
     if args.load_profile:
@@ -661,7 +681,7 @@ def main() -> None:
                     left_state,
                     left_tcp,
                     gate=status_gate,
-                    heartbeat_sec=args.status_sec,
+                    heartbeat_sec=status_heartbeat_sec,
                     now=loop_start,
                 )
             if components.right_backend is not None:
@@ -670,21 +690,21 @@ def main() -> None:
                     right_state,
                     right_tcp,
                     gate=status_gate,
-                    heartbeat_sec=args.status_sec,
+                    heartbeat_sec=status_heartbeat_sec,
                     now=loop_start,
                 )
             _log_hand_status(
                 "left",
                 components.left_hand_backend,
                 gate=status_gate,
-                heartbeat_sec=args.status_sec,
+                heartbeat_sec=status_heartbeat_sec,
                 now=loop_start,
             )
             _log_hand_status(
                 "right",
                 components.right_hand_backend,
                 gate=status_gate,
-                heartbeat_sec=args.status_sec,
+                heartbeat_sec=status_heartbeat_sec,
                 now=loop_start,
             )
 

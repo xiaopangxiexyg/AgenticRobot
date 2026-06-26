@@ -15,6 +15,7 @@ from scipy.spatial.transform import Rotation as R
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from ..arm_frames import TOOL_TCP_FRAME
 from ..calibration import TeleopCalibration
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
@@ -24,9 +25,10 @@ from ..diagnostics import TeleopRunState
 from ..episodes import EpisodeRecorder, EpisodeRecorderConfig
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, TARGET_INSPIRE_HAND_Q6_ORDER
 from ..hand_tcp_alignment import (
-    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
+    add_vive_tracker_height_correction_args,
     tracker_hand_to_rm65_tcp_rotation,
-    vive_tracker_height_correction_offset,
+    vive_tracker_local_translation_offset_from_args,
 )
 from ..hand_render import (
     LEFT_HAND_RENDER_JOINT_NAMES,
@@ -49,7 +51,7 @@ from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
-from ..tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
+from ..tcp import legacy_tcp_mode_requested
 from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
 from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event
 from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
@@ -364,7 +366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tcp-mode",
         type=str,
-        default=HAND_BASE_TCP_FRAME,
+        default=TOOL_TCP_FRAME,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -426,25 +428,7 @@ def parse_args() -> argparse.Namespace:
         help="Only update preview hand state when max q6 delta exceeds this threshold.",
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Scale applied to desk-frame translation")
-    parser.add_argument(
-        "--vive-tracker-height-correction",
-        dest="vive_tracker_height_correction",
-        action="store_true",
-        help="Shift wrist tracker input by -Z in the tracker local frame before arm IK. Default.",
-    )
-    parser.add_argument(
-        "--no-vive-tracker-height-correction",
-        dest="vive_tracker_height_correction",
-        action="store_false",
-        help="Disable the 4cm VIVE tracker local -Z position correction.",
-    )
-    parser.add_argument(
-        "--vive-tracker-height-correction-m",
-        type=float,
-        default=DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
-        help="VIVE tracker height correction distance in meters; applied as local [0, 0, -value].",
-    )
-    parser.set_defaults(vive_tracker_height_correction=True)
+    add_vive_tracker_height_correction_args(parser)
     parser.add_argument(
         "--no-collision",
         "--disable-collision-avoidance",
@@ -498,8 +482,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aux-tracker-name",
         type=str,
-        default="tracker_3",
-        help="Optional auxiliary tracker name. Pass empty string to disable.",
+        default="",
+        help="Optional auxiliary tracker name. Empty by default; pass tracker_3 to enable a third tracker.",
     )
     parser.add_argument("--headless", action="store_true", help="Disable the SAPIEN viewer window")
     parser.add_argument(
@@ -581,24 +565,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite")
     args = parser.parse_args()
-    args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
-    args.tcp_mode = HAND_BASE_TCP_FRAME
+    args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
+    args.tcp_mode = TOOL_TCP_FRAME
     return args
 
 
 def _vive_tracker_local_translation_offset(args: argparse.Namespace) -> np.ndarray | None:
-    if not bool(getattr(args, "vive_tracker_height_correction", True)):
-        return None
-    height_m = float(
-        getattr(
-            args,
-            "vive_tracker_height_correction_m",
-            DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
-        )
-    )
-    if height_m < 0.0:
-        raise ValueError("--vive-tracker-height-correction-m must be >= 0.")
-    return vive_tracker_height_correction_offset(height_m)
+    return vive_tracker_local_translation_offset_from_args(args)
 
 
 def build_components(args: argparse.Namespace) -> VirtualRunComponents:
@@ -662,7 +635,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
                 getattr(
                     args,
                     "vive_tracker_height_correction_m",
-                    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+                    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m,
                 )
             ),
             "vive_tracker_local_translation_offset_m": None
@@ -2456,7 +2429,7 @@ def main() -> None:
         if legacy_tcp_mode_requested(args.requested_tcp_mode):
             _log(
                 "TCP",
-                "legacy --tcp-mode rm_eef was requested; runtime now uses hand_base only.",
+                "legacy --tcp-mode rm_eef was requested; runtime now uses tool_tcp actions.",
             )
         components.session.set_calibration_ready()
         components.session.mark_debug_passed()

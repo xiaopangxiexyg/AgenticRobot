@@ -6,9 +6,10 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 
@@ -20,11 +21,12 @@ from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     build_annotated_dual_rm65_calibration,
 )
+from ..arm_frames import TOOL_TCP_FRAME
 from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from ..retargeters import PoseToArmRetargeter, PoseToArmRetargeterConfig
 from ..schemas import TeleopObservation, latest_channel_timestamp, merge_teleop_commands
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
-from ..tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
+from ..tcp import legacy_tcp_mode_requested
 from ..tracker_hand import (
     TRACKER_OFFSET_CALIBRATION_VERSION,
     canonical_hand_rpy_default,
@@ -39,6 +41,7 @@ from .calibration_flow import (
     pose_from_rotation_translation,
     tracker_offset_from_neutral_pose,
 )
+from .calibration_web_ui import CalibrationWebUi, WebUiKeyInput
 from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event, log_stage
 from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
@@ -130,6 +133,7 @@ class CalibrationDebugComponents:
     left_retargeter: PoseToArmRetargeter
     right_retargeter: PoseToArmRetargeter
     renderer: SapienArmHandRenderer | None
+    ui: CalibrationWebUi | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tcp-mode",
         type=str,
-        default=HAND_BASE_TCP_FRAME,
+        default=TOOL_TCP_FRAME,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -165,12 +169,49 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--left-tracker-name", type=str, default="tracker_1", help="Left wrist tracker device name")
     parser.add_argument("--right-tracker-name", type=str, default="tracker_2", help="Right wrist tracker device name")
-    parser.add_argument("--aux-tracker-name", type=str, default="tracker_3", help="Auxiliary calibration tracker device name")
+    parser.add_argument(
+        "--aux-tracker-name",
+        type=str,
+        default="",
+        help="Optional auxiliary calibration tracker device name. Empty disables the third tracker.",
+    )
+    parser.add_argument(
+        "--virtual-desk-tracker-role",
+        choices=["auto", "auxiliary", "left_wrist", "right_wrist"],
+        default="auto",
+        help=(
+            "Tracker role used for virtual-desk sweeps. 'auto' prefers auxiliary when present, "
+            "then left_wrist, then right_wrist, so a two-tracker setup is sufficient."
+        ),
+    )
     parser.add_argument("--headless", action="store_true", help="Disable the SAPIEN viewer window")
     parser.add_argument(
         "--skip-renderer",
         action="store_true",
         help="Skip SAPIEN renderer creation. Useful when only terminal validation is needed.",
+    )
+    parser.add_argument(
+        "--ui-mode",
+        choices=["terminal", "web"],
+        default="web",
+        help="Choose terminal key input or a browser-based control panel.",
+    )
+    parser.add_argument(
+        "--ui-host",
+        type=str,
+        default="127.0.0.1",
+        help="Host used by the browser control panel HTTP server.",
+    )
+    parser.add_argument(
+        "--ui-port",
+        type=int,
+        default=0,
+        help="Port used by the browser control panel HTTP server; 0 picks an available port.",
+    )
+    parser.add_argument(
+        "--no-open-browser",
+        action="store_true",
+        help="Do not auto-open the browser when using --ui-mode web.",
     )
     parser.add_argument(
         "--show-tracker-frame-viz",
@@ -204,7 +245,7 @@ def parse_args() -> argparse.Namespace:
         "--hold-capture-sec",
         type=_positive_float,
         default=2.0,
-        help="Timed capture duration for neutral and wrist coarse captures",
+        help="Timed capture duration for wrist coarse captures",
     )
     parser.add_argument("--min-sweep-extent-m", type=_positive_float, default=0.15, help="Minimum extent required for each auxiliary sweep")
     parser.add_argument(
@@ -232,7 +273,7 @@ def parse_args() -> argparse.Namespace:
         "--min-hold-samples",
         type=int,
         default=20,
-        help="Minimum valid samples required for neutral and wrist hold captures",
+        help="Minimum valid samples required for wrist coarse hold captures",
     )
     parser.add_argument(
         "--fine-tune-step-deg",
@@ -302,8 +343,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Optional limit for validation loop steps, 0 means infinite")
     args = parser.parse_args()
-    args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
-    args.tcp_mode = HAND_BASE_TCP_FRAME
+    args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
+    args.tcp_mode = TOOL_TCP_FRAME
     return args
 
 
@@ -320,28 +361,31 @@ def build_components(args: argparse.Namespace) -> CalibrationDebugComponents:
             "left_tracker_name": args.left_tracker_name,
             "right_tracker_name": args.right_tracker_name,
             "aux_tracker_name": args.aux_tracker_name,
+            "virtual_desk_tracker_role": args.virtual_desk_tracker_role,
             "tcp_mode": args.tcp_mode,
             "arm_mode": args.arm_mode,
             "left_arm_ip": args.left_arm_ip,
             "right_arm_ip": args.right_arm_ip,
         }
     )
-    source = VivePoseSource(
-        tracker_configs=[
-            ViveTrackerConfig(
-                name=args.left_tracker_name,
-                side="left",
-                role="left_wrist",
-                channel_name="left_wrist_pose",
-                legacy_index=0,
-            ),
-            ViveTrackerConfig(
-                name=args.right_tracker_name,
-                side="right",
-                role="right_wrist",
-                channel_name="right_wrist_pose",
-                legacy_index=1,
-            ),
+    tracker_configs = [
+        ViveTrackerConfig(
+            name=args.left_tracker_name,
+            side="left",
+            role="left_wrist",
+            channel_name="left_wrist_pose",
+            legacy_index=0,
+        ),
+        ViveTrackerConfig(
+            name=args.right_tracker_name,
+            side="right",
+            role="right_wrist",
+            channel_name="right_wrist_pose",
+            legacy_index=1,
+        ),
+    ]
+    if str(args.aux_tracker_name or "").strip():
+        tracker_configs.append(
             ViveTrackerConfig(
                 name=args.aux_tracker_name,
                 side=None,
@@ -349,8 +393,10 @@ def build_components(args: argparse.Namespace) -> CalibrationDebugComponents:
                 channel_name="auxiliary_tracker_pose",
                 legacy_index=2,
                 critical=False,
-            ),
-        ],
+            )
+        )
+    source = VivePoseSource(
+        tracker_configs=tracker_configs,
         host=args.host,
         port=args.port,
     )
@@ -375,24 +421,6 @@ def build_components(args: argparse.Namespace) -> CalibrationDebugComponents:
             initial_qpos=None if args.arm_mode == "real" and args.right_arm_ip else tuple(DEFAULT_RIGHT_ARM_QPOS.tolist()),
         )
     )
-    renderer = None
-    if not args.skip_renderer:
-        try:
-            renderer = SapienArmHandRenderer(
-                left_urdf_path=arm_urdf_path,
-                left_retargeting_joint_names=(),
-                right_urdf_path=arm_urdf_path,
-                right_retargeting_joint_names=(),
-                left_right_base_distance=args.left_right_base_distance,
-                show_viewer=not args.headless,
-                debug_frame_axis_length=args.debug_frame_axis_length,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Failed to create the SAPIEN renderer. Check that the current environment "
-                "has a usable Vulkan/OpenGL render device, or rerun with --skip-renderer "
-                "to validate the calibration flow without 3D visualization."
-            ) from exc
 
     left_retargeter = PoseToArmRetargeter(
         PoseToArmRetargeterConfig(
@@ -421,7 +449,8 @@ def build_components(args: argparse.Namespace) -> CalibrationDebugComponents:
         right_backend=right_backend,
         left_retargeter=left_retargeter,
         right_retargeter=right_retargeter,
-        renderer=renderer,
+        renderer=None,
+        ui=None,
     )
 
 
@@ -436,7 +465,17 @@ class CalibrationApp:
     def __init__(self, args: argparse.Namespace, components: CalibrationDebugComponents):
         self.args = args
         self.components = components
-        self.key_input = TerminalKeyInput()
+        self.ui: CalibrationWebUi | None = None
+        if self.args.ui_mode == "web":
+            self.ui = CalibrationWebUi(
+                host=self.args.ui_host,
+                port=self.args.ui_port,
+                open_browser=not self.args.no_open_browser,
+            )
+            self.key_input = WebUiKeyInput(self.ui)
+            self.components = replace(self.components, ui=self.ui)
+        else:
+            self.key_input = TerminalKeyInput()
         self.virtual_desk_result = None
         self.coarse_tracker_offsets: dict[str, np.ndarray] = {}
         self.fine_tune_rpy_deg = {
@@ -455,8 +494,50 @@ class CalibrationApp:
         self.frame_viz_mode = str(self.args.frame_viz_mode)
         self.virtual_desk_post_yaw_deg = float(self.args.virtual_desk_post_yaw_deg)
         self._base_world_to_desk_pose: np.ndarray | None = None
-        if self.components.renderer is not None:
-            self.components.renderer.reserve_debug_frames(
+        self._renderer_initialized = False
+        self._restore_loaded_profile_state()
+        self._publish_ui_state(stage="Starting...")
+
+    def _log(self, tag: str, message: str, *, now: float | None = None) -> None:
+        log_event(tag, message, now=now)
+        if self.ui is not None:
+            self.ui.append_message(tag, message)
+
+    def _stage(self, title: str, *, now: float | None = None) -> None:
+        log_stage("STAGE", title, now=now)
+        self._publish_ui_state(stage=title)
+
+    def _publish_ui_state(self, **updates: object) -> None:
+        if self.ui is None:
+            return
+        state = {
+            "selected_side": self.selected_side,
+            "frame_viz_mode": self.frame_viz_mode,
+            "virtual_desk_post_yaw_deg": self.virtual_desk_post_yaw_deg,
+            "renderer_ready": bool(self.components.renderer is not None),
+            "ui_mode": self.args.ui_mode,
+            "host": self.args.host,
+            "port": self.args.port,
+            "load_profile": self.args.load_profile,
+            "show_tracker_frame_viz": bool(self.args.show_tracker_frame_viz),
+        }
+        state.update(updates)
+        self.ui.publish(**state)
+
+    def _ensure_renderer(self) -> None:
+        if self.components.renderer is not None or self.args.skip_renderer:
+            return
+        try:
+            renderer = SapienArmHandRenderer(
+                left_urdf_path=require_asset_path("rm65_arm.urdf"),
+                left_retargeting_joint_names=(),
+                right_urdf_path=require_asset_path("rm65_arm.urdf"),
+                right_retargeting_joint_names=(),
+                left_right_base_distance=self.args.left_right_base_distance,
+                show_viewer=not self.args.headless,
+                debug_frame_axis_length=self.args.debug_frame_axis_length,
+            )
+            renderer.reserve_debug_frames(
                 (
                     "desk",
                     "left_arm_base",
@@ -472,13 +553,15 @@ class CalibrationApp:
                     "aux_tracker_raw",
                 )
             )
-        self._restore_loaded_profile_state()
-
-    def _log(self, tag: str, message: str, *, now: float | None = None) -> None:
-        log_event(tag, message, now=now)
-
-    def _stage(self, title: str, *, now: float | None = None) -> None:
-        log_stage("STAGE", title, now=now)
+            self.components = replace(self.components, renderer=renderer)
+            self._renderer_initialized = True
+            self._publish_ui_state(renderer_ready=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to create the SAPIEN renderer. Check that the current environment "
+                "has a usable Vulkan/OpenGL render device, or rerun with --skip-renderer "
+                "to validate the calibration flow without 3D visualization."
+            ) from exc
 
     def _restore_loaded_profile_state(self) -> None:
         calibration = self.components.calibration
@@ -519,17 +602,20 @@ class CalibrationApp:
         return "left" in self.coarse_tracker_offsets and "right" in self.coarse_tracker_offsets
 
     def run(self) -> None:
-        if not self.key_input.enabled:
+        if self.ui is None and not self.key_input.enabled:
             raise RuntimeError("Calibration debug requires an interactive terminal (TTY).")
         try:
+            self.key_input.start()
+            if self.ui is not None:
+                self.ui.start()
+            self._publish_ui_state(stage="Link Check")
             self.components.left_backend.start()
             self.components.right_backend.start()
             self.components.source.start()
-            self.key_input.start()
             if legacy_tcp_mode_requested(self.args.requested_tcp_mode):
                 self._log(
                     "TCP",
-                    "legacy --tcp-mode rm_eef was requested; runtime now uses hand_base only.",
+                    "legacy --tcp-mode rm_eef was requested; runtime now uses tool_tcp actions.",
                 )
             self._stage("Link Check")
             self._run_link_check()
@@ -561,6 +647,7 @@ class CalibrationApp:
             else:
                 self._stage("Wrist Coarse")
                 self._run_dual_wrist_calibration()
+            self._ensure_renderer()
             if self.args.show_tracker_frame_viz and self.components.renderer is not None:
                 self._stage("Tracker Frame Viz")
                 self._run_tracker_frame_visualization()
@@ -568,6 +655,8 @@ class CalibrationApp:
             self._save_profile()
         finally:
             self.key_input.close()
+            if self.ui is not None:
+                self.ui.close()
             self.components.source.close()
             self.components.left_backend.close()
             self.components.right_backend.close()
@@ -613,6 +702,7 @@ class CalibrationApp:
         current_index = order.index(self.frame_viz_mode)
         self.frame_viz_mode = order[(current_index + 1) % len(order)]
         self._log("FrameViz", f"frame_viz_mode={self.frame_viz_mode}", now=now)
+        self._publish_ui_state()
 
     def _virtual_desk_post_rotation_pose(self) -> np.ndarray:
         yaw_rad = np.deg2rad(self.virtual_desk_post_yaw_deg)
@@ -661,6 +751,7 @@ class CalibrationApp:
             "XY signs updated and home anchors cleared",
             now=now,
         )
+        self._publish_ui_state()
 
     def _desk_debug_frames(self) -> dict[str, np.ndarray]:
         frames = {"desk": identity_pose()}
@@ -737,9 +828,42 @@ class CalibrationApp:
         self.components.right_retargeter.clear_home_anchors()
         self._last_validation_target_poses = {}
 
+    @staticmethod
+    def _channel_for_tracker_role(role: str) -> str:
+        return {
+            "auxiliary": "auxiliary_tracker_pose",
+            "left_wrist": "left_wrist_pose",
+            "right_wrist": "right_wrist_pose",
+        }[str(role)]
+
+    def _resolve_virtual_desk_channel_name(self, channels: Mapping[str, object] | None = None) -> str:
+        requested = str(getattr(self.args, "virtual_desk_tracker_role", "auto") or "auto")
+        if requested != "auto":
+            return self._channel_for_tracker_role(requested)
+        if channels:
+            for candidate in ("auxiliary_tracker_pose", "left_wrist_pose", "right_wrist_pose"):
+                channel = channels.get(candidate)
+                if channel is not None and getattr(channel, "valid", False):
+                    return candidate
+        if str(getattr(self.args, "aux_tracker_name", "") or "").strip():
+            return "auxiliary_tracker_pose"
+        return "left_wrist_pose"
+
+    @staticmethod
+    def _tracker_role_for_channel(channel_name: str) -> str:
+        return {
+            "auxiliary_tracker_pose": "auxiliary",
+            "left_wrist_pose": "left_wrist",
+            "right_wrist_pose": "right_wrist",
+        }.get(str(channel_name), str(channel_name))
+
     def _run_link_check(self) -> None:
-        self._log("LinkCheck", "READY: PRESS N TO CONTINUE AFTER left/right/aux tracker channels are present.")
-        self._log("LinkCheck", "q=quit, n=continue when left/right/aux tracker channels are present.")
+        self._log("LinkCheck", "READY: PRESS N TO CONTINUE AFTER left/right wrist tracker channels are present.")
+        self._log(
+            "LinkCheck",
+            "q=quit, n=continue when left/right tracker channels are present. "
+            "Virtual desk sweeps can use auxiliary, left_wrist, or right_wrist.",
+        )
         self._log(
             "LinkCheck",
             "logical arm mapping: left_wrist_pose -> left_arm(slot at desk -Y / screen-left), "
@@ -765,20 +889,25 @@ class CalibrationApp:
                 raise KeyboardInterrupt
             ready = {
                 name: bool(channels.get(name) is not None and channels[name].valid)
-                for name in ("left_wrist_pose", "right_wrist_pose", "auxiliary_tracker_pose")
+                for name in ("left_wrist_pose", "right_wrist_pose")
             }
+            desk_channel = self._resolve_virtual_desk_channel_name(channels)
+            desk_ready = bool(channels.get(desk_channel) is not None and channels[desk_channel].valid)
             status_snapshot = (
                 tuple(sorted(ready.items())),
+                desk_channel,
+                desk_ready,
                 tuple(sorted(channels)),
             )
             if self.log_gate.should_emit("link_check_status", status_snapshot, now=loop_start):
                 self._log(
                     "LinkCheck",
-                    f"ready={ready} channels={sorted(channels)} press 'n' to continue",
+                    f"ready={ready} virtual_desk_channel={desk_channel} "
+                    f"virtual_desk_ready={desk_ready} channels={sorted(channels)} press 'n' to continue",
                     now=loop_start,
                 )
             if "n" in events and all(ready.values()):
-                self._log("LinkCheck", "all required trackers are ready; continuing", now=loop_start)
+                self._log("LinkCheck", "required wrist trackers are ready; continuing", now=loop_start)
                 return
             if "n" in events and not all(ready.values()):
                 missing = [name for name, is_ready in ready.items() if not is_ready]
@@ -1064,17 +1193,25 @@ class CalibrationApp:
                 )
             return None
 
+        channels = self._poll_channels()
+        desk_channel_name = self._resolve_virtual_desk_channel_name(channels)
+        desk_tracker_role = self._tracker_role_for_channel(desk_channel_name)
+        self._log(
+            "VirtualDesk",
+            f"using {desk_channel_name} ({desk_tracker_role}) for virtual-desk sweeps",
+        )
+
         x_sweep = self._capture_single_channel(
             stage_name="VirtualDeskX",
             instructions=(
-                "Hold the auxiliary tracker and perform the X sweep so that the fitted +X points forward: "
+                f"Use {desk_tracker_role} and perform the X sweep so that the fitted +X points forward: "
                 "start nearer your back and finish in front of your body."
             ),
             timed_flow_hint=(
                 "Press c once, then sweep BACK -> FRONT. "
                 "Start nearer your back side and finish in front of your body before auto-end."
             ),
-            channel_name="auxiliary_tracker_pose",
+            channel_name=desk_channel_name,
             min_samples=max(8, self.args.min_hold_samples),
             capture_duration_sec=self.args.sweep_capture_sec,
             transform=lambda channel: as_pose_matrix(channel.value),
@@ -1090,7 +1227,7 @@ class CalibrationApp:
                 "Press c once, then sweep RIGHT -> LEFT. "
                 "Start near your right side and finish near your left side before auto-end."
             ),
-            channel_name="auxiliary_tracker_pose",
+            channel_name=desk_channel_name,
             min_samples=max(8, self.args.min_hold_samples),
             capture_duration_sec=self.args.sweep_capture_sec,
             transform=lambda channel: as_pose_matrix(channel.value),
@@ -1105,31 +1242,16 @@ class CalibrationApp:
                 "Press c once, start low, move upward, and finish high at the end of the timed window. "
                 "Do not return downward before auto-end."
             ),
-            channel_name="auxiliary_tracker_pose",
+            channel_name=desk_channel_name,
             min_samples=max(8, self.args.min_hold_samples),
             capture_duration_sec=self.args.sweep_capture_sec,
             transform=lambda channel: as_pose_matrix(channel.value),
             validator=_sweep_validator,
         )
-        neutral_hold = self._capture_single_channel(
-            stage_name="VirtualDeskNeutral",
-            instructions=(
-                "Hold the auxiliary tracker near your preferred teleop center. "
-                "This sets the session origin of the virtual desk."
-            ),
-            timed_flow_hint=(
-                "Press c once, then hold the tracker as still as possible until the timed capture ends automatically."
-            ),
-            channel_name="auxiliary_tracker_pose",
-            min_samples=self.args.min_hold_samples,
-            capture_duration_sec=self.args.hold_capture_sec,
-            transform=lambda channel: as_pose_matrix(channel.value),
-        )
         result = fit_virtual_desk_frame(
             x_sweep_poses=x_sweep,
             y_sweep_poses=y_sweep,
             z_sweep_poses=z_sweep,
-            neutral_poses=neutral_hold,
         )
         max_raw_non_orthogonality = max(
             result.xy_non_orthogonality_deg,
@@ -1188,6 +1310,8 @@ class CalibrationApp:
         if abs(self.virtual_desk_post_yaw_deg) > 1e-6:
             self._apply_virtual_desk_post_rotation(update_offsets=False)
         self.components.calibration.metadata["virtual_desk"] = result.to_metadata()
+        self.components.calibration.metadata["virtual_desk_tracker_role"] = desk_tracker_role
+        self.components.calibration.metadata["virtual_desk_channel_name"] = desk_channel_name
         self.components.calibration.metadata["virtual_desk_sweep_convention_version"] = (
             _VIRTUAL_DESK_SWEEP_CONVENTION_VERSION
         )
@@ -1195,7 +1319,8 @@ class CalibrationApp:
             "VirtualDesk",
             f"calibrated x={np.array2string(result.x_axis_world, precision=3)} "
             f"y={np.array2string(result.y_axis_world, precision=3)} "
-            f"z={np.array2string(result.z_axis_world, precision=3)}",
+            f"z={np.array2string(result.z_axis_world, precision=3)} "
+            f"origin_source={result.origin_source}",
         )
         if abs(self.virtual_desk_post_yaw_deg) > 1e-6:
             self._log(
@@ -1435,10 +1560,12 @@ class CalibrationApp:
                     if self.selected_side != "left":
                         self.selected_side = "left"
                         self._log("TrackerFrameViz", "selected_side=left", now=loop_start)
+                        self._publish_ui_state()
                 elif event == "2":
                     if self.selected_side != "right":
                         self.selected_side = "right"
                         self._log("TrackerFrameViz", "selected_side=right", now=loop_start)
+                        self._publish_ui_state()
                 elif event == "j":
                     self.fine_tune_rpy_deg[self.selected_side][2] -= self.args.fine_tune_step_deg
                     tuned = True
@@ -1616,10 +1743,12 @@ class CalibrationApp:
                     if self.selected_side != "left":
                         self.selected_side = "left"
                         self._log("Validate", "selected_side=left", now=loop_start)
+                        self._publish_ui_state()
                 elif event == "2":
                     if self.selected_side != "right":
                         self.selected_side = "right"
                         self._log("Validate", "selected_side=right", now=loop_start)
+                        self._publish_ui_state()
                 elif event == "j":
                     self.fine_tune_rpy_deg[self.selected_side][2] -= self.args.fine_tune_step_deg
                     tuned = True

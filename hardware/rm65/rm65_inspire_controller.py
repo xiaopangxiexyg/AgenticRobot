@@ -1,4 +1,4 @@
-from .robotic_arm_package.robotic_arm import * 
+from .rm_api2_adapter import Arm, RM65
 import time
 import numpy as np
 #import pickle
@@ -7,16 +7,17 @@ import multiprocessing
 import signal
 from copy import deepcopy
 import sys
-from .utils import interpolate_vectors_linear
+from .motion_utils import interpolate_vectors_linear
 
 """
 ### 底层控制进程
 对手臂：维护一个插值后的轨迹点队列，以一定底层控制频率不断透传下一个点，策略每做一次决策，控制器插值出从当前到目标的路径点，清空队列、替换成新的路径点
 对灵巧手：每次策略决策后，直接将动作透传给灵巧手，不做插值
 """
-def run_arm_hand_controller(robot_ip, tgt_now, tgt_changed, current_tgt_done, lock, maxd, control_dt, 
+def run_arm_hand_controller(robot_ip, tgt_now, tgt_changed, current_tgt_done, lock, maxd, control_dt,
                             stop_event, controller_ready_event):
     signal.signal(signal.SIGINT, signal.SIG_IGN) # 忽略子进程的SIGINT信号, 由主进程发异常处理event
+    robot = None
     try:
         # create arm connection
         robot = Arm(RM65, robot_ip)
@@ -58,11 +59,12 @@ def run_arm_hand_controller(robot_ip, tgt_now, tgt_changed, current_tgt_done, lo
             time.sleep(max(control_dt - now_time + start_time, 0))
     except Exception as e:
         print('Arm process exception:', e)
-    finally:    
+    finally:
         # 断开连接
-        robot.RM_API_UnInit()
-        robot.Arm_Socket_Close()
-        print('Arm connection closed.')
+        if robot is not None:
+            robot.RM_API_UnInit()
+            robot.Arm_Socket_Close()
+            print('Arm connection closed.')
 
 
 class RM65_Inspire_Controller:

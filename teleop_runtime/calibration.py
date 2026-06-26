@@ -7,7 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from .tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
+from .arm_frames import TOOL_TCP_FRAME
+from .tcp import canonical_tcp_frame
 from .transforms import as_pose_matrix, clip_pose_translation, identity_pose, invert_pose
 
 VIRTUAL_DESK_SWEEP_CONVENTION_VERSION = 2
@@ -68,8 +69,8 @@ class ArmCalibration:
     home_qpos: np.ndarray | None = None
     home_pose_debug: np.ndarray | None = None
     home_pose_fine: np.ndarray | None = None
-    tcp_debug_frame: str = HAND_BASE_TCP_FRAME
-    tcp_fine_frame: str = HAND_BASE_TCP_FRAME
+    tcp_debug_frame: str = TOOL_TCP_FRAME
+    tcp_fine_frame: str = TOOL_TCP_FRAME
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -86,14 +87,14 @@ class ArmCalibration:
             pose = as_pose_matrix(active_home_pose)
             self.home_pose_debug = pose.copy()
             self.home_pose_fine = pose.copy()
-        self.tcp_debug_frame = HAND_BASE_TCP_FRAME
-        self.tcp_fine_frame = HAND_BASE_TCP_FRAME
+        self.tcp_debug_frame = canonical_tcp_frame(self.tcp_debug_frame or TOOL_TCP_FRAME)
+        self.tcp_fine_frame = canonical_tcp_frame(self.tcp_fine_frame or TOOL_TCP_FRAME)
 
     def tcp_frame_name(self, tcp_mode: str | None = None) -> str:
-        return canonical_tcp_frame(tcp_mode)
+        return canonical_tcp_frame(TOOL_TCP_FRAME if tcp_mode is None else tcp_mode)
 
     def home_pose_for_tcp_mode(self, tcp_mode: str | None = None) -> np.ndarray | None:
-        _ = canonical_tcp_frame(tcp_mode)
+        _ = canonical_tcp_frame(TOOL_TCP_FRAME if tcp_mode is None else tcp_mode)
         if self.home_pose_fine is not None:
             return self.home_pose_fine.copy()
         if self.home_pose_debug is not None:
@@ -165,7 +166,7 @@ class TeleopCalibration:
         pose_matrix = as_pose_matrix(pose)
         if effector_name not in self.arms:
             raise KeyError(f"No arm calibration registered for effector '{effector_name}'.")
-        _ = canonical_tcp_frame(tcp_mode)
+        _ = canonical_tcp_frame(TOOL_TCP_FRAME if tcp_mode is None else tcp_mode)
         self.arms[effector_name].home_pose_debug = pose_matrix.copy()
         self.arms[effector_name].home_pose_fine = pose_matrix.copy()
 
@@ -330,6 +331,8 @@ class TeleopCalibration:
                 tcp_frame = arm_payload.get("tcp_fine_frame")
             if tcp_frame is None:
                 tcp_frame = arm_payload.get("tcp_debug_frame")
+            if tcp_frame is None:
+                tcp_frame = TOOL_TCP_FRAME
             arms[name] = ArmCalibration(
                 name=arm_payload["name"],
                 side=arm_payload["side"],

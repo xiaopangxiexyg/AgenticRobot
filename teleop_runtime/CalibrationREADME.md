@@ -21,7 +21,8 @@
 当前终端日志默认带 `[HH:MM:SS]` 时间戳，并且只在状态变化、关键采样进度节点或异常时输出，不再持续刷固定频率状态行。
 当前默认只在 `TRACKER_FRAME_VIZ` 阶段执行 SAPIEN `render_data(...)`；`LINK_CHECK`、`VirtualDesk`、`WristCoarse` 都不会做逐帧渲染，以避免拖慢采样。
 当前 timed capture 的 `LIVE ...` 心跳默认约每 `0.5s` 一次。
-当前 runtime 已统一固定为 `hand_base`；legacy TCP alias 不再代表另一套独立模式。
+当前 action 主 frame 已统一为 `tool_tcp`；`hand_base` / `arm_link6` 只作为 RM65
+后端内部或兼容 frame 使用。
 
 ## 1. 坐标系定义
 
@@ -87,9 +88,11 @@ python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
   --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist \
-  --tracker tracker_3:auxiliary
+  --tracker tracker_2:right_wrist
 ```
+
+第三只 `tracker_3:auxiliary` 可选。没有 auxiliary 时，calibration debug 会用左或右
+wrist tracker 完成 virtual desk 扫动。
 
 ```bash
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
@@ -112,8 +115,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --host 0.0.0.0 \
   --port 9999 \
-  --arm-mode virtual \
-  --tcp-mode hand_base
+  --arm-mode virtual
 ```
 
 ## 4. 当前状态机
@@ -124,10 +126,9 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 2. `VIRTUAL_DESK_X`
 3. `VIRTUAL_DESK_Y`
 4. `VIRTUAL_DESK_Z`
-5. `VIRTUAL_DESK_NEUTRAL`
-6. `WRIST_COARSE`
-7. `TRACKER_FRAME_VIZ` 可选
-8. `SAVE`
+5. `WRIST_COARSE`
+6. `TRACKER_FRAME_VIZ` 可选
+7. `SAVE`
 
 ## 5. 按键说明
 
@@ -175,7 +176,6 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 ### 5.5 Timed Capture 默认时长
 
 - `VirtualDesk X/Y/Z`: 默认 `3.0s`
-- `VirtualDeskNeutral`: 默认 `2.0s`
 - `WristCoarse`: 默认 `2.0s`
 
 对应 CLI 参数：
@@ -238,21 +238,11 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 - 不需要特别大幅，但要清楚
 - 不要在同一个 capture 窗口里上去又回来，否则 `start_end_distance` 容易不足
 
-### 6.5 Virtual Desk Neutral
+三段 sweep 完成后，工具会自动把所有 sweep 样本的位置均值作为 `origin_V`。
+这个原点只用于形成一个完整的坐标系；后续 runtime home 会重新绑定当前人手
+和机器人 TCP，因此不需要额外做虚拟 desk 原点 hold。
 
-动作：
-
-- 按一次 `c`
-- 把 auxiliary tracker 放到你觉得舒服的 teleop 中心位置
-- 在整个时间窗里尽量稳定停住
-
-这一步定义的是：
-
-- 本次 session 的 `origin_V`
-
-它不是物理桌面原点，只是虚拟 desk 的中心参考。
-
-### 6.6 Wrist Coarse
+### 6.5 Wrist Coarse
 
 建议 neutral 姿态：
 

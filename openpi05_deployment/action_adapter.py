@@ -92,6 +92,23 @@ def adapt_openpi_result(
             seed_vector=observation.hold_action(),
         )
         metadata: dict[str, Any] = {"source": "openpi"}
+        metadata["arm_action_specs_by_side"] = dict(
+            observation.metadata.get("arm_action_specs_by_side", {})
+        )
+        metadata["arm_controlled_frame_by_side"] = dict(
+            observation.metadata.get("arm_controlled_frame_by_side", {})
+        )
+        metadata["arm_reference_frame_by_side"] = dict(
+            observation.metadata.get("arm_reference_frame_by_side", {})
+        )
+        metadata["arm_spec_required"] = True
+        metadata["hand_action_specs_by_side"] = dict(
+            observation.metadata.get("hand_action_specs_by_side", {})
+        )
+        metadata["hand_active_mask_by_side"] = dict(
+            observation.metadata.get("hand_active_mask_by_side", {})
+        )
+        metadata["hand_spec_required"] = True
         if overrides:
             metadata["safety_overrides"] = dict(overrides)
         if timing_metadata:

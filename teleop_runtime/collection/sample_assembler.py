@@ -9,6 +9,7 @@ from scipy.spatial.transform import Rotation as R
 from ..recording import _to_serializable
 from ..schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from ..session import SessionStepResult
+from .action_record import collection_action_record_metadata
 from .build_collect_components import CollectorComponents
 from .video_frame import NearestFrameBuffer, VideoFrame
 
@@ -401,6 +402,7 @@ class CollectorSampleBuilder:
             for channel_name, channel in step_result.channels.items()
         }
         return {
+            "canonical_action_record": collection_action_record_metadata(step_result),
             "command_metadata": command_metadata,
             "command_metadata_by_effector": command_metadata_by_effector,
             "channel_metadata": channel_metadata,

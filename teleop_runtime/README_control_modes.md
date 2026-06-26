@@ -68,11 +68,12 @@
 
 ### 3.1 VIVE 发送端
 
-[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 默认会发送最多 3 个 tracker：
+[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 默认发送两个 wrist tracker：
 
 - `tracker_1:left_wrist`
 - `tracker_2:right_wrist`
-- `tracker_3:auxiliary`
+
+第三只 `tracker_3:auxiliary` 可选；virtual desk 标定可以直接使用左/右 wrist tracker。
 
 每个 tracker 打包内容包括：
 
@@ -237,7 +238,7 @@ target_rotation    = home_robot.rotation * inv(home_human.rotation) * current_hu
 - 检查坐标系有没有对上
 - 检查 tracker 角色映射有没有写反
 - 检查左右臂基座外参是否合理
-- 调试当前统一固定的 `hand_base` TCP frame
+- 调试当前统一的 `tool_tcp` action frame
 
 它不一定适合作为第一选择的真机精细遥操作模式，因为对标定质量非常敏感。
 
@@ -379,8 +380,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
   --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist \
-  --tracker tracker_3:auxiliary
+  --tracker tracker_2:right_wrist
 ```
 
 跨机器调试时，把 `--host` 改成运行 `teleop_runtime` 接收端那台机器的 IP。
@@ -391,7 +391,6 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode hand_base \
   --control-mode absolute
 ```
 
@@ -428,7 +427,6 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode hand_base \
   --control-mode delta_clutch \
   --keyboard-clutch
 ```
@@ -441,7 +439,6 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode hand_base \
   --control-mode delta_clutch
 ```
 
@@ -453,7 +450,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - `--collision-avoidance-mode boundary_slide|freeze_on_contact`：双臂推向碰撞区时的默认行为
 - `--collision-scene-profile dual_arm|dual_arm_hand_proxy_open|dual_arm_hand|dual_arm_cylinder_table`：当前 joint-space 双臂碰撞场景 profile，默认先用 `dual_arm_hand_proxy_open`
 - `--no-collision`：退回旧的两条独立单臂链路
-- `--tcp-mode hand_base`：当前 runtime 固定使用 `hand_base`
+- `--tcp-mode hand_base`：历史兼容参数；当前 action 主 frame 是 `tool_tcp`
 - `--skip-renderer`：不启动 SAPIEN，只跑控制主链
 - `--headless`：创建渲染器但不弹 viewer
 - `--hz`：主循环频率
@@ -509,7 +506,7 @@ keyboard.set_button("left_clutch_button", False, side="left", critical=False)
 keyboard.set_button("right_clutch_button", False, side="right", critical=False)
 
 session = TeleopSession(
-    config=TeleopSessionConfig(mode="bimanual", tcp_mode="hand_base"),
+    config=TeleopSessionConfig(mode="bimanual"),
     sources=[
         VivePoseSource(
             tracker_configs=[

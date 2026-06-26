@@ -7,7 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from .tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
+from .arm_frames import TOOL_TCP_FRAME
+from .tcp import canonical_tcp_frame
 from .transforms import as_pose_matrix
 
 
@@ -52,7 +53,7 @@ class AlignmentSideState:
 
 @dataclass
 class TeleopInitialAlignment:
-    tcp_frame: str = HAND_BASE_TCP_FRAME
+    tcp_frame: str = TOOL_TCP_FRAME
     sides: dict[str, AlignmentSideState] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -88,7 +89,7 @@ class TeleopInitialAlignment:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TeleopInitialAlignment":
         return cls(
-            tcp_frame=payload.get("tcp_frame", HAND_BASE_TCP_FRAME),
+            tcp_frame=payload.get("tcp_frame", TOOL_TCP_FRAME),
             sides={
                 side: AlignmentSideState(**state_payload)
                 for side, state_payload in payload.get("sides", {}).items()

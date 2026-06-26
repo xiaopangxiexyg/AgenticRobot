@@ -1,0 +1,6291 @@
+{
+  "schema_version": 1,
+  "generated_by": "hardware/rm65/utils/scripts/rm65_pose_response_probe.py",
+  "arm": "left",
+  "ip": "192.168.101.21",
+  "executed": true,
+  "axis": "z",
+  "offset": 0.01,
+  "control_hz": 40.0,
+  "pre_sec": 1.0,
+  "hold_sec": 1.5,
+  "return_sec": 1.0,
+  "state_read_every": 1,
+  "force_read_every": 1,
+  "trajectory_mode": 0,
+  "radio": 0,
+  "start_state": {
+    "joint_deg": [
+      91.75,
+      29.91900062561035,
+      93.41600036621094,
+      4.5289998054504395,
+      -38.4739990234375,
+      -101.44499969482422
+    ],
+    "pose": [
+      0.006246,
+      -0.463541,
+      0.361147,
+      -1.481,
+      -0.132,
+      3.111
+    ]
+  },
+  "records": [
+    {
+      "step": 1,
+      "time_sec": 2.08060082513839e-05,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006257,
+        -0.463547,
+        0.361128,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.922000885009766,
+        93.41600036621094,
+        4.5289998054504395,
+        -38.474998474121094,
+        -101.44599914550781
+      ],
+      "observed_axis_offset": -1.8999999999991246e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0030002593994140625,
+      "pose_linear_delta_m": 2.2759613353476644e-05,
+      "pose_angular_delta_rad": 0.0,
+      "force_norm_n": 0.5295856854209723,
+      "torque_norm_nm": 0.02694438709374325,
+      "timing": {
+        "command_sec": 0.00017727899830788374,
+        "state_read_sec": 0.006349026982206851,
+        "force_read_sec": 0.004302703979192302,
+        "loop_elapsed_sec": 0.01090033000218682,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 2,
+      "time_sec": 0.025090718001592904,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006248,
+        -0.463547,
+        0.361129,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.922000885009766,
+        93.41600036621094,
+        4.5269999504089355,
+        -38.474998474121094,
+        -101.44499969482422
+      ],
+      "observed_axis_offset": -1.8000000000018e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0030002593994140625,
+      "pose_linear_delta_m": 1.9078784028357813e-05,
+      "pose_angular_delta_rad": 0.0,
+      "force_norm_n": 0.40872238532791083,
+      "torque_norm_nm": 0.02455605778950251,
+      "timing": {
+        "command_sec": 0.00018241701764054596,
+        "state_read_sec": 0.006397758988896385,
+        "force_read_sec": 0.004310251009883359,
+        "loop_elapsed_sec": 0.010979116021189839,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 3,
+      "time_sec": 0.05007876601302996,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006248,
+        -0.463536,
+        0.36115,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.917999267578125,
+        93.41799926757812,
+        4.5269999504089355,
+        -38.4739990234375,
+        -101.44599914550781
+      ],
+      "observed_axis_offset": 3.000000000030756e-06,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0019998550415039062,
+      "pose_linear_delta_m": 6.164414002965573e-06,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.6287256718503915,
+      "torque_norm_nm": 0.026324892488861912,
+      "timing": {
+        "command_sec": 0.00017988099716603756,
+        "state_read_sec": 0.006334220001008362,
+        "force_read_sec": 0.004263143986463547,
+        "loop_elapsed_sec": 0.0108376260031946,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 4,
+      "time_sec": 0.07507400901522487,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006273,
+        -0.463544,
+        0.36114,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75299835205078,
+        29.92099952697754,
+        93.41600036621094,
+        4.526000022888184,
+        -38.474998474121094,
+        -101.44499969482422
+      ],
+      "observed_axis_offset": -6.999999999979245e-06,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0029997825622558594,
+      "pose_linear_delta_m": 2.8053520278209296e-05,
+      "pose_angular_delta_rad": 0.0,
+      "force_norm_n": 0.5593612534064624,
+      "torque_norm_nm": 0.026019223417400577,
+      "timing": {
+        "command_sec": 0.00017871198360808194,
+        "state_read_sec": 0.006368529982864857,
+        "force_read_sec": 0.00841075400239788,
+        "loop_elapsed_sec": 0.01503245800267905,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 5,
+      "time_sec": 0.10008521901909262,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006257,
+        -0.463538,
+        0.361143,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.91900062561035,
+        93.41799926757812,
+        4.5289998054504395,
+        -38.474998474121094,
+        -101.44599914550781
+      ],
+      "observed_axis_offset": -4.000000000004e-06,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0019989013671875,
+      "pose_linear_delta_m": 1.208304597359029e-05,
+      "pose_angular_delta_rad": 0.0,
+      "force_norm_n": 0.4782813042265231,
+      "torque_norm_nm": 0.02626785084054362,
+      "timing": {
+        "command_sec": 0.00018941701273433864,
+        "state_read_sec": 0.004292065015761182,
+        "force_read_sec": 0.006350529991323128,
+        "loop_elapsed_sec": 0.010907179996138439,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 6,
+      "time_sec": 0.1250704349949956,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00626,
+        -0.463544,
+        0.361136,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.92099952697754,
+        93.41600036621094,
+        4.5269999504089355,
+        -38.4739990234375,
+        -101.44599914550781
+      ],
+      "observed_axis_offset": -1.0999999999983245e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0019998550415039062,
+      "pose_linear_delta_m": 1.8055470085262785e-05,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.453763144278025,
+      "torque_norm_nm": 0.025099800383417123,
+      "timing": {
+        "command_sec": 0.000176175992237404,
+        "state_read_sec": 0.006395706994226202,
+        "force_read_sec": 0.004350167990196496,
+        "loop_elapsed_sec": 0.010996634024195373,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 7,
+      "time_sec": 0.15008039202075452,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006257,
+        -0.463544,
+        0.361136,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.92099952697754,
+        93.41600036621094,
+        4.5289998054504395,
+        -38.4739990234375,
+        -101.44499969482422
+      ],
+      "observed_axis_offset": -1.0999999999983245e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0019989013671875,
+      "pose_linear_delta_m": 1.584297951774946e-05,
+      "pose_angular_delta_rad": 0.0,
+      "force_norm_n": 0.4780878616888979,
+      "torque_norm_nm": 0.024779023727399284,
+      "timing": {
+        "command_sec": 0.00018112099496647716,
+        "state_read_sec": 0.006382763996953145,
+        "force_read_sec": 0.005697640008293092,
+        "loop_elapsed_sec": 0.012324172974331304,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 8,
+      "time_sec": 0.17507024502265267,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006246,
+        -0.463536,
+        0.361115,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.92099952697754,
+        93.41999816894531,
+        4.5289998054504395,
+        -38.474998474121094,
+        -101.44499969482422
+      ],
+      "observed_axis_offset": -3.199999999997649e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.003997802734375,
+      "pose_linear_delta_m": 3.238826948137656e-05,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5232294056956847,
+      "torque_norm_nm": 0.027495454205503755,
+      "timing": {
+        "command_sec": 0.0001676960091572255,
+        "state_read_sec": 0.008457200019620359,
+        "force_read_sec": 0.012551638996228576,
+        "loop_elapsed_sec": 0.021247589000267908,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 9,
+      "time_sec": 0.20006899599684402,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006259,
+        -0.463536,
+        0.361115,
+        -1.482,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.92099952697754,
+        93.41999816894531,
+        4.5269999504089355,
+        -38.474998474121094,
+        -101.44599914550781
+      ],
+      "observed_axis_offset": -3.199999999997649e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.003997802734375,
+      "pose_linear_delta_m": 3.489985673320548e-05,
+      "pose_angular_delta_rad": 0.0014142135623730178,
+      "force_norm_n": 0.5162276704535783,
+      "torque_norm_nm": 0.027946377273485944,
+      "timing": {
+        "command_sec": 0.00017098401440307498,
+        "state_read_sec": 0.004288256022846326,
+        "force_read_sec": 0.006333630997687578,
+        "loop_elapsed_sec": 0.010872953018406406,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 10,
+      "time_sec": 0.2250675490067806,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006245,
+        -0.463532,
+        0.361099,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.92099952697754,
+        93.4229965209961,
+        4.5289998054504395,
+        -38.474998474121094,
+        -101.44499969482422
+      ],
+      "observed_axis_offset": -4.799999999999249e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.00699615478515625,
+      "pose_linear_delta_m": 4.884669896726842e-05,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.4589128550666225,
+      "torque_norm_nm": 0.027313000032018104,
+      "timing": {
+        "command_sec": 0.00015925298794172704,
+        "state_read_sec": 0.006338058010442182,
+        "force_read_sec": 0.004266106989234686,
+        "loop_elapsed_sec": 0.010829679988091812,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 11,
+      "time_sec": 0.25006869100616314,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006234,
+        -0.463525,
+        0.361056,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.922000885009766,
+        93.42900085449219,
+        4.5289998054504395,
+        -38.474998474121094,
+        -101.44499969482422
+      ],
+      "observed_axis_offset": -9.100000000000774e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.01300048828125,
+      "pose_linear_delta_m": 9.3171884171139e-05,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.49688730753932614,
+      "torque_norm_nm": 0.025099800383417123,
+      "timing": {
+        "command_sec": 0.00015775198698975146,
+        "state_read_sec": 0.006344161985907704,
+        "force_read_sec": 0.004336536017945036,
+        "loop_elapsed_sec": 0.010903876012889668,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 12,
+      "time_sec": 0.275084886001423,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006241,
+        -0.463517,
+        0.361052,
+        -1.482,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.92099952697754,
+        93.43099975585938,
+        4.52400016784668,
+        -38.474998474121094,
+        -101.44300079345703
+      ],
+      "observed_axis_offset": -9.500000000001174e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0149993896484375,
+      "pose_linear_delta_m": 9.811218069129194e-05,
+      "pose_angular_delta_rad": 0.0014142135623730178,
+      "force_norm_n": 0.5861877116186562,
+      "torque_norm_nm": 0.02701851160277158,
+      "timing": {
+        "command_sec": 0.000172439991729334,
+        "state_read_sec": 0.006439474003855139,
+        "force_read_sec": 0.004369403992313892,
+        "loop_elapsed_sec": 0.011047223000787199,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 13,
+      "time_sec": 0.3000843710033223,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006261,
+        -0.46352,
+        0.361021,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.923999786376953,
+        93.43299865722656,
+        4.526000022888184,
+        -38.474998474121094,
+        -101.44000244140625
+      ],
+      "observed_axis_offset": -0.000126000000000015,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.016998291015625,
+      "pose_linear_delta_m": 0.00012861570666136972,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6794218024762699,
+      "torque_norm_nm": 0.02321637420898554,
+      "timing": {
+        "command_sec": 0.00017822399968281388,
+        "state_read_sec": 0.006421985977794975,
+        "force_read_sec": 0.010558453010162339,
+        "loop_elapsed_sec": 0.01723296201089397,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 14,
+      "time_sec": 0.32507608001469634,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006236,
+        -0.463518,
+        0.361028,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.922000885009766,
+        93.43299865722656,
+        4.5269999504089355,
+        -38.4739990234375,
+        -101.43599700927734
+      ],
+      "observed_axis_offset": -0.00011899999999998023,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.016998291015625,
+      "pose_linear_delta_m": 0.00012161414391424655,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6213066969319337,
+      "torque_norm_nm": 0.029017236102778694,
+      "timing": {
+        "command_sec": 0.00017257698345929384,
+        "state_read_sec": 0.004286806011805311,
+        "force_read_sec": 0.006468452018452808,
+        "loop_elapsed_sec": 0.010999721998814493,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 15,
+      "time_sec": 0.3500782920164056,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006236,
+        -0.463524,
+        0.36099,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.926000595092773,
+        93.43399810791016,
+        4.5269999504089355,
+        -38.474998474121094,
+        -101.43499755859375
+      ],
+      "observed_axis_offset": -0.00015700000000001824,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.01799774169921875,
+      "pose_linear_delta_m": 0.00015823400393090404,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.48327424871785823,
+      "torque_norm_nm": 0.023345234697624756,
+      "timing": {
+        "command_sec": 0.00022253597853705287,
+        "state_read_sec": 0.006441091012675315,
+        "force_read_sec": 0.0042567010095808655,
+        "loop_elapsed_sec": 0.01099036299274303,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 16,
+      "time_sec": 0.3750682510144543,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006248,
+        -0.463533,
+        0.360938,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.93199920654297,
+        93.43599700927734,
+        4.5269999504089355,
+        -38.474998474121094,
+        -101.43099975585938
+      ],
+      "observed_axis_offset": -0.00020900000000001473,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.01999664306640625,
+      "pose_linear_delta_m": 0.00020916261616265534,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5473810377977072,
+      "torque_norm_nm": 0.028284271405512595,
+      "timing": {
+        "command_sec": 0.000164106982992962,
+        "state_read_sec": 0.006336036982247606,
+        "force_read_sec": 0.004208106984151527,
+        "loop_elapsed_sec": 0.010756169009255245,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 17,
+      "time_sec": 0.40009056800045073,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006248,
+        -0.463541,
+        0.360924,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.934999465942383,
+        93.43399810791016,
+        4.5269999504089355,
+        -38.474998474121094,
+        -101.43099975585938
+      ],
+      "observed_axis_offset": -0.00022299999999997322,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.01799774169921875,
+      "pose_linear_delta_m": 0.00022300896842949625,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.48716424624924115,
+      "torque_norm_nm": 0.023958296519265034,
+      "timing": {
+        "command_sec": 0.00014134999946691096,
+        "state_read_sec": 0.004279402986867353,
+        "force_read_sec": 0.0063859990041237324,
+        "loop_elapsed_sec": 0.010867261007661,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 18,
+      "time_sec": 0.4250627000001259,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006237,
+        -0.463547,
+        0.360897,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.937000274658203,
+        93.43399810791016,
+        4.5269999504089355,
+        -38.4739990234375,
+        -101.4280014038086
+      ],
+      "observed_axis_offset": -0.00024999999999997247,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.017999649047851562,
+      "pose_linear_delta_m": 0.00025023389059035606,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.37464115553798966,
+      "torque_norm_nm": 0.024919871113971603,
+      "timing": {
+        "command_sec": 0.00011673502740450203,
+        "state_read_sec": 0.006385896995197982,
+        "force_read_sec": 0.006450179993407801,
+        "loop_elapsed_sec": 0.012999077996937558,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 19,
+      "time_sec": 0.45006822800496593,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006262,
+        -0.463553,
+        0.360876,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.940000534057617,
+        93.43399810791016,
+        4.526000022888184,
+        -38.4739990234375,
+        -101.42500305175781
+      ],
+      "observed_axis_offset": -0.0002710000000000212,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.020999908447265625,
+      "pose_linear_delta_m": 0.0002717370052091025,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.40804289511971537,
+      "torque_norm_nm": 0.027658633393428774,
+      "timing": {
+        "command_sec": 0.00012045699986629188,
+        "state_read_sec": 0.006413489987608045,
+        "force_read_sec": 0.0043488819792401046,
+        "loop_elapsed_sec": 0.010949598014121875,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 20,
+      "time_sec": 0.4750666930049192,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006275,
+        -0.463553,
+        0.360856,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75299835205078,
+        29.94099998474121,
+        93.43599700927734,
+        4.52400016784668,
+        -38.4739990234375,
+        -101.4229965209961
+      ],
+      "observed_axis_offset": -0.0002909999999999857,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.022003173828125,
+      "pose_linear_delta_m": 0.00029268754671149235,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5855689379659523,
+      "torque_norm_nm": 0.028513155090281222,
+      "timing": {
+        "command_sec": 0.00012037597480230033,
+        "state_read_sec": 0.0063151189824566245,
+        "force_read_sec": 0.004212603002088144,
+        "loop_elapsed_sec": 0.010696164012188092,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 21,
+      "time_sec": 0.5000631239963695,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006245,
+        -0.463562,
+        0.360839,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.944000244140625,
+        93.43399810791016,
+        4.5229997634887695,
+        -38.47200012207031,
+        -101.41799926757812
+      ],
+      "observed_axis_offset": -0.00030799999999997496,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.02700042724609375,
+      "pose_linear_delta_m": 0.00030871669860890955,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6425651517334127,
+      "torque_norm_nm": 0.02435159080241827,
+      "timing": {
+        "command_sec": 0.00012406401219777763,
+        "state_read_sec": 0.006376573001034558,
+        "force_read_sec": 0.004242299997713417,
+        "loop_elapsed_sec": 0.010799552022945136,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 22,
+      "time_sec": 0.5251125520153437,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00627,
+        -0.463553,
+        0.360857,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.94099998474121,
+        93.43599700927734,
+        4.521999835968018,
+        -38.4739990234375,
+        -101.41300201416016
+      ],
+      "observed_axis_offset": -0.00029000000000001247,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0319976806640625,
+      "pose_linear_delta_m": 0.00029123873368768713,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.3903139755833499,
+      "torque_norm_nm": 0.026324892488861912,
+      "timing": {
+        "command_sec": 0.00017692099208943546,
+        "state_read_sec": 0.004301447013858706,
+        "force_read_sec": 0.0063065589929465204,
+        "loop_elapsed_sec": 0.010848742997040972,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 23,
+      "time_sec": 0.5500693890207913,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006266,
+        -0.463566,
+        0.360864,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.944000244140625,
+        93.43099975585938,
+        4.51800012588501,
+        -38.474998474121094,
+        -101.41000366210938
+      ],
+      "observed_axis_offset": -0.0002829999999999777,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.03499603271484375,
+      "pose_linear_delta_m": 0.00028480519658178157,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6047594454363489,
+      "torque_norm_nm": 0.025238858563377334,
+      "timing": {
+        "command_sec": 0.0001413480204064399,
+        "state_read_sec": 0.008337645005667582,
+        "force_read_sec": 0.0042064379958901554,
+        "loop_elapsed_sec": 0.01273462999961339,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 24,
+      "time_sec": 0.5750782270042691,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006273,
+        -0.463559,
+        0.36084,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.944000244140625,
+        93.43599700927734,
+        4.513999938964844,
+        -38.474998474121094,
+        -101.40599822998047
+      ],
+      "observed_axis_offset": -0.0003070000000000017,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.03900146484375,
+      "pose_linear_delta_m": 0.00030871022010941216,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6268604452461167,
+      "torque_norm_nm": 0.027037011554003426,
+      "timing": {
+        "command_sec": 0.0001779060112312436,
+        "state_read_sec": 0.0064392469939775765,
+        "force_read_sec": 0.004301353998016566,
+        "loop_elapsed_sec": 0.010990216018399224,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 25,
+      "time_sec": 0.6000688810017891,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006286,
+        -0.463559,
+        0.360844,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.944000244140625,
+        93.43599700927734,
+        4.51200008392334,
+        -38.47600173950195,
+        -101.4020004272461
+      ],
+      "observed_axis_offset": -0.0003029999999999977,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.042999267578125,
+      "pose_linear_delta_m": 0.00030615845570553706,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.4681719690602936,
+      "torque_norm_nm": 0.025317977464510623,
+      "timing": {
+        "command_sec": 0.00016172800678759813,
+        "state_read_sec": 0.01046354600111954,
+        "force_read_sec": 0.004282465990399942,
+        "loop_elapsed_sec": 0.014973873010603711,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 26,
+      "time_sec": 0.6251107900170609,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006291,
+        -0.463559,
+        0.360859,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.94300079345703,
+        93.43399810791016,
+        4.508999824523926,
+        -38.474998474121094,
+        -101.4010009765625
+      ],
+      "observed_axis_offset": -0.00028800000000001047,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.04399871826171875,
+      "pose_linear_delta_m": 0.00029204965331259457,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.475650082690754,
+      "torque_norm_nm": 0.02860069948648576,
+      "timing": {
+        "command_sec": 0.00016200201935134828,
+        "state_read_sec": 0.006439346994739026,
+        "force_read_sec": 0.004297521023545414,
+        "loop_elapsed_sec": 0.010964163986500353,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 27,
+      "time_sec": 0.6500771700229961,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006277,
+        -0.463556,
+        0.36087,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.94099998474121,
+        93.43399810791016,
+        4.511000156402588,
+        -38.474998474121094,
+        -101.39900207519531
+      ],
+      "observed_axis_offset": -0.0002769999999999717,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.04599761962890625,
+      "pose_linear_delta_m": 0.00027913258498424293,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5552323904774666,
+      "torque_norm_nm": 0.02767670452890375,
+      "timing": {
+        "command_sec": 0.00016998802311718464,
+        "state_read_sec": 0.006356739002512768,
+        "force_read_sec": 0.004348235001089051,
+        "loop_elapsed_sec": 0.010941363987512887,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 28,
+      "time_sec": 0.6750677440140862,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006291,
+        -0.463554,
+        0.360843,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.94300079345703,
+        93.43699645996094,
+        4.508999824523926,
+        -38.474998474121094,
+        -101.3949966430664
+      ],
+      "observed_axis_offset": -0.00030399999999997096,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0500030517578125,
+      "pose_linear_delta_m": 0.0003075873859571998,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5013940487559614,
+      "torque_norm_nm": 0.024186774051969877,
+      "timing": {
+        "command_sec": 0.00016509598935954273,
+        "state_read_sec": 0.006317626975942403,
+        "force_read_sec": 0.004277764994185418,
+        "loop_elapsed_sec": 0.010826224985066801,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 29,
+      "time_sec": 0.7000687420077156,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006285,
+        -0.463559,
+        0.360841,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.944000244140625,
+        93.43599700927734,
+        4.506999969482422,
+        -38.474998474121094,
+        -101.39099884033203
+      ],
+      "observed_axis_offset": -0.00030599999999997296,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0540008544921875,
+      "pose_linear_delta_m": 0.0003089999999999743,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6696454215303095,
+      "torque_norm_nm": 0.025475477573077897,
+      "timing": {
+        "command_sec": 0.0001580860116519034,
+        "state_read_sec": 0.0063091759802773595,
+        "force_read_sec": 0.008446492021903396,
+        "loop_elapsed_sec": 0.015053643001010641,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 30,
+      "time_sec": 0.7250675480172504,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006269,
+        -0.463562,
+        0.360848,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.944000244140625,
+        93.43399810791016,
+        4.508999824523926,
+        -38.474998474121094,
+        -101.38500213623047
+      ],
+      "observed_axis_offset": -0.0002989999999999937,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.05999755859375,
+      "pose_linear_delta_m": 0.00030061769741649607,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6405450708318512,
+      "torque_norm_nm": 0.027766886877796323,
+      "timing": {
+        "command_sec": 0.000173677020939067,
+        "state_read_sec": 0.004229240003041923,
+        "force_read_sec": 0.006481582997366786,
+        "loop_elapsed_sec": 0.010945250978693366,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 31,
+      "time_sec": 0.7500771839986555,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006269,
+        -0.463561,
+        0.360867,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.94300079345703,
+        93.43299865722656,
+        4.508999824523926,
+        -38.474998474121094,
+        -101.38099670410156
+      ],
+      "observed_axis_offset": -0.00028000000000000247,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06400299072265625,
+      "pose_linear_delta_m": 0.0002816540431096316,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5505833232192663,
+      "torque_norm_nm": 0.02699999987251229,
+      "timing": {
+        "command_sec": 0.00016619899543002248,
+        "state_read_sec": 0.006447291991207749,
+        "force_read_sec": 0.004388973000459373,
+        "loop_elapsed_sec": 0.01106726101716049,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 32,
+      "time_sec": 0.7750681390170939,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00628,
+        -0.463556,
+        0.360854,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.94300079345703,
+        93.43599700927734,
+        4.508999824523926,
+        -38.47600173950195,
+        -101.37899780273438
+      ],
+      "observed_axis_offset": -0.0002929999999999877,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06600189208984375,
+      "pose_linear_delta_m": 0.000295347253246063,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.47233992679599546,
+      "torque_norm_nm": 0.026645825012790815,
+      "timing": {
+        "command_sec": 0.00016384298214688897,
+        "state_read_sec": 0.00633999501587823,
+        "force_read_sec": 0.008435298019321635,
+        "loop_elapsed_sec": 0.015008935995865613,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 33,
+      "time_sec": 0.8000821979949251,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006294,
+        -0.463567,
+        0.360842,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.945999145507812,
+        93.43299865722656,
+        4.507999897003174,
+        -38.4739990234375,
+        -101.3759994506836
+      ],
+      "observed_axis_offset": -0.0003049999999999997,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.069000244140625,
+      "pose_linear_delta_m": 0.00030984673630684125,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5518885653970281,
+      "torque_norm_nm": 0.024919872459388356,
+      "timing": {
+        "command_sec": 0.0001993910118471831,
+        "state_read_sec": 0.004315088997827843,
+        "force_read_sec": 0.010660995001671836,
+        "loop_elapsed_sec": 0.015255932026775554,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 34,
+      "time_sec": 0.8250750110018998,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006293,
+        -0.463564,
+        0.360841,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.945999145507812,
+        93.43399810791016,
+        4.507999897003174,
+        -38.47600173950195,
+        -101.3759994506836
+      ],
+      "observed_axis_offset": -0.00030599999999997296,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.069000244140625,
+      "pose_linear_delta_m": 0.0003104416209208798,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5736139632150619,
+      "torque_norm_nm": 0.02619160098686904,
+      "timing": {
+        "command_sec": 0.00019119097851216793,
+        "state_read_sec": 0.0043841890001203865,
+        "force_read_sec": 0.006361064995871857,
+        "loop_elapsed_sec": 0.01102296300814487,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 35,
+      "time_sec": 0.8500774830172304,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006271,
+        -0.463561,
+        0.360871,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.94300079345703,
+        93.43299865722656,
+        4.507999897003174,
+        -38.47600173950195,
+        -101.375
+      ],
+      "observed_axis_offset": -0.00027599999999999847,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06999969482421875,
+      "pose_linear_delta_m": 0.0002778506793225454,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.60561042181407,
+      "torque_norm_nm": 0.025238858563377334,
+      "timing": {
+        "command_sec": 0.00018246000399813056,
+        "state_read_sec": 0.004338550992542878,
+        "force_read_sec": 0.006417113996576518,
+        "loop_elapsed_sec": 0.011011609982233495,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 36,
+      "time_sec": 0.8751134269987233,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00628,
+        -0.463559,
+        0.360859,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.94300079345703,
+        93.43399810791016,
+        4.508999824523926,
+        -38.474998474121094,
+        -101.375
+      ],
+      "observed_axis_offset": -0.00028800000000001047,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06999969482421875,
+      "pose_linear_delta_m": 0.0002905580836941328,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6060404463505803,
+      "torque_norm_nm": 0.0256124979480875,
+      "timing": {
+        "command_sec": 0.00016683401190675795,
+        "state_read_sec": 0.006479197007138282,
+        "force_read_sec": 0.004241477989125997,
+        "loop_elapsed_sec": 0.010954188008327037,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 37,
+      "time_sec": 0.9000686380022671,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006269,
+        -0.463559,
+        0.360859,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.94300079345703,
+        93.43399810791016,
+        4.508999824523926,
+        -38.474998474121094,
+        -101.375
+      ],
+      "observed_axis_offset": -0.00028800000000001047,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06999969482421875,
+      "pose_linear_delta_m": 0.0002894771148122191,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5667927253059107,
+      "torque_norm_nm": 0.02455605778950251,
+      "timing": {
+        "command_sec": 0.00016535699251107872,
+        "state_read_sec": 0.006342084001516923,
+        "force_read_sec": 0.004278421984054148,
+        "loop_elapsed_sec": 0.010853339015739039,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 38,
+      "time_sec": 0.925106233014958,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006291,
+        -0.463561,
+        0.360852,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.944000244140625,
+        93.43399810791016,
+        4.508999824523926,
+        -38.47600173950195,
+        -101.375
+      ],
+      "observed_axis_offset": -0.0002949999999999897,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06999969482421875,
+      "pose_linear_delta_m": 0.00029908192857475477,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5515804520159674,
+      "torque_norm_nm": 0.0237907538653659,
+      "timing": {
+        "command_sec": 0.00016467200475744903,
+        "state_read_sec": 0.0063946020090952516,
+        "force_read_sec": 0.004366133012808859,
+        "loop_elapsed_sec": 0.010990565991960466,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 39,
+      "time_sec": 0.9500720780051779,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006271,
+        -0.463567,
+        0.360849,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.945999145507812,
+        93.43299865722656,
+        4.507999897003174,
+        -38.47600173950195,
+        -101.375
+      ],
+      "observed_axis_offset": -0.00029800000000002047,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06999969482421875,
+      "pose_linear_delta_m": 0.0003001749489881085,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.46679651784307014,
+      "torque_norm_nm": 0.028142494671192404,
+      "timing": {
+        "command_sec": 0.000170202023582533,
+        "state_read_sec": 0.006367777998093516,
+        "force_read_sec": 0.004386662010801956,
+        "loop_elapsed_sec": 0.01099511401844211,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 40,
+      "time_sec": 0.975080550997518,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006277,
+        -0.463564,
+        0.360844,
+        -1.482,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.945999145507812,
+        93.43399810791016,
+        4.511000156402588,
+        -38.47800064086914,
+        -101.37200164794922
+      ],
+      "observed_axis_offset": -0.0003029999999999977,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.072998046875,
+      "pose_linear_delta_m": 0.00030544885005512524,
+      "pose_angular_delta_rad": 0.0014142135623730178,
+      "force_norm_n": 0.5959345689366419,
+      "torque_norm_nm": 0.02747726284948068,
+      "timing": {
+        "command_sec": 0.00017481198301538825,
+        "state_read_sec": 0.004287563991965726,
+        "force_read_sec": 0.006443934980779886,
+        "loop_elapsed_sec": 0.010974850010825321,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 41,
+      "time_sec": 1.000068488996476,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006279,
+        -0.463558,
+        0.360848,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.944000244140625,
+        93.43599700927734,
+        4.508999824523926,
+        -38.47800064086914,
+        -101.37300109863281
+      ],
+      "observed_axis_offset": -0.0002989999999999937,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.07199859619140625,
+      "pose_linear_delta_m": 0.00030129553597754775,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.4870451757615492,
+      "torque_norm_nm": 0.024617068107313053,
+      "timing": {
+        "command_sec": 0.00016388000221922994,
+        "state_read_sec": 0.004277934989659116,
+        "force_read_sec": 0.00633862498216331,
+        "loop_elapsed_sec": 0.010848808014998212,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 42,
+      "time_sec": 1.0250689730164595,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006291,
+        -0.463556,
+        0.360858,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.94300079345703,
+        93.43599700927734,
+        4.508999824523926,
+        -38.47800064086914,
+        -101.37200164794922
+      ],
+      "observed_axis_offset": -0.0002889999999999837,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.072998046875,
+      "pose_linear_delta_m": 0.0002928668639501435,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5337752357333025,
+      "torque_norm_nm": 0.027313000032018104,
+      "timing": {
+        "command_sec": 0.00016940999194048345,
+        "state_read_sec": 0.006358810001984239,
+        "force_read_sec": 0.0044081789965275675,
+        "loop_elapsed_sec": 0.011009266978362575,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 43,
+      "time_sec": 1.0500702050048858,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006279,
+        -0.463562,
+        0.360876,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.944000244140625,
+        93.43299865722656,
+        4.508999824523926,
+        -38.481998443603516,
+        -101.37200164794922
+      ],
+      "observed_axis_offset": -0.0002710000000000212,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.072998046875,
+      "pose_linear_delta_m": 0.0002738083271195586,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.5171895287718844,
+      "torque_norm_nm": 0.02701851160277158,
+      "timing": {
+        "command_sec": 0.00017375999595969915,
+        "state_read_sec": 0.006369552022079006,
+        "force_read_sec": 0.004396889009512961,
+        "loop_elapsed_sec": 0.01101226799073629,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 44,
+      "time_sec": 1.0751158960047178,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006288,
+        -0.46356,
+        0.36086,
+        -1.482,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.944000244140625,
+        93.43399810791016,
+        4.511000156402588,
+        -38.479000091552734,
+        -101.37300109863281
+      ],
+      "observed_axis_offset": -0.0002869999999999817,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.07199859619140625,
+      "pose_linear_delta_m": 0.00029067851657800807,
+      "pose_angular_delta_rad": 0.0009999999999998899,
+      "force_norm_n": 0.6368500577837097,
+      "torque_norm_nm": 0.023706539335944177,
+      "timing": {
+        "command_sec": 0.00016996200429275632,
+        "state_read_sec": 0.006426415988244116,
+        "force_read_sec": 0.0043198440107516944,
+        "loop_elapsed_sec": 0.010986576991854236,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 45,
+      "time_sec": 1.1000699030118994,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006263,
+        -0.463555,
+        0.360885,
+        -1.482,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.94099998474121,
+        93.43399810791016,
+        4.51200008392334,
+        -38.48099899291992,
+        -101.37200164794922
+      ],
+      "observed_axis_offset": -0.00026199999999998447,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.072998046875,
+      "pose_linear_delta_m": 0.00026292394337525116,
+      "pose_angular_delta_rad": 0.0014142135623730178,
+      "force_norm_n": 0.5600027024468932,
+      "torque_norm_nm": 0.029154758822566847,
+      "timing": {
+        "command_sec": 0.0001660020207054913,
+        "state_read_sec": 0.006426219013519585,
+        "force_read_sec": 0.004409291985211894,
+        "loop_elapsed_sec": 0.011069119005696848,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 46,
+      "time_sec": 1.12507945499965,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006269,
+        -0.463556,
+        0.360916,
+        -1.482,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.940000534057617,
+        93.43099975585938,
+        4.514999866485596,
+        -38.481998443603516,
+        -101.37000274658203
+      ],
+      "observed_axis_offset": -0.00023099999999998122,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.0749969482421875,
+      "pose_linear_delta_m": 0.0002326263097759852,
+      "pose_angular_delta_rad": 0.0014142135623730178,
+      "force_norm_n": 0.6303800486281717,
+      "torque_norm_nm": 0.043370497851919355,
+      "timing": {
+        "command_sec": 0.00016810998204164207,
+        "state_read_sec": 0.006480900978203863,
+        "force_read_sec": 0.004386891989270225,
+        "loop_elapsed_sec": 0.011104035016614944,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 47,
+      "time_sec": 1.150113946001511,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006283,
+        -0.463551,
+        0.361157,
+        -1.481,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.922000885009766,
+        93.41400146484375,
+        4.513999938964844,
+        -38.479000091552734,
+        -101.375
+      ],
+      "observed_axis_offset": 1.0000000000010001e-05,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06999969482421875,
+      "pose_linear_delta_m": 3.9610604640682305e-05,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.4640571196154923,
+      "torque_norm_nm": 0.05517245743238023,
+      "timing": {
+        "command_sec": 0.00017448898870497942,
+        "state_read_sec": 0.006494877015938982,
+        "force_read_sec": 0.004297648003557697,
+        "loop_elapsed_sec": 0.011036148003768176,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 48,
+      "time_sec": 1.1750798790017143,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006252,
+        -0.463568,
+        0.36162,
+        -1.481,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.88800048828125,
+        93.36699676513672,
+        4.521999835968018,
+        -38.448001861572266,
+        -101.37699890136719
+      ],
+      "observed_axis_offset": 0.0004730000000000012,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.06800079345703125,
+      "pose_linear_delta_m": 0.0004738079779826434,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.5528064526841203,
+      "torque_norm_nm": 0.048672374227421954,
+      "timing": {
+        "command_sec": 0.00016970699653029442,
+        "state_read_sec": 0.00639449100708589,
+        "force_read_sec": 0.004289445991162211,
+        "loop_elapsed_sec": 0.01092274600523524,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 49,
+      "time_sec": 1.200070468999911,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006274,
+        -0.463573,
+        0.362056,
+        -1.48,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.844999313354492,
+        93.3219985961914,
+        4.5289998054504395,
+        -38.38600158691406,
+        -101.38300323486328
+      ],
+      "observed_axis_offset": 0.0009089999999999931,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.09400177001953125,
+      "pose_linear_delta_m": 0.0009099939560238791,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5351093381453471,
+      "torque_norm_nm": 0.02090454578064358,
+      "timing": {
+        "command_sec": 0.00016922599752433598,
+        "state_read_sec": 0.006348432012600824,
+        "force_read_sec": 0.004310831980546936,
+        "loop_elapsed_sec": 0.010897404019488022,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 50,
+      "time_sec": 1.2250749689992517,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006265,
+        -0.463551,
+        0.362561,
+        -1.48,
+        -0.131,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.784000396728516,
+        93.27300262451172,
+        4.5370001792907715,
+        -38.2869987487793,
+        -101.39399719238281
+      ],
+      "observed_axis_offset": 0.0014140000000000263,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.18700027465820312,
+      "pose_linear_delta_m": 0.0014141630033345078,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5931003310596034,
+      "torque_norm_nm": 0.051951902122589856,
+      "timing": {
+        "command_sec": 0.00017813101294450462,
+        "state_read_sec": 0.006463155994424596,
+        "force_read_sec": 0.004314885009080172,
+        "loop_elapsed_sec": 0.01102760701905936,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 51,
+      "time_sec": 1.2500710980093572,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006242,
+        -0.463551,
+        0.363354,
+        -1.479,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.70800018310547,
+        93.19499969482422,
+        4.552999973297119,
+        -38.1879997253418,
+        -101.40699768066406
+      ],
+      "observed_axis_offset": 0.0022070000000000145,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.2859992980957031,
+      "pose_linear_delta_m": 0.002207026279861675,
+      "pose_angular_delta_rad": 0.0024494897427833166,
+      "force_norm_n": 0.5487130381674513,
+      "torque_norm_nm": 0.02179449448695052,
+      "timing": {
+        "command_sec": 0.00016726800822652876,
+        "state_read_sec": 0.004279449000023305,
+        "force_read_sec": 0.010643326997524127,
+        "loop_elapsed_sec": 0.015158418013015762,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 52,
+      "time_sec": 1.2750706229999196,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006254,
+        -0.463572,
+        0.363953,
+        -1.479,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.645000457763672,
+        93.12200164794922,
+        4.565999984741211,
+        -38.06700134277344,
+        -101.4229965209961
+      ],
+      "observed_axis_offset": 0.0028060000000000307,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.4069976806640625,
+      "pose_linear_delta_m": 0.0028061826383897702,
+      "pose_angular_delta_rad": 0.0024494897427833166,
+      "force_norm_n": 1.0948461117396275,
+      "torque_norm_nm": 0.057306196069915674,
+      "timing": {
+        "command_sec": 0.00017384000238962471,
+        "state_read_sec": 0.004285556002287194,
+        "force_read_sec": 0.006741065008100122,
+        "loop_elapsed_sec": 0.01127487700432539,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 53,
+      "time_sec": 1.300069846009137,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006253,
+        -0.463557,
+        0.364254,
+        -1.479,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.59000015258789,
+        93.08300018310547,
+        4.578999996185303,
+        -37.93299865722656,
+        -101.43599700927734
+      ],
+      "observed_axis_offset": 0.0031070000000000264,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.5410003662109375,
+      "pose_linear_delta_m": 0.0031070490823287885,
+      "pose_angular_delta_rad": 0.0024494897427833166,
+      "force_norm_n": 0.6415644767329428,
+      "torque_norm_nm": 0.02927456287209159,
+      "timing": {
+        "command_sec": 0.0001981109962798655,
+        "state_read_sec": 0.00636355098686181,
+        "force_read_sec": 0.004336452984716743,
+        "loop_elapsed_sec": 0.010972232994390652,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 54,
+      "time_sec": 1.325072274019476,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006235,
+        -0.463542,
+        0.364491,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.551000595092773,
+        93.05500030517578,
+        4.5920000076293945,
+        -37.8489990234375,
+        -101.4469985961914
+      ],
+      "observed_axis_offset": 0.0033440000000000136,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.625,
+      "pose_linear_delta_m": 0.0033440182415770538,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.40479501812680135,
+      "torque_norm_nm": 0.04221374183029203,
+      "timing": {
+        "command_sec": 0.0001744150067679584,
+        "state_read_sec": 0.00635472999420017,
+        "force_read_sec": 0.010515335015952587,
+        "loop_elapsed_sec": 0.017112684989115223,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 55,
+      "time_sec": 1.3501110070210416,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006233,
+        -0.463563,
+        0.364907,
+        -1.479,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.510000228881836,
+        93.00299835205078,
+        4.607999801635742,
+        -37.76900100708008,
+        -101.46099853515625
+      ],
+      "observed_axis_offset": 0.0037599999999999856,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.7049980163574219,
+      "pose_linear_delta_m": 0.0037600868341036878,
+      "pose_angular_delta_rad": 0.0024494897427833166,
+      "force_norm_n": 0.42838300055097506,
+      "torque_norm_nm": 0.028425341207084433,
+      "timing": {
+        "command_sec": 0.00016110000433400273,
+        "state_read_sec": 0.006488515005912632,
+        "force_read_sec": 0.006478625989984721,
+        "loop_elapsed_sec": 0.013194568979088217,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 56,
+      "time_sec": 1.3750760260154493,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006233,
+        -0.463585,
+        0.365284,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.464000701904297,
+        92.947998046875,
+        4.620999813079834,
+        -37.65399932861328,
+        -101.4749984741211
+      ],
+      "observed_axis_offset": 0.004137000000000002,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.8199996948242188,
+      "pose_linear_delta_m": 0.004137254403587,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.615263356687718,
+      "torque_norm_nm": 0.02291287806425208,
+      "timing": {
+        "command_sec": 0.00018313300097361207,
+        "state_read_sec": 0.006361375009873882,
+        "force_read_sec": 0.008505189995048568,
+        "loop_elapsed_sec": 0.01513060598517768,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 57,
+      "time_sec": 1.4000868370058015,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006239,
+        -0.463563,
+        0.365689,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.402000427246094,
+        92.9010009765625,
+        4.63700008392334,
+        -37.52199935913086,
+        -101.48999786376953
+      ],
+      "observed_axis_offset": 0.0045419999999999905,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.9519996643066406,
+      "pose_linear_delta_m": 0.0045420586742137,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.48635070672568964,
+      "torque_norm_nm": 0.02420743630196397,
+      "timing": {
+        "command_sec": 0.00018326201825402677,
+        "state_read_sec": 0.010516534006455913,
+        "force_read_sec": 0.006341994012473151,
+        "loop_elapsed_sec": 0.017117542010964826,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 58,
+      "time_sec": 1.4250741630094126,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006222,
+        -0.463556,
+        0.365983,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.364999771118164,
+        92.86799621582031,
+        4.6479997634887695,
+        -37.45100021362305,
+        -101.4990005493164
+      ],
+      "observed_axis_offset": 0.004836000000000007,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.0229988098144531,
+      "pose_linear_delta_m": 0.004836082815668077,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5766264057373834,
+      "torque_norm_nm": 0.028460498599883748,
+      "timing": {
+        "command_sec": 0.00017727099475450814,
+        "state_read_sec": 0.0063654120021965355,
+        "force_read_sec": 0.004320795997045934,
+        "loop_elapsed_sec": 0.010948579991236329,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 59,
+      "time_sec": 1.4500810540048406,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006216,
+        -0.463538,
+        0.366302,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.326000213623047,
+        92.83799743652344,
+        4.6579999923706055,
+        -37.38999938964844,
+        -101.50900268554688
+      ],
+      "observed_axis_offset": 0.005155000000000021,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.0839996337890625,
+      "pose_linear_delta_m": 0.00515508816607439,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.48902046053666137,
+      "torque_norm_nm": 0.024392622130054442,
+      "timing": {
+        "command_sec": 0.00018398801330477,
+        "state_read_sec": 0.0063900770037434995,
+        "force_read_sec": 0.006408035987988114,
+        "loop_elapsed_sec": 0.013063619990134612,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 60,
+      "time_sec": 1.475082763005048,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006214,
+        -0.463538,
+        0.366578,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.292999267578125,
+        92.80500030517578,
+        4.665999889373779,
+        -37.32400131225586,
+        -101.52100372314453
+      ],
+      "observed_axis_offset": 0.005431000000000019,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.1499977111816406,
+      "pose_linear_delta_m": 0.005431095101358491,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5593335288426912,
+      "torque_norm_nm": 0.026134269232697294,
+      "timing": {
+        "command_sec": 0.00019786000484600663,
+        "state_read_sec": 0.006414648989448324,
+        "force_read_sec": 0.0043210459989495575,
+        "loop_elapsed_sec": 0.011015646014129743,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 61,
+      "time_sec": 1.5000738270173315,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006211,
+        -0.463549,
+        0.366871,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.260000228881836,
+        92.76699829101562,
+        4.676000118255615,
+        -37.25299835205078,
+        -101.52999877929688
+      ],
+      "observed_axis_offset": 0.005724000000000007,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.2210006713867188,
+      "pose_linear_delta_m": 0.005724112594979249,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.42743538538882064,
+      "torque_norm_nm": 0.03001666196439818,
+      "timing": {
+        "command_sec": 0.00015869401977397501,
+        "state_read_sec": 0.006387792993336916,
+        "force_read_sec": 0.006394216994522139,
+        "loop_elapsed_sec": 0.013020387996220961,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 62,
+      "time_sec": 1.5250834320031572,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006212,
+        -0.46355,
+        0.367155,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.229000091552734,
+        92.73400115966797,
+        4.681000232696533,
+        -37.194000244140625,
+        -101.53700256347656
+      ],
+      "observed_axis_offset": 0.006008000000000013,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.279998779296875,
+      "pose_linear_delta_m": 0.006008102945189951,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.46136969378630943,
+      "torque_norm_nm": 0.02988310494572773,
+      "timing": {
+        "command_sec": 0.0001947190030477941,
+        "state_read_sec": 0.006347065995214507,
+        "force_read_sec": 0.004286614974262193,
+        "loop_elapsed_sec": 0.010916361003182828,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 63,
+      "time_sec": 1.5500824650225695,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006223,
+        -0.463553,
+        0.367494,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.194000244140625,
+        92.69499969482422,
+        4.688000202178955,
+        -37.1349983215332,
+        -101.5479965209961
+      ],
+      "observed_axis_offset": 0.0063469999999999915,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.3390007019042969,
+      "pose_linear_delta_m": 0.006347053016952032,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6897194892364632,
+      "torque_norm_nm": 0.03781534005565202,
+      "timing": {
+        "command_sec": 0.00019507098477333784,
+        "state_read_sec": 0.006347129005007446,
+        "force_read_sec": 0.00439522200031206,
+        "loop_elapsed_sec": 0.011027967993868515,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 64,
+      "time_sec": 1.5750762890093029,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006215,
+        -0.46355,
+        0.367693,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.166000366210938,
+        92.66899871826172,
+        4.692999839782715,
+        -37.06700134277344,
+        -101.5530014038086
+      ],
+      "observed_axis_offset": 0.006545999999999996,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.4069976806640625,
+      "pose_linear_delta_m": 0.006546079590105818,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6348504012527204,
+      "torque_norm_nm": 0.029189039356187205,
+      "timing": {
+        "command_sec": 0.00019145102123729885,
+        "state_read_sec": 0.006358439015457407,
+        "force_read_sec": 0.006413472990971059,
+        "loop_elapsed_sec": 0.013052082998910919,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 65,
+      "time_sec": 1.6000759779999498,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006213,
+        -0.463562,
+        0.367783,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.149999618530273,
+        92.6500015258789,
+        4.699999809265137,
+        -37.01499938964844,
+        -101.56300354003906
+      ],
+      "observed_axis_offset": 0.006636000000000031,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.4589996337890625,
+      "pose_linear_delta_m": 0.006636115279288057,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.37932836142693405,
+      "torque_norm_nm": 0.02441311202861761,
+      "timing": {
+        "command_sec": 0.00017329701222479343,
+        "state_read_sec": 0.006386025022948161,
+        "force_read_sec": 0.004371204995550215,
+        "loop_elapsed_sec": 0.011027299013221636,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 66,
+      "time_sec": 1.6250743880227674,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006227,
+        -0.463551,
+        0.367907,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.1299991607666,
+        92.63600158691406,
+        4.703000068664551,
+        -36.97100067138672,
+        -101.57099914550781
+      ],
+      "observed_axis_offset": 0.006759999999999988,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.5029983520507812,
+      "pose_linear_delta_m": 0.00676003409754713,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5951697070396319,
+      "torque_norm_nm": 0.032449961230287185,
+      "timing": {
+        "command_sec": 0.00019197899382561445,
+        "state_read_sec": 0.00632346302154474,
+        "force_read_sec": 0.004246935015544295,
+        "loop_elapsed_sec": 0.01082788297208026,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 67,
+      "time_sec": 1.650075536017539,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006219,
+        -0.463529,
+        0.368185,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.100000381469727,
+        92.61399841308594,
+        4.710999965667725,
+        -36.9370002746582,
+        -101.5790023803711
+      ],
+      "observed_axis_offset": 0.007037999999999989,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.5369987487792969,
+      "pose_linear_delta_m": 0.00703806202018708,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.45171784338607796,
+      "torque_norm_nm": 0.03844476494673424,
+      "timing": {
+        "command_sec": 0.0001996280043385923,
+        "state_read_sec": 0.006375258002663031,
+        "force_read_sec": 0.00437907999730669,
+        "loop_elapsed_sec": 0.011037474003387615,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 68,
+      "time_sec": 1.6750807640200946,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006205,
+        -0.463526,
+        0.368457,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.073999404907227,
+        92.58699798583984,
+        4.7170000076293945,
+        -36.9010009765625,
+        -101.58699798583984
+      ],
+      "observed_axis_offset": 0.007309999999999983,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.572998046875,
+      "pose_linear_delta_m": 0.00731013036819452,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.4616773703287423,
+      "torque_norm_nm": 0.029983329142946512,
+      "timing": {
+        "command_sec": 0.00020551501074805856,
+        "state_read_sec": 0.006389080983353779,
+        "force_read_sec": 0.004308424016926438,
+        "loop_elapsed_sec": 0.010988049994921312,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 69,
+      "time_sec": 1.7000823730195407,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006201,
+        -0.463518,
+        0.368722,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.04599952697754,
+        92.56099700927734,
+        4.723999977111816,
+        -36.861000061035156,
+        -101.59300231933594
+      ],
+      "observed_axis_offset": 0.007574999999999998,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.6129989624023438,
+      "pose_linear_delta_m": 0.007575168578982251,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5559442540593156,
+      "torque_norm_nm": 0.025079872355201118,
+      "timing": {
+        "command_sec": 0.0001975929772015661,
+        "state_read_sec": 0.006381048995535821,
+        "force_read_sec": 0.004336523008532822,
+        "loop_elapsed_sec": 0.011001695995219052,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 70,
+      "time_sec": 1.7250870529969689,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006207,
+        -0.463534,
+        0.368894,
+        -1.479,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        29.0310001373291,
+        92.53600311279297,
+        4.730000019073486,
+        -36.82699966430664,
+        -101.59600067138672
+      ],
+      "observed_axis_offset": 0.007747000000000004,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.6469993591308594,
+      "pose_linear_delta_m": 0.007747101328884247,
+      "pose_angular_delta_rad": 0.0024494897427833166,
+      "force_norm_n": 0.5537490353237905,
+      "torque_norm_nm": 0.027037011554003426,
+      "timing": {
+        "command_sec": 0.0002147100167348981,
+        "state_read_sec": 0.006432763999328017,
+        "force_read_sec": 0.00428912800271064,
+        "loop_elapsed_sec": 0.011030250025214627,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 71,
+      "time_sec": 1.750079514022218,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006184,
+        -0.463547,
+        0.369034,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.011999130249023,
+        92.51100158691406,
+        4.736999988555908,
+        -36.76900100708008,
+        -101.60099792480469
+      ],
+      "observed_axis_offset": 0.007886999999999977,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.7049980163574219,
+      "pose_linear_delta_m": 0.00788724597055269,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5728847841005384,
+      "torque_norm_nm": 0.025416529896568802,
+      "timing": {
+        "command_sec": 0.00020181300351396203,
+        "state_read_sec": 0.012649751995922998,
+        "force_read_sec": 0.004367585992440581,
+        "loop_elapsed_sec": 0.017306888999883085,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 72,
+      "time_sec": 1.7750753590080421,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006191,
+        -0.463568,
+        0.369133,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.00200080871582,
+        92.49099731445312,
+        4.74399995803833,
+        -36.73400115966797,
+        -101.60399627685547
+      ],
+      "observed_axis_offset": 0.007985999999999993,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.7399978637695312,
+      "pose_linear_delta_m": 0.007986235032854961,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5337920891671994,
+      "torque_norm_nm": 0.023366642576066705,
+      "timing": {
+        "command_sec": 0.0001969219883903861,
+        "state_read_sec": 0.006366444984450936,
+        "force_read_sec": 0.004321133019402623,
+        "loop_elapsed_sec": 0.010964899003738537,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 73,
+      "time_sec": 1.8000718289986253,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006185,
+        -0.463581,
+        0.369242,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.98699951171875,
+        92.47000122070312,
+        4.754000186920166,
+        -36.68600082397461,
+        -101.60900115966797
+      ],
+      "observed_axis_offset": 0.008095000000000019,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.7879981994628906,
+      "pose_linear_delta_m": 0.008095328652994905,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5773577748107913,
+      "torque_norm_nm": 0.02229349634890745,
+      "timing": {
+        "command_sec": 0.00017269799718633294,
+        "state_read_sec": 0.012612007005373016,
+        "force_read_sec": 0.004321815009461716,
+        "loop_elapsed_sec": 0.017182145005790517,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 74,
+      "time_sec": 1.8250736320042051,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006165,
+        -0.463582,
+        0.369276,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.97599983215332,
+        92.45999908447266,
+        4.756999969482422,
+        -36.645999908447266,
+        -101.61299896240234
+      ],
+      "observed_axis_offset": 0.008128999999999997,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.8279991149902344,
+      "pose_linear_delta_m": 0.008129506934617864,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.3931081132216376,
+      "torque_norm_nm": 0.026589470950254074,
+      "timing": {
+        "command_sec": 0.00019433200941421092,
+        "state_read_sec": 0.01260431800619699,
+        "force_read_sec": 0.004317982995416969,
+        "loop_elapsed_sec": 0.017210445017553866,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 75,
+      "time_sec": 1.850072645000182,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006194,
+        -0.46358,
+        0.369332,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75199890136719,
+        28.965999603271484,
+        92.4520034790039,
+        4.76200008392334,
+        -36.62099838256836,
+        -101.61499786376953
+      ],
+      "observed_axis_offset": 0.008184999999999998,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.8530006408691406,
+      "pose_linear_delta_m": 0.00818525809000547,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5501399780542011,
+      "torque_norm_nm": 0.03477067742956549,
+      "timing": {
+        "command_sec": 0.00018144899513572454,
+        "state_read_sec": 0.006371966999722645,
+        "force_read_sec": 0.004316274978918955,
+        "loop_elapsed_sec": 0.010954244004096836,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 76,
+      "time_sec": 1.8750829150085337,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006184,
+        -0.463584,
+        0.369461,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.952999114990234,
+        92.43599700927734,
+        4.764999866485596,
+        -36.59199905395508,
+        -101.61900329589844
+      ],
+      "observed_axis_offset": 0.008313999999999988,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.8819999694824219,
+      "pose_linear_delta_m": 0.00831434236725911,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.3749826740031259,
+      "torque_norm_nm": 0.034942811615914914,
+      "timing": {
+        "command_sec": 0.0001920729991979897,
+        "state_read_sec": 0.006410722009604797,
+        "force_read_sec": 0.006384517997503281,
+        "loop_elapsed_sec": 0.013072931003989652,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 77,
+      "time_sec": 1.900071199022932,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006171,
+        -0.463572,
+        0.369617,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.93600082397461,
+        92.4229965209961,
+        4.76800012588501,
+        -36.57400131225586,
+        -101.62300109863281
+      ],
+      "observed_axis_offset": 0.008469999999999978,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.8999977111816406,
+      "pose_linear_delta_m": 0.008470388775020874,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6168549348027893,
+      "torque_norm_nm": 0.022978251677560454,
+      "timing": {
+        "command_sec": 0.00018596899462863803,
+        "state_read_sec": 0.006380841979989782,
+        "force_read_sec": 0.004336675978265703,
+        "loop_elapsed_sec": 0.010985513974446803,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 78,
+      "time_sec": 1.9250744620221667,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.00617,
+        -0.463564,
+        0.369732,
+        -1.48,
+        -0.13,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.922000885009766,
+        92.41200256347656,
+        4.769999980926514,
+        -36.551998138427734,
+        -101.6240005493164
+      ],
+      "observed_axis_offset": 0.00858500000000001,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.9220008850097656,
+      "pose_linear_delta_m": 0.008585367202397354,
+      "pose_angular_delta_rad": 0.0024494897427833617,
+      "force_norm_n": 0.542410358220212,
+      "torque_norm_nm": 0.026495282196580556,
+      "timing": {
+        "command_sec": 0.00018638299661688507,
+        "state_read_sec": 0.0064179129840340465,
+        "force_read_sec": 0.0043124830117449164,
+        "loop_elapsed_sec": 0.01100286198197864,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 79,
+      "time_sec": 1.9500734850007575,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.00616,
+        -0.463553,
+        0.369869,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.906999588012695,
+        92.4010009765625,
+        4.771999835968018,
+        -36.53499984741211,
+        -101.62999725341797
+      ],
+      "observed_axis_offset": 0.008722000000000008,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.9389991760253906,
+      "pose_linear_delta_m": 0.008722432229602024,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.4196415251616296,
+      "torque_norm_nm": 0.022203602714218132,
+      "timing": {
+        "command_sec": 0.00018625298980623484,
+        "state_read_sec": 0.01052276900736615,
+        "force_read_sec": 0.01666675801970996,
+        "loop_elapsed_sec": 0.02746113101602532,
+        "missed_deadline": true
+      }
+    },
+    {
+      "step": 80,
+      "time_sec": 1.9775445160048548,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006174,
+        -0.463559,
+        0.369952,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.899999618530273,
+        92.38999938964844,
+        4.771999835968018,
+        -36.520999908447266,
+        -101.63099670410156
+      ],
+      "observed_axis_offset": 0.008805000000000007,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.9529991149902344,
+      "pose_linear_delta_m": 0.008805312771276221,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6055229037953322,
+      "torque_norm_nm": 0.02720294095721536,
+      "timing": {
+        "command_sec": 0.00020269598462618887,
+        "state_read_sec": 0.01468259099056013,
+        "force_read_sec": 0.012720772996544838,
+        "loop_elapsed_sec": 0.02768854799796827,
+        "missed_deadline": true
+      }
+    },
+    {
+      "step": 81,
+      "time_sec": 2.0052428640192375,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006186,
+        -0.463549,
+        0.370023,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.892000198364258,
+        92.38600158691406,
+        4.771999835968018,
+        -36.513999938964844,
+        -101.63400268554688
+      ],
+      "observed_axis_offset": 0.008875999999999995,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.9599990844726562,
+      "pose_linear_delta_m": 0.008876206396879239,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.516703007067944,
+      "torque_norm_nm": 0.024351591070132104,
+      "timing": {
+        "command_sec": 0.00017522100824862719,
+        "state_read_sec": 0.01054448599461466,
+        "force_read_sec": 0.008454035996692255,
+        "loop_elapsed_sec": 0.019247853982960805,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 82,
+      "time_sec": 2.0250845800037496,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.00619,
+        -0.463551,
+        0.370096,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.884000778198242,
+        92.37699890136719,
+        4.771999835968018,
+        -36.49599838256836,
+        -101.63500213623047
+      ],
+      "observed_axis_offset": 0.008948999999999985,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.9780006408691406,
+      "pose_linear_delta_m": 0.008949180800497872,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5085243252161009,
+      "torque_norm_nm": 0.023958296519265034,
+      "timing": {
+        "command_sec": 0.00018932000966742635,
+        "state_read_sec": 0.006373408017680049,
+        "force_read_sec": 0.008540973998606205,
+        "loop_elapsed_sec": 0.015183142997557297,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 83,
+      "time_sec": 2.050082066009054,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006174,
+        -0.463552,
+        0.370179,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.875999450683594,
+        92.36699676513672,
+        4.769000053405762,
+        -36.48099899291992,
+        -101.63700103759766
+      ],
+      "observed_axis_offset": 0.009031999999999984,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.9930000305175781,
+      "pose_linear_delta_m": 0.009032293673259285,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5486656566799265,
+      "torque_norm_nm": 0.029359836344065898,
+      "timing": {
+        "command_sec": 0.0001956750056706369,
+        "state_read_sec": 0.006408021989045665,
+        "force_read_sec": 0.006355235003866255,
+        "loop_elapsed_sec": 0.01303929599816911,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 84,
+      "time_sec": 2.0751118210027926,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006187,
+        -0.463563,
+        0.370234,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.8700008392334,
+        92.35600280761719,
+        4.769999980926514,
+        -36.46200180053711,
+        -101.63999938964844
+      ],
+      "observed_axis_offset": 0.009087000000000012,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0119972229003906,
+      "pose_linear_delta_m": 0.009087218166193668,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.45160158589408167,
+      "torque_norm_nm": 0.024103941789468036,
+      "timing": {
+        "command_sec": 0.0001756979909259826,
+        "state_read_sec": 0.00430446001701057,
+        "force_read_sec": 0.008413680014200509,
+        "loop_elapsed_sec": 0.012961208005435765,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 85,
+      "time_sec": 2.100073550012894,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006187,
+        -0.463562,
+        0.370343,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.861000061035156,
+        92.34500122070312,
+        4.771999835968018,
+        -36.44900131225586,
+        -101.64399719238281
+      ],
+      "observed_axis_offset": 0.009195999999999982,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0249977111816406,
+      "pose_linear_delta_m": 0.009196213242416667,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5278105858415189,
+      "torque_norm_nm": 0.02471841409107008,
+      "timing": {
+        "command_sec": 0.0001722169981803745,
+        "state_read_sec": 0.006405851017916575,
+        "force_read_sec": 0.010537113004829735,
+        "loop_elapsed_sec": 0.017191024991916493,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 86,
+      "time_sec": 2.1250756370136514,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006194,
+        -0.463571,
+        0.370379,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.854999542236328,
+        92.33599853515625,
+        4.769999980926514,
+        -36.42599868774414,
+        -101.64600372314453
+      ],
+      "observed_axis_offset": 0.009232000000000018,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0480003356933594,
+      "pose_linear_delta_m": 0.009232195188577869,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6437212166586387,
+      "torque_norm_nm": 0.025199206216963064,
+      "timing": {
+        "command_sec": 0.0001925610122270882,
+        "state_read_sec": 0.010560808004811406,
+        "force_read_sec": 0.006386869994457811,
+        "loop_elapsed_sec": 0.01722002000315115,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 87,
+      "time_sec": 2.1500732200220227,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006208,
+        -0.463564,
+        0.370424,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.847000122070312,
+        92.33100128173828,
+        4.769999980926514,
+        -36.40999984741211,
+        -101.64900207519531
+      ],
+      "observed_axis_offset": 0.00927699999999998,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0639991760253906,
+      "pose_linear_delta_m": 0.009277106337646434,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.4856614115544879,
+      "torque_norm_nm": 0.026589470950254074,
+      "timing": {
+        "command_sec": 0.0001522350066807121,
+        "state_read_sec": 0.006519968999782577,
+        "force_read_sec": 0.006355229008477181,
+        "loop_elapsed_sec": 0.013120683986926451,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 88,
+      "time_sec": 2.175081212015357,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.00621,
+        -0.463579,
+        0.370383,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.847999572753906,
+        92.3270034790039,
+        4.771999835968018,
+        -36.38999938964844,
+        -101.6510009765625
+      ],
+      "observed_axis_offset": 0.009236000000000022,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0839996337890625,
+      "pose_linear_delta_m": 0.00923614833142043,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.45683913663959835,
+      "torque_norm_nm": 0.028460498599883748,
+      "timing": {
+        "command_sec": 0.00015105202328413725,
+        "state_read_sec": 0.0063906009891070426,
+        "force_read_sec": 0.0063457940123043954,
+        "loop_elapsed_sec": 0.01300899899797514,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 89,
+      "time_sec": 2.2001039900060277,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006204,
+        -0.463577,
+        0.370414,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.843000411987305,
+        92.322998046875,
+        4.769999980926514,
+        -36.37699890136719,
+        -101.65499877929688
+      ],
+      "observed_axis_offset": 0.009267000000000025,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0970001220703125,
+      "pose_linear_delta_m": 0.009267165100504062,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5443555864077281,
+      "torque_norm_nm": 0.025139610077409686,
+      "timing": {
+        "command_sec": 0.0001693190133664757,
+        "state_read_sec": 0.006339712999761105,
+        "force_read_sec": 0.00636166799813509,
+        "loop_elapsed_sec": 0.012953914992976934,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 90,
+      "time_sec": 2.225078706018394,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006196,
+        -0.463583,
+        0.370453,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.836999893188477,
+        92.31500244140625,
+        4.769999980926514,
+        -36.356998443603516,
+        -101.65899658203125
+      ],
+      "observed_axis_offset": 0.009305999999999981,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.1170005798339844,
+      "pose_linear_delta_m": 0.009306229096685706,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6068352318096202,
+      "torque_norm_nm": 0.024919872459388356,
+      "timing": {
+        "command_sec": 0.00017259997548535466,
+        "state_read_sec": 0.014636280975537375,
+        "force_read_sec": 0.006290850986260921,
+        "loop_elapsed_sec": 0.021176640002522618,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 91,
+      "time_sec": 2.2500642540107947,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.00621,
+        -0.463586,
+        0.37047,
+        -1.481,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.834999084472656,
+        92.31099700927734,
+        4.769999980926514,
+        -36.34600067138672,
+        -101.66200256347656
+      ],
+      "observed_axis_offset": 0.009323000000000026,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.1279983520507812,
+      "pose_linear_delta_m": 0.00932317810620394,
+      "pose_angular_delta_rad": 0.0014142135623733318,
+      "force_norm_n": 0.7260117288225301,
+      "torque_norm_nm": 0.024617068107313053,
+      "timing": {
+        "command_sec": 0.00013963598757982254,
+        "state_read_sec": 0.0062762250017840415,
+        "force_read_sec": 0.006269639008678496,
+        "loop_elapsed_sec": 0.012731177994282916,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 92,
+      "time_sec": 2.2750696250004694,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006224,
+        -0.463589,
+        0.370497,
+        -1.481,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.829999923706055,
+        92.30500030517578,
+        4.769999980926514,
+        -36.33300018310547,
+        -101.66200256347656
+      ],
+      "observed_axis_offset": 0.009350000000000025,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.1409988403320312,
+      "pose_linear_delta_m": 0.009350149089720467,
+      "pose_angular_delta_rad": 0.0014142135623733318,
+      "force_norm_n": 0.43556400018007535,
+      "torque_norm_nm": 0.02720294095721536,
+      "timing": {
+        "command_sec": 0.00015928101493045688,
+        "state_read_sec": 0.006385902990587056,
+        "force_read_sec": 0.006328699993900955,
+        "loop_elapsed_sec": 0.012937559018610045,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 93,
+      "time_sec": 2.300075031002052,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006223,
+        -0.463594,
+        0.370524,
+        -1.481,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.827999114990234,
+        92.30000305175781,
+        4.771999835968018,
+        -36.323001861572266,
+        -101.66699981689453
+      ],
+      "observed_axis_offset": 0.009377000000000024,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.1509971618652344,
+      "pose_linear_delta_m": 0.009377177987006562,
+      "pose_angular_delta_rad": 0.0014142135623733318,
+      "force_norm_n": 0.4700787105031082,
+      "torque_norm_nm": 0.025019991566267247,
+      "timing": {
+        "command_sec": 0.00017540398403070867,
+        "state_read_sec": 0.006388676003552973,
+        "force_read_sec": 0.004395608993945643,
+        "loop_elapsed_sec": 0.011070178996305913,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 94,
+      "time_sec": 2.325055631023133,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006216,
+        -0.463595,
+        0.370583,
+        -1.481,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.82200050354004,
+        92.29299926757812,
+        4.769999980926514,
+        -36.3129997253418,
+        -101.66799926757812
+      ],
+      "observed_axis_offset": 0.009436,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.160999298095703,
+      "pose_linear_delta_m": 0.009436202202157391,
+      "pose_angular_delta_rad": 0.0014142135623733318,
+      "force_norm_n": 0.6819897553728127,
+      "torque_norm_nm": 0.02549509703463357,
+      "timing": {
+        "command_sec": 0.00023347101523540914,
+        "state_read_sec": 0.006419490004191175,
+        "force_read_sec": 0.00425287798861973,
+        "loop_elapsed_sec": 0.010988752997945994,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 95,
+      "time_sec": 2.350072994013317,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006221,
+        -0.463602,
+        0.370588,
+        -1.481,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.820999145507812,
+        92.28900146484375,
+        4.769000053405762,
+        -36.301998138427734,
+        -101.6709976196289
+      ],
+      "observed_axis_offset": 0.009440999999999977,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.1720008850097656,
+      "pose_linear_delta_m": 0.009441230163490327,
+      "pose_angular_delta_rad": 0.0014142135623733318,
+      "force_norm_n": 0.3747118774624414,
+      "torque_norm_nm": 0.027166155342007704,
+      "timing": {
+        "command_sec": 0.00016842299373820424,
+        "state_read_sec": 0.006324868008960038,
+        "force_read_sec": 0.004230299004120752,
+        "loop_elapsed_sec": 0.010782731988001615,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 96,
+      "time_sec": 2.3750656900228932,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.00622,
+        -0.463602,
+        0.370674,
+        -1.481,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.81399917602539,
+        92.28099822998047,
+        4.769999980926514,
+        -36.29600143432617,
+        -101.67400360107422
+      ],
+      "observed_axis_offset": 0.009527000000000008,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.177997589111328,
+      "pose_linear_delta_m": 0.009527230762398912,
+      "pose_angular_delta_rad": 0.0014142135623733318,
+      "force_norm_n": 0.7079569490102947,
+      "torque_norm_nm": 0.025495097984399973,
+      "timing": {
+        "command_sec": 0.00013818099978379905,
+        "state_read_sec": 0.004339816980063915,
+        "force_read_sec": 0.008421325997915119,
+        "loop_elapsed_sec": 0.01296499598538503,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 97,
+      "time_sec": 2.4000687880034093,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006221,
+        -0.463609,
+        0.370713,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.81100082397461,
+        92.27400207519531,
+        4.769999980926514,
+        -36.2869987487793,
+        -101.677001953125
+      ],
+      "observed_axis_offset": 0.009566000000000019,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.187000274658203,
+      "pose_linear_delta_m": 0.009566274353163847,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5921537150840531,
+      "torque_norm_nm": 0.026776855615107956,
+      "timing": {
+        "command_sec": 0.00015761700342409313,
+        "state_read_sec": 0.006365442008245736,
+        "force_read_sec": 0.006354362005367875,
+        "loop_elapsed_sec": 0.012942689994815737,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 98,
+      "time_sec": 2.425073467020411,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006223,
+        -0.46361,
+        0.37076,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.80699920654297,
+        92.26799774169922,
+        4.769999980926514,
+        -36.279998779296875,
+        -101.67900085449219
+      ],
+      "observed_axis_offset": 0.009612999999999983,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.194000244140625,
+      "pose_linear_delta_m": 0.009613275144299141,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.42740613373832026,
+      "torque_norm_nm": 0.02563201093190673,
+      "timing": {
+        "command_sec": 0.00018631399143487215,
+        "state_read_sec": 0.006350731011480093,
+        "force_read_sec": 0.006397320015821606,
+        "loop_elapsed_sec": 0.01301354099996388,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 99,
+      "time_sec": 2.45007916202303,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006215,
+        -0.463617,
+        0.370793,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.805999755859375,
+        92.26300048828125,
+        4.769000053405762,
+        -36.2760009765625,
+        -101.68099975585938
+      ],
+      "observed_axis_offset": 0.009645999999999988,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.197998046875,
+      "pose_linear_delta_m": 0.009646349205787637,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.4667193956991965,
+      "torque_norm_nm": 0.02626785084054362,
+      "timing": {
+        "command_sec": 0.00017181900329887867,
+        "state_read_sec": 0.006384893989888951,
+        "force_read_sec": 0.010544963995926082,
+        "loop_elapsed_sec": 0.017172747990116477,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 100,
+      "time_sec": 2.4750710600055754,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.371147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.01,
+      "observed_pose": [
+        0.006227,
+        -0.463615,
+        0.370858,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.799999237060547,
+        92.25700378417969,
+        4.769000053405762,
+        -36.27199935913086,
+        -101.68299865722656
+      ],
+      "observed_axis_offset": 0.009711000000000025,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.2019996643066406,
+      "pose_linear_delta_m": 0.009711300530824927,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6046958068202175,
+      "torque_norm_nm": 0.02694438709374325,
+      "timing": {
+        "command_sec": 0.00017999499686993659,
+        "state_read_sec": 0.006357734004268423,
+        "force_read_sec": 0.004323428001953289,
+        "loop_elapsed_sec": 0.010938091989373788,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 101,
+      "time_sec": 2.500082304002717,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006225,
+        -0.463611,
+        0.370896,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.79599952697754,
+        92.25399780273438,
+        4.769999980926514,
+        -36.268001556396484,
+        -101.68599700927734
+      ],
+      "observed_axis_offset": 0.009749000000000008,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.2059974670410156,
+      "pose_linear_delta_m": 0.009749273921682585,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5589642180931259,
+      "torque_norm_nm": 0.025709920059190757,
+      "timing": {
+        "command_sec": 0.00017560500418767333,
+        "state_read_sec": 0.006347930000629276,
+        "force_read_sec": 0.004372935014544055,
+        "loop_elapsed_sec": 0.010970352013828233,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 102,
+      "time_sec": 2.525076635007281,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006229,
+        -0.463608,
+        0.37097,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.788999557495117,
+        92.24800109863281,
+        4.769000053405762,
+        -36.2599983215332,
+        -101.68900299072266
+      ],
+      "observed_axis_offset": 0.009823000000000026,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.214000701904297,
+      "pose_linear_delta_m": 0.009823243201712992,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5469085784661138,
+      "torque_norm_nm": 0.029189039356187205,
+      "timing": {
+        "command_sec": 0.00019045898807235062,
+        "state_read_sec": 0.006391689996235073,
+        "force_read_sec": 0.00630867900326848,
+        "loop_elapsed_sec": 0.012962770008016378,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 103,
+      "time_sec": 2.550076198007446,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006243,
+        -0.463602,
+        0.371004,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.78499984741211,
+        92.24600219726562,
+        4.76800012588501,
+        -36.25699996948242,
+        -101.69200134277344
+      ],
+      "observed_axis_offset": 0.009857000000000005,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.216999053955078,
+      "pose_linear_delta_m": 0.009857189203824794,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5643686737669165,
+      "torque_norm_nm": 0.02284732029068324,
+      "timing": {
+        "command_sec": 0.00011174200335517526,
+        "state_read_sec": 0.006301270012045279,
+        "force_read_sec": 0.006336455000564456,
+        "loop_elapsed_sec": 0.012810784013709053,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 104,
+      "time_sec": 2.57507003901992,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006232,
+        -0.463599,
+        0.371011,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.784000396728516,
+        92.24600219726562,
+        4.76800012588501,
+        -36.25600051879883,
+        -101.69000244140625
+      ],
+      "observed_axis_offset": 0.009863999999999984,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.217998504638672,
+      "pose_linear_delta_m": 0.009864180452526185,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.615657391720155,
+      "torque_norm_nm": 0.02275961286931707,
+      "timing": {
+        "command_sec": 0.00015334298950619996,
+        "state_read_sec": 0.010489384992979467,
+        "force_read_sec": 0.006358655984513462,
+        "loop_elapsed_sec": 0.017081031983252615,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 105,
+      "time_sec": 2.6000719880103134,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006218,
+        -0.463597,
+        0.371018,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.781999588012695,
+        92.24600219726562,
+        4.769000053405762,
+        -36.25400161743164,
+        -101.69000244140625
+      ],
+      "observed_axis_offset": 0.009871000000000019,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.2199974060058594,
+      "pose_linear_delta_m": 0.009871198559445574,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.5676918106961193,
+      "torque_norm_nm": 0.031160872450344008,
+      "timing": {
+        "command_sec": 0.00017313900752924383,
+        "state_read_sec": 0.006315314996754751,
+        "force_read_sec": 0.006318034982541576,
+        "loop_elapsed_sec": 0.01285848199040629,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 106,
+      "time_sec": 2.6250622130173724,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006234,
+        -0.463591,
+        0.371037,
+        -1.48,
+        -0.131,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        28.780000686645508,
+        92.24600219726562,
+        4.765999794006348,
+        -36.25299835205078,
+        -101.69000244140625
+      ],
+      "observed_axis_offset": 0.00989000000000001,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.2210006713867188,
+      "pose_linear_delta_m": 0.009890133669470813,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.536639539511662,
+      "torque_norm_nm": 0.024041631130874604,
+      "timing": {
+        "command_sec": 0.0001291810185648501,
+        "state_read_sec": 0.006324554997263476,
+        "force_read_sec": 0.004267042007995769,
+        "loop_elapsed_sec": 0.01078103799954988,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 107,
+      "time_sec": 2.6500662860053126,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006228,
+        -0.463592,
+        0.371034,
+        -1.48,
+        -0.132,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.781999588012695,
+        92.24800109863281,
+        4.76200008392334,
+        -36.26300048828125,
+        -101.69000244140625
+      ],
+      "observed_axis_offset": 0.00988699999999998,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.21099853515625,
+      "pose_linear_delta_m": 0.009887147920406552,
+      "pose_angular_delta_rad": 0.0014142135623734103,
+      "force_norm_n": 0.5463954591780241,
+      "torque_norm_nm": 0.02441311202861761,
+      "timing": {
+        "command_sec": 0.0005871529865544289,
+        "state_read_sec": 0.006316852988675237,
+        "force_read_sec": 0.004218046989990398,
+        "loop_elapsed_sec": 0.011175791005371138,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 108,
+      "time_sec": 2.675073024001904,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006221,
+        -0.463629,
+        0.370875,
+        -1.48,
+        -0.132,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74600219726562,
+        28.81399917602539,
+        92.26000213623047,
+        4.754000186920166,
+        -36.323001861572266,
+        -101.68800354003906
+      ],
+      "observed_axis_offset": 0.009728000000000014,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.1509971618652344,
+      "pose_linear_delta_m": 0.009728430140572541,
+      "pose_angular_delta_rad": 0.0014142135623734103,
+      "force_norm_n": 0.9404031036730471,
+      "torque_norm_nm": 0.0418927200619457,
+      "timing": {
+        "command_sec": 0.0001315870031248778,
+        "state_read_sec": 0.0042275559972040355,
+        "force_read_sec": 0.008385285007534549,
+        "loop_elapsed_sec": 0.012789758009603247,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 109,
+      "time_sec": 2.7000916649994906,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00624,
+        -0.463644,
+        0.370512,
+        -1.48,
+        -0.132,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.861000061035156,
+        92.3010025024414,
+        4.738999843597412,
+        -36.415000915527344,
+        -101.68299865722656
+      ],
+      "observed_axis_offset": 0.009365000000000012,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 2.0589981079101562,
+      "pose_linear_delta_m": 0.00936556832231767,
+      "pose_angular_delta_rad": 0.0014142135623734103,
+      "force_norm_n": 0.8759668632765448,
+      "torque_norm_nm": 0.03170173458285991,
+      "timing": {
+        "command_sec": 0.0001722630113363266,
+        "state_read_sec": 0.006307189003564417,
+        "force_read_sec": 0.0063488279993180186,
+        "loop_elapsed_sec": 0.012922252004500479,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 110,
+      "time_sec": 2.7250740340095945,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006261,
+        -0.463624,
+        0.370126,
+        -1.479,
+        -0.132,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.75,
+        28.902999877929688,
+        92.35600280761719,
+        4.728000164031982,
+        -36.516998291015625,
+        -101.67900085449219
+      ],
+      "observed_axis_offset": 0.008979000000000015,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.957000732421875,
+      "pose_linear_delta_m": 0.008979396137825764,
+      "pose_angular_delta_rad": 0.002236067977499941,
+      "force_norm_n": 0.46364317824044077,
+      "torque_norm_nm": 0.030232433311942777,
+      "timing": {
+        "command_sec": 0.00018294501933269203,
+        "state_read_sec": 0.006364332977682352,
+        "force_read_sec": 0.014662083995062858,
+        "loop_elapsed_sec": 0.02128580500721,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 111,
+      "time_sec": 2.750082933023805,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006248,
+        -0.463611,
+        0.36953,
+        -1.48,
+        -0.132,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        28.959999084472656,
+        92.4260025024414,
+        4.710999965667725,
+        -36.61399841308594,
+        -101.6729965209961
+      ],
+      "observed_axis_offset": 0.00838300000000003,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.8600006103515625,
+      "pose_linear_delta_m": 0.008383292491616913,
+      "pose_angular_delta_rad": 0.0014142135623734103,
+      "force_norm_n": 0.7583824721272111,
+      "torque_norm_nm": 0.04229657039877911,
+      "timing": {
+        "command_sec": 0.00018135501886717975,
+        "state_read_sec": 0.006385998014593497,
+        "force_read_sec": 0.004275220999261364,
+        "loop_elapsed_sec": 0.010914896993199363,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 112,
+      "time_sec": 2.7750778920017183,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006273,
+        -0.463616,
+        0.368764,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.035999298095703,
+        92.50900268554688,
+        4.689000129699707,
+        -36.736000061035156,
+        -101.66000366210938
+      ],
+      "observed_axis_offset": 0.007616999999999985,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.7379989624023438,
+      "pose_linear_delta_m": 0.0076174170819248025,
+      "pose_angular_delta_rad": 0.0,
+      "force_norm_n": 0.7042655795337295,
+      "torque_norm_nm": 0.07595393040714021,
+      "timing": {
+        "command_sec": 0.00018798699602484703,
+        "state_read_sec": 0.010467461979715154,
+        "force_read_sec": 0.00638747398625128,
+        "loop_elapsed_sec": 0.01711971699842252,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 113,
+      "time_sec": 2.8000757450063247,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006278,
+        -0.463608,
+        0.368413,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.076000213623047,
+        92.55400085449219,
+        4.677000045776367,
+        -36.821998596191406,
+        -101.65499877929688
+      ],
+      "observed_axis_offset": 0.007265999999999995,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.6520004272460938,
+      "pose_linear_delta_m": 0.0072663793597637005,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.5490883351096391,
+      "torque_norm_nm": 0.06707458618158509,
+      "timing": {
+        "command_sec": 0.00019475299632176757,
+        "state_read_sec": 0.006386307999491692,
+        "force_read_sec": 0.006308860989520326,
+        "loop_elapsed_sec": 0.012958664010511711,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 114,
+      "time_sec": 2.8250641180202365,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006258,
+        -0.463613,
+        0.368122,
+        -1.48,
+        -0.133,
+        3.11
+      ],
+      "observed_joint_deg": [
+        91.74600219726562,
+        29.1200008392334,
+        92.59400177001953,
+        4.664999961853027,
+        -36.92900085449219,
+        -101.64600372314453
+      ],
+      "observed_axis_offset": 0.006975000000000009,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.5449981689453125,
+      "pose_linear_delta_m": 0.006975381925027484,
+      "pose_angular_delta_rad": 0.0017320508075691352,
+      "force_norm_n": 0.6994326278026656,
+      "torque_norm_nm": 0.025690465163130536,
+      "timing": {
+        "command_sec": 0.00012548500671982765,
+        "state_read_sec": 0.006279534019995481,
+        "force_read_sec": 0.006276536994846538,
+        "loop_elapsed_sec": 0.012722386978566647,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 115,
+      "time_sec": 2.8500419940100983,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006299,
+        -0.463603,
+        0.367714,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.167999267578125,
+        92.64700317382812,
+        4.6479997634887695,
+        -37.034000396728516,
+        -101.63300323486328
+      ],
+      "observed_axis_offset": 0.0065669999999999895,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.4399986267089844,
+      "pose_linear_delta_m": 0.00656750652835609,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.7593398279140346,
+      "torque_norm_nm": 0.03163858392654838,
+      "timing": {
+        "command_sec": 0.00017614898388274014,
+        "state_read_sec": 0.006333027995424345,
+        "force_read_sec": 0.00426819798303768,
+        "loop_elapsed_sec": 0.010848186007933691,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 116,
+      "time_sec": 2.8750684070109855,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006327,
+        -0.463604,
+        0.367156,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75299835205078,
+        29.2189998626709,
+        92.7040023803711,
+        4.63700008392334,
+        -37.099998474121094,
+        -101.62000274658203
+      ],
+      "observed_axis_offset": 0.006008999999999987,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.3740005493164062,
+      "pose_linear_delta_m": 0.006009876121851419,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.5619145901627861,
+      "torque_norm_nm": 0.050734604035222675,
+      "timing": {
+        "command_sec": 0.00015627199900336564,
+        "state_read_sec": 0.0063327540119644254,
+        "force_read_sec": 0.004280567984096706,
+        "loop_elapsed_sec": 0.010832600004505366,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 117,
+      "time_sec": 2.900068201008253,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006302,
+        -0.463583,
+        0.366858,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.2549991607666,
+        92.7490005493164,
+        4.622000217437744,
+        -37.19200134277344,
+        -101.60800170898438
+      ],
+      "observed_axis_offset": 0.005711000000000022,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.2819976806640625,
+      "pose_linear_delta_m": 0.005711428980561717,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.6058885989311813,
+      "torque_norm_nm": 0.04558508549934351,
+      "timing": {
+        "command_sec": 0.0001568300067447126,
+        "state_read_sec": 0.00633366999682039,
+        "force_read_sec": 0.0042849910096265376,
+        "loop_elapsed_sec": 0.010839525988558307,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 118,
+      "time_sec": 2.925068653014023,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006313,
+        -0.463576,
+        0.366524,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.29599952697754,
+        92.79299926757812,
+        4.611999988555908,
+        -37.284000396728516,
+        -101.59100341796875
+      ],
+      "observed_axis_offset": 0.005377000000000021,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.1899986267089844,
+      "pose_linear_delta_m": 0.0053775313109269965,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5921494678344662,
+      "torque_norm_nm": 0.026795521731307448,
+      "timing": {
+        "command_sec": 0.0001580130192451179,
+        "state_read_sec": 0.0063195340044330806,
+        "force_read_sec": 0.004267299023922533,
+        "loop_elapsed_sec": 0.010808639985043555,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 119,
+      "time_sec": 2.9500778520014137,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00628,
+        -0.463585,
+        0.366172,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74600219726562,
+        29.343000411987305,
+        92.83399963378906,
+        4.603000164031982,
+        -37.380001068115234,
+        -101.57599639892578
+      ],
+      "observed_axis_offset": 0.005025000000000002,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.0939979553222656,
+      "pose_linear_delta_m": 0.005025307652273642,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.4332031777907289,
+      "torque_norm_nm": 0.02683281596323756,
+      "timing": {
+        "command_sec": 0.0001582070253789425,
+        "state_read_sec": 0.010496248985873535,
+        "force_read_sec": 0.006427261017961428,
+        "loop_elapsed_sec": 0.01714589199400507,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 120,
+      "time_sec": 2.975073005014565,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006285,
+        -0.463591,
+        0.365912,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.37700080871582,
+        92.86399841308594,
+        4.598999977111816,
+        -37.45100021362305,
+        -101.56400299072266
+      ],
+      "observed_axis_offset": 0.004765000000000019,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 1.0229988098144531,
+      "pose_linear_delta_m": 0.004765421912066148,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5196864340780984,
+      "torque_norm_nm": 0.025396851207580753,
+      "timing": {
+        "command_sec": 0.00015967999934218824,
+        "state_read_sec": 0.01055477702175267,
+        "force_read_sec": 0.006403240986401215,
+        "loop_elapsed_sec": 0.01718232498387806,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 121,
+      "time_sec": 3.000069522007834,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006289,
+        -0.463604,
+        0.365646,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.406999588012695,
+        92.88899993896484,
+        4.5920000076293945,
+        -37.49399948120117,
+        -101.55599975585938
+      ],
+      "observed_axis_offset": 0.004499000000000031,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.9799995422363281,
+      "pose_linear_delta_m": 0.004499646541674166,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.6007944794345894,
+      "torque_norm_nm": 0.02273763350996224,
+      "timing": {
+        "command_sec": 0.00015312302275560796,
+        "state_read_sec": 0.006324904010398313,
+        "force_read_sec": 0.006301410001469776,
+        "loop_elapsed_sec": 0.012830677995225415,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 122,
+      "time_sec": 3.0250824300164822,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00629,
+        -0.463611,
+        0.365378,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.437000274658203,
+        92.91600036621094,
+        4.585999965667725,
+        -37.54399871826172,
+        -101.5479965209961
+      ],
+      "observed_axis_offset": 0.004230999999999985,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.9300003051757812,
+      "pose_linear_delta_m": 0.004231807769736224,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.5801887700708952,
+      "torque_norm_nm": 0.03206243876215272,
+      "timing": {
+        "command_sec": 0.00018873900990001857,
+        "state_read_sec": 0.004313397977966815,
+        "force_read_sec": 0.0063442320097237825,
+        "loop_elapsed_sec": 0.010925899987341836,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 123,
+      "time_sec": 3.050073450023774,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006302,
+        -0.463615,
+        0.365092,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.472000122070312,
+        92.947998046875,
+        4.578999996185303,
+        -37.606998443603516,
+        -101.53900146484375
+      ],
+      "observed_axis_offset": 0.003945000000000032,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.8670005798339844,
+      "pose_linear_delta_m": 0.003946091357280043,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.530057526663951,
+      "torque_norm_nm": 0.029478806418092494,
+      "timing": {
+        "command_sec": 0.00017391701112501323,
+        "state_read_sec": 0.006361134990584105,
+        "force_read_sec": 0.006408280023606494,
+        "loop_elapsed_sec": 0.013019380974583328,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 124,
+      "time_sec": 3.075080009002704,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006288,
+        -0.463626,
+        0.36483,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.506999969482422,
+        92.97699737548828,
+        4.573999881744385,
+        -37.676998138427734,
+        -101.5270004272461
+      ],
+      "observed_axis_offset": 0.003682999999999992,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.7970008850097656,
+      "pose_linear_delta_m": 0.003684220134573929,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.7727755260179184,
+      "torque_norm_nm": 0.02229349716353023,
+      "timing": {
+        "command_sec": 0.00019428200903348625,
+        "state_read_sec": 0.006386184017173946,
+        "force_read_sec": 0.006298330990830436,
+        "loop_elapsed_sec": 0.01294732399401255,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 125,
+      "time_sec": 3.1000759140006267,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006291,
+        -0.463615,
+        0.364572,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.53499984741211,
+        93.01000213623047,
+        4.565999984741211,
+        -37.733001708984375,
+        -101.51899719238281
+      ],
+      "observed_axis_offset": 0.0034250000000000114,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.740997314453125,
+      "pose_linear_delta_m": 0.0034260948615004927,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.4706431664656312,
+      "torque_norm_nm": 0.04178516472670794,
+      "timing": {
+        "command_sec": 0.0001777769939508289,
+        "state_read_sec": 0.004295883991289884,
+        "force_read_sec": 0.006449160980992019,
+        "loop_elapsed_sec": 0.010980352002661675,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 126,
+      "time_sec": 3.125114530004794,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006284,
+        -0.463594,
+        0.364386,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.558000564575195,
+        93.04100036621094,
+        4.563000202178955,
+        -37.80099868774414,
+        -101.51200103759766
+      ],
+      "observed_axis_offset": 0.003238999999999992,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.6730003356933594,
+      "pose_linear_delta_m": 0.0032396564632688985,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.42568651045498157,
+      "torque_norm_nm": 0.029681643502150638,
+      "timing": {
+        "command_sec": 0.0001626639859750867,
+        "state_read_sec": 0.006426856009056792,
+        "force_read_sec": 0.004296208004234359,
+        "loop_elapsed_sec": 0.010936039994703606,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 127,
+      "time_sec": 3.1500707560044248,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006283,
+        -0.463564,
+        0.36426,
+        -1.48,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.575000762939453,
+        93.06999969482422,
+        4.556000232696533,
+        -37.86399841308594,
+        -101.4990005493164
+      ],
+      "observed_axis_offset": 0.003112999999999977,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.6100006103515625,
+      "pose_linear_delta_m": 0.0031133048357011007,
+      "pose_angular_delta_rad": 0.001000000000000112,
+      "force_norm_n": 0.5763167677319928,
+      "torque_norm_nm": 0.02422808219444334,
+      "timing": {
+        "command_sec": 0.00011638898286037147,
+        "state_read_sec": 0.006327231996692717,
+        "force_read_sec": 0.0043232470052316785,
+        "loop_elapsed_sec": 0.010819785995408893,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 128,
+      "time_sec": 3.1750623190018814,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006287,
+        -0.463566,
+        0.364081,
+        -1.48,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.594999313354492,
+        93.08899688720703,
+        4.551000118255615,
+        -37.900001525878906,
+        -101.49099731445312
+      ],
+      "observed_axis_offset": 0.002933999999999992,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.5739974975585938,
+      "pose_linear_delta_m": 0.002934392952554234,
+      "pose_angular_delta_rad": 0.001000000000000112,
+      "force_norm_n": 0.7043429805970257,
+      "torque_norm_nm": 0.01658312391808049,
+      "timing": {
+        "command_sec": 0.00011532098869793117,
+        "state_read_sec": 0.01250586798414588,
+        "force_read_sec": 0.004335417994298041,
+        "loop_elapsed_sec": 0.017009407019941136,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 129,
+      "time_sec": 3.2000693360168952,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00629,
+        -0.463561,
+        0.363923,
+        -1.48,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.61199951171875,
+        93.10900115966797,
+        4.545000076293945,
+        -37.930999755859375,
+        -101.48600006103516
+      ],
+      "observed_axis_offset": 0.0027760000000000007,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.542999267578125,
+      "pose_linear_delta_m": 0.0027764207173985723,
+      "pose_angular_delta_rad": 0.001000000000000112,
+      "force_norm_n": 0.7074645020710278,
+      "torque_norm_nm": 0.02165640755007079,
+      "timing": {
+        "command_sec": 0.0002373939787503332,
+        "state_read_sec": 0.010459785989951342,
+        "force_read_sec": 0.0062906050006859004,
+        "loop_elapsed_sec": 0.017077968979720026,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 130,
+      "time_sec": 3.225067288003629,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006308,
+        -0.463573,
+        0.363737,
+        -1.48,
+        -0.132,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.631000518798828,
+        93.12200164794922,
+        4.539999961853027,
+        -37.94900131225586,
+        -101.47899627685547
+      ],
+      "observed_axis_offset": 0.002589999999999981,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.5249977111816406,
+      "pose_linear_delta_m": 0.0025909395979065017,
+      "pose_angular_delta_rad": 0.001000000000000112,
+      "force_norm_n": 0.6459558880488673,
+      "torque_norm_nm": 0.023065124770702973,
+      "timing": {
+        "command_sec": 0.00015857801190577447,
+        "state_read_sec": 0.006285581010160968,
+        "force_read_sec": 0.004243041999870911,
+        "loop_elapsed_sec": 0.010732485010521486,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 131,
+      "time_sec": 3.250068117020419,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006318,
+        -0.46359,
+        0.363544,
+        -1.481,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.65399932861328,
+        93.13800048828125,
+        4.531000137329102,
+        -37.979000091552734,
+        -101.47599792480469
+      ],
+      "observed_axis_offset": 0.0023969999999999825,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.4949989318847656,
+      "pose_linear_delta_m": 0.002398581664234078,
+      "pose_angular_delta_rad": 0.0010000000000000009,
+      "force_norm_n": 0.6625028415639236,
+      "torque_norm_nm": 0.04047221207501541,
+      "timing": {
+        "command_sec": 0.00016369999502785504,
+        "state_read_sec": 0.006338558014249429,
+        "force_read_sec": 0.00431223600753583,
+        "loop_elapsed_sec": 0.010897475993260741,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 132,
+      "time_sec": 3.275070196017623,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006308,
+        -0.463604,
+        0.363425,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.676000595092773,
+        93.1500015258789,
+        4.526000022888184,
+        -38.0260009765625,
+        -101.47200012207031
+      ],
+      "observed_axis_offset": 0.0022780000000000022,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.447998046875,
+      "pose_linear_delta_m": 0.0022797142364779,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.6227913089624925,
+      "torque_norm_nm": 0.024617067085838436,
+      "timing": {
+        "command_sec": 0.0001701079891063273,
+        "state_read_sec": 0.0063602620211895555,
+        "force_read_sec": 0.004302187997382134,
+        "loop_elapsed_sec": 0.01090680799097754,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 133,
+      "time_sec": 3.3000854249985423,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00633,
+        -0.463608,
+        0.363286,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.75,
+        29.69700050354004,
+        93.16600036621094,
+        4.521999835968018,
+        -38.06999969482422,
+        -101.46800231933594
+      ],
+      "observed_axis_offset": 0.002139000000000002,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.40399932861328125,
+      "pose_linear_delta_m": 0.002141696990706205,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.7233297984860521,
+      "torque_norm_nm": 0.025238858563377334,
+      "timing": {
+        "command_sec": 0.0001716650149319321,
+        "state_read_sec": 0.006406928994692862,
+        "force_read_sec": 0.004332490003434941,
+        "loop_elapsed_sec": 0.010983643005602062,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 134,
+      "time_sec": 3.325071626022691,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00631,
+        -0.463602,
+        0.363158,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.711000442504883,
+        93.18299865722656,
+        4.51800012588501,
+        -38.0989990234375,
+        -101.46700286865234
+      ],
+      "observed_axis_offset": 0.002010999999999985,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.375,
+      "pose_linear_delta_m": 0.002012942622133066,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5517327529837155,
+      "torque_norm_nm": 0.022693611338968456,
+      "timing": {
+        "command_sec": 0.00017368598491884768,
+        "state_read_sec": 0.006370674003846943,
+        "force_read_sec": 0.006435272982344031,
+        "loop_elapsed_sec": 0.013054917973931879,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 135,
+      "time_sec": 3.3500746230129153,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006314,
+        -0.463609,
+        0.363038,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.726999282836914,
+        93.19499969482422,
+        4.51200008392334,
+        -38.12900161743164,
+        -101.46099853515625
+      ],
+      "observed_axis_offset": 0.0018910000000000315,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.3449974060058594,
+      "pose_linear_delta_m": 0.0018934436880985188,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5758966902706798,
+      "torque_norm_nm": 0.026172504391859794,
+      "timing": {
+        "command_sec": 0.00017020199447870255,
+        "state_read_sec": 0.006346420006593689,
+        "force_read_sec": 0.00855034199776128,
+        "loop_elapsed_sec": 0.015136141009861603,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 136,
+      "time_sec": 3.3751168560120277,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006323,
+        -0.463606,
+        0.36288,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.746000289916992,
+        93.21399688720703,
+        4.508999824523926,
+        -38.16899871826172,
+        -101.45700073242188
+      ],
+      "observed_axis_offset": 0.0017329999999999846,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.30500030517578125,
+      "pose_linear_delta_m": 0.001735927129806995,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5357994008155611,
+      "torque_norm_nm": 0.03088689096281462,
+      "timing": {
+        "command_sec": 0.00017819699132815003,
+        "state_read_sec": 0.012716676981654018,
+        "force_read_sec": 0.008609385025920346,
+        "loop_elapsed_sec": 0.021573028003331274,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 137,
+      "time_sec": 3.4000739920011256,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006307,
+        -0.463591,
+        0.362868,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.750999450683594,
+        93.2239990234375,
+        4.508999824523926,
+        -38.19599914550781,
+        -101.45700073242188
+      ],
+      "observed_axis_offset": 0.001721000000000028,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.2779998779296875,
+      "pose_linear_delta_m": 0.0017228064313787826,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.5450678958798791,
+      "torque_norm_nm": 0.023895605842332822,
+      "timing": {
+        "command_sec": 0.00017068302258849144,
+        "state_read_sec": 0.006379540980560705,
+        "force_read_sec": 0.00645354701555334,
+        "loop_elapsed_sec": 0.01307149400236085,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 138,
+      "time_sec": 3.425085854018107,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006302,
+        -0.463588,
+        0.362737,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74800109863281,
+        29.763999938964844,
+        93.23899841308594,
+        4.508999824523926,
+        -38.22100067138672,
+        -101.4530029296875
+      ],
+      "observed_axis_offset": 0.0015899999999999803,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.25299835205078125,
+      "pose_linear_delta_m": 0.0015916799301366902,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.6110818217350866,
+      "torque_norm_nm": 0.02823118850193753,
+      "timing": {
+        "command_sec": 0.0001759449951350689,
+        "state_read_sec": 0.006520717986859381,
+        "force_read_sec": 0.0043563189974520355,
+        "loop_elapsed_sec": 0.01112184498924762,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 139,
+      "time_sec": 3.4500796619977336,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.006307,
+        -0.463577,
+        0.36269,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.7490005493164,
+        29.77400016784668,
+        93.2509994506836,
+        4.508999824523926,
+        -38.257999420166016,
+        -101.4489974975586
+      ],
+      "observed_axis_offset": 0.0015430000000000166,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.21599960327148438,
+      "pose_linear_delta_m": 0.0015446248735534638,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.6133750746341944,
+      "torque_norm_nm": 0.02453568912602186,
+      "timing": {
+        "command_sec": 0.00017057897639460862,
+        "state_read_sec": 0.006446472980314866,
+        "force_read_sec": 0.004382063983939588,
+        "loop_elapsed_sec": 0.011067912011640146,
+        "missed_deadline": false
+      }
+    },
+    {
+      "step": 140,
+      "time_sec": 3.4750831139972433,
+      "command_pose": [
+        0.006246,
+        -0.463541,
+        0.361147,
+        -1.481,
+        -0.132,
+        3.111
+      ],
+      "command_axis_offset": 0.0,
+      "observed_pose": [
+        0.00628,
+        -0.463573,
+        0.362575,
+        -1.48,
+        -0.133,
+        3.111
+      ],
+      "observed_joint_deg": [
+        91.74600219726562,
+        29.788000106811523,
+        93.26699829101562,
+        4.508999824523926,
+        -38.28799819946289,
+        -101.44599914550781
+      ],
+      "observed_axis_offset": 0.0014279999999999848,
+      "state_sampled": true,
+      "force_sampled": true,
+      "joint_delta_deg": 0.18600082397460938,
+      "pose_linear_delta_m": 0.0014287631014272305,
+      "pose_angular_delta_rad": 0.0014142135623731748,
+      "force_norm_n": 0.41328562542162234,
+      "torque_norm_nm": 0.022045408674061514,
+      "timing": {
+        "command_sec": 0.00017619301797822118,
+        "state_read_sec": 0.006492363987490535,
+        "force_read_sec": 0.006335504993330687,
+        "loop_elapsed_sec": 0.013073161011561751,
+        "missed_deadline": false
+      }
+    }
+  ],
+  "summary": {
+    "loops": 140,
+    "missed_deadlines": 2,
+    "max_joint_delta_deg": 2.2210006713867188,
+    "max_pose_linear_delta_m": 0.009890133669470813,
+    "max_pose_angular_delta_rad": 0.0024494897427833617,
+    "max_force_norm_n": 1.0948461117396275,
+    "max_torque_norm_nm": 0.07595393040714021,
+    "response_events": {
+      "command_step": {
+        "time_sec": 1.000068488996476,
+        "step": 41,
+        "value": 0.01
+      },
+      "command_return": {
+        "time_sec": 2.500082304002717,
+        "step": 101,
+        "value": 0.0
+      },
+      "rise_10": {
+        "time_sec": 1.2250749689992517,
+        "step": 50,
+        "value": 0.0014140000000000263,
+        "latency_ms": 225.0064800027758
+      },
+      "rise_50": {
+        "time_sec": 1.4500810540048406,
+        "step": 59,
+        "value": 0.005155000000000021,
+        "latency_ms": 450.0125650083646
+      },
+      "rise_90": {
+        "time_sec": 2.050082066009054,
+        "step": 83,
+        "value": 0.009031999999999984,
+        "latency_ms": 1050.013577012578
+      }
+    },
+    "timing": {
+      "command": {
+        "mean_ms": 0.17520547262392938,
+        "p50_ms": 0.17348701658193022,
+        "p95_ms": 0.20185715256957334,
+        "p99_ms": 0.23586402297951276,
+        "max_ms": 0.5871529865544289
+      },
+      "state_read": {
+        "mean_ms": 6.775430156267248,
+        "p50_ms": 6.372687508701347,
+        "p95_ms": 10.658061003778096,
+        "p99_ms": 13.887635417922837,
+        "max_ms": 14.68259099056013
+      },
+      "force_read": {
+        "mean_ms": 5.8917774993460625,
+        "p50_ms": 4.408735490869731,
+        "p95_ms": 10.545638446637895,
+        "p99_ms": 13.904972705640802,
+        "max_ms": 16.66675801970996
+      },
+      "loop_elapsed": {
+        "mean_ms": 12.914759200066328,
+        "p50_ms": 11.057242008973844,
+        "p95_ms": 17.40393724903694,
+        "p99_ms": 25.164770841074557,
+        "max_ms": 27.68854799796827
+      },
+      "loop_interval": {
+        "mean_ms": 25.00044825891361,
+        "p50_ms": 24.99979399726726,
+        "p95_ms": 25.039050602936186,
+        "p99_ms": 26.558605780010122,
+        "max_ms": 27.698348014382645
+      }
+    }
+  },
+  "final_state": {
+    "joint_deg": [
+      91.7490005493164,
+      29.906999588012695,
+      93.39199829101562,
+      4.511000156402588,
+      -38.48699951171875,
+      -101.3759994506836
+    ],
+    "pose": [
+      0.006264,
+      -0.463556,
+      0.361432,
+      -1.481,
+      -0.131,
+      3.111
+    ]
+  }
+}

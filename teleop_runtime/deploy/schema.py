@@ -5,6 +5,14 @@ from typing import Any, Mapping
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from ..action import (
+    ArmActionSpec,
+    HandActionSpec,
+    arm_action_specs_metadata,
+    hand_action_specs_metadata,
+    normalize_arm_action_specs,
+    normalize_hand_action_specs,
+)
 from ..recording import _to_serializable
 
 
@@ -38,6 +46,35 @@ STATE_HAND_SLICES: dict[str, slice] = {
     "left": slice(13, 19),
     "right": slice(32, 38),
 }
+
+DEFAULT_HAND_ACTION_SPECS_BY_SIDE: dict[str, HandActionSpec] = normalize_hand_action_specs(None)
+DEFAULT_HAND_ACTION_SPECS_METADATA: dict[str, Any] = hand_action_specs_metadata(
+    DEFAULT_HAND_ACTION_SPECS_BY_SIDE
+)
+DEFAULT_ARM_ACTION_SPECS_BY_SIDE: dict[str, ArmActionSpec] = normalize_arm_action_specs(None)
+DEFAULT_ARM_ACTION_SPECS_METADATA: dict[str, Any] = arm_action_specs_metadata(
+    DEFAULT_ARM_ACTION_SPECS_BY_SIDE
+)
+
+
+def normalize_deploy_arm_action_specs(
+    specs: Mapping[str, Any] | None,
+) -> dict[str, ArmActionSpec]:
+    return normalize_arm_action_specs(specs)
+
+
+def deploy_arm_specs_metadata(specs: Mapping[str, ArmActionSpec] | None = None) -> dict[str, Any]:
+    return arm_action_specs_metadata(DEFAULT_ARM_ACTION_SPECS_BY_SIDE if specs is None else specs)
+
+
+def normalize_deploy_hand_action_specs(
+    specs: Mapping[str, Any] | None,
+) -> dict[str, HandActionSpec]:
+    return normalize_hand_action_specs(specs)
+
+
+def deploy_hand_specs_metadata(specs: Mapping[str, HandActionSpec] | None = None) -> dict[str, Any]:
+    return hand_action_specs_metadata(DEFAULT_HAND_ACTION_SPECS_BY_SIDE if specs is None else specs)
 
 
 def nan_vector(length: int) -> np.ndarray:

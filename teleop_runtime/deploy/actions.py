@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from ..action import ArmActionSpec, arm_action_specs_from_metadata, hand_action_specs_from_metadata
 from ..schemas import EffectorCommand
 from .observation import DeploymentObservation
 from .schema import (
@@ -21,6 +22,8 @@ from .schema import (
     STATE_ARM_POSE_SLICES,
     STATE_ARM_QPOS_SLICES,
     STATE_HAND_SLICES,
+    deploy_arm_specs_metadata,
+    deploy_hand_specs_metadata,
     mapping_get,
     nan_vector,
     vector_or_none,
@@ -48,6 +51,36 @@ def _base_action(observation: DeploymentObservation) -> np.ndarray:
     if base.shape != (ACTION_DIM,):
         base = nan_vector(ACTION_DIM)
     return base.astype(np.float32, copy=True)
+
+
+def _normalized_action_metadata(
+    observation: DeploymentObservation,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = {} if extra is None else dict(extra)
+    metadata.setdefault(
+        "arm_action_specs_by_side",
+        dict(observation.metadata.get("arm_action_specs_by_side", deploy_arm_specs_metadata())),
+    )
+    metadata.setdefault(
+        "arm_controlled_frame_by_side",
+        dict(observation.metadata.get("arm_controlled_frame_by_side", {})),
+    )
+    metadata.setdefault(
+        "arm_reference_frame_by_side",
+        dict(observation.metadata.get("arm_reference_frame_by_side", {})),
+    )
+    metadata.setdefault("arm_spec_required", True)
+    metadata.setdefault(
+        "hand_action_specs_by_side",
+        dict(observation.metadata.get("hand_action_specs_by_side", deploy_hand_specs_metadata())),
+    )
+    metadata.setdefault(
+        "hand_active_mask_by_side",
+        dict(observation.metadata.get("hand_active_mask_by_side", {})),
+    )
+    metadata.setdefault("hand_spec_required", True)
+    return metadata
 
 
 def _replace_vector_slice(
@@ -80,7 +113,10 @@ def _compact_vector_to_action(
     active = _ordered_active_sides(active_sides)
 
     if arr.shape == (ACTION_DIM,):
-        return NormalizedAction(vector=arr.astype(np.float32, copy=True))
+        return NormalizedAction(
+            vector=arr.astype(np.float32, copy=True),
+            metadata=_normalized_action_metadata(observation),
+        )
 
     if arms_enabled:
         if arr.shape == (ARM_POSE_DOF * len(active),) and active:
@@ -88,10 +124,10 @@ def _compact_vector_to_action(
             for side in active:
                 base[ACTION_ARM_POSE_SLICES[side]] = arr[offset : offset + ARM_POSE_DOF]
                 offset += ARM_POSE_DOF
-            return NormalizedAction(vector=base)
+            return NormalizedAction(vector=base, metadata=_normalized_action_metadata(observation))
         if arr.shape == (ARM_POSE_DOF,) and len(active) == 1:
             base[ACTION_ARM_POSE_SLICES[active[0]]] = arr
-            return NormalizedAction(vector=base)
+            return NormalizedAction(vector=base, metadata=_normalized_action_metadata(observation))
 
     if hands_enabled:
         if arr.shape == (HAND_DOF * len(active),) and active:
@@ -99,10 +135,10 @@ def _compact_vector_to_action(
             for side in active:
                 base[ACTION_HAND_SLICES[side]] = arr[offset : offset + HAND_DOF]
                 offset += HAND_DOF
-            return NormalizedAction(vector=base)
+            return NormalizedAction(vector=base, metadata=_normalized_action_metadata(observation))
         if arr.shape == (HAND_DOF,) and len(active) == 1:
             base[ACTION_HAND_SLICES[active[0]]] = arr
-            return NormalizedAction(vector=base)
+            return NormalizedAction(vector=base, metadata=_normalized_action_metadata(observation))
 
     raise ValueError(
         "Unsupported action vector shape "
@@ -204,6 +240,10 @@ def _mapping_to_action_chunk(
             )
 
     active = _ordered_active_sides(active_sides)
+    action_metadata = _normalized_action_metadata(
+        observation,
+        mapping.get("metadata") if isinstance(mapping.get("metadata"), Mapping) else None,
+    )
     components: dict[tuple[str, str], Any] = {}
     for side in active:
         arm_value = mapping_get(mapping, (f"{side}_arm",))
@@ -276,7 +316,13 @@ def _mapping_to_action_chunk(
                     value,
                     expected_dim=HAND_DOF,
                 )
-        chunk.append(NormalizedAction(vector=vector, arm_joint_targets=arm_joint_targets))
+        chunk.append(
+            NormalizedAction(
+                vector=vector,
+                arm_joint_targets=arm_joint_targets,
+                metadata=dict(action_metadata),
+            )
+        )
     return chunk
 
 
@@ -565,14 +611,24 @@ class ActionSafetyFilter:
         safety_metadata: dict[str, Any] = {
             "policy_name": policy_name,
             "arm": {},
+            "arm_action_specs_by_side": {},
             "hand_rate_limited": {},
+            "hand_action_specs_by_side": {},
         }
 
         active = set(self.config.active_sides)
+        arm_specs = arm_action_specs_from_metadata(normalized.metadata)
+        if not arm_specs:
+            arm_specs = arm_action_specs_from_metadata(observation.metadata)
+        if not arm_specs:
+            arm_specs = arm_action_specs_from_metadata(
+                {"arm_action_specs_by_side": deploy_arm_specs_metadata()}
+            )
         if self.config.arms_enabled:
             for side in ALL_SIDES:
                 if side not in active:
                     continue
+                arm_spec = arm_specs.get(side) or ArmActionSpec.tool_tcp(side)
                 if side in normalized.arm_joint_targets:
                     _, command, arm_faults, metadata = self._filter_arm_qpos(
                         side=side,
@@ -592,19 +648,40 @@ class ActionSafetyFilter:
                     filtered[ACTION_ARM_POSE_SLICES[side]] = pose
                 faults.extend(arm_faults)
                 safety_metadata["arm"][side] = metadata
+                safety_metadata["arm_action_specs_by_side"][side] = arm_spec.to_metadata()
                 if command is not None:
                     command.metadata["policy_name"] = policy_name
+                    command.metadata["arm_action_spec"] = arm_spec.to_metadata()
+                    command.metadata["arm_controlled_frame"] = arm_spec.controlled_frame
+                    command.metadata["target_pose_controlled_frame"] = arm_spec.controlled_frame
+                    command.metadata["arm_reference_frame"] = arm_spec.reference_frame
                     commands[f"{side}_arm"] = command
 
         if self.config.hands_enabled:
+            hand_specs = hand_action_specs_from_metadata(normalized.metadata)
+            if not hand_specs:
+                hand_specs = hand_action_specs_from_metadata(observation.metadata)
+            if not hand_specs:
+                hand_specs = hand_action_specs_from_metadata(
+                    {"hand_action_specs_by_side": deploy_hand_specs_metadata()}
+                )
             for side in HAND_VECTOR_ORDER:
                 if side not in active:
                     continue
+                spec = hand_specs.get(side)
+                if spec is None:
+                    raise ValueError(f"{side}_hand action requires hand_action_specs_by_side metadata.")
+                safety_metadata["hand_action_specs_by_side"][side] = spec.to_metadata()
                 target_slice = ACTION_HAND_SLICES[side]
                 hand_target = vector_or_none(filtered[target_slice], length=HAND_DOF)
                 if hand_target is None:
                     faults.append(f"{side}_hand_action_invalid")
                     continue
+                if int(spec.slot_count) != HAND_DOF:
+                    raise ValueError(
+                        f"{side}_hand deploy q6 schema requires HandActionSpec.slot_count={HAND_DOF}, "
+                        f"got {spec.slot_count}. Use a hand adapter for non-q6 embodiments."
+                    )
                 clipped = np.clip(hand_target, 0.0, 1.0)
                 filtered[target_slice] = clipped
                 safety_metadata["hand_rate_limited"][side] = False
@@ -618,6 +695,8 @@ class ActionSafetyFilter:
                         "source": "policy",
                         "policy_name": policy_name,
                         "raw_action": raw[target_slice].copy(),
+                        "hand_action_spec": spec.to_metadata(),
+                        "hand_active_mask": list(spec.active_mask or ()),
                         "safety": {
                             "clip_range": [0.0, 1.0],
                             "rate_limited": False,

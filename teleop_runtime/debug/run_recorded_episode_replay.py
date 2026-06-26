@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from ..arm_frames import TOOL_TCP_FRAME
 from ..configs import ANNOTATED_DUAL_RM65_BASE_DISTANCE_M
 from ..episodes import compare_start_qpos_pair, episode_start_qpos_pair, require_valid_episode
 from ..hand_render import (
@@ -190,7 +191,7 @@ def main() -> None:
         RM65ArmBackendConfig(
             arm_ip="0.0.0.0" if args.arm_mode == "virtual" else args.left_arm_ip,
             side="left",
-            default_tcp_frame="hand_base",
+            default_tcp_frame=TOOL_TCP_FRAME,
             arm_urdf_path=arm_urdf_path,
             connect_hardware=bool(args.arm_mode == "real"),
             control_dt=1.0 / replay_hz,
@@ -203,7 +204,7 @@ def main() -> None:
         RM65ArmBackendConfig(
             arm_ip="0.0.0.0" if args.arm_mode == "virtual" else args.right_arm_ip,
             side="right",
-            default_tcp_frame="hand_base",
+            default_tcp_frame=TOOL_TCP_FRAME,
             arm_urdf_path=arm_urdf_path,
             connect_hardware=bool(args.arm_mode == "real"),
             control_dt=1.0 / replay_hz,

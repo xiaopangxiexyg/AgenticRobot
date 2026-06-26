@@ -30,23 +30,22 @@ from ..calibration import TeleopCalibration
 from ..configs import build_annotated_dual_rm65_calibration
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
 from ..hand_tcp_alignment import (
-    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
+    add_vive_tracker_height_correction_args,
     tracker_hand_to_rm65_tcp_rotation,
-    vive_tracker_height_correction_offset,
-)
-from ..LeftArmFixed import (
-    FixedArmRetargeter,
-    FixedArmRetargeterConfig,
-    SmoothJitterArmRetargeter,
-    SmoothJitterArmRetargeterConfig,
+    vive_tracker_local_translation_offset_from_args,
 )
 from ..retargeters import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
+    FixedArmRetargeter,
+    FixedArmRetargeterConfig,
     JointsToDexHandRetargeter,
     JointsToDexHandRetargeterConfig,
     PoseToArmRetargeter,
     PoseToArmRetargeterConfig,
+    SmoothJitterArmRetargeter,
+    SmoothJitterArmRetargeterConfig,
 )
 from ..diagnostics import TeleopRunState
 from ..deploy.actions import ActionSafetyFilter, ActionSafetyFilterConfig, NormalizedAction
@@ -74,16 +73,44 @@ from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
 from ..tactile_visualizer import (
+    AsyncTactileUVVisualizer,
     TactileUVVisualizer,
     TactileVisualizerConfig,
     tactile_by_side_from_backends,
+    tactile_by_side_from_hand_states,
 )
 from ..transforms import as_pose_matrix, interpolate_pose
 from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
 from .camera_preview import CameraPreviewConfig, CameraPreviewer
+from .diagnostics import (
+    PhaseTimer,
+    build_end_to_end_latency_breakdown,
+    format_end_to_end_latency_breakdown,
+    format_phase_timings,
+    should_report_debug_frozen,
+)
+from .modes import (
+    fixed_arm_sides as _mode_fixed_arm_sides,
+    jitter_arm_sides as _mode_jitter_arm_sides,
+    moving_arm_sides as _mode_moving_arm_sides,
+    resolve_collection_mode,
+)
+from .preview_rate import PreviewRateLimiter
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
+from .status_snapshot import (
+    arm_debug_text as _snapshot_arm_debug_text,
+    camera_debug_text as _snapshot_camera_debug_text,
+    camera_state_signature_text as _snapshot_camera_state_signature_text,
+    camera_status_text as _snapshot_camera_status_text,
+    compact_log_value as _snapshot_compact_log_value,
+    fault_signature as _snapshot_fault_signature,
+    fault_status_text as _snapshot_fault_status_text,
+    hand_debug_text as _snapshot_hand_debug_text,
+    writer_debug_text as _snapshot_writer_debug_text,
+)
+from .topology import CollectionTopology, parse_active_sides as _topology_parse_active_sides
 from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 
 
@@ -260,12 +287,10 @@ def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
 
 
 def _parse_active_sides(text: str) -> tuple[str, ...]:
-    value = str(text).strip().lower()
-    if value == "both":
-        return ("left", "right")
-    if value in {"left", "right"}:
-        return (value,)
-    raise argparse.ArgumentTypeError("active-sides must be one of: left, right, both")
+    try:
+        return _topology_parse_active_sides(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_replay_group_key(text: str) -> str:
@@ -517,32 +542,15 @@ def _assert_tactile_visualization_config(
 
 
 def _fixed_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
-    if not bool(getattr(args, "left_arm_fixed", False)):
-        return ()
-    if bool(getattr(args, "left_arm_jitter", False)):
-        raise ValueError("--left-arm-fixed and --left-arm-jitter are mutually exclusive.")
-    if set(active_sides) != {"left", "right"}:
-        raise ValueError("--left-arm-fixed requires --active-sides both.")
-    return ("left",)
+    return _mode_fixed_arm_sides(args, active_sides)
 
 
 def _jitter_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
-    if not bool(getattr(args, "left_arm_jitter", False)):
-        return ()
-    if bool(getattr(args, "left_arm_fixed", False)):
-        raise ValueError("--left-arm-fixed and --left-arm-jitter are mutually exclusive.")
-    if set(active_sides) != {"left", "right"}:
-        raise ValueError("--left-arm-jitter requires --active-sides both.")
-    if bool(getattr(args, "disable_dual_arm_collision_avoidance", False)):
-        raise ValueError("--left-arm-jitter requires dual-arm IK; remove --disable-dual-arm-collision-avoidance.")
-    return ("left",)
+    return _mode_jitter_arm_sides(args, active_sides)
 
 
 def _moving_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
-    non_operator = set(_fixed_arm_sides(args, active_sides)) | set(
-        _jitter_arm_sides(args, active_sides)
-    )
-    return tuple(side for side in active_sides if side not in non_operator)
+    return _mode_moving_arm_sides(args, active_sides)
 
 
 def parse_args() -> argparse.Namespace:
@@ -707,6 +715,12 @@ def parse_args() -> argparse.Namespace:
         help="Per-hand tactile visualizer panel size in pixels.",
     )
     parser.add_argument(
+        "--tactile-vis-hz",
+        type=_positive_float,
+        default=15.0,
+        help="Maximum tactile visualization update rate. Frames above this rate are skipped.",
+    )
+    parser.add_argument(
         "--inspire-hand-max-force",
         "--max-force",
         "--max-fingertip-force",
@@ -722,25 +736,7 @@ def parse_args() -> argparse.Namespace:
         help="Arm retargeting mode.",
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Desk-frame translation scale.")
-    parser.add_argument(
-        "--vive-tracker-height-correction",
-        dest="vive_tracker_height_correction",
-        action="store_true",
-        help="Shift wrist tracker input by -Z in the tracker local frame before arm IK. Default.",
-    )
-    parser.add_argument(
-        "--no-vive-tracker-height-correction",
-        dest="vive_tracker_height_correction",
-        action="store_false",
-        help="Disable the 4cm VIVE tracker local -Z position correction.",
-    )
-    parser.add_argument(
-        "--vive-tracker-height-correction-m",
-        type=float,
-        default=DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
-        help="VIVE tracker height correction distance in meters; applied as local [0, 0, -value].",
-    )
-    parser.set_defaults(vive_tracker_height_correction=True)
+    add_vive_tracker_height_correction_args(parser)
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control rate.")
     parser.add_argument(
         "--arm-max-angvel",
@@ -859,6 +855,12 @@ def parse_args() -> argparse.Namespace:
             "Camera key to visualize when --vis_cam is set. "
             "Defaults to 'front' when present, otherwise the first configured camera."
         ),
+    )
+    parser.add_argument(
+        "--vis-cam-hz",
+        type=_positive_float,
+        default=15.0,
+        help="Maximum camera preview update rate. Frames above this rate are skipped.",
     )
     parser.add_argument("--write-video", dest="write_video", action="store_true")
     parser.add_argument("--no-video", dest="write_video", action="store_false")
@@ -1191,7 +1193,7 @@ class CollectApp:
     sample_builder: CollectorSampleBuilder
     runtime: CollectionRuntime
     control_state: "CollectControlState"
-    tactile_visualizer: TactileUVVisualizer | None
+    tactile_visualizer: TactileUVVisualizer | AsyncTactileUVVisualizer | None
     camera_previewer: CameraPreviewer | None
     replay_groups: dict[str, "ReplayTrajectoryPool"]
     replay_action_filter: ActionSafetyFilter | None
@@ -1721,7 +1723,7 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
         getattr(
             args,
             "vive_tracker_height_correction_m",
-            DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+            DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m,
         )
     )
     calibration.metadata["vive_tracker_local_translation_offset_m"] = (
@@ -1731,21 +1733,11 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
 
 
 def _vive_tracker_local_translation_offset(args: argparse.Namespace) -> np.ndarray | None:
-    if not bool(getattr(args, "vive_tracker_height_correction", True)):
-        return None
-    height_m = float(
-        getattr(
-            args,
-            "vive_tracker_height_correction_m",
-            DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
-        )
-    )
-    if height_m < 0.0:
-        raise ValueError("--vive-tracker-height-correction-m must be >= 0.")
-    return vive_tracker_height_correction_offset(height_m)
+    return vive_tracker_local_translation_offset_from_args(args)
 
 
 def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> VivePoseSource:
+    topology = CollectionTopology.for_active_sides(active_sides)
     moving_sides = _moving_arm_sides(args, active_sides)
     non_operator_sides = tuple(side for side in active_sides if side not in moving_sides)
     tracker_configs: list[ViveTrackerConfig] = []
@@ -1754,8 +1746,8 @@ def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) 
             ViveTrackerConfig(
                 name=args.left_tracker_name,
                 side="left",
-                role="left_wrist",
-                channel_name="left_wrist_pose",
+                role=topology.wrist_tracker_role("left"),
+                channel_name=topology.wrist_pose_channel("left"),
             )
         )
     if "left" in non_operator_sides:
@@ -1763,8 +1755,8 @@ def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) 
             ViveTrackerConfig(
                 name=args.left_tracker_name,
                 side="left",
-                role="left_wrist",
-                channel_name="left_wrist_pose",
+                role=topology.wrist_tracker_role("left"),
+                channel_name=topology.wrist_pose_channel("left"),
                 critical=False,
             )
         )
@@ -1773,8 +1765,8 @@ def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) 
             ViveTrackerConfig(
                 name=args.right_tracker_name,
                 side="right",
-                role="right_wrist",
-                channel_name="right_wrist_pose",
+                role=topology.wrist_tracker_role("right"),
+                channel_name=topology.wrist_pose_channel("right"),
             )
         )
     return VivePoseSource(
@@ -1845,11 +1837,12 @@ def _build_arm_retargeters(
     fixed_sides = _fixed_arm_sides(args, active_sides)
     jitter_sides = _jitter_arm_sides(args, active_sides)
     moving_sides = _moving_arm_sides(args, active_sides)
+    topology = CollectionTopology.for_active_sides(active_sides)
     fixed_retargeters = {
         side: FixedArmRetargeter(
             FixedArmRetargeterConfig(
                 side=side,
-                effector_name=f"{side}_arm",
+                effector_name=topology.arm_effector(side),
             )
         )
         for side in fixed_sides
@@ -1859,7 +1852,7 @@ def _build_arm_retargeters(
         side: SmoothJitterArmRetargeter(
             SmoothJitterArmRetargeterConfig(
                 side=side,
-                effector_name=f"{side}_arm",
+                effector_name=topology.arm_effector(side),
                 max_translation_m=float(args.left_arm_jitter_position_m),
                 max_rotation_deg=float(args.left_arm_jitter_rotation_deg),
                 target_refresh_sec=float(args.left_arm_jitter_refresh_sec),
@@ -1875,8 +1868,8 @@ def _build_arm_retargeters(
         pose_retargeters[side] = PoseToArmRetargeter(
             PoseToArmRetargeterConfig(
                 side=side,
-                input_channel_name=f"{side}_wrist_pose",
-                effector_name=f"{side}_arm",
+                input_channel_name=topology.wrist_pose_channel(side),
+                effector_name=topology.arm_effector(side),
                 control_mode=str(args.control_mode),
                 translation_scale=float(args.translation_scale),
                 input_local_translation_offset=tracker_translation_offset,
@@ -1920,6 +1913,7 @@ def _build_hand_retargeters(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> dict[str, JointsToDexHandRetargeter]:
+    topology = CollectionTopology.for_active_sides(active_sides)
     retargeters: dict[str, JointsToDexHandRetargeter] = {}
     for side in active_sides:
         hand_port = getattr(args, f"{side}_hand_port")
@@ -1928,8 +1922,8 @@ def _build_hand_retargeters(
         retargeters[side] = JointsToDexHandRetargeter(
             JointsToDexHandRetargeterConfig(
                 side=side,
-                input_channel_name=f"{side}_hand_q6",
-                effector_name=f"{side}_hand",
+                input_channel_name=topology.hand_q6_channel(side),
+                effector_name=topology.hand_effector(side),
                 joint_order=tuple(args.hand_joint_order),
                 invert=bool(args.hand_invert),
                 alpha=float(args.hand_command_alpha),
@@ -1942,6 +1936,7 @@ def _build_backends(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    topology = CollectionTopology.for_active_sides(active_sides)
     arm_urdf_path = require_asset_path("rm65_arm.urdf")
     control_dt = 1.0 / float(args.hz)
     all_backends: dict[str, Any] = {}
@@ -1962,8 +1957,9 @@ def _build_backends(
                 background_streaming_hz=float(args.hz),
             )
         )
-        all_backends[f"{side}_arm"] = arm_backend
-        rig_backends[f"{side}_arm"] = arm_backend
+        arm_effector = topology.arm_effector(side)
+        all_backends[arm_effector] = arm_backend
+        rig_backends[arm_effector] = arm_backend
 
         hand_ip = str(getattr(args, f"{side}_hand_ip"))
         hand_port = str(getattr(args, f"{side}_hand_port"))
@@ -1981,35 +1977,23 @@ def _build_backends(
                 tactile_regions=tactile_regions,
             )
         )
-        all_backends[f"{side}_hand"] = hand_backend
+        all_backends[topology.hand_effector(side)] = hand_backend
     return all_backends, rig_backends
 
 
 def _build_tactile_visualizer(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
-) -> TactileUVVisualizer | None:
+) -> TactileUVVisualizer | AsyncTactileUVVisualizer | None:
     if not bool(args.visualize_tactile):
         return None
-    return TactileUVVisualizer(
+    return AsyncTactileUVVisualizer(
         TactileVisualizerConfig(
             enabled_sides=active_sides,
             image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
             value_scale=float(args.tactile_vis_value_scale),
         )
     )
-
-
-def _source_entrypoint_for_modes(
-    *,
-    fixed_sides: tuple[str, ...],
-    jitter_sides: tuple[str, ...],
-) -> str:
-    if jitter_sides:
-        return "teleop_runtime.LeftArmFixed.run_collect_jitter"
-    if fixed_sides:
-        return "teleop_runtime.LeftArmFixed.run_collect"
-    return "teleop_runtime.collection.run_collect"
 
 
 def _episode_metadata(
@@ -2020,14 +2004,12 @@ def _episode_metadata(
     preview_camera_sources: dict[str, RealSenseRGBSource],
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    fixed_sides = _fixed_arm_sides(args, active_sides)
-    jitter_sides = _jitter_arm_sides(args, active_sides)
-    moving_sides = _moving_arm_sides(args, active_sides)
+    mode_spec = resolve_collection_mode(args, active_sides)
+    fixed_sides = mode_spec.fixed_arm_sides
+    jitter_sides = mode_spec.jitter_arm_sides
+    moving_sides = mode_spec.moving_arm_sides
     metadata = {
-        "source_entrypoint": _source_entrypoint_for_modes(
-            fixed_sides=fixed_sides,
-            jitter_sides=jitter_sides,
-        ),
+        "source_entrypoint": mode_spec.source_entrypoint,
         "task_name": str(args.task_name),
         "task_id": str(args.task_id),
         "task_description": str(args.task_description),
@@ -2157,10 +2139,7 @@ def _print_standby(app: CollectApp) -> None:
 
 
 def _compact_log_value(value: object, *, max_chars: int = 90) -> str:
-    text = str(value)
-    if len(text) <= max_chars:
-        return text
-    return text[: max(0, max_chars - 3)] + "..."
+    return _snapshot_compact_log_value(value, max_chars=max_chars)
 
 
 def _qpos_or_none(value: Any) -> np.ndarray | None:
@@ -2208,12 +2187,16 @@ def _channel_pose_in_desk(channel: ObservationChannel, calibration: TeleopCalibr
 
 
 def _arm_backend(app: CollectApp, side: str) -> RM65ArmBackend | None:
-    backend = app.components.backends.get(f"{side}_arm")
+    backend = app.components.backends.get(
+        CollectionTopology.for_active_sides((side,)).arm_effector(side)
+    )
     return backend if isinstance(backend, RM65ArmBackend) else None
 
 
 def _hand_backend(app: CollectApp, side: str) -> InspireTacHandBackend | None:
-    backend = app.components.backends.get(f"{side}_hand")
+    backend = app.components.backends.get(
+        CollectionTopology.for_active_sides((side,)).hand_effector(side)
+    )
     return backend if isinstance(backend, InspireTacHandBackend) else None
 
 
@@ -2222,136 +2205,32 @@ _DEBUG_FROZEN_RESET = "\033[0m"
 
 
 def _debug_frozen_phase_text(phases: Sequence[tuple[str, float]], *, limit: int = 10) -> str:
-    if not phases:
-        return "phases=none"
-    ordered = sorted(
-        ((str(name), float(elapsed)) for name, elapsed in phases),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    return "phases=" + ", ".join(
-        f"{name}:{elapsed * 1000.0:.1f}ms" for name, elapsed in ordered[: max(1, int(limit))]
-    )
+    return format_phase_timings(phases, limit=limit)
 
 
 def _debug_frozen_writer_text(app: CollectApp) -> str:
-    try:
-        stats = app.runtime.writer_pool.stats()
-    except Exception as exc:  # noqa: BLE001
-        return f"writer=status_error:{type(exc).__name__}:{_compact_log_value(exc, max_chars=80)}"
-    return (
-        "writer="
-        f"queued:{stats.queued} submitted:{stats.submitted} completed:{stats.completed} "
-        f"dropped:{stats.dropped} failures:{stats.failures} workers:{stats.worker_count}"
-    )
+    return _snapshot_writer_debug_text(app.runtime.writer_pool)
 
 
 def _debug_frozen_camera_text(app: CollectApp) -> str:
-    if not app.camera_sources:
-        return "camera=off"
-    parts: list[str] = []
-    if app.camera_previewer is not None:
-        disabled_reason = app.camera_previewer.disabled_reason
-        parts.append(
-            "preview=active"
-            if not disabled_reason
-            else f"preview=disabled:{_compact_log_value(disabled_reason, max_chars=80)}"
-        )
-    for camera_key, source in sorted(app.camera_sources.items()):
-        try:
-            info = source.device_info()
-        except Exception as exc:  # noqa: BLE001
-            parts.append(f"{camera_key}=status_error:{type(exc).__name__}")
-            continue
-        frame_count = int(info.get("frame_count", 0) or 0)
-        age = info.get("last_frame_age_sec")
-        age_text = "none" if age is None else f"{float(age):.3f}s"
-        last_error = info.get("last_error")
-        error_text = "ok" if not last_error else _compact_log_value(last_error, max_chars=70)
-        parts.append(
-            f"{camera_key}=frames:{frame_count},age:{age_text},"
-            f"timeouts:{int(info.get('timeout_count', 0) or 0)},"
-            f"consecutive:{int(info.get('consecutive_timeout_count', 0) or 0)},"
-            f"restarts:{int(info.get('restart_count', 0) or 0)},err:{error_text}"
-        )
-    return "camera=" + "; ".join(parts)
+    return _snapshot_camera_debug_text(
+        app.camera_sources,
+        camera_previewer=app.camera_previewer,
+    )
 
 
 def _debug_frozen_hand_text(app: CollectApp) -> str:
-    parts: list[str] = []
-    now = time.time()
-    for side in app.active_sides:
-        backend = _hand_backend(app, side)
-        if backend is None:
-            continue
-        try:
-            state = backend.get_state()
-        except Exception as exc:  # noqa: BLE001
-            parts.append(f"{side}=state_error:{type(exc).__name__}")
-            continue
-        telemetry_at = state.get("telemetry_timestamp")
-        tactile_at = state.get("tactile_timestamp")
-        telemetry_age = "none" if telemetry_at is None else f"{now - float(telemetry_at):.3f}s"
-        tactile_age = "none" if tactile_at is None else f"{now - float(tactile_at):.3f}s"
-        error = state.get("telemetry_error")
-        error_text = "ok" if not error else _compact_log_value(error, max_chars=70)
-        parts.append(
-            f"{side}=connected:{bool(state.get('is_connected'))},"
-            f"telemetry_age:{telemetry_age},tactile_age:{tactile_age},"
-            f"reconnects:{int(state.get('reconnect_count', 0) or 0)},err:{error_text}"
-        )
-    return "hand=none" if not parts else "hand=" + "; ".join(parts)
+    return _snapshot_hand_debug_text(app.active_sides, lambda side: _hand_backend(app, side))
 
 
 def _debug_frozen_arm_text(app: CollectApp) -> str:
-    parts: list[str] = []
-    now = time.time()
-    for side in app.active_sides:
-        backend = _arm_backend(app, side)
-        if backend is None:
-            continue
-        try:
-            state = backend.get_state()
-        except Exception as exc:  # noqa: BLE001
-            parts.append(f"{side}=state_error:{type(exc).__name__}")
-            continue
-        refresh_at = state.get("hardware_refresh_time")
-        refresh_age = "none" if refresh_at is None else f"{now - float(refresh_at):.3f}s"
-        code = state.get("hardware_result_code")
-        code_text = "none" if code is None else str(code)
-        result_text = _compact_log_value(state.get("hardware_result_text", ""), max_chars=50)
-        ik_meta = state.get("ik_metadata")
-        ik_text = ""
-        if isinstance(ik_meta, Mapping) and ik_meta:
-            ik_keys = (
-                "collision_avoidance_status",
-                "collision_avoidance_fallback_reason",
-                "collision_distance_m",
-                "ik_branch_selection",
-                "ik_jump_gate_status",
-                "ik_jump_gate_reason",
-                "ik_jump_gate_hold_frames",
-            )
-            ik_parts = [
-                f"{key}:{_compact_log_value(ik_meta[key], max_chars=40)}"
-                for key in ik_keys
-                if key in ik_meta and ik_meta[key] is not None
-            ]
-            if ik_parts:
-                ik_text = ",ik:{" + ",".join(ik_parts) + "}"
-        parts.append(
-            f"{side}=refresh_age:{refresh_age},code:{code_text},text:{result_text},"
-            f"dt:{float(state.get('effective_control_dt_sec', 0.0) or 0.0):.4f},"
-            f"scale:{float(state.get('effective_step_scale', 0.0) or 0.0):.3f}"
-            f"{ik_text}"
-        )
-    return "arm=none" if not parts else "arm=" + "; ".join(parts)
+    return _snapshot_arm_debug_text(app.active_sides, lambda side: _arm_backend(app, side))
 
 
 def _debug_frozen_fault_text(result: SessionStepResult | None) -> str:
     if result is None or not result.faults:
         return "faults=none"
-    return "faults=" + _fault_status_text(result.faults)
+    return "faults=" + _snapshot_fault_status_text(result.faults)
 
 
 def _debug_frozen_mode_text(app: CollectApp, result: SessionStepResult | None) -> str:
@@ -2417,6 +2296,11 @@ def _debug_frozen_report(
         prefix,
         "  " + _debug_frozen_mode_text(app, result),
         "  " + _debug_frozen_phase_text(phases),
+        "  "
+        + format_end_to_end_latency_breakdown(
+            build_end_to_end_latency_breakdown(result, reference_time=now),
+            limit=6,
+        ),
         "  " + _debug_frozen_writer_text(app),
         "  " + _debug_frozen_camera_text(app),
         "  " + _debug_frozen_hand_text(app),
@@ -2441,8 +2325,12 @@ def _debug_frozen_maybe_report(
 ) -> None:
     if not app.control_state.debug_frozen_enabled:
         return
-    threshold = float(app.control_state.debug_frozen_threshold_sec)
-    if force or elapsed_sec >= threshold or any(float(duration) >= threshold for _, duration in phases):
+    if should_report_debug_frozen(
+        elapsed_sec=elapsed_sec,
+        phases=phases,
+        threshold_sec=float(app.control_state.debug_frozen_threshold_sec),
+        force=force,
+    ):
         _debug_frozen_report(
             app,
             reason=reason,
@@ -2638,12 +2526,16 @@ def _build_replay_deployment_observation(
     replay_group: str,
     replay_index: int,
 ) -> Any:
+    topology = CollectionTopology.for_active_sides(app.active_sides)
     arm_states = _collect_arm_states_for_deployment(app)
     hand_states = _collect_hand_states_for_deployment(app)
     return build_deployment_observation(
         active_sides=app.active_sides,
         arms_enabled=True,
-        hands_enabled=any(f"{side}_hand" in app.components.backends for side in app.active_sides),
+        hands_enabled=any(
+            topology.hand_effector(side) in app.components.backends
+            for side in app.active_sides
+        ),
         step_index=step_count,
         arm_states=arm_states,
         hand_states=hand_states,
@@ -2666,6 +2558,9 @@ def _build_joint_target_teleop_command(
     hand_sides: Sequence[str] = (),
     now: float,
 ) -> TeleopCommand:
+    topology = CollectionTopology.for_active_sides(
+        tuple(qpos_by_side) + tuple(hand_sides)
+    )
     command = TeleopCommand(
         timestamp=float(now),
         metadata={"mode": "trajectory_replay_qpos_init"},
@@ -2673,7 +2568,7 @@ def _build_joint_target_teleop_command(
     for side, qpos in qpos_by_side.items():
         command.add_command(
             EffectorCommand(
-                effector_name=f"{side}_arm",
+                effector_name=topology.arm_effector(str(side)),
                 side=side,
                 command_type="joint_vector",
                 value=np.asarray(qpos, dtype=float).reshape(6),
@@ -2689,7 +2584,7 @@ def _build_joint_target_teleop_command(
                 continue
             command.add_command(
                 EffectorCommand(
-                    effector_name=f"{side}_hand",
+                    effector_name=topology.hand_effector(side),
                     side=side,
                     command_type="joint_vector",
                     value=np.clip(target, 0.0, 1.0),
@@ -3021,11 +2916,12 @@ def _build_runtime_fixed_arm_command(
     app: CollectApp,
     observation: TeleopObservation | None,
 ) -> TeleopCommand | None:
-    if observation is None or not app.fixed_arm_retargeters:
+    fixed_arm_retargeters = getattr(app, "fixed_arm_retargeters", {}) or {}
+    if observation is None or not fixed_arm_retargeters:
         return None
     commands = [
         retargeter.retarget(observation, app.calibration)
-        for retargeter in app.fixed_arm_retargeters.values()
+        for retargeter in fixed_arm_retargeters.values()
     ]
     merged = merge_teleop_commands(tuple(commands))
     if not merged.commands:
@@ -3037,11 +2933,12 @@ def _build_runtime_hand_command_for_recovery(
     app: CollectApp,
     observation: TeleopObservation | None,
 ) -> TeleopCommand | None:
-    if observation is None or not app.hand_retargeters:
+    hand_retargeters = getattr(app, "hand_retargeters", {}) or {}
+    if observation is None or not hand_retargeters:
         return None
     commands = [
         retargeter.retarget(observation, app.calibration)
-        for retargeter in app.hand_retargeters.values()
+        for retargeter in hand_retargeters.values()
     ]
     merged = merge_teleop_commands(tuple(commands))
     if not merged.commands:
@@ -3085,10 +2982,12 @@ def _start_recovery_plan(
     ramp_sec: float,
 ) -> tuple[RecoveryPlan | None, TeleopCommand | None, bool]:
     _seed_dual_arm_retargeter_from_backends(app)
+    fixed_arm_retargeters = getattr(app, "fixed_arm_retargeters", {}) or {}
+    jitter_arm_retargeters = getattr(app, "jitter_arm_retargeters", {}) or {}
     moving_sides = tuple(
         side
         for side in app.active_sides
-        if side not in app.fixed_arm_retargeters and side not in app.jitter_arm_retargeters
+        if side not in fixed_arm_retargeters and side not in jitter_arm_retargeters
     )
 
     if control_mode == "delta_clutch":
@@ -3131,8 +3030,9 @@ def _start_recovery_plan(
             app.calibration,
         )
         if resolution is None:
+            channel_name = CollectionTopology.for_active_sides((side,)).wrist_pose_channel(side)
             raise RuntimeError(
-                f"Absolute recovery requires active wrist channel '{side}_wrist_pose' to be valid."
+                f"Absolute recovery requires active wrist channel '{channel_name}' to be valid."
             )
         end_resolutions[side] = resolution
     return (
@@ -3322,6 +3222,7 @@ def _runtime_home_calibration(
 ) -> None:
     if not app.active_sides:
         return
+    topology = CollectionTopology.for_active_sides(app.active_sides)
     calibration = app.calibration
     fixed_sides = tuple(app.fixed_arm_retargeters)
     jitter_sides = tuple(app.jitter_arm_retargeters)
@@ -3354,7 +3255,7 @@ def _runtime_home_calibration(
             )
         channels, _ = app.components.session.poll_sources(now)
         for side in moving_sides:
-            channel_name = f"{side}_wrist_pose"
+            channel_name = topology.wrist_pose_channel(side)
             channel = channels.get(channel_name)
             if channel is None:
                 continue
@@ -3396,10 +3297,11 @@ def _runtime_home_calibration(
         "sample_counts": {side: len(samples[side]) for side in moving_sides},
     }
     for side in app.active_sides:
+        arm_effector = topology.arm_effector(side)
         robot_home_desk, qpos = _resolve_robot_home_for_side(app, side=side)
-        calibration.capture_home_pose(f"{side}_arm", robot_home_desk)
+        calibration.capture_home_pose(arm_effector, robot_home_desk)
         if qpos is not None:
-            calibration.capture_home_qpos(f"{side}_arm", qpos)
+            calibration.capture_home_qpos(arm_effector, qpos)
         if side in app.fixed_arm_retargeters:
             fixed_qpos, fixed_pose_base, _ = _set_fixed_arm_state_from_backend(
                 app,
@@ -3528,6 +3430,7 @@ def _build_return_home_command(
     *,
     now: float,
 ) -> TeleopCommand:
+    topology = CollectionTopology.for_active_sides(target_qpos_by_side)
     command = TeleopCommand(
         timestamp=float(now),
         metadata={"mode": "return_home", "key": "r"},
@@ -3535,7 +3438,7 @@ def _build_return_home_command(
     for side, qpos in target_qpos_by_side.items():
         command.add_command(
             EffectorCommand(
-                effector_name=f"{side}_arm",
+                effector_name=topology.arm_effector(str(side)),
                 side=side,
                 command_type="joint_vector",
                 value=np.asarray(qpos, dtype=float).reshape(6),
@@ -3760,15 +3663,7 @@ def _save_active_episode(
     reason: str,
     show_standby: bool = True,
 ) -> bool:
-    save_started = time.perf_counter()
-    phase_started = save_started
-    phases: list[tuple[str, float]] = []
-
-    def mark_phase(name: str) -> None:
-        nonlocal phase_started
-        now = time.perf_counter()
-        phases.append((name, now - phase_started))
-        phase_started = now
+    phase_timer = PhaseTimer()
 
     state = app.control_state
     if not state.recording_active or state.active_episode_index is None:
@@ -3778,29 +3673,29 @@ def _save_active_episode(
     frame_count = int(app.sample_builder.frame_index)
     print(f"\n录制完成 Recording finished for episode {episode_index}")
     print(f"  数据帧数 Data frames: {frame_count}")
-    mark_phase("save:announce")
+    phase_timer.mark("save:announce")
     _freeze_jitter_arms_at_current_pose(app)
-    mark_phase("save:freeze_jitter_arms")
+    phase_timer.mark("save:freeze_jitter_arms")
     active_run = state.active_replay_run
     if active_run is not None:
         _restore_replay_arm_speed_override(app, active_run.original_max_angvel_by_side)
-    mark_phase("save:restore_replay_speed")
+    phase_timer.mark("save:restore_replay_speed")
     if frame_count <= 0:
         app.runtime.flush()
-        mark_phase("save:flush_empty_episode")
+        phase_timer.mark("save:flush_empty_episode")
         app.writer.discard_episode(episode_index)
-        mark_phase("save:discard_empty_episode")
+        phase_timer.mark("save:discard_empty_episode")
         state.discarded_episodes += 1
         _reset_recording_state(state)
         print(f"  丢弃片段 Discarding episode {episode_index}: no samples")
         if show_standby:
             _print_standby(app)
-        mark_phase("save:reset_empty_episode")
+        phase_timer.mark("save:reset_empty_episode")
         _debug_frozen_maybe_report(
             app,
             reason=f"save_empty:{reason}",
-            elapsed_sec=time.perf_counter() - save_started,
-            phases=phases,
+            elapsed_sec=phase_timer.elapsed_sec(),
+            phases=phase_timer.phases,
             step_count=step_count,
         )
         return False
@@ -3814,23 +3709,23 @@ def _save_active_episode(
             "episode_frame_count": frame_count,
         },
     ))
-    mark_phase("save:plan_finalize_episode")
+    phase_timer.mark("save:plan_finalize_episode")
     for job in finalize_jobs:
         app.runtime.writer_pool.submit(job)
-    mark_phase("save:submit_finalize_jobs")
+    phase_timer.mark("save:submit_finalize_jobs")
     app.runtime.flush()
-    mark_phase("save:flush_writer")
+    phase_timer.mark("save:flush_writer")
     state.saved_episodes += 1
     _reset_recording_state(state)
     print(f"  已保存片段 Episode saved {episode_index}")
     if show_standby:
         _print_standby(app)
-    mark_phase("save:reset_recording_state")
+    phase_timer.mark("save:reset_recording_state")
     _debug_frozen_maybe_report(
         app,
         reason=f"save:{reason}",
-        elapsed_sec=time.perf_counter() - save_started,
-        phases=phases,
+        elapsed_sec=phase_timer.elapsed_sec(),
+        phases=phase_timer.phases,
         step_count=step_count,
     )
     return True
@@ -3842,15 +3737,7 @@ def _discard_active_episode(
     reason: str,
     show_standby: bool = True,
 ) -> bool:
-    discard_started = time.perf_counter()
-    phase_started = discard_started
-    phases: list[tuple[str, float]] = []
-
-    def mark_phase(name: str) -> None:
-        nonlocal phase_started
-        now = time.perf_counter()
-        phases.append((name, now - phase_started))
-        phase_started = now
+    phase_timer = PhaseTimer()
 
     state = app.control_state
     if not state.recording_active or state.active_episode_index is None:
@@ -3860,28 +3747,28 @@ def _discard_active_episode(
     frame_count = int(app.sample_builder.frame_index)
     print(f"\n录制完成 Recording finished for episode {episode_index}")
     print(f"  数据帧数 Data frames: {frame_count}")
-    mark_phase("discard:announce")
+    phase_timer.mark("discard:announce")
     _freeze_jitter_arms_at_current_pose(app)
-    mark_phase("discard:freeze_jitter_arms")
+    phase_timer.mark("discard:freeze_jitter_arms")
     active_run = state.active_replay_run
     if active_run is not None:
         _restore_replay_arm_speed_override(app, active_run.original_max_angvel_by_side)
-    mark_phase("discard:restore_replay_speed")
+    phase_timer.mark("discard:restore_replay_speed")
     app.runtime.flush()
-    mark_phase("discard:flush_writer")
+    phase_timer.mark("discard:flush_writer")
     discarded = app.writer.discard_episode(episode_index)
-    mark_phase("discard:writer_discard")
+    phase_timer.mark("discard:writer_discard")
     state.discarded_episodes += 1
     _reset_recording_state(state)
     print(f"  丢弃片段 Discarding episode {episode_index} discarded={discarded}")
     if show_standby:
         _print_standby(app)
-    mark_phase("discard:reset_recording_state")
+    phase_timer.mark("discard:reset_recording_state")
     _debug_frozen_maybe_report(
         app,
         reason=f"discard:{reason}",
-        elapsed_sec=time.perf_counter() - discard_started,
-        phases=phases,
+        elapsed_sec=phase_timer.elapsed_sec(),
+        phases=phase_timer.phases,
     )
     return True
 
@@ -3983,13 +3870,16 @@ def _start_replay_episode(
         )
     )
     app.sample_builder.set_episode(episode_index)
+    topology = CollectionTopology.for_active_sides(app.active_sides)
     startup_initializer = StartupInitializer(
         duration_s=float(startup_duration),
         source=startup_source,
         target_action=first_action,
         active_sides=app.active_sides,
         arms_enabled=True,
-        hands_enabled=any(f"{side}_hand" in app.components.backends for side in app.active_sides),
+        hands_enabled=any(
+            topology.hand_effector(side) in app.components.backends for side in app.active_sides
+        ),
     )
     startup_initializer.reset()
     state.recording_active = True
@@ -4077,13 +3967,16 @@ def _start_recorded_replay_run_from_group(
         )
     )
     app.sample_builder.set_episode(episode_index)
+    topology = CollectionTopology.for_active_sides(app.active_sides)
     startup_initializer = StartupInitializer(
         duration_s=float(startup_duration),
         source=str(startup_source) if float(startup_duration) > 0.0 else "disabled",
         target_action=startup_target_action,
         active_sides=app.active_sides,
         arms_enabled=True,
-        hands_enabled=any(f"{side}_hand" in app.components.backends for side in app.active_sides),
+        hands_enabled=any(
+            topology.hand_effector(side) in app.components.backends for side in app.active_sides
+        ),
     )
     startup_initializer.reset()
     state.recording_active = True
@@ -4148,13 +4041,17 @@ def _start_unrecorded_replay_run(
         return
     startup_initializer: StartupInitializer | None = None
     if float(startup_duration_s) > 0.0:
+        topology = CollectionTopology.for_active_sides(app.active_sides)
         startup_initializer = StartupInitializer(
             duration_s=float(startup_duration_s),
             source=str(startup_source),
             target_action=None if target_action is None else np.asarray(target_action, dtype=np.float32).reshape(ACTION_DIM),
             active_sides=app.active_sides,
             arms_enabled=True,
-            hands_enabled=any(f"{side}_hand" in app.components.backends for side in app.active_sides),
+            hands_enabled=any(
+                topology.hand_effector(side) in app.components.backends
+                for side in app.active_sides
+            ),
         )
         startup_initializer.reset()
     state.active_unrecorded_replay_run = ActiveUnrecordedReplayRun(
@@ -4275,13 +4172,15 @@ def _advance_unrecorded_replay_run(
 
     raw_action: NormalizedAction | None = None
     if run.purpose == "move_to_init_start" and run.startup_target_qpos_by_side:
+        topology = CollectionTopology.for_active_sides(app.active_sides)
+        rig_backends = getattr(app.components.rig, "backends", {})
         command = _build_joint_target_teleop_command(
             run.startup_target_qpos_by_side,
             hand_action=run.group.actions[0],
             hand_sides=[
                 side
                 for side in app.active_sides
-                if f"{side}_hand" in getattr(app.components.rig, "backends", {})
+                if topology.hand_effector(side) in rig_backends
             ],
             now=float(now),
         )
@@ -4595,11 +4494,13 @@ def _handle_key(
 
 def build_collect_app(args: argparse.Namespace) -> CollectApp:
     active_sides = tuple(args.active_sides)
+    topology = CollectionTopology.for_active_sides(active_sides)
     _assert_side_config_consistency(args, active_sides)
     _assert_tactile_visualization_config(args, active_sides)
-    fixed_sides = _fixed_arm_sides(args, active_sides)
-    jitter_sides = _jitter_arm_sides(args, active_sides)
-    moving_sides = _moving_arm_sides(args, active_sides)
+    mode_spec = resolve_collection_mode(args, active_sides)
+    fixed_sides = mode_spec.fixed_arm_sides
+    jitter_sides = mode_spec.jitter_arm_sides
+    moving_sides = mode_spec.moving_arm_sides
     replay_groups = _build_replay_groups(args)
     replay_init_plan = _build_replay_init_plan(args)
     calibration = _load_calibration(args)
@@ -4615,7 +4516,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     default_clutch_pressed = args.control_mode == "delta_clutch"
     for side in ("left", "right"):
         keyboard_source.set_button(
-            f"{side}_clutch_button",
+            CollectionTopology.for_active_sides((side,)).clutch_button_channel(side),
             default_clutch_pressed,
             side=side,
             critical=False,
@@ -4652,22 +4553,23 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         tuple(
             side
             for side in active_sides
-            if f"{side}_hand" in all_backends
+            if topology.hand_effector(side) in all_backends
         )
         if replay_groups
         else tuple(hand_retargeters)
     )
     for side in hand_rig_sides:
-        hand_backend = all_backends.get(f"{side}_hand")
+        hand_effector = topology.hand_effector(side)
+        hand_backend = all_backends.get(hand_effector)
         if hand_backend is not None:
-            rig_backends[f"{side}_hand"] = hand_backend
-            rig_backend_names.add(f"{side}_hand")
+            rig_backends[hand_effector] = hand_backend
+            rig_backend_names.add(hand_effector)
 
     rig = BimanualRig(
         backends=rig_backends,
         parallel_dispatch=len(rig_backends) > 1,
     )
-    replay_hands_enabled = any(f"{side}_hand" in rig_backends for side in active_sides)
+    replay_hands_enabled = any(topology.hand_effector(side) in rig_backends for side in active_sides)
     replay_action_filter = (
         ActionSafetyFilter(
             ActionSafetyFilterConfig(
@@ -4688,7 +4590,6 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     session = TeleopSession(
         config=TeleopSessionConfig(
             mode="collect_real",
-            tcp_mode="hand_base",
             record_enabled=False,
             recovery_healthy_frame_count=max(1, int(args.recovery_healthy_frames)),
         ),
@@ -4700,7 +4601,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             freeze_on_fault=True,
             required_channels=()
             if replay_groups
-            else tuple(f"{side}_wrist_pose" for side in moving_sides),
+            else tuple(topology.wrist_pose_channel(side) for side in moving_sides),
             invalid_frame_limit=max(1, int(args.invalid_frame_limit)),
             minimum_control_hz=float(args.minimum_control_hz),
             target_control_hz=float(args.hz),
@@ -4713,10 +4614,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         backends=all_backends,
         rig=rig,
         metadata={
-            "source_entrypoint": _source_entrypoint_for_modes(
-                fixed_sides=fixed_sides,
-                jitter_sides=jitter_sides,
-            ),
+            "source_entrypoint": mode_spec.source_entrypoint,
             "task_name": str(args.task_name),
             "task_id": str(args.task_id),
             "task_description": str(args.task_description),
@@ -4810,91 +4708,29 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
 
 
 def _camera_status_text(app: CollectApp) -> str:
-    if not app.camera_sources:
-        return " camera=off"
-    bits: list[str] = []
-    if app.camera_previewer is not None and app.camera_previewer.disabled_reason:
-        bits.append(
-            "preview=disabled:"
-            + _compact_log_value(app.camera_previewer.disabled_reason, max_chars=80)
-        )
-    for camera_key, source in sorted(app.camera_sources.items()):
-        try:
-            info = source.device_info()
-        except Exception as exc:  # noqa: BLE001
-            bits.append(f"{camera_key}=status_error:{type(exc).__name__}")
-            continue
-        frame_count = int(info.get("frame_count", 0) or 0)
-        last_error = info.get("last_error")
-        if last_error:
-            bits.append(
-                f"{camera_key}=frames:{frame_count},err:"
-                f"{_compact_log_value(last_error, max_chars=70)}"
-            )
-        else:
-            bits.append(f"{camera_key}=frames:{frame_count}")
-    return "" if not bits else f" camera={';'.join(bits)}"
+    return _snapshot_camera_status_text(
+        app.camera_sources,
+        camera_previewer=app.camera_previewer,
+    )
 
 
 def _camera_state_signature_text(app: CollectApp) -> tuple[tuple[str, ...], str]:
-    if not app.camera_sources:
-        return (), "camera=off"
-    signature_parts: list[str] = []
-    text_parts: list[str] = []
-    if app.camera_previewer is not None:
-        disabled_reason = app.camera_previewer.disabled_reason
-        if disabled_reason:
-            reason_text = _compact_log_value(disabled_reason, max_chars=80)
-            signature_parts.append(f"preview:disabled:{reason_text}")
-            text_parts.append(f"preview=disabled:{reason_text}")
-        else:
-            signature_parts.append("preview:active")
-            text_parts.append("preview=active")
-    for camera_key, source in sorted(app.camera_sources.items()):
-        try:
-            info = source.device_info()
-        except Exception as exc:  # noqa: BLE001
-            state = f"status_error:{type(exc).__name__}"
-            signature_parts.append(f"{camera_key}:{state}")
-            text_parts.append(f"{camera_key}={state}")
-            continue
-        frame_count = int(info.get("frame_count", 0) or 0)
-        last_error = info.get("last_error")
-        if last_error:
-            error_text = _compact_log_value(last_error, max_chars=70)
-            signature_parts.append(f"{camera_key}:error:{error_text}")
-            text_parts.append(f"{camera_key}=error:{error_text}")
-        elif frame_count > 0:
-            signature_parts.append(f"{camera_key}:streaming")
-            text_parts.append(f"{camera_key}=streaming")
-        else:
-            signature_parts.append(f"{camera_key}:waiting")
-            text_parts.append(f"{camera_key}=waiting")
-    return tuple(signature_parts), "camera=" + ";".join(text_parts)
+    return _snapshot_camera_state_signature_text(
+        app.camera_sources,
+        camera_previewer=app.camera_previewer,
+    )
 
 
 def _fault_signature(faults: list[Any]) -> tuple[str, ...]:
-    parts: list[str] = []
-    for fault in faults:
-        code = str(getattr(fault, "code", fault))
-        channel_name = getattr(fault, "channel_name", None)
-        parts.append(f"{code}:{channel_name}" if channel_name else code)
-    return tuple(sorted(parts))
+    return _snapshot_fault_signature(faults)
 
 
 def _fault_status_text(faults: list[Any]) -> str:
-    bits: list[str] = []
-    for fault in faults:
-        code = str(getattr(fault, "code", fault))
-        channel_name = getattr(fault, "channel_name", None)
-        message = str(getattr(fault, "message", "") or "")
-        if channel_name:
-            code = f"{code}:{channel_name}"
-        bits.append(code if not message else f"{code}({_compact_log_value(message, max_chars=70)})")
-    return "; ".join(bits)
+    return _snapshot_fault_status_text(faults)
 
 
 def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None, app: CollectApp) -> str:
+    topology = CollectionTopology.for_active_sides(app.active_sides)
     state_value = (
         result.state.value
         if result is not None
@@ -4911,7 +4747,7 @@ def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None
     hand_bits: list[str] = []
     if result is not None:
         for side in app.active_sides:
-            channel = result.channels.get(f"{side}_hand_q6")
+            channel = result.channels.get(topology.hand_q6_channel(side))
             if channel is None:
                 continue
             if channel.valid:
@@ -4969,6 +4805,8 @@ def main() -> int:
     last_status_at = 0.0
     last_fault_signature: tuple[str, ...] | None = None
     last_camera_state_signature: tuple[str, ...] | None = None
+    tactile_preview_rate = PreviewRateLimiter(float(args.tactile_vis_hz))
+    camera_preview_rate = PreviewRateLimiter(float(args.vis_cam_hz))
     loop_period_sec = 1.0 / float(args.hz)
     should_quit = False
     recovery_plan: RecoveryPlan | None = None
@@ -5014,7 +4852,7 @@ def main() -> int:
 
         if app.fixed_arm_retargeters:
             _log(
-                "LeftArmFixed",
+                "NonOperatorArmFixed",
                 "enabled; left_arm will hold the qpos captured by p, right_wrist_pose drives right_arm.",
             )
         if app.jitter_arm_retargeters:
@@ -5040,8 +4878,9 @@ def main() -> int:
         if app.replay_groups:
             print("采集模式 / Collection mode: trajectory replay")
             rig_backend_names = set(getattr(app.components.rig, "backends", {}) or {})
+            topology = CollectionTopology.for_active_sides(app.active_sides)
             replay_hand_sides = [
-                side for side in app.active_sides if f"{side}_hand" in rig_backend_names
+                side for side in app.active_sides if topology.hand_effector(side) in rig_backend_names
             ]
             print(
                 "  replay hands: "
@@ -5093,18 +4932,7 @@ def main() -> int:
             if int(args.max_steps) > 0 and step_count >= int(args.max_steps):
                 break
             loop_started_at = time.time()
-            loop_perf_started = time.perf_counter()
-            phase_started = loop_perf_started
-            phase_timings: list[tuple[str, float]] = []
-
-            def mark_loop_phase(name: str) -> None:
-                nonlocal phase_started
-                now_perf = time.perf_counter()
-                phase_timings.append((name, now_perf - phase_started))
-                phase_started = now_perf
-
-            def record_nested_phase(name: str, elapsed_sec: float) -> None:
-                phase_timings.append((name, float(elapsed_sec)))
+            loop_phase_timer = PhaseTimer()
 
             for key in key_controller.poll():
                 should_quit = _handle_key(
@@ -5115,7 +4943,7 @@ def main() -> int:
                 )
                 if should_quit:
                     break
-            mark_loop_phase("loop.keys")
+            loop_phase_timer.mark("loop.keys")
             if should_quit:
                 break
 
@@ -5128,7 +4956,7 @@ def main() -> int:
                     step_count=step_count,
                 )
                 step_count += 1
-                mark_loop_phase("loop.advance_unrecorded_replay")
+                loop_phase_timer.mark("loop.advance_unrecorded_replay")
             elif app.control_state.active_replay_run is not None:
                 _advance_replay_episode(
                     app,
@@ -5137,20 +4965,20 @@ def main() -> int:
                     step_count=step_count,
                 )
                 step_count += 1
-                mark_loop_phase("loop.advance_replay")
+                loop_phase_timer.mark("loop.advance_replay")
             elif app.control_state.return_home_plan is not None:
                 _advance_return_home(app, now=loop_started_at)
                 step_count += 1
-                mark_loop_phase("loop.advance_return_home")
+                loop_phase_timer.mark("loop.advance_return_home")
             elif app.calibration.metadata.get("home_ready"):
                 result = runtime.step(
                     now=loop_started_at,
-                    phase_recorder=record_nested_phase
+                    phase_recorder=loop_phase_timer.record
                     if app.control_state.debug_frozen_enabled
                     else None,
                 )
                 step_count += 1
-                mark_loop_phase("loop.runtime_step")
+                loop_phase_timer.mark("loop.runtime_step")
                 recovery_plan = _drive_recovery_step(
                     app,
                     args,
@@ -5158,7 +4986,7 @@ def main() -> int:
                     recovery_plan,
                     now=loop_started_at,
                 )
-                mark_loop_phase("loop.drive_recovery")
+                loop_phase_timer.mark("loop.drive_recovery")
                 current_fault_signature = _fault_signature(result.faults)
                 if current_fault_signature != last_fault_signature:
                     if current_fault_signature:
@@ -5166,19 +4994,40 @@ def main() -> int:
                     elif last_fault_signature is not None:
                         _log("State", "faults cleared")
                     last_fault_signature = current_fault_signature
-                mark_loop_phase("loop.fault_logging")
+                loop_phase_timer.mark("loop.fault_logging")
             else:
-                mark_loop_phase("loop.idle_no_home")
-            if app.tactile_visualizer is not None:
-                app.tactile_visualizer.update(
-                    tactile_by_side_from_backends(
-                        app.active_sides,
-                        lambda side: _hand_backend(app, side),
+                loop_phase_timer.mark("loop.idle_no_home")
+            current_sample = runtime.last_sample if result is not None else None
+            if app.tactile_visualizer is not None and tactile_preview_rate.should_update(loop_started_at):
+                if current_sample is not None:
+                    app.tactile_visualizer.update(
+                        tactile_by_side_from_hand_states(
+                            app.active_sides,
+                            current_sample.hand_states,
+                        )
                     )
-                )
-            mark_loop_phase("loop.tactile_visualizer")
-            if app.camera_previewer is not None:
-                for key in app.camera_previewer.update(app.preview_camera_sources):
+                else:
+                    app.tactile_visualizer.update(
+                        tactile_by_side_from_backends(
+                            app.active_sides,
+                            lambda side: _hand_backend(app, side),
+                        )
+                    )
+            loop_phase_timer.mark("loop.tactile_visualizer")
+            if app.camera_previewer is not None and camera_preview_rate.should_update(loop_started_at):
+                if current_sample is not None:
+                    preview_frames = {
+                        key: current_sample.camera_frames[key]
+                        for key in app.preview_camera_sources
+                        if key in current_sample.camera_frames
+                    }
+                    preview_keys = app.camera_previewer.update_frame_matches(
+                        preview_frames,
+                        camera_sources=app.preview_camera_sources,
+                    )
+                else:
+                    preview_keys = app.camera_previewer.update(app.preview_camera_sources)
+                for key in preview_keys:
                     should_quit = _handle_key(
                         key,
                         app=app,
@@ -5187,7 +5036,7 @@ def main() -> int:
                     )
                     if should_quit:
                         break
-            mark_loop_phase("loop.camera_previewer")
+            loop_phase_timer.mark("loop.camera_previewer")
             if should_quit:
                 break
             if app.camera_sources:
@@ -5195,21 +5044,21 @@ def main() -> int:
                 if camera_signature != last_camera_state_signature:
                     _log("Camera", f"state changed: {camera_text}")
                     last_camera_state_signature = camera_signature
-            mark_loop_phase("loop.camera_status")
+            loop_phase_timer.mark("loop.camera_status")
             if (
                 not bool(args.silent)
                 and (loop_started_at - last_status_at) >= float(args.status_sec)
             ):
                 print(_status_line(step_count, runtime, result, app))
                 last_status_at = loop_started_at
-            mark_loop_phase("loop.status_line")
+            loop_phase_timer.mark("loop.status_line")
             elapsed = time.time() - loop_started_at
-            active_elapsed_sec = time.perf_counter() - loop_perf_started
+            active_elapsed_sec = loop_phase_timer.elapsed_sec()
             _debug_frozen_maybe_report(
                 app,
                 reason="main_loop",
                 elapsed_sec=active_elapsed_sec,
-                phases=phase_timings,
+                phases=loop_phase_timer.phases,
                 step_count=step_count,
                 result=result,
             )

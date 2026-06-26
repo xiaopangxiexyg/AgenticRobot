@@ -14,7 +14,6 @@ from triad_openvr.triad_openvr import matrix_to_flat_list
 DEFAULT_TRACKERS = (
     "tracker_1:left_wrist",
     "tracker_2:right_wrist",
-    "tracker_3:auxiliary",
 )
 
 
@@ -27,7 +26,7 @@ class TrackerSpec:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read up to three VIVE trackers via triad_openvr and send structured UDP JSON "
+            "Read VIVE trackers via triad_openvr and send structured UDP JSON "
             "packets to the teleop runtime receiver."
         )
     )
@@ -39,7 +38,8 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Tracker mapping in the form 'device_name:tracker_role', "
-            "for example 'tracker_1:left_wrist'. May be specified up to 3 times."
+            "for example 'tracker_1:left_wrist'. Two wrist trackers are sufficient; "
+            "an optional third 'tracker_3:auxiliary' may still be specified."
         ),
     )
     parser.add_argument("--hz", type=float, default=60.0, help="Target send rate")

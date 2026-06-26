@@ -7,6 +7,7 @@ from typing import Any, Callable, Iterable
 from ..session import SessionStepResult
 from .async_writer import AsyncWriterPool, WriteJob
 from .build_collect_components import CollectorComponents
+from .observers import CollectionWriterObserver
 
 SampleBuilder = Callable[[SessionStepResult, CollectorComponents], Any | None]
 WritePlanner = Callable[[Any, CollectorComponents], Iterable[WriteJob]]
@@ -35,14 +36,19 @@ class CollectionRuntime:
         self.write_planner = write_planner
         self.writer_pool = writer_pool
         self.config = config if config is not None else CollectionRuntimeConfig()
+        self.writer_observer = CollectionWriterObserver(
+            components=self.components,
+            sample_builder=self.sample_builder,
+            write_planner=self.write_planner,
+            writer_pool=self.writer_pool,
+        )
         self._started = False
-        self._submitted_samples = 0
 
     def start(self) -> None:
         if self._started:
             return
         if self.config.auto_start_writer_pool:
-            self.writer_pool.start()
+            self.writer_observer.start()
         if self.config.auto_start_session:
             self.components.session.start()
         self._started = True
@@ -70,24 +76,11 @@ class CollectionRuntime:
             phase_recorder=phase_recorder,
         )
         mark_phase("runtime.session.run_step")
-        sample = self.sample_builder(result, self.components)
-        mark_phase("runtime.sample_builder")
-        if sample is None:
-            return result
-        if phase_recorder is None:
-            for job in self.write_planner(sample, self.components):
-                self.writer_pool.submit(job)
-        else:
-            jobs = list(self.write_planner(sample, self.components))
-            mark_phase("runtime.write_planner")
-            for job in jobs:
-                self.writer_pool.submit(job)
-            mark_phase("runtime.writer_submit")
-        self._submitted_samples += 1
+        self.writer_observer.handle_step(result, phase_recorder=phase_recorder)
         return result
 
     def flush(self) -> None:
-        self.writer_pool.join()
+        self.writer_observer.flush()
 
     def close(self) -> None:
         try:
@@ -100,7 +93,11 @@ class CollectionRuntime:
 
     @property
     def submitted_samples(self) -> int:
-        return int(self._submitted_samples)
+        return self.writer_observer.submitted_samples
+
+    @property
+    def last_sample(self) -> Any | None:
+        return self.writer_observer.last_sample
 
     def __enter__(self) -> "CollectionRuntime":
         self.start()

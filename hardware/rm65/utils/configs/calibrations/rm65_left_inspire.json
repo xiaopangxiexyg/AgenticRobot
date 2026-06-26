@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "data_type": "rm65_calibration_profile",
+  "name": "inspire",
+  "arm": "left",
+  "tool_name": "inspire",
+  "created_at": 1782362710.1801322,
+  "updated_at": 1782362779.3184888,
+  "notes": "",
+  "paths": {
+    "pose_sequence_json": "",
+    "force_measurements_json": "",
+    "fit_json": "hardware/rm65/utils/results/rm65_left_inspire_force_measurements_calibration_fit.json",
+    "official_report_json": "",
+    "tool_payload_validation_json": ""
+  },
+  "payload": {
+    "schema_version": 1,
+    "mass_kg": 0.9338152674174209,
+    "com_tool_m": [
+      0.0012632086233525868,
+      -0.0018197969815320202,
+      0.10140896827230611
+    ],
+    "source_fit_json": "hardware/rm65/utils/results/rm65_left_inspire_force_measurements_calibration_fit.json",
+    "fit_source": "tool",
+    "fit_mode": "tool_gravity_model",
+    "updated_at": 1782362716.6767774
+  },
+  "tcp": {
+    "schema_version": 1,
+    "frame_name": "tool_tcp",
+    "pose_flange_m_rad": [
+      0.0,
+      0.0,
+      0.13999999999999996,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_flange_m": [
+      0.0,
+      0.0,
+      0.13999999999999996
+    ],
+    "rotation_flange_rpy_rad": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_source": "gui_adjusted",
+    "rotation_policy": "preserve_existing_tool_rotation",
+    "confirmed": true,
+    "seed_source": "hand-base",
+    "initial_pose_flange_m_rad": [
+      0.0,
+      0.0,
+      0.009,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "base_tool_pose_flange_m_rad": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "com_tool_m": [
+      0.0012632086233525868,
+      -0.0018197969815320202,
+      0.10140896827230611
+    ],
+    "com_distance_m": 0.10143316125968713,
+    "max_auto_com_distance_m": 0.2,
+    "source_fit_json": "hardware/rm65/utils/results/rm65_left_inspire_force_measurements_calibration_fit.json",
+    "warnings": [
+      "tool inspire defaults to hand_base TCP; use GUI adjustment to confirm a task TCP"
+    ],
+    "updated_at": 1782362779.318483,
+    "safety_warnings": []
+  },
+  "impedance": {
+    "pose": {
+      "mode": "pose",
+      "force_source": "work",
+      "axes": "all",
+      "force_sign": 1.0,
+      "angular_force_sign": -1.0,
+      "angular_axis_signs": [
+        1.0,
+        1.0,
+        -1.0
+      ],
+      "control_hz": 40.0,
+      "action_hz": 20.0,
+      "lowpass_alpha": 0.85,
+      "force_deadband_n": 0.3,
+      "torque_deadband_nm": 0.03,
+      "linear_gain_m_s_per_n": 0.0,
+      "angular_gain_rad_s_per_nm": 0.0,
+      "linear_damping_n_s_per_m": 0.0,
+      "angular_damping_nm_s_per_rad": 0.0,
+      "linear_compliance_m_per_n": 0.004,
+      "angular_compliance_rad_per_nm": 0.04,
+      "max_linear_velocity_m_s": 0.04,
+      "max_angular_velocity_rad_s": 0.15,
+      "max_linear_offset_m": 0.05,
+      "max_angular_offset_rad": 0.04,
+      "return_rate_s": 0.35,
+      "trajectory_mode": 0,
+      "radio": 0,
+      "hard_stop_force_n": 50.0,
+      "hard_stop_torque_nm": 10.0,
+      "max_command_joint_step_deg": 20.0
+    },
+    "joint": {
+      "mode": "joint",
+      "force_source": "work",
+      "axes": "all",
+      "force_sign": 1.0,
+      "angular_force_sign": -1.0,
+      "angular_axis_signs": [
+        1.0,
+        1.0,
+        -1.0
+      ],
+      "control_hz": 40.0,
+      "action_hz": 20.0,
+      "lowpass_alpha": 0.85,
+      "force_deadband_n": 0.3,
+      "torque_deadband_nm": 0.03,
+      "linear_gain_m_s_per_n": 0.0,
+      "angular_gain_rad_s_per_nm": 0.0,
+      "linear_damping_n_s_per_m": 0.0,
+      "angular_damping_nm_s_per_rad": 0.0,
+      "linear_compliance_m_per_n": 0.004,
+      "angular_compliance_rad_per_nm": 0.04,
+      "max_linear_velocity_m_s": 0.04,
+      "max_angular_velocity_rad_s": 0.15,
+      "max_linear_offset_m": 0.05,
+      "max_angular_offset_rad": 0.04,
+      "return_rate_s": 0.35,
+      "trajectory_mode": 0,
+      "radio": 0,
+      "hard_stop_force_n": 50.0,
+      "hard_stop_torque_nm": 10.0,
+      "max_command_joint_step_deg": 20.0
+    }
+  }
+}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .run_policy import main
+from .cli import main
 
 
 if __name__ == "__main__":

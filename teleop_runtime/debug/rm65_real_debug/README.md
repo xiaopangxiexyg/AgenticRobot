@@ -131,7 +131,7 @@ python -m teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz \
 - `--load-profile PATH`: 载入已有 calibration profile
 - `--save-initial-alignment PATH_OR_DIR`: 指定初始对齐状态保存位置；运行时按 `s` 保存
 - `--hz`: 状态轮询和渲染频率，默认 `30`
-- `--status-sec`: 终端状态心跳周期，默认 `0.5s`
+- `--status-sec`: 终端状态心跳周期，默认 `0`，表示只打印启动信息、状态变化、错误和保存事件；需要周期性姿态摘要时传入正数
 - `--headless`: 禁用 SAPIEN viewer
 - `--skip-renderer`: 不创建 SAPIEN，只做终端输出
 - `--max-steps`: 限制最大循环步数

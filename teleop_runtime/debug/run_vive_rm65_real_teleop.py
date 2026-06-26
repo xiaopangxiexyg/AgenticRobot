@@ -11,12 +11,18 @@ from pathlib import Path
 
 import numpy as np
 
-from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from ..backends.arms import (
+    RM65ArmBackend,
+    RM65ArmBackendConfig,
+    RM65ImpedanceArmBackend,
+    RM65ImpedanceArmBackendConfig,
+)
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
 )
+from ..arm_frames import TOOL_TCP_FRAME
 from ..calibration import TeleopCalibration
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
@@ -34,7 +40,8 @@ from ..hand_render import (
     RIGHT_HAND_RENDER_JOINT_NAMES,
 )
 from ..hand_tcp_alignment import (
-    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
+    add_vive_tracker_height_correction_args,
     tracker_hand_to_rm65_tcp_rotation,
 )
 from ..initial_alignment import TeleopInitialAlignment
@@ -59,7 +66,7 @@ from ..tactile_visualizer import (
     TactileVisualizerConfig,
     tactile_by_side_from_backends,
 )
-from ..tcp import HAND_BASE_TCP_FRAME, legacy_tcp_mode_requested
+from ..tcp import legacy_tcp_mode_requested
 from .log_utils import ChangeGate
 from .run_vive_sapien_virtual import (
     RecoveryPlan,
@@ -107,8 +114,8 @@ from rm65_inspire_tac.rendering import SapienArmHandRenderer
 class RealTeleopComponents:
     session: TeleopSession
     active_sides: tuple[str, ...]
-    left_command_backend: RM65ArmBackend | None
-    right_command_backend: RM65ArmBackend | None
+    left_command_backend: RM65ArmBackend | RM65ImpedanceArmBackend | None
+    right_command_backend: RM65ArmBackend | RM65ImpedanceArmBackend | None
     left_preview_backend: RM65ArmBackend
     right_preview_backend: RM65ArmBackend
     left_state_backend: RM65ArmBackend | None
@@ -280,31 +287,59 @@ def parse_args() -> argparse.Namespace:
         help="Arm retargeting mode. Use delta_clutch with --keyboard-clutch for relative control.",
     )
     parser.add_argument(
+        "--arm-control-mode",
+        choices=["impedance", "position"],
+        default="impedance",
+        help=(
+            "Real-arm execution mode. Default impedance uses the outer-loop pose impedance profile; "
+            "position uses the legacy IK + Movej_CANFD path."
+        ),
+    )
+    parser.add_argument(
+        "--impedance-mode",
+        choices=["pose"],
+        default="pose",
+        help="Impedance controller reference mode. Pose is the default and matches the unified arm action.",
+    )
+    parser.add_argument(
+        "--force-tare-sec",
+        type=_positive_float,
+        default=3.0,
+        help="Required stillness/tare duration after runtime home before enabling impedance force control.",
+    )
+    parser.add_argument(
+        "--strict-tool-profile",
+        dest="strict_tool_profile",
+        action="store_true",
+        help="Require active RM65 tool, confirmed TCP, payload, and impedance profile before arming. Default.",
+    )
+    parser.add_argument(
+        "--no-strict-tool-profile",
+        dest="strict_tool_profile",
+        action="store_false",
+        help="Allow incomplete tool profiles for lab debugging. Not recommended for real teleop.",
+    )
+    parser.set_defaults(strict_tool_profile=True)
+    parser.add_argument(
+        "--left-tool-profile",
+        type=str,
+        default="",
+        help="Optional explicit left RM65 calibration/impedance profile name or JSON path.",
+    )
+    parser.add_argument(
+        "--right-tool-profile",
+        type=str,
+        default="",
+        help="Optional explicit right RM65 calibration/impedance profile name or JSON path.",
+    )
+    parser.add_argument(
         "--tcp-mode",
         type=str,
-        default=HAND_BASE_TCP_FRAME,
+        default=TOOL_TCP_FRAME,
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Scale applied to desk-frame translation")
-    parser.add_argument(
-        "--vive-tracker-height-correction",
-        dest="vive_tracker_height_correction",
-        action="store_true",
-        help="Shift wrist tracker input by -Z in the tracker local frame before arm IK. Default.",
-    )
-    parser.add_argument(
-        "--no-vive-tracker-height-correction",
-        dest="vive_tracker_height_correction",
-        action="store_false",
-        help="Disable the 4cm VIVE tracker local -Z position correction.",
-    )
-    parser.add_argument(
-        "--vive-tracker-height-correction-m",
-        type=float,
-        default=DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
-        help="VIVE tracker height correction distance in meters; applied as local [0, 0, -value].",
-    )
-    parser.set_defaults(vive_tracker_height_correction=True)
+    add_vive_tracker_height_correction_args(parser)
     parser.add_argument(
         "--no-collision",
         "--disable-collision-avoidance",
@@ -364,8 +399,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aux-tracker-name",
         type=str,
-        default="tracker_3",
-        help="Optional auxiliary tracker name. Pass empty string to disable.",
+        default="",
+        help="Optional auxiliary tracker name. Empty by default; pass tracker_3 to enable a third tracker.",
     )
     parser.add_argument("--headless", action="store_true", help="Disable the SAPIEN viewer window")
     parser.add_argument(
@@ -514,8 +549,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if int(args.tactile_vis_size) <= 0:
         parser.error("--tactile-vis-size must be positive.")
-    args.requested_tcp_mode = str(getattr(args, "tcp_mode", HAND_BASE_TCP_FRAME))
-    args.tcp_mode = HAND_BASE_TCP_FRAME
+    args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
+    args.tcp_mode = TOOL_TCP_FRAME
     active_sides = _active_sides_from_args(args)
     if bool(args.visualize_tactile):
         tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
@@ -567,6 +602,47 @@ def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
     return parse_tactile_regions(value)
 
 
+def _arm_control_mode_arg(args: argparse.Namespace) -> str:
+    return str(getattr(args, "arm_control_mode", "impedance"))
+
+
+def _impedance_mode_arg(args: argparse.Namespace) -> str:
+    return str(getattr(args, "impedance_mode", "pose"))
+
+
+def _strict_tool_profile_arg(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "strict_tool_profile", True))
+
+
+def _force_tare_sec_arg(args: argparse.Namespace) -> float:
+    return float(getattr(args, "force_tare_sec", 3.0))
+
+
+def _tool_profile_arg(args: argparse.Namespace, side: str) -> str | None:
+    return getattr(args, f"{side}_tool_profile", "") or None
+
+
+def _tool_tcp_pose_flange_arg(args: argparse.Namespace, side: str) -> tuple[float, ...] | None:
+    profile_arg = _tool_profile_arg(args, side)
+    if not profile_arg:
+        return None
+    try:
+        from hardware.rm65.calibration_profiles import load_profile
+
+        profile = load_profile(profile_arg, arm=side)
+        tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
+        pose = tcp.get("pose_flange_m_rad")
+        if pose is None:
+            return None
+        values = np.asarray(pose, dtype=float).reshape(6)
+        if not np.all(np.isfinite(values)):
+            return None
+        return tuple(float(value) for value in values)
+    except Exception as exc:
+        _log("TCP", f"WARNING: could not load {side} tool TCP for collision solver: {exc}")
+        return None
+
+
 def _alignment_qpos_pair(alignment: TeleopInitialAlignment | None) -> dict[str, np.ndarray] | None:
     if alignment is None:
         return None
@@ -608,6 +684,10 @@ def _build_episode_metadata(
         "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
         "start_reason": start_reason,
         "control_mode": args.control_mode,
+        "arm_control_mode": _arm_control_mode_arg(args),
+        "impedance_mode": _impedance_mode_arg(args),
+        "strict_tool_profile": _strict_tool_profile_arg(args),
+        "force_tare_sec": _force_tare_sec_arg(args),
         "arm_mode": "real",
         "active_sides": list(components.active_sides),
         "runtime_arm_state_source": "last_commanded_action",
@@ -687,6 +767,10 @@ def _stop_episode_recording(
 
 def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     active_sides = _active_sides_from_args(args)
+    arm_control_mode = _arm_control_mode_arg(args)
+    impedance_mode = _impedance_mode_arg(args)
+    strict_tool_profile = _strict_tool_profile_arg(args)
+    force_tare_sec = _force_tare_sec_arg(args)
     logical_ip_by_side: dict[str, tuple[str, str]] = {}
     inactive_arm_config: list[str] = []
     for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
@@ -776,6 +860,12 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "teleop_hardware_port": int(args.teleop_hardware_port),
             "swap_arm_sides": bool(args.swap_arm_sides),
             "control_dt": control_dt,
+            "arm_control_mode": arm_control_mode,
+            "impedance_mode": impedance_mode,
+            "strict_tool_profile": strict_tool_profile,
+            "force_tare_sec": force_tare_sec,
+            "left_tool_profile": _tool_profile_arg(args, "left"),
+            "right_tool_profile": _tool_profile_arg(args, "right"),
             "arm_io_threads": int(arm_io_threads),
             "arm_step_dt_scaling": bool(args.arm_step_dt_scaling),
             "arm_step_dt_alpha": float(args.arm_step_dt_alpha),
@@ -792,7 +882,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 getattr(
                     args,
                     "vive_tracker_height_correction_m",
-                    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+                    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m,
                 )
             ),
             "vive_tracker_local_translation_offset_m": None
@@ -900,9 +990,16 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                         enforce_realistic_joint_step=True,
                         left_execution_max_joint_step_rad=realistic_joint_step,
                         right_execution_max_joint_step_rad=realistic_joint_step,
+                        left_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "left"),
+                        right_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "right"),
                         left_initial_qpos=left_seed_qpos,
                         right_initial_qpos=right_seed_qpos,
                         ik_tuning=ik_tuning,
+                        output_command_type=(
+                            "cartesian_pose"
+                            if arm_control_mode == "impedance"
+                            else "joint_vector"
+                        ),
                     ),
                     left_pose_retargeter=left_retargeter,
                     right_pose_retargeter=right_retargeter,
@@ -1054,29 +1151,49 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     for _source_name, (logical_side, arm_ip) in side_assignments.items():
         if not arm_ip or logical_side not in active_sides:
             continue
-        command_backend = RM65ArmBackend(
-            RM65ArmBackendConfig(
-                arm_ip=arm_ip,
-                side=logical_side,
-                default_tcp_frame=args.tcp_mode,
-                arm_urdf_path=arm_urdf_path,
-                connect_hardware=True,
-                control_dt=control_dt,
-                max_angvel=tuple(arm_max_angvel.tolist()),
-                dry_run_fast=False,
-                hardware_read_retries=int(args.rm65_hardware_read_retries),
-                hardware_read_retry_delay_sec=float(args.rm65_hardware_read_retry_delay_sec),
-                initial_qpos=None,
-                use_actual_send_dt_scaling=bool(args.arm_step_dt_scaling),
-                actual_send_dt_alpha=float(args.arm_step_dt_alpha),
-                actual_send_dt_min_scale=1.0,
-                actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
-                actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
-                background_streaming_enabled=True,
-                background_streaming_hz=float(args.hz),
-                ik_tuning=ik_tuning,
+        if arm_control_mode == "impedance":
+            command_backend = RM65ImpedanceArmBackend(
+                RM65ImpedanceArmBackendConfig(
+                    arm_ip=arm_ip,
+                    side=logical_side,
+                    connect_hardware=True,
+                    tool_profile=_tool_profile_arg(args, logical_side),
+                    strict_tool_profile=strict_tool_profile,
+                    impedance_mode=impedance_mode,
+                    force_tare_sec=force_tare_sec,
+                    control_dt=control_dt,
+                    action_hz=float(args.hz),
+                    max_angvel=tuple(arm_max_angvel.tolist()),
+                    actual_send_dt_alpha=float(args.arm_step_dt_alpha),
+                    actual_send_dt_min_scale=1.0,
+                    actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
+                    actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
+                )
             )
-        )
+        else:
+            command_backend = RM65ArmBackend(
+                RM65ArmBackendConfig(
+                    arm_ip=arm_ip,
+                    side=logical_side,
+                    default_tcp_frame=args.tcp_mode,
+                    arm_urdf_path=arm_urdf_path,
+                    connect_hardware=True,
+                    control_dt=control_dt,
+                    max_angvel=tuple(arm_max_angvel.tolist()),
+                    dry_run_fast=False,
+                    hardware_read_retries=int(args.rm65_hardware_read_retries),
+                    hardware_read_retry_delay_sec=float(args.rm65_hardware_read_retry_delay_sec),
+                    initial_qpos=None,
+                    use_actual_send_dt_scaling=bool(args.arm_step_dt_scaling),
+                    actual_send_dt_alpha=float(args.arm_step_dt_alpha),
+                    actual_send_dt_min_scale=1.0,
+                    actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
+                    actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
+                    background_streaming_enabled=True,
+                    background_streaming_hz=float(args.hz),
+                    ik_tuning=ik_tuning,
+                )
+            )
         state_backend = RM65ArmBackend(
             RM65ArmBackendConfig(
                 arm_ip=arm_ip,
@@ -1399,16 +1516,54 @@ def _apply_active_arm_command_to_preview_real(
 def _command_backend_for_side(
     components: RealTeleopComponents,
     side: str,
-) -> RM65ArmBackend | None:
+) -> RM65ArmBackend | RM65ImpedanceArmBackend | None:
     return components.left_command_backend if side == "left" else components.right_command_backend
 
 
-def _active_command_backend(components: RealTeleopComponents) -> RM65ArmBackend | None:
+def _active_command_backend(components: RealTeleopComponents) -> RM65ArmBackend | RM65ImpedanceArmBackend | None:
     for side in components.active_sides:
         backend = _command_backend_for_side(components, side)
         if backend is not None:
             return backend
     return None
+
+
+def _enable_impedance_force_control_after_runtime_home(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> None:
+    if _arm_control_mode_arg(args) != "impedance":
+        return
+    backends: list[tuple[str, RM65ImpedanceArmBackend]] = []
+    for side in components.active_sides:
+        backend = _command_backend_for_side(components, side)
+        if not isinstance(backend, RM65ImpedanceArmBackend):
+            raise RuntimeError(f"{side}_arm command backend is not RM65ImpedanceArmBackend.")
+        backends.append((side, backend))
+    _log(
+        "ForceControl",
+        f"runtime home captured; hold active tools still for tare_sec={_force_tare_sec_arg(args):.2f}s "
+        f"before enabling pose impedance.",
+    )
+
+    def enable_one(item: tuple[str, RM65ImpedanceArmBackend]) -> tuple[str, dict[str, object]]:
+        side, backend = item
+        backend.enable_force_control()
+        return side, backend.get_state()
+
+    if len(backends) > 1 and int(getattr(args, "arm_io_threads", 1)) > 1:
+        with ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="rm65_tare") as executor:
+            results = [future.result() for future in (executor.submit(enable_one, item) for item in backends)]
+    else:
+        results = [enable_one(item) for item in backends]
+    for side, state in results:
+        _log(
+            "ForceControl",
+            f"{side}_arm pose impedance enabled "
+            f"tool={state.get('active_tool_name')} "
+            f"profile={state.get('active_tool_profile_path')} "
+            f"tare_sec={state.get('force_tare_sec')}",
+        )
 
 
 def _extract_hand_command_from_command(command: TeleopCommand | None) -> TeleopCommand | None:
@@ -1668,6 +1823,10 @@ def main() -> None:
         )
         _log(
             "ArmMode",
+            f"control_mode={_arm_control_mode_arg(args)} "
+            f"impedance_mode={_impedance_mode_arg(args)} "
+            f"strict_tool_profile={_strict_tool_profile_arg(args)} "
+            f"force_tare_sec={_force_tare_sec_arg(args):.2f} "
             f"state_read_retries={args.rm65_hardware_read_retries} "
             f"retry_delay_sec={args.rm65_hardware_read_retry_delay_sec:.3f} "
             f"io_threads={max(1, int(args.arm_io_threads))} "
@@ -1721,10 +1880,11 @@ def main() -> None:
         if legacy_tcp_mode_requested(args.requested_tcp_mode):
             _log(
                 "TCP",
-                "legacy --tcp-mode rm_eef was requested; runtime now uses hand_base only.",
+                "legacy --tcp-mode rm_eef was requested; runtime now uses tool_tcp actions.",
             )
         components.session.set_calibration_ready()
         components.session.mark_debug_passed()
+        _enable_impedance_force_control_after_runtime_home(args, components)
         components.session.arm_hardware()
         clutch_input.consume_episode_start_request()
         clutch_input.consume_episode_stop_request()

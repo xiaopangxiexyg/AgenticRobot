@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
+from .action.schema import ActionRecord
 from .calibration import TeleopCalibration
 from .diagnostics import FaultEvent, FaultSeverity, RateTracker, TeleopRunState, TeleopStateMachine
 from .interfaces import ObservationSource, Retargeter, Rig
@@ -25,7 +26,7 @@ class TeleopSessionConfig:
     source_profile: str = ""
     embodiment_profile: str = ""
     teleop_profile: str = ""
-    tcp_mode: str = "hand_base"
+    tcp_mode: str = "tool_tcp"
     scale: float = 1.0
     stale_timeout_sec: float = 0.5
     record_enabled: bool = True
@@ -55,6 +56,8 @@ class SessionStepResult:
     channels: dict[str, ObservationChannel] = field(default_factory=dict)
     observation: TeleopObservation | None = None
     command: TeleopCommand | None = None
+    command_dispatched: bool = False
+    action_record: ActionRecord | None = None
     faults: list[FaultEvent] = field(default_factory=list)
 
 
@@ -353,11 +356,13 @@ class TeleopSession:
             self.recorder.record_command(command)
             mark_phase("session.record_command")
 
+        command_dispatched = False
         if self.rig is not None and self.state_machine.state in {
             TeleopRunState.ARMED,
             TeleopRunState.RUNNING,
         }:
             self.rig.send_commands(command, phase_recorder=phase_recorder)
+            command_dispatched = True
             mark_phase("session.rig.send_commands")
             if self.state_machine.state != TeleopRunState.RUNNING:
                 self._transition(TeleopRunState.RUNNING, "first command dispatched")
@@ -370,6 +375,7 @@ class TeleopSession:
             channels=channels,
             observation=observation,
             command=command,
+            command_dispatched=command_dispatched,
             faults=faults,
         )
 

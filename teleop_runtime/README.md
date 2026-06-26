@@ -21,11 +21,13 @@
 - `InspireTacHandBackend`
 - `BimanualRig`
 - 独立数据采集 CLI runner：
-  [teleop_runtime/collection/run_collect.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/run_collect.py)
+  `python -m teleop_runtime.collection`
+  （兼容旧入口 `python -m teleop_runtime.collection.run_collect`）
 - 数据采集使用说明：
   [teleop_runtime/collection/README.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/collection/README.md)
 - 独立策略部署 CLI runner：
-  [teleop_runtime/deploy/run_policy.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/deploy/run_policy.py)
+  `python -m teleop_runtime.deploy`
+  （兼容旧入口 `python -m teleop_runtime.deploy.run_policy`）
 - 策略部署使用说明：
   [teleop_runtime/deploy/README.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/deploy/README.md)
 - 交互式 calibration debug app：
@@ -53,6 +55,38 @@
 - `teleop_runtime/session.py`: 主循环
 - `teleop_runtime/calibration.py`: 标定和坐标变换
 
+## Action Contract 说明
+
+当前 RM65 + InspireTac 主线仍使用 26 维 action：
+
+- `left_arm_pose7 + right_arm_pose7 + left_hand_q6 + right_hand_q6`
+
+arm pose7 的正式语义是 `T_arm_base_tool_tcp`：
+
+- `tool_tcp` 是 action 主 frame；tracker retarget、数据集 arm pose、policy pose 输出和真机执行目标都按 TCP 解释。
+- TCP 与末端工具 profile 绑定，左右臂分开加载，例如
+  `hardware/rm65/utils/configs/calibrations/rm65_right_empty.json`。
+- 如果只控制机械臂、不加载末端工具 profile，`tool_tcp` 会退回为机械臂
+  `arm_endpoint` 本身。
+- 加载 profile 时会检查 TCP 相对 `arm_endpoint` 的偏移；距离超过 `0.20m` 或总旋转
+  偏差超过 `90deg` 时会打印显式 warning。
+- RM65 后端内部会把 `tool_tcp` 转到 SDK/IK 需要的 hand_base 或 arm_link6 frame；这些内部 frame 不应作为模型 action 语义。
+- `arm_endpoint` / `hand_base` 仅保留为兼容和调试 frame。
+- 数据集和部署 metadata 会写 `arm_action_specs_by_side`、
+  `arm_controlled_frame_by_side` 和 `arm_reference_frame_by_side`；下游代码应按这些
+  spec 解释 arm pose，不要凭维度猜测 pose 控制的是 TCP 还是内部 frame。
+
+为了后续接入夹爪和高自由度灵巧手，action 层已经预留 hand16 contract：
+
+- `left_arm_pose7 + right_arm_pose7 + left_hand_q16 + right_hand_q16`
+
+hand16 中的空槽必须按无效值处理，而不是按 0 处理：
+
+- 有效槽由 `hand_active_dof_by_side` / `hand_active_mask_by_side` / 本体 hand spec 定义
+- 无效槽值约定为 `NaN`
+- 下游模型、数据统计、loss、replay 和部署下发都只能使用有效槽
+- 旧数据集和旧模型应自行通过 adapter 映射到当前 contract，runtime 主线不为旧维度保留额外语义兼容
+
 ## 依赖
 
 按链路分别准备：
@@ -73,7 +107,9 @@
 
 - `tracker_1 -> left_wrist`
 - `tracker_2 -> right_wrist`
-- `tracker_3 -> auxiliary`
+
+第三只 `auxiliary` tracker 是可选项。实际遥操和当前标定流程只需要左右两个 wrist tracker；
+virtual desk 扫动可以用 `left_wrist` 或 `right_wrist` 代替 auxiliary。
 
 示例：
 
@@ -82,8 +118,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
   --host 192.168.20.90 \
   --port 9999 \
   --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist \
-  --tracker tracker_3:auxiliary
+  --tracker tracker_2:right_wrist
 ```
 
 发送协议是结构化 JSON UDP，`teleop_runtime` 也保留了 legacy float 包兼容。
@@ -96,7 +131,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 它当前实现的是：
 
-- `auxiliary tracker -> virtual desk` 标定
+- `auxiliary/left_wrist/right_wrist tracker -> virtual desk` 标定
 - 左右 wrist tracker 同步 coarse 标定
 - 可选的 tracker/hand frame 可视化
 - `TRACKER_FRAME_VIZ` 中的 wrist 姿态细调
@@ -113,7 +148,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 当前已经落地的主线不是“固定物理 desk 绝对外参恢复”，而是：
 
-1. 用 `auxiliary tracker` 标定一个 `virtual desk`
+1. 用 auxiliary 或任意一只 wrist tracker 标定一个 `virtual desk`
 2. 用左右 wrist tracker 同步标定 `tracker -> hand control frame` 外参
 3. 每次 session 再做 `home anchor`
 
@@ -173,8 +208,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 ```bash
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --host 0.0.0.0 \
-  --port 9999 \
-  --tcp-mode hand_base
+  --port 9999
 ```
 
 如果你已经保存过一个可用 profile，可以直接载入并跳过 `virtual desk` 和 `wrist coarse`：
@@ -183,7 +217,6 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode hand_base \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
 
@@ -193,14 +226,14 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 2. `VIRTUAL_DESK_X`
 3. `VIRTUAL_DESK_Y`
 4. `VIRTUAL_DESK_Z`
-5. `VIRTUAL_DESK_NEUTRAL`
-6. `WRIST_COARSE`
-7. `TRACKER_FRAME_VIZ` 可选
-8. `SAVE`
+5. `WRIST_COARSE`
+6. `TRACKER_FRAME_VIZ` 可选
+7. `SAVE`
 
 当前这套流程的核心是：
 
-- `auxiliary tracker` 不需要固定在物理桌面上
+- virtual desk tracker 不需要固定在物理桌面上；没有第三只 tracker 时直接使用左/右 wrist tracker
+- virtual desk 原点由三段 X/Y/Z sweep 样本均值自动给出，不再额外采 `VIRTUAL_DESK_NEUTRAL`
 - 通过一组扫动动作拟合出 `virtual desk`
 - 机器人侧仍沿用现有 `desk -> base` 预设
 
@@ -233,6 +266,11 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 - `--right-tracker-translation`
 - `--show-tracker-frame-viz`
 - `--frame-viz-mode`
+
+运行时 VIVE tracker 到手腕/TCP 的默认局部高度修正集中在
+`teleop_runtime/hand_tcp_alignment.py` 的 `ViveTrackerAlignmentConfig`。
+现有默认值保持 `height_correction_m = 0.04`，各入口统一暴露
+`--vive-tracker-height-correction-m` 和 `--no-vive-tracker-height-correction`。
 
 ### 3. Home Anchor
 
@@ -267,7 +305,6 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode hand_base \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
 
@@ -277,7 +314,6 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
-  --tcp-mode hand_base \
   --control-mode absolute \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
@@ -416,7 +452,6 @@ session = build_bimanual_session(
     calibration=calibration,
     session_config=TeleopSessionConfig(
         mode="bimanual",
-        tcp_mode="hand_base",
         record_enabled=True,
     ),
     keyboard_source=keyboard,
@@ -489,8 +524,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
   --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist \
-  --tracker tracker_3:auxiliary
+  --tracker tracker_2:right_wrist
 ```
 
 SAPIEN 虚拟跑法：
@@ -504,7 +538,6 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --right-arm-ip 192.168.1.20 \
   --left-hand-port /dev/serial/by-id/your_left_hand \
   --right-hand-port /dev/serial/by-id/your_right_hand \
-  --tcp-mode hand_base \
   --control-mode absolute
 ```
 
@@ -515,7 +548,6 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
   --host 0.0.0.0 \
   --port 9999 \
   --arm-mode virtual \
-  --tcp-mode hand_base \
   --control-mode absolute \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
@@ -533,7 +565,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 当前预留的 scene profile 顺序是：`dual_arm` -> `dual_arm_hand_proxy_open` -> `dual_arm_hand` -> `dual_arm_cylinder_table`
 - runtime home calibration 只负责 home 锚点，不负责完整 desk/world 对齐
 - 启动时会打印 `expecting ...` 和 `observed ...`，这是当前最直接的 tracker 绑定验收信息
-- 当前 runtime 固定只使用 `hand_base`
+- 当前 action 主 frame 是 `tool_tcp`；`--tcp-mode hand_base` 只作为历史兼容参数保留
 - 如果加了 `--left-hand-port` / `--right-hand-port`，对应手部 `q6` 会实时映射成 SAPIEN 手部关节；不传这些参数时，行为和之前完全一致
 - 手部默认 `--hand-joint-order` 是 `5,4,3,2,0,1`，也就是把 reader 的 `[thumb_yaw, thumb_flex, index, middle, ring, pinky]` 重排成 InspireTac 顺序 `[pinky, ring, middle, index, thumb_yaw, thumb_flex]`
 - 手部输入默认是**附加功能**：手部输入异常不会触发 arm teleop 的 `FROZEN`
@@ -743,7 +775,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 4. 先用 `control_mode="absolute"` 做虚拟验收，确认前/左/上和双臂相对关系
 5. 再切到 `control_mode="delta_clutch"` 验证真实遥操作手感
 6. 录一段 episode，按 `validate -> SAPIEN replay -> real replay` 跑完复现检查
-7. 启动 `run_vive_rm65_real_teleop.py` 接入双臂真机，统一用 `tcp_mode="hand_base"`
+7. 启动 `run_vive_rm65_real_teleop.py` 接入双臂真机，统一按 `tool_tcp` action 执行
 8. 最后再接 `hand_q6 -> InspireTac`
 
 如果下一步继续开发，建议优先补：

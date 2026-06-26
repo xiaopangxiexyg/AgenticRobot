@@ -8,6 +8,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from ..action import (
+    arm_action_specs_metadata,
+    hand_action_specs_metadata,
+    normalize_arm_action_specs,
+    normalize_hand_action_specs,
+)
 from ..recording import _to_serializable
 from .async_writer import WriteJob
 from .sample_assembler import CollectorSample
@@ -97,6 +103,8 @@ class LeRobotV21WriterConfig:
     format_name: str = "lerobot_v2.1_style"
     write_parquet: bool = True
     write_video: bool = True
+    arm_action_specs: Mapping[str, Any] | None = None
+    hand_action_specs: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
@@ -104,6 +112,8 @@ class LeRobotV21WriterConfig:
             raise ValueError("chunk_size must be positive.")
         if float(self.nominal_fps) <= 0.0:
             raise ValueError("nominal_fps must be positive.")
+        self.arm_action_specs = normalize_arm_action_specs(self.arm_action_specs)
+        self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
 
 
 @dataclass
@@ -218,6 +228,8 @@ class LeRobotV21Writer:
         )
 
     def _write_info_locked(self) -> None:
+        arm_specs = arm_action_specs_metadata(self.config.arm_action_specs)
+        hand_specs = hand_action_specs_metadata(self.config.hand_action_specs)
         _write_json(
             self.info_path,
             {
@@ -231,6 +243,19 @@ class LeRobotV21Writer:
                 "write_video": bool(self.config.write_video),
                 "task_id": self.config.task_id,
                 "task_description": self.config.task_description,
+                "arm_action_specs_by_side": arm_specs,
+                "arm_controlled_frame_by_side": {
+                    side: spec["controlled_frame"] for side, spec in arm_specs.items()
+                },
+                "arm_reference_frame_by_side": {
+                    side: spec["reference_frame"] for side, spec in arm_specs.items()
+                },
+                "arm_spec_required": True,
+                "hand_action_specs_by_side": hand_specs,
+                "hand_active_mask_by_side": {
+                    side: list(spec["active_mask"]) for side, spec in hand_specs.items()
+                },
+                "hand_spec_required": True,
                 "features": {
                     "action": {"shape": [26], "dtype": "float32"},
                     "observation.state": {"shape": [38], "dtype": "float32"},
@@ -274,17 +299,57 @@ class LeRobotV21Writer:
             state = self._episodes[episode_index]
             if metadata:
                 state.metadata.update(_to_serializable(dict(metadata)))
+            state.metadata.setdefault(
+                "arm_action_specs_by_side",
+                arm_action_specs_metadata(self.config.arm_action_specs),
+            )
+            state.metadata.setdefault(
+                "hand_action_specs_by_side",
+                hand_action_specs_metadata(self.config.hand_action_specs),
+            )
             return state
         episode_id = episode_id_from_index(episode_index)
         chunk_id = chunk_id_from_episode_index(
             episode_index,
             chunk_size=self.config.chunk_size,
         )
+        episode_metadata = {} if metadata is None else dict(_to_serializable(dict(metadata)))
+        episode_metadata.setdefault(
+            "arm_action_specs_by_side",
+            arm_action_specs_metadata(self.config.arm_action_specs),
+        )
+        episode_metadata.setdefault(
+            "arm_controlled_frame_by_side",
+            {
+                side: spec.controlled_frame
+                for side, spec in self.config.arm_action_specs.items()
+            },
+        )
+        episode_metadata.setdefault(
+            "arm_reference_frame_by_side",
+            {
+                side: spec.reference_frame
+                for side, spec in self.config.arm_action_specs.items()
+            },
+        )
+        episode_metadata.setdefault("arm_spec_required", True)
+        episode_metadata.setdefault(
+            "hand_action_specs_by_side",
+            hand_action_specs_metadata(self.config.hand_action_specs),
+        )
+        episode_metadata.setdefault(
+            "hand_active_mask_by_side",
+            {
+                side: list(spec.active_mask or ())
+                for side, spec in self.config.hand_action_specs.items()
+            },
+        )
+        episode_metadata.setdefault("hand_spec_required", True)
         state = _EpisodeState(
             episode_index=int(episode_index),
             episode_id=episode_id,
             chunk_id=chunk_id,
-            metadata={} if metadata is None else dict(_to_serializable(dict(metadata))),
+            metadata=episode_metadata,
         )
         self._episodes[episode_index] = state
         self._next_episode_index = max(self._next_episode_index, episode_index + 1)

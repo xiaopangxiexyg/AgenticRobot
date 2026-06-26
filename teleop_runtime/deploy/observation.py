@@ -20,6 +20,8 @@ from .schema import (
     STATE_ARM_POSE_SLICES,
     STATE_ARM_QPOS_SLICES,
     STATE_HAND_SLICES,
+    deploy_arm_specs_metadata,
+    deploy_hand_specs_metadata,
     nan_vector,
     normalize_active_sides,
     pose_matrix_to_xyzquat,
@@ -304,6 +306,32 @@ def build_deployment_observation(
     last = nan_vector(ACTION_DIM) if last_action is None else np.asarray(last_action, dtype=np.float32).reshape(-1)
     if last.shape != (ACTION_DIM,):
         last = nan_vector(ACTION_DIM)
+    observation_metadata = {} if metadata is None else dict(to_serializable(dict(metadata)))
+    observation_metadata.setdefault("arm_action_specs_by_side", deploy_arm_specs_metadata())
+    observation_metadata.setdefault(
+        "arm_controlled_frame_by_side",
+        {
+            side: str(spec.get("controlled_frame", ""))
+            for side, spec in observation_metadata["arm_action_specs_by_side"].items()
+        },
+    )
+    observation_metadata.setdefault(
+        "arm_reference_frame_by_side",
+        {
+            side: str(spec.get("reference_frame", ""))
+            for side, spec in observation_metadata["arm_action_specs_by_side"].items()
+        },
+    )
+    observation_metadata.setdefault("arm_spec_required", True)
+    observation_metadata.setdefault("hand_action_specs_by_side", deploy_hand_specs_metadata())
+    observation_metadata.setdefault(
+        "hand_active_mask_by_side",
+        {
+            side: list(spec.get("active_mask", ()))
+            for side, spec in observation_metadata["hand_action_specs_by_side"].items()
+        },
+    )
+    observation_metadata.setdefault("hand_spec_required", True)
     return DeploymentObservation(
         timestamp=now,
         step_index=int(step_index),
@@ -322,5 +350,5 @@ def build_deployment_observation(
         arm_states={str(side): dict(to_serializable(dict(state or {}))) for side, state in arm_states.items()},
         hand_states={str(side): dict(to_serializable(dict(state or {}))) for side, state in hand_states.items()},
         faults=faults,
-        metadata={} if metadata is None else dict(to_serializable(dict(metadata))),
+        metadata=observation_metadata,
     )

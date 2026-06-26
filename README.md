@@ -10,6 +10,8 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 ```
 
+### 00. 机械臂末端重力标定和TCP标定见 hardware/rm65/utils/README.md
+
 ## 0. 本地路径配置
 
 机器相关路径集中放在仓库根目录的 `local_paths.json`，该文件已被 `.gitignore` 忽略。没有该文件时，代码默认使用仓库内的 `datasets/` 和 `teleop_records/`。
@@ -247,7 +249,7 @@ cd "$REPO"
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root "$DATASET_ROOT" \
   --task right_arm_dual_data \
   --task-description "bimanual InspireTac teleop with single RealSense front camera" \
@@ -282,7 +284,7 @@ cd "$REPO"
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate grasp_py310_copy
 
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root "$DATASET_ROOT" \
   --task right_arm_new_soft_hard \
   --task-description "right InspireTac teleop with single RealSense front camera" \
@@ -445,9 +447,9 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 
 
-# LeftArmFixed 采集模式
+# 左臂非操作者实验模式
 
-这里放两条复用 `teleop_runtime.collection.run_collect` 的左臂非操作者采集链路：
+这里放两条复用 `teleop_runtime.collection` 主采集链路的左臂非操作者采集链路：
 
 - `left-arm-fixed`：左臂固定在按 `p` 时读取到的当前位置。
 - `left-arm-jitter`：左臂以按 `p` 时的位置为中心，末端做小范围随机平滑抖动，并和右臂一起走双臂 IK。
@@ -463,10 +465,11 @@ python -m teleop_runtime.collection.replay_dataset_sapien \
 
 ## 固定左臂启动
 
-推荐用专用入口，它会自动打开 `--left-arm-fixed`：
+当前只保留主采集入口，显式传入 `--left-arm-fixed`：
 
 ```bash
-python -m teleop_runtime.LeftArmFixed.run_collect \
+python -m teleop_runtime.collection \
+  --left-arm-fixed \
   --dataset-root /path/to/datasets \
   --task-name grasp_demo_left_arm_fixed \
   --active-sides both \
@@ -483,16 +486,9 @@ python -m teleop_runtime.LeftArmFixed.run_collect \
   --no-video
 ```
 
-也可以直接用原 collector：
-
-```bash
-python -m teleop_runtime.collection.run_collect --left-arm-fixed ...
-```
-
-
 ## 相机可视化
 
-`LeftArmFixed` 两个入口都会直接复用 `teleop_runtime.collection.run_collect` 的相机链路，因此支持：
+这两个实验模式都会直接复用 `teleop_runtime.collection` 的相机链路，因此支持：
 
 - `--camera-config`：加载 RealSense 配置。
 - `--vis_cam` / `--vis-cam`：打开实时相机预览窗口。
@@ -502,7 +498,8 @@ python -m teleop_runtime.collection.run_collect --left-arm-fixed ...
 固定左臂模式带相机预览示例：
 
 ```bash
-python -m teleop_runtime.LeftArmFixed.run_collect \
+python -m teleop_runtime.collection \
+  --left-arm-fixed \
   --dataset-root /path/to/datasets \
   --task-name grasp_demo_left_arm_fixed_camera \
   --active-sides both \
@@ -520,14 +517,15 @@ python -m teleop_runtime.LeftArmFixed.run_collect \
   --vis-cam-key front
 ```
 
-抖动左臂模式同样支持相机预览，只需要在 `run_collect_jitter` 命令里加入相同的 `--camera-config --vis_cam --vis-cam-key front` 参数。
+抖动左臂模式同样支持相机预览，只需要在主采集命令里加入相同的 `--camera-config --vis_cam --vis-cam-key front` 参数。
 
 ## 左臂小范围抖动 + 双臂 IK
 
-这个入口会自动打开 `--left-arm-jitter`：
+显式打开 `--left-arm-jitter`：
 
 ```bash
-python -m teleop_runtime.LeftArmFixed.run_collect_jitter \
+python -m teleop_runtime.collection \
+  --left-arm-jitter \
   --dataset-root ./test_left_fix_datasets \
   --task-name grasp_demo_left_arm_jitter \
   --active-sides both \

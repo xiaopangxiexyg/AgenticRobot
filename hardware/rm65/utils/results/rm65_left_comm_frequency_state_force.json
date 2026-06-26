@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "generated_by": "hardware/rm65/utils/scripts/rm65_comm_frequency_probe.py",
+  "arm": "left",
+  "ip": "192.168.101.21",
+  "mode": "state-force",
+  "duration_sec": 3.0,
+  "hz_values": [
+    20.0,
+    33.0,
+    50.0,
+    75.0,
+    100.0
+  ],
+  "thresholds": {
+    "max_missed_fraction": 0.05,
+    "max_p99_period_ratio": 1.0
+  },
+  "reports": [
+    {
+      "hz": 20.0,
+      "mode": "state-force",
+      "period_ms": 50.0,
+      "loops": 60,
+      "total_sec": 3.0001174499921035,
+      "actual_hz": 19.99921703070589,
+      "command_count": 0,
+      "state_count": 60,
+      "force_count": 60,
+      "missed_deadlines": 0,
+      "missed_fraction": 0.0,
+      "loop_duration": {
+        "mean_ms": 11.884856199806867,
+        "p50_ms": 10.912271507550031,
+        "p95_ms": 16.88239963405067,
+        "p99_ms": 20.125941214791958,
+        "max_ms": 21.37080699321814
+      },
+      "loop_interval": {
+        "mean_ms": 50.001911474174776,
+        "p50_ms": 50.00056899734773,
+        "p95_ms": 50.07475058082491,
+        "p99_ms": 50.07937178306747,
+        "max_ms": 50.08074000943452
+      },
+      "p99_period_ratio": 0.40251882429583913,
+      "max_joint_delta_deg": 0.0059999823570251465,
+      "max_pose_linear_delta_m": 3.90640499692279e-05,
+      "max_pose_angular_delta_rad": 0.002999999999999966,
+      "max_force_norm_n": 0.5743666194945706,
+      "max_torque_norm_nm": 0.009110433206837451,
+      "passed": true
+    },
+    {
+      "hz": 33.0,
+      "mode": "state-force",
+      "period_ms": 30.303030303030305,
+      "loops": 99,
+      "total_sec": 3.0001156340003945,
+      "actual_hz": 32.99872807502158,
+      "command_count": 0,
+      "state_count": 99,
+      "force_count": 99,
+      "missed_deadlines": 0,
+      "missed_fraction": 0.0,
+      "loop_duration": {
+        "mean_ms": 12.663443373796069,
+        "p50_ms": 12.760017008986324,
+        "p95_ms": 19.159654193208553,
+        "p99_ms": 19.443552607554004,
+        "max_ms": 21.459344017785043
+      },
+      "loop_interval": {
+        "mean_ms": 30.304133255041812,
+        "p50_ms": 30.304087995318696,
+        "p95_ms": 30.348343649529852,
+        "p99_ms": 30.370967285416555,
+        "max_ms": 30.414626002311707
+      },
+      "p99_period_ratio": 0.6416372360492821,
+      "max_joint_delta_deg": 0.006999999284744263,
+      "max_pose_linear_delta_m": 4.8031239834048625e-05,
+      "max_pose_angular_delta_rad": 0.0028284271247461927,
+      "max_force_norm_n": 0.5168162185621898,
+      "max_torque_norm_nm": 0.01135781715931931,
+      "passed": true
+    },
+    {
+      "hz": 50.0,
+      "mode": "state-force",
+      "period_ms": 20.0,
+      "loops": 150,
+      "total_sec": 3.000116587005323,
+      "actual_hz": 49.99805695875574,
+      "command_count": 0,
+      "state_count": 150,
+      "force_count": 150,
+      "missed_deadlines": 19,
+      "missed_fraction": 0.12666666666666668,
+      "loop_duration": {
+        "mean_ms": 14.094565320022715,
+        "p50_ms": 12.834134497097693,
+        "p95_ms": 21.363307307183277,
+        "p99_ms": 29.57533956127005,
+        "max_ms": 38.279386004433036
+      },
+      "loop_interval": {
+        "mean_ms": 20.000748181224946,
+        "p50_ms": 19.999537005787715,
+        "p95_ms": 21.366459014825523,
+        "p99_ms": 29.617096628062466,
+        "max_ms": 38.28301199246198
+      },
+      "p99_period_ratio": 1.4787669780635024,
+      "max_joint_delta_deg": 0.0059999823570251465,
+      "max_pose_linear_delta_m": 4.474371464241474e-05,
+      "max_pose_angular_delta_rad": 0.004242640687119132,
+      "max_force_norm_n": 0.5192244055073492,
+      "max_torque_norm_nm": 0.008485281447995555,
+      "passed": false
+    },
+    {
+      "hz": 75.0,
+      "mode": "state-force",
+      "period_ms": 13.333333333333334,
+      "loops": 225,
+      "total_sec": 3.0089847540075425,
+      "actual_hz": 74.77605185613912,
+      "command_count": 0,
+      "state_count": 225,
+      "force_count": 225,
+      "missed_deadlines": 75,
+      "missed_fraction": 0.3333333333333333,
+      "loop_duration": {
+        "mean_ms": 13.04833859593297,
+        "p50_ms": 10.894136998103932,
+        "p95_ms": 19.26118118572049,
+        "p99_ms": 28.77364099491384,
+        "max_ms": 63.23299399809912
+      },
+      "loop_interval": {
+        "mean_ms": 13.356561946368727,
+        "p50_ms": 12.633242993615568,
+        "p95_ms": 19.26541853317758,
+        "p99_ms": 28.81705328996763,
+        "max_ms": 63.236124988179654
+      },
+      "p99_period_ratio": 2.158023074618538,
+      "max_joint_delta_deg": 0.0059999823570251465,
+      "max_pose_linear_delta_m": 4.67867502611553e-05,
+      "max_pose_angular_delta_rad": 0.002999999999999966,
+      "max_force_norm_n": 0.491264697026362,
+      "max_torque_norm_nm": 0.008831760995822311,
+      "passed": false
+    },
+    {
+      "hz": 100.0,
+      "mode": "state-force",
+      "period_ms": 10.0,
+      "loops": 300,
+      "total_sec": 3.8819518410018645,
+      "actual_hz": 77.28071142752127,
+      "command_count": 0,
+      "state_count": 300,
+      "force_count": 300,
+      "missed_deadlines": 244,
+      "missed_fraction": 0.8133333333333334,
+      "loop_duration": {
+        "mean_ms": 12.936566619221898,
+        "p50_ms": 10.88650849123951,
+        "p95_ms": 21.258094896620605,
+        "p99_ms": 29.62844242429128,
+        "max_ms": 56.88859199290164
+      },
+      "loop_interval": {
+        "mean_ms": 12.918659327703569,
+        "p50_ms": 10.890139994444326,
+        "p95_ms": 21.261913399212062,
+        "p99_ms": 29.63263250305317,
+        "max_ms": 56.89147501834668
+      },
+      "p99_period_ratio": 2.962844242429128,
+      "max_joint_delta_deg": 0.006999999284744263,
+      "max_pose_linear_delta_m": 4.294182110718616e-05,
+      "max_pose_angular_delta_rad": 0.002999999999999966,
+      "max_force_norm_n": 0.5286340777944156,
+      "max_torque_norm_nm": 0.008544003824126746,
+      "passed": false
+    }
+  ],
+  "all_passed": false
+}

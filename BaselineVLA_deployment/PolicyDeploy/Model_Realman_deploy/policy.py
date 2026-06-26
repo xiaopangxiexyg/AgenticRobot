@@ -398,6 +398,23 @@ class ManipRepRealmanPolicy(ManipRepFR3Policy):
             "action_shape": list(action.shape),
             "model_action_shape": model_action_shape,
             "action_chunk_size": self.action_chunk_size,
+            "arm_action_specs_by_side": dict(
+                getattr(observation, "metadata", {}).get("arm_action_specs_by_side", {})
+            ),
+            "arm_controlled_frame_by_side": dict(
+                getattr(observation, "metadata", {}).get("arm_controlled_frame_by_side", {})
+            ),
+            "arm_reference_frame_by_side": dict(
+                getattr(observation, "metadata", {}).get("arm_reference_frame_by_side", {})
+            ),
+            "arm_spec_required": True,
+            "hand_action_specs_by_side": dict(
+                getattr(observation, "metadata", {}).get("hand_action_specs_by_side", {})
+            ),
+            "hand_active_mask_by_side": dict(
+                getattr(observation, "metadata", {}).get("hand_active_mask_by_side", {})
+            ),
+            "hand_spec_required": True,
         }
         payload["metadata"] = dict(self._last_metadata)
         return payload

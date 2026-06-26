@@ -131,6 +131,48 @@ def _split_observation_state(observation_state: np.ndarray) -> dict[str, list[fl
     }
 
 
+def _hand_specs_from_sample_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    canonical = metadata.get("canonical_action_record")
+    if isinstance(canonical, Mapping):
+        action = canonical.get("action")
+        if isinstance(action, Mapping):
+            action_metadata = action.get("metadata")
+            if isinstance(action_metadata, Mapping):
+                specs = action_metadata.get("hand_action_specs_by_side")
+                if isinstance(specs, Mapping):
+                    return dict(_to_serializable(specs))
+    specs = metadata.get("hand_action_specs_by_side")
+    if isinstance(specs, Mapping):
+        return dict(_to_serializable(specs))
+    return {}
+
+
+def _arm_specs_from_sample_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    canonical = metadata.get("canonical_action_record")
+    if isinstance(canonical, Mapping):
+        action = canonical.get("action")
+        if isinstance(action, Mapping):
+            action_metadata = action.get("metadata")
+            if isinstance(action_metadata, Mapping):
+                specs = action_metadata.get("arm_action_specs_by_side")
+                if isinstance(specs, Mapping):
+                    return dict(_to_serializable(specs))
+    specs = metadata.get("arm_action_specs_by_side")
+    if isinstance(specs, Mapping):
+        return dict(_to_serializable(specs))
+    return {}
+
+
+def _hand_active_masks_from_specs(specs: Mapping[str, Any]) -> dict[str, list[bool]]:
+    masks: dict[str, list[bool]] = {}
+    for side, spec in specs.items():
+        if isinstance(spec, Mapping):
+            active_mask = spec.get("active_mask")
+            if isinstance(active_mask, list | tuple):
+                masks[str(side)] = [bool(value) for value in active_mask]
+    return masks
+
+
 def collector_sample_to_row(
     sample: CollectorSample,
     *,
@@ -138,6 +180,9 @@ def collector_sample_to_row(
 ) -> tuple[dict[str, Any], dict[str, bool]]:
     action_split = _split_action(sample.action)
     observation_split = _split_observation_state(sample.observation_state)
+    arm_specs = _arm_specs_from_sample_metadata(sample.metadata)
+    hand_specs = _hand_specs_from_sample_metadata(sample.metadata)
+    hand_active_masks = _hand_active_masks_from_specs(hand_specs)
     row: dict[str, Any] = {
         "index": int(sample.index),
         "episode_index": int(sample.episode_index),
@@ -170,6 +215,21 @@ def collector_sample_to_row(
         "observation.right_hand.qpos": observation_split["right_hand_qpos"],
         "sample_metadata_json": json.dumps(
             _to_serializable(sample.metadata),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "arm_action_specs_json": json.dumps(
+            _to_serializable(arm_specs),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "hand_action_specs_json": json.dumps(
+            _to_serializable(hand_specs),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "hand_active_mask_by_side_json": json.dumps(
+            _to_serializable(hand_active_masks),
             ensure_ascii=True,
             sort_keys=True,
         ),

@@ -437,3 +437,15 @@ def tactile_by_side_from_backends(
         tactile = backend.get_state().get("tactile")
         tactile_by_side[side] = None if tactile is None else np.asarray(tactile, dtype=float).reshape(-1)
     return tactile_by_side
+
+
+def tactile_by_side_from_hand_states(
+    active_sides: object,
+    hand_states: dict[str, dict[str, Any] | None],
+) -> dict[str, np.ndarray | None]:
+    tactile_by_side: dict[str, np.ndarray | None] = {"left": None, "right": None}
+    for side in tuple(str(side) for side in active_sides):
+        state = hand_states.get(side) or {}
+        tactile = state.get("tactile")
+        tactile_by_side[side] = None if tactile is None else np.asarray(tactile, dtype=float).reshape(-1)
+    return tactile_by_side

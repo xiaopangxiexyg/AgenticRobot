@@ -10,9 +10,24 @@
 - 确认双臂 arm / 双手 q6 / InspireTac telemetry 都正常后，再接 RealSense RGB
 - 单臂模式或不含手模式不是单独一套实现，而是复用同一套双臂 schema，未启用部分留空
 
-当前入口脚本是：
+当前推荐入口是：
 
+- `python -m teleop_runtime.collection`
+
+兼容入口仍然保留：
+
+- `python -m teleop_runtime.collection.run_collect`
 - [run_collect.py](run_collect.py)
+
+第一阶段重构后，包级入口只是一层薄 CLI，真实行为仍由原 collector 承接；后续会继续把
+`run_collect.py` 中的 mode、home calibration、replay、writer 和 debug 逻辑拆到独立模块。
+第二阶段开始把循环耗时与 `--debug-frozen` 相关的纯诊断工具移到
+`teleop_runtime.collection.diagnostics`，并把状态文本快照移到
+`teleop_runtime.collection.status_snapshot`，不改变采集数据 schema 或控制行为。
+开启 `--debug-frozen` 时，报告会额外输出只读端到端延迟分解：
+`step_age / obs_age / cmd_age / channel_age / receiver_age / sender_age`。
+为兼容其他本体/机械臂，side、effector 与 observation channel 的命名被集中到
+`teleop_runtime.collection.topology`；该模块只描述拓扑命名，不负责启动硬件或隐藏 backend。
 
 ## 2. 当前支持范围
 
@@ -79,7 +94,7 @@ VIVE 侧如果沿用当前默认配置，receiver 默认读取：
 完整位置建议放在 `--active-sides` 后面，示例：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root datasets/demo_bimanual_no_camera \
   --task grasp_demo \
   --active-sides both \
@@ -112,7 +127,7 @@ python -m teleop_runtime.collection.run_collect \
 这是当前推荐的第一条真机采集路径：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /path/to/datasets/demo_bimanual_no_camera \
   --task grasp_demo \
   --task-description "bimanual no-camera collection" \
@@ -144,7 +159,7 @@ python -m teleop_runtime.collection.run_collect \
 如果你想先验证双臂 + q6 输入，但暂时不接真实 InspireTac：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /path/to/datasets/demo_bimanual_q6_only \
   --active-sides both \
   --left-arm-ip 192.168.101.21 \
@@ -168,7 +183,7 @@ python -m teleop_runtime.collection.run_collect \
 如果你只想先测 arm collector：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /path/to/datasets/demo_bimanual_arm_only \
   --active-sides both \
   --left-arm-ip 192.168.101.21 \
@@ -182,7 +197,7 @@ python -m teleop_runtime.collection.run_collect \
 单臂不是另一份 schema，只是未启用 side 留空：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /path/to/datasets/demo_left_only \
   --active-sides left \
   --left-arm-ip 192.168.101.21 \
@@ -195,6 +210,22 @@ python -m teleop_runtime.collection.run_collect \
 - `right` 侧字段仍然存在
 - 但低维槽位会留空
 - dataset meta 里会写 `active_sides=["left"]`
+
+## 5.5 Action metadata / spec
+
+collector 导出的 dataset metadata 会写入 action spec，训练和 replay 代码应优先读取
+metadata，而不是只按向量长度猜语义：
+
+- `arm_action_specs_by_side`: arm pose7 控制 `tool_tcp`，也就是当前臂/末端 profile
+  绑定的软件 TCP。
+- `arm_controlled_frame_by_side`: 当前主线固定为 `tool_tcp`。
+- `arm_reference_frame_by_side`: arm pose 所在 reference frame，例如 `left_arm_base` /
+  `right_arm_base`。
+- `hand_action_specs_by_side` 和 `hand_active_mask_by_side`: hand 槽位的有效 mask。
+
+如果后续使用 hand16，未启用槽位是 padding/invalid slot，值通常为 `NaN`。
+这些槽位不能被当成恒定 0 参与 loss、归一化统计或硬件下发；模型和 adapter 只应使用
+mask 标记为有效的槽位。
 
 ## 6. 运行时行为与按键
 
@@ -222,7 +253,7 @@ python -m teleop_runtime.collection.run_collect \
 示例：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /path/to/new_datasets/replay_collect \
   --task-name replay_collect_demo \
   --active-sides both \
@@ -242,7 +273,7 @@ python -m teleop_runtime.collection.run_collect \
 ```
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /path/to/new_datasets/replay_collect \
   --task-name replay_collect_demo_right \
   --active-sides both \
@@ -319,7 +350,7 @@ init_episode 预备模式：
 `T` 可以来自主 `--replay-dataset`，也可以用 `--replay-init-dataset` 或 `--replay-init-parquet` 单独指定。这样 A/D 正式采集轨迹和 H 预备轨迹可以来自不同数据集。
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /home/ai/Desktop/DexTeleop/datasets/2026-05-16_right_arm_dual_data_soft_hard_fixed_tactile_addtion \
   --task-name replay_collect_demo_right \
   --active-sides right \
@@ -433,6 +464,25 @@ qpos 数据要求：
 - arm pose 使用 `xyz + xyzw quaternion`
 - arm action 的 pose frame 是 robot base frame
 - 未启用 side 的槽位按空值写出
+
+### 7.2.1 hand16 空槽语义
+
+后续接入夹爪或高自由度灵巧手时，主 action contract 会使用固定 hand slot，
+例如 `left_hand_q16/right_hand_q16`。这类固定冗余槽只统一数据接口长度，不表示
+每个槽都是真实执行器。
+
+导出的数据集必须同时写清：
+
+- `hand_slot_dof`: 固定槽位数量，例如 `16`
+- `hand_active_dof_by_side`: 每侧本体实际有效自由度
+- `hand_active_mask_by_side`: 每侧哪些槽有效
+- `hand_invalid_slot_value`: 无效槽值，当前约定为 `NaN`
+- `hand_slot_semantics`: 槽位说明
+
+`NaN` 或 mask 为 `False` 的 hand 槽是无效 padding，不是恒定 0 控制量。训练、
+归一化、loss、统计量、replay 和可视化都必须只使用 mask 为 `True` 的有效槽。
+旧数据集、旧模型或特定本体需要自行通过 adapter 映射到当前 action contract；
+collector 不为旧 state/action 维度做额外兼容语义。
 
 ### 7.3 相机语义
 
@@ -683,8 +733,8 @@ collector 启动后会打印按键输入来源：
 
 当前代码已经做过这些轻量检查：
 
-1. `python -m py_compile teleop_runtime/session.py teleop_runtime/collection/sample_assembler.py teleop_runtime/collection/writer_v21.py teleop_runtime/collection/run_collect.py`
-2. `python -m teleop_runtime.collection.run_collect --help`
+1. `python -m py_compile teleop_runtime/session.py teleop_runtime/collection/topology.py teleop_runtime/collection/modes.py teleop_runtime/collection/diagnostics.py teleop_runtime/collection/status_snapshot.py teleop_runtime/collection/cli.py teleop_runtime/collection/__main__.py teleop_runtime/collection/sample_assembler.py teleop_runtime/collection/writer_v21.py teleop_runtime/collection/run_collect.py`
+2. `python -m teleop_runtime.collection --help`
 3. 静态 `build_collect_app(...)` 组装检查：
    - 双臂双手 `--no-camera`
    - 单臂 arm only
@@ -721,10 +771,16 @@ collector 启动后会打印按键输入来源：
 ```bash
 python -m py_compile \
   teleop_runtime/session.py \
+  teleop_runtime/collection/topology.py \
+  teleop_runtime/collection/modes.py \
+  teleop_runtime/collection/diagnostics.py \
+  teleop_runtime/collection/status_snapshot.py \
+  teleop_runtime/collection/cli.py \
+  teleop_runtime/collection/__main__.py \
   teleop_runtime/collection/sample_assembler.py \
   teleop_runtime/collection/writer_v21.py \
   teleop_runtime/collection/run_collect.py
-python -m teleop_runtime.collection.run_collect --help
+python -m teleop_runtime.collection --help
 ```
 
 #### B. 组件装配检查
@@ -759,7 +815,7 @@ PY
 第一条真机链路建议先只带 arm：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /tmp/collect_arm_only_short \
   --active-sides both \
   --left-arm-ip 192.168.101.21 \
@@ -783,7 +839,7 @@ python -m teleop_runtime.collection.run_collect \
 arm only 通过后，再上双手：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /tmp/collect_bimanual_bihand_short \
   --active-sides both \
   --left-arm-ip 192.168.101.21 \
@@ -826,7 +882,7 @@ find /tmp/collect_bimanual_bihand_short -maxdepth 3 -type f | sort
 无相机链路稳定后，再启用相机：
 
 ```bash
-python -m teleop_runtime.collection.run_collect \
+python -m teleop_runtime.collection \
   --dataset-root /tmp/collect_bimanual_with_camera_short \
   --active-sides both \
   --left-arm-ip 192.168.101.21 \

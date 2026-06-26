@@ -5,6 +5,8 @@ from .backends import (
     InspireTacHandBackendConfig,
     RM65ArmBackend,
     RM65ArmBackendConfig,
+    RM65ImpedanceArmBackend,
+    RM65ImpedanceArmBackendConfig,
 )
 from .calibration import (
     ArmCalibration,
@@ -100,6 +102,8 @@ __all__ = [
     "RecordingConfig",
     "RM65ArmBackend",
     "RM65ArmBackendConfig",
+    "RM65ImpedanceArmBackend",
+    "RM65ImpedanceArmBackendConfig",
     "SafetyMonitor",
     "SafetyViolation",
     "SessionRecorder",

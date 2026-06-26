@@ -1,6 +1,9 @@
 # teleop_runtime.deploy
 
-`teleop_runtime.deploy` 是独立于采集主循环和 `LeftArmFixed` 的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`。
+`teleop_runtime.deploy` 是独立于采集主循环和左臂实验模式的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`。
+
+当前推荐入口是 `python -m teleop_runtime.deploy`。兼容入口
+`python -m teleop_runtime.deploy.run_policy` 仍然保留。
 
 部署频率兼容旧接口：
 
@@ -15,7 +18,14 @@
 
 - `action`: 26 维 `[left_arm_pose7, right_arm_pose7, left_hand_q6, right_hand_q6]`
 - `observation.state`: 38 维 `[left_qpos6, left_pose7, left_hand6, right_qpos6, right_pose7, right_hand6]`
-- arm pose 是 base frame 下的 `[x, y, z, qx, qy, qz, qw]`
+- arm pose 是 base frame 下的 `[x, y, z, qx, qy, qz, qw]`，控制对象是
+  `tool_tcp`，也就是当前臂/末端 profile 绑定的软件 TCP。
+- RM65 真机执行会把 `tool_tcp` 目标转换到 SDK/IK 所需的 hand_base 或 arm_link6
+  内部 frame；policy action 不应直接使用这些内部 frame。
+- payload、重力补偿和 impedance 参数同样由部署/真机执行 profile 解释。
+- 部署 observation/action metadata 默认携带 `arm_action_specs_by_side`、
+  `arm_controlled_frame_by_side`、`arm_reference_frame_by_side`。下游模型或 adapter
+  必须按 spec 解释 arm pose。
 
 策略输出支持：
 
@@ -27,10 +37,25 @@
 - dict: `{"left_arm_pose": pose7, "right_arm_pose": pose7, "left_hand": q6, "right_hand": q6}`
 - dict: `{"left_arm_qpos": q6, "right_arm_qpos": q6}` 可直接下发 joint target
 
+### hand16 / 空槽部署语义
+
+后续 hand16 action layout 中，手部固定槽位用于统一夹爪、InspireTac 和高自由度
+灵巧手的接口长度。固定槽位不代表所有槽都有效：
+
+- 有效槽由 `hand_active_mask_by_side` 或本体 `HandActionSpec` 定义。
+- 无效槽值约定为 `NaN`，表示 padding/unused slot。
+- 部署侧不得把 `NaN` 槽解释为 0，也不得把它们下发给硬件。
+- policy 输出、teleop 输入和 dataset replay 都必须在进入 safety filter/backend 前按 mask
+  只取有效槽，再由具体 hand adapter 映射到本体命令。
+
+因此，模型 checkpoint 或部署脚本如果使用 hand16，必须随同声明 hand spec；仅凭固定
+action 维度不足以判断哪些 hand 槽可执行。旧模型/旧数据集应通过自己的 adapter 映射，
+部署主线不为旧 state/action 维度保留额外兼容口径。
+
 ## 单臂 Dry-Run
 
 ```bash
-python -m teleop_runtime.deploy.run_policy \
+python -m teleop_runtime.deploy \
   --policy hold \
   --active-sides right \
   --right-arm-ip "$RIGHT_ARM_IP" \
@@ -42,7 +67,7 @@ python -m teleop_runtime.deploy.run_policy \
 ## 单臂真实下发
 
 ```bash
-python -m teleop_runtime.deploy.run_policy \
+python -m teleop_runtime.deploy \
   --policy /abs/path/my_policy.py:Policy \
   --policy-kwargs-json '{"checkpoint": "/abs/path/model.pt"}' \
   --active-sides right \
@@ -53,7 +78,7 @@ python -m teleop_runtime.deploy.run_policy \
 ## 双臂 + 双手
 
 ```bash
-python -m teleop_runtime.deploy.run_policy \
+python -m teleop_runtime.deploy \
   --policy /abs/path/my_policy.py:create_policy \
   --active-sides both \
   --left-arm-ip "$LEFT_ARM_IP" \
@@ -73,7 +98,7 @@ chunk，避免按 `--min-action-queue` 补队列时跳过轨迹尾部；普通�
 replace pending queue。
 
 ```bash
-python -m teleop_runtime.deploy.run_policy \
+python -m teleop_runtime.deploy \
   --debug-replay-dataset /abs/path/to/dataset \
   --debug-replay-episode 0 \
   --active-sides both \
@@ -87,7 +112,7 @@ python -m teleop_runtime.deploy.run_policy \
 ## 用真机数据集校准部署频率
 
 ```bash
-python -m teleop_runtime.deploy.run_policy \
+python -m teleop_runtime.deploy \
   --policy /abs/path/my_policy.py:Policy \
   --policy-kwargs-json '{"checkpoint": "/abs/path/model.pt"}' \
   --active-sides right \

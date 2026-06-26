@@ -1,4 +1,5 @@
-from .robotic_arm_package.robotic_arm import * 
+from .rm_api2_adapter import Arm, RM65
+import os
 import time
 import numpy as np
 #import pickle
@@ -7,7 +8,7 @@ import multiprocessing
 import signal
 from copy import deepcopy
 import sys
-from .utils import interpolate_vectors_linear
+from .motion_utils import interpolate_vectors_linear
 from hardware.inspire_tac.inspire_tac_modbus import InspireTacModbus
 from dex_retargeting.robot_wrapper import RobotWrapper
 
@@ -30,9 +31,14 @@ class PinRobot:
 对手臂：维护一个插值后的轨迹点队列，以一定底层控制频率不断透传下一个点，策略每做一次决策，控制器插值出从当前到目标的路径点，清空队列、替换成新的路径点
 对灵巧手：每次策略决策后，直接将动作透传给灵巧手，不做插值
 """
-def run_arm_hand_controller(arm_ip, hand_ip, max_fingertip_force, tgt_now, tgt_changed, current_tgt_done, lock, maxd, control_dt, 
-                            stop_event, controller_ready_event, force_pos_control=False):
+def run_arm_hand_controller(arm_ip, hand_ip, max_fingertip_force, tgt_now, tgt_changed, current_tgt_done, lock, maxd, control_dt,
+                            stop_event, controller_ready_event, force_pos_control=False,
+                            force_sensor=1, force_mode=0, force_dir=0, force=0.0,
+                            force_follow=False, singularity_threshold=0.02):
     signal.signal(signal.SIGINT, signal.SIG_IGN) # 忽略子进程的SIGINT信号, 由主进程发异常处理event
+    robot = None
+    hand = None
+    force_position_active = False
     try:
         # create arm connection
         robot = Arm(RM65, arm_ip)
@@ -49,11 +55,11 @@ def run_arm_hand_controller(arm_ip, hand_ip, max_fingertip_force, tgt_now, tgt_c
         if force_pos_control:
             res = robot.Clear_Force_Data(True)
             res = robot.Start_Force_Position_Move(True)
-        
+            force_position_active = True
+
             # handle singularity
             pin_robot = PinRobot()
-            force_mode = True
-        
+
         waypoints = []
         waypoint_ptr = 0
         last_waypoint = deepcopy(tgt_now[:6])
@@ -80,20 +86,22 @@ def run_arm_hand_controller(arm_ip, hand_ip, max_fingertip_force, tgt_now, tgt_c
                 if force_pos_control:
                     # handle singularity
                     res, joint_now, _, _, _ = robot.Get_Current_Arm_State()
-                    min_s = pin_robot.get_min_singular_value(np.array(joint_now)/180.0*np.pi) 
+                    min_s = pin_robot.get_min_singular_value(np.array(joint_now)/180.0*np.pi)
                     print("min_s:", min_s)
-                    if min_s<=0.02:
-                        if force_mode:
+                    if min_s<=singularity_threshold:
+                        if force_position_active:
                             robot.Stop_Force_Position_Move(block=True)
-                            force_mode = False
+                            force_position_active = False
                         robot.Movej_Cmd(waypoints[-1][0:6]/np.pi*180, 5, block=True)
                         waypoint_ptr = len(waypoints)-1
                     else: # switch to force control
-                        if not force_mode:
+                        if not force_position_active:
                             res = robot.Start_Force_Position_Move(True)
-                            force_mode = True
-                        res = robot.Force_Position_Move_Joint(waypoints[waypoint_ptr][0:6]/np.pi*180.0, 
-                                                              sensor=1, mode=0, dir=0, force=0, follow=False)
+                            force_position_active = True
+                        res = robot.Force_Position_Move_Joint(waypoints[waypoint_ptr][0:6]/np.pi*180.0,
+                                                              sensor=force_sensor, mode=force_mode,
+                                                              dir=force_dir, force=force,
+                                                              follow=force_follow)
                 else:
                     robot.Movej_CANFD(waypoints[waypoint_ptr][0:6]/np.pi*180.0, False)
                 last_waypoint = waypoints[waypoint_ptr]
@@ -105,13 +113,17 @@ def run_arm_hand_controller(arm_ip, hand_ip, max_fingertip_force, tgt_now, tgt_c
             time.sleep(max(control_dt - now_time + start_time, 0))
     except Exception as e:
         print('Arm process exception:', e)
-    finally:    
+    finally:
         # 断开连接
-        robot.RM_API_UnInit()
-        robot.Arm_Socket_Close()
-        print('Arm connection closed.')
-        hand.close()
-        print('Hand connection closed.')
+        if robot is not None:
+            if force_position_active:
+                robot.Stop_Force_Position_Move(block=True)
+            robot.RM_API_UnInit()
+            robot.Arm_Socket_Close()
+            print('Arm connection closed.')
+        if hand is not None:
+            hand.close()
+            print('Hand connection closed.')
 
 
 class RM65_Inspire_Tac_Controller:
@@ -121,6 +133,13 @@ class RM65_Inspire_Tac_Controller:
                  max_fingertip_force=800,
                  max_angvel=[0.2]*6, # max angvel for each arm joint, in rad/s
                  control_dt=0.02, # low-level control frequency for the arm
+                 force_pos_control=False,
+                 force_sensor=1,
+                 force_mode=0,
+                 force_dir=0,
+                 force=0.0,
+                 force_follow=False,
+                 singularity_threshold=0.02,
                  ):
         assert np.max(max_angvel)<1.58 # safety
         self.maxd = np.asarray(max_angvel) * control_dt
@@ -136,10 +155,11 @@ class RM65_Inspire_Tac_Controller:
         signal.signal(signal.SIGINT, self.signal_handler)
         
         # mp
-        self.controller_process = multiprocessing.Process(target=run_arm_hand_controller, 
-            args=(arm_ip, hand_ip, max_fingertip_force, self.tgt_now, self.tgt_changed, self.current_tgt_done, 
-                self.lock, self.maxd, self.control_dt, self.stop_event, 
-                self.controller_ready_event))
+        self.controller_process = multiprocessing.Process(target=run_arm_hand_controller,
+            args=(arm_ip, hand_ip, max_fingertip_force, self.tgt_now, self.tgt_changed, self.current_tgt_done,
+                self.lock, self.maxd, self.control_dt, self.stop_event,
+                self.controller_ready_event, force_pos_control, force_sensor, force_mode,
+                force_dir, force, force_follow, singularity_threshold))
         #self.controller_process.daemon = True
         self.controller_process.start()
         while not self.controller_ready_event.is_set():

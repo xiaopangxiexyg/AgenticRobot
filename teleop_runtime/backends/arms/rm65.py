@@ -8,6 +8,17 @@ from typing import Sequence
 import numpy as np
 import time
 
+from hardware.rm65.calibration_profiles import (
+    ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD,
+    tcp_endpoint_delta,
+    tcp_safety_warnings,
+)
+from ...arm_frames import (
+    ARM_ENDPOINT_FRAME,
+    TOOL_TCP_FRAME,
+    canonical_arm_controlled_frame,
+    rm65_urdf_frame_for_controlled_frame,
+)
 from rm65_inspire_tac.ik_tuning import (
     RM65IKTuningConfig,
     joint_jump_exceeds,
@@ -18,12 +29,15 @@ from rm65_inspire_tac.ik_tuning import (
 from ...interfaces import EffectorBackend
 from ...registry import register_backend
 from ...schemas import EffectorCommand
-from ...tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
+from ...tcp import HAND_BASE_TCP_FRAME
+
+
+HAND_BASE_POSE_FLANGE_M_RAD = (0.0, 0.0, 0.009, 0.0, 0.0, 0.0)
 
 
 def _load_rm65_sdk():
     try:
-        from hardware.rm65.robotic_arm_package.robotic_arm import Arm, RM65
+        from hardware.rm65.rm_api2_adapter import Arm, RM65
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "RM65ArmBackend requires the RM65 SDK to be importable."
@@ -69,12 +83,87 @@ def _state_result_is_usable(
     return False
 
 
+def _tool_name_from_frame_result(frame_result: object) -> str:
+    if isinstance(frame_result, tuple) and len(frame_result) >= 2:
+        frame = frame_result[1]
+    else:
+        frame = frame_result
+    if isinstance(frame, dict):
+        value = frame.get("name") or frame.get("frame_name") or frame.get("tool_name")
+        if value is not None:
+            return str(value).strip("\x00")
+    return ""
+
+
+def _rotation_matrix_from_euler_xyz(rx: float, ry: float, rz: float) -> np.ndarray:
+    sx, cx = np.sin(float(rx)), np.cos(float(rx))
+    sy, cy = np.sin(float(ry)), np.cos(float(ry))
+    sz, cz = np.sin(float(rz)), np.cos(float(rz))
+    rx_mat = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=float)
+    ry_mat = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=float)
+    rz_mat = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+    return rz_mat @ ry_mat @ rx_mat
+
+
+def _pose6_to_matrix(pose: Sequence[float]) -> np.ndarray:
+    values = np.asarray(pose, dtype=float).reshape(6)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("TCP pose contains non-finite values.")
+    matrix = np.eye(4, dtype=float)
+    matrix[:3, :3] = _rotation_matrix_from_euler_xyz(*values[3:6])
+    matrix[:3, 3] = values[:3]
+    return matrix
+
+
+def _invert_transform(transform: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(transform, dtype=float).reshape(4, 4)
+    out = np.eye(4, dtype=float)
+    out[:3, :3] = matrix[:3, :3].T
+    out[:3, 3] = -out[:3, :3] @ matrix[:3, 3]
+    return out
+
+
+def _as_pose_matrix(value: object) -> np.ndarray:
+    pose = np.asarray(value, dtype=float)
+    if pose.shape == (4, 4):
+        return pose.copy()
+    if pose.shape == (7,):
+        x, y, z, qx, qy, qz, qw = pose
+        norm = np.linalg.norm(pose[3:7])
+        if norm <= 0.0:
+            raise ValueError("target quaternion norm must be positive")
+        qx, qy, qz, qw = np.asarray([qx, qy, qz, qw], dtype=float) / norm
+        matrix = np.eye(4, dtype=float)
+        matrix[:3, 3] = [x, y, z]
+        matrix[:3, :3] = np.array(
+            [
+                [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+            ],
+            dtype=float,
+        )
+        return matrix
+    raise ValueError(f"Unsupported pose shape for configured TCP transform: {pose.shape}")
+
+
+def _warn_if_tcp_outside_safety_limits(
+    *,
+    owner: str,
+    pose_flange_m_rad: Sequence[float],
+    source: str,
+) -> None:
+    warnings = tcp_safety_warnings(pose_flange_m_rad, label=f"{owner} TCP")
+    for warning in warnings:
+        print(f"WARNING: {warning}; source={source}. Verify this TCP before robot motion.")
+
+
 @dataclass
 class RM65ArmBackendConfig:
     arm_ip: str
     side: str
     effector_name: str | None = None
-    default_tcp_frame: str = "hand_base"
+    default_tcp_frame: str = TOOL_TCP_FRAME
     arm_urdf_path: str | Path | None = None
     connect_hardware: bool = True
     control_dt: float = 0.02
@@ -93,13 +182,23 @@ class RM65ArmBackendConfig:
     actual_send_dt_stall_reset_sec: float = 0.25
     background_streaming_enabled: bool = False
     background_streaming_hz: float = 30.0
+    force_position_control: bool = False
+    force_sensor: int = 1
+    force_mode: int = 0
+    force_dir: int = 0
+    force: float = 0.0
+    force_follow: bool = False
+    force_clear_on_start: bool = True
+    auto_load_tool_profile: bool = True
+    tool_profile: str | None = None
+    tcp_pose_flange_m_rad: tuple[float, ...] | None = None
     ik_tuning_json_path: str | None = None
     ik_tuning: RM65IKTuningConfig | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
             self.effector_name = f"{self.side}_arm"
-        self.default_tcp_frame = canonical_tcp_frame(self.default_tcp_frame)
+        self.default_tcp_frame = canonical_arm_controlled_frame(self.default_tcp_frame)
         if len(self.max_angvel) != 6:
             raise ValueError("max_angvel must contain 6 joint velocity limits.")
         if len(self.dry_run_max_joint_step) != 6:
@@ -116,8 +215,35 @@ class RM65ArmBackendConfig:
             raise ValueError("actual_send_dt_stall_reset_sec must be positive.")
         if float(self.background_streaming_hz) <= 0.0:
             raise ValueError("background_streaming_hz must be positive.")
+        if self.force_sensor not in (0, 1):
+            raise ValueError("force_sensor must be 0 (one-axis) or 1 (six-axis).")
+        if self.force_mode not in (0, 1):
+            raise ValueError("force_mode must be 0 (base frame) or 1 (tool frame).")
+        if not 0 <= int(self.force_dir) <= 5:
+            raise ValueError("force_dir must be in [0, 5].")
         if self.ik_tuning is None:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
+        if self.tool_profile:
+            from hardware.rm65.calibration_profiles import load_profile
+
+            profile = load_profile(self.tool_profile, arm=self.side if self.side in ("left", "right") else None)
+            if str(profile.get("arm")) != self.side:
+                raise ValueError(f"tool_profile arm={profile.get('arm')} does not match backend side={self.side}")
+            tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
+            pose = tcp.get("pose_flange_m_rad")
+            if pose is None:
+                raise ValueError(f"tool_profile {self.tool_profile!r} does not contain tcp.pose_flange_m_rad")
+            self.tcp_pose_flange_m_rad = tuple(float(value) for value in pose)
+        if self.tcp_pose_flange_m_rad is not None:
+            pose = np.asarray(self.tcp_pose_flange_m_rad, dtype=float).reshape(-1)
+            if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+                raise ValueError("tcp_pose_flange_m_rad must contain 6 finite values.")
+            self.tcp_pose_flange_m_rad = tuple(float(value) for value in pose)
+            _warn_if_tcp_outside_safety_limits(
+                owner=f"rm65_{self.side}",
+                pose_flange_m_rad=self.tcp_pose_flange_m_rad,
+                source="RM65ArmBackendConfig.tcp_pose_flange_m_rad",
+            )
 
 
 @register_backend("rm65_arm")
@@ -153,6 +279,7 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_target_qpos: np.ndarray | None = None
         self._stream_stop_event = threading.Event()
         self._stream_thread: threading.Thread | None = None
+        self._force_position_active = False
         self._ik_tuning = config.ik_tuning
         assert self._ik_tuning is not None
         self._joint_distance_weights = np.asarray(
@@ -165,6 +292,14 @@ class RM65ArmBackend(EffectorBackend):
         self._jump_hold_frames = 0
         self._last_target_pose: np.ndarray | None = None
         self._last_ik_metadata: dict[str, object] = {}
+        self._hand_base_to_configured_tcp = self._build_hand_base_to_configured_tcp()
+        self._configured_tcp_enabled = not np.allclose(
+            self._hand_base_to_configured_tcp,
+            np.eye(4, dtype=float),
+            atol=1e-9,
+        )
+        self._active_tool_profile_path: str | None = None
+        self._active_tool_name: str | None = None
 
     @property
     def name(self) -> str:
@@ -175,6 +310,9 @@ class RM65ArmBackend(EffectorBackend):
             return
         Arm, RM65 = _load_rm65_sdk()
         self.arm = Arm(RM65, self.config.arm_ip)
+        self._auto_load_active_tool_profile()
+        if self.config.force_position_control:
+            self._start_force_position_control()
         state = self.refresh_state_from_hardware()
         if state["hardware_result_code"] != 0 and self._current_qpos is None:
             self._current_qpos = np.zeros(6, dtype=float)
@@ -233,7 +371,7 @@ class RM65ArmBackend(EffectorBackend):
             return
 
         if self.arm is not None:
-            raw_send_result = self.arm.Movej_CANFD(qpos_target / np.pi * 180.0, False)
+            raw_send_result = self._send_joint_target(qpos_target)
             send_code, send_text = _parse_rm65_result(raw_send_result)
             with self._state_lock:
                 self._last_send_result_code = send_code
@@ -247,6 +385,7 @@ class RM65ArmBackend(EffectorBackend):
             self._last_command_timestamp = command_start_time
 
     def _solver_for_tcp_frame(self, tcp_frame: str):
+        tcp_frame = canonical_arm_controlled_frame(tcp_frame)
         if tcp_frame not in self._solvers:
             from rm65_inspire_tac.ik import SingleArmIKSolver
 
@@ -268,10 +407,128 @@ class RM65ArmBackend(EffectorBackend):
         return self._solvers[tcp_frame]
 
     def _candidate_tcp_frames(self, tcp_frame: str) -> tuple[str, ...]:
-        tcp_frame = canonical_tcp_frame(tcp_frame)
-        if tcp_frame == HAND_BASE_TCP_FRAME:
+        tcp_frame = canonical_arm_controlled_frame(tcp_frame)
+        if tcp_frame == ARM_ENDPOINT_FRAME:
+            return (rm65_urdf_frame_for_controlled_frame(tcp_frame), HAND_BASE_TCP_FRAME)
+        if tcp_frame in {TOOL_TCP_FRAME, HAND_BASE_TCP_FRAME}:
             return (HAND_BASE_TCP_FRAME, "arm_link6")
         return (tcp_frame, HAND_BASE_TCP_FRAME, "arm_link6")
+
+    def _build_hand_base_to_configured_tcp(self) -> np.ndarray:
+        pose_flange_m_rad = self._active_tcp_pose_flange_m_rad()
+        t_flange_hand_base = _pose6_to_matrix(HAND_BASE_POSE_FLANGE_M_RAD)
+        t_flange_tcp = _pose6_to_matrix(pose_flange_m_rad)
+        return _invert_transform(t_flange_hand_base) @ t_flange_tcp
+
+    def _active_tcp_pose_flange_m_rad(self) -> tuple[float, ...]:
+        pose_flange_m_rad = (
+            ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD
+            if self.config.tcp_pose_flange_m_rad is None
+            else self.config.tcp_pose_flange_m_rad
+        )
+        return tuple(float(value) for value in pose_flange_m_rad)
+
+    def _active_tcp_source(self) -> str:
+        if self.config.tcp_pose_flange_m_rad is None:
+            return "arm_endpoint_default"
+        if self._active_tool_profile_path:
+            return "active_tool_profile"
+        if self.config.tool_profile:
+            return "configured_tool_profile"
+        return "configured_tcp_pose"
+
+    def _set_configured_tcp_pose(self, pose_flange_m_rad: Sequence[float]) -> None:
+        pose = np.asarray(pose_flange_m_rad, dtype=float).reshape(6)
+        if not np.all(np.isfinite(pose)):
+            raise ValueError("tcp_pose_flange_m_rad must contain finite values.")
+        self.config.tcp_pose_flange_m_rad = tuple(float(value) for value in pose)
+        _warn_if_tcp_outside_safety_limits(
+            owner=self.name,
+            pose_flange_m_rad=self.config.tcp_pose_flange_m_rad,
+            source="active tool profile",
+        )
+        self._hand_base_to_configured_tcp = self._build_hand_base_to_configured_tcp()
+        self._configured_tcp_enabled = not np.allclose(
+            self._hand_base_to_configured_tcp,
+            np.eye(4, dtype=float),
+            atol=1e-9,
+        )
+
+    def _auto_load_active_tool_profile(self) -> None:
+        if self.arm is None:
+            return
+        if self.config.tcp_pose_flange_m_rad is not None:
+            return
+        if self.config.tool_profile or not self.config.auto_load_tool_profile:
+            return
+        if self.config.side not in ("left", "right"):
+            return
+        try:
+            code, frame = self.arm.Get_Current_Tool_Frame()
+        except Exception as exc:
+            print(f"WARNING: {self.name} could not read active RM65 tool frame for TCP profile auto-load: {exc}")
+            return
+        if int(code) != 0:
+            print(f"WARNING: {self.name} Get_Current_Tool_Frame failed during TCP profile auto-load: {code}")
+            return
+        tool_name = _tool_name_from_frame_result((code, frame))
+        self._active_tool_name = tool_name or None
+        if not tool_name:
+            return
+        try:
+            from hardware.rm65.calibration_profiles import load_profile
+
+            profile = load_profile(tool_name, arm=self.config.side)
+            profile_tool = str(profile.get("tool_name") or profile.get("name") or "")
+            if profile_tool != tool_name:
+                raise ValueError(f"profile tool_name={profile_tool!r} does not match active tool {tool_name!r}")
+            tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
+            pose = tcp.get("pose_flange_m_rad")
+            if pose is None:
+                print(
+                    f"WARNING: {self.name} active tool profile arm={self.config.side} "
+                    f"tool={tool_name} has no tcp.pose_flange_m_rad; using arm_endpoint"
+                )
+                return
+            self._set_configured_tcp_pose(pose)
+            metrics = tcp_endpoint_delta(self.config.tcp_pose_flange_m_rad)
+            self._active_tool_profile_path = str(profile.get("_profile_path") or "")
+            print(
+                f"{self.name}: auto-loaded TCP profile "
+                f"tool={tool_name} path={self._active_tool_profile_path or '(unknown)'} "
+                f"configured_tcp_enabled={self._configured_tcp_enabled} "
+                f"tcp_endpoint_delta={metrics['translation_m']:.4f}m/{metrics['rotation_deg']:.2f}deg"
+            )
+        except Exception as exc:
+            print(
+                f"WARNING: {self.name} no usable TCP profile for active tool "
+                f"arm={self.config.side} tool={tool_name}: {exc}. Using arm_endpoint."
+            )
+
+    def _target_pose_for_solver(self, tcp_frame: str, target_pose: object) -> np.ndarray:
+        matrix = _as_pose_matrix(target_pose)
+        controlled_frame = canonical_arm_controlled_frame(tcp_frame)
+        if controlled_frame == ARM_ENDPOINT_FRAME:
+            return matrix
+        if controlled_frame == TOOL_TCP_FRAME and self._configured_tcp_enabled:
+            return matrix @ _invert_transform(self._hand_base_to_configured_tcp)
+        return matrix
+
+    def _pose_from_solver_frame(self, tcp_frame: str, solver_pose: np.ndarray) -> np.ndarray:
+        matrix = np.asarray(solver_pose, dtype=float).reshape(4, 4)
+        controlled_frame = canonical_arm_controlled_frame(tcp_frame)
+        if controlled_frame == ARM_ENDPOINT_FRAME:
+            return matrix
+        if controlled_frame == TOOL_TCP_FRAME and self._configured_tcp_enabled:
+            return matrix @ self._hand_base_to_configured_tcp
+        return matrix
+
+    def _controlled_frame_for_cartesian_command(self, command: EffectorCommand) -> str:
+        for key in ("arm_controlled_frame", "target_pose_controlled_frame", "controlled_frame"):
+            value = command.metadata.get(key)
+            if value:
+                return canonical_arm_controlled_frame(str(value))
+        return canonical_arm_controlled_frame(command.metadata.get("tcp_frame", self.config.default_tcp_frame))
 
     def _solve_cartesian_command(
         self,
@@ -279,9 +536,9 @@ class RM65ArmBackend(EffectorBackend):
         *,
         max_joint_step: np.ndarray | None = None,
     ) -> np.ndarray:
-        tcp_frame = canonical_tcp_frame(command.metadata.get("tcp_frame", self.config.default_tcp_frame))
+        tcp_frame = self._controlled_frame_for_cartesian_command(command)
         solver = self._solver_for_tcp_frame(tcp_frame)
-        target_pose = np.asarray(command.value, dtype=float)
+        target_pose = self._target_pose_for_solver(tcp_frame, command.value)
         current_qpos = np.asarray(self._current_qpos, dtype=float).copy()
         command_max_joint_step = (
             np.asarray(max_joint_step, dtype=float).reshape(6)
@@ -390,7 +647,7 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 next_qpos = current_qpos + delta
                 if self.arm is not None and not np.allclose(next_qpos, current_qpos, atol=1e-10):
-                    raw_send_result = self.arm.Movej_CANFD(next_qpos / np.pi * 180.0, False)
+                    raw_send_result = self._send_joint_target(next_qpos)
                     send_code, send_text = _parse_rm65_result(raw_send_result)
                     with self._state_lock:
                         self._last_send_result_code = send_code
@@ -419,6 +676,7 @@ class RM65ArmBackend(EffectorBackend):
                 "ik_objective_mode": self._ik_tuning.ik_objective_mode,
                 "ik_branch_selection": getattr(solver, "last_branch_selection", "unknown"),
                 "ik_jump_gate_status": "disabled",
+                "configured_tcp_enabled": self._configured_tcp_enabled,
             }
             return candidate_qpos
 
@@ -479,6 +737,7 @@ class RM65ArmBackend(EffectorBackend):
             "ik_joint_jump_weighted_deg": float(weighted_jump_deg),
             "ik_joint_jump_threshold_deg": float(weighted_limit),
             "ik_release_ready": release_ready,
+            "configured_tcp_enabled": self._configured_tcp_enabled,
         }
 
         should_hold = bool(small_pose and jump_exceeded and not release_ready)
@@ -508,6 +767,39 @@ class RM65ArmBackend(EffectorBackend):
         self._last_target_pose = target_pose.copy()
         self._last_ik_metadata = metadata
         return candidate_qpos.copy()
+
+    def _start_force_position_control(self) -> None:
+        if self.arm is None:
+            return
+        if self.config.force_clear_on_start:
+            clear_result = self.arm.Clear_Force_Data(True)
+            clear_code, clear_text = _parse_rm65_result(clear_result)
+            if clear_code != 0:
+                raise RuntimeError(
+                    f"{self.name} failed to clear force data before force-position control: {clear_text}"
+                )
+        start_result = self.arm.Start_Force_Position_Move(True)
+        start_code, start_text = _parse_rm65_result(start_result)
+        if start_code != 0:
+            raise RuntimeError(
+                f"{self.name} failed to start force-position control: {start_text}"
+            )
+        self._force_position_active = True
+
+    def _send_joint_target(self, qpos_rad: np.ndarray) -> object:
+        if self.arm is None:
+            return None
+        joint_deg = np.asarray(qpos_rad, dtype=float).reshape(6) / np.pi * 180.0
+        if self.config.force_position_control:
+            return self.arm.Force_Position_Move_Joint(
+                joint_deg,
+                sensor=self.config.force_sensor,
+                mode=self.config.force_mode,
+                dir=self.config.force_dir,
+                force=self.config.force,
+                follow=self.config.force_follow,
+            )
+        return self.arm.Movej_CANFD(joint_deg, False)
 
     def refresh_state_from_hardware(self) -> dict[str, np.ndarray | EffectorCommand | None | int | float | str]:
         if self.arm is None:
@@ -565,8 +857,17 @@ class RM65ArmBackend(EffectorBackend):
             hardware_pose_6d = (
                 None if self._last_hardware_pose_6d is None else self._last_hardware_pose_6d.copy()
             )
+        current_tcp_pose = None
+        if current_qpos is not None:
+            try:
+                current_tcp_pose = self.compute_tcp_pose(qpos=current_qpos)
+            except Exception:
+                current_tcp_pose = None
+        tcp_pose_flange = self._active_tcp_pose_flange_m_rad()
+        tcp_delta = tcp_endpoint_delta(tcp_pose_flange)
         return {
             "current_qpos": current_qpos,
+            "current_tcp_pose": current_tcp_pose,
             "hardware_qpos": hardware_qpos,
             "last_target_qpos": last_target_qpos,
             "last_command": last_command,
@@ -583,6 +884,13 @@ class RM65ArmBackend(EffectorBackend):
             "effective_control_dt_sec": float(self._last_effective_control_dt),
             "effective_step_scale": float(self._last_effective_step_scale),
             "ik_metadata": dict(self._last_ik_metadata),
+            "active_tool_name": self._active_tool_name,
+            "active_tool_profile_path": self._active_tool_profile_path,
+            "configured_tcp_enabled": self._configured_tcp_enabled,
+            "tool_tcp_source": self._active_tcp_source(),
+            "tool_tcp_pose_flange_m_rad": np.asarray(tcp_pose_flange, dtype=float),
+            "tool_tcp_endpoint_delta_m": float(tcp_delta["translation_m"]),
+            "tool_tcp_endpoint_delta_deg": float(tcp_delta["rotation_deg"]),
         }
 
     def set_local_qpos(self, qpos: Sequence[float] | np.ndarray | None) -> None:
@@ -614,9 +922,12 @@ class RM65ArmBackend(EffectorBackend):
             qpos_array = np.asarray(qpos, dtype=float).reshape(-1)
             if qpos_array.shape != (6,) or not np.all(np.isfinite(qpos_array)):
                 raise RuntimeError(f"{self.name} does not have a current joint state yet.")
-        tcp_frame = canonical_tcp_frame(self.config.default_tcp_frame if tcp_frame is None else tcp_frame)
+        tcp_frame = canonical_arm_controlled_frame(
+            self.config.default_tcp_frame if tcp_frame is None else tcp_frame
+        )
         solver = self._solver_for_tcp_frame(tcp_frame)
-        return np.asarray(solver.compute_pose(qpos_array), dtype=float)
+        solver_pose = np.asarray(solver.compute_pose(qpos_array), dtype=float)
+        return self._pose_from_solver_frame(tcp_frame, solver_pose)
 
     def close(self) -> None:
         if self._stream_thread is not None:
@@ -626,6 +937,9 @@ class RM65ArmBackend(EffectorBackend):
         if self.arm is None:
             return
         try:
+            if self._force_position_active:
+                self.arm.Stop_Force_Position_Move(True)
+                self._force_position_active = False
             self.arm.RM_API_UnInit()
         finally:
             try:

@@ -116,6 +116,7 @@ class VirtualDeskCalibrationResult:
     y_fit: SignedAxisFit
     z_fit: SignedAxisFit
     origin_world: np.ndarray
+    origin_source: str
     x_axis_world: np.ndarray
     y_axis_world: np.ndarray
     z_axis_world: np.ndarray
@@ -132,6 +133,7 @@ class VirtualDeskCalibrationResult:
         return {
             "T_W_V": self.T_W_V.tolist(),
             "origin_world": self.origin_world.tolist(),
+            "origin_source": self.origin_source,
             "x_axis_world": self.x_axis_world.tolist(),
             "y_axis_world": self.y_axis_world.tolist(),
             "z_axis_world": self.z_axis_world.tolist(),
@@ -188,7 +190,7 @@ def fit_virtual_desk_frame(
     x_sweep_poses: list[np.ndarray],
     y_sweep_poses: list[np.ndarray],
     z_sweep_poses: list[np.ndarray],
-    neutral_poses: list[np.ndarray],
+    neutral_poses: list[np.ndarray] | None = None,
 ) -> VirtualDeskCalibrationResult:
     x_fit = fit_signed_axis_from_poses(x_sweep_poses)
     y_fit = fit_signed_axis_from_poses(y_sweep_poses)
@@ -208,10 +210,16 @@ def fit_virtual_desk_frame(
         handedness_flip_applied = True
     x_axis = x_raw
 
-    origin_world = np.mean(
-        np.asarray([as_pose_matrix(pose)[:3, 3] for pose in neutral_poses], dtype=float),
-        axis=0,
-    )
+    if neutral_poses:
+        origin_positions = [as_pose_matrix(pose)[:3, 3] for pose in neutral_poses]
+        origin_source = "neutral_hold"
+    else:
+        origin_positions = [
+            as_pose_matrix(pose)[:3, 3]
+            for pose in (list(x_sweep_poses) + list(y_sweep_poses) + list(z_sweep_poses))
+        ]
+        origin_source = "sweep_mean"
+    origin_world = np.mean(np.asarray(origin_positions, dtype=float), axis=0)
     T_W_V = pose_from_rotation_translation(
         np.column_stack([x_axis, y_axis, z_axis]),
         origin_world,
@@ -230,6 +238,7 @@ def fit_virtual_desk_frame(
         y_fit=y_fit,
         z_fit=z_fit,
         origin_world=origin_world,
+        origin_source=origin_source,
         x_axis_world=x_axis,
         y_axis_world=y_axis,
         z_axis_world=z_axis,

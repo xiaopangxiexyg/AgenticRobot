@@ -1,0 +1,313 @@
+{
+  "schema_version": 1,
+  "generated_by": "hardware/rm65/utils/scripts/rm65_force_payload_calibrate.py",
+  "input_json": "/home/password-1/DexTeleop/hardware/rm65/utils/data/measurements/rm65_right_empty_force_sensor_calib4_measurements.json",
+  "arm": "right",
+  "ip": "192.168.1.20",
+  "tool_label": "empth",
+  "input_data_type": "force_measurement_dataset",
+  "gravity_base_dir": [
+    0.0,
+    0.0,
+    -1.0
+  ],
+  "fit": {
+    "mode": "tool_gravity_model",
+    "source": "tool",
+    "euler_order": "yzx",
+    "records": 4,
+    "warnings": [
+      "The pose-dependent gravity term is small compared with the constant force bias; treat mass/CoM as unreliable and use this as an empirical no-contact bias correction only."
+    ],
+    "force_bias_tool_n": [
+      -2.7590843629618615,
+      -2.883806381318659,
+      -3.596549233908169
+    ],
+    "signed_weight_n": 0.16058126577643292,
+    "gravity_fraction_of_mean_force": 0.029510883232943378,
+    "mass_kg_abs": 0.016374732021274638,
+    "weighted_com_n_m": [
+      0.00010862553956304954,
+      -0.002702110278473849,
+      -0.004850233889018809
+    ],
+    "com_tool_m": [
+      0.0006764521318089619,
+      -0.01682705803450214,
+      -0.03020423251471614
+    ],
+    "torque_bias_tool_nm": [
+      -0.08759624116443472,
+      0.017616377870570205,
+      0.04058344811631711
+    ],
+    "before_force_norm_mean_n": 5.44142527042952,
+    "before_force_norm_max_n": 5.513585104655662,
+    "corrected_force_norm_mean_n": 0.1790445842598881,
+    "corrected_force_norm_max_n": 0.31713299505988135,
+    "corrected_force_norm_rms_n": 0.20248337064961094,
+    "before_torque_norm_mean_nm": 0.09954316096968285,
+    "before_torque_norm_max_nm": 0.10199330787677281,
+    "corrected_torque_norm_mean_nm": 0.0012322862299432077,
+    "corrected_torque_norm_max_nm": 0.0014856660444251863,
+    "corrected_torque_norm_rms_nm": 0.0012562198546259829,
+    "mean_corrected_force_base_n": [
+      -0.0004967146593302246,
+      -0.06378716029653057,
+      -4.0146011515140856e-11
+    ],
+    "per_record": [
+      {
+        "index": 1,
+        "position_base": [
+          0.014593260000000002,
+          0.23848731999999997,
+          0.7303558
+        ],
+        "measured_force_base": [
+          0.1416380272879812,
+          4.143745372260199,
+          -3.283646998474308
+        ],
+        "corrected_force_base": [
+          0.21157816717584327,
+          -0.23592343151164577,
+          -0.0121716964278379
+        ],
+        "measured_force_tool": [
+          -2.7797200012207033,
+          -2.5425800037384034,
+          -3.7123400020599364
+        ],
+        "predicted_force_tool": [
+          -2.7625868823535256,
+          -2.8563990745097496,
+          -3.754735563310411
+        ],
+        "corrected_force_tool": [
+          -0.01713311886717772,
+          0.3138190707713462,
+          0.0423955612504745
+        ],
+        "measured_torque_tool": [
+          -0.08401999950408935,
+          0.016360000334680082,
+          0.040340000241994856
+        ],
+        "predicted_torque_tool": [
+          -0.08410661395185985,
+          0.017829174260410512,
+          0.040543050750364636
+        ],
+        "corrected_torque_tool": [
+          8.661444777049998e-05,
+          -0.0014691739257304305,
+          -0.00020305050836978006
+        ],
+        "gravity_tool": [
+          -0.02181150693220044,
+          0.17067561820733873,
+          -0.9850858295168443
+        ]
+      },
+      {
+        "index": 2,
+        "position_base": [
+          0.1634674,
+          0.28757742000000003,
+          0.57958332
+        ],
+        "measured_force_base": [
+          -1.4248140308192807,
+          -3.2927418278871463,
+          -4.159700022588407
+        ],
+        "corrected_force_base": [
+          0.0675721942067456,
+          0.00831244565684579,
+          -0.031767474499070567
+        ],
+        "measured_force_tool": [
+          -2.7496200037002563,
+          -3.086520013809204,
+          -3.617779994010925
+        ],
+        "predicted_force_tool": [
+          -2.7489159591350267,
+          -3.028482777464244,
+          -3.665481714498248
+        ],
+        "corrected_force_tool": [
+          -0.0007040445652295446,
+          -0.058037236344960164,
+          0.047701720487322685
+        ],
+        "measured_torque_tool": [
+          -0.09044000074267387,
+          0.018319999817758798,
+          0.03990000016987324
+        ],
+        "predicted_torque_tool": [
+          -0.09080614982165569,
+          0.017355878560526995,
+          0.040656685781034395
+        ],
+        "corrected_torque_tool": [
+          0.00036614907898181726,
+          0.0009641212572318036,
+          -0.0007566856111611564
+        ],
+        "gravity_tool": [
+          0.06332247898077802,
+          -0.9009543887081359,
+          -0.42926850935431815
+        ]
+      },
+      {
+        "index": 3,
+        "position_base": [
+          -0.01456448,
+          0.23016366000000002,
+          0.46374536
+        ],
+        "measured_force_base": [
+          -3.6258814514548705,
+          -2.9648938736959476,
+          2.8253815265075666
+        ],
+        "corrected_force_base": [
+          -0.18784177646416772,
+          -0.011930345033965612,
+          0.10083857478792874
+        ],
+        "measured_force_tool": [
+          -2.756780014038086,
+          -3.080719995498657,
+          -3.581859993934631
+        ],
+        "predicted_force_tool": [
+          -2.756106440962706,
+          -2.9208371927773378,
+          -3.440324415452073
+        ],
+        "corrected_force_tool": [
+          -0.0006735730753799629,
+          -0.15988280272131927,
+          -0.14153557848255804
+        ],
+        "measured_torque_tool": [
+          -0.09134000018239022,
+          0.017340000029653312,
+          0.04194000020623207
+        ],
+        "predicted_torque_tool": [
+          -0.09134353249053155,
+          0.017420753410610928,
+          0.040608508211265285
+        ],
+        "corrected_torque_tool": [
+          3.5323081413324298e-06,
+          -8.075338095761553e-05,
+          0.0013314919949667867
+        ],
+        "gravity_tool": [
+          0.018544641460863355,
+          -0.2306048048608246,
+          0.9728707623565367
+        ]
+      },
+      {
+        "index": 4,
+        "position_base": [
+          -0.1681799,
+          0.19566168,
+          0.63682594
+        ],
+        "measured_force_base": [
+          1.6949883037441356,
+          2.5744241160098693,
+          -4.57153976547926
+        ],
+        "corrected_force_base": [
+          -0.09329544355574204,
+          -0.015607310297356701,
+          -0.056899404021604316
+        ],
+        "measured_force_tool": [
+          -2.7439999914169313,
+          -3.1187200021743773,
+          -3.6254200172424316
+        ],
+        "predicted_force_tool": [
+          -2.7625107251656322,
+          -3.0228209675855044,
+          -3.6768583103906423
+        ],
+        "corrected_force_tool": [
+          0.018510733748700936,
+          -0.09589903458887283,
+          0.05143829314821069
+        ],
+        "measured_torque_tool": [
+          -0.09090000048279762,
+          0.01835999982431531,
+          0.04005999997258186
+        ],
+        "predicted_torque_tool": [
+          -0.09044370456030773,
+          0.017774193757242703,
+          0.04043175580743429
+        ],
+        "corrected_torque_tool": [
+          -0.0004562959224898855,
+          0.0005858060670726056,
+          -0.00037175583485243163
+        ],
+        "gravity_tool": [
+          -0.021337247450402184,
+          -0.8656961669512957,
+          -0.5001148552053567
+        ]
+      }
+    ],
+    "candidate_orders": [
+      {
+        "euler_order": "yzx",
+        "corrected_force_norm_rms_n": 0.20248337064961094,
+        "corrected_torque_norm_rms_nm": 0.0012562198546259829,
+        "mass_kg_abs": 0.016374732021274638
+      },
+      {
+        "euler_order": "zxy",
+        "corrected_force_norm_rms_n": 0.20488405051382372,
+        "corrected_torque_norm_rms_nm": 0.0008848688495490003,
+        "mass_kg_abs": 0.015417466500724555
+      },
+      {
+        "euler_order": "zyx",
+        "corrected_force_norm_rms_n": 0.21075127161371382,
+        "corrected_torque_norm_rms_nm": 0.0018883517586507392,
+        "mass_kg_abs": 0.013986979716309118
+      },
+      {
+        "euler_order": "yxz",
+        "corrected_force_norm_rms_n": 0.2439066159133174,
+        "corrected_torque_norm_rms_nm": 0.0024080129978031545,
+        "mass_kg_abs": 0.00235193439822379
+      },
+      {
+        "euler_order": "xyz",
+        "corrected_force_norm_rms_n": 0.24398227713628265,
+        "corrected_torque_norm_rms_nm": 0.002594148275615891,
+        "mass_kg_abs": 0.002166141299956217
+      },
+      {
+        "euler_order": "xzy",
+        "corrected_force_norm_rms_n": 0.24438347648755532,
+        "corrected_torque_norm_rms_nm": 0.0022598489661140165,
+        "mass_kg_abs": 0.0016483507665431365
+      }
+    ]
+  }
+}

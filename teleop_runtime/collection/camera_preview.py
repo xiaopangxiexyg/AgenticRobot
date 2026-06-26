@@ -186,6 +186,44 @@ class CameraPreviewer:
                     return [chr(key).lower()]
         return []
 
+    def update_frame_matches(
+        self,
+        camera_frames: Mapping[str, Any],
+        *,
+        camera_sources: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        if self._closed or not self.ensure_available():
+            return []
+        any_window = False
+        sources = {} if camera_sources is None else dict(camera_sources)
+        for camera_key, frame_or_match in camera_frames.items():
+            key = str(camera_key)
+            frame = getattr(frame_or_match, "frame", frame_or_match)
+            source = sources.get(key)
+            if frame is None:
+                if source is None:
+                    continue
+                image = self._placeholder_image(
+                    camera_key=key,
+                    source=source,
+                    extra_status="no matched frame",
+                )
+            else:
+                image = self._display_image(frame)
+            name = self._window_name(key)
+            self._ensure_window(name)
+            self._require_cv2().imshow(name, image)
+            any_window = True
+        if any_window:
+            key_code = self._require_cv2().waitKey(1)
+            if key_code >= 0:
+                key = key_code & 0xFF
+                if key == 3:
+                    raise KeyboardInterrupt
+                if 0 < key < 128:
+                    return [chr(key).lower()]
+        return []
+
     def status_snapshot(self, camera_sources: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         return {
             str(camera_key): self._camera_status(source)

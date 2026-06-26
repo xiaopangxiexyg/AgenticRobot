@@ -8,7 +8,7 @@ from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from ..calibration import TeleopCalibration
 from ..hand_tcp_alignment import (
-    DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
     tracker_hand_to_rm65_tcp_rotation,
     vive_tracker_height_correction_offset,
 )
@@ -31,7 +31,7 @@ def default_vive_tracker_configs(
     *,
     left_tracker_name: str = "tracker_1",
     right_tracker_name: str = "tracker_2",
-    auxiliary_tracker_name: str | None = "tracker_3",
+    auxiliary_tracker_name: str | None = None,
 ) -> list[ViveTrackerConfig]:
     configs = [
         ViveTrackerConfig(
@@ -78,8 +78,12 @@ def build_bimanual_session(
     keyboard_source: KeyboardButtonSource | None = None,
     enable_dual_arm_collision_avoidance: bool = True,
     dual_arm_collision_config: DualArmCollisionAwareRetargeterConfig | None = None,
-    vive_tracker_height_correction: bool = True,
-    vive_tracker_height_correction_m: float = DEFAULT_VIVE_TRACKER_HEIGHT_CORRECTION_M,
+    vive_tracker_height_correction: bool = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_enabled
+    ),
+    vive_tracker_height_correction_m: float = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m
+    ),
 ) -> TeleopSession:
     sources = []
     retargeters = []
@@ -157,6 +161,16 @@ def build_bimanual_session(
                     None
                     if right_arm_backend_config is None
                     else right_arm_backend_config.initial_qpos
+                ),
+                left_tool_tcp_pose_flange_m_rad=(
+                    None
+                    if left_arm_backend_config is None
+                    else left_arm_backend_config.tcp_pose_flange_m_rad
+                ),
+                right_tool_tcp_pose_flange_m_rad=(
+                    None
+                    if right_arm_backend_config is None
+                    else right_arm_backend_config.tcp_pose_flange_m_rad
                 ),
             )
         )

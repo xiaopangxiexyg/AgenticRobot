@@ -7,6 +7,13 @@ from typing import Literal, Sequence
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from hardware.rm65.calibration_profiles import tcp_safety_warnings
+from ..arm_frames import (
+    ARM_ENDPOINT_FRAME,
+    TOOL_TCP_FRAME,
+    TOOL_TCP_SEMANTICS,
+    canonical_arm_controlled_frame,
+)
 from rm65_inspire_tac.ik_tuning import (
     RM65IKTuningConfig,
     joint_jump_exceeds,
@@ -28,7 +35,7 @@ from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
 from ..tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
-from ..transforms import as_pose_matrix, interpolate_pose
+from ..transforms import as_pose_matrix, interpolate_pose, invert_pose
 from .pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 
 
@@ -59,11 +66,39 @@ def _optional_joint_step(value: Sequence[float] | np.ndarray | None) -> np.ndarr
     return joint_step.copy()
 
 
+def _optional_pose6(value: Sequence[float] | np.ndarray | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    pose = np.asarray(value, dtype=float).reshape(-1)
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        raise ValueError(f"Expected a finite 6D pose, got shape {pose.shape}.")
+    return pose.copy()
+
+
+def _pose6_to_matrix(pose6: Sequence[float] | np.ndarray | None) -> np.ndarray:
+    if pose6 is None:
+        return np.eye(4, dtype=float)
+    values = np.asarray(pose6, dtype=float).reshape(6)
+    matrix = np.eye(4, dtype=float)
+    matrix[:3, 3] = values[:3]
+    matrix[:3, :3] = R.from_euler("xyz", values[3:6], degrees=False).as_matrix()
+    return matrix
+
+
+def _warn_tcp_safety(side: str, pose6: Sequence[float] | np.ndarray | None) -> None:
+    if pose6 is None:
+        return
+    for warning in tcp_safety_warnings(pose6, label=f"{side} collision TCP"):
+        print(f"WARNING: {warning}; verify tool profile before enabling dual-arm collision retargeting.")
+
+
 @dataclass(frozen=True)
 class DualArmTargetContext:
     timestamp: float | None
     left_target: np.ndarray
     right_target: np.ndarray
+    left_world_to_base: np.ndarray | None
+    right_world_to_base: np.ndarray | None
     left_cartesian: EffectorCommand | None
     right_cartesian: EffectorCommand | None
     left_input_skipped: str | None
@@ -93,12 +128,15 @@ class DualArmCollisionAwareRetargeterConfig:
     debug_viz: bool = False
     debug_profile: bool = False
     debug_profile_print_every: int = 0
+    output_command_type: Literal["joint_vector", "cartesian_pose"] = "joint_vector"
     solve_max_iterations: int = 1
     solve_translation_tolerance_m: float = 2e-3
     solve_orientation_tolerance_deg: float = 0.5
     enforce_realistic_joint_step: bool = False
     left_execution_max_joint_step_rad: np.ndarray | Sequence[float] | None = None
     right_execution_max_joint_step_rad: np.ndarray | Sequence[float] | None = None
+    left_tool_tcp_pose_flange_m_rad: np.ndarray | Sequence[float] | None = None
+    right_tool_tcp_pose_flange_m_rad: np.ndarray | Sequence[float] | None = None
     left_initial_qpos: np.ndarray | Sequence[float] | None = None
     right_initial_qpos: np.ndarray | Sequence[float] | None = None
     ik_tuning_json_path: str | None = None
@@ -124,12 +162,22 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("solve_orientation_tolerance_deg must be >= 0.")
         if self.debug_profile_print_every < 0:
             raise ValueError("debug_profile_print_every must be >= 0.")
+        if self.output_command_type not in {"joint_vector", "cartesian_pose"}:
+            raise ValueError("output_command_type must be joint_vector or cartesian_pose.")
         self.left_execution_max_joint_step_rad = _optional_joint_step(
             self.left_execution_max_joint_step_rad
         )
         self.right_execution_max_joint_step_rad = _optional_joint_step(
             self.right_execution_max_joint_step_rad
         )
+        self.left_tool_tcp_pose_flange_m_rad = _optional_pose6(
+            self.left_tool_tcp_pose_flange_m_rad
+        )
+        self.right_tool_tcp_pose_flange_m_rad = _optional_pose6(
+            self.right_tool_tcp_pose_flange_m_rad
+        )
+        _warn_tcp_safety("left", self.left_tool_tcp_pose_flange_m_rad)
+        _warn_tcp_safety("right", self.right_tool_tcp_pose_flange_m_rad)
         if self.enforce_realistic_joint_step:
             if self.left_execution_max_joint_step_rad is None:
                 raise ValueError(
@@ -248,6 +296,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             np.asarray(self.ik_solver.robot.model.upperPositionLimit, dtype=float)
         )[1]
         self._last_target_poses: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        self._tool_tcp_from_solver = {
+            "left": _pose6_to_matrix(config.left_tool_tcp_pose_flange_m_rad),
+            "right": _pose6_to_matrix(config.right_tool_tcp_pose_flange_m_rad),
+        }
+        self._solver_from_tool_tcp = {
+            "left": np.linalg.inv(self._tool_tcp_from_solver["left"]),
+            "right": np.linalg.inv(self._tool_tcp_from_solver["right"]),
+        }
         self._jump_hold_active = False
         self._jump_hold_full_q: np.ndarray | None = None
         self._jump_hold_anchor_targets: dict[str, np.ndarray] | None = None
@@ -427,6 +483,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             timestamp=observation.timestamp,
             left_target=left_target.copy(),
             right_target=right_target.copy(),
+            left_world_to_base=(
+                None
+                if calibration.get_arm_for_side("left").T_D_B is None
+                else invert_pose(calibration.get_arm_for_side("left").T_D_B)
+            ),
+            right_world_to_base=(
+                None
+                if calibration.get_arm_for_side("right").T_D_B is None
+                else invert_pose(calibration.get_arm_for_side("right").T_D_B)
+            ),
             left_cartesian=left_cartesian.copy() if left_cartesian is not None else None,
             right_cartesian=right_cartesian.copy() if right_cartesian is not None else None,
             left_input_skipped=left_command.metadata.get("skipped"),
@@ -762,79 +828,163 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "left_inactive_jitter_hold": left_inactive_jitter_hold is not None,
             }
         )
-        command.add_command(
-            EffectorCommand(
-                effector_name=self.config.left_effector_name,
-                side="left",
-                command_type="joint_vector",
-                value=left_qpos,
-                metadata={
-                    "controller": self.name,
-                    "scene_profile": self.profile.name,
-                    "collision_pair_count": len(self.profile.collision_pairs),
-                    "collision_avoidance_mode": self.config.contact_mode,
-                    "collision_avoidance_status": status,
-                    "collision_avoidance_fallback_reason": fallback_reason,
-                    "collision_distance_m": min_distance_m,
-                    "source_command_type": (
-                        None
-                        if context.left_cartesian is None
-                        else context.left_cartesian.command_type
-                    ),
-                    "source_target_pose_base": left_source_target_pose_base,
-                    "source_target_pose_desk": left_source_target_pose_desk,
-                    "source_target_pose_operator": left_source_target_pose_operator,
-                    "ik_objective_mode": self.ik_tuning.ik_objective_mode,
-                    "ik_branch_candidate": branch_candidate,
-                    "ik_branch_distance_score_deg": branch_score_deg,
-                    "ik_solve_iterations": int(solve_iteration_count),
-                    "ik_solve_pose_error": dict(solve_pose_error.get("left", {})),
-                    "ik_jump_gate_status": jump_gate_status,
-                    "ik_jump_gate_reason": jump_gate_reason,
-                    "ik_jump_gate_release_ready": jump_gate_release_ready,
-                    "ik_jump_gate_hold_frames": jump_gate_hold_frames,
-                    "ik_jump_gate_metrics": dict(jump_gate_metrics.get("left", {})),
-                    "execution_step_metadata": dict(execution_step_metadata),
-                    "inactive_jitter_hold": left_inactive_jitter_hold is not None,
-                },
+        left_metadata = {
+            "controller": self.name,
+            "scene_profile": self.profile.name,
+            "collision_pair_count": len(self.profile.collision_pairs),
+            "collision_avoidance_mode": self.config.contact_mode,
+            "collision_avoidance_status": status,
+            "collision_avoidance_fallback_reason": fallback_reason,
+            "collision_distance_m": min_distance_m,
+            "source_command_type": (
+                None
+                if context.left_cartesian is None
+                else context.left_cartesian.command_type
+            ),
+            "source_target_pose_base": left_source_target_pose_base,
+            "source_target_pose_desk": left_source_target_pose_desk,
+            "source_target_pose_operator": left_source_target_pose_operator,
+            "ik_objective_mode": self.ik_tuning.ik_objective_mode,
+            "ik_branch_candidate": branch_candidate,
+            "ik_branch_distance_score_deg": branch_score_deg,
+            "ik_solve_iterations": int(solve_iteration_count),
+            "ik_solve_pose_error": dict(solve_pose_error.get("left", {})),
+            "ik_jump_gate_status": jump_gate_status,
+            "ik_jump_gate_reason": jump_gate_reason,
+            "ik_jump_gate_release_ready": jump_gate_release_ready,
+            "ik_jump_gate_hold_frames": jump_gate_hold_frames,
+            "ik_jump_gate_metrics": dict(jump_gate_metrics.get("left", {})),
+            "execution_step_metadata": dict(execution_step_metadata),
+            "inactive_jitter_hold": left_inactive_jitter_hold is not None,
+        }
+        right_metadata = {
+            "controller": self.name,
+            "scene_profile": self.profile.name,
+            "collision_pair_count": len(self.profile.collision_pairs),
+            "collision_avoidance_mode": self.config.contact_mode,
+            "collision_avoidance_status": status,
+            "collision_avoidance_fallback_reason": fallback_reason,
+            "collision_distance_m": min_distance_m,
+            "source_command_type": (
+                None
+                if context.right_cartesian is None
+                else context.right_cartesian.command_type
+            ),
+            "source_target_pose_base": right_source_target_pose_base,
+            "source_target_pose_desk": right_source_target_pose_desk,
+            "source_target_pose_operator": right_source_target_pose_operator,
+            "ik_objective_mode": self.ik_tuning.ik_objective_mode,
+            "ik_branch_candidate": branch_candidate,
+            "ik_branch_distance_score_deg": branch_score_deg,
+            "ik_solve_iterations": int(solve_iteration_count),
+            "ik_solve_pose_error": dict(solve_pose_error.get("right", {})),
+            "ik_jump_gate_status": jump_gate_status,
+            "ik_jump_gate_reason": jump_gate_reason,
+            "ik_jump_gate_release_ready": jump_gate_release_ready,
+            "ik_jump_gate_hold_frames": jump_gate_hold_frames,
+            "ik_jump_gate_metrics": dict(jump_gate_metrics.get("right", {})),
+            "execution_step_metadata": dict(execution_step_metadata),
+        }
+        if self.config.output_command_type == "cartesian_pose":
+            left_world_pose = self.ik_solver.compute_frame_pose(self.profile.left_frame_name, active_q)
+            right_world_pose = self.ik_solver.compute_frame_pose(self.profile.right_frame_name, active_q)
+            left_base_pose = (
+                left_world_pose
+                if context.left_world_to_base is None
+                else context.left_world_to_base @ left_world_pose
             )
-        )
-        command.add_command(
-            EffectorCommand(
-                effector_name=self.config.right_effector_name,
-                side="right",
-                command_type="joint_vector",
-                value=right_qpos,
-                metadata={
-                    "controller": self.name,
-                    "scene_profile": self.profile.name,
-                    "collision_pair_count": len(self.profile.collision_pairs),
-                    "collision_avoidance_mode": self.config.contact_mode,
-                    "collision_avoidance_status": status,
-                    "collision_avoidance_fallback_reason": fallback_reason,
-                    "collision_distance_m": min_distance_m,
-                    "source_command_type": (
-                        None
-                        if context.right_cartesian is None
-                        else context.right_cartesian.command_type
-                    ),
-                    "source_target_pose_base": right_source_target_pose_base,
-                    "source_target_pose_desk": right_source_target_pose_desk,
-                    "source_target_pose_operator": right_source_target_pose_operator,
-                    "ik_objective_mode": self.ik_tuning.ik_objective_mode,
-                    "ik_branch_candidate": branch_candidate,
-                    "ik_branch_distance_score_deg": branch_score_deg,
-                    "ik_solve_iterations": int(solve_iteration_count),
-                    "ik_solve_pose_error": dict(solve_pose_error.get("right", {})),
-                    "ik_jump_gate_status": jump_gate_status,
-                    "ik_jump_gate_reason": jump_gate_reason,
-                    "ik_jump_gate_release_ready": jump_gate_release_ready,
-                    "ik_jump_gate_hold_frames": jump_gate_hold_frames,
-                    "ik_jump_gate_metrics": dict(jump_gate_metrics.get("right", {})),
-                    "execution_step_metadata": dict(execution_step_metadata),
-                },
+            right_base_pose = (
+                right_world_pose
+                if context.right_world_to_base is None
+                else context.right_world_to_base @ right_world_pose
             )
-        )
+            left_tcp_base_pose = left_base_pose @ self._tool_tcp_from_solver["left"]
+            right_tcp_base_pose = right_base_pose @ self._tool_tcp_from_solver["right"]
+            left_metadata.update(
+                {
+                    "arm_controlled_frame": TOOL_TCP_FRAME,
+                    "arm_reference_frame": "arm_base",
+                    "arm_action_spec": {
+                        "side": "left",
+                        "controlled_frame": TOOL_TCP_FRAME,
+                        "reference_frame": "arm_base",
+                        "representation": "xyz_quat",
+                        "dof": 7,
+                        "semantics": TOOL_TCP_SEMANTICS,
+                        "metadata": {"controller": self.name},
+                    },
+                    "target_pose_desk": (
+                        left_world_pose @ self._tool_tcp_from_solver["left"]
+                    ).copy(),
+                    "target_pose_base": left_tcp_base_pose.copy(),
+                    "target_pose_tcp_base": left_tcp_base_pose.copy(),
+                    "target_pose_controlled_frame": TOOL_TCP_FRAME,
+                    "solver_output_endpoint_pose_base": left_base_pose.copy(),
+                    "solver_output_qpos": left_qpos.copy(),
+                }
+            )
+            right_metadata.update(
+                {
+                    "arm_controlled_frame": TOOL_TCP_FRAME,
+                    "arm_reference_frame": "arm_base",
+                    "arm_action_spec": {
+                        "side": "right",
+                        "controlled_frame": TOOL_TCP_FRAME,
+                        "reference_frame": "arm_base",
+                        "representation": "xyz_quat",
+                        "dof": 7,
+                        "semantics": TOOL_TCP_SEMANTICS,
+                        "metadata": {"controller": self.name},
+                    },
+                    "target_pose_desk": (
+                        right_world_pose @ self._tool_tcp_from_solver["right"]
+                    ).copy(),
+                    "target_pose_base": right_tcp_base_pose.copy(),
+                    "target_pose_tcp_base": right_tcp_base_pose.copy(),
+                    "target_pose_controlled_frame": TOOL_TCP_FRAME,
+                    "solver_output_endpoint_pose_base": right_base_pose.copy(),
+                    "solver_output_qpos": right_qpos.copy(),
+                }
+            )
+            command.add_command(
+                EffectorCommand(
+                    effector_name=self.config.left_effector_name,
+                    side="left",
+                    command_type="cartesian_pose",
+                    value=left_tcp_base_pose,
+                    frame_name="arm_base",
+                    metadata=left_metadata,
+                )
+            )
+            command.add_command(
+                EffectorCommand(
+                    effector_name=self.config.right_effector_name,
+                    side="right",
+                    command_type="cartesian_pose",
+                    value=right_tcp_base_pose,
+                    frame_name="arm_base",
+                    metadata=right_metadata,
+                )
+            )
+        else:
+            command.add_command(
+                EffectorCommand(
+                    effector_name=self.config.left_effector_name,
+                    side="left",
+                    command_type="joint_vector",
+                    value=left_qpos,
+                    metadata=left_metadata,
+                )
+            )
+            command.add_command(
+                EffectorCommand(
+                    effector_name=self.config.right_effector_name,
+                    side="right",
+                    command_type="joint_vector",
+                    value=right_qpos,
+                    metadata=right_metadata,
+                )
+            )
         self._last_target_poses = {
             "left": left_target.copy(),
             "right": right_target.copy(),
@@ -874,6 +1024,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 pose_world=as_pose_matrix(target_pose_desk),
                 command=command,
                 fallback_frame_name=fallback_frame_name,
+                side=side,
             )
         pose_base = as_pose_matrix(command.value)
         if calibration is not None:
@@ -883,6 +1034,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     pose_world=arm.T_D_B @ pose_base,
                     command=command,
                     fallback_frame_name=fallback_frame_name,
+                    side=side,
                 )
         pose_transform = (
             self.profile.left_pose_transform
@@ -893,6 +1045,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             pose_world=pose_transform @ pose_base,
             command=command,
             fallback_frame_name=fallback_frame_name,
+            side=side,
         )
 
     def _inactive_jitter_hold_qpos(self, command: EffectorCommand | None) -> np.ndarray | None:
@@ -917,8 +1070,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         pose_world: np.ndarray,
         command: EffectorCommand,
         fallback_frame_name: str,
+        side: Literal["left", "right"],
     ) -> np.ndarray:
         pose_world = as_pose_matrix(pose_world)
+        controlled_frame = canonical_arm_controlled_frame(
+            command.metadata.get("arm_controlled_frame")
+            or command.metadata.get("target_pose_controlled_frame")
+            or command.metadata.get("controlled_frame")
+        )
+        if controlled_frame == TOOL_TCP_FRAME:
+            return pose_world @ self._solver_from_tool_tcp[side]
+        if controlled_frame == ARM_ENDPOINT_FRAME:
+            return pose_world
         tcp_frame = canonical_tcp_frame(command.metadata.get("tcp_frame", HAND_BASE_TCP_FRAME))
         if tcp_frame != HAND_BASE_TCP_FRAME:
             return pose_world

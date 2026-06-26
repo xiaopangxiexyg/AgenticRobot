@@ -18,6 +18,7 @@ from .schema import (
     ALL_SIDES,
     HAND_VECTOR_ORDER,
     STATE_ARM_POSE_SLICES,
+    deploy_arm_specs_metadata,
 )
 
 _STARTUP_ARM_POSITION_TOLERANCE_M = 0.03
@@ -259,6 +260,16 @@ def _interpolate_action(
 
 def _startup_action_metadata() -> dict[str, Any]:
     return {
+        "arm_action_specs_by_side": deploy_arm_specs_metadata(),
+        "arm_controlled_frame_by_side": {
+            side: spec["controlled_frame"]
+            for side, spec in deploy_arm_specs_metadata().items()
+        },
+        "arm_reference_frame_by_side": {
+            side: spec["reference_frame"]
+            for side, spec in deploy_arm_specs_metadata().items()
+        },
+        "arm_spec_required": True,
         "safety_overrides": {
             "max_arm_xyz_step_m": 0.0,
             "max_arm_rot_step_deg": 0.0,

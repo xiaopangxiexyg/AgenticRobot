@@ -29,7 +29,7 @@ def interpolate_vectors_linear(
 def _load_rm65_dependencies() -> tuple[Any, Any, Any]:
     try:
         from hardware.inspire_tac.inspire_tac_modbus import InspireTacModbus
-        from hardware.rm65.robotic_arm_package.robotic_arm import Arm, RM65
+        from hardware.rm65.rm_api2_adapter import Arm, RM65
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "Portable RM65 hardware control requires the RM65 SDK and pymodbus stack."
@@ -49,11 +49,19 @@ def _run_arm_hand_controller(
     control_dt: float,
     stop_event: multiprocessing.Event,
     ready_event: multiprocessing.Event,
+    force_position_control: bool = False,
+    force_sensor: int = 1,
+    force_mode: int = 0,
+    force_dir: int = 0,
+    force: float = 0.0,
+    force_follow: bool = False,
+    force_clear_on_start: bool = True,
 ) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     Arm = RM65 = InspireTacModbus = None
     robot = None
     hand = None
+    force_position_active = False
     try:
         Arm, RM65, InspireTacModbus = _load_rm65_dependencies()
         robot = Arm(RM65, arm_ip)
@@ -62,6 +70,11 @@ def _run_arm_hand_controller(
             target_now[:6] = [joint / 180.0 * np.pi for joint in joint_now]
 
         hand = InspireTacModbus(ip=hand_ip, max_fingertip_force=max_fingertip_force)
+        if force_position_control:
+            if force_clear_on_start:
+                robot.Clear_Force_Data(True)
+            robot.Start_Force_Position_Move(True)
+            force_position_active = True
 
         last_waypoint = np.array(target_now[:6], dtype=float)
         waypoints: list[np.ndarray] = []
@@ -83,7 +96,18 @@ def _run_arm_hand_controller(
                     hand.set_joint_pos(np.array(target_now[6:], dtype=float))
 
             if waypoint_index < len(waypoints):
-                robot.Movej_CANFD(waypoints[waypoint_index] / np.pi * 180.0, False)
+                joint_deg = waypoints[waypoint_index] / np.pi * 180.0
+                if force_position_control:
+                    robot.Force_Position_Move_Joint(
+                        joint_deg,
+                        sensor=force_sensor,
+                        mode=force_mode,
+                        dir=force_dir,
+                        force=force,
+                        follow=force_follow,
+                    )
+                else:
+                    robot.Movej_CANFD(joint_deg, False)
                 last_waypoint = waypoints[waypoint_index]
                 waypoint_index += 1
             else:
@@ -94,6 +118,8 @@ def _run_arm_hand_controller(
                 time.sleep(remaining)
     finally:
         if robot is not None:
+            if force_position_active:
+                robot.Stop_Force_Position_Move(True)
             robot.RM_API_UnInit()
             robot.Arm_Socket_Close()
         if hand is not None:
@@ -143,6 +169,13 @@ class RM65InspireTacController:
         control_dt: float = 0.02,
         start_listener: bool = True,
         startup_timeout: float = 10.0,
+        force_position_control: bool = False,
+        force_sensor: int = 1,
+        force_mode: int = 0,
+        force_dir: int = 0,
+        force: float = 0.0,
+        force_follow: bool = False,
+        force_clear_on_start: bool = True,
     ):
         max_angvel_array = np.asarray(max_angvel, dtype=float)
         if np.max(max_angvel_array) >= 1.58:
@@ -172,6 +205,13 @@ class RM65InspireTacController:
                 self.control_dt,
                 self.stop_event,
                 self.ready_event,
+                force_position_control,
+                force_sensor,
+                force_mode,
+                force_dir,
+                force,
+                force_follow,
+                force_clear_on_start,
             ),
         )
         self.controller_process.start()
@@ -252,6 +292,13 @@ class ArmHardwareConfig:
     max_fingertip_force: int = 800
     max_angvel: tuple[float, ...] = (0.2,) * 6
     control_dt: float = 0.02
+    force_position_control: bool = False
+    force_sensor: int = 1
+    force_mode: int = 0
+    force_dir: int = 0
+    force: float = 0.0
+    force_follow: bool = False
+    force_clear_on_start: bool = True
 
 
 class BimanualRM65InspireTacSystem:
@@ -278,6 +325,13 @@ class BimanualRM65InspireTacSystem:
                 max_fingertip_force=left.max_fingertip_force,
                 max_angvel=left.max_angvel,
                 control_dt=left.control_dt,
+                force_position_control=left.force_position_control,
+                force_sensor=left.force_sensor,
+                force_mode=left.force_mode,
+                force_dir=left.force_dir,
+                force=left.force,
+                force_follow=left.force_follow,
+                force_clear_on_start=left.force_clear_on_start,
             )
         if right is not None:
             right_controller = RM65InspireTacController(
@@ -286,6 +340,13 @@ class BimanualRM65InspireTacSystem:
                 max_fingertip_force=right.max_fingertip_force,
                 max_angvel=right.max_angvel,
                 control_dt=right.control_dt,
+                force_position_control=right.force_position_control,
+                force_sensor=right.force_sensor,
+                force_mode=right.force_mode,
+                force_dir=right.force_dir,
+                force=right.force,
+                force_follow=right.force_follow,
+                force_clear_on_start=right.force_clear_on_start,
             )
         return cls(left=left_controller, right=right_controller)
 

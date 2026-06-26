@@ -5,13 +5,13 @@ from typing import Sequence
 
 import numpy as np
 
+from ..arm_frames import TOOL_TCP_FRAME, TOOL_TCP_SEMANTICS
 from ..calibration import TeleopCalibration
 from ..clutch import DeltaClutchController
 from ..hand_tcp_alignment import apply_local_pose_rotation
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
-from ..tcp import HAND_BASE_TCP_FRAME
 from ..transforms import as_pose_matrix, rotation_is_orthonormal
 
 
@@ -202,10 +202,12 @@ class PoseToArmRetargeter(Retargeter):
             command.metadata["skipped"] = self.config.input_channel_name
             return command
 
-        target_tcp_frame = calibration.target_frame_name(self.config.side)
-        target_pose = as_pose_matrix(target_pose_desk)
-        self._last_target_pose_desk = target_pose.copy()
-        target_pose_base = calibration.desk_to_base(target_pose, side=self.config.side)
+        target_pose_tcp_desk = as_pose_matrix(target_pose_desk)
+        self._last_target_pose_desk = target_pose_tcp_desk.copy()
+        target_pose_base = calibration.desk_to_base(
+            target_pose_tcp_desk,
+            side=self.config.side,
+        )
         clutch_pressed = self._resolve_clutch_pressed(observation)
 
         command.add_command(
@@ -216,8 +218,19 @@ class PoseToArmRetargeter(Retargeter):
                 value=target_pose_base,
                 frame_name=self.config.output_frame_name,
                 metadata={
-                    "tcp_mode": HAND_BASE_TCP_FRAME,
-                    "tcp_frame": target_tcp_frame,
+                    "arm_controlled_frame": TOOL_TCP_FRAME,
+                    "arm_reference_frame": self.config.output_frame_name,
+                    "arm_action_spec": {
+                        "side": self.config.side,
+                        "controlled_frame": TOOL_TCP_FRAME,
+                        "reference_frame": self.config.output_frame_name,
+                        "representation": "xyz_quat",
+                        "dof": 7,
+                        "semantics": TOOL_TCP_SEMANTICS,
+                        "metadata": {
+                            "retarget_target_frame": TOOL_TCP_FRAME,
+                        },
+                    },
                     "control_mode": self.config.control_mode,
                     "orientation_mode": self.config.orientation_mode,
                     "input_channel": self.config.input_channel_name,
@@ -226,7 +239,13 @@ class PoseToArmRetargeter(Retargeter):
                     "target_pose_operator": None
                     if pose_operator is None
                     else as_pose_matrix(pose_operator),
-                    "target_pose_desk": target_pose,
+                    "target_pose_desk": target_pose_tcp_desk,
+                    "target_pose_tcp_desk": target_pose_tcp_desk.copy(),
+                    "target_pose_base": target_pose_base.copy(),
+                    "target_pose_tcp_base": target_pose_base.copy(),
+                    "target_pose_controlled_frame": TOOL_TCP_FRAME,
+                    "target_pose_retarget_frame": TOOL_TCP_FRAME,
+                    "target_pose_desk_retarget_frame": target_pose_tcp_desk.copy(),
                     "input_local_translation_offset_m": None
                     if self._input_local_translation_offset is None
                     else self._input_local_translation_offset.copy(),
