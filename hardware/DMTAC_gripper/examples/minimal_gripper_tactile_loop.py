@@ -21,7 +21,7 @@ def main() -> None:
             mode="delta",
             baseline_frames=20,
             deadband_abs=5e-5,
-            temporal_alpha=0.35,
+            temporal_alpha=0.85,
             spatial_blur_ksize=5,
         ),
     )

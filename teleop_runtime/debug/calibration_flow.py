@@ -152,8 +152,8 @@ class VirtualDeskCalibrationResult:
 
 
 def fit_signed_axis_from_poses(poses: list[np.ndarray]) -> SignedAxisFit:
-    if len(poses) < 8:
-        raise ValueError("At least 8 pose samples are required to fit a sweep axis.")
+    if len(poses) < 3:
+        raise ValueError("At least 3 pose samples are required to fit a sweep axis.")
     pose_stack = [as_pose_matrix(pose) for pose in poses]
     positions = np.asarray([pose[:3, 3] for pose in pose_stack], dtype=float)
     centered = positions - np.mean(positions, axis=0, keepdims=True)

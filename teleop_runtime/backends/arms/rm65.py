@@ -10,17 +10,20 @@ import time
 
 from hardware.rm65.calibration_profiles import (
     ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD,
+    is_position_endpoint_profile,
     tcp_endpoint_delta,
     tcp_safety_warnings,
 )
 from ...arm_frames import (
     ARM_ENDPOINT_FRAME,
+    EMPTY_TOOL_FRAME,
     TOOL_TCP_FRAME,
     canonical_arm_controlled_frame,
     rm65_urdf_frame_for_controlled_frame,
 )
 from rm65_inspire_tac.ik_tuning import (
     RM65IKTuningConfig,
+    hard_branch_jump_exceeds,
     joint_jump_exceeds,
     load_ik_tuning_config,
     pose_delta_metrics,
@@ -33,6 +36,22 @@ from ...tcp import HAND_BASE_TCP_FRAME
 
 
 HAND_BASE_POSE_FLANGE_M_RAD = (0.0, 0.0, 0.009, 0.0, 0.0, 0.0)
+_SINGULARITY_WARNING_INTERVAL_SEC = 1.0
+_SINGULARITY_LABELS = {
+    0: "normal",
+    -1: "shoulder_singularity",
+    -2: "elbow_singularity",
+    -3: "wrist_singularity",
+}
+
+
+def _is_empty_tool_frame_name(value: object) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    stem = Path(text).stem
+    normalized = stem if stem else text
+    return normalized == EMPTY_TOOL_FRAME or normalized.endswith(f"_{EMPTY_TOOL_FRAME}")
 
 
 def _load_rm65_sdk():
@@ -56,6 +75,12 @@ def _parse_rm65_result(result: object) -> tuple[int | None, str]:
     except (TypeError, ValueError):
         code = None
     return code, text
+
+
+def _singularity_status_label(status_code: int | None) -> str:
+    if status_code is None:
+        return "unavailable"
+    return _SINGULARITY_LABELS.get(int(status_code), f"unknown_status_{int(status_code)}")
 
 
 def _joint_now_to_qpos(joint_now: object) -> np.ndarray | None:
@@ -192,8 +217,15 @@ class RM65ArmBackendConfig:
     auto_load_tool_profile: bool = True
     tool_profile: str | None = None
     tcp_pose_flange_m_rad: tuple[float, ...] | None = None
+    singularity_protection_enabled: bool = True
+    configure_singularity_thresholds: bool = True
+    singularity_elbow_threshold_deg: float = 3.0
+    singularity_wrist_threshold_deg: float = 3.0
+    singularity_shoulder_threshold_m: float = 0.05
     ik_tuning_json_path: str | None = None
     ik_tuning: RM65IKTuningConfig | None = field(default=None, repr=False)
+    builtin_empty_tool_frame: bool = field(default=False, init=False, repr=False)
+    position_endpoint_profile: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
@@ -221,8 +253,20 @@ class RM65ArmBackendConfig:
             raise ValueError("force_mode must be 0 (base frame) or 1 (tool frame).")
         if not 0 <= int(self.force_dir) <= 5:
             raise ValueError("force_dir must be in [0, 5].")
+        if float(self.singularity_elbow_threshold_deg) < 0.0:
+            raise ValueError("singularity_elbow_threshold_deg must be >= 0.")
+        if float(self.singularity_wrist_threshold_deg) < 0.0:
+            raise ValueError("singularity_wrist_threshold_deg must be >= 0.")
+        if float(self.singularity_shoulder_threshold_m) < 0.0:
+            raise ValueError("singularity_shoulder_threshold_m must be >= 0.")
         if self.ik_tuning is None:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
+        if _is_empty_tool_frame_name(self.tool_profile):
+            self.builtin_empty_tool_frame = True
+            self.tool_profile = None
+            self.auto_load_tool_profile = False
+            if self.tcp_pose_flange_m_rad is None:
+                self.tcp_pose_flange_m_rad = tuple(ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD)
         if self.tool_profile:
             from hardware.rm65.calibration_profiles import load_profile
 
@@ -234,6 +278,9 @@ class RM65ArmBackendConfig:
             if pose is None:
                 raise ValueError(f"tool_profile {self.tool_profile!r} does not contain tcp.pose_flange_m_rad")
             self.tcp_pose_flange_m_rad = tuple(float(value) for value in pose)
+            if is_position_endpoint_profile(profile):
+                self.position_endpoint_profile = True
+                self.auto_load_tool_profile = False
         if self.tcp_pose_flange_m_rad is not None:
             pose = np.asarray(self.tcp_pose_flange_m_rad, dtype=float).reshape(-1)
             if pose.shape != (6,) or not np.all(np.isfinite(pose)):
@@ -269,6 +316,13 @@ class RM65ArmBackend(EffectorBackend):
         self._last_hardware_sys_err: int | None = None
         self._last_send_result_code: int | None = None
         self._last_send_result_text: str | None = None
+        self._singularity_config_attempted = False
+        self._singularity_protection_ready = False
+        self._last_singularity_metadata: dict[str, object] = {
+            "singularity_gate_status": "not_checked",
+        }
+        self._last_singularity_warning_time = 0.0
+        self._last_singularity_warning_key: tuple[object, ...] | None = None
         self._base_control_dt = float(config.control_dt)
         self._base_max_joint_step = np.asarray(config.max_angvel, dtype=float) * self._base_control_dt
         self._last_send_time: float | None = None
@@ -276,6 +330,8 @@ class RM65ArmBackend(EffectorBackend):
         self._last_effective_control_dt = self._base_control_dt
         self._last_effective_step_scale = 1.0
         self._state_lock = threading.RLock()
+        self._send_lock = threading.RLock()
+        self._emergency_stopped = False
         self._stream_target_qpos: np.ndarray | None = None
         self._stream_stop_event = threading.Event()
         self._stream_thread: threading.Thread | None = None
@@ -300,6 +356,8 @@ class RM65ArmBackend(EffectorBackend):
         )
         self._active_tool_profile_path: str | None = None
         self._active_tool_name: str | None = None
+        self._builtin_empty_tool_frame = bool(config.builtin_empty_tool_frame)
+        self._position_endpoint_profile = bool(config.position_endpoint_profile)
 
     @property
     def name(self) -> str:
@@ -311,6 +369,7 @@ class RM65ArmBackend(EffectorBackend):
         Arm, RM65 = _load_rm65_sdk()
         self.arm = Arm(RM65, self.config.arm_ip)
         self._auto_load_active_tool_profile()
+        self._configure_singularity_protection()
         if self.config.force_position_control:
             self._start_force_position_control()
         state = self.refresh_state_from_hardware()
@@ -328,12 +387,251 @@ class RM65ArmBackend(EffectorBackend):
     def is_ready(self) -> bool:
         return (not self.config.connect_hardware) or (self.arm is not None)
 
+    def hold_motion(self, reason: str = "manual hold") -> None:
+        del reason
+        with self._send_lock:
+            with self._state_lock:
+                self._stream_target_qpos = None
+                self._last_target_qpos = None
+                self._last_target_pose = None
+                self._jump_gate_active = False
+                self._jump_hold_qpos = None
+                self._jump_hold_anchor_pose = None
+                self._jump_hold_frames = 0
+            if self.arm is None:
+                with self._state_lock:
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = "hold_no_arm"
+                return
+            stop_method = getattr(self.arm, "Arm_Slow_Stop", None)
+            stop_label = "Arm_Slow_Stop"
+            if stop_method is None:
+                stop_method = getattr(self.arm, "Arm_Stop", None)
+                stop_label = "Arm_Stop"
+            if stop_method is None:
+                with self._state_lock:
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = "hold_no_stop_method"
+                return
+            stop_result = stop_method()
+            stop_code, stop_text = _parse_rm65_result(stop_result)
+            with self._state_lock:
+                self._last_send_result_code = stop_code
+                self._last_send_result_text = f"hold:{stop_label}:{stop_text}"
+
+    def reset_motion_state(self, qpos: Sequence[float] | np.ndarray | None = None) -> None:
+        with self._send_lock:
+            with self._state_lock:
+                if qpos is not None:
+                    qpos_array = np.asarray(qpos, dtype=float).reshape(6)
+                    if not np.all(np.isfinite(qpos_array)):
+                        raise ValueError(f"{self.name} expected finite qpos for reset_motion_state.")
+                    self._current_qpos = qpos_array.copy()
+                    self._last_hardware_qpos = qpos_array.copy()
+                self._stream_target_qpos = None
+                self._last_target_qpos = None
+                self._last_target_pose = None
+                self._last_command = None
+                self._last_command_timestamp = None
+                self._last_send_time = None
+                self._smoothed_send_dt = self._base_control_dt
+                self._last_effective_control_dt = self._base_control_dt
+                self._last_effective_step_scale = 1.0
+                self._jump_gate_active = False
+                self._jump_hold_qpos = None
+                self._jump_hold_anchor_pose = None
+                self._jump_hold_frames = 0
+
+    def _configure_singularity_protection(self) -> None:
+        if self._singularity_config_attempted:
+            return
+        self._singularity_config_attempted = True
+        self._singularity_protection_ready = False
+        if not self.config.singularity_protection_enabled or self.arm is None:
+            return
+        analyzer = getattr(self.arm, "Algo_Kin_Singularity_Analyse", None)
+        if analyzer is None:
+            print(f"WARNING: {self.name} RM65 SDK does not expose singularity analysis; backend gate disabled.")
+            return
+        if not self.config.configure_singularity_thresholds:
+            self._singularity_protection_ready = True
+            return
+        setter = getattr(self.arm, "Algo_Kin_Set_Singularity_Thresholds", None)
+        if setter is None:
+            print(
+                f"WARNING: {self.name} RM65 SDK does not expose singularity threshold configuration; "
+                "backend gate disabled to avoid using unknown SDK defaults."
+            )
+            return
+        try:
+            setter(
+                self.config.singularity_elbow_threshold_deg,
+                self.config.singularity_wrist_threshold_deg,
+                self.config.singularity_shoulder_threshold_m,
+            )
+            self._singularity_protection_ready = True
+        except Exception as exc:  # noqa: BLE001 - protection should fail open for teleop.
+            print(
+                f"WARNING: {self.name} failed to configure singularity thresholds: {exc}; "
+                "backend singularity gate disabled."
+            )
+            return
+        getter = getattr(self.arm, "Algo_Kin_Get_Singularity_Thresholds", None)
+        if getter is None:
+            print(
+                f"{self.name}: singularity gate enabled "
+                f"elbow={self.config.singularity_elbow_threshold_deg:.3f}deg "
+                f"wrist={self.config.singularity_wrist_threshold_deg:.3f}deg "
+                f"shoulder={self.config.singularity_shoulder_threshold_m:.3f}m"
+            )
+            return
+        try:
+            qe, qw, d = getter()
+            print(f"{self.name}: singularity gate enabled elbow={qe:.3f}deg wrist={qw:.3f}deg shoulder={d:.3f}m")
+        except Exception as exc:  # noqa: BLE001 - diagnostic only.
+            print(f"WARNING: {self.name} failed to read singularity thresholds after setting: {exc}")
+
+    def _analyze_singularity(self, qpos_rad: Sequence[float] | np.ndarray) -> dict[str, object]:
+        if self.arm is None:
+            return {"status_code": None, "label": "unavailable", "reason": "no_arm"}
+        analyzer = getattr(self.arm, "Algo_Kin_Singularity_Analyse", None)
+        if analyzer is None:
+            return {"status_code": None, "label": "unavailable", "reason": "missing_sdk_method"}
+        joint_deg = (np.asarray(qpos_rad, dtype=float).reshape(6) / np.pi * 180.0).tolist()
+        try:
+            result = analyzer(joint_deg)
+        except Exception as exc:  # noqa: BLE001 - protection should fail open for teleop.
+            return {"status_code": None, "label": "unavailable", "reason": str(exc)}
+        if not isinstance(result, tuple) or len(result) < 2:
+            return {
+                "status_code": None,
+                "label": "unavailable",
+                "reason": f"unexpected_result:{result}",
+            }
+        status, distance = result[:2]
+        try:
+            status_code = int(status)
+        except (TypeError, ValueError):
+            return {
+                "status_code": None,
+                "label": "unavailable",
+                "reason": f"unexpected_status:{status}",
+            }
+        metadata: dict[str, object] = {
+            "status_code": status_code,
+            "label": _singularity_status_label(status_code),
+        }
+        try:
+            metadata["wrist_center_distance_m"] = float(distance)
+        except (TypeError, ValueError):
+            metadata["wrist_center_distance_m"] = str(distance)
+        return metadata
+
+    def _record_singularity_metadata(self, metadata: dict[str, object]) -> None:
+        with self._state_lock:
+            self._last_singularity_metadata = dict(metadata)
+
+    def _emit_singularity_warning(self, metadata: dict[str, object]) -> None:
+        now = time.time()
+        key = (
+            metadata.get("singularity_gate_status"),
+            metadata.get("target_singularity_label"),
+            metadata.get("source"),
+        )
+        if (
+            key == self._last_singularity_warning_key
+            and now - self._last_singularity_warning_time < _SINGULARITY_WARNING_INTERVAL_SEC
+        ):
+            return
+        self._last_singularity_warning_key = key
+        self._last_singularity_warning_time = now
+        print(
+            f"WARNING: {self.name} singularity gate hold "
+            f"source={metadata.get('source')} "
+            f"target={metadata.get('target_singularity_label')} "
+            f"current={metadata.get('current_singularity_label')}"
+        )
+
+    def _apply_singularity_protection(
+        self,
+        qpos_target: np.ndarray,
+        *,
+        reference_qpos: np.ndarray,
+        source: str,
+    ) -> np.ndarray:
+        target = np.asarray(qpos_target, dtype=float).reshape(6)
+        reference = np.asarray(reference_qpos, dtype=float).reshape(6)
+        if not self.config.singularity_protection_enabled:
+            self._record_singularity_metadata(
+                {
+                    "singularity_gate_status": "disabled",
+                    "source": source,
+                }
+            )
+            return target
+        if self.arm is None:
+            self._record_singularity_metadata(
+                {
+                    "singularity_gate_status": "not_checked",
+                    "source": source,
+                    "reason": "no_arm",
+                }
+            )
+            return target
+        self._configure_singularity_protection()
+        if not self._singularity_protection_ready:
+            self._record_singularity_metadata(
+                {
+                    "singularity_gate_status": "unavailable",
+                    "source": source,
+                }
+            )
+            return target
+
+        target_status = self._analyze_singularity(target)
+        target_code = target_status.get("status_code")
+        target_singular = target_code not in (0, None)
+        current_status = (
+            self._analyze_singularity(reference)
+            if target_singular
+            else {"status_code": 0, "label": "normal"}
+        )
+        current_code = current_status.get("status_code")
+        entering_singularity = bool(target_singular and current_code == 0)
+        gate_status = "hold_entry" if entering_singularity else "pass"
+        if target_singular and current_code not in (0, None):
+            gate_status = "allow_current_singular"
+        elif target_code is None:
+            gate_status = "analysis_unavailable"
+        metadata: dict[str, object] = {
+            "singularity_gate_status": gate_status,
+            "source": source,
+            "target_singularity_code": target_code,
+            "target_singularity_label": target_status.get("label"),
+            "current_singularity_code": current_code,
+            "current_singularity_label": current_status.get("label"),
+            "configured_elbow_threshold_deg": float(self.config.singularity_elbow_threshold_deg),
+            "configured_wrist_threshold_deg": float(self.config.singularity_wrist_threshold_deg),
+            "configured_shoulder_threshold_m": float(self.config.singularity_shoulder_threshold_m),
+        }
+        if "wrist_center_distance_m" in target_status:
+            metadata["target_wrist_center_distance_m"] = target_status["wrist_center_distance_m"]
+        if "wrist_center_distance_m" in current_status:
+            metadata["current_wrist_center_distance_m"] = current_status["wrist_center_distance_m"]
+        self._record_singularity_metadata(metadata)
+        if entering_singularity:
+            self._emit_singularity_warning(metadata)
+            return reference.copy()
+        return target
+
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
             raise ValueError(
                 f"{self.name} received command for effector '{command.effector_name}'."
             )
         with self._state_lock:
+            if self._emergency_stopped:
+                raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
             if self._current_qpos is None:
                 self._current_qpos = np.zeros(6, dtype=float)
         command_start_time = time.time()
@@ -341,6 +639,7 @@ class RM65ArmBackend(EffectorBackend):
             now=command_start_time,
             update_state=True,
         )
+        ik_solve_elapsed_ms: float | None = None
 
         if command.command_type == "joint_vector":
             qpos_target = np.asarray(command.value, dtype=float)
@@ -356,26 +655,52 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 qpos_target = self._current_qpos + delta
         elif command.command_type == "cartesian_pose":
+            ik_solve_started = time.perf_counter()
             qpos_target = self._solve_cartesian_command(command, max_joint_step=max_joint_step)
+            ik_solve_elapsed_ms = (time.perf_counter() - ik_solve_started) * 1000.0
         else:
             raise ValueError(
                 f"{self.name} does not support command_type '{command.command_type}'."
             )
+        if ik_solve_elapsed_ms is not None:
+            self._last_ik_metadata = {
+                **dict(self._last_ik_metadata),
+                "ik_status": dict(self._last_ik_metadata).get("ik_jump_gate_status", "pass"),
+                "ik_backend_source": "rm65_arm_backend",
+                "ik_backend_solve_ms": float(ik_solve_elapsed_ms),
+                "ik_frame_total_ms": float(ik_solve_elapsed_ms),
+                "ik_solve_total_ms": float(ik_solve_elapsed_ms),
+            }
+
+        with self._state_lock:
+            reference_qpos = self._current_qpos.copy()
+        qpos_target = self._apply_singularity_protection(
+            qpos_target,
+            reference_qpos=reference_qpos,
+            source=command.command_type,
+        )
 
         if self.arm is not None and self.config.background_streaming_enabled:
-            with self._state_lock:
-                self._stream_target_qpos = qpos_target.copy()
-                self._last_target_qpos = qpos_target.copy()
-                self._last_command = command.copy()
-                self._last_command_timestamp = command_start_time
+            with self._send_lock:
+                with self._state_lock:
+                    if self._emergency_stopped:
+                        raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
+                    self._stream_target_qpos = qpos_target.copy()
+                    self._last_target_qpos = qpos_target.copy()
+                    self._last_command = command.copy()
+                    self._last_command_timestamp = command_start_time
             return
 
-        if self.arm is not None:
-            raw_send_result = self._send_joint_target(qpos_target)
-            send_code, send_text = _parse_rm65_result(raw_send_result)
+        with self._send_lock:
             with self._state_lock:
-                self._last_send_result_code = send_code
-                self._last_send_result_text = send_text
+                if self._emergency_stopped:
+                    raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
+            if self.arm is not None:
+                raw_send_result = self._send_joint_target(qpos_target)
+                send_code, send_text = _parse_rm65_result(raw_send_result)
+                with self._state_lock:
+                    self._last_send_result_code = send_code
+                    self._last_send_result_text = send_text
         self._last_send_time = command_start_time
 
         with self._state_lock:
@@ -429,6 +754,10 @@ class RM65ArmBackend(EffectorBackend):
         return tuple(float(value) for value in pose_flange_m_rad)
 
     def _active_tcp_source(self) -> str:
+        if self._position_endpoint_profile:
+            return "position_endpoint_profile"
+        if self._builtin_empty_tool_frame:
+            return "builtin_empty_arm_endpoint"
         if self.config.tcp_pose_flange_m_rad is None:
             return "arm_endpoint_default"
         if self._active_tool_profile_path:
@@ -474,6 +803,13 @@ class RM65ArmBackend(EffectorBackend):
         tool_name = _tool_name_from_frame_result((code, frame))
         self._active_tool_name = tool_name or None
         if not tool_name:
+            return
+        if _is_empty_tool_frame_name(tool_name):
+            self._builtin_empty_tool_frame = True
+            print(
+                f"{self.name}: active tool frame is '{tool_name}'; using built-in "
+                "arm_endpoint TCP and skipping calibration profile auto-load for position control."
+            )
             return
         try:
             from hardware.rm65.calibration_profiles import load_profile
@@ -646,14 +982,23 @@ class RM65ArmBackend(EffectorBackend):
                     max_joint_step,
                 )
                 next_qpos = current_qpos + delta
+                next_qpos = self._apply_singularity_protection(
+                    next_qpos,
+                    reference_qpos=current_qpos,
+                    source="background_stream",
+                )
                 if self.arm is not None and not np.allclose(next_qpos, current_qpos, atol=1e-10):
-                    raw_send_result = self._send_joint_target(next_qpos)
-                    send_code, send_text = _parse_rm65_result(raw_send_result)
-                    with self._state_lock:
-                        self._last_send_result_code = send_code
-                        self._last_send_result_text = send_text
-                        self._current_qpos = next_qpos.copy()
-                        self._last_send_time = loop_start
+                    with self._send_lock:
+                        with self._state_lock:
+                            if self._emergency_stopped or self._stream_stop_event.is_set():
+                                break
+                        raw_send_result = self._send_joint_target(next_qpos)
+                        send_code, send_text = _parse_rm65_result(raw_send_result)
+                        with self._state_lock:
+                            self._last_send_result_code = send_code
+                            self._last_send_result_text = send_text
+                            self._current_qpos = next_qpos.copy()
+                            self._last_send_time = loop_start
             elapsed = time.time() - loop_start
             remaining = period_sec - elapsed
             if remaining > 0.0:
@@ -703,12 +1048,42 @@ class RM65ArmBackend(EffectorBackend):
             and pose_translation_m <= float(jump_gate.small_pose_translation_m)
             and pose_rotation_deg <= float(jump_gate.small_pose_rotation_deg)
         )
+        moderate_pose_translation_m = max(
+            float(jump_gate.small_pose_translation_m),
+            float(getattr(jump_gate, "moderate_pose_translation_m", jump_gate.release_translation_m)),
+        )
+        moderate_pose_rotation_deg = max(
+            float(jump_gate.small_pose_rotation_deg),
+            float(getattr(jump_gate, "moderate_pose_rotation_deg", jump_gate.release_rotation_deg)),
+        )
+        moderate_pose = bool(
+            self._last_target_pose is not None
+            and pose_translation_m <= moderate_pose_translation_m
+            and pose_rotation_deg <= moderate_pose_rotation_deg
+        )
         jump_exceeded, per_joint_delta_deg, weighted_jump_deg = joint_jump_exceeds(
             reference_q=current_qpos,
             candidate_q=candidate_qpos,
             joint_distance_weights=self._joint_distance_weights,
             per_joint_jump_deg=per_joint_limit,
             weighted_jump_threshold_deg=weighted_limit,
+        )
+        moderate_jump_scale = max(
+            1.0,
+            float(getattr(jump_gate, "moderate_pose_joint_jump_scale", 1.25)),
+        )
+        moderate_per_joint_limit = np.asarray(per_joint_limit, dtype=float).reshape(-1) * moderate_jump_scale
+        moderate_weighted_limit = float(weighted_limit) * moderate_jump_scale
+        moderate_jump_exceeded = bool(
+            np.any(per_joint_delta_deg > moderate_per_joint_limit)
+            or weighted_jump_deg > moderate_weighted_limit
+        )
+        moderate_pose_large_jump = bool(moderate_pose and moderate_jump_exceeded)
+        hard_branch_exceeded, hard_branch_delta_deg = hard_branch_jump_exceeds(
+            reference_q=current_qpos,
+            candidate_q=candidate_qpos,
+            joint_indices=jump_gate.hard_branch_joint_indices,
+            max_delta_deg=jump_gate.hard_branch_max_delta_deg,
         )
         release_ready = False
         if self._jump_gate_active and self._jump_hold_anchor_pose is not None:
@@ -733,20 +1108,52 @@ class RM65ArmBackend(EffectorBackend):
             "ik_jump_gate_hold_frames": self._jump_hold_frames,
             "ik_pose_delta_m": None if not np.isfinite(pose_translation_m) else pose_translation_m,
             "ik_pose_delta_deg": None if not np.isfinite(pose_rotation_deg) else pose_rotation_deg,
+            "ik_pose_is_small": small_pose,
+            "ik_pose_is_moderate": moderate_pose,
             "ik_joint_jump_max_deg": float(np.max(per_joint_delta_deg)),
             "ik_joint_jump_weighted_deg": float(weighted_jump_deg),
             "ik_joint_jump_threshold_deg": float(weighted_limit),
+            "ik_moderate_pose_translation_m": float(moderate_pose_translation_m),
+            "ik_moderate_pose_rotation_deg": float(moderate_pose_rotation_deg),
+            "ik_moderate_pose_joint_jump_scale": float(moderate_jump_scale),
+            "ik_moderate_pose_joint_jump_exceeded": bool(moderate_jump_exceeded),
+            "ik_moderate_pose_large_jump": bool(moderate_pose_large_jump),
+            "ik_moderate_pose_per_joint_threshold_deg": moderate_per_joint_limit.tolist(),
+            "ik_moderate_pose_weighted_threshold_deg": float(moderate_weighted_limit),
+            "ik_hard_branch_joint_indices": list(jump_gate.hard_branch_joint_indices),
+            "ik_hard_branch_delta_deg": hard_branch_delta_deg.tolist(),
+            "ik_hard_branch_max_delta_deg": list(jump_gate.hard_branch_max_delta_deg),
+            "ik_hard_branch_exceeded": bool(hard_branch_exceeded),
             "ik_release_ready": release_ready,
             "configured_tcp_enabled": self._configured_tcp_enabled,
         }
 
-        should_hold = bool(small_pose and jump_exceeded and not release_ready)
+        should_hold = bool(
+            (
+                hard_branch_exceeded
+                or (small_pose and jump_exceeded)
+                or moderate_pose_large_jump
+            )
+            and not release_ready
+        )
         if self._jump_gate_active and not should_hold and release_ready:
             metadata["ik_jump_gate_status"] = "released"
         elif self._jump_gate_active and should_hold:
             metadata["ik_jump_gate_status"] = "holding"
+            if hard_branch_exceeded:
+                metadata["ik_jump_gate_reason"] = "hard_branch_jump"
+            elif small_pose and jump_exceeded:
+                metadata["ik_jump_gate_reason"] = "small_pose_large_q_jump"
+            else:
+                metadata["ik_jump_gate_reason"] = "moderate_pose_large_q_jump"
         elif should_hold:
             metadata["ik_jump_gate_status"] = "hold_entered"
+            if hard_branch_exceeded:
+                metadata["ik_jump_gate_reason"] = "hard_branch_jump"
+            elif small_pose and jump_exceeded:
+                metadata["ik_jump_gate_reason"] = "small_pose_large_q_jump"
+            else:
+                metadata["ik_jump_gate_reason"] = "moderate_pose_large_q_jump"
 
         if should_hold:
             if not self._jump_gate_active:
@@ -857,6 +1264,8 @@ class RM65ArmBackend(EffectorBackend):
             hardware_pose_6d = (
                 None if self._last_hardware_pose_6d is None else self._last_hardware_pose_6d.copy()
             )
+            singularity_metadata = dict(self._last_singularity_metadata)
+            emergency_stopped = bool(self._emergency_stopped)
         current_tcp_pose = None
         if current_qpos is not None:
             try:
@@ -865,6 +1274,8 @@ class RM65ArmBackend(EffectorBackend):
                 current_tcp_pose = None
         tcp_pose_flange = self._active_tcp_pose_flange_m_rad()
         tcp_delta = tcp_endpoint_delta(tcp_pose_flange)
+        ik_metadata = dict(self._last_ik_metadata)
+        ik_metadata.update(singularity_metadata)
         return {
             "current_qpos": current_qpos,
             "current_tcp_pose": current_tcp_pose,
@@ -881,9 +1292,12 @@ class RM65ArmBackend(EffectorBackend):
             "hardware_sys_err": self._last_hardware_sys_err,
             "send_result_code": self._last_send_result_code,
             "send_result_text": self._last_send_result_text,
+            "emergency_stopped": emergency_stopped,
             "effective_control_dt_sec": float(self._last_effective_control_dt),
             "effective_step_scale": float(self._last_effective_step_scale),
-            "ik_metadata": dict(self._last_ik_metadata),
+            "ik_metadata": ik_metadata,
+            "singularity_metadata": singularity_metadata,
+            "singularity_protection_ready": bool(self._singularity_protection_ready),
             "active_tool_name": self._active_tool_name,
             "active_tool_profile_path": self._active_tool_profile_path,
             "configured_tcp_enabled": self._configured_tcp_enabled,
@@ -928,6 +1342,35 @@ class RM65ArmBackend(EffectorBackend):
         solver = self._solver_for_tcp_frame(tcp_frame)
         solver_pose = np.asarray(solver.compute_pose(qpos_array), dtype=float)
         return self._pose_from_solver_frame(tcp_frame, solver_pose)
+
+    def emergency_stop(self) -> None:
+        with self._send_lock:
+            self._stream_stop_event.set()
+            with self._state_lock:
+                self._emergency_stopped = True
+                self._stream_target_qpos = None
+            if self.arm is None:
+                with self._state_lock:
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = "emergency_stop_no_arm"
+                return
+            if self._force_position_active:
+                self.arm.Stop_Force_Position_Move(True)
+                self._force_position_active = False
+            stop_method = getattr(self.arm, "Arm_Stop", None)
+            stop_label = "Arm_Stop"
+            if stop_method is None:
+                stop_method = getattr(self.arm, "Arm_Slow_Stop", None)
+                stop_label = "Arm_Slow_Stop"
+            if stop_method is None:
+                raise RuntimeError(f"{self.name} RM65 SDK exposes no Arm_Stop/Arm_Slow_Stop method")
+            stop_result = stop_method()
+            stop_code, stop_text = _parse_rm65_result(stop_result)
+            with self._state_lock:
+                self._last_send_result_code = stop_code
+                self._last_send_result_text = f"emergency_stop:{stop_label}:{stop_text}"
+            if stop_code not in (0, None):
+                raise RuntimeError(f"{self.name} {stop_label} failed with return code {stop_text}")
 
     def close(self) -> None:
         if self._stream_thread is not None:

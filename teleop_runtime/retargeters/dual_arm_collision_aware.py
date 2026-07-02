@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -16,6 +16,7 @@ from ..arm_frames import (
 )
 from rm65_inspire_tac.ik_tuning import (
     RM65IKTuningConfig,
+    hard_branch_jump_exceeds,
     joint_jump_exceeds,
     load_ik_tuning_config,
     pose_delta_metrics,
@@ -29,6 +30,12 @@ from rm65_inspire_tac.pipeline import (
     DualArmSceneProfile,
     build_dual_arm_scene_profile,
 )
+from robot_motion.joint_limits import (
+    JointVelocityLimitProfile,
+    load_joint_velocity_limit_profiles,
+)
+from robot_motion.posture_preferences import JointPosturePreference, posture_preference_from_metadata
+from robot_motion.profiles import IKSafetyProfile, load_ik_safety_profiles
 
 from ..calibration import TeleopCalibration
 from ..interfaces import Retargeter
@@ -44,6 +51,24 @@ _HAND_BASE_FROM_ARM_LINK6[2, 3] = 0.009
 _ARM_LINK6_FROM_HAND_BASE = np.linalg.inv(_HAND_BASE_FROM_ARM_LINK6)
 _CURRENT_TARGET_HOLD_TRANSLATION_M = 1e-3
 _CURRENT_TARGET_HOLD_ROTATION_DEG = 0.5
+
+
+@dataclass(frozen=True)
+class _DualArmCandidate:
+    name: str
+    qpos: np.ndarray
+    source: str
+    method: str
+    raw_score_deg: float = 0.0
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _DualArmEvaluatedCandidate:
+    candidate: _DualArmCandidate
+    output_qpos: np.ndarray
+    score: float
+    metadata: dict[str, object]
 
 
 def _optional_qpos(value: Sequence[float] | np.ndarray | None) -> np.ndarray | None:
@@ -92,6 +117,54 @@ def _warn_tcp_safety(side: str, pose6: Sequence[float] | np.ndarray | None) -> N
         print(f"WARNING: {warning}; verify tool profile before enabling dual-arm collision retargeting.")
 
 
+def _load_safety_profile(path: str | None, profile_name: str) -> IKSafetyProfile:
+    profiles = load_ik_safety_profiles(path)
+    name = str(profile_name).strip()
+    if name not in profiles:
+        raise ValueError(
+            f"Unknown IK safety profile {name!r}. Available profiles: {sorted(profiles)}"
+        )
+    return profiles[name]
+
+
+def _load_joint_velocity_profile(
+    path: str | None,
+    profile_name: str,
+) -> JointVelocityLimitProfile | None:
+    name = str(profile_name).strip()
+    if not name:
+        return None
+    profiles = load_joint_velocity_limit_profiles(path)
+    if name not in profiles:
+        raise ValueError(
+            f"Unknown joint velocity limit profile {name!r}. Available profiles: {sorted(profiles)}"
+        )
+    profile = profiles[name]
+    if profile.dof != 6:
+        raise ValueError(
+            f"Dual-arm retargeting expects a per-arm 6-DOF velocity profile, got {profile.dof}."
+        )
+    return profile
+
+
+def _dual_arm_step_scale_factors(profile: IKSafetyProfile) -> tuple[float, ...]:
+    raw_scales = tuple(float(value) for value in getattr(profile, "local_step_scale_factors", ()) or ())
+    if not raw_scales:
+        raw_scales = (1.0,)
+    scales: list[float] = []
+    for value in raw_scales:
+        if not np.isfinite(value) or value <= 0.0:
+            continue
+        scale = max(1e-6, min(1.0, float(value)))
+        if any(abs(scale - existing) < 1e-9 for existing in scales):
+            continue
+        scales.append(scale)
+    if not scales:
+        scales = [1.0]
+    scales.sort(reverse=True)
+    return tuple(scales)
+
+
 @dataclass(frozen=True)
 class DualArmTargetContext:
     timestamp: float | None
@@ -103,6 +176,7 @@ class DualArmTargetContext:
     right_cartesian: EffectorCommand | None
     left_input_skipped: str | None
     right_input_skipped: str | None
+    target_smoothing_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -128,11 +202,12 @@ class DualArmCollisionAwareRetargeterConfig:
     debug_viz: bool = False
     debug_profile: bool = False
     debug_profile_print_every: int = 0
+    solve_time_budget_ms: float | None = None
     output_command_type: Literal["joint_vector", "cartesian_pose"] = "joint_vector"
     solve_max_iterations: int = 1
     solve_translation_tolerance_m: float = 2e-3
     solve_orientation_tolerance_deg: float = 0.5
-    enforce_realistic_joint_step: bool = False
+    enforce_realistic_joint_step: bool = True
     left_execution_max_joint_step_rad: np.ndarray | Sequence[float] | None = None
     right_execution_max_joint_step_rad: np.ndarray | Sequence[float] | None = None
     left_tool_tcp_pose_flange_m_rad: np.ndarray | Sequence[float] | None = None
@@ -141,6 +216,19 @@ class DualArmCollisionAwareRetargeterConfig:
     right_initial_qpos: np.ndarray | Sequence[float] | None = None
     ik_tuning_json_path: str | None = None
     ik_tuning: RM65IKTuningConfig | None = field(default=None, repr=False)
+    ik_safety_profiles_json: str | None = None
+    ik_safety_profile_name: str = "dual_arm_teleop"
+    ik_safety_profile: IKSafetyProfile | None = field(default=None, repr=False)
+    joint_velocity_limits_json: str | None = None
+    joint_velocity_limit_profile: str = "rm65"
+    joint_velocity_profile: JointVelocityLimitProfile | None = field(default=None, repr=False)
+    target_pose_smoother: Any | None = field(default=None, repr=False)
+    inactive_side_hold_enabled: bool = True
+    inactive_side_hold_translation_deadband_m: float = 0.003
+    inactive_side_hold_rotation_deadband_deg: float = 0.5
+    inactive_side_hold_max_unexplained_position_m: float = 0.025
+    inactive_side_hold_max_unexplained_rotation_deg: float = 8.0
+    inactive_side_hold_score_weight: float = 1_000_000.0
 
     def __post_init__(self) -> None:
         if self.contact_mode not in {"boundary_slide", "freeze_on_contact"}:
@@ -162,8 +250,26 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("solve_orientation_tolerance_deg must be >= 0.")
         if self.debug_profile_print_every < 0:
             raise ValueError("debug_profile_print_every must be >= 0.")
+        if self.solve_time_budget_ms is None:
+            self.solve_time_budget_ms = 1000.0 / float(self.solver_frequency)
+        elif self.solve_time_budget_ms < 0.0:
+            raise ValueError("solve_time_budget_ms must be >= 0.")
         if self.output_command_type not in {"joint_vector", "cartesian_pose"}:
             raise ValueError("output_command_type must be joint_vector or cartesian_pose.")
+        if self.target_pose_smoother is not None and not callable(
+            getattr(self.target_pose_smoother, "smooth_pair", None)
+        ):
+            raise ValueError("target_pose_smoother must provide a smooth_pair method.")
+        if self.inactive_side_hold_translation_deadband_m < 0.0:
+            raise ValueError("inactive_side_hold_translation_deadband_m must be >= 0.")
+        if self.inactive_side_hold_rotation_deadband_deg < 0.0:
+            raise ValueError("inactive_side_hold_rotation_deadband_deg must be >= 0.")
+        if self.inactive_side_hold_max_unexplained_position_m < 0.0:
+            raise ValueError("inactive_side_hold_max_unexplained_position_m must be >= 0.")
+        if self.inactive_side_hold_max_unexplained_rotation_deg < 0.0:
+            raise ValueError("inactive_side_hold_max_unexplained_rotation_deg must be >= 0.")
+        if self.inactive_side_hold_score_weight < 0.0:
+            raise ValueError("inactive_side_hold_score_weight must be >= 0.")
         self.left_execution_max_joint_step_rad = _optional_joint_step(
             self.left_execution_max_joint_step_rad
         )
@@ -178,14 +284,30 @@ class DualArmCollisionAwareRetargeterConfig:
         )
         _warn_tcp_safety("left", self.left_tool_tcp_pose_flange_m_rad)
         _warn_tcp_safety("right", self.right_tool_tcp_pose_flange_m_rad)
+        if self.ik_safety_profile is None:
+            self.ik_safety_profile = _load_safety_profile(
+                self.ik_safety_profiles_json,
+                self.ik_safety_profile_name,
+            )
+        if self.joint_velocity_profile is None:
+            self.joint_velocity_profile = _load_joint_velocity_profile(
+                self.joint_velocity_limits_json,
+                self.joint_velocity_limit_profile,
+            )
+        elif self.joint_velocity_profile.dof != 6:
+            raise ValueError(
+                f"Dual-arm retargeting expects a per-arm 6-DOF velocity profile, got {self.joint_velocity_profile.dof}."
+            )
         if self.enforce_realistic_joint_step:
-            if self.left_execution_max_joint_step_rad is None:
+            if self.left_execution_max_joint_step_rad is None and self.joint_velocity_profile is None:
                 raise ValueError(
-                    "enforce_realistic_joint_step=True requires left_execution_max_joint_step_rad."
+                    "enforce_realistic_joint_step=True requires either left_execution_max_joint_step_rad "
+                    "or a joint_velocity_profile."
                 )
-            if self.right_execution_max_joint_step_rad is None:
+            if self.right_execution_max_joint_step_rad is None and self.joint_velocity_profile is None:
                 raise ValueError(
-                    "enforce_realistic_joint_step=True requires right_execution_max_joint_step_rad."
+                    "enforce_realistic_joint_step=True requires either right_execution_max_joint_step_rad "
+                    "or a joint_velocity_profile."
                 )
         self.left_initial_qpos = _optional_qpos(self.left_initial_qpos)
         self.right_initial_qpos = _optional_qpos(self.right_initial_qpos)
@@ -206,6 +328,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self.config = config
         self.ik_tuning = config.ik_tuning
         assert self.ik_tuning is not None
+        self.ik_safety_profile = config.ik_safety_profile
+        assert self.ik_safety_profile is not None
+        self.posture_preference: JointPosturePreference | None = posture_preference_from_metadata(
+            self.ik_safety_profile.metadata
+        )
+        self.joint_velocity_profile = config.joint_velocity_profile
         self.profile: DualArmSceneProfile = build_dual_arm_scene_profile(config.scene_profile)
         self.left_pose_retargeter = (
             left_pose_retargeter
@@ -282,6 +410,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             dtype=float,
         )
         self._full_joint_weights = self._make_full_joint_weights(self.ik_solver.current_q)
+        self._execution_dt_sec = 1.0 / float(config.solver_frequency)
         self._full_execution_joint_step = self._make_full_execution_joint_step(
             self.ik_solver.current_q
         )
@@ -309,6 +438,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._jump_hold_anchor_targets: dict[str, np.ndarray] | None = None
         self._jump_hold_frames = 0
         self._profile_frame_index = 0
+        self._time_budget_warning_frames = 0
+        self._target_pose_smoother = config.target_pose_smoother
 
         self.set_current_qpos_pair(
             left_qpos=config.left_initial_qpos,
@@ -319,6 +450,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
     @property
     def name(self) -> str:
         return "dual_arm_collision_aware"
+
+    def reset_target_pose_smoothing(self) -> None:
+        reset = getattr(self._target_pose_smoother, "reset", None)
+        if callable(reset):
+            reset()
 
     def set_current_qpos_pair(
         self,
@@ -373,6 +509,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "hold_recovery_ms": 0.0,
             "target_already_reached": False,
             "frame_total_ms": 0.0,
+            "time_budget_ms": float(self.config.solve_time_budget_ms or 0.0),
+            "time_budget_exceeded": False,
         }
 
     def _record_solver_profile(self, profile: dict[str, object] | None) -> None:
@@ -443,6 +581,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             f"iters={iterations} status={status} branch={branch_candidate}"
         )
 
+    def _maybe_warn_time_budget(self, *, elapsed_ms: float, budget_ms: float) -> None:
+        if budget_ms <= 0.0 or elapsed_ms <= budget_ms:
+            self._time_budget_warning_frames = 0
+            return
+        self._time_budget_warning_frames += 1
+        if self._time_budget_warning_frames == 1 or self._time_budget_warning_frames % 30 == 0:
+            print(
+                "[dual_arm_collision_aware WARNING] "
+                f"IK frame exceeded time budget: elapsed={elapsed_ms:.3f}ms "
+                f"budget={budget_ms:.3f}ms status=warning_only"
+            )
+
     def interpolate_world_targets(
         self,
         start_targets: dict[str, np.ndarray],
@@ -479,6 +629,19 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             side="right",
             calibration=calibration,
         )
+        target_smoothing_metadata: dict[str, object] = {"enabled": False}
+        if self._target_pose_smoother is not None:
+            smoothed_targets, target_smoothing_metadata = (
+                self._target_pose_smoother.smooth_pair(
+                    left_target=left_target,
+                    right_target=right_target,
+                    left_active=left_cartesian is not None,
+                    right_active=right_cartesian is not None,
+                    timestamp=observation.timestamp,
+                )
+            )
+            left_target = as_pose_matrix(smoothed_targets["left"])
+            right_target = as_pose_matrix(smoothed_targets["right"])
         return DualArmTargetContext(
             timestamp=observation.timestamp,
             left_target=left_target.copy(),
@@ -497,6 +660,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             right_cartesian=right_cartesian.copy() if right_cartesian is not None else None,
             left_input_skipped=left_command.metadata.get("skipped"),
             right_input_skipped=right_command.metadata.get("skipped"),
+            target_smoothing_metadata=dict(target_smoothing_metadata),
         )
 
     def build_command_for_context(
@@ -515,6 +679,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         current_targets = {"left": left_target.copy(), "right": right_target.copy()}
         solver_targets_before_solve = self.current_world_targets()
+        target_activity_metadata = self._target_activity_metadata(current_targets)
         left_source_target_pose_base = (
             None
             if context.left_cartesian is None or context.left_cartesian.command_type != "cartesian_pose"
@@ -559,6 +724,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "right_input_skipped": context.right_input_skipped,
                 "ik_objective_mode": self.ik_tuning.ik_objective_mode,
                 "ik_tuning_source": self.ik_tuning.source_path,
+                "ik_safety_profile": self.ik_safety_profile.name,
+                "joint_velocity_limit_profile": (
+                    None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
+                ),
                 "source_target_pose_base": {
                     "left": left_source_target_pose_base,
                     "right": right_source_target_pose_base,
@@ -571,6 +740,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "left": left_source_target_pose_operator,
                     "right": right_source_target_pose_operator,
                 },
+                "target_pose_smoothing": dict(context.target_smoothing_metadata),
+                "target_activity": dict(target_activity_metadata),
             }
         )
 
@@ -584,6 +755,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         jump_gate_release_ready = False
         jump_gate_hold_frames = self._jump_hold_frames
         jump_gate_metrics: dict[str, object] = {}
+        candidate_selection_metadata: dict[str, object] = {}
         execution_step_metadata: dict[str, object] = {
             "enabled": bool(self.config.enforce_realistic_joint_step),
             "step_limited": False,
@@ -631,10 +803,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     profile=profile,
                 )
                 branch_start = time.perf_counter()
-                candidate_q, branch_candidate, branch_score_deg, branch_min_distance = (
-                    self._select_normalized_candidate(
+                candidate_q, branch_candidate, branch_score_deg, branch_min_distance, candidate_selection_metadata = (
+                    self._select_safe_tracking_candidate(
                         raw_full_q=solved_q,
                         reference_full_q=pre_solve_q,
+                        current_targets=current_targets,
+                        target_activity=target_activity_metadata,
                         profile=profile,
                     )
                 )
@@ -806,8 +980,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
             self.ik_solver.set_configuration_q(active_q)
             self._last_safe_full_q = active_q.copy()
+        left_limit_margin = self._joint_limit_margin_metadata("left", left_qpos)
+        right_limit_margin = self._joint_limit_margin_metadata("right", right_qpos)
+        frame_total_ms = (time.perf_counter() - frame_start) * 1000.0
+        time_budget_ms = float(self.config.solve_time_budget_ms or 0.0)
+        time_budget_exceeded = bool(time_budget_ms > 0.0 and frame_total_ms > time_budget_ms)
+        self._maybe_warn_time_budget(elapsed_ms=frame_total_ms, budget_ms=time_budget_ms)
         if profile is not None:
-            profile["frame_total_ms"] = (time.perf_counter() - frame_start) * 1000.0
+            profile["frame_total_ms"] = frame_total_ms
+            profile["time_budget_ms"] = time_budget_ms
+            profile["time_budget_exceeded"] = time_budget_exceeded
         command.metadata.update(
             {
                 "collision_avoidance_status": status,
@@ -824,8 +1006,18 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "ik_jump_gate_release_ready": jump_gate_release_ready,
                 "ik_jump_gate_hold_frames": jump_gate_hold_frames,
                 "ik_jump_gate_metrics": jump_gate_metrics,
+                "ik_candidate_selection": dict(candidate_selection_metadata),
+                "joint_limit_margin": {
+                    "left": dict(left_limit_margin),
+                    "right": dict(right_limit_margin),
+                },
+                "ik_frame_total_ms": frame_total_ms,
+                "ik_time_budget_ms": time_budget_ms,
+                "ik_time_budget_exceeded": time_budget_exceeded,
                 "execution_step_metadata": dict(execution_step_metadata),
                 "left_inactive_jitter_hold": left_inactive_jitter_hold is not None,
+                "target_pose_smoothing": dict(context.target_smoothing_metadata),
+                "target_activity": dict(target_activity_metadata),
             }
         )
         left_metadata = {
@@ -854,8 +1046,17 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_jump_gate_release_ready": jump_gate_release_ready,
             "ik_jump_gate_hold_frames": jump_gate_hold_frames,
             "ik_jump_gate_metrics": dict(jump_gate_metrics.get("left", {})),
+            "ik_candidate_selection": dict(candidate_selection_metadata),
+            "joint_limit_margin": dict(left_limit_margin),
+            "ik_frame_total_ms": frame_total_ms,
+            "ik_time_budget_ms": time_budget_ms,
+            "ik_time_budget_exceeded": time_budget_exceeded,
             "execution_step_metadata": dict(execution_step_metadata),
             "inactive_jitter_hold": left_inactive_jitter_hold is not None,
+            "target_pose_smoothing": dict(
+                context.target_smoothing_metadata.get("left", {})
+            ),
+            "target_activity": dict(target_activity_metadata.get("left", {})),
         }
         right_metadata = {
             "controller": self.name,
@@ -883,7 +1084,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_jump_gate_release_ready": jump_gate_release_ready,
             "ik_jump_gate_hold_frames": jump_gate_hold_frames,
             "ik_jump_gate_metrics": dict(jump_gate_metrics.get("right", {})),
+            "ik_candidate_selection": dict(candidate_selection_metadata),
+            "joint_limit_margin": dict(right_limit_margin),
+            "ik_frame_total_ms": frame_total_ms,
+            "ik_time_budget_ms": time_budget_ms,
+            "ik_time_budget_exceeded": time_budget_exceeded,
             "execution_step_metadata": dict(execution_step_metadata),
+            "target_pose_smoothing": dict(
+                context.target_smoothing_metadata.get("right", {})
+            ),
+            "target_activity": dict(target_activity_metadata.get("right", {})),
         }
         if self.config.output_command_type == "cartesian_pose":
             left_world_pose = self.ik_solver.compute_frame_pose(self.profile.left_frame_name, active_q)
@@ -1183,6 +1393,24 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             return qpos[0:6].copy(), qpos[6:12].copy()
         raise ValueError(f"{self.name} received unsupported solver output shape: {qpos.shape}")
 
+    def _joint_limit_margin_metadata(self, side: str, qpos: np.ndarray) -> dict[str, object]:
+        lower, upper = self._left_arm_limits if side == "left" else self._right_arm_limits
+        q = np.asarray(qpos, dtype=float).reshape(6)
+        lower = np.asarray(lower, dtype=float).reshape(6)
+        upper = np.asarray(upper, dtype=float).reshape(6)
+        lower_margin = q - lower
+        upper_margin = upper - q
+        min_margin = np.minimum(lower_margin, upper_margin)
+        nearest_index = int(np.argmin(min_margin))
+        return {
+            "lower_margin_deg": np.rad2deg(lower_margin).copy(),
+            "upper_margin_deg": np.rad2deg(upper_margin).copy(),
+            "min_margin_deg": np.rad2deg(min_margin).copy(),
+            "nearest_joint": int(nearest_index + 1),
+            "nearest_margin_deg": float(np.rad2deg(min_margin[nearest_index])),
+            "near_limit": bool(min_margin[nearest_index] < np.deg2rad(5.0)),
+        }
+
     def _pose_to_target(self, pose: np.ndarray) -> np.ndarray:
         quat = R.from_matrix(as_pose_matrix(pose)[:3, :3]).as_quat()
         pose_matrix = as_pose_matrix(pose)
@@ -1219,11 +1447,34 @@ class DualArmCollisionAwareRetargeter(Retargeter):
     def _make_full_execution_joint_step(self, qpos: np.ndarray) -> np.ndarray | None:
         if not self.config.enforce_realistic_joint_step:
             return None
+        if self.joint_velocity_profile is not None:
+            dt_sec = max(1e-6, float(self._execution_dt_sec))
+            arm_step = np.deg2rad(self.joint_velocity_profile.max_step_deg(dt_sec))
+            return self._make_full_step_from_arm_steps(
+                qpos,
+                left_step=arm_step,
+                right_step=arm_step,
+            )
         left_step = self.config.left_execution_max_joint_step_rad
         right_step = self.config.right_execution_max_joint_step_rad
         if left_step is None or right_step is None:
             return None
+        return self._make_full_step_from_arm_steps(
+            qpos,
+            left_step=left_step,
+            right_step=right_step,
+        )
+
+    def _make_full_step_from_arm_steps(
+        self,
+        qpos: np.ndarray,
+        *,
+        left_step: np.ndarray | Sequence[float],
+        right_step: np.ndarray | Sequence[float],
+    ) -> np.ndarray:
         q = np.asarray(qpos, dtype=float).reshape(-1)
+        left_step = np.asarray(left_step, dtype=float).reshape(6)
+        right_step = np.asarray(right_step, dtype=float).reshape(6)
         max_step = np.zeros_like(q)
         if self.profile.solution_layout == "dual_arm_hand" and q.shape[0] >= 24:
             max_step[0:6] = left_step
@@ -1253,6 +1504,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             self.ik_solver.current_q
         )
 
+    def set_execution_dt_sec(self, dt_sec: float) -> None:
+        self._execution_dt_sec = max(1e-6, float(dt_sec))
+        self._full_execution_joint_step = self._make_full_execution_joint_step(
+            self.ik_solver.current_q
+        )
+
     def _limit_to_execution_step(
         self,
         *,
@@ -1267,6 +1524,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "weighted_delta_deg": 0.0,
             "left_max_abs_delta_deg": 0.0,
             "right_max_abs_delta_deg": 0.0,
+            "joint_velocity_limit_profile": (
+                None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
+            ),
+            "joint_velocity_limit_dt_sec": float(self._execution_dt_sec),
+            "joint_velocity_limit_max_dt_sec": (
+                None if self.joint_velocity_profile is None else float(self.joint_velocity_profile.max_dt_sec)
+            ),
         }
         if not self.config.enforce_realistic_joint_step or self._full_execution_joint_step is None:
             return candidate_q.copy(), metadata
@@ -1277,6 +1541,15 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         step_limited = not np.allclose(limited_q, candidate_q, atol=1e-10)
         left_delta, right_delta = self._split_solution(limited_q - reference_q)
+        left_max_step, right_max_step = self._split_solution(self._full_execution_joint_step)
+        requested_delta_deg = np.rad2deg(candidate_q - reference_q)
+        max_step_deg = np.rad2deg(np.asarray(self._full_execution_joint_step, dtype=float).reshape(reference_q.shape))
+        ratios = np.divide(
+            np.abs(requested_delta_deg),
+            max_step_deg,
+            out=np.zeros_like(requested_delta_deg, dtype=float),
+            where=max_step_deg > 0.0,
+        )
         metadata.update(
             {
                 "step_limited": bool(step_limited),
@@ -1289,6 +1562,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 ),
                 "left_max_abs_delta_deg": float(np.rad2deg(np.max(np.abs(left_delta)))),
                 "right_max_abs_delta_deg": float(np.rad2deg(np.max(np.abs(right_delta)))),
+                "joint_velocity_limit_requested_delta_deg": requested_delta_deg.astype(float).tolist(),
+                "joint_velocity_limit_delta_deg": np.rad2deg(limited_q - reference_q).astype(float).tolist(),
+                "joint_velocity_limit_max_step_deg": max_step_deg.astype(float).tolist(),
+                "joint_velocity_limit_ratio": float(np.max(ratios)) if ratios.size else 0.0,
+                "left_max_step_deg": np.rad2deg(left_max_step).astype(float).tolist(),
+                "right_max_step_deg": np.rad2deg(right_max_step).astype(float).tolist(),
             }
         )
         return limited_q.copy(), metadata
@@ -1299,6 +1578,60 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             candidate_q=candidate_full_q,
             joint_distance_weights=self._full_joint_weights,
         )
+
+    def _dual_posture_penalty_deg(self, full_q: np.ndarray) -> float:
+        if self.posture_preference is None:
+            return 0.0
+        left_q, right_q = self._split_solution(np.asarray(full_q, dtype=float).reshape(-1))
+        return float(
+            self.posture_preference.evaluate(left_q).score_deg
+            + self.posture_preference.evaluate(right_q).score_deg
+        )
+
+    def _dual_posture_comparison_metadata(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray,
+    ) -> dict[str, object] | None:
+        if self.posture_preference is None:
+            return None
+        ref_left, ref_right = self._split_solution(reference_full_q)
+        cand_left, cand_right = self._split_solution(candidate_full_q)
+        left = self.posture_preference.compare(ref_left, cand_left)
+        right = self.posture_preference.compare(ref_right, cand_right)
+        return {
+            "name": self.posture_preference.name,
+            "left": left.metadata(),
+            "right": right.metadata(),
+            "score_penalty_deg": float(left.candidate.score_deg + right.candidate.score_deg),
+            "improvement_deg": float(left.improvement_deg + right.improvement_deg),
+            "any_reference_bad": bool(left.reference.bad or right.reference.bad),
+            "any_candidate_bad": bool(left.candidate.bad or right.candidate.bad),
+            "improving_sides": [
+                side
+                for side, comparison in (("left", left), ("right", right))
+                if comparison.improvement_deg > 0.0
+            ],
+        }
+
+    def _posture_hard_branch_escape_metadata(
+        self,
+        *,
+        side: str,
+        reference_q: np.ndarray,
+        candidate_q: np.ndarray,
+        exceeded_joint_indices: tuple[int, ...],
+    ) -> dict[str, object] | None:
+        if self.posture_preference is None:
+            return None
+        metadata = self.posture_preference.hard_branch_escape_metadata(
+            reference_qpos=reference_q,
+            candidate_qpos=candidate_q,
+            exceeded_joint_indices=exceeded_joint_indices,
+        )
+        metadata["side"] = side
+        return metadata
 
     def _branch_candidates(
         self,
@@ -1370,11 +1703,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if any(np.allclose(candidate_q, existing, atol=1e-8) for existing in seen):
                 continue
             seen.append(candidate_q.copy())
+            posture_penalty = self._dual_posture_penalty_deg(candidate_q)
             ranked.append(
                 (
                     name,
                     candidate_q.copy(),
-                    self._full_joint_distance_score(reference_full, candidate_q),
+                    self._full_joint_distance_score(reference_full, candidate_q) + posture_penalty,
                 )
             )
         ranked.sort(key=lambda item: item[2])
@@ -1408,6 +1742,1612 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                         return fallback_q.copy(), fallback_name, float(fallback_score), None
         return candidate_q.copy(), candidate_name, float(score_deg), candidate_min_distance
 
+    def _select_safe_tracking_candidate(
+        self,
+        *,
+        raw_full_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+        target_activity: dict[str, object] | None = None,
+        profile: dict[str, object] | None = None,
+    ) -> tuple[np.ndarray, str, float, float | None, dict[str, object]]:
+        safety_profile = self.ik_safety_profile
+        if (
+            safety_profile is None
+            or not bool(safety_profile.local_step_enabled)
+            or not bool(self.config.enforce_realistic_joint_step)
+        ):
+            q, name, score, min_distance = self._select_normalized_candidate(
+                raw_full_q=raw_full_q,
+                reference_full_q=reference_full_q,
+                profile=profile,
+            )
+            return q, name, score, min_distance, {
+                "enabled": False,
+                "reason": (
+                    "execution_step_limit_disabled"
+                    if not bool(self.config.enforce_realistic_joint_step)
+                    else "ik_safety_profile_local_step_disabled"
+                ),
+                "selected": name,
+            }
+
+        reference_full = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        target_activity_metadata = (
+            self._target_activity_metadata(current_targets)
+            if target_activity is None
+            else dict(target_activity)
+        )
+        inactive_hold_active = bool(
+            target_activity_metadata.get("enabled", False)
+            and any(
+                float(
+                    dict(target_activity_metadata.get(side, {}) or {}).get(
+                        "hold_weight", 0.0
+                    )
+                    or 0.0
+                )
+                > 0.0
+                for side in ("left", "right")
+            )
+        )
+        selection_start = time.perf_counter()
+        time_budget_ms = float(self.config.solve_time_budget_ms or 0.0)
+        solve_elapsed_ms = (
+            float(profile.get("solve_total_ms", 0.0))
+            if isinstance(profile, dict)
+            else 0.0
+        )
+        branch_budget_ms = 0.0
+        if time_budget_ms > 0.0:
+            branch_budget_ms = max(5.0, time_budget_ms - solve_elapsed_ms - 5.0)
+
+        base_candidates, limit_escape_metadata = self._dual_arm_tracking_candidates(
+            raw_full_q=raw_full_q,
+            reference_full_q=reference_full,
+            current_targets=current_targets,
+            include_limit_escape=False,
+            include_posture_escape=False,
+            include_wrist_unload=False,
+        )
+        scale_factors = _dual_arm_step_scale_factors(safety_profile)
+        evaluated: list[_DualArmEvaluatedCandidate] = []
+        rejections: list[dict[str, object]] = []
+        candidate_eval_stopped_early = False
+        stage_summaries: list[dict[str, object]] = []
+
+        def deadline_reached() -> bool:
+            if branch_budget_ms <= 0.0:
+                return False
+            elapsed_ms = (time.perf_counter() - selection_start) * 1000.0
+            return elapsed_ms >= branch_budget_ms
+
+        def evaluate_stage(
+            *,
+            stage: str,
+            candidates: list[_DualArmCandidate],
+            scales: tuple[float, ...],
+            stop_after_first_accept_per_candidate: bool = True,
+        ) -> None:
+            nonlocal candidate_eval_stopped_early
+            accepted_before = len(evaluated)
+            rejected_before = len(rejections)
+            attempts = 0
+            for candidate in candidates:
+                candidate_accepted = False
+                for scale in scales:
+                    attempts += 1
+                    accepted, output_qpos, metadata = self._evaluate_dual_arm_step_candidate(
+                        candidate=candidate,
+                        reference_full_q=reference_full,
+                        current_targets=current_targets,
+                        target_activity=target_activity_metadata,
+                        step_scale=scale,
+                    )
+                    metadata["candidate_eval_stage"] = stage
+                    if accepted:
+                        evaluated.append(
+                            _DualArmEvaluatedCandidate(
+                                candidate=candidate,
+                                output_qpos=output_qpos,
+                                score=float(metadata.get("score", 1e18)),
+                                metadata=metadata,
+                            )
+                        )
+                        candidate_accepted = True
+                        if stop_after_first_accept_per_candidate:
+                            break
+                    else:
+                        rejections.append(metadata)
+                if deadline_reached() and evaluated:
+                    candidate_eval_stopped_early = True
+                    break
+                if candidate_accepted and deadline_reached():
+                    candidate_eval_stopped_early = True
+                    break
+            stage_summaries.append(
+                {
+                    "stage": stage,
+                    "candidate_count": len(candidates),
+                    "scale_factors": list(scales),
+                    "attempt_count": attempts,
+                    "accepted_count": len(evaluated) - accepted_before,
+                    "rejected_count": len(rejections) - rejected_before,
+                    "stopped_early": bool(candidate_eval_stopped_early),
+                }
+            )
+
+        def selection_metadata(
+            *,
+            candidates: list[_DualArmCandidate],
+            auxiliary_metadata: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            combined = dict(limit_escape_metadata)
+            if auxiliary_metadata:
+                combined.update(auxiliary_metadata)
+            combined.setdefault("posture_escape", {"enabled": False, "status": "deferred"})
+            combined.setdefault("wrist_unload", {"enabled": False, "status": "deferred"})
+            elapsed_ms = (time.perf_counter() - selection_start) * 1000.0
+            return {
+                "enabled": True,
+                "profile": safety_profile.name,
+                "joint_velocity_limit_profile": (
+                    None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
+                ),
+                "execution_dt_sec": float(self._execution_dt_sec),
+                "candidate_count": len(candidates),
+                "evaluated_count": len(evaluated),
+                "rejection_count": len(rejections),
+                "last_rejections": rejections[-8:],
+                "scale_factors": list(scale_factors),
+                "candidate_eval_stages": list(stage_summaries),
+                "candidate_eval_elapsed_ms": float(elapsed_ms),
+                "candidate_eval_branch_budget_ms": (
+                    None if branch_budget_ms <= 0.0 else float(branch_budget_ms)
+                ),
+                "candidate_eval_stopped_early": bool(candidate_eval_stopped_early),
+                "target_activity": dict(target_activity_metadata),
+                "inactive_side_hold_active": bool(inactive_hold_active),
+                "limit_escape": dict(combined),
+                "posture_escape": dict(combined.get("posture_escape", {})),
+                "wrist_unload": dict(combined.get("wrist_unload", {})),
+            }
+
+        def choose_from_evaluated(
+            *,
+            metadata: dict[str, object],
+        ) -> tuple[np.ndarray, str, float, float | None, dict[str, object]] | None:
+            if not evaluated:
+                return None
+            selection_pool, selection_policy = self._dual_stable_selection_pool(evaluated)
+            metadata["selection_policy"] = selection_policy
+            selection_pool = list(selection_pool)
+            selection_pool.sort(key=lambda item: item.score)
+            collision_rejections: list[dict[str, object]] = []
+            max_collision_checks = max(1, int(safety_profile.max_candidate_count))
+            for item in selection_pool[:max_collision_checks]:
+                min_distance = self._profiled_min_collision_distance(
+                    item.output_qpos,
+                    profile,
+                    phase="candidate_selection",
+                )
+                fallback_reason = self._fallback_reason_for_distance(min_distance)
+                if fallback_reason is not None:
+                    collision_rejections.append(
+                        {
+                            "candidate": item.candidate.name,
+                            "method": item.candidate.method,
+                            "scale": item.metadata.get("step_scale"),
+                            "collision_distance_m": min_distance,
+                            "reject_reason": fallback_reason,
+                        }
+                    )
+                    continue
+                selected_metadata = dict(item.metadata)
+                metadata.update(
+                    {
+                        "status": "selected",
+                        "selected": item.candidate.name,
+                        "selected_source": item.candidate.source,
+                        "selected_method": item.candidate.method,
+                        "selected_score": float(item.score),
+                        "selected_step_scale": selected_metadata.get("step_scale"),
+                        "collision_distance_m": min_distance,
+                        "collision_rejection_count": len(collision_rejections),
+                        "collision_rejections": collision_rejections[-8:],
+                        "selected_metadata": selected_metadata,
+                    }
+                )
+                return (
+                    item.output_qpos.copy(),
+                    item.candidate.name,
+                    float(item.score),
+                    min_distance,
+                    metadata,
+                )
+            metadata.update(
+                {
+                    "collision_rejection_count": len(collision_rejections),
+                    "collision_rejections": collision_rejections[-8:],
+                }
+            )
+            return None
+
+        primary_scales = scale_factors if inactive_hold_active else scale_factors[:1]
+        fallback_scales = () if inactive_hold_active else scale_factors[1:]
+        evaluate_stage(
+            stage="base_primary",
+            candidates=base_candidates,
+            scales=primary_scales,
+            stop_after_first_accept_per_candidate=not inactive_hold_active,
+        )
+        if not evaluated and fallback_scales:
+            evaluate_stage(stage="base_fallback", candidates=base_candidates, scales=fallback_scales)
+
+        base_metadata = selection_metadata(candidates=base_candidates)
+        base_selection = choose_from_evaluated(metadata=base_metadata)
+        if base_selection is not None:
+            base_selection[4]["candidate_eval_mode"] = "base_only"
+            return base_selection
+
+        auxiliary_candidates, auxiliary_metadata = self._dual_arm_tracking_candidates(
+            raw_full_q=raw_full_q,
+            reference_full_q=reference_full,
+            current_targets=current_targets,
+            include_base=False,
+            include_limit_escape=True,
+            include_posture_escape=not candidate_eval_stopped_early,
+            include_wrist_unload=not candidate_eval_stopped_early,
+        )
+        all_candidates = list(base_candidates) + list(auxiliary_candidates)
+        if auxiliary_candidates and not candidate_eval_stopped_early:
+            evaluate_stage(
+                stage="auxiliary_primary",
+                candidates=auxiliary_candidates,
+                scales=primary_scales,
+                stop_after_first_accept_per_candidate=not inactive_hold_active,
+            )
+            if not evaluated and fallback_scales and not candidate_eval_stopped_early:
+                evaluate_stage(
+                    stage="auxiliary_fallback",
+                    candidates=auxiliary_candidates,
+                    scales=fallback_scales,
+                )
+
+        metadata = selection_metadata(
+            candidates=all_candidates,
+            auxiliary_metadata=auxiliary_metadata,
+        )
+        auxiliary_selection = choose_from_evaluated(metadata=metadata)
+        if auxiliary_selection is not None:
+            auxiliary_selection[4]["candidate_eval_mode"] = "base_then_auxiliary"
+            return auxiliary_selection
+
+        if candidate_eval_stopped_early and evaluated:
+            metadata["candidate_eval_stopped_with_accepted_candidates"] = True
+            stopped_selection = choose_from_evaluated(metadata=metadata)
+            if stopped_selection is not None:
+                stopped_selection[4]["candidate_eval_mode"] = "deadline_partial"
+                return stopped_selection
+
+        if candidate_eval_stopped_early:
+            metadata["candidate_eval_stop_reason"] = "branch_budget_exhausted"
+
+        if not evaluated:
+            hold_q = reference_full.copy()
+            min_distance = self._profiled_min_collision_distance(
+                hold_q,
+                profile,
+                phase="candidate_selection_hold",
+            )
+            metadata.update(
+                {
+                    "status": "hold_reference",
+                    "selected": "local_step_hold",
+                    "reason": "no_progress_candidate",
+                    "collision_distance_m": min_distance,
+                }
+            )
+            return hold_q, "local_step_hold", 0.0, min_distance, metadata
+
+        hold_q = reference_full.copy()
+        min_distance = self._profiled_min_collision_distance(
+            hold_q,
+            profile,
+            phase="candidate_selection_collision_hold",
+        )
+        metadata.update(
+            {
+                "status": "hold_reference",
+                "selected": "local_step_hold",
+                "reason": "candidate_collision_rejected",
+                "collision_distance_m": min_distance,
+                "collision_rejection_count": len(metadata.get("collision_rejections", [])),
+                "collision_rejections": metadata.get("collision_rejections", [])[-8:],
+            }
+        )
+        return hold_q, "local_step_hold", 0.0, min_distance, metadata
+
+    def _dual_arm_tracking_candidates(
+        self,
+        *,
+        raw_full_q: np.ndarray,
+        reference_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+        include_base: bool = True,
+        include_limit_escape: bool = True,
+        include_posture_escape: bool = True,
+        include_wrist_unload: bool = True,
+    ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
+        candidates: list[_DualArmCandidate] = []
+        seen: list[np.ndarray] = []
+        if include_base:
+            for name, qpos, score_deg in self._branch_candidates(
+                raw_full_q=raw_full_q,
+                reference_full_q=reference_full_q,
+            ):
+                posture_metadata = self._dual_posture_comparison_metadata(
+                    reference_full_q=reference_full_q,
+                    candidate_full_q=qpos,
+                )
+                candidates.append(
+                    _DualArmCandidate(
+                        name=name,
+                        qpos=qpos.copy(),
+                        source="multitask",
+                        method=name,
+                        raw_score_deg=float(score_deg),
+                        metadata=(
+                            {}
+                            if posture_metadata is None
+                            else {"posture_preference": posture_metadata}
+                        ),
+                    )
+                )
+                seen.append(qpos.copy())
+
+        if include_limit_escape:
+            limit_candidates, limit_metadata = self._dual_arm_limit_escape_candidates(
+                reference_full_q=reference_full_q,
+                current_targets=current_targets,
+            )
+        else:
+            limit_candidates = []
+            limit_metadata = {"enabled": False, "status": "deferred", "candidate_count": 0}
+        for candidate in limit_candidates:
+            if any(np.allclose(candidate.qpos, existing, atol=1e-9) for existing in seen):
+                continue
+            candidates.append(candidate)
+            seen.append(candidate.qpos.copy())
+
+        if include_posture_escape:
+            posture_candidates, posture_metadata = self._dual_arm_posture_escape_candidates(
+                reference_full_q=reference_full_q,
+            )
+        else:
+            posture_candidates = []
+            posture_metadata = {"enabled": False, "status": "deferred", "candidate_count": 0}
+        for candidate in posture_candidates:
+            if any(np.allclose(candidate.qpos, existing, atol=1e-9) for existing in seen):
+                continue
+            candidates.append(candidate)
+            seen.append(candidate.qpos.copy())
+
+        if include_wrist_unload:
+            wrist_candidates, wrist_metadata = self._dual_arm_wrist_unload_candidates(
+                reference_full_q=reference_full_q,
+            )
+        else:
+            wrist_candidates = []
+            wrist_metadata = {"enabled": False, "status": "deferred", "candidate_count": 0}
+        for candidate in wrist_candidates:
+            if any(np.allclose(candidate.qpos, existing, atol=1e-9) for existing in seen):
+                continue
+            candidates.append(candidate)
+            seen.append(candidate.qpos.copy())
+
+        combined_metadata = dict(limit_metadata)
+        combined_metadata["posture_escape"] = dict(posture_metadata)
+        combined_metadata["wrist_unload"] = dict(wrist_metadata)
+        return candidates, combined_metadata
+
+    def _dual_arm_posture_escape_candidates(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+    ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
+        metadata: dict[str, object] = {
+            "enabled": bool(
+                self.posture_preference is not None
+                and self.posture_preference.enabled
+                and self.posture_preference.local_escape_enabled
+            ),
+            "candidate_count": 0,
+        }
+        if self.posture_preference is None or not self.posture_preference.local_escape_enabled:
+            metadata["status"] = "disabled"
+            return [], metadata
+        if self._full_execution_joint_step is None:
+            metadata["status"] = "joint_step_unavailable"
+            return [], metadata
+
+        q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        left_q, right_q = self._split_solution(q)
+        left_step, right_step = self._split_solution(self._full_execution_joint_step)
+        left_targets, left_metadata = self.posture_preference.local_escape_targets(
+            reference_qpos=left_q,
+            max_step_rad=left_step,
+            q_min=self._left_arm_limits[0],
+            q_max=self._left_arm_limits[1],
+        )
+        right_targets, right_metadata = self.posture_preference.local_escape_targets(
+            reference_qpos=right_q,
+            max_step_rad=right_step,
+            q_min=self._right_arm_limits[0],
+            q_max=self._right_arm_limits[1],
+        )
+        candidates: list[_DualArmCandidate] = []
+        seen: list[np.ndarray] = []
+        max_candidates = max(0, int(self.posture_preference.local_escape_max_candidates))
+        for side, targets in (("left", left_targets), ("right", right_targets)):
+            for label, arm_q, arm_metadata in targets:
+                if len(candidates) >= max_candidates:
+                    break
+                candidate_q = self._embed_arm_qpos(
+                    current_full_q=q,
+                    left_qpos=arm_q if side == "left" else left_q,
+                    right_qpos=arm_q if side == "right" else right_q,
+                )
+                if any(np.allclose(candidate_q, existing, atol=1e-9) for existing in seen):
+                    continue
+                seen.append(candidate_q.copy())
+                posture_metadata = self._dual_posture_comparison_metadata(
+                    reference_full_q=q,
+                    candidate_full_q=candidate_q,
+                )
+                candidates.append(
+                    _DualArmCandidate(
+                        name=f"posture_escape_{side}_{label}",
+                        qpos=candidate_q.copy(),
+                        source="posture_escape",
+                        method=f"posture_escape_{side}_{label}",
+                        metadata={
+                            "local_step_posture_escape_candidate": True,
+                            "local_step_posture_escape_side": side,
+                            "local_step_posture_escape_label": label,
+                            "local_step_posture_escape_arm_metadata": dict(arm_metadata),
+                            **(
+                                {}
+                                if posture_metadata is None
+                                else {"posture_preference": posture_metadata}
+                            ),
+                        },
+                    )
+                )
+            if len(candidates) >= max_candidates:
+                break
+        metadata.update(
+            {
+                "status": "active" if candidates else "no_candidates",
+                "candidate_count": len(candidates),
+                "max_candidates": int(max_candidates),
+                "left": dict(left_metadata),
+                "right": dict(right_metadata),
+                "emitted_methods": [candidate.method for candidate in candidates],
+            }
+        )
+        return candidates, metadata
+
+    def _dual_arm_wrist_unload_candidates(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+    ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
+        metadata: dict[str, object] = {
+            "enabled": bool(
+                self.posture_preference is not None
+                and self.posture_preference.enabled
+                and self.posture_preference.wrist_unload_enabled
+            ),
+            "candidate_count": 0,
+        }
+        if self.posture_preference is None or not self.posture_preference.wrist_unload_enabled:
+            metadata["status"] = "disabled"
+            return [], metadata
+        if self._full_execution_joint_step is None:
+            metadata["status"] = "joint_step_unavailable"
+            return [], metadata
+
+        q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        left_q, right_q = self._split_solution(q)
+        left_step, right_step = self._split_solution(self._full_execution_joint_step)
+        left_targets, left_metadata = self.posture_preference.wrist_unload_targets(
+            reference_qpos=left_q,
+            max_step_rad=left_step,
+            q_min=self._left_arm_limits[0],
+            q_max=self._left_arm_limits[1],
+        )
+        right_targets, right_metadata = self.posture_preference.wrist_unload_targets(
+            reference_qpos=right_q,
+            max_step_rad=right_step,
+            q_min=self._right_arm_limits[0],
+            q_max=self._right_arm_limits[1],
+        )
+        candidates: list[_DualArmCandidate] = []
+        seen: list[np.ndarray] = []
+        max_candidates = max(0, int(self.posture_preference.wrist_unload_max_candidates))
+        for side, targets in (("left", left_targets), ("right", right_targets)):
+            for label, arm_q, arm_metadata in targets:
+                if len(candidates) >= max_candidates:
+                    break
+                candidate_q = self._embed_arm_qpos(
+                    current_full_q=q,
+                    left_qpos=arm_q if side == "left" else left_q,
+                    right_qpos=arm_q if side == "right" else right_q,
+                )
+                if any(np.allclose(candidate_q, existing, atol=1e-9) for existing in seen):
+                    continue
+                seen.append(candidate_q.copy())
+                posture_metadata = self._dual_posture_comparison_metadata(
+                    reference_full_q=q,
+                    candidate_full_q=candidate_q,
+                )
+                candidates.append(
+                    _DualArmCandidate(
+                        name=f"wrist_unload_{side}_{label}",
+                        qpos=candidate_q.copy(),
+                        source="wrist_unload",
+                        method=f"wrist_unload_{side}_{label}",
+                        metadata={
+                            "local_step_wrist_unload_candidate": True,
+                            "local_step_wrist_unload_side": side,
+                            "local_step_wrist_unload_label": label,
+                            "local_step_wrist_unload_arm_metadata": dict(arm_metadata),
+                            "local_step_wrist_unload_cost_improvement_deg": float(
+                                arm_metadata.get("local_step_wrist_unload_cost_improvement_deg", 0.0) or 0.0
+                            ),
+                            **(
+                                {}
+                                if posture_metadata is None
+                                else {"posture_preference": posture_metadata}
+                            ),
+                        },
+                    )
+                )
+            if len(candidates) >= max_candidates:
+                break
+        metadata.update(
+            {
+                "status": "active" if candidates else "no_candidates",
+                "candidate_count": len(candidates),
+                "max_candidates": int(max_candidates),
+                "left": dict(left_metadata),
+                "right": dict(right_metadata),
+                "emitted_methods": [candidate.method for candidate in candidates],
+            }
+        )
+        return candidates, metadata
+
+    def _dual_arm_limit_escape_candidates(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+    ) -> tuple[list[_DualArmCandidate], dict[str, object]]:
+        safety_profile = self.ik_safety_profile
+        metadata: dict[str, object] = {
+            "enabled": bool(
+                safety_profile is not None
+                and getattr(safety_profile, "local_step_limit_escape_enabled", False)
+            ),
+            "candidate_count": 0,
+        }
+        if safety_profile is None or not bool(getattr(safety_profile, "local_step_limit_escape_enabled", False)):
+            metadata["status"] = "disabled"
+            return [], metadata
+        if self._full_execution_joint_step is None:
+            metadata["status"] = "joint_step_unavailable"
+            return [], metadata
+
+        q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        q_min = np.asarray(self.ik_solver.robot.model.lowerPositionLimit, dtype=float).reshape(q.shape)
+        q_max = np.asarray(self.ik_solver.robot.model.upperPositionLimit, dtype=float).reshape(q.shape)
+        if np.any(q_max <= q_min):
+            metadata["status"] = "invalid_joint_position_limits"
+            return [], metadata
+
+        arm_entries = self._arm_joint_entries(q)
+        arm_indices = np.array([entry[2] for entry in arm_entries], dtype=int)
+        lower_margin = q - q_min
+        upper_margin = q_max - q
+        min_margin = np.minimum(lower_margin, upper_margin)
+        activation_margin_rad = np.deg2rad(
+            max(0.0, float(getattr(safety_profile, "local_step_limit_escape_activation_margin_deg", 2.0)))
+        )
+        active_full_indices = [
+            int(index)
+            for index in arm_indices.tolist()
+            if min_margin[int(index)] <= activation_margin_rad
+        ]
+        metadata.update(
+            {
+                "status": "inactive" if not active_full_indices else "active",
+                "activation_margin_deg": float(np.rad2deg(activation_margin_rad)),
+                "active_full_joint_indices": active_full_indices,
+                "active_joints": [
+                    f"{side}_j{local_index + 1}"
+                    for side, local_index, full_index in arm_entries
+                    if int(full_index) in set(active_full_indices)
+                ],
+                "min_margin_deg": np.rad2deg(min_margin[arm_indices]).astype(float).tolist(),
+            }
+        )
+        if not active_full_indices:
+            return [], metadata
+
+        max_candidates = max(0, int(getattr(safety_profile, "local_step_limit_escape_max_candidates", 12)))
+        if max_candidates <= 0:
+            metadata["status"] = "max_candidates_zero"
+            return [], metadata
+        step_fraction = max(
+            0.0,
+            min(1.0, float(getattr(safety_profile, "local_step_limit_escape_step_fraction", 1.0))),
+        )
+        if step_fraction <= 0.0:
+            metadata["status"] = "step_fraction_zero"
+            return [], metadata
+
+        before_metrics = self._dual_pose_metrics(q, current_targets)
+        before_score = self._dual_pose_score(before_metrics)
+        full_step = np.asarray(self._full_execution_joint_step, dtype=float).reshape(q.shape) * step_fraction
+        active_set = set(active_full_indices)
+        scored: list[tuple[float, float, int, int, str, int, np.ndarray, dict[str, object]]] = []
+        eps = 1e-9
+        for side, local_index, full_index in arm_entries:
+            for direction in (-1, 1):
+                if direction < 0 and q[full_index] <= q_min[full_index] + eps:
+                    continue
+                if direction > 0 and q[full_index] >= q_max[full_index] - eps:
+                    continue
+                if full_index in active_set:
+                    near_upper = upper_margin[full_index] <= lower_margin[full_index]
+                    if near_upper and direction > 0:
+                        continue
+                    if (not near_upper) and direction < 0:
+                        continue
+                step = min(
+                    float(full_step[full_index]),
+                    float(upper_margin[full_index] if direction > 0 else lower_margin[full_index]),
+                )
+                if step <= 1e-12:
+                    continue
+                candidate_q = q.copy()
+                candidate_q[full_index] += float(direction) * step
+                after_metrics = self._dual_pose_metrics(candidate_q, current_targets)
+                after_score = self._dual_pose_score(after_metrics)
+                pose_progress = before_score - after_score
+                candidate_lower_margin = candidate_q - q_min
+                candidate_upper_margin = q_max - candidate_q
+                margin_before = float(np.min(min_margin[arm_indices]))
+                margin_after = float(np.min(np.minimum(candidate_lower_margin, candidate_upper_margin)[arm_indices]))
+                margin_progress = margin_after - margin_before
+                candidate_metadata = {
+                    "local_step_limit_escape_candidate": True,
+                    "local_step_limit_escape_side": side,
+                    "local_step_limit_escape_joint_index": int(local_index),
+                    "local_step_limit_escape_full_joint_index": int(full_index),
+                    "local_step_limit_escape_direction": int(direction),
+                    "local_step_limit_escape_step_deg": float(np.rad2deg(step)),
+                    "local_step_limit_escape_step_fraction": float(step_fraction),
+                    "local_step_limit_escape_min_margin_before_deg": float(np.rad2deg(margin_before)),
+                    "local_step_limit_escape_min_margin_after_deg": float(np.rad2deg(margin_after)),
+                    "local_step_limit_escape_margin_progress_deg": float(np.rad2deg(margin_progress)),
+                    "local_step_limit_escape_pose_progress": float(pose_progress),
+                }
+                scored.append(
+                    (
+                        int(full_index not in active_set),
+                        -float(margin_progress),
+                        -float(pose_progress),
+                        int(local_index),
+                        side,
+                        int(direction),
+                        candidate_q,
+                        candidate_metadata,
+                    )
+                )
+
+        scored.sort(key=lambda item: item[:6])
+        candidates: list[_DualArmCandidate] = []
+        seen: list[np.ndarray] = []
+        for _non_active, _margin_score, _pose_score, local_index, side, direction, candidate_q, candidate_metadata in scored:
+            if len(candidates) >= max_candidates:
+                break
+            if any(np.allclose(candidate_q, existing, atol=1e-9) for existing in seen):
+                continue
+            seen.append(candidate_q.copy())
+            candidates.append(
+                _DualArmCandidate(
+                    name=f"joint_limit_escape_{side}_j{int(local_index) + 1}_{'pos' if int(direction) > 0 else 'neg'}",
+                    qpos=candidate_q.copy(),
+                    source="joint_limit_escape",
+                    method=f"joint_limit_escape_{side}_j{int(local_index) + 1}_{'pos' if int(direction) > 0 else 'neg'}",
+                    metadata=candidate_metadata,
+                )
+            )
+        metadata.update(
+            {
+                "candidate_count": len(candidates),
+                "max_candidates": int(max_candidates),
+                "step_fraction": float(step_fraction),
+                "emitted_methods": [candidate.method for candidate in candidates],
+            }
+        )
+        return candidates, metadata
+
+    def _evaluate_dual_arm_step_candidate(
+        self,
+        *,
+        candidate: _DualArmCandidate,
+        reference_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+        target_activity: dict[str, object] | None = None,
+        step_scale: float,
+    ) -> tuple[bool, np.ndarray, dict[str, object]]:
+        safety_profile = self.ik_safety_profile
+        assert safety_profile is not None
+        reference_full = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        raw_full = np.asarray(candidate.qpos, dtype=float).reshape(reference_full.shape)
+        scale = max(1e-6, min(1.0, float(step_scale)))
+        output_q, limit_metadata = self._limit_full_joint_step(
+            reference_full_q=reference_full,
+            candidate_full_q=raw_full,
+            step_scale=scale,
+        )
+        metadata: dict[str, object] = {
+            "candidate": candidate.name,
+            "source": candidate.source,
+            "method": candidate.method,
+            "candidate_metadata": dict(candidate.metadata),
+            "step_scale": scale,
+            **limit_metadata,
+        }
+
+        raw_left, raw_right = self._split_solution(raw_full)
+        ref_left, ref_right = self._split_solution(reference_full)
+        for side, ref_q, raw_q in (
+            ("left", ref_left, raw_left),
+            ("right", ref_right, raw_right),
+        ):
+            raw_delta_deg = np.rad2deg(np.abs(raw_q - ref_q))
+            branch_indices = tuple(int(index) for index in safety_profile.hard_branch_joint_indices)
+            branch_limits = safety_profile.hard_branch_limits_array()
+            if branch_indices:
+                branch_delta = raw_delta_deg[list(branch_indices)]
+                metadata[f"{side}_hard_branch_joint_delta_deg"] = branch_delta.tolist()
+                if np.any(branch_delta > branch_limits):
+                    exceeded = tuple(
+                        int(branch_indices[index])
+                        for index, exceeded in enumerate((branch_delta > branch_limits).tolist())
+                        if bool(exceeded)
+                    )
+                    escape_metadata = self._posture_hard_branch_escape_metadata(
+                        side=side,
+                        reference_q=ref_q,
+                        candidate_q=raw_q,
+                        exceeded_joint_indices=exceeded,
+                    )
+                    if escape_metadata is not None:
+                        metadata[f"{side}_posture_hard_branch_escape"] = escape_metadata
+                    if escape_metadata is None or not bool(escape_metadata.get("allowed", False)):
+                        metadata["reject_reason"] = f"hard_branch_jump:{side}"
+                        metadata["hard_branch_max_delta_deg"] = branch_limits.tolist()
+                        metadata["score"] = 1e18
+                        return False, output_q, metadata
+                    metadata[f"{side}_hard_branch_escape_allowed"] = True
+                    metadata["hard_branch_max_delta_deg"] = branch_limits.tolist()
+
+        if not self._full_qpos_within_limits(output_q):
+            metadata["reject_reason"] = "joint_position_limit"
+            metadata["score"] = 1e18
+            return False, output_q, metadata
+
+        before_metrics = self._dual_pose_metrics(reference_full, current_targets)
+        after_metrics = self._dual_pose_metrics(output_q, current_targets)
+        output_motion_metrics = self._dual_output_motion_metrics(reference_full, output_q)
+        before_score = self._dual_pose_score(before_metrics)
+        after_score = self._dual_pose_score(after_metrics)
+        before_pose_fraction = self._dual_pose_fraction(before_metrics)
+        posture_metadata = self._dual_posture_comparison_metadata(
+            reference_full_q=reference_full,
+            candidate_full_q=output_q,
+        )
+        posture_penalty_deg = (
+            0.0
+            if posture_metadata is None
+            else float(posture_metadata.get("score_penalty_deg", 0.0) or 0.0)
+        )
+        posture_improvement_deg = (
+            0.0
+            if posture_metadata is None
+            else float(posture_metadata.get("improvement_deg", 0.0) or 0.0)
+        )
+        progress = before_score - after_score
+        worsen_limits = self._dual_worsen_limits(before_metrics)
+        bounded_worsening = self._dual_bounded_worsening(
+            before_metrics=before_metrics,
+            after_metrics=after_metrics,
+            max_position_worsen_m=float(worsen_limits["position_m"]),
+            max_orientation_worsen_deg=float(worsen_limits["orientation_deg"]),
+        )
+        orientation_recovery_limits = {
+            "position_m": max(
+                float(worsen_limits["position_m"]),
+                max(
+                    0.0,
+                    float(getattr(safety_profile, "local_step_orientation_recovery_max_position_worsen_m", 0.06)),
+                ),
+            ),
+            "orientation_deg": max(
+                float(worsen_limits["orientation_deg"]),
+                max(
+                    0.0,
+                    float(getattr(safety_profile, "local_step_dynamic_worsen_max_orientation_deg", 8.0)),
+                ),
+            ),
+            "after_position_m": max(
+                0.0,
+                float(getattr(safety_profile, "local_step_orientation_recovery_max_after_position_error_m", 0.25)),
+            ),
+        }
+        orientation_recovery_bounded = self._dual_bounded_worsening(
+            before_metrics=before_metrics,
+            after_metrics=after_metrics,
+            max_position_worsen_m=float(orientation_recovery_limits["position_m"]),
+            max_orientation_worsen_deg=float(orientation_recovery_limits["orientation_deg"]),
+        )
+        max_orientation_progress_deg = max(
+            float(before_metrics[side]["rotation_deg"]) - float(after_metrics[side]["rotation_deg"])
+            for side in ("left", "right")
+        )
+        max_after_position_m = max(float(after_metrics[side]["translation_m"]) for side in ("left", "right"))
+        orientation_recovery_ok = (
+            bool(getattr(safety_profile, "local_step_orientation_recovery_enabled", False))
+            and max_orientation_progress_deg
+            >= max(0.0, float(getattr(safety_profile, "local_step_orientation_recovery_min_progress_deg", 5.0)))
+            and orientation_recovery_bounded
+            and (
+                float(orientation_recovery_limits["after_position_m"]) <= 0.0
+                or max_after_position_m <= float(orientation_recovery_limits["after_position_m"])
+            )
+        )
+        within_tolerance = self._dual_within_tolerance(after_metrics)
+        side_position_progress_m = {
+            side: float(before_metrics[side]["translation_m"]) - float(after_metrics[side]["translation_m"])
+            for side in ("left", "right")
+        }
+        side_orientation_progress_deg = {
+            side: float(before_metrics[side]["rotation_deg"]) - float(after_metrics[side]["rotation_deg"])
+            for side in ("left", "right")
+        }
+        inactive_hold = self._inactive_side_hold_evaluation(
+            target_activity=target_activity,
+            output_motion_metrics=output_motion_metrics,
+            side_position_progress_m=side_position_progress_m,
+            side_orientation_progress_deg=side_orientation_progress_deg,
+        )
+        max_position_progress_m = max(side_position_progress_m.values())
+        component_progress_limits = {
+            "position_m": max(
+                float(worsen_limits["position_m"]),
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            safety_profile,
+                            "local_step_component_progress_max_position_worsen_m",
+                            0.0,
+                        )
+                    ),
+                ),
+            ),
+            "orientation_deg": max(
+                float(worsen_limits["orientation_deg"]),
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            safety_profile,
+                            "local_step_component_progress_max_orientation_worsen_deg",
+                            0.0,
+                        )
+                    ),
+                ),
+            ),
+            "after_position_m": max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_component_progress_max_after_position_error_m",
+                        0.0,
+                    )
+                ),
+            ),
+            "max_score_regression": max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_component_progress_max_score_regression",
+                        0.0,
+                    )
+                ),
+            ),
+            "min_position_progress_m": max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_component_progress_min_position_m",
+                        safety_profile.local_step_accept_position_progress_m,
+                    )
+                ),
+            ),
+            "min_orientation_progress_deg": max(
+                0.0,
+                float(
+                    getattr(
+                        safety_profile,
+                        "local_step_component_progress_min_orientation_deg",
+                        safety_profile.local_step_accept_orientation_progress_deg,
+                    )
+                ),
+            ),
+        }
+        component_progress_bounded = self._dual_bounded_worsening(
+            before_metrics=before_metrics,
+            after_metrics=after_metrics,
+            max_position_worsen_m=float(component_progress_limits["position_m"]),
+            max_orientation_worsen_deg=float(component_progress_limits["orientation_deg"]),
+        )
+        component_progress_ok = (
+            bool(getattr(safety_profile, "local_step_component_progress_enabled", False))
+            and not within_tolerance
+            and progress >= -float(component_progress_limits["max_score_regression"])
+            and component_progress_bounded
+            and (
+                float(component_progress_limits["after_position_m"]) <= 0.0
+                or max_after_position_m <= float(component_progress_limits["after_position_m"])
+            )
+            and (
+                max_position_progress_m >= float(component_progress_limits["min_position_progress_m"])
+                or max_orientation_progress_deg
+                >= float(component_progress_limits["min_orientation_progress_deg"])
+            )
+        )
+        if inactive_hold["reject"]:
+            reject_sides = ",".join(str(side) for side in inactive_hold["reject_sides"])
+            metadata.update(
+                {
+                    "reject_reason": f"inactive_side_unexplained_motion:{reject_sides}",
+                    "score": 1e18,
+                    "dual_pose_progress": float(progress),
+                    "dual_pose_before": before_metrics,
+                    "dual_pose_after": after_metrics,
+                    "dual_output_motion": output_motion_metrics,
+                    "target_activity": dict(target_activity or {}),
+                    "inactive_side_hold": inactive_hold,
+                    "dual_bounded_worsening": bool(bounded_worsening),
+                    "dual_side_position_progress_m": dict(side_position_progress_m),
+                    "dual_side_orientation_progress_deg": dict(side_orientation_progress_deg),
+                }
+            )
+            return False, output_q, metadata
+        limit_escape_candidate = bool(candidate.metadata.get("local_step_limit_escape_candidate", False))
+        posture_escape_candidate = bool(candidate.metadata.get("local_step_posture_escape_candidate", False))
+        wrist_unload_candidate = bool(candidate.metadata.get("local_step_wrist_unload_candidate", False))
+        limit_escape_margin_progress_deg = float(
+            candidate.metadata.get("local_step_limit_escape_margin_progress_deg", 0.0) or 0.0
+        )
+        wrist_unload_improvement_deg = float(
+            candidate.metadata.get("local_step_wrist_unload_cost_improvement_deg", 0.0) or 0.0
+        )
+        limit_escape_bounded = self._dual_bounded_worsening(
+            before_metrics=before_metrics,
+            after_metrics=after_metrics,
+            max_position_worsen_m=max(
+                float(worsen_limits["position_m"]),
+                max(0.0, float(getattr(safety_profile, "local_step_limit_escape_max_position_worsen_m", 0.025))),
+            ),
+            max_orientation_worsen_deg=max(
+                float(worsen_limits["orientation_deg"]),
+                max(0.0, float(getattr(safety_profile, "local_step_limit_escape_max_orientation_worsen_deg", 10.0))),
+            ),
+        )
+        posture_escape_bounded = False
+        posture_escape_active = False
+        if self.posture_preference is not None and posture_metadata is not None:
+            posture_escape_active = bool(
+                posture_improvement_deg
+                >= max(0.0, float(self.posture_preference.local_escape_min_improvement_deg))
+                and (
+                    posture_escape_candidate
+                    or bool(posture_metadata.get("any_reference_bad", False))
+                )
+            )
+            posture_escape_bounded = self._dual_bounded_worsening(
+                before_metrics=before_metrics,
+                after_metrics=after_metrics,
+                max_position_worsen_m=max(
+                    float(worsen_limits["position_m"]),
+                    max(0.0, float(self.posture_preference.local_escape_max_position_worsen_m)),
+                ),
+                max_orientation_worsen_deg=max(
+                    float(worsen_limits["orientation_deg"]),
+                    max(0.0, float(self.posture_preference.local_escape_max_orientation_worsen_deg)),
+                ),
+            )
+        wrist_unload_active = False
+        wrist_unload_bounded = False
+        if self.posture_preference is not None:
+            wrist_unload_active = bool(
+                wrist_unload_candidate
+                and (
+                    wrist_unload_improvement_deg
+                    >= max(0.0, float(self.posture_preference.wrist_unload_min_cost_improvement_deg))
+                    or progress > 0.0
+                )
+            )
+            wrist_unload_bounded = self._dual_bounded_worsening(
+                before_metrics=before_metrics,
+                after_metrics=after_metrics,
+                max_position_worsen_m=max(
+                    float(worsen_limits["position_m"]),
+                    max(0.0, float(self.posture_preference.wrist_unload_max_position_worsen_m)),
+                ),
+                max_orientation_worsen_deg=max(
+                    float(worsen_limits["orientation_deg"]),
+                    max(0.0, float(self.posture_preference.wrist_unload_max_orientation_worsen_deg)),
+                ),
+            )
+        min_progress = max(0.0, float(safety_profile.local_step_min_progress_fraction))
+        progress_accept_reason = ""
+        if within_tolerance:
+            if bool(getattr(safety_profile, "local_step_accept_worse_within_tolerance", True)):
+                progress_accept_reason = "within_pose_tolerance"
+            elif progress >= -min_progress:
+                progress_accept_reason = "within_pose_tolerance_nonregressing"
+            elif (
+                limit_escape_candidate
+                and bool(getattr(safety_profile, "local_step_limit_escape_accept_worse_within_tolerance", True))
+                and limit_escape_margin_progress_deg > 0.0
+                and limit_escape_bounded
+            ):
+                progress_accept_reason = "within_pose_tolerance_joint_limit_escape"
+        elif progress >= min_progress and bounded_worsening:
+            progress_accept_reason = "dual_pose_score_progress"
+        elif orientation_recovery_ok:
+            progress_accept_reason = "dual_orientation_recovery_bounded_position_worsening"
+        elif component_progress_ok:
+            progress_accept_reason = "dual_component_progress_bounded_score_regression"
+        elif (
+            limit_escape_candidate
+            and bool(getattr(safety_profile, "local_step_limit_escape_accept_bounded_worse", True))
+            and limit_escape_margin_progress_deg > 0.0
+            and limit_escape_bounded
+        ):
+            progress_accept_reason = "joint_limit_escape_bounded_worsening"
+        elif posture_escape_active and posture_escape_bounded:
+            progress_accept_reason = "posture_escape_bounded_worsening"
+        elif wrist_unload_active and wrist_unload_bounded:
+            progress_accept_reason = "wrist_unload_bounded_worsening"
+        if not progress_accept_reason:
+            metadata.update(
+                {
+                    "reject_reason": "dual_local_step_no_pose_progress",
+                    "score": 1e18,
+                    "dual_pose_progress": float(progress),
+                    "dual_pose_before": before_metrics,
+                    "dual_pose_after": after_metrics,
+                    "dual_output_motion": output_motion_metrics,
+                    "dual_bounded_worsening": bool(bounded_worsening),
+                    "target_activity": dict(target_activity or {}),
+                    "inactive_side_hold": inactive_hold,
+                    "dual_orientation_recovery_ok": bool(orientation_recovery_ok),
+                    "dual_component_progress_ok": bool(component_progress_ok),
+                    "dual_component_progress_bounded": bool(component_progress_bounded),
+                    "dual_component_progress_limits": dict(component_progress_limits),
+                    "dual_side_position_progress_m": dict(side_position_progress_m),
+                    "dual_side_orientation_progress_deg": dict(side_orientation_progress_deg),
+                    "dual_max_position_progress_m": float(max_position_progress_m),
+                    "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
+                    "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
+                    "dual_posture_escape_active": bool(posture_escape_active),
+                    "dual_posture_escape_bounded_worsening": bool(posture_escape_bounded),
+                    "dual_wrist_unload_active": bool(wrist_unload_active),
+                    "dual_wrist_unload_bounded_worsening": bool(wrist_unload_bounded),
+                    "posture_preference": posture_metadata,
+                }
+            )
+            return False, output_q, metadata
+
+        delta_deg = np.rad2deg(output_q - reference_full)
+        metadata.update(
+            {
+                "reject_reason": None,
+                "dual_pose_before": before_metrics,
+                "dual_pose_after": after_metrics,
+                "dual_output_motion": output_motion_metrics,
+                "dual_pose_score_before": float(before_score),
+                "dual_pose_score_after": float(after_score),
+                "dual_pose_fraction_before": float(before_pose_fraction),
+                "dual_pose_progress": float(progress),
+                "dual_progress_accept_reason": progress_accept_reason,
+                "dual_bounded_worsening": bool(bounded_worsening),
+                "target_activity": dict(target_activity or {}),
+                "inactive_side_hold": inactive_hold,
+                "dual_orientation_recovery_ok": bool(orientation_recovery_ok),
+                "dual_orientation_recovery_limits": dict(orientation_recovery_limits),
+                "dual_component_progress_ok": bool(component_progress_ok),
+                "dual_component_progress_bounded": bool(component_progress_bounded),
+                "dual_component_progress_limits": dict(component_progress_limits),
+                "dual_side_position_progress_m": dict(side_position_progress_m),
+                "dual_side_orientation_progress_deg": dict(side_orientation_progress_deg),
+                "dual_max_position_progress_m": float(max_position_progress_m),
+                "dual_max_orientation_progress_deg": float(max_orientation_progress_deg),
+                "dual_limit_escape_bounded_worsening": bool(limit_escape_bounded),
+                "dual_posture_escape_active": bool(posture_escape_active),
+                "dual_posture_escape_bounded_worsening": bool(posture_escape_bounded),
+                "dual_wrist_unload_active": bool(wrist_unload_active),
+                "dual_wrist_unload_bounded_worsening": bool(wrist_unload_bounded),
+                "dual_wrist_unload_improvement_deg": float(wrist_unload_improvement_deg),
+                "posture_preference": posture_metadata,
+                "dual_worsen_limits": dict(worsen_limits),
+                "within_pose_tolerance": bool(within_tolerance),
+                "dual_recovery_state": (
+                    "joint_limit_escape"
+                    if progress_accept_reason.startswith("joint_limit_escape")
+                    else (
+                        "orientation_recovery"
+                        if progress_accept_reason.startswith("dual_orientation_recovery")
+                        else (
+                            "component_progress"
+                            if progress_accept_reason.startswith("dual_component_progress")
+                            else (
+                                "posture_escape"
+                                if progress_accept_reason.startswith("posture_escape")
+                                else (
+                                    "wrist_unload"
+                                    if progress_accept_reason.startswith("wrist_unload")
+                                    else "tracking"
+                                )
+                            )
+                        )
+                    )
+                ),
+                "joint_delta_deg": delta_deg.astype(float).tolist(),
+                "joint_delta_norm_deg": float(np.linalg.norm(delta_deg)),
+                "score": float(
+                    after_score * 1_000_000.0
+                    + posture_penalty_deg * 100_000.0
+                    + float(inactive_hold["score_penalty"])
+                    + np.linalg.norm(delta_deg) * 10.0
+                    + (1.0 - scale) * 100.0
+                    + (
+                        -min(10_000_000.0, 5_000_000.0 + max(0.0, limit_escape_margin_progress_deg) * 1_000_000.0)
+                        if progress_accept_reason.startswith("joint_limit_escape")
+                        else 0.0
+                    )
+                    + (
+                        -min(5_000_000.0, 100_000.0 + max(0.0, posture_improvement_deg) * 100_000.0)
+                        if progress_accept_reason.startswith("posture_escape")
+                        else 0.0
+                    )
+                    + (
+                        -min(1_000_000.0, 50_000.0 + max(0.0, wrist_unload_improvement_deg) * 50_000.0)
+                        if progress_accept_reason.startswith("wrist_unload")
+                        else 0.0
+                    )
+                    + (-500.0 if progress_accept_reason.startswith("dual_orientation_recovery") else 0.0)
+                    + (-250.0 if progress_accept_reason.startswith("dual_component_progress") else 0.0)
+                ),
+            }
+        )
+        return True, output_q, metadata
+
+    def _limit_full_joint_step(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray,
+        step_scale: float,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        candidate_q = np.asarray(candidate_full_q, dtype=float).reshape(reference_q.shape)
+        metadata: dict[str, object] = {
+            "step_limited": False,
+            "step_scale": float(step_scale),
+            "joint_velocity_limit_profile": (
+                None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
+            ),
+            "joint_velocity_limit_dt_sec": float(self._execution_dt_sec),
+        }
+        if not self.config.enforce_realistic_joint_step or self._full_execution_joint_step is None:
+            metadata["step_limit_enabled"] = False
+            return candidate_q.copy(), metadata
+        max_step = np.asarray(self._full_execution_joint_step, dtype=float).reshape(reference_q.shape)
+        full_limited = reference_q + np.clip(candidate_q - reference_q, -max_step, max_step)
+        full_delta = full_limited - reference_q
+        output_q = reference_q + full_delta * max(1e-6, min(1.0, float(step_scale)))
+        limited = not np.allclose(full_limited, candidate_q, atol=1e-10)
+        left_delta, right_delta = self._split_solution(output_q - reference_q)
+        left_max_step, right_max_step = self._split_solution(max_step)
+        metadata.update(
+            {
+                "step_limit_enabled": True,
+                "step_limited": bool(limited or step_scale < 1.0),
+                "joint_velocity_limit_delta_deg": np.rad2deg(output_q - reference_q).astype(float).tolist(),
+                "joint_velocity_limit_full_delta_deg": np.rad2deg(full_delta).astype(float).tolist(),
+                "joint_velocity_limit_max_step_deg": np.rad2deg(max_step).astype(float).tolist(),
+                "left_max_abs_delta_deg": float(np.rad2deg(np.max(np.abs(left_delta)))),
+                "right_max_abs_delta_deg": float(np.rad2deg(np.max(np.abs(right_delta)))),
+                "left_max_step_deg": np.rad2deg(left_max_step).astype(float).tolist(),
+                "right_max_step_deg": np.rad2deg(right_max_step).astype(float).tolist(),
+            }
+        )
+        return output_q.copy(), metadata
+
+    def _dual_pose_metrics(
+        self,
+        qpos: np.ndarray,
+        current_targets: dict[str, np.ndarray],
+    ) -> dict[str, dict[str, float]]:
+        q = np.asarray(qpos, dtype=float).reshape(-1)
+        left_pose = self.ik_solver.compute_frame_pose(self.profile.left_frame_name, q)
+        right_pose = self.ik_solver.compute_frame_pose(self.profile.right_frame_name, q)
+        left_m, left_deg = pose_delta_metrics(left_pose, current_targets["left"])
+        right_m, right_deg = pose_delta_metrics(right_pose, current_targets["right"])
+        return {
+            "left": {"translation_m": float(left_m), "rotation_deg": float(left_deg)},
+            "right": {"translation_m": float(right_m), "rotation_deg": float(right_deg)},
+        }
+
+    def _dual_pose_score(self, metrics: dict[str, dict[str, float]]) -> float:
+        safety_profile = self.ik_safety_profile
+        assert safety_profile is not None
+        position_tol = max(1e-6, float(safety_profile.target_tolerance.position_m))
+        orientation_tol = max(1e-6, float(safety_profile.target_tolerance.orientation_deg))
+        side_scores = []
+        for side in ("left", "right"):
+            values = metrics[side]
+            side_scores.append(
+                float(values["translation_m"]) / position_tol
+                + float(values["rotation_deg"]) / orientation_tol
+            )
+        return float(max(side_scores) * 10.0 + sum(side_scores))
+
+    def _target_activity_metadata(
+        self,
+        current_targets: dict[str, np.ndarray],
+    ) -> dict[str, object]:
+        translation_deadband = float(self.config.inactive_side_hold_translation_deadband_m)
+        rotation_deadband = float(self.config.inactive_side_hold_rotation_deadband_deg)
+        metadata: dict[str, object] = {
+            "enabled": bool(self.config.inactive_side_hold_enabled),
+            "translation_deadband_m": translation_deadband,
+            "rotation_deadband_deg": rotation_deadband,
+        }
+        for side in ("left", "right"):
+            previous_target = self._last_target_poses.get(side)
+            if (
+                not bool(self.config.inactive_side_hold_enabled)
+                or previous_target is None
+            ):
+                metadata[side] = {
+                    "previous_target_available": previous_target is not None,
+                    "translation_m": None,
+                    "rotation_deg": None,
+                    "activity_ratio": None,
+                    "hold_weight": 0.0,
+                    "inactive": False,
+                }
+                continue
+            translation_m, rotation_deg = pose_delta_metrics(
+                previous_target,
+                current_targets[side],
+            )
+            if translation_deadband <= 0.0:
+                translation_ratio = 0.0 if translation_m <= 0.0 else float("inf")
+            else:
+                translation_ratio = float(translation_m) / translation_deadband
+            if rotation_deadband <= 0.0:
+                rotation_ratio = 0.0 if rotation_deg <= 0.0 else float("inf")
+            else:
+                rotation_ratio = float(rotation_deg) / rotation_deadband
+            activity_ratio = max(float(translation_ratio), float(rotation_ratio))
+            hold_weight = 0.0
+            if np.isfinite(activity_ratio):
+                hold_weight = max(0.0, min(1.0, 1.0 - activity_ratio))
+            metadata[side] = {
+                "previous_target_available": True,
+                "translation_m": float(translation_m),
+                "rotation_deg": float(rotation_deg),
+                "activity_ratio": None if not np.isfinite(activity_ratio) else float(activity_ratio),
+                "hold_weight": float(hold_weight),
+                "inactive": bool(hold_weight > 0.0),
+            }
+        return metadata
+
+    def _dual_output_motion_metrics(
+        self,
+        reference_full_q: np.ndarray,
+        output_full_q: np.ndarray,
+    ) -> dict[str, dict[str, float]]:
+        reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        output_q = np.asarray(output_full_q, dtype=float).reshape(reference_q.shape)
+        ref_left_q, ref_right_q = self._split_solution(reference_q)
+        out_left_q, out_right_q = self._split_solution(output_q)
+        result: dict[str, dict[str, float]] = {}
+        for side, frame_name, ref_q, out_q in (
+            ("left", self.profile.left_frame_name, ref_left_q, out_left_q),
+            ("right", self.profile.right_frame_name, ref_right_q, out_right_q),
+        ):
+            reference_pose = self.ik_solver.compute_frame_pose(frame_name, reference_q)
+            output_pose = self.ik_solver.compute_frame_pose(frame_name, output_q)
+            translation_m, rotation_deg = pose_delta_metrics(reference_pose, output_pose)
+            joint_delta_deg = np.rad2deg(out_q - ref_q)
+            result[side] = {
+                "translation_m": float(translation_m),
+                "rotation_deg": float(rotation_deg),
+                "joint_max_abs_delta_deg": float(np.max(np.abs(joint_delta_deg))),
+                "joint_weighted_delta_deg": float(
+                    np.linalg.norm(joint_delta_deg * self._arm_joint_weights)
+                ),
+            }
+        return result
+
+    def _inactive_side_hold_evaluation(
+        self,
+        *,
+        target_activity: dict[str, object] | None,
+        output_motion_metrics: dict[str, dict[str, float]],
+        side_position_progress_m: dict[str, float],
+        side_orientation_progress_deg: dict[str, float],
+    ) -> dict[str, object]:
+        enabled = bool(
+            self.config.inactive_side_hold_enabled
+            and isinstance(target_activity, dict)
+            and target_activity.get("enabled", False)
+        )
+        max_position_m = max(
+            1e-9,
+            float(self.config.inactive_side_hold_max_unexplained_position_m),
+        )
+        max_rotation_deg = max(
+            1e-9,
+            float(self.config.inactive_side_hold_max_unexplained_rotation_deg),
+        )
+        score_weight = float(self.config.inactive_side_hold_score_weight)
+        result: dict[str, object] = {
+            "enabled": enabled,
+            "max_unexplained_position_m": max_position_m,
+            "max_unexplained_rotation_deg": max_rotation_deg,
+            "score_weight": score_weight,
+            "score_penalty": 0.0,
+            "reject": False,
+            "reject_sides": [],
+            "sides": {},
+        }
+        if not enabled:
+            return result
+        assert target_activity is not None
+        sides: dict[str, object] = {}
+        reject_sides: list[str] = []
+        score_penalty = 0.0
+        for side in ("left", "right"):
+            side_activity_raw = target_activity.get(side, {})
+            side_activity = (
+                dict(side_activity_raw)
+                if isinstance(side_activity_raw, dict)
+                else {}
+            )
+            hold_weight = max(
+                0.0,
+                min(1.0, float(side_activity.get("hold_weight", 0.0) or 0.0)),
+            )
+            motion = output_motion_metrics[side]
+            position_progress = max(0.0, float(side_position_progress_m.get(side, 0.0)))
+            rotation_progress = max(0.0, float(side_orientation_progress_deg.get(side, 0.0)))
+            unexplained_position_m = max(
+                0.0,
+                float(motion["translation_m"]) - position_progress,
+            )
+            unexplained_rotation_deg = max(
+                0.0,
+                float(motion["rotation_deg"]) - rotation_progress,
+            )
+            normalized = (
+                unexplained_position_m / max_position_m
+                + unexplained_rotation_deg / max_rotation_deg
+            )
+            side_penalty = hold_weight * normalized * score_weight
+            side_reject = bool(
+                hold_weight >= 0.999
+                and (
+                    unexplained_position_m > max_position_m
+                    or unexplained_rotation_deg > max_rotation_deg
+                )
+            )
+            if side_reject:
+                reject_sides.append(side)
+            score_penalty += side_penalty
+            sides[side] = {
+                "hold_weight": float(hold_weight),
+                "output_translation_m": float(motion["translation_m"]),
+                "output_rotation_deg": float(motion["rotation_deg"]),
+                "position_progress_m": float(position_progress),
+                "rotation_progress_deg": float(rotation_progress),
+                "unexplained_position_m": float(unexplained_position_m),
+                "unexplained_rotation_deg": float(unexplained_rotation_deg),
+                "score_penalty": float(side_penalty),
+                "reject": bool(side_reject),
+            }
+        result.update(
+            {
+                "score_penalty": float(score_penalty),
+                "reject": bool(reject_sides),
+                "reject_sides": reject_sides,
+                "sides": sides,
+            }
+        )
+        return result
+
+    def _dual_pose_fraction(self, metrics: dict[str, dict[str, float]]) -> float:
+        safety_profile = self.ik_safety_profile
+        assert safety_profile is not None
+        position_tol = max(1e-6, float(safety_profile.target_tolerance.position_m))
+        orientation_tol = max(1e-6, float(safety_profile.target_tolerance.orientation_deg))
+        fractions = []
+        for side in ("left", "right"):
+            values = metrics[side]
+            fractions.append(float(values["translation_m"]) / position_tol)
+            fractions.append(float(values["rotation_deg"]) / orientation_tol)
+        return float(max(fractions) if fractions else 0.0)
+
+    def _dual_stable_selection_pool(
+        self,
+        evaluated: list[_DualArmEvaluatedCandidate],
+    ) -> tuple[list[_DualArmEvaluatedCandidate], dict[str, object]]:
+        preferred = [
+            item
+            for item in evaluated
+            if not self._dual_auxiliary_recovery_without_pose_progress(item.metadata)
+        ]
+        if preferred:
+            return preferred, {
+                "name": "prefer_tracking_over_auxiliary_posture_recovery",
+                "accepted_count": len(evaluated),
+                "selection_count": len(preferred),
+                "posture_wrist_auxiliary_deprioritized_count": len(evaluated) - len(preferred),
+                "fallback_to_auxiliary_recovery": False,
+            }
+        return evaluated, {
+            "name": "prefer_tracking_over_auxiliary_posture_recovery",
+            "accepted_count": len(evaluated),
+            "selection_count": len(evaluated),
+            "posture_wrist_auxiliary_deprioritized_count": 0,
+            "fallback_to_auxiliary_recovery": True,
+        }
+
+    def _dual_auxiliary_recovery_without_pose_progress(self, metadata: dict[str, object]) -> bool:
+        source = str(metadata.get("source", ""))
+        if source not in {"posture_escape", "wrist_unload"}:
+            return False
+        reason = str(metadata.get("dual_progress_accept_reason", ""))
+        if reason in {"dual_pose_score_progress", "dual_orientation_recovery_bounded_position_worsening"}:
+            return False
+        return True
+
+    def _dual_within_tolerance(self, metrics: dict[str, dict[str, float]]) -> bool:
+        safety_profile = self.ik_safety_profile
+        assert safety_profile is not None
+        return all(
+            float(metrics[side]["translation_m"]) <= float(safety_profile.target_tolerance.position_m)
+            and float(metrics[side]["rotation_deg"]) <= float(safety_profile.target_tolerance.orientation_deg)
+            for side in ("left", "right")
+        )
+
+    def _dual_worsen_limits(self, before_metrics: dict[str, dict[str, float]]) -> dict[str, object]:
+        safety_profile = self.ik_safety_profile
+        assert safety_profile is not None
+        base_position_m = max(0.0, float(safety_profile.local_step_max_position_worsen_m))
+        base_orientation_deg = max(0.0, float(safety_profile.local_step_max_orientation_worsen_deg))
+        before_m = max(float(before_metrics[side]["translation_m"]) for side in ("left", "right"))
+        before_deg = max(float(before_metrics[side]["rotation_deg"]) for side in ("left", "right"))
+        enabled = bool(getattr(safety_profile, "local_step_dynamic_worsen_enabled", False))
+        start_m = max(0.0, float(getattr(safety_profile, "local_step_dynamic_worsen_error_start_m", 0.05)))
+        start_deg = max(0.0, float(getattr(safety_profile, "local_step_dynamic_worsen_error_start_deg", 15.0)))
+        active = bool(enabled and (before_m >= start_m or before_deg >= start_deg))
+        position_m = base_position_m
+        orientation_deg = base_orientation_deg
+        if active:
+            position_fraction = max(
+                0.0,
+                float(getattr(safety_profile, "local_step_dynamic_worsen_position_fraction", 0.10)),
+            )
+            orientation_fraction = max(
+                0.0,
+                float(getattr(safety_profile, "local_step_dynamic_worsen_orientation_fraction", 0.10)),
+            )
+            max_position_m = max(
+                0.0,
+                float(getattr(safety_profile, "local_step_dynamic_worsen_max_position_m", 0.02)),
+            )
+            max_orientation_deg = max(
+                0.0,
+                float(getattr(safety_profile, "local_step_dynamic_worsen_max_orientation_deg", 8.0)),
+            )
+            position_m = max(position_m, before_m * position_fraction)
+            orientation_deg = max(orientation_deg, before_deg * orientation_fraction)
+            if max_position_m > 0.0:
+                position_m = min(position_m, max_position_m)
+            if max_orientation_deg > 0.0:
+                orientation_deg = min(orientation_deg, max_orientation_deg)
+        return {
+            "position_m": float(position_m),
+            "orientation_deg": float(orientation_deg),
+            "base_position_m": float(base_position_m),
+            "base_orientation_deg": float(base_orientation_deg),
+            "active": bool(active),
+        }
+
+    def _dual_bounded_worsening(
+        self,
+        *,
+        before_metrics: dict[str, dict[str, float]],
+        after_metrics: dict[str, dict[str, float]],
+        max_position_worsen_m: float,
+        max_orientation_worsen_deg: float,
+    ) -> bool:
+        for side in ("left", "right"):
+            position_worsen = float(after_metrics[side]["translation_m"]) - float(
+                before_metrics[side]["translation_m"]
+            )
+            orientation_worsen = float(after_metrics[side]["rotation_deg"]) - float(
+                before_metrics[side]["rotation_deg"]
+            )
+            if position_worsen > max_position_worsen_m:
+                return False
+            if orientation_worsen > max_orientation_worsen_deg:
+                return False
+        return True
+
+    def _full_qpos_within_limits(self, qpos: np.ndarray) -> bool:
+        q = np.asarray(qpos, dtype=float).reshape(-1)
+        q_min = np.asarray(self.ik_solver.robot.model.lowerPositionLimit, dtype=float).reshape(q.shape)
+        q_max = np.asarray(self.ik_solver.robot.model.upperPositionLimit, dtype=float).reshape(q.shape)
+        return bool(np.all(q >= q_min - 1e-8) and np.all(q <= q_max + 1e-8))
+
+    def _arm_joint_entries(self, qpos: np.ndarray) -> tuple[tuple[str, int, int], ...]:
+        q = np.asarray(qpos, dtype=float).reshape(-1)
+        if self.profile.solution_layout == "dual_arm_hand" and q.shape[0] >= 24:
+            return tuple(
+                [("left", index, index) for index in range(6)]
+                + [("right", index, 18 + index) for index in range(6)]
+            )
+        if q.shape[0] == 14:
+            return tuple(
+                [("left", index, 1 + index) for index in range(6)]
+                + [("right", index, 8 + index) for index in range(6)]
+            )
+        if q.shape[0] == 12:
+            return tuple(
+                [("left", index, index) for index in range(6)]
+                + [("right", index, 6 + index) for index in range(6)]
+            )
+        raise ValueError(f"{self.name} cannot map arm joint entries for solver shape {q.shape}.")
+
     def _evaluate_jump_gate(
         self,
         *,
@@ -1432,6 +3372,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
 
         metrics: dict[str, object] = {}
         triggered_sides: list[str] = []
+        hard_branch_sides: list[str] = []
+        soft_jump_warning_sides: list[str] = []
         for side, ref_q, cand_q in (
             ("left", ref_left_q, cand_left_q),
             ("right", ref_right_q, cand_right_q),
@@ -1456,8 +3398,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 per_joint_jump_deg=per_joint_limit,
                 weighted_jump_threshold_deg=weighted_limit,
             )
-            if pose_is_small and exceeded:
+            hard_branch_exceeded, hard_branch_delta_deg = hard_branch_jump_exceeds(
+                reference_q=ref_q,
+                candidate_q=cand_q,
+                joint_indices=jump_gate.hard_branch_joint_indices,
+                max_delta_deg=jump_gate.hard_branch_max_delta_deg,
+            )
+            if hard_branch_exceeded:
+                hard_branch_sides.append(side)
+            if hard_branch_exceeded:
                 triggered_sides.append(side)
+            elif pose_is_small and exceeded:
+                if self.config.enforce_realistic_joint_step:
+                    soft_jump_warning_sides.append(side)
+                else:
+                    triggered_sides.append(side)
             metrics[side] = {
                 "pose_delta_m": None if not np.isfinite(pose_translation_m) else pose_translation_m,
                 "pose_delta_deg": None if not np.isfinite(pose_rotation_deg) else pose_rotation_deg,
@@ -1465,7 +3420,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "joint_jump_max_deg": float(np.max(per_joint_delta_deg)),
                 "joint_jump_weighted_deg": float(weighted_jump_deg),
                 "joint_jump_exceeded": bool(exceeded),
+                "hard_branch_joint_indices": list(jump_gate.hard_branch_joint_indices),
+                "hard_branch_delta_deg": hard_branch_delta_deg.tolist(),
+                "hard_branch_max_delta_deg": list(jump_gate.hard_branch_max_delta_deg),
+                "hard_branch_exceeded": bool(hard_branch_exceeded),
             }
+        metrics["soft_joint_jump_warning_sides"] = list(soft_jump_warning_sides)
 
         release_ready = False
         release_metrics: dict[str, object] = {}
@@ -1490,7 +3450,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         hold = bool(triggered_sides)
         if hold:
             status = "holding" if self._jump_hold_active else "hold_entered"
-            reason = f"small_pose_large_q_jump:{','.join(triggered_sides)}"
+            if hard_branch_sides:
+                reason = f"hard_branch_jump:{','.join(hard_branch_sides)}"
+            else:
+                reason = f"small_pose_large_q_jump:{','.join(triggered_sides)}"
+        elif soft_jump_warning_sides:
+            status = "warning"
+            reason = f"small_pose_large_q_jump_warning_only:{','.join(soft_jump_warning_sides)}"
         elif self._jump_hold_active and release_ready:
             status = "released"
             reason = "hold_anchor_released"

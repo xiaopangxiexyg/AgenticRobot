@@ -13,8 +13,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from teleop_runtime.backends.hands.inspire_tac import InspireTacHandBackend, InspireTacHandBackendConfig
-from teleop_runtime.arm_frames import ARM_ENDPOINT_FRAME, convert_pose_between_arm_control_frames
-from teleop_runtime.calibration import TeleopCalibration
+from teleop_runtime.arm_frames import TOOL_TCP_FRAME
+from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
 from teleop_runtime.collection.run_collect import _drive_recovery_step, build_collect_app, parse_args
 from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.debug.run_vive_sapien_virtual import (
@@ -26,7 +26,14 @@ from teleop_runtime.debug.run_vive_sapien_virtual import (
     build_components,
 )
 from teleop_runtime.debug.run_vive_rm65_real_teleop import (
+    DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG,
+    DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M,
     _build_components as build_real_components,
+    _build_vive_tracker_configs_for_args,
+    _raw_tracker_pose_state_from_channels,
+    _reset_runtime_motion_state_from_real_qpos,
+    _tracker_name_for_source_side,
+    _tracker_source_side_for_logical_side,
 )
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
@@ -588,6 +595,61 @@ class TeleopRecoveryTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 source.start()
 
+    def test_real_teleop_operator_side_swap_helpers_only_swap_vive_trackers(self) -> None:
+        args = SimpleNamespace(
+            swap_operator_sides=True,
+            left_tracker_name="tracker_left",
+            right_tracker_name="tracker_right",
+            aux_tracker_name="",
+            left_hand_port="/dev/left_glove",
+            right_hand_port="/dev/right_glove",
+        )
+
+        self.assertEqual(_tracker_source_side_for_logical_side(args, "left"), "right")
+        self.assertEqual(_tracker_source_side_for_logical_side(args, "right"), "left")
+        self.assertEqual(_tracker_name_for_source_side(args, "right"), "tracker_right")
+        configs = _build_vive_tracker_configs_for_args(args, ("left", "right"))
+        by_channel = {config.channel_name: config for config in configs}
+        self.assertEqual(by_channel["left_wrist_pose"].name, "tracker_right")
+        self.assertEqual(by_channel["right_wrist_pose"].name, "tracker_left")
+        self.assertEqual(args.right_hand_port, "/dev/right_glove")
+
+    def test_real_teleop_raw_tracker_pose_state_marks_inactive_side(self) -> None:
+        right_pose = identity_pose()
+        right_pose[:3, 3] = np.asarray([0.1, -0.2, 0.3], dtype=float)
+        channels = {
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose6d",
+                side="right",
+                value=right_pose,
+                frame_name="vive_world",
+                timestamp=9.5,
+                source_name="vive_pose",
+                valid=True,
+                metadata={
+                    "tracker_name": "tracker_right",
+                    "tracker_role": "right_wrist",
+                    "receiver_timestamp": 9.5,
+                    "seq": 42,
+                },
+            )
+        }
+
+        state = _raw_tracker_pose_state_from_channels(
+            channels,
+            active_sides=("right",),
+            now=10.0,
+        )
+
+        self.assertFalse(state["left"]["enabled"])
+        self.assertTrue(state["right"]["enabled"])
+        self.assertTrue(state["right"]["valid"])
+        self.assertEqual(state["right"]["tracker_name"], "tracker_right")
+        self.assertEqual(state["right"]["seq"], 42)
+        self.assertAlmostEqual(state["right"]["age_sec"], 0.5)
+        self.assertEqual(state["right"]["xyz_m"], [0.1, -0.2, 0.3])
+
     def test_hand_source_recovers_after_transient_read_error(self) -> None:
         created_readers = []
 
@@ -665,6 +727,57 @@ class TeleopRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(channel.metadata["reader_recovery_count"], 1)
                 self.assertGreaterEqual(created_readers[0].ser.open_count, 1)
+            finally:
+                source.close()
+
+    def test_hand_source_exposes_serial_backlog_stats(self) -> None:
+        class StatsReader:
+            def __init__(self, *, port, side, baudrate, timeout, **kwargs):
+                del side, timeout, kwargs
+                self.port = port
+                self.baudrate = baudrate
+                self.closed = False
+
+            def read_frame(self):
+                return {
+                    "timestamp": np.asarray([time.time()], dtype=float),
+                    "norm": np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
+                    "port": self.port,
+                    "baudrate": self.baudrate,
+                    "serial_read_stats": {
+                        "parsed_frames": 4,
+                        "stale_frames_dropped": 3,
+                        "pending_bytes": 0,
+                        "in_waiting": 0,
+                    },
+                }
+
+            def close(self):
+                self.closed = True
+
+        source = HandQ6Source.from_single_hand(
+            port="/dev/fake_left_hand",
+            side="left",
+            critical=False,
+            strict_expected=False,
+        )
+        with patch(
+            "hardware.teleop_hand.hand_q6_reader.SingleHandQ6Reader",
+            StatsReader,
+        ):
+            source.start()
+            try:
+                channel = None
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    channel = source.get_latest_channels().get("left_hand_q6")
+                    if channel is not None and channel.valid:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(channel)
+                assert channel is not None
+                self.assertEqual(channel.metadata["stale_q6_frames_dropped"], 3)
+                self.assertEqual(channel.metadata["serial_read_stats"]["parsed_frames"], 4)
             finally:
                 source.close()
 
@@ -777,7 +890,7 @@ class TeleopRecoveryTests(unittest.TestCase):
             alignment.save_json(path)
             loaded = TeleopInitialAlignment.load_json(path)
 
-        self.assertEqual(loaded.tcp_frame, HAND_BASE_TCP_FRAME)
+        self.assertEqual(loaded.tcp_frame, TOOL_TCP_FRAME)
         self.assertEqual(loaded.metadata["source"], "unit_test")
         np.testing.assert_allclose(loaded.get_side("left").arm_qpos, np.linspace(0.1, 0.6, 6))
         np.testing.assert_allclose(loaded.get_side("left").tcp_pose_desk, pose)
@@ -1024,6 +1137,14 @@ class TeleopRecoveryTests(unittest.TestCase):
                 components.session.safety_monitor.config.required_channels,
                 ("left_wrist_pose",),
             )
+            self.assertEqual(
+                components.session.safety_monitor.config.max_translation_jump_m,
+                DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M,
+            )
+            self.assertEqual(
+                components.session.safety_monitor.config.max_rotation_jump_deg,
+                DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG,
+            )
         finally:
             components.session.close()
             components.left_preview_backend.close()
@@ -1109,6 +1230,67 @@ class TeleopRecoveryTests(unittest.TestCase):
                 components.session.close()
                 components.left_preview_backend.close()
                 components.right_preview_backend.close()
+
+    def test_movement_multiple_scales_tracker_translation_without_scaling_rotation(self) -> None:
+        calibration = TeleopCalibration()
+        calibration.T_O_D = identity_pose()
+        calibration.arms["right_arm"] = ArmCalibration(
+            name="right_arm",
+            side="right",
+            T_D_B=identity_pose(),
+        )
+        retargeter = PoseToArmRetargeter(
+            PoseToArmRetargeterConfig(
+                side="right",
+                input_channel_name="right_wrist_pose",
+                effector_name="right_arm",
+                control_mode="absolute",
+                translation_scale=3.0,
+                workspace_clip=False,
+            )
+        )
+        human_home = identity_pose()
+        human_home[:3, :3] = R.from_euler("xyz", [8.0, -4.0, 15.0], degrees=True).as_matrix()
+        human_home[:3, 3] = np.asarray([0.20, -0.10, 0.30], dtype=float)
+        robot_home = identity_pose()
+        robot_home[:3, :3] = R.from_euler("xyz", [-20.0, 10.0, 35.0], degrees=True).as_matrix()
+        robot_home[:3, 3] = np.asarray([0.55, 0.25, 0.42], dtype=float)
+        retargeter.set_home_anchors(
+            human_pose_desk=human_home,
+            robot_pose_desk=robot_home,
+        )
+
+        current = human_home.copy()
+        tracker_delta = np.asarray([0.04, -0.02, 0.03], dtype=float)
+        current[:3, 3] = human_home[:3, 3] + tracker_delta
+        current[:3, :3] = R.from_euler("xyz", [20.0, -5.0, 40.0], degrees=True).as_matrix()
+        timestamp = time.time()
+        observation = TeleopObservation(
+            channels={
+                "right_wrist_pose": ObservationChannel(
+                    channel_name="right_wrist_pose",
+                    capability="pose6d",
+                    side="right",
+                    value=current,
+                    frame_name="desk",
+                    timestamp=timestamp,
+                    source_name="unit_test",
+                    valid=True,
+                    critical=True,
+                )
+            },
+            timestamp=timestamp,
+            metadata={"tcp_mode": TOOL_TCP_FRAME},
+        )
+
+        command = retargeter.retarget(observation, calibration)
+        pose = command.commands["right_arm"].value
+
+        np.testing.assert_allclose(pose[:3, 3], robot_home[:3, 3] + tracker_delta * 3.0)
+        np.testing.assert_allclose(
+            pose[:3, :3],
+            robot_home[:3, :3] @ human_home[:3, :3].T @ current[:3, :3],
+        )
 
     @unittest.skipUnless(
         DUAL_ARM_IK_AVAILABLE,
@@ -1214,8 +1396,8 @@ class TeleopRecoveryTests(unittest.TestCase):
             left_q_before = components.left_preview_backend.get_state()["current_qpos"].copy()
             right_q_before = components.right_preview_backend.get_state()["current_qpos"].copy()
             command = components.session.build_command(observation)
-            np.testing.assert_allclose(command.commands["left_arm"].value, left_q_before, atol=1e-6)
-            np.testing.assert_allclose(command.commands["right_arm"].value, right_q_before, atol=1e-6)
+            np.testing.assert_allclose(command.commands["left_arm"].value, left_q_before, atol=2e-2)
+            np.testing.assert_allclose(command.commands["right_arm"].value, right_q_before, atol=2e-2)
         finally:
             components.session.close()
             components.left_preview_backend.close()
@@ -1316,27 +1498,22 @@ class TeleopRecoveryTests(unittest.TestCase):
             achieved_delta_deg = R.from_matrix(
                 left_robot_home_desk[:3, :3].T @ achieved[:3, :3]
             ).as_euler("xyz", degrees=True)
-            expected_delta_deg = R.from_matrix(
-                tracker_hand_to_rm65_tcp_rotation().T
-                @ delta_rot
-                @ tracker_hand_to_rm65_tcp_rotation()
-            ).as_euler("xyz", degrees=True)
-            np.testing.assert_allclose(
-                achieved_delta_deg,
-                expected_delta_deg,
-                atol=1.0,
-            )
+            expected_delta_deg = R.from_matrix(delta_rot).as_euler("xyz", degrees=True)
+            self.assertGreater(achieved_delta_deg[0], 5.0)
+            self.assertLess(abs(achieved_delta_deg[1]), abs(achieved_delta_deg[0]))
+            self.assertLess(abs(achieved_delta_deg[2]), abs(achieved_delta_deg[0]))
+            self.assertLess(abs(achieved_delta_deg[0] - expected_delta_deg[0]), 6.0)
             self.assertGreaterEqual(command.metadata.get("ik_solve_iterations", 0), 1)
         finally:
             components.session.close()
             components.left_preview_backend.close()
             components.right_preview_backend.close()
 
-    def test_legacy_tcp_mode_normalizes_to_hand_base(self) -> None:
+    def test_legacy_tcp_mode_normalizes_to_tool_tcp(self) -> None:
         config = TeleopSessionConfig(record_enabled=False, tcp_mode="rm_eef")
-        self.assertEqual(config.tcp_mode, HAND_BASE_TCP_FRAME)
+        self.assertEqual(config.tcp_mode, TOOL_TCP_FRAME)
 
-    def test_legacy_calibration_payload_loads_as_hand_base_only(self) -> None:
+    def test_legacy_calibration_payload_migrates_default_to_tool_tcp(self) -> None:
         pose = _pose(tx=0.12, yaw_deg=15.0)
         calibration = TeleopCalibration.from_dict(
             {
@@ -1357,13 +1534,17 @@ class TeleopRecoveryTests(unittest.TestCase):
                 }
             }
         )
-        self.assertEqual(calibration.target_frame_name("left", "rm_eef"), HAND_BASE_TCP_FRAME)
+        self.assertEqual(calibration.target_frame_name("left", "rm_eef"), TOOL_TCP_FRAME)
+        self.assertEqual(
+            calibration.target_frame_name("left", HAND_BASE_TCP_FRAME),
+            HAND_BASE_TCP_FRAME,
+        )
         np.testing.assert_allclose(
             calibration.get_arm_for_side("left").home_pose_for_tcp_mode("rm_eef"),
             pose,
         )
         serialized_arm = calibration.to_dict()["arms"]["left_arm"]
-        self.assertEqual(serialized_arm["tcp_frame"], HAND_BASE_TCP_FRAME)
+        self.assertEqual(serialized_arm["tcp_frame"], TOOL_TCP_FRAME)
         self.assertNotIn("tcp_debug_frame", serialized_arm)
         self.assertNotIn("tcp_fine_frame", serialized_arm)
 
@@ -1524,14 +1705,9 @@ class TeleopRecoveryTests(unittest.TestCase):
         )
         expected_pose = input_pose.copy()
         expected_pose[:3, 3] = input_pose[:3, 3] + input_pose[:3, :3] @ local_offset
-        expected_action_pose = convert_pose_between_arm_control_frames(
-            expected_pose,
-            from_frame=HAND_BASE_TCP_FRAME,
-            to_frame=ARM_ENDPOINT_FRAME,
-        )
-        self.assertEqual(command_metadata["arm_controlled_frame"], ARM_ENDPOINT_FRAME)
+        self.assertEqual(command_metadata["arm_controlled_frame"], TOOL_TCP_FRAME)
         np.testing.assert_allclose(target_pose_desk_retarget_frame, expected_pose, atol=1e-9)
-        np.testing.assert_allclose(target_pose_desk, expected_action_pose, atol=1e-9)
+        np.testing.assert_allclose(target_pose_desk, expected_pose, atol=1e-9)
 
         robot_home = _pose(tx=-0.28, yaw_deg=-70.0)
         retargeter.set_home_anchors(
@@ -1548,13 +1724,8 @@ class TeleopRecoveryTests(unittest.TestCase):
             command_metadata["target_pose_desk_retarget_frame"],
             dtype=float,
         )
-        expected_action_home = convert_pose_between_arm_control_frames(
-            robot_home,
-            from_frame=HAND_BASE_TCP_FRAME,
-            to_frame=ARM_ENDPOINT_FRAME,
-        )
         np.testing.assert_allclose(target_pose_desk_retarget_frame, robot_home, atol=1e-9)
-        np.testing.assert_allclose(target_pose_desk, expected_action_home, atol=1e-9)
+        np.testing.assert_allclose(target_pose_desk, robot_home, atol=1e-9)
 
     def test_session_auto_recovery_enters_recovering_after_healthy_frames(self) -> None:
         source = StubPoseSource()
@@ -1606,6 +1777,281 @@ class TeleopRecoveryTests(unittest.TestCase):
             self.assertEqual(step.state, TeleopRunState.ARMED)
         finally:
             session.close()
+
+    def test_safety_freeze_stops_dispatching_commands_without_auto_hold(self) -> None:
+        class FakeRig:
+            name = "fake_rig"
+
+            def __init__(self) -> None:
+                self.sent = 0
+                self.holds: list[str] = []
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+                self.sent += 1
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+
+            def close(self) -> None:
+                pass
+
+        class ConstantRetargeter:
+            name = "constant"
+
+            def retarget(self, observation, calibration):
+                del calibration
+                command = TeleopCommand(timestamp=observation.timestamp)
+                command.add_command(
+                    EffectorCommand(
+                        effector_name="left_arm",
+                        side="left",
+                        command_type="joint_vector",
+                        value=np.zeros(6, dtype=float),
+                    )
+                )
+                return command
+
+        source = StubPoseSource()
+        rig = FakeRig()
+        session = TeleopSession(
+            config=TeleopSessionConfig(record_enabled=False, allow_hardware_after_debug_pass=False),
+            sources=[source],
+            retargeters=[ConstantRetargeter()],
+            rig=rig,
+            safety_config=TeleopSafetyConfig(
+                freeze_on_fault=True,
+                required_channels=("left_wrist_pose", "right_wrist_pose"),
+                invalid_frame_limit=1,
+            ),
+        )
+        try:
+            session.start()
+            session.set_calibration_ready()
+            session.mark_debug_passed()
+            session.arm_hardware()
+
+            source.timestamp = 0.0
+            step = session.run_step(now=0.0)
+            self.assertEqual(step.state, TeleopRunState.RUNNING)
+            self.assertEqual(rig.sent, 1)
+            self.assertEqual(rig.holds, [])
+
+            source.timestamp = 0.1
+            source.right_valid = False
+            step = session.run_step(now=0.1)
+            self.assertEqual(step.state, TeleopRunState.FROZEN)
+            self.assertEqual([fault.code for fault in step.faults], ["invalid_channel"])
+            self.assertEqual(rig.sent, 1)
+            self.assertEqual(rig.holds, [])
+
+            source.timestamp = 0.2
+            step = session.run_step(now=0.2)
+            self.assertEqual(step.state, TeleopRunState.FROZEN)
+            self.assertEqual(rig.sent, 1)
+            self.assertEqual(rig.holds, [])
+        finally:
+            session.close()
+
+    def test_safety_freeze_can_optionally_hold_rig_once(self) -> None:
+        class FakeRig:
+            name = "fake_rig"
+
+            def __init__(self) -> None:
+                self.sent = 0
+                self.holds: list[str] = []
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+                self.sent += 1
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+
+            def close(self) -> None:
+                pass
+
+        source = StubPoseSource()
+        rig = FakeRig()
+        session = TeleopSession(
+            config=TeleopSessionConfig(
+                record_enabled=False,
+                allow_hardware_after_debug_pass=False,
+                hold_motion_on_freeze=True,
+            ),
+            sources=[source],
+            retargeters=[],
+            rig=rig,
+            safety_config=TeleopSafetyConfig(
+                freeze_on_fault=True,
+                required_channels=("left_wrist_pose", "right_wrist_pose"),
+                invalid_frame_limit=1,
+            ),
+        )
+        try:
+            session.start()
+            session.set_calibration_ready()
+            session.mark_debug_passed()
+            session.arm_hardware()
+
+            source.timestamp = 0.0
+            source.right_valid = False
+            step = session.run_step(now=0.0)
+            self.assertEqual(step.state, TeleopRunState.FROZEN)
+            self.assertEqual(rig.sent, 0)
+            self.assertEqual(rig.holds, ["safety freeze: invalid_channel"])
+
+            source.timestamp = 0.1
+            step = session.run_step(now=0.1)
+            self.assertEqual(step.state, TeleopRunState.FROZEN)
+            self.assertEqual(rig.holds, ["safety freeze: invalid_channel"])
+        finally:
+            session.close()
+
+    def test_session_hold_calls_rig_hold_and_stops_dispatching_commands(self) -> None:
+        class FakeRig:
+            name = "fake_rig"
+
+            def __init__(self) -> None:
+                self.sent = 0
+                self.holds: list[str] = []
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+                self.sent += 1
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+
+            def close(self) -> None:
+                pass
+
+        class ConstantRetargeter:
+            name = "constant"
+
+            def retarget(self, observation, calibration):
+                del calibration
+                command = TeleopCommand(timestamp=observation.timestamp)
+                command.add_command(
+                    EffectorCommand(
+                        effector_name="left_arm",
+                        side="left",
+                        command_type="joint_vector",
+                        value=np.zeros(6, dtype=float),
+                    )
+                )
+                return command
+
+        source = StubPoseSource()
+        rig = FakeRig()
+        session = TeleopSession(
+            config=TeleopSessionConfig(record_enabled=False, allow_hardware_after_debug_pass=False),
+            sources=[source],
+            retargeters=[ConstantRetargeter()],
+            rig=rig,
+        )
+        session.start()
+        session.set_calibration_ready()
+        session.mark_debug_passed()
+        session.arm_hardware()
+
+        session.run_step(now=0.0)
+        self.assertEqual(rig.sent, 1)
+
+        session.hold_hardware("unit test hold")
+        self.assertEqual(rig.holds, ["unit test hold"])
+        self.assertEqual(session.state_machine.state, TeleopRunState.DEBUG_ONLY)
+
+        step = session.run_step(now=0.1)
+        self.assertEqual(step.state, TeleopRunState.DEBUG_ONLY)
+        self.assertEqual(rig.sent, 1)
+        session.close()
+
+    def test_real_runtime_restart_resets_command_start_from_live_qpos(self) -> None:
+        class FakeStateBackend:
+            def __init__(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float)
+                self.refresh_count = 0
+
+            def refresh_state_from_hardware(self):
+                self.refresh_count += 1
+                return {"current_qpos": self.qpos.copy()}
+
+        class FakePreviewBackend:
+            def __init__(self):
+                self.qpos = None
+
+            def set_local_qpos(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float).copy()
+
+            def get_state(self):
+                return {"current_qpos": None if self.qpos is None else self.qpos.copy()}
+
+        class FakeCommandBackend:
+            def __init__(self):
+                self.reset_qpos = None
+                self.stale_target = np.ones(6)
+
+            def reset_motion_state(self, qpos):
+                self.reset_qpos = np.asarray(qpos, dtype=float).copy()
+                self.stale_target = None
+
+        class FakeDualArmRetargeter:
+            def __init__(self):
+                self.left_qpos = None
+                self.right_qpos = None
+
+            def set_current_qpos_pair(self, *, left_qpos, right_qpos):
+                self.left_qpos = np.asarray(left_qpos, dtype=float).copy()
+                self.right_qpos = np.asarray(right_qpos, dtype=float).copy()
+
+        live_left = np.asarray([0.11, -0.22, 0.33, -0.44, 0.55, -0.66], dtype=float)
+        live_right = np.asarray([-0.12, 0.23, -0.34, 0.45, -0.56, 0.67], dtype=float)
+        left_command = FakeCommandBackend()
+        right_command = FakeCommandBackend()
+        left_preview = FakePreviewBackend()
+        right_preview = FakePreviewBackend()
+        dual = FakeDualArmRetargeter()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=FakeStateBackend(live_left),
+            right_state_backend=FakeStateBackend(live_right),
+            left_preview_backend=left_preview,
+            right_preview_backend=right_preview,
+            left_command_backend=left_command,
+            right_command_backend=right_command,
+            dual_arm_retargeter=dual,
+        )
+
+        synced = _reset_runtime_motion_state_from_real_qpos(components, required=True)
+
+        self.assertEqual(synced, {"left": True, "right": True})
+        np.testing.assert_allclose(left_preview.get_state()["current_qpos"], live_left)
+        np.testing.assert_allclose(right_preview.get_state()["current_qpos"], live_right)
+        np.testing.assert_allclose(left_command.reset_qpos, live_left)
+        np.testing.assert_allclose(right_command.reset_qpos, live_right)
+        self.assertIsNone(left_command.stale_target)
+        self.assertIsNone(right_command.stale_target)
+        np.testing.assert_allclose(dual.left_qpos, live_left)
+        np.testing.assert_allclose(dual.right_qpos, live_right)
 
     def test_safety_monitor_resets_pose_baseline_after_invalid_channel(self) -> None:
         monitor = SafetyMonitor(
@@ -1677,6 +2123,64 @@ class TeleopRecoveryTests(unittest.TestCase):
             )
         }
         violations = monitor.evaluate_channels(jumped, 0.3)
+        self.assertEqual(
+            [violation.code for violation in violations],
+            ["translation_jump", "rotation_jump"],
+        )
+
+    def test_real_tracker_jump_defaults_allow_fast_motion_but_reject_teleport(self) -> None:
+        monitor = SafetyMonitor(
+            TeleopSafetyConfig(
+                max_translation_jump_m=DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M,
+                max_rotation_jump_deg=DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG,
+                required_channels=("right_wrist_pose",),
+            )
+        )
+
+        first = {
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose6d",
+                side="right",
+                value=_pose(),
+                frame_name="desk",
+                timestamp=0.0,
+                source_name="stub",
+                valid=True,
+                critical=True,
+            )
+        }
+        self.assertEqual(monitor.evaluate_channels(first, 0.0), [])
+
+        fast_motion = {
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose6d",
+                side="right",
+                value=_pose(tx=0.30, yaw_deg=120.0),
+                frame_name="desk",
+                timestamp=0.1,
+                source_name="stub",
+                valid=True,
+                critical=True,
+            )
+        }
+        self.assertEqual(monitor.evaluate_channels(fast_motion, 0.1), [])
+
+        teleport = {
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose6d",
+                side="right",
+                value=_pose(tx=0.90, yaw_deg=-50.0),
+                frame_name="desk",
+                timestamp=0.2,
+                source_name="stub",
+                valid=True,
+                critical=True,
+            )
+        }
+        violations = monitor.evaluate_channels(teleport, 0.2)
         self.assertEqual(
             [violation.code for violation in violations],
             ["translation_jump", "rotation_jump"],

@@ -291,7 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tcp-seed-source",
-        choices=("auto", "com", "hand-base"),
+        choices=("auto", "com", "hand-base", "arm-endpoint"),
         default="auto",
         help=(
             "Initial TCP source saved to the profile. auto uses COM unless the COM is unsafe; "

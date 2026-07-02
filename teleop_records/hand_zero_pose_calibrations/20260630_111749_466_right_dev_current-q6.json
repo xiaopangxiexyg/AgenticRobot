@@ -1,0 +1,57 @@
+{
+  "baudrate": 115200,
+  "deg_at_0": [
+    200.0,
+    201.0,
+    202.0,
+    203.0,
+    204.0,
+    205.0
+  ],
+  "deg_at_1": [
+    240.0,
+    131.0,
+    262.0,
+    263.0,
+    264.0,
+    265.0
+  ],
+  "offset": [
+    40.0,
+    -70.0,
+    60.0,
+    60.0,
+    60.0,
+    60.0
+  ],
+  "port": "/dev/current-q6",
+  "port_aliases": [
+    "/dev/current-q6"
+  ],
+  "port_realpath": null,
+  "q6_order": [
+    "thumb_yaw",
+    "thumb_flex",
+    "index",
+    "middle",
+    "ring",
+    "pinky"
+  ],
+  "sample_count": 30,
+  "side": "right",
+  "stable_eps_deg": 0.5,
+  "stable_window": 20,
+  "timestamp": 1782789469.4669068,
+  "timestamp_local": "2026-06-30 11:17:49",
+  "used_count": 20,
+  "used_max_range_deg": 0.0,
+  "used_range_deg": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "zero_pose_required": true
+}

@@ -141,6 +141,8 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 启动后按 `p` 或回车做 runtime home。这里验证前/左/上方向、左右映射、姿态跟随、workspace、碰撞规避。再切 `--control-mode delta_clutch --keyboard-clutch` 验证相对控制手感。
 
+特殊位控 --right-tool-profile position_endpoint
+
 **5. 真机单臂测试**
 先右臂、低速、小范围、不接手部末端控制：
 
@@ -150,8 +152,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --host 0.0.0.0 \
   --port 9999 \
-  --load-profile teleop_records/calibration_profiles/your_profile.json \
-  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_empty.json \
+  --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_125700_vive_rm65_virtual_desk.json \
+  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_L.json \
   --no-collision
 ```
 
@@ -175,6 +177,9 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 **6. 真机双臂测试**
 双臂需要左右两边 profile 都齐全：
 
+export LEFT_ARM_IP=192.168.101.21
+export RIGHT_ARM_IP=192.168.1.20
+
 ```bash
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --active-sides both \
@@ -197,14 +202,6 @@ hardware/rm65/utils/configs/calibrations/rm65_right_empty.json
 ```
 
 你 IDE 里开的 `rm65_right_inspire.json` 当前路径下不存在。也就是说：按默认 strict profile，右臂 empty 可以走；right inspire、left inspire、双臂都需要先生成/确认对应 `rm65_{arm}_{tool}.json`，否则真机 impedance 入口会在启动阶段拒绝。
-
-
-
-
-
-
-
-
 
 
 

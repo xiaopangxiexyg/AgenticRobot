@@ -1,0 +1,59 @@
+{
+  "baudrate": 115200,
+  "deg_at_0": [
+    169.58900451660156,
+    165.08700561523438,
+    178.77000427246094,
+    184.91549682617188,
+    175.25,
+    176.08949279785156
+  ],
+  "deg_at_1": [
+    209.58900451660156,
+    95.08700561523438,
+    238.77000427246094,
+    244.91549682617188,
+    235.25,
+    236.08949279785156
+  ],
+  "offset": [
+    40.0,
+    -70.0,
+    60.0,
+    60.0,
+    60.0,
+    60.0
+  ],
+  "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+  "port_aliases": [
+    "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+    "/dev/ttyACM0",
+    "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+  ],
+  "port_realpath": "/dev/ttyACM0",
+  "q6_order": [
+    "thumb_yaw",
+    "thumb_flex",
+    "index",
+    "middle",
+    "ring",
+    "pinky"
+  ],
+  "sample_count": 91,
+  "side": "right",
+  "stable_eps_deg": 0.5,
+  "stable_window": 20,
+  "timestamp": 1782728808.768317,
+  "timestamp_local": "2026-06-29 18:26:48",
+  "used_count": 20,
+  "used_max_range_deg": 0.44000244140625,
+  "used_range_deg": [
+    0.44000244140625,
+    0.089996337890625,
+    0.0,
+    0.2700042724609375,
+    0.0,
+    0.0900115966796875
+  ],
+  "zero_pose_required": true
+}

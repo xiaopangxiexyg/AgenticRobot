@@ -1,0 +1,45 @@
+{
+  "gripper": {
+    "source_dim": 2,
+    "output_dim": 1,
+    "invert": false,
+    "alpha": 1.0,
+    "speed": 1.0,
+    "force": 1.0,
+    "max_action": 0.98,
+    "send_threshold": 0.01,
+    "command_hz": 40.0,
+    "continuous_grasp": false,
+    "telemetry_hz": 10.0
+  },
+  "tasks": {
+    "soft_grasp": {
+      "gripper": {
+        "force": 0.7,
+        "speed": 1.0,
+        "max_action": 0.98,
+        "continuous_grasp": true,
+        "left": {
+          "force": 1.0
+        },
+        "right": {
+          "force": 1.0
+        }
+      }
+    },
+    "firm_grasp": {
+      "gripper": {
+        "force": 1.0,
+        "speed": 1.0,
+        "max_action": 0.98,
+        "continuous_grasp": true,
+        "left": {
+          "force": 1.0
+        },
+        "right": {
+          "force": 1.0
+        }
+      }
+    }
+  }
+}

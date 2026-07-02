@@ -113,6 +113,102 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
         self.assertEqual(canonical["active_effectors"], ["right_arm"])
         np.testing.assert_allclose(canonical["arm_pose_by_side"]["right"], pose, atol=1e-6)
 
+    def test_default_sample_metadata_strips_ik_collision_debug_metadata(self) -> None:
+        pose = np.array([0.31, 0.32, 0.33, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        command = TeleopCommand(
+            timestamp=4.0,
+            metadata={
+                "source_target_pose_base": {"left": xyzquat_to_matrix(pose)},
+                "collision_avoidance_status": "tracking",
+                "ik_candidate_selection": {"selected": "original"},
+            },
+        )
+        command.add_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.arange(6, dtype=np.float32),
+                frame_name=None,
+                metadata={
+                    "source_target_pose_base": xyzquat_to_matrix(pose),
+                    "collision_avoidance_status": "tracking",
+                    "ik_candidate_selection": {"selected": "original"},
+                    "joint_limit_margin": {"near_limit": False},
+                },
+            )
+        )
+        step = SessionStepResult(
+            timestamp=4.0,
+            state=TeleopRunState.RUNNING,
+            control_hz=30.0,
+            observation=TeleopObservation(timestamp=3.9),
+            command=command,
+        )
+
+        metadata = CollectorSampleBuilder._default_metadata(
+            step,
+            None,
+            {},
+            {},
+            {},
+        )
+
+        self.assertIn("source_target_pose_base", metadata["command_metadata"])
+        self.assertNotIn("collision_avoidance_status", metadata["command_metadata"])
+        self.assertNotIn("ik_candidate_selection", metadata["command_metadata"])
+        left_arm_metadata = metadata["command_metadata_by_effector"]["left_arm"]
+        self.assertIn("source_target_pose_base", left_arm_metadata)
+        self.assertNotIn("collision_avoidance_status", left_arm_metadata)
+        self.assertNotIn("ik_candidate_selection", left_arm_metadata)
+        self.assertNotIn("joint_limit_margin", left_arm_metadata)
+        self.assertNotIn("command", metadata["canonical_action_record"]["execution"])
+
+    def test_debug_sample_metadata_keeps_ik_collision_metadata(self) -> None:
+        command = TeleopCommand(
+            timestamp=5.0,
+            metadata={
+                "collision_avoidance_status": "tracking",
+                "ik_candidate_selection": {"selected": "original"},
+            },
+        )
+        command.add_command(
+            EffectorCommand(
+                effector_name="right_arm",
+                side="right",
+                command_type="cartesian_pose",
+                value=np.eye(4, dtype=np.float32),
+                frame_name="right_arm_base",
+                metadata={
+                    "collision_avoidance_status": "tracking",
+                    "ik_candidate_selection": {"selected": "original"},
+                },
+            )
+        )
+        step = SessionStepResult(
+            timestamp=5.0,
+            state=TeleopRunState.RUNNING,
+            control_hz=30.0,
+            observation=TeleopObservation(timestamp=4.9),
+            command=command,
+        )
+
+        metadata = CollectorSampleBuilder._default_metadata(
+            step,
+            None,
+            {},
+            {},
+            {},
+            include_debug_metadata=True,
+        )
+
+        self.assertEqual(metadata["command_metadata"]["collision_avoidance_status"], "tracking")
+        self.assertIn("ik_candidate_selection", metadata["command_metadata"])
+        right_arm_metadata = metadata["command_metadata_by_effector"]["right_arm"]
+        self.assertEqual(right_arm_metadata["collision_avoidance_status"], "tracking")
+        self.assertIn("ik_candidate_selection", right_arm_metadata)
+        self.assertIn("command", metadata["canonical_action_record"]["execution"])
+
 
 if __name__ == "__main__":
     unittest.main()

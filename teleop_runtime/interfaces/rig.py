@@ -26,6 +26,9 @@ class Rig(ABC):
     ) -> None:
         raise NotImplementedError
 
+    def hold_motion(self, reason: str = "manual hold") -> None:
+        """Optional recoverable motion hold hook."""
+
     def close(self) -> None:
         """Optional resource release hook."""
 

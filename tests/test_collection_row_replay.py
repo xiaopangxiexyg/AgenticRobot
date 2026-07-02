@@ -11,6 +11,7 @@ from teleop_runtime.action.row_replay import (
     synthetic_frames_from_collection_rows,
 )
 from teleop_runtime.action.synthetic import run_synthetic_action_replay
+from teleop_runtime.arm_frames import ARM_ENDPOINT_FRAME
 
 
 class CollectionRowReplayTest(unittest.TestCase):
@@ -60,6 +61,18 @@ class CollectionRowReplayTest(unittest.TestCase):
 
         self.assertEqual(report.results[0].action.active_effectors, ("right_arm", "right_hand"))
         self.assertEqual(sorted(report.commands[0].commands), ["right_arm", "right_hand"])
+        self.assertEqual(
+            report.results[0].action.metadata["legacy_replay_compatibility"]["arm_pose_frame"],
+            ARM_ENDPOINT_FRAME,
+        )
+        self.assertEqual(
+            report.commands[0].commands["right_arm"].metadata["arm_controlled_frame"],
+            ARM_ENDPOINT_FRAME,
+        )
+        self.assertEqual(
+            report.commands[0].commands["right_arm"].metadata["arm_action_spec"]["controlled_frame"],
+            ARM_ENDPOINT_FRAME,
+        )
 
     def test_builds_multiple_synthetic_frames_from_rows(self) -> None:
         rows = [

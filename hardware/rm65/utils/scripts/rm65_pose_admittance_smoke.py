@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from hardware.rm65.force_compensation import (  # noqa: E402
     PoseAdmittance,
     WrenchProcessor,
+    admittance_wrench_for_arm,
     angle_delta,
     apply_pose_offset,
     finite_list,
@@ -329,7 +330,9 @@ def _run_admittance(robot: Arm, side: str, start_state: dict[str, list[float]], 
 
             compute_start = time.perf_counter()
             processed = processor.process(readings[args.force_source])
-            update = admittance.update(processed["deadbanded"], dt)
+            raw_deadbanded = list(processed["deadbanded"])
+            admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, side)
+            update = admittance.update(admittance_wrench, dt)
             pose_cmd = normalize_pose(apply_pose_offset(start_state["pose"], update["offset"]))
             compute_sec = time.perf_counter() - compute_start
             compute_durations.append(compute_sec)
@@ -424,7 +427,8 @@ def _run_admittance(robot: Arm, side: str, start_state: dict[str, list[float]], 
                     "measured_wrench": processed["measured"],
                     "tare_corrected_wrench": processed["tare_corrected"],
                     "filtered_wrench": processed["filtered"],
-                    "deadbanded_wrench": processed["deadbanded"],
+                    "deadbanded_wrench": admittance_wrench,
+                    "raw_deadbanded_wrench": raw_deadbanded,
                     "active_wrench": update["active_wrench"],
                     "target_offset": update["target_offset"],
                     "velocity": update["velocity"],

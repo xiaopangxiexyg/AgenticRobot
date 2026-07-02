@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import os
 import select
 import sys
 import termios
 import time
 import tty
+import warnings
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
+from scipy.spatial.transform import Rotation as SciPyRotation
 
 from project_paths import calibration_profiles_dir
 
@@ -41,7 +44,7 @@ from .calibration_flow import (
     pose_from_rotation_translation,
     tracker_offset_from_neutral_pose,
 )
-from .calibration_web_ui import CalibrationWebUi, WebUiKeyInput
+from ..gui.calibration_web_ui import CalibrationWebUi, WebUiKeyInput
 from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event, log_stage
 from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
@@ -55,6 +58,13 @@ def _positive_float(text: str) -> float:
     value = float(text)
     if value <= 0.0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
+def _non_negative_float(text: str) -> float:
+    value = float(text)
+    if value < 0.0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return value
 
 
@@ -84,6 +94,61 @@ def _parse_xyz(text: str) -> np.ndarray:
         return np.asarray([float(item) for item in parts], dtype=float)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
+
+
+def _pose_xyz_rpy_summary(channel, *, now: float) -> dict[str, object]:
+    if channel is None:
+        return {
+            "valid": False,
+            "xyz_m": None,
+            "rpy_deg": None,
+            "age_sec": None,
+            "tracker_name": "",
+            "tracker_role": "",
+            "seq": None,
+        }
+    metadata = channel.metadata or {}
+    pose = as_pose_matrix(channel.value)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rpy_deg = SciPyRotation.from_matrix(pose[:3, :3]).as_euler("xyz", degrees=True)
+    except ValueError:
+        rpy_deg = np.full(3, np.nan, dtype=float)
+    rpy_deg = np.round(rpy_deg.astype(float), 1)
+    rpy_values = [float(value) if np.isfinite(value) else None for value in rpy_deg]
+    timestamp = metadata.get("receiver_timestamp")
+    if timestamp is None:
+        timestamp = channel.timestamp
+    age_sec = max(0.0, now - float(timestamp)) if timestamp is not None else None
+    return {
+        "valid": bool(channel.valid),
+        "xyz_m": np.round(pose[:3, 3].astype(float), 4).tolist(),
+        "rpy_deg": rpy_values,
+        "age_sec": round(age_sec, 3) if age_sec is not None else None,
+        "tracker_name": str(metadata.get("tracker_name") or ""),
+        "tracker_role": str(metadata.get("tracker_role") or ""),
+        "seq": metadata.get("seq"),
+    }
+
+
+def _pose_matrix_xyz_rpy_text(pose: np.ndarray) -> str:
+    pose_matrix = as_pose_matrix(pose)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rpy_deg = SciPyRotation.from_matrix(pose_matrix[:3, :3]).as_euler("xyz", degrees=True)
+    except ValueError:
+        rpy_deg = np.full(3, np.nan, dtype=float)
+    xyz = np.array2string(pose_matrix[:3, 3], precision=4, suppress_small=True)
+    rpy = np.array2string(rpy_deg, precision=1, suppress_small=True)
+    return f"xyz_m={xyz} rpy_deg={rpy}"
+
+
+def _qpos_deg_text(qpos: np.ndarray | None) -> str:
+    if qpos is None:
+        return "None"
+    return np.array2string(np.rad2deg(np.asarray(qpos, dtype=float)), precision=1, suppress_small=True)
 
 
 class TerminalKeyInput:
@@ -141,8 +206,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Interactive VIVE -> RM65 calibration debug tool. "
             "This app calibrates a virtual desk frame from an auxiliary tracker, "
-            "captures left/right wrist tracker offsets, and saves a reusable profile. "
-            "Session home capture is intentionally not part of this tool."
+            "captures left/right wrist tracker offsets, captures session home anchors, "
+            "and saves a reusable profile."
         )
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver")
@@ -159,8 +224,18 @@ def parse_args() -> argparse.Namespace:
         default="real",
         help="Render read-only real RM65 state when IPs are provided, or pure virtual arm poses.",
     )
-    parser.add_argument("--left-arm-ip", type=str, default="", help="Optional left RM65 IP for read-only rendering")
-    parser.add_argument("--right-arm-ip", type=str, default="", help="Optional right RM65 IP for read-only rendering")
+    parser.add_argument(
+        "--left-arm-ip",
+        type=str,
+        default=os.environ.get("LEFT_ARM_IP", ""),
+        help="Optional left RM65 IP for read-only rendering; defaults to LEFT_ARM_IP.",
+    )
+    parser.add_argument(
+        "--right-arm-ip",
+        type=str,
+        default=os.environ.get("RIGHT_ARM_IP", ""),
+        help="Optional right RM65 IP for read-only rendering; defaults to RIGHT_ARM_IP.",
+    )
     parser.add_argument(
         "--left-right-base-distance",
         type=float,
@@ -195,6 +270,20 @@ def parse_args() -> argparse.Namespace:
         choices=["terminal", "web"],
         default="web",
         help="Choose terminal key input or a browser-based control panel.",
+    )
+    parser.add_argument(
+        "--gui",
+        dest="ui_mode",
+        action="store_const",
+        const="web",
+        help="Use the browser-based calibration control panel. Alias for --ui-mode web.",
+    )
+    parser.add_argument(
+        "--no-gui",
+        dest="ui_mode",
+        action="store_const",
+        const="terminal",
+        help="Use terminal keyboard controls only. Alias for --ui-mode terminal.",
     )
     parser.add_argument(
         "--ui-host",
@@ -238,14 +327,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sweep-capture-sec",
         type=_positive_float,
-        default=3.0,
+        default=5.0,
         help="Timed capture duration for each VirtualDesk X/Y/Z sweep",
+    )
+    parser.add_argument(
+        "--capture-prep-sec",
+        type=_non_negative_float,
+        default=3.0,
+        help="Preparation countdown before each timed capture starts.",
+    )
+    parser.add_argument(
+        "--wrist-capture-prep-sec",
+        type=_non_negative_float,
+        default=5.0,
+        help="Preparation countdown before the combined wrist/home capture starts.",
     )
     parser.add_argument(
         "--hold-capture-sec",
         type=_positive_float,
-        default=2.0,
-        help="Timed capture duration for wrist coarse captures",
+        default=4.0,
+        help="Timed capture duration for the combined wrist/home capture",
+    )
+    parser.add_argument(
+        "--capture-extra-wait-sec",
+        type=_non_negative_float,
+        default=0.0,
+        help="Extra time to keep a capture open when the timed window ends before enough fresh samples arrive.",
     )
     parser.add_argument("--min-sweep-extent-m", type=_positive_float, default=0.15, help="Minimum extent required for each auxiliary sweep")
     parser.add_argument(
@@ -270,16 +377,50 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--min-sweep-samples",
+        type=int,
+        default=3,
+        help="Minimum valid fresh samples required for each VirtualDesk X/Y/Z sweep.",
+    )
+    parser.add_argument(
         "--min-hold-samples",
         type=int,
-        default=20,
-        help="Minimum valid samples required for wrist coarse hold captures",
+        default=3,
+        help="Minimum valid samples required for the combined wrist/home capture",
+    )
+    parser.add_argument(
+        "--home-capture-sec",
+        type=_positive_float,
+        default=4.0,
+        help="Timed capture duration for left/right session home anchors",
+    )
+    parser.add_argument(
+        "--home-samples",
+        type=int,
+        default=3,
+        help="Minimum valid samples required for each side during session home capture",
+    )
+    parser.add_argument(
+        "--skip-session-home",
+        action="store_true",
+        help="Skip home capture and validation, then save only tracker/station calibration.",
+    )
+    parser.add_argument(
+        "--station-only-profile",
+        action="store_true",
+        help="Compatibility flag; calibration profiles are always saved without session home anchors.",
     )
     parser.add_argument(
         "--fine-tune-step-deg",
         type=_positive_float,
         default=2.0,
         help="Fine tuning step for wrist orientation offsets during validation",
+    )
+    parser.add_argument(
+        "--default-side",
+        choices=["left", "right"],
+        default="right",
+        help="Initial hand selected for wrist/frame fine tuning in the web and terminal controls.",
     )
     parser.add_argument(
         "--debug-frame-axis-length",
@@ -484,17 +625,19 @@ class CalibrationApp:
         }
         self.home_ready = False
         self.empty_hand = np.empty(0, dtype=float)
-        self.selected_side = "left"
+        self.selected_side = str(self.args.default_side)
         self.log_gate = ChangeGate()
         self._render_enabled = False
         self._debug_frames: dict[str, np.ndarray] = {}
         self._last_validation_target_poses: dict[str, np.ndarray] = {}
         self._last_arm_refresh_time: float | None = None
         self._arm_refresh_period_sec = 0.10
+        self._arm_visualization_enabled = {"left": False, "right": False}
         self.frame_viz_mode = str(self.args.frame_viz_mode)
         self.virtual_desk_post_yaw_deg = float(self.args.virtual_desk_post_yaw_deg)
         self._base_world_to_desk_pose: np.ndarray | None = None
         self._renderer_initialized = False
+        self._simulate_arm_preview = False
         self._restore_loaded_profile_state()
         self._publish_ui_state(stage="Starting...")
 
@@ -505,7 +648,33 @@ class CalibrationApp:
 
     def _stage(self, title: str, *, now: float | None = None) -> None:
         log_stage("STAGE", title, now=now)
-        self._publish_ui_state(stage=title)
+        self._publish_ui_state(
+            stage=title,
+            active_controls=["q"],
+            control_hint="",
+            **self._empty_capture_ui_state(),
+        )
+
+    @staticmethod
+    def _empty_capture_ui_state() -> dict[str, object]:
+        return {
+            "capture_stage": "",
+            "capture_phase": "idle",
+            "capturing": False,
+            "capture_channel": "",
+            "capture_samples": None,
+            "capture_left_samples": None,
+            "capture_right_samples": None,
+            "capture_min_samples": None,
+            "capture_valid": None,
+            "capture_left_valid": None,
+            "capture_right_valid": None,
+            "capture_elapsed_sec": None,
+            "capture_duration_sec": None,
+            "capture_prep_remaining_sec": None,
+            "capture_prep_total_sec": None,
+            "capture_waiting_for_samples": False,
+        }
 
     def _publish_ui_state(self, **updates: object) -> None:
         if self.ui is None:
@@ -520,19 +689,83 @@ class CalibrationApp:
             "port": self.args.port,
             "load_profile": self.args.load_profile,
             "show_tracker_frame_viz": bool(self.args.show_tracker_frame_viz),
+            "home_ready": bool(self.home_ready),
         }
         state.update(updates)
         self.ui.publish(**state)
 
+    def _source_debug_stats(self) -> dict[str, object]:
+        get_stats = getattr(self.components.source, "debug_stats", None)
+        if get_stats is None:
+            return {}
+        stats = get_stats()
+        return stats if isinstance(stats, dict) else {}
+
+    def _publish_raw_tracker_pose_state(
+        self,
+        channels: Mapping[str, object],
+        *,
+        now: float | None = None,
+    ) -> None:
+        if self.ui is None:
+            return
+        current_time = time.time() if now is None else float(now)
+        self._publish_ui_state(
+            raw_tracker_poses={
+                "left": _pose_xyz_rpy_summary(
+                    channels.get("left_wrist_pose"),
+                    now=current_time,
+                ),
+                "right": _pose_xyz_rpy_summary(
+                    channels.get("right_wrist_pose"),
+                    now=current_time,
+                ),
+            }
+        )
+
+    def _format_source_rates(
+        self,
+        *,
+        start_stats: dict[str, object],
+        channel_names: tuple[str, ...],
+        elapsed_sec: float,
+        now: float,
+    ) -> str:
+        current_stats = self._source_debug_stats()
+        if not current_stats:
+            return "source_stats=unavailable"
+        elapsed = max(float(elapsed_sec), 1e-6)
+        packet_count = int(current_stats.get("packet_count") or 0)
+        start_packet_count = int(start_stats.get("packet_count") or 0)
+        packet_hz = (packet_count - start_packet_count) / elapsed
+        update_counts = current_stats.get("channel_update_counts") or {}
+        start_update_counts = start_stats.get("channel_update_counts") or {}
+        last_updates = current_stats.get("last_channel_update_at") or {}
+        channel_parts = []
+        if isinstance(update_counts, dict) and isinstance(start_update_counts, dict):
+            for channel_name in channel_names:
+                count = int(update_counts.get(channel_name) or 0)
+                start_count = int(start_update_counts.get(channel_name) or 0)
+                channel_hz = (count - start_count) / elapsed
+                last_update_at = last_updates.get(channel_name) if isinstance(last_updates, dict) else None
+                age = (now - float(last_update_at)) if last_update_at is not None else float("nan")
+                channel_parts.append(f"{channel_name}_hz={channel_hz:.1f} age={age:.2f}s")
+        last_packet_at = current_stats.get("last_packet_received_at")
+        packet_age = (now - float(last_packet_at)) if last_packet_at is not None else float("nan")
+        return f"source_udp_hz={packet_hz:.1f} packet_age={packet_age:.2f}s " + " ".join(channel_parts)
+
     def _ensure_renderer(self) -> None:
         if self.components.renderer is not None or self.args.skip_renderer:
             return
+        self._refresh_arm_render_state(force=True)
+        left_urdf_path = self._renderer_arm_urdf_path("left")
+        right_urdf_path = self._renderer_arm_urdf_path("right")
         try:
             renderer = SapienArmHandRenderer(
-                left_urdf_path=require_asset_path("rm65_arm.urdf"),
-                left_retargeting_joint_names=(),
-                right_urdf_path=require_asset_path("rm65_arm.urdf"),
-                right_retargeting_joint_names=(),
+                left_urdf_path=left_urdf_path,
+                left_retargeting_joint_names=() if left_urdf_path is not None else None,
+                right_urdf_path=right_urdf_path,
+                right_retargeting_joint_names=() if right_urdf_path is not None else None,
                 left_right_base_distance=self.args.left_right_base_distance,
                 show_viewer=not self.args.headless,
                 debug_frame_axis_length=self.args.debug_frame_axis_length,
@@ -555,6 +788,7 @@ class CalibrationApp:
             )
             self.components = replace(self.components, renderer=renderer)
             self._renderer_initialized = True
+            self._ensure_renderer_arm_models()
             self._publish_ui_state(renderer_ready=True)
         except RuntimeError as exc:
             raise RuntimeError(
@@ -562,6 +796,89 @@ class CalibrationApp:
                 "has a usable Vulkan/OpenGL render device, or rerun with --skip-renderer "
                 "to validate the calibration flow without 3D visualization."
             ) from exc
+
+    def _backend_for_side(self, side: str) -> RM65ArmBackend:
+        return self.components.left_backend if side == "left" else self.components.right_backend
+
+    def _refresh_arm_visualization_availability(self, *, now: float | None = None) -> None:
+        for side in ("left", "right"):
+            backend = self._backend_for_side(side)
+            state = backend.get_state()
+            if self.args.arm_mode == "real":
+                if not backend.config.connect_hardware:
+                    enabled = False
+                    reason = "no real RM65 IP/configured hardware connection"
+                elif backend.arm is None:
+                    enabled = False
+                    reason = "RM65 SDK arm object is unavailable"
+                elif state.get("hardware_qpos") is None:
+                    enabled = False
+                    reason = (
+                        "hardware_qpos unavailable "
+                        f"result={state.get('hardware_result_code')} text={state.get('hardware_result_text')}"
+                    )
+                else:
+                    enabled = True
+                    reason = "hardware_qpos readable"
+            else:
+                enabled = state.get("current_qpos") is not None
+                reason = "local_qpos readable" if enabled else "local_qpos unavailable"
+            previous = self._arm_visualization_enabled.get(side, False)
+            self._arm_visualization_enabled[side] = enabled
+            if previous != enabled:
+                if enabled:
+                    self._log(
+                        "ArmViz",
+                        f"{side} arm visualization enabled from "
+                        f"{'hardware_qpos' if self.args.arm_mode == 'real' else 'local_qpos'} "
+                        f"qpos_deg={_qpos_deg_text(state.get('hardware_qpos') if self.args.arm_mode == 'real' else state.get('current_qpos'))}",
+                        now=now,
+                    )
+                else:
+                    self._log(
+                        "ArmViz",
+                        f"{side} arm visualization disabled; reason={reason}; showing VIVE frames only for this side",
+                        now=now,
+                    )
+            elif not enabled and self.log_gate.should_emit(f"arm_viz_{side}_disabled_reason", reason, now=now):
+                self._log(
+                    "ArmViz",
+                    f"{side} arm visualization disabled; reason={reason}; showing VIVE frames only for this side",
+                    now=now,
+                )
+
+    def _ensure_renderer_arm_models(self) -> None:
+        renderer = self.components.renderer
+        if renderer is None:
+            return
+        ensure_arm_loaded = getattr(renderer, "ensure_arm_loaded", None)
+        if ensure_arm_loaded is None:
+            return
+        for side in ("left", "right"):
+            if not self._arm_visualization_enabled.get(side, False):
+                continue
+            robot_attr = "left_robot" if side == "left" else "right_robot"
+            if getattr(renderer, robot_attr, None) is not None:
+                continue
+            try:
+                loaded = bool(
+                    ensure_arm_loaded(
+                        side=side,
+                        urdf_path=require_asset_path("rm65_arm.urdf"),
+                        retargeting_joint_names=(),
+                    )
+                )
+            except Exception as exc:
+                if self.log_gate.should_emit(f"arm_viz_{side}_dynamic_load_failed", str(exc)):
+                    self._log("ArmViz", f"{side} arm model load failed: {exc}")
+                continue
+            if loaded:
+                self._log("ArmViz", f"{side} arm model loaded into existing SAPIEN scene")
+
+    def _renderer_arm_urdf_path(self, side: str) -> str | None:
+        if not self._arm_visualization_enabled.get(side, False):
+            return None
+        return require_asset_path("rm65_arm.urdf")
 
     def _restore_loaded_profile_state(self) -> None:
         calibration = self.components.calibration
@@ -609,8 +926,9 @@ class CalibrationApp:
             if self.ui is not None:
                 self.ui.start()
             self._publish_ui_state(stage="Link Check")
-            self.components.left_backend.start()
-            self.components.right_backend.start()
+            self._start_arm_backend("left", self.components.left_backend)
+            self._start_arm_backend("right", self.components.right_backend)
+            self._refresh_arm_visualization_availability()
             self.components.source.start()
             if legacy_tcp_mode_requested(self.args.requested_tcp_mode):
                 self._log(
@@ -628,7 +946,8 @@ class CalibrationApp:
                 else:
                     self._log(
                         "ArmMode",
-                        "arm-mode=real but no arm IPs provided; rendering falls back to virtual default poses.",
+                        "arm-mode=real but no arm IPs provided; robot arms will not be visualized. "
+                        "Only VIVE trackers and coordinate frames are shown.",
                     )
             else:
                 self._log("ArmMode", "virtual mode: rendering uses local unlimited-speed preview state only.")
@@ -645,31 +964,59 @@ class CalibrationApp:
             if self.args.load_profile and self._has_loaded_tracker_offsets():
                 self._log("Load", f"loaded wrist tracker offsets from {self.args.load_profile}")
             else:
-                self._stage("Wrist Coarse")
+                self._stage("Wrist/Home Capture")
                 self._run_dual_wrist_calibration()
             self._ensure_renderer()
             if self.args.show_tracker_frame_viz and self.components.renderer is not None:
                 self._stage("Tracker Frame Viz")
                 self._run_tracker_frame_visualization()
-            self._stage("Save")
-            self._save_profile()
+            if self.args.skip_session_home:
+                self._stage("Save")
+                self._save_profile()
+            else:
+                if not self.home_ready and self.args.load_profile and self._has_loaded_tracker_offsets():
+                    self._stage("Home Capture")
+                    self._capture_home()
+                elif not self.home_ready:
+                    self._log(
+                        "HomeCapture",
+                        "home anchors are not ready because robot home qpos was unavailable; "
+                        "validation will show VIVE/coordinate frames only until you reconnect arms or press h after hardware is ready.",
+                    )
+                self._stage("Validate")
+                self._run_validation_loop()
         finally:
             self.key_input.close()
             if self.ui is not None:
+                self.ui.mark_shutdown("标定服务已退出，这个网页已经失效。")
+                time.sleep(0.35)
                 self.ui.close()
             self.components.source.close()
             self.components.left_backend.close()
             self.components.right_backend.close()
 
+    def _start_arm_backend(self, side: str, backend: RM65ArmBackend) -> None:
+        try:
+            backend.start()
+        except Exception as exc:
+            self._arm_visualization_enabled[side] = False
+            self._log(
+                "ArmMode",
+                f"{side} RM65 read-only connection failed: {exc}. "
+                "This side will not be visualized as a robot arm.",
+            )
+
     def _poll_channels(self) -> dict[str, object]:
         self.key_input.poll()
-        return self.components.source.get_latest_channels()
+        channels = self.components.source.get_latest_channels()
+        self._publish_raw_tracker_pose_state(channels, now=time.time())
+        return channels
 
     def _render(self) -> None:
         if not self._render_enabled or self.components.renderer is None:
             return
-        left_qpos = _state_qpos(self.components.left_backend, DEFAULT_LEFT_ARM_QPOS)
-        right_qpos = _state_qpos(self.components.right_backend, DEFAULT_RIGHT_ARM_QPOS)
+        left_qpos = self._render_qpos_for_side("left")
+        right_qpos = self._render_qpos_for_side("right")
         self.components.renderer.set_debug_frames(self._debug_frames)
         self.components.renderer.render_data(
             left_qpos_arm=left_qpos,
@@ -678,6 +1025,24 @@ class CalibrationApp:
             right_qpos_hand=self.empty_hand,
             capture_image=False,
         )
+
+    def _render_qpos_for_side(self, side: str) -> np.ndarray | None:
+        if not self._arm_visualization_enabled.get(side, False):
+            return None
+        backend = self._backend_for_side(side)
+        state = backend.get_state()
+        if self.args.arm_mode == "real":
+            qpos = state.get("current_qpos") if self._simulate_arm_preview else state.get("hardware_qpos")
+            if qpos is None:
+                qpos = state.get("hardware_qpos")
+        else:
+            fallback = DEFAULT_LEFT_ARM_QPOS if side == "left" else DEFAULT_RIGHT_ARM_QPOS
+            qpos = state.get("current_qpos")
+            if qpos is None:
+                qpos = fallback
+        if qpos is None:
+            return None
+        return np.asarray(qpos, dtype=float).copy()
 
     def _refresh_arm_render_state(self, *, now: float | None = None, force: bool = False) -> None:
         if not force and not self._render_enabled:
@@ -693,6 +1058,8 @@ class CalibrationApp:
             if backend.config.connect_hardware:
                 backend.refresh_state_from_hardware()
         self._last_arm_refresh_time = current_time
+        self._refresh_arm_visualization_availability(now=current_time)
+        self._ensure_renderer_arm_models()
 
     def _set_debug_frames(self, frames: dict[str, np.ndarray] | None) -> None:
         self._debug_frames = {} if frames is None else {key: value.copy() for key, value in frames.items()}
@@ -762,12 +1129,17 @@ class CalibrationApp:
         return frames
 
     def _current_actual_tcp_pose_desk(self, side: str) -> np.ndarray | None:
+        if not self._arm_visualization_enabled.get(side, False):
+            return None
         backend = self.components.left_backend if side == "left" else self.components.right_backend
         arm = self.components.calibration.get_arm_for_side(side)
         if arm.T_D_B is None:
             return None
+        qpos = self._render_qpos_for_side(side)
+        if qpos is None:
+            return None
         try:
-            pose_base = backend.compute_tcp_pose(self.args.tcp_mode)
+            pose_base = backend.compute_tcp_pose(self.args.tcp_mode, qpos=qpos)
         except Exception:
             return None
         return arm.T_D_B @ as_pose_matrix(pose_base)
@@ -827,6 +1199,23 @@ class CalibrationApp:
         self.components.left_retargeter.clear_home_anchors()
         self.components.right_retargeter.clear_home_anchors()
         self._last_validation_target_poses = {}
+        self._publish_ui_state(home_ready=False)
+
+    def _set_selected_side(self, side: str, stage_name: str, *, now: float | None = None) -> None:
+        if side not in {"left", "right"}:
+            return
+        if self.selected_side == side:
+            return
+        self.selected_side = side
+        self._log(stage_name, f"selected_side={side}", now=now)
+        self._publish_ui_state()
+
+    def _toggle_selected_side(self, stage_name: str, *, now: float | None = None) -> None:
+        self._set_selected_side(
+            "left" if self.selected_side == "right" else "right",
+            stage_name,
+            now=now,
+        )
 
     @staticmethod
     def _channel_for_tracker_role(role: str) -> str:
@@ -858,6 +1247,12 @@ class CalibrationApp:
         }.get(str(channel_name), str(channel_name))
 
     def _run_link_check(self) -> None:
+        self._publish_ui_state(
+            stage="Link Check",
+            active_controls=["n", "q"],
+            control_hint="等待左右 wrist tracker 在线；在线后按 Next/n 进入三轴标定。",
+            **self._empty_capture_ui_state(),
+        )
         self._log("LinkCheck", "READY: PRESS N TO CONTINUE AFTER left/right wrist tracker channels are present.")
         self._log(
             "LinkCheck",
@@ -906,6 +1301,14 @@ class CalibrationApp:
                     f"virtual_desk_ready={desk_ready} channels={sorted(channels)} press 'n' to continue",
                     now=loop_start,
                 )
+            self._publish_ui_state(
+                stage="Link Check",
+                active_controls=["n", "q"],
+                control_hint=(
+                    f"left={ready['left_wrist_pose']} right={ready['right_wrist_pose']} "
+                    f"desk_channel={desk_channel} desk_ready={desk_ready}"
+                ),
+            )
             if "n" in events and all(ready.values()):
                 self._log("LinkCheck", "required wrist trackers are ready; continuing", now=loop_start)
                 return
@@ -921,6 +1324,7 @@ class CalibrationApp:
         stage_name: str,
         instructions: str,
         timed_flow_hint: str,
+        direction_hint: str,
         channel_name: str,
         min_samples: int,
         capture_duration_sec: float,
@@ -932,15 +1336,20 @@ class CalibrationApp:
         self._log(stage_name, "READY: PRESS C TO START TIMED CAPTURE.")
         self._log(
             stage_name,
-            f"c=start timed capture ({capture_duration_sec:.1f}s), r=abort/reset, q=quit",
+            f"c=start {self.args.capture_prep_sec:.1f}s prep, then timed capture ({capture_duration_sec:.1f}s); "
+            "r=abort/reset, q=quit",
         )
         poses: list[np.ndarray] = []
+        preparing = False
         capturing = False
         capture_start_time = 0.0
         capture_deadline = 0.0
+        capture_extension_deadline = 0.0
+        source_stats_at_start: dict[str, object] = {}
         last_sample_key: tuple[object, object, object] | None = None
         stage_gate = ChangeGate()
         min_samples_reported = False
+        waiting_for_samples_reported = False
         while True:
             loop_start = time.time()
             channels = self._poll_channels()
@@ -949,31 +1358,87 @@ class CalibrationApp:
                 raise KeyboardInterrupt
             if "r" in events:
                 poses = []
+                preparing = False
                 capturing = False
                 min_samples_reported = False
+                waiting_for_samples_reported = False
                 self._log(stage_name, "reset", now=loop_start)
             if "c" in events:
-                if not capturing:
+                if not capturing and not preparing:
                     poses = []
-                    capturing = True
-                    capture_start_time = loop_start
+                    preparing = True
+                    capture_start_time = loop_start + self.args.capture_prep_sec
                     capture_deadline = capture_start_time + capture_duration_sec
+                    capture_extension_deadline = capture_deadline + self.args.capture_extra_wait_sec
+                    source_stats_at_start = {}
                     last_sample_key = None
                     min_samples_reported = False
+                    waiting_for_samples_reported = False
                     self._log(
                         stage_name,
-                        f"CAPTURE STARTED window={capture_duration_sec:.1f}s auto_end_at={_format_wall_time(capture_deadline)}",
+                        f"CAPTURE PREP prep={self.args.capture_prep_sec:.1f}s "
+                        f"start_at={_format_wall_time(capture_start_time)} "
+                        f"auto_end_at={_format_wall_time(capture_deadline)}",
                         now=loop_start,
                     )
                 else:
                     self._log(
                         stage_name,
-                        "CAPTURE ALREADY RUNNING; wait for auto-end or press r to abort",
+                        "CAPTURE ALREADY ACTIVE; wait for auto-end or press r to abort",
                         now=loop_start,
                     )
 
             channel = channels.get(channel_name)
             channel_valid = bool(channel is not None and channel.valid)
+            if preparing and loop_start >= capture_start_time:
+                preparing = False
+                capturing = True
+                source_stats_at_start = self._source_debug_stats()
+                if channel_valid:
+                    last_sample_key = _channel_sample_key(channel)
+                self._log(
+                    stage_name,
+                    f"CAPTURE STARTED window={capture_duration_sec:.1f}s "
+                    f"auto_end_at={_format_wall_time(capture_deadline)}",
+                    now=loop_start,
+                )
+            elapsed = max(0.0, loop_start - capture_start_time) if capturing else 0.0
+            waiting_for_samples = bool(capturing and loop_start >= capture_deadline and len(poses) < min_samples)
+            capture_active = preparing or capturing
+            capture_phase = (
+                "preparing"
+                if preparing
+                else "waiting"
+                if waiting_for_samples
+                else "capturing"
+                if capturing
+                else "ready"
+            )
+            self._publish_ui_state(
+                stage=stage_name,
+                active_controls=["r", "q"] if capture_active else ["c", "r", "q"],
+                control_hint=direction_hint,
+                capture_stage=stage_name,
+                capture_phase=capture_phase,
+                capturing=capture_active,
+                capture_channel=channel_name,
+                capture_samples=len(poses),
+                capture_left_samples=None,
+                capture_right_samples=None,
+                capture_min_samples=min_samples,
+                capture_valid=channel_valid,
+                capture_left_valid=None,
+                capture_right_valid=None,
+                capture_elapsed_sec=elapsed if capturing else None,
+                capture_duration_sec=(
+                    capture_duration_sec + self.args.capture_extra_wait_sec
+                    if waiting_for_samples
+                    else capture_duration_sec
+                ),
+                capture_prep_remaining_sec=max(0.0, capture_start_time - loop_start) if preparing else None,
+                capture_prep_total_sec=self.args.capture_prep_sec,
+                capture_waiting_for_samples=waiting_for_samples,
+            )
             if capturing and stage_gate.should_emit(f"{stage_name}_channel_valid", channel_valid, now=loop_start):
                 self._log(stage_name, f"channel_valid={channel_valid}", now=loop_start)
             if capturing and channel_valid:
@@ -997,28 +1462,46 @@ class CalibrationApp:
                 elapsed = max(0.0, loop_start - capture_start_time)
                 self._log(
                     stage_name,
-                    f"LIVE time={elapsed:.1f}/{capture_duration_sec:.1f}s samples={len(poses)} valid={channel_valid}",
+                    f"LIVE time={elapsed:.1f}/{capture_duration_sec:.1f}s samples={len(poses)} "
+                    f"valid={channel_valid} "
+                    f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
                     now=loop_start,
                 )
             if capturing:
-                elapsed = max(0.0, loop_start - capture_start_time)
                 if loop_start >= capture_deadline:
                     capturing = False
                     effective_hz = len(poses) / max(elapsed, 1e-6)
                     if len(poses) < min_samples:
+                        if loop_start < capture_extension_deadline:
+                            capturing = True
+                            if not waiting_for_samples_reported:
+                                waiting_for_samples_reported = True
+                                self._log(
+                                    stage_name,
+                                    f"AUTO-END WAITING samples={len(poses)} need>={min_samples} "
+                                    f"effective_hz={effective_hz:.1f} "
+                                    f"extra_until={_format_wall_time(capture_extension_deadline)}",
+                                    now=loop_start,
+                                )
+                            self._render()
+                            time.sleep(max(0.0, (1.0 / self.args.hz) - (time.time() - loop_start)))
+                            continue
                         self._log(
                             stage_name,
                             f"AUTO-END INSUFFICIENT samples={len(poses)} need>={min_samples} "
-                            f"effective_hz={effective_hz:.1f}",
+                            f"effective_hz={effective_hz:.1f} "
+                            f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
                             now=loop_start,
                         )
                         poses = []
                         min_samples_reported = False
+                        waiting_for_samples_reported = False
                         last_sample_key = None
                     elif validator is None:
                         self._log(
                             stage_name,
-                            f"AUTO-END ACCEPTED samples={len(poses)} effective_hz={effective_hz:.1f}",
+                            f"AUTO-END ACCEPTED samples={len(poses)} effective_hz={effective_hz:.1f} "
+                            f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
                             now=loop_start,
                         )
                         return poses
@@ -1027,17 +1510,20 @@ class CalibrationApp:
                         if error is None:
                             self._log(
                                 stage_name,
-                                f"AUTO-END ACCEPTED samples={len(poses)} effective_hz={effective_hz:.1f}",
+                                f"AUTO-END ACCEPTED samples={len(poses)} effective_hz={effective_hz:.1f} "
+                                f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
                                 now=loop_start,
                             )
                             return poses
                         self._log(
                             stage_name,
-                            f"AUTO-END REJECTED: {error} effective_hz={effective_hz:.1f}",
+                            f"AUTO-END REJECTED: {error} effective_hz={effective_hz:.1f} "
+                            f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
                             now=loop_start,
                         )
                         poses = []
                         min_samples_reported = False
+                        waiting_for_samples_reported = False
                         last_sample_key = None
             self._render()
             time.sleep(max(0.0, (1.0 / self.args.hz) - (time.time() - loop_start)))
@@ -1051,18 +1537,23 @@ class CalibrationApp:
         self._log("HomeCapture", "READY: PRESS C TO START TIMED CAPTURE.")
         self._log(
             "HomeCapture",
-            f"c=start timed capture ({self.args.home_capture_sec:.1f}s), r=abort/reset, q=quit",
+            f"c=start {self.args.capture_prep_sec:.1f}s prep, then timed capture ({self.args.home_capture_sec:.1f}s); "
+            "r=abort/reset, q=quit",
         )
         left_poses: list[np.ndarray] = []
         right_poses: list[np.ndarray] = []
+        preparing = False
         capturing = False
         capture_start_time = 0.0
         capture_deadline = 0.0
+        capture_extension_deadline = 0.0
+        source_stats_at_start: dict[str, object] = {}
         left_last_sample_key: tuple[object, object, object] | None = None
         right_last_sample_key: tuple[object, object, object] | None = None
         stage_gate = ChangeGate()
         left_min_reported = False
         right_min_reported = False
+        waiting_for_samples_reported = False
         while True:
             loop_start = time.time()
             channels = self._poll_channels()
@@ -1072,31 +1563,37 @@ class CalibrationApp:
             if "r" in events:
                 left_poses = []
                 right_poses = []
+                preparing = False
                 capturing = False
                 left_min_reported = False
                 right_min_reported = False
+                waiting_for_samples_reported = False
                 self._log("HomeCapture", "reset", now=loop_start)
             if "c" in events:
-                if not capturing:
+                if not capturing and not preparing:
                     left_poses = []
                     right_poses = []
-                    capturing = True
-                    capture_start_time = loop_start
+                    preparing = True
+                    capture_start_time = loop_start + self.args.capture_prep_sec
                     capture_deadline = capture_start_time + self.args.home_capture_sec
+                    capture_extension_deadline = capture_deadline + self.args.capture_extra_wait_sec
+                    source_stats_at_start = {}
                     left_last_sample_key = None
                     right_last_sample_key = None
                     left_min_reported = False
                     right_min_reported = False
+                    waiting_for_samples_reported = False
                     self._log(
                         "HomeCapture",
-                        f"CAPTURE STARTED window={self.args.home_capture_sec:.1f}s "
+                        f"CAPTURE PREP prep={self.args.capture_prep_sec:.1f}s "
+                        f"start_at={_format_wall_time(capture_start_time)} "
                         f"auto_end_at={_format_wall_time(capture_deadline)}",
                         now=loop_start,
                     )
                 else:
                     self._log(
                         "HomeCapture",
-                        "CAPTURE ALREADY RUNNING; wait for auto-end or press r to abort",
+                        "CAPTURE ALREADY ACTIVE; wait for auto-end or press r to abort",
                         now=loop_start,
                     )
 
@@ -1105,6 +1602,64 @@ class CalibrationApp:
             left_valid = bool(left_channel is not None and left_channel.valid)
             right_valid = bool(right_channel is not None and right_channel.valid)
             validity_snapshot = (left_valid, right_valid)
+            if preparing and loop_start >= capture_start_time:
+                preparing = False
+                capturing = True
+                source_stats_at_start = self._source_debug_stats()
+                if left_valid:
+                    left_last_sample_key = _channel_sample_key(left_channel)
+                if right_valid:
+                    right_last_sample_key = _channel_sample_key(right_channel)
+                self._log(
+                    "HomeCapture",
+                    f"CAPTURE STARTED window={self.args.home_capture_sec:.1f}s "
+                    f"auto_end_at={_format_wall_time(capture_deadline)}",
+                    now=loop_start,
+                )
+            elapsed = max(0.0, loop_start - capture_start_time) if capturing else 0.0
+            waiting_for_samples = bool(
+                capturing
+                and loop_start >= capture_deadline
+                and (len(left_poses) < self.args.home_samples or len(right_poses) < self.args.home_samples)
+            )
+            capture_active = preparing or capturing
+            capture_phase = (
+                "preparing"
+                if preparing
+                else "waiting"
+                if waiting_for_samples
+                else "capturing"
+                if capturing
+                else "ready"
+            )
+            self._publish_ui_state(
+                stage="Home Capture",
+                active_controls=["r", "q"] if capture_active else ["c", "r", "q"],
+                control_hint=(
+                    f"把左右手放到本次 teleop 起始姿态；开始采集后先准备 {self.args.capture_prep_sec:.1f}s，"
+                    f"再保持 {self.args.home_capture_sec:.1f}s。"
+                ),
+                capture_stage="HomeCapture",
+                capture_phase=capture_phase,
+                capturing=capture_active,
+                capture_channel="left_wrist_pose,right_wrist_pose",
+                capture_samples=None,
+                capture_left_samples=len(left_poses),
+                capture_right_samples=len(right_poses),
+                capture_min_samples=self.args.home_samples,
+                capture_valid=None,
+                capture_left_valid=left_valid,
+                capture_right_valid=right_valid,
+                capture_elapsed_sec=elapsed if capturing else None,
+                capture_duration_sec=(
+                    self.args.home_capture_sec + self.args.capture_extra_wait_sec
+                    if waiting_for_samples
+                    else self.args.home_capture_sec
+                ),
+                capture_prep_remaining_sec=max(0.0, capture_start_time - loop_start) if preparing else None,
+                capture_prep_total_sec=self.args.capture_prep_sec,
+                capture_waiting_for_samples=waiting_for_samples,
+            )
             if capturing and stage_gate.should_emit("home_capture_validity", validity_snapshot, now=loop_start):
                 self._log(
                     "HomeCapture",
@@ -1146,11 +1701,11 @@ class CalibrationApp:
                     "HomeCapture",
                     f"LIVE time={elapsed:.1f}/{self.args.home_capture_sec:.1f}s "
                     f"left={len(left_poses)} right={len(right_poses)} "
-                    f"valid={{'left': {left_valid}, 'right': {right_valid}}}",
+                    f"valid={{'left': {left_valid}, 'right': {right_valid}}} "
+                    f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=('left_wrist_pose', 'right_wrist_pose'), elapsed_sec=elapsed, now=loop_start)}",
                     now=loop_start,
                 )
             if capturing:
-                elapsed = max(0.0, loop_start - capture_start_time)
                 if loop_start >= capture_deadline:
                     capturing = False
                     left_hz = len(left_poses) / max(elapsed, 1e-6)
@@ -1159,20 +1714,37 @@ class CalibrationApp:
                         self._log(
                             "HomeCapture",
                             f"AUTO-END ACCEPTED left={len(left_poses)} right={len(right_poses)} "
-                            f"left_hz={left_hz:.1f} right_hz={right_hz:.1f}",
+                            f"left_hz={left_hz:.1f} right_hz={right_hz:.1f} "
+                            f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=('left_wrist_pose', 'right_wrist_pose'), elapsed_sec=elapsed, now=loop_start)}",
                             now=loop_start,
                         )
                         return left_poses, right_poses
+                    if loop_start < capture_extension_deadline:
+                        capturing = True
+                        if not waiting_for_samples_reported:
+                            waiting_for_samples_reported = True
+                            self._log(
+                                "HomeCapture",
+                                f"AUTO-END WAITING left={len(left_poses)} right={len(right_poses)} "
+                                f"need>={self.args.home_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f} "
+                                f"extra_until={_format_wall_time(capture_extension_deadline)}",
+                                now=loop_start,
+                            )
+                        self._render()
+                        time.sleep(max(0.0, (1.0 / self.args.hz) - (time.time() - loop_start)))
+                        continue
                     self._log(
                         "HomeCapture",
                         f"AUTO-END INSUFFICIENT left={len(left_poses)} right={len(right_poses)} "
-                        f"need>={self.args.home_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f}",
+                        f"need>={self.args.home_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f} "
+                        f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=('left_wrist_pose', 'right_wrist_pose'), elapsed_sec=elapsed, now=loop_start)}",
                         now=loop_start,
                     )
                     left_poses = []
                     right_poses = []
                     left_min_reported = False
                     right_min_reported = False
+                    waiting_for_samples_reported = False
                     left_last_sample_key = None
                     right_last_sample_key = None
             self._render()
@@ -1204,15 +1776,16 @@ class CalibrationApp:
         x_sweep = self._capture_single_channel(
             stage_name="VirtualDeskX",
             instructions=(
-                f"Use {desk_tracker_role} and perform the X sweep so that the fitted +X points forward: "
-                "start nearer your back and finish in front of your body."
+                f"使用 {desk_tracker_role} 做 X 轴扫动，让拟合后的 +X 指向身体前方："
+                "从靠近身体后侧的位置开始，向身体前方移动并结束。"
             ),
             timed_flow_hint=(
-                "Press c once, then sweep BACK -> FRONT. "
-                "Start nearer your back side and finish in front of your body before auto-end."
+                "按一次开始采集/c 后，按“后 -> 前”扫动。"
+                "采集自动结束前，请停在身体前方。"
             ),
+            direction_hint="后 -> 前",
             channel_name=desk_channel_name,
-            min_samples=max(8, self.args.min_hold_samples),
+            min_samples=self.args.min_sweep_samples,
             capture_duration_sec=self.args.sweep_capture_sec,
             transform=lambda channel: as_pose_matrix(channel.value),
             validator=_sweep_validator,
@@ -1220,15 +1793,16 @@ class CalibrationApp:
         y_sweep = self._capture_single_channel(
             stage_name="VirtualDeskY",
             instructions=(
-                "Perform the Y sweep so that the fitted +Y points to your left: "
-                "start on your right side and finish on your left side."
+                "做 Y 轴扫动，让拟合后的 +Y 指向你的左侧："
+                "从身体右侧开始，向身体左侧移动并结束。"
             ),
             timed_flow_hint=(
-                "Press c once, then sweep RIGHT -> LEFT. "
-                "Start near your right side and finish near your left side before auto-end."
+                "按一次开始采集/c 后，按“右 -> 左”扫动。"
+                "采集自动结束前，请停在身体左侧。"
             ),
+            direction_hint="右 -> 左",
             channel_name=desk_channel_name,
-            min_samples=max(8, self.args.min_hold_samples),
+            min_samples=self.args.min_sweep_samples,
             capture_duration_sec=self.args.sweep_capture_sec,
             transform=lambda channel: as_pose_matrix(channel.value),
             validator=_sweep_validator,
@@ -1236,14 +1810,15 @@ class CalibrationApp:
         z_sweep = self._capture_single_channel(
             stage_name="VirtualDeskZ",
             instructions=(
-                "Move the auxiliary tracker upward and downward. Start low and finish high to define +Z."
+                "做 Z 轴扫动，让拟合后的 +Z 指向上方：从低处开始，向上移动并结束。"
             ),
             timed_flow_hint=(
-                "Press c once, start low, move upward, and finish high at the end of the timed window. "
-                "Do not return downward before auto-end."
+                "按一次开始采集/c 后，按“低 -> 高”扫动。"
+                "采集自动结束前不要再向下返回。"
             ),
+            direction_hint="低 -> 高",
             channel_name=desk_channel_name,
-            min_samples=max(8, self.args.min_hold_samples),
+            min_samples=self.args.min_sweep_samples,
             capture_duration_sec=self.args.sweep_capture_sec,
             transform=lambda channel: as_pose_matrix(channel.value),
             validator=_sweep_validator,
@@ -1329,34 +1904,41 @@ class CalibrationApp:
             )
 
     def _capture_dual_wrist_coarse_holds(self) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        wrist_prep_sec = float(self.args.wrist_capture_prep_sec)
         self._log(
-            "WristCoarse",
-            "Place both hands in the canonical neutral pose: forearms forward, hand backs up, "
-            "and fingers roughly aligned with virtual-desk +X.",
+            "WristHome",
+            "Place both hands in the canonical session start pose: forearms forward, hand backs up, "
+            "and fingers roughly aligned with virtual-desk +X. This single capture defines both wrist offsets "
+            "and the session home anchor when real arm qpos is readable.",
         )
         self._log(
-            "WristCoarse",
+            "WristHome",
             "Default canonical wrist frame uses XYZ Euler [0, 0, 0] deg; the captured neutral pose directly defines the tracker-to-hand correction.",
         )
         self._log(
-            "WristCoarse",
+            "WristHome",
             "Press c once, then keep both wrist trackers and both hand poses steady until the timed capture ends automatically.",
         )
-        self._log("WristCoarse", "READY: PRESS C TO START TIMED CAPTURE.")
+        self._log("WristHome", "READY: PRESS C TO START TIMED CAPTURE.")
         self._log(
-            "WristCoarse",
-            f"c=start timed capture ({self.args.hold_capture_sec:.1f}s), r=abort/reset, q=quit",
+            "WristHome",
+            f"c=start {wrist_prep_sec:.1f}s prep, then timed capture ({self.args.hold_capture_sec:.1f}s); "
+            "r=abort/reset, q=quit",
         )
         left_poses: list[np.ndarray] = []
         right_poses: list[np.ndarray] = []
+        preparing = False
         capturing = False
         capture_start_time = 0.0
         capture_deadline = 0.0
+        capture_extension_deadline = 0.0
+        source_stats_at_start: dict[str, object] = {}
         left_last_sample_key: tuple[object, object, object] | None = None
         right_last_sample_key: tuple[object, object, object] | None = None
         stage_gate = ChangeGate()
         left_min_reported = False
         right_min_reported = False
+        waiting_for_samples_reported = False
         while True:
             loop_start = time.time()
             channels = self._poll_channels()
@@ -1366,31 +1948,37 @@ class CalibrationApp:
             if "r" in events:
                 left_poses = []
                 right_poses = []
+                preparing = False
                 capturing = False
                 left_min_reported = False
                 right_min_reported = False
-                self._log("WristCoarse", "reset", now=loop_start)
+                waiting_for_samples_reported = False
+                self._log("WristHome", "reset", now=loop_start)
             if "c" in events:
-                if not capturing:
+                if not capturing and not preparing:
                     left_poses = []
                     right_poses = []
-                    capturing = True
-                    capture_start_time = loop_start
+                    preparing = True
+                    capture_start_time = loop_start + wrist_prep_sec
                     capture_deadline = capture_start_time + self.args.hold_capture_sec
+                    capture_extension_deadline = capture_deadline + self.args.capture_extra_wait_sec
+                    source_stats_at_start = {}
                     left_last_sample_key = None
                     right_last_sample_key = None
                     left_min_reported = False
                     right_min_reported = False
+                    waiting_for_samples_reported = False
                     self._log(
-                        "WristCoarse",
-                        f"CAPTURE STARTED window={self.args.hold_capture_sec:.1f}s "
+                        "WristHome",
+                        f"CAPTURE PREP prep={wrist_prep_sec:.1f}s "
+                        f"start_at={_format_wall_time(capture_start_time)} "
                         f"auto_end_at={_format_wall_time(capture_deadline)}",
                         now=loop_start,
                     )
                 else:
                     self._log(
-                        "WristCoarse",
-                        "CAPTURE ALREADY RUNNING; wait for auto-end or press r to abort",
+                        "WristHome",
+                        "CAPTURE ALREADY ACTIVE; wait for auto-end or press r to abort",
                         now=loop_start,
                     )
 
@@ -1399,9 +1987,64 @@ class CalibrationApp:
             left_valid = bool(left_channel is not None and left_channel.valid)
             right_valid = bool(right_channel is not None and right_channel.valid)
             validity_snapshot = (left_valid, right_valid)
+            if preparing and loop_start >= capture_start_time:
+                preparing = False
+                capturing = True
+                source_stats_at_start = self._source_debug_stats()
+                if left_valid:
+                    left_last_sample_key = _channel_sample_key(left_channel)
+                if right_valid:
+                    right_last_sample_key = _channel_sample_key(right_channel)
+                self._log(
+                    "WristHome",
+                    f"CAPTURE STARTED window={self.args.hold_capture_sec:.1f}s "
+                    f"auto_end_at={_format_wall_time(capture_deadline)}",
+                    now=loop_start,
+                )
+            elapsed = max(0.0, loop_start - capture_start_time) if capturing else 0.0
+            waiting_for_samples = bool(
+                capturing
+                and loop_start >= capture_deadline
+                and (len(left_poses) < self.args.min_hold_samples or len(right_poses) < self.args.min_hold_samples)
+            )
+            capture_active = preparing or capturing
+            capture_phase = (
+                "preparing"
+                if preparing
+                else "waiting"
+                if waiting_for_samples
+                else "capturing"
+                if capturing
+                else "ready"
+            )
+            self._publish_ui_state(
+                stage="Wrist/Home Capture",
+                active_controls=["r", "q"] if capture_active else ["c", "r", "q"],
+                control_hint="左右手起始姿态",
+                capture_stage="WristHome",
+                capture_phase=capture_phase,
+                capturing=capture_active,
+                capture_channel="left_wrist_pose,right_wrist_pose",
+                capture_samples=None,
+                capture_left_samples=len(left_poses),
+                capture_right_samples=len(right_poses),
+                capture_min_samples=self.args.min_hold_samples,
+                capture_valid=None,
+                capture_left_valid=left_valid,
+                capture_right_valid=right_valid,
+                capture_elapsed_sec=elapsed if capturing else None,
+                capture_duration_sec=(
+                    self.args.hold_capture_sec + self.args.capture_extra_wait_sec
+                    if waiting_for_samples
+                    else self.args.hold_capture_sec
+                ),
+                capture_prep_remaining_sec=max(0.0, capture_start_time - loop_start) if preparing else None,
+                capture_prep_total_sec=wrist_prep_sec,
+                capture_waiting_for_samples=waiting_for_samples,
+            )
             if capturing and stage_gate.should_emit("wrist_coarse_validity", validity_snapshot, now=loop_start):
                 self._log(
-                    "WristCoarse",
+                    "WristHome",
                     f"channel_valid={{'left': {left_valid}, 'right': {right_valid}}}",
                     now=loop_start,
                 )
@@ -1413,7 +2056,7 @@ class CalibrationApp:
                 if len(left_poses) >= self.args.min_hold_samples and not left_min_reported:
                     left_min_reported = True
                     self._log(
-                        "WristCoarse",
+                        "WristHome",
                         f"left minimum sample target reached {len(left_poses)}/{self.args.min_hold_samples}",
                         now=loop_start,
                     )
@@ -1425,7 +2068,7 @@ class CalibrationApp:
                 if len(right_poses) >= self.args.min_hold_samples and not right_min_reported:
                     right_min_reported = True
                     self._log(
-                        "WristCoarse",
+                        "WristHome",
                         f"right minimum sample target reached {len(right_poses)}/{self.args.min_hold_samples}",
                         now=loop_start,
                     )
@@ -1437,36 +2080,53 @@ class CalibrationApp:
             ):
                 elapsed = max(0.0, loop_start - capture_start_time)
                 self._log(
-                    "WristCoarse",
+                    "WristHome",
                     f"LIVE time={elapsed:.1f}/{self.args.hold_capture_sec:.1f}s "
                     f"left={len(left_poses)} right={len(right_poses)} "
-                    f"valid={{'left': {left_valid}, 'right': {right_valid}}}",
+                    f"valid={{'left': {left_valid}, 'right': {right_valid}}} "
+                    f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=('left_wrist_pose', 'right_wrist_pose'), elapsed_sec=elapsed, now=loop_start)}",
                     now=loop_start,
                 )
             if capturing:
-                elapsed = max(0.0, loop_start - capture_start_time)
                 if loop_start >= capture_deadline:
                     capturing = False
                     left_hz = len(left_poses) / max(elapsed, 1e-6)
                     right_hz = len(right_poses) / max(elapsed, 1e-6)
                     if len(left_poses) >= self.args.min_hold_samples and len(right_poses) >= self.args.min_hold_samples:
                         self._log(
-                            "WristCoarse",
+                            "WristHome",
                             f"AUTO-END ACCEPTED left={len(left_poses)} right={len(right_poses)} "
-                            f"left_hz={left_hz:.1f} right_hz={right_hz:.1f}",
+                            f"left_hz={left_hz:.1f} right_hz={right_hz:.1f} "
+                            f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=('left_wrist_pose', 'right_wrist_pose'), elapsed_sec=elapsed, now=loop_start)}",
                             now=loop_start,
                         )
                         return left_poses, right_poses
+                    if loop_start < capture_extension_deadline:
+                        capturing = True
+                        if not waiting_for_samples_reported:
+                            waiting_for_samples_reported = True
+                            self._log(
+                                "WristHome",
+                                f"AUTO-END WAITING left={len(left_poses)} right={len(right_poses)} "
+                                f"need>={self.args.min_hold_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f} "
+                                f"extra_until={_format_wall_time(capture_extension_deadline)}",
+                                now=loop_start,
+                            )
+                        self._render()
+                        time.sleep(max(0.0, (1.0 / self.args.hz) - (time.time() - loop_start)))
+                        continue
                     self._log(
-                        "WristCoarse",
+                        "WristHome",
                         f"AUTO-END INSUFFICIENT left={len(left_poses)} right={len(right_poses)} "
-                        f"need>={self.args.min_hold_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f}",
+                        f"need>={self.args.min_hold_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f} "
+                        f"{self._format_source_rates(start_stats=source_stats_at_start, channel_names=('left_wrist_pose', 'right_wrist_pose'), elapsed_sec=elapsed, now=loop_start)}",
                         now=loop_start,
                     )
                     left_poses = []
                     right_poses = []
                     left_min_reported = False
                     right_min_reported = False
+                    waiting_for_samples_reported = False
                     left_last_sample_key = None
                     right_last_sample_key = None
             self._render()
@@ -1511,15 +2171,39 @@ class CalibrationApp:
                 "captured_tracker_pose_virtual": tracker_pose_virtual.tolist(),
             }
             self._log(
-                "WristCoarse",
+                "WristHome",
                 f"{side} tracker_offset captured translation="
                 f"{np.array2string(np.asarray(translation, dtype=float), precision=3)} "
                 f"canonical_rpy_deg={np.array2string(np.asarray(canonical_rpy_deg, dtype=float), precision=1)} "
                 f"canonical_version={TRACKER_OFFSET_CALIBRATION_VERSION}",
             )
+        if not self.args.skip_session_home:
+            left_human_home = average_pose(
+                [
+                    pose @ self.components.calibration.get_tracker_offset("left_wrist")
+                    for pose in left_poses
+                ]
+            )
+            right_human_home = average_pose(
+                [
+                    pose @ self.components.calibration.get_tracker_offset("right_wrist")
+                    for pose in right_poses
+                ]
+            )
+            self._set_home_anchors_from_human_poses(
+                left_human_home=left_human_home,
+                right_human_home=right_human_home,
+                source="wrist_home_capture",
+            )
 
     def _run_tracker_frame_visualization(self) -> None:
         self._render_enabled = True
+        self._publish_ui_state(
+            stage="Tracker Frame Viz",
+            active_controls=["1", "2", "t", "j", "l", "i", "k", "u", "o", "x", "v", "f", "s", "q"],
+            control_hint="检查左右 tracker/frame；微调后按 Save/s 继续。",
+            **self._empty_capture_ui_state(),
+        )
         self._log(
             "TrackerFrameViz",
             "Viewer is interactive. Move the camera in SAPIEN to inspect desk/base frames, raw wrist tracker frames, "
@@ -1531,14 +2215,14 @@ class CalibrationApp:
         )
         self._log(
             "TrackerFrameViz",
-            "1/2=select left/right, j/l=yaw-/+, i/k=pitch+/-, u/o=roll-/+, x=reset selected fine tune, "
+            "1/2=select left/right, t=toggle selected side, "
+            "j/l=yaw-/+, i/k=pitch+/-, u/o=roll-/+, x=reset selected fine tune, "
             f"v=cycle frame_viz_mode(current={self.frame_viz_mode}), "
             f"f=toggle XY sign flip(current_yaw={self.virtual_desk_post_yaw_deg:.0f}), "
             "s=save+exit, q=quit",
         )
         while True:
             loop_start = time.time()
-            self._refresh_arm_render_state(now=loop_start)
             channels = self._poll_channels()
             events = self.key_input.consume_events()
             if self.key_input.should_quit:
@@ -1557,15 +2241,11 @@ class CalibrationApp:
                 self._log("TrackerFrameViz", f"channel_valid={channel_valid}", now=loop_start)
             for event in events:
                 if event == "1":
-                    if self.selected_side != "left":
-                        self.selected_side = "left"
-                        self._log("TrackerFrameViz", "selected_side=left", now=loop_start)
-                        self._publish_ui_state()
+                    self._set_selected_side("left", "TrackerFrameViz", now=loop_start)
                 elif event == "2":
-                    if self.selected_side != "right":
-                        self.selected_side = "right"
-                        self._log("TrackerFrameViz", "selected_side=right", now=loop_start)
-                        self._publish_ui_state()
+                    self._set_selected_side("right", "TrackerFrameViz", now=loop_start)
+                elif event == "t":
+                    self._toggle_selected_side("TrackerFrameViz", now=loop_start)
                 elif event == "j":
                     self.fine_tune_rpy_deg[self.selected_side][2] -= self.args.fine_tune_step_deg
                     tuned = True
@@ -1619,10 +2299,61 @@ class CalibrationApp:
         left_poses, right_poses = self._capture_dual_home_holds()
         left_human_home = average_pose(left_poses)
         right_human_home = average_pose(right_poses)
-        left_robot_home_base = self.components.left_backend.compute_tcp_pose(self.args.tcp_mode)
-        right_robot_home_base = self.components.right_backend.compute_tcp_pose(self.args.tcp_mode)
-        left_robot_home_desk = self.components.calibration.get_arm_for_side("left").T_D_B @ left_robot_home_base
-        right_robot_home_desk = self.components.calibration.get_arm_for_side("right").T_D_B @ right_robot_home_base
+        self._set_home_anchors_from_human_poses(
+            left_human_home=left_human_home,
+            right_human_home=right_human_home,
+            source="home_recapture",
+        )
+
+    def _robot_home_pose_desk_for_side(self, side: str) -> np.ndarray | None:
+        if not self._arm_visualization_enabled.get(side, False):
+            return None
+        backend = self._backend_for_side(side)
+        arm = self.components.calibration.get_arm_for_side(side)
+        if arm.T_D_B is None:
+            return None
+        state = backend.get_state()
+        qpos = state.get("hardware_qpos") if self.args.arm_mode == "real" else state.get("current_qpos")
+        if qpos is None:
+            return None
+        try:
+            robot_home_base = backend.compute_tcp_pose(self.args.tcp_mode, qpos=qpos)
+        except Exception as exc:
+            self._log("HomeCapture", f"{side} robot TCP pose unavailable: {exc}")
+            return None
+        return arm.T_D_B @ robot_home_base
+
+    def _robot_home_qpos_for_side(self, side: str) -> np.ndarray | None:
+        if not self._arm_visualization_enabled.get(side, False):
+            return None
+        backend = self._backend_for_side(side)
+        state = backend.get_state()
+        qpos = state.get("hardware_qpos") if self.args.arm_mode == "real" else state.get("current_qpos")
+        return None if qpos is None else np.asarray(qpos, dtype=float).copy()
+
+    def _set_home_anchors_from_human_poses(
+        self,
+        *,
+        left_human_home: np.ndarray,
+        right_human_home: np.ndarray,
+        source: str,
+    ) -> bool:
+        self._refresh_arm_render_state(force=True)
+        left_robot_home_desk = self._robot_home_pose_desk_for_side("left")
+        right_robot_home_desk = self._robot_home_pose_desk_for_side("right")
+        if left_robot_home_desk is None or right_robot_home_desk is None:
+            self._clear_home()
+            missing = []
+            if left_robot_home_desk is None:
+                missing.append("left_robot_home")
+            if right_robot_home_desk is None:
+                missing.append("right_robot_home")
+            self._log(
+                "HomeCapture",
+                f"cannot set home anchors; missing={missing}. "
+                "SAPIEN will show VIVE/coordinate frames only until real arm qpos is readable.",
+            )
+            return False
 
         self.components.left_retargeter.set_home_anchors(
             human_pose_desk=left_human_home,
@@ -1634,13 +2365,14 @@ class CalibrationApp:
         )
         self.components.calibration.capture_home_pose("left_arm", left_robot_home_desk, tcp_mode=self.args.tcp_mode)
         self.components.calibration.capture_home_pose("right_arm", right_robot_home_desk, tcp_mode=self.args.tcp_mode)
-        left_qpos = self.components.left_backend.get_state()["current_qpos"]
-        right_qpos = self.components.right_backend.get_state()["current_qpos"]
+        left_qpos = self._robot_home_qpos_for_side("left")
+        right_qpos = self._robot_home_qpos_for_side("right")
         if left_qpos is not None:
             self.components.calibration.capture_home_qpos("left_arm", left_qpos)
         if right_qpos is not None:
             self.components.calibration.capture_home_qpos("right_arm", right_qpos)
         self.components.calibration.metadata["home_capture"] = {
+            "source": source,
             "tcp_mode": self.args.tcp_mode,
             "left_human_home_virtual": left_human_home.tolist(),
             "right_human_home_virtual": right_human_home.tolist(),
@@ -1648,7 +2380,29 @@ class CalibrationApp:
             "right_robot_home_desk": right_robot_home_desk.tolist(),
         }
         self.home_ready = True
-        self._log("HomeCapture", "home anchors updated")
+        left_human_tcp_home = self.components.left_retargeter.home_human_pose_desk
+        right_human_tcp_home = self.components.right_retargeter.home_human_pose_desk
+        self._log(
+            "HomeCapture",
+            f"home anchors updated source={source} "
+            f"left_human_tcp=({_pose_matrix_xyz_rpy_text(left_human_tcp_home) if left_human_tcp_home is not None else 'None'}) "
+            f"left_robot_tcp=({_pose_matrix_xyz_rpy_text(left_robot_home_desk)}) "
+            f"left_qpos_deg={_qpos_deg_text(left_qpos)}",
+        )
+        self._log(
+            "HomeCapture",
+            f"home anchors updated source={source} "
+            f"right_human_tcp=({_pose_matrix_xyz_rpy_text(right_human_tcp_home) if right_human_tcp_home is not None else 'None'}) "
+            f"right_robot_tcp=({_pose_matrix_xyz_rpy_text(right_robot_home_desk)}) "
+            f"right_qpos_deg={_qpos_deg_text(right_qpos)}",
+        )
+        self._publish_ui_state(
+            home_ready=True,
+            active_controls=["1", "2", "t", "j", "l", "i", "k", "u", "o", "x", "v", "f", "h", "s", "q"],
+            control_hint="左右起始坐标系点已采集；可移动手柄验证三轴方向，按 Save/s 保存。",
+            **self._empty_capture_ui_state(),
+        )
+        return True
 
     def _apply_side_fine_tune(self, side: str) -> None:
         if side not in self.coarse_tracker_offsets:
@@ -1674,14 +2428,58 @@ class CalibrationApp:
             if self.args.output_path
             else DEFAULT_CALIBRATION_PROFILE_DIR / f"{timestamp}_vive_rm65_virtual_desk.json"
         )
+        runtime_home_was_available = bool(self.home_ready)
         self.components.calibration.clear_home_state()
         self.components.calibration.metadata["profile_scope"] = "tracker_station_only"
+        self.components.calibration.metadata["runtime_home_used_for_visual_check"] = runtime_home_was_available
+        self.components.calibration.metadata["home_policy"] = (
+            "session home anchors are intentionally not saved; real teleop must recapture wrist home"
+        )
         self.components.calibration.metadata["saved_at"] = datetime.now().isoformat(timespec="seconds")
         self.components.calibration.save_json(output_path)
         self._log("Save", f"calibration profile written to {output_path}")
+        self._publish_ui_state(
+            stage="Saved",
+            active_controls=["q"],
+            control_hint=f"saved to {output_path}",
+            **self._empty_capture_ui_state(),
+        )
         return output_path
 
+    def _preview_command_locally(
+        self,
+        *,
+        side: str,
+        backend: RM65ArmBackend,
+        command,
+        now: float,
+    ) -> None:
+        state = backend.get_state()
+        qpos = state.get("current_qpos")
+        if qpos is None:
+            qpos = state.get("hardware_qpos")
+        if qpos is None:
+            qpos = DEFAULT_LEFT_ARM_QPOS if side == "left" else DEFAULT_RIGHT_ARM_QPOS
+        backend.set_local_qpos(qpos)
+        try:
+            if command.command_type == "joint_vector":
+                target = np.asarray(command.value, dtype=float).reshape(6)
+                max_step = backend.get_effective_max_joint_step(now=now)
+                current = np.asarray(backend.get_state()["current_qpos"], dtype=float).reshape(6)
+                qpos_target = current + np.clip(target - current, -max_step, max_step)
+            elif command.command_type == "cartesian_pose":
+                max_step = backend.get_effective_max_joint_step(now=now)
+                qpos_target = backend._solve_cartesian_command(command, max_joint_step=max_step)
+            else:
+                return
+        except Exception as exc:
+            if self.log_gate.should_emit(f"{side}_preview_ik_failed", str(exc), now=now):
+                self._log("Validate", f"{side} SAPIEN preview IK failed: {exc}", now=now)
+            return
+        backend.set_local_qpos(qpos_target)
+
     def _run_validation_step(self, channels: dict[str, object]) -> None:
+        now = time.time()
         observation_channels = {}
         for name in ("left_wrist_pose", "right_wrist_pose"):
             channel = channels.get(name)
@@ -1708,19 +2506,47 @@ class CalibrationApp:
             target_pose_desk = left_command.metadata.get("target_pose_desk")
             if target_pose_desk is not None:
                 target_poses_desk["left"] = as_pose_matrix(target_pose_desk)
-            self.components.left_backend.send_command(left_command)
+            if self.components.left_backend.config.connect_hardware:
+                if self.log_gate.should_emit("left_read_only_skip_send", True, now=time.time()):
+                    self._log("Validate", "left hardware command skipped; SAPIEN preview updates locally only.")
+                self._preview_command_locally(
+                    side="left",
+                    backend=self.components.left_backend,
+                    command=left_command,
+                    now=now,
+                )
+            else:
+                self.components.left_backend.send_command(left_command)
         if right_command is not None:
             target_pose_desk = right_command.metadata.get("target_pose_desk")
             if target_pose_desk is not None:
                 target_poses_desk["right"] = as_pose_matrix(target_pose_desk)
-            self.components.right_backend.send_command(right_command)
+            if self.components.right_backend.config.connect_hardware:
+                if self.log_gate.should_emit("right_read_only_skip_send", True, now=time.time()):
+                    self._log("Validate", "right hardware command skipped; SAPIEN preview updates locally only.")
+                self._preview_command_locally(
+                    side="right",
+                    backend=self.components.right_backend,
+                    command=right_command,
+                    now=now,
+                )
+            else:
+                self.components.right_backend.send_command(right_command)
         self._last_validation_target_poses = target_poses_desk
 
     def _run_validation_loop(self) -> None:
         self._render_enabled = True
+        self._simulate_arm_preview = True
+        self._publish_ui_state(
+            stage="Validate",
+            active_controls=["1", "2", "t", "j", "l", "i", "k", "u", "o", "x", "v", "f", "h", "s", "q"],
+            control_hint="SAPIEN 本地预览跟随 VIVE；真机不动。",
+            **self._empty_capture_ui_state(),
+        )
         self._log(
             "Validate",
-            "Viewer is interactive. 1=select left, 2=select right, j/l=yaw-/+, i/k=pitch+/-, "
+            "Viewer is interactive. 1=select left, 2=select right, t=toggle selected side, "
+            "j/l=yaw-/+, i/k=pitch+/-, "
             "u/o=roll-/+, x=reset selected fine tune, h=recapture home, v=cycle frame_viz_mode, "
             f"f=toggle XY sign flip(current_yaw={self.virtual_desk_post_yaw_deg:.0f}), "
             "s=save+exit, q=quit",
@@ -1729,6 +2555,7 @@ class CalibrationApp:
             "Validate",
             "Scene convention: +X=forward, +Y=left, +Z=up; left arm base is at -Y, right arm base is at +Y.",
         )
+        self._log("Validate", "SAPIEN preview uses local qpos after calibration; hardware state is not polled continuously.")
         step_index = 0
         while True:
             loop_start = time.time()
@@ -1740,15 +2567,11 @@ class CalibrationApp:
             tuned = False
             for event in events:
                 if event == "1":
-                    if self.selected_side != "left":
-                        self.selected_side = "left"
-                        self._log("Validate", "selected_side=left", now=loop_start)
-                        self._publish_ui_state()
+                    self._set_selected_side("left", "Validate", now=loop_start)
                 elif event == "2":
-                    if self.selected_side != "right":
-                        self.selected_side = "right"
-                        self._log("Validate", "selected_side=right", now=loop_start)
-                        self._publish_ui_state()
+                    self._set_selected_side("right", "Validate", now=loop_start)
+                elif event == "t":
+                    self._toggle_selected_side("Validate", now=loop_start)
                 elif event == "j":
                     self.fine_tune_rpy_deg[self.selected_side][2] -= self.args.fine_tune_step_deg
                     tuned = True
@@ -1819,10 +2642,13 @@ class CalibrationApp:
 
 
 def main() -> None:
-    args = parse_args()
-    components = build_components(args)
-    app = CalibrationApp(args, components)
-    app.run()
+    try:
+        args = parse_args()
+        components = build_components(args)
+        app = CalibrationApp(args, components)
+        app.run()
+    except KeyboardInterrupt:
+        print("\n[Exit] calibration stopped by user")
 
 
 if __name__ == "__main__":

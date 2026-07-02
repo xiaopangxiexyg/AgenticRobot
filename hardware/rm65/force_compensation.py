@@ -45,6 +45,21 @@ def axis_index(axis: str) -> int:
     return AXES.index(axis)
 
 
+def admittance_wrench_for_arm(wrench: Iterable[float], arm: str) -> list[float]:
+    """Return the user-facing wrench channels used by RM65 admittance.
+
+    The right-arm force data exposes the first two angular channels opposite to
+    the Euler pose axes used by the admittance UI: sensor rx drives pose ry, and
+    sensor ry drives pose rx. Swap those channels before applying rx/ry tuning.
+    """
+    values = finite_list(wrench, expected_len=6, label="wrench")
+    if arm == "right":
+        values[3], values[4] = values[4], values[3]
+    elif arm != "left":
+        raise ValueError("arm must be left or right")
+    return values
+
+
 def parse_signs(text: str, *, expected_len: int = 3, label: str = "signs") -> list[float]:
     normalized = text.lower().replace(",", " ").replace("+", " ")
     tokens = [token.strip() for token in normalized.split() if token.strip()]

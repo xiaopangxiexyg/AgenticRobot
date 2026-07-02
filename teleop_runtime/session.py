@@ -33,6 +33,7 @@ class TeleopSessionConfig:
     allow_hardware_after_debug_pass: bool = True
     auto_recovery_enabled: bool = True
     recovery_healthy_frame_count: int = 10
+    hold_motion_on_freeze: bool = False
     non_freezing_fault_codes: tuple[str, ...] = ("low_control_rate",)
     auto_recoverable_fault_codes: tuple[str, ...] = (
         "missing_channel",
@@ -73,6 +74,7 @@ class TeleopSession:
         safety_config: TeleopSafetyConfig | None = None,
         recorder: SessionRecorder | None = None,
         state_machine: TeleopStateMachine | None = None,
+        command_filter: Callable[[TeleopCommand, TeleopObservation, float], TeleopCommand] | None = None,
     ):
         self.config = config
         self.sources = list(sources or [])
@@ -81,6 +83,7 @@ class TeleopSession:
         self.calibration = calibration
         self.safety_monitor = SafetyMonitor(safety_config)
         self.recorder = recorder
+        self.command_filter = command_filter
         if self.recorder is None and config.record_enabled:
             self.recorder = SessionRecorder(config=RecordingConfig(enabled=True))
         self.state_machine = state_machine if state_machine is not None else TeleopStateMachine()
@@ -128,11 +131,23 @@ class TeleopSession:
 
     def hold_hardware(self, reason: str = "manual hold") -> None:
         self._clear_recovery_context()
+        if self.rig is not None:
+            self.rig.hold_motion(reason)
         self._transition(TeleopRunState.DEBUG_ONLY, reason)
 
     def freeze(self, reason: str) -> None:
+        already_frozen = self.state_machine.state == TeleopRunState.FROZEN
         print("\033[1;31;40m" + f"[Debug Info] FROZEN triggered due to: {reason}" + "\033[0m")
         self._transition(TeleopRunState.FROZEN, reason)
+        if self.config.hold_motion_on_freeze and self.rig is not None and not already_frozen:
+            try:
+                self.rig.hold_motion(f"safety freeze: {reason}")
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "\033[1;31;40m"
+                    + f"[Debug Info] safety freeze hold_motion failed: {type(exc).__name__}: {exc}"
+                    + "\033[0m"
+                )
 
     def fault(self, reason: str) -> None:
         print("\033[1;31;40m" + f"[Debug Info] FAULT triggered due to: {reason}" + "\033[0m")
@@ -219,10 +234,21 @@ class TeleopSession:
             metadata={"tcp_mode": self.config.tcp_mode},
         )
 
-    def _build_command(self, observation: TeleopObservation) -> TeleopCommand:
+    def _build_command(
+        self,
+        observation: TeleopObservation,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> TeleopCommand:
         commands: list[TeleopCommand] = []
-        for retargeter in self.retargeters:
+        for index, retargeter in enumerate(self.retargeters):
+            started_at = time.perf_counter()
             commands.append(retargeter.retarget(observation, self.calibration))
+            if phase_recorder is not None:
+                retargeter_name = str(getattr(retargeter, "name", "") or type(retargeter).__name__)
+                phase_recorder(
+                    f"session.retargeter.{index}.{retargeter_name}",
+                    time.perf_counter() - started_at,
+                )
         command = merge_teleop_commands(commands)
         if command.timestamp is None:
             command.timestamp = observation.timestamp
@@ -349,8 +375,11 @@ class TeleopSession:
 
         observation = self._build_observation(channels, current_time)
         mark_phase("session.build_observation")
-        command = self._build_command(observation)
+        command = self._build_command(observation, phase_recorder=phase_recorder)
         mark_phase("session.build_command")
+        if self.command_filter is not None:
+            command = self.command_filter(command, observation, current_time)
+            mark_phase("session.filter_command")
 
         if self.recorder is not None:
             self.recorder.record_command(command)

@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RM65 Dual-Arm Collision Scene</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 24px; color: #202124; }
+.summary { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin-bottom: 18px; }
+.viewer-wrap { border: 1px solid #bbb; background: #f8fafc; margin: 16px 0 20px; }
+#scene3d { display: block; width: 100%; height: 720px; cursor: grab; }
+#scene3d.dragging { cursor: grabbing; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #d6d6d6; background: #fff; }
+.toolbar label { white-space: nowrap; font-size: 14px; }
+.hint { color: #5f6368; font-size: 13px; }
+.viz { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 14px; }
+svg { border: 1px solid #ccc; background: #fafafa; }
+.title { font-size: 18px; font-weight: 700; }
+    .pair-line { stroke: #374151; stroke-opacity: 0.55; stroke-width: 2; }
+    .pair-index-bg { fill: rgba(255,255,255,0.88); stroke: #374151; stroke-width: 1; }
+    .pair-index { font-size: 9px; fill: #111827; text-anchor: middle; font-weight: 700; }
+.geom { stroke: #222; stroke-width: 1; }
+.geom-left { fill: #3b82f6; }
+.geom-right { fill: #f97316; }
+.geom-fixed { fill: #ef4444; }
+.geom-label { font-size: 10px; fill: #111; }
+table { border-collapse: collapse; margin-top: 14px; width: 100%; }
+th, td { border: 1px solid #ddd; padding: 5px 8px; font-size: 13px; }
+th { background: #f3f4f6; text-align: left; }
+code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>RM65 Dual-Arm Collision Scene</h1>
+<div class="summary">
+<strong>profile</strong><span><code>dual_arm_hand_proxy_open</code></span>
+<strong>urdf</strong><span><code>/home/password-1/DexTeleop/assets/rm65_inspire_tac/rm65_dual_arm_hand_proxy_open.urdf</code></span>
+<strong>collision pairs</strong><span>10</span>
+<strong>q deg</strong><span>89.95, -26.93, 111.15, 0.00, 40.11, -89.95, -89.95, -26.93, 111.15, 177.62, -40.11, -89.95</span>
+<strong>hand proxy</strong><span>left_hand_proxy_0@hand_base size=(0.07, 0.07, 0.37), right_hand_proxy_0@right_hand_base size=(0.07, 0.07, 0.37), arm_link3_proxy_0@arm_link3 size=(0.07, 0.165, 0.1), right_arm_link3_proxy_0@right_arm_link3 size=(0.07, 0.165, 0.1)</span>
+<strong>fixed boxes</strong><span>camera_pole_0@world size=(0.03, 0.03, 0.8), table_0@world size=(1.0, 2.0, 0.05)</span>
+</div>
+<p>Blue is left arm, orange is right arm, red is fixed scene geometry. Thick colored lines are link chains, translucent boxes are hand/camera proxies, and gray lines are the configured collision pairs checked by Pinocchio/HPP-FCL.</p>
+<div class="viewer-wrap">
+  <div class="toolbar">
+    <label><input id="togglePairs" type="checkbox" checked> collision pairs</label>
+    <label><input id="toggleLabels" type="checkbox" checked> labels</label>
+    <label><input id="togglePoints" type="checkbox" checked> collision points</label>
+    <label><input id="toggleBoxes" type="checkbox" checked> proxy boxes</label>
+    <span class="hint">Drag to rotate, wheel to zoom, double-click to reset.</span>
+  </div>
+  <canvas id="scene3d"></canvas>
+</div>
+<details>
+<summary>Static top/front fallback views</summary>
+<div class="viz"><svg viewBox="0 0 720 720" width="720" height="720" role="img">
+<rect x="0" y="0" width="720" height="720" fill="#fafafa"/>
+<text x="20" y="28" class="title">Top view (X-Y)</text>
+<line x1="621.29" y1="606.95" x2="621.27" y2="101.69" class="pair-line"/>
+<circle cx="621.28" cy="354.32" r="8" class="pair-index-bg"/>
+<text x="621.28" y="357.82" class="pair-index">1</text>
+<line x1="621.29" y1="606.95" x2="367.88" y2="109.92" class="pair-line"/>
+<circle cx="494.59" cy="358.43" r="8" class="pair-index-bg"/>
+<text x="494.59" y="361.93" class="pair-index">2</text>
+<line x1="367.88" y1="618.31" x2="621.27" y2="101.69" class="pair-line"/>
+<circle cx="494.58" cy="360.00" r="8" class="pair-index-bg"/>
+<text x="494.58" y="363.50" class="pair-index">3</text>
+<line x1="367.88" y1="618.31" x2="367.88" y2="109.92" class="pair-line"/>
+<circle cx="367.88" cy="364.11" r="8" class="pair-index-bg"/>
+<text x="367.88" y="367.61" class="pair-index">4</text>
+<line x1="367.88" y1="618.31" x2="557.97" y2="365.87" class="pair-line"/>
+<circle cx="462.92" cy="492.09" r="8" class="pair-index-bg"/>
+<text x="462.92" y="495.59" class="pair-index">5</text>
+<line x1="367.88" y1="109.92" x2="557.97" y2="365.87" class="pair-line"/>
+<circle cx="462.93" cy="237.89" r="8" class="pair-index-bg"/>
+<text x="462.93" y="241.39" class="pair-index">6</text>
+<line x1="367.88" y1="618.31" x2="98.71" y2="365.87" class="pair-line"/>
+<circle cx="233.29" cy="492.09" r="8" class="pair-index-bg"/>
+<text x="233.29" y="495.59" class="pair-index">7</text>
+<line x1="367.88" y1="109.92" x2="98.71" y2="365.87" class="pair-line"/>
+<circle cx="233.30" cy="237.89" r="8" class="pair-index-bg"/>
+<text x="233.30" y="241.39" class="pair-index">8</text>
+<line x1="621.29" y1="606.95" x2="98.71" y2="365.87" class="pair-line"/>
+<circle cx="360.00" cy="486.41" r="8" class="pair-index-bg"/>
+<text x="360.00" y="489.91" class="pair-index">9</text>
+<line x1="621.27" y1="101.69" x2="98.71" y2="365.87" class="pair-line"/>
+<circle cx="359.99" cy="233.78" r="8" class="pair-index-bg"/>
+<text x="359.99" y="237.28" class="pair-index">10</text>
+<circle cx="621.29" cy="606.95" r="5" class="geom geom-left"/>
+<text x="628.29" y="599.95" class="geom-label">arm_link3_proxy</text>
+<circle cx="557.97" cy="365.87" r="5" class="geom geom-fixed"/>
+<text x="564.97" y="358.87" class="geom-label">camera_pole</text>
+<circle cx="367.88" cy="618.31" r="5" class="geom geom-left"/>
+<text x="374.88" y="611.31" class="geom-label">left_hand_proxy</text>
+<circle cx="621.27" cy="101.69" r="5" class="geom geom-right"/>
+<text x="628.27" y="94.69" class="geom-label">right_arm_link3_proxy</text>
+<circle cx="367.88" cy="109.92" r="5" class="geom geom-right"/>
+<text x="374.88" y="102.92" class="geom-label">right_hand_proxy</text>
+<circle cx="98.71" cy="365.87" r="5" class="geom geom-fixed"/>
+<text x="105.71" y="358.87" class="geom-label">table</text>
+</svg><svg viewBox="0 0 720 720" width="720" height="720" role="img">
+<rect x="0" y="0" width="720" height="720" fill="#fafafa"/>
+<text x="20" y="28" class="title">Front view (Y-Z)</text>
+<line x1="110.20" y1="102.55" x2="621.29" y2="102.55" class="pair-line"/>
+<circle cx="365.75" cy="102.55" r="8" class="pair-index-bg"/>
+<text x="365.75" y="106.05" class="pair-index">1</text>
+<line x1="110.20" y1="102.55" x2="612.97" y2="165.95" class="pair-line"/>
+<circle cx="361.59" cy="134.25" r="8" class="pair-index-bg"/>
+<text x="361.59" y="137.75" class="pair-index">2</text>
+<line x1="98.71" y1="166.03" x2="621.29" y2="102.55" class="pair-line"/>
+<circle cx="360.00" cy="134.29" r="8" class="pair-index-bg"/>
+<text x="360.00" y="137.79" class="pair-index">3</text>
+<line x1="98.71" y1="166.03" x2="612.97" y2="165.95" class="pair-line"/>
+<circle cx="355.84" cy="165.99" r="8" class="pair-index-bg"/>
+<text x="355.84" y="169.49" class="pair-index">4</text>
+<line x1="98.71" y1="166.03" x2="354.07" y2="178.46" class="pair-line"/>
+<circle cx="226.39" cy="172.25" r="8" class="pair-index-bg"/>
+<text x="226.39" y="175.75" class="pair-index">5</text>
+<line x1="612.97" y1="165.95" x2="354.07" y2="178.46" class="pair-line"/>
+<circle cx="483.52" cy="172.21" r="8" class="pair-index-bg"/>
+<text x="483.52" y="175.71" class="pair-index">6</text>
+<line x1="98.71" y1="166.03" x2="354.07" y2="617.45" class="pair-line"/>
+<circle cx="226.39" cy="391.74" r="8" class="pair-index-bg"/>
+<text x="226.39" y="395.24" class="pair-index">7</text>
+<line x1="612.97" y1="165.95" x2="354.07" y2="617.45" class="pair-line"/>
+<circle cx="483.52" cy="391.70" r="8" class="pair-index-bg"/>
+<text x="483.52" y="395.20" class="pair-index">8</text>
+<line x1="110.20" y1="102.55" x2="354.07" y2="617.45" class="pair-line"/>
+<circle cx="232.13" cy="360.00" r="8" class="pair-index-bg"/>
+<text x="232.13" y="363.50" class="pair-index">9</text>
+<line x1="621.29" y1="102.55" x2="354.07" y2="617.45" class="pair-line"/>
+<circle cx="487.68" cy="360.00" r="8" class="pair-index-bg"/>
+<text x="487.68" y="363.50" class="pair-index">10</text>
+<circle cx="110.20" cy="102.55" r="5" class="geom geom-left"/>
+<text x="117.20" y="95.55" class="geom-label">arm_link3_proxy</text>
+<circle cx="354.07" cy="178.46" r="5" class="geom geom-fixed"/>
+<text x="361.07" y="171.46" class="geom-label">camera_pole</text>
+<circle cx="98.71" cy="166.03" r="5" class="geom geom-left"/>
+<text x="105.71" y="159.03" class="geom-label">left_hand_proxy</text>
+<circle cx="621.29" cy="102.55" r="5" class="geom geom-right"/>
+<text x="628.29" y="95.55" class="geom-label">right_arm_link3_proxy</text>
+<circle cx="612.97" cy="165.95" r="5" class="geom geom-right"/>
+<text x="619.97" y="158.95" class="geom-label">right_hand_proxy</text>
+<circle cx="354.07" cy="617.45" r="5" class="geom geom-fixed"/>
+<text x="361.07" y="610.45" class="geom-label">table</text>
+</svg></div>
+</details>
+<h2>Closest Pair Distances</h2>
+<table><thead><tr><th>#</th><th>Geometry A</th><th>Geometry B</th><th>distance m</th></tr></thead><tbody><tr><td>6</td><td>right_hand_proxy_0</td><td>camera_pole_0</td><td>0.21295</td></tr>
+<tr><td>5</td><td>left_hand_proxy_0</td><td>camera_pole_0</td><td>0.21372</td></tr>
+<tr><td>8</td><td>right_hand_proxy_0</td><td>table_0</td><td>0.27753</td></tr>
+<tr><td>7</td><td>left_hand_proxy_0</td><td>table_0</td><td>0.27879</td></tr>
+<tr><td>1</td><td>arm_link3_proxy_0</td><td>right_arm_link3_proxy_0</td><td>0.42497</td></tr>
+<tr><td>2</td><td>arm_link3_proxy_0</td><td>right_hand_proxy_0</td><td>0.42809</td></tr>
+<tr><td>10</td><td>right_arm_link3_proxy_0</td><td>table_0</td><td>0.44302</td></tr>
+<tr><td>9</td><td>arm_link3_proxy_0</td><td>table_0</td><td>0.44303</td></tr>
+<tr><td>4</td><td>left_hand_proxy_0</td><td>right_hand_proxy_0</td><td>0.45249</td></tr>
+<tr><td>3</td><td>left_hand_proxy_0</td><td>right_arm_link3_proxy_0</td><td>0.45286</td></tr></tbody></table>
+<h2>All Collision Pairs</h2>
+<table><thead><tr><th>#</th><th>Geometry A</th><th>Geometry B</th><th>distance m</th></tr></thead><tbody><tr><td>1</td><td>arm_link3_proxy_0</td><td>right_arm_link3_proxy_0</td><td>0.42497</td></tr>
+<tr><td>2</td><td>arm_link3_proxy_0</td><td>right_hand_proxy_0</td><td>0.42809</td></tr>
+<tr><td>3</td><td>left_hand_proxy_0</td><td>right_arm_link3_proxy_0</td><td>0.45286</td></tr>
+<tr><td>4</td><td>left_hand_proxy_0</td><td>right_hand_proxy_0</td><td>0.45249</td></tr>
+<tr><td>5</td><td>left_hand_proxy_0</td><td>camera_pole_0</td><td>0.21372</td></tr>
+<tr><td>6</td><td>right_hand_proxy_0</td><td>camera_pole_0</td><td>0.21295</td></tr>
+<tr><td>7</td><td>left_hand_proxy_0</td><td>table_0</td><td>0.27879</td></tr>
+<tr><td>8</td><td>right_hand_proxy_0</td><td>table_0</td><td>0.27753</td></tr>
+<tr><td>9</td><td>arm_link3_proxy_0</td><td>table_0</td><td>0.44303</td></tr>
+<tr><td>10</td><td>right_arm_link3_proxy_0</td><td>table_0</td><td>0.44302</td></tr></tbody></table>
+<script id="scene-data" type="application/json">{"profile":"dual_arm_hand_proxy_open","points":[{"name":"arm_link3_proxy_0","label":"arm_link3_proxy","side":"left","xyz":[0.06893733041218396,-0.2505546396609231,0.4734961281899924]},{"name":"camera_pole_0","label":"camera_pole","side":"fixed","xyz":[0.0,0.0,0.4]},{"name":"left_hand_proxy_0","label":"left_hand_proxy","side":"left","xyz":[-0.20695396646422587,-0.26235986896901076,0.4120410222521585]},{"name":"right_arm_link3_proxy_0","label":"right_arm_link3_proxy","side":"right","xyz":[0.06891821816788377,0.27455513842944107,0.4734961281899924]},{"name":"right_hand_proxy_0","label":"right_hand_proxy","side":"right","xyz":[-0.20694921218260526,0.26600797598252734,0.4121165149432944]},{"name":"table_0","label":"table","side":"fixed","xyz":[-0.5,0.0,-0.025]}],"pairs":[{"index":1,"a":"arm_link3_proxy_0","b":"right_arm_link3_proxy_0","distance":0.4249734743516235},{"index":2,"a":"arm_link3_proxy_0","b":"right_hand_proxy_0","distance":0.4280863596296648},{"index":3,"a":"left_hand_proxy_0","b":"right_arm_link3_proxy_0","distance":0.4528568354149432},{"index":4,"a":"left_hand_proxy_0","b":"right_hand_proxy_0","distance":0.45248556644794224},{"index":5,"a":"left_hand_proxy_0","b":"camera_pole_0","distance":0.21372470096447493},{"index":6,"a":"right_hand_proxy_0","b":"camera_pole_0","distance":0.21294517589990125},{"index":7,"a":"left_hand_proxy_0","b":"table_0","distance":0.2787855961694159},{"index":8,"a":"right_hand_proxy_0","b":"table_0","distance":0.27753447453241725},{"index":9,"a":"arm_link3_proxy_0","b":"table_0","distance":0.443025556026202},{"index":10,"a":"right_arm_link3_proxy_0","b":"table_0","distance":0.44302359603544994}],"chains":[{"name":"left_arm","side":"left","points":[{"name":"base_link","xyz":[0.0,-0.2625,0.0]},{"name":"arm_link1","xyz":[0.0,-0.2625,0.2405]},{"name":"arm_link3","xyz":[0.11593801425656595,-0.262591898699361,0.46874190764378343]},{"name":"arm_link4","xyz":[-0.0929961887943828,-0.2624262862183123,0.4898717767387652]},{"name":"arm_link5","xyz":[-0.0929961887943828,-0.2624262862183123,0.4898717767387652]},{"name":"arm_link6","xyz":[-0.21190859381181362,-0.26233202985495974,0.40865705486699816]},{"name":"hand_base","xyz":[-0.2193406190991487,-0.2623261057734147,0.403581134750047]},{"name":"left_hand_proxy","xyz":[-0.2193406190991487,-0.2623261057734147,0.403581134750047]}]},{"name":"right_arm","side":"right","points":[{"name":"right_base_link","xyz":[0.0,0.2625,0.0]},{"name":"right_arm_link1","xyz":[0.0,0.2625,0.2405]},{"name":"right_arm_link3","xyz":[0.1159380135783069,0.2625927504337289,0.46874190764378343]},{"name":"right_arm_link4","xyz":[-0.09299618825034699,0.262425603036893,0.4898717767387652]},{"name":"right_arm_link5","xyz":[-0.09299618825034699,0.262425603036893,0.4898717767387652]},{"name":"right_arm_link6","xyz":[-0.2119035906936682,0.2661886148307166,0.40873689283287923]},{"name":"right_hand_base","xyz":[-0.2193353034584539,0.2664237700374737,0.4036659612211873]},{"name":"right_hand_proxy","xyz":[-0.2193353034584539,0.2664237700374737,0.4036659612211873]}]}],"boxes":[{"name":"left_hand_proxy_0","side":"left","size":[0.07,0.07,0.37],"vertices":[[-0.33987774978603535,-0.22701500724237839,0.27878559618274124],[-0.03434031812460556,-0.22784783273374767,0.4874628212348255],[-0.34008838729691543,-0.2970146843021898,0.27881463686334895],[-0.03455095563548566,-0.29784750979355906,0.48749186191543314],[-0.3793569772929661,-0.22687222814446245,0.33659018258888385],[-0.07381954563153631,-0.22770505363583174,0.545267407640968],[-0.37956761480384615,-0.2968719052042738,0.3366192232694915],[-0.07403018314241641,-0.2977047306956431,0.5452964483215758]],"edges":[[0,1],[0,2],[0,4],[3,1],[3,2],[3,7],[5,1],[5,4],[5,7],[6,2],[6,4],[6,7]]},{"name":"right_hand_proxy_0","side":"right","size":[0.07,0.07,0.37],"vertices":[[-0.33980524337841705,0.30723316187344096,0.2804929645309266],[-0.034281658574150664,0.29697690851809744,0.4889399563429011],[-0.34013451402989703,0.23729648395801842,0.2775344745457273],[-0.03461092922563064,0.22704023060267486,0.48598146635770184],[-0.3792874951395799,0.3049757213623798,0.3382515635288869],[-0.07376391033531349,0.29471946800703624,0.5466985553408614],[-0.37961676579105985,0.23503904344695725,0.33529307354368765],[-0.07409318098679346,0.2247827900916137,0.5437400653556621]],"edges":[[0,1],[0,2],[0,4],[3,1],[3,2],[3,7],[5,1],[5,4],[5,7],[6,2],[6,4],[6,7]]},{"name":"arm_link3_proxy_0","side":"left","size":[0.07,0.165,0.1],"vertices":[[-0.009582687225366635,-0.20049238476595838,0.5166195263055204],[-0.009661952576045532,-0.30049235335097435,0.5166195263068697],[0.15457990088609308,-0.20062250885821092,0.5000174863023205],[0.1545006355354142,-0.3006224774432269,0.5000174863036697],[-0.01662597471104628,-0.20048680187861934,0.44697477007631514],[-0.016705240061725177,-0.3004867704636353,0.44697477007766434],[0.14753661340041346,-0.20061692597087188,0.43037273007311516],[0.14745734804973454,-0.30061689455588786,0.43037273007446436]],"edges":[[0,1],[0,2],[0,4],[3,1],[3,2],[3,7],[5,1],[5,4],[5,7],[6,2],[6,4],[6,7]]},{"name":"right_arm_link3_proxy_0","side":"right","size":[0.07,0.165,0.1],"vertices":[[-0.009681431681155206,0.3244922746967336,0.5166195263055204],[-0.009601431689688578,0.2244923066967319,0.5166195263068697],[0.15448115546993002,0.32462360479424757,0.5000174863023205],[0.15456115546139665,0.22462363679424585,0.5000174863036697],[-0.016724719125629117,0.3244866400646363,0.44697477007631514],[-0.01664471913416249,0.22448667206463457,0.44697477007766434],[0.1474378680254561,0.3246179701621502,0.43037273007311516],[0.14751786801692274,0.22461800216214853,0.43037273007446436]],"edges":[[0,1],[0,2],[0,4],[3,1],[3,2],[3,7],[5,1],[5,4],[5,7],[6,2],[6,4],[6,7]]},{"name":"camera_pole_0","side":"fixed","size":[0.03,0.03,0.8],"vertices":[[-0.015,-0.015,0.0],[-0.015,-0.015,0.8],[-0.015,0.015,0.0],[-0.015,0.015,0.8],[0.015,-0.015,0.0],[0.015,-0.015,0.8],[0.015,0.015,0.0],[0.015,0.015,0.8]],"edges":[[0,1],[0,2],[0,4],[3,1],[3,2],[3,7],[5,1],[5,4],[5,7],[6,2],[6,4],[6,7]]},{"name":"table_0","side":"fixed","size":[1.0,2.0,0.05],"vertices":[[-1.0,-1.0,-0.05],[-1.0,-1.0,0.0],[-1.0,1.0,-0.05],[-1.0,1.0,0.0],[0.0,-1.0,-0.05],[0.0,-1.0,0.0],[0.0,1.0,-0.05],[0.0,1.0,0.0]],"edges":[[0,1],[0,2],[0,4],[3,1],[3,2],[3,7],[5,1],[5,4],[5,7],[6,2],[6,4],[6,7]]}],"center":[-0.10078729027009259,0.0018045456662472072,0.36163676615729135]}</script>
+<script>
+(() => {
+  const scene = JSON.parse(document.getElementById("scene-data").textContent);
+  const canvas = document.getElementById("scene3d");
+  const ctx = canvas.getContext("2d");
+  const toggles = {
+    pairs: document.getElementById("togglePairs"),
+    labels: document.getElementById("toggleLabels"),
+    points: document.getElementById("togglePoints"),
+    boxes: document.getElementById("toggleBoxes"),
+  };
+  const color = {
+    left: "#2563eb",
+    right: "#ea580c",
+    fixed: "#dc2626",
+    pair: "rgba(31,41,55,0.42)",
+    grid: "rgba(90,90,90,0.14)",
+    text: "#111827",
+  };
+  let state = { yaw: -0.75, pitch: 0.48, scale: 520, panX: 0, panY: 20 };
+  let dragging = false;
+  let last = { x: 0, y: 0 };
+  const center = scene.center || [0, 0, 0];
+  const pointsByName = new Map(scene.points.map((point) => [point.name, point]));
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(rect.width * ratio));
+    canvas.height = Math.max(1, Math.round(rect.height * ratio));
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    draw();
+  }
+
+  function rotate(point) {
+    const x = point[0] - center[0];
+    const y = point[1] - center[1];
+    const z = point[2] - center[2];
+    const cy = Math.cos(state.yaw);
+    const sy = Math.sin(state.yaw);
+    const cp = Math.cos(state.pitch);
+    const sp = Math.sin(state.pitch);
+    const x1 = cy * x - sy * y;
+    const y1 = sy * x + cy * y;
+    const z1 = z;
+    const y2 = cp * y1 - sp * z1;
+    const z2 = sp * y1 + cp * z1;
+    return [x1, y2, z2];
+  }
+
+  function project(point) {
+    const rotated = rotate(point);
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: rect.width / 2 + state.panX + rotated[0] * state.scale,
+      y: rect.height / 2 + state.panY - rotated[2] * state.scale,
+      depth: rotated[1],
+    };
+  }
+
+  function line3(a, b, stroke, width = 1, dash = []) {
+    const pa = project(a);
+    const pb = project(b);
+    ctx.save();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = width;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function pairIndex3(a, b, text, close) {
+    const mid = [
+      (a[0] + b[0]) * 0.5,
+      (a[1] + b[1]) * 0.5,
+      (a[2] + b[2]) * 0.5,
+    ];
+    const p = project(mid);
+    ctx.save();
+    ctx.fillStyle = close ? "rgba(254,242,242,0.94)" : "rgba(255,255,255,0.9)";
+    ctx.strokeStyle = close ? "#dc2626" : "#374151";
+    ctx.lineWidth = close ? 2 : 1;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, close ? 10 : 9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = close ? "#991b1b" : "#111827";
+    ctx.font = "bold 10px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(text), p.x, p.y + 0.5);
+    ctx.restore();
+  }
+
+  function circle3(point, radius, fill, stroke = "#111827") {
+    const p = project(point);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    return p;
+  }
+
+  function text3(point, text, dx = 8, dy = -8) {
+    const p = project(point);
+    ctx.fillStyle = color.text;
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.fillText(text, p.x + dx, p.y + dy);
+  }
+
+  function drawGrid() {
+    const z = 0;
+    for (let v = -0.8; v <= 0.8; v += 0.1) {
+      line3([-0.55, v, z], [0.55, v, z], color.grid, 1);
+      line3([v, -0.55, z], [v, 0.55, z], color.grid, 1);
+    }
+    line3([0, 0, 0], [0.18, 0, 0], "#ef4444", 2);
+    line3([0, 0, 0], [0, 0.18, 0], "#22c55e", 2);
+    line3([0, 0, 0], [0, 0, 0.18], "#3b82f6", 2);
+    text3([0.19, 0, 0], "X", 2, 4);
+    text3([0, 0.19, 0], "Y", 2, 4);
+    text3([0, 0, 0.19], "Z", 2, 4);
+  }
+
+  function drawBoxes() {
+    if (!toggles.boxes.checked) return;
+    for (const box of scene.boxes) {
+      const sideColor = color[box.side] || color.fixed;
+      for (const edge of box.edges) {
+        line3(box.vertices[edge[0]], box.vertices[edge[1]], sideColor, 2);
+      }
+      if (toggles.labels.checked && box.vertices.length) {
+        text3(box.vertices[0], box.name);
+      }
+    }
+  }
+
+  function drawChains() {
+    for (const chain of scene.chains) {
+      const chainColor = color[chain.side] || "#111827";
+      const points = chain.points || [];
+      for (let i = 0; i < points.length - 1; i += 1) {
+        line3(points[i].xyz, points[i + 1].xyz, chainColor, 5);
+      }
+      for (const point of points) {
+        circle3(point.xyz, 4, chainColor);
+        if (toggles.labels.checked) text3(point.xyz, point.name);
+      }
+    }
+  }
+
+  function drawPairs() {
+    if (!toggles.pairs.checked) return;
+    for (const pair of scene.pairs) {
+      const a = pointsByName.get(pair.a);
+      const b = pointsByName.get(pair.b);
+      if (!a || !b) continue;
+      const distance = pair.distance == null ? 1 : pair.distance;
+      const close = distance < 0.08;
+      line3(a.xyz, b.xyz, close ? "rgba(220,38,38,0.8)" : color.pair, close ? 3 : 2);
+      if (toggles.labels.checked) pairIndex3(a.xyz, b.xyz, pair.index, close);
+    }
+  }
+
+  function drawPoints() {
+    if (!toggles.points.checked) return;
+    const ordered = [...scene.points].sort((a, b) => project(a.xyz).depth - project(b.xyz).depth);
+    for (const point of ordered) {
+      const sideColor = color[point.side] || color.fixed;
+      circle3(point.xyz, 5, sideColor);
+      if (toggles.labels.checked) text3(point.xyz, point.label || point.name);
+    }
+  }
+
+  function draw() {
+    const rect = canvas.getBoundingClientRect();
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    ctx.fillStyle = "#f8fafc";
+    ctx.fillRect(0, 0, rect.width, rect.height);
+    drawGrid();
+    drawPairs();
+    drawBoxes();
+    drawChains();
+    drawPoints();
+    ctx.fillStyle = "rgba(255,255,255,0.86)";
+    ctx.fillRect(12, rect.height - 76, 310, 56);
+    ctx.fillStyle = "#111827";
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.fillText("left: blue  right: orange  fixed: red", 24, rect.height - 50);
+    ctx.fillText("close pairs (<0.08m) are red", 24, rect.height - 28);
+  }
+
+  canvas.addEventListener("mousedown", (event) => {
+    dragging = true;
+    last = { x: event.clientX, y: event.clientY };
+    canvas.classList.add("dragging");
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    canvas.classList.remove("dragging");
+  });
+  window.addEventListener("mousemove", (event) => {
+    if (!dragging) return;
+    const dx = event.clientX - last.x;
+    const dy = event.clientY - last.y;
+    last = { x: event.clientX, y: event.clientY };
+    state.yaw += dx * 0.008;
+    state.pitch = Math.max(-1.35, Math.min(1.35, state.pitch + dy * 0.008));
+    draw();
+  });
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const factor = Math.exp(-event.deltaY * 0.001);
+    state.scale = Math.max(120, Math.min(1600, state.scale * factor));
+    draw();
+  }, { passive: false });
+  canvas.addEventListener("dblclick", () => {
+    state = { yaw: -0.75, pitch: 0.48, scale: 520, panX: 0, panY: 20 };
+    draw();
+  });
+  Object.values(toggles).forEach((input) => input.addEventListener("change", draw));
+  window.addEventListener("resize", resize);
+  resize();
+})();
+</script>
+</body>
+</html>

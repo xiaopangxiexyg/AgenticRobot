@@ -8,7 +8,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TypeVar
 
 import numpy as np
 import serial
@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 
 
 ANGLE_RE = re.compile(r"=\s*([-+]?\d+(?:\.\d+)?)")
+_ParsedT = TypeVar("_ParsedT")
 OFFSET = [40.0, -70.0, 60.0, 60.0, 60.0, 60.0]
 Q6_ORDER = [
     "thumb_yaw",
@@ -41,6 +42,10 @@ Q6_ORDER = [
 # teleop_sim.py
 SIM_Q6_UPPER_RAD = np.array([1.54, 0.60, 1.57, 1.57, 1.57, 1.57], dtype=np.float32)
 SIM_Q6_LOWER_RAD = np.zeros(6, dtype=np.float32)
+
+
+class MissingPortSpecificCalibrationError(KeyError):
+    """Raised when the saved zero pose does not cover the current Q6 device."""
 
 
 def _default_zero_pose_record_dir() -> Path:
@@ -68,18 +73,128 @@ def _calibration_from_deg_at_0(side: str, deg_at_0: Sequence[float]) -> Dict[str
     return {"deg_at_0": deg0, "deg_at_1": deg0 + offset}
 
 
+def _calibration_from_payload(side: str, payload: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+    deg0 = np.asarray(payload["deg_at_0"], dtype=np.float32).reshape(6)
+    if "deg_at_1" in payload:
+        deg1 = np.asarray(payload["deg_at_1"], dtype=np.float32).reshape(6)
+        return {"deg_at_0": deg0, "deg_at_1": deg1}
+    return _calibration_from_deg_at_0(side, deg0)
+
+
+def _unique_text(values: Sequence[object]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _port_identity(port: str | Path | None) -> dict[str, object]:
+    if not port:
+        return {"port": None, "port_realpath": None, "port_aliases": []}
+    aliases: list[str] = [str(port)]
+    realpath: str | None = None
+    try:
+        path = Path(str(port))
+        if path.exists():
+            realpath = str(path.resolve())
+            aliases.append(realpath)
+    except OSError:
+        realpath = None
+    if realpath is not None:
+        for alias_dir in (Path("/dev/serial/by-id"), Path("/dev/serial/by-path")):
+            if not alias_dir.exists():
+                continue
+            try:
+                candidates = sorted(alias_dir.iterdir())
+            except OSError:
+                continue
+            for candidate in candidates:
+                try:
+                    if str(candidate.resolve()) == realpath:
+                        aliases.append(str(candidate))
+                except OSError:
+                    continue
+    return {
+        "port": str(port),
+        "port_realpath": realpath,
+        "port_aliases": _unique_text(aliases),
+    }
+
+
+def _stable_port_aliases(aliases: Sequence[object]) -> set[str]:
+    stable_prefixes = ("/dev/serial/by-id/", "/dev/serial/by-path/")
+    return {
+        str(alias)
+        for alias in aliases
+        if str(alias).startswith(stable_prefixes)
+    }
+
+
+def _find_port_calibration_payload(
+    payload: Mapping[str, Any],
+    *,
+    side: str,
+    port: str | Path,
+) -> Mapping[str, Any] | None:
+    port_calibrations = payload.get("port_calibrations")
+    side_registry = (
+        port_calibrations.get(str(side))
+        if isinstance(port_calibrations, Mapping)
+        else None
+    )
+    if not isinstance(side_registry, Mapping):
+        return None
+    identity = _port_identity(port)
+    aliases = set(str(alias) for alias in identity.get("port_aliases", []))
+    stable_aliases = _stable_port_aliases(tuple(aliases))
+    preferred_aliases = stable_aliases if stable_aliases else aliases
+    for alias in preferred_aliases:
+        candidate = side_registry.get(alias)
+        if isinstance(candidate, Mapping) and "deg_at_0" in candidate:
+            return candidate
+    for candidate in side_registry.values():
+        if not isinstance(candidate, Mapping) or "deg_at_0" not in candidate:
+            continue
+        candidate_aliases = set(str(alias) for alias in candidate.get("port_aliases", []))
+        for key in ("port", "port_realpath"):
+            if candidate.get(key):
+                candidate_aliases.add(str(candidate[key]))
+        if preferred_aliases.intersection(candidate_aliases):
+            return candidate
+    return None
+
+
 def load_exo_hand_calibration(
     side: str,
     calibration_path: str | Path | None = None,
+    *,
+    port: str | Path | None = None,
 ) -> Dict[str, np.ndarray]:
     path = Path(calibration_path) if calibration_path is not None else _default_exo_hand_calibration_path()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    side_name = str(side)
+    if port is not None:
+        port_payload = _find_port_calibration_payload(payload, side=side_name, port=port)
+        if port_payload is None:
+            raise MissingPortSpecificCalibrationError(
+                f"Missing port-specific exo hand zero pose calibration for "
+                f"side={side!r}, port={str(port)!r} in {path}. "
+                "Refusing to reuse a saved Q6 normalization from another device; "
+                "auto zero-pose calibration is required while holding this Q6 at zero pose."
+            )
+        calib = _calibration_from_payload(side_name, port_payload)
+        print(f"[Calib:{side}] loaded port-specific exo hand zero pose for port={port} <- {path}")
+        return calib
     try:
-        side_payload = payload["calibrations"][str(side)]
-        deg_at_0 = side_payload["deg_at_0"]
+        side_payload = payload["calibrations"][side_name]
     except KeyError as exc:
         raise KeyError(f"Missing fixed exo hand zero pose calibration for side={side!r} in {path}") from exc
-    calib = _calibration_from_deg_at_0(str(side), deg_at_0)
+    calib = _calibration_from_payload(side_name, side_payload)
     print(f"[Calib:{side}] loaded fixed exo hand zero pose <- {path}")
     return calib
 
@@ -87,6 +202,8 @@ def load_exo_hand_calibration(
 def _update_fixed_exo_hand_calibration(
     *,
     side: str,
+    port: str | None,
+    baudrate: int | None,
     deg_at_0: np.ndarray,
     record_path: Path | None,
     calibration_path: str | Path | None = None,
@@ -99,21 +216,40 @@ def _update_fixed_exo_hand_calibration(
     payload.setdefault("calibrations", {})
     offset = _offset_for_side(side)
     deg0 = np.asarray(deg_at_0, dtype=float).reshape(6)
-    payload["calibrations"][str(side)] = {
+    side_entry = {
         "deg_at_0": deg0.tolist(),
         "offset": np.asarray(offset, dtype=float).tolist(),
         "deg_at_1": (deg0 + np.asarray(offset, dtype=float)).tolist(),
     }
+    payload["calibrations"][str(side)] = dict(side_entry)
     timestamp = time.time()
+    identity = _port_identity(port)
+    port_key = str(port) if port is not None else f"{side}_unknown_port"
+    port_entry = {
+        **side_entry,
+        "side": str(side),
+        "baudrate": None if baudrate is None else int(baudrate),
+        "record_path": None if record_path is None else str(record_path),
+        "updated_at": timestamp,
+        "updated_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
+        **identity,
+    }
+    payload.setdefault("port_calibrations", {})
+    payload["port_calibrations"].setdefault(str(side), {})
+    payload["port_calibrations"][str(side)][port_key] = port_entry
+    for alias in identity.get("port_aliases", []):
+        payload["port_calibrations"][str(side)][str(alias)] = port_entry
     payload["updated_at"] = timestamp
     payload["updated_at_local"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
     payload["last_update"] = {
         "side": str(side),
+        "port": None if port is None else str(port),
+        "baudrate": None if baudrate is None else int(baudrate),
         "record_path": None if record_path is None else str(record_path),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"[Calib:{side}] updated fixed exo hand zero pose -> {path}")
+    print(f"[Calib:{side}] updated exo hand zero pose registry for port={port} -> {path}")
     return path
 
 
@@ -142,11 +278,14 @@ def _save_zero_pose_calibration_record(
         f"{_safe_name(side)}_{_safe_name(port)}.json"
     )
     path = record_dir / filename
+    identity = _port_identity(port)
     payload = {
         "timestamp": timestamp,
         "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
         "side": str(side),
         "port": None if port is None else str(port),
+        "port_realpath": identity.get("port_realpath"),
+        "port_aliases": identity.get("port_aliases", []),
         "baudrate": None if baudrate is None else int(baudrate),
         "q6_order": list(Q6_ORDER),
         "zero_pose_required": True,
@@ -210,6 +349,136 @@ def parse_angles_line(line: str) -> Optional[List[float]]:
         return [float(x) for x in matches]
     except ValueError:
         return None
+
+
+class BufferedSerialLineReader:
+    """Read complete serial lines while dropping stale backlog.
+
+    Q6 devices can publish faster than preview/control loops consume. Reading
+    one ``readline()`` per loop can make the loop act on old buffered frames.
+    This reader drains complete lines already available on the serial port and
+    returns the newest parsed frame.
+    """
+
+    def __init__(
+        self,
+        ser: Any,
+        *,
+        show_raw_lines: bool = False,
+        raw_prefix: str = "",
+    ) -> None:
+        self.ser = ser
+        self.show_raw_lines = bool(show_raw_lines)
+        self.raw_prefix = str(raw_prefix)
+        self._pending = bytearray()
+        self.last_read_stats: dict[str, int] = {
+            "parsed_frames": 0,
+            "stale_frames_dropped": 0,
+            "pending_bytes": 0,
+            "in_waiting": 0,
+        }
+
+    def _in_waiting(self) -> int:
+        try:
+            return max(0, int(getattr(self.ser, "in_waiting", 0) or 0))
+        except Exception:
+            return 0
+
+    def _read_chunk(self, size: int) -> bytes:
+        chunk = self.ser.read(max(1, int(size)))
+        return chunk if isinstance(chunk, (bytes, bytearray)) else bytes(chunk or b"")
+
+    def _read_some_blocking(self) -> None:
+        waiting = self._in_waiting()
+        chunk = self._read_chunk(waiting if waiting > 0 else 1)
+        if chunk:
+            self._pending.extend(chunk)
+
+    def _drain_immediately_available(self) -> None:
+        for _ in range(64):
+            waiting = self._in_waiting()
+            if waiting <= 0:
+                return
+            chunk = self._read_chunk(waiting)
+            if not chunk:
+                return
+            self._pending.extend(chunk)
+
+    def _consume_complete_lines(
+        self,
+        parse_line: Callable[[str], _ParsedT | None],
+    ) -> tuple[_ParsedT | None, int]:
+        latest: _ParsedT | None = None
+        parsed_count = 0
+        while True:
+            newline_index = self._pending.find(b"\n")
+            if newline_index < 0:
+                return latest, parsed_count
+            raw = bytes(self._pending[: newline_index + 1])
+            del self._pending[: newline_index + 1]
+            text = raw.decode("utf-8", errors="ignore").strip()
+            if self.show_raw_lines and text:
+                print(f"{self.raw_prefix}{text}", flush=True)
+            parsed = parse_line(text)
+            if parsed is not None:
+                latest = parsed
+                parsed_count += 1
+
+    def read_latest_parsed(
+        self,
+        parse_line: Callable[[str], _ParsedT | None],
+    ) -> _ParsedT:
+        latest: _ParsedT | None = None
+        parsed_total = 0
+        while latest is None:
+            latest, parsed_count = self._consume_complete_lines(parse_line)
+            parsed_total += parsed_count
+            if latest is not None:
+                break
+            self._read_some_blocking()
+
+        self._drain_immediately_available()
+        drained_latest, parsed_count = self._consume_complete_lines(parse_line)
+        parsed_total += parsed_count
+        if drained_latest is not None:
+            latest = drained_latest
+
+        self.last_read_stats = {
+            "parsed_frames": int(parsed_total),
+            "stale_frames_dropped": max(0, int(parsed_total) - 1),
+            "pending_bytes": int(len(self._pending)),
+            "in_waiting": int(self._in_waiting()),
+        }
+        return latest
+
+    def read_latest_parsed_until(
+        self,
+        parse_line: Callable[[str], _ParsedT | None],
+        *,
+        deadline: float,
+    ) -> _ParsedT | None:
+        latest: _ParsedT | None = None
+        parsed_total = 0
+        while latest is None and time.time() < float(deadline):
+            latest, parsed_count = self._consume_complete_lines(parse_line)
+            parsed_total += parsed_count
+            if latest is not None:
+                break
+            self._read_some_blocking()
+
+        self._drain_immediately_available()
+        drained_latest, parsed_count = self._consume_complete_lines(parse_line)
+        parsed_total += parsed_count
+        if drained_latest is not None:
+            latest = drained_latest
+
+        self.last_read_stats = {
+            "parsed_frames": int(parsed_total),
+            "stale_frames_dropped": max(0, int(parsed_total) - 1),
+            "pending_bytes": int(len(self._pending)),
+            "in_waiting": int(self._in_waiting()),
+        }
+        return latest
 
 
 def swap01(x6: Sequence[float]) -> np.ndarray:
@@ -289,11 +558,41 @@ def auto_calibrate(
     if update_fixed:
         _update_fixed_exo_hand_calibration(
             side=side,
+            port=port,
+            baudrate=baudrate,
             deg_at_0=deg_at_0,
             record_path=record_path,
             calibration_path=calibration_path,
         )
     return {"deg_at_0": deg_at_0, "deg_at_1": deg_at_1}
+
+
+def _load_or_auto_calibrate_exo_hand(
+    *,
+    ser: serial.Serial,
+    side: str,
+    port: str,
+    baudrate: int,
+    show_raw_lines: bool,
+    calibration_path: str | Path | None,
+) -> Dict[str, np.ndarray]:
+    try:
+        return load_exo_hand_calibration(side, calibration_path, port=port)
+    except MissingPortSpecificCalibrationError as exc:
+        print(
+            f"[Calib:{side}] {exc}. "
+            "Auto-calibrating this Q6 now; keep it at zero pose and still.",
+            flush=True,
+        )
+        return auto_calibrate(
+            ser=ser,
+            side=side,
+            port=port,
+            baudrate=baudrate,
+            show_raw_lines=show_raw_lines,
+            update_fixed=True,
+            calibration_path=calibration_path,
+        )
 
 
 def map_angles_to_norm(angles_deg: Sequence[float], deg_at_0: np.ndarray, deg_at_1: np.ndarray) -> np.ndarray:
@@ -376,6 +675,14 @@ class SingleHandQ6Reader:
             "(for ttyACM USB CDC devices, baudrate may be only nominal)"
         )
         self.ser = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=self.timeout)
+        reset = getattr(self.ser, "reset_input_buffer", None)
+        if callable(reset):
+            reset()
+        self._line_reader = BufferedSerialLineReader(
+            self.ser,
+            show_raw_lines=self.show_raw_lines,
+            raw_prefix=f"[RAW:{self.side}] ",
+        )
         self.calib = (
             None
             if self.raw_only
@@ -389,26 +696,27 @@ class SingleHandQ6Reader:
                 calibration_path=self.calibration_path,
             )
             if self.exo_hand_calibration
-            else load_exo_hand_calibration(self.side, self.calibration_path)
-        )
-
-    def read_frame(self) -> Dict[str, object]:
-        while True:
-            line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-            if self.show_raw_lines and line:
-                print(f"[RAW:{self.side}] {line}")
-
-            angles = parse_angles_line(line)
-            if angles is None:
-                continue
-
-            return build_hand_packet(
-                angles_deg=angles,
+            else _load_or_auto_calibrate_exo_hand(
+                ser=self.ser,
                 side=self.side,
                 port=self.port,
                 baudrate=self.baudrate,
-                calib=self.calib,
+                show_raw_lines=self.show_raw_lines,
+                calibration_path=self.calibration_path,
             )
+        )
+
+    def read_frame(self) -> Dict[str, object]:
+        angles = self._line_reader.read_latest_parsed(parse_angles_line)
+        packet = build_hand_packet(
+            angles_deg=angles,
+            side=self.side,
+            port=self.port,
+            baudrate=self.baudrate,
+            calib=self.calib,
+        )
+        packet["serial_read_stats"] = dict(self._line_reader.last_read_stats)
+        return packet
 
     def get_norm_values(self) -> np.ndarray:
         packet = self.read_frame()

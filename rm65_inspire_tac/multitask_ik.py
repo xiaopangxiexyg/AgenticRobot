@@ -346,15 +346,20 @@ class MultiTaskIKSolver:
                     target_setup_total += time.perf_counter() - task_start
 
         qp_start = time.perf_counter() if self.debug_profile else 0.0
-        velocity = self.solve_ik_fn(
-            self.configuration,
-            self.tasks,
-            self.dt,
-            solver=self.solver,
-            barriers=getattr(self, "barriers", None),
-            damping=0.01,
-            safety_break=False,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Converted matrix '.*' of your problem to scipy\.sparse\.csc_matrix.*",
+            )
+            velocity = self.solve_ik_fn(
+                self.configuration,
+                self.tasks,
+                self.dt,
+                solver=self.solver,
+                barriers=getattr(self, "barriers", None),
+                damping=0.01,
+                safety_break=False,
+            )
         qp_elapsed = time.perf_counter() - qp_start if self.debug_profile else 0.0
         integrate_start = time.perf_counter() if self.debug_profile else 0.0
         self.configuration.integrate_inplace(velocity, self.dt)

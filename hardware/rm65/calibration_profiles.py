@@ -12,6 +12,7 @@ RM65_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = RM65_DIR / "utils" / "configs" / "calibrations"
 ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 HAND_BASE_TCP_POSE_FLANGE_M_RAD = [0.0, 0.0, 0.009, 0.0, 0.0, 0.0]
+POSITION_ENDPOINT_PROFILE_NAME = "position_endpoint"
 DEFAULT_MAX_TCP_COM_DISTANCE_M = 0.20
 DEFAULT_TCP_SAFETY_MAX_ENDPOINT_DISTANCE_M = 0.20
 DEFAULT_TCP_SAFETY_MAX_ROTATION_DEG = 90.0
@@ -147,6 +148,64 @@ def arm_endpoint_tcp() -> dict[str, Any]:
         "confirmed": False,
         "updated_at": now,
     }
+
+
+def position_endpoint_tcp() -> dict[str, Any]:
+    tcp = arm_endpoint_tcp()
+    tcp.update(
+        {
+            "position_source": "position_endpoint_profile",
+            "confirmed": True,
+            "notes": "Position-control compatibility TCP at the RM65 mechanical endpoint.",
+        }
+    )
+    return tcp
+
+
+def make_position_endpoint_profile(*, arm: str) -> dict[str, Any]:
+    if arm not in ("left", "right"):
+        raise ValueError("arm must be left or right")
+    now = time.time()
+    return {
+        "schema_version": 1,
+        "data_type": "rm65_calibration_profile",
+        "name": POSITION_ENDPOINT_PROFILE_NAME,
+        "arm": arm,
+        "tool_name": POSITION_ENDPOINT_PROFILE_NAME,
+        "created_at": now,
+        "updated_at": now,
+        "notes": (
+            "Position-control compatibility profile. It intentionally uses the "
+            "mechanical arm endpoint as tool_tcp and carries no payload or "
+            "impedance settings."
+        ),
+        "paths": {},
+        "control_interface": {
+            "mode": "position",
+            "controlled_frame": "arm_endpoint",
+            "uses_force_control": False,
+            "uses_payload_compensation": False,
+            "position_endpoint_profile": True,
+        },
+        "payload": {},
+        "tcp": position_endpoint_tcp(),
+        "impedance": {},
+    }
+
+
+def is_position_endpoint_profile(profile: dict[str, Any] | Any) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    control = profile.get("control_interface") if isinstance(profile.get("control_interface"), dict) else {}
+    return bool(
+        profile.get("name") == POSITION_ENDPOINT_PROFILE_NAME
+        or control.get("position_endpoint_profile") is True
+        or (
+            control.get("mode") == "position"
+            and control.get("controlled_frame") == "arm_endpoint"
+            and control.get("uses_force_control") is False
+        )
+    )
 
 
 def make_payload(

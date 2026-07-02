@@ -18,7 +18,7 @@ class TactileDenoiseConfig:
     mode: str = "delta"
     baseline_frames: int = 20
     deadband_abs: float = 5e-5
-    temporal_alpha: float = 0.35
+    temporal_alpha: float = 0.85
     spatial_blur_ksize: int = 5
 
 

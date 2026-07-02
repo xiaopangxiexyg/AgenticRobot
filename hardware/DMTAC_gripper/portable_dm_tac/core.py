@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import ctypes.util
+import logging
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -38,6 +42,68 @@ DATA_SPECS: Tuple[DataSpec, ...] = (
 
 
 _LIBUDEV_PATCHED = False
+_THREAD_EXCEPTHOOK_LOCK = threading.Lock()
+_THREAD_EXCEPTHOOK_INSTALLED = False
+_THREAD_EXCEPTHOOK_PREVIOUS = None
+_SDK_SHUTDOWN_SUPPRESS_UNTIL = 0.0
+_SDK_SHUTDOWN_SUPPRESS_SECONDS = 2.0
+_SDK_DISCONNECT_SETTLE_S = 0.15
+
+
+def _suppress_dmrobotics_shutdown_thread_errors_for(seconds: float = _SDK_SHUTDOWN_SUPPRESS_SECONDS) -> None:
+    global _SDK_SHUTDOWN_SUPPRESS_UNTIL
+    with _THREAD_EXCEPTHOOK_LOCK:
+        _SDK_SHUTDOWN_SUPPRESS_UNTIL = max(
+            _SDK_SHUTDOWN_SUPPRESS_UNTIL,
+            time.monotonic() + max(0.0, float(seconds)),
+        )
+
+
+def _traceback_mentions_dmrobotics_update_image(tb: Any) -> bool:
+    while tb is not None:
+        frame = tb.tb_frame
+        module_name = str(frame.f_globals.get("__name__", ""))
+        filename = str(frame.f_code.co_filename)
+        function_name = str(frame.f_code.co_name)
+        if (
+            "dmrobotics.src.dmSDK" in module_name
+            or "dmrobotics.src.dmSDK" in filename
+        ) and "update_image" in function_name:
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def _should_suppress_dmrobotics_thread_error(args: threading.ExceptHookArgs) -> bool:
+    with _THREAD_EXCEPTHOOK_LOCK:
+        in_shutdown_window = time.monotonic() <= _SDK_SHUTDOWN_SUPPRESS_UNTIL
+    if not in_shutdown_window:
+        return False
+    exc_text = f"{getattr(args, 'exc_type', '')}: {getattr(args, 'exc_value', '')}"
+    if "cvarrToMat" not in exc_text or "Unknown array type" not in exc_text:
+        return False
+    return _traceback_mentions_dmrobotics_update_image(args.exc_traceback)
+
+
+def _dmrobotics_thread_excepthook(args: threading.ExceptHookArgs) -> None:
+    if _should_suppress_dmrobotics_thread_error(args):
+        logging.getLogger(__name__).debug(
+            "Suppressed DM-Tac SDK image-thread shutdown exception",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+        return
+    previous = _THREAD_EXCEPTHOOK_PREVIOUS or threading.__excepthook__
+    previous(args)
+
+
+def _install_dmrobotics_thread_excepthook() -> None:
+    global _THREAD_EXCEPTHOOK_INSTALLED, _THREAD_EXCEPTHOOK_PREVIOUS
+    with _THREAD_EXCEPTHOOK_LOCK:
+        if _THREAD_EXCEPTHOOK_INSTALLED:
+            return
+        _THREAD_EXCEPTHOOK_PREVIOUS = threading.excepthook
+        threading.excepthook = _dmrobotics_thread_excepthook
+        _THREAD_EXCEPTHOOK_INSTALLED = True
 
 
 def add_local_sdk_path() -> bool:
@@ -71,6 +137,7 @@ def patch_libudev_for_conda(system_libudev: str = "/lib/x86_64-linux-gnu/libudev
 
 
 def _import_dmrobotics():
+    _install_dmrobotics_thread_excepthook()
     patch_libudev_for_conda()
     try:
         import dmrobotics  # type: ignore
@@ -116,6 +183,49 @@ def discover_devices() -> List[Any]:
     if isinstance(devices, list):
         return devices
     return list(devices)
+
+
+def discover_device_candidates() -> List[Dict[str, Any]]:
+    """Return N160MU2 video nodes seen by udev, including unusable nodes."""
+    if sys.platform.startswith("linux"):
+        try:
+            import pyudev  # type: ignore
+        except ImportError:
+            return [{"error": "pyudev is not installed"}]
+        out: List[Dict[str, Any]] = []
+        ctx = pyudev.Context()
+        for dev in ctx.list_devices(subsystem="video4linux"):
+            node = dev.device_node or ""
+            if not node.startswith("/dev/video"):
+                continue
+            model = dev.get("ID_MODEL") or ""
+            product = dev.get("ID_V4L_PRODUCT") or ""
+            text = f"{model} {product}".upper()
+            if "N160MU2" not in text and "GENERIC_N160MU2" not in text:
+                continue
+            serial = dev.get("ID_SERIAL_SHORT") or dev.get("ID_SERIAL") or ""
+            exists = os.path.exists(node)
+            readable = os.access(node, os.R_OK) if exists else False
+            writable = os.access(node, os.W_OK) if exists else False
+            reason = "ok"
+            if not exists:
+                reason = "missing_device_node"
+            elif not readable:
+                reason = "not_readable"
+            out.append(
+                {
+                    "device_node": node,
+                    "serial": serial,
+                    "model": model,
+                    "product": product,
+                    "exists": exists,
+                    "readable": readable,
+                    "writable": writable,
+                    "reason": reason,
+                }
+            )
+        return out
+    return []
 
 
 def discover_device_ids(prefer_serial: bool = True) -> List[DeviceId]:
@@ -223,6 +333,7 @@ class TacFrame:
     last_event_seq: Optional[int] = None
     fids: Dict[str, int] = field(default_factory=dict)
     errors: Dict[str, str] = field(default_factory=dict)
+    timings_ms: Dict[str, float] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -250,6 +361,8 @@ class TacFrame:
         }
         if self.errors:
             out["errors"] = dict(self.errors)
+        if self.timings_ms:
+            out["timings_ms"] = dict(self.timings_ms)
         return out
 
 
@@ -308,21 +421,29 @@ class DMTacDevice:
         self.config = config
         self.sensor: Any = None
         self._last_fid = -1
+        self._io_lock = threading.RLock()
 
     @property
     def dev_id(self) -> DeviceId:
         return self.config.dev_id
 
     def connect(self) -> "DMTacDevice":
-        dmrobotics = _import_dmrobotics()
-        self.sensor = dmrobotics.Sensor(self.config.to_sensor_options())
+        with self._io_lock:
+            dmrobotics = _import_dmrobotics()
+            self.sensor = dmrobotics.Sensor(self.config.to_sensor_options())
         return self
 
     def close(self) -> None:
-        if self.sensor is not None:
-            self.sensor.disconnect()
-            time.sleep(0.05)
+        with self._io_lock:
+            sensor = self.sensor
+            if sensor is None:
+                return
             self.sensor = None
+            _suppress_dmrobotics_shutdown_thread_errors_for()
+            try:
+                sensor.disconnect()
+            finally:
+                time.sleep(_SDK_DISCONNECT_SETTLE_S)
 
     def __enter__(self) -> "DMTacDevice":
         return self.connect()
@@ -335,8 +456,9 @@ class DMTacDevice:
             self.connect()
 
     def status(self) -> int:
-        self.ensure_connected()
-        return int(self.sensor.getDevStatus())
+        with self._io_lock:
+            self.ensure_connected()
+            return int(self.sensor.getDevStatus())
 
     def wait_until_ready(self, timeout_s: float = 10.0, poll_s: float = 0.02) -> bool:
         deadline = time.time() + timeout_s
@@ -347,14 +469,16 @@ class DMTacDevice:
         return self.status() == 0
 
     def reset(self) -> None:
-        self.ensure_connected()
-        self.sensor.reset()
-        self._last_fid = -1
+        with self._io_lock:
+            self.ensure_connected()
+            self.sensor.reset()
+            self._last_fid = -1
 
     def set_max_fps(self, max_fps: int) -> Any:
-        self.ensure_connected()
-        self.config.max_fps = int(max_fps)
-        return self.sensor.setMaxFPS(int(max_fps))
+        with self._io_lock:
+            self.ensure_connected()
+            self.config.max_fps = int(max_fps)
+            return self.sensor.setMaxFPS(int(max_fps))
 
     def read(
         self,
@@ -369,43 +493,51 @@ class DMTacDevice:
         timeout_ms. Set strict=True to raise getter errors instead of storing
         them in TacFrame.errors.
         """
-        self.ensure_connected()
-        status = int(self.sensor.getDevStatus())
-        if require_ready and status != 0:
-            return None
-
-        if wait and status == 0:
-            if not self.sensor.wait_for_new(self._last_fid, timeout_ms=timeout_ms):
+        with self._io_lock:
+            self.ensure_connected()
+            status_start = time.perf_counter()
+            status = int(self.sensor.getDevStatus())
+            timings_ms = {"getDevStatus": (time.perf_counter() - status_start) * 1000.0}
+            if require_ready and status != 0:
                 return None
 
-        frame = TacFrame(device_id=self.dev_id, timestamp_ns=time.time_ns(), status=status)
+            if wait and status == 0:
+                wait_start = time.perf_counter()
+                ok = self.sensor.wait_for_new(self._last_fid, timeout_ms=timeout_ms)
+                timings_ms["wait_for_new"] = (time.perf_counter() - wait_start) * 1000.0
+                if not ok:
+                    return None
 
-        self._read_fid_getter(frame, "raw", "raw", self.sensor.getRawImg, self.config.should_read_raw(), strict)
-        self._read_fid_getter(frame, "infer", "infer", self.sensor.getInferImg, self.config.include_infer, strict)
-        self._read_fid_getter(frame, "deformation2d", "deformation2d", self.sensor.getDeformation2D, self.config.should_read_deformation(), strict)
-        self._read_fid_getter(frame, "shear", "shear", self.sensor.getShear, self.config.should_read_shear(), strict)
-        self._read_fid_getter(frame, "depth", "depth", self.sensor.getDepth, self.config.should_read_depth(), strict)
-        self._read_fid_getter(frame, "force", "force", self.sensor.getForce, self.config.should_read_force(), strict, to_array=True)
-        self._read_fid_getter(
-            frame,
-            "distributed_force",
-            "distributed_force",
-            self.sensor.getDistributeForce,
-            self.config.include_distributed_force,
-            strict,
-        )
+            frame = TacFrame(device_id=self.dev_id, timestamp_ns=time.time_ns(), status=status)
+            frame.timings_ms.update(timings_ms)
 
-        if self.config.include_contact_area:
-            self._read_plain(frame, "contact_area", self.sensor.getContactArea, strict, cast_float=True)
-        if self.config.include_base_frame:
-            self._read_plain(frame, "base_frame", self.sensor.getBaseFrame, strict)
-        if self.config.include_events:
-            self._read_events(frame, strict)
+            self._read_fid_getter(frame, "raw", "raw", self.sensor.getRawImg, self.config.should_read_raw(), strict)
+            self._read_fid_getter(frame, "infer", "infer", self.sensor.getInferImg, self.config.include_infer, strict)
+            self._read_fid_getter(frame, "deformation2d", "deformation2d", self.sensor.getDeformation2D, self.config.should_read_deformation(), strict)
+            self._read_fid_getter(frame, "shear", "shear", self.sensor.getShear, self.config.should_read_shear(), strict)
+            self._read_fid_getter(frame, "depth", "depth", self.sensor.getDepth, self.config.should_read_depth(), strict)
+            self._read_fid_getter(frame, "force", "force", self.sensor.getForce, self.config.should_read_force(), strict, to_array=True)
+            self._read_fid_getter(
+                frame,
+                "distributed_force",
+                "distributed_force",
+                self.sensor.getDistributeForce,
+                self.config.include_distributed_force,
+                strict,
+                to_array=True,
+            )
 
-        frame.fid = self._choose_frame_fid(frame.fids)
-        if frame.fid is not None:
-            self._last_fid = frame.fid
-        return frame
+            if self.config.include_contact_area:
+                self._read_plain(frame, "contact_area", self.sensor.getContactArea, strict, cast_float=True)
+            if self.config.include_base_frame:
+                self._read_plain(frame, "base_frame", self.sensor.getBaseFrame, strict)
+            if self.config.include_events:
+                self._read_events(frame, strict)
+
+            frame.fid = self._choose_frame_fid(frame.fids)
+            if frame.fid is not None:
+                self._last_fid = frame.fid
+            return frame
 
     def _read_fid_getter(
         self,
@@ -419,6 +551,7 @@ class DMTacDevice:
     ) -> None:
         if not enabled:
             return
+        start = time.perf_counter()
         try:
             fid, data = _normalize_fid_data(fid_key, getter())
             if to_array and data is not None:
@@ -429,8 +562,11 @@ class DMTacDevice:
             if strict:
                 raise
             frame.errors[fid_key] = repr(exc)
+        finally:
+            frame.timings_ms[attr] = (time.perf_counter() - start) * 1000.0
 
     def _read_plain(self, frame: TacFrame, attr: str, getter, strict: bool, cast_float: bool = False) -> None:
+        start = time.perf_counter()
         try:
             value = getter()
             if cast_float and value is not None:
@@ -440,8 +576,11 @@ class DMTacDevice:
             if strict:
                 raise
             frame.errors[attr] = repr(exc)
+        finally:
+            frame.timings_ms[attr] = (time.perf_counter() - start) * 1000.0
 
     def _read_events(self, frame: TacFrame, strict: bool) -> None:
+        start = time.perf_counter()
         try:
             events, last_seq = self.sensor.getEvents()
             frame.events = list(events) if events is not None else []
@@ -450,6 +589,8 @@ class DMTacDevice:
             if strict:
                 raise
             frame.errors["events"] = repr(exc)
+        finally:
+            frame.timings_ms["events"] = (time.perf_counter() - start) * 1000.0
 
     @staticmethod
     def _choose_frame_fid(fids: Mapping[str, int]) -> Optional[int]:
@@ -460,25 +601,32 @@ class DMTacDevice:
 
 
 class DMTacMultiDevice:
-    """Sequential multi-device wrapper. Supports two or more devices."""
+    """Multi-device wrapper. Supports sequential or parallel reads."""
 
     def __init__(self, configs: Sequence[DeviceConfig]):
         if not configs:
             raise ValueError("configs must contain at least one DeviceConfig")
         self.devices = [DMTacDevice(config) for config in configs]
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._io_lock = threading.RLock()
 
     @classmethod
     def from_device_ids(cls, device_ids: Sequence[DeviceId], **config_kwargs: Any) -> "DMTacMultiDevice":
         return cls([DeviceConfig(dev_id=dev_id, **config_kwargs) for dev_id in device_ids])
 
     def connect(self) -> "DMTacMultiDevice":
-        for device in self.devices:
-            device.connect()
+        with self._io_lock:
+            for device in self.devices:
+                device.connect()
         return self
 
     def close(self) -> None:
-        for device in reversed(self.devices):
-            device.close()
+        with self._io_lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+                self._executor = None
+            for device in reversed(self.devices):
+                device.close()
 
     def __enter__(self) -> "DMTacMultiDevice":
         return self.connect()
@@ -495,20 +643,59 @@ class DMTacMultiDevice:
         wait: bool = True,
         require_ready: bool = True,
         strict: bool = False,
+        parallel: bool = False,
     ) -> Dict[DeviceId, Optional[TacFrame]]:
-        return {
-            device.dev_id: device.read(
+        with self._io_lock:
+            if bool(parallel) and len(self.devices) > 1:
+                return self._read_all_parallel(
+                    timeout_ms=timeout_ms,
+                    wait=wait,
+                    require_ready=require_ready,
+                    strict=strict,
+                )
+            return {
+                device.dev_id: device.read(
+                    timeout_ms=timeout_ms,
+                    wait=wait,
+                    require_ready=require_ready,
+                    strict=strict,
+                )
+                for device in self.devices
+            }
+
+    def _read_all_parallel(
+        self,
+        *,
+        timeout_ms: int,
+        wait: bool,
+        require_ready: bool,
+        strict: bool,
+    ) -> Dict[DeviceId, Optional[TacFrame]]:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=max(1, len(self.devices)),
+                thread_name_prefix="dmtac_read",
+            )
+        futures = {
+            self._executor.submit(
+                device.read,
                 timeout_ms=timeout_ms,
                 wait=wait,
                 require_ready=require_ready,
                 strict=strict,
-            )
+            ): device.dev_id
             for device in self.devices
         }
+        results: Dict[DeviceId, Optional[TacFrame]] = {}
+        for future in as_completed(futures):
+            dev_id = futures[future]
+            results[dev_id] = future.result()
+        return {device.dev_id: results.get(device.dev_id) for device in self.devices}
 
     def reset_all(self) -> None:
-        for device in self.devices:
-            device.reset()
+        with self._io_lock:
+            for device in self.devices:
+                device.reset()
 
 
 def format_frame_summary(frame: Optional[TacFrame]) -> str:

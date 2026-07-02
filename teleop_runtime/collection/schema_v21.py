@@ -177,6 +177,8 @@ def collector_sample_to_row(
     sample: CollectorSample,
     *,
     camera_video_paths: Mapping[str, str] | None = None,
+    tactile_storage_refs: Mapping[str, Mapping[str, Any]] | None = None,
+    inline_tactile: bool = True,
 ) -> tuple[dict[str, Any], dict[str, bool]]:
     action_split = _split_action(sample.action)
     observation_split = _split_observation_state(sample.observation_state)
@@ -246,6 +248,12 @@ def collector_sample_to_row(
     for side in ("left", "right"):
         arm_state = sample.arm_states.get(side) or {}
         hand_state = sample.hand_states.get(side) or {}
+        raw_tactile_ref = (
+            tactile_storage_refs.get(side)
+            if tactile_storage_refs is not None
+            else None
+        )
+        tactile_ref = dict(raw_tactile_ref) if isinstance(raw_tactile_ref, Mapping) else {}
         arm_command = _command_from_state(arm_state)
         hand_command = _command_from_state(hand_state)
         arm_command_metadata = command_metadata_by_effector.get(f"{side}_arm", {})
@@ -302,17 +310,136 @@ def collector_sample_to_row(
             hand_state.get("joint_pos"),
             length=6,
         )
+        row[f"observation.hand.{side}.measured_joint_pos"] = _vector_list(
+            hand_state.get("measured_joint_pos"),
+            length=6,
+        )
+        row[f"observation.hand.{side}.commanded_joint_pos"] = _vector_list(
+            hand_state.get("commanded_joint_pos"),
+            length=6,
+        )
         row[f"observation.hand.{side}.joint_timestamp"] = hand_state.get("joint_timestamp")
-        row[f"observation.hand.{side}.tactile"] = _vector_list(hand_state.get("tactile"))
+        row[f"observation.hand.{side}.tactile"] = (
+            _vector_list(hand_state.get("tactile")) if inline_tactile else None
+        )
         row[f"observation.hand.{side}.tactile_timestamp"] = hand_state.get("tactile_timestamp")
         row[f"observation.hand.{side}.telemetry_timestamp"] = hand_state.get("telemetry_timestamp")
+        row[f"observation.hand.{side}.gripper_read_elapsed_s"] = hand_state.get(
+            "gripper_read_elapsed_s"
+        )
+        row[f"observation.hand.{side}.tactile_read_elapsed_s"] = hand_state.get(
+            "tactile_read_elapsed_s"
+        )
+        row[f"observation.hand.{side}.tactile_gate_wait_s"] = hand_state.get(
+            "tactile_gate_wait_s"
+        )
+        row[f"observation.hand.{side}.telemetry_elapsed_s"] = hand_state.get(
+            "telemetry_elapsed_s"
+        )
+        row[f"observation.hand.{side}.tactile_timings_ms_json"] = json.dumps(
+            _to_serializable(hand_state.get("tactile_timings_ms", {})),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        row[f"observation.hand.{side}.tactile_wait_for_new"] = hand_state.get(
+            "tactile_wait_for_new"
+        )
+        row[f"observation.hand.{side}.tactile_read_hz"] = hand_state.get(
+            "tactile_read_hz"
+        )
+        row[f"observation.hand.{side}.tactile_read_skipped"] = hand_state.get(
+            "tactile_read_skipped"
+        )
+        row[f"observation.hand.{side}.tactile_process_read"] = hand_state.get(
+            "tactile_process_read"
+        )
+        row[f"observation.hand.{side}.tactile_process_nice"] = hand_state.get(
+            "tactile_process_nice"
+        )
+        row[f"observation.hand.{side}.tactile_process_cpu_affinity"] = hand_state.get(
+            "tactile_process_cpu_affinity"
+        )
+        row[f"observation.hand.{side}.tactile_process_queue_size"] = hand_state.get(
+            "tactile_process_queue_size"
+        )
+        row[f"observation.hand.{side}.tactile_worker_alive"] = hand_state.get(
+            "tactile_worker_alive"
+        )
+        row[f"observation.hand.{side}.tactile_worker_receiver_alive"] = hand_state.get(
+            "tactile_worker_receiver_alive"
+        )
+        row[f"observation.hand.{side}.tactile_parallel_read"] = hand_state.get(
+            "tactile_parallel_read"
+        )
+        row[f"observation.hand.{side}.tactile_global_read_lock"] = hand_state.get(
+            "tactile_global_read_lock"
+        )
+        row[f"observation.hand.{side}.tactile_compute_profile"] = hand_state.get(
+            "tactile_compute_profile"
+        )
+        row[f"observation.hand.{side}.tactile_max_fps"] = hand_state.get(
+            "tactile_max_fps"
+        )
+        row[f"observation.hand.{side}.tactile_denoise"] = hand_state.get(
+            "tactile_denoise"
+        )
+        row[f"observation.hand.{side}.tactile_store_flat_vector"] = hand_state.get(
+            "tactile_store_flat_vector"
+        )
         row[f"observation.hand.{side}.tactile_regions"] = list(
             hand_state.get("tactile_regions", ())
+        )
+        row[f"observation.hand.{side}.tactile_storage_format"] = tactile_ref.get(
+            "format",
+            "parquet_inline" if inline_tactile and hand_state.get("tactile") is not None else None,
+        )
+        row[f"observation.hand.{side}.tactile_path"] = tactile_ref.get("path")
+        row[f"observation.hand.{side}.tactile_frame_index"] = tactile_ref.get("frame_index")
+        row[f"observation.hand.{side}.tactile_sensor_keys"] = list(
+            tactile_ref.get(
+                "sensor_keys",
+                hand_state.get("tactile_devices", hand_state.get("tactile_regions", ())),
+            )
+            or ()
+        )
+        row[f"observation.hand.{side}.tactile_frame_ids_json"] = json.dumps(
+            _to_serializable(hand_state.get("tactile_frame_ids", {})),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        row[f"observation.hand.{side}.tactile_shapes_json"] = json.dumps(
+            _to_serializable(hand_state.get("tactile_shapes", {})),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        row[f"observation.hand.{side}.tactile_version"] = hand_state.get("tactile_version")
+        row[f"observation.hand.{side}.tactile_raw_shape_per_sensor"] = (
+            list(hand_state.get("tactile_raw_shape_per_sensor"))
+            if hand_state.get("tactile_raw_shape_per_sensor") is not None
+            else None
         )
         row[f"action.replay.{side}_hand_joint_target"] = _vector_list(
             hand_state.get("last_sent_command"),
             length=6,
         )
+        row[f"observation.gripper.{side}.state"] = hand_state.get("gripper_state_scalar")
+        row[f"observation.gripper.{side}.measured"] = hand_state.get("gripper_measured_scalar")
+        row[f"observation.gripper.{side}.commanded"] = hand_state.get("gripper_commanded_scalar")
+        target_from_action = action_split[f"{side}_hand"]
+        output_dim = hand_command_metadata.get("output_dim")
+        try:
+            output_index = int(output_dim)
+        except (TypeError, ValueError):
+            output_index = 1
+        row[f"action.gripper.{side}.target"] = (
+            None
+            if target_from_action is None or not 0 <= output_index < len(target_from_action)
+            else float(target_from_action[output_index])
+        )
+        row[f"action.gripper.{side}.source_value"] = hand_command_metadata.get("source_value")
+        row[f"action.gripper.{side}.source_dim"] = hand_command_metadata.get("source_dim")
+        row[f"action.gripper.{side}.output_dim"] = hand_command_metadata.get("output_dim")
+        row[f"action.gripper.{side}.invert"] = hand_command_metadata.get("invert")
         row[f"teleop.action_source.{side}_hand_q6"] = _command_vector_metadata(
             hand_command,
             "source_q6",
@@ -326,6 +453,9 @@ def collector_sample_to_row(
         )
         row[f"teleop.channels.{channel_name}.receiver_timestamp"] = channel.metadata.get(
             "receiver_timestamp"
+        )
+        row[f"teleop.channels.{channel_name}.sender_read_elapsed_ms"] = channel.metadata.get(
+            "sender_read_elapsed_ms"
         )
         row[f"teleop.channels.{channel_name}.valid"] = bool(channel.valid)
 

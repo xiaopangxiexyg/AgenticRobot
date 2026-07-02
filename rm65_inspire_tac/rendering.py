@@ -85,12 +85,16 @@ class SapienArmHandRenderer:
 
         loader = self.scene.create_urdf_loader()
         loader.fix_root_link = True
+        self._urdf_loader = loader
+        self._arm_joint_names = tuple(arm_joint_names)
+        self._left_right_base_distance = float(left_right_base_distance)
         self._debug_frame_axis_length = float(debug_frame_axis_length)
         self._debug_frame_axis_thickness = float(debug_frame_axis_thickness)
         self._debug_frame_actors: dict[str, Any] = {}
         self._debug_box_actors: dict[str, Any] = {}
         self._debug_box_templates: dict[str, DebugBoxTemplate] = {}
         self._hidden_pose = None
+        self._viewer_close_reported = False
 
         if show_desk_plane:
             desk_builder = self.scene.create_actor_builder()
@@ -152,6 +156,44 @@ class SapienArmHandRenderer:
             )
         )
         self._hidden_pose = self.sapien.Pose(p=[1000.0, 1000.0, 1000.0])
+
+    def _disable_viewer(self, reason: str) -> None:
+        viewer = self.viewer
+        if viewer is None:
+            return
+        close = getattr(viewer, "close", None)
+        try:
+            if callable(close) and not bool(getattr(viewer, "closed", False)):
+                close()
+        except Exception:
+            pass
+        self.viewer = None
+        if not getattr(self, "_viewer_close_reported", False):
+            print(f"SAPIEN viewer disabled ({reason}); continuing without the 3D viewer.")
+            self._viewer_close_reported = True
+
+    def _render_viewer(self) -> None:
+        viewer = self.viewer
+        if viewer is None:
+            return
+        if bool(getattr(viewer, "closed", False)) or getattr(viewer, "window", None) is None:
+            self._disable_viewer("window closed")
+            return
+        try:
+            if bool(getattr(viewer.window, "should_close", False)):
+                self._disable_viewer("window close requested")
+                return
+            viewer.render()
+        except AttributeError as exc:
+            if getattr(viewer, "window", None) is None or "should_close" in str(exc):
+                self._disable_viewer("window closed")
+                return
+            raise
+        except RuntimeError:
+            if getattr(viewer, "window", None) is None:
+                self._disable_viewer("window closed")
+                return
+            raise
 
     def _matrix_to_pose(self, pose_matrix: np.ndarray):
         pose_matrix = np.asarray(pose_matrix, dtype=float).reshape(4, 4)
@@ -307,6 +349,41 @@ class SapienArmHandRenderer:
         )
         return robot, index_map
 
+    def ensure_arm_loaded(
+        self,
+        *,
+        side: str,
+        urdf_path: str | Path,
+        retargeting_joint_names: Sequence[str] | None,
+    ) -> bool:
+        if retargeting_joint_names is None:
+            return False
+        if side == "left":
+            if self.left_robot is not None:
+                return False
+            self.left_robot, self.left_retargeting_to_sapien = self._load_robot(
+                loader=self._urdf_loader,
+                urdf_path=str(urdf_path),
+                base_position=[0.0, rm65_base_y_for_side("left", self._left_right_base_distance), 0.0],
+                base_euler=[0.0, 0.0, rm65_base_yaw_for_side("left")],
+                arm_joint_names=self._arm_joint_names,
+                hand_joint_names=retargeting_joint_names,
+            )
+            return True
+        if side == "right":
+            if self.right_robot is not None:
+                return False
+            self.right_robot, self.right_retargeting_to_sapien = self._load_robot(
+                loader=self._urdf_loader,
+                urdf_path=str(urdf_path),
+                base_position=[0.0, rm65_base_y_for_side("right", self._left_right_base_distance), 0.0],
+                base_euler=[0.0, 0.0, rm65_base_yaw_for_side("right")],
+                arm_joint_names=self._arm_joint_names,
+                hand_joint_names=retargeting_joint_names,
+            )
+            return True
+        raise ValueError(f"Unsupported arm side: {side}")
+
     def render_data(
         self,
         left_qpos_arm: np.ndarray | None,
@@ -324,8 +401,7 @@ class SapienArmHandRenderer:
             self.right_robot.set_qpos(qpos[self.right_retargeting_to_sapien])
 
         self.scene.update_render()
-        if self.viewer is not None:
-            self.viewer.render()
+        self._render_viewer()
         if not capture_image:
             return None
         self.camera.take_picture()

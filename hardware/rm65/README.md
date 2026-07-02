@@ -276,7 +276,7 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
+  --duration-sec 40 \
   --linear-compliance-m-per-n 0.004 \
   --angular-axis-signs 1,1,-1 \
   --angular-compliance-rad-per-nm 0.04 \
@@ -298,7 +298,7 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
+  --duration-sec 40 \
   --linear-compliance-m-per-n 0.004 \
   --angular-axis-signs 1,1,-1 \
   --angular-compliance-rad-per-nm 0.04 \
@@ -320,7 +320,7 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
+  --duration-sec 40 \
   --linear-compliance-m-per-n 0.004 \
   --angular-axis-signs 1,1,-1 \
   --angular-compliance-rad-per-nm 0.04 \
@@ -342,7 +342,7 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
+  --duration-sec 40 \
   --linear-compliance-m-per-n 0.004 \
   --angular-axis-signs 1,1,-1 \
   --angular-compliance-rad-per-nm 0.04 \

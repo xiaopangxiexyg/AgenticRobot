@@ -344,6 +344,10 @@ class EpisodeRecorder:
     def is_recording(self) -> bool:
         return self._episode_dir is not None
 
+    @property
+    def frame_count(self) -> int:
+        return int(self._frame_count)
+
     def _ensure_root_dir(self) -> Path:
         if self.root_dir is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")

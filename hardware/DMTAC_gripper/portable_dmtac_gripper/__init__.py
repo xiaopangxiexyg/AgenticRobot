@@ -9,6 +9,7 @@ from portable_dm_tac import (
     DMTacMultiDevice,
     DeviceConfig,
     TacFrame,
+    discover_device_candidates,
     discover_device_ids,
     discover_devices,
     format_frame_summary,
@@ -16,12 +17,14 @@ from portable_dm_tac import (
 
 from .device import (
     DEFAULT_TACTILE_FIELDS,
+    TACTILE_COMPUTE_PROFILES,
     TACTILE_FIELDS,
     DMTacGripperDevice,
     DeviceSnapshot,
     GripperConfig,
     TactileConfig,
     format_snapshot_summary,
+    normalize_tactile_compute_profile,
     normalize_tactile_fields,
 )
 from .force_visualizer import DistributedForceXYVisualizer, ForceVizConfig
@@ -36,6 +39,7 @@ from .tactile_filter import DistributedForceDenoiser, TactileDenoiseConfig
 
 __all__ = [
     "DEFAULT_TACTILE_FIELDS",
+    "TACTILE_COMPUTE_PROFILES",
     "TACTILE_FIELDS",
     "DMTacDevice",
     "DMTacGripperDevice",
@@ -53,10 +57,12 @@ __all__ = [
     "TacFrame",
     "TactileConfig",
     "TactileDenoiseConfig",
+    "discover_device_candidates",
     "discover_device_ids",
     "discover_devices",
     "format_frame_summary",
     "format_snapshot_summary",
     "list_serial_devices",
+    "normalize_tactile_compute_profile",
     "normalize_tactile_fields",
 ]

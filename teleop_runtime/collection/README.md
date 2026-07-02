@@ -103,6 +103,8 @@ python -m teleop_runtime.collection \
   --port 9999 \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20 \
+  --left-tool-profile position_endpoint \
+  --right-tool-profile position_endpoint \
   --left-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
   --right-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00 \
   --left-hand-ip 192.168.12.210 \
@@ -142,7 +144,7 @@ python -m teleop_runtime.collection \
   --right-hand-ip 192.168.11.210 \
   --no-camera \
   --no-video \
-  --hz 30 \
+  --hz 15 \
   --calibration-timeout 15 \
   --calibration-samples 20
 ```
@@ -511,6 +513,9 @@ collector 不为旧 state/action 维度做额外兼容语义。
   加载已有 `TeleopCalibration` JSON。加载后仍需按 `p` 做本次 session 的起始位置标定。
 - `--left-arm-ip --right-arm-ip`
   启用 side 对应的 RM65 IP 必填。
+- `--left-tool-profile --right-tool-profile`
+  可显式指定 RM65 tool profile。旧版位控兼容建议用 `position_endpoint`，它把
+  `tool_tcp` 固定在机械臂末端，不依赖 payload、重力补偿或 impedance 标定。
 - `--left-hand-port --right-hand-port`
   q6 serial 输入端口，可选。
 - `--left-hand-ip --right-hand-ip`
@@ -527,6 +532,16 @@ collector 不为旧 state/action 维度做额外兼容语义。
   禁止视频导出。当前如果同时保留相机但关闭视频，只会保留相机时间相关 metadata，不会保存图像内容。
 - `--no-parquet`
   禁止 parquet 导出，通常只在调 writer 行为时使用。
+- `--storage-queue-size`
+  每路相机写盘队列容量，默认 `64`。视频帧是非关键 job；队列满时丢最旧视频帧并在
+  episode summary 里记录 dropped/missing。传 `0` 可退回旧的直接提交 writer pool 行为。
+- `--tactile-storage parquet|external`
+  触觉保存方式。默认 `external` 会把高维触觉按每侧、每个 sensor 追加到二进制
+  stream，parquet 中只保留 `tactile_path`、`tactile_frame_index`、sensor keys 和
+  frame/shape metadata。需要旧行为时传 `--tactile-storage parquet`，把
+  `observation.hand.<side>.tactile` 作为向量写入 parquet。
+- `--external-tactile`
+  `--tactile-storage external` 的快捷写法。
 - `--calibration-timeout`
   runtime home capture 超时时间。
 - `--calibration-samples`
@@ -558,6 +573,13 @@ dataset_root/
     observation.images.front/
       chunk-000/
         episode_000000.mp4
+  tactile/
+    observation.hand.left.tactile/
+      chunk-000/
+        episode_000000/
+          manifest.json
+          L_IN.float32.bin
+          L_OUT.float32.bin
 ```
 
 说明：
@@ -569,6 +591,9 @@ dataset_root/
 - `meta/devices/realsense.json` 只在启用相机时写出。
 - `data/chunk-xxx/episode_xxxxxx.parquet` 是低维主表。
 - `videos/observation.images.<camera_key>/...` 是每路 RGB 的 mp4。
+- `tactile/observation.hand.<side>.tactile/...` 只在 `--tactile-storage external`
+  且该侧有触觉帧时写出。`manifest.json` 记录 sensor key、shape、dtype、frame
+  对齐关系；`.float32.bin` 是按 frame 顺序追加的原始 float32 数组。
 
 ## 10. SAPIEN 数据集回放
 

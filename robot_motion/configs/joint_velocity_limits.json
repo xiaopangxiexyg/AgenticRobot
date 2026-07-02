@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "rm65": {
+      "joint_names": ["J1", "J2", "J3", "J4", "J5", "J6"],
+      "max_velocity_deg_s": [85.0, 85.0, 95.0, 105.0, 120.0, 120.0],
+      "max_dt_sec": 1.0,
+      "metadata": {
+        "robot_family": "RM65",
+        "units": "deg/s",
+        "source": "Conservative shared command limit derived from existing RM65 teleop max_angvel defaults."
+      }
+    }
+  }
+}

@@ -15,6 +15,7 @@ active.
 ## Layout
 
 - `scripts/`: command-line utilities.
+- `init_arm/`: Vive teleoperation standard-pose recording and safe init motion.
 - `data/poses/`: recorded safe joint pose sequences.
 - `data/measurements/`: force measurements replayed at pose sequences.
 - `data/trajectories/`: read-only taught trajectories.
@@ -27,12 +28,29 @@ active.
   `joint_targets_deg`.
 - Force measurement dataset: `data_type="force_measurement_dataset"`, with one
   sampled force summary per pose.
+- Teleoperation standard pose: `data_type="rm65_standard_pose"`, with per-arm
+  Cartesian TCP pose only (`[x, y, z, rx, ry, rz]`) and no qpos target.
 - Calibration profile: `data_type="rm65_calibration_profile"`, binding one
   arm to one tool profile. It stores calibration paths, payload/CoM, the
   confirmed TCP, and tuned pose/joint impedance parameters. Left/right arms use
   separate profiles even when the tool name is the same.
 
 ## Main Commands
+
+### Vive Teleoperation Init Pose
+
+Record a standard bare-end pose in the controller `empty` frame and move one or
+both arms back to it slowly with pose position control before Vive tracker
+teleoperation. Details and safety knobs are in `init_arm/README.md`.
+
+```bash
+python hardware/rm65/utils/init_arm/rm65_record_standard_pose.py --arm both --overwrite
+python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py --arm both
+python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py \
+  --arm both \
+  --execute \
+  --confirm INIT_RM65_STANDARD_POSE
+```
 
 ### Record Four Calibration Poses
 
@@ -62,6 +80,9 @@ python hardware/rm65/utils/scripts/rm65_auto_record_force_poses.py \
 
 During execution, Ctrl-C/SIGTERM sends `Arm_Slow_Stop` before closing the
 socket. Use `--interrupt-stop-mode fast` only when a hard stop is required.
+This replay writes a force measurement dataset for the payload/CoM fit below.
+It is not required when you only need to rerun the official force-sensor
+calibration with an already-correct tool payload.
 
 Left execute:
 
@@ -90,20 +111,24 @@ python hardware/rm65/utils/scripts/rm65_replay_force_pose_records.py \
 
 ### Fit, Apply, And Validate Tool Payload
 
-`rm65_apply_tool_payload_from_fit.py` also updates the matching calibration
-profile. It stores payload mass/CoM and initializes a TCP candidate. The default
+This is the payload/CoM branch. It consumes the force measurement dataset from
+`rm65_replay_force_pose_records.py`; it does not move through the four poses
+again. `rm65_force_payload_calibrate.py` is an offline fit, and
+`rm65_apply_tool_payload_from_fit.py` only reads/writes the controller tool
+frame and updates the matching calibration profile.
+
+The profile stores payload mass/CoM and initializes a TCP candidate. The default
 candidate is the fitted CoM shifted from the current tool pose; if the CoM is
 farther than 0.20 m from the current tool origin, the script warns and falls
-back to `hand_base`. The `inspire` tool defaults to `hand_base` first and can be
-adjusted later in the TCP GUI.
+back to `arm_endpoint`. The `inspire` tool defaults to `hand_base` first and can
+be adjusted later in the TCP GUI.
 
-Left, one-shot chain:
+Left, fit/apply after replay:
 
 ```bash
 python hardware/rm65/utils/scripts/rm65_force_payload_calibrate.py \
   --arm left \
-  --expected-tool inspire \
-  --interp-speed-multiplier 4.0 && \
+  --expected-tool inspire && \
 python hardware/rm65/utils/scripts/rm65_apply_tool_payload_from_fit.py \
   --arm left \
   --expected-tool inspire \
@@ -128,16 +153,15 @@ python hardware/rm65/utils/scripts/rm65_tool_tcp_adjust.py \
   --arm left
 ```
 
-Right, one-shot chain:
+Right, fit/apply after replay:
 
 ```bash
 python hardware/rm65/utils/scripts/rm65_force_payload_calibrate.py \
   --arm right \
-  --expected-tool empty \
-  --interp-speed-multiplier 4.0 && \
+  --expected-tool inspire && \
 python hardware/rm65/utils/scripts/rm65_apply_tool_payload_from_fit.py \
   --arm right \
-  --expected-tool empty \
+  --expected-tool inspire \
   --execute \
   --confirm APPLY_RM65_TOOL_PAYLOAD
 ```
@@ -149,7 +173,7 @@ finishes successfully.
 
 ```bash
 python hardware/rm65/utils/scripts/rm65_tool_tcp_adjust.py \
-  --profile empty \
+  --profile inspire \
   --arm right
 ```
 
@@ -161,9 +185,24 @@ exists, so retargeting does not need a separate tool-profile argument.
 
 ### Run Official Force-Sensor Calibration
 
-Large adjacent calibration-pose jumps are smoothed by default with segmented
-MoveJ commands before each `Manual_Set_Force` point. Tune with
-`--interp-max-joint-step-deg` or `--max-interpolation-segments` if needed.
+This is the controller force-sensor gravity calibration branch. It reuses the
+recorded four-pose sequence, but it must call `Manual_Set_Force` at each point;
+it cannot consume the replayed measurement JSON directly. Run it after the
+active RealMan tool frame has the desired payload/CoM. If the payload/CoM fit
+has already been applied for the mounted tool, skip the replay/fit/apply branch
+above and run this section directly.
+
+With `--move-to-first`, this script only moves slowly to the first selected
+pose before submitting the four official calibration points. The controller is
+expected to run its own four-point calibration motion after point 4. Do not use
+`--smooth-between-points` in normal runs; it is a compatibility option that adds
+an extra MoveJ pre-pass before the official controller motion.
+
+Run a dry-run first and inspect the selected point order. If it reports a large
+adjacent joint jump, record more/closer candidate poses by rerunning
+`rm65_auto_record_force_poses.py` with a larger `--max-records`, or pass
+reviewed `--pose-indices`/`--candidate-indices`; the script cannot smooth the
+controller's internal calibration motion.
 
 Left:
 
@@ -171,6 +210,8 @@ Left:
 python hardware/rm65/utils/scripts/rm65_official_force_sensor_calibrate.py \
   --arm left \
   --expected-tool inspire \
+  --pose-indices 1,2,3,4 \
+  --max-adjacent-joint-delta-deg 170 \
   --check-current \
   --move-to-first \
   --execute \
@@ -182,12 +223,15 @@ Right:
 ```bash
 python hardware/rm65/utils/scripts/rm65_official_force_sensor_calibrate.py \
   --arm right \
-  --expected-tool test \
+  --expected-tool DMTAC_M \
+  --pose-indices 1,2,3,4 \
+  --max-adjacent-joint-delta-deg 170 \
   --check-current \
   --move-to-first \
   --execute \
   --confirm CALIBRATE_RM65_FORCE_SENSOR
 ```
+
 
 ### Create And Inspect Profile
 
@@ -209,6 +253,9 @@ python hardware/rm65/utils/scripts/rm65_calibration_profile.py create \
   --expected-tool inspire
 ```
 
+### Here Already Fine for Teleop, Belows are Other Tests.
+
+
 ### Fixed-Point Impedance Tuning
 
 Start fixed-point tuning with conservative compliance. The right-arm pose
@@ -227,7 +274,7 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
+  --duration-sec 40 \
   --linear-compliance-m-per-n 0.004 \
   --angular-axis-signs 1,1,-1 \
   --angular-compliance-rad-per-nm 0.04 \
@@ -248,10 +295,10 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
-  --linear-compliance-m-per-n 0.004 \
+  --duration-sec 40 \
+  --linear-compliance-m-per-n 0.00 \
   --angular-axis-signs 1,1,-1 \
-  --angular-compliance-rad-per-nm 0.04 \
+  --angular-compliance-rad-per-nm 0.08 \
   --hard-stop-force-n 50.0 \
   --save-to-profile \
   --execute \
@@ -269,10 +316,10 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
-  --linear-compliance-m-per-n 0.004 \
-  --angular-axis-signs 1,1,-1 \
-  --angular-compliance-rad-per-nm 0.04 \
+  --duration-sec 10 \
+  --linear-compliance-m-per-n 0.005 \
+  --angular-axis-signs -1,1,-1 \
+  --angular-compliance-rad-per-nm 0.07 \
   --hard-stop-force-n 50.0 \
   --save-to-profile \
   --execute \
@@ -290,15 +337,15 @@ python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
   --axes all \
   --control-hz 40 \
   --action-hz 20 \
-  --duration-sec 60.0 \
-  --linear-compliance-m-per-n 0.004 \
-  --angular-axis-signs 1,1,-1 \
-  --angular-compliance-rad-per-nm 0.04 \
+  --duration-sec 40 \
+  --linear-compliance-m-per-n 0.005 \
+  --angular-axis-signs -1,1,-1 \
+  --angular-compliance-rad-per-nm 0.07 \
   --hard-stop-force-n 50.0 \
   --save-to-profile \
   --execute \
   --confirm TEST_RM65_FIXED_POINT_IMPEDANCE \
-  --output-json hardware/rm65/utils/results/rm65_right_DMTAC_L_fixed_joint_impedance_tune.json
+  --output-json hardware/rm65/utils/results/rm65_right_DMTAC_L_fixed_pose_impedance_tune.json
 ```
 
 If the run stops with `Algo_Inverse_Kinematics failed with return code 1`,

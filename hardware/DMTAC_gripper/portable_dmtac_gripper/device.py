@@ -32,6 +32,29 @@ TACTILE_FIELDS: Tuple[str, ...] = (
 )
 
 DEFAULT_TACTILE_FIELDS: Tuple[str, ...] = ("distributed_force",)
+TACTILE_COMPUTE_PROFILES: Tuple[str, ...] = (
+    "dist-only",
+    "legacy",
+    "requested",
+    "shear-depth",
+)
+_TACTILE_COMPUTE_PROFILE_ALIASES: Dict[str, str] = {
+    "default": "dist-only",
+    "dist_only": "dist-only",
+    "distributed-force": "dist-only",
+    "distributed_force": "dist-only",
+    "force-only": "dist-only",
+    "force_only": "dist-only",
+    "minimal": "dist-only",
+    "old": "legacy",
+    "compat": "legacy",
+    "compatible": "legacy",
+    "request-only": "requested",
+    "request_only": "requested",
+    "explicit": "requested",
+    "shear_depth": "shear-depth",
+    "sheardepth": "shear-depth",
+}
 
 
 @dataclass
@@ -51,11 +74,13 @@ class TactileConfig:
     mode: str = "standard"
     max_fps: int = 120
     fields: Sequence[str] = DEFAULT_TACTILE_FIELDS
+    compute_profile: str = "dist-only"
     show_fps: bool = False
     cuda_id: int = 0
     remote_addr: str = "192.168.127.10:50051"
     pc_host: str = "0.0.0.0"
     pc_port: int = 60001
+    parallel_read: bool = True
     denoise_distributed_force: bool = True
     denoise_config: TactileDenoiseConfig = field(default_factory=TactileDenoiseConfig)
 
@@ -93,9 +118,64 @@ def normalize_tactile_fields(fields: Optional[Iterable[str]]) -> Tuple[str, ...]
     return tuple(normalized) if normalized else DEFAULT_TACTILE_FIELDS
 
 
+def normalize_tactile_compute_profile(profile: str | None) -> str:
+    key = str(profile or "dist-only").strip().lower().replace(" ", "-")
+    key = _TACTILE_COMPUTE_PROFILE_ALIASES.get(key, key)
+    if key not in TACTILE_COMPUTE_PROFILES:
+        raise ValueError(
+            f"Unsupported tactile compute profile '{profile}'. "
+            f"Valid profiles: {TACTILE_COMPUTE_PROFILES}"
+        )
+    return key
+
+
+def tactile_compute_flags(fields: Iterable[str], compute_profile: str | None) -> Dict[str, bool]:
+    selected = set(normalize_tactile_fields(fields))
+    need_distributed_force = "distributed_force" in selected
+    explicit = {
+        "raw": "raw" in selected,
+        "deformation": "deformation2d" in selected,
+        "shear": "shear" in selected,
+        "depth": "depth" in selected,
+        "force": "force" in selected,
+    }
+    profile = normalize_tactile_compute_profile(compute_profile)
+    if profile == "legacy":
+        return {
+            "enable_raw": explicit["raw"],
+            "enable_deformation": explicit["deformation"] or need_distributed_force,
+            "enable_shear": explicit["shear"] or need_distributed_force,
+            "enable_depth": explicit["depth"] or need_distributed_force,
+            "enable_force": explicit["force"] or need_distributed_force,
+        }
+    if profile == "requested":
+        return {
+            "enable_raw": explicit["raw"],
+            "enable_deformation": explicit["deformation"],
+            "enable_shear": explicit["shear"],
+            "enable_depth": explicit["depth"],
+            "enable_force": explicit["force"],
+        }
+    if profile == "shear-depth":
+        return {
+            "enable_raw": explicit["raw"],
+            "enable_deformation": explicit["deformation"],
+            "enable_shear": explicit["shear"] or need_distributed_force,
+            "enable_depth": explicit["depth"] or need_distributed_force,
+            "enable_force": explicit["force"],
+        }
+    return {
+        "enable_raw": explicit["raw"],
+        "enable_deformation": explicit["deformation"],
+        "enable_shear": explicit["shear"],
+        "enable_depth": explicit["depth"],
+        "enable_force": explicit["force"] or need_distributed_force,
+    }
+
+
 def tactile_device_config(dev_id: DeviceId, cfg: TactileConfig) -> DeviceConfig:
     fields = set(normalize_tactile_fields(cfg.fields))
-    need_distributed_force = "distributed_force" in fields
+    compute_flags = tactile_compute_flags(fields, cfg.compute_profile)
     return DeviceConfig(
         dev_id=dev_id,
         backend=cfg.backend,
@@ -106,11 +186,7 @@ def tactile_device_config(dev_id: DeviceId, cfg: TactileConfig) -> DeviceConfig:
         remote_addr=cfg.remote_addr,
         pc_host=cfg.pc_host,
         pc_port=cfg.pc_port,
-        enable_raw=("raw" in fields),
-        enable_deformation=("deformation2d" in fields) or need_distributed_force,
-        enable_shear=("shear" in fields) or need_distributed_force,
-        enable_depth=("depth" in fields) or need_distributed_force,
-        enable_force=("force" in fields) or need_distributed_force,
+        **compute_flags,
         include_infer=("infer" in fields),
         include_distributed_force=("distributed_force" in fields),
         include_contact_area=("contact_area" in fields),
@@ -298,6 +374,7 @@ class DMTacGripperDevice:
             timeout_ms=timeout_ms,
             wait=wait,
             require_ready=require_ready,
+            parallel=bool(self.tactile_config.parallel_read),
         )
         return self._denoise_tactile_frames(frames)
 

@@ -75,6 +75,10 @@ arm pose7 的正式语义是 `T_arm_base_tool_tcp`：
 - 数据集和部署 metadata 会写 `arm_action_specs_by_side`、
   `arm_controlled_frame_by_side` 和 `arm_reference_frame_by_side`；下游代码应按这些
   spec 解释 arm pose，不要凭维度猜测 pose 控制的是 TCP 还是内部 frame。
+- 旧参数 `--tcp-mode rm_eef` 现在按 `tool_tcp` 归一；旧 profile 里显式写出的
+  `hand_base` 仍保留为兼容 frame。
+- 旧采集 row 如果缺少 canonical action metadata，`teleop_runtime.action.row_replay`
+  会显式按历史 `arm_endpoint` pose contract 回放；带 metadata 的新数据不走该兼容分支。
 
 为了后续接入夹爪和高自由度灵巧手，action 层已经预留 hand16 contract：
 
@@ -101,7 +105,7 @@ hand16 中的空槽必须按无效值处理，而不是按 0 处理：
 
 ## VIVE 发送端
 
-新的发送端在 [hardware/VIVE/mocap/vive_data_sender.py](/home/user/zc/dex_inspire_teleop/hardware/VIVE/mocap/vive_data_sender.py)。
+推荐发送端在 [hardware/VIVE/VIVE_sender/data_sender_new.py](/home/user/zc/dex_inspire_teleop/hardware/VIVE/VIVE_sender/data_sender_new.py)。它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。
 
 默认 tracker 映射：
 
@@ -114,14 +118,16 @@ virtual desk 扫动可以用 `left_wrist` 或 `right_wrist` 代替 auxiliary。
 示例：
 
 ```bash
-python hardware/VIVE/mocap/vive_data_sender.py \
+python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --host 192.168.20.90 \
   --port 9999 \
+  --hz 60 \
   --tracker tracker_1:left_wrist \
   --tracker tracker_2:right_wrist
 ```
 
 发送协议是结构化 JSON UDP，`teleop_runtime` 也保留了 legacy float 包兼容。
+不要用 `hardware/VIVE/VIVE_sender/data_sender.py` 跑当前 teleop；它近似满速发送并且逐 tracker 读取 OpenVR，容易造成 receiver 积压。`data_time_sender.py` 发送 `double timestamp + 36 float` 到默认 `6666`，不是当前主链路协议。
 
 ## Calibration Tool
 
@@ -520,9 +526,10 @@ from teleop_runtime import RM65ArmBackendConfig, InspireTacHandBackendConfig
 VIVE 发送端：
 
 ```bash
-python hardware/VIVE/mocap/vive_data_sender.py \
+python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --host 127.0.0.1 \
   --port 9999 \
+  --hz 60 \
   --tracker tracker_1:left_wrist \
   --tracker tracker_2:right_wrist
 ```
@@ -571,6 +578,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 手部输入默认是**附加功能**：手部输入异常不会触发 arm teleop 的 `FROZEN`
 - 如果当前机器没有可用渲染设备，可以先用 `--skip-renderer` 验证 teleop 主链是否正常跑通
 - joint-space 双臂碰撞规避依赖 `pinocchio + pink + qpsolvers`
+- RM65 位控 backend 默认启用轻量奇异保护：只在目标关节从正常区进入 SDK 判定的奇异区时保持当前小步；如果当前已经在奇异区，则允许继续小步运动以便操作者退出奇异区
 - 更详细的控制模式说明见 [teleop_runtime/README_control_modes.md](/home/user/zc/dex_inspire_teleop/teleop_runtime/README_control_modes.md)
 - 如果发现 `+X/+Y` 同时反了，先回 calibration tool 按 `f`，或者在标定入口直接加 `--virtual-desk-post-yaw-deg 180`
 
@@ -608,6 +616,16 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
   --load-profile teleop_records/calibration_profiles/your_profile.json
+```
+
+如果需要保留旧版位控链路，并让 `tool_tcp` 直接等于机械臂末端、跳过 payload/impedance
+profile 依赖，可以显式加载位控专属 profile：
+
+```bash
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+  --arm-control-mode position \
+  --left-tool-profile position_endpoint \
+  --right-tool-profile position_endpoint
 ```
 
 如果你当前已经在用双臂 `50Hz`、较高 arm 角速度上限，并且想在此基础上打开 InspireTac 触觉读取检查频率是否合理，可以直接从下面这组参数开始：
@@ -648,6 +666,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 
 - `--load-initial-alignment` 在这个入口里只用于启动前的关节误差检查，不会替代 `p` 时刻的 live robot home capture
 - 如果同时给了 `--left/right-hand-port` 和 `--left/right-hand-ip`，runtime 会把手部串口 `q6` 映射后下发到 InspireTac
+- `--gui` 会显示 SAPIEN 真机预览窗口；`--no-gui`/`--headless` 会关闭窗口但保留遥操逻辑；`--skip-renderer` 则完全不创建 renderer
+- 如果操作者左右 VIVE tracker 在开始前需要互换，使用 `--swap-operator-sides` 或在 `--gui` 控制面板点“交换 Tracker”。它只交换 VIVE tracker 到 logical left/right 的绑定，手部串口、真手、profile 和机械臂 IP 都不变；机械臂 IP 左右互换仍然使用 `--swap-arm-sides`
 - 默认手部映射顺序仍是 `5,4,3,2,0,1`，对应 reader `q6=[thumb_yaw, thumb_flex, index, middle, ring, pinky] -> InspireTac q6=[pinky, ring, middle, index, thumb_yaw, thumb_flex]`
 - 如果只给 `--left/right-hand-port`，则只做 hand preview，不会连接真手
 - 如果只给 `--left/right-hand-ip`，则只读手部遥测并渲染当前真手状态，不会有 hand teleop 输入
@@ -664,6 +684,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 - 手部控制链是附加子链：手部输入掉线或无效不会阻断 arm teleop；arm 的 `FROZEN -> RECOVERING` 逻辑保持原样
 - `--swap-arm-sides` 仍然只影响 arm 逻辑侧映射；`--teleop-hardware-ip` / `--teleop-hardware-port` 继续保留但当前仍未启用
 - `FROZEN -> RECOVERING` 逻辑和 episode 录制格式沿用虚拟入口，方便后续 replay / live teleop 统一
+- impedance 模式默认会把 `--left/right-tool-profile` 中的 TCP 和 payload/CoM 写入或创建到 RealMan 控制器工具坐标，并自动 `Change_Tool_Frame`；可用 `--no-auto-sync-tool-frame` 临时关闭
+- `--left/right-tool-profile position_endpoint` 是位控兼容 profile：TCP 固定在 RM65 机械臂末端，不要求 payload、重力补偿或 impedance 信息；双臂防碰撞 IK 仍会按这个 endpoint TCP 求解
 
 当前支持的 tactile region 名称是：
 
@@ -763,13 +785,13 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 还没有现成的 `run_bimanual_session.py`
 - 还没有真实键盘监听，`KeyboardButtonSource` 目前需要你主动 `set_button(...)`
 - `run_vive_rm65_calibration_debug.py` 已可用，但当前还没有把 `W / V / D / target axes` 显式叠加画到 SAPIEN 里
-- 双臂 joint-space 碰撞规避当前默认推荐 `dual_arm_hand_proxy_open`；它用固定张开手的 proxy 几何维持 12DoF arm-only 求解。`dual_arm_hand` 仍保留给完整手模型实验路径，`dual_arm_cylinder_table` 仍是特定场景 profile
+- 双臂 joint-space 碰撞规避当前默认推荐 `dual_arm_hand_proxy_open`；它用固定张开手的 proxy 几何和固定桌面 box 维持 12DoF arm-only 求解。`dual_arm_hand` 仍保留给完整手模型实验路径，`dual_arm_cylinder_table` 仍是特定场景 profile
 - 当前 `virtual desk` 标定不恢复物理桌面的绝对世界原点
 - wrist 外参目前是“neutral pose 粗标 + 人工细调”，不是完全自动辨识；当前 coarse 默认 canonical hand frame 为 `[0, 0, 0]`，neutral hold 直接定义 tracker-to-hand 粗标外参
 
 ## 建议的当前工作流
 
-1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py`
+1. 先跑 `hardware/VIVE/VIVE_sender/data_sender_new.py --hz 60`
 2. 跑 `run_vive_rm65_calibration_debug.py` 完成 `LINK_CHECK -> virtual desk -> wrist offset -> save profile`
 3. 启动 `run_vive_sapien_virtual.py`，读取 profile，并在当前真机/虚拟起始姿态上做 session `home capture`
 4. 先用 `control_mode="absolute"` 做虚拟验收，确认前/左/上和双臂相对关系

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "data_type": "rm65_calibration_profile",
+  "name": "position_endpoint",
+  "arm": "right",
+  "tool_name": "position_endpoint",
+  "created_at": 0.0,
+  "updated_at": 0.0,
+  "notes": "Position-control compatibility profile. It intentionally uses the mechanical arm endpoint as tool_tcp and carries no payload or impedance settings.",
+  "paths": {},
+  "control_interface": {
+    "mode": "position",
+    "controlled_frame": "arm_endpoint",
+    "uses_force_control": false,
+    "uses_payload_compensation": false,
+    "position_endpoint_profile": true
+  },
+  "payload": {},
+  "tcp": {
+    "schema_version": 1,
+    "frame_name": "tool_tcp",
+    "pose_flange_m_rad": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_flange_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rotation_flange_rpy_rad": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_source": "position_endpoint_profile",
+    "rotation_policy": "arm_endpoint_identity",
+    "confirmed": true,
+    "updated_at": 0.0,
+    "notes": "Position-control compatibility TCP at the RM65 mechanical endpoint."
+  },
+  "impedance": {}
+}

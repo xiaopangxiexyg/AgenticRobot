@@ -1,6 +1,6 @@
 # teleop_runtime.deploy
 
-`teleop_runtime.deploy` 是独立于采集主循环和左臂实验模式的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`。
+`teleop_runtime.deploy` 是独立于采集主循环和左臂实验模式的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手、DMTac 1D gripper 和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`。
 
 当前推荐入口是 `python -m teleop_runtime.deploy`。兼容入口
 `python -m teleop_runtime.deploy.run_policy` 仍然保留。
@@ -23,9 +23,14 @@
 - RM65 真机执行会把 `tool_tcp` 目标转换到 SDK/IK 所需的 hand_base 或 arm_link6
   内部 frame；policy action 不应直接使用这些内部 frame。
 - payload、重力补偿和 impedance 参数同样由部署/真机执行 profile 解释。
+- 如果部署旧版位控模型、且不希望依赖力控标定 profile，可以给对应 side 传
+  `--left/right-tool-profile position_endpoint`。该 profile 将 `tool_tcp` 固定在 RM65
+  机械臂末端，且不携带 payload、重力补偿或 impedance 参数。
 - 部署 observation/action metadata 默认携带 `arm_action_specs_by_side`、
   `arm_controlled_frame_by_side`、`arm_reference_frame_by_side`。下游模型或 adapter
   必须按 spec 解释 arm pose。
+- 旧 row/replay 数据如果缺少 canonical action metadata，会由 row replay 兼容入口按历史
+  `arm_endpoint` pose 解释；新数据和 policy 输出按 `tool_tcp` spec 解释。
 
 策略输出支持：
 
@@ -72,6 +77,7 @@ python -m teleop_runtime.deploy \
   --policy-kwargs-json '{"checkpoint": "/abs/path/model.pt"}' \
   --active-sides right \
   --right-arm-ip "$RIGHT_ARM_IP" \
+  --right-tool-profile position_endpoint \
   --send-actions
 ```
 
@@ -89,6 +95,27 @@ python -m teleop_runtime.deploy \
   --hand-tactile-regions all \
   --send-actions
 ```
+
+## 双臂 + DMTac Gripper
+
+先按根目录 `README.md` 的“GRIPPER 和 DM TAC 分开标注”保存
+`teleop_records/dmtac_hardware_configs/latest.json`；部署时读取同一份 latest：
+
+```bash
+python -m teleop_runtime.deploy \
+  --policy /abs/path/my_policy.py:create_policy \
+  --active-sides both \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --hand-backend dmtac-gripper \
+  --dmtac-config latest \
+  --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json \
+  --send-actions
+```
+
+没有 DM TAC 触觉时加 `--dmtac-no-tactile`。DMTac gripper 仍占用 6 维 hand action
+兼容槽，但部署 metadata 会把 `HandActionSpec` 标成 `dmtac_gripper`，只有
+`--gripper-output-dim` 指定的槽是真实 gripper close command。
 
 ## Dataset Replay Debug
 

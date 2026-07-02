@@ -152,12 +152,18 @@ def _hand_spec_for(
     *,
     side: str,
     cfg: TeleopCommandActionAdapterConfig,
+    command_metadata: Mapping[str, Any],
     value_size: int,
     finite_count: int,
 ) -> HandActionSpec:
     configured = dict(cfg.hand_specs or {}).get(side)
     if configured is not None:
         return configured
+    spec_payload = command_metadata.get("hand_action_spec")
+    if isinstance(spec_payload, HandActionSpec):
+        return spec_payload
+    if isinstance(spec_payload, Mapping):
+        return HandActionSpec.from_metadata(spec_payload)
     if cfg.hand_slot_dof == INSPIRE_HAND_DOF:
         return HandActionSpec.inspire_tac(side)
     active_dof = int(finite_count if int(value_size) == cfg.hand_slot_dof else value_size)
@@ -200,12 +206,19 @@ def _hand_vector(
     *,
     side: str,
     cfg: TeleopCommandActionAdapterConfig,
+    command_metadata: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, HandActionSpec]:
     arr = np.asarray(value, dtype=np.float32).reshape(-1)
     if np.any(np.isinf(arr)):
         raise ValueError(f"{side}_hand joint_vector contains non-finite values.")
     finite_count = int(np.sum(np.isfinite(arr)))
-    spec = _hand_spec_for(side=side, cfg=cfg, value_size=int(arr.size), finite_count=finite_count)
+    spec = _hand_spec_for(
+        side=side,
+        cfg=cfg,
+        command_metadata={} if command_metadata is None else command_metadata,
+        value_size=int(arr.size),
+        finite_count=finite_count,
+    )
     if arr.shape == (spec.slot_count,):
         if spec.slot_count == INSPIRE_HAND_DOF and not np.all(np.isfinite(arr)):
             raise ValueError(f"{side}_hand q6 joint_vector must be fully finite.")
@@ -281,6 +294,7 @@ def robot_action_from_teleop_command(
                 effector_command.value,
                 side=side,
                 cfg=cfg,
+                command_metadata=effector_command.metadata,
             )
         active_effectors.append(effector)
 

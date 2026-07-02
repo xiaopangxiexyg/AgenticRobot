@@ -4,13 +4,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..backends.grippers import GRIPPER_ACTION_MAX
 from ..calibration import TeleopCalibration
+from ..action import HandActionSpec
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
-
-
-GRIPPER_ACTION_MAX = 0.9
 
 
 @dataclass(frozen=True)
@@ -18,9 +17,9 @@ class ScalarToGripperRetargeterConfig:
     side: str
     input_channel_name: str
     effector_name: str | None = None
-    source_dim: int = 1
+    source_dim: int = 2
     output_dim: int = 1
-    invert: bool = True
+    invert: bool = False
     alpha: float = 1.0
     output_min: float = 0.0
     output_max: float = GRIPPER_ACTION_MAX
@@ -112,6 +111,10 @@ class ScalarToGripperRetargeter(Retargeter):
                     "source_q6": source.copy(),
                     "source_value": float(source_value),
                     "gripper_joint_target": float(self._filtered_value),
+                    "hand_action_spec": HandActionSpec.dmtac_gripper(
+                        self.config.side,
+                        gripper_slot=int(self.config.output_dim),
+                    ).to_metadata(),
                     "gripper_command_semantics": (
                         "Six-wide compatibility vector; only output_dim is a gripper actuator."
                     ),

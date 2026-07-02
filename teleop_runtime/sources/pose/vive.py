@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import select
 import socket
 import struct
 import threading
@@ -34,6 +35,9 @@ class VivePoseSource(ObservationSource):
         port: int = 9999,
         legacy_tracker_count: int = 3,
         socket_timeout_sec: float = 0.2,
+        drain_stale_packets: bool = True,
+        max_drain_packets: int = 64,
+        max_datagram_size: int = 65536,
         name: str = "vive_pose",
     ):
         self._name = name
@@ -41,6 +45,9 @@ class VivePoseSource(ObservationSource):
         self.port = int(port)
         self.legacy_tracker_count = int(legacy_tracker_count)
         self.socket_timeout_sec = float(socket_timeout_sec)
+        self.drain_stale_packets = bool(drain_stale_packets)
+        self.max_drain_packets = max(0, int(max_drain_packets))
+        self.max_datagram_size = int(max_datagram_size)
         self._tracker_configs = list(tracker_configs)
         self.tracker_configs = {config.name: config for config in tracker_configs}
         self._configs_by_role = {config.role: config for config in tracker_configs}
@@ -48,9 +55,29 @@ class VivePoseSource(ObservationSource):
         self._running = False
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._socket_lock = threading.Lock()
         self._latest_by_channel: dict[str, dict[str, Any]] = {}
+        self._packet_count = 0
+        self._last_packet_received_at: float | None = None
+        self._dropped_stale_packet_count = 0
+        self._last_drain_count = 0
+        self._channel_update_counts: dict[str, int] = {}
+        self._last_channel_update_at: dict[str, float] = {}
+        self._recv_error_count = 0
+        self._last_recv_error: str | None = None
+        self._socket_restart_count = 0
+        self._last_socket_restart_at: float | None = None
         self._legacy_format = f"<{self.legacy_tracker_count * 12}f"
         self._legacy_packet_size = struct.calcsize(self._legacy_format)
+
+    def set_tracker_configs(self, tracker_configs: list[ViveTrackerConfig]) -> None:
+        with self._lock:
+            self._tracker_configs = list(tracker_configs)
+            self.tracker_configs = {config.name: config for config in tracker_configs}
+            self._configs_by_role = {config.role: config for config in tracker_configs}
+            self._latest_by_channel = {}
+            self._channel_update_counts = {}
+            self._last_channel_update_at = {}
 
     @property
     def name(self) -> str:
@@ -64,39 +91,142 @@ class VivePoseSource(ObservationSource):
     def start(self) -> None:
         if self._running:
             return
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.host, self.port))
-        self.sock.settimeout(self.socket_timeout_sec)
+        with self._socket_lock:
+            self._open_socket_locked()
         self._running = True
-        self._thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._thread = threading.Thread(
+            target=self._recv_loop,
+            daemon=True,
+            name=f"{self.name}_recv",
+        )
         self._thread.start()
 
     def close(self) -> None:
         self._running = False
-        if self.sock is not None:
-            self.sock.close()
-            self.sock = None
+        with self._socket_lock:
+            self._close_socket_locked()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
 
-    def _recv_loop(self) -> None:
-        while self._running and self.sock is not None:
+    def _open_socket_locked(self) -> None:
+        if self.sock is not None:
+            self._close_socket_locked()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.host, self.port))
+        sock.settimeout(self.socket_timeout_sec)
+        self.sock = sock
+
+    def _close_socket_locked(self) -> None:
+        sock = self.sock
+        self.sock = None
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _record_recv_error(self, exc: BaseException) -> None:
+        with self._lock:
+            self._recv_error_count += 1
+            self._last_recv_error = f"{type(exc).__name__}: {exc}"
+
+    def _restart_socket_after_error(self, exc: BaseException) -> bool:
+        self._record_recv_error(exc)
+        if not self._running:
+            return False
+        try:
+            with self._socket_lock:
+                if not self._running:
+                    return False
+                self._open_socket_locked()
+        except OSError as restart_exc:
+            self._record_recv_error(restart_exc)
+            return False
+        with self._lock:
+            self._socket_restart_count += 1
+            self._last_socket_restart_at = time.time()
+        return True
+
+    def _ensure_socket_open(self) -> bool:
+        if not self._running:
+            return False
+        with self._socket_lock:
+            if self.sock is not None:
+                return True
             try:
-                packet, _ = self.sock.recvfrom(65536)
+                self._open_socket_locked()
+            except OSError as exc:
+                self._record_recv_error(exc)
+                return False
+        with self._lock:
+            self._socket_restart_count += 1
+            self._last_socket_restart_at = time.time()
+        return True
+
+    def _recv_loop(self) -> None:
+        while self._running:
+            try:
+                received = self._recv_latest_packet()
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except (OSError, ValueError) as exc:
+                if not self._restart_socket_after_error(exc) and not self._running:
+                    break
+                time.sleep(min(0.25, max(0.01, self.socket_timeout_sec)))
+                continue
+            if received is None:
+                self._ensure_socket_open()
+                time.sleep(min(0.05, max(0.0, self.socket_timeout_sec)))
+                continue
 
-            received_at = time.time()
+            packet, received_at, stale_count = received
             parsed = self._parse_packet(packet, received_at)
             if not parsed:
                 continue
 
             with self._lock:
+                self._packet_count += 1
+                self._last_packet_received_at = received_at
+                self._dropped_stale_packet_count += stale_count
+                self._last_drain_count = stale_count
                 for channel_name, tracker_payload in parsed.items():
                     self._latest_by_channel[channel_name] = tracker_payload
+                    self._channel_update_counts[channel_name] = (
+                        self._channel_update_counts.get(channel_name, 0) + 1
+                    )
+                    self._last_channel_update_at[channel_name] = received_at
+
+    def _recv_latest_packet(self) -> tuple[bytes, float, int] | None:
+        with self._socket_lock:
+            sock = self.sock
+        if sock is None:
+            return None
+
+        packet, _ = sock.recvfrom(self.max_datagram_size)
+        received_at = time.time()
+        stale_count = 0
+
+        if not self.drain_stale_packets:
+            return packet, received_at, stale_count
+
+        while stale_count < self.max_drain_packets:
+            with self._socket_lock:
+                if sock is not self.sock:
+                    break
+            readable, _, _ = select.select([sock], [], [], 0.0)
+            if not readable:
+                break
+            try:
+                packet, _ = sock.recvfrom(self.max_datagram_size)
+            except (BlockingIOError, socket.timeout):
+                break
+            received_at = time.time()
+            stale_count += 1
+
+        return packet, received_at, stale_count
 
     def _parse_packet(self, packet: bytes, received_at: float) -> dict[str, dict[str, Any]]:
         json_payload = self._parse_json_packet(packet, received_at)
@@ -156,6 +286,7 @@ class VivePoseSource(ObservationSource):
                 "role": tracker_role or config.role,
                 "valid": valid,
                 "error": tracker.get("error"),
+                "sender_read_elapsed_ms": tracker.get("read_elapsed_ms"),
                 "config": config,
             }
         return parsed
@@ -209,8 +340,9 @@ class VivePoseSource(ObservationSource):
         channels: dict[str, ObservationChannel] = {}
         with self._lock:
             latest = dict(self._latest_by_channel)
+            tracker_configs = list(self._tracker_configs)
 
-        for config in self._tracker_configs:
+        for config in tracker_configs:
             tracker_payload = latest.get(config.channel_name)
             if tracker_payload is None:
                 continue
@@ -237,7 +369,25 @@ class VivePoseSource(ObservationSource):
                     "seq": tracker_payload.get("seq"),
                     "receiver_timestamp": receiver_timestamp,
                     "sender_timestamp": sender_timestamp,
+                    "sender_read_elapsed_ms": tracker_payload.get(
+                        "sender_read_elapsed_ms"
+                    ),
                     "sender_error": tracker_payload.get("error"),
                 },
             )
         return channels
+
+    def debug_stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "packet_count": self._packet_count,
+                "last_packet_received_at": self._last_packet_received_at,
+                "dropped_stale_packet_count": self._dropped_stale_packet_count,
+                "last_drain_count": self._last_drain_count,
+                "channel_update_counts": dict(self._channel_update_counts),
+                "last_channel_update_at": dict(self._last_channel_update_at),
+                "recv_error_count": self._recv_error_count,
+                "last_recv_error": self._last_recv_error,
+                "socket_restart_count": self._socket_restart_count,
+                "last_socket_restart_at": self._last_socket_restart_at,
+            }

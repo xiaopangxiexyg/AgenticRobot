@@ -26,7 +26,7 @@ from teleop_runtime.action import (
     effector_name,
     xyzquat_to_matrix,
 )
-from teleop_runtime.arm_frames import ARM_ENDPOINT_FRAME
+from teleop_runtime.arm_frames import ARM_ENDPOINT_FRAME, TOOL_TCP_FRAME
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObservation
 
 
@@ -43,7 +43,7 @@ class TeleopActionContractTest(unittest.TestCase):
         self.assertEqual(action.active_effectors, ("left_arm", "right_hand"))
         self.assertEqual(action.active_sides, ("left", "right"))
         self.assertEqual(action.arm_frame("left"), "left_arm_base")
-        self.assertEqual(action.arm_controlled_frame("left"), ARM_ENDPOINT_FRAME)
+        self.assertEqual(action.arm_controlled_frame("left"), TOOL_TCP_FRAME)
         self.assertTrue(action.is_active("left_arm"))
         self.assertFalse(action.is_active("right_arm"))
 
@@ -123,13 +123,13 @@ class TeleopActionContractTest(unittest.TestCase):
         self.assertEqual(action.action_space, BIMANUAL_EE_POSE_V1)
         np.testing.assert_allclose(action.arm_pose_by_side["left"], pose, atol=1e-6)
         self.assertEqual(action.active_effectors, ("left_arm",))
-        self.assertEqual(action.arm_controlled_frame("left"), ARM_ENDPOINT_FRAME)
+        self.assertEqual(action.arm_controlled_frame("left"), TOOL_TCP_FRAME)
         self.assertEqual(
             action.metadata["arm_action_specs_by_side"]["left"]["controlled_frame"],
-            ARM_ENDPOINT_FRAME,
+            TOOL_TCP_FRAME,
         )
 
-    def test_resolver_marks_arm_endpoint_controlled_frame(self) -> None:
+    def test_resolver_preserves_explicit_arm_endpoint_controlled_frame(self) -> None:
         pose = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         spec = ArmActionSpec.endpoint("left")
         action = RobotAction.bimanual_ee_pose(

@@ -96,20 +96,32 @@ def main() -> None:
     try:
         while True:
             loop_start = time.time()
+            pose_snapshot = None
+            frame_error = None
+            try:
+                pose_snapshot = vive.get_pose()
+            except Exception as exc:  # triad_openvr/OpenVR can raise backend-specific errors.
+                frame_error = str(exc)
             trackers = []
 
             for spec in tracker_specs:
+                tracker_start = time.perf_counter()
                 pose_matrix = np.eye(4, dtype=float)
                 valid = False
                 error_message = None
 
                 try:
+                    if frame_error is not None:
+                        raise RuntimeError(frame_error)
                     device = vive.devices[spec.device_name]
-                    flat_pose = matrix_to_flat_list(device.get_pose_matrix())
+                    flat_pose = matrix_to_flat_list(
+                        device.get_pose_matrix(pose_snapshot)
+                    )
                     pose_matrix = flat_to_pose_matrix(flat_pose)
                     valid = bool(np.all(np.isfinite(pose_matrix)))
                 except Exception as exc:  # triad_openvr raises varied runtime errors.
                     error_message = str(exc)
+                tracker_elapsed_ms = (time.perf_counter() - tracker_start) * 1000.0
 
                 trackers.append(
                     {
@@ -118,6 +130,7 @@ def main() -> None:
                         "valid": valid,
                         "pose_matrix_4x4": pose_matrix.tolist(),
                         "error": error_message,
+                        "read_elapsed_ms": tracker_elapsed_ms,
                     }
                 )
 

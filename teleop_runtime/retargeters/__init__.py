@@ -12,6 +12,7 @@ from .non_operator_arm import (
     SmoothJitterArmRetargeterConfig,
 )
 from .pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
+from .scalar_to_gripper import ScalarToGripperRetargeter, ScalarToGripperRetargeterConfig
 
 __all__ = [
     "DualArmCollisionAwareRetargeter",
@@ -22,6 +23,8 @@ __all__ = [
     "JointsToDexHandRetargeterConfig",
     "PoseToArmRetargeter",
     "PoseToArmRetargeterConfig",
+    "ScalarToGripperRetargeter",
+    "ScalarToGripperRetargeterConfig",
     "SmoothJitterArmRetargeter",
     "SmoothJitterArmRetargeterConfig",
 ]

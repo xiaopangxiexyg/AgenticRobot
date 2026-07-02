@@ -1,0 +1,95 @@
+{
+  "profiles": {
+    "rm65": {
+      "enabled": true,
+      "dof": 6,
+      "joint_names": ["J1", "J2", "J3", "J4", "J5", "J6"],
+      "source_label_allowlist": ["reference", "previous_safe"],
+      "max_extra_seeds": 8,
+      "dedupe_atol_rad": 0.0000001,
+      "perturbations": [
+        {
+          "label": "j2_j3_coord_pos_5deg",
+          "offset_deg": [0.0, 5.0, -5.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "j2_j3_coord_neg_5deg",
+          "offset_deg": [0.0, -5.0, 5.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "wrist_flip_j4p_j6p",
+          "scale": [1.0, 1.0, 1.0, 1.0, -1.0, 1.0],
+          "offset_deg": [0.0, 0.0, 0.0, 180.0, 0.0, 180.0]
+        },
+        {
+          "label": "wrist_flip_j4n_j6n",
+          "scale": [1.0, 1.0, 1.0, 1.0, -1.0, 1.0],
+          "offset_deg": [0.0, 0.0, 0.0, -180.0, 0.0, -180.0]
+        },
+        {
+          "label": "small_j2_pos_2deg",
+          "offset_deg": [0.0, 2.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j2_neg_2deg",
+          "offset_deg": [0.0, -2.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j4_pos_2deg",
+          "offset_deg": [0.0, 0.0, 0.0, 2.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j4_neg_2deg",
+          "offset_deg": [0.0, 0.0, 0.0, -2.0, 0.0, 0.0]
+        },
+        {
+          "label": "wrist_flip_j4p_j6n",
+          "scale": [1.0, 1.0, 1.0, 1.0, -1.0, 1.0],
+          "offset_deg": [0.0, 0.0, 0.0, 180.0, 0.0, -180.0]
+        },
+        {
+          "label": "wrist_flip_j4n_j6p",
+          "scale": [1.0, 1.0, 1.0, 1.0, -1.0, 1.0],
+          "offset_deg": [0.0, 0.0, 0.0, -180.0, 0.0, 180.0]
+        },
+        {
+          "label": "small_j1_pos_2deg",
+          "offset_deg": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j1_neg_2deg",
+          "offset_deg": [-2.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j3_pos_2deg",
+          "offset_deg": [0.0, 0.0, 2.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j3_neg_2deg",
+          "offset_deg": [0.0, 0.0, -2.0, 0.0, 0.0, 0.0]
+        },
+        {
+          "label": "small_j5_pos_2deg",
+          "offset_deg": [0.0, 0.0, 0.0, 0.0, 2.0, 0.0]
+        },
+        {
+          "label": "small_j5_neg_2deg",
+          "offset_deg": [0.0, 0.0, 0.0, 0.0, -2.0, 0.0]
+        },
+        {
+          "label": "small_j6_pos_2deg",
+          "offset_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 2.0]
+        },
+        {
+          "label": "small_j6_neg_2deg",
+          "offset_deg": [0.0, 0.0, 0.0, 0.0, 0.0, -2.0]
+        }
+      ],
+      "metadata": {
+        "robot_family": "RM65",
+        "units": "deg",
+        "source": "Lightweight deterministic IK seed expansion shared by teleop, deploy, and init workflows; deeper perturbations are kept ordered for manual tuning but are disabled by max_extra_seeds."
+      }
+    }
+  }
+}

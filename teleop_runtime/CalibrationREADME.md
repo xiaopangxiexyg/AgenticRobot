@@ -98,10 +98,14 @@ wrist tracker 完成 virtual desk 扫动。
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --host 0.0.0.0 \
   --port 9999 \
+  --gui \
   --arm-mode real \
   --left-arm-ip 192.168.101.21 \
   --right-arm-ip 192.168.1.20
 ```
+
+`--gui` 会打开浏览器控制面板，等价于 `--ui-mode web`。如果只想使用终端按键，
+可以改用 `--no-gui` 或 `--ui-mode terminal`。
 
 如果本机没有可用渲染设备，可以先加：
 
@@ -172,6 +176,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   - 左右 calibrated hand-control 坐标系
   - 左右当前 TCP 坐标系
 - viewer 相机可以直接用 SAPIEN 自带交互控制移动视角
+- 如果关闭 SAPIEN viewer 窗口，校准脚本会继续在无 3D 窗口模式下运行；仍可在终端或 Web UI 里按 `s` 保存退出
 
 ### 5.5 Timed Capture 默认时长
 

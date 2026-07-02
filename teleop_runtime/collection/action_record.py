@@ -17,9 +17,11 @@ from ..session import SessionStepResult
 @dataclass(frozen=True)
 class CollectionActionRecordConfig:
     action_adapter: TeleopCommandActionAdapterConfig = field(
-        default_factory=TeleopCommandActionAdapterConfig
+        default_factory=lambda: TeleopCommandActionAdapterConfig(
+            include_command_metadata=False
+        )
     )
-    include_observation_ref: bool = True
+    include_observation_ref: bool = False
     metadata: Mapping[str, Any] | None = None
 
 
@@ -64,6 +66,7 @@ def collection_action_record_metadata(
     step_result: SessionStepResult,
     *,
     config: CollectionActionRecordConfig | None = None,
+    include_debug_metadata: bool = False,
 ) -> dict[str, Any]:
     record = build_collection_action_record(step_result, config=config)
     action_vector = None
@@ -73,10 +76,18 @@ def collection_action_record_metadata(
             action_vector = encode_robot_action(record.action)
         except ValueError as exc:
             action_vector_error = str(exc)
+    execution = {
+        "timestamp": float(record.execution.timestamp),
+        "sent": bool(record.execution.sent),
+        "faults": list(record.execution.faults),
+        "metadata": _to_serializable(record.execution.metadata),
+    }
+    if include_debug_metadata:
+        execution["command"] = _to_serializable(record.execution.command)
     metadata = {
         "action": _to_serializable(record.action),
         "action_vector": _to_serializable(action_vector),
-        "execution": _to_serializable(record.execution),
+        "execution": execution,
         "record_timestamp": float(record.timestamp),
         "metadata": _to_serializable(record.metadata),
     }

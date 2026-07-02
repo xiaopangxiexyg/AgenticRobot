@@ -12,16 +12,36 @@ def compact_log_value(value: object, *, max_chars: int = 90) -> str:
     return text[: max(0, max_chars - 3)] + "..."
 
 
+def _backend_state(
+    backend: Any,
+    *,
+    include_tactile_arrays: bool = True,
+) -> Mapping[str, Any]:
+    get_state = getattr(backend, "get_state")
+    code = getattr(get_state, "__code__", None)
+    arg_count = int(getattr(code, "co_argcount", 0) or 0) + int(
+        getattr(code, "co_kwonlyargcount", 0) or 0
+    )
+    if code is not None and "include_tactile_arrays" in code.co_varnames[:arg_count]:
+        return get_state(include_tactile_arrays=include_tactile_arrays)
+    return get_state()
+
+
 def writer_debug_text(writer_pool: Any) -> str:
     try:
         stats = writer_pool.stats()
     except Exception as exc:  # noqa: BLE001
         return f"writer=status_error:{type(exc).__name__}:{compact_log_value(exc, max_chars=80)}"
-    return (
+    text = (
         "writer="
         f"queued:{stats.queued} submitted:{stats.submitted} completed:{stats.completed} "
         f"dropped:{stats.dropped} failures:{stats.failures} workers:{stats.worker_count}"
     )
+    if hasattr(stats, "queue_high_water") and hasattr(stats, "max_queue_size"):
+        text += f" high:{stats.queue_high_water}/{stats.max_queue_size}"
+    if hasattr(stats, "submit_wait_max_sec"):
+        text += f" submit_wait_max:{float(stats.submit_wait_max_sec) * 1000.0:.1f}ms"
+    return text
 
 
 def camera_debug_text(
@@ -144,7 +164,7 @@ def hand_debug_text(
         if backend is None:
             continue
         try:
-            state = backend.get_state()
+            state = _backend_state(backend, include_tactile_arrays=False)
         except Exception as exc:  # noqa: BLE001
             parts.append(f"{side}=state_error:{type(exc).__name__}")
             continue
@@ -156,9 +176,67 @@ def hand_debug_text(
         tactile_age = "none" if tactile_at is None else f"{current_time - float(tactile_at):.3f}s"
         error = state.get("telemetry_error")
         error_text = "ok" if not error else compact_log_value(error, max_chars=70)
+        tactile_read_elapsed = state.get("tactile_read_elapsed_s")
+        tactile_gate_wait = state.get("tactile_gate_wait_s")
+        telemetry_elapsed = state.get("telemetry_elapsed_s")
+        tactile_read_hz = state.get("tactile_read_hz")
+        tactile_read_skipped = bool(state.get("tactile_read_skipped", False))
+        tactile_process_read = bool(state.get("tactile_process_read", False))
+        tactile_worker_alive = bool(state.get("tactile_worker_alive", False))
+        tactile_worker_receiver_alive = bool(state.get("tactile_worker_receiver_alive", False))
+        tactile_process_nice = state.get("tactile_process_nice")
+        tactile_process_queue_size = state.get("tactile_process_queue_size")
+        tactile_process_cpu_affinity_value = state.get("tactile_process_cpu_affinity")
+        if tactile_process_cpu_affinity_value is None:
+            tactile_process_cpu_affinity = ()
+        elif isinstance(tactile_process_cpu_affinity_value, (str, bytes)):
+            tactile_process_cpu_affinity = (tactile_process_cpu_affinity_value,)
+        else:
+            try:
+                tactile_process_cpu_affinity = tuple(tactile_process_cpu_affinity_value)
+            except TypeError:
+                tactile_process_cpu_affinity = (tactile_process_cpu_affinity_value,)
+        tactile_read_text = (
+            "none"
+            if tactile_read_elapsed is None
+            else f"{float(tactile_read_elapsed) * 1000.0:.1f}ms"
+        )
+        tactile_gate_text = (
+            "none"
+            if tactile_gate_wait is None
+            else f"{float(tactile_gate_wait) * 1000.0:.1f}ms"
+        )
+        telemetry_elapsed_text = (
+            "none"
+            if telemetry_elapsed is None
+            else f"{float(telemetry_elapsed) * 1000.0:.1f}ms"
+        )
+        tactile_hz_text = (
+            "none"
+            if tactile_read_hz is None
+            else f"{float(tactile_read_hz):.1f}"
+        )
+        tactile_worker_sched_text = (
+            ""
+            if (
+                tactile_process_nice is None
+                and tactile_process_queue_size is None
+                and not tactile_process_cpu_affinity
+            )
+            else (
+                f",nice:{tactile_process_nice},"
+                f"cpus:{list(tactile_process_cpu_affinity)},"
+                f"queue:{tactile_process_queue_size}"
+            )
+        )
         parts.append(
             f"{side}=connected:{bool(state.get('is_connected'))},"
             f"telemetry_age:{telemetry_age},tactile_age:{tactile_age},"
+            f"tactile_read:{tactile_read_text},gate:{tactile_gate_text},"
+            f"tactile_hz:{tactile_hz_text},"
+            f"tactile_skip:{tactile_read_skipped},"
+            f"tactile_proc:{tactile_process_read}/{tactile_worker_alive}/{tactile_worker_receiver_alive}{tactile_worker_sched_text},"
+            f"telemetry:{telemetry_elapsed_text},"
             f"reconnects:{int(state.get('reconnect_count', 0) or 0)},err:{error_text}"
         )
     return "hand=none" if not parts else "hand=" + "; ".join(parts)
@@ -197,6 +275,9 @@ def arm_debug_text(
                 "ik_jump_gate_status",
                 "ik_jump_gate_reason",
                 "ik_jump_gate_hold_frames",
+                "ik_frame_total_ms",
+                "ik_time_budget_ms",
+                "ik_time_budget_exceeded",
             )
             ik_parts = [
                 f"{key}:{compact_log_value(ik_meta[key], max_chars=40)}"

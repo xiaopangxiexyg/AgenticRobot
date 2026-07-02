@@ -22,6 +22,12 @@ class EffectorBackend(ABC):
     def send_command(self, command: EffectorCommand) -> None:
         raise NotImplementedError
 
+    def hold_motion(self, reason: str = "manual hold") -> None:
+        """Optional recoverable motion hold hook."""
+
+    def reset_motion_state(self, qpos: Any | None = None) -> None:
+        """Optional hook to discard buffered targets before restarting motion."""
+
     def close(self) -> None:
         """Optional resource release hook."""
 

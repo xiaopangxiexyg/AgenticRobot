@@ -448,6 +448,13 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    if args.max_records and len(poses) >= args.max_records:
+        print(
+            f"{output_path} already has {len(poses)} poses, meeting "
+            f"--max-records {args.max_records}; nothing to record. "
+            "Use --no-resume to replace the file or a larger --max-records to append."
+        )
+        return 0
 
     robot = None
     stop_requested = False

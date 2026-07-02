@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from hardware.rm65.force_compensation import (  # noqa: E402
     PoseAdmittance,
     WrenchProcessor,
+    admittance_wrench_for_arm,
     apply_pose_offset,
     finite_list,
     mean_wrench,
@@ -590,7 +591,9 @@ def _run_replay(
 
             compute_start = time.perf_counter()
             processed = processor.process(readings[args.force_source])
-            update = admittance.update(processed["deadbanded"], period)
+            raw_deadbanded = list(processed["deadbanded"])
+            admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, side)
+            update = admittance.update(admittance_wrench, period)
             command_pose = _normalize_pose(apply_pose_offset(ref_pose, update["offset"]))
             compute_sec = time.perf_counter() - compute_start
             timing["compute"].append(compute_sec)
@@ -666,6 +669,8 @@ def _run_replay(
                     "observed_joint_deg": state["joint_deg"],
                     "tare_corrected_wrench": processed["tare_corrected"],
                     "filtered_wrench": processed["filtered"],
+                    "raw_deadbanded_wrench": raw_deadbanded,
+                    "admittance_wrench": admittance_wrench,
                     "active_wrench": update["active_wrench"],
                     "target_offset": update["target_offset"],
                     "offset": update["offset"],

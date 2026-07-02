@@ -127,6 +127,37 @@ class HandQ6Source(ObservationSource):
             strict_expected=strict_expected,
         )
 
+    @classmethod
+    def from_default_config(
+        cls,
+        *,
+        active_sides: tuple[str, ...] = ("left", "right"),
+        config: str = "latest",
+        baudrate: int = 115200,
+        timeout: float = 0.05,
+        show_raw_lines: bool = False,
+        exo_hand_calibration: bool = False,
+        calibration_path: str | None = None,
+        critical: bool = False,
+        strict_expected: bool = False,
+    ) -> "HandQ6Source | None":
+        from ...configs.q6_hardware import load_latest_q6_ports
+
+        ports = load_latest_q6_ports(active_sides=active_sides, config=config, allow_missing=True)
+        if not ports:
+            return None
+        return cls.from_bimanual(
+            left_port=ports.get("left"),
+            right_port=ports.get("right"),
+            baudrate=baudrate,
+            timeout=timeout,
+            show_raw_lines=show_raw_lines,
+            exo_hand_calibration=exo_hand_calibration,
+            calibration_path=calibration_path,
+            critical=critical,
+            strict_expected=strict_expected,
+        )
+
     def expected_channel_names(self) -> tuple[str, ...]:
         return self._expected if self._strict_expected else ()
 
@@ -198,6 +229,12 @@ class HandQ6Source(ObservationSource):
             "reader_error_count": int(self._reader_error_counts.get(side, 0)),
             "reader_recovery_count": int(self._reader_recovery_counts.get(side, 0)),
         }
+        serial_read_stats = packet.get("serial_read_stats")
+        if isinstance(serial_read_stats, dict):
+            metadata["serial_read_stats"] = dict(serial_read_stats)
+            metadata["stale_q6_frames_dropped"] = int(
+                serial_read_stats.get("stale_frames_dropped", 0) or 0
+            )
         if recovered_after_errors > 0:
             metadata["recovered_after_errors"] = int(recovered_after_errors)
         return ObservationChannel(

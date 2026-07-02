@@ -5,7 +5,7 @@
   "arm": "right",
   "tool_name": "DMTAC_L",
   "created_at": 1782367751.0076554,
-  "updated_at": 1782442652.059093,
+  "updated_at": 1782445213.4643855,
   "notes": "",
   "paths": {
     "pose_sequence_json": "/home/password-1/DexTeleop/hardware/rm65/utils/data/poses/rm65_right_force_sensor_calib4_pose_sequence.json",
@@ -82,37 +82,13 @@
   },
   "impedance": {
     "pose": {
-      "mode": "pose",
-      "force_source": "work",
-      "axes": "all",
-      "force_sign": 1.0,
-      "angular_force_sign": -1.0,
+      "linear_compliance_m_per_n": 0.005,
       "angular_axis_signs": [
-        1.0,
+        -1.0,
         1.0,
         -1.0
       ],
-      "control_hz": 40.0,
-      "action_hz": 20.0,
-      "lowpass_alpha": 0.95,
-      "force_deadband_n": 0.3,
-      "torque_deadband_nm": 0.03,
-      "linear_gain_m_s_per_n": 0.0,
-      "angular_gain_rad_s_per_nm": 0.0,
-      "linear_damping_n_s_per_m": 0.0,
-      "angular_damping_nm_s_per_rad": 0.0,
-      "linear_compliance_m_per_n": 0.004,
-      "angular_compliance_rad_per_nm": 0.04,
-      "max_linear_velocity_m_s": 0.4,
-      "max_angular_velocity_rad_s": 0.4,
-      "max_linear_offset_m": 0.05,
-      "max_angular_offset_rad": 0.4,
-      "return_rate_s": 0.35,
-      "trajectory_mode": 0,
-      "radio": 0,
-      "hard_stop_force_n": 50.0,
-      "hard_stop_torque_nm": 10.0,
-      "max_command_joint_step_deg": 20.0
+      "angular_compliance_rad_per_nm": 0.07
     },
     "joint": {
       "mode": "joint",

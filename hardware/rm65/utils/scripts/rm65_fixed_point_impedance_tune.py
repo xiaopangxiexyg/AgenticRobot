@@ -5,6 +5,8 @@ import json
 import math
 import statistics
 import sys
+import termios
+import tty
 from pathlib import Path
 
 
@@ -12,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hardware.rm65.calibration_profiles import load_profile, save_profile, update_impedance  # noqa: E402
+from hardware.rm65.calibration_profiles import load_profile, save_profile  # noqa: E402
 from hardware.rm65.impedance import (  # noqa: E402
     RM65ImpedanceConfig,
     RM65JointImpedanceController,
@@ -21,6 +23,11 @@ from hardware.rm65.impedance import (  # noqa: E402
 
 
 CONFIRM_TEXT = "TEST_RM65_FIXED_POINT_IMPEDANCE"
+PROFILE_TUNING_FIELDS = (
+    "linear_compliance_m_per_n",
+    "angular_axis_signs",
+    "angular_compliance_rad_per_nm",
+)
 
 
 def _normalize_argv(argv: list[str] | None) -> list[str] | None:
@@ -72,6 +79,36 @@ def _profile_metadata_dict(config: RM65ImpedanceConfig) -> dict[str, object]:
     }
 
 
+def _profile_tuning_dict(config: RM65ImpedanceConfig) -> dict[str, object]:
+    config_values = _config_dict(config)
+    return {key: config_values[key] for key in PROFILE_TUNING_FIELDS}
+
+
+def _confirm_profile_save() -> bool:
+    prompt = "Press S to save tuning fields to profile; any other key skips: "
+    if not sys.stdin.isatty():
+        print("WARNING: --save-to-profile requested but stdin is not a TTY; profile save skipped")
+        return False
+    print(prompt, end="", flush=True)
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        key = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        print()
+    return key.lower() == "s"
+
+
+def _save_profile_tuning_only(profile: dict[str, object], mode: str, values: dict[str, object]) -> None:
+    profile.setdefault("impedance", {})
+    impedance = profile["impedance"]
+    if not isinstance(impedance, dict):
+        raise ValueError("profile impedance must be a JSON object")
+    impedance[mode] = dict(values)
+
+
 def _print_saturation_estimates(config: RM65ImpedanceConfig) -> None:
     thresholds = config.saturation_thresholds()
     if not any(value is not None for value in thresholds.values()):
@@ -107,7 +144,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm", default="")
     parser.add_argument("--output-json", default="")
-    parser.add_argument("--save-to-profile", action="store_true")
+    parser.add_argument(
+        "--save-to-profile",
+        action="store_true",
+        help=(
+            "After execution, wait for S and save only tuned compliance fields "
+            "to the selected profile."
+        ),
+    )
 
     parser.add_argument("--control-hz", type=float, default=None)
     parser.add_argument("--action-hz", type=float, default=None)
@@ -304,10 +348,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.save_to_profile:
         if profile is None:
             print("WARNING: --save-to-profile ignored because no --profile was provided")
+        elif not _confirm_profile_save():
+            print("profile save skipped")
         else:
-            update_impedance(profile, args.mode, _config_dict(config))
+            tuning = _profile_tuning_dict(config)
+            _save_profile_tuning_only(profile, args.mode, tuning)
             path = save_profile(profile, profile.get("_profile_path"))
-            print(f"saved tuned {args.mode} impedance to {path}")
+            print(f"saved tuned {args.mode} impedance fields {sorted(tuning)} to {path}")
     return 0
 
 

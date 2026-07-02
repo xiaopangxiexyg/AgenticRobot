@@ -38,6 +38,8 @@ datasets
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.agents
+logs/
 
 datasets_debug
 teleop_records/*
@@ -49,6 +51,9 @@ BaselineVLA_deployment/Data
 BaselineVLA_deployment/Outputs
 BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs
 BaselineVLA_deployment/ServerClientDeploy/Pi
+
+hardware/VIVE/VIVE_sender/
+hardware/VIVE/VIVE_sender.zip
 *.egg-info/
 *.whl
 

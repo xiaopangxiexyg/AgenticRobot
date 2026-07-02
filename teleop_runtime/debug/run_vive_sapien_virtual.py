@@ -455,7 +455,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Joint-space collision scene profile used by the dual-arm solver. "
             "'dual_arm_hand_proxy_open' keeps arm IK at 12DoF while attaching fixed open-hand "
-            "proxy geometry to both wrists for collision."
+            "proxy geometry to both wrists and a fixed table box for collision."
         ),
     )
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control/update rate")
@@ -1534,6 +1534,7 @@ def _runtime_home_calibration(
     arm_mode: str,
     timeout_sec: float,
     num_samples: int,
+    progress_callback=None,
 ) -> None:
     calibration = components.session.calibration
     assert calibration is not None
@@ -1602,10 +1603,35 @@ def _runtime_home_calibration(
     sample_markers = sorted({1, max(1, num_samples // 2), num_samples})
     reported: dict[str, set[int]] = {side: set() for side in active_sides}
 
+    def publish_progress(*, now: float, channels=None, waiting: bool = False) -> None:
+        if progress_callback is None:
+            return
+        valid = {}
+        if channels is not None:
+            valid = {
+                side: bool(
+                    channels.get(f"{side}_wrist_pose") is not None
+                    and channels[f"{side}_wrist_pose"].valid
+                )
+                for side in active_sides
+            }
+        progress_callback(
+            sample_counts={side: len(samples[side]) for side in active_sides},
+            valid_by_side=valid,
+            min_samples=int(num_samples),
+            elapsed_sec=max(0.0, now - start_time),
+            timeout_sec=float(timeout_sec),
+            waiting_for_samples=bool(waiting),
+            now=now,
+        )
+
+    publish_progress(now=start_time, waiting=False)
+
     while any(len(samples[side]) < num_samples for side in active_sides):
         now = time.time()
         if now - start_time > timeout_sec:
             counts = {side: len(samples[side]) for side in active_sides}
+            publish_progress(now=now, waiting=True)
             raise TimeoutError(
                 "Timed out waiting for active wrist tracker(s) during runtime calibration. "
                 f"sample_counts={counts}. "
@@ -1665,7 +1691,14 @@ def _runtime_home_calibration(
                             now=now,
                         )
         if any(len(samples[side]) < num_samples for side in active_sides):
+            publish_progress(
+                now=now,
+                channels=channels,
+                waiting=True,
+            )
             time.sleep(0.01)
+
+    publish_progress(now=time.time(), waiting=False)
 
     if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
         synced = _sync_preview_from_real_state(components, required=False)
@@ -1730,18 +1763,44 @@ def _wait_for_calibration_start(
         )
     _log("Calibration", "Press 'q' to quit.")
     status_gate = ChangeGate()
+
+    def wait_after_start_request(delay_sec: float = 3.0) -> bool:
+        hook = getattr(clutch_input, "before_calibration_start_delay", None)
+        if callable(hook):
+            return bool(hook(delay_sec, arm_mode=arm_mode))
+        deadline = time.time() + max(0.0, float(delay_sec))
+        _log(
+            "Calibration",
+            f"start requested; waiting {delay_sec:.1f}s before capture so the operator can react.",
+        )
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0.0:
+                return True
+            clutch_input.poll()
+            if clutch_input.should_quit:
+                return False
+            time.sleep(min(0.05, remaining))
+
     while True:
         loop_start = time.time()
         clutch_input.poll()
         if clutch_input.should_quit:
             return False
         if clutch_input.consume_calibration_request():
-            return True
+            return wait_after_start_request()
 
         if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
             _sync_preview_from_real_state(components, required=False)
 
         channels, _ = components.session.poll_sources(loop_start)
+        publish_raw_tracker_pose_state = getattr(
+            clutch_input,
+            "publish_raw_tracker_pose_state",
+            None,
+        )
+        if callable(publish_raw_tracker_pose_state):
+            publish_raw_tracker_pose_state(channels=channels, now=loop_start)
         _update_optional_hand_preview_from_channels(
             components,
             channels,

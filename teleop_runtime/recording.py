@@ -19,6 +19,12 @@ class RecordingConfig:
     save_calibration: bool = True
     save_commands: bool = True
     save_fault_events: bool = True
+    flush_every: int = 1
+    compact_json: bool = False
+
+    def __post_init__(self) -> None:
+        if int(self.flush_every) <= 0:
+            raise ValueError("flush_every must be positive.")
 
 
 def _to_serializable(value: Any) -> Any:
@@ -47,6 +53,7 @@ class SessionRecorder:
             root_dir = teleop_records_root() / stamp
         self.root_dir = Path(root_dir)
         self._handles: dict[str, TextIO] = {}
+        self._pending_flush_counts: dict[str, int] = {}
         if self.config.enabled:
             self.root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -60,8 +67,21 @@ class SessionRecorder:
         if not self.config.enabled:
             return
         handle = self._open(stream_name)
-        handle.write(json.dumps(_to_serializable(payload), ensure_ascii=True) + "\n")
-        handle.flush()
+        separators = (",", ":") if bool(self.config.compact_json) else None
+        handle.write(
+            json.dumps(
+                _to_serializable(payload),
+                ensure_ascii=True,
+                separators=separators,
+            )
+            + "\n"
+        )
+        pending = int(self._pending_flush_counts.get(stream_name, 0)) + 1
+        flush_every = max(1, int(self.config.flush_every))
+        if pending >= flush_every:
+            handle.flush()
+            pending = 0
+        self._pending_flush_counts[stream_name] = pending
 
     def record_channels(self, channels: dict[str, Any], timestamp: float | None = None) -> None:
         if not (self.config.enabled and self.config.save_raw_inputs):
@@ -102,8 +122,10 @@ class SessionRecorder:
 
     def close(self) -> None:
         for handle in self._handles.values():
+            handle.flush()
             handle.close()
         self._handles.clear()
+        self._pending_flush_counts.clear()
 
     def __enter__(self) -> "SessionRecorder":
         return self

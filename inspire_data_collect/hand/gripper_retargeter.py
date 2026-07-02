@@ -7,7 +7,7 @@ import numpy as np
 from ..common import EffectorCommand, ObservationChannel
 
 
-GRIPPER_ACTION_MAX = 0.9
+GRIPPER_ACTION_MAX = 0.99
 
 
 @dataclass(frozen=True)

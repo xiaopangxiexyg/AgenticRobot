@@ -80,6 +80,13 @@ class BimanualRig(Rig):
                     elapsed_sec,
                 )
 
+    def hold_motion(self, reason: str = "manual hold") -> None:
+        for backend in self.backends.values():
+            try:
+                backend.hold_motion(reason)
+            except Exception:
+                pass
+
     def close(self) -> None:
         if self._executor is not None:
             self._executor.shutdown(wait=True)

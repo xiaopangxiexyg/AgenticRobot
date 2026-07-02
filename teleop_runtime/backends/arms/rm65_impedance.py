@@ -9,7 +9,11 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from hardware.rm65.calibration_profiles import tcp_endpoint_delta, tcp_safety_warnings
+from hardware.rm65.calibration_profiles import (
+    is_position_endpoint_profile,
+    tcp_endpoint_delta,
+    tcp_safety_warnings,
+)
 from hardware.rm65.calibration_profiles import load_profile
 from hardware.rm65.impedance import RM65ImpedanceConfig, RM65PoseImpedanceController
 
@@ -127,6 +131,44 @@ def _warn_profile_tcp_safety(
         print(f"WARNING: {warning}; profile={profile.get('_profile_path') or profile.get('name')}. Verify before impedance control.")
 
 
+def _require_rm65_success(result: object, label: str) -> None:
+    code, text = _parse_rm65_result(result)
+    if code != 0:
+        raise RuntimeError(f"{label} failed with return code {text}")
+
+
+def _profile_tool_frame_params(profile: Mapping[str, Any]) -> tuple[str, list[float], float, list[float]]:
+    tool_name = str(profile.get("tool_name") or "").strip()
+    if not tool_name:
+        raise RuntimeError("profile tool_name is empty; cannot sync RM65 tool frame")
+    tcp = profile.get("tcp") if isinstance(profile.get("tcp"), Mapping) else {}
+    payload = profile.get("payload") if isinstance(profile.get("payload"), Mapping) else {}
+    try:
+        tcp_pose = np.asarray(tcp.get("pose_flange_m_rad"), dtype=float).reshape(-1)
+    except Exception as exc:
+        raise RuntimeError("profile tcp.pose_flange_m_rad is not a numeric 6D pose") from exc
+    if tcp_pose.shape != (6,) or not np.all(np.isfinite(tcp_pose)):
+        raise RuntimeError("profile tcp.pose_flange_m_rad must contain 6 finite values")
+    try:
+        payload_mass = float(payload.get("mass_kg"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("profile payload.mass_kg is missing or non-numeric") from exc
+    if not np.isfinite(payload_mass) or payload_mass < 0.0:
+        raise RuntimeError("profile payload.mass_kg must be a finite non-negative value")
+    try:
+        payload_com = np.asarray(payload.get("com_tool_m"), dtype=float).reshape(-1)
+    except Exception as exc:
+        raise RuntimeError("profile payload.com_tool_m is missing or non-numeric") from exc
+    if payload_com.shape != (3,) or not np.all(np.isfinite(payload_com)):
+        raise RuntimeError("profile payload.com_tool_m must contain 3 finite values")
+    return (
+        tool_name,
+        [float(value) for value in tcp_pose],
+        float(payload_mass),
+        [float(value) for value in payload_com],
+    )
+
+
 @dataclass
 class RM65ImpedanceArmBackendConfig:
     arm_ip: str
@@ -136,6 +178,8 @@ class RM65ImpedanceArmBackendConfig:
     tool_profile: str | Path | None = None
     auto_load_tool_profile: bool = True
     strict_tool_profile: bool = True
+    auto_sync_tool_frame: bool = True
+    auto_create_tool_frame: bool = True
     impedance_mode: str = "pose"
     force_tare_sec: float = 3.0
     control_dt: float = 1.0 / 30.0
@@ -177,6 +221,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._active_tool_profile_path: str | None = None
         self._endpoint_to_tool_tcp = np.eye(4, dtype=float)
         self._latest_target_pose6: list[float] | None = None
+        self._latest_target_joint_deg: list[float] | None = None
         self._last_command: EffectorCommand | None = None
         self._last_command_timestamp: float | None = None
         self._last_step_record: dict[str, object] | None = None
@@ -185,6 +230,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._last_send_result_text: str | None = None
         self._enabled = False
         self._state_lock = threading.RLock()
+        self._send_lock = threading.RLock()
+        self._emergency_stopped = False
         self._loop_stop_event = threading.Event()
         self._loop_thread: threading.Thread | None = None
         self._last_send_time: float | None = None
@@ -206,6 +253,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             raise RuntimeError(f"{self.name} failed to connect RM65 ip={self.config.arm_ip}: {socket_code}")
         self._active_tool_name = self._read_active_tool_name()
         self._profile = self._load_profile(self._active_tool_name)
+        self._validate_profile(self._profile, self._active_tool_name, check_active_tool=False)
+        self._active_tool_name = self._sync_profile_tool_frame(self._profile, self._active_tool_name)
         self._validate_profile(self._profile, self._active_tool_name)
         tcp = self._profile.get("tcp") if isinstance(self._profile.get("tcp"), Mapping) else {}
         self._endpoint_to_tool_tcp = _pose6_to_matrix(tcp.get("pose_flange_m_rad", [0.0] * 6))
@@ -227,23 +276,134 @@ class RM65ImpedanceArmBackend(EffectorBackend):
     def is_ready(self) -> bool:
         return (not self.config.connect_hardware) or self.arm is not None
 
+    def hold_motion(self, reason: str = "manual hold") -> None:
+        del reason
+        with self._send_lock:
+            self._loop_stop_event.set()
+            with self._state_lock:
+                self._enabled = False
+                self._latest_target_pose6 = None
+                self._latest_target_joint_deg = None
+                self._last_command = None
+                self._last_command_timestamp = None
+                self._last_step_record = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = "hold"
+            controller = self._controller
+            robot = self.arm
+            if robot is None and controller is not None:
+                robot = controller.robot
+            if controller is not None:
+                try:
+                    controller.stop_motion()
+                except Exception as exc:  # noqa: BLE001
+                    with self._state_lock:
+                        self._last_send_result_code = -1
+                        self._last_send_result_text = f"hold:stop_motion:{type(exc).__name__}: {exc}"
+            elif robot is not None:
+                stop_method = getattr(robot, "Arm_Slow_Stop", None)
+                stop_label = "Arm_Slow_Stop"
+                if stop_method is None:
+                    stop_method = getattr(robot, "Arm_Stop", None)
+                    stop_label = "Arm_Stop"
+                if stop_method is not None:
+                    stop_result = stop_method()
+                    stop_code, stop_text = _parse_rm65_result(stop_result)
+                    with self._state_lock:
+                        self._last_send_result_code = stop_code
+                        self._last_send_result_text = f"hold:{stop_label}:{stop_text}"
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=1.0)
+            if not self._loop_thread.is_alive():
+                self._loop_thread = None
+
+    def reset_motion_state(self, qpos: object | None = None) -> None:
+        del qpos
+        with self._send_lock:
+            with self._state_lock:
+                self._latest_target_pose6 = None
+                self._latest_target_joint_deg = None
+                self._last_command = None
+                self._last_command_timestamp = None
+                self._last_step_record = None
+                self._last_send_time = None
+                self._smoothed_send_dt = float(self.config.control_dt)
+                self._last_effective_control_dt = float(self.config.control_dt)
+                self._last_effective_step_scale = 1.0
+                if not self._enabled:
+                    self._last_send_result_text = "reset_motion_state"
+
     def enable_force_control(self) -> None:
         if self._enabled:
             return
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=1.0)
+            if self._loop_thread.is_alive():
+                raise RuntimeError(f"{self.name} previous pose impedance loop is still alive.")
+            self._loop_thread = None
         if not self.config.connect_hardware:
-            self._enabled = True
+            with self._state_lock:
+                self._last_fault = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = "dry_run"
+                self._enabled = True
             return
         self.start()
         assert self._controller is not None
+        with self._state_lock:
+            self._last_fault = None
+            self._last_send_result_code = None
+            self._last_send_result_text = "starting"
+            self._last_step_record = None
         self._controller.start()
-        self._enabled = True
         self._loop_stop_event.clear()
+        with self._state_lock:
+            self._enabled = True
         self._loop_thread = threading.Thread(
             target=self._impedance_loop,
             daemon=True,
             name=f"{self.name}_pose_impedance",
         )
         self._loop_thread.start()
+
+    def force_control_status_text(self) -> str:
+        with self._state_lock:
+            if self._loop_thread is None:
+                loop_text = "not_started"
+            elif self._loop_thread.is_alive():
+                loop_text = "alive"
+            else:
+                loop_text = "stopped"
+            bits = [
+                f"enabled={bool(self._enabled)}",
+                f"loop={loop_text}",
+                f"last_step={'yes' if self._last_step_record is not None else 'none'}",
+            ]
+            if self._last_fault:
+                bits.append(f"last_fault={self._last_fault}")
+            if self._last_send_result_text:
+                bits.append(f"last_send={self._last_send_result_text}")
+            return " ".join(bits)
+
+    def wait_until_force_control_ready(self, *, timeout_sec: float = 1.0) -> dict[str, Any]:
+        if not self.config.connect_hardware:
+            return self.get_state()
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            state = self.get_state()
+            if state.get("fault") or not bool(state.get("impedance_enabled")):
+                raise RuntimeError(
+                    f"{self.name} pose impedance failed to stay enabled: "
+                    f"{self.force_control_status_text()}"
+                )
+            if state.get("last_impedance_record") is not None and state.get("send_result_code") == 0:
+                return state
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"{self.name} pose impedance did not report a successful control tick "
+                    f"within {timeout_sec:.3f}s: {self.force_control_status_text()}"
+                )
+            time.sleep(0.005)
 
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
@@ -252,18 +412,33 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             raise ValueError(
                 f"{self.name} pose impedance requires cartesian_pose command, got {command.command_type!r}."
             )
-        if self.config.connect_hardware and not self._enabled:
-            raise RuntimeError(f"{self.name} force control is not enabled; run tare/enable after runtime home first.")
+        with self._state_lock:
+            if self._emergency_stopped:
+                raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
+        if self.config.connect_hardware:
+            with self._state_lock:
+                force_control_ready = bool(self._enabled) and self._last_fault is None
+            if not force_control_ready:
+                raise RuntimeError(
+                    f"{self.name} force control is not enabled; "
+                    "run tare/enable after runtime home first. "
+                    f"status={self.force_control_status_text()}"
+                )
         now = time.time()
         target_pose6 = self._command_to_tool_tcp_pose6(command)
-        with self._state_lock:
-            self._latest_target_pose6 = list(target_pose6)
-            self._last_command = command.copy()
-            self._last_command_timestamp = now
-            self._update_dt_scale(now)
-        if not self.config.connect_hardware:
-            self._last_send_result_code = 0
-            self._last_send_result_text = "dry_run"
+        target_joint_deg = self._command_solver_output_joint_deg(command)
+        with self._send_lock:
+            with self._state_lock:
+                if self._emergency_stopped:
+                    raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
+                self._latest_target_pose6 = list(target_pose6)
+                self._latest_target_joint_deg = None if target_joint_deg is None else list(target_joint_deg)
+                self._last_command = command.copy()
+                self._last_command_timestamp = now
+                self._update_dt_scale(now)
+                if not self.config.connect_hardware:
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = "dry_run"
 
     def _read_active_tool_name(self) -> str | None:
         if self.arm is None:
@@ -284,14 +459,70 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             "Pass --left/--right-tool-profile or enable a named active RM65 tool frame."
         )
 
-    def _validate_profile(self, profile: Mapping[str, Any], active_tool_name: str | None) -> None:
+    def _sync_profile_tool_frame(
+        self,
+        profile: Mapping[str, Any],
+        active_tool_name: str | None,
+    ) -> str | None:
+        if not self.config.auto_sync_tool_frame or self.arm is None:
+            return active_tool_name
+        tool_name, tcp_pose, payload_mass, payload_com = _profile_tool_frame_params(profile)
+        updater = getattr(self.arm, "Update_Tool_Frame", None)
+        creator = getattr(self.arm, "Manual_Set_Tool_Frame", None)
+        changer = getattr(self.arm, "Change_Tool_Frame", None)
+        if changer is None:
+            raise RuntimeError(f"{self.name} RM65 SDK does not expose Change_Tool_Frame")
+        action = "updated"
+        update_result = updater(tool_name, tcp_pose, payload_mass, *payload_com) if updater is not None else -1
+        update_code, update_text = _parse_rm65_result(update_result)
+        if update_code != 0:
+            if not self.config.auto_create_tool_frame:
+                raise RuntimeError(
+                    f"{self.name} Update_Tool_Frame({tool_name}) failed with return code {update_text}; "
+                    "tool frame creation is disabled"
+                )
+            if creator is None:
+                raise RuntimeError(
+                    f"{self.name} Update_Tool_Frame({tool_name}) failed with return code {update_text}; "
+                    "RM65 SDK does not expose Manual_Set_Tool_Frame"
+                )
+            _require_rm65_success(
+                creator(tool_name, tcp_pose, payload_mass, *payload_com),
+                f"{self.name} Manual_Set_Tool_Frame({tool_name})",
+            )
+            action = "created"
+        _require_rm65_success(changer(tool_name), f"{self.name} Change_Tool_Frame({tool_name})")
+        time.sleep(0.05)
+        synced_tool_name = self._read_active_tool_name()
+        if tool_name not in str(synced_tool_name or ""):
+            raise RuntimeError(
+                f"{self.name} requested active tool frame {tool_name!r}, got {synced_tool_name!r}"
+            )
+        print(
+            f"{self.name}: {action} and activated RM65 tool frame from profile "
+            f"tool={tool_name} tcp={tcp_pose} payload={payload_mass:.6f}kg com={payload_com}"
+        )
+        return synced_tool_name
+
+    def _validate_profile(
+        self,
+        profile: Mapping[str, Any],
+        active_tool_name: str | None,
+        *,
+        check_active_tool: bool = True,
+    ) -> None:
+        if is_position_endpoint_profile(dict(profile)):
+            raise RuntimeError(
+                f"{self.name} received the position-only profile {profile.get('name')!r}. "
+                "Use --arm-control-mode position for endpoint-TCP position control, or pass an impedance-capable tool profile."
+            )
         _warn_profile_tcp_safety(owner=self.name, profile=profile)
         if not self.config.strict_tool_profile:
             return
         errors = _strict_profile_errors(
             profile,
             side=self.config.side,
-            active_tool_name=active_tool_name,
+            active_tool_name=active_tool_name if check_active_tool else None,
             mode=self.config.impedance_mode,
         )
         if errors:
@@ -308,6 +539,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         overrides = {
             "tare_sec": float(self.config.force_tare_sec),
             "action_hz": min(requested_action_hz, control_hz),
+            "hold_last_safe_on_ik_failure": True,
             **dict(self.config.impedance_overrides),
         }
         return RM65ImpedanceConfig.from_profile(
@@ -331,6 +563,18 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         )
         tool_tcp_pose = endpoint_pose @ self._endpoint_to_tool_tcp
         return _matrix_to_pose6(tool_tcp_pose)
+
+    def _command_solver_output_joint_deg(self, command: EffectorCommand) -> list[float] | None:
+        raw_qpos = command.metadata.get("solver_output_qpos")
+        if raw_qpos is None:
+            return None
+        try:
+            qpos = np.asarray(raw_qpos, dtype=float).reshape(6)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(qpos)):
+            return None
+        return np.rad2deg(qpos).astype(float).tolist()
 
     def _update_dt_scale(self, now: float) -> None:
         if self._last_send_time is None:
@@ -359,26 +603,39 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         period = 1.0 / float(self._controller.config.control_hz)
         next_deadline = time.perf_counter()
         while not self._loop_stop_event.is_set():
-            with self._state_lock:
-                target = None if self._latest_target_pose6 is None else list(self._latest_target_pose6)
             try:
-                record = self._controller.step(target)
+                with self._state_lock:
+                    if self._emergency_stopped or self._loop_stop_event.is_set():
+                        break
+                    target = None if self._latest_target_pose6 is None else list(self._latest_target_pose6)
+                    target_joint_deg = (
+                        None
+                        if self._latest_target_joint_deg is None
+                        else list(self._latest_target_joint_deg)
+                    )
+                with self._send_lock:
+                    with self._state_lock:
+                        if self._emergency_stopped or self._loop_stop_event.is_set():
+                            break
+                    record = self._controller.step(target, target_joint_deg=target_joint_deg)
+                    with self._state_lock:
+                        if self._emergency_stopped or self._loop_stop_event.is_set():
+                            break
+                        self._last_step_record = dict(record)
+                        self._last_send_result_code = 0
+                        self._last_send_result_text = "ok"
             except Exception as exc:
                 fault = f"{type(exc).__name__}: {exc}"
                 with self._state_lock:
                     self._last_fault = fault
                     self._last_send_result_code = -1
                     self._last_send_result_text = fault
+                    self._enabled = False
                 try:
                     self._controller.stop_motion()
                 finally:
-                    self._enabled = False
                     self._loop_stop_event.set()
                 break
-            with self._state_lock:
-                self._last_step_record = dict(record)
-                self._last_send_result_code = 0
-                self._last_send_result_text = "ok"
             next_deadline += period
             sleep_sec = next_deadline - time.perf_counter()
             if sleep_sec > 0.0:
@@ -388,19 +645,37 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         with self._state_lock:
             command = None if self._last_command is None else self._last_command.copy()
             record = None if self._last_step_record is None else dict(self._last_step_record)
+            if self._loop_thread is None:
+                loop_state = "not_started"
+            elif self._loop_thread.is_alive():
+                loop_state = "alive"
+            else:
+                loop_state = "stopped"
+            emergency_stopped = bool(self._emergency_stopped)
             current_qpos = None
             current_pose = None
+            target_qpos = None
+            target_pose = None
             if record is not None:
-                joint_deg = record.get("command_joint_deg")
-                pose6 = record.get("command_pose")
+                measured_joint_deg = record.get("measured_joint_deg")
+                measured_pose6 = record.get("measured_pose")
+                command_joint_deg = record.get("command_joint_deg")
+                command_pose6 = record.get("command_pose")
+                joint_deg = measured_joint_deg if measured_joint_deg is not None else command_joint_deg
+                pose6 = measured_pose6 if measured_pose6 is not None else command_pose6
                 if joint_deg is not None:
                     current_qpos = np.asarray(joint_deg, dtype=float).reshape(6) / 180.0 * np.pi
                 if pose6 is not None:
                     current_pose = _pose6_to_matrix(pose6)
+                if command_joint_deg is not None:
+                    target_qpos = np.asarray(command_joint_deg, dtype=float).reshape(6) / 180.0 * np.pi
+                if command_pose6 is not None:
+                    target_pose = _pose6_to_matrix(command_pose6)
             return {
                 "current_qpos": current_qpos,
                 "current_tcp_pose": current_pose,
-                "last_target_qpos": current_qpos,
+                "last_target_qpos": target_qpos if target_qpos is not None else current_qpos,
+                "last_target_tcp_pose": target_pose,
                 "last_command": command,
                 "last_command_timestamp": self._last_command_timestamp,
                 "arm_state_source": "pose_impedance_command",
@@ -408,16 +683,53 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 "hardware_result_text": self._last_fault or "ok",
                 "send_result_code": self._last_send_result_code,
                 "send_result_text": self._last_send_result_text,
+                "emergency_stopped": emergency_stopped,
                 "effective_control_dt_sec": float(self._last_effective_control_dt),
                 "effective_step_scale": float(self._last_effective_step_scale),
                 "impedance_enabled": bool(self._enabled),
+                "impedance_loop_state": loop_state,
                 "impedance_mode": self.config.impedance_mode,
                 "force_tare_sec": float(self.config.force_tare_sec),
                 "active_tool_name": self._active_tool_name,
                 "active_tool_profile_path": self._active_tool_profile_path,
                 "last_impedance_record": record,
+                "ik_metadata": (
+                    dict(record.get("ik_metadata", {}))
+                    if isinstance(record, Mapping)
+                    else {}
+                ),
                 "fault": self._last_fault,
             }
+
+    def emergency_stop(self) -> None:
+        with self._send_lock:
+            self._loop_stop_event.set()
+            with self._state_lock:
+                self._enabled = False
+                self._emergency_stopped = True
+                self._latest_target_pose6 = None
+                self._latest_target_joint_deg = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = "emergency_stop"
+            robot = self.arm
+            if robot is None and self._controller is not None:
+                robot = self._controller.robot
+            if robot is None:
+                return
+            stop_method = getattr(robot, "Arm_Stop", None)
+            stop_label = "Arm_Stop"
+            if stop_method is None:
+                stop_method = getattr(robot, "Arm_Slow_Stop", None)
+                stop_label = "Arm_Slow_Stop"
+            if stop_method is None:
+                raise RuntimeError(f"{self.name} RM65 SDK exposes no Arm_Stop/Arm_Slow_Stop method")
+            stop_result = stop_method()
+            stop_code, stop_text = _parse_rm65_result(stop_result)
+            with self._state_lock:
+                self._last_send_result_code = stop_code
+                self._last_send_result_text = f"emergency_stop:{stop_label}:{stop_text}"
+            if stop_code not in (0, None):
+                raise RuntimeError(f"{self.name} {stop_label} failed with return code {stop_text}")
 
     def close(self) -> None:
         self._loop_stop_event.set()
@@ -426,7 +738,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             self._loop_thread = None
         if self._controller is not None:
             try:
-                self._controller.stop_motion()
+                if not self._emergency_stopped:
+                    self._controller.stop_motion()
             except Exception:
                 pass
             self._controller.close()
@@ -436,4 +749,5 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self.arm.Arm_Socket_Close()
             finally:
                 self.arm = None
-        self._enabled = False
+        with self._state_lock:
+            self._enabled = False

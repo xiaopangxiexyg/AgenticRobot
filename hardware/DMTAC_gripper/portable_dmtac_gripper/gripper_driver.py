@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import threading
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional, Sequence, Union
 
 import serial
@@ -583,12 +585,28 @@ class InspireGripper:
         self,
         timeout: float = 3.0,
         poll_interval: float = 0.05,
+        start_grace: float = 0.2,
     ) -> GripperState:
-        deadline = time.time() + float(timeout)
-        last_state = self.get_state()
+        timeout_s = max(0.0, float(timeout))
+        poll_s = max(0.0, float(poll_interval))
+        start_grace_s = max(0.0, float(start_grace))
 
-        while last_state.is_moving and time.time() < deadline:
-            time.sleep(float(poll_interval))
+        start_time = time.time()
+        deadline = start_time + timeout_s
+        grace_deadline = min(deadline, start_time + start_grace_s)
+        last_state = self.get_state()
+        observed_motion = bool(last_state.is_moving)
+
+        while time.time() < deadline:
+            if last_state.is_moving:
+                observed_motion = True
+            elif observed_motion or time.time() >= grace_deadline:
+                return last_state
+
+            sleep_s = min(poll_s, max(0.0, deadline - time.time()))
+            if sleep_s <= 0.0:
+                break
+            time.sleep(sleep_s)
             last_state = self.get_state()
 
         return last_state
@@ -640,6 +658,37 @@ class InspireGripper:
 def list_serial_devices() -> list[dict]:
     ports = []
     for port in list_ports.comports():
+        aliases: list[str] = []
+        try:
+            device_path = Path(str(port.device))
+            if device_path.exists():
+                realpath = str(device_path.resolve())
+                for alias_dir in (Path("/dev/serial/by-id"), Path("/dev/serial/by-path")):
+                    if not alias_dir.exists():
+                        continue
+                    for candidate in sorted(alias_dir.iterdir()):
+                        try:
+                            if str(candidate.resolve()) == realpath:
+                                aliases.append(str(candidate))
+                        except OSError:
+                            continue
+        except OSError:
+            pass
+        permissions = {}
+        try:
+            stat = os.stat(port.device)
+            permissions = {
+                "mode": oct(stat.st_mode & 0o777),
+                "uid": stat.st_uid,
+                "gid": stat.st_gid,
+                "readable": os.access(port.device, os.R_OK),
+                "writable": os.access(port.device, os.W_OK),
+            }
+        except OSError:
+            permissions = {
+                "readable": False,
+                "writable": False,
+            }
         ports.append(
             {
                 "device": port.device,
@@ -648,6 +697,12 @@ def list_serial_devices() -> list[dict]:
                 "manufacturer": port.manufacturer,
                 "product": port.product,
                 "serial_number": port.serial_number,
+                "vid": port.vid,
+                "pid": port.pid,
+                "location": getattr(port, "location", None),
+                "interface": getattr(port, "interface", None),
+                "usb_aliases": aliases,
+                "permissions": permissions,
             }
         )
     return ports

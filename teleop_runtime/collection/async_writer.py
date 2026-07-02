@@ -49,6 +49,10 @@ class AsyncWriterStats:
     dropped: int
     failures: int
     worker_count: int
+    max_queue_size: int
+    queue_high_water: int
+    submit_wait_total_sec: float
+    submit_wait_max_sec: float
 
 
 _QueueItem = WriteJob | object
@@ -75,6 +79,9 @@ class AsyncWriterPool:
         self._submitted = 0
         self._completed = 0
         self._dropped = 0
+        self._queue_high_water = 0
+        self._submit_wait_total_sec = 0.0
+        self._submit_wait_max_sec = 0.0
 
     def _record_failure(self, exc: BaseException) -> None:
         with self._failure_lock:
@@ -114,6 +121,7 @@ class AsyncWriterPool:
             raise AsyncWriterError(f"{self.name} is closed and cannot accept new jobs.")
         self._ensure_started()
         policy = self.config.backpressure_policy
+        submit_started_at = time.perf_counter()
 
         if policy == "raise":
             try:
@@ -134,7 +142,11 @@ class AsyncWriterPool:
                     f"{self.name} queue is full after waiting {self.config.put_timeout_sec:.3f}s."
                 ) from exc
 
+        submit_elapsed = time.perf_counter() - submit_started_at
+        self._submit_wait_total_sec += float(submit_elapsed)
+        self._submit_wait_max_sec = max(self._submit_wait_max_sec, float(submit_elapsed))
         self._submitted += 1
+        self._queue_high_water = max(self._queue_high_water, int(self._queue.qsize()))
         return True
 
     def _worker_loop(self) -> None:
@@ -179,6 +191,10 @@ class AsyncWriterPool:
             dropped=int(self._dropped),
             failures=len(self._failures),
             worker_count=int(self.config.worker_count),
+            max_queue_size=int(self.config.max_queue_size),
+            queue_high_water=int(self._queue_high_water),
+            submit_wait_total_sec=float(self._submit_wait_total_sec),
+            submit_wait_max_sec=float(self._submit_wait_max_sec),
         )
 
     def __enter__(self) -> "AsyncWriterPool":

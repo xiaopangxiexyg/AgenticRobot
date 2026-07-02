@@ -1,6 +1,8 @@
 """Generic teleoperation runtime package."""
 
 from .backends import (
+    DMTacGripperBackend,
+    DMTacGripperBackendConfig,
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
     RM65ArmBackend,
@@ -67,7 +69,13 @@ from .configs import (
     build_annotated_dual_rm65_calibration,
     build_bimanual_session,
     default_vive_tracker_configs,
+    dmtac_backend_configs_from_assignment,
+    load_dmtac_hardware_assignment,
+    load_latest_dmtac_backend_configs,
+    load_latest_q6_ports,
+    load_q6_hardware_assignment,
     load_realsense_camera_config_map,
+    q6_ports_from_assignment,
 )
 
 __all__ = [
@@ -77,6 +85,8 @@ __all__ = [
     "ClutchState",
     "DeltaClutchController",
     "DeskFrameConfig",
+    "DMTacGripperBackend",
+    "DMTacGripperBackendConfig",
     "DualArmCollisionAwareRetargeter",
     "DualArmCollisionAwareRetargeterConfig",
     "EpisodeRecorder",
@@ -123,9 +133,15 @@ __all__ = [
     "build_bimanual_session",
     "compare_start_qpos_pair",
     "default_vive_tracker_configs",
+    "dmtac_backend_configs_from_assignment",
     "episode_start_qpos_pair",
+    "load_dmtac_hardware_assignment",
     "load_episode",
+    "load_latest_dmtac_backend_configs",
+    "load_latest_q6_ports",
+    "load_q6_hardware_assignment",
     "load_realsense_camera_config_map",
+    "q6_ports_from_assignment",
     "require_valid_episode",
     "register_backend",
     "register_retargeter",

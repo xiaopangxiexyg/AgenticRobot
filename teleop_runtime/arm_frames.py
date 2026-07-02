@@ -10,6 +10,7 @@ from .transforms import as_pose_matrix, invert_pose
 
 TOOL_TCP_FRAME = "tool_tcp"
 ARM_ENDPOINT_FRAME = "arm_endpoint"
+EMPTY_TOOL_FRAME = "empty"
 RM65_ARM_ENDPOINT_URDF_FRAME = "arm_link6"
 ARM_ENDPOINT_TO_HAND_BASE_Z_M = 0.009
 
@@ -44,7 +45,7 @@ def canonical_arm_controlled_frame(frame: str | None = None) -> str:
     text = "" if frame is None else str(frame).strip()
     if text in {"", "tcp", TOOL_TCP_FRAME}:
         return TOOL_TCP_FRAME
-    if text in {ARM_ENDPOINT_FRAME, RM65_ARM_ENDPOINT_URDF_FRAME}:
+    if text in {ARM_ENDPOINT_FRAME, EMPTY_TOOL_FRAME, RM65_ARM_ENDPOINT_URDF_FRAME}:
         return ARM_ENDPOINT_FRAME
     if text == HAND_BASE_TCP_FRAME:
         return HAND_BASE_TCP_FRAME

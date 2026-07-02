@@ -15,7 +15,7 @@ from ..common import EffectorCommand
 DEFAULT_DMTAC_GRIPPER_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 DEFAULT_DMTAC_GRIPPER_SPEED = 0.2
 DEFAULT_DMTAC_GRIPPER_TORQUE = 0.2
-GRIPPER_ACTION_MAX = 0.9
+GRIPPER_ACTION_MAX = 0.99
 
 
 @dataclass
@@ -52,7 +52,7 @@ class DMTacGripperBackendConfig:
     tactile_denoise_mode: str = "delta"
     tactile_baseline_frames: int = 20
     tactile_deadband_abs: float = 5e-5
-    tactile_temporal_alpha: float = 0.35
+    tactile_temporal_alpha: float = 0.85
     tactile_spatial_blur_ksize: int = 5
     dmtac_root: str | Path | None = None
     debug: bool = False

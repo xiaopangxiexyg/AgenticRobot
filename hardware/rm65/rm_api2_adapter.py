@@ -212,11 +212,86 @@ class Arm:
         params = rm_inverse_kinematics_params_t(q_seed, pose_values[:pose_len], int(flag))
         return self._robot.rm_algo_inverse_kinematics(params)
 
+    def Algo_Inverse_Kinematics_All(self, q_in, pose, flag=1):
+        """Return all local SDK IK branches when the API2 library exposes them."""
+        q_seed = self._joint_for_canfd(q_in)
+        pose_values = _as_float_list(pose)
+        pose_len = 7 if int(flag) == 0 else 6
+        params = rm_inverse_kinematics_params_t(q_seed, pose_values[:pose_len], int(flag))
+        solver = getattr(self._robot, "rm_algo_inverse_kinematics_all", None)
+        if solver is None:
+            raise AttributeError("rm_algo_inverse_kinematics_all is not available")
+        return solver(params)
+
+    def Algo_IKine_Check_Joint_Position_Limit(self, joint):
+        checker = getattr(self._robot, "rm_algo_ikine_check_joint_position_limit", None)
+        q = self._joint_for_dof(joint)
+        if checker is not None:
+            try:
+                code = int(checker(q))
+                if code != -1:
+                    return code
+            except Exception:
+                pass
+        fallback = self._manual_joint_position_limit_code(q)
+        if fallback is not None:
+            return fallback
+        raise AttributeError("rm_algo_ikine_check_joint_position_limit is not available")
+
+    def Algo_IKine_Check_Joint_Velocity_Limit(self, dt, q_ref, q_solve):
+        checker = getattr(self._robot, "rm_algo_ikine_check_joint_velocity_limit", None)
+        if checker is None:
+            raise AttributeError("rm_algo_ikine_check_joint_velocity_limit is not available")
+        return checker(float(dt), self._joint_for_dof(q_ref), self._joint_for_dof(q_solve))
+
+    def Algo_Safety_Robot_Self_Collision_Detection(self, joint):
+        checker = getattr(self._robot, "rm_algo_safety_robot_self_collision_detection", None)
+        if checker is None:
+            raise AttributeError("rm_algo_safety_robot_self_collision_detection is not available")
+        return checker(self._joint_for_dof(joint))
+
+    def _manual_joint_position_limit_code(self, joint: Iterable[float]) -> int | None:
+        min_getter = getattr(self._robot, "rm_algo_get_joint_min_limit", None)
+        max_getter = getattr(self._robot, "rm_algo_get_joint_max_limit", None)
+        if min_getter is None or max_getter is None:
+            return None
+        try:
+            q = self._joint_for_dof(joint)
+            q_min = _as_float_list(min_getter())[: self.arm_dof]
+            q_max = _as_float_list(max_getter())[: self.arm_dof]
+        except Exception:
+            return None
+        if len(q_min) < self.arm_dof or len(q_max) < self.arm_dof:
+            return None
+        for index, value in enumerate(q):
+            if value < q_min[index] or value > q_max[index]:
+                return index + 1
+        return 0
+
     def Algo_Forward_Kinematics(self, joint, flag=1):
         return self._robot.rm_algo_forward_kinematics(self._joint_for_dof(joint), int(flag))
 
     def Algo_Kin_Singularity_Analyse(self, joint):
         return self._robot.rm_algo_kin_robot_singularity_analyse(self._joint_for_dof(joint))
+
+    def Algo_Kin_Set_Singularity_Thresholds(self, limit_qe, limit_qw, limit_d):
+        return self._robot.rm_algo_kin_set_singularity_thresholds(
+            float(limit_qe),
+            float(limit_qw),
+            float(limit_d),
+        )
+
+    def Algo_Kin_Get_Singularity_Thresholds(self):
+        return self._robot.rm_algo_kin_get_singularity_thresholds()
+
+    def Algo_Kin_Singularity_Thresholds_Init(self):
+        return self._robot.rm_algo_kin_singularity_thresholds_init()
+
+    def Set_Avoid_Singularity_Mode(self, mode):
+        return self._robot.rm_set_avoid_singularity_mode(int(mode))
+
+    def Get_Avoid_Singularity_Mode(self):
+        return self._robot.rm_get_avoid_singularity_mode()
 
     def Set_MoveV_CANFD_Init(self, avoid_singularity_flag=1, frame_type=1, dt=20):
         return self._robot.rm_set_movev_canfd_init(

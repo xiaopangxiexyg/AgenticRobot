@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from hardware.rm65.force_compensation import (  # noqa: E402
     PoseAdmittance,
     WrenchProcessor,
+    admittance_wrench_for_arm,
     angle_delta,
     apply_pose_offset,
     finite_list,
@@ -289,7 +290,9 @@ def _run_qpos_admittance(robot: Arm, side: str, start_state: dict[str, list[floa
 
             compute_start = time.perf_counter()
             processed = processor.process(readings[args.force_source])
-            update = admittance.update(processed["deadbanded"], dt)
+            raw_deadbanded = list(processed["deadbanded"])
+            admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, side)
+            update = admittance.update(admittance_wrench, dt)
             target_pose = normalize_pose(apply_pose_offset(start_state["pose"], update["offset"]))
             timing["compute"].append(time.perf_counter() - compute_start)
 
@@ -378,6 +381,8 @@ def _run_qpos_admittance(robot: Arm, side: str, start_state: dict[str, list[floa
                     "observed_pose": state["pose"],
                     "tare_corrected_wrench": processed["tare_corrected"],
                     "filtered_wrench": processed["filtered"],
+                    "raw_deadbanded_wrench": raw_deadbanded,
+                    "admittance_wrench": admittance_wrench,
                     "active_wrench": update["active_wrench"],
                     "target_offset": update["target_offset"],
                     "offset": update["offset"],

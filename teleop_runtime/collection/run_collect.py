@@ -7,20 +7,26 @@ import re
 import select
 import sys
 import termios
+import threading
 import time
 import tty
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
 from project_paths import calibration_profiles_dir, default_dataset_root
 from rm65_inspire_tac.paths import require_asset_path
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from ..backends.grippers import (
+    DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DMTacGripperBackend,
+    DMTacGripperBackendConfig,
+    GRIPPER_ACTION_MAX,
+)
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
     InspireTacHandBackend,
@@ -28,6 +34,12 @@ from ..backends.hands import (
 )
 from ..calibration import TeleopCalibration
 from ..configs import build_annotated_dual_rm65_calibration
+from ..configs.dmtac_hardware import (
+    dmtac_backend_configs_from_assignment,
+    load_dmtac_hardware_assignment,
+)
+from ..configs.q6_hardware import load_latest_q6_ports
+from ..defaults import DEFAULT_RM65_ARM_CONTROL_HZ, DEFAULT_TELEOP_SAMPLE_HZ
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
 from ..hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
@@ -44,20 +56,25 @@ from ..retargeters import (
     JointsToDexHandRetargeterConfig,
     PoseToArmRetargeter,
     PoseToArmRetargeterConfig,
+    ScalarToGripperRetargeter,
+    ScalarToGripperRetargeterConfig,
     SmoothJitterArmRetargeter,
     SmoothJitterArmRetargeterConfig,
 )
 from ..diagnostics import TeleopRunState
 from ..deploy.actions import ActionSafetyFilter, ActionSafetyFilterConfig, NormalizedAction
 from ..deploy.observation import build_deployment_observation
-from ..deploy.replay import (
-    infer_replay_action_hz,
-    load_replay_arm_joint_targets_from_parquet,
-    load_replay_actions_from_parquet,
-    resolve_replay_parquet_path,
-)
-from ..deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM, ACTION_HAND_SLICES
+from ..deploy.schema import ACTION_DIM, ACTION_HAND_SLICES
 from ..deploy.startup_init import StartupInitializer
+from ..replay.randomizer import ReplayTrajectoryRandomizer
+from ..replay.trajectory import (
+    ReplayInitEpisodePlan,
+    ReplayTrajectoryGroup,
+    ReplayTrajectoryPool,
+    build_replay_groups_from_args as _build_replay_groups,
+    build_replay_init_plan_from_args as _build_replay_init_plan,
+    replay_active_arm_poses_are_finite as _replay_active_arm_poses_are_finite,
+)
 from ..rigs import BimanualRig
 from ..safety import TeleopSafetyConfig
 from ..schemas import (
@@ -98,6 +115,7 @@ from .modes import (
 )
 from .preview_rate import PreviewRateLimiter
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
+from .observers import CollectionWriterObserverConfig
 from .sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
 from .status_snapshot import (
     arm_debug_text as _snapshot_arm_debug_text,
@@ -120,6 +138,27 @@ DEFAULT_CAMERA_CONFIG_PATH = (
 DEFAULT_DATASET_ROOT = default_dataset_root()
 DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
 _CALIBRATION_PROFILE_TIMESTAMP_RE = re.compile(r"^(\d{8})_(\d{6})")
+HAND_BACKEND_INSPIRE = "inspire"
+HAND_BACKEND_DMTAC_GRIPPER = "dmtac-gripper"
+HAND_BACKEND_NONE = "none"
+HAND_BACKEND_CHOICES = (
+    HAND_BACKEND_INSPIRE,
+    HAND_BACKEND_DMTAC_GRIPPER,
+    HAND_BACKEND_NONE,
+)
+GRIPPER_POLICY_DEFAULTS = {
+    "source_dim": 2,
+    "output_dim": 1,
+    "invert": False,
+    "alpha": 1.0,
+    "speed": 0.2,
+    "torque": 0.2,
+    "max_action": GRIPPER_ACTION_MAX,
+    "send_threshold": 0.002,
+    "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    "continuous_grasp": False,
+    "telemetry_hz": 10.0,
+}
 
 
 def _calibration_profile_timestamp(path: Path) -> float | None:
@@ -186,6 +225,29 @@ def _non_negative_float(text: str) -> float:
     value = float(text)
     if value < 0.0:
         raise argparse.ArgumentTypeError("value must be >= 0")
+    return value
+
+
+def _dmtac_worker_cpu_affinity(text: str) -> tuple[int, ...]:
+    parts = [part.strip() for part in re.split(r"[,\s]+", str(text)) if part.strip()]
+    if not parts:
+        return ()
+    cpus: list[int] = []
+    for part in parts:
+        try:
+            cpu = int(part)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("CPU affinity must be a comma-separated integer list") from exc
+        if cpu < 0:
+            raise argparse.ArgumentTypeError("CPU affinity indices must be >= 0")
+        cpus.append(cpu)
+    return tuple(dict.fromkeys(cpus))
+
+
+def _dmtac_worker_nice(text: str) -> int:
+    value = int(text)
+    if not 0 <= value <= 19:
+        raise argparse.ArgumentTypeError("worker nice must be in [0, 19]")
     return value
 
 
@@ -293,158 +355,6 @@ def _parse_active_sides(text: str) -> tuple[str, ...]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _parse_replay_group_key(text: str) -> str:
-    key = str(text).strip().lower()
-    if len(key) != 1:
-        raise ValueError("replay group key must be a single character.")
-    if key in {"p", "z", "c", "h", "q", "x", "r"}:
-        raise ValueError(
-            f"replay group key '{key}' conflicts with an existing control key."
-        )
-    return key
-
-
-def _parse_replay_index_token(
-    text: str,
-    *,
-    total_frames: int,
-    default: int,
-) -> int:
-    token = str(text).strip().lower()
-    if not token:
-        return int(default)
-    if token == "start":
-        return 0
-    if token in {"end", "last"}:
-        return int(total_frames)
-    if token in {"mid", "half"}:
-        return int(total_frames // 2)
-    value = int(token)
-    if value < 0:
-        value = int(total_frames) + value
-    return int(value)
-
-
-def _parse_episode_range_token(text: str, *, available_indices: Sequence[int]) -> tuple[int, ...]:
-    token = str(text).strip().lower()
-    available = tuple(sorted({int(index) for index in available_indices}))
-    if not available:
-        raise ValueError("No replay source episodes are available.")
-    if not token or token in {"all", "*"}:
-        return available
-    separators = ("-", "..")
-    for separator in separators:
-        if separator in token:
-            left, right = [part.strip() for part in token.split(separator, 1)]
-            if not left or not right:
-                raise ValueError(f"Invalid replay episode range: {text!r}")
-            start = int(left)
-            end = int(right)
-            if end < start:
-                raise ValueError(f"Replay episode range end must be >= start: {text!r}")
-            selected = tuple(index for index in available if start <= index <= end)
-            if not selected:
-                raise ValueError(
-                    f"Replay episode range {text!r} selected no available episodes; "
-                    f"available=[{available[0]}..{available[-1]}]."
-                )
-            return selected
-    selected_values = tuple(
-        int(part.strip())
-        for part in token.split(",")
-        if part.strip()
-    )
-    if not selected_values:
-        raise ValueError(f"Invalid replay episode range: {text!r}")
-    available_set = set(available)
-    missing = sorted(set(selected_values) - available_set)
-    if missing:
-        raise ValueError(
-            f"Replay episode list {text!r} contains unavailable episode(s): {missing}."
-        )
-    return tuple(index for index in available if index in set(selected_values))
-
-
-@dataclass(frozen=True)
-class ReplayGroupSpec:
-    key: str
-    start_index: int
-    end_index: int
-    episode_range: str = "all"
-
-
-@dataclass(frozen=True)
-class ReplayInitEpisodeSpec:
-    episode_index: int
-    start_index: int
-    end_index: int
-
-
-def _parse_replay_group_spec(
-    spec: str,
-    *,
-    available_episode_indices: Sequence[int],
-) -> ReplayGroupSpec:
-    parts = [part.strip() for part in str(spec).split(":")]
-    if len(parts) != 2:
-        raise ValueError(
-            "replay group spec must be 'key:episode_range', "
-            "for example 'a:0-49' or 'd:50-99'."
-        )
-    key = _parse_replay_group_key(parts[0])
-    episode_range = parts[1] if parts[1] else "all"
-    _parse_episode_range_token(episode_range, available_indices=available_episode_indices)
-    return ReplayGroupSpec(
-        key=key,
-        start_index=0,
-        end_index=-1,
-        episode_range=str(episode_range),
-    )
-
-
-def _parse_replay_init_episode_spec(
-    spec: str,
-    *,
-    default_total_frames: int,
-) -> ReplayInitEpisodeSpec:
-    text = str(spec).strip()
-    if not text:
-        raise ValueError("replay init episode spec is empty.")
-    parts = [part.strip() for part in text.split(":")]
-    if len(parts) not in {1, 3}:
-        raise ValueError(
-            "replay init episode spec must be 'episode' or 'episode:start:end', "
-            "for example '0' or '3:0:end'."
-        )
-    episode_index = int(parts[0])
-    start = 0
-    end = int(default_total_frames)
-    if len(parts) == 3:
-        start = _parse_replay_index_token(
-            parts[1],
-            total_frames=default_total_frames,
-            default=0,
-        )
-        end = _parse_replay_index_token(
-            parts[2],
-            total_frames=default_total_frames,
-            default=default_total_frames,
-        )
-    if start < 0 or start >= default_total_frames:
-        raise ValueError(
-            f"replay init episode start_index={start} is outside [0, {default_total_frames})."
-        )
-    if end <= start or end > default_total_frames:
-        raise ValueError(
-            f"replay init episode end_index={end} must satisfy start < end <= {default_total_frames}."
-        )
-    return ReplayInitEpisodeSpec(
-        episode_index=int(episode_index),
-        start_index=int(start),
-        end_index=int(end),
-    )
-
-
 def _sanitize_task_name_for_path(task_name: str) -> str:
     text = str(task_name).strip()
     if not text:
@@ -492,8 +402,316 @@ def _apply_collection_layout(args: argparse.Namespace) -> None:
     args.dataset_name = dataset_name
 
 
+def _apply_default_q6_ports(
+    args: argparse.Namespace,
+    *,
+    parser: argparse.ArgumentParser | None = None,
+) -> None:
+    args.q6_config_loaded_ports = {}
+    if not bool(getattr(args, "q6_default_config", True)):
+        return
+    active_sides = tuple(str(side) for side in getattr(args, "active_sides", ()))
+    missing_sides = tuple(
+        side
+        for side in active_sides
+        if side in {"left", "right"} and not str(getattr(args, f"{side}_hand_port", "") or "")
+    )
+    if not missing_sides:
+        return
+    try:
+        loaded_ports = load_latest_q6_ports(
+            active_sides=missing_sides,
+            config=str(getattr(args, "q6_config", "latest") or "latest"),
+            allow_missing=not bool(getattr(args, "q6_config_required", False)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        message = f"Failed to load hand Q6 assignment {getattr(args, 'q6_config', 'latest')!r}: {exc}"
+        if parser is not None:
+            parser.error(message)
+        raise RuntimeError(message) from exc
+    args.q6_config_loaded_ports = dict(loaded_ports)
+    for side, port in loaded_ports.items():
+        if side in missing_sides and port:
+            setattr(args, f"{side}_hand_port", str(port))
+
+
+def _hand_backend_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "hand_backend", HAND_BACKEND_INSPIRE) or HAND_BACKEND_INSPIRE)
+    if mode not in HAND_BACKEND_CHOICES:
+        raise ValueError(f"Unsupported hand backend {mode!r}; expected one of {HAND_BACKEND_CHOICES}.")
+    return mode
+
+
+def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
+    path_text = str(getattr(args, "gripper_task_profile", "") or "").strip()
+    if not path_text:
+        return {}
+    path = Path(path_text).expanduser()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Gripper task profile {path} must contain a JSON object.")
+    base_gripper = payload.get("gripper")
+    if base_gripper is not None and not isinstance(base_gripper, Mapping):
+        raise ValueError(f"Profile {path} field 'gripper' must be an object.")
+    selected: Mapping[str, Any] | None = None
+    tasks = payload.get("tasks")
+    if isinstance(tasks, Mapping):
+        task_keys = (
+            str(getattr(args, "gripper_task", "") or ""),
+            str(getattr(args, "task_id", "") or ""),
+            str(getattr(args, "task_name", "") or ""),
+            str(getattr(args, "task", "") or ""),
+        )
+        for key in task_keys:
+            item = tasks.get(key)
+            if isinstance(item, Mapping):
+                selected = item
+                setattr(args, "_resolved_gripper_task", key)
+                break
+    if selected is not None:
+        gripper = selected.get("gripper")
+        if gripper is not None and not isinstance(gripper, Mapping):
+            raise ValueError(f"Profile {path} selected task field 'gripper' must be an object.")
+        merged = dict(base_gripper) if isinstance(base_gripper, Mapping) else {}
+        merged.update(dict(gripper) if isinstance(gripper, Mapping) else dict(selected))
+        return merged
+    if isinstance(base_gripper, Mapping):
+        return dict(base_gripper)
+    if "gripper" in payload:
+        raise ValueError(f"Profile {path} field 'gripper' must be an object.")
+    return dict(payload)
+
+
+def _profile_value(profile: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in profile:
+            return profile[key]
+    return None
+
+
+def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
+    cached = getattr(args, "_resolved_gripper_policy", None)
+    if isinstance(cached, dict):
+        return dict(cached)
+
+    profile = _load_gripper_task_profile(args)
+    policy: dict[str, Any] = dict(GRIPPER_POLICY_DEFAULTS)
+    profile_keys = {
+        "source_dim": ("source_dim", "q6_dim"),
+        "output_dim": ("output_dim", "gripper_slot"),
+        "invert": ("invert",),
+        "alpha": ("alpha", "command_alpha"),
+        "speed": ("speed",),
+        "torque": ("torque", "force"),
+        "max_action": ("max_action", "max_close"),
+        "send_threshold": ("send_threshold",),
+        "command_hz": ("command_hz", "max_command_hz"),
+        "continuous_grasp": ("continuous_grasp", "continuous"),
+        "telemetry_hz": ("telemetry_hz",),
+    }
+    for key, aliases in profile_keys.items():
+        value = _profile_value(profile, *aliases)
+        if value is not None:
+            policy[key] = value
+
+    cli_overrides = {
+        "source_dim": getattr(args, "gripper_source_dim", None),
+        "output_dim": getattr(args, "gripper_output_dim", None),
+        "invert": getattr(args, "gripper_invert", None),
+        "alpha": getattr(args, "gripper_alpha", None),
+        "speed": getattr(args, "gripper_speed", None),
+        "torque": getattr(args, "gripper_torque", None),
+        "max_action": getattr(args, "gripper_max_action", None),
+        "send_threshold": getattr(args, "gripper_send_threshold", None),
+        "command_hz": getattr(args, "gripper_command_hz", None),
+        "continuous_grasp": getattr(args, "gripper_continuous_grasp", None),
+        "telemetry_hz": getattr(args, "gripper_telemetry_hz", None),
+    }
+    for key, value in cli_overrides.items():
+        if value is not None:
+            policy[key] = value
+
+    policy["source_dim"] = int(policy["source_dim"])
+    policy["output_dim"] = int(policy["output_dim"])
+    policy["invert"] = bool(policy["invert"])
+    policy["alpha"] = float(policy["alpha"])
+    policy["speed"] = float(policy["speed"])
+    policy["torque"] = float(policy["torque"])
+    policy["max_action"] = float(policy["max_action"])
+    policy["send_threshold"] = float(policy["send_threshold"])
+    policy["command_hz"] = float(policy["command_hz"])
+    policy["continuous_grasp"] = bool(policy["continuous_grasp"])
+    policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    if not 0 <= int(policy["source_dim"]) < 6:
+        raise ValueError("gripper source_dim must be in [0, 5].")
+    if not 0 <= int(policy["output_dim"]) < 6:
+        raise ValueError("gripper output_dim must be in [0, 5].")
+    if not 0.0 < float(policy["alpha"]) <= 1.0:
+        raise ValueError("gripper alpha must be in (0, 1].")
+    if float(policy["send_threshold"]) < 0.0:
+        raise ValueError("gripper send_threshold must be >= 0.")
+    if float(policy["command_hz"]) <= 0.0:
+        raise ValueError("gripper command_hz must be > 0.")
+    if float(policy["telemetry_hz"]) <= 0.0:
+        raise ValueError("gripper telemetry_hz must be > 0.")
+    setattr(args, "_resolved_gripper_policy", dict(policy))
+    return dict(policy)
+
+
+def _dmtac_tactile_enabled(args: argparse.Namespace) -> bool:
+    explicit = getattr(args, "dmtac_tactile", None)
+    if explicit is not None:
+        return bool(explicit)
+    return bool(getattr(args, "with_tactile", True))
+
+
+def _manual_dmtac_config_for_side(
+    args: argparse.Namespace,
+    side: str,
+    policy: Mapping[str, Any],
+) -> DMTacGripperBackendConfig | None:
+    port = str(getattr(args, f"{side}_gripper_port", "") or "").strip()
+    if not port:
+        return None
+    return DMTacGripperBackendConfig(
+        side=side,
+        effector_name=f"{side}_hand",
+        gripper_port=port,
+        gripper_id=int(getattr(args, f"{side}_gripper_id", 1) or 1),
+        command_dim=int(policy["output_dim"]),
+        speed=float(policy["speed"]),
+        torque=float(policy["torque"]),
+        max_action=float(policy["max_action"]),
+        send_threshold=float(policy["send_threshold"]),
+        command_hz=float(policy["command_hz"]),
+        continuous_grasp=bool(policy["continuous_grasp"]),
+        enable_telemetry=True,
+        telemetry_hz=float(policy["telemetry_hz"]),
+        connect_tactile=False,
+        tactile_ids=(),
+    )
+
+
+def _apply_gripper_policy_to_dmtac_config(
+    config: DMTacGripperBackendConfig,
+    *,
+    args: argparse.Namespace,
+    policy: Mapping[str, Any],
+) -> DMTacGripperBackendConfig:
+    config.speed = float(policy["speed"])
+    config.torque = float(policy["torque"])
+    config.max_action = float(policy["max_action"])
+    config.command_dim = int(policy["output_dim"])
+    config.send_threshold = float(policy["send_threshold"])
+    config.command_hz = float(policy["command_hz"])
+    config.continuous_grasp = bool(policy["continuous_grasp"])
+    config.telemetry_hz = float(policy["telemetry_hz"])
+    tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
+    if tactile_timeout_ms is not None:
+        config.tactile_timeout_ms = int(tactile_timeout_ms)
+    tactile_wait_for_new = getattr(args, "dmtac_tactile_wait_for_new", None)
+    if tactile_wait_for_new is not None:
+        config.tactile_wait_for_new = bool(tactile_wait_for_new)
+    tactile_read_hz = getattr(args, "dmtac_tactile_read_hz", None)
+    if tactile_read_hz is not None:
+        config.tactile_read_hz = float(tactile_read_hz)
+    tactile_process_read = getattr(args, "dmtac_tactile_process_read", None)
+    if tactile_process_read is not None:
+        config.tactile_process_read = bool(tactile_process_read)
+    tactile_worker_cpus = getattr(args, "dmtac_tactile_worker_cpus", None)
+    if tactile_worker_cpus is not None:
+        config.tactile_process_cpu_affinity = tuple(int(cpu) for cpu in tactile_worker_cpus)
+    tactile_worker_nice = getattr(args, "dmtac_tactile_worker_nice", None)
+    if tactile_worker_nice is not None:
+        config.tactile_process_nice = int(tactile_worker_nice)
+    tactile_worker_queue_size = getattr(args, "dmtac_tactile_worker_queue_size", None)
+    if tactile_worker_queue_size is not None:
+        config.tactile_process_queue_size = int(tactile_worker_queue_size)
+    tactile_compute_profile = getattr(args, "dmtac_tactile_compute_profile", None)
+    if tactile_compute_profile:
+        config.tactile_compute_profile = str(tactile_compute_profile)
+    tactile_max_fps = getattr(args, "dmtac_tactile_max_fps", None)
+    if tactile_max_fps is not None:
+        config.tactile_max_fps = int(tactile_max_fps)
+    tactile_warmup_frames = getattr(args, "dmtac_tactile_warmup_frames", None)
+    if tactile_warmup_frames is not None:
+        config.tactile_warmup_frames = int(tactile_warmup_frames)
+    tactile_denoise = getattr(args, "dmtac_tactile_denoise", None)
+    if tactile_denoise is not None:
+        config.tactile_denoise = bool(tactile_denoise)
+    tactile_flat_vector = getattr(args, "dmtac_tactile_flat_vector", None)
+    if tactile_flat_vector is not None:
+        config.tactile_store_flat_vector = bool(tactile_flat_vector)
+    tactile_parallel_read = getattr(args, "dmtac_tactile_parallel_read", None)
+    if tactile_parallel_read is not None:
+        config.tactile_parallel_read = bool(tactile_parallel_read)
+    elif bool(getattr(args, "dmtac_tactile_sequential_read", False)):
+        config.tactile_parallel_read = False
+    tactile_global_read_lock = getattr(args, "dmtac_tactile_global_read_lock", None)
+    if tactile_global_read_lock is not None:
+        config.tactile_global_read_lock = bool(tactile_global_read_lock)
+    if not _dmtac_tactile_enabled(args):
+        config.connect_tactile = False
+        config.tactile_ids = ()
+    config.enable_telemetry = bool(config.connect_hardware or config.connect_tactile)
+    return config
+
+
+def _dmtac_backend_configs(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> dict[str, DMTacGripperBackendConfig]:
+    cached = getattr(args, "_dmtac_backend_configs", None)
+    if isinstance(cached, dict):
+        return dict(cached)
+    if _hand_backend_mode(args) != HAND_BACKEND_DMTAC_GRIPPER:
+        setattr(args, "_dmtac_backend_configs", {})
+        return {}
+
+    policy = _resolved_gripper_policy(args)
+    configs: dict[str, DMTacGripperBackendConfig] = {}
+    if bool(getattr(args, "dmtac_default_config", True)):
+        try:
+            assignment = load_dmtac_hardware_assignment(
+                str(getattr(args, "dmtac_config", "latest") or "latest"),
+                validate_current_usb=bool(getattr(args, "dmtac_validate_current_usb", True)),
+                allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
+                assume_yes_for_extra=bool(getattr(args, "dmtac_assume_yes_for_extra", True)),
+            )
+            configs.update(
+                dmtac_backend_configs_from_assignment(
+                    assignment,
+                    active_sides=active_sides,
+                    tactile_backend=str(getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"),
+                    speed=float(policy["speed"]),
+                    torque=float(policy["torque"]),
+                    max_action=float(policy["max_action"]),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            if bool(getattr(args, "dmtac_config_required", False)):
+                raise RuntimeError(
+                    f"Failed to load DMTAC hardware assignment {getattr(args, 'dmtac_config', 'latest')!r}: {exc}"
+                ) from exc
+            _log("DMTAC", f"WARNING: could not load DMTAC hardware assignment: {exc}")
+
+    for side in active_sides:
+        manual = _manual_dmtac_config_for_side(args, side, policy)
+        if manual is not None:
+            configs[side] = manual
+
+    resolved = {
+        side: _apply_gripper_policy_to_dmtac_config(config, args=args, policy=policy)
+        for side, config in configs.items()
+        if side in active_sides and (config.connect_hardware or config.connect_tactile)
+    }
+    setattr(args, "_dmtac_backend_configs", dict(resolved))
+    setattr(args, "dmtac_config_loaded_sides", sorted(resolved))
+    return dict(resolved)
+
+
 def _active_side_value(args: argparse.Namespace, side: str, suffix: str) -> str:
-    return str(getattr(args, f"{side}_{suffix}"))
+    return str(getattr(args, f"{side}_{suffix}", "") or "")
 
 
 def _assert_side_config_consistency(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
@@ -506,6 +724,7 @@ def _assert_side_config_consistency(args: argparse.Namespace, active_sides: tupl
             "arm_ip": _active_side_value(args, side, "arm_ip"),
             "hand_ip": _active_side_value(args, side, "hand_ip"),
             "hand_port": _active_side_value(args, side, "hand_port"),
+            "gripper_port": _active_side_value(args, side, "gripper_port"),
         }
         present = [flag for flag, value in unexpected_values.items() if value]
         if present:
@@ -524,6 +743,11 @@ def _assert_tactile_visualization_config(
     if not bool(args.with_tactile):
         raise ValueError(
             "--visualize-tactile requires tactile polling; remove --without-tactile."
+        )
+    if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
+        raise ValueError(
+            "--visualize-tactile currently supports InspireTac UV tactile only; "
+            "DMTAC tactile is recorded but needs a separate visualizer."
         )
     tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
     if not tactile_regions:
@@ -603,6 +827,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-arm-ip", type=str, default="", help="Left RM65 IP.")
     parser.add_argument("--right-arm-ip", type=str, default="", help="Right RM65 IP.")
     parser.add_argument(
+        "--left-tool-profile",
+        type=str,
+        default="",
+        help=(
+            "Optional explicit left RM65 tool profile name or JSON path. "
+            "Use position_endpoint for endpoint-TCP position control without payload/impedance metadata."
+        ),
+    )
+    parser.add_argument(
+        "--right-tool-profile",
+        type=str,
+        default="",
+        help=(
+            "Optional explicit right RM65 tool profile name or JSON path. "
+            "Use position_endpoint for endpoint-TCP position control without payload/impedance metadata."
+        ),
+    )
+    parser.add_argument(
         "--left-arm-fixed",
         action="store_true",
         help=(
@@ -652,6 +894,254 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-hand-ip", type=str, default="", help="Optional right InspireTac IP.")
     parser.add_argument("--left-hand-port", type=str, default="", help="Optional left q6 serial port.")
     parser.add_argument("--right-hand-port", type=str, default="", help="Optional right q6 serial port.")
+    parser.add_argument(
+        "--hand-backend",
+        choices=HAND_BACKEND_CHOICES,
+        default=HAND_BACKEND_INSPIRE,
+        help=(
+            "Hand/gripper backend type. Use dmtac-gripper to map Q6 to a generic "
+            "1D gripper controller through the DMTAC gripper backend."
+        ),
+    )
+    parser.add_argument(
+        "--q6-config",
+        type=str,
+        default="latest",
+        help=(
+            "Hand Q6 left/right assignment config. Explicit --left/right-hand-port "
+            "wins; missing ports are loaded from this config when available."
+        ),
+    )
+    parser.add_argument(
+        "--no-q6-default-config",
+        dest="q6_default_config",
+        action="store_false",
+        default=True,
+        help="Do not auto-fill missing hand Q6 ports from the latest saved assignment.",
+    )
+    parser.add_argument(
+        "--q6-config-required",
+        action="store_true",
+        help="Fail if --q6-config cannot be loaded while an active side is missing a hand port.",
+    )
+    parser.add_argument("--left-gripper-port", type=str, default="", help="Optional left 1D gripper serial port.")
+    parser.add_argument("--right-gripper-port", type=str, default="", help="Optional right 1D gripper serial port.")
+    parser.add_argument("--left-gripper-id", type=int, default=1, help="Left gripper Modbus id.")
+    parser.add_argument("--right-gripper-id", type=int, default=1, help="Right gripper Modbus id.")
+    parser.add_argument(
+        "--dmtac-config",
+        type=str,
+        default="latest",
+        help="DMTAC gripper/tactile assignment config used when --hand-backend dmtac-gripper.",
+    )
+    parser.add_argument(
+        "--no-dmtac-default-config",
+        dest="dmtac_default_config",
+        action="store_false",
+        default=True,
+        help="Do not auto-load DMTAC gripper/tactile ports from latest assignment.",
+    )
+    parser.add_argument(
+        "--dmtac-config-required",
+        action="store_true",
+        help="Fail if --dmtac-config cannot be loaded for --hand-backend dmtac-gripper.",
+    )
+    parser.add_argument(
+        "--dmtac-allow-missing",
+        action="store_true",
+        help="Allow configured DMTAC gripper/tactile devices to be missing during USB validation.",
+    )
+    parser.add_argument(
+        "--dmtac-no-validate-current-usb",
+        dest="dmtac_validate_current_usb",
+        action="store_false",
+        default=True,
+        help="Load DMTAC assignment without probing current USB devices.",
+    )
+    parser.add_argument(
+        "--dmtac-confirm-extra",
+        dest="dmtac_assume_yes_for_extra",
+        action="store_false",
+        default=True,
+        help="Ask before continuing when extra unassigned DMTAC devices are detected.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-backend",
+        type=str,
+        default="cpu",
+        help="DM-Tac tactile backend passed to portable_dmtac_gripper.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-timeout-ms",
+        type=_positive_int,
+        default=None,
+        help="Per-sensor DM-Tac read timeout. Runtime telemetry does not wait for new frames by default.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-max-fps",
+        type=_positive_int,
+        default=None,
+        help="DM-Tac camera max_fps. Lower values reduce USB/CPU pressure; default follows backend config.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-warmup-frames",
+        type=_non_negative_int,
+        default=None,
+        help="DM-Tac tactile filter warmup frames. Runtime default is 0 like the assignment GUI.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-wait-for-new",
+        action="store_true",
+        default=None,
+        help="Wait for a new DM-Tac frame on each telemetry read. Higher latency; off by default.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-read-hz",
+        type=_non_negative_float,
+        default=None,
+        help=(
+            "Max DM-Tac tactile read rate per gripper backend. Default is backend config "
+            "1 Hz; use 0 to read every gripper telemetry cycle."
+        ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-process-read",
+        dest="dmtac_tactile_process_read",
+        action="store_true",
+        default=None,
+        help="Read DM-Tac tactile frames in a separate low-priority process. Runtime default is on.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-in-process-read",
+        dest="dmtac_tactile_process_read",
+        action="store_false",
+        help="Read DM-Tac tactile frames in the main collection process.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-worker-cpus",
+        type=_dmtac_worker_cpu_affinity,
+        default=None,
+        help=(
+            "Comma/space-separated CPU cores for low-priority DM-Tac tactile worker processes, "
+            "for example '6,7'. Unset lets the OS schedule normally."
+        ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-worker-nice",
+        type=_dmtac_worker_nice,
+        default=None,
+        help="Lower scheduling priority for DM-Tac tactile worker processes; 0 is normal, 19 is lowest.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-worker-queue-size",
+        type=_positive_int,
+        default=None,
+        help="Latest-frame queue size between each DM-Tac tactile worker process and the main process.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-parallel-read",
+        dest="dmtac_tactile_parallel_read",
+        action="store_true",
+        default=None,
+        help="Read sensors in each DM-Tac gripper backend concurrently. Higher USB/CPU pressure.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-sequential-read",
+        dest="dmtac_tactile_parallel_read",
+        action="store_false",
+        help="Read sensors in each DM-Tac gripper backend sequentially. This is the runtime default.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-global-read-lock",
+        dest="dmtac_tactile_global_read_lock",
+        action="store_true",
+        default=None,
+        help="Serialize DMTAC tactile reads across left/right gripper backends. Runtime default is on.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-no-global-read-lock",
+        dest="dmtac_tactile_global_read_lock",
+        action="store_false",
+        help="Allow left/right DMTAC tactile reads to overlap.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-compute-profile",
+        choices=("dist-only", "legacy", "requested", "shear-depth"),
+        default="dist-only",
+        help=(
+            "SDK compute channels for DMTAC distributed_force telemetry. dist-only is lowest latency; "
+            "legacy matches the old deformation/shear/depth/force setup."
+        ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-denoise",
+        dest="dmtac_tactile_denoise",
+        action="store_true",
+        default=None,
+        help="Enable runtime distributed_force denoise. This is heavier than the assignment GUI default.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-no-denoise",
+        dest="dmtac_tactile_denoise",
+        action="store_false",
+        help="Disable runtime distributed_force denoise.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-flat-vector",
+        dest="dmtac_tactile_flat_vector",
+        action="store_true",
+        default=None,
+        help="Keep building the legacy flattened tactile vector in telemetry.",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-no-flat-vector",
+        dest="dmtac_tactile_flat_vector",
+        action="store_false",
+        help="Do not build the legacy flattened tactile vector in telemetry.",
+    )
+    parser.add_argument("--dmtac-with-tactile", dest="dmtac_tactile", action="store_true", default=None)
+    parser.add_argument("--dmtac-no-tactile", dest="dmtac_tactile", action="store_false")
+    parser.add_argument(
+        "--gripper-task-profile",
+        type=str,
+        default="",
+        help=(
+            "Optional JSON profile with top-level gripper defaults and/or tasks.<name>.gripper "
+            "overrides. It can set speed, force/torque, max_action, send_threshold, command_hz, "
+            "continuous_grasp, source_dim, output_dim, invert, alpha."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-task",
+        type=str,
+        default="",
+        help="Explicit gripper task key; overrides --task-id/--task-name for --gripper-task-profile.",
+    )
+    parser.add_argument("--gripper-source-dim", type=int, default=None, help="Q6 source dimension for 1D gripper.")
+    parser.add_argument("--gripper-output-dim", type=int, default=None, help="Output slot in the 6-wide hand vector.")
+    parser.add_argument("--gripper-invert", dest="gripper_invert", action="store_true", default=None)
+    parser.add_argument("--gripper-no-invert", dest="gripper_invert", action="store_false")
+    parser.add_argument("--gripper-alpha", type=_alpha_float, default=None, help="EMA alpha for 1D gripper command.")
+    parser.add_argument("--gripper-speed", type=float, default=None, help="Gripper move speed for this task.")
+    parser.add_argument(
+        "--gripper-torque",
+        "--gripper-force",
+        dest="gripper_torque",
+        type=float,
+        default=None,
+        help="Gripper torque/force setting for this task.",
+    )
+    parser.add_argument("--gripper-max-action", type=float, default=None, help="Max normalized close command.")
+    parser.add_argument(
+        "--gripper-send-threshold",
+        type=float,
+        default=None,
+        help="Minimum normalized delta before sending another gripper command.",
+    )
+    parser.add_argument("--gripper-continuous", dest="gripper_continuous_grasp", action="store_true", default=None)
+    parser.add_argument("--gripper-no-continuous", dest="gripper_continuous_grasp", action="store_false")
+    parser.add_argument("--gripper-command-hz", type=_positive_float, default=None)
+    parser.add_argument("--gripper-telemetry-hz", type=_positive_float, default=None)
     parser.add_argument("--hand-reader-baudrate", type=int, default=115200, help="Hand q6 baudrate.")
     parser.add_argument(
         "--hand-reader-timeout",
@@ -737,7 +1227,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Desk-frame translation scale.")
     add_vive_tracker_height_correction_args(parser)
-    parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control rate.")
+    parser.add_argument(
+        "--hz",
+        type=_positive_float,
+        default=DEFAULT_TELEOP_SAMPLE_HZ,
+        help="Dataset sampling/action rate. Defaults to 15 Hz for single-arm and bimanual collection.",
+    )
+    parser.add_argument(
+        "--arm-control-hz",
+        type=_positive_float,
+        default=DEFAULT_RM65_ARM_CONTROL_HZ,
+        help="RM65 backend streaming/control rate after each sampled action. Defaults to 40 Hz.",
+    )
+    parser.add_argument(
+        "--dual-arm-ik-hz",
+        type=_positive_float,
+        default=15.0,
+        help="Target dual-arm MultiTask IK update frequency used for solver dt and default time budget.",
+    )
     parser.add_argument(
         "--arm-max-angvel",
         type=_parse_arm_max_angvel,
@@ -868,7 +1375,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-parquet", dest="write_parquet", action="store_true")
     parser.add_argument("--no-parquet", dest="write_parquet", action="store_false")
     parser.set_defaults(write_parquet=True)
-    parser.add_argument("--nominal-fps", type=_positive_float, default=30.0, help="Dataset nominal fps metadata.")
+    parser.add_argument(
+        "--nominal-fps",
+        type=_positive_float,
+        default=None,
+        help="Dataset nominal fps metadata. Defaults to --hz so recorded metadata matches the collection rate.",
+    )
     parser.add_argument(
         "--replay-dataset",
         type=str,
@@ -1080,6 +1592,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--writer-workers", type=int, default=2, help="Async writer worker count.")
     parser.add_argument("--writer-queue-size", type=int, default=256, help="Async writer queue size.")
     parser.add_argument(
+        "--storage-queue-size",
+        type=_non_negative_int,
+        default=64,
+        help=(
+            "Per-camera video storage queue size before the async writer pool. "
+            "When full, the oldest non-critical video frame is dropped. Use 0 for legacy direct submit."
+        ),
+    )
+    parser.add_argument(
+        "--tactile-storage",
+        choices=("parquet", "external"),
+        default="external",
+        help=(
+            "How high-dimensional tactile frames are stored. external is the default and writes "
+            "binary per-sensor streams; parquet keeps the legacy inline vector."
+        ),
+    )
+    parser.add_argument(
+        "--external-tactile",
+        dest="tactile_storage",
+        action="store_const",
+        const="external",
+        help="Shortcut for --tactile-storage external.",
+    )
+    parser.add_argument(
         "--calibration-timeout",
         type=_positive_float,
         default=10.0,
@@ -1137,6 +1674,8 @@ def parse_args() -> argparse.Namespace:
         help="Print periodic status lines every --status-sec seconds.",
     )
     args = parser.parse_args(_normalize_qpos_option_argv(sys.argv[1:]))
+    if args.nominal_fps is None:
+        args.nominal_fps = float(args.hz)
     for side in ("left", "right"):
         qpos_rad = getattr(args, f"return_{side}_qpos", None)
         qpos_deg = getattr(args, f"return_{side}_qpos_deg", None)
@@ -1172,7 +1711,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--replay-init-dataset requires --replay-init-episode.")
     if str(args.replay_init_parquet).strip() and not str(args.replay_init_episode).strip():
         parser.error("--replay-init-parquet requires --replay-init-episode.")
+    _apply_default_q6_ports(args, parser=parser)
     _apply_collection_layout(args)
+    args.dmtac_config_loaded_sides = []
+    if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
+        try:
+            args.gripper_policy = _resolved_gripper_policy(args)
+        except Exception as exc:  # noqa: BLE001
+            parser.error(str(exc))
+    else:
+        args.gripper_policy = {}
     return args
 
 
@@ -1186,7 +1734,7 @@ class CollectApp:
     pose_retargeters: dict[str, PoseToArmRetargeter]
     fixed_arm_retargeters: dict[str, FixedArmRetargeter]
     jitter_arm_retargeters: dict[str, SmoothJitterArmRetargeter]
-    hand_retargeters: dict[str, JointsToDexHandRetargeter]
+    hand_retargeters: dict[str, Any]
     dual_arm_retargeter: DualArmCollisionAwareRetargeter | None
     unmanaged_backends: dict[str, Any]
     writer: LeRobotV21Writer
@@ -1201,6 +1749,30 @@ class CollectApp:
 
 
 @dataclass
+class EpisodeFinalizeTask:
+    episode_index: int
+    frame_count: int
+    reason: str
+    show_standby: bool
+    started_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
+    success: bool = False
+    error: str | None = None
+    thread: threading.Thread | None = field(default=None, repr=False)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def done(self) -> bool:
+        return self.completed_at is not None
+
+    def mark_done(self, *, success: bool, error: str | None = None) -> None:
+        with self.lock:
+            self.success = bool(success)
+            self.error = error
+            self.completed_at = time.time()
+
+
+@dataclass
 class CollectControlState:
     recording_active: bool = False
     active_episode_index: int | None = None
@@ -1208,6 +1780,7 @@ class CollectControlState:
     saved_episodes: int = 0
     discarded_episodes: int = 0
     submitted_samples: int = 0
+    finalize_tasks: list[EpisodeFinalizeTask] = field(default_factory=list)
     active_replay_run: "ActiveReplayRun | None" = None
     active_unrecorded_replay_run: "ActiveUnrecordedReplayRun | None" = None
     replay_init_at_start: bool = False
@@ -1237,48 +1810,6 @@ class ReturnHomePlan:
     timeout_sec: float
 
 
-@dataclass(frozen=True)
-class ReplayTrajectoryGroup:
-    key: str
-    label: str
-    source_path: str
-    source_episode_index: int
-    start_index: int
-    end_index: int
-    frame_count: int
-    action_hz: float
-    actions: np.ndarray
-    arm_joint_targets: dict[str, np.ndarray] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ReplayTrajectoryPool:
-    key: str
-    label: str
-    groups: list[ReplayTrajectoryGroup]
-    episode_indices: tuple[int, ...] = ()
-    episode_range_spec: str = "all"
-    cursor: int = 0
-    started_count: int = 0
-
-    def __post_init__(self) -> None:
-        self.groups = list(self.groups)
-        if not self.groups:
-            raise ValueError(f"ReplayTrajectoryPool '{self.key}' requires at least one group.")
-
-    @property
-    def size(self) -> int:
-        return int(len(self.groups))
-
-    def next_group(self) -> ReplayTrajectoryGroup:
-        index = int(self.cursor) % len(self.groups)
-        group = self.groups[index]
-        self.cursor = (index + 1) % len(self.groups)
-        self.started_count += 1
-        return group
-
-
 @dataclass
 class ActiveReplayRun:
     group: ReplayTrajectoryGroup
@@ -1291,13 +1822,6 @@ class ActiveReplayRun:
     last_action: np.ndarray = field(
         default_factory=lambda: np.full(ACTION_DIM, np.nan, dtype=np.float32)
     )
-
-
-@dataclass(frozen=True)
-class ReplayInitEpisodePlan:
-    group: ReplayTrajectoryGroup
-    move_time_s: float
-    to_record_time_s: float
 
 
 @dataclass
@@ -1318,294 +1842,6 @@ class ActiveUnrecordedReplayRun:
     last_action: np.ndarray = field(
         default_factory=lambda: np.full(ACTION_DIM, np.nan, dtype=np.float32)
     )
-
-
-def _random_unit_rotvec(rng: np.random.Generator, max_angle_rad: float) -> np.ndarray:
-    if float(max_angle_rad) <= 0.0:
-        return np.zeros(3, dtype=np.float32)
-    direction = rng.normal(size=3)
-    norm = float(np.linalg.norm(direction))
-    if norm <= 1e-12:
-        direction = np.array([0.0, 0.0, 1.0], dtype=float)
-    else:
-        direction = direction / norm
-    angle = rng.uniform(-float(max_angle_rad), float(max_angle_rad))
-    return (direction * angle).astype(np.float32)
-
-
-def _random_xyz_offset(rng: np.random.Generator, max_xyz_m: float) -> np.ndarray:
-    if float(max_xyz_m) <= 0.0:
-        return np.zeros(3, dtype=np.float32)
-    return rng.uniform(
-        -float(max_xyz_m),
-        float(max_xyz_m),
-        size=3,
-    ).astype(np.float32)
-
-
-def _smoothstep_unit(alpha: float) -> float:
-    x = float(np.clip(alpha, 0.0, 1.0))
-    return x * x * (3.0 - 2.0 * x)
-
-
-def _replay_active_arm_poses_are_finite(
-    action: np.ndarray,
-    active_sides: tuple[str, ...],
-) -> bool:
-    vector = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
-    for side in active_sides:
-        pose = vector[ACTION_ARM_POSE_SLICES[side]]
-        if not np.all(np.isfinite(pose)):
-            return False
-    return True
-
-
-@dataclass
-class ReplayPoseOffset:
-    xyz_m: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
-    rotvec_rad: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
-
-    def copy(self) -> "ReplayPoseOffset":
-        return ReplayPoseOffset(
-            xyz_m=np.asarray(self.xyz_m, dtype=np.float32).reshape(3).copy(),
-            rotvec_rad=np.asarray(self.rotvec_rad, dtype=np.float32).reshape(3).copy(),
-        )
-
-    def to_metadata(self) -> dict[str, Any]:
-        rotvec = np.asarray(self.rotvec_rad, dtype=np.float32).reshape(3)
-        return {
-            "xyz_m": np.round(np.asarray(self.xyz_m, dtype=np.float32).reshape(3), 6).tolist(),
-            "rotvec_rad": np.round(rotvec, 6).tolist(),
-            "rot_angle_deg": float(np.rad2deg(np.linalg.norm(rotvec))),
-        }
-
-    @staticmethod
-    def interpolate(
-        start: "ReplayPoseOffset",
-        target: "ReplayPoseOffset",
-        alpha: float,
-    ) -> "ReplayPoseOffset":
-        t = float(alpha)
-        return ReplayPoseOffset(
-            xyz_m=(
-                np.asarray(start.xyz_m, dtype=np.float32)
-                + (np.asarray(target.xyz_m, dtype=np.float32) - np.asarray(start.xyz_m, dtype=np.float32)) * t
-            ).astype(np.float32),
-            rotvec_rad=(
-                np.asarray(start.rotvec_rad, dtype=np.float32)
-                + (
-                    np.asarray(target.rotvec_rad, dtype=np.float32)
-                    - np.asarray(start.rotvec_rad, dtype=np.float32)
-                )
-                * t
-            ).astype(np.float32),
-        )
-
-
-class ReplayTrajectoryRandomizer:
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        mode: str,
-        seed: int | None,
-        active_sides: tuple[str, ...],
-        max_xyz_m: float,
-        max_rot_deg: float,
-        noise_xyz_m: float,
-        noise_rot_deg: float,
-        refresh_sec: float,
-        smoothing_sec: float,
-        independent_sides: bool,
-    ):
-        self.enabled = bool(enabled)
-        self.mode = str(mode)
-        self.seed = seed
-        self.active_sides = tuple(side for side in ("left", "right") if side in set(active_sides))
-        self.max_xyz_m = max(0.0, float(max_xyz_m))
-        self.max_rot_rad = np.deg2rad(max(0.0, float(max_rot_deg)))
-        self.noise_xyz_m = max(0.0, float(noise_xyz_m))
-        self.noise_rot_rad = np.deg2rad(max(0.0, float(noise_rot_deg)))
-        self.refresh_sec = max(1e-6, float(refresh_sec))
-        self.smoothing_sec = max(0.0, float(smoothing_sec))
-        self.independent_sides = bool(independent_sides)
-        self._rng = np.random.default_rng(seed)
-        self._episode_offsets = self._sample_offsets(
-            max_xyz_m=self.max_xyz_m,
-            max_rot_rad=self.max_rot_rad,
-        )
-        self._current_noise = self._zero_offsets()
-        self._start_noise = self._zero_offsets()
-        self._target_noise = self._zero_offsets()
-        self._target_started_at: float | None = None
-        self._next_target_at: float | None = None
-
-    @classmethod
-    def from_args(
-        cls,
-        args: argparse.Namespace,
-        *,
-        active_sides: tuple[str, ...],
-        episode_index: int,
-        pool_started_count: int,
-        source_episode_index: int,
-    ) -> "ReplayTrajectoryRandomizer | None":
-        if not bool(getattr(args, "replay_randomize", False)):
-            return None
-        base_seed = int(getattr(args, "replay_random_seed", -1))
-        seed = None
-        if base_seed >= 0:
-            seed = (
-                int(base_seed)
-                + int(episode_index) * 1000003
-                + int(source_episode_index) * 9176
-                + int(pool_started_count) * 131
-            ) % (2**32)
-        max_xyz = float(getattr(args, "replay_random_xyz_m", 0.0))
-        max_rot = float(getattr(args, "replay_random_rot_deg", 0.0))
-        noise_xyz = float(getattr(args, "replay_random_noise_xyz_m", -1.0))
-        noise_rot = float(getattr(args, "replay_random_noise_rot_deg", -1.0))
-        if noise_xyz < 0.0:
-            noise_xyz = max_xyz * 0.5
-        if noise_rot < 0.0:
-            noise_rot = max_rot * 0.5
-        return cls(
-            enabled=True,
-            mode=str(getattr(args, "replay_random_mode", "both")),
-            seed=seed,
-            active_sides=active_sides,
-            max_xyz_m=max_xyz,
-            max_rot_deg=max_rot,
-            noise_xyz_m=noise_xyz,
-            noise_rot_deg=noise_rot,
-            refresh_sec=float(getattr(args, "replay_random_refresh_sec", 0.8)),
-            smoothing_sec=float(getattr(args, "replay_random_smoothing_sec", 0.3)),
-            independent_sides=bool(getattr(args, "replay_random_independent_sides", False)),
-        )
-
-    def _zero_offsets(self) -> dict[str, ReplayPoseOffset]:
-        return {side: ReplayPoseOffset() for side in self.active_sides}
-
-    def _sample_one_offset(self, *, max_xyz_m: float, max_rot_rad: float) -> ReplayPoseOffset:
-        return ReplayPoseOffset(
-            xyz_m=_random_xyz_offset(self._rng, max_xyz_m),
-            rotvec_rad=_random_unit_rotvec(self._rng, max_rot_rad),
-        )
-
-    def _sample_offsets(self, *, max_xyz_m: float, max_rot_rad: float) -> dict[str, ReplayPoseOffset]:
-        if not self.independent_sides:
-            shared = self._sample_one_offset(max_xyz_m=max_xyz_m, max_rot_rad=max_rot_rad)
-            return {side: shared.copy() for side in self.active_sides}
-        return {
-            side: self._sample_one_offset(max_xyz_m=max_xyz_m, max_rot_rad=max_rot_rad)
-            for side in self.active_sides
-        }
-
-    def _episode_offset_for(self, side: str) -> ReplayPoseOffset:
-        if self.mode not in {"episode_offset", "both"}:
-            return ReplayPoseOffset()
-        return self._episode_offsets.get(side, ReplayPoseOffset())
-
-    def _noise_offset_for(self, side: str, now: float | None) -> ReplayPoseOffset:
-        if self.mode not in {"smooth_noise", "both"}:
-            return ReplayPoseOffset()
-        if now is None:
-            return self._current_noise.get(side, ReplayPoseOffset())
-        self._advance_noise(float(now))
-        return self._current_noise.get(side, ReplayPoseOffset())
-
-    def _advance_noise(self, now: float) -> None:
-        if self._target_started_at is None:
-            self._target_started_at = float(now)
-            self._next_target_at = float(now)
-        if self._next_target_at is not None and now >= self._next_target_at:
-            self._start_noise = {side: offset.copy() for side, offset in self._current_noise.items()}
-            self._target_noise = self._sample_offsets(
-                max_xyz_m=self.noise_xyz_m,
-                max_rot_rad=self.noise_rot_rad,
-            )
-            self._target_started_at = float(now)
-            self._next_target_at = float(now) + self.refresh_sec
-
-        assert self._target_started_at is not None
-        if self.smoothing_sec <= 1e-9:
-            alpha = 1.0
-        else:
-            alpha = _smoothstep_unit((float(now) - self._target_started_at) / self.smoothing_sec)
-        self._current_noise = {
-            side: ReplayPoseOffset.interpolate(
-                self._start_noise.get(side, ReplayPoseOffset()),
-                self._target_noise.get(side, ReplayPoseOffset()),
-                alpha,
-            )
-            for side in self.active_sides
-        }
-
-    @staticmethod
-    def _compose_offsets(first: ReplayPoseOffset, second: ReplayPoseOffset) -> ReplayPoseOffset:
-        return ReplayPoseOffset(
-            xyz_m=(
-                np.asarray(first.xyz_m, dtype=np.float32)
-                + np.asarray(second.xyz_m, dtype=np.float32)
-            ).astype(np.float32),
-            rotvec_rad=(
-                np.asarray(first.rotvec_rad, dtype=np.float32)
-                + np.asarray(second.rotvec_rad, dtype=np.float32)
-            ).astype(np.float32),
-        )
-
-    def offset_for(self, side: str, now: float | None) -> ReplayPoseOffset:
-        return self._compose_offsets(
-            self._episode_offset_for(side),
-            self._noise_offset_for(side, now),
-        )
-
-    def apply(self, action: np.ndarray, *, now: float | None = None) -> np.ndarray:
-        vector = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM).copy()
-        if not self.enabled:
-            return vector
-        for side in self.active_sides:
-            target_slice = ACTION_ARM_POSE_SLICES[side]
-            pose = vector[target_slice].astype(np.float32, copy=True)
-            if pose.shape != (7,) or not np.all(np.isfinite(pose)):
-                continue
-            offset = self.offset_for(side, now)
-            pose[:3] = pose[:3] + np.asarray(offset.xyz_m, dtype=np.float32).reshape(3)
-            quat = np.asarray(pose[3:7], dtype=float).reshape(4)
-            quat_norm = float(np.linalg.norm(quat))
-            if quat_norm <= 1e-12:
-                continue
-            base_rot = R.from_quat(quat / quat_norm)
-            delta_rot = R.from_rotvec(np.asarray(offset.rotvec_rad, dtype=float).reshape(3))
-            pose[3:7] = (delta_rot * base_rot).as_quat().astype(np.float32)
-            vector[target_slice] = pose
-        return vector
-
-    def metadata(self) -> dict[str, Any]:
-        return {
-            "enabled": bool(self.enabled),
-            "mode": self.mode,
-            "seed": self.seed,
-            "active_sides": list(self.active_sides),
-            "independent_sides": bool(self.independent_sides),
-            "max_xyz_m": float(self.max_xyz_m),
-            "max_rot_deg": float(np.rad2deg(self.max_rot_rad)),
-            "noise_xyz_m": float(self.noise_xyz_m),
-            "noise_rot_deg": float(np.rad2deg(self.noise_rot_rad)),
-            "refresh_sec": float(self.refresh_sec),
-            "smoothing_sec": float(self.smoothing_sec),
-            "episode_offsets": {
-                side: offset.to_metadata()
-                for side, offset in sorted(self._episode_offsets.items())
-            },
-        }
-
-    def current_offsets_metadata(self) -> dict[str, Any]:
-        return {
-            side: self.offset_for(side, None).to_metadata()
-            for side in self.active_sides
-        }
-
 
 class TerminalKeyController:
     def __init__(self) -> None:
@@ -1717,6 +1953,8 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
     calibration.metadata["calibration_profile_auto_selected"] = bool(auto_selected_profile)
     calibration.metadata["left_tracker_name"] = str(args.left_tracker_name)
     calibration.metadata["right_tracker_name"] = str(args.right_tracker_name)
+    calibration.metadata["left_tool_profile"] = getattr(args, "left_tool_profile", "") or None
+    calibration.metadata["right_tool_profile"] = getattr(args, "right_tool_profile", "") or None
     offset = _vive_tracker_local_translation_offset(args)
     calibration.metadata["vive_tracker_height_correction_enabled"] = offset is not None
     calibration.metadata["vive_tracker_height_correction_m"] = float(
@@ -1734,6 +1972,27 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
 
 def _vive_tracker_local_translation_offset(args: argparse.Namespace) -> np.ndarray | None:
     return vive_tracker_local_translation_offset_from_args(args)
+
+
+def _tool_tcp_pose_flange_arg(args: argparse.Namespace, side: str) -> tuple[float, ...] | None:
+    profile_arg = getattr(args, f"{side}_tool_profile", "") or None
+    if not profile_arg:
+        return None
+    try:
+        from hardware.rm65.calibration_profiles import load_profile
+
+        profile = load_profile(profile_arg, arm=side)
+        tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
+        pose = tcp.get("pose_flange_m_rad")
+        if pose is None:
+            return None
+        values = np.asarray(pose, dtype=float).reshape(6)
+        if not np.all(np.isfinite(values)):
+            return None
+        return tuple(float(value) for value in values)
+    except Exception as exc:
+        _log("TCP", f"WARNING: could not load {side} tool TCP for collision solver: {exc}")
+        return None
 
 
 def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> VivePoseSource:
@@ -1893,7 +2152,9 @@ def _build_arm_retargeters(
                 translation_scale=float(args.translation_scale),
                 scene_profile=str(args.collision_scene_profile),
                 contact_mode=str(args.collision_avoidance_mode),
-                solver_frequency=float(args.hz),
+                solver_frequency=float(getattr(args, "dual_arm_ik_hz", 15.0)),
+                left_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "left"),
+                right_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "right"),
             ),
             left_pose_retargeter=left_pose_retargeter,
             right_pose_retargeter=pose_retargeters["right"],
@@ -1912,9 +2173,34 @@ def _build_arm_retargeters(
 def _build_hand_retargeters(
     args: argparse.Namespace,
     active_sides: tuple[str, ...],
-) -> dict[str, JointsToDexHandRetargeter]:
+) -> dict[str, Any]:
     topology = CollectionTopology.for_active_sides(active_sides)
-    retargeters: dict[str, JointsToDexHandRetargeter] = {}
+    retargeters: dict[str, Any] = {}
+    mode = _hand_backend_mode(args)
+    if mode == HAND_BACKEND_NONE:
+        return retargeters
+    if mode == HAND_BACKEND_DMTAC_GRIPPER:
+        policy = _resolved_gripper_policy(args)
+        dmtac_configs = _dmtac_backend_configs(args, active_sides)
+        for side in active_sides:
+            hand_port = getattr(args, f"{side}_hand_port")
+            dmtac_config = dmtac_configs.get(side)
+            if not hand_port or dmtac_config is None or not bool(dmtac_config.connect_hardware):
+                continue
+            retargeters[side] = ScalarToGripperRetargeter(
+                ScalarToGripperRetargeterConfig(
+                    side=side,
+                    input_channel_name=topology.hand_q6_channel(side),
+                    effector_name=topology.hand_effector(side),
+                    source_dim=int(policy["source_dim"]),
+                    output_dim=int(policy["output_dim"]),
+                    invert=bool(policy["invert"]),
+                    alpha=float(policy["alpha"]),
+                    output_max=float(policy["max_action"]),
+                )
+            )
+        return retargeters
+
     for side in active_sides:
         hand_port = getattr(args, f"{side}_hand_port")
         if not hand_port:
@@ -1938,10 +2224,13 @@ def _build_backends(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     topology = CollectionTopology.for_active_sides(active_sides)
     arm_urdf_path = require_asset_path("rm65_arm.urdf")
-    control_dt = 1.0 / float(args.hz)
+    arm_control_hz = float(args.arm_control_hz)
+    control_dt = 1.0 / arm_control_hz
     all_backends: dict[str, Any] = {}
     rig_backends: dict[str, Any] = {}
     tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions) if args.with_tactile else ()
+    hand_backend_mode = _hand_backend_mode(args)
+    dmtac_configs = _dmtac_backend_configs(args, active_sides) if hand_backend_mode == HAND_BACKEND_DMTAC_GRIPPER else {}
 
     for side in active_sides:
         arm_backend = RM65ArmBackend(
@@ -1953,13 +2242,23 @@ def _build_backends(
                 control_dt=control_dt,
                 max_angvel=tuple(float(value) for value in args.arm_max_angvel),
                 dry_run_fast=False,
+                tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
                 background_streaming_enabled=True,
-                background_streaming_hz=float(args.hz),
+                background_streaming_hz=arm_control_hz,
             )
         )
         arm_effector = topology.arm_effector(side)
         all_backends[arm_effector] = arm_backend
         rig_backends[arm_effector] = arm_backend
+
+        if hand_backend_mode == HAND_BACKEND_NONE:
+            continue
+        if hand_backend_mode == HAND_BACKEND_DMTAC_GRIPPER:
+            dmtac_config = dmtac_configs.get(side)
+            if dmtac_config is None:
+                continue
+            all_backends[topology.hand_effector(side)] = DMTacGripperBackend(dmtac_config)
+            continue
 
         hand_ip = str(getattr(args, f"{side}_hand_ip"))
         hand_port = str(getattr(args, f"{side}_hand_port"))
@@ -2050,13 +2349,39 @@ def _episode_metadata(
         "runtime_arm_state_source": "last_commanded_action",
         "control_mode": str(args.control_mode),
         "hz": float(args.hz),
+        "arm_control_hz": float(args.arm_control_hz),
         "nominal_fps": float(args.nominal_fps),
+        "tactile_storage": str(getattr(args, "tactile_storage", "external")),
+        "storage_queue_size": int(getattr(args, "storage_queue_size", 64)),
         "left_arm_ip": args.left_arm_ip or None,
         "right_arm_ip": args.right_arm_ip or None,
         "left_hand_ip": args.left_hand_ip or None,
         "right_hand_ip": args.right_hand_ip or None,
         "left_hand_port": args.left_hand_port or None,
         "right_hand_port": args.right_hand_port or None,
+        "hand_backend": _hand_backend_mode(args),
+        "q6_config": str(getattr(args, "q6_config", "latest")),
+        "q6_default_config_enabled": bool(getattr(args, "q6_default_config", True)),
+        "q6_config_loaded_ports": dict(getattr(args, "q6_config_loaded_ports", {}) or {}),
+        "dmtac_config": str(getattr(args, "dmtac_config", "latest")),
+        "dmtac_default_config_enabled": bool(getattr(args, "dmtac_default_config", True)),
+        "dmtac_config_loaded_sides": list(getattr(args, "dmtac_config_loaded_sides", []) or []),
+        "dmtac_tactile_compute_profile": str(getattr(args, "dmtac_tactile_compute_profile", "dist-only")),
+        "dmtac_tactile_parallel_read": getattr(args, "dmtac_tactile_parallel_read", None),
+        "dmtac_tactile_global_read_lock": getattr(args, "dmtac_tactile_global_read_lock", None),
+        "dmtac_tactile_read_hz": getattr(args, "dmtac_tactile_read_hz", None),
+        "dmtac_tactile_process_read": getattr(args, "dmtac_tactile_process_read", None),
+        "dmtac_tactile_worker_cpus": list(getattr(args, "dmtac_tactile_worker_cpus", None) or []),
+        "dmtac_tactile_worker_nice": getattr(args, "dmtac_tactile_worker_nice", None),
+        "dmtac_tactile_worker_queue_size": getattr(args, "dmtac_tactile_worker_queue_size", None),
+        "dmtac_tactile_max_fps": getattr(args, "dmtac_tactile_max_fps", None),
+        "dmtac_tactile_warmup_frames": getattr(args, "dmtac_tactile_warmup_frames", None),
+        "dmtac_tactile_denoise": getattr(args, "dmtac_tactile_denoise", None),
+        "dmtac_tactile_flat_vector": getattr(args, "dmtac_tactile_flat_vector", None),
+        "gripper_task_profile": str(getattr(args, "gripper_task_profile", "") or "") or None,
+        "gripper_policy": dict(getattr(args, "gripper_policy", {}) or _resolved_gripper_policy(args))
+        if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
+        else {},
         "max_fingertip_force": int(args.max_fingertip_force),
         "hand_tactile_regions": list(_parse_hand_tactile_regions(args.hand_tactile_regions))
         if args.with_tactile
@@ -2193,11 +2518,11 @@ def _arm_backend(app: CollectApp, side: str) -> RM65ArmBackend | None:
     return backend if isinstance(backend, RM65ArmBackend) else None
 
 
-def _hand_backend(app: CollectApp, side: str) -> InspireTacHandBackend | None:
+def _hand_backend(app: CollectApp, side: str) -> Any | None:
     backend = app.components.backends.get(
         CollectionTopology.for_active_sides((side,)).hand_effector(side)
     )
-    return backend if isinstance(backend, InspireTacHandBackend) else None
+    return backend if hasattr(backend, "get_state") else None
 
 
 _DEBUG_FROZEN_RED = "\033[1;31;40m"
@@ -2665,215 +2990,6 @@ def _hand_target_summary(action: np.ndarray, active_sides: Sequence[str]) -> str
             f"{side}=min:{float(np.min(target)):.3f},max:{float(np.max(target)):.3f}"
         )
     return " ".join(bits) if bits else "hands=none"
-
-
-def _read_replay_dataset_episode_indices(dataset_root: str | Path) -> list[int]:
-    root = Path(dataset_root).expanduser().resolve()
-    episodes_path = root / "meta" / "episodes.jsonl"
-    if not episodes_path.exists():
-        raise FileNotFoundError(
-            f"Balanced replay requires dataset metadata: {episodes_path}"
-        )
-    indices: list[int] = []
-    for line in episodes_path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text:
-            continue
-        row = json.loads(text)
-        try:
-            indices.append(int(row["episode_index"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid replay episode row in {episodes_path}: {row!r}") from exc
-    if not indices:
-        raise ValueError(f"Replay dataset has no episodes in {episodes_path}.")
-    return sorted(set(indices))
-
-
-def _resolve_replay_episode_indices(args: argparse.Namespace) -> list[int]:
-    dataset = str(args.replay_dataset).strip()
-    if not dataset:
-        return [int(args.replay_episode)]
-    if not bool(getattr(args, "replay_all_episodes", True)):
-        return [int(args.replay_episode)]
-    return _read_replay_dataset_episode_indices(dataset)
-
-
-def _build_replay_group_for_episode(
-    args: argparse.Namespace,
-    *,
-    episode_index: int,
-    group_spec: ReplayGroupSpec,
-    balanced_episode_count: int,
-    require_arm_joint_targets: bool = False,
-) -> ReplayTrajectoryGroup:
-    source_path, resolved_metadata = resolve_replay_parquet_path(
-        dataset_root=str(args.replay_dataset).strip() or None,
-        parquet_path=str(args.replay_parquet).strip() or None,
-        episode_index=int(episode_index),
-    )
-    all_actions = load_replay_actions_from_parquet(
-        source_path,
-        action_column=str(args.replay_action_column or "action"),
-        start_index=0,
-        end_index=None,
-    )
-    total_frames = int(all_actions.shape[0])
-    start_index = int(group_spec.start_index)
-    end_index = int(group_spec.end_index)
-    if end_index < 0:
-        end_index = total_frames
-    if start_index < 0 or start_index >= total_frames:
-        raise ValueError(
-            f"replay group '{group_spec.key}' start_index={start_index} "
-            f"is outside source episode {episode_index} frame range [0, {total_frames})."
-        )
-    if end_index <= start_index or end_index > total_frames:
-        raise ValueError(
-            f"replay group '{group_spec.key}' end_index={end_index} must satisfy "
-            f"start < end <= {total_frames} for source episode {episode_index}."
-        )
-    action_hz_info = infer_replay_action_hz(
-        parquet_path=source_path,
-        dataset_root=str(args.replay_dataset).strip() or None,
-        episode_index=int(episode_index),
-        start_index=start_index,
-        end_index=end_index,
-        resolved_metadata=resolved_metadata,
-    )
-    actions = all_actions[start_index:end_index].astype(np.float32, copy=True)
-    arm_joint_targets = load_replay_arm_joint_targets_from_parquet(
-        source_path,
-        active_sides=args.active_sides,
-        start_index=start_index,
-        end_index=end_index,
-        required=bool(require_arm_joint_targets),
-    )
-    source_episode_index = int(resolved_metadata.get("episode_index", int(episode_index)))
-    return ReplayTrajectoryGroup(
-        key=group_spec.key,
-        label=f"episodes_{group_spec.episode_range}",
-        source_path=str(source_path),
-        source_episode_index=source_episode_index,
-        start_index=int(start_index),
-        end_index=int(end_index),
-        frame_count=int(actions.shape[0]),
-        action_hz=float(action_hz_info["hz"]),
-        actions=actions,
-        arm_joint_targets=arm_joint_targets,
-        metadata={
-            "action_hz_estimate": dict(action_hz_info),
-            "source_metadata": dict(resolved_metadata),
-            "action_column": str(args.replay_action_column or "action"),
-            "balanced_replay": bool(str(args.replay_dataset).strip())
-            and bool(getattr(args, "replay_all_episodes", True)),
-            "balanced_episode_count": int(balanced_episode_count),
-            "source_episode_index": source_episode_index,
-            "episode_range_spec": str(group_spec.episode_range),
-        },
-    )
-
-
-def _build_replay_groups(args: argparse.Namespace) -> dict[str, ReplayTrajectoryPool]:
-    if not (str(args.replay_dataset).strip() or str(args.replay_parquet).strip()):
-        return {}
-    group_specs = list(args.replay_group or [])
-    if not group_specs:
-        group_specs = ["a:all"]
-    available_episode_indices = _resolve_replay_episode_indices(args)
-    pools: dict[str, ReplayTrajectoryPool] = {}
-    for spec in group_specs:
-        parsed_spec = _parse_replay_group_spec(
-            spec,
-            available_episode_indices=available_episode_indices,
-        )
-        if str(args.replay_parquet).strip() and parsed_spec.episode_range not in {"all", "*"}:
-            raise ValueError(
-                "With --replay-parquet, --replay-group only supports 'key:all' because "
-                "there is only one source parquet. Use --replay-dataset to select episode index ranges."
-            )
-        selected_episode_indices = (
-            tuple(available_episode_indices)
-            if str(args.replay_parquet).strip()
-            else _parse_episode_range_token(
-                parsed_spec.episode_range,
-                available_indices=available_episode_indices,
-            )
-        )
-        candidates = [
-            _build_replay_group_for_episode(
-                args,
-                episode_index=episode_index,
-                group_spec=parsed_spec,
-                balanced_episode_count=len(selected_episode_indices),
-            )
-            for episode_index in selected_episode_indices
-        ]
-        key = candidates[0].key
-        label = candidates[0].label
-        if key in pools:
-            raise ValueError(f"Duplicate replay group key '{key}'.")
-        if any(candidate.key != key for candidate in candidates):
-            raise ValueError(f"Replay group spec {spec!r} produced inconsistent keys.")
-        pools[key] = ReplayTrajectoryPool(
-            key=key,
-            label=label,
-            groups=candidates,
-            episode_indices=tuple(int(index) for index in selected_episode_indices),
-            episode_range_spec=str(parsed_spec.episode_range),
-        )
-    return pools
-
-
-def _build_replay_init_plan(args: argparse.Namespace) -> ReplayInitEpisodePlan | None:
-    spec_text = str(getattr(args, "replay_init_episode", "") or "").strip()
-    if not spec_text:
-        return None
-    init_dataset_root = str(getattr(args, "replay_init_dataset", "") or "").strip()
-    init_parquet_path = str(getattr(args, "replay_init_parquet", "") or "").strip()
-    source_dataset_root = init_dataset_root or str(args.replay_dataset).strip()
-    source_parquet_path = init_parquet_path or str(args.replay_parquet).strip()
-    episode_token = spec_text.split(":", 1)[0].strip()
-    if not episode_token:
-        raise ValueError("replay init episode spec must start with an episode index.")
-    episode_index = int(episode_token)
-    init_episode_path, _ = resolve_replay_parquet_path(
-        dataset_root=source_dataset_root or None,
-        parquet_path=source_parquet_path or None,
-        episode_index=episode_index,
-    )
-    total_frames = int(
-        load_replay_actions_from_parquet(
-            init_episode_path,
-            action_column=str(args.replay_action_column or "action"),
-            start_index=0,
-            end_index=None,
-        ).shape[0]
-    )
-    parsed = _parse_replay_init_episode_spec(
-        spec_text,
-        default_total_frames=total_frames,
-    )
-    group_spec = ReplayGroupSpec(
-        key="h",
-        start_index=int(parsed.start_index),
-        end_index=int(parsed.end_index),
-        episode_range=str(parsed.episode_index),
-    )
-    group_args = argparse.Namespace(**vars(args))
-    group_args.replay_dataset = source_dataset_root
-    group_args.replay_parquet = source_parquet_path
-    group = _build_replay_group_for_episode(
-        group_args,
-        episode_index=int(parsed.episode_index),
-        group_spec=group_spec,
-        balanced_episode_count=1,
-        require_arm_joint_targets=True,
-    )
-    return ReplayInitEpisodePlan(
-        group=group,
-        move_time_s=float(args.replay_init_episode_move_time),
-        to_record_time_s=float(args.replay_init_episode_to_record_time),
-    )
 
 
 def _freeze_jitter_arms_at_current_pose(app: CollectApp) -> None:
@@ -3626,6 +3742,9 @@ def _start_recording_episode(app: CollectApp, args: argparse.Namespace) -> None:
     if state.recording_active:
         _log("Episode", f"ignore z: episode {state.active_episode_index} is already recording.")
         return
+    if _has_active_finalize_tasks(state):
+        _log("Episode", "ignore z: previous episode is still finalizing.")
+        return
     if state.active_replay_run is not None:
         _log("Episode", "ignore z: trajectory replay episode is active.")
         return
@@ -3654,6 +3773,143 @@ def _reset_recording_state(state: CollectControlState) -> None:
     state.active_episode_index = None
     state.active_episode_started_at = None
     state.active_replay_run = None
+
+
+def _active_finalize_tasks(state: CollectControlState) -> list[EpisodeFinalizeTask]:
+    return [task for task in state.finalize_tasks if not task.done]
+
+
+def _has_active_finalize_tasks(state: CollectControlState) -> bool:
+    return bool(_active_finalize_tasks(state))
+
+
+def _writer_stats_payload(runtime: CollectionRuntime) -> dict[str, Any]:
+    try:
+        return asdict(runtime.writer_pool.stats())
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _storage_queue_stats_payload(runtime: CollectionRuntime) -> dict[str, Any]:
+    observer = getattr(runtime, "writer_observer", None)
+    stats_fn = getattr(observer, "storage_stats", None)
+    if not callable(stats_fn):
+        return {"enabled": False, "routes": {}}
+    try:
+        return dict(stats_fn())
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": False, "error": f"{type(exc).__name__}: {exc}", "routes": {}}
+
+
+def _finalize_task_summary(
+    app: CollectApp,
+    *,
+    reason: str,
+    step_count: int,
+    frame_count: int,
+) -> dict[str, Any]:
+    return {
+        "stop_reason": reason,
+        "step_count": int(step_count),
+        "submitted_samples_total": int(app.runtime.submitted_samples),
+        "episode_frame_count": int(frame_count),
+        "writer_pool_stats_at_stop": _writer_stats_payload(app.runtime),
+        "storage_queue_stats_at_stop": _storage_queue_stats_payload(app.runtime),
+    }
+
+
+def _run_finalize_task(
+    app: CollectApp,
+    task: EpisodeFinalizeTask,
+    *,
+    summary: Mapping[str, Any],
+) -> None:
+    summary_payload = dict(summary)
+    try:
+        app.runtime.flush()
+        summary_payload["writer_pool_stats_after_flush"] = _writer_stats_payload(app.runtime)
+        summary_payload["storage_queue_stats"] = _storage_queue_stats_payload(app.runtime)
+        summary_payload["background_finalize"] = True
+        summary_payload["finalize_started_at"] = float(task.started_at)
+        app.writer.finalize_episode(task.episode_index, summary=summary_payload)
+    except BaseException as exc:  # noqa: BLE001
+        task.mark_done(success=False, error=f"{type(exc).__name__}: {exc}")
+        return
+    task.mark_done(success=True)
+
+
+def _start_finalize_task(
+    app: CollectApp,
+    *,
+    episode_index: int,
+    frame_count: int,
+    reason: str,
+    step_count: int,
+    show_standby: bool,
+) -> EpisodeFinalizeTask:
+    task = EpisodeFinalizeTask(
+        episode_index=int(episode_index),
+        frame_count=int(frame_count),
+        reason=str(reason),
+        show_standby=bool(show_standby),
+    )
+    summary = _finalize_task_summary(
+        app,
+        reason=reason,
+        step_count=step_count,
+        frame_count=frame_count,
+    )
+    thread = threading.Thread(
+        target=_run_finalize_task,
+        name=f"episode_finalize_{episode_index}",
+        args=(app, task),
+        kwargs={"summary": summary},
+        daemon=True,
+    )
+    task.thread = thread
+    app.control_state.finalize_tasks.append(task)
+    thread.start()
+    return task
+
+
+def _poll_finalize_tasks(app: CollectApp) -> None:
+    state = app.control_state
+    remaining: list[EpisodeFinalizeTask] = []
+    for task in state.finalize_tasks:
+        if not task.done:
+            remaining.append(task)
+            continue
+        if task.thread is not None:
+            task.thread.join(timeout=0.0)
+        if task.success:
+            state.saved_episodes += 1
+            elapsed = 0.0 if task.completed_at is None else task.completed_at - task.started_at
+            print(
+                f"  已保存片段 Episode saved {task.episode_index} "
+                f"(后台收尾 {elapsed:.2f}s)",
+                flush=True,
+            )
+            if task.show_standby:
+                _print_standby(app)
+        else:
+            print(
+                f"  保存失败 Episode finalize failed {task.episode_index}: {task.error}",
+                flush=True,
+            )
+        # Completed tasks are intentionally not kept; episode records live in meta/.
+    state.finalize_tasks = remaining
+
+
+def _wait_finalize_tasks(app: CollectApp) -> None:
+    while _has_active_finalize_tasks(app.control_state):
+        _poll_finalize_tasks(app)
+        active = _active_finalize_tasks(app.control_state)
+        if not active:
+            break
+        for task in active:
+            if task.thread is not None:
+                task.thread.join(timeout=0.1)
+    _poll_finalize_tasks(app)
 
 
 def _save_active_episode(
@@ -3699,31 +3955,21 @@ def _save_active_episode(
             step_count=step_count,
         )
         return False
-    print(f"  正在保存片段 Saving episode {episode_index}...")
-    finalize_jobs = list(app.writer.plan_finalize_episode(
-        episode_index,
-        summary={
-            "stop_reason": reason,
-            "step_count": int(step_count),
-            "submitted_samples_total": int(app.runtime.submitted_samples),
-            "episode_frame_count": frame_count,
-        },
-    ))
-    phase_timer.mark("save:plan_finalize_episode")
-    for job in finalize_jobs:
-        app.runtime.writer_pool.submit(job)
-    phase_timer.mark("save:submit_finalize_jobs")
-    app.runtime.flush()
-    phase_timer.mark("save:flush_writer")
-    state.saved_episodes += 1
+    print(f"  正在后台收尾 Finalizing episode {episode_index} in background...")
     _reset_recording_state(state)
-    print(f"  已保存片段 Episode saved {episode_index}")
-    if show_standby:
-        _print_standby(app)
     phase_timer.mark("save:reset_recording_state")
+    _start_finalize_task(
+        app,
+        episode_index=episode_index,
+        frame_count=frame_count,
+        reason=reason,
+        step_count=step_count,
+        show_standby=show_standby,
+    )
+    phase_timer.mark("save:start_finalize_task")
     _debug_frozen_maybe_report(
         app,
-        reason=f"save:{reason}",
+        reason=f"save_background:{reason}",
         elapsed_sec=phase_timer.elapsed_sec(),
         phases=phase_timer.phases,
         step_count=step_count,
@@ -3783,7 +4029,12 @@ def _start_replay_episode(
     pool = app.replay_groups.get(str(key).lower())
     if pool is None:
         return
-    if state.recording_active or state.active_replay_run is not None or state.active_unrecorded_replay_run is not None:
+    if (
+        state.recording_active
+        or state.active_replay_run is not None
+        or state.active_unrecorded_replay_run is not None
+        or _has_active_finalize_tasks(state)
+    ):
         _log(
             "Replay",
             f"ignore {key}: episode {state.active_episode_index} is already active.",
@@ -3924,7 +4175,7 @@ def _start_recorded_replay_run_from_group(
     startup_target_action: np.ndarray | None,
 ) -> None:
     state = app.control_state
-    if state.recording_active or state.active_replay_run is not None:
+    if state.recording_active or state.active_replay_run is not None or _has_active_finalize_tasks(state):
         _log("Replay", "ignore recorded start: another recorded replay is active.")
         return
     episode_index = app.writer.start_episode(
@@ -4036,7 +4287,12 @@ def _start_unrecorded_replay_run(
         raise RuntimeError("Trajectory replay requires an active rig.")
     if app.replay_action_filter is None:
         raise RuntimeError("Trajectory replay action filter is unavailable.")
-    if state.recording_active or state.active_replay_run is not None or state.active_unrecorded_replay_run is not None:
+    if (
+        state.recording_active
+        or state.active_replay_run is not None
+        or state.active_unrecorded_replay_run is not None
+        or _has_active_finalize_tasks(state)
+    ):
         _log("ReplayInit", f"ignore start purpose={purpose}: another run is already active.")
         return
     startup_initializer: StartupInitializer | None = None
@@ -4100,7 +4356,12 @@ def _start_replay_init_episode_cycle(app: CollectApp, args: argparse.Namespace) 
     if plan is None:
         _log("ReplayInit", "ignore h: no --replay-init-episode is configured.")
         return
-    if state.recording_active or state.active_replay_run is not None or state.active_unrecorded_replay_run is not None:
+    if (
+        state.recording_active
+        or state.active_replay_run is not None
+        or state.active_unrecorded_replay_run is not None
+        or _has_active_finalize_tasks(state)
+    ):
         _log("ReplayInit", "ignore h: another recording/replay run is active.")
         return
     if not state.replay_init_at_start:
@@ -4555,7 +4816,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             for side in active_sides
             if topology.hand_effector(side) in all_backends
         )
-        if replay_groups
+        if replay_groups or _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
         else tuple(hand_retargeters)
     )
     for side in hand_rig_sides:
@@ -4624,6 +4885,10 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             "fixed_arm_sides": list(fixed_sides),
             "jitter_arm_sides": list(jitter_sides),
             "runtime_arm_state_source": "last_commanded_action",
+            "hand_backend": _hand_backend_mode(args),
+            "gripper_policy": dict(getattr(args, "gripper_policy", {}) or _resolved_gripper_policy(args))
+            if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
+            else {},
         },
     )
 
@@ -4636,6 +4901,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             dataset_name=str(args.dataset_name),
             write_parquet=bool(args.write_parquet),
             write_video=bool(args.write_video and not args.no_camera),
+            tactile_storage=str(getattr(args, "tactile_storage", "external")),
+            allow_missing_video_frames=int(getattr(args, "storage_queue_size", 64)) > 0,
         )
     )
     control_state = CollectControlState(
@@ -4651,6 +4918,11 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 for camera_key, source in camera_sources.items()
             },
             episode_index=writer.next_episode_index,
+            tactile_array_snapshot_policy=(
+                "always"
+                if str(getattr(args, "tactile_storage", "external")).strip().lower().replace("-", "_") == "parquet"
+                else "on_change"
+            ),
         )
     )
     writer_pool = AsyncWriterPool(
@@ -4677,6 +4949,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         config=CollectionRuntimeConfig(
             auto_start_session=False,
             auto_start_writer_pool=True,
+        ),
+        writer_observer_config=CollectionWriterObserverConfig(
+            storage_queue_size=int(getattr(args, "storage_queue_size", 64)),
         ),
     )
     return CollectApp(
@@ -4789,10 +5064,18 @@ def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None
             f" init_at_start={control.replay_init_at_start}"
         )
     return_home = "" if control.return_home_plan is None else " return_home=active"
+    finalizing = ""
+    active_finalizers = _active_finalize_tasks(control)
+    if active_finalizers:
+        finalizing = " finalizing=" + ",".join(
+            f"{task.episode_index}:{int(time.time() - task.started_at)}s"
+            for task in active_finalizers
+        )
     return (
         f"step={step_count} state={state_value} home={home} recording={recording} "
         f"episode={episode} control_hz={control_hz:.2f} submitted={submitted}"
-        f"{replay}{replay_init}{return_home}{fixed_status}{jitter_status}{hand_status}{_camera_status_text(app)}"
+        f"{replay}{replay_init}{return_home}{finalizing}"
+        f"{fixed_status}{jitter_status}{hand_status}{_camera_status_text(app)}"
     )
 
 
@@ -4946,6 +5229,8 @@ def main() -> int:
             loop_phase_timer.mark("loop.keys")
             if should_quit:
                 break
+            _poll_finalize_tasks(app)
+            loop_phase_timer.mark("loop.finalize_status")
 
             result = None
             if app.control_state.active_unrecorded_replay_run is not None:
@@ -5096,6 +5381,7 @@ def main() -> int:
                     reason="shutdown/save_active",
                     show_standby=False,
                 )
+            _wait_finalize_tasks(app)
         finally:
             try:
                 key_controller.close()

@@ -539,7 +539,8 @@ if __name__ == '__main__':
     from tqdm import trange
     import numpy as np
     test1 = InspireTacModbus(max_fingertip_force=1200, ip='192.168.11.210')
-    test1.set_joint_pos([1, 1, 1, 1, 1, 0])
+    test1.set_joint_pos([1, 1, 1, 1, 1, 1])
+    exit(0)
     test2 = InspireTacModbus(max_fingertip_force=1200, ip='192.168.12.210')
     test2.set_joint_pos([1, 1, 1, 1, 1, 0])
     exit(0)

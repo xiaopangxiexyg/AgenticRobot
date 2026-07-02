@@ -127,7 +127,7 @@ python -m teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz \
 - `--left-arm-ip` / `--right-arm-ip`: 左右 RM65 IP；在 `arm-mode=real` 下提供哪一侧，就读取哪一侧真机
 - `--left-hand-ip` / `--right-hand-ip`: 左右 InspireTac IP；可独立于 arm 连接，未提供时该手保持固定张开姿态
 - `--swap-arm-sides`: 交换提供的两个 IP 对应的逻辑左/右臂
-- `--tcp-mode hand_base`: 当前 runtime 固定只使用 `hand_base`
+- `--tcp-mode hand_base`: 历史兼容参数；当前 action 主 frame 是 `tool_tcp`
 - `--load-profile PATH`: 载入已有 calibration profile
 - `--save-initial-alignment PATH_OR_DIR`: 指定初始对齐状态保存位置；运行时按 `s` 保存
 - `--hz`: 状态轮询和渲染频率，默认 `30`

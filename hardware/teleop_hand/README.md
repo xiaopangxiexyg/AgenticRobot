@@ -13,9 +13,9 @@
 
 这个目录里现在有两条最小读取器：
 
-- [teleop_6dof_reader.py](/home/user/zc/g1_o6_teleop/minimal_control/teleop_6dof_reader.py)
+- [teleop_6dof_reader.py](/home/user/zc/g1_o6_teleop/teleop_hand/teleop_6dof_reader.py)
   作用：外骨骼手臂 `q14` -> 左右手末端 6DoF pose
-- [hand_q6_reader.py](/home/user/zc/g1_o6_teleop/minimal_control/hand_q6_reader.py)
+- [hand_q6_reader.py](/home/user/zc/g1_o6_teleop/teleop_hand/hand_q6_reader.py)
   作用：手部串口设备 -> 6 个手指关节值
 
 如果你现在只想拿到遥操作的六维信息，最小做法就是：
@@ -39,7 +39,7 @@
 最小读取命令：
 
 ```bash
-python minimal_control/hand_q6_reader.py \
+python teleop_hand/hand_q6_reader.py \
   --port /dev/ttyACM0 \
   --baudrate 115200 \
   --side right
@@ -48,7 +48,7 @@ python minimal_control/hand_q6_reader.py \
 如果你只想先看串口里到底发了什么原始文本：
 
 ```bash
-python minimal_control/hand_q6_reader.py \
+python teleop_hand/hand_q6_reader.py \
   --port /dev/ttyACM0 \
   --baudrate 115200 \
   --raw-only \
@@ -70,7 +70,7 @@ python minimal_control/hand_q6_reader.py \
 如果你想把单手数据发布到 Redis：
 
 ```bash
-python minimal_control/hand_q6_reader.py \
+python teleop_hand/hand_q6_reader.py \
   --port /dev/ttyACM0 \
   --baudrate 115200 \
   --side right \
@@ -95,7 +95,7 @@ python minimal_control/hand_q6_reader.py \
 最小 Python 用法：
 
 ```python
-from minimal_control.hand_q6_reader import SingleHandQ6Reader
+from teleop_hand.hand_q6_reader import SingleHandQ6Reader
 from drivers.hand_driver import DexHand
 
 reader = SingleHandQ6Reader(
@@ -126,7 +126,7 @@ finally:
 `hand_q6_reader.py` 现在支持双手模式：
 
 ```bash
-python minimal_control/hand_q6_reader.py \
+python teleop_hand/hand_q6_reader.py \
   --left-port /dev/ttyACM0 \
   --right-port /dev/ttyACM1 \
   --baudrate 115200
@@ -141,7 +141,7 @@ python minimal_control/hand_q6_reader.py \
 Python 里对应的便捷接口：
 
 ```python
-from minimal_control.hand_q6_reader import BimanualHandQ6Reader
+from teleop_hand.hand_q6_reader import BimanualHandQ6Reader
 
 reader = BimanualHandQ6Reader(
     left_port="/dev/ttyACM0",
@@ -186,25 +186,25 @@ finally:
 先做一次纯 FK 自检，不碰硬件：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py --dry-run --print-q14
+python teleop_hand/teleop_6dof_reader.py --dry-run --print-q14
 ```
 
 先查看当前机器能看到哪些串口：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py --list-ports
+python teleop_hand/teleop_6dof_reader.py --list-ports
 ```
 
 直接读取外骨骼并在终端打印左右 6DoF：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py --hz 20
+python teleop_hand/teleop_6dof_reader.py --hz 20
 ```
 
 如果你希望和现有 Redis 流程对齐，把结果发布出去：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py \
+python teleop_hand/teleop_6dof_reader.py \
   --hz 20 \
   --redis-key teleop:arm6d
 ```
@@ -212,7 +212,7 @@ python minimal_control/teleop_6dof_reader.py \
 如果当前外骨骼开机后需要和 `teleop.py` 一样先做复位：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py \
+python teleop_hand/teleop_6dof_reader.py \
   --hz 20 \
   --reset-exo
 ```
@@ -220,7 +220,7 @@ python minimal_control/teleop_6dof_reader.py \
 如果端口能打开，但你怀疑它不是正确的 Dynamixel 总线，可以先做低层探测：
 
 ```bash
-python minimal_control/dxl_bus_probe.py \
+python teleop_hand/dxl_bus_probe.py \
   --port /dev/ttyUSB0 \
   --baudrates 57600 115200 1000000 \
   --id-start 0 \
@@ -249,7 +249,7 @@ python minimal_control/dxl_bus_probe.py \
 2. 执行一次：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py --list-ports
+python teleop_hand/teleop_6dof_reader.py --list-ports
 ```
 
 3. 插上设备，再执行一次同样命令。
@@ -257,7 +257,7 @@ python minimal_control/teleop_6dof_reader.py --list-ports
 5. 运行脚本时显式传入：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py \
+python teleop_hand/teleop_6dof_reader.py \
   --port /dev/ttyUSB0 \
   --hz 20
 ```
@@ -265,7 +265,7 @@ python minimal_control/teleop_6dof_reader.py \
 如果你看到了 `/dev/serial/by-id/...`，更推荐直接用它：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py \
+python teleop_hand/teleop_6dof_reader.py \
   --port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_FTA7NOIE-if00-port0 \
   --hz 20
 ```
@@ -279,7 +279,7 @@ python minimal_control/teleop_6dof_reader.py \
 3. 最后两台都插上，再执行：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py --list-ports
+python teleop_hand/teleop_6dof_reader.py --list-ports
 ```
 
 4. 用 `serial_number` 或 `location` 区分哪一台是哪一台。
@@ -306,13 +306,13 @@ No such file or directory: /dev/serial/by-id/...
 这时先执行：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py --list-ports
+python teleop_hand/teleop_6dof_reader.py --list-ports
 ```
 
 如果能看到设备，例如 `/dev/ttyUSB0`，就先这样运行：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py \
+python teleop_hand/teleop_6dof_reader.py \
   --port /dev/ttyUSB0 \
   --hz 20
 ```
@@ -333,7 +333,7 @@ python minimal_control/teleop_6dof_reader.py \
 
 建议排查顺序：
 
-1. 先跑 `python minimal_control/dxl_bus_probe.py --port <你的端口> --baudrates 57600 115200 1000000 --id-start 0 --id-end 13`
+1. 先跑 `python teleop_hand/dxl_bus_probe.py --port <你的端口> --baudrates 57600 115200 1000000 --id-start 0 --id-end 13`
 2. 如果 3 个波特率都主要报 `Incorrect status packet`，基本可以判定这个端口不是目标总线
 3. 如果变成 `There is no status packet`，再继续怀疑波特率、ID、接线
 4. 如果某个波特率下能扫出 `id=0..13` 中的一部分或全部，就把这个波特率和端口用到 `teleop_6dof_reader.py`
@@ -373,7 +373,7 @@ sudo udevadm trigger
 之后就可以固定使用：
 
 ```bash
-python minimal_control/teleop_6dof_reader.py \
+python teleop_hand/teleop_6dof_reader.py \
   --port /dev/teleop_exo \
   --hz 20
 ```

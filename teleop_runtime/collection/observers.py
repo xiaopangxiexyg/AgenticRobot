@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+import queue
+import threading
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Iterable, Mapping
 
 from ..session import SessionStepResult
 from .action_record import build_collection_action_record
@@ -17,6 +19,152 @@ WritePlanner = Callable[[Any, CollectorComponents], Iterable[WriteJob]]
 @dataclass(frozen=True)
 class CollectionWriterObserverConfig:
     name: str = "collection_writer_observer"
+    storage_queue_size: int = 0
+
+    def __post_init__(self) -> None:
+        if int(self.storage_queue_size) < 0:
+            raise ValueError("storage_queue_size must be >= 0.")
+
+
+@dataclass(frozen=True)
+class StorageRouteStats:
+    key: str
+    queued: int
+    enqueued: int
+    submitted: int
+    dropped: int
+    high_water: int
+    max_queue_size: int
+
+
+_StorageItem = WriteJob | object
+_STORAGE_SENTINEL = object()
+
+
+class _StorageRouteQueue:
+    def __init__(
+        self,
+        *,
+        key: str,
+        writer_pool: AsyncWriterPool,
+        max_queue_size: int,
+    ):
+        self.key = str(key)
+        self.writer_pool = writer_pool
+        self.max_queue_size = int(max_queue_size)
+        self._queue: queue.Queue[_StorageItem] = queue.Queue(maxsize=self.max_queue_size)
+        self._thread: threading.Thread | None = None
+        self._started = False
+        self._closed = False
+        self._failure_lock = threading.Lock()
+        self._failures: list[BaseException] = []
+        self._enqueued = 0
+        self._submitted = 0
+        self._dropped = 0
+        self._high_water = 0
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name=f"storage_queue_{self.key}",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started = True
+
+    def _record_failure(self, exc: BaseException) -> None:
+        with self._failure_lock:
+            self._failures.append(exc)
+        self._closed = True
+
+    def raise_if_failed(self) -> None:
+        with self._failure_lock:
+            if not self._failures:
+                return
+            first = self._failures[0]
+        raise RuntimeError(f"storage queue '{self.key}' failed: {first}") from first
+
+    def enqueue(self, job: WriteJob) -> bool:
+        self.raise_if_failed()
+        if self._closed:
+            raise RuntimeError(f"storage queue '{self.key}' is closed.")
+        self.start()
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._queue.task_done()
+                self._dropped += 1
+            try:
+                self._queue.put_nowait(job)
+            except queue.Full:
+                self._dropped += 1
+                return False
+        self._enqueued += 1
+        self._high_water = max(self._high_water, int(self._queue.qsize()))
+        return True
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is _STORAGE_SENTINEL:
+                    return
+                assert isinstance(item, WriteJob)
+                try:
+                    if self.writer_pool.submit(item):
+                        self._submitted += 1
+                except BaseException as exc:  # noqa: BLE001
+                    self._record_failure(exc)
+            finally:
+                self._queue.task_done()
+
+    def flush(self) -> None:
+        self._queue.join()
+        self.raise_if_failed()
+
+    def close(self, *, wait: bool = True) -> None:
+        if self._closed and not self._started:
+            return
+        self._closed = True
+        if wait:
+            self.flush()
+        if self._started:
+            while True:
+                try:
+                    self._queue.put_nowait(_STORAGE_SENTINEL)
+                    break
+                except queue.Full:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        continue
+                    self._queue.task_done()
+                    self._dropped += 1
+            self._queue.join()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+        self._started = False
+        self.raise_if_failed()
+
+    def stats(self) -> StorageRouteStats:
+        return StorageRouteStats(
+            key=self.key,
+            queued=int(self._queue.qsize()),
+            enqueued=int(self._enqueued),
+            submitted=int(self._submitted),
+            dropped=int(self._dropped),
+            high_water=int(self._high_water),
+            max_queue_size=int(self.max_queue_size),
+        )
 
 
 class CollectionWriterObserver:
@@ -39,6 +187,7 @@ class CollectionWriterObserver:
         self._submitted_samples = 0
         self._submitted_jobs = 0
         self._last_sample: Any | None = None
+        self._storage_routes: dict[str, _StorageRouteQueue] = {}
 
     @property
     def submitted_samples(self) -> int:
@@ -55,6 +204,38 @@ class CollectionWriterObserver:
     def start(self) -> None:
         self.writer_pool.start()
 
+    @property
+    def storage_queue_enabled(self) -> bool:
+        return int(self.config.storage_queue_size) > 0
+
+    def _storage_route_key(self, job: WriteJob) -> str | None:
+        if not self.storage_queue_enabled:
+            return None
+        if str(job.metadata.get("storage_queue", "")) != "video":
+            return None
+        camera_key = job.metadata.get("camera_key")
+        if camera_key is None and isinstance(job.payload, dict):
+            camera_key = job.payload.get("camera_key")
+        return None if camera_key is None else str(camera_key)
+
+    def _storage_route(self, key: str) -> _StorageRouteQueue:
+        route_key = str(key)
+        route = self._storage_routes.get(route_key)
+        if route is None:
+            route = _StorageRouteQueue(
+                key=route_key,
+                writer_pool=self.writer_pool,
+                max_queue_size=int(self.config.storage_queue_size),
+            )
+            self._storage_routes[route_key] = route
+        return route
+
+    def _submit_job(self, job: WriteJob) -> bool:
+        route_key = self._storage_route_key(job)
+        if route_key is not None:
+            return self._storage_route(route_key).enqueue(job)
+        return self.writer_pool.submit(job)
+
     def _ensure_action_record(self, result: SessionStepResult) -> None:
         if result.action_record is None:
             result.action_record = build_collection_action_record(result)
@@ -64,15 +245,18 @@ class CollectionWriterObserver:
         result: SessionStepResult,
         *,
         phase_recorder: Callable[[str, float], None] | None = None,
+        metadata_extra: Mapping[str, Any] | None = None,
     ) -> Any | None:
         phase_started = time.perf_counter()
+        local_phases: list[tuple[str, float]] = []
 
         def mark_phase(name: str) -> None:
             nonlocal phase_started
-            if phase_recorder is None:
-                return
             current = time.perf_counter()
-            phase_recorder(name, current - phase_started)
+            elapsed = current - phase_started
+            local_phases.append((str(name), float(elapsed)))
+            if phase_recorder is not None:
+                phase_recorder(name, elapsed)
             phase_started = current
 
         self._ensure_action_record(result)
@@ -84,16 +268,21 @@ class CollectionWriterObserver:
         if sample is None:
             return None
         self._last_sample = sample
+        sample.metadata.setdefault("runtime_phase_timings_ms", {}).update(
+            {name: elapsed * 1000.0 for name, elapsed in local_phases}
+        )
+        if metadata_extra:
+            sample.metadata.update(dict(metadata_extra))
 
         if phase_recorder is None:
             for job in self.write_planner(sample, self.components):
-                if self.writer_pool.submit(job):
+                if self._submit_job(job):
                     self._submitted_jobs += 1
         else:
             jobs = list(self.write_planner(sample, self.components))
             mark_phase("runtime.write_planner")
             for job in jobs:
-                if self.writer_pool.submit(job):
+                if self._submit_job(job):
                     self._submitted_jobs += 1
             mark_phase("runtime.writer_submit")
         self._submitted_samples += 1
@@ -103,9 +292,23 @@ class CollectionWriterObserver:
         self.handle_step(result)
 
     def flush(self) -> None:
+        for route in list(self._storage_routes.values()):
+            route.flush()
         self.writer_pool.join()
 
     def close(self, *, flush: bool = True) -> None:
         if flush:
             self.flush()
+        for route in list(self._storage_routes.values()):
+            route.close(wait=flush)
         self.writer_pool.close(wait=flush)
+
+    def storage_stats(self) -> dict[str, Any]:
+        return {
+            "enabled": self.storage_queue_enabled,
+            "storage_queue_size": int(self.config.storage_queue_size),
+            "routes": {
+                key: asdict(route.stats())
+                for key, route in sorted(self._storage_routes.items())
+            },
+        }

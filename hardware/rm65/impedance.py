@@ -3,13 +3,17 @@ from __future__ import annotations
 import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
 
-from hardware.rm65.calibration_profiles import load_profile
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+from hardware.rm65.calibration_profiles import HAND_BASE_TCP_POSE_FLANGE_M_RAD, load_profile
 from hardware.rm65.force_compensation import (
     PoseAdmittance,
     WrenchProcessor,
+    admittance_wrench_for_arm,
     angle_delta,
     apply_pose_offset,
     finite_list,
@@ -18,7 +22,21 @@ from hardware.rm65.force_compensation import (
     norm,
     parse_axes,
 )
+from hardware.rm65.ik_provider import RM65SDKIKProvider
 from hardware.rm65.rm_api2_adapter import Arm, LEFT_ARM_IP, RIGHT_ARM_IP, RM65
+from hardware.rm65.safety_diagnostics import check_rm65_joint_safety
+from robot_motion.composite_provider import CompositeKinematicsProvider
+from robot_motion.ik_resolver import IKSafetyResolver
+from robot_motion.joint_limits import (
+    JointRateLimiter,
+    JointVelocityLimitProfile,
+    load_joint_velocity_limit_profiles,
+)
+from robot_motion.pinocchio_provider import PinocchioIKProvider
+from robot_motion.pose import matrix_to_pose6, pose6_to_matrix
+from robot_motion.profiles import load_ik_safety_profiles
+from robot_motion.seed_expansion import load_seed_expansion_profiles
+from robot_motion.types import IKResolveRequest
 
 
 ActionSource = Callable[[int, float, dict[str, object] | None], Iterable[float] | None]
@@ -113,6 +131,10 @@ def _joint_delta_deg(a: list[float], b: list[float]) -> float:
     return max(abs(x - y) for x, y in zip(a, b))
 
 
+def _joint_deltas_deg(a: Iterable[float], b: Iterable[float]) -> list[float]:
+    return [abs(float(x) - float(y)) for x, y in zip(a, b)]
+
+
 def _format_vector(values: Iterable[float], *, precision: int = 5) -> str:
     return "[" + ", ".join(f"{float(value):.{precision}f}" for value in values) + "]"
 
@@ -134,6 +156,58 @@ def _interpolate_joint(a: list[float], b: list[float], alpha: float) -> list[flo
 
 def _scaled_offset(offset: Iterable[float], scale: float) -> list[float]:
     return [float(value) * float(scale) for value in offset]
+
+
+def _pose6_to_quat_pose(pose: Iterable[float]) -> list[float]:
+    values = finite_list(pose, expected_len=6, label="pose")
+    quat_xyzw = R.from_euler("xyz", values[3:6]).as_quat()
+    return values[:3] + [
+        float(quat_xyzw[3]),
+        float(quat_xyzw[0]),
+        float(quat_xyzw[1]),
+        float(quat_xyzw[2]),
+    ]
+
+
+def _invert_transform(matrix: np.ndarray) -> np.ndarray:
+    transform = np.asarray(matrix, dtype=float).reshape(4, 4)
+    out = np.eye(4, dtype=float)
+    out[:3, :3] = transform[:3, :3].T
+    out[:3, 3] = -out[:3, :3] @ transform[:3, 3]
+    return out
+
+
+def _joint_deg_to_rad(values: Iterable[float], *, label: str) -> np.ndarray:
+    return np.deg2rad(np.asarray(finite_list(values, expected_len=6, label=label), dtype=float))
+
+
+def _append_unique_seed(
+    seeds: list[np.ndarray],
+    labels: list[str],
+    qpos: np.ndarray | None,
+    label: str,
+) -> None:
+    if qpos is None:
+        return
+    candidate = np.asarray(qpos, dtype=float).reshape(-1)
+    if candidate.shape != (6,) or not np.all(np.isfinite(candidate)):
+        return
+    if any(np.allclose(candidate, existing, atol=1e-9) for existing in seeds):
+        return
+    seeds.append(candidate.copy())
+    labels.append(str(label))
+
+
+def _coerce_float_list(values: object, *, expected_len: int) -> list[float] | None:
+    if values is None:
+        return None
+    try:
+        out = [float(value) for value in list(values)[:expected_len]]
+    except (TypeError, ValueError):
+        return None
+    if len(out) != expected_len or not all(math.isfinite(value) for value in out):
+        return None
+    return out
 
 
 @dataclass
@@ -165,7 +239,39 @@ class RM65ImpedanceConfig:
     hard_stop_force_n: float = 50.0
     hard_stop_torque_nm: float = 10.0
     max_command_joint_step_deg: float = 20.0
+    max_command_joint_velocity_deg_s: float = 120.0
+    joint_rate_limiter_enabled: bool = True
+    joint_velocity_limits_json: str | None = None
+    joint_velocity_limit_profile: str = "rm65"
+    pose_command_transport: str = "joint"
     ik_offset_backoff_min_scale: float = 1.0
+    ik_reference_backoff_min_scale: float = 0.1
+    ik_command_step_backoff_min_scale: float = 0.02
+    ik_quaternion_fallback: bool = True
+    ik_branch_jump_guard_deg: float = 90.0
+    ik_branch_jump_guard_joints: int = 3
+    ik_resolver_enabled: bool = True
+    ik_safety_profile: str = "teleop"
+    ik_safety_profile_json: str | None = None
+    ik_resolver_include_pinocchio: bool = True
+    ik_resolver_use_all_sdk_solutions: bool = True
+    ik_resolver_enable_expensive_seed_expansion: bool | None = None
+    ik_resolver_allow_parallel: bool | None = None
+    ik_resolver_candidate_provider_names: list[str] = field(default_factory=lambda: ["rm65_pinocchio"])
+    ik_resolver_pinocchio_eef_name: str = "hand_base"
+    ik_resolver_pinocchio_max_iterations: int = 16
+    ik_resolver_pinocchio_max_joint_step_rad: float = 0.08
+    ik_resolver_pinocchio_damping: float = 0.1
+    ik_resolver_pinocchio_tolerance: float = 1e-4
+    ik_resolver_local_step_provider_names: list[str] = field(default_factory=lambda: ["rm65_pinocchio"])
+    ik_resolver_local_step_max_iterations: int | None = None
+    ik_resolver_local_step_trigger_ratio: float | None = None
+    ik_seed_expansion_enabled: bool = True
+    ik_seed_expansion_profile: str = "rm65"
+    ik_seed_expansion_json: str | None = None
+    direct_joint_hint_max_linear_offset_m: float = 1e-3
+    direct_joint_hint_max_angular_offset_rad: float = 2e-3
+    hold_last_safe_on_ik_failure: bool = False
     debug_arm_endpoint_tcp: bool = False
     debug_tool_frame_name: str = ""
     tare_sec: float = 1.0
@@ -205,8 +311,58 @@ class RM65ImpedanceConfig:
             raise ValueError("force_source must be zero, work, or tool")
         if self.state_read_every < 1:
             raise ValueError("state_read_every must be >= 1")
+        if self.max_command_joint_step_deg <= 0.0:
+            raise ValueError("max_command_joint_step_deg must be positive")
+        if self.max_command_joint_velocity_deg_s <= 0.0:
+            raise ValueError("max_command_joint_velocity_deg_s must be positive")
+        if self.pose_command_transport not in ("joint", "pose"):
+            raise ValueError("pose_command_transport must be 'joint' or 'pose'")
+        if self.joint_rate_limiter_enabled and self.pose_command_transport != "joint":
+            raise ValueError("joint_rate_limiter_enabled requires pose_command_transport='joint'")
+        if self.joint_rate_limiter_enabled and not str(self.joint_velocity_limit_profile).strip():
+            raise ValueError("joint_velocity_limit_profile must not be empty when joint_rate_limiter_enabled")
         if not 0.0 <= self.ik_offset_backoff_min_scale <= 1.0:
             raise ValueError("ik_offset_backoff_min_scale must be in [0, 1]")
+        if not 0.0 <= self.ik_reference_backoff_min_scale <= 1.0:
+            raise ValueError("ik_reference_backoff_min_scale must be in [0, 1]")
+        if not 0.0 <= self.ik_command_step_backoff_min_scale <= 1.0:
+            raise ValueError("ik_command_step_backoff_min_scale must be in [0, 1]")
+        if self.ik_branch_jump_guard_deg <= 0.0:
+            raise ValueError("ik_branch_jump_guard_deg must be positive")
+        if not 1 <= int(self.ik_branch_jump_guard_joints) <= 6:
+            raise ValueError("ik_branch_jump_guard_joints must be in [1, 6]")
+        if not str(self.ik_safety_profile).strip():
+            raise ValueError("ik_safety_profile must not be empty")
+        if not str(self.ik_resolver_pinocchio_eef_name).strip():
+            raise ValueError("ik_resolver_pinocchio_eef_name must not be empty")
+        if int(self.ik_resolver_pinocchio_max_iterations) < 1:
+            raise ValueError("ik_resolver_pinocchio_max_iterations must be >= 1")
+        if self.ik_resolver_pinocchio_max_joint_step_rad <= 0.0:
+            raise ValueError("ik_resolver_pinocchio_max_joint_step_rad must be positive")
+        if self.ik_resolver_pinocchio_damping <= 0.0:
+            raise ValueError("ik_resolver_pinocchio_damping must be positive")
+        if self.ik_resolver_pinocchio_tolerance <= 0.0:
+            raise ValueError("ik_resolver_pinocchio_tolerance must be positive")
+        self.ik_resolver_local_step_provider_names = [
+            str(name).strip()
+            for name in list(self.ik_resolver_local_step_provider_names or [])
+            if str(name).strip()
+        ]
+        self.ik_resolver_candidate_provider_names = [
+            str(name).strip()
+            for name in list(self.ik_resolver_candidate_provider_names or [])
+            if str(name).strip()
+        ]
+        if self.ik_resolver_local_step_max_iterations is not None and int(self.ik_resolver_local_step_max_iterations) < 1:
+            raise ValueError("ik_resolver_local_step_max_iterations must be >= 1")
+        if self.ik_resolver_local_step_trigger_ratio is not None and float(self.ik_resolver_local_step_trigger_ratio) < 1.0:
+            raise ValueError("ik_resolver_local_step_trigger_ratio must be >= 1")
+        if self.ik_seed_expansion_enabled and not str(self.ik_seed_expansion_profile).strip():
+            raise ValueError("ik_seed_expansion_profile must not be empty when ik_seed_expansion_enabled")
+        if self.direct_joint_hint_max_linear_offset_m < 0.0:
+            raise ValueError("direct_joint_hint_max_linear_offset_m must be non-negative")
+        if self.direct_joint_hint_max_angular_offset_rad < 0.0:
+            raise ValueError("direct_joint_hint_max_angular_offset_rad must be non-negative")
         if self.tcp_pose_flange_m_rad is not None:
             self.tcp_pose_flange_m_rad = finite_list(
                 self.tcp_pose_flange_m_rad,
@@ -315,15 +471,29 @@ class RM65BaseImpedanceController:
         self._processor: WrenchProcessor | None = None
         self._admittance: PoseAdmittance | None = None
         self._reference: _ReferenceInterpolator | None = None
+        self._joint_hint_reference: _ReferenceInterpolator | None = None
         self._previous_command_joint: list[float] | None = None
         self._ik_seed: list[float] | None = None
         self._tool_frame: dict[str, object] | None = None
         self._original_tool_name: str | None = None
         self._debug_tool_frame_active = False
         self._model_fk_pose: list[float] | None = None
-        self._latest_wrench_context: dict[str, list[float]] | None = None
+        self._latest_wrench_context: dict[str, object] | None = None
         self._last_step_time: float | None = None
+        self._current_step_dt: float | None = None
+        self._previous_command_pose: list[float] | None = None
         self._step_index = 0
+        self._last_ik_hold_warning_time = 0.0
+        self._last_ik_hold_warning_key: str | None = None
+        self._ik_resolver: IKSafetyResolver | None = None
+        self._ik_resolver_provider: CompositeKinematicsProvider | None = None
+        self._ik_resolver_init_metadata: dict[str, object] = {}
+        self._joint_rate_limiter: JointRateLimiter | None = None
+        self._joint_velocity_limit_profile: JointVelocityLimitProfile | None = None
+        self._last_joint_rate_limit_warning_time = 0.0
+        self._joint_position_limits_deg: tuple[list[float], list[float]] | None = None
+        self._joint_position_limits_checked = False
+        self._joint_position_limits_error = ""
 
     @classmethod
     def from_profile(cls, profile_name_or_path: str, *, mode: str, arm: str | None = None, **overrides):
@@ -422,6 +592,443 @@ class RM65BaseImpedanceController:
         pose = self.robot.Algo_Forward_Kinematics(list(joint_deg), flag=1)
         return normalize_pose(finite_list(pose[:6], expected_len=6, label="fk_pose"))
 
+    def _target_tcp_to_hand_base_transform(self) -> np.ndarray | None:
+        if self.config.tcp_pose_flange_m_rad is None:
+            return None
+        t_flange_hand_base = pose6_to_matrix(HAND_BASE_TCP_POSE_FLANGE_M_RAD)
+        t_flange_tcp = pose6_to_matrix(self.config.tcp_pose_flange_m_rad)
+        return _invert_transform(t_flange_tcp) @ t_flange_hand_base
+
+    def _initialize_ik_resolver(self) -> None:
+        self._ik_resolver = None
+        self._ik_resolver_provider = None
+        self._ik_resolver_init_metadata = {
+            "enabled": bool(self.config.ik_resolver_enabled),
+            "profile": str(self.config.ik_safety_profile),
+            "provider_names": [],
+            "provider_errors": [],
+        }
+        if not bool(self.config.ik_resolver_enabled):
+            return
+        if self.robot is None:
+            self._ik_resolver_init_metadata["provider_errors"] = ["robot_unavailable"]
+            return
+
+        try:
+            profiles = load_ik_safety_profiles(self.config.ik_safety_profile_json)
+            profile = profiles[str(self.config.ik_safety_profile)]
+        except Exception as exc:  # noqa: BLE001 - keep impedance usable with legacy IK.
+            error = f"load_profile_failed:{type(exc).__name__}: {exc}"
+            self._ik_resolver_init_metadata["provider_errors"] = [error]
+            print(f"WARNING: {self.side}: IK safety resolver disabled: {error}")
+            return
+
+        replace_kwargs: dict[str, object] = {}
+        if self.config.ik_resolver_enable_expensive_seed_expansion is not None:
+            replace_kwargs["enable_expensive_seed_expansion"] = bool(
+                self.config.ik_resolver_enable_expensive_seed_expansion
+            )
+        if self.config.ik_resolver_allow_parallel is not None:
+            replace_kwargs["allow_parallel_candidate_generation"] = bool(self.config.ik_resolver_allow_parallel)
+        if self.config.ik_resolver_local_step_max_iterations is not None:
+            local_step_iterations = int(self.config.ik_resolver_local_step_max_iterations)
+            replace_kwargs["local_step_max_iterations"] = local_step_iterations
+            replace_kwargs["local_step_iteration_counts"] = (local_step_iterations,)
+        if self.config.ik_resolver_local_step_trigger_ratio is not None:
+            replace_kwargs["local_step_trigger_ratio"] = float(self.config.ik_resolver_local_step_trigger_ratio)
+        if replace_kwargs:
+            profile = replace(profile, **replace_kwargs)
+
+        errors: list[str] = []
+        seed_expansion_profile = None
+        seed_expansion_metadata: dict[str, object] = {
+            "enabled": bool(self.config.ik_seed_expansion_enabled),
+            "profile": str(self.config.ik_seed_expansion_profile),
+            "profile_source": self.config.ik_seed_expansion_json or "default",
+        }
+        if bool(self.config.ik_seed_expansion_enabled):
+            try:
+                seed_profiles = load_seed_expansion_profiles(self.config.ik_seed_expansion_json)
+                seed_expansion_profile = seed_profiles[str(self.config.ik_seed_expansion_profile)]
+                seed_expansion_metadata.update(
+                    {
+                        "loaded": True,
+                        "max_extra_seeds": int(seed_expansion_profile.max_extra_seeds),
+                        "perturbation_count": len(seed_expansion_profile.perturbations),
+                        "source_label_allowlist": list(seed_expansion_profile.source_label_allowlist),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - optional seed expansion must not break teleop.
+                seed_expansion_metadata.update(
+                    {
+                        "loaded": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                errors.append(
+                    f"seed_expansion_failed:{type(exc).__name__}: {exc}"
+                )
+
+        providers: list[object] = [
+            RM65SDKIKProvider(
+                self.robot,
+                use_quaternion_fallback=bool(self.config.ik_quaternion_fallback),
+                use_all_solutions=bool(self.config.ik_resolver_use_all_sdk_solutions),
+                include_wrist_flip_candidates=True,
+            )
+        ]
+        names = ["rm65_sdk"]
+
+        if bool(self.config.ik_resolver_include_pinocchio):
+            target_to_eef = self._target_tcp_to_hand_base_transform()
+            if target_to_eef is None:
+                errors.append("rm65_pinocchio_skipped:tcp_pose_flange_m_rad_unavailable")
+            else:
+                try:
+                    from rm65_inspire_tac.ik import SingleArmIKSolver
+
+                    providers.append(
+                        PinocchioIKProvider(
+                            solver=SingleArmIKSolver(
+                                eef_name=str(self.config.ik_resolver_pinocchio_eef_name),
+                            ),
+                            source="rm65_pinocchio",
+                            target_to_eef_transform=target_to_eef,
+                            qpos_size=6,
+                        )
+                    )
+                    names.append("rm65_pinocchio")
+                except Exception as exc:  # noqa: BLE001 - optional provider must not break teleop.
+                    errors.append(f"rm65_pinocchio_failed:{type(exc).__name__}: {exc}")
+
+        candidate_provider_names = [
+            str(name).strip()
+            for name in list(self.config.ik_resolver_candidate_provider_names or [])
+            if str(name).strip()
+        ]
+        primary_provider_index = 0
+        for provider_name in candidate_provider_names:
+            if provider_name in names:
+                primary_provider_index = names.index(provider_name)
+                break
+        self._ik_resolver_provider = CompositeKinematicsProvider(
+            providers=tuple(providers),
+            names=tuple(names),
+            primary_index=primary_provider_index,
+        )
+        unknown_candidate_provider_names = [
+            name for name in candidate_provider_names if name not in names
+        ]
+        if unknown_candidate_provider_names:
+            errors.append(
+                "candidate_provider_names_unavailable:"
+                + ",".join(unknown_candidate_provider_names)
+            )
+        self._ik_resolver = IKSafetyResolver(
+            profile=profile,
+            provider=self._ik_resolver_provider,
+            seed_expansion_profile=seed_expansion_profile,
+        )
+        self._ik_resolver_init_metadata = {
+            "enabled": True,
+            "profile": profile.name,
+            "profile_source": self.config.ik_safety_profile_json or "default",
+            "provider_names": list(names),
+            "primary_provider_name": names[primary_provider_index],
+            "candidate_provider_names": list(candidate_provider_names),
+            "rm_sdk_inverse_candidates_enabled": (
+                not candidate_provider_names or "rm65_sdk" in candidate_provider_names
+            ),
+            "provider_errors": list(errors),
+            "resolver_policy": "minimize_penalized_max_joint_delta_then_norm",
+            "target_tolerance_position_m": float(profile.target_tolerance.position_m),
+            "target_tolerance_orientation_deg": float(profile.target_tolerance.orientation_deg),
+            "relaxation_fractions": list(profile.relaxation_fractions),
+            "reject_singular": bool(profile.reject_singular),
+            "provider_time_budget_ms": profile.provider_time_budget_ms,
+            "coarse_tracking_enabled": bool(profile.coarse_tracking_enabled),
+            "coarse_tracking_start_fraction": float(profile.coarse_tracking_start_fraction),
+            "coarse_tracking_max_tolerance_fraction": float(profile.coarse_tracking_max_tolerance_fraction),
+            "coarse_tracking_max_position_error_m": float(profile.coarse_tracking_max_position_error_m),
+            "coarse_tracking_max_orientation_error_deg": float(profile.coarse_tracking_max_orientation_error_deg),
+            "coarse_tracking_min_fraction_progress": float(profile.coarse_tracking_min_fraction_progress),
+            "coarse_tracking_orientation_recovery_enabled": bool(
+                profile.coarse_tracking_orientation_recovery_enabled
+            ),
+            "coarse_tracking_orientation_recovery_min_progress_deg": float(
+                profile.coarse_tracking_orientation_recovery_min_progress_deg
+            ),
+            "coarse_tracking_orientation_recovery_max_position_worsen_m": float(
+                profile.coarse_tracking_orientation_recovery_max_position_worsen_m
+            ),
+            "local_step_enabled": bool(profile.local_step_enabled),
+            "local_step_first_enabled": bool(profile.local_step_first_enabled),
+            "local_step_first_full_solve_interval": int(profile.local_step_first_full_solve_interval),
+            "local_step_provider_names": list(self.config.ik_resolver_local_step_provider_names),
+            "local_step_trigger_ratio": float(profile.local_step_trigger_ratio),
+            "local_step_max_iterations": int(profile.local_step_max_iterations),
+            "local_step_iteration_counts": [
+                int(value)
+                for value in (profile.local_step_iteration_counts or (profile.local_step_max_iterations,))
+            ],
+            "local_step_scale_factors": [float(value) for value in profile.local_step_scale_factors],
+            "local_step_dynamic_worsen_enabled": bool(profile.local_step_dynamic_worsen_enabled),
+            "local_step_dynamic_worsen_error_start_m": float(profile.local_step_dynamic_worsen_error_start_m),
+            "local_step_dynamic_worsen_error_start_deg": float(profile.local_step_dynamic_worsen_error_start_deg),
+            "local_step_dynamic_worsen_position_fraction": float(profile.local_step_dynamic_worsen_position_fraction),
+            "local_step_dynamic_worsen_orientation_fraction": float(profile.local_step_dynamic_worsen_orientation_fraction),
+            "local_step_dynamic_worsen_max_position_m": float(profile.local_step_dynamic_worsen_max_position_m),
+            "local_step_dynamic_worsen_max_orientation_deg": float(profile.local_step_dynamic_worsen_max_orientation_deg),
+            "local_step_accept_worse_within_tolerance": bool(profile.local_step_accept_worse_within_tolerance),
+            "local_step_orientation_recovery_enabled": bool(profile.local_step_orientation_recovery_enabled),
+            "local_step_orientation_recovery_min_progress_deg": float(
+                profile.local_step_orientation_recovery_min_progress_deg
+            ),
+            "local_step_orientation_recovery_max_position_worsen_m": float(
+                profile.local_step_orientation_recovery_max_position_worsen_m
+            ),
+            "local_step_orientation_recovery_max_after_position_error_m": float(
+                profile.local_step_orientation_recovery_max_after_position_error_m
+            ),
+            "local_step_limit_escape_enabled": bool(profile.local_step_limit_escape_enabled),
+            "local_step_limit_escape_activation_margin_deg": float(profile.local_step_limit_escape_activation_margin_deg),
+            "local_step_limit_escape_step_fraction": float(profile.local_step_limit_escape_step_fraction),
+            "local_step_limit_escape_max_candidates": int(profile.local_step_limit_escape_max_candidates),
+            "local_step_limit_escape_accept_worse_within_tolerance": bool(
+                profile.local_step_limit_escape_accept_worse_within_tolerance
+            ),
+            "local_step_limit_escape_accept_bounded_worse": bool(
+                profile.local_step_limit_escape_accept_bounded_worse
+            ),
+            "local_step_limit_escape_max_position_worsen_m": float(
+                profile.local_step_limit_escape_max_position_worsen_m
+            ),
+            "local_step_limit_escape_max_orientation_worsen_deg": float(
+                profile.local_step_limit_escape_max_orientation_worsen_deg
+            ),
+            "local_step_singularity_escape_enabled": bool(profile.local_step_singularity_escape_enabled),
+            "local_step_singularity_escape_step_fraction": float(profile.local_step_singularity_escape_step_fraction),
+            "local_step_singularity_escape_max_candidates": int(profile.local_step_singularity_escape_max_candidates),
+            "local_step_singularity_escape_max_position_worsen_m": float(
+                profile.local_step_singularity_escape_max_position_worsen_m
+            ),
+            "local_step_singularity_escape_max_orientation_worsen_deg": float(
+                profile.local_step_singularity_escape_max_orientation_worsen_deg
+            ),
+            "local_step_full_target_step_enabled": bool(profile.local_step_full_target_step_enabled),
+            "local_step_accept_position_progress_m": float(profile.local_step_accept_position_progress_m),
+            "local_step_accept_orientation_progress_deg": float(profile.local_step_accept_orientation_progress_deg),
+            "local_step_max_position_worsen_m": float(profile.local_step_max_position_worsen_m),
+            "local_step_max_orientation_worsen_deg": float(profile.local_step_max_orientation_worsen_deg),
+            "seed_expansion": seed_expansion_metadata,
+        }
+        if errors:
+            print(f"WARNING: {self.side}: IK resolver provider warnings: {'; '.join(errors)}")
+
+    def _initialize_joint_rate_limiter(self) -> None:
+        self._joint_rate_limiter = None
+        self._joint_velocity_limit_profile = None
+        if not bool(self.config.joint_rate_limiter_enabled):
+            return
+        profiles = load_joint_velocity_limit_profiles(self.config.joint_velocity_limits_json)
+        profile_name = str(self.config.joint_velocity_limit_profile).strip()
+        if profile_name not in profiles:
+            raise RuntimeError(
+                f"{self.side}: joint velocity limit profile {profile_name!r} not found; "
+                f"available={sorted(profiles)}"
+            )
+        profile = profiles[profile_name]
+        if profile.dof != 6:
+            raise RuntimeError(
+                f"{self.side}: joint velocity limit profile {profile_name!r} has dof={profile.dof}, expected 6"
+            )
+        self._joint_velocity_limit_profile = profile
+        self._joint_rate_limiter = JointRateLimiter(profile)
+        if self._previous_command_joint is not None:
+            self._joint_rate_limiter.reset(
+                _joint_deg_to_rad(self._previous_command_joint, label="previous_command_joint")
+            )
+
+    def _joint_position_limits(self) -> tuple[list[float], list[float]] | None:
+        if self._joint_position_limits_checked:
+            return self._joint_position_limits_deg
+        self._joint_position_limits_checked = True
+        self._joint_position_limits_error = ""
+        candidates = [self.robot, getattr(self.robot, "_robot", None) if self.robot is not None else None]
+        getter_pairs = (
+            ("rm_algo_get_joint_min_limit", "rm_algo_get_joint_max_limit"),
+            ("Algo_Get_Joint_Min_Limit", "Algo_Get_Joint_Max_Limit"),
+        )
+        for owner in candidates:
+            if owner is None:
+                continue
+            for min_name, max_name in getter_pairs:
+                min_getter = getattr(owner, min_name, None)
+                max_getter = getattr(owner, max_name, None)
+                if min_getter is None or max_getter is None:
+                    continue
+                try:
+                    q_min = _coerce_float_list(min_getter(), expected_len=6)
+                    q_max = _coerce_float_list(max_getter(), expected_len=6)
+                except Exception as exc:  # noqa: BLE001 - diagnostic path.
+                    self._joint_position_limits_error = f"{type(exc).__name__}: {exc}"
+                    continue
+                if q_min is None or q_max is None:
+                    self._joint_position_limits_error = f"{min_name}/{max_name} returned invalid limits"
+                    continue
+                self._joint_position_limits_deg = (q_min, q_max)
+                return self._joint_position_limits_deg
+        if not self._joint_position_limits_error:
+            self._joint_position_limits_error = "joint limit getters unavailable"
+        return None
+
+    def _joint_limit_margin_metadata(self, joint_deg: Iterable[float]) -> dict[str, object]:
+        joint = finite_list(joint_deg, expected_len=6, label="joint_deg")
+        metadata: dict[str, object] = {"available": False}
+        limits = self._joint_position_limits()
+        position_limit_code = None
+        if self.robot is not None:
+            checker = getattr(self.robot, "Algo_IKine_Check_Joint_Position_Limit", None)
+            if checker is not None:
+                try:
+                    position_limit_code = int(checker(joint))
+                except Exception as exc:  # noqa: BLE001 - diagnostic path.
+                    metadata["position_limit_error"] = f"{type(exc).__name__}: {exc}"
+        if position_limit_code is not None:
+            metadata["position_limit_code"] = int(position_limit_code)
+            metadata["position_limit_ok"] = int(position_limit_code) == 0
+        if limits is None:
+            metadata["error"] = self._joint_position_limits_error
+            return metadata
+
+        q_min, q_max = limits
+        lower = [float(joint[index] - q_min[index]) for index in range(6)]
+        upper = [float(q_max[index] - joint[index]) for index in range(6)]
+        per_joint_min = [min(lower[index], upper[index]) for index in range(6)]
+        nearest_index = int(min(range(6), key=lambda index: per_joint_min[index]))
+        metadata.update(
+            {
+                "available": True,
+                "lower_margin_deg": lower,
+                "upper_margin_deg": upper,
+                "min_margin_deg": float(per_joint_min[nearest_index]),
+                "nearest_joint": f"J{nearest_index + 1}",
+                "nearest_joint_index": nearest_index,
+                "nearest_lower_margin_deg": float(lower[nearest_index]),
+                "nearest_upper_margin_deg": float(upper[nearest_index]),
+                "limit_min_deg": list(q_min),
+                "limit_max_deg": list(q_max),
+            }
+        )
+        return metadata
+
+    def _singularity_metadata(self, joint_deg: Iterable[float]) -> dict[str, object]:
+        if self.robot is None:
+            return {"available": False, "label": "unavailable", "error": "robot_unavailable"}
+        joint = finite_list(joint_deg, expected_len=6, label="joint_deg")
+        labels = {
+            0: "normal",
+            -1: "shoulder_singularity",
+            -2: "elbow_singularity",
+            -3: "wrist_singularity",
+        }
+        try:
+            result = self.robot.Algo_Kin_Singularity_Analyse(joint)
+        except Exception as exc:  # noqa: BLE001 - diagnostic path must not mask control.
+            return {
+                "available": False,
+                "label": "unavailable",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if not isinstance(result, tuple) or len(result) < 2:
+            return {
+                "available": False,
+                "label": "unknown",
+                "raw": repr(result),
+            }
+        try:
+            status = int(result[0])
+        except (TypeError, ValueError):
+            status = None
+        try:
+            metric = float(result[1])
+        except (TypeError, ValueError):
+            metric = None
+        return {
+            "available": True,
+            "status_code": status,
+            "label": labels.get(status, f"unknown_status_{status}"),
+            "is_singular": status not in (0, None),
+            "wrist_center_distance_m": metric,
+            "raw": repr(result),
+        }
+
+    def _attach_ik_timing_metadata(
+        self,
+        metadata: dict[str, object],
+        *,
+        source: str,
+        elapsed_ms: float,
+        provider_metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        provider_metadata = dict(provider_metadata or {})
+        existing_profile = metadata.get("ik_debug_profile")
+        ik_debug_profile = dict(existing_profile) if isinstance(existing_profile, dict) else {}
+        provider_last_elapsed_ms = provider_metadata.get("provider_elapsed_ms")
+        provider_elapsed_ms = ik_debug_profile.get("provider_total_ms", provider_last_elapsed_ms)
+        time_budget_ms = ik_debug_profile.get(
+            "time_budget_ms",
+            provider_metadata.get("provider_time_budget_ms"),
+        )
+        time_budget_exceeded = bool(
+            ik_debug_profile.get(
+                "time_budget_exceeded",
+                provider_metadata.get("provider_time_budget_exceeded", False),
+            )
+        )
+        ik_debug_profile.setdefault("frame_total_ms", float(elapsed_ms))
+        ik_debug_profile.setdefault("solve_total_ms", float(elapsed_ms))
+        if provider_elapsed_ms is not None:
+            ik_debug_profile.setdefault("provider_total_ms", provider_elapsed_ms)
+        if provider_last_elapsed_ms is not None:
+            ik_debug_profile["provider_last_ms"] = provider_last_elapsed_ms
+        if time_budget_ms is not None:
+            ik_debug_profile.setdefault("time_budget_ms", time_budget_ms)
+        ik_debug_profile["time_budget_exceeded"] = bool(time_budget_exceeded)
+        metadata.update(
+            {
+                "ik_frame_total_ms": float(elapsed_ms),
+                "ik_solve_total_ms": float(elapsed_ms),
+                "ik_backend_solve_ms": float(elapsed_ms),
+                "ik_resolve_elapsed_ms": float(elapsed_ms),
+                "ik_provider_elapsed_ms": provider_elapsed_ms,
+                "ik_provider_last_elapsed_ms": provider_last_elapsed_ms,
+                "ik_provider_total_ms": ik_debug_profile.get("provider_total_ms"),
+                "ik_non_provider_ms": ik_debug_profile.get("non_provider_ms"),
+                "ik_fk_ms": ik_debug_profile.get("fk_ms"),
+                "ik_singularity_ms": ik_debug_profile.get("singularity_ms"),
+                "ik_collision_ms": ik_debug_profile.get("collision_ms"),
+                "ik_candidate_eval_ms": ik_debug_profile.get("candidate_eval_ms"),
+                "ik_time_budget_ms": time_budget_ms,
+                "ik_time_budget_exceeded": time_budget_exceeded,
+                "ik_timing_source": source,
+                "ik_debug_profile": ik_debug_profile,
+            }
+        )
+        if provider_metadata:
+            metadata["provider"] = provider_metadata
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["ik_timing"] = {
+                "available": True,
+                "source": source,
+                "frame_total_ms": float(elapsed_ms),
+                "solve_total_ms": float(elapsed_ms),
+                "provider_elapsed_ms": provider_elapsed_ms,
+                "time_budget_ms": time_budget_ms,
+                "time_budget_exceeded": time_budget_exceeded,
+            }
+        return metadata
+
     def _post_start_preflight(self) -> None:
         """Optional subclass preflight after state/reference initialization."""
 
@@ -439,7 +1046,13 @@ class RM65BaseImpedanceController:
     def _initial_reference(self, state: dict[str, list[float]]) -> list[float]:
         raise NotImplementedError
 
-    def _command_from_reference(self, reference: list[float], offset: list[float]) -> tuple[list[float], list[float]]:
+    def _command_from_reference(
+        self,
+        reference: list[float],
+        offset: list[float],
+        *,
+        preferred_joint: list[float] | None = None,
+    ) -> tuple[list[float], list[float]]:
         raise NotImplementedError
 
     def _singularity_summary(self, joint_deg: Iterable[float]) -> str | None:
@@ -476,15 +1089,91 @@ class RM65BaseImpedanceController:
                 out.append(bounded)
         return out
 
+    def _reference_backoff_scales(self) -> list[float]:
+        min_scale = float(self.config.ik_reference_backoff_min_scale)
+        if min_scale >= 1.0:
+            return []
+        candidates = [0.75, 0.5, 0.25, 0.1, min_scale]
+        out: list[float] = []
+        for scale in candidates:
+            bounded = max(min_scale, min(1.0, float(scale)))
+            if bounded < 1.0 and all(abs(bounded - previous) > 1e-9 for previous in out):
+                out.append(bounded)
+        return out
+
+    def _command_step_backoff_scales(self, *, command_step: float, max_allowed: float) -> list[float]:
+        min_scale = float(self.config.ik_command_step_backoff_min_scale)
+        if min_scale >= 1.0:
+            return []
+        adaptive = 0.0
+        if command_step > 1e-9 and max_allowed > 0.0:
+            adaptive = 0.9 * float(max_allowed) / float(command_step)
+        candidates = [0.75, 0.5, 0.25, adaptive, 0.1, 0.05, 0.02, min_scale]
+        out: list[float] = []
+        for scale in candidates:
+            bounded = max(min_scale, min(1.0, float(scale)))
+            if bounded < 1.0 and all(abs(bounded - previous) > 1e-9 for previous in out):
+                out.append(bounded)
+        out.sort(reverse=True)
+        return out
+
+    def _max_allowed_command_joint_step_deg(self) -> float:
+        dt_for_velocity = self._observed_control_dt_sec()
+        if self._joint_velocity_limit_profile is not None:
+            profile_max_step = self._joint_velocity_limit_profile.max_step_deg(dt_for_velocity)
+            if self.config.joint_rate_limiter_enabled:
+                profile_max_abs = float(np.max(profile_max_step)) if profile_max_step.size else 0.0
+                return max(float(self.config.max_command_joint_step_deg), profile_max_abs)
+            dt_for_velocity = self._joint_velocity_limit_profile.effective_dt_sec(dt_for_velocity)
+        else:
+            dt_for_velocity = min(dt_for_velocity, 1.0)
+        return min(
+            float(self.config.max_command_joint_step_deg),
+            float(self.config.max_command_joint_velocity_deg_s) * dt_for_velocity,
+        )
+
+    def _validate_ik_solution(
+        self,
+        *,
+        command_joint: Iterable[float],
+        reference_joint: Iterable[float],
+        target_pose: Iterable[float],
+        method: str,
+    ) -> list[float]:
+        joint = finite_list(list(command_joint)[:6], expected_len=6, label="ik_joint_deg")
+        reference = finite_list(list(reference_joint)[:6], expected_len=6, label="reference_joint_deg")
+        guard_count = int(self.config.ik_branch_jump_guard_joints)
+        deltas = [abs(joint[index] - reference[index]) for index in range(guard_count)]
+        max_delta = max(deltas) if deltas else 0.0
+        if max_delta > float(self.config.ik_branch_jump_guard_deg):
+            raise RuntimeError(
+                f"{self.side}: IK branch jump guard tripped on J1-J{guard_count}: "
+                f"max_delta={max_delta:.3f}deg > "
+                f"ik_branch_jump_guard_deg={float(self.config.ik_branch_jump_guard_deg):.3f}deg "
+                f"method={method} "
+                f"reference_joint_deg={_format_vector(reference, precision=3)} "
+                f"candidate_joint_deg={_format_vector(joint, precision=3)} "
+                f"target_pose={_format_vector(target_pose, precision=6)}"
+            )
+        return joint
+
     def _solve_ik_with_current_retry(
         self,
         *,
         seed_joint: list[float],
         command_pose: list[float],
-    ) -> tuple[int, list[float], list[float]]:
+    ) -> tuple[int, list[float], list[float], str]:
         assert self.robot is not None
         code, command_joint = self.robot.Algo_Inverse_Kinematics(seed_joint, command_pose, flag=1)
         used_seed = list(seed_joint)
+        method = "euler"
+        if int(code) != 0 and self.config.ik_quaternion_fallback:
+            quat_pose = _pose6_to_quat_pose(command_pose)
+            quat_code, quat_joint = self.robot.Algo_Inverse_Kinematics(seed_joint, quat_pose, flag=0)
+            if int(quat_code) == 0:
+                code = quat_code
+                command_joint = quat_joint
+                method = "quaternion"
         if int(code) != 0 and self._state is not None:
             current_joint = finite_list(self._state["joint_deg"], expected_len=6, label="current_joint_deg")
             if _joint_delta_deg(used_seed, current_joint) > 1e-6:
@@ -493,22 +1182,234 @@ class RM65BaseImpedanceController:
                     used_seed = current_joint
                     code = retry_code
                     command_joint = retry_joint
-        return int(code), list(command_joint), used_seed
+                    method = "current_seed_euler"
+                elif self.config.ik_quaternion_fallback:
+                    quat_pose = _pose6_to_quat_pose(command_pose)
+                    retry_quat_code, retry_quat_joint = self.robot.Algo_Inverse_Kinematics(
+                        current_joint,
+                        quat_pose,
+                        flag=0,
+                    )
+                    if int(retry_quat_code) == 0:
+                        used_seed = current_joint
+                        code = retry_quat_code
+                        command_joint = retry_quat_joint
+                        method = "current_seed_quaternion"
+        if int(code) == 0:
+            reference_joint = self._previous_command_joint or used_seed
+            command_joint = self._validate_ik_solution(
+                command_joint=command_joint,
+                reference_joint=reference_joint,
+                target_pose=command_pose,
+                method=method,
+            )
+        return int(code), list(command_joint), used_seed, method
+
+    def _resolver_seed_qpos(
+        self,
+        *,
+        reference_qpos: np.ndarray,
+        seed_joint_override: list[float] | None,
+    ) -> tuple[tuple[np.ndarray, ...], tuple[str, ...]]:
+        seeds: list[np.ndarray] = []
+        labels: list[str] = []
+        if seed_joint_override is not None:
+            _append_unique_seed(
+                seeds,
+                labels,
+                _joint_deg_to_rad(seed_joint_override, label="seed_joint_override"),
+                "preferred_joint",
+            )
+        if self._ik_seed is not None:
+            _append_unique_seed(
+                seeds,
+                labels,
+                _joint_deg_to_rad(self._ik_seed, label="ik_seed"),
+                "ik_seed",
+            )
+        if self._state is not None:
+            _append_unique_seed(
+                seeds,
+                labels,
+                _joint_deg_to_rad(self._state["joint_deg"], label="current_joint_deg"),
+                "measured_current",
+            )
+        if self._previous_command_joint is not None:
+            _append_unique_seed(
+                seeds,
+                labels,
+                _joint_deg_to_rad(self._previous_command_joint, label="previous_command_joint_deg"),
+                "previous_command",
+            )
+        _append_unique_seed(seeds, labels, reference_qpos, "reference_duplicate_guard")
+        return tuple(seeds), tuple(labels)
+
+    def _command_from_pose_with_resolver(
+        self,
+        *,
+        reference_pose: list[float],
+        offset: list[float],
+        seed_joint_override: list[float] | None = None,
+    ) -> tuple[list[float], list[float], list[float], float, list[float], int]:
+        if self._ik_resolver is None:
+            raise RuntimeError("IK resolver is not initialized")
+        assert self._ik_seed is not None
+        command_pose = normalize_pose(apply_pose_offset(reference_pose, offset))
+        reference_joint = (
+            seed_joint_override
+            if seed_joint_override is not None
+            else (self._previous_command_joint or self._ik_seed)
+        )
+        reference_qpos = _joint_deg_to_rad(reference_joint, label="reference_joint")
+        seed_qpos, seed_labels = self._resolver_seed_qpos(
+            reference_qpos=reference_qpos,
+            seed_joint_override=seed_joint_override,
+        )
+        previous_safe_qpos = (
+            None
+            if self._previous_command_joint is None
+            else _joint_deg_to_rad(self._previous_command_joint, label="previous_command_joint_deg")
+        )
+        reference_pose_matrix = pose6_to_matrix(self._previous_command_pose or reference_pose)
+        target_pose_matrix = pose6_to_matrix(command_pose)
+        request = IKResolveRequest(
+            target_pose=target_pose_matrix,
+            reference_qpos=reference_qpos,
+            reference_pose=reference_pose_matrix,
+            seed_qpos=seed_qpos,
+            seed_labels=seed_labels,
+            previous_safe_qpos=previous_safe_qpos,
+            metadata={
+                "side": self.side,
+                "controller": type(self).__name__,
+                "tool_name": self.config.tool_name,
+                "ik_resolver_init": dict(self._ik_resolver_init_metadata),
+                **(
+                    {
+                        "provider_name_allowlist": list(
+                            self.config.ik_resolver_candidate_provider_names
+                        )
+                    }
+                    if self.config.ik_resolver_candidate_provider_names
+                    else {}
+                ),
+                "pinocchio_max_iterations": int(self.config.ik_resolver_pinocchio_max_iterations),
+                "pinocchio_max_joint_step_rad": float(self.config.ik_resolver_pinocchio_max_joint_step_rad),
+                "pinocchio_damping": float(self.config.ik_resolver_pinocchio_damping),
+                "pinocchio_tolerance": float(self.config.ik_resolver_pinocchio_tolerance),
+            },
+        )
+
+        started_at = time.perf_counter()
+        if bool(self.config.joint_rate_limiter_enabled) and self.config.pose_command_transport == "joint":
+            if self._joint_velocity_limit_profile is None:
+                self._initialize_joint_rate_limiter()
+            rate_limit_dt_details = self._joint_rate_limit_dt_details()
+            result = self._ik_resolver.resolve_step(
+                request,
+                joint_velocity_profile=self._joint_velocity_limit_profile,
+                dt_sec=float(rate_limit_dt_details["effective_dt_sec"]),
+                local_provider_names=tuple(self.config.ik_resolver_local_step_provider_names),
+                local_options={
+                    "pinocchio_damping": float(self.config.ik_resolver_pinocchio_damping),
+                    "pinocchio_tolerance": float(self.config.ik_resolver_pinocchio_tolerance),
+                    "joint_velocity_limit_observed_dt_sec": float(rate_limit_dt_details["observed_dt_sec"]),
+                    "joint_velocity_limit_effective_dt_sec": float(rate_limit_dt_details["effective_dt_sec"]),
+                    "joint_velocity_limit_max_dt_sec": float(rate_limit_dt_details["max_dt_sec"]),
+                },
+            )
+        else:
+            result = self._ik_resolver.resolve(request)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        provider_metadata = (
+            dict(self._ik_resolver_provider.last_metadata)
+            if self._ik_resolver_provider is not None
+            else {}
+        )
+        base_metadata: dict[str, object] = {
+            **dict(result.metadata),
+            "status": result.status.value,
+            "source": "generic_ik_resolver",
+            "result_message": result.message,
+            "candidate_source": result.candidate_source,
+            "accepted": bool(result.accepted),
+            "seed_joint_deg": np.rad2deg(reference_qpos).astype(float).tolist(),
+            "seed_labels": list(seed_labels),
+            "requested_target_pose": list(command_pose),
+            "ik_resolver_init": dict(self._ik_resolver_init_metadata),
+        }
+        self._attach_ik_timing_metadata(
+            base_metadata,
+            source="generic_ik_resolver",
+            elapsed_ms=elapsed_ms,
+            provider_metadata=provider_metadata,
+        )
+
+        if not result.accepted or result.qpos is None:
+            if self._latest_wrench_context is not None:
+                self._latest_wrench_context["ik_method"] = ["generic_ik_resolver"]
+                self._latest_wrench_context["ik_metadata"] = base_metadata
+            return (
+                command_pose,
+                [0.0] * 6,
+                np.rad2deg(reference_qpos).astype(float).tolist(),
+                1.0,
+                list(offset),
+                -100,
+            )
+
+        command_joint = np.rad2deg(np.asarray(result.qpos, dtype=float).reshape(6)).astype(float).tolist()
+        effective_pose = normalize_pose(matrix_to_pose6(result.effective_target_pose))
+        method = str(base_metadata.get("method") or result.candidate_source or "generic_ik_resolver")
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["ik_method"] = [method]
+            self._latest_wrench_context["ik_resolver_tolerance_fraction"] = [float(result.tolerance_fraction)]
+            self._latest_wrench_context["ik_metadata"] = base_metadata
+        return (
+            effective_pose,
+            command_joint,
+            np.rad2deg(reference_qpos).astype(float).tolist(),
+            float(result.tolerance_fraction),
+            list(offset),
+            0,
+        )
 
     def _command_from_pose_with_ik_backoff(
         self,
         *,
         reference_pose: list[float],
         offset: list[float],
+        seed_joint_override: list[float] | None = None,
     ) -> tuple[list[float], list[float], list[float], float, list[float], int]:
         assert self._ik_seed is not None
-        seed_joint = list(self._ik_seed)
+        seed_joint = (
+            finite_list(seed_joint_override, expected_len=6, label="seed_joint_override")
+            if seed_joint_override is not None
+            else list(self._ik_seed)
+        )
+        legacy_started_at = time.perf_counter()
+
+        def timed_metadata(metadata: dict[str, object]) -> dict[str, object]:
+            return self._attach_ik_timing_metadata(
+                metadata,
+                source="rm_sdk_legacy",
+                elapsed_ms=(time.perf_counter() - legacy_started_at) * 1000.0,
+            )
+
         command_pose = normalize_pose(apply_pose_offset(reference_pose, offset))
-        code, command_joint, used_seed = self._solve_ik_with_current_retry(
+        code, command_joint, used_seed, method = self._solve_ik_with_current_retry(
             seed_joint=seed_joint,
             command_pose=command_pose,
         )
         if int(code) == 0:
+            if self._latest_wrench_context is not None:
+                self._latest_wrench_context["ik_method"] = [method]
+                self._latest_wrench_context["ik_metadata"] = timed_metadata({
+                    "status": "pass",
+                    "method": method,
+                    "source": "rm_sdk_legacy",
+                    "seed_joint_deg": list(used_seed),
+                })
             return command_pose, command_joint, used_seed, 1.0, list(offset), int(code)
 
         last_code = int(code)
@@ -517,7 +1418,7 @@ class RM65BaseImpedanceController:
             for scale in self._ik_backoff_scales():
                 scaled = _scaled_offset(offset, scale)
                 scaled_pose = normalize_pose(apply_pose_offset(reference_pose, scaled))
-                retry_code, retry_joint, retry_seed = self._solve_ik_with_current_retry(
+                retry_code, retry_joint, retry_seed, retry_method = self._solve_ik_with_current_retry(
                     seed_joint=seed_joint,
                     command_pose=scaled_pose,
                 )
@@ -529,9 +1430,362 @@ class RM65BaseImpedanceController:
                     if self._latest_wrench_context is not None:
                         self._latest_wrench_context["ik_backoff_scale"] = [float(scale)]
                         self._latest_wrench_context["applied_offset"] = list(scaled)
+                        self._latest_wrench_context["ik_method"] = [retry_method]
+                        self._latest_wrench_context["ik_metadata"] = timed_metadata({
+                            "status": "relaxed",
+                            "method": retry_method,
+                            "source": "rm_sdk_legacy",
+                            "relaxation_type": "offset_backoff",
+                            "scale": float(scale),
+                            "seed_joint_deg": list(retry_seed),
+                        })
                     return scaled_pose, retry_joint, retry_seed, float(scale), scaled, int(retry_code)
 
+        if self._previous_command_pose is not None:
+            for scale in self._reference_backoff_scales():
+                scaled_reference = _interpolate_pose(self._previous_command_pose, reference_pose, scale)
+                scaled_pose = normalize_pose(apply_pose_offset(scaled_reference, offset))
+                retry_code, retry_joint, retry_seed, retry_method = self._solve_ik_with_current_retry(
+                    seed_joint=seed_joint,
+                    command_pose=scaled_pose,
+                )
+                last_code = int(retry_code)
+                last_seed = list(retry_seed)
+                if int(retry_code) == 0:
+                    if self._reference is not None and self.reference_kind == "pose":
+                        self._reference.current = list(scaled_reference)
+                    if self._latest_wrench_context is not None:
+                        self._latest_wrench_context["ik_reference_backoff_scale"] = [float(scale)]
+                        self._latest_wrench_context["ik_method"] = [retry_method]
+                        self._latest_wrench_context["ik_metadata"] = timed_metadata({
+                            "status": "relaxed",
+                            "method": retry_method,
+                            "source": "rm_sdk_legacy",
+                            "relaxation_type": "reference_backoff",
+                            "scale": float(scale),
+                            "seed_joint_deg": list(retry_seed),
+                        })
+                    return scaled_pose, retry_joint, retry_seed, float(scale), list(offset), int(retry_code)
+
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["ik_metadata"] = timed_metadata({
+                "status": "smoothing_required",
+                "method": "rm_sdk_legacy",
+                "source": "rm_sdk_legacy",
+                "last_code": int(last_code),
+                "seed_joint_deg": list(last_seed),
+            })
         return command_pose, command_joint, last_seed, 1.0, list(offset), last_code
+
+    def _command_step_failure_message(
+        self,
+        *,
+        command_pose: Iterable[float],
+        command_joint: Iterable[float],
+        command_step: float,
+    ) -> str:
+        previous_joint = (
+            []
+            if self._previous_command_joint is None
+            else finite_list(self._previous_command_joint, expected_len=6, label="previous_command_joint_deg")
+        )
+        candidate_joint = finite_list(list(command_joint)[:6], expected_len=6, label="candidate_joint_deg")
+        deltas = _joint_deltas_deg(previous_joint, candidate_joint) if previous_joint else []
+        max_index = deltas.index(max(deltas)) if deltas else -1
+        lines = [
+            f"{self.side}: command joint step {command_step:.4f}deg > allowed_command_joint_step",
+            f"allowed_command_joint_step_deg={self._max_allowed_command_joint_step_deg():.4f}",
+            f"max_command_joint_step_deg={float(self.config.max_command_joint_step_deg):.4f}",
+            f"max_command_joint_velocity_deg_s={float(self.config.max_command_joint_velocity_deg_s):.4f}",
+        ]
+        if max_index >= 0:
+            lines.append(f"max_delta_joint=J{max_index + 1}")
+            lines.append(f"joint_delta_deg={_format_vector(deltas, precision=3)}")
+            lines.append(f"previous_command_joint_deg={_format_vector(previous_joint, precision=3)}")
+        lines.append(f"candidate_joint_deg={_format_vector(candidate_joint, precision=3)}")
+        lines.append(f"candidate_pose={_format_vector(command_pose, precision=6)}")
+        if self._previous_command_pose is not None:
+            lines.append(f"previous_command_pose={_format_vector(self._previous_command_pose, precision=6)}")
+        if self._latest_wrench_context is not None:
+            for key in (
+                "ik_method",
+                "ik_backoff_scale",
+                "ik_reference_backoff_scale",
+                "ik_command_step_backoff_scale",
+                "ik_command_step_candidate_deg",
+                "ik_command_step_allowed_deg",
+                "ik_command_step_applied_deg",
+            ):
+                value = self._latest_wrench_context.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, list) and len(value) == 1:
+                    lines.append(f"{key}={value[0]}")
+                else:
+                    lines.append(f"{key}={value}")
+        return "\n".join(lines)
+
+    def _observed_control_dt_sec(self) -> float:
+        dt = self._current_step_dt
+        if dt is None or not math.isfinite(float(dt)) or float(dt) <= 0.0:
+            return 1.0 / float(self.config.control_hz)
+        return float(dt)
+
+    def _joint_rate_limit_dt_details(self) -> dict[str, float]:
+        observed_dt = self._observed_control_dt_sec()
+        max_dt = 1.0
+        effective_dt = min(observed_dt, max_dt)
+        if self._joint_velocity_limit_profile is not None:
+            max_dt = float(self._joint_velocity_limit_profile.max_dt_sec)
+            effective_dt = self._joint_velocity_limit_profile.effective_dt_sec(observed_dt)
+        return {
+            "observed_dt_sec": float(observed_dt),
+            "effective_dt_sec": float(effective_dt),
+            "max_dt_sec": float(max_dt),
+        }
+
+    def _joint_rate_limit_dt(self) -> float:
+        return self._joint_rate_limit_dt_details()["effective_dt_sec"]
+
+    def _emit_joint_rate_limit_warning(self, metadata: dict[str, object]) -> None:
+        now = time.time()
+        if now - self._last_joint_rate_limit_warning_time < 1.0:
+            return
+        self._last_joint_rate_limit_warning_time = now
+        print(
+            f"WARNING: {self.side} joint rate limiter active "
+            f"profile={metadata.get('joint_velocity_limit_profile')} "
+            f"requested_max_delta={float(metadata.get('joint_velocity_limit_requested_max_abs_delta_deg', 0.0)):.3f}deg "
+            f"applied_max_delta={float(metadata.get('joint_velocity_limit_applied_max_abs_delta_deg', 0.0)):.3f}deg "
+            f"ratio={float(metadata.get('joint_velocity_limit_ratio', 0.0)):.3f}; "
+            "continuing to chase latest IK target."
+        )
+
+    def _record_joint_rate_limit_metadata(self, metadata: dict[str, object]) -> None:
+        if self._latest_wrench_context is None:
+            return
+        self._latest_wrench_context.update(metadata)
+        ik_metadata = dict(self._latest_wrench_context.get("ik_metadata", {}))
+        ik_metadata.update(metadata)
+        self._latest_wrench_context["ik_metadata"] = ik_metadata
+
+    def _apply_joint_rate_limiter(
+        self,
+        *,
+        command_pose: list[float],
+        command_joint: list[float],
+    ) -> tuple[list[float], list[float]]:
+        previous_joint = self._previous_command_joint
+        if previous_joint is None:
+            return command_pose, command_joint
+        if self._joint_rate_limiter is None or self._joint_velocity_limit_profile is None:
+            self._initialize_joint_rate_limiter()
+        if self._joint_rate_limiter is None or self._joint_velocity_limit_profile is None:
+            return command_pose, command_joint
+
+        target_qpos = _joint_deg_to_rad(command_joint, label="rate_limit_target_joint")
+        previous_qpos = _joint_deg_to_rad(previous_joint, label="rate_limit_previous_joint")
+        dt_details = self._joint_rate_limit_dt_details()
+        dt_sec = float(dt_details["effective_dt_sec"])
+        result = self._joint_rate_limiter.step(
+            target_qpos=target_qpos,
+            reference_qpos=previous_qpos,
+            dt_sec=dt_sec,
+        )
+        limited_joint = np.rad2deg(result.qpos).astype(float).tolist()
+        requested_delta_deg = np.rad2deg(target_qpos - previous_qpos).astype(float)
+        requested_max = float(np.max(np.abs(requested_delta_deg))) if requested_delta_deg.size else 0.0
+        metadata: dict[str, object] = {
+            "joint_rate_limiter_enabled": True,
+            "joint_rate_limited": bool(result.limited),
+            "joint_velocity_limit_profile": self._joint_velocity_limit_profile.name,
+            "joint_velocity_limit_dt_sec": float(dt_sec),
+            "joint_velocity_limit_observed_dt_sec": float(dt_details["observed_dt_sec"]),
+            "joint_velocity_limit_effective_dt_sec": float(dt_sec),
+            "joint_velocity_limit_max_dt_sec": float(dt_details["max_dt_sec"]),
+            "joint_velocity_limit_requested_delta_deg": requested_delta_deg.tolist(),
+            "joint_velocity_limit_requested_max_abs_delta_deg": requested_max,
+            "joint_velocity_limit_delta_deg": result.delta_deg.tolist(),
+            "joint_velocity_limit_applied_max_abs_delta_deg": float(result.max_abs_delta_deg),
+            "joint_velocity_limit_max_step_deg": result.max_step_deg.tolist(),
+            "joint_velocity_limit_ratio": float(result.limit_ratio),
+            "joint_velocity_limit_target_joint_deg": list(command_joint),
+            "joint_velocity_limit_output_joint_deg": list(limited_joint),
+        }
+
+        report = check_rm65_joint_safety(
+            self.robot,
+            limited_joint,
+            side=self.side,
+            label=self._step_index + 1,
+            previous_joint_deg=previous_joint,
+            check_position_limit=True,
+            check_self_collision=True,
+            context={
+                "phase": "impedance_rate_limited_command",
+                "requested_pose": list(command_pose),
+                "ik_target_pose": list(command_pose),
+                "ik_target_joint_deg": list(command_joint),
+                "ik_target_delta_from_previous_deg": requested_delta_deg.tolist(),
+                "joint_rate_limited": bool(result.limited),
+                "joint_velocity_limit_profile": self._joint_velocity_limit_profile.name,
+                "joint_velocity_limit_observed_dt_sec": float(dt_details["observed_dt_sec"]),
+                "joint_velocity_limit_effective_dt_sec": float(dt_sec),
+                "joint_velocity_limit_max_dt_sec": float(dt_details["max_dt_sec"]),
+                "joint_velocity_limit_delta_deg": result.delta_deg.tolist(),
+                "joint_velocity_limit_max_step_deg": result.max_step_deg.tolist(),
+                "joint_velocity_limit_ratio": float(result.limit_ratio),
+            },
+        )
+        metadata["joint_safety"] = {
+            "ok": bool(report.ok),
+            "position_limit_code": report.position_limit_code,
+            "position_limit_available": bool(report.position_limit_available),
+            "self_collision_code": report.self_collision_code,
+            "self_collision_available": bool(report.self_collision_available),
+            "status_text": report.status_text,
+        }
+        self._record_joint_rate_limit_metadata(metadata)
+        report.raise_if_unsafe()
+
+        if result.limited:
+            self._emit_joint_rate_limit_warning(metadata)
+            return self._forward_pose(limited_joint), limited_joint
+        return command_pose, command_joint
+
+    def _apply_joint_step_policy(
+        self,
+        *,
+        command_pose: list[float],
+        command_joint: list[float],
+    ) -> tuple[list[float], list[float]]:
+        if self.config.joint_rate_limiter_enabled:
+            return self._apply_joint_rate_limiter(command_pose=command_pose, command_joint=command_joint)
+        return self._limit_command_joint_step(command_pose=command_pose, command_joint=command_joint)
+
+    def _limit_command_joint_step(
+        self,
+        *,
+        command_pose: list[float],
+        command_joint: list[float],
+    ) -> tuple[list[float], list[float]]:
+        previous_joint = self._previous_command_joint
+        if previous_joint is None:
+            return command_pose, command_joint
+        max_allowed = self._max_allowed_command_joint_step_deg()
+        command_step = _joint_delta_deg(previous_joint, command_joint)
+        if command_step <= max_allowed:
+            return command_pose, command_joint
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["ik_command_step_candidate_deg"] = [float(command_step)]
+            self._latest_wrench_context["ik_command_step_allowed_deg"] = [float(max_allowed)]
+
+        if self._previous_command_pose is not None:
+            seed_joint = list(previous_joint)
+            step_backoff_started_at = time.perf_counter()
+            for scale in self._command_step_backoff_scales(
+                command_step=command_step,
+                max_allowed=max_allowed,
+            ):
+                scaled_pose = _interpolate_pose(self._previous_command_pose, command_pose, scale)
+                retry_code, retry_joint, _retry_seed, retry_method = self._solve_ik_with_current_retry(
+                    seed_joint=seed_joint,
+                    command_pose=scaled_pose,
+                )
+                if int(retry_code) != 0:
+                    continue
+                retry_joint = finite_list(retry_joint[:6], expected_len=6, label="ik_joint_deg")
+                retry_step = _joint_delta_deg(previous_joint, retry_joint)
+                if retry_step <= max_allowed:
+                    if self._latest_wrench_context is not None:
+                        self._latest_wrench_context["ik_command_step_backoff_scale"] = [float(scale)]
+                        self._latest_wrench_context["ik_command_step_applied_deg"] = [float(retry_step)]
+                        self._latest_wrench_context["ik_method"] = [retry_method]
+                        self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata(
+                            {
+                                "status": "relaxed",
+                                "method": retry_method,
+                                "source": "rm_sdk_legacy",
+                                "relaxation_type": "command_step_backoff",
+                                "scale": float(scale),
+                                "candidate_step_deg": float(command_step),
+                                "applied_step_deg": float(retry_step),
+                            },
+                            source="rm_sdk_legacy",
+                            elapsed_ms=(time.perf_counter() - step_backoff_started_at) * 1000.0,
+                        )
+                    if self._reference is not None and self.reference_kind == "pose":
+                        offset = None
+                        if self._latest_wrench_context is not None:
+                            raw_offset = self._latest_wrench_context.get("offset")
+                            if raw_offset is not None:
+                                offset = finite_list(raw_offset, expected_len=6, label="offset")
+                        if offset is None:
+                            self._reference.current = list(scaled_pose)
+                        else:
+                            self._reference.current = normalize_pose(
+                                [scaled_pose[index] - offset[index] for index in range(6)]
+                            )
+                    elif self._reference is not None and self.reference_kind == "joint":
+                        self._reference.current = list(retry_joint)
+                    return scaled_pose, retry_joint
+
+        raise RuntimeError(
+            self._command_step_failure_message(
+                command_pose=command_pose,
+                command_joint=command_joint,
+                command_step=command_step,
+            )
+        )
+
+    def _hardware_command_failure_message(
+        self,
+        *,
+        exc: Exception,
+        phase: str,
+        command_pose: Iterable[float],
+        command_joint: Iterable[float],
+        command_step: float,
+        allowed_command_step: float,
+    ) -> str:
+        lines = [
+            f"{self.side}: hardware command failure during {phase}: {type(exc).__name__}: {exc}",
+            f"step={int(self._step_index + 1)}",
+            f"command_transport={self.config.pose_command_transport if self.reference_kind == 'pose' else 'joint'}",
+            f"command_joint_step_deg={float(command_step):.4f}",
+            f"allowed_command_joint_step_deg={float(allowed_command_step):.4f}",
+            f"command_joint_deg={_format_vector(command_joint, precision=3)}",
+            f"command_pose={_format_vector(command_pose, precision=6)}",
+        ]
+        if self._previous_command_joint is not None:
+            previous_joint = finite_list(
+                self._previous_command_joint,
+                expected_len=6,
+                label="previous_command_joint_deg",
+            )
+            lines.append(f"previous_command_joint_deg={_format_vector(previous_joint, precision=3)}")
+            lines.append(
+                "joint_delta_deg="
+                + _format_vector(_joint_deltas_deg(previous_joint, command_joint), precision=3)
+            )
+        if self._previous_command_pose is not None:
+            lines.append(f"previous_command_pose={_format_vector(self._previous_command_pose, precision=6)}")
+        if self._latest_wrench_context is not None:
+            ik_method = self._latest_wrench_context.get("ik_method")
+            if ik_method is not None:
+                lines.append(f"ik_method={ik_method[0]}")
+            for key in (
+                "ik_backoff_scale",
+                "ik_reference_backoff_scale",
+                "ik_command_step_backoff_scale",
+                "ik_command_step_candidate_deg",
+                "ik_command_step_allowed_deg",
+                "ik_command_step_applied_deg",
+            ):
+                value = self._latest_wrench_context.get(key)
+                if value is not None:
+                    lines.append(f"{key}={value[0] if isinstance(value, list) and len(value) == 1 else value}")
+        return "\n".join(lines)
 
     def _ik_failure_message(
         self,
@@ -600,9 +1854,12 @@ class RM65BaseImpedanceController:
         if self._latest_wrench_context is not None:
             tare_corrected = self._latest_wrench_context.get("tare_corrected")
             deadbanded = self._latest_wrench_context.get("deadbanded")
+            raw_deadbanded = self._latest_wrench_context.get("raw_deadbanded")
             target_offset = self._latest_wrench_context.get("target_offset")
             applied_offset = self._latest_wrench_context.get("applied_offset")
             ik_backoff_scale = self._latest_wrench_context.get("ik_backoff_scale")
+            ik_reference_backoff_scale = self._latest_wrench_context.get("ik_reference_backoff_scale")
+            ik_method = self._latest_wrench_context.get("ik_method")
             if tare_corrected is not None:
                 lines.append(
                     "tare_corrected_wrench="
@@ -614,6 +1871,12 @@ class RM65BaseImpedanceController:
                     "deadbanded_wrench="
                     + _format_vector(deadbanded, precision=5)
                     + f" |F|={norm(deadbanded[:3]):.5f}N |T|={norm(deadbanded[3:]):.5f}Nm"
+                )
+            if raw_deadbanded is not None and raw_deadbanded != deadbanded:
+                lines.append(
+                    "raw_deadbanded_wrench="
+                    + _format_vector(raw_deadbanded, precision=5)
+                    + f" |F|={norm(raw_deadbanded[:3]):.5f}N |T|={norm(raw_deadbanded[3:]):.5f}Nm"
                 )
             if target_offset is not None:
                 lines.append(
@@ -635,6 +1898,10 @@ class RM65BaseImpedanceController:
                 )
             if ik_backoff_scale is not None:
                 lines.append(f"ik_backoff_scale={float(ik_backoff_scale[0]):.6f}")
+            if ik_reference_backoff_scale is not None:
+                lines.append(f"ik_reference_backoff_scale={float(ik_reference_backoff_scale[0]):.6f}")
+            if ik_method is not None:
+                lines.append(f"ik_method={ik_method[0]}")
         thresholds = self.config.saturation_thresholds()
         hints: list[str] = []
         linear_force = thresholds.get("linear_filtered_force_n_for_max_offset")
@@ -698,6 +1965,94 @@ class RM65BaseImpedanceController:
             )
         )
 
+    def _emit_ik_hold_warning(self, message: str) -> None:
+        first_line = str(message).splitlines()[0] if str(message).strip() else "IK failure"
+        now = time.time()
+        if (
+            self._last_ik_hold_warning_key == first_line
+            and now - self._last_ik_hold_warning_time < 1.0
+        ):
+            return
+        self._last_ik_hold_warning_key = first_line
+        self._last_ik_hold_warning_time = now
+        print(
+            f"WARNING: {self.side} impedance IK hold_last_safe: {first_line}; "
+            "holding previous safe command until a later target is solvable."
+        )
+
+    def _hold_last_safe_command_after_ik_failure(
+        self,
+        *,
+        reason: str,
+        message: str,
+        target_pose: Iterable[float],
+        seed_joint: Iterable[float] | None = None,
+        code: object | None = None,
+    ) -> tuple[list[float], list[float]] | None:
+        if not bool(self.config.hold_last_safe_on_ik_failure):
+            return None
+        if self._previous_command_pose is None or self._previous_command_joint is None:
+            return None
+        self._emit_ik_hold_warning(message)
+        if self._reference is not None:
+            if self.reference_kind == "pose":
+                self._reference.current = list(self._previous_command_pose)
+            elif self.reference_kind == "joint":
+                self._reference.current = list(self._previous_command_joint)
+        if self._latest_wrench_context is not None:
+            previous_metadata = dict(self._latest_wrench_context.get("ik_metadata", {}))
+            source = str(previous_metadata.get("source") or "rm_sdk_legacy")
+            failed_metadata = dict(previous_metadata)
+            failed_metadata.pop("failed_ik_metadata", None)
+            failed_metadata.pop("hold_previous_ik_metadata", None)
+            metadata = {
+                "status": "hold_last_safe",
+                "method": "hold_previous_command",
+                "source": source,
+                "reason": str(reason),
+                "last_code": None if code is None else int(code),
+                "seed_joint_deg": [] if seed_joint is None else list(seed_joint),
+                "target_pose": list(target_pose),
+                "message": str(message).splitlines()[0] if str(message).strip() else "",
+                "previous_ik_status": previous_metadata.get("status"),
+                "previous_ik_method": previous_metadata.get("method"),
+                "previous_ik_source": previous_metadata.get("source"),
+                "failed_ik_metadata": failed_metadata,
+            }
+            for key in (
+                "ik_frame_total_ms",
+                "ik_solve_total_ms",
+                "ik_backend_solve_ms",
+                "ik_resolve_elapsed_ms",
+                "ik_provider_elapsed_ms",
+                "ik_time_budget_ms",
+                "ik_time_budget_exceeded",
+                "ik_timing_source",
+                "provider",
+                "ik_debug_profile",
+                "best_rejected",
+                "last_rejections",
+                "local_step_status",
+                "local_step_first_status",
+                "local_step_first_attempted",
+                "local_step_first_periodic_full_solve",
+                "local_step_scale_strategy",
+                "local_step_recovery_state",
+                "local_step_rejection_count",
+                "local_step_last_rejections",
+                "local_step_singularity_escape",
+                "local_step_provider",
+                "local_step_provider_horizons",
+                "full_target_result_message",
+                "provider_budget_skipped_names",
+                "provider_global_time_budget_ms",
+                "provider_global_time_budget_scope",
+            ):
+                if key in previous_metadata:
+                    metadata[key] = previous_metadata[key]
+            self._latest_wrench_context["ik_metadata"] = metadata
+        return list(self._previous_command_pose), list(self._previous_command_joint)
+
     def start(self) -> None:
         if self._started:
             return
@@ -720,9 +2075,17 @@ class RM65BaseImpedanceController:
             kind=self.reference_kind,
             action_hz=self.config.action_hz,
         )
+        self._joint_hint_reference = _ReferenceInterpolator(
+            list(self._state["joint_deg"]),
+            kind="joint",
+            action_hz=self.config.action_hz,
+        )
         self._previous_command_joint = list(self._state["joint_deg"])
+        self._previous_command_pose = list(self._state["pose"])
         self._ik_seed = list(self._state["joint_deg"])
         self._model_fk_pose = self._forward_pose(self._state["joint_deg"])
+        self._initialize_joint_rate_limiter()
+        self._initialize_ik_resolver()
         self._latest_wrench_context = None
         self._post_start_preflight()
         self._last_step_time = time.perf_counter()
@@ -733,7 +2096,12 @@ class RM65BaseImpedanceController:
         assert self._reference is not None
         self._reference.set_target(target, duration_sec)
 
-    def step(self, target: Iterable[float] | None = None) -> dict[str, object]:
+    def step(
+        self,
+        target: Iterable[float] | None = None,
+        *,
+        target_joint_deg: Iterable[float] | None = None,
+    ) -> dict[str, object]:
         self.start()
         assert self.robot is not None
         assert self._state is not None
@@ -744,24 +2112,48 @@ class RM65BaseImpedanceController:
         now = time.perf_counter()
         dt = now - self._last_step_time if self._last_step_time is not None else 1.0 / self.config.control_hz
         self._last_step_time = now
+        self._current_step_dt = dt
         if target is not None:
             self._reference.set_target(target)
+        has_preferred_joint = target_joint_deg is not None
+        if has_preferred_joint and self._joint_hint_reference is not None:
+            self._joint_hint_reference.set_target(target_joint_deg)
         reference = self._reference.advance(dt)
+        preferred_joint = (
+            None
+            if not has_preferred_joint or self._joint_hint_reference is None
+            else self._joint_hint_reference.advance(dt)
+        )
 
         readings = _read_force(self.robot, self.side)
         processed = self._processor.process(readings[self.config.force_source])
-        update = self._admittance.update(processed["deadbanded"], dt)
+        raw_deadbanded = list(processed["deadbanded"])
+        admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, self.side)
+        update = self._admittance.update(admittance_wrench, dt)
         self._latest_wrench_context = {
             "tare_corrected": list(processed["tare_corrected"]),
-            "deadbanded": list(processed["deadbanded"]),
+            "deadbanded": list(admittance_wrench),
+            "raw_deadbanded": raw_deadbanded,
             "target_offset": list(update["target_offset"]),
             "offset": list(update["offset"]),
+            "preferred_joint_deg": [] if preferred_joint is None else list(preferred_joint),
         }
-        command_pose, command_joint = self._command_from_reference(reference, update["offset"])
+        command_pose, command_joint = self._command_from_reference(
+            reference,
+            update["offset"],
+            preferred_joint=preferred_joint,
+        )
 
         command_step = _joint_delta_deg(self._previous_command_joint, command_joint)
-        if command_step > self.config.max_command_joint_step_deg:
-            raise RuntimeError(f"{self.side}: command joint step {command_step:.4f}deg > max_command_joint_step_deg")
+        allowed_command_step = self._max_allowed_command_joint_step_deg()
+        if command_step > allowed_command_step:
+            raise RuntimeError(
+                self._command_step_failure_message(
+                    command_pose=command_pose,
+                    command_joint=command_joint,
+                    command_step=command_step,
+                )
+            )
         force_norm = norm(processed["tare_corrected"][:3])
         torque_norm = norm(processed["tare_corrected"][3:])
         if force_norm > self.config.hard_stop_force_n:
@@ -769,25 +2161,147 @@ class RM65BaseImpedanceController:
         if torque_norm > self.config.hard_stop_torque_nm:
             raise RuntimeError(f"{self.side}: torque {torque_norm:.4f}Nm > hard_stop_torque_nm")
 
-        self._send(command_pose, command_joint)
-        self._previous_command_joint = list(command_joint)
+        try:
+            self._send(command_pose, command_joint)
+        except Exception as exc:
+            raise RuntimeError(
+                self._hardware_command_failure_message(
+                    exc=exc,
+                    phase="send",
+                    command_pose=command_pose,
+                    command_joint=command_joint,
+                    command_step=command_step,
+                    allowed_command_step=allowed_command_step,
+                )
+            ) from exc
         self._step_index += 1
         if self._step_index % self.config.state_read_every == 0:
-            self._state = _read_state(self.robot, self.side)
+            try:
+                self._state = _read_state(self.robot, self.side)
+            except Exception as exc:
+                raise RuntimeError(
+                    self._hardware_command_failure_message(
+                        exc=exc,
+                        phase="state_read_after_send",
+                        command_pose=command_pose,
+                        command_joint=command_joint,
+                        command_step=command_step,
+                        allowed_command_step=allowed_command_step,
+                    )
+                ) from exc
+        self._previous_command_joint = list(command_joint)
+        self._previous_command_pose = list(command_pose)
         pose_delta = _pose_delta(command_pose, self._state["pose"]) if self._state else (math.nan, math.nan)
+        measured_joint = None if self._state is None else list(self._state["joint_deg"])
+        command_singularity = self._singularity_metadata(command_joint)
+        measured_singularity = (
+            {"available": False, "label": "unavailable", "error": "state_unavailable"}
+            if measured_joint is None
+            else self._singularity_metadata(measured_joint)
+        )
+        command_joint_limit_margin = self._joint_limit_margin_metadata(command_joint)
+        measured_joint_limit_margin = (
+            {"available": False, "error": "state_unavailable"}
+            if measured_joint is None
+            else self._joint_limit_margin_metadata(measured_joint)
+        )
+        singularity_metadata = {
+            "command": command_singularity,
+            "measured": measured_singularity,
+        }
+        joint_limit_margin_metadata = {
+            "command": command_joint_limit_margin,
+            "measured": measured_joint_limit_margin,
+        }
+        ik_metadata = dict(self._latest_wrench_context.get("ik_metadata", {}))
+        ik_metadata.setdefault("command_singularity", command_singularity)
+        ik_metadata.setdefault("measured_singularity", measured_singularity)
+        ik_metadata.setdefault("command_joint_limit_margin", command_joint_limit_margin)
+        ik_metadata.setdefault("measured_joint_limit_margin", measured_joint_limit_margin)
+        ik_metadata.setdefault("ik_resolver_init", dict(self._ik_resolver_init_metadata))
+        self._latest_wrench_context["ik_metadata"] = ik_metadata
+        ik_timing = dict(self._latest_wrench_context.get("ik_timing", {}))
         return {
             "step": self._step_index,
             "dt_sec": dt,
             "reference": reference,
             "command_pose": command_pose,
             "command_joint_deg": command_joint,
+            "measured_pose": None if self._state is None else list(self._state["pose"]),
+            "measured_joint_deg": measured_joint,
             "offset": update["offset"],
             "target_offset": update["target_offset"],
             "active_wrench": update["active_wrench"],
             "tare_corrected_wrench": processed["tare_corrected"],
+            "raw_deadbanded_wrench": raw_deadbanded,
+            "admittance_wrench": admittance_wrench,
             "force_norm_n": force_norm,
             "torque_norm_nm": torque_norm,
             "command_joint_step_deg": command_step,
+            "allowed_command_joint_step_deg": allowed_command_step,
+            "joint_rate_limited": self._latest_wrench_context.get("joint_rate_limited"),
+            "joint_velocity_limit_profile": self._latest_wrench_context.get("joint_velocity_limit_profile"),
+            "joint_velocity_limit_dt_sec": self._latest_wrench_context.get("joint_velocity_limit_dt_sec"),
+            "joint_velocity_limit_observed_dt_sec": self._latest_wrench_context.get(
+                "joint_velocity_limit_observed_dt_sec"
+            ),
+            "joint_velocity_limit_effective_dt_sec": self._latest_wrench_context.get(
+                "joint_velocity_limit_effective_dt_sec"
+            ),
+            "joint_velocity_limit_max_dt_sec": self._latest_wrench_context.get("joint_velocity_limit_max_dt_sec"),
+            "joint_velocity_limit_requested_delta_deg": self._latest_wrench_context.get(
+                "joint_velocity_limit_requested_delta_deg"
+            ),
+            "joint_velocity_limit_delta_deg": self._latest_wrench_context.get("joint_velocity_limit_delta_deg"),
+            "joint_velocity_limit_max_step_deg": self._latest_wrench_context.get(
+                "joint_velocity_limit_max_step_deg"
+            ),
+            "joint_velocity_limit_ratio": self._latest_wrench_context.get("joint_velocity_limit_ratio"),
+            "joint_safety": self._latest_wrench_context.get("joint_safety"),
+            "ik_method": (
+                None
+                if self._latest_wrench_context.get("ik_method") is None
+                else self._latest_wrench_context["ik_method"][0]
+            ),
+            "ik_backoff_scale": (
+                None
+                if self._latest_wrench_context.get("ik_backoff_scale") is None
+                else self._latest_wrench_context["ik_backoff_scale"][0]
+            ),
+            "ik_reference_backoff_scale": (
+                None
+                if self._latest_wrench_context.get("ik_reference_backoff_scale") is None
+                else self._latest_wrench_context["ik_reference_backoff_scale"][0]
+            ),
+            "ik_command_step_backoff_scale": (
+                None
+                if self._latest_wrench_context.get("ik_command_step_backoff_scale") is None
+                else self._latest_wrench_context["ik_command_step_backoff_scale"][0]
+            ),
+            "ik_command_step_candidate_deg": (
+                None
+                if self._latest_wrench_context.get("ik_command_step_candidate_deg") is None
+                else self._latest_wrench_context["ik_command_step_candidate_deg"][0]
+            ),
+            "ik_command_step_allowed_deg": (
+                None
+                if self._latest_wrench_context.get("ik_command_step_allowed_deg") is None
+                else self._latest_wrench_context["ik_command_step_allowed_deg"][0]
+            ),
+            "ik_command_step_applied_deg": (
+                None
+                if self._latest_wrench_context.get("ik_command_step_applied_deg") is None
+                else self._latest_wrench_context["ik_command_step_applied_deg"][0]
+            ),
+            "ik_resolver_tolerance_fraction": (
+                None
+                if self._latest_wrench_context.get("ik_resolver_tolerance_fraction") is None
+                else self._latest_wrench_context["ik_resolver_tolerance_fraction"][0]
+            ),
+            "ik_timing": ik_timing,
+            "singularity": singularity_metadata,
+            "joint_limit_margin": joint_limit_margin_metadata,
+            "ik_metadata": ik_metadata,
             "pose_tracking_linear_m": pose_delta[0],
             "pose_tracking_angular_rad": pose_delta[1],
         }
@@ -880,12 +2394,111 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 ),
             )
 
-    def _command_from_reference(self, reference: list[float], offset: list[float]) -> tuple[list[float], list[float]]:
+    def _command_from_reference(
+        self,
+        reference: list[float],
+        offset: list[float],
+        *,
+        preferred_joint: list[float] | None = None,
+    ) -> tuple[list[float], list[float]]:
         assert self._ik_seed is not None
-        command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
-            self._command_from_pose_with_ik_backoff(reference_pose=reference, offset=offset)
+        preferred = (
+            None
+            if preferred_joint is None
+            else finite_list(preferred_joint, expected_len=6, label="preferred_joint")
         )
+        offset_values = finite_list(offset, expected_len=6, label="pose_offset")
+        linear_offset_m = norm(offset_values[:3])
+        angular_offset_rad = norm(offset_values[3:])
+        direct_joint_hint = bool(
+            preferred is not None
+            and linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
+            and angular_offset_rad <= float(self.config.direct_joint_hint_max_angular_offset_rad)
+        )
+        if direct_joint_hint:
+            command_pose = normalize_pose(reference)
+            command_joint = list(preferred)
+            if self._latest_wrench_context is not None:
+                self._latest_wrench_context["ik_method"] = ["dual_arm_joint_hint"]
+                self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata({
+                    "status": "pass",
+                    "method": "dual_arm_joint_hint",
+                    "source": "retargeter_solver_output_qpos",
+                    "seed_joint_deg": list(preferred),
+                    "direct_joint_hint_linear_offset_m": float(linear_offset_m),
+                    "direct_joint_hint_angular_offset_rad": float(angular_offset_rad),
+                    "direct_joint_hint_max_linear_offset_m": float(
+                        self.config.direct_joint_hint_max_linear_offset_m
+                    ),
+                    "direct_joint_hint_max_angular_offset_rad": float(
+                        self.config.direct_joint_hint_max_angular_offset_rad
+                    ),
+                    "direct_joint_hint_offset_ignored": bool(
+                        linear_offset_m > 1e-9 or angular_offset_rad > 1e-9
+                    ),
+                }, source="retargeter_solver_output_qpos", elapsed_ms=0.0)
+            try:
+                command_pose, command_joint = self._apply_joint_step_policy(
+                    command_pose=command_pose,
+                    command_joint=command_joint,
+                )
+            except RuntimeError as exc:
+                held = self._hold_last_safe_command_after_ik_failure(
+                    reason="joint_hint_step_limit",
+                    message=str(exc),
+                    target_pose=command_pose,
+                    seed_joint=preferred,
+                )
+                if held is not None:
+                    self._ik_seed = list(held[1])
+                    return held
+                raise
+            self._ik_seed = list(command_joint)
+            return command_pose, command_joint
+
+        try:
+            command_solver = (
+                self._command_from_pose_with_resolver
+                if self._ik_resolver is not None
+                else self._command_from_pose_with_ik_backoff
+            )
+            command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
+                command_solver(
+                    reference_pose=reference,
+                    offset=offset,
+                    seed_joint_override=preferred,
+                )
+            )
+        except RuntimeError as exc:
+            held = self._hold_last_safe_command_after_ik_failure(
+                reason="ik_exception",
+                message=str(exc),
+                target_pose=reference,
+                seed_joint=self._ik_seed,
+            )
+            if held is not None:
+                self._ik_seed = list(held[1])
+                return held
+            raise
         if int(code) != 0:
+            source = "generic_ik_resolver" if self._ik_resolver is not None else "rm_sdk_legacy"
+            message = self._ik_failure_message(
+                code=code,
+                seed_joint=seed_joint,
+                target_pose=command_pose,
+                reference=reference,
+                offset=offset,
+            )
+            held = self._hold_last_safe_command_after_ik_failure(
+                reason="generic_resolver_return_code" if source == "generic_ik_resolver" else "ik_return_code",
+                message=message,
+                target_pose=command_pose,
+                seed_joint=seed_joint,
+                code=code,
+            )
+            if held is not None:
+                self._ik_seed = list(held[1])
+                return held
             self._raise_ik_failure(
                 code=code,
                 seed_joint=seed_joint,
@@ -894,20 +2507,46 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 offset=offset,
             )
         command_joint = finite_list(command_joint[:6], expected_len=6, label="ik_joint_deg")
+        try:
+            command_pose, command_joint = self._apply_joint_step_policy(
+                command_pose=command_pose,
+                command_joint=command_joint,
+            )
+        except RuntimeError as exc:
+            held = self._hold_last_safe_command_after_ik_failure(
+                reason="command_step_limit",
+                message=str(exc),
+                target_pose=command_pose,
+                seed_joint=seed_joint,
+            )
+            if held is not None:
+                self._ik_seed = list(held[1])
+                return held
+            raise
         self._ik_seed = list(command_joint)
         return command_pose, command_joint
 
     def _send(self, command_pose: list[float], command_joint: list[float]) -> None:
-        del command_joint
         assert self.robot is not None
+        if self.config.pose_command_transport == "pose":
+            _require_zero(
+                self.robot.Movep_CANFD(
+                    command_pose,
+                    follow=False,
+                    trajectory_mode=self.config.trajectory_mode,
+                    radio=self.config.radio,
+                ),
+                f"{self.side} Movep_CANFD",
+            )
+            return
         _require_zero(
-            self.robot.Movep_CANFD(
-                command_pose,
+            self.robot.Movej_CANFD(
+                command_joint,
                 follow=False,
                 trajectory_mode=self.config.trajectory_mode,
                 radio=self.config.radio,
             ),
-            f"{self.side} Movep_CANFD",
+            f"{self.side} Movej_CANFD",
         )
 
 
@@ -917,8 +2556,15 @@ class RM65JointImpedanceController(RM65BaseImpedanceController):
     def _initial_reference(self, state: dict[str, list[float]]) -> list[float]:
         return list(state["joint_deg"])
 
-    def _command_from_reference(self, reference: list[float], offset: list[float]) -> tuple[list[float], list[float]]:
+    def _command_from_reference(
+        self,
+        reference: list[float],
+        offset: list[float],
+        *,
+        preferred_joint: list[float] | None = None,
+    ) -> tuple[list[float], list[float]]:
         assert self._ik_seed is not None
+        del preferred_joint
         ref_joint = finite_list(reference, expected_len=6, label="reference_joint")
         ref_pose = self._forward_pose(ref_joint)
         command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
@@ -933,6 +2579,10 @@ class RM65JointImpedanceController(RM65BaseImpedanceController):
                 offset=offset,
             )
         command_joint = finite_list(command_joint[:6], expected_len=6, label="ik_joint_deg")
+        command_pose, command_joint = self._apply_joint_step_policy(
+            command_pose=command_pose,
+            command_joint=command_joint,
+        )
         self._ik_seed = list(command_joint)
         return command_pose, command_joint
 

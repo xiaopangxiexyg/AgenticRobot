@@ -196,8 +196,7 @@ def _auto_select_poses(poses: list[dict[str, object]], args) -> list[dict[str, o
     best_safe_score = None
     best_any = None
     best_any_score = None
-    for combo in itertools.combinations(candidates, 4):
-        combo = tuple(sorted(combo, key=lambda pose: int(pose["index"])))
+    for combo in itertools.permutations(candidates, 4):
         adjacent = [
             _joint_distance_deg(combo[index]["joint_deg"], combo[index + 1]["joint_deg"])
             for index in range(3)
@@ -344,7 +343,9 @@ def _validate_selected(selected: list[dict[str, object]], args) -> None:
                     f"selected point {index + 1}->{index + 2} max joint jump "
                     f"{distance['max_abs']:.3f}deg > "
                     f"--max-adjacent-joint-delta-deg {args.max_adjacent_joint_delta_deg:.3f}; "
-                    "enable --smooth-between-points or choose closer poses"
+                    "choose closer poses, use --pose-indices/--candidate-indices, or raise "
+                    "--max-adjacent-joint-delta-deg only after reviewing the official "
+                    "controller calibration path"
                 )
             if segments > args.max_interpolation_segments:
                 raise RuntimeError(
@@ -356,7 +357,9 @@ def _validate_selected(selected: list[dict[str, object]], args) -> None:
                 f"WARNING: selected point {index + 1}->{index + 2} max joint jump "
                 f"{distance['max_abs']:.3f}deg exceeds "
                 f"--max-adjacent-joint-delta-deg {args.max_adjacent_joint_delta_deg:.3f}; "
-                f"will smooth with {segments} MoveJ segments"
+                f"--smooth-between-points will add a {segments}-segment pre-submission "
+                "MoveJ pass, but the controller may still run its own calibration motion "
+                "after point 4"
             )
 
 
@@ -445,8 +448,13 @@ def _run_official_manual_calibration(
     results = []
     print(
         "\nStarting official rm_manual_set_force sequence. "
-        "The controller may start automatic calibration motion after point 4."
+        "The controller is expected to run its own calibration motion after point 4."
     )
+    if args.smooth_between_points:
+        print(
+            "WARNING: --smooth-between-points is enabled; this adds an extra "
+            "MoveJ pre-submission pass before Manual_Set_Force calls."
+        )
     try:
         for point_num, pose in enumerate(selected, start=1):
             joint = pose["joint_deg"]
@@ -542,8 +550,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--smooth-between-points",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="MoveJ through interpolated waypoints before submitting each Manual_Set_Force point.",
+        default=False,
+        help=(
+            "Compatibility option: MoveJ through interpolated waypoints before submitting "
+            "each Manual_Set_Force point. On controllers that auto-run calibration after "
+            "point 4, this creates an extra pre-pass and should normally stay disabled."
+        ),
     )
     parser.add_argument("--movej-speed", type=int, default=2)
     parser.add_argument("--settle-sec", type=float, default=2.0)
@@ -628,7 +640,6 @@ def main(argv: list[str] | None = None) -> int:
                 selected = _poses_by_indices(poses, _parse_index_list(args.pose_indices))
             else:
                 selected = _auto_select_poses(poses, args)
-        _validate_selected(selected, args)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -639,15 +650,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"tool_label={tool_label or '(not set)'} expected_tool={args.expected_tool or '(not checked)'}")
     print(
         "WARNING: official force sensor calibration writes controller calibration data "
-        "and may move the robot after point 4."
+        "and is expected to move the robot after point 4."
     )
     print(
-        f"smooth_between_points={args.smooth_between_points} "
+        f"preposition_between_points={args.smooth_between_points} "
         f"interp_max_joint_step_deg={args.interp_max_joint_step_deg:.3f} "
         f"max_interpolation_segments={args.max_interpolation_segments}"
     )
     print("WARNING: do not run while the arm is in contact with the environment.")
     _print_selected(selected, args)
+    try:
+        _validate_selected(selected, args)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     robot = None
     pre_summary = None
@@ -703,6 +719,7 @@ def main(argv: list[str] | None = None) -> int:
             "selected_pose_indices": [pose["index"] for pose in selected],
             "selected_joint_deg": [pose["joint_deg"] for pose in selected],
             "smooth_between_points": args.smooth_between_points,
+            "preposition_between_points": args.smooth_between_points,
             "interp_max_joint_step_deg": args.interp_max_joint_step_deg,
             "max_interpolation_segments": args.max_interpolation_segments,
             "move_reached_tolerance_deg": args.move_reached_tolerance_deg,

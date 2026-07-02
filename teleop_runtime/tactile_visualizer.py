@@ -4,6 +4,7 @@ import multiprocessing as mp
 import queue
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -425,6 +426,292 @@ class AsyncTactileUVVisualizer:
                 pass
 
 
+@dataclass(frozen=True)
+class DMTacForceVisualizerConfig:
+    enabled_sides: tuple[str, ...] = ("left", "right")
+    window_name: str = "dmtac_gripper_tactile"
+    dmtac_root: str | Path | None = None
+    grid_rows: int = 20
+    grid_cols: int = 30
+    cell_size: int = 18
+    vector_stride: int = 2
+    stride: int = 16
+    scale: int = 1
+    arrow_scale: float = 0.42
+    min_arrow_norm: float = 0.02
+    fixed_ref: float | None = None
+    normal_sign: float = 1.0
+    mode: str = "absolute"
+    resizable_window: bool = True
+
+
+class DMTacDistributedForceVisualizer:
+    """Render DMTAC distributed_force as 20x30x3 pressure/vector grids."""
+
+    def __init__(self, config: DMTacForceVisualizerConfig):
+        self.config = config
+        self._cv2 = None
+        self._window_created = False
+        self._latest_canvas: np.ndarray | None = None
+        self._closed = False
+
+    def _ensure_cv2(self) -> Any:
+        if self._cv2 is None:
+            try:
+                import cv2  # noqa: PLC0415
+            except ImportError as exc:
+                raise ImportError("OpenCV (cv2) is required for DMTAC tactile visualization.") from exc
+            self._cv2 = cv2
+        return self._cv2
+
+    @staticmethod
+    def _coarse_force_grid(
+        distributed_force: Any,
+        *,
+        rows: int,
+        cols: int,
+        cv2: Any,
+    ) -> np.ndarray:
+        force = np.asarray(distributed_force, dtype=np.float32)
+        if force.ndim != 3 or force.shape[2] < 3:
+            raise ValueError("distributed_force must have shape (H, W, C) with at least three channels")
+        row_count = max(1, int(rows))
+        col_count = max(1, int(cols))
+        source = np.ascontiguousarray(
+            np.nan_to_num(force[..., :3], nan=0.0, posinf=0.0, neginf=0.0)
+        )
+        resized = cv2.resize(
+            source,
+            (col_count, row_count),
+            interpolation=cv2.INTER_AREA,
+        )
+        return np.nan_to_num(np.asarray(resized, dtype=np.float32), copy=False)
+
+    @staticmethod
+    def _robust_ref(values: np.ndarray, fixed_ref: float | None) -> float:
+        if fixed_ref is not None and float(fixed_ref) > 0.0:
+            return float(fixed_ref)
+        finite = np.asarray(values, dtype=np.float32)
+        finite = finite[np.isfinite(finite)]
+        if finite.size <= 0:
+            return 1.0
+        ref = float(np.percentile(np.abs(finite), 98))
+        if ref <= 1e-8:
+            ref = float(np.max(np.abs(finite))) if finite.size else 1.0
+        return max(ref, 1e-6)
+
+    def _render_blank(self, title: str = "no DMTAC tactile") -> np.ndarray:
+        cv2 = self._ensure_cv2()
+        rows = max(1, int(self.config.grid_rows))
+        cols = max(1, int(self.config.grid_cols))
+        cell = max(4, int(self.config.cell_size))
+        image = np.zeros((rows * cell + 58, cols * cell, 3), dtype=np.uint8)
+        cv2.putText(image, title, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            "20x30x3 force grid",
+            (10, image.shape[0] - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
+        )
+        return image
+
+    def _render_force_grid(self, force: Any, *, title: str) -> np.ndarray:
+        cv2 = self._ensure_cv2()
+        rows = max(1, int(self.config.grid_rows))
+        cols = max(1, int(self.config.grid_cols))
+        cell = max(4, int(self.config.cell_size))
+        grid = self._coarse_force_grid(force, rows=rows, cols=cols, cv2=cv2)
+        pressure = np.maximum(float(self.config.normal_sign) * grid[..., 1], 0.0)
+        pressure_ref = self._robust_ref(pressure, self.config.fixed_ref)
+        pressure_u8 = np.clip(pressure / pressure_ref, 0.0, 1.0)
+        heat = cv2.applyColorMap((pressure_u8 * 255.0).astype(np.uint8), cv2.COLORMAP_TURBO)
+        image = cv2.resize(
+            heat,
+            (cols * cell, rows * cell),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        grid_color = (45, 45, 45)
+        for col in range(cols + 1):
+            x = col * cell
+            cv2.line(image, (x, 0), (x, rows * cell), grid_color, 1)
+        for row in range(rows + 1):
+            y = row * cell
+            cv2.line(image, (0, y), (cols * cell, y), grid_color, 1)
+
+        plane = grid[..., (0, 2)]
+        plane_norm = np.linalg.norm(plane, axis=2)
+        vector_ref = self._robust_ref(plane_norm, self.config.fixed_ref)
+        stride = max(1, int(self.config.vector_stride))
+        max_len = float(cell) * max(0.05, float(self.config.arrow_scale))
+        min_norm = float(self.config.min_arrow_norm)
+        for row in range(0, rows, stride):
+            for col in range(0, cols, stride):
+                norm = float(plane_norm[row, col])
+                if norm / vector_ref < min_norm:
+                    continue
+                direction = plane[row, col] / max(norm, 1e-8)
+                length = min(max_len, max_len * norm / vector_ref)
+                cx = int(round((col + 0.5) * cell))
+                cy = int(round((row + 0.5) * cell))
+                ex = int(round(cx + float(direction[0]) * length))
+                ey = int(round(cy - float(direction[1]) * length))
+                cv2.arrowedLine(
+                    image,
+                    (cx, cy),
+                    (ex, ey),
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                    tipLength=0.35,
+                )
+
+        header_h = 36
+        footer_h = 26
+        canvas = np.zeros((header_h + image.shape[0] + footer_h, image.shape[1], 3), dtype=np.uint8)
+        canvas[header_h : header_h + image.shape[0], :, :] = image
+        cv2.putText(
+            canvas,
+            title,
+            (8, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+        footer = (
+            f"20x30x3  color=max(Fy,0) ref={pressure_ref:.3g}  "
+            f"arrows=(Fx,Fz) ref={vector_ref:.3g}"
+        )
+        cv2.putText(
+            canvas,
+            footer,
+            (8, canvas.shape[0] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (210, 210, 210),
+            1,
+            cv2.LINE_AA,
+        )
+        return canvas
+
+    @staticmethod
+    def _hstack_equal_height(images: list[np.ndarray]) -> np.ndarray:
+        if not images:
+            raise ValueError("images must not be empty")
+        max_h = max(int(img.shape[0]) for img in images)
+        resized: list[np.ndarray] = []
+        for img in images:
+            if int(img.shape[0]) == max_h:
+                resized.append(img)
+                continue
+            new_w = int(round(int(img.shape[1]) * max_h / max(1, int(img.shape[0]))))
+            import cv2  # noqa: PLC0415
+
+            resized.append(cv2.resize(img, (new_w, max_h), interpolation=cv2.INTER_LINEAR))
+        return np.concatenate(resized, axis=1)
+
+    @staticmethod
+    def _vstack_equal_width(images: list[np.ndarray]) -> np.ndarray:
+        if not images:
+            raise ValueError("images must not be empty")
+        max_w = max(int(img.shape[1]) for img in images)
+        resized: list[np.ndarray] = []
+        for img in images:
+            if int(img.shape[1]) == max_w:
+                resized.append(img)
+                continue
+            new_h = int(round(int(img.shape[0]) * max_w / max(1, int(img.shape[1]))))
+            import cv2  # noqa: PLC0415
+
+            resized.append(cv2.resize(img, (max_w, new_h), interpolation=cv2.INTER_LINEAR))
+        return np.concatenate(resized, axis=0)
+
+    def _ensure_window(self, canvas: np.ndarray) -> None:
+        if self._window_created:
+            return
+        self._ensure_cv2()
+        assert self._cv2 is not None
+        flag = (
+            self._cv2.WINDOW_NORMAL
+            if self.config.resizable_window
+            else self._cv2.WINDOW_AUTOSIZE
+        )
+        self._cv2.namedWindow(self.config.window_name, flag)
+        if self.config.resizable_window:
+            height, width = canvas.shape[:2]
+            self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
+        self._window_created = True
+
+    def update(self, tactile_by_side: dict[str, dict[str, np.ndarray] | None]) -> list[str]:
+        if self._closed:
+            return []
+        side_panels: list[np.ndarray] = []
+        for side in tuple(str(side) for side in self.config.enabled_sides):
+            tactile_dict = tactile_by_side.get(side) or {}
+            sensor_panels: list[np.ndarray] = []
+            for sensor_key, force in sorted(tactile_dict.items(), key=lambda item: str(item[0])):
+                sensor_panels.append(
+                    self._render_force_grid(
+                        force,
+                        title=f"{side} dev {sensor_key}",
+                    )
+                )
+            if not sensor_panels:
+                sensor_panels.append(self._render_blank(title=f"{side}: no DMTAC tactile"))
+            side_panels.append(self._hstack_equal_height(sensor_panels))
+        if not side_panels:
+            side_panels.append(self._render_blank(title="no DMTAC tactile"))
+        canvas = self._vstack_equal_width(side_panels)
+        self._ensure_window(canvas)
+        assert self._cv2 is not None
+        self._latest_canvas = canvas
+        self._cv2.imshow(self.config.window_name, canvas)
+        key_code = self._cv2.waitKey(1)
+        if key_code < 0:
+            return []
+        key = key_code & 0xFF
+        if key == 3:
+            raise KeyboardInterrupt
+        if 0 < key < 128:
+            return [chr(key).lower()]
+        return []
+
+    def poll_events(self) -> list[str]:
+        if self._closed:
+            return []
+        if self._latest_canvas is None:
+            return self.update({})
+        assert self._cv2 is not None
+        self._cv2.imshow(self.config.window_name, self._latest_canvas)
+        key_code = self._cv2.waitKey(1)
+        if key_code < 0:
+            return []
+        key = key_code & 0xFF
+        if key == 3:
+            raise KeyboardInterrupt
+        if 0 < key < 128:
+            return [chr(key).lower()]
+        return []
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._cv2 is None:
+            return
+        try:
+            self._cv2.destroyWindow(self.config.window_name)
+            self._cv2.waitKey(1)
+        except Exception:
+            pass
+
+
 def tactile_by_side_from_backends(
     active_sides: object,
     backend_for_side: Callable[[str], InspireTacHandBackend | None],
@@ -436,6 +723,36 @@ def tactile_by_side_from_backends(
             continue
         tactile = backend.get_state().get("tactile")
         tactile_by_side[side] = None if tactile is None else np.asarray(tactile, dtype=float).reshape(-1)
+    return tactile_by_side
+
+
+def dmtac_force_by_side_from_backends(
+    active_sides: object,
+    backend_for_side: Callable[[str], Any | None],
+) -> dict[str, dict[str, np.ndarray] | None]:
+    tactile_by_side: dict[str, dict[str, np.ndarray] | None] = {"left": None, "right": None}
+    for side in tuple(str(side) for side in active_sides):
+        backend = backend_for_side(side)
+        if backend is None:
+            continue
+        get_state = getattr(backend, "get_state")
+        code = getattr(get_state, "__code__", None)
+        arg_count = int(getattr(code, "co_argcount", 0) or 0) + int(
+            getattr(code, "co_kwonlyargcount", 0) or 0
+        )
+        if code is not None and "include_tactile_vector" in code.co_varnames[:arg_count]:
+            state = get_state(include_tactile_vector=False)
+        else:
+            state = get_state()
+        tactile_dict = state.get("tactile_dict")
+        if not isinstance(tactile_dict, dict):
+            tactile_by_side[side] = None
+            continue
+        tactile_by_side[side] = {
+            str(key): np.asarray(value, dtype=np.float32)
+            for key, value in tactile_dict.items()
+            if value is not None
+        }
     return tactile_by_side
 
 

@@ -28,7 +28,7 @@ class ForceVizConfig:
     arrow_scale: float = 18.0
     min_arrow_norm: float = 0.015
     deadband_abs: float = 5e-5
-    temporal_alpha: float = 0.35
+    temporal_alpha: float = 0.85
     spatial_blur_ksize: int = 5
     arrow_pool: int = 16
     norm_percentile: float = 99.0
@@ -331,7 +331,15 @@ def distributed_force_stats(distributed_force: Any, prev_force: Any = None) -> D
         "xy_p99": _safe_percentile(xy_mag, 99.0),
     }
     if force.shape[2] >= 3:
+        xz = np.nan_to_num(force[..., (0, 2)], nan=0.0, posinf=0.0, neginf=0.0)
+        xz_mag = np.linalg.norm(xz, axis=2)
+        y_abs = np.abs(np.nan_to_num(force[..., 1], nan=0.0, posinf=0.0, neginf=0.0))
         z_abs = np.abs(np.nan_to_num(force[..., 2], nan=0.0, posinf=0.0, neginf=0.0))
+        out["xz_mean"] = float(np.nanmean(xz_mag)) if xz_mag.size else 0.0
+        out["xz_max"] = float(np.nanmax(xz_mag)) if xz_mag.size else 0.0
+        out["xz_p99"] = _safe_percentile(xz_mag, 99.0)
+        out["y_abs_mean"] = float(np.nanmean(y_abs)) if y_abs.size else 0.0
+        out["y_abs_max"] = float(np.nanmax(y_abs)) if y_abs.size else 0.0
         out["z_abs_mean"] = float(np.nanmean(z_abs)) if z_abs.size else 0.0
         out["z_abs_max"] = float(np.nanmax(z_abs)) if z_abs.size else 0.0
         xyz_mag = np.linalg.norm(np.nan_to_num(force[..., :3], nan=0.0, posinf=0.0, neginf=0.0), axis=2)
@@ -345,6 +353,13 @@ def distributed_force_stats(distributed_force: Any, prev_force: Any = None) -> D
             dxy = np.linalg.norm(delta[..., :2], axis=2)
             out["dxy_mean"] = float(np.nanmean(dxy)) if dxy.size else 0.0
             out["dxy_max"] = float(np.nanmax(dxy)) if dxy.size else 0.0
+            if delta.shape[2] >= 3:
+                dxz = np.linalg.norm(delta[..., (0, 2)], axis=2)
+                out["dxz_mean"] = float(np.nanmean(dxz)) if dxz.size else 0.0
+                out["dxz_max"] = float(np.nanmax(dxz)) if dxz.size else 0.0
+                dy_abs = np.abs(delta[..., 1])
+                out["dy_abs_mean"] = float(np.nanmean(dy_abs)) if dy_abs.size else 0.0
+                out["dy_abs_max"] = float(np.nanmax(dy_abs)) if dy_abs.size else 0.0
             dxyz = np.linalg.norm(delta[..., : min(3, delta.shape[2])], axis=2)
             out["dxyz_mean"] = float(np.nanmean(dxyz)) if dxyz.size else 0.0
             out["dxyz_max"] = float(np.nanmax(dxyz)) if dxyz.size else 0.0
@@ -362,11 +377,39 @@ def format_distributed_force_stats(dev_id: Any, fid: Any, stats: Mapping[str, An
     if "z_abs_max" in stats:
         parts.extend(
             [
+                f"xz_max={stats.get('xz_max', 0.0):.6g}",
+                f"dxz_max={stats.get('dxz_max', 0.0):.6g}",
+                f"y_abs_mean={stats.get('y_abs_mean', 0.0):.6g}",
+                f"y_abs_max={stats.get('y_abs_max', 0.0):.6g}",
+                f"dy_abs_max={stats.get('dy_abs_max', 0.0):.6g}",
                 f"z_abs_mean={stats['z_abs_mean']:.6g}",
                 f"z_abs_max={stats['z_abs_max']:.6g}",
                 f"dxyz_max={stats.get('dxyz_max', 0.0):.6g}",
             ]
         )
+    return " ".join(parts)
+
+
+def _format_timing_ms(timings: Mapping[str, Any]) -> str:
+    order = (
+        "getDevStatus",
+        "wait_for_new",
+        "distributed_force",
+        "force",
+        "shear",
+        "depth",
+        "deformation2d",
+        "raw",
+        "infer",
+        "events",
+    )
+    parts = []
+    for key in order:
+        if key in timings:
+            parts.append(f"{key}={float(timings[key]):.1f}ms")
+    for key, value in timings.items():
+        if key not in order:
+            parts.append(f"{key}={float(value):.1f}ms")
     return " ".join(parts)
 
 
@@ -392,8 +435,14 @@ def probe_distributed_force(
     try:
         _prepare_tactile(dev, timeout_ms=timeout_ms, reset_tactile=reset_tactile, warmup_frames=warmup_frames)
         for i in range(count):
+            read_started_at = time.perf_counter()
             frames = dev.read_tactile(timeout_ms=timeout_ms)
-            print(f"frame {i}")
+            read_ms = (time.perf_counter() - read_started_at) * 1000.0
+            print(
+                f"frame {i} read={read_ms:.1f}ms "
+                f"profile={getattr(tactile_config, 'compute_profile', '')} "
+                f"parallel={bool(getattr(tactile_config, 'parallel_read', False))}"
+            )
             for dev_id, frame in frames.items():
                 if frame is None or getattr(frame, "distributed_force", None) is None:
                     print(f"  dev={dev_id} no distributed_force frame")
@@ -401,7 +450,14 @@ def probe_distributed_force(
                 force = frame.distributed_force
                 stats = distributed_force_stats(force, prev_by_dev.get(dev_id))
                 prev_by_dev[dev_id] = _as_distributed_force_array(force).copy()
-                print("  " + format_distributed_force_stats(dev_id, getattr(frame, "fid", None), stats))
+                line = "  " + format_distributed_force_stats(dev_id, getattr(frame, "fid", None), stats)
+                timings = getattr(frame, "timings_ms", {}) or {}
+                if timings:
+                    line += " timings[" + _format_timing_ms(timings) + "]"
+                errors = getattr(frame, "errors", {}) or {}
+                if errors:
+                    line += f" errors={dict(errors)}"
+                print(line)
             if period_s > 0:
                 time.sleep(period_s)
     finally:

@@ -97,6 +97,26 @@ class HandActionSpec:
         )
 
     @classmethod
+    def dmtac_gripper(cls, side: str, *, gripper_slot: int = 1) -> "HandActionSpec":
+        active_mask = tuple(index == int(gripper_slot) for index in range(INSPIRE_HAND_DOF))
+        return cls(
+            side=side,
+            hand_model="dmtac_gripper",
+            slot_count=INSPIRE_HAND_DOF,
+            active_dof=1,
+            active_mask=active_mask,
+            joint_names=("gripper_close",),
+            command_space="normalized_0_0.9",
+            slot_map={"gripper_close": int(gripper_slot)},
+            invalid_slot_value="zero_padding",
+            semantics=(
+                "DM-Tac gripper uses the fixed 6-wide hand slot for compatibility; "
+                "only gripper_close is a real actuator target and the other slots are padding."
+            ),
+            metadata={"gripper_slot": int(gripper_slot)},
+        )
+
+    @classmethod
     def q16(
         cls,
         side: str,

@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from ..arm_frames import ARM_ENDPOINT_FRAME, ARM_ENDPOINT_SEMANTICS
 from .codec import ActionVectorEncoding
 from .schema import RobotAction
 from .synthetic import SyntheticReplayFrame
@@ -92,6 +93,29 @@ def _active_sides(row: Mapping[str, Any]) -> set[str]:
     return sides
 
 
+def _legacy_arm_endpoint_specs(*, left_arm: Any | None, right_arm: Any | None) -> dict[str, Any]:
+    specs: dict[str, Any] = {}
+    for side, value in (("left", left_arm), ("right", right_arm)):
+        if value is None:
+            continue
+        specs[side] = {
+            "side": side,
+            "controlled_frame": ARM_ENDPOINT_FRAME,
+            "reference_frame": f"{side}_arm_base",
+            "representation": "xyz_quat",
+            "dof": 7,
+            "semantics": ARM_ENDPOINT_SEMANTICS,
+            "metadata": {
+                "compatibility_source": "legacy_collection_row_without_action_spec",
+                "compatibility_note": (
+                    "Rows without canonical action metadata are interpreted as the historical "
+                    "arm_endpoint pose contract for replay."
+                ),
+            },
+        }
+    return specs
+
+
 def _fallback_ee_pose_action_from_row(row: Mapping[str, Any]) -> RobotAction | None:
     action = _vector_with_optional_nan(row.get("action"), length=26)
     if action is None:
@@ -133,6 +157,14 @@ def _fallback_ee_pose_action_from_row(row: Mapping[str, Any]) -> RobotAction | N
             "episode_index": row.get("episode_index"),
             "frame_index": row.get("frame_index"),
             "source": "fallback_action_vector",
+            "legacy_replay_compatibility": {
+                "arm_pose_frame": ARM_ENDPOINT_FRAME,
+                "reason": "missing canonical action metadata",
+            },
+            "arm_action_specs_by_side": _legacy_arm_endpoint_specs(
+                left_arm=left_arm,
+                right_arm=right_arm,
+            ),
         },
     )
 

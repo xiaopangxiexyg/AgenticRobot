@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "data_type": "rm65_calibration_profile",
+  "name": "DMTAC_M",
+  "arm": "right",
+  "tool_name": "DMTAC_M",
+  "created_at": 1782791379.6544676,
+  "updated_at": 1782791762.1870224,
+  "notes": "",
+  "paths": {
+    "pose_sequence_json": "",
+    "force_measurements_json": "",
+    "fit_json": "/home/password-1/DexTeleop/hardware/rm65/utils/results/rm65_right_DMTAC_M_force_sensor_calib4_measurements_calibration_fit.json",
+    "official_report_json": "",
+    "tool_payload_validation_json": ""
+  },
+  "payload": {
+    "schema_version": 1,
+    "mass_kg": 0.12410692158344747,
+    "com_tool_m": [
+      -0.0015118517940668269,
+      0.030646071599070665,
+      0.20403462749118292
+    ],
+    "source_fit_json": "/home/password-1/DexTeleop/hardware/rm65/utils/results/rm65_right_DMTAC_M_force_sensor_calib4_measurements_calibration_fit.json",
+    "fit_source": "tool",
+    "fit_mode": "tool_gravity_model",
+    "updated_at": 1782791689.353576
+  },
+  "tcp": {
+    "schema_version": 1,
+    "frame_name": "tool_tcp",
+    "pose_flange_m_rad": [
+      0.0,
+      0.0,
+      0.13999999999999996,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_flange_m": [
+      0.0,
+      0.0,
+      0.13999999999999996
+    ],
+    "rotation_flange_rpy_rad": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_source": "gui_adjusted",
+    "rotation_policy": "preserve_existing_tool_rotation",
+    "confirmed": true,
+    "seed_source": "arm-endpoint",
+    "initial_pose_flange_m_rad": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "base_tool_pose_flange_m_rad": [
+      0.02,
+      0.0,
+      0.18,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "com_tool_m": [
+      -0.0015118517940668269,
+      0.030646071599070665,
+      0.20403462749118292
+    ],
+    "com_distance_m": 0.20632885550927765,
+    "max_auto_com_distance_m": 0.2,
+    "source_fit_json": "/home/password-1/DexTeleop/hardware/rm65/utils/results/rm65_right_DMTAC_M_force_sensor_calib4_measurements_calibration_fit.json",
+    "warnings": [
+      "fitted CoM distance 0.206329m exceeds 0.200000m; using arm_endpoint as the default TCP"
+    ],
+    "updated_at": 1782791762.1870139,
+    "safety_warnings": []
+  },
+  "impedance": {
+    "pose": {
+      "mode": "pose",
+      "force_source": "work",
+      "axes": "all",
+      "force_sign": 1.0,
+      "angular_force_sign": -1.0,
+      "angular_axis_signs": [
+        1.0,
+        1.0,
+        -1.0
+      ],
+      "control_hz": 40.0,
+      "action_hz": 20.0,
+      "lowpass_alpha": 0.85,
+      "force_deadband_n": 0.3,
+      "torque_deadband_nm": 0.03,
+      "linear_gain_m_s_per_n": 0.0,
+      "angular_gain_rad_s_per_nm": 0.0,
+      "linear_damping_n_s_per_m": 0.0,
+      "angular_damping_nm_s_per_rad": 0.0,
+      "linear_compliance_m_per_n": 0.004,
+      "angular_compliance_rad_per_nm": 0.04,
+      "max_linear_velocity_m_s": 0.04,
+      "max_angular_velocity_rad_s": 0.15,
+      "max_linear_offset_m": 0.05,
+      "max_angular_offset_rad": 0.4,
+      "return_rate_s": 0.35,
+      "trajectory_mode": 0,
+      "radio": 0,
+      "hard_stop_force_n": 50.0,
+      "hard_stop_torque_nm": 10.0,
+      "max_command_joint_step_deg": 20.0,
+      "direct_joint_hint_max_linear_offset_m": 0.002,
+      "direct_joint_hint_max_angular_offset_rad": 0.004
+    },
+    "joint": {
+      "mode": "joint",
+      "force_source": "work",
+      "axes": "all",
+      "force_sign": 1.0,
+      "angular_force_sign": -1.0,
+      "angular_axis_signs": [
+        1.0,
+        1.0,
+        -1.0
+      ],
+      "control_hz": 40.0,
+      "action_hz": 20.0,
+      "lowpass_alpha": 0.85,
+      "force_deadband_n": 0.3,
+      "torque_deadband_nm": 0.03,
+      "linear_gain_m_s_per_n": 0.0,
+      "angular_gain_rad_s_per_nm": 0.0,
+      "linear_damping_n_s_per_m": 0.0,
+      "angular_damping_nm_s_per_rad": 0.0,
+      "linear_compliance_m_per_n": 0.004,
+      "angular_compliance_rad_per_nm": 0.04,
+      "max_linear_velocity_m_s": 0.04,
+      "max_angular_velocity_rad_s": 0.15,
+      "max_linear_offset_m": 0.05,
+      "max_angular_offset_rad": 0.4,
+      "return_rate_s": 0.35,
+      "trajectory_mode": 0,
+      "radio": 0,
+      "hard_stop_force_n": 50.0,
+      "hard_stop_torque_nm": 10.0,
+      "max_command_joint_step_deg": 20.0
+    }
+  }
+}

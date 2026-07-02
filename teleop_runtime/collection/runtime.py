@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable
 from ..session import SessionStepResult
 from .async_writer import AsyncWriterPool, WriteJob
 from .build_collect_components import CollectorComponents
-from .observers import CollectionWriterObserver
+from .observers import CollectionWriterObserver, CollectionWriterObserverConfig
 
 SampleBuilder = Callable[[SessionStepResult, CollectorComponents], Any | None]
 WritePlanner = Callable[[Any, CollectorComponents], Iterable[WriteJob]]
@@ -30,6 +30,7 @@ class CollectionRuntime:
         write_planner: WritePlanner,
         writer_pool: AsyncWriterPool,
         config: CollectionRuntimeConfig | None = None,
+        writer_observer_config: CollectionWriterObserverConfig | None = None,
     ):
         self.components = components
         self.sample_builder = sample_builder
@@ -41,6 +42,7 @@ class CollectionRuntime:
             sample_builder=self.sample_builder,
             write_planner=self.write_planner,
             writer_pool=self.writer_pool,
+            config=writer_observer_config,
         )
         self._started = False
 
@@ -87,7 +89,7 @@ class CollectionRuntime:
             if self.config.flush_on_close:
                 self.flush()
         finally:
-            self.writer_pool.close(wait=False if not self.config.flush_on_close else True)
+            self.writer_observer.close(flush=False if not self.config.flush_on_close else True)
             self.components.session.close()
             self._started = False
 

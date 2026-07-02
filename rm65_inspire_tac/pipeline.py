@@ -240,6 +240,14 @@ def _load_hand_proxy_boxes(urdf_path: Path) -> tuple[HandProxyBoxSpec, ...]:
     )
 
 
+def _load_link3_proxy_boxes(urdf_path: Path) -> tuple[HandProxyBoxSpec, ...]:
+    root = ET.parse(urdf_path).getroot()
+    return (
+        _build_hand_proxy_spec(root, link_name="arm_link3_proxy", side="left"),
+        _build_hand_proxy_spec(root, link_name="right_arm_link3_proxy", side="right"),
+    )
+
+
 def _load_fixed_scene_box(urdf_path: Path, *, link_name: str) -> FixedSceneBoxSpec:
     root = ET.parse(urdf_path).getroot()
     return _build_fixed_scene_box_spec(root, link_name=link_name)
@@ -251,14 +259,14 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
         left_links = (
             "arm_link1_0",
             "arm_link2_0",
-            "arm_link3_0",
+            "arm_link3_proxy_0",
             "arm_link4_0",
             "arm_link5_0",
         )
         right_links = (
             "right_arm_link1_0",
             "right_arm_link2_0",
-            "right_arm_link3_0",
+            "right_arm_link3_proxy_0",
             "right_arm_link4_0",
             "right_arm_link5_0",
         )
@@ -279,11 +287,14 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
     if name == "dual_arm_hand_proxy_open":
         urdf_path = asset_dir / "rm65_dual_arm_hand_proxy_open.urdf"
         hand_proxy_boxes = _load_hand_proxy_boxes(urdf_path)
+        link3_proxy_boxes = _load_link3_proxy_boxes(urdf_path)
+        profile_proxy_boxes = (*hand_proxy_boxes, *link3_proxy_boxes)
         camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="camera_pole")
+        table_box = _load_fixed_scene_box(urdf_path, link_name="table")
         left_links = (
             "arm_link1_0",
             "arm_link2_0",
-            "arm_link3_0",
+            "arm_link3_proxy_0",
             "arm_link4_0",
             "arm_link5_0",
             "left_hand_proxy_0",
@@ -291,7 +302,7 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
         right_links = (
             "right_arm_link1_0",
             "right_arm_link2_0",
-            "right_arm_link3_0",
+            "right_arm_link3_proxy_0",
             "right_arm_link4_0",
             "right_arm_link5_0",
             "right_hand_proxy_0",
@@ -308,11 +319,43 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             (spec.geometry_name, camera_pole_box.geometry_name) for spec in hand_proxy_boxes
         )
         collision_pairs.extend(
+            (spec.geometry_name, table_box.geometry_name) for spec in hand_proxy_boxes
+        )
+        collision_pairs.extend(
+            (
+                ("arm_link3_proxy_0", table_box.geometry_name),
+                ("right_arm_link3_proxy_0", table_box.geometry_name),
+            )
+        )
+        collision_pairs.extend(
             (
                 ("arm_link2_0", camera_pole_box.geometry_name),
                 ("right_arm_link2_0", camera_pole_box.geometry_name),
             )
         )
+        disabled_geometries = {
+            "arm_link1_0",
+            "right_arm_link1_0",
+            "arm_link2_0",
+            "right_arm_link2_0",
+            "arm_link3_0",
+            "right_arm_link3_0",
+            "arm_link4_0",
+            "right_arm_link4_0",
+            "arm_link5_0",
+            "right_arm_link5_0",
+        }
+        disabled_pairs = {
+            frozenset(("arm_link5_0", camera_pole_box.geometry_name)),
+            frozenset(("right_arm_link5_0", camera_pole_box.geometry_name)),
+        }
+        collision_pairs = [
+            pair
+            for pair in collision_pairs
+            if pair[0] not in disabled_geometries
+            and pair[1] not in disabled_geometries
+            and frozenset(pair) not in disabled_pairs
+        ]
         return DualArmSceneProfile(
             name=name,
             urdf_path=urdf_path,
@@ -320,8 +363,8 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             left_frame_name="arm_link6",
             right_frame_name="right_arm_link6",
             collision_pairs=tuple(collision_pairs),
-            hand_proxy_boxes=hand_proxy_boxes,
-            fixed_scene_boxes=(camera_pole_box,),
+            hand_proxy_boxes=profile_proxy_boxes,
+            fixed_scene_boxes=(camera_pole_box, table_box),
             left_pose_transform=_POSE_TRANSFORM_LEFT,
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="auto",

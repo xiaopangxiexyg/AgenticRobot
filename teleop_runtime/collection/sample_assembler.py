@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -12,6 +13,32 @@ from ..session import SessionStepResult
 from .action_record import collection_action_record_metadata
 from .build_collect_components import CollectorComponents
 from .video_frame import NearestFrameBuffer, VideoFrame
+
+_COMPACT_COMMAND_METADATA_KEYS = frozenset(
+    {
+        "arm_action_spec",
+        "arm_controlled_frame",
+        "arm_reference_frame",
+        "controlled_frame",
+        "frame_name",
+        "hand_action_spec",
+        "invert",
+        "output_dim",
+        "source_command_type",
+        "source_dim",
+        "source_q6",
+        "source_target_pose_base",
+        "source_target_pose_desk",
+        "source_target_pose_operator",
+        "source_value",
+        "target_pose_base",
+        "target_pose_controlled_frame",
+        "target_pose_desk",
+        "target_pose_operator",
+        "target_pose_tcp_base",
+        "tcp_frame",
+    }
+)
 
 
 def _nan_vector(length: int) -> np.ndarray:
@@ -32,6 +59,175 @@ def _copy_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_copy_value(item) for item in value)
     return value
+
+
+def _get_state_arg_names(get_state: Any) -> set[str]:
+    code = getattr(get_state, "__code__", None)
+    if code is None:
+        return set()
+    arg_count = int(getattr(code, "co_argcount", 0) or 0) + int(
+        getattr(code, "co_kwonlyargcount", 0) or 0
+    )
+    return {str(name) for name in code.co_varnames[:arg_count]}
+
+
+def _hand_backend_state_for_sample(
+    backend: Any,
+    *,
+    include_tactile_arrays: bool | None = None,
+    copy_tactile_arrays: bool | None = None,
+) -> dict[str, Any]:
+    get_state = getattr(backend, "get_state")
+    arg_names = _get_state_arg_names(get_state)
+    kwargs: dict[str, Any] = {}
+    if include_tactile_arrays is not None and "include_tactile_arrays" in arg_names:
+        kwargs["include_tactile_arrays"] = bool(include_tactile_arrays)
+    if copy_tactile_arrays is not None and "copy_tactile_arrays" in arg_names:
+        kwargs["copy_tactile_arrays"] = bool(copy_tactile_arrays)
+    if "include_tactile_vector" in arg_names:
+        kwargs["include_tactile_vector"] = False
+    return dict(get_state(**kwargs))
+
+
+def _backend_supports_tactile_array_filter(backend: Any) -> bool:
+    get_state = getattr(backend, "get_state", None)
+    if get_state is None:
+        return False
+    return "include_tactile_arrays" in _get_state_arg_names(get_state)
+
+
+def _tactile_snapshot_key(state: Mapping[str, Any]) -> tuple[str, Any] | None:
+    version = state.get("tactile_version")
+    if version is not None:
+        return ("version", version)
+    frame_ids = state.get("tactile_frame_ids")
+    if isinstance(frame_ids, Mapping) and frame_ids:
+        return (
+            "frame_ids",
+            tuple(sorted((str(key), value) for key, value in frame_ids.items())),
+        )
+    timestamp = state.get("tactile_timestamp")
+    if timestamp is not None:
+        return ("timestamp", timestamp)
+    return None
+
+
+def _state_has_tactile_metadata(state: Mapping[str, Any]) -> bool:
+    return (
+        state.get("tactile_timestamp") is not None
+        or bool(state.get("tactile_devices"))
+        or bool(state.get("tactile_frame_ids"))
+        or bool(state.get("tactile_shapes"))
+    )
+
+
+def _state_has_tactile_arrays(state: Mapping[str, Any]) -> bool:
+    tactile_dict = state.get("tactile_dict")
+    if isinstance(tactile_dict, Mapping) and bool(tactile_dict):
+        return True
+    tactile = state.get("tactile")
+    if tactile is None:
+        return False
+    try:
+        return np.asarray(tactile).size > 0
+    except Exception:
+        return True
+
+
+def _camera_debug_snapshot(
+    *,
+    sample_timestamp: float,
+    camera_frames: Mapping[str, VideoFrame | None] | None,
+) -> dict[str, Any]:
+    if not camera_frames:
+        return {}
+    debug: dict[str, Any] = {}
+    for camera_key, frame in camera_frames.items():
+        name = str(camera_key)
+        if frame is None:
+            debug[name] = {"missing": True}
+            continue
+        source_timestamp = float(frame.source_timestamp)
+        receive_timestamp = (
+            None if frame.receive_timestamp is None else float(frame.receive_timestamp)
+        )
+        debug[name] = {
+            "missing": False,
+            "frame_index": frame.frame_index,
+            "source_timestamp": source_timestamp,
+            "receive_timestamp": receive_timestamp,
+            "source_age_sec": float(sample_timestamp - source_timestamp),
+            "receive_age_sec": (
+                None
+                if receive_timestamp is None
+                else float(sample_timestamp - receive_timestamp)
+            ),
+        }
+    return debug
+
+
+def _hand_debug_snapshot(
+    *,
+    sample_timestamp: float,
+    hand_states: Mapping[str, Mapping[str, Any] | None],
+) -> dict[str, Any]:
+    debug: dict[str, Any] = {}
+    for side, state in hand_states.items():
+        hand_state = state or {}
+        frame_ids = hand_state.get("tactile_frame_ids", {})
+        timings = hand_state.get("tactile_timings_ms", {})
+        cpu_affinity_value = hand_state.get("tactile_process_cpu_affinity")
+        if cpu_affinity_value is None:
+            cpu_affinity = []
+        else:
+            try:
+                cpu_affinity = list(cpu_affinity_value)
+            except TypeError:
+                cpu_affinity = [cpu_affinity_value]
+
+        def age(timestamp: Any) -> float | None:
+            if timestamp is None:
+                return None
+            try:
+                return float(sample_timestamp - float(timestamp))
+            except (TypeError, ValueError):
+                return None
+
+        debug[str(side)] = {
+            "joint_age_sec": age(hand_state.get("joint_timestamp")),
+            "tactile_age_sec": age(hand_state.get("tactile_timestamp")),
+            "telemetry_age_sec": age(hand_state.get("telemetry_timestamp")),
+            "gripper_read_elapsed_s": hand_state.get("gripper_read_elapsed_s"),
+            "tactile_read_elapsed_s": hand_state.get("tactile_read_elapsed_s"),
+            "tactile_gate_wait_s": hand_state.get("tactile_gate_wait_s"),
+            "telemetry_elapsed_s": hand_state.get("telemetry_elapsed_s"),
+            "tactile_version": hand_state.get("tactile_version"),
+            "tactile_devices": list(hand_state.get("tactile_devices", ())),
+            "tactile_frame_ids": dict(frame_ids) if isinstance(frame_ids, Mapping) else {},
+            "tactile_timings_ms": dict(timings) if isinstance(timings, Mapping) else {},
+            "tactile_read_hz": hand_state.get("tactile_read_hz"),
+            "tactile_read_skipped": hand_state.get("tactile_read_skipped"),
+            "tactile_process_read": hand_state.get("tactile_process_read"),
+            "tactile_process_nice": hand_state.get("tactile_process_nice"),
+            "tactile_process_cpu_affinity": cpu_affinity,
+            "tactile_process_queue_size": hand_state.get("tactile_process_queue_size"),
+            "tactile_worker_alive": hand_state.get("tactile_worker_alive"),
+            "tactile_worker_receiver_alive": hand_state.get("tactile_worker_receiver_alive"),
+            "tactile_parallel_read": hand_state.get("tactile_parallel_read"),
+            "tactile_global_read_lock": hand_state.get("tactile_global_read_lock"),
+            "telemetry_error": hand_state.get("telemetry_error"),
+        }
+    return debug
+
+
+def _compact_command_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    return {
+        str(key): _to_serializable(value)
+        for key, value in metadata.items()
+        if str(key) in _COMPACT_COMMAND_METADATA_KEYS
+    }
 
 
 def _vector_or_nan(value: Any, *, length: int) -> np.ndarray:
@@ -150,6 +346,8 @@ class CollectorSampleBuilderConfig:
     episode_index: int = 0
     frame_index_start: int = 0
     sample_index_start: int = 0
+    include_debug_metadata: bool = False
+    tactile_array_snapshot_policy: str = "on_change"
 
     def __post_init__(self) -> None:
         self.active_sides = tuple(str(side) for side in self.active_sides)
@@ -162,6 +360,11 @@ class CollectorSampleBuilderConfig:
         self.camera_buffers = {
             str(camera_key): buffer for camera_key, buffer in dict(self.camera_buffers).items()
         }
+        self.include_debug_metadata = bool(self.include_debug_metadata)
+        policy = str(self.tactile_array_snapshot_policy).strip().lower().replace("-", "_")
+        if policy not in {"always", "on_change", "never"}:
+            raise ValueError("tactile_array_snapshot_policy must be always, on_change, or never.")
+        self.tactile_array_snapshot_policy = policy
 
 
 class SampleAssembler:
@@ -303,9 +506,11 @@ class CollectorSampleBuilder:
             SampleAssemblerConfig(active_sides=self.config.active_sides)
         )
         self.metadata_builder = metadata_builder
+        self.include_debug_metadata = bool(self.config.include_debug_metadata)
         self._episode_index = int(self.config.episode_index)
         self._frame_index = int(self.config.frame_index_start)
         self._sample_index = int(self.config.sample_index_start)
+        self._last_tactile_snapshot_key_by_side: dict[str, tuple[str, Any] | None] = {}
 
     @property
     def episode_index(self) -> int:
@@ -322,12 +527,14 @@ class CollectorSampleBuilder:
     def next_episode(self) -> int:
         self._episode_index += 1
         self._frame_index = 0
+        self._last_tactile_snapshot_key_by_side.clear()
         return int(self._episode_index)
 
     def set_episode(self, episode_index: int) -> None:
         self._episode_index = int(episode_index)
         self._frame_index = 0
         self.assembler.reset_last_action()
+        self._last_tactile_snapshot_key_by_side.clear()
 
     def _snapshot_arm_states(self, components: CollectorComponents) -> dict[str, dict[str, Any]]:
         states: dict[str, dict[str, Any]] = {}
@@ -361,8 +568,36 @@ class CollectorSampleBuilder:
             if backend is None or not hasattr(backend, "get_state"):
                 states[side] = {}
                 continue
-            states[side] = dict(getattr(backend, "get_state")())
+            states[side] = self._snapshot_hand_state(side, backend)
         return states
+
+    def _snapshot_hand_state(self, side: str, backend: Any) -> dict[str, Any]:
+        policy = str(self.config.tactile_array_snapshot_policy)
+        if policy == "always" or not _backend_supports_tactile_array_filter(backend):
+            return _hand_backend_state_for_sample(backend, copy_tactile_arrays=False)
+        if policy == "never":
+            return _hand_backend_state_for_sample(backend, include_tactile_arrays=False)
+
+        light_state = _hand_backend_state_for_sample(
+            backend,
+            include_tactile_arrays=False,
+            copy_tactile_arrays=False,
+        )
+        snapshot_key = _tactile_snapshot_key(light_state)
+        if snapshot_key is None or not _state_has_tactile_metadata(light_state):
+            return light_state
+        if self._last_tactile_snapshot_key_by_side.get(side) == snapshot_key:
+            return light_state
+
+        full_state = _hand_backend_state_for_sample(
+            backend,
+            include_tactile_arrays=True,
+            copy_tactile_arrays=False,
+        )
+        if _state_has_tactile_arrays(full_state):
+            self._last_tactile_snapshot_key_by_side[side] = snapshot_key
+            return full_state
+        return light_state
 
     def _snapshot_camera_frames(self, timestamp: float) -> dict[str, VideoFrame | None]:
         frames: dict[str, VideoFrame | None] = {}
@@ -377,14 +612,28 @@ class CollectorSampleBuilder:
         _arm_states: Mapping[str, Any],
         _hand_states: Mapping[str, Any],
         camera_frames: Mapping[str, VideoFrame | None],
+        *,
+        include_debug_metadata: bool = False,
     ) -> dict[str, Any]:
         command = step_result.command
-        command_metadata = {} if command is None else _to_serializable(command.metadata)
+        command_metadata = (
+            {}
+            if command is None
+            else (
+                _to_serializable(command.metadata)
+                if include_debug_metadata
+                else _compact_command_metadata(command.metadata)
+            )
+        )
         command_metadata_by_effector = (
             {}
             if command is None
             else {
-                effector_name: _to_serializable(effector_command.metadata)
+                effector_name: (
+                    _to_serializable(effector_command.metadata)
+                    if include_debug_metadata
+                    else _compact_command_metadata(effector_command.metadata)
+                )
                 for effector_name, effector_command in command.commands.items()
             }
         )
@@ -398,11 +647,15 @@ class CollectorSampleBuilder:
                 "valid": bool(channel.valid),
                 "sender_timestamp": channel.metadata.get("sender_timestamp"),
                 "receiver_timestamp": channel.metadata.get("receiver_timestamp"),
+                "sender_read_elapsed_ms": channel.metadata.get("sender_read_elapsed_ms"),
             }
             for channel_name, channel in step_result.channels.items()
         }
         return {
-            "canonical_action_record": collection_action_record_metadata(step_result),
+            "canonical_action_record": collection_action_record_metadata(
+                step_result,
+                include_debug_metadata=include_debug_metadata,
+            ),
             "command_metadata": command_metadata,
             "command_metadata_by_effector": command_metadata_by_effector,
             "channel_metadata": channel_metadata,
@@ -414,21 +667,49 @@ class CollectorSampleBuilder:
         step_result: SessionStepResult,
         components: CollectorComponents,
     ) -> CollectorSample:
+        timing_started = time.perf_counter()
         arm_states = self._snapshot_arm_states(components)
+        arm_snapshot_s = time.perf_counter() - timing_started
+        timing_started = time.perf_counter()
         hand_states = self._snapshot_hand_states(components)
+        hand_snapshot_s = time.perf_counter() - timing_started
+        timing_started = time.perf_counter()
         camera_frames = self._snapshot_camera_frames(float(step_result.timestamp))
-        metadata_builder = (
-            self.metadata_builder
-            if self.metadata_builder is not None
-            else self._default_metadata
-        )
-        metadata = metadata_builder(
-            step_result,
-            components,
-            arm_states,
-            hand_states,
-            camera_frames,
-        )
+        camera_snapshot_s = time.perf_counter() - timing_started
+        timing_started = time.perf_counter()
+        if self.metadata_builder is None:
+            metadata = self._default_metadata(
+                step_result,
+                components,
+                arm_states,
+                hand_states,
+                camera_frames,
+                include_debug_metadata=bool(self.include_debug_metadata),
+            )
+        else:
+            metadata = self.metadata_builder(
+                step_result,
+                components,
+                arm_states,
+                hand_states,
+                camera_frames,
+            )
+        metadata = {} if metadata is None else dict(metadata)
+        metadata["sample_builder_debug"] = {
+            "arm_snapshot_s": float(arm_snapshot_s),
+            "hand_snapshot_s": float(hand_snapshot_s),
+            "camera_snapshot_s": float(camera_snapshot_s),
+            "metadata_build_s": float(time.perf_counter() - timing_started),
+            "camera_frames": _camera_debug_snapshot(
+                sample_timestamp=float(step_result.timestamp),
+                camera_frames=camera_frames,
+            ),
+            "hand_states": _hand_debug_snapshot(
+                sample_timestamp=float(step_result.timestamp),
+                hand_states=hand_states,
+            ),
+        }
+        timing_started = time.perf_counter()
         sample = self.assembler.build_sample(
             step_result=step_result,
             arm_states=arm_states,
@@ -438,6 +719,9 @@ class CollectorSampleBuilder:
             episode_index=self._episode_index,
             frame_index=self._frame_index,
             metadata=metadata,
+        )
+        sample.metadata.setdefault("sample_builder_debug", {})["build_sample_s"] = float(
+            time.perf_counter() - timing_started
         )
         self._sample_index += 1
         self._frame_index += 1

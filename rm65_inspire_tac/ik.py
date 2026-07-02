@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -67,6 +68,9 @@ class SingleArmIKSolver:
         )
         self.last_branch_selection = "original"
         self.last_branch_distance_score_deg = 0.0
+        self.last_solve_iterations = 0
+        self.last_solve_converged = False
+        self.last_solve_deadline_exceeded = False
 
     def compute_pose(self, qpos: np.ndarray) -> np.ndarray:
         qpos = np.asarray(qpos, dtype=float)
@@ -158,21 +162,37 @@ class SingleArmIKSolver:
         max_joint_step: float | np.ndarray = 0.1,
         damping: float = 0.1,
         tolerance: float = 1e-4,
+        deadline_monotonic: float | None = None,
+        max_wall_time_sec: float | None = None,
     ) -> np.ndarray:
         target_pose = _to_pose_matrix(target_pose)
+        start_time = time.perf_counter()
+        deadline = _solver_deadline(
+            started_at=start_time,
+            deadline_monotonic=deadline_monotonic,
+            max_wall_time_sec=max_wall_time_sec,
+        )
         reference_q = (
             np.zeros(self.num_dofs, dtype=float)
             if q_init is None
             else np.asarray(q_init, dtype=float)
         )
         q = reference_q.copy()
+        self.last_solve_iterations = 0
+        self.last_solve_converged = False
+        self.last_solve_deadline_exceeded = False
 
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
+            if _deadline_exceeded(deadline):
+                self.last_solve_deadline_exceeded = True
+                break
             current_pose = self.compute_pose(q)
             pos_err = target_pose[:3, 3] - current_pose[:3, 3]
             rot_err = self.pin.log3(target_pose[:3, :3] @ current_pose[:3, :3].T)
             error = np.concatenate([pos_err, rot_err])
+            self.last_solve_iterations = iteration + 1
             if np.linalg.norm(error) < tolerance:
+                self.last_solve_converged = True
                 break
             q = self._solve_step_raw(
                 target_pose=target_pose,
@@ -180,6 +200,9 @@ class SingleArmIKSolver:
                 max_joint_step=max_joint_step,
                 damping=damping,
             )
+            if _deadline_exceeded(deadline):
+                self.last_solve_deadline_exceeded = True
+                break
         return self._normalize_branch(candidate_qpos=q, reference_qpos=reference_q)
 
     def _normalize_branch(
@@ -222,3 +245,29 @@ class SingleArmIKSolver:
             joint_distance_weights=self._joint_distance_weights,
         )
         return np.asarray(best, dtype=float).copy()
+
+
+def _solver_deadline(
+    *,
+    started_at: float,
+    deadline_monotonic: float | None,
+    max_wall_time_sec: float | None,
+) -> float | None:
+    deadlines: list[float] = []
+    try:
+        deadline = float(deadline_monotonic)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    if np.isfinite(deadline) and deadline > 0.0:
+        deadlines.append(deadline)
+    try:
+        max_wall = float(max_wall_time_sec)
+    except (TypeError, ValueError):
+        max_wall = 0.0
+    if np.isfinite(max_wall) and max_wall > 0.0:
+        deadlines.append(float(started_at) + max_wall)
+    return min(deadlines) if deadlines else None
+
+
+def _deadline_exceeded(deadline: float | None) -> bool:
+    return deadline is not None and time.perf_counter() >= float(deadline)

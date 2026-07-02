@@ -1,0 +1,20 @@
+{
+  "format": "vive_rm65_real_teleop_tasks",
+  "version": 1,
+  "tasks": [
+    {
+      "key": "soft_grasp",
+      "english_name": "Soft Grasp",
+      "chinese_name": "轻柔抓取",
+      "description": "Low force DMTAC gripper setting for fragile objects.",
+      "gripper_task": "soft_grasp"
+    },
+    {
+      "key": "firm_grasp",
+      "english_name": "Firm Grasp",
+      "chinese_name": "稳定抓取",
+      "description": "Higher force DMTAC gripper setting for rigid objects.",
+      "gripper_task": "firm_grasp"
+    }
+  ]
+}

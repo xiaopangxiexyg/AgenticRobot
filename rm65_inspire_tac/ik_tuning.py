@@ -28,8 +28,13 @@ class BranchNormalizationConfig:
 @dataclass(frozen=True)
 class JumpGateConfig:
     enabled: bool = True
+    hard_branch_joint_indices: tuple[int, ...] = (0, 1, 2)
+    hard_branch_max_delta_deg: tuple[float, ...] = (90.0, 90.0, 90.0)
     small_pose_translation_m: float = 0.05
     small_pose_rotation_deg: float = 5.0
+    moderate_pose_translation_m: float = 0.08
+    moderate_pose_rotation_deg: float = 12.0
+    moderate_pose_joint_jump_scale: float = 1.25
     per_joint_jump_deg: tuple[float, ...] = (15.0, 15.0, 18.0, 25.0, 30.0, 45.0)
     weighted_jump_threshold_deg: float = 35.0
     relaxed_per_joint_jump_deg: tuple[float, ...] = (25.0, 25.0, 30.0, 40.0, 50.0, 70.0)
@@ -96,6 +101,9 @@ def ik_tuning_from_dict(payload: dict[str, Any], *, source_path: str | None = No
     branch_payload = payload.get("branch_normalization", {})
     jump_payload = payload.get("jump_gate", {})
     recovery_payload = payload.get("dual_arm_recovery", {})
+    hard_branch_joint_indices = tuple(
+        int(value) for value in jump_payload.get("hard_branch_joint_indices", (0, 1, 2))
+    )
 
     return RM65IKTuningConfig(
         ik_objective_mode=str(payload.get("ik_objective_mode", "orientation_priority")),
@@ -110,8 +118,18 @@ def ik_tuning_from_dict(payload: dict[str, Any], *, source_path: str | None = No
         ),
         jump_gate=JumpGateConfig(
             enabled=bool(jump_payload.get("enabled", True)),
+            hard_branch_joint_indices=hard_branch_joint_indices,
+            hard_branch_max_delta_deg=_ensure_tuple_of_floats(
+                jump_payload.get("hard_branch_max_delta_deg", (90.0, 90.0, 90.0)),
+                expected_len=len(hard_branch_joint_indices),
+            ),
             small_pose_translation_m=float(jump_payload.get("small_pose_translation_m", 0.05)),
             small_pose_rotation_deg=float(jump_payload.get("small_pose_rotation_deg", 5.0)),
+            moderate_pose_translation_m=float(jump_payload.get("moderate_pose_translation_m", 0.08)),
+            moderate_pose_rotation_deg=float(jump_payload.get("moderate_pose_rotation_deg", 12.0)),
+            moderate_pose_joint_jump_scale=float(
+                jump_payload.get("moderate_pose_joint_jump_scale", 1.25)
+            ),
             per_joint_jump_deg=_ensure_tuple_of_floats(
                 jump_payload.get("per_joint_jump_deg", (15.0, 15.0, 18.0, 25.0, 30.0, 45.0)),
                 expected_len=6,
@@ -274,6 +292,27 @@ def joint_jump_exceeds(
         or weighted_score > float(weighted_jump_threshold_deg)
     )
     return exceeds, delta_deg, weighted_score
+
+
+def hard_branch_jump_exceeds(
+    *,
+    reference_q: np.ndarray,
+    candidate_q: np.ndarray,
+    joint_indices: tuple[int, ...] | list[int],
+    max_delta_deg: tuple[float, ...] | list[float],
+) -> tuple[bool, np.ndarray]:
+    reference = np.asarray(reference_q, dtype=float).reshape(-1)
+    candidate = np.asarray(candidate_q, dtype=float).reshape(-1)
+    indices = tuple(int(index) for index in joint_indices)
+    limits = np.asarray(max_delta_deg, dtype=float).reshape(-1)
+    if reference.shape != candidate.shape:
+        raise ValueError("reference_q and candidate_q must share the same shape.")
+    if limits.shape != (len(indices),):
+        raise ValueError("max_delta_deg must match joint_indices.")
+    if any(index < 0 or index >= reference.shape[0] for index in indices):
+        raise ValueError("hard branch joint index out of range.")
+    deltas = np.rad2deg(np.abs(candidate[list(indices)] - reference[list(indices)]))
+    return bool(np.any(deltas > limits)), deltas
 
 
 def pose_delta_metrics(reference_pose: np.ndarray, target_pose: np.ndarray) -> tuple[float, float]:

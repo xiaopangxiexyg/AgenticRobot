@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import numpy as np
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from ..backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from ..backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from ..calibration import TeleopCalibration
 from ..hand_tcp_alignment import (
@@ -24,7 +23,12 @@ from ..retargeters import (
     JointsToDexHandRetargeterConfig,
     PoseToArmRetargeter,
     PoseToArmRetargeterConfig,
+    ScalarToGripperRetargeter,
+    ScalarToGripperRetargeterConfig,
 )
+from ..interfaces import EffectorBackend
+from .q6_hardware import load_latest_q6_ports
+from .pose_smoothing import build_bimanual_pose_smoother, load_default_pose_smoothing_config
 
 
 def default_vive_tracker_configs(
@@ -63,6 +67,54 @@ def default_vive_tracker_configs(
     return configs
 
 
+HandBackendConfig = InspireTacHandBackendConfig | DMTacGripperBackendConfig
+
+
+def _build_hand_backend(config: HandBackendConfig) -> EffectorBackend:
+    if isinstance(config, DMTacGripperBackendConfig):
+        return DMTacGripperBackend(config)
+    if isinstance(config, InspireTacHandBackendConfig):
+        return InspireTacHandBackend(config)
+    raise TypeError(f"Unsupported hand backend config: {type(config).__name__}")
+
+
+def _hand_effector_name(
+    config: HandBackendConfig | None,
+    *,
+    side: str,
+) -> str:
+    if config is not None and config.effector_name is not None:
+        return str(config.effector_name)
+    return f"{side}_hand"
+
+
+def _build_hand_retargeter(
+    config: HandBackendConfig | None,
+    *,
+    side: str,
+    input_channel_name: str,
+):
+    effector_name = _hand_effector_name(config, side=side)
+    if isinstance(config, DMTacGripperBackendConfig):
+        return ScalarToGripperRetargeter(
+            ScalarToGripperRetargeterConfig(
+                side=side,
+                input_channel_name=input_channel_name,
+                effector_name=effector_name,
+                source_dim=2,
+                output_dim=1,
+                output_max=float(config.max_action),
+            )
+        )
+    return JointsToDexHandRetargeter(
+        JointsToDexHandRetargeterConfig(
+            side=side,
+            input_channel_name=input_channel_name,
+            effector_name=effector_name,
+        )
+    )
+
+
 def build_bimanual_session(
     *,
     calibration: TeleopCalibration,
@@ -73,8 +125,10 @@ def build_bimanual_session(
     right_hand_serial_port: str | None = None,
     left_arm_backend_config: RM65ArmBackendConfig | None = None,
     right_arm_backend_config: RM65ArmBackendConfig | None = None,
-    left_hand_backend_config: InspireTacHandBackendConfig | None = None,
-    right_hand_backend_config: InspireTacHandBackendConfig | None = None,
+    left_hand_backend_config: HandBackendConfig | None = None,
+    right_hand_backend_config: HandBackendConfig | None = None,
+    hand_serial_config: str = "latest",
+    load_default_hand_serial_ports: bool = True,
     keyboard_source: KeyboardButtonSource | None = None,
     enable_dual_arm_collision_avoidance: bool = True,
     dual_arm_collision_config: DualArmCollisionAwareRetargeterConfig | None = None,
@@ -88,6 +142,21 @@ def build_bimanual_session(
     sources = []
     retargeters = []
     backends = {}
+
+    if bool(load_default_hand_serial_ports):
+        missing_hand_sides = []
+        if left_hand_serial_port is None and left_hand_backend_config is not None:
+            missing_hand_sides.append("left")
+        if right_hand_serial_port is None and right_hand_backend_config is not None:
+            missing_hand_sides.append("right")
+        if missing_hand_sides:
+            default_ports = load_latest_q6_ports(
+                active_sides=tuple(missing_hand_sides),
+                config=hand_serial_config,
+                allow_missing=True,
+            )
+            left_hand_serial_port = left_hand_serial_port or default_ports.get("left")
+            right_hand_serial_port = right_hand_serial_port or default_ports.get("right")
 
     vive_source = VivePoseSource(
         tracker_configs=vive_tracker_configs or default_vive_tracker_configs(),
@@ -172,6 +241,9 @@ def build_bimanual_session(
                     if right_arm_backend_config is None
                     else right_arm_backend_config.tcp_pose_flange_m_rad
                 ),
+                target_pose_smoother=build_bimanual_pose_smoother(
+                    load_default_pose_smoothing_config()
+                ),
             )
         )
         retargeters.append(
@@ -194,22 +266,18 @@ def build_bimanual_session(
 
     if left_hand_serial_port is not None:
         retargeters.append(
-            JointsToDexHandRetargeter(
-                JointsToDexHandRetargeterConfig(
-                    side="left",
-                    input_channel_name="left_hand_q6",
-                    effector_name="left_hand",
-                )
+            _build_hand_retargeter(
+                left_hand_backend_config,
+                side="left",
+                input_channel_name="left_hand_q6",
             )
         )
     if right_hand_serial_port is not None:
         retargeters.append(
-            JointsToDexHandRetargeter(
-                JointsToDexHandRetargeterConfig(
-                    side="right",
-                    input_channel_name="right_hand_q6",
-                    effector_name="right_hand",
-                )
+            _build_hand_retargeter(
+                right_hand_backend_config,
+                side="right",
+                input_channel_name="right_hand_q6",
             )
         )
 
@@ -218,9 +286,11 @@ def build_bimanual_session(
     if right_arm_backend_config is not None:
         backends["right_arm"] = RM65ArmBackend(right_arm_backend_config)
     if left_hand_backend_config is not None:
-        backends["left_hand"] = InspireTacHandBackend(left_hand_backend_config)
+        left_backend = _build_hand_backend(left_hand_backend_config)
+        backends[left_backend.name] = left_backend
     if right_hand_backend_config is not None:
-        backends["right_hand"] = InspireTacHandBackend(right_hand_backend_config)
+        right_backend = _build_hand_backend(right_hand_backend_config)
+        backends[right_backend.name] = right_backend
 
     rig = BimanualRig(backends=backends)
     return TeleopSession(
