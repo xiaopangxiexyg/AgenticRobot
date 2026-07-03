@@ -23,9 +23,11 @@ from rm65_inspire_tac.paths import require_asset_path
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DMTAC_TACTILE_FIELDS,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
     GRIPPER_ACTION_MAX,
+    normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
@@ -33,6 +35,7 @@ from ..backends.hands import (
     InspireTacHandBackendConfig,
 )
 from ..calibration import TeleopCalibration
+from ..cameras import build_camera_registry_snapshot, load_camera_registry
 from ..configs import build_annotated_dual_rm65_calibration
 from ..configs.dmtac_hardware import (
     dmtac_backend_configs_from_assignment,
@@ -48,6 +51,8 @@ from ..hand_tcp_alignment import (
     vive_tracker_local_translation_offset_from_args,
 )
 from ..retargeters import (
+    DEFAULT_GRIPPER_INPUT_MAX,
+    DEFAULT_GRIPPER_INPUT_MIN,
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
     FixedArmRetargeter,
@@ -97,6 +102,7 @@ from ..tactile_visualizer import (
     tactile_by_side_from_hand_states,
 )
 from ..transforms import as_pose_matrix, interpolate_pose
+from .arm_state_polling import ArmHardwareStatePoller, ArmHardwareStatePollerConfig
 from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
 from .camera_preview import CameraPreviewConfig, CameraPreviewer
@@ -135,6 +141,9 @@ from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 DEFAULT_CAMERA_CONFIG_PATH = (
     Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
 )
+DEFAULT_CAMERA_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[1] / "configs" / "cameras" / "realsense_registry.json"
+)
 DEFAULT_DATASET_ROOT = default_dataset_root()
 DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
 _CALIBRATION_PROFILE_TIMESTAMP_RE = re.compile(r"^(\d{8})_(\d{6})")
@@ -151,6 +160,8 @@ GRIPPER_POLICY_DEFAULTS = {
     "output_dim": 1,
     "invert": False,
     "alpha": 1.0,
+    "input_min": DEFAULT_GRIPPER_INPUT_MIN,
+    "input_max": DEFAULT_GRIPPER_INPUT_MAX,
     "speed": 0.2,
     "torque": 0.2,
     "max_action": GRIPPER_ACTION_MAX,
@@ -249,6 +260,13 @@ def _dmtac_worker_nice(text: str) -> int:
     if not 0 <= value <= 19:
         raise argparse.ArgumentTypeError("worker nice must be in [0, 19]")
     return value
+
+
+def _parse_dmtac_tactile_fields(text: str) -> tuple[str, ...]:
+    try:
+        return normalize_dmtac_tactile_fields(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_joint_order(text: str) -> tuple[int, ...]:
@@ -501,6 +519,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "output_dim": ("output_dim", "gripper_slot"),
         "invert": ("invert",),
         "alpha": ("alpha", "command_alpha"),
+        "input_min": ("input_min", "q6_min", "source_min"),
+        "input_max": ("input_max", "q6_max", "source_max"),
         "speed": ("speed",),
         "torque": ("torque", "force"),
         "max_action": ("max_action", "max_close"),
@@ -508,6 +528,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
+        "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
     for key, aliases in profile_keys.items():
         value = _profile_value(profile, *aliases)
@@ -519,6 +541,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "output_dim": getattr(args, "gripper_output_dim", None),
         "invert": getattr(args, "gripper_invert", None),
         "alpha": getattr(args, "gripper_alpha", None),
+        "input_min": getattr(args, "gripper_input_min", None),
+        "input_max": getattr(args, "gripper_input_max", None),
         "speed": getattr(args, "gripper_speed", None),
         "torque": getattr(args, "gripper_torque", None),
         "max_action": getattr(args, "gripper_max_action", None),
@@ -535,6 +559,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["output_dim"] = int(policy["output_dim"])
     policy["invert"] = bool(policy["invert"])
     policy["alpha"] = float(policy["alpha"])
+    policy["input_min"] = float(policy["input_min"])
+    policy["input_max"] = float(policy["input_max"])
     policy["speed"] = float(policy["speed"])
     policy["torque"] = float(policy["torque"])
     policy["max_action"] = float(policy["max_action"])
@@ -542,12 +568,18 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    if policy.get("tactile_fields") is not None:
+        policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
+    if policy.get("tactile_compute_profile") is not None:
+        policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if not 0 <= int(policy["source_dim"]) < 6:
         raise ValueError("gripper source_dim must be in [0, 5].")
     if not 0 <= int(policy["output_dim"]) < 6:
         raise ValueError("gripper output_dim must be in [0, 5].")
     if not 0.0 < float(policy["alpha"]) <= 1.0:
         raise ValueError("gripper alpha must be in (0, 1].")
+    if not 0.0 <= float(policy["input_min"]) < float(policy["input_max"]) <= 1.0:
+        raise ValueError("gripper input_min/input_max must satisfy 0 <= input_min < input_max <= 1.")
     if float(policy["send_threshold"]) < 0.0:
         raise ValueError("gripper send_threshold must be >= 0.")
     if float(policy["command_hz"]) <= 0.0:
@@ -627,9 +659,16 @@ def _apply_gripper_policy_to_dmtac_config(
     tactile_worker_queue_size = getattr(args, "dmtac_tactile_worker_queue_size", None)
     if tactile_worker_queue_size is not None:
         config.tactile_process_queue_size = int(tactile_worker_queue_size)
+    tactile_fields = getattr(args, "dmtac_tactile_fields", None)
+    if tactile_fields is None:
+        tactile_fields = policy.get("tactile_fields")
+    if tactile_fields is not None:
+        config.tactile_fields = normalize_dmtac_tactile_fields(tactile_fields)
     tactile_compute_profile = getattr(args, "dmtac_tactile_compute_profile", None)
     if tactile_compute_profile:
         config.tactile_compute_profile = str(tactile_compute_profile)
+    elif policy.get("tactile_compute_profile"):
+        config.tactile_compute_profile = str(policy["tactile_compute_profile"])
     tactile_max_fps = getattr(args, "dmtac_tactile_max_fps", None)
     if tactile_max_fps is not None:
         config.tactile_max_fps = int(tactile_max_fps)
@@ -1065,12 +1104,23 @@ def parse_args() -> argparse.Namespace:
         help="Allow left/right DMTAC tactile reads to overlap.",
     )
     parser.add_argument(
+        "--dmtac-tactile-fields",
+        type=_parse_dmtac_tactile_fields,
+        default=None,
+        metavar="FIELDS",
+        help=(
+            "DM-Tac fields to read/store, e.g. 'distributed_force' for the original path "
+            "or 'raw' for raw-image-only collection. Valid fields: "
+            + ", ".join(DMTAC_TACTILE_FIELDS)
+        ),
+    )
+    parser.add_argument(
         "--dmtac-tactile-compute-profile",
         choices=("dist-only", "legacy", "requested", "shear-depth"),
-        default="dist-only",
+        default=None,
         help=(
             "SDK compute channels for DMTAC distributed_force telemetry. dist-only is lowest latency; "
-            "legacy matches the old deformation/shear/depth/force setup."
+            "legacy matches the old deformation/shear/depth/force setup. Default follows backend config."
         ),
     )
     parser.add_argument(
@@ -1108,7 +1158,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional JSON profile with top-level gripper defaults and/or tasks.<name>.gripper "
             "overrides. It can set speed, force/torque, max_action, send_threshold, command_hz, "
-            "continuous_grasp, source_dim, output_dim, invert, alpha."
+            "continuous_grasp, source_dim, output_dim, invert, alpha, input_min, input_max."
         ),
     )
     parser.add_argument(
@@ -1122,6 +1172,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-invert", dest="gripper_invert", action="store_true", default=None)
     parser.add_argument("--gripper-no-invert", dest="gripper_invert", action="store_false")
     parser.add_argument("--gripper-alpha", type=_alpha_float, default=None, help="EMA alpha for 1D gripper command.")
+    parser.add_argument(
+        "--gripper-input-min",
+        type=float,
+        default=None,
+        help="Q6 value mapped to fully open gripper before optional inversion.",
+    )
+    parser.add_argument(
+        "--gripper-input-max",
+        type=float,
+        default=None,
+        help="Q6 value mapped to fully closed gripper before optional inversion.",
+    )
     parser.add_argument("--gripper-speed", type=float, default=None, help="Gripper move speed for this task.")
     parser.add_argument(
         "--gripper-torque",
@@ -1345,6 +1407,15 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_CAMERA_CONFIG_PATH),
         help="JSON config for RealSense RGB cameras.",
     )
+    parser.add_argument(
+        "--camera-registry",
+        type=str,
+        default=str(DEFAULT_CAMERA_REGISTRY_PATH),
+        help=(
+            "Project-level camera registry with profile intrinsics and URDF frame placements. "
+            "Use an empty string to disable registry snapshots."
+        ),
+    )
     parser.add_argument("--no-camera", action="store_true", help="Disable camera startup and video export.")
     parser.add_argument(
         "--vis_cam",
@@ -1380,6 +1451,38 @@ def parse_args() -> argparse.Namespace:
         type=_positive_float,
         default=None,
         help="Dataset nominal fps metadata. Defaults to --hz so recorded metadata matches the collection rate.",
+    )
+    parser.add_argument(
+        "--record-actual-wrist-camera-pose",
+        "--record-actual-wrist-pose",
+        dest="record_actual_wrist_camera_pose",
+        action="store_true",
+        default=True,
+        help=(
+            "Annotate each dataset frame with the latest background-polled RM65 feedback "
+            "TCP pose as observation.wrist_camera.* without changing training state/action fields. "
+            "Enabled by default; pass --no-record-actual-wrist-camera-pose to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-record-actual-wrist-camera-pose",
+        "--no-record-actual-wrist-pose",
+        dest="record_actual_wrist_camera_pose",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--actual-wrist-camera-pose-hz",
+        "--actual-wrist-pose-hz",
+        type=_positive_float,
+        default=30.0,
+        help="Background feedback polling rate for actual wrist camera pose annotation.",
+    )
+    parser.add_argument(
+        "--actual-wrist-camera-pose-max-age-sec",
+        "--actual-wrist-pose-max-age-sec",
+        type=_positive_float,
+        default=0.2,
+        help="Mark actual wrist camera pose annotations stale when their sample-time age exceeds this value.",
     )
     parser.add_argument(
         "--replay-dataset",
@@ -1693,6 +1796,9 @@ def parse_args() -> argparse.Namespace:
         if bool(args.vis_cam):
             parser.error("--vis_cam requires cameras; remove --no-camera.")
         args.write_video = False
+    camera_registry_path = str(getattr(args, "camera_registry", "") or "").strip()
+    if camera_registry_path and not Path(camera_registry_path).exists():
+        parser.error(f"--camera-registry does not exist: {camera_registry_path}")
     replay_requested = bool(str(args.replay_dataset).strip() or str(args.replay_parquet).strip())
     if replay_requested:
         if str(args.replay_dataset).strip() and str(args.replay_parquet).strip():
@@ -1746,6 +1852,7 @@ class CollectApp:
     replay_groups: dict[str, "ReplayTrajectoryPool"]
     replay_action_filter: ActionSafetyFilter | None
     replay_init_plan: "ReplayInitEpisodePlan | None"
+    arm_state_poller: ArmHardwareStatePoller | None
 
 
 @dataclass
@@ -2047,6 +2154,36 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
     }
 
 
+def _camera_device_info_by_key(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+) -> dict[str, dict[str, Any]]:
+    infos: dict[str, dict[str, Any]] = {}
+    for camera_key, source in camera_sources.items():
+        try:
+            info = source.device_info()
+        except Exception as exc:  # noqa: BLE001
+            info = {
+                "camera_key": str(camera_key),
+                "device_info_error": f"{type(exc).__name__}: {exc}",
+            }
+        infos[str(camera_key)] = dict(info)
+    return infos
+
+
+def _camera_registry_snapshot(
+    args: argparse.Namespace,
+    camera_sources: Mapping[str, RealSenseRGBSource],
+) -> dict[str, Any] | None:
+    registry_path = str(getattr(args, "camera_registry", "") or "").strip()
+    if not registry_path:
+        return None
+    registry = load_camera_registry(registry_path)
+    return build_camera_registry_snapshot(
+        registry,
+        device_info_by_key=_camera_device_info_by_key(camera_sources),
+    )
+
+
 def _select_preview_camera_sources(
     camera_sources: dict[str, RealSenseRGBSource],
     requested_key: str,
@@ -2196,6 +2333,8 @@ def _build_hand_retargeters(
                     output_dim=int(policy["output_dim"]),
                     invert=bool(policy["invert"]),
                     alpha=float(policy["alpha"]),
+                    input_min=float(policy["input_min"]),
+                    input_max=float(policy["input_max"]),
                     output_max=float(policy["max_action"]),
                 )
             )
@@ -2307,6 +2446,7 @@ def _episode_metadata(
     fixed_sides = mode_spec.fixed_arm_sides
     jitter_sides = mode_spec.jitter_arm_sides
     moving_sides = mode_spec.moving_arm_sides
+    camera_registry_snapshot = _camera_registry_snapshot(args, camera_sources)
     metadata = {
         "source_entrypoint": mode_spec.source_entrypoint,
         "task_name": str(args.task_name),
@@ -2366,7 +2506,10 @@ def _episode_metadata(
         "dmtac_config": str(getattr(args, "dmtac_config", "latest")),
         "dmtac_default_config_enabled": bool(getattr(args, "dmtac_default_config", True)),
         "dmtac_config_loaded_sides": list(getattr(args, "dmtac_config_loaded_sides", []) or []),
-        "dmtac_tactile_compute_profile": str(getattr(args, "dmtac_tactile_compute_profile", "dist-only")),
+        "dmtac_tactile_fields": list(getattr(args, "dmtac_tactile_fields", None) or []),
+        "dmtac_tactile_compute_profile": str(
+            getattr(args, "dmtac_tactile_compute_profile", None) or "dist-only"
+        ),
         "dmtac_tactile_parallel_read": getattr(args, "dmtac_tactile_parallel_read", None),
         "dmtac_tactile_global_read_lock": getattr(args, "dmtac_tactile_global_read_lock", None),
         "dmtac_tactile_read_hz": getattr(args, "dmtac_tactile_read_hz", None),
@@ -2393,6 +2536,8 @@ def _episode_metadata(
         "vis_camera_keys": sorted(preview_camera_sources),
         "camera_keys": sorted(camera_sources),
         "camera_config_path": None if args.no_camera else str(args.camera_config),
+        "camera_registry_path": str(getattr(args, "camera_registry", "") or "") or None,
+        "camera_registry_snapshot": camera_registry_snapshot,
         "calibration_path": args.load_profile or None,
         "calibration_snapshot": calibration.to_dict(),
     }
@@ -4803,6 +4948,20 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     retargeters = list(arm_retargeters) + list(hand_retargeters.values())
 
     all_backends, rig_backends = _build_backends(args, active_sides)
+    arm_state_poller = (
+        ArmHardwareStatePoller(
+            backends_by_side={
+                side: all_backends.get(topology.arm_effector(side))
+                for side in active_sides
+            },
+            config=ArmHardwareStatePollerConfig(
+                poll_hz=float(args.actual_wrist_camera_pose_hz),
+                stale_after_sec=float(args.actual_wrist_camera_pose_max_age_sec),
+            ),
+        )
+        if bool(getattr(args, "record_actual_wrist_camera_pose", True))
+        else None
+    )
     tactile_visualizer = _build_tactile_visualizer(args, active_sides)
     camera_previewer = (
         CameraPreviewer(CameraPreviewConfig())
@@ -4885,6 +5044,12 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             "fixed_arm_sides": list(fixed_sides),
             "jitter_arm_sides": list(jitter_sides),
             "runtime_arm_state_source": "last_commanded_action",
+            "record_actual_wrist_camera_pose": bool(arm_state_poller is not None),
+            "actual_wrist_camera_pose_source": "rm65_feedback_qpos_fk",
+            "actual_wrist_camera_pose_hz": float(args.actual_wrist_camera_pose_hz),
+            "actual_wrist_camera_pose_max_age_sec": float(
+                args.actual_wrist_camera_pose_max_age_sec
+            ),
             "hand_backend": _hand_backend_mode(args),
             "gripper_policy": dict(getattr(args, "gripper_policy", {}) or _resolved_gripper_policy(args))
             if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
@@ -4923,7 +5088,14 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 if str(getattr(args, "tactile_storage", "external")).strip().lower().replace("-", "_") == "parquet"
                 else "on_change"
             ),
-        )
+        ),
+        arm_state_metadata_provider=(
+            None
+            if arm_state_poller is None
+            else lambda _components, sample_timestamp: arm_state_poller.latest_by_side(
+                sample_timestamp=float(sample_timestamp)
+            )
+        ),
     )
     writer_pool = AsyncWriterPool(
         writer.handle_job,
@@ -4979,6 +5151,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         replay_groups=replay_groups,
         replay_action_filter=replay_action_filter,
         replay_init_plan=replay_init_plan,
+        arm_state_poller=arm_state_poller,
     )
 
 
@@ -5117,16 +5290,18 @@ def main() -> int:
         runtime.start()
         _start_unmanaged_backends(app.unmanaged_backends)
         app.components.session.start()
+        if app.arm_state_poller is not None:
+            app.arm_state_poller.start()
         key_controller.start()
         synced = _sync_arm_backends_from_hardware(app, required=True)
         _log("ArmSync", f"startup hardware sync complete synced={synced}")
+        camera_registry_snapshot = _camera_registry_snapshot(args, app.camera_sources)
+        if camera_registry_snapshot is not None:
+            app.writer.write_device_config("camera_registry", camera_registry_snapshot)
         if app.camera_sources:
             app.writer.write_device_config(
                 "realsense",
-                {
-                    camera_key: source.device_info()
-                    for camera_key, source in app.camera_sources.items()
-                },
+                _camera_device_info_by_key(app.camera_sources),
             )
             if app.camera_previewer is not None and app.camera_previewer.disabled_reason is None:
                 _log("Camera", f"--vis_cam active for cameras={sorted(app.preview_camera_sources)}")
@@ -5387,15 +5562,19 @@ def main() -> int:
                 key_controller.close()
             finally:
                 try:
-                    if app.tactile_visualizer is not None:
-                        app.tactile_visualizer.close()
+                    if app.arm_state_poller is not None:
+                        app.arm_state_poller.close()
                 finally:
                     try:
-                        if app.camera_previewer is not None:
-                            app.camera_previewer.close()
+                        if app.tactile_visualizer is not None:
+                            app.tactile_visualizer.close()
                     finally:
-                        runtime.close()
-                        _close_unmanaged_backends(app.unmanaged_backends)
+                        try:
+                            if app.camera_previewer is not None:
+                                app.camera_previewer.close()
+                        finally:
+                            runtime.close()
+                            _close_unmanaged_backends(app.unmanaged_backends)
 
     print(
         "采集结束 / Collection done: "

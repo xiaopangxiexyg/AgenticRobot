@@ -1,4 +1,4 @@
-(dexteleop310) password-1@1:~/DexTeleop$ python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides right   --right-arm-ip "$RIGHT_ARM_IP"   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_190203_vive_rm65_virtual_desk.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
+(dexteleop310) password-1@1:~/DexTeleop$ python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides right   --right-arm-ip "$RIGHT_ARM_IP"   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
 
 
 
@@ -6,11 +6,11 @@ export LEFT_ARM_IP=192.168.101.21
 export RIGHT_ARM_IP=192.168.1.20
 
 
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_190203_vive_rm65_virtual_desk.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording 
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording 
 
 
 
-(dexteleop310) password-1@1:~/DexTeleop$ python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_190203_vive_rm65_virtual_desk.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording --dmtac-with-tactile --hz 15 \
+(dexteleop310) password-1@1:~/DexTeleop$ python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording --dmtac-with-tactile --hz 15 \
 --arm-io-threads 2 \
 --dmtac-with-tactile \
 --dmtac-tactile-read-hz 15 \
@@ -30,7 +30,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both  
 --dmtac-tactile-global-read-lock
 
 
-taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_190203_vive_rm65_virtual_desk.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording --dmtac-with-tactile \
+taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording --dmtac-with-tactile \
 --hz 15 \
 --arm-control-hz 50 \
 --arm-io-threads 4 \
@@ -90,7 +90,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
   --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json \
   --gui \
-  --load-profile teleop_records/calibration_profiles/20260701_210039_vive_rm65_real_teleop.json \
+  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json \
   --hand-backend dmtac-gripper \
   --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json \
   --q6-hold-recalibration-gesture \
@@ -122,7 +122,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
   --gui \
-  --load-profile teleop_records/calibration_profiles/20260701_210039_vive_rm65_real_teleop.json \
+  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json \
   --hand-backend dmtac-gripper \
   --q6-hold-recalibration-gesture \
   --no-episode-recording \
@@ -165,7 +165,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-arm-ip "$LEFT_ARM_IP" \
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
   --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json \
-  --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_190203_vive_rm65_virtual_desk.json \
+  --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json \
   --gui \
   --hand-backend dmtac-gripper \
   --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json \
@@ -237,3 +237,123 @@ data/chunk-*/episode_*.parquet
 ```
 
 页面操作：Load 数据集 -> 选择 episode -> Play/Pause/拖动时间轴。若数据集中有 `video_paths` 和 `tactile_paths`，摄像头与 DMTAC 触觉会自动显示。
+
+
+## DMTAC raw-only 实现与调试记录
+
+目标：数采和遥操实时链路只采集 DMTAC 原始图像，避免在主链路里实时解算触觉力；后续可以再用 SDK 根据 raw 图像离线解算 force / distributed_force。
+
+实现要点：
+
+- 默认保持原始实现：`tactile_fields=("distributed_force",)`，`tactile_compute_profile="dist-only"`。
+- 新增可配置触觉字段：`raw`、`infer`、`deformation2d`、`shear`、`depth`、`force`、`distributed_force` 等。
+- raw-only 推荐配置：
+
+```bash
+--dmtac-with-tactile \
+--dmtac-tactile-fields raw \
+--dmtac-tactile-compute-profile requested \
+--dmtac-tactile-no-flat-vector \
+--external-tactile
+```
+
+- 回到原始 force 实时路径：
+
+```bash
+--dmtac-with-tactile \
+--dmtac-tactile-fields distributed_force \
+--dmtac-tactile-compute-profile dist-only
+```
+
+- 如果旧脚本依赖扁平触觉向量，再加：
+
+```bash
+--dmtac-tactile-flat-vector
+```
+
+离线可行性依据：SDK 的 `dmrobotics.utils.init_h5/read_h5` 存的是 `(N,H,W) uint8` raw 图像和 serial，`read_h5()` 会恢复成 `DMTacImage`，再交给 `Sensor.process(...)` 解算。现在 dataset external tactile 也保留 raw 的 `uint8` dtype 和 shape，后续可以按 manifest 拼回同样的输入。
+
+数采 timing/debug 已保存内容：
+
+- dataset parquet 每帧会保存 DMTAC timing 列：
+  `observation.hand.<side>.gripper_read_elapsed_s`、
+  `tactile_read_elapsed_s`、`tactile_gate_wait_s`、`telemetry_elapsed_s`、
+  `tactile_timings_ms_json`。
+- `sample_metadata_json` 每帧会保存 `sample_builder_debug`，包含 arm/hand/camera snapshot 耗时和 camera/hand debug snapshot。
+- 正在录制 dataset 时，`sample_metadata_json` 还会保存主循环 `loop_phase_timings_ms` 和 `loop_elapsed_before_record_s`。
+- episode finalize summary 会保存 `writer_pool_stats`、`storage_queue_stats`、`collection_frequency`；用于判断 writer 队列、相机队列、触觉写入频率是否拖慢。
+- GUI/日志在数采频率低于 `--collection-warning-hz` 时会打印 `DatasetFreq` 和 `DatasetFreqDebug`，包含 writer、storage queue、camera、hand/DMTAC 状态。
+
+建议开启的调试保存方式：
+
+```bash
+--debug-timing \
+--debug-timing-threshold-sec 0.066 \
+--debug-timing-report-interval-sec 1.0 \
+--session-record-root teleop_records/debug_sessions \
+--session-record-compact-json \
+--session-record-flush-every 30
+```
+
+说明：
+
+- `--debug-timing`：慢帧时打印主循环分段耗时；15Hz 目标下 `0.066s` 对应一帧预算。
+- `--session-record-root`：开启额外 JSONL debug session，目录形如 `teleop_records/debug_sessions/<timestamp>_vive_rm65_real_teleop/`。
+- 不要加 `--no-record`，否则 session JSONL 不会保存。
+- 如果想减少同步写盘影响，可以保留 `--session-record-compact-json --session-record-flush-every 30`。
+- 如果不想保存同步 `commands.jsonl`，可以加 `--no-session-record-commands`；正式 dataset 不受影响。
+- 若使用独立 `teleop_runtime.collection.run_collect`，对应卡顿诊断开关是：
+
+```bash
+--debug-frozen \
+--debug-frozen-threshold-sec 0.066 \
+--debug-frozen-report-interval-sec 1.0
+```
+
+raw-only 双臂 15Hz 示例：
+
+```bash
+taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+  --active-sides both \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
+  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json \
+  --gui \
+  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json \
+  --hand-backend dmtac-gripper \
+  --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json \
+  --q6-hold-recalibration-gesture \
+  --hz 15 \
+  --arm-control-hz 50 \
+  --arm-io-threads 4 \
+  --dual-arm-ik-hz 15 \
+  --dmtac-with-tactile \
+  --dmtac-tactile-fields raw \
+  --dmtac-tactile-compute-profile requested \
+  --dmtac-tactile-read-hz 15 \
+  --dmtac-tactile-process-read \
+  --dmtac-tactile-worker-cpus 12,13,14,15 \
+  --dmtac-tactile-worker-nice 15 \
+  --dmtac-tactile-worker-queue-size 4 \
+  --dmtac-tactile-parallel-read \
+  --dmtac-tactile-global-read-lock \
+  --dmtac-tactile-no-denoise \
+  --dmtac-tactile-no-flat-vector \
+  --external-tactile \
+  --writer-workers 6 \
+  --writer-queue-size 1024 \
+  --storage-queue-size 128 \
+  --debug-timing \
+  --debug-timing-threshold-sec 0.066 \
+  --session-record-root teleop_records/debug_sessions \
+  --session-record-compact-json \
+  --session-record-flush-every 30
+```
+
+排查顺序：
+
+1. 先看 GUI 的 `采集频率` 和 `触觉写入` 是否接近目标。
+2. 频率低时看终端 `DatasetFreqDebug`：writer 队列满、storage queue drop/high_water、camera age、hand tactile timing 哪个先异常。
+3. 保存后看 parquet 的 `sample_metadata_json` 和 `observation.hand.*.tactile_timings_ms_json`。
+4. 若 raw-only 仍慢，优先降低相机/触觉读频率或切回 `--dmtac-tactile-global-read-lock` 串行读；若只有 force 路径慢，继续用 raw-only。

@@ -15,6 +15,7 @@ from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBa
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.gui import calibration_web_ui
 from teleop_runtime.schemas import ObservationChannel
+from teleop_runtime.sources.pose import VivePoseSource
 from teleop_runtime.tactile_visualizer import DMTacDistributedForceVisualizer
 
 
@@ -142,6 +143,7 @@ def _args(**overrides: object) -> SimpleNamespace:
         "gripper_task_profile": "",
         "left_tracker_name": "tracker_1",
         "right_tracker_name": "tracker_2",
+        "aux_tracker_name": "",
         "teleop_hardware_ip": "",
         "teleop_hardware_port": 0,
         "swap_arm_sides": False,
@@ -729,6 +731,75 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(parsed["raw_tracker_poses"]["left"]["rpy_deg"], [None, 2.0, 3.0])
         self.assertIsNone(parsed["ik_timing"]["solve_ms"])
         self.assertEqual(parsed["gripper_status"]["right"]["q6_values"], [0.1, None])
+
+    def test_single_right_gui_tracker_swap_remaps_to_left_tracker(self) -> None:
+        args = _args()
+        components = _components()
+        source = VivePoseSource(
+            tracker_configs=real_teleop._build_vive_tracker_configs_for_args(
+                args,
+                components.active_sides,
+            )
+        )
+        components.session.sources = [source]
+        ui = _FakeUi(events=["w"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=args,
+            components=components,
+        )
+
+        control.poll()
+
+        self.assertTrue(args.swap_operator_sides)
+        configs = list(source.tracker_configs.values())
+        self.assertEqual(len(configs), 1)
+        config = configs[0]
+        self.assertEqual(config.channel_name, "right_wrist_pose")
+        self.assertEqual(config.side, "right")
+        self.assertEqual(config.name, "tracker_1")
+        self.assertEqual(config.role, "left_wrist")
+        self.assertIn("logical_right<-left_tracker", ui.messages[-1][1])
+
+    def test_single_right_hold_tracker_swap_is_allowed_before_rehome(self) -> None:
+        args = _args()
+        components = _components()
+        source = VivePoseSource(
+            tracker_configs=real_teleop._build_vive_tracker_configs_for_args(
+                args,
+                components.active_sides,
+            )
+        )
+        components.session.sources = [source]
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=args,
+            components=components,
+        )
+        control._teleop_started = True
+        control._tracker_swap_locked = True
+
+        control.request_hold()
+        self.assertIn("w", ui.published[-1]["active_controls"])
+
+        ui.events.append("w")
+        control.poll()
+
+        self.assertTrue(args.swap_operator_sides)
+        configs = list(source.tracker_configs.values())
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].channel_name, "right_wrist_pose")
+        self.assertEqual(configs[0].name, "tracker_1")
+        self.assertEqual(configs[0].role, "left_wrist")
+        status_publish = next(
+            item for item in reversed(ui.published) if "teleop_running" in item
+        )
+        self.assertFalse(status_publish["teleop_running"])
+        self.assertFalse(status_publish["home_ready"])
+        self.assertIn("重新点击", ui.messages[-1][1])
 
     def test_gripper_runtime_status_signature_includes_q6_and_send_details(self) -> None:
         backend = DMTacGripperBackend(

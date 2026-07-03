@@ -5,12 +5,13 @@
 - `absolute`：绝对控制
 - `delta_clutch`：相对控制 / 带 clutch 的增量控制
 
-这里讨论的是 `VIVE -> PoseToArmRetargeter -> RM65` 这条链路，**不包含** `q6 -> Inspire Tac` 手部链路。  
+这里讨论的是 `VIVE -> PoseToArmRetargeter -> RM65` 这条链路，**不包含** `q6 -> hand/gripper` 手部链路。
 当前真正可运行的调试入口是：
 
 - [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
+- [teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)
 
-它使用真实 VIVE 输入，但默认只驱动 SAPIEN 中的双 RM65 虚拟模型，不直接连接真机。
+前者使用真实 VIVE 输入，但默认只驱动 SAPIEN 中的双 RM65 虚拟模型；后者接入 RM65 真机。
 
 ## 1. 先说结论
 
@@ -32,8 +33,8 @@
 
 当前相对控制和绝对控制，主链路是下面这条：
 
-1. [hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py)  
-   用 `triad_openvr` 读取 VIVE tracker，发 UDP JSON。
+1. [hardware/VIVE/VIVE_sender/data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py)
+   每帧取一次 OpenVR pose snapshot，给所有 tracker 复用后发 UDP JSON。
 2. [teleop_runtime/sources/pose/vive.py](./sources/pose/vive.py)  
    接收 UDP，解析成 `ObservationChannel`。
 3. [teleop_runtime/session.py](./session.py)  
@@ -55,12 +56,12 @@
 
 这点要特别注意，因为：
 
-- 新版 [vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 发送的是 JSON UDP
+- 当前推荐的 [data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py) 发送的是 JSON UDP
 - 当前真正参与控制闭环的接收器是 [teleop_runtime/sources/pose/vive.py](./sources/pose/vive.py)
 - `teleop_runtime` 的 `VivePoseSource` 同时兼容 JSON 包和 legacy float 包
 - 但 `hardware/VIVE/mocap/vive_data_receiver.py` 本身仍然是 legacy float-only
 
-所以如果你现在把新版 `vive_data_sender.py` 直接对着 `vive_data_receiver.py` 发，**它们并不是当前推荐的主控配对**。
+所以如果你现在把推荐 sender 直接对着 `vive_data_receiver.py` 发，**它们并不是当前推荐的主控配对**。
 
 ## 3. 共享的数据流和坐标变换
 
@@ -68,7 +69,7 @@
 
 ### 3.1 VIVE 发送端
 
-[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 默认发送两个 wrist tracker：
+[hardware/VIVE/VIVE_sender/data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py) 默认发送两个 wrist tracker：
 
 - `tracker_1:left_wrist`
 - `tracker_2:right_wrist`
@@ -360,7 +361,7 @@ target.rotation = current_human.rotation
 仓库现有 README 里推荐：
 
 ```bash
-conda activate grasp_py310_copy
+conda activate dexteleop310
 ```
 
 如果只做虚拟跑法，至少要保证：
@@ -376,9 +377,10 @@ conda activate grasp_py310_copy
 同机调试：
 
 ```bash
-python hardware/VIVE/mocap/vive_data_sender.py \
+python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --host 127.0.0.1 \
   --port 9999 \
+  --hz 60 \
   --tracker tracker_1:left_wrist \
   --tracker tracker_2:right_wrist
 ```
@@ -459,134 +461,17 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 ## 7. 真机现在怎么接
 
-当前仓库里**还没有现成的真机 CLI runner**，所以真机接法是：
+当前真机入口是：
 
-1. 自己写一个小入口脚本
-2. 创建 `TeleopSession`
-3. 给 `PoseToArmRetargeterConfig(control_mode=...)` 选 `absolute` 或 `delta_clutch`
-4. 给 `RM65ArmBackendConfig(connect_hardware=True, arm_ip=...)`
-5. 按 session 生命周期启动
-
-生命周期顺序是：
-
-```python
-session.start()
-session.set_calibration_ready()
-session.mark_debug_passed()
-session.arm_hardware()
-
-while True:
-    session.run_step()
+```bash
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+  --left-arm-ip 192.168.101.21 \
+  --right-arm-ip 192.168.1.20 \
+  --load-profile teleop_records/calibration_profiles/your_profile.json \
+  --control-mode absolute
 ```
 
-如果 `TeleopSession` 里已经挂了 `rig`，那么 `session.run_step()` 内部就会自动把命令发给 backend，不需要你像虚拟跑法那样手动取 `left_arm` / `right_arm` 再转发。
-
-一个最小化的真机示意可以写成：
-
-```python
-import time
-
-from teleop_runtime import (
-    KeyboardButtonSource,
-    PoseToArmRetargeter,
-    PoseToArmRetargeterConfig,
-    RM65ArmBackend,
-    RM65ArmBackendConfig,
-    TeleopSession,
-    TeleopSessionConfig,
-    VivePoseSource,
-    ViveTrackerConfig,
-)
-from teleop_runtime.configs import build_annotated_dual_rm65_calibration
-from teleop_runtime.rigs import BimanualRig
-
-calibration = build_annotated_dual_rm65_calibration()
-keyboard = KeyboardButtonSource(name="operator_buttons")
-keyboard.set_button("left_clutch_button", False, side="left", critical=False)
-keyboard.set_button("right_clutch_button", False, side="right", critical=False)
-
-session = TeleopSession(
-    config=TeleopSessionConfig(mode="bimanual"),
-    sources=[
-        VivePoseSource(
-            tracker_configs=[
-                ViveTrackerConfig(
-                    name="tracker_1",
-                    side="left",
-                    role="left_wrist",
-                    channel_name="left_wrist_pose",
-                ),
-                ViveTrackerConfig(
-                    name="tracker_2",
-                    side="right",
-                    role="right_wrist",
-                    channel_name="right_wrist_pose",
-                ),
-            ],
-            host="0.0.0.0",
-            port=9999,
-        ),
-        keyboard,
-    ],
-    retargeters=[
-        PoseToArmRetargeter(
-            PoseToArmRetargeterConfig(
-                side="left",
-                input_channel_name="left_wrist_pose",
-                control_mode="delta_clutch",
-            )
-        ),
-        PoseToArmRetargeter(
-            PoseToArmRetargeterConfig(
-                side="right",
-                input_channel_name="right_wrist_pose",
-                control_mode="delta_clutch",
-            )
-        ),
-    ],
-    rig=BimanualRig(
-        backends={
-            "left_arm": RM65ArmBackend(
-                RM65ArmBackendConfig(
-                    arm_ip="LEFT_ARM_IP",
-                    side="left",
-                    connect_hardware=True,
-                )
-            ),
-            "right_arm": RM65ArmBackend(
-                RM65ArmBackendConfig(
-                    arm_ip="RIGHT_ARM_IP",
-                    side="right",
-                    connect_hardware=True,
-                )
-            ),
-        }
-    ),
-    calibration=calibration,
-)
-
-session.start()
-session.set_calibration_ready()
-session.mark_debug_passed()
-session.arm_hardware()
-
-try:
-    while True:
-        session.run_step()
-        time.sleep(0.02)
-finally:
-    session.close()
-```
-
-如果你想切成绝对控制，只需要把 `control_mode="delta_clutch"` 改成 `control_mode="absolute"`。
-
-如果你用的是 [teleop_runtime/configs/builders.py](./configs/builders.py) 里的 `build_bimanual_session(...)`，要注意：
-
-- 它默认创建的 `PoseToArmRetargeterConfig` 没显式传 `control_mode`
-- 所以会走 `PoseToArmRetargeterConfig` 的默认值，也就是 `delta_clutch`
-- 但 `build_bimanual_session(...)` 本身没有内置现成的终端 clutch 逻辑
-
-所以真机场景下，若要稳定跑 `delta_clutch`，你还需要自己把 `KeyboardButtonSource` 或其他按钮源接进去。
+正式采集时优先使用同一个入口加 `--gui`、相机参数和需要的 hand/gripper backend；不要再新写一套绕开现有状态机的真机 runner。
 
 ## 8. 两种模式分别会看到什么现象
 
@@ -614,13 +499,14 @@ finally:
 
 不影响 `JointsToDexHandRetargeter` 那条手部链路。
 
-### 9.2 现成入口是虚拟跑法，不是现成真机主程序
+### 9.2 现成入口的边界
 
 当前可以直接跑的是：
 
 - [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
+- [teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)
 
-真机已经有 backend，但没有封装成现成 CLI。
+前者用于虚拟验收，后者用于真机短测和 GUI 采集。
 
 ### 9.3 默认虚拟标定更像调试预设
 
@@ -643,12 +529,12 @@ finally:
 
 建议按这个顺序排查：
 
-1. 先跑 `vive_data_sender.py`，确认 VIVE tracker 本身正常输出
+1. 先跑 `hardware/VIVE/VIVE_sender/data_sender_new.py`，确认 VIVE tracker 本身正常输出
 2. 再跑 `run_vive_sapien_virtual.py --control-mode absolute`
 3. 确认左右 tracker 映射、坐标方向、TCP frame 都合理
 4. 再切到 `--control-mode delta_clutch --keyboard-clutch`
 5. 确认 clutch anchor、释放、重抓取符合预期
-6. 最后再把同样的 retargeter / backend 配置搬到真机入口里
+6. 最后用 `run_vive_rm65_real_teleop.py` 做真机短测或 GUI 采集
 
 如果你只是想判断“模式是不是工作了”，最直观的判断标准是：
 

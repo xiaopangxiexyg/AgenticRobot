@@ -22,7 +22,50 @@ DEFAULT_DMTAC_GRIPPER_SPEED = 1.0
 DEFAULT_DMTAC_GRIPPER_TORQUE = 0.2
 DEFAULT_DMTAC_GRIPPER_COMMAND_HZ = 20.0
 GRIPPER_ACTION_MAX = 0.99
+DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S = 0.15
 DMTAC_DISTRIBUTED_FORCE_SHAPE = (288, 384, 3)
+DMTAC_RAW_IMAGE_SHAPE = (480, 640)
+DMTAC_TACTILE_FIELDS = (
+    "raw",
+    "infer",
+    "deformation2d",
+    "shear",
+    "depth",
+    "force",
+    "distributed_force",
+    "contact_area",
+    "base_frame",
+    "events",
+)
+DMTAC_TACTILE_ARRAY_FIELDS = (
+    "raw",
+    "infer",
+    "deformation2d",
+    "shear",
+    "depth",
+    "force",
+    "distributed_force",
+)
+DMTAC_DEFAULT_TACTILE_FIELDS = ("distributed_force",)
+DMTAC_TACTILE_FIELD_DEFAULT_SHAPES = {
+    "raw": DMTAC_RAW_IMAGE_SHAPE,
+    "infer": (288, 384),
+    "deformation2d": (288, 384, 2),
+    "shear": (288, 384, 2),
+    "depth": (288, 384),
+    "force": (6,),
+    "distributed_force": DMTAC_DISTRIBUTED_FORCE_SHAPE,
+}
+DMTAC_TACTILE_FIELD_ALIASES = {
+    "dist_force": "distributed_force",
+    "distforce": "distributed_force",
+    "distributed_force": "distributed_force",
+    "distributedforce": "distributed_force",
+    "distributed": "distributed_force",
+    "deformation": "deformation2d",
+    "deformation_2d": "deformation2d",
+    "base": "base_frame",
+}
 DMTAC_TELEMETRY_STOP_TIMEOUT_S = 2.0
 DMTAC_TACTILE_CLOSE_GRACE_S = 3.0
 DMTAC_TACTILE_GLOBAL_READ_GATE = threading.Semaphore(1)
@@ -50,23 +93,131 @@ def _put_latest(queue_out: Any, payload: dict[str, Any]) -> None:
                 return
 
 
-def _frames_payload(frames: dict[Any, Any]) -> tuple[dict[str, np.ndarray], dict[str, int | None], dict[str, tuple[int, ...]], dict[str, dict[str, float]]]:
+def _normalize_dmtac_tactile_fields(fields: Any) -> tuple[str, ...]:
+    if fields is None:
+        return DMTAC_DEFAULT_TACTILE_FIELDS
+    if isinstance(fields, str):
+        items = [part.strip() for part in fields.replace(",", " ").split() if part.strip()]
+    else:
+        items = list(fields)
+    normalized: list[str] = []
+    for item in items:
+        key = str(item).strip().lower().replace("-", "_")
+        key = DMTAC_TACTILE_FIELD_ALIASES.get(key, key)
+        if key == "all":
+            return DMTAC_TACTILE_FIELDS
+        if key not in DMTAC_TACTILE_FIELDS:
+            raise ValueError(
+                f"Unsupported DMTAC tactile field {item!r}. Valid fields: {DMTAC_TACTILE_FIELDS}"
+            )
+        if key not in normalized:
+            normalized.append(key)
+    return tuple(normalized) if normalized else DMTAC_DEFAULT_TACTILE_FIELDS
+
+
+normalize_dmtac_tactile_fields = _normalize_dmtac_tactile_fields
+
+
+def _dmtac_tactile_array_fields(fields: Any) -> tuple[str, ...]:
+    return tuple(
+        field
+        for field in _normalize_dmtac_tactile_fields(fields)
+        if field in DMTAC_TACTILE_ARRAY_FIELDS
+    )
+
+
+def _dmtac_tactile_output_key(dev_id: Any, field: str, fields: tuple[str, ...]) -> str:
+    base = str(dev_id)
+    if len(fields) <= 1:
+        return base
+    return f"{base}:{field}"
+
+
+def _dmtac_frame_id_for_field(frame: Any, field: str) -> int | None:
+    fids = getattr(frame, "fids", None)
+    if isinstance(fids, dict) and field in fids:
+        return fids.get(field)
+    return getattr(frame, "fid", None)
+
+
+def _dmtac_frame_array(frame: Any, field: str) -> np.ndarray | None:
+    value = getattr(frame, field, None)
+    if value is None:
+        return None
+    if hasattr(value, "img"):
+        value = getattr(value, "img", None)
+        if value is None:
+            return None
+    array = np.asarray(value)
+    if array.size == 0:
+        return None
+    if field == "distributed_force":
+        if array.ndim != 3 or array.shape[2] < 2:
+            return None
+        return np.ascontiguousarray(array, dtype=np.float32)
+    if field in {"deformation2d", "shear"}:
+        if array.ndim != 3 or array.shape[2] < 2:
+            return None
+        return np.ascontiguousarray(array, dtype=np.float32)
+    if field == "depth":
+        if array.ndim < 2:
+            return None
+        return np.ascontiguousarray(array, dtype=np.float32)
+    if field == "force":
+        vector = array.reshape(-1)
+        if vector.size == 0:
+            return None
+        return np.ascontiguousarray(vector, dtype=np.float32)
+    if field in {"raw", "infer"}:
+        if array.ndim < 2:
+            return None
+        return np.ascontiguousarray(array)
+    return None
+
+
+def _dmtac_tactile_shape_per_sensor(
+    shapes: dict[str, tuple[int, ...]],
+    fields: Any,
+) -> tuple[int, ...] | None:
+    if shapes:
+        return tuple(next(iter(shapes.values())))
+    for field in _dmtac_tactile_array_fields(fields):
+        shape = DMTAC_TACTILE_FIELD_DEFAULT_SHAPES.get(field)
+        if shape is not None:
+            return tuple(shape)
+    return None
+
+
+def _frames_payload(
+    frames: dict[Any, Any],
+    *,
+    fields: Any = DMTAC_DEFAULT_TACTILE_FIELDS,
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, int | None],
+    dict[str, tuple[int, ...]],
+    dict[str, dict[str, float]],
+    dict[str, str],
+]:
     tactile_dict: dict[str, np.ndarray] = {}
     frame_ids: dict[str, int | None] = {}
     shapes: dict[str, tuple[int, ...]] = {}
     timings_by_device: dict[str, dict[str, float]] = {}
+    field_by_key: dict[str, str] = {}
+    array_fields = _dmtac_tactile_array_fields(fields)
     for dev_id, frame in frames.items():
         if frame is None:
             continue
+        for field in array_fields:
+            array = _dmtac_frame_array(frame, field)
+            if array is None:
+                continue
+            key = _dmtac_tactile_output_key(dev_id, field, array_fields)
+            tactile_dict[key] = array.copy()
+            shapes[key] = tuple(array.shape)
+            frame_ids[key] = _dmtac_frame_id_for_field(frame, field)
+            field_by_key[key] = field
         key = str(dev_id)
-        distributed_force = getattr(frame, "distributed_force", None)
-        if distributed_force is not None:
-            force = np.asarray(distributed_force, dtype=np.float32)
-            if force.ndim == 3 and force.shape[2] >= 2:
-                force = force.astype(np.float32, copy=True)
-                tactile_dict[key] = force
-                shapes[key] = tuple(force.shape)
-                frame_ids[key] = getattr(frame, "fid", None)
         timings = getattr(frame, "timings_ms", None)
         if isinstance(timings, dict):
             device_timings: dict[str, float] = {}
@@ -77,7 +228,7 @@ def _frames_payload(frames: dict[Any, Any]) -> tuple[dict[str, np.ndarray], dict
                     continue
             if device_timings:
                 timings_by_device[key] = device_timings
-    return tactile_dict, frame_ids, shapes, timings_by_device
+    return tactile_dict, frame_ids, shapes, timings_by_device, field_by_key
 
 
 def _dmtac_tactile_worker_main(
@@ -112,7 +263,9 @@ def _dmtac_tactile_worker_main(
             backend=str(config_payload.get("tactile_backend", "cpu")),
             mode=str(config_payload.get("tactile_mode", "standard")),
             max_fps=int(config_payload.get("tactile_max_fps", 30)),
-            fields=("distributed_force",),
+            fields=normalize_dmtac_tactile_fields(
+                config_payload.get("tactile_fields", DMTAC_DEFAULT_TACTILE_FIELDS)
+            ),
             compute_profile=str(config_payload.get("tactile_compute_profile", "dist-only")),
             parallel_read=bool(config_payload.get("tactile_parallel_read", False)),
             denoise_distributed_force=bool(config_payload.get("tactile_denoise", False)),
@@ -176,7 +329,13 @@ def _dmtac_tactile_worker_main(
                     if gate_acquired:
                         read_gate.release()
                 read_elapsed_s = time.perf_counter() - perf_started
-                tactile_dict, frame_ids, shapes, timings_ms = _frames_payload(frames)
+                tactile_fields = normalize_dmtac_tactile_fields(
+                    config_payload.get("tactile_fields", DMTAC_DEFAULT_TACTILE_FIELDS)
+                )
+                tactile_dict, frame_ids, shapes, timings_ms, field_by_key = _frames_payload(
+                    frames,
+                    fields=tactile_fields,
+                )
                 if frames:
                     version += 1
                 _put_latest(
@@ -188,6 +347,8 @@ def _dmtac_tactile_worker_main(
                         "frame_ids": frame_ids,
                         "shapes": shapes,
                         "timings_ms": timings_ms,
+                        "field_by_key": field_by_key,
+                        "fields": list(tactile_fields),
                         "devices": list(tactile_dict),
                         "version": version,
                         "read_elapsed_s": read_elapsed_s,
@@ -234,11 +395,13 @@ class DMTacGripperBackendConfig:
     open_on_start: bool = False
     enable_telemetry: bool = True
     telemetry_hz: float = 10.0
+    gripper_telemetry_command_grace_s: float = DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S
     connect_tactile: bool = True
     tactile_ids: tuple[str | int, ...] = ()
     tactile_backend: str = "cpu"
     tactile_mode: str = "standard"
     tactile_max_fps: int = 30
+    tactile_fields: tuple[str, ...] = DMTAC_DEFAULT_TACTILE_FIELDS
     tactile_compute_profile: str = "dist-only"
     tactile_timeout_ms: int = 100
     tactile_wait_for_new: bool = False
@@ -282,8 +445,11 @@ class DMTacGripperBackendConfig:
             raise ValueError("command_hz must be positive.")
         if float(self.telemetry_hz) <= 0.0:
             raise ValueError("telemetry_hz must be positive.")
+        if float(self.gripper_telemetry_command_grace_s) < 0.0:
+            raise ValueError("gripper_telemetry_command_grace_s must be non-negative.")
         if int(self.tactile_max_fps) <= 0:
             raise ValueError("tactile_max_fps must be positive.")
+        self.tactile_fields = normalize_dmtac_tactile_fields(self.tactile_fields)
         profile = str(self.tactile_compute_profile).strip().lower().replace("_", "-")
         if profile not in {"dist-only", "legacy", "requested", "shear-depth"}:
             raise ValueError("tactile_compute_profile must be dist-only, legacy, requested, or shear-depth.")
@@ -349,9 +515,12 @@ class DMTacGripperBackend(EffectorBackend):
         self._latest_tactile_frame_ids: dict[str, int | None] = {}
         self._latest_tactile_shapes: dict[str, tuple[int, ...]] = {}
         self._latest_tactile_timings_ms: dict[str, dict[str, float]] = {}
+        self._latest_tactile_field_by_key: dict[str, str] = {}
         self._latest_tactile_version: int = 0
         self._latest_telemetry_timestamp: float | None = None
         self._latest_gripper_read_elapsed_s: float | None = None
+        self._latest_gripper_read_skipped = False
+        self._latest_gripper_read_skip_reason: str | None = None
         self._latest_tactile_read_elapsed_s: float | None = None
         self._latest_tactile_gate_wait_s: float | None = None
         self._latest_tactile_read_skipped = False
@@ -367,6 +536,15 @@ class DMTacGripperBackend(EffectorBackend):
         self._tactile_worker_stop_event: Any | None = None
         self._tactile_worker_receiver_stop: threading.Event | None = None
         self._tactile_worker_receiver_thread: threading.Thread | None = None
+        self._applied_speed: float | None = None
+        self._applied_torque: float | None = None
+        self._applied_continuous_grasp: bool | None = None
+        self._last_send_attempt_timestamp: float | None = None
+        self._last_send_elapsed_s: float | None = None
+        self._last_send_lock_wait_s: float | None = None
+        self._last_send_status: str | None = None
+        self._last_send_skip_reason: str | None = None
+        self._last_send_target_scalar: float | None = None
 
     @property
     def name(self) -> str:
@@ -400,7 +578,7 @@ class DMTacGripperBackend(EffectorBackend):
             backend=str(self.config.tactile_backend),
             mode=str(self.config.tactile_mode),
             max_fps=int(self.config.tactile_max_fps),
-            fields=("distributed_force",),
+            fields=normalize_dmtac_tactile_fields(self.config.tactile_fields),
             compute_profile=str(self.config.tactile_compute_profile),
             parallel_read=bool(self.config.tactile_parallel_read),
             denoise_distributed_force=bool(self.config.tactile_denoise),
@@ -430,6 +608,7 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_backend": str(self.config.tactile_backend),
             "tactile_mode": str(self.config.tactile_mode),
             "tactile_max_fps": int(self.config.tactile_max_fps),
+            "tactile_fields": list(self.config.tactile_fields),
             "tactile_compute_profile": str(self.config.tactile_compute_profile),
             "tactile_timeout_ms": int(self.config.tactile_timeout_ms),
             "tactile_wait_for_new": bool(self.config.tactile_wait_for_new),
@@ -517,7 +696,9 @@ class DMTacGripperBackend(EffectorBackend):
                     if self.config.clear_fault_on_start:
                         self.device.clear_fault()
                     self.device.set_speed(float(self.config.speed))
+                    self._applied_speed = float(self.config.speed)
                     self.device.set_torque(float(self.config.torque))
+                    self._applied_torque = float(self.config.torque)
                     if self.config.open_on_start:
                         self.device.open(wait=False)
                 if (
@@ -596,6 +777,9 @@ class DMTacGripperBackend(EffectorBackend):
         bypass_send_commands: bool,
         force: bool,
     ) -> bool:
+        attempt_started_perf = time.perf_counter()
+        attempt_started_wall = time.time()
+        lock_wait_s: float | None = None
         target_scalar = self._extract_gripper_scalar(joint_pos)
         target_scalar = float(np.clip(target_scalar, 0.0, float(self.config.max_action)))
         target = self._q6_from_scalar(
@@ -603,43 +787,94 @@ class DMTacGripperBackend(EffectorBackend):
             dim=int(self.config.command_dim),
             max_value=float(self.config.max_action),
         )
+
+        def finish(status: str, *, sent: bool, skip_reason: str | None = None) -> bool:
+            self._last_send_attempt_timestamp = attempt_started_wall
+            self._last_send_elapsed_s = time.perf_counter() - attempt_started_perf
+            self._last_send_lock_wait_s = lock_wait_s
+            self._last_send_status = str(status)
+            self._last_send_skip_reason = skip_reason
+            self._last_send_target_scalar = float(target_scalar)
+            return bool(sent)
+
         if not self.config.send_commands and not bool(bypass_send_commands):
-            return False
+            return finish("send_disabled", sent=False, skip_reason="send_disabled")
         if self._last_sent_command is not None and not bool(force):
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < float(self.config.send_threshold):
-                return False
-        command_time = time.time()
+                return finish("skipped_threshold", sent=False, skip_reason="threshold")
+        command_time = attempt_started_wall
         if (
             self._last_sent_command_timestamp is not None
             and not bool(force)
             and command_time - float(self._last_sent_command_timestamp)
             < 1.0 / float(self.config.command_hz)
         ):
-            return False
+            return finish("rate_limited", sent=False, skip_reason="command_hz")
         if self.config.connect_hardware:
             if self.device is None:
                 self._telemetry_error = "send_failed: device is not connected"
-                return False
+                return finish("not_connected", sent=False, skip_reason="not_connected")
             try:
-                with self._lock:
+                lock_started_perf = time.perf_counter()
+                self._lock.acquire()
+                lock_wait_s = time.perf_counter() - lock_started_perf
+                try:
                     if self.device is None:
                         self._telemetry_error = "send_failed: device is not connected"
-                        return False
+                        return finish("not_connected", sent=False, skip_reason="not_connected")
+                    speed, torque, continuous = self._move_parameters_for_current_config()
                     self.device.move(
                         float(np.clip(target_scalar, 0.0, float(self.config.max_action))),
-                        speed=float(self.config.speed),
-                        torque=float(self.config.torque),
-                        continuous=bool(self.config.continuous_grasp),
+                        speed=speed,
+                        torque=torque,
+                        continuous=continuous,
                         wait=False,
                     )
+                    if speed is not None:
+                        self._applied_speed = float(speed)
+                    if torque is not None:
+                        self._applied_torque = float(torque)
+                    if continuous is not None:
+                        self._applied_continuous_grasp = bool(continuous)
+                finally:
+                    self._lock.release()
             except Exception as exc:  # noqa: BLE001
                 self._telemetry_error = f"send_failed: {exc}"
-                return False
+                return finish("send_exception", sent=False, skip_reason=f"{type(exc).__name__}: {exc}")
         self._latest_joint_pos = target.copy()
         self._last_sent_command = target.copy()
         self._last_sent_command_timestamp = command_time
-        return True
+        return finish("sent", sent=True)
+
+    def _move_parameters_for_current_config(self) -> tuple[float | None, float | None, bool | None]:
+        speed = float(self.config.speed)
+        torque = float(self.config.torque)
+        continuous = bool(self.config.continuous_grasp)
+        speed_arg = (
+            speed
+            if self._applied_speed is None or abs(float(self._applied_speed) - speed) > 1e-6
+            else None
+        )
+        torque_arg = (
+            torque
+            if self._applied_torque is None or abs(float(self._applied_torque) - torque) > 1e-6
+            else None
+        )
+        continuous_arg = (
+            continuous
+            if self._applied_continuous_grasp is None
+            or bool(self._applied_continuous_grasp) != continuous
+            else None
+        )
+        return speed_arg, torque_arg, continuous_arg
+
+    def _skip_gripper_telemetry_after_recent_command(self, now: float) -> bool:
+        last_sent = self._last_sent_command_timestamp
+        if last_sent is None:
+            return False
+        grace_s = float(self.config.gripper_telemetry_command_grace_s)
+        return bool(grace_s > 0.0 and float(now) - float(last_sent) < grace_s)
 
     def _apply_tactile_worker_payload(self, payload: dict[str, Any]) -> bool:
         payload_type = str(payload.get("type") or "")
@@ -660,7 +895,7 @@ class DMTacGripperBackend(EffectorBackend):
         tactile_dict_raw = payload.get("tactile_dict")
         tactile_dict = (
             {
-                str(name): np.asarray(value, dtype=np.float32).copy()
+                str(name): np.asarray(value).copy()
                 for name, value in tactile_dict_raw.items()
             }
             if isinstance(tactile_dict_raw, dict)
@@ -687,6 +922,14 @@ class DMTacGripperBackend(EffectorBackend):
                 }
                 if isinstance(payload.get("shapes"), dict)
                 else {name: tuple(value.shape) for name, value in tactile_dict.items()}
+            )
+            self._latest_tactile_field_by_key = (
+                {
+                    str(name): str(value)
+                    for name, value in payload.get("field_by_key", {}).items()
+                }
+                if isinstance(payload.get("field_by_key"), dict)
+                else {}
             )
             self._latest_tactile_timings_ms = (
                 {
@@ -760,6 +1003,8 @@ class DMTacGripperBackend(EffectorBackend):
         read_started_at = time.time()
         telemetry_started_at = time.perf_counter()
         gripper_read_elapsed_s = None
+        gripper_read_skipped = False
+        gripper_read_skip_reason = None
         tactile_read_elapsed_s = None
         tactile_gate_wait_s = None
         tactile_read_attempted = False
@@ -767,13 +1012,24 @@ class DMTacGripperBackend(EffectorBackend):
         tactile_worker_active = bool(
             self.config.connect_tactile and self.config.tactile_process_read
         )
-        with self._lock:
-            if self.device is not device:
-                return
-            if self.config.connect_hardware and device.gripper is not None:
-                gripper_read_started_at = time.perf_counter()
-                gripper_state = device.read_gripper_state()
-                gripper_read_elapsed_s = time.perf_counter() - gripper_read_started_at
+        if self.config.connect_hardware and device.gripper is not None:
+            if self._skip_gripper_telemetry_after_recent_command(read_started_at):
+                gripper_read_skipped = True
+                gripper_read_skip_reason = "recent_command"
+            else:
+                acquired_gripper_lock = self._lock.acquire(blocking=False)
+                if not acquired_gripper_lock:
+                    gripper_read_skipped = True
+                    gripper_read_skip_reason = "io_busy"
+                else:
+                    try:
+                        if self.device is not device:
+                            return
+                        gripper_read_started_at = time.perf_counter()
+                        gripper_state = device.read_gripper_state()
+                        gripper_read_elapsed_s = time.perf_counter() - gripper_read_started_at
+                    finally:
+                        self._lock.release()
 
         if tactile_worker_active and not self._tactile_worker_receiver_active():
             self._drain_tactile_worker_queue()
@@ -831,9 +1087,10 @@ class DMTacGripperBackend(EffectorBackend):
             self._latest_joint_timestamp = float(getattr(gripper_state, "timestamp", read_started_at))
 
         if tactile_read_attempted:
-            tactile_vec, tactile_dict, frame_ids = self._frames_to_tactile(
+            tactile_vec, tactile_dict, frame_ids, field_by_key = self._frames_to_tactile(
                 tactile_frames,
                 build_vector=bool(self.config.tactile_store_flat_vector),
+                fields=self.config.tactile_fields,
             )
             with self._state_lock:
                 self._latest_tactile = tactile_vec
@@ -845,11 +1102,14 @@ class DMTacGripperBackend(EffectorBackend):
                     name: tuple(value.shape)
                     for name, value in tactile_dict.items()
                 }
+                self._latest_tactile_field_by_key = field_by_key
                 self._latest_tactile_timings_ms = self._frame_timings_ms(tactile_frames)
                 if tactile_frames:
                     self._latest_tactile_version += 1
         self._latest_telemetry_timestamp = time.time()
         self._latest_gripper_read_elapsed_s = gripper_read_elapsed_s
+        self._latest_gripper_read_skipped = bool(gripper_read_skipped)
+        self._latest_gripper_read_skip_reason = gripper_read_skip_reason
         if not tactile_worker_active:
             with self._state_lock:
                 self._latest_tactile_read_elapsed_s = tactile_read_elapsed_s
@@ -867,28 +1127,24 @@ class DMTacGripperBackend(EffectorBackend):
         frames: dict[Any, Any],
         *,
         build_vector: bool,
-    ) -> tuple[np.ndarray | None, dict[str, np.ndarray], dict[str, int | None]]:
-        tactile_dict: dict[str, np.ndarray] = {}
-        frame_ids: dict[str, int | None] = {}
+        fields: Any = DMTAC_DEFAULT_TACTILE_FIELDS,
+    ) -> tuple[np.ndarray | None, dict[str, np.ndarray], dict[str, int | None], dict[str, str]]:
+        tactile_dict, frame_ids, _shapes, _timings, field_by_key = _frames_payload(
+            frames,
+            fields=fields,
+        )
         vectors: list[np.ndarray] = []
-        for dev_id, frame in frames.items():
-            key = str(dev_id)
-            if frame is None:
-                continue
-            distributed_force = getattr(frame, "distributed_force", None)
-            if distributed_force is None:
-                continue
-            force = np.asarray(distributed_force, dtype=np.float32)
-            if force.ndim != 3 or force.shape[2] < 2:
-                continue
-            force = force.astype(np.float32, copy=True)
-            tactile_dict[key] = force
-            frame_ids[key] = getattr(frame, "fid", None)
+        for key in sorted(tactile_dict):
             if build_vector:
-                vectors.append(force.reshape(-1))
+                vectors.append(np.asarray(tactile_dict[key], dtype=np.float32).reshape(-1))
         if not vectors:
-            return None, tactile_dict, frame_ids
-        return np.concatenate(vectors).astype(np.float32, copy=False), tactile_dict, frame_ids
+            return None, tactile_dict, frame_ids, field_by_key
+        return (
+            np.concatenate(vectors).astype(np.float32, copy=False),
+            tactile_dict,
+            frame_ids,
+            field_by_key,
+        )
 
     @staticmethod
     def _frame_timings_ms(frames: dict[Any, Any]) -> dict[str, dict[str, float]]:
@@ -960,6 +1216,7 @@ class DMTacGripperBackend(EffectorBackend):
             latest_tactile_devices = tuple(self._latest_tactile_devices)
             latest_tactile_frame_ids = dict(self._latest_tactile_frame_ids)
             latest_tactile_shapes = dict(self._latest_tactile_shapes)
+            latest_tactile_field_by_key = dict(self._latest_tactile_field_by_key)
             latest_tactile_timings_ms = {
                 name: dict(values)
                 for name, values in self._latest_tactile_timings_ms.items()
@@ -976,7 +1233,7 @@ class DMTacGripperBackend(EffectorBackend):
                 if include_tactile_vector:
                     if latest_tactile is not None:
                         tactile = latest_tactile.copy() if copy_tactile_arrays else latest_tactile
-                    else:
+                    elif bool(self.config.tactile_store_flat_vector):
                         tactile = self._tactile_dict_to_vector(latest_tactile_dict)
                 tactile_dict = (
                     None
@@ -1010,10 +1267,22 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_devices": latest_tactile_devices,
             "tactile_frame_ids": latest_tactile_frame_ids,
             "tactile_shapes": latest_tactile_shapes,
+            "tactile_field_by_key": latest_tactile_field_by_key,
             "tactile_timings_ms": latest_tactile_timings_ms,
             "tactile_version": latest_tactile_version,
-            "tactile_raw_shape_per_sensor": DMTAC_DISTRIBUTED_FORCE_SHAPE,
+            "tactile_raw_shape_per_sensor": _dmtac_tactile_shape_per_sensor(
+                latest_tactile_shapes,
+                self.config.tactile_fields,
+            ),
             "gripper_read_elapsed_s": self._latest_gripper_read_elapsed_s,
+            "gripper_read_skipped": bool(self._latest_gripper_read_skipped),
+            "gripper_read_skip_reason": self._latest_gripper_read_skip_reason,
+            "gripper_send_attempt_timestamp": self._last_send_attempt_timestamp,
+            "gripper_send_elapsed_s": self._last_send_elapsed_s,
+            "gripper_send_lock_wait_s": self._last_send_lock_wait_s,
+            "gripper_last_send_status": self._last_send_status,
+            "gripper_last_send_skip_reason": self._last_send_skip_reason,
+            "gripper_last_send_target_scalar": self._last_send_target_scalar,
             "tactile_read_elapsed_s": latest_tactile_read_elapsed_s,
             "tactile_gate_wait_s": latest_tactile_gate_wait_s,
             "telemetry_elapsed_s": self._latest_telemetry_elapsed_s,
@@ -1031,6 +1300,7 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_worker_receiver_alive": self._tactile_worker_receiver_active(),
             "tactile_parallel_read": bool(self.config.tactile_parallel_read),
             "tactile_global_read_lock": bool(self.config.tactile_global_read_lock),
+            "tactile_fields": tuple(self.config.tactile_fields),
             "tactile_compute_profile": str(self.config.tactile_compute_profile),
             "tactile_max_fps": int(self.config.tactile_max_fps),
             "tactile_warmup_frames": int(self.config.tactile_warmup_frames),

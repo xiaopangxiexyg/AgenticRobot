@@ -155,13 +155,23 @@ class _TactileSensorStream:
     sensor_key: str
     relative_path: str
     path: Path
-    dtype: str = "float32"
+    dtype: str | None = None
     shape: tuple[int, ...] | None = None
     frame_count: int = 0
     handle: Any | None = None
 
     def append(self, value: Any) -> None:
-        array = np.asarray(value, dtype=np.float32)
+        array = np.asarray(value)
+        if array.dtype == np.dtype("O"):
+            raise ValueError(f"Tactile sensor '{self.sensor_key}' has unsupported object dtype.")
+        dtype = str(array.dtype)
+        if self.dtype is None:
+            self.dtype = dtype
+        elif str(self.dtype) != dtype:
+            raise ValueError(
+                f"Tactile sensor '{self.sensor_key}' dtype changed from "
+                f"{self.dtype} to {dtype}."
+            )
         if self.shape is None:
             self.shape = tuple(int(dim) for dim in array.shape)
         elif tuple(int(dim) for dim in array.shape) != self.shape:
@@ -172,7 +182,7 @@ class _TactileSensorStream:
         if self.handle is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.handle = self.path.open("ab")
-        contiguous = np.ascontiguousarray(array, dtype=np.float32)
+        contiguous = np.ascontiguousarray(array)
         self.handle.write(contiguous.tobytes(order="C"))
         self.frame_count += 1
 
@@ -517,7 +527,7 @@ class LeRobotV21Writer:
             for key, value in tactile_dict.items():
                 if value is None:
                     continue
-                array = np.asarray(value, dtype=np.float32)
+                array = np.asarray(value)
                 if array.size <= 0:
                     continue
                 arrays[str(key)] = array
@@ -571,6 +581,8 @@ class LeRobotV21Writer:
                         ),
                         "frame_ids": dict(hand_state.get("tactile_frame_ids", {}) or {}),
                         "shapes": dict(hand_state.get("tactile_shapes", {}) or {}),
+                        "field_by_key": dict(hand_state.get("tactile_field_by_key", {}) or {}),
+                        "fields": list(hand_state.get("tactile_fields", ()) or ()),
                         "version": hand_state.get("tactile_version"),
                     },
                 )
@@ -767,12 +779,13 @@ class LeRobotV21Writer:
         self,
         state: _TactileSideState,
         sensor_key: str,
+        dtype: str,
     ) -> _TactileSensorStream:
         if sensor_key in state.streams:
             return state.streams[sensor_key]
         safe_name = _safe_path_token(sensor_key)
         used_names = {
-            Path(stream.relative_path).stem.removesuffix(".float32")
+            Path(stream.relative_path).name.rsplit(".", 2)[0]
             for stream in state.streams.values()
         }
         base_name = safe_name
@@ -780,11 +793,13 @@ class LeRobotV21Writer:
         while safe_name in used_names:
             suffix += 1
             safe_name = f"{base_name}_{suffix}"
-        relative_path = str(Path(state.relative_dir) / f"{safe_name}.float32.bin")
+        safe_dtype = _safe_path_token(dtype)
+        relative_path = str(Path(state.relative_dir) / f"{safe_name}.{safe_dtype}.bin")
         stream = _TactileSensorStream(
             sensor_key=str(sensor_key),
             relative_path=relative_path,
             path=self.root_dir / relative_path,
+            dtype=str(dtype),
         )
         state.streams[sensor_key] = stream
         return stream
@@ -800,7 +815,7 @@ class LeRobotV21Writer:
         if not isinstance(raw_arrays, Mapping):
             raise ValueError("Tactile frame payload arrays must be a mapping.")
         arrays = {
-            str(key): np.asarray(value, dtype=np.float32)
+            str(key): np.asarray(value)
             for key, value in raw_arrays.items()
             if value is not None and np.asarray(value).size > 0
         }
@@ -817,7 +832,11 @@ class LeRobotV21Writer:
 
         tactile_frame_index = int(state.next_tactile_frame_index)
         for sensor_key in sensor_keys:
-            self._sensor_stream_for(state, sensor_key).append(arrays[sensor_key])
+            array = arrays[sensor_key]
+            if array.dtype == np.dtype("O"):
+                raise ValueError(f"Tactile sensor '{sensor_key}' has unsupported object dtype.")
+            self._sensor_stream_for(state, sensor_key, str(array.dtype)).append(array)
+        dtypes = {sensor_key: str(arrays[sensor_key].dtype) for sensor_key in sensor_keys}
         state.frame_records.append(
             {
                 "sample_frame_index": int(sample_index),
@@ -827,6 +846,9 @@ class LeRobotV21Writer:
                 "regions": list(payload.get("regions", ())),
                 "frame_ids": dict(payload.get("frame_ids", {}) or {}),
                 "shapes": dict(payload.get("shapes", {}) or {}),
+                "dtypes": dtypes,
+                "field_by_key": dict(payload.get("field_by_key", {}) or {}),
+                "fields": list(payload.get("fields", ()) or ()),
                 "version": payload.get("version"),
             }
         )

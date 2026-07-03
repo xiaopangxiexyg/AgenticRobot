@@ -18,9 +18,11 @@ from robot_motion.runtime_gate import IKActionChunkGate
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DMTAC_TACTILE_FIELDS,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
     GRIPPER_ACTION_MAX,
+    normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
@@ -185,6 +187,13 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _parse_dmtac_tactile_fields(text: str) -> tuple[str, ...]:
+    try:
+        return normalize_dmtac_tactile_fields(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _parse_active_sides(value: str | list[str] | tuple[str, ...]) -> tuple[str, ...]:
     if isinstance(value, (list, tuple)):
         parts = [
@@ -335,6 +344,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
+        "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
     for key, aliases in profile_keys.items():
         value = _profile_value(profile, *aliases)
@@ -363,6 +374,10 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    if policy.get("tactile_fields") is not None:
+        policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
+    if policy.get("tactile_compute_profile") is not None:
+        policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if not 0 <= int(policy["output_dim"]) < 6:
         raise ValueError("gripper output_dim must be in [0, 5].")
     if float(policy["send_threshold"]) < 0.0:
@@ -429,9 +444,16 @@ def _apply_gripper_policy_to_dmtac_config(
     tactile_wait_for_new = getattr(args, "dmtac_tactile_wait_for_new", None)
     if tactile_wait_for_new is not None:
         config.tactile_wait_for_new = bool(tactile_wait_for_new)
+    tactile_fields = getattr(args, "dmtac_tactile_fields", None)
+    if tactile_fields is None:
+        tactile_fields = policy.get("tactile_fields")
+    if tactile_fields is not None:
+        config.tactile_fields = normalize_dmtac_tactile_fields(tactile_fields)
     tactile_compute_profile = getattr(args, "dmtac_tactile_compute_profile", None)
     if tactile_compute_profile:
         config.tactile_compute_profile = str(tactile_compute_profile)
+    elif policy.get("tactile_compute_profile"):
+        config.tactile_compute_profile = str(policy["tactile_compute_profile"])
     if bool(getattr(args, "dmtac_tactile_sequential_read", False)):
         config.tactile_parallel_read = False
     if not _dmtac_tactile_enabled(args):
@@ -757,9 +779,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dmtac-tactile-wait-for-new", action="store_true", default=None)
     parser.add_argument("--dmtac-tactile-sequential-read", action="store_true")
     parser.add_argument(
+        "--dmtac-tactile-fields",
+        type=_parse_dmtac_tactile_fields,
+        default=None,
+        metavar="FIELDS",
+        help=(
+            "DM-Tac fields to read/store, e.g. 'distributed_force' for the original path "
+            "or 'raw' for raw-image-only collection. Valid fields: "
+            + ", ".join(DMTAC_TACTILE_FIELDS)
+        ),
+    )
+    parser.add_argument(
         "--dmtac-tactile-compute-profile",
         choices=("dist-only", "legacy", "requested", "shear-depth"),
-        default="dist-only",
+        default=None,
     )
     parser.add_argument("--dmtac-with-tactile", dest="dmtac_tactile", action="store_true", default=None)
     parser.add_argument("--dmtac-no-tactile", dest="dmtac_tactile", action="store_false")

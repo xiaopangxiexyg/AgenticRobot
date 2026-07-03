@@ -12,6 +12,31 @@ from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
 
 
+DEFAULT_GRIPPER_INPUT_MIN = 0.1
+DEFAULT_GRIPPER_INPUT_MAX = 0.9
+
+
+def map_scalar_to_gripper_target(
+    source_value: float,
+    *,
+    input_min: float = DEFAULT_GRIPPER_INPUT_MIN,
+    input_max: float = DEFAULT_GRIPPER_INPUT_MAX,
+    invert: bool = False,
+    output_min: float = 0.0,
+    output_max: float = GRIPPER_ACTION_MAX,
+) -> tuple[float, float]:
+    source = float(np.clip(float(source_value), 0.0, 1.0))
+    lower = float(input_min)
+    upper = float(input_max)
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("input_min must be finite and smaller than input_max.")
+    normalized = float(np.clip((source - lower) / (upper - lower), 0.0, 1.0))
+    if invert:
+        normalized = 1.0 - normalized
+    target = float(output_min) + normalized * (float(output_max) - float(output_min))
+    return float(target), float(normalized)
+
+
 @dataclass(frozen=True)
 class ScalarToGripperRetargeterConfig:
     side: str
@@ -21,6 +46,8 @@ class ScalarToGripperRetargeterConfig:
     output_dim: int = 1
     invert: bool = False
     alpha: float = 1.0
+    input_min: float = DEFAULT_GRIPPER_INPUT_MIN
+    input_max: float = DEFAULT_GRIPPER_INPUT_MAX
     output_min: float = 0.0
     output_max: float = GRIPPER_ACTION_MAX
 
@@ -33,6 +60,8 @@ class ScalarToGripperRetargeterConfig:
             raise ValueError("output_dim must be in [0, 5].")
         if not 0.0 < float(self.alpha) <= 1.0:
             raise ValueError("alpha must be in (0, 1].")
+        if not 0.0 <= float(self.input_min) < float(self.input_max) <= 1.0:
+            raise ValueError("input_min/input_max must satisfy 0 <= input_min < input_max <= 1.")
         if float(self.output_min) < 0.0:
             raise ValueError("output_min must be non-negative.")
         if float(self.output_max) > GRIPPER_ACTION_MAX:
@@ -72,13 +101,13 @@ class ScalarToGripperRetargeter(Retargeter):
             )
         source = np.clip(source, 0.0, 1.0)
         source_value = float(source[int(self.config.source_dim)])
-        target_value = 1.0 - source_value if self.config.invert else source_value
-        target_value = float(
-            np.clip(
-                target_value,
-                float(self.config.output_min),
-                float(self.config.output_max),
-            )
+        target_value, normalized_value = map_scalar_to_gripper_target(
+            source_value,
+            input_min=float(self.config.input_min),
+            input_max=float(self.config.input_max),
+            invert=bool(self.config.invert),
+            output_min=float(self.config.output_min),
+            output_max=float(self.config.output_max),
         )
         if self._filtered_value is None or self.config.alpha >= 1.0:
             self._filtered_value = target_value
@@ -108,8 +137,11 @@ class ScalarToGripperRetargeter(Retargeter):
                     "output_dim": int(self.config.output_dim),
                     "invert": bool(self.config.invert),
                     "alpha": float(self.config.alpha),
+                    "input_min": float(self.config.input_min),
+                    "input_max": float(self.config.input_max),
                     "source_q6": source.copy(),
                     "source_value": float(source_value),
+                    "source_normalized_value": float(normalized_value),
                     "gripper_joint_target": float(self._filtered_value),
                     "hand_action_spec": HandActionSpec.dmtac_gripper(
                         self.config.side,

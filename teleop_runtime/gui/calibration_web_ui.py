@@ -230,6 +230,40 @@ button.danger {
   font-size: 12px;
   line-height: 1.45;
 }
+.shortcut-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.shortcut-item kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid rgba(20, 122, 116, 0.30);
+  background: #fff;
+  color: var(--accent);
+  font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.shortcut-item span {
+  min-width: 0;
+  line-height: 1.25;
+}
 .capture-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -496,7 +530,7 @@ button.danger {
 }
 @media (max-width: 760px) {
   main { padding: 12px; }
-  .status-grid, .capture-grid, .button-grid, .raw-pose-grid, .ik-timing-grid, .gripper-grid { grid-template-columns: 1fr; }
+  .status-grid, .capture-grid, .button-grid, .raw-pose-grid, .ik-timing-grid, .gripper-grid, .shortcut-strip { grid-template-columns: 1fr; }
   .numeric-control { grid-template-columns: auto minmax(92px, 1fr) auto; }
   .numeric-control button[data-event="movement_multiple_reset"] { grid-column: 1 / -1; }
 }
@@ -570,6 +604,11 @@ button.danger {
   <section class="panel">
     <header><h2>控制</h2></header>
     <div class="panel-body">
+      <div class="shortcut-strip" aria-label="快捷键">
+        <div class="shortcut-item"><kbd>A</kbd><span>开始 / 停止数采</span></div>
+        <div class="shortcut-item"><kbd>B</kbd><span>开始遥操 / Hold</span></div>
+        <div class="shortcut-item"><kbd>C</kbd><span>急停</span></div>
+      </div>
       <div id="sendStatus" class="send-status"></div>
       <div class="control-title">标定 / 坐标系</div>
       <div class="button-grid">
@@ -658,6 +697,8 @@ button.danger {
 <script>
 (function () {
   var legacyTimer = null;
+  var legacyLatestState = {};
+  var legacyActiveControls = {};
 
   function byId(id) {
     return document.getElementById(id);
@@ -842,6 +883,7 @@ button.danger {
     var controls = state.active_controls || [];
     var i;
     for (i = 0; i < controls.length; i += 1) active[String(controls[i])] = true;
+    legacyActiveControls = active;
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (i = 0; i < buttons.length; i += 1) {
       var eventName = buttons[i].getAttribute("data-event");
@@ -870,6 +912,7 @@ button.danger {
 
   function renderState(state) {
     if (!state || window.__calibrationWebUiModernRefreshOk) return;
+    legacyLatestState = state || {};
     setText("stage", labelStage(state.stage || "Starting..."));
     setText("selectedSide", state.selected_side === "left" ? "左手" : state.selected_side === "right" ? "右手" : state.selected_side);
     setText("frameVizMode", state.frame_viz_mode);
@@ -911,13 +954,31 @@ button.danger {
     }
   }
 
-  function postEvent(eventName) {
+  function collectEpisodeStartPayloadLegacy() {
+    return {
+      dataset_base_root: byId("datasetBaseRootInput") ? byId("datasetBaseRootInput").value : "",
+      task_key: byId("taskSelect") ? byId("taskSelect").value : "",
+      task_english_name: byId("taskEnglishNameInput") ? byId("taskEnglishNameInput").value : "",
+      task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : ""
+    };
+  }
+
+  function postEvent(eventName, extraPayload) {
     if (window.__calibrationWebUiModernRefreshOk) return;
     try {
       var xhr = new XMLHttpRequest();
+      var payload = {event: eventName};
+      var key;
+      if (extraPayload) {
+        for (key in extraPayload) {
+          if (Object.prototype.hasOwnProperty.call(extraPayload, key)) {
+            payload[key] = extraPayload[key];
+          }
+        }
+      }
       xhr.open("POST", "/event", true);
       xhr.setRequestHeader("Content-Type", "application/json");
-      xhr.send(JSON.stringify({event: eventName}));
+      xhr.send(JSON.stringify(payload));
       if (eventName === "d") {
         var button = byId("ikDebugLogButton");
         if (button) button.textContent = "IK 记录切换中...";
@@ -927,11 +988,53 @@ button.danger {
     }
   }
 
+  function isEditableTargetLegacy(target) {
+    var tagName = target && target.tagName ? String(target.tagName).toUpperCase() : "";
+    return Boolean(target && (target.isContentEditable || tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT"));
+  }
+
+  function postKeyboardShortcutLegacy(key) {
+    var state = legacyLatestState || {};
+    var eventName = "";
+    var payload = null;
+    if (key === "a") {
+      eventName = state.episode_recording ? "episode_stop" : "episode_start";
+      if (eventName === "episode_start") payload = collectEpisodeStartPayloadLegacy();
+    } else if (key === "b") {
+      eventName = state.teleop_running ? "h" : "p";
+    } else if (key === "c") {
+      eventName = "q";
+    } else {
+      return false;
+    }
+    if (!legacyActiveControls[eventName]) {
+      setText("sendStatus", "快捷键 " + key.toUpperCase() + " 当前不可用");
+      return true;
+    }
+    postEvent(eventName, payload);
+    setText("sendStatus", "快捷键 " + key.toUpperCase() + " 已发送");
+    return true;
+  }
+
+  function bindKeyboard() {
+    document.onkeydown = function (event) {
+      if (window.__calibrationWebUiModernRefreshOk) return;
+      event = event || window.event;
+      if (event.repeat || isEditableTargetLegacy(event.target || event.srcElement)) return;
+      var key = String(event.key || "").toLowerCase();
+      if (key !== "a" && key !== "b" && key !== "c") return;
+      if (event.preventDefault) event.preventDefault();
+      event.returnValue = false;
+      postKeyboardShortcutLegacy(key);
+    };
+  }
+
   function bindButtons() {
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
-        postEvent(this.getAttribute("data-event"));
+        var eventName = this.getAttribute("data-event");
+        postEvent(eventName, eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null);
       };
     }
   }
@@ -939,6 +1042,7 @@ button.danger {
   window.__calibrationWebUiLegacyPollActive = true;
   markScriptRunning();
   bindButtons();
+  bindKeyboard();
   fetchState();
   legacyTimer = window.setInterval(fetchState, 500);
 })();
@@ -1008,6 +1112,7 @@ let ikDebugLogTogglePending = false;
 let ikDebugLogToggleExpected = null;
 let ikDebugLogToggleRequestedAt = 0;
 let stateRefreshFailureCount = 0;
+let latestState = {};
 
 const stageLabels = {
   "Starting...": "启动中...",
@@ -1139,6 +1244,46 @@ function collectEpisodeStartPayload() {
   };
 }
 
+function isEditableTarget(target) {
+  if (!target) return false;
+  const tagName = String(target.tagName || "").toUpperCase();
+  return target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(tagName);
+}
+
+function buttonForEvent(eventName) {
+  return Array.from(buttons).find((button) => button.dataset.event === eventName) || null;
+}
+
+function canSendEvent(eventName) {
+  const button = buttonForEvent(eventName);
+  if (button) return !button.disabled;
+  return activeControls.has(eventName);
+}
+
+async function sendGuiShortcut(key) {
+  const state = latestState || {};
+  let eventName = "";
+  let payload = null;
+  if (key === "a") {
+    eventName = state.episode_recording ? "episode_stop" : "episode_start";
+    if (eventName === "episode_start") payload = collectEpisodeStartPayload();
+  } else if (key === "b") {
+    eventName = state.teleop_running ? "h" : "p";
+  } else if (key === "c") {
+    eventName = "q";
+  } else {
+    return false;
+  }
+  if (!canSendEvent(eventName)) {
+    const label = key.toUpperCase();
+    sendStatusEl.textContent = `快捷键 ${label} 当前不可用`;
+    return true;
+  }
+  await sendEvent(eventName, payload);
+  sendStatusEl.textContent = `快捷键 ${key.toUpperCase()} 已发送`;
+  return true;
+}
+
 function clampNumber(value, minValue, maxValue) {
   if (!Number.isFinite(value)) return minValue;
   return Math.max(minValue, Math.min(maxValue, value));
@@ -1197,8 +1342,17 @@ if (taskSelectEl) {
 
 document.addEventListener("keydown", async (event) => {
   if (event.repeat) return;
-  if (event.target && ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+  if (isEditableTarget(event.target)) return;
   const key = event.key.toLowerCase();
+  if (["a", "b", "c"].includes(key)) {
+    event.preventDefault();
+    try {
+      await sendGuiShortcut(key);
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+    return;
+  }
   if (!activeControls.has(key)) return;
   event.preventDefault();
   try {
@@ -1735,6 +1889,7 @@ async function refresh() {
     const response = await fetch("/state.json?ts=" + Date.now(), {cache: "no-store"});
     if (!response.ok) throw new Error("state fetch failed: " + response.status);
     const state = await response.json();
+    latestState = state || {};
     stageEl.textContent = labelFor(stageLabels, state.stage || "Starting...");
     pillsEl.innerHTML = formatPills(state);
     selectedSideEl.textContent = labelFor(sideLabels, state.selected_side);
@@ -1780,6 +1935,8 @@ _FALLBACK_SCRIPT = r"""
 (function () {
   if (window.__calibrationWebUiExternalFallbackLoaded) return;
   window.__calibrationWebUiExternalFallbackLoaded = true;
+  var fallbackLatestState = {};
+  var fallbackActiveControls = {};
 
   function byId(id) {
     return document.getElementById(id);
@@ -1942,6 +2099,7 @@ _FALLBACK_SCRIPT = r"""
     var controls = state.active_controls || [];
     var i;
     for (i = 0; i < controls.length; i += 1) active[String(controls[i])] = true;
+    fallbackActiveControls = active;
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (i = 0; i < buttons.length; i += 1) {
       var eventName = buttons[i].getAttribute("data-event");
@@ -1984,6 +2142,7 @@ _FALLBACK_SCRIPT = r"""
 
   function renderState(state) {
     if (!state || window.__calibrationWebUiModernRefreshOk || window.__calibrationWebUiLegacyPollActive) return;
+    fallbackLatestState = state || {};
     setText("stage", labelStage(state.stage || "Starting..."));
     setText("selectedSide", state.selected_side === "left" ? "左手" : state.selected_side === "right" ? "右手" : state.selected_side);
     setText("frameVizMode", state.frame_viz_mode);
@@ -2023,22 +2182,81 @@ _FALLBACK_SCRIPT = r"""
     }
   }
 
-  function postEvent(eventName) {
+  function collectEpisodeStartPayloadFallback() {
+    return {
+      dataset_base_root: byId("datasetBaseRootInput") ? byId("datasetBaseRootInput").value : "",
+      task_key: byId("taskSelect") ? byId("taskSelect").value : "",
+      task_english_name: byId("taskEnglishNameInput") ? byId("taskEnglishNameInput").value : "",
+      task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : ""
+    };
+  }
+
+  function postEvent(eventName, extraPayload) {
     try {
       var xhr = new XMLHttpRequest();
+      var payload = {event: eventName};
+      var key;
+      if (extraPayload) {
+        for (key in extraPayload) {
+          if (Object.prototype.hasOwnProperty.call(extraPayload, key)) {
+            payload[key] = extraPayload[key];
+          }
+        }
+      }
       xhr.open("POST", "/event", true);
       xhr.setRequestHeader("Content-Type", "application/json");
-      xhr.send(JSON.stringify({event: eventName}));
+      xhr.send(JSON.stringify(payload));
     } catch (error) {
       setHealth("外部兼容脚本发送按钮事件失败: " + error);
     }
+  }
+
+  function isEditableTargetFallback(target) {
+    var tagName = target && target.tagName ? String(target.tagName).toUpperCase() : "";
+    return Boolean(target && (target.isContentEditable || tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT"));
+  }
+
+  function postKeyboardShortcutFallback(key) {
+    var state = fallbackLatestState || {};
+    var eventName = "";
+    var payload = null;
+    if (key === "a") {
+      eventName = state.episode_recording ? "episode_stop" : "episode_start";
+      if (eventName === "episode_start") payload = collectEpisodeStartPayloadFallback();
+    } else if (key === "b") {
+      eventName = state.teleop_running ? "h" : "p";
+    } else if (key === "c") {
+      eventName = "q";
+    } else {
+      return false;
+    }
+    if (!fallbackActiveControls[eventName]) {
+      setText("sendStatus", "快捷键 " + key.toUpperCase() + " 当前不可用");
+      return true;
+    }
+    postEvent(eventName, payload);
+    setText("sendStatus", "快捷键 " + key.toUpperCase() + " 已发送");
+    return true;
+  }
+
+  function bindKeyboard() {
+    document.onkeydown = function (event) {
+      event = event || window.event;
+      if (event.repeat || isEditableTargetFallback(event.target || event.srcElement)) return;
+      var key = String(event.key || "").toLowerCase();
+      if (key !== "a" && key !== "b" && key !== "c") return;
+      if (event.preventDefault) event.preventDefault();
+      event.returnValue = false;
+      postKeyboardShortcutFallback(key);
+    };
   }
 
   function bindButtons() {
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
-        postEvent(this.getAttribute("data-event"));
+        var eventName = this.getAttribute("data-event");
+        postEvent(eventName, eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null);
       };
     }
   }
@@ -2049,6 +2267,7 @@ _FALLBACK_SCRIPT = r"""
   window.__calibrationWebUiExternalFallbackActive = true;
   setHealth("外部兼容脚本已启动，正在接管 state.json 实时刷新...");
   bindButtons();
+  bindKeyboard();
   fetchState();
   window.setInterval(fetchState, 500);
 })();

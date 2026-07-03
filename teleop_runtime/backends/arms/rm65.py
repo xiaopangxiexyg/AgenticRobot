@@ -1208,9 +1208,28 @@ class RM65ArmBackend(EffectorBackend):
             )
         return self.arm.Movej_CANFD(joint_deg, False)
 
-    def refresh_state_from_hardware(self) -> dict[str, np.ndarray | EffectorCommand | None | int | float | str]:
+    def refresh_state_from_hardware(
+        self,
+        *,
+        hardware_read_retries: int | None = None,
+        hardware_read_retry_delay_sec: float | None = None,
+    ) -> dict[str, np.ndarray | EffectorCommand | None | int | float | str]:
         if self.arm is None:
             return self.get_state()
+        retry_count = max(
+            1,
+            int(
+                self.config.hardware_read_retries
+                if hardware_read_retries is None
+                else hardware_read_retries
+            )
+            + 1,
+        )
+        retry_delay_sec = float(
+            self.config.hardware_read_retry_delay_sec
+            if hardware_read_retry_delay_sec is None
+            else hardware_read_retry_delay_sec
+        )
         raw_result = -1
         joint_now = None
         pose_now = None
@@ -1219,7 +1238,7 @@ class RM65ArmBackend(EffectorBackend):
         parsed_code: int | None = None
         parsed_text = ""
         qpos_from_joint_now = None
-        for attempt in range(max(1, int(self.config.hardware_read_retries) + 1)):
+        for attempt in range(retry_count):
             try:
                 raw_result, joint_now, pose_now, arm_err, sys_err = self.arm.Get_Current_Arm_State()
             except Exception as exc:
@@ -1236,8 +1255,8 @@ class RM65ArmBackend(EffectorBackend):
                 pose_now=pose_now,
             ):
                 break
-            if attempt + 1 < max(1, int(self.config.hardware_read_retries) + 1):
-                time.sleep(float(self.config.hardware_read_retry_delay_sec))
+            if attempt + 1 < retry_count:
+                time.sleep(retry_delay_sec)
         self._last_hardware_result_code = parsed_code
         self._last_hardware_result_text = parsed_text
         self._last_hardware_arm_err = None if arm_err is None else int(arm_err)

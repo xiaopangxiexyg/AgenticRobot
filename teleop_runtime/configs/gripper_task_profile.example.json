@@ -4,10 +4,12 @@
     "output_dim": 1,
     "invert": false,
     "alpha": 1.0,
+    "input_min": 0.1,
+    "input_max": 0.9,
     "speed": 1.0,
     "force": 1.0,
-    "max_action": 0.98,
-    "send_threshold": 0.01,
+    "max_action": 0.99,
+    "send_threshold": 0.002,
     "command_hz": 40.0,
     "continuous_grasp": false,
     "telemetry_hz": 10.0
@@ -17,7 +19,7 @@
       "gripper": {
         "force": 0.7,
         "speed": 1.0,
-        "max_action": 0.98,
+        "max_action": 0.99,
         "continuous_grasp": true,
         "left": {
           "force": 1.0
@@ -31,7 +33,7 @@
       "gripper": {
         "force": 1.0,
         "speed": 1.0,
-        "max_action": 0.98,
+        "max_action": 0.99,
         "continuous_grasp": true,
         "left": {
           "force": 1.0

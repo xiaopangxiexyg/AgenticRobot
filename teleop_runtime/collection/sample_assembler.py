@@ -331,6 +331,10 @@ MetadataBuilder = Callable[
     [SessionStepResult, CollectorComponents, Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]],
     Mapping[str, Any] | None,
 ]
+ArmStateMetadataProvider = Callable[
+    [CollectorComponents, float],
+    Mapping[str, Mapping[str, Any]] | None,
+]
 
 
 @dataclass
@@ -500,12 +504,14 @@ class CollectorSampleBuilder:
         *,
         assembler: SampleAssembler | None = None,
         metadata_builder: MetadataBuilder | None = None,
+        arm_state_metadata_provider: ArmStateMetadataProvider | None = None,
     ):
         self.config = config if config is not None else CollectorSampleBuilderConfig()
         self.assembler = assembler if assembler is not None else SampleAssembler(
             SampleAssemblerConfig(active_sides=self.config.active_sides)
         )
         self.metadata_builder = metadata_builder
+        self.arm_state_metadata_provider = arm_state_metadata_provider
         self.include_debug_metadata = bool(self.config.include_debug_metadata)
         self._episode_index = int(self.config.episode_index)
         self._frame_index = int(self.config.frame_index_start)
@@ -536,8 +542,43 @@ class CollectorSampleBuilder:
         self.assembler.reset_last_action()
         self._last_tactile_snapshot_key_by_side.clear()
 
-    def _snapshot_arm_states(self, components: CollectorComponents) -> dict[str, dict[str, Any]]:
+    def _snapshot_arm_state_metadata(
+        self,
+        components: CollectorComponents,
+        *,
+        sample_timestamp: float,
+    ) -> dict[str, dict[str, Any]]:
+        provider = self.arm_state_metadata_provider
+        if provider is None:
+            return {}
+        try:
+            metadata = provider(components, float(sample_timestamp))
+        except Exception as exc:  # noqa: BLE001 - annotation failures should not block collection.
+            return {
+                side: {
+                    "actual_state_provider_error": f"{type(exc).__name__}: {exc}",
+                }
+                for side in ("left", "right")
+            }
+        if not isinstance(metadata, Mapping):
+            return {}
+        return {
+            str(side): dict(_to_serializable(value))
+            for side, value in metadata.items()
+            if isinstance(value, Mapping)
+        }
+
+    def _snapshot_arm_states(
+        self,
+        components: CollectorComponents,
+        *,
+        sample_timestamp: float,
+    ) -> dict[str, dict[str, Any]]:
         states: dict[str, dict[str, Any]] = {}
+        actual_metadata = self._snapshot_arm_state_metadata(
+            components,
+            sample_timestamp=sample_timestamp,
+        )
         for side in ("left", "right"):
             backend_name = self.config.arm_backend_names.get(side)
             if backend_name is None:
@@ -554,6 +595,9 @@ class CollectorSampleBuilder:
                     state["current_tcp_pose"] = compute_tcp_pose()
                 except Exception:
                     state["current_tcp_pose"] = None
+            extra = actual_metadata.get(side)
+            if extra:
+                state.update(_copy_value(extra))
             states[side] = state
         return states
 
@@ -668,7 +712,10 @@ class CollectorSampleBuilder:
         components: CollectorComponents,
     ) -> CollectorSample:
         timing_started = time.perf_counter()
-        arm_states = self._snapshot_arm_states(components)
+        arm_states = self._snapshot_arm_states(
+            components,
+            sample_timestamp=float(step_result.timestamp),
+        )
         arm_snapshot_s = time.perf_counter() - timing_started
         timing_started = time.perf_counter()
         hand_states = self._snapshot_hand_states(components)

@@ -58,6 +58,40 @@ def _sample(*, frame_index: int = 0) -> CollectorSample:
     )
 
 
+def _raw_tactile_sample(*, frame_index: int = 0) -> CollectorSample:
+    raw = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    return CollectorSample(
+        index=frame_index,
+        episode_index=0,
+        frame_index=frame_index,
+        timestamp=10.0 + frame_index,
+        session_state="running",
+        control_hz=30.0,
+        action=np.zeros(26, dtype=np.float32),
+        observation_state=np.zeros(38, dtype=np.float32),
+        observation_last_action=np.zeros(26, dtype=np.float32),
+        arm_state_source="unit",
+        active_sides=("left",),
+        hand_states={
+            "left": {
+                "tactile": None,
+                "tactile_dict": {"M_RAW": raw},
+                "tactile_timestamp": 9.9 + frame_index,
+                "telemetry_timestamp": 9.95 + frame_index,
+                "tactile_regions": ("M_RAW",),
+                "tactile_devices": ("M_RAW",),
+                "tactile_frame_ids": {"M_RAW": 11 + frame_index},
+                "tactile_shapes": {"M_RAW": raw.shape},
+                "tactile_field_by_key": {"M_RAW": "raw"},
+                "tactile_fields": ("raw",),
+                "tactile_version": 3 + frame_index,
+                "tactile_raw_shape_per_sensor": raw.shape,
+            },
+            "right": {},
+        },
+    )
+
+
 class _VersionedTactileBackend:
     def __init__(self) -> None:
         self.version = 1
@@ -192,6 +226,40 @@ class TactileExternalStorageTest(unittest.TestCase):
             self.assertEqual(
                 episode_record["tactile_paths"]["left"],
                 "tactile/observation.hand.left.tactile/chunk-000/episode_000000/manifest.json",
+            )
+
+    def test_external_writer_preserves_raw_tactile_uint8_dtype(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_video=False,
+                    write_parquet=False,
+                    tactile_storage="external",
+                )
+            )
+            writer.start_episode(episode_index=0)
+            for job in writer.plan_sample_jobs(_raw_tactile_sample()):
+                writer.handle_job(job)
+            writer.finalize_episode(0)
+
+            manifest_path = (
+                Path(tmpdir)
+                / "tactile"
+                / "observation.hand.left.tactile"
+                / "chunk-000"
+                / "episode_000000"
+                / "manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            stream = manifest["streams"]["M_RAW"]
+            self.assertEqual(stream["dtype"], "uint8")
+            self.assertEqual(stream["shape"], [3, 4])
+            self.assertEqual(manifest["frames"][0]["field_by_key"], {"M_RAW": "raw"})
+            raw_path = Path(tmpdir) / stream["path"]
+            np.testing.assert_array_equal(
+                np.fromfile(raw_path, dtype=np.uint8).reshape(3, 4),
+                np.arange(12, dtype=np.uint8).reshape(3, 4),
             )
 
     def test_external_writer_parquet_keeps_only_tactile_reference(self) -> None:

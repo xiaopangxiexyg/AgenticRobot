@@ -108,7 +108,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         np.testing.assert_allclose(
             command.commands["left_hand"].value,
-            np.array([0.0, 0.25, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([0.0, 0.185625, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
         )
         spec = action.metadata["hand_action_specs_by_side"]["left"]
         self.assertEqual(spec["hand_model"], "dmtac_gripper")
@@ -148,6 +148,49 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             np.array([0.0, 0.95, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
         )
 
+    def test_scalar_gripper_retargeter_maps_q6_01_to_09_to_full_gripper_range(self) -> None:
+        retargeter = ScalarToGripperRetargeter(
+            ScalarToGripperRetargeterConfig(
+                side="right",
+                input_channel_name="right_hand_q6",
+                effector_name="right_hand",
+                source_dim=2,
+                output_dim=1,
+                output_max=0.95,
+            )
+        )
+
+        def command_for(value: float) -> np.ndarray:
+            observation = TeleopObservation(
+                channels={
+                    "right_hand_q6": ObservationChannel(
+                        channel_name="right_hand_q6",
+                        capability="joint_vector",
+                        side="right",
+                        value=np.array([0.0, 0.0, value, 0.0, 0.0, 0.0], dtype=np.float32),
+                        frame_name=None,
+                        timestamp=1.0,
+                        source_name="unit",
+                    )
+                },
+                timestamp=1.0,
+            )
+            return retargeter.retarget(observation).commands["right_hand"].value
+
+        np.testing.assert_allclose(
+            command_for(0.1),
+            np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            command_for(0.5),
+            np.array([0.0, 0.475, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        )
+        np.testing.assert_allclose(
+            command_for(0.9),
+            np.array([0.0, 0.95, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        )
+
     def test_run_collect_builds_dmtac_gripper_retargeter_from_q6(self) -> None:
         args = SimpleNamespace(
             hand_backend="dmtac-gripper",
@@ -181,6 +224,8 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(retargeters["left"].config.source_dim, 2)
         self.assertEqual(retargeters["left"].config.output_dim, 2)
         self.assertFalse(retargeters["left"].config.invert)
+        self.assertAlmostEqual(retargeters["left"].config.input_min, 0.1)
+        self.assertAlmostEqual(retargeters["left"].config.input_max, 0.9)
         self.assertEqual(configs["left"].gripper_port, "/dev/gripper-left")
         self.assertEqual(configs["left"].command_dim, 2)
         self.assertFalse(configs["left"].connect_tactile)
@@ -213,6 +258,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             dmtac_tactile_worker_cpus=(6, 7),
             dmtac_tactile_worker_nice=15,
             dmtac_tactile_worker_queue_size=4,
+            dmtac_tactile_fields=("raw",),
             dmtac_tactile_compute_profile="legacy",
             dmtac_tactile_parallel_read=None,
             dmtac_tactile_sequential_read=True,
@@ -227,6 +273,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         updated = run_collect._apply_gripper_policy_to_dmtac_config(config, args=args, policy=policy)
 
         self.assertFalse(updated.tactile_parallel_read)
+        self.assertEqual(updated.tactile_fields, ("raw",))
         self.assertEqual(updated.tactile_compute_profile, "legacy")
         self.assertAlmostEqual(updated.tactile_read_hz, 2.5)
         self.assertTrue(updated.tactile_process_read)
@@ -256,6 +303,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(config.tactile_process_cpu_affinity, ())
         self.assertEqual(config.tactile_process_queue_size, 2)
         self.assertEqual(config.tactile_max_fps, 30)
+        self.assertEqual(config.tactile_fields, ("distributed_force",))
 
     def test_gripper_task_profile_overrides_force_for_selected_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -344,7 +392,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertAlmostEqual(policy["speed"], 0.22)
         self.assertAlmostEqual(policy["max_action"], 0.77)
 
-    def test_real_teleop_gripper_task_profile_supports_left_right_force(self) -> None:
+    def test_real_teleop_gripper_task_profile_supports_left_right_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             profile_path = Path(tmp_dir) / "gripper_tasks.json"
             profile_path.write_text(
@@ -354,6 +402,8 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
                             "speed": 1.0,
                             "force": 0.2,
                             "max_action": 0.95,
+                            "input_min": 0.12,
+                            "input_max": 0.88,
                             "left": {"force": 0.21},
                             "right": {"force": 0.22},
                         },
@@ -361,7 +411,9 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
                             "firm_grasp": {
                                 "gripper": {
                                     "force": 0.4,
-                                    "left": {"force": 0.31},
+                                    "input_min": 0.2,
+                                    "input_max": 0.8,
+                                    "left": {"force": 0.31, "q6_min": 0.15, "q6_max": 0.85},
                                     "right": {"force": 0.47},
                                 }
                             }
@@ -395,12 +447,18 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         self.assertAlmostEqual(base_policy["speed"], 1.0)
         self.assertAlmostEqual(base_policy["torque"], 0.4)
+        self.assertAlmostEqual(base_policy["input_min"], 0.2)
+        self.assertAlmostEqual(base_policy["input_max"], 0.8)
         self.assertAlmostEqual(left_policy["speed"], 1.0)
         self.assertAlmostEqual(right_policy["speed"], 1.0)
         self.assertAlmostEqual(left_policy["torque"], 0.31)
         self.assertAlmostEqual(right_policy["torque"], 0.47)
+        self.assertAlmostEqual(left_policy["input_min"], 0.15)
+        self.assertAlmostEqual(left_policy["input_max"], 0.85)
+        self.assertAlmostEqual(right_policy["input_min"], 0.2)
+        self.assertAlmostEqual(right_policy["input_max"], 0.8)
 
-    def test_real_teleop_example_gripper_profile_builds_095_dmtac_config(self) -> None:
+    def test_real_teleop_example_gripper_profile_builds_dmtac_config(self) -> None:
         args = SimpleNamespace(
             hand_backend="dmtac-gripper",
             gripper_task_profile="teleop_runtime/configs/gripper_task_profile.example.json",
@@ -449,7 +507,15 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             configs = real_teleop._dmtac_backend_configs(args, ("right",))
 
         self.assertIn("right", configs)
-        self.assertAlmostEqual(configs["right"].max_action, 0.95)
+        self.assertAlmostEqual(configs["right"].max_action, 0.99)
+        self.assertAlmostEqual(configs["right"].send_threshold, 0.002)
+        for task_name in ("soft_grasp", "firm_grasp"):
+            task_args = argparse.Namespace(**vars(args))
+            task_args.gripper_task = task_name
+            real_teleop._clear_gripper_policy_cache(task_args)
+            policy = real_teleop._resolved_gripper_policy(task_args)
+            self.assertAlmostEqual(policy["max_action"], 0.99)
+            self.assertAlmostEqual(policy["send_threshold"], 0.002)
 
     def test_real_teleop_keeps_gripper_gui_visible_without_backend(self) -> None:
         components = SimpleNamespace(
@@ -761,7 +827,78 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         self.assertTrue(backend.send_command(first))
         self.assertFalse(backend.send_command(second))
+        self.assertEqual(backend.get_state()["gripper_last_send_status"], "rate_limited")
         self.assertTrue(backend.send_fixed_joint_pos(0.0))
+
+    def test_dmtac_gripper_telemetry_skips_recent_command_window(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read_gripper_state(self):
+                self.reads += 1
+                raise AssertionError("recent command telemetry should skip gripper state read")
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="left",
+                connect_hardware=True,
+                connect_tactile=False,
+                gripper_telemetry_command_grace_s=1.0,
+            )
+        )
+        backend.device = fake
+        backend._last_sent_command_timestamp = time.time()
+
+        backend._read_telemetry_once()
+        state = backend.get_state(include_tactile_arrays=False)
+
+        self.assertEqual(fake.reads, 0)
+        self.assertTrue(state["gripper_read_skipped"])
+        self.assertEqual(state["gripper_read_skip_reason"], "recent_command")
+
+    def test_dmtac_backend_reuses_static_motion_parameters_between_commands(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.moves: list[dict[str, object]] = []
+
+            def move(self, joint_pos: float, **kwargs: object) -> None:
+                self.moves.append({"joint_pos": float(joint_pos), **dict(kwargs)})
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="left",
+                connect_hardware=True,
+                connect_tactile=False,
+                speed=1.0,
+                torque=0.2,
+                continuous_grasp=False,
+            )
+        )
+        backend.device = fake
+        backend._applied_speed = 1.0
+        backend._applied_torque = 0.2
+        backend._applied_continuous_grasp = False
+
+        self.assertTrue(backend.send_fixed_joint_pos(np.asarray([0.2], dtype=np.float32)))
+        self.assertIsNone(fake.moves[-1]["speed"])
+        self.assertIsNone(fake.moves[-1]["torque"])
+        self.assertIsNone(fake.moves[-1]["continuous"])
+
+        backend.config.torque = 0.4
+        backend.config.continuous_grasp = True
+        self.assertTrue(backend.send_fixed_joint_pos(np.asarray([0.3], dtype=np.float32)))
+        self.assertIsNone(fake.moves[-1]["speed"])
+        self.assertAlmostEqual(fake.moves[-1]["torque"], 0.4)
+        self.assertTrue(fake.moves[-1]["continuous"])
 
     def test_deploy_builds_dmtac_gripper_backend_from_assignment(self) -> None:
         parser = argparse.ArgumentParser()
@@ -970,11 +1107,63 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             backend._latest_tactile_dict["M_TEST"],
         )
 
+        default_state = backend.get_state()
+        self.assertIsNone(default_state["tactile"])
+
+        backend.config.tactile_store_flat_vector = True
         compatible_state = backend.get_state()
         np.testing.assert_allclose(
             compatible_state["tactile"],
             np.arange(18, dtype=np.float32),
         )
+
+    def test_dmtac_backend_can_read_raw_tactile_images_without_force_array(self) -> None:
+        class _RawImage:
+            def __init__(self) -> None:
+                self.img = np.arange(12, dtype=np.uint8).reshape(3, 4)
+                self.serial = "M_RAW"
+
+        class _FakeFrame:
+            fid = 7
+
+            def __init__(self) -> None:
+                self.raw = _RawImage()
+                self.fids = {"raw": 7}
+                self.timings_ms = {"raw": 1.5, "getDevStatus": 0.25}
+
+        class _FakeDevice:
+            gripper = None
+            tactile = object()
+
+            def read_tactile(self, **_kwargs):
+                return {"M_RAW": _FakeFrame()}
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="left",
+                connect_hardware=False,
+                connect_tactile=True,
+                tactile_process_read=False,
+                tactile_fields=("raw",),
+                tactile_compute_profile="requested",
+            )
+        )
+        backend.device = _FakeDevice()
+
+        backend._read_telemetry_once()
+        state = backend.get_state(include_tactile_vector=False)
+
+        self.assertEqual(state["tactile_fields"], ("raw",))
+        self.assertEqual(state["tactile_raw_shape_per_sensor"], (3, 4))
+        self.assertEqual(state["tactile_shapes"], {"M_RAW": (3, 4)})
+        self.assertEqual(state["tactile_frame_ids"], {"M_RAW": 7})
+        self.assertEqual(state["tactile_field_by_key"], {"M_RAW": "raw"})
+        self.assertEqual(state["tactile_dict"]["M_RAW"].dtype, np.dtype("uint8"))
+        np.testing.assert_array_equal(
+            state["tactile_dict"]["M_RAW"],
+            np.arange(12, dtype=np.uint8).reshape(3, 4),
+        )
+        self.assertIsNone(state["tactile"])
 
     def test_dmtac_process_worker_queue_is_drained_by_get_state(self) -> None:
         class _FakeQueue:

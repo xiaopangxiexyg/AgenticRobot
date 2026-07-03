@@ -5,13 +5,13 @@
 默认假设在采集电脑上执行，工作目录固定为：
 
 ```bash
-cd /path/to/dex_inspire_teleop_new
+cd /home/zc/HandMotion/Developing/DexTeleop
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate dexteleop310
 ```
 
 ## 00. 机械臂末端重力标定和TCP标定见 hardware/rm65/utils/README.md
-## 01. 遥操作开始时用/home/password-1/DexTeleop/hardware/rm65/utils/init_arm/README.md来让双臂归位，起始状态手部自然贴合机械臂姿态双手与肩同宽
+## 01. 遥操作开始时用 hardware/rm65/utils/init_arm/README.md 让双臂归位，起始状态手部自然贴合机械臂姿态双手与肩同宽
 
 ```bash
 python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py \
@@ -23,7 +23,7 @@ python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py \
 
 ## 02. Q6 控制双臂 1D 夹爪
 
-Q6 夹爪控制已接入 `teleop_runtime.collection.run_collect`。先按上一节保存 Q6 左右手配置，再按下一节保存 gripper / DM TAC USB 配置。
+Q6 夹爪控制已接入 `teleop_runtime.debug.run_vive_rm65_real_teleop` 和 `teleop_runtime.collection.run_collect`。先保存 Q6 左右手配置，再保存 gripper / DM TAC USB 配置。
 
 采集命令中追加：
 
@@ -33,7 +33,7 @@ Q6 夹爪控制已接入 `teleop_runtime.collection.run_collect`。先按上一�
 --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
 ```
 
-如果没有 DM TAC 触觉，只接 1D gripper，追加 `--dmtac-no-tactile`。夹爪默认读取 Q6 第 `1` 维并写到 hand action 第 `1` 槽，可用 `--gripper-source-dim` / `--gripper-output-dim` 调整。
+如果没有 DM TAC 触觉，只接 1D gripper，追加 `--dmtac-no-tactile`。夹爪默认读取 Q6 `source_dim=2`，把 Q6 的 `0.1..0.9` 映射到夹爪 `0..0.99`，并写到 hand action `output_dim=1`；可用 `--gripper-source-dim` / `--gripper-output-dim` 调整。
 
 ### 03. USB 权限修复和 GUI 启动预检
 
@@ -86,12 +86,6 @@ cp local_paths.example.json local_paths.json
 }
 ```
 
-## 1. 下载解压assets到项目路径: https://disk.pku.edu.cn/link/AA669C31FE27A74A01A2A3BADD61ADF559
-文件名：assets.zip
-有效期限：2026-06-08 14:10
-提取码：YIlq
-
-
 ## 2. 固定设备配置
 
 当前 README 中使用的设备配置如下：
@@ -111,7 +105,7 @@ cp local_paths.example.json local_paths.json
 
 ```bash
 export REPO=$(pwd)
-export PROFILE=/home/ai/Desktop/DexTeleop/teleop_records/calibration_profiles/20260506_122501_vive_rm65_virtual_desk.json
+export PROFILE=$REPO/teleop_records/calibration_profiles/your_profile.json
 export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
 export DATASET_ROOT=$REPO/datasets
 export VIVE_TARGET_HOST=192.168.20.90
@@ -147,7 +141,7 @@ teleop_records/rm65_arm_ip_configs/latest.json
 因此默认行为是：数据和 policy action 以 `15Hz` 对齐，RM65 真机执行层仍按 `40Hz` 持续跟随最新 action。
 
 ```bash
-cd /home/ai/zc/DexTeleop
+cd "$REPO"
 
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --active-sides right \
@@ -263,11 +257,10 @@ python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --port 9999 \
   --hz 60 \
   --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist \
-  --tracker tracker_3:auxiliary
+  --tracker tracker_2:right_wrist
 ```
 
-推荐使用 `hardware/VIVE/VIVE_sender/data_sender_new.py`：它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。不要用 `hardware/VIVE/VIVE_sender/data_sender.py` 跑当前 teleop；它近似满速发 UDP，容易让 receiver 忙于清包。`data_time_sender.py` 发送的是 `double timestamp + 36 float` 到默认 `6666`，不是当前主链路协议。
+推荐使用 `hardware/VIVE/VIVE_sender/data_sender_new.py`：它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。第三只 `auxiliary` tracker 需要时再显式追加。不要用 `hardware/VIVE/VIVE_sender/data_sender.py` 跑当前 teleop；它近似满速发 UDP，容易让 receiver 忙于清包。`data_time_sender.py` 发送的是 `double timestamp + 36 float` 到默认 `6666`，不是当前主链路协议。
 
 如果 sender 和 receiver 在同一台机器上临时自测，可以把 `VIVE_TARGET_HOST` 改成 `127.0.0.1`。
 
@@ -513,155 +506,3 @@ Frame 兼容约定：
 - 长时间带相机真机采集压力测试
 - 全 17 tactile 区域高频读取压力测试
 - 多相机同步采集
-
-
-
-
-## 11. Being-H-Tac 真机部署
-
-```DexTeleop/teleop_runtime/deploy```里面写的是deploy原始所需的文件和部署脚本。
-
-
-
-
-# 左臂非操作者实验模式
-
-这里放两条复用 `teleop_runtime.collection` 主采集链路的左臂非操作者采集链路：
-
-- `left-arm-fixed`：左臂固定在按 `p` 时读取到的当前位置。
-- `left-arm-jitter`：左臂以按 `p` 时的位置为中心，末端做小范围随机平滑抖动，并和右臂一起走双臂 IK。
-
-## 固定左臂行为
-
-- 左臂：按 `p` 时同步真实 RM65 当前关节和 TCP pose，之后每帧发送同一个 `left_arm` joint hold command。
-- 右臂：继续使用 `right_wrist_pose -> right_arm` 遥操作。
-- 左手/右手：继续使用现有 q6 到 InspireTac 的遥操作和 telemetry/tactile 采集。
-- 数据：仍使用双臂 schema，`action` 26 维、`observation.state` 38 维，左臂 qpos、pose、replay joint target 都保留，不会退化成单臂空槽。
-
-固定左臂模式会关闭双臂 joint-space collision-aware retargeter，右臂走独立 `PoseToArmRetargeter`。运行前需要确认固定左臂不会处在右臂工作路径里。
-
-## 固定左臂启动
-
-当前只保留主采集入口，显式传入 `--left-arm-fixed`：
-
-```bash
-python -m teleop_runtime.collection \
-  --left-arm-fixed \
-  --dataset-root /path/to/datasets \
-  --task-name grasp_demo_left_arm_fixed \
-  --active-sides both \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --right-tracker-name tracker_2 \
-  --left-arm-ip 192.168.101.21 \
-  --right-arm-ip 192.168.1.20 \
-  --left-hand-port /dev/ttyUSB0 \
-  --right-hand-port /dev/ttyUSB1 \
-  --left-hand-ip 192.168.12.210 \
-  --right-hand-ip 192.168.11.210 \
-  --no-camera \
-  --no-video
-```
-
-## 相机可视化
-
-这两个实验模式都会直接复用 `teleop_runtime.collection` 的相机链路，因此支持：
-
-- `--camera-config`：加载 RealSense 配置。
-- `--vis_cam` / `--vis-cam`：打开实时相机预览窗口。
-- `--vis-cam-key` / `--vis-camera-key`：指定预览哪一路 camera key；不指定时默认显示全部已配置相机。
-- `--no-video`：只预览、不导出视频；保留视频时会继续按双臂 schema 写入数据集。
-
-固定左臂模式带相机预览示例：
-
-```bash
-python -m teleop_runtime.collection \
-  --left-arm-fixed \
-  --dataset-root /path/to/datasets \
-  --task-name grasp_demo_left_arm_fixed_camera \
-  --active-sides both \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --right-tracker-name tracker_2 \
-  --left-arm-ip 192.168.101.21 \
-  --right-arm-ip 192.168.1.20 \
-  --left-hand-port /dev/ttyUSB0 \
-  --right-hand-port /dev/ttyUSB1 \
-  --left-hand-ip 192.168.12.210 \
-  --right-hand-ip 192.168.11.210 \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
-  --vis_cam \
-  --vis-cam-key front
-```
-
-抖动左臂模式同样支持相机预览，只需要在主采集命令里加入相同的 `--camera-config --vis_cam --vis-cam-key front` 参数。
-
-## 左臂小范围抖动 + 双臂 IK
-
-显式打开 `--left-arm-jitter`：
-
-```bash
-python -m teleop_runtime.collection \
-  --left-arm-jitter \
-  --dataset-root ./test_left_fix_datasets \
-  --task-name grasp_demo_left_arm_jitter \
-  --active-sides both \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --load-profile "$PROFILE" \
-  --right-tracker-name tracker_2 \
-  --left-arm-ip 192.168.101.21 \
-  --right-arm-ip 192.168.1.20 \
-  --left-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130705-if00 \
-  --right-hand-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ABA130707-if00 \
-  --left-hand-ip 192.168.12.210 \
-  --right-hand-ip 192.168.11.210 \
-  --left-arm-jitter-position-m 0.01 \
-  --left-arm-jitter-rotation-deg 2 \
-  --left-arm-jitter-refresh-sec 1.2 \
-  --left-arm-jitter-smoothing-sec 0.45 \
-  --vis_cam \
-  --vis-cam-key front \
-  --visualize-tactile \
-  --hand-tactile-regions all \
-  --max-force 800
-```
-
-折纸 max force 1000, 薯片 400, 轻重 200
-
-`--dataset-root` 是基础输出目录，实际数据集目录会自动命名为
-`<dataset-root>/<YYYY-MM-DD>_<task-name>`；旧的 `--task` 仍可用作兼容入口。
-
-抖动模式行为：
-
-- 左臂：按 `p` 时记录当前 TCP pose 作为 anchor，之后生成围绕 anchor 的随机平滑 cartesian target。
-- 抖动启停：只有按 `z` 开始录制后才推进随机抖动；录制前以及按 `c`/`d` 结束后，左臂保持静止。`c`/`d` 会把左臂停在当时当前位置，不会拉回 `p` 时的 anchor。
-- 双臂 IK：左臂 jitter target 和右臂 wrist target 一起输入 `DualArmCollisionAwareRetargeter`，输出左右 arm joint command。
-- 左手：继续用左 q6 控制左 InspireTac hand。
-- 右臂：继续用右 wrist tracker 遥操作。
-- 右手：继续用右 q6 控制右 InspireTac hand。
-- InspireTac 启动 force：继承 collector 参数 `--inspire-hand-max-force N`，默认 `800`；兼容 `--max-fingertip-force` 和 `--max-force`。
-- 数据：仍是双臂双手 schema，左臂 action/observation/replay joint target 来自双臂 IK 后的左臂命令和 backend 状态。
-
-抖动参数：
-
-- `--left-arm-jitter-position-m`：TCP 平移抖动最大半径，单位米。
-- `--left-arm-jitter-rotation-deg`：TCP 姿态抖动最大角度，单位度。
-- `--left-arm-jitter-refresh-sec`：多久采样一个新的随机目标。
-- `--left-arm-jitter-smoothing-sec`：一阶平滑时间常数；越大越慢。
-- `--left-arm-jitter-seed`：随机种子；负数使用系统随机源。
-
-抖动模式需要双臂 IK，因此不能和 `--disable-dual-arm-collision-avoidance` 同时使用。
-
-## 按键流程
-
-按键和普通 collector 一致：
-
-- `p`：同步左右臂当前真机状态；右臂采集 wrist home；左臂锁定当前位置。
-- `z`：开始 episode。
-- `c`：保存 episode。
-- `d`：丢弃当前 episode。
-- `h`：停止跟随并清除 home/fixed/jitter state。
-- `q`：退出。
-
-这两种模式都只需要右臂 wrist tracker 正常输入；左 wrist tracker 不参与运行时 home，也不是安全必需 channel。如果发送端仍然提供左 wrist tracker，collector 会把它作为非关键 channel 记录下来。

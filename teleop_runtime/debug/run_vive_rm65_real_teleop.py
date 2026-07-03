@@ -28,9 +28,11 @@ from ..backends.arms import (
 )
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DMTAC_TACTILE_FIELDS,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
     GRIPPER_ACTION_MAX,
+    normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
@@ -47,6 +49,7 @@ from ..collection.diagnostics import (
     should_report_debug_frozen,
 )
 from ..collection.async_writer import AsyncWriterConfig, AsyncWriterPool
+from ..collection.arm_state_polling import ArmHardwareStatePoller, ArmHardwareStatePollerConfig
 from ..collection.camera_preview import CameraPreviewConfig, CameraPreviewer
 from ..collection.build_collect_components import CollectorComponents
 from ..collection.observers import CollectionWriterObserver, CollectionWriterObserverConfig
@@ -100,6 +103,8 @@ from ..hand_tcp_alignment import (
 from ..tracker_hand import TRACKER_OFFSET_CALIBRATION_VERSION, canonical_hand_rpy_default
 from ..initial_alignment import TeleopInitialAlignment
 from ..retargeters import (
+    DEFAULT_GRIPPER_INPUT_MAX,
+    DEFAULT_GRIPPER_INPUT_MIN,
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
     JointsToDexHandRetargeter,
@@ -108,6 +113,7 @@ from ..retargeters import (
     PoseToArmRetargeterConfig,
     ScalarToGripperRetargeter,
     ScalarToGripperRetargeterConfig,
+    map_scalar_to_gripper_target,
 )
 from ..recording import RecordingConfig, SessionRecorder
 from ..rigs import BimanualRig
@@ -208,6 +214,8 @@ GRIPPER_POLICY_DEFAULTS = {
     "output_dim": 1,
     "invert": False,
     "alpha": 1.0,
+    "input_min": DEFAULT_GRIPPER_INPUT_MIN,
+    "input_max": DEFAULT_GRIPPER_INPUT_MAX,
     "speed": 1.0,
     "torque": 0.2,
     "max_action": GRIPPER_ACTION_MAX,
@@ -701,6 +709,13 @@ def _dmtac_worker_nice(text: str) -> int:
     return value
 
 
+def _parse_dmtac_tactile_fields(text: str) -> tuple[str, ...]:
+    try:
+        return normalize_dmtac_tactile_fields(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _hand_backend_mode(args: argparse.Namespace) -> str:
     mode = str(getattr(args, "hand_backend", HAND_BACKEND_INSPIRE) or HAND_BACKEND_INSPIRE)
     if mode not in HAND_BACKEND_CHOICES:
@@ -812,6 +827,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "output_dim": ("output_dim", "gripper_slot"),
         "invert": ("invert",),
         "alpha": ("alpha", "command_alpha"),
+        "input_min": ("input_min", "q6_min", "source_min"),
+        "input_max": ("input_max", "q6_max", "source_max"),
         "speed": ("speed",),
         "torque": ("torque", "force"),
         "max_action": ("max_action", "max_close"),
@@ -819,6 +836,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
+        "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
     for key, aliases in profile_keys.items():
         value = _profile_value(profile, *aliases)
@@ -830,6 +849,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "output_dim": getattr(args, "gripper_output_dim", None),
         "invert": getattr(args, "gripper_invert", None),
         "alpha": getattr(args, "gripper_alpha", None),
+        "input_min": getattr(args, "gripper_input_min", None),
+        "input_max": getattr(args, "gripper_input_max", None),
         "speed": getattr(args, "gripper_speed", None),
         "torque": getattr(args, "gripper_torque", None),
         "max_action": getattr(args, "gripper_max_action", None),
@@ -846,6 +867,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["output_dim"] = int(policy["output_dim"])
     policy["invert"] = bool(policy["invert"])
     policy["alpha"] = float(policy["alpha"])
+    policy["input_min"] = float(policy["input_min"])
+    policy["input_max"] = float(policy["input_max"])
     policy["speed"] = float(policy["speed"])
     policy["torque"] = float(policy["torque"])
     policy["max_action"] = float(policy["max_action"])
@@ -853,12 +876,18 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    if policy.get("tactile_fields") is not None:
+        policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
+    if policy.get("tactile_compute_profile") is not None:
+        policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if not 0 <= int(policy["source_dim"]) < 6:
         raise ValueError("gripper source_dim must be in [0, 5].")
     if not 0 <= int(policy["output_dim"]) < 6:
         raise ValueError("gripper output_dim must be in [0, 5].")
     if not 0.0 < float(policy["alpha"]) <= 1.0:
         raise ValueError("gripper alpha must be in (0, 1].")
+    if not 0.0 <= float(policy["input_min"]) < float(policy["input_max"]) <= 1.0:
+        raise ValueError("gripper input_min/input_max must satisfy 0 <= input_min < input_max <= 1.")
     if float(policy["send_threshold"]) < 0.0:
         raise ValueError("gripper send_threshold must be >= 0.")
     if float(policy["command_hz"]) <= 0.0:
@@ -891,6 +920,12 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
     side_override = _gripper_side_override(profile, side)
     policy = dict(base_policy)
     profile_keys = {
+        "source_dim": ("source_dim", "q6_dim"),
+        "output_dim": ("output_dim", "gripper_slot"),
+        "invert": ("invert",),
+        "alpha": ("alpha", "command_alpha"),
+        "input_min": ("input_min", "q6_min", "source_min"),
+        "input_max": ("input_max", "q6_max", "source_max"),
         "speed": ("speed",),
         "torque": ("torque", "force"),
         "max_action": ("max_action", "max_close"),
@@ -898,11 +933,19 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
+        "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
     for key, aliases in profile_keys.items():
         value = _profile_value(side_override, *aliases)
         if value is not None:
             policy[key] = value
+    policy["source_dim"] = int(policy["source_dim"])
+    policy["output_dim"] = int(policy["output_dim"])
+    policy["invert"] = bool(policy["invert"])
+    policy["alpha"] = float(policy["alpha"])
+    policy["input_min"] = float(policy["input_min"])
+    policy["input_max"] = float(policy["input_max"])
     policy["speed"] = float(policy["speed"])
     policy["torque"] = float(policy["torque"])
     policy["max_action"] = float(policy["max_action"])
@@ -910,6 +953,18 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    if policy.get("tactile_fields") is not None:
+        policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
+    if policy.get("tactile_compute_profile") is not None:
+        policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
+    if not 0 <= int(policy["source_dim"]) < 6:
+        raise ValueError("gripper source_dim must be in [0, 5].")
+    if not 0 <= int(policy["output_dim"]) < 6:
+        raise ValueError("gripper output_dim must be in [0, 5].")
+    if not 0.0 < float(policy["alpha"]) <= 1.0:
+        raise ValueError("gripper alpha must be in (0, 1].")
+    if not 0.0 <= float(policy["input_min"]) < float(policy["input_max"]) <= 1.0:
+        raise ValueError("gripper input_min/input_max must satisfy 0 <= input_min < input_max <= 1.")
     if not 0.0 <= float(policy["speed"]) <= 1.0:
         raise ValueError("gripper speed must be in [0, 1].")
     if not 0.0 <= float(policy["torque"]) <= 1.0:
@@ -1223,9 +1278,16 @@ def _apply_gripper_policy_to_dmtac_config(
     tactile_worker_queue_size = getattr(args, "dmtac_tactile_worker_queue_size", None)
     if tactile_worker_queue_size is not None:
         config.tactile_process_queue_size = int(tactile_worker_queue_size)
+    tactile_fields = getattr(args, "dmtac_tactile_fields", None)
+    if tactile_fields is None:
+        tactile_fields = policy.get("tactile_fields")
+    if tactile_fields is not None:
+        config.tactile_fields = normalize_dmtac_tactile_fields(tactile_fields)
     tactile_compute_profile = getattr(args, "dmtac_tactile_compute_profile", None)
     if tactile_compute_profile:
         config.tactile_compute_profile = str(tactile_compute_profile)
+    elif policy.get("tactile_compute_profile"):
+        config.tactile_compute_profile = str(policy["tactile_compute_profile"])
     tactile_max_fps = getattr(args, "dmtac_tactile_max_fps", None)
     if tactile_max_fps is not None:
         config.tactile_max_fps = int(tactile_max_fps)
@@ -1556,10 +1618,21 @@ def parse_args() -> argparse.Namespace:
         help="Allow left/right DMTAC tactile reads to overlap.",
     )
     parser.add_argument(
+        "--dmtac-tactile-fields",
+        type=_parse_dmtac_tactile_fields,
+        default=None,
+        metavar="FIELDS",
+        help=(
+            "DM-Tac fields to read/store, e.g. 'distributed_force' for the original path "
+            "or 'raw' for raw-image-only collection. Valid fields: "
+            + ", ".join(DMTAC_TACTILE_FIELDS)
+        ),
+    )
+    parser.add_argument(
         "--dmtac-tactile-compute-profile",
         choices=("dist-only", "legacy", "requested", "shear-depth"),
-        default="dist-only",
-        help="SDK compute channels for DMTAC distributed_force telemetry.",
+        default=None,
+        help="SDK compute channels for DMTAC telemetry. Default follows backend config.",
     )
     parser.add_argument(
         "--dmtac-tactile-denoise",
@@ -1636,7 +1709,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional JSON profile with a top-level gripper object and/or tasks.<name>.gripper "
             "overrides. It can set speed, force/torque, max_action, send_threshold, command_hz, "
-            "continuous_grasp, source_dim, output_dim, invert, alpha."
+            "continuous_grasp, source_dim, output_dim, invert, alpha, input_min, input_max."
         ),
     )
     parser.add_argument(
@@ -1662,6 +1735,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-invert", dest="gripper_invert", action="store_true", default=None)
     parser.add_argument("--gripper-no-invert", dest="gripper_invert", action="store_false")
     parser.add_argument("--gripper-alpha", type=_alpha_float, default=None, help="EMA alpha for 1D gripper command.")
+    parser.add_argument(
+        "--gripper-input-min",
+        type=float,
+        default=None,
+        help="Q6 value mapped to fully open gripper before optional inversion.",
+    )
+    parser.add_argument(
+        "--gripper-input-max",
+        type=float,
+        default=None,
+        help="Q6 value mapped to fully closed gripper before optional inversion.",
+    )
     parser.add_argument("--gripper-speed", type=float, default=None, help="Gripper move speed for this task.")
     parser.add_argument(
         "--gripper-torque",
@@ -2371,6 +2456,38 @@ def parse_args() -> argparse.Namespace:
         type=_positive_float,
         default=15.0,
         help="GUI warning threshold for actual dataset recording rate. Defaults to 15 Hz.",
+    )
+    parser.add_argument(
+        "--record-actual-wrist-camera-pose",
+        "--record-actual-wrist-pose",
+        dest="record_actual_wrist_camera_pose",
+        action="store_true",
+        default=True,
+        help=(
+            "Annotate each dataset frame with the latest background-polled RM65 feedback "
+            "TCP pose as observation.wrist_camera.* without changing training state/action fields. "
+            "Enabled by default; pass --no-record-actual-wrist-camera-pose to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-record-actual-wrist-camera-pose",
+        "--no-record-actual-wrist-pose",
+        dest="record_actual_wrist_camera_pose",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--actual-wrist-camera-pose-hz",
+        "--actual-wrist-pose-hz",
+        type=_positive_float,
+        default=30.0,
+        help="Background feedback polling rate for actual wrist camera pose annotation.",
+    )
+    parser.add_argument(
+        "--actual-wrist-camera-pose-max-age-sec",
+        "--actual-wrist-pose-max-age-sec",
+        type=_positive_float,
+        default=0.2,
+        help="Mark actual wrist camera pose annotations stale when their sample-time age exceeds this value.",
     )
     parser.add_argument(
         "--no-episode-recording",
@@ -4064,6 +4181,16 @@ def _build_episode_metadata(
         "arm_mode": "real",
         "active_sides": list(components.active_sides),
         "runtime_arm_state_source": "last_commanded_action",
+        "record_actual_wrist_camera_pose": bool(
+            getattr(args, "record_actual_wrist_camera_pose", True)
+        ),
+        "actual_wrist_camera_pose_source": "rm65_feedback_qpos_fk",
+        "actual_wrist_camera_pose_hz": float(
+            getattr(args, "actual_wrist_camera_pose_hz", 30.0)
+        ),
+        "actual_wrist_camera_pose_max_age_sec": float(
+            getattr(args, "actual_wrist_camera_pose_max_age_sec", 0.2)
+        ),
         "hz": float(args.hz),
         "movement_multiple": _movement_multiple_value(args),
         "translation_scale": float(args.translation_scale),
@@ -4091,7 +4218,10 @@ def _build_episode_metadata(
         "dmtac_config": str(getattr(args, "dmtac_config", "latest")),
         "dmtac_default_config_enabled": bool(getattr(args, "dmtac_default_config", True)),
         "dmtac_config_loaded_sides": list(getattr(args, "dmtac_config_loaded_sides", []) or []),
-        "dmtac_tactile_compute_profile": str(getattr(args, "dmtac_tactile_compute_profile", "dist-only")),
+        "dmtac_tactile_fields": list(getattr(args, "dmtac_tactile_fields", None) or []),
+        "dmtac_tactile_compute_profile": str(
+            getattr(args, "dmtac_tactile_compute_profile", None) or "dist-only"
+        ),
         "dmtac_tactile_parallel_read": getattr(args, "dmtac_tactile_parallel_read", None),
         "dmtac_tactile_global_read_lock": getattr(args, "dmtac_tactile_global_read_lock", None),
         "dmtac_tactile_read_hz": getattr(args, "dmtac_tactile_read_hz", None),
@@ -4273,6 +4403,7 @@ class RealTeleopDatasetRecorder:
         self.components = components
         self.camera_sources = dict(camera_sources)
         self.dataset_root = Path(args.dataset_root)
+        self.arm_state_poller = self._build_arm_state_poller()
         self.writer = LeRobotV21Writer(
             LeRobotV21WriterConfig(
                 root_dir=self.dataset_root,
@@ -4307,6 +4438,13 @@ class RealTeleopDatasetRecorder:
                 "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
                 "active_sides": list(components.active_sides),
                 "movement_multiple": _movement_multiple_value(args),
+                "record_actual_wrist_camera_pose": bool(self.arm_state_poller is not None),
+                "actual_wrist_camera_pose_hz": float(
+                    getattr(args, "actual_wrist_camera_pose_hz", 30.0)
+                ),
+                "actual_wrist_camera_pose_max_age_sec": float(
+                    getattr(args, "actual_wrist_camera_pose_max_age_sec", 0.2)
+                ),
             },
         )
         self.sample_builder = CollectorSampleBuilder(
@@ -4322,7 +4460,8 @@ class RealTeleopDatasetRecorder:
                     if str(args.tactile_storage).strip().lower().replace("-", "_") == "parquet"
                     else "on_change"
                 ),
-            )
+            ),
+            arm_state_metadata_provider=self._latest_actual_arm_state_metadata,
         )
         self.writer_observer = CollectionWriterObserver(
             components=self.collector_components,
@@ -4344,6 +4483,39 @@ class RealTeleopDatasetRecorder:
         self.frequency_min_elapsed_sec = 2.0
         self._record_timestamps: deque[float] = deque()
         self._episode_start_monotonic: float | None = None
+
+    def _build_arm_state_poller(self) -> ArmHardwareStatePoller | None:
+        if not bool(getattr(self.args, "record_actual_wrist_camera_pose", True)):
+            return None
+        backends_by_side = {
+            "left": self.components.left_state_backend,
+            "right": self.components.right_state_backend,
+        }
+        active_backends = {
+            side: backend
+            for side, backend in backends_by_side.items()
+            if side in self.components.active_sides and backend is not None
+        }
+        if not active_backends:
+            return None
+        return ArmHardwareStatePoller(
+            backends_by_side=active_backends,
+            config=ArmHardwareStatePollerConfig(
+                poll_hz=float(getattr(self.args, "actual_wrist_camera_pose_hz", 30.0)),
+                stale_after_sec=float(
+                    getattr(self.args, "actual_wrist_camera_pose_max_age_sec", 0.2)
+                ),
+            ),
+        )
+
+    def _latest_actual_arm_state_metadata(
+        self,
+        _components: CollectorComponents,
+        sample_timestamp: float,
+    ) -> Mapping[str, Mapping[str, Any]]:
+        if self.arm_state_poller is None:
+            return {}
+        return self.arm_state_poller.latest_by_side(sample_timestamp=float(sample_timestamp))
 
     def reconfigure_for_current_args(self) -> None:
         desired_root = Path(self.args.dataset_root)
@@ -4379,6 +4551,8 @@ class RealTeleopDatasetRecorder:
 
     def start(self) -> None:
         self.writer_observer.start()
+        if self.arm_state_poller is not None:
+            self.arm_state_poller.start()
 
     def write_camera_device_config(self) -> None:
         if not self.camera_sources:
@@ -4622,6 +4796,8 @@ class RealTeleopDatasetRecorder:
             self.poll_finalize_tasks()
 
     def close(self) -> None:
+        if self.arm_state_poller is not None:
+            self.arm_state_poller.close()
         self.wait_finalize_tasks()
         self.writer_observer.close(flush=True)
 
@@ -4797,7 +4973,10 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "dmtac_config": str(getattr(args, "dmtac_config", "latest")),
             "dmtac_default_config_enabled": bool(getattr(args, "dmtac_default_config", True)),
             "dmtac_config_loaded_sides": list(getattr(args, "dmtac_config_loaded_sides", []) or []),
-            "dmtac_tactile_compute_profile": str(getattr(args, "dmtac_tactile_compute_profile", "dist-only")),
+            "dmtac_tactile_fields": list(getattr(args, "dmtac_tactile_fields", None) or []),
+            "dmtac_tactile_compute_profile": str(
+                getattr(args, "dmtac_tactile_compute_profile", None) or "dist-only"
+            ),
             "dmtac_tactile_parallel_read": getattr(args, "dmtac_tactile_parallel_read", None),
             "dmtac_tactile_global_read_lock": getattr(args, "dmtac_tactile_global_read_lock", None),
             "dmtac_tactile_read_hz": getattr(args, "dmtac_tactile_read_hz", None),
@@ -4852,6 +5031,16 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "action_dt": action_dt,
             "arm_control_hz": arm_control_hz,
             "arm_control_dt": arm_control_dt,
+            "record_actual_wrist_camera_pose": bool(
+                getattr(args, "record_actual_wrist_camera_pose", True)
+            ),
+            "actual_wrist_camera_pose_source": "rm65_feedback_qpos_fk",
+            "actual_wrist_camera_pose_hz": float(
+                getattr(args, "actual_wrist_camera_pose_hz", 30.0)
+            ),
+            "actual_wrist_camera_pose_max_age_sec": float(
+                getattr(args, "actual_wrist_camera_pose_max_age_sec", 0.2)
+            ),
             "arm_control_mode": arm_control_mode,
             "impedance_mode": impedance_mode,
             "strict_tool_profile": strict_tool_profile,
@@ -4907,40 +5096,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         critical=False,
     )
 
-    tracker_configs: list[ViveTrackerConfig] = []
-    if "left" in active_sides:
-        source_side = _tracker_source_side_for_logical_side(args, "left")
-        tracker_configs.append(
-            ViveTrackerConfig(
-                name=_tracker_name_for_source_side(args, source_side),
-                side="left",
-                role=_tracker_role_for_source_side(source_side),
-                channel_name="left_wrist_pose",
-                legacy_index=_tracker_legacy_index_for_source_side(source_side),
-            )
-        )
-    if "right" in active_sides:
-        source_side = _tracker_source_side_for_logical_side(args, "right")
-        tracker_configs.append(
-            ViveTrackerConfig(
-                name=_tracker_name_for_source_side(args, source_side),
-                side="right",
-                role=_tracker_role_for_source_side(source_side),
-                channel_name="right_wrist_pose",
-                legacy_index=_tracker_legacy_index_for_source_side(source_side),
-            )
-        )
-    if args.aux_tracker_name:
-        tracker_configs.append(
-            ViveTrackerConfig(
-                name=args.aux_tracker_name,
-                side=None,
-                role="auxiliary",
-                channel_name="auxiliary_tracker_pose",
-                legacy_index=2,
-                critical=False,
-            )
-        )
+    tracker_configs = _build_vive_tracker_configs_for_args(args, active_sides)
 
     left_retargeter = PoseToArmRetargeter(
         PoseToArmRetargeterConfig(
@@ -5089,6 +5245,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                     output_dim=int(gripper_policy["output_dim"]),
                     invert=bool(gripper_policy["invert"]),
                     alpha=float(gripper_policy["alpha"]),
+                    input_min=float(gripper_policy["input_min"]),
+                    input_max=float(gripper_policy["input_max"]),
                     output_max=float(gripper_policy["max_action"]),
                 )
             )
@@ -5107,6 +5265,8 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                     output_dim=int(gripper_policy["output_dim"]),
                     invert=bool(gripper_policy["invert"]),
                     alpha=float(gripper_policy["alpha"]),
+                    input_min=float(gripper_policy["input_min"]),
+                    input_max=float(gripper_policy["input_max"]),
                     output_max=float(gripper_policy["max_action"]),
                 )
             )
@@ -6032,7 +6192,12 @@ def _tactile_visualization_available(
     if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
         for side in components.active_sides:
             backend = _gripper_backend_for_side(components, side)
-            if backend is not None and bool(getattr(backend.config, "connect_tactile", False)):
+            tactile_fields = tuple(getattr(backend.config, "tactile_fields", ()) or ()) if backend is not None else ()
+            if (
+                backend is not None
+                and bool(getattr(backend.config, "connect_tactile", False))
+                and "distributed_force" in tactile_fields
+            ):
                 return True
         return False
     return any(_hand_backend_for_side(components, side) is not None for side in components.active_sides)
@@ -6146,6 +6311,8 @@ def _q6_retarget_status(
     output_dim = int(components.gripper_policy.get("output_dim", 1))
     invert = bool(components.gripper_policy.get("invert", False))
     alpha = float(components.gripper_policy.get("alpha", 1.0))
+    input_min = float(components.gripper_policy.get("input_min", DEFAULT_GRIPPER_INPUT_MIN))
+    input_max = float(components.gripper_policy.get("input_max", DEFAULT_GRIPPER_INPUT_MAX))
     output_min = 0.0
     output_max = float(components.gripper_policy.get("max_action", GRIPPER_ACTION_MAX))
     if retargeter is not None:
@@ -6155,10 +6322,13 @@ def _q6_retarget_status(
             output_dim = int(getattr(config, "output_dim", output_dim))
             invert = bool(getattr(config, "invert", invert))
             alpha = float(getattr(config, "alpha", alpha))
+            input_min = float(getattr(config, "input_min", input_min))
+            input_max = float(getattr(config, "input_max", input_max))
             output_min = float(getattr(config, "output_min", output_min))
             output_max = float(getattr(config, "output_max", output_max))
 
     source_value: float | None = None
+    normalized_value: float | None = None
     target_preview: float | None = None
     try:
         q6_array = np.asarray(q6_values, dtype=float).reshape(-1)
@@ -6166,10 +6336,17 @@ def _q6_retarget_status(
             raw_source = _safe_float_value(q6_array[source_dim])
             if raw_source is not None:
                 source_value = float(np.clip(raw_source, 0.0, 1.0))
-                raw_target = 1.0 - source_value if invert else source_value
-                target_preview = float(np.clip(raw_target, output_min, output_max))
+                target_preview, normalized_value = map_scalar_to_gripper_target(
+                    source_value,
+                    input_min=input_min,
+                    input_max=input_max,
+                    invert=invert,
+                    output_min=output_min,
+                    output_max=output_max,
+                )
     except Exception:
         source_value = None
+        normalized_value = None
         target_preview = None
 
     filtered_target = None
@@ -6182,9 +6359,12 @@ def _q6_retarget_status(
         "q6_output_dim": output_dim,
         "q6_invert": invert,
         "q6_alpha": alpha,
+        "q6_input_min": input_min,
+        "q6_input_max": input_max,
         "q6_output_min": output_min,
         "q6_output_max": output_max,
         "q6_source_value": source_value,
+        "q6_normalized_value": normalized_value,
         "q6_target_preview": target_preview,
         "q6_filtered_target": filtered_target,
     }
@@ -6250,6 +6430,7 @@ def _gripper_status_for_side(
         "tactile_read_elapsed_s": state.get("tactile_read_elapsed_s"),
         "tactile_gate_wait_s": state.get("tactile_gate_wait_s"),
         "telemetry_elapsed_s": state.get("telemetry_elapsed_s"),
+        "tactile_fields": _json_safe_value(state.get("tactile_fields") or ()),
         "tactile_devices": _json_safe_value(state.get("tactile_devices") or ()),
         "tactile_shapes": _json_safe_value(state.get("tactile_shapes") or {}),
         "tactile_timings_ms": _json_safe_value(state.get("tactile_timings_ms") or {}),
@@ -6310,6 +6491,20 @@ def _dispatch_q6_gripper_control(
                 }
         return None
     commands: list[TeleopCommand] = []
+
+    def backend_send_fields(backend: DMTacGripperBackend) -> dict[str, object]:
+        elapsed_s = _safe_float_value(getattr(backend, "_last_send_elapsed_s", None))
+        lock_wait_s = _safe_float_value(getattr(backend, "_last_send_lock_wait_s", None))
+        return {
+            "backend_status": str(getattr(backend, "_last_send_status", "") or ""),
+            "skip_reason": str(getattr(backend, "_last_send_skip_reason", "") or ""),
+            "send_elapsed_s": elapsed_s,
+            "send_elapsed_ms": None if elapsed_s is None else float(elapsed_s) * 1000.0,
+            "send_lock_wait_s": lock_wait_s,
+            "send_lock_wait_ms": None if lock_wait_s is None else float(lock_wait_s) * 1000.0,
+            "send_target": _safe_float_value(getattr(backend, "_last_send_target_scalar", None)),
+        }
+
     for side in components.active_sides:
         side_status: dict[str, object] = {
             "status": "pending",
@@ -6365,9 +6560,11 @@ def _dispatch_q6_gripper_control(
             _log("Gripper", f"{side} Q6 command failed: {exc}", now=now)
             continue
         if not sent_ok:
-            finish("send_returned_false")
+            fields = backend_send_fields(backend)
+            backend_status = str(fields.get("backend_status") or "send_returned_false")
+            finish(backend_status, **fields)
             continue
-        finish("sent", sent=True)
+        finish("sent", sent=True, **backend_send_fields(backend))
         commands.append(command)
     if not commands:
         return None
@@ -6423,6 +6620,8 @@ def _gripper_runtime_status_signature(
         sent_text = _compact_runtime_bool(cmd_status.get("sent", False))
         cmd_target = _compact_runtime_float(cmd_status.get("target"))
         cmd_source = _compact_runtime_float(cmd_status.get("source_value"))
+        cmd_send_ms = _compact_runtime_float(cmd_status.get("send_elapsed_ms"), digits=1)
+        cmd_skip = str(cmd_status.get("skip_reason") or "")
         q6_valid = "ok" if bool(q6_status.get("q6_valid")) else (
             "missing" if not bool(q6_status.get("q6_channel_present")) else "invalid"
         )
@@ -6446,6 +6645,12 @@ def _gripper_runtime_status_signature(
             prefix = f"{side}=state_error:{exc}"
         else:
             if backend is not None:
+                if cmd_send_ms == "-":
+                    send_elapsed_s = _safe_float_value(state.get("gripper_send_elapsed_s"))
+                    if send_elapsed_s is not None:
+                        cmd_send_ms = _compact_runtime_float(float(send_elapsed_s) * 1000.0, digits=1)
+                if not cmd_skip:
+                    cmd_skip = str(state.get("gripper_last_send_skip_reason") or "")
                 connected = "connected" if bool(state.get("is_connected")) else "disconnected"
                 error = state.get("telemetry_error")
                 measured = state.get("gripper_measured_scalar")
@@ -6458,7 +6663,9 @@ def _gripper_runtime_status_signature(
         statuses.append(
             f"{prefix} q6={q6_valid} dim={q6_source_dim} src={q6_source} "
             f"target={q6_target} filt={q6_filtered} vals={q6_values_text} "
-            f"send={cmd_text}/{sent_text} send_src={cmd_source} send_target={cmd_target}"
+            f"send={cmd_text}/{sent_text} send_src={cmd_source} send_target={cmd_target} "
+            f"send_ms={cmd_send_ms}"
+            + (f" skip={cmd_skip}" if cmd_skip else "")
             + (f" q6_error={q6_error}" if q6_error else "")
         )
     return tuple(statuses)
@@ -7948,6 +8155,28 @@ class RealTeleopControlInput:
         controls.extend(self._vive_calibration_controls(allow_load=False))
         return controls
 
+    def _single_arm_tracker_swap_allowed_in_hold(self) -> bool:
+        return bool(
+            self._hold_active and len(tuple(self.components.active_sides)) == 1
+        )
+
+    def _pre_home_controls(self) -> list[str]:
+        controls = ["p", "w", "q"]
+        controls.extend(self._visualization_controls())
+        controls.extend(self._vive_calibration_controls(allow_load=True))
+        controls.extend(self._movement_multiple_controls())
+        return controls
+
+    def _hold_controls(self) -> list[str]:
+        controls = ["p", "c"]
+        if len(tuple(self.components.active_sides)) == 1:
+            controls.append("w")
+        controls.append("q")
+        controls.extend(self._visualization_controls())
+        controls.extend(self._vive_calibration_controls(allow_load=True))
+        controls.extend(self._movement_multiple_controls())
+        return controls
+
     def start(self) -> None:
         self.terminal.start()
         if self.ui is None:
@@ -7959,14 +8188,7 @@ class RealTeleopControlInput:
             host=str(self.args.host),
             port=int(self.args.port),
             load_profile=str(getattr(self.args, "load_profile", "") or ""),
-            active_controls=[
-                "p",
-                "w",
-                "q",
-                *self._visualization_controls(),
-                *self._vive_calibration_controls(allow_load=True),
-                *self._movement_multiple_controls(),
-            ],
+            active_controls=self._pre_home_controls(),
             control_hint=self._control_hint(),
             capture_stage="runtime_home",
             capture_phase="ready",
@@ -8273,18 +8495,19 @@ class RealTeleopControlInput:
         if self.ui is not None:
             self.ui.publish(
                 stage="Hold / 停臂保持",
-                active_controls=[
-                    "p",
-                    "c",
-                    "q",
-                    *self._visualization_controls(),
-                    *self._vive_calibration_controls(allow_load=True),
-                    *self._movement_multiple_controls(),
-                ],
+                active_controls=self._hold_controls(),
                 control_hint=(
                     "机械臂保持当前位置；请松开双手 Q6 后三维到释放区间 1 秒，再同时握紧 1 秒以重新标定。"
                     if is_q6_gesture
-                    else "机械臂保持当前位置；需要重新标定时，摆好 VIVE/Q6 后点击“开始遥操”或“采集 Home”。"
+                    else (
+                        "机械臂保持当前位置；单臂模式可先点击“交换 Tracker”，"
+                        "然后重新点击“开始遥操”或“采集 Home”。"
+                        if len(tuple(self.components.active_sides)) == 1
+                        else (
+                            "机械臂保持当前位置；需要重新标定时，"
+                            "摆好 VIVE/Q6 后点击“开始遥操”或“采集 Home”。"
+                        )
+                    )
                 ),
                 capture_stage="runtime_home",
                 capture_phase="ready",
@@ -8622,12 +8845,9 @@ class RealTeleopControlInput:
             self.ui.append_message("Calibration", message)
         self.ui.publish(
             stage="RM65 真机遥操准备" if not self._teleop_started else "Hold / 停臂保持",
-            active_controls=[
-                *(["p", "c", "q"] if self._teleop_started else ["p", "w", "q"]),
-                *self._visualization_controls(),
-                *self._vive_calibration_controls(allow_load=True),
-                *self._movement_multiple_controls(),
-            ],
+            active_controls=self._hold_controls()
+            if self._teleop_started
+            else self._pre_home_controls(),
             control_hint=(
                 message
                 or "请选择：标定/加载/保存 VIVE 坐标系，或采集 Home 后开始遥操。"
@@ -8944,16 +9164,36 @@ class RealTeleopControlInput:
         )
 
     def _toggle_vive_tracker_swap(self) -> None:
-        if self._tracker_swap_locked:
+        hold_swap_allowed = self._single_arm_tracker_swap_allowed_in_hold()
+        if self._tracker_swap_locked and not hold_swap_allowed:
             if self.ui is not None:
-                self.ui.append_message("InputMapping", "已开始遥操准备，运行中不能互换 VIVE tracker。")
+                self.ui.append_message(
+                    "InputMapping",
+                    "已开始遥操准备，运行中不能互换 VIVE tracker。",
+                )
             return
-        self.args.swap_operator_sides = not bool(getattr(self.args, "swap_operator_sides", False))
+        self.args.swap_operator_sides = not bool(
+            getattr(self.args, "swap_operator_sides", False)
+        )
         _apply_vive_tracker_mapping(self.args, self.components)
         message = self._control_hint()
+        if hold_swap_allowed:
+            message = (
+                f"{message} 单臂 Hold 状态已切换 tracker；"
+                "请重新点击“开始遥操”采集 runtime home。"
+            )
         _log("InputMapping", message)
         if self.ui is not None:
-            self.ui.publish(control_hint=message)
+            payload: dict[str, object] = {"control_hint": message}
+            if hold_swap_allowed:
+                payload.update(
+                    {
+                        "active_controls": self._hold_controls(),
+                        "home_ready": False,
+                        "teleop_running": False,
+                    }
+                )
+            self.ui.publish(**payload)
             self.ui.append_message("InputMapping", message)
             self.publish_raw_tracker_pose_state(force=True)
 
@@ -10024,14 +10264,7 @@ def main() -> None:
                 if control_ui is not None:
                     control_ui.publish(
                         stage="Hold / 停臂保持",
-                        active_controls=[
-                            "p",
-                            "c",
-                            "q",
-                            *clutch_input._visualization_controls(),
-                            *clutch_input._vive_calibration_controls(allow_load=True),
-                            *clutch_input._movement_multiple_controls(),
-                        ],
+                        active_controls=clutch_input._hold_controls(),
                         control_hint="机械臂已保持停止；可手动调整机械臂，之后重新采集 runtime Home 再遥操。",
                         capture_stage="runtime_home",
                         capture_phase="ready",

@@ -274,6 +274,81 @@ def collector_sample_to_row(
             "last_command_timestamp"
         )
         row[f"observation.arm.{side}.effective_step_scale"] = arm_state.get("effective_step_scale")
+        row[f"observation.arm.{side}.actual_qpos"] = _vector_list(
+            arm_state.get("actual_qpos"),
+            length=6,
+        )
+        row[f"observation.arm.{side}.actual_tcp_pose"] = _pose_matrix_to_xyzquat_list(
+            arm_state.get("actual_tcp_pose")
+        )
+        row[f"observation.arm.{side}.actual_hardware_qpos"] = _vector_list(
+            arm_state.get("actual_hardware_qpos"),
+            length=6,
+        )
+        row[f"observation.arm.{side}.actual_hardware_pose_6d"] = _vector_list(
+            arm_state.get("actual_hardware_pose_6d"),
+            length=6,
+        )
+        row[f"observation.arm.{side}.actual_hardware_refresh_time"] = arm_state.get(
+            "actual_hardware_refresh_time"
+        )
+        row[f"observation.arm.{side}.actual_hardware_result_code"] = arm_state.get(
+            "actual_hardware_result_code"
+        )
+        row[f"observation.arm.{side}.actual_hardware_result_text"] = arm_state.get(
+            "actual_hardware_result_text"
+        )
+        row[f"observation.arm.{side}.actual_hardware_arm_err"] = arm_state.get(
+            "actual_hardware_arm_err"
+        )
+        row[f"observation.arm.{side}.actual_hardware_sys_err"] = arm_state.get(
+            "actual_hardware_sys_err"
+        )
+        row[f"observation.arm.{side}.actual_state_source"] = arm_state.get(
+            "actual_state_source"
+        )
+        row[f"observation.arm.{side}.actual_state_timestamp"] = arm_state.get(
+            "actual_state_timestamp"
+        )
+        row[f"observation.arm.{side}.actual_state_read_start_time"] = arm_state.get(
+            "actual_state_read_start_time"
+        )
+        row[f"observation.arm.{side}.actual_state_read_end_time"] = arm_state.get(
+            "actual_state_read_end_time"
+        )
+        row[f"observation.arm.{side}.actual_state_read_elapsed_s"] = arm_state.get(
+            "actual_state_read_elapsed_s"
+        )
+        row[f"observation.arm.{side}.actual_sample_age_sec"] = arm_state.get(
+            "actual_sample_age_sec"
+        )
+        row[f"observation.arm.{side}.actual_state_stale"] = arm_state.get(
+            "actual_state_stale"
+        )
+        row[f"observation.arm.{side}.actual_state_error"] = arm_state.get(
+            "actual_state_error"
+        )
+        row[f"observation.arm.{side}.actual_state_provider_error"] = arm_state.get(
+            "actual_state_provider_error"
+        )
+        row[f"observation.wrist_camera.{side}.pose_base"] = _pose_matrix_to_xyzquat_list(
+            arm_state.get("wrist_camera_pose_base")
+        )
+        row[f"observation.wrist_camera.{side}.timestamp"] = arm_state.get(
+            "wrist_camera_pose_timestamp"
+        )
+        row[f"observation.wrist_camera.{side}.age_sec"] = arm_state.get(
+            "wrist_camera_pose_age_sec"
+        )
+        row[f"observation.wrist_camera.{side}.sample_time_offset_sec"] = arm_state.get(
+            "wrist_camera_pose_sample_time_offset_sec"
+        )
+        row[f"observation.wrist_camera.{side}.read_elapsed_s"] = arm_state.get(
+            "wrist_camera_pose_read_elapsed_s"
+        )
+        row[f"observation.wrist_camera.{side}.source"] = arm_state.get(
+            "wrist_camera_pose_source"
+        )
         row[f"action.replay.{side}_arm_joint_target"] = _vector_list(
             arm_state.get("last_target_qpos"),
             length=6,
@@ -377,6 +452,9 @@ def collector_sample_to_row(
         row[f"observation.hand.{side}.tactile_compute_profile"] = hand_state.get(
             "tactile_compute_profile"
         )
+        row[f"observation.hand.{side}.tactile_fields"] = list(
+            hand_state.get("tactile_fields", ()) or ()
+        )
         row[f"observation.hand.{side}.tactile_max_fps"] = hand_state.get(
             "tactile_max_fps"
         )
@@ -409,6 +487,11 @@ def collector_sample_to_row(
         )
         row[f"observation.hand.{side}.tactile_shapes_json"] = json.dumps(
             _to_serializable(hand_state.get("tactile_shapes", {})),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        row[f"observation.hand.{side}.tactile_field_by_key_json"] = json.dumps(
+            _to_serializable(hand_state.get("tactile_field_by_key", {})),
             ensure_ascii=True,
             sort_keys=True,
         )

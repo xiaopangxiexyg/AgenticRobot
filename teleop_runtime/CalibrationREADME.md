@@ -3,7 +3,7 @@
 这份文档只说明**当前已经落地的** VIVE -> RM65 标定调试流程。  
 它对应的入口是：
 
-- [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_rm65_calibration_debug.py)
+- [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](./debug/run_vive_rm65_calibration_debug.py)
 
 当前这套流程的核心目标是：
 
@@ -15,7 +15,7 @@
 这套流程**不会**重标 `desk -> base`。  
 机器人侧继续沿用当前 preset 里的 `T_D_B_left/right`。
 它现在也**不会**采集 session `home anchor`。`home` 已经移到
-[teleop_runtime/debug/run_vive_sapien_virtual.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/run_vive_sapien_virtual.py)
+[teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
 和后续真机部署入口中，每次启动单独采。
 
 当前终端日志默认带 `[HH:MM:SS]` 时间戳，并且只在状态变化、关键采样进度节点或异常时输出，不再持续刷固定频率状态行。
@@ -82,11 +82,12 @@
 推荐命令：
 
 ```bash
-conda activate grasp_py310_copy
+conda activate dexteleop310
 
-python hardware/VIVE/mocap/vive_data_sender.py \
+python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --host 127.0.0.1 \
   --port 9999 \
+  --hz 60 \
   --tracker tracker_1:left_wrist \
   --tracker tracker_2:right_wrist
 ```
