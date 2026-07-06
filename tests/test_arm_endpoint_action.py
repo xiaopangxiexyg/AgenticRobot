@@ -149,6 +149,43 @@ class ArmEndpointActionTest(unittest.TestCase):
 
         self.assertEqual(backend._candidate_tcp_frames(ARM_ENDPOINT_FRAME)[0], "arm_link6")
 
+    def test_rm65_position_backend_defaults_to_robot_motion_ik_framework(self) -> None:
+        config = RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+        )
+
+        self.assertEqual(config.ik_framework, "robot_motion")
+
+    def test_rm65_position_backend_rejects_legacy_ik_framework(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported RM65 IK framework"):
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                ik_framework="legacy",
+            )
+
+    def test_rm65_position_backend_robot_motion_framework_uses_shared_builder(self) -> None:
+        sentinel_solver = object()
+        with mock.patch(
+            "teleop_runtime.backends.arms.rm65.build_rm65_single_arm_ik_solver",
+            return_value=sentinel_solver,
+        ) as build_solver:
+            backend = RM65ArmBackend(
+                RM65ArmBackendConfig(
+                    arm_ip="0.0.0.0",
+                    side="left",
+                    connect_hardware=False,
+                )
+            )
+            solver = backend._solver_for_tcp_frame(TOOL_TCP_FRAME)
+
+        self.assertIs(solver, sentinel_solver)
+        build_solver.assert_called_once()
+        self.assertEqual(build_solver.call_args.args[0].controlled_frame, TOOL_TCP_FRAME)
+
     def test_rm65_position_reset_motion_state_uses_live_qpos_and_clears_targets(self) -> None:
         backend = RM65ArmBackend(
             RM65ArmBackendConfig(
@@ -316,6 +353,32 @@ class ArmEndpointActionTest(unittest.TestCase):
         backend.send_command(command)
 
         np.testing.assert_allclose(backend._latest_target_joint_deg, joint_deg)
+
+    def test_impedance_backend_debug_timing_records_send_command_lock_wait(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="right",
+                connect_hardware=False,
+                tool_profile="DMTAC_L",
+                debug_timing=True,
+            )
+        )
+        command = EffectorCommand(
+            effector_name="right_arm",
+            side="right",
+            command_type="cartesian_pose",
+            value=np.eye(4),
+        )
+
+        backend.send_command(command)
+        timing = backend.get_state()["last_send_command_timing"]
+
+        self.assertTrue(timing["enabled"])
+        self.assertGreaterEqual(timing["send_lock_wait_ms"], 0.0)
+        phase_names = [phase["name"] for phase in timing["phases"]]
+        self.assertIn("send_lock_wait", phase_names)
+        self.assertIn("state_update", phase_names)
 
     def test_rm65_position_backend_emergency_stop_requests_arm_stop(self) -> None:
         backend = RM65ArmBackend(

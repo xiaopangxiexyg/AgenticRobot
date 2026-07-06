@@ -228,13 +228,40 @@ def run_replay_preflight(
                 )
             )
             continue
+        target_array = np.asarray(targets, dtype=float)
+        if target_array.shape[0] != int(group.frame_count):
+            checks.append(
+                ReplayCheckResult(
+                    name=f"{side}_qpos_targets_frame_count",
+                    ok=False,
+                    message=(
+                        f"{side} qpos target frame count {target_array.shape[0]} "
+                        f"does not match replay frame count {int(group.frame_count)}."
+                    ),
+                    details={"shape": list(target_array.shape), "frame_count": int(group.frame_count)},
+                )
+            )
+            continue
+        if not np.all(np.isfinite(target_array)):
+            invalid = np.argwhere(~np.isfinite(target_array))
+            checks.append(
+                ReplayCheckResult(
+                    name=f"{side}_qpos_targets_finite",
+                    ok=False,
+                    message=f"{side} qpos targets contain non-finite values.",
+                    details={
+                        "first_invalid": invalid[0].astype(int).tolist() if invalid.size else None,
+                    },
+                )
+            )
+            continue
         checks.append(
             ReplayCheckResult(
                 name=f"{side}_qpos_targets_present",
                 ok=True,
                 level="info",
                 message=f"{side} qpos targets present",
-                details={"frame_count": int(np.asarray(targets).shape[0])},
+                details={"frame_count": int(target_array.shape[0])},
             )
         )
 

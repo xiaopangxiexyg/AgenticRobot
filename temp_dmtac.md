@@ -114,8 +114,12 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --session-record-compact-json \
   --writer-workers 6 \
   --writer-queue-size 1024 \
-  --storage-queue-size 128
+  --storage-queue-size 128 \
+  --wrist-depth-mask
 ```
+
+采集固定一侧的: 添加--fix-arm
+
 
 taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --active-sides right \
@@ -245,9 +249,9 @@ data/chunk-*/episode_*.parquet
 
 实现要点：
 
-- 默认保持原始实现：`tactile_fields=("distributed_force",)`，`tactile_compute_profile="dist-only"`。
+- 默认采集 raw 图：`tactile_fields=("raw",)`，`tactile_compute_profile="dist-only"`。
 - 新增可配置触觉字段：`raw`、`infer`、`deformation2d`、`shear`、`depth`、`force`、`distributed_force` 等。
-- raw-only 推荐配置：
+- raw-only 默认配置；显式写法：
 
 ```bash
 --dmtac-with-tactile \

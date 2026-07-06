@@ -284,12 +284,18 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="auto",
         )
-    if name == "dual_arm_hand_proxy_open":
-        urdf_path = asset_dir / "rm65_dual_arm_hand_proxy_open.urdf"
+    if name in {"dual_arm_hand_proxy_open", "dual_arm_hand_proxy_strict"}:
+        urdf_name = (
+            "rm65_dual_arm_hand_proxy_strict.urdf"
+            if name == "dual_arm_hand_proxy_strict"
+            else "rm65_dual_arm_hand_proxy_open.urdf"
+        )
+        urdf_path = asset_dir / urdf_name
         hand_proxy_boxes = _load_hand_proxy_boxes(urdf_path)
         link3_proxy_boxes = _load_link3_proxy_boxes(urdf_path)
         profile_proxy_boxes = (*hand_proxy_boxes, *link3_proxy_boxes)
         camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="camera_pole")
+        left_camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="left_camera_pole")
         table_box = _load_fixed_scene_box(urdf_path, link_name="table")
         left_links = (
             "arm_link1_0",
@@ -327,6 +333,7 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
                 ("right_arm_link3_proxy_0", table_box.geometry_name),
             )
         )
+        collision_pairs.append(("arm_link3_proxy_0", left_camera_pole_box.geometry_name))
         collision_pairs.extend(
             (
                 ("arm_link2_0", camera_pole_box.geometry_name),
@@ -364,7 +371,7 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
             right_frame_name="right_arm_link6",
             collision_pairs=tuple(collision_pairs),
             hand_proxy_boxes=profile_proxy_boxes,
-            fixed_scene_boxes=(camera_pole_box, table_box),
+            fixed_scene_boxes=(camera_pole_box, left_camera_pole_box, table_box),
             left_pose_transform=_POSE_TRANSFORM_LEFT,
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="auto",

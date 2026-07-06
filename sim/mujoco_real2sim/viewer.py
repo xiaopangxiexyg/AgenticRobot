@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from .scene import MujocoScene
 
@@ -12,6 +13,7 @@ def launch_passive_viewer(
     realtime_hz: float = 30.0,
     show_left_ui: bool = True,
     show_right_ui: bool = True,
+    on_step: Callable[[float], None] | None = None,
 ) -> None:
     """Open a MuJoCo GUI viewer for the current scene state.
 
@@ -30,10 +32,12 @@ def launch_passive_viewer(
         show_right_ui=bool(show_right_ui),
     ) as handle:
         while handle.is_running():
+            elapsed = time.time() - started_at
+            if on_step is not None:
+                on_step(elapsed)
             scene.forward()
             handle.sync()
             if duration_sec is not None and duration_sec > 0.0:
-                if time.time() - started_at >= float(duration_sec):
+                if elapsed >= float(duration_sec):
                     break
             time.sleep(period)
-

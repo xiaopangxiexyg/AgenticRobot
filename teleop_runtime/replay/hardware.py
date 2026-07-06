@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -11,7 +11,7 @@ from rm65_inspire_tac.paths import require_asset_path
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..deploy.schema import ARM_JOINT_DOF, xyzquat_to_pose_matrix
-from ..schemas import EffectorCommand
+from ..schemas import EffectorCommand, TeleopCommand
 
 
 ALL_SIDES = ("left", "right")
@@ -76,6 +76,7 @@ class ReplayHardwareConfig:
     replay_arm_max_angvel: tuple[float, ...] = (3.0, 3.0, 3.0, 4.0, 4.0, 4.0)
     background_streaming_enabled: bool = True
     connect_hardware: bool = True
+    rm65_ik_framework: str = "robot_motion"
 
     def __post_init__(self) -> None:
         self.active_sides = normalize_active_sides(self.active_sides)
@@ -91,6 +92,7 @@ class ReplayHardwareConfig:
         self.replay_arm_max_angvel = tuple(float(value) for value in self.replay_arm_max_angvel)
         if len(self.arm_max_angvel) != ARM_JOINT_DOF or len(self.replay_arm_max_angvel) != ARM_JOINT_DOF:
             raise ValueError("arm max_angvel tuples must contain 6 values.")
+        self.rm65_ik_framework = str(self.rm65_ik_framework or "robot_motion")
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ReplayHardwareConfig":
@@ -142,6 +144,11 @@ class ReplayHardwareConfig:
                 if "connect_hardware" in payload
                 else payload.get("connectHardware", True)
             ),
+            rm65_ik_framework=str(
+                payload.get("rm65_ik_framework")
+                or payload.get("rm65IkFramework")
+                or "robot_motion"
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -154,6 +161,7 @@ class ReplayHardwareConfig:
             "replay_arm_max_angvel": list(self.replay_arm_max_angvel),
             "background_streaming_enabled": bool(self.background_streaming_enabled),
             "connect_hardware": bool(self.connect_hardware),
+            "rm65_ik_framework": str(self.rm65_ik_framework),
         }
 
 
@@ -194,6 +202,7 @@ class ReplayHardwareRig:
                     max_angvel=tuple(float(value) for value in self.config.arm_max_angvel),
                     dry_run_fast=False,
                     tool_profile=self.config.tool_profile_by_side.get(side) or None,
+                    ik_framework=self.config.rm65_ik_framework,
                     background_streaming_enabled=bool(self.config.background_streaming_enabled),
                     background_streaming_hz=float(self.config.arm_control_hz),
                 )
@@ -226,6 +235,18 @@ class ReplayHardwareRig:
             if backend is not None:
                 _set_backend_max_angvel(backend, max_angvel)
         self._original_max_angvel_by_side.clear()
+
+    def hold_motion(self, reason: str = "hardware replay hold") -> None:
+        errors: list[str] = []
+        for side, backend in self.arm_backends.items():
+            if side not in self.config.active_sides:
+                continue
+            try:
+                backend.hold_motion(reason)
+            except Exception as exc:  # noqa: BLE001 - stop all active arms before reporting.
+                errors.append(f"{side}: {exc}")
+        if errors:
+            raise RuntimeError("hardware replay hold failed: " + "; ".join(errors))
 
     def refresh_state(self, side: str) -> dict[str, Any]:
         backend = self.arm_backends.get(str(side))
@@ -276,12 +297,10 @@ class ReplayHardwareRig:
         return {side: self.current_tcp_flange(side) for side in self.config.active_sides}
 
     def send_joint_targets(self, qpos_by_side: Mapping[str, Any], *, source: str) -> None:
+        command = TeleopCommand(metadata={"source": source})
         for side, qpos in qpos_by_side.items():
-            backend = self.arm_backends.get(str(side))
-            if backend is None:
-                continue
             target = np.asarray(qpos, dtype=float).reshape(ARM_JOINT_DOF)
-            backend.send_command(
+            command.add_command(
                 EffectorCommand(
                     effector_name=f"{side}_arm",
                     side=str(side),
@@ -291,6 +310,27 @@ class ReplayHardwareRig:
                     metadata={"source": source},
                 )
             )
+        self.send_commands(command)
+
+    def send_commands(
+        self,
+        command: TeleopCommand,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> None:
+        del phase_recorder
+        for effector_name, effector_command in command.commands.items():
+            side = effector_command.side
+            if side is None:
+                side = str(effector_name).removesuffix("_arm")
+            side = str(side)
+            if effector_name != f"{side}_arm":
+                raise ValueError(
+                    f"ReplayHardwareRig only supports arm commands, got effector {effector_name!r}."
+                )
+            backend = self.arm_backends.get(side)
+            if backend is None:
+                raise KeyError(f"ReplayHardwareRig backend missing for effector {effector_name!r}.")
+            backend.send_command(effector_command)
 
     def send_action_poses(self, action_by_side: Mapping[str, Any], *, source: str) -> None:
         for side, xyzquat in action_by_side.items():

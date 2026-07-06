@@ -1,0 +1,29 @@
+{
+  "front": {
+    "serial": "213222079798",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "metadata": {
+      "mount": "single_front"
+    }
+  },
+  "left_wrist": {
+    "serial": "261122273924",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "metadata": {
+      "mount": "single_left_wrist"
+    }
+  },
+  "right_wrist": {
+    "serial": "260522278055",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "metadata": {
+      "mount": "single_right_wrist"
+    }
+  }
+}

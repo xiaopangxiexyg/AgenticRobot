@@ -66,6 +66,19 @@ def _visual_rgba(visual: URDFVisual) -> str:
     return format_float_list(rgba)
 
 
+def _proxy_debug_rgba(link_name: str) -> tuple[float, float, float, float]:
+    name = str(link_name).lower()
+    if "left" in name and "hand" in name:
+        return (1.0, 0.45, 0.05, 0.78)
+    if "left" in name:
+        return (1.0, 0.12, 0.12, 0.78)
+    if "right" in name and "hand" in name:
+        return (0.1, 1.0, 0.35, 0.78)
+    if "right" in name:
+        return (0.05, 0.45, 1.0, 0.78)
+    return (1.0, 0.95, 0.05, 0.78)
+
+
 def _add_geom(
     body: ET.Element,
     *,
@@ -76,6 +89,7 @@ def _add_geom(
     asset: ET.Element,
     mesh_assets: dict[Path, str],
     used_mesh_names: set[str],
+    debug_proxy_visuals: bool = False,
 ) -> None:
     pos_text, quat_text = pose_to_pos_quat_text(visual.origin)
     geom_attrs = {
@@ -86,6 +100,9 @@ def _add_geom(
         "contype": "0",
         "conaffinity": "0",
     }
+    if debug_proxy_visuals and "proxy" in str(link_name).lower():
+        geom_attrs["rgba"] = format_float_list(_proxy_debug_rgba(link_name))
+        geom_attrs["group"] = "2"
     geometry = visual.geometry
     if geometry.kind == "mesh":
         if geometry.filename is None:
@@ -123,7 +140,7 @@ def _add_joint(body: ET.Element, joint: URDFJoint) -> None:
         "type": "slide" if joint.joint_type == "prismatic" else "hinge",
         "axis": format_float_list(joint.axis),
     }
-    if joint.joint_type == "revolute" and joint.limit is not None:
+    if joint.joint_type in {"revolute", "prismatic"} and joint.limit is not None:
         if joint.limit.lower is not None and joint.limit.upper is not None:
             attrs["range"] = format_float_list((joint.limit.lower, joint.limit.upper))
             attrs["limited"] = "true"
@@ -152,6 +169,7 @@ def convert_urdf_to_mjcf_xml(
     camera_mounts: Iterable[CameraMount],
     timestep: float = 1.0 / 30.0,
     gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    debug_proxy_visuals: bool = False,
 ) -> str:
     mounts_by_link: dict[str, list[CameraMount]] = {}
     for mount in camera_mounts:
@@ -201,6 +219,7 @@ def convert_urdf_to_mjcf_xml(
                 asset=asset,
                 mesh_assets=mesh_assets,
                 used_mesh_names=used_mesh_names,
+                debug_proxy_visuals=debug_proxy_visuals,
             )
         for mount in mounts_by_link.get(link_name, []):
             _add_camera(body, mount)
@@ -238,6 +257,7 @@ def write_mjcf(
     output_path: str | Path | None = None,
     timestep: float = 1.0 / 30.0,
     gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    debug_proxy_visuals: bool = False,
 ) -> MJCFConversion:
     model = parse_urdf(urdf_path)
     mounts = tuple(camera_mounts)
@@ -246,6 +266,7 @@ def write_mjcf(
         camera_mounts=mounts,
         timestep=timestep,
         gravity=gravity,
+        debug_proxy_visuals=debug_proxy_visuals,
     )
     if output_path is None:
         handle = tempfile.NamedTemporaryFile(

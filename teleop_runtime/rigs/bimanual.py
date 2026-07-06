@@ -81,11 +81,20 @@ class BimanualRig(Rig):
                 )
 
     def hold_motion(self, reason: str = "manual hold") -> None:
-        for backend in self.backends.values():
+        failures: list[tuple[str, Exception]] = []
+        for effector_name, backend in self.backends.items():
             try:
                 backend.hold_motion(reason)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                failures.append((effector_name, exc))
+        if failures:
+            details = "; ".join(
+                f"{effector_name}: {type(exc).__name__}: {exc}"
+                for effector_name, exc in failures
+            )
+            raise RuntimeError(
+                f"{self.name} hold_motion failed for {len(failures)} backend(s): {details}"
+            )
 
     def close(self) -> None:
         if self._executor is not None:

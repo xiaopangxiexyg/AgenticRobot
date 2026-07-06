@@ -17,6 +17,19 @@ class QposController:
         return self.scene.arm_qpos_by_side()
 
 
+class GripperController:
+    def __init__(self, scene: MujocoScene):
+        self.scene = scene
+
+    def apply(self, close_by_name: Mapping[str, float] | float) -> dict[str, float]:
+        if isinstance(close_by_name, (float, int)):
+            self.scene.set_gripper_close(None, float(close_by_name))
+        else:
+            for name, close in close_by_name.items():
+                self.scene.set_gripper_close(str(name), float(close))
+        return self.scene.gripper_close_by_name()
+
+
 class PoseIKController:
     def __init__(self, scene: MujocoScene, ik_solver: DampedLeastSquaresIK | None = None):
         self.scene = scene
@@ -28,4 +41,3 @@ class PoseIKController:
             for side, pose in pose_by_side.items()
         }
         return self.ik_solver.solve(targets)
-

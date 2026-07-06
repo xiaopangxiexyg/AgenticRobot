@@ -42,6 +42,18 @@ data/chunk-*/episode_*.parquet
 
 ## 真机轨迹 Replay
 
+当前真机 replay 面向 `teleop_runtime.debug.run_vive_rm65_real_teleop`
+采集的数据集。机械臂控制不使用 26 维 `action` pose 直接下发，而是使用：
+
+```text
+action.replay.left_arm_joint_target
+action.replay.right_arm_joint_target
+```
+
+`Move Start` 会先用 `robot_motion` 的 qpos init planner 从当前真机 qpos 规划到轨迹首帧 qpos；`Start`
+之后按帧把 recorded qpos target 包成 `TeleopCommand/EffectorCommand(joint_vector)`，再走
+RM65 backend 下发路径。
+
 右臂示例：
 
 ```bash
@@ -78,15 +90,16 @@ GUI 中按顺序操作：
 2. 默认 `Arm Output` 关闭；确认安全后再勾选。
 3. 点击 `Connect`。
 4. 点击 `Preflight`，确认所有阻断项通过。
-5. 点击 `Move Start`，从当前 qpos 平滑移动到轨迹首帧 qpos。
-6. 点击 `Start` 开始复现轨迹；需要停止时点 `Abort`。
+5. 点击 `Move Start`，执行 qpos init plan 到轨迹首帧。
+6. 点击 `Start`，按 `action.replay.<side>_arm_joint_target` 复现轨迹。
+7. 需要停止时点 `Abort`；replay 会请求 arm hold 并恢复 replay speed override。
 
 ## Preflight 检查
 
 真机 replay 会在开始运动前检查：
 
 - 数据集是否有有效轨迹。
-- 数据集中是否存在 `action.replay.<side>_arm_joint_target`。
+- 数据集中是否存在 `action.replay.<side>_arm_joint_target`，且帧数与 replay 轨迹一致、全帧 finite。
 - 当前真机 qpos 与轨迹首帧 qpos 是否在允许范围内。
 - 数据集记录的 tool profile TCP 与当前 GUI/CLI 配置的 TCP 数值是否一致。
 - 当前 TCP 位姿到轨迹首帧位姿的距离会显示为提示信息。

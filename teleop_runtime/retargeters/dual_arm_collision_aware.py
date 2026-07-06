@@ -23,16 +23,24 @@ from rm65_inspire_tac.ik_tuning import (
     preferred_wrist_flip_candidate,
     weighted_joint_distance_score,
 )
-from rm65_inspire_tac.multitask_ik import MultiTaskIKSolver
 from rm65_inspire_tac.pipeline import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
-    DualArmSceneProfile,
-    build_dual_arm_scene_profile,
 )
 from robot_motion.joint_limits import (
     JointVelocityLimitProfile,
     load_joint_velocity_limit_profiles,
+)
+from robot_motion.rm65 import (
+    DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN,
+    DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+    DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
+    DEFAULT_DUAL_ARM_COLLISION_SAFE_DISPLACEMENT_GAIN,
+    DEFAULT_DUAL_ARM_POSTURE_COST,
+    DEFAULT_DUAL_ARM_SOLVER_FREQUENCY_HZ,
+    RM65DualArmCollisionIKConfig,
+    build_rm65_dual_arm_collision_ik_solver,
+    build_rm65_dual_arm_scene_profile,
 )
 from robot_motion.posture_preferences import JointPosturePreference, posture_preference_from_metadata
 from robot_motion.profiles import IKSafetyProfile, load_ik_safety_profiles
@@ -51,6 +59,24 @@ _HAND_BASE_FROM_ARM_LINK6[2, 3] = 0.009
 _ARM_LINK6_FROM_HAND_BASE = np.linalg.inv(_HAND_BASE_FROM_ARM_LINK6)
 _CURRENT_TARGET_HOLD_TRANSLATION_M = 1e-3
 _CURRENT_TARGET_HOLD_ROTATION_DEG = 0.5
+IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
+IK_FRAMEWORK_CHOICES = (IK_FRAMEWORK_ROBOT_MOTION,)
+
+
+def _normalize_ik_framework(value: object) -> str:
+    text = str(value or IK_FRAMEWORK_ROBOT_MOTION).strip().lower().replace("-", "_")
+    aliases = {
+        "default": IK_FRAMEWORK_ROBOT_MOTION,
+        "shared": IK_FRAMEWORK_ROBOT_MOTION,
+        "robotmotion": IK_FRAMEWORK_ROBOT_MOTION,
+        "robot_motion": IK_FRAMEWORK_ROBOT_MOTION,
+    }
+    resolved = aliases.get(text, text)
+    if resolved not in IK_FRAMEWORK_CHOICES:
+        raise ValueError(
+            f"Unsupported dual-arm IK framework {value!r}. Expected one of {IK_FRAMEWORK_CHOICES}."
+        )
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -192,13 +218,14 @@ class DualArmCollisionAwareRetargeterConfig:
     scene_profile: str = "dual_arm_hand_proxy_open"
     contact_mode: Literal["boundary_slide", "freeze_on_contact"] = "boundary_slide"
     solver: str | None = None
-    solver_frequency: float = 30.0
-    posture_cost: float = 1e-1
-    collision_min_distance_m: float = 0.03
-    collision_distance_epsilon_m: float = 1e-4
-    collision_barrier_gain: float = 10.0
-    collision_safe_displacement_gain: float = 0.001
+    solver_frequency: float = DEFAULT_DUAL_ARM_SOLVER_FREQUENCY_HZ
+    posture_cost: float = DEFAULT_DUAL_ARM_POSTURE_COST
+    collision_min_distance_m: float = DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M
+    collision_distance_epsilon_m: float = DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
+    collision_barrier_gain: float = DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN
+    collision_safe_displacement_gain: float = DEFAULT_DUAL_ARM_COLLISION_SAFE_DISPLACEMENT_GAIN
     hold_last_safe_on_failure: bool = True
+    ik_framework: str = IK_FRAMEWORK_ROBOT_MOTION
     debug_viz: bool = False
     debug_profile: bool = False
     debug_profile_print_every: int = 0
@@ -229,6 +256,8 @@ class DualArmCollisionAwareRetargeterConfig:
     inactive_side_hold_max_unexplained_position_m: float = 0.025
     inactive_side_hold_max_unexplained_rotation_deg: float = 8.0
     inactive_side_hold_score_weight: float = 1_000_000.0
+    inactive_side_hold_execution_cap_enabled: bool = True
+    inactive_side_hold_execution_cap_deg: float = 0.5
 
     def __post_init__(self) -> None:
         if self.contact_mode not in {"boundary_slide", "freeze_on_contact"}:
@@ -236,6 +265,7 @@ class DualArmCollisionAwareRetargeterConfig:
                 f"Unsupported contact_mode: {self.contact_mode}. "
                 "Expected 'boundary_slide' or 'freeze_on_contact'."
             )
+        self.ik_framework = _normalize_ik_framework(self.ik_framework)
         if self.solver_frequency <= 0.0:
             raise ValueError("solver_frequency must be positive.")
         if self.collision_min_distance_m < 0.0:
@@ -270,6 +300,8 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("inactive_side_hold_max_unexplained_rotation_deg must be >= 0.")
         if self.inactive_side_hold_score_weight < 0.0:
             raise ValueError("inactive_side_hold_score_weight must be >= 0.")
+        if self.inactive_side_hold_execution_cap_deg < 0.0:
+            raise ValueError("inactive_side_hold_execution_cap_deg must be >= 0.")
         self.left_execution_max_joint_step_rad = _optional_joint_step(
             self.left_execution_max_joint_step_rad
         )
@@ -323,7 +355,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         *,
         left_pose_retargeter: PoseToArmRetargeter | None = None,
         right_pose_retargeter: PoseToArmRetargeter | None = None,
-        ik_solver: MultiTaskIKSolver | None = None,
+        ik_solver: Any | None = None,
     ):
         self.config = config
         self.ik_tuning = config.ik_tuning
@@ -334,7 +366,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             self.ik_safety_profile.metadata
         )
         self.joint_velocity_profile = config.joint_velocity_profile
-        self.profile: DualArmSceneProfile = build_dual_arm_scene_profile(config.scene_profile)
+        self.profile = None
         self.left_pose_retargeter = (
             left_pose_retargeter
             if left_pose_retargeter is not None
@@ -367,43 +399,48 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         if ik_solver is not None:
             self.ik_solver = ik_solver
+            self.profile = build_rm65_dual_arm_scene_profile(config.scene_profile)
+            solver_tasks_configured = False
         else:
             try:
-                self.ik_solver = MultiTaskIKSolver(
-                    robot_urdf_path=self.profile.urdf_path,
-                    robot_package_dirs=list(self.profile.package_dirs),
-                    robot_root_joint=None,
-                    robot_list_of_joints_to_lock=None,
-                    robot_collision_pair_names=list(self.profile.collision_pairs),
-                    solver=config.solver,
-                    frequency=float(config.solver_frequency),
-                    debug_viz=bool(config.debug_viz),
-                    debug_profile=bool(config.debug_profile),
-                    sleep=False,
-                    collision_barrier_gain=float(config.collision_barrier_gain),
-                    collision_safe_displacement_gain=float(
-                        config.collision_safe_displacement_gain
-                    ),
-                    collision_min_distance_m=float(config.collision_min_distance_m),
+                bundle = build_rm65_dual_arm_collision_ik_solver(
+                    RM65DualArmCollisionIKConfig(
+                        scene_profile=config.scene_profile,
+                        solver=config.solver,
+                        solver_frequency=float(config.solver_frequency),
+                        posture_cost=float(config.posture_cost),
+                        collision_min_distance_m=float(config.collision_min_distance_m),
+                        collision_distance_epsilon_m=float(config.collision_distance_epsilon_m),
+                        collision_barrier_gain=float(config.collision_barrier_gain),
+                        collision_safe_displacement_gain=float(config.collision_safe_displacement_gain),
+                        debug_viz=bool(config.debug_viz),
+                        debug_profile=bool(config.debug_profile),
+                        ik_tuning=self.ik_tuning,
+                    )
                 )
+                self.ik_solver = bundle.solver
+                self.profile = bundle.scene_profile
+                solver_tasks_configured = True
             except ModuleNotFoundError as exc:
                 raise ModuleNotFoundError(
                     "DualArmCollisionAwareRetargeter requires pinocchio, pink, and qpsolvers "
                     "for joint-space collision avoidance."
                 ) from exc
+        assert self.profile is not None
 
-        objective = self.ik_tuning.objective_weights()
-        self.ik_solver.add_frame_task(
-            self.profile.left_frame_name,
-            position_cost=float(objective.dual_arm_position_cost),
-            orientation_cost=float(objective.dual_arm_orientation_cost),
-        )
-        self.ik_solver.add_frame_task(
-            self.profile.right_frame_name,
-            position_cost=float(objective.dual_arm_position_cost),
-            orientation_cost=float(objective.dual_arm_orientation_cost),
-        )
-        self.ik_solver.add_posture_task(cost=float(config.posture_cost))
+        if not solver_tasks_configured:
+            objective = self.ik_tuning.objective_weights()
+            self.ik_solver.add_frame_task(
+                self.profile.left_frame_name,
+                position_cost=float(objective.dual_arm_position_cost),
+                orientation_cost=float(objective.dual_arm_orientation_cost),
+            )
+            self.ik_solver.add_frame_task(
+                self.profile.right_frame_name,
+                position_cost=float(objective.dual_arm_position_cost),
+                orientation_cost=float(objective.dual_arm_orientation_cost),
+            )
+            self.ik_solver.add_posture_task(cost=float(config.posture_cost))
 
         self._arm_joint_weights = np.asarray(
             self.ik_tuning.branch_normalization.joint_distance_weights,
@@ -455,6 +492,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         reset = getattr(self._target_pose_smoother, "reset", None)
         if callable(reset):
             reset()
+        self._last_target_poses = {"left": None, "right": None}
+        self._clear_hold()
 
     def set_current_qpos_pair(
         self,
@@ -722,6 +761,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "collision_min_distance_m": float(self.config.collision_min_distance_m),
                 "left_input_skipped": context.left_input_skipped,
                 "right_input_skipped": context.right_input_skipped,
+                "ik_framework": self.config.ik_framework,
                 "ik_objective_mode": self.ik_tuning.ik_objective_mode,
                 "ik_tuning_source": self.ik_tuning.source_path,
                 "ik_safety_profile": self.ik_safety_profile.name,
@@ -946,6 +986,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             active_q, execution_step_metadata = self._limit_to_execution_step(
                 reference_full_q=pre_solve_q,
                 candidate_full_q=active_q,
+                target_activity=target_activity_metadata,
             )
             self.ik_solver.set_configuration_q(active_q)
             if bool(execution_step_metadata.get("enabled")):
@@ -1036,6 +1077,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "source_target_pose_base": left_source_target_pose_base,
             "source_target_pose_desk": left_source_target_pose_desk,
             "source_target_pose_operator": left_source_target_pose_operator,
+            "ik_framework": self.config.ik_framework,
             "ik_objective_mode": self.ik_tuning.ik_objective_mode,
             "ik_branch_candidate": branch_candidate,
             "ik_branch_distance_score_deg": branch_score_deg,
@@ -1074,6 +1116,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "source_target_pose_base": right_source_target_pose_base,
             "source_target_pose_desk": right_source_target_pose_desk,
             "source_target_pose_operator": right_source_target_pose_operator,
+            "ik_framework": self.config.ik_framework,
             "ik_objective_mode": self.ik_tuning.ik_objective_mode,
             "ik_branch_candidate": branch_candidate,
             "ik_branch_distance_score_deg": branch_score_deg,
@@ -1515,6 +1558,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         *,
         reference_full_q: np.ndarray,
         candidate_full_q: np.ndarray,
+        target_activity: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, dict[str, object]]:
         reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
         candidate_q = np.asarray(candidate_full_q, dtype=float).reshape(-1)
@@ -1539,7 +1583,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             -self._full_execution_joint_step,
             self._full_execution_joint_step,
         )
-        step_limited = not np.allclose(limited_q, candidate_q, atol=1e-10)
+        inactive_capped_q, inactive_cap_metadata = self._apply_inactive_side_execution_cap(
+            reference_full_q=reference_q,
+            candidate_full_q=limited_q,
+            target_activity=target_activity,
+        )
+        step_limited = bool(
+            not np.allclose(limited_q, candidate_q, atol=1e-10)
+            or inactive_cap_metadata.get("applied", False)
+        )
+        limited_q = inactive_capped_q
         left_delta, right_delta = self._split_solution(limited_q - reference_q)
         left_max_step, right_max_step = self._split_solution(self._full_execution_joint_step)
         requested_delta_deg = np.rad2deg(candidate_q - reference_q)
@@ -1568,9 +1621,83 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "joint_velocity_limit_ratio": float(np.max(ratios)) if ratios.size else 0.0,
                 "left_max_step_deg": np.rad2deg(left_max_step).astype(float).tolist(),
                 "right_max_step_deg": np.rad2deg(right_max_step).astype(float).tolist(),
+                "inactive_side_hold_execution_cap": inactive_cap_metadata,
             }
         )
         return limited_q.copy(), metadata
+
+    def _apply_inactive_side_execution_cap(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        candidate_full_q: np.ndarray,
+        target_activity: dict[str, object] | None,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
+        output_q = np.asarray(candidate_full_q, dtype=float).reshape(reference_q.shape).copy()
+        cap_deg = max(0.0, float(self.config.inactive_side_hold_execution_cap_deg))
+        enabled = bool(
+            self.config.inactive_side_hold_enabled
+            and self.config.inactive_side_hold_execution_cap_enabled
+            and isinstance(target_activity, dict)
+            and target_activity.get("enabled", False)
+        )
+        metadata: dict[str, object] = {
+            "enabled": enabled,
+            "cap_deg": cap_deg,
+            "applied": False,
+            "sides": {},
+        }
+        if not enabled:
+            return output_q.copy(), metadata
+
+        cap_rad = np.deg2rad(cap_deg)
+        ref_left, ref_right = self._split_solution(reference_q)
+        out_left, out_right = self._split_solution(output_q)
+        applied_any = False
+        sides: dict[str, object] = {}
+        for side in ("left", "right"):
+            side_activity_raw = target_activity.get(side, {})
+            side_activity = dict(side_activity_raw) if isinstance(side_activity_raw, dict) else {}
+            hold_weight = max(0.0, min(1.0, float(side_activity.get("hold_weight", 0.0) or 0.0)))
+            inactive = bool(side_activity.get("inactive", False) or hold_weight > 0.0)
+            ref_arm = ref_left if side == "left" else ref_right
+            out_arm = out_left if side == "left" else out_right
+            requested_delta = out_arm - ref_arm
+            requested_max_deg = float(np.rad2deg(np.max(np.abs(requested_delta))))
+            side_metadata = {
+                "inactive": inactive,
+                "hold_weight": float(hold_weight),
+                "requested_max_abs_delta_deg": requested_max_deg,
+                "applied": False,
+            }
+            if inactive and hold_weight > 0.0 and requested_max_deg > cap_deg + 1e-9:
+                capped_delta = np.clip(requested_delta, -cap_rad, cap_rad)
+                capped_arm = ref_arm + capped_delta
+                side_metadata.update(
+                    {
+                        "applied": True,
+                        "capped_max_abs_delta_deg": float(
+                            np.rad2deg(np.max(np.abs(capped_delta)))
+                        ),
+                    }
+                )
+                applied_any = True
+                if side == "left":
+                    out_left = capped_arm
+                else:
+                    out_right = capped_arm
+            sides[side] = side_metadata
+
+        if applied_any:
+            output_q = self._embed_arm_qpos(
+                current_full_q=output_q,
+                left_qpos=out_left,
+                right_qpos=out_right,
+            )
+        metadata["applied"] = bool(applied_any)
+        metadata["sides"] = sides
+        return output_q.copy(), metadata
 
     def _full_joint_distance_score(self, reference_full_q: np.ndarray, candidate_full_q: np.ndarray) -> float:
         return weighted_joint_distance_score(
@@ -2503,6 +2630,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             reference_full_q=reference_full,
             candidate_full_q=raw_full,
             step_scale=scale,
+            target_activity=target_activity,
         )
         metadata: dict[str, object] = {
             "candidate": candidate.name,
@@ -2962,6 +3090,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         reference_full_q: np.ndarray,
         candidate_full_q: np.ndarray,
         step_scale: float,
+        target_activity: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, dict[str, object]]:
         reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
         candidate_q = np.asarray(candidate_full_q, dtype=float).reshape(reference_q.shape)
@@ -2980,7 +3109,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         full_limited = reference_q + np.clip(candidate_q - reference_q, -max_step, max_step)
         full_delta = full_limited - reference_q
         output_q = reference_q + full_delta * max(1e-6, min(1.0, float(step_scale)))
-        limited = not np.allclose(full_limited, candidate_q, atol=1e-10)
+        inactive_capped_q, inactive_cap_metadata = self._apply_inactive_side_execution_cap(
+            reference_full_q=reference_q,
+            candidate_full_q=output_q,
+            target_activity=target_activity,
+        )
+        limited = bool(
+            not np.allclose(full_limited, candidate_q, atol=1e-10)
+            or inactive_cap_metadata.get("applied", False)
+        )
+        output_q = inactive_capped_q
         left_delta, right_delta = self._split_solution(output_q - reference_q)
         left_max_step, right_max_step = self._split_solution(max_step)
         metadata.update(
@@ -2994,6 +3132,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "right_max_abs_delta_deg": float(np.rad2deg(np.max(np.abs(right_delta)))),
                 "left_max_step_deg": np.rad2deg(left_max_step).astype(float).tolist(),
                 "right_max_step_deg": np.rad2deg(right_max_step).astype(float).tolist(),
+                "inactive_side_hold_execution_cap": inactive_cap_metadata,
             }
         )
         return output_q.copy(), metadata

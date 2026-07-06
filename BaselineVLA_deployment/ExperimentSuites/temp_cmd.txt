@@ -1,4 +1,0 @@
-python Scripts/run_experiment_suite.py ExperimentSuites/future_tactile/future_tactile_screen.json
-python Scripts/run_experiment_suite.py ExperimentSuites/future_tactile/future_tactile_full.json
-python Scripts/run_experiment_suite.py ExperimentSuites/future_tactile/future_tactile_screen.json --only=rawhand_vla
-python Scripts/run_experiment_suite.py ExperimentSuites/future_tactile/future_tactile_screen.json --force

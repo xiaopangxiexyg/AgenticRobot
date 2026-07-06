@@ -189,6 +189,7 @@ class RM65ImpedanceArmBackendConfig:
     actual_send_dt_min_scale: float = 1.0
     actual_send_dt_max_scale: float = 2.0
     actual_send_dt_stall_reset_sec: float = 0.25
+    debug_timing: bool = False
     impedance_overrides: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -238,6 +239,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._smoothed_send_dt = float(config.control_dt)
         self._last_effective_control_dt = float(config.control_dt)
         self._last_effective_step_scale = 1.0
+        self._last_send_command_timing: dict[str, object] | None = None
+        self._last_impedance_loop_timing: dict[str, object] | None = None
 
     @property
     def name(self) -> str:
@@ -287,6 +290,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._last_command = None
                 self._last_command_timestamp = None
                 self._last_step_record = None
+                self._last_send_command_timing = None
+                self._last_impedance_loop_timing = None
                 self._last_send_result_code = 0
                 self._last_send_result_text = "hold"
             controller = self._controller
@@ -318,7 +323,11 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._loop_thread = None
 
     def reset_motion_state(self, qpos: object | None = None) -> None:
-        del qpos
+        qpos_array: np.ndarray | None = None
+        if qpos is not None:
+            qpos_array = np.asarray(qpos, dtype=float).reshape(-1)
+            if qpos_array.shape != (6,) or not np.all(np.isfinite(qpos_array)):
+                raise ValueError(f"{self.name} reset_motion_state qpos must be a finite 6-vector.")
         with self._send_lock:
             with self._state_lock:
                 self._latest_target_pose6 = None
@@ -326,12 +335,17 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._last_command = None
                 self._last_command_timestamp = None
                 self._last_step_record = None
+                self._last_send_command_timing = None
+                self._last_impedance_loop_timing = None
                 self._last_send_time = None
                 self._smoothed_send_dt = float(self.config.control_dt)
                 self._last_effective_control_dt = float(self.config.control_dt)
                 self._last_effective_step_scale = 1.0
                 if not self._enabled:
                     self._last_send_result_text = "reset_motion_state"
+            controller = self._controller
+            if controller is not None and qpos_array is not None:
+                controller.reset_motion_state(qpos_array)
 
     def enable_force_control(self) -> None:
         if self._enabled:
@@ -385,6 +399,24 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 bits.append(f"last_send={self._last_send_result_text}")
             return " ".join(bits)
 
+    def force_control_warm_started(self) -> bool:
+        controller = self._controller
+        return bool(getattr(controller, "_started", False))
+
+    def warm_start_force_control(self) -> None:
+        if self.force_control_warm_started():
+            return
+        if not self.config.connect_hardware:
+            return
+        self.start()
+        assert self._controller is not None
+        self._controller.start()
+        with self._state_lock:
+            if not self._enabled:
+                self._last_fault = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = "warm_started"
+
     def wait_until_force_control_ready(self, *, timeout_sec: float = 1.0) -> dict[str, Any]:
         if not self.config.connect_hardware:
             return self.get_state()
@@ -412,6 +444,25 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             raise ValueError(
                 f"{self.name} pose impedance requires cartesian_pose command, got {command.command_type!r}."
             )
+        timing_enabled = bool(self.config.debug_timing)
+        timing_started_at = time.perf_counter()
+        timing_last_at = timing_started_at
+        timing_phases: list[dict[str, object]] = []
+
+        def mark_timing(name: str) -> None:
+            nonlocal timing_last_at
+            if not timing_enabled:
+                return
+            now_timing = time.perf_counter()
+            timing_phases.append(
+                {
+                    "name": name,
+                    "dt_ms": (now_timing - timing_last_at) * 1000.0,
+                    "elapsed_ms": (now_timing - timing_started_at) * 1000.0,
+                }
+            )
+            timing_last_at = now_timing
+
         with self._state_lock:
             if self._emergency_stopped:
                 raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
@@ -424,10 +475,17 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     "run tare/enable after runtime home first. "
                     f"status={self.force_control_status_text()}"
                 )
+        mark_timing("precheck")
         now = time.time()
         target_pose6 = self._command_to_tool_tcp_pose6(command)
         target_joint_deg = self._command_solver_output_joint_deg(command)
+        mark_timing("command_conversion")
+        send_lock_wait_started_at = time.perf_counter()
+        send_lock_wait_ms = 0.0
         with self._send_lock:
+            send_lock_acquired_at = time.perf_counter()
+            send_lock_wait_ms = (send_lock_acquired_at - send_lock_wait_started_at) * 1000.0
+            mark_timing("send_lock_wait")
             with self._state_lock:
                 if self._emergency_stopped:
                     raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
@@ -439,6 +497,21 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 if not self.config.connect_hardware:
                     self._last_send_result_code = 0
                     self._last_send_result_text = "dry_run"
+            mark_timing("state_update")
+        if timing_enabled:
+            timing_finished_at = time.perf_counter()
+            timing = {
+                "enabled": True,
+                "side": self.config.side,
+                "effector_name": self.name,
+                "timestamp": now,
+                "total_ms": (timing_finished_at - timing_started_at) * 1000.0,
+                "send_lock_wait_ms": send_lock_wait_ms,
+                "target_joint_hint_present": target_joint_deg is not None,
+                "phases": timing_phases,
+            }
+            with self._state_lock:
+                self._last_send_command_timing = timing
 
     def _read_active_tool_name(self) -> str | None:
         if self.arm is None:
@@ -540,6 +613,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             "tare_sec": float(self.config.force_tare_sec),
             "action_hz": min(requested_action_hz, control_hz),
             "hold_last_safe_on_ik_failure": True,
+            "debug_timing": bool(self.config.debug_timing),
             **dict(self.config.impedance_overrides),
         }
         return RM65ImpedanceConfig.from_profile(
@@ -602,7 +676,34 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         assert self._controller is not None
         period = 1.0 / float(self._controller.config.control_hz)
         next_deadline = time.perf_counter()
+        previous_loop_start: float | None = None
         while not self._loop_stop_event.is_set():
+            timing_enabled = bool(self.config.debug_timing)
+            timing_started_at = time.perf_counter()
+            timing_last_at = timing_started_at
+            timing_phases: list[dict[str, object]] = []
+            loop_period_ms = (
+                None
+                if previous_loop_start is None
+                else (timing_started_at - previous_loop_start) * 1000.0
+            )
+            deadline_lag_ms = max(0.0, (timing_started_at - next_deadline) * 1000.0)
+            previous_loop_start = timing_started_at
+
+            def mark_timing(name: str) -> None:
+                nonlocal timing_last_at
+                if not timing_enabled:
+                    return
+                now_timing = time.perf_counter()
+                timing_phases.append(
+                    {
+                        "name": name,
+                        "dt_ms": (now_timing - timing_last_at) * 1000.0,
+                        "elapsed_ms": (now_timing - timing_started_at) * 1000.0,
+                    }
+                )
+                timing_last_at = now_timing
+
             try:
                 with self._state_lock:
                     if self._emergency_stopped or self._loop_stop_event.is_set():
@@ -613,15 +714,42 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                         if self._latest_target_joint_deg is None
                         else list(self._latest_target_joint_deg)
                     )
+                mark_timing("target_snapshot")
+                send_lock_wait_started_at = time.perf_counter()
+                send_lock_wait_ms = 0.0
                 with self._send_lock:
+                    send_lock_acquired_at = time.perf_counter()
+                    send_lock_wait_ms = (send_lock_acquired_at - send_lock_wait_started_at) * 1000.0
+                    mark_timing("send_lock_wait")
                     with self._state_lock:
                         if self._emergency_stopped or self._loop_stop_event.is_set():
                             break
-                    record = self._controller.step(target, target_joint_deg=target_joint_deg)
+                    mark_timing("pre_step_check")
+                    record = dict(self._controller.step(target, target_joint_deg=target_joint_deg))
+                    mark_timing("controller_step")
+                    loop_timing = None
+                    if timing_enabled:
+                        timing_finished_at = time.perf_counter()
+                        loop_timing = {
+                            "enabled": True,
+                            "side": self.config.side,
+                            "effector_name": self.name,
+                            "period_target_ms": period * 1000.0,
+                            "loop_period_ms": loop_period_ms,
+                            "deadline_lag_ms": deadline_lag_ms,
+                            "total_ms": (timing_finished_at - timing_started_at) * 1000.0,
+                            "send_lock_wait_ms": send_lock_wait_ms,
+                            "target_present": target is not None,
+                            "target_joint_hint_present": target_joint_deg is not None,
+                            "phases": timing_phases,
+                        }
+                        record["rm65_backend_loop_timing"] = loop_timing
                     with self._state_lock:
                         if self._emergency_stopped or self._loop_stop_event.is_set():
                             break
                         self._last_step_record = dict(record)
+                        if loop_timing is not None:
+                            self._last_impedance_loop_timing = loop_timing
                         self._last_send_result_code = 0
                         self._last_send_result_text = "ok"
             except Exception as exc:
@@ -645,6 +773,12 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         with self._state_lock:
             command = None if self._last_command is None else self._last_command.copy()
             record = None if self._last_step_record is None else dict(self._last_step_record)
+            send_command_timing = (
+                None if self._last_send_command_timing is None else dict(self._last_send_command_timing)
+            )
+            impedance_loop_timing = (
+                None if self._last_impedance_loop_timing is None else dict(self._last_impedance_loop_timing)
+            )
             if self._loop_thread is None:
                 loop_state = "not_started"
             elif self._loop_thread.is_alive():
@@ -692,6 +826,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 "force_tare_sec": float(self.config.force_tare_sec),
                 "active_tool_name": self._active_tool_name,
                 "active_tool_profile_path": self._active_tool_profile_path,
+                "last_send_command_timing": send_command_timing,
+                "last_impedance_loop_timing": impedance_loop_timing,
                 "last_impedance_record": record,
                 "ik_metadata": (
                     dict(record.get("ik_metadata", {}))

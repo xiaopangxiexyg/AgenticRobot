@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import deque
 from pathlib import Path
 import time
@@ -66,6 +67,17 @@ class _FakeUi:
         return events
 
 
+class _BatchedFakeUi(_FakeUi):
+    def __init__(self, event_batches: list[list[str]]) -> None:
+        super().__init__([])
+        self.event_batches = [list(batch) for batch in event_batches]
+
+    def consume_events(self) -> list[str]:
+        if not self.event_batches:
+            return []
+        return self.event_batches.pop(0)
+
+
 class _FakeCalibration:
     def __init__(self) -> None:
         self.tracker_offsets = {"right_wrist": object()}
@@ -74,8 +86,60 @@ class _FakeCalibration:
     def world_to_desk_pose(self) -> object:
         return object()
 
+    def world_to_desk(self, pose: object) -> object:
+        return pose
+
     def to_dict(self) -> dict[str, object]:
         return {"format": "fake_calibration"}
+
+
+class _FakeCameraSource:
+    def __init__(self, info: dict[str, object]) -> None:
+        self._info = dict(info)
+        self.config = SimpleNamespace(
+            serial="CONFIG_SERIAL",
+            width=640,
+            height=480,
+            fps=30,
+            color_space="bgr",
+        )
+        self.name = "fake_camera"
+
+    def device_info(self) -> dict[str, object]:
+        return dict(self._info)
+
+
+class _FakeViveSource:
+    def __init__(self) -> None:
+        pose = np.eye(4)
+        now = time.time()
+        self.channels = {
+            "left_wrist_pose": ObservationChannel(
+                channel_name="left_wrist_pose",
+                capability="pose",
+                side="left",
+                value=pose,
+                frame_name="world",
+                timestamp=now,
+                source_name="vive",
+                valid=True,
+                metadata={"seq": 1, "tracker_name": "tracker_1", "tracker_role": "left_wrist"},
+            ),
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose",
+                side="right",
+                value=pose,
+                frame_name="world",
+                timestamp=now,
+                source_name="vive",
+                valid=True,
+                metadata={"seq": 1, "tracker_name": "tracker_2", "tracker_role": "right_wrist"},
+            ),
+        }
+
+    def get_latest_channels(self) -> dict[str, ObservationChannel]:
+        return dict(self.channels)
 
 
 def _components() -> SimpleNamespace:
@@ -117,6 +181,8 @@ def _args(**overrides: object) -> SimpleNamespace:
         "load_profile": "",
         "load_initial_alignment": "",
         "debug_ik_timing": False,
+        "no_record": True,
+        "debug_trajectory_recording": False,
         "no_episode_recording": False,
         "camera_visualization_available": True,
         "tactile_visualization_available": True,
@@ -154,6 +220,54 @@ def _args(**overrides: object) -> SimpleNamespace:
 
 
 class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
+    def test_parse_args_defaults_load_profile_to_newest_calibration_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            older = profile_dir / "20260701_120000_vive_rm65_real_teleop.json"
+            newer = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
+            older.write_text("{}", encoding="utf-8")
+            newer.write_text("{}", encoding="utf-8")
+            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--active-sides",
+                    "left",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--no-camera",
+                    "--no-video",
+                    "--headless",
+                    "--no-gui",
+                ],
+            ):
+                args = real_teleop.parse_args()
+
+        self.assertEqual(args.load_profile, str(newer))
+
+    def test_parse_args_errors_when_default_load_profile_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", Path(tmp_dir)), patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--active-sides",
+                    "left",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--no-camera",
+                    "--no-video",
+                    "--headless",
+                    "--no-gui",
+                ],
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    real_teleop.parse_args()
+
+        self.assertEqual(ctx.exception.code, 2)
+
     def test_ik_debug_log_defaults_to_compact_payload(self) -> None:
         pose = np.eye(4)
         target_pose = np.eye(4)
@@ -321,6 +435,239 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("ik_resolver_init", encoded)
         self.assertIn('"matrix"', encoded)
 
+    def test_ik_debug_log_recorder_stop_flushes_stop_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            recorder = real_teleop.IkDebugLogRecorder(root_dir=tmp_dir)
+            path = recorder.start(now=1.234)
+            recorder.record_frame(
+                {
+                    "schema": "dexteleop_ik_debug_v1",
+                    "event": "frame",
+                    "step_index": 1,
+                }
+            )
+
+            stopped_path = recorder.stop(reason="unit_test", now=2.0)
+
+            self.assertEqual(stopped_path, path)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line)["event"] for line in lines]
+            self.assertIn("start", events)
+            self.assertIn("frame", events)
+            self.assertEqual(events[-1], "stop")
+            self.assertIn("_234", path.name)
+
+    def test_ik_debug_log_recorder_defaults_to_teleop_ik_debug_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "teleop_records" / "ik_debug"
+            with patch.object(real_teleop, "DEFAULT_IK_DEBUG_LOG_ROOT", root):
+                recorder = real_teleop.IkDebugLogRecorder()
+                path = recorder.start(now=1.0)
+                recorder.stop(reason="unit_test", now=2.0)
+
+            self.assertEqual(path.parent, root)
+            self.assertTrue(path.exists())
+
+    def test_debug_timing_log_recorder_records_slow_and_heartbeat_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            recorder = real_teleop.DebugTimingLogRecorder(
+                root_dir=tmp_dir,
+                heartbeat_sec=1.0,
+            )
+            path = recorder.start(now=1.234)
+
+            reason = recorder.select_frame_reason(
+                now=1.25,
+                elapsed_sec=0.01,
+                phases=(),
+                state="RUNNING",
+                fault_codes=(),
+                threshold_sec=0.05,
+            )
+            self.assertEqual(reason, "state_change")
+            recorder.record_frame({"schema": "dexteleop_debug_timing_v1", "event": "frame", "reason": reason})
+
+            self.assertIsNone(
+                recorder.select_frame_reason(
+                    now=1.50,
+                    elapsed_sec=0.01,
+                    phases=(),
+                    state="RUNNING",
+                    fault_codes=(),
+                    threshold_sec=0.05,
+                )
+            )
+
+            reason = recorder.select_frame_reason(
+                now=1.75,
+                elapsed_sec=0.01,
+                phases=(("loop.session_run_step", 0.08),),
+                state="RUNNING",
+                fault_codes=(),
+                threshold_sec=0.05,
+            )
+            self.assertEqual(reason, "slow")
+            recorder.record_frame({"schema": "dexteleop_debug_timing_v1", "event": "frame", "reason": reason})
+
+            reason = recorder.select_frame_reason(
+                now=2.80,
+                elapsed_sec=0.01,
+                phases=(),
+                state="RUNNING",
+                fault_codes=(),
+                threshold_sec=0.05,
+            )
+            self.assertEqual(reason, "heartbeat")
+            recorder.record_frame({"schema": "dexteleop_debug_timing_v1", "event": "frame", "reason": reason})
+
+            stopped_path = recorder.stop(reason="unit_test", now=3.0)
+
+            self.assertEqual(stopped_path, path)
+            self.assertEqual(path.parent, Path(tmp_dir))
+            self.assertIn("debug_timing_", path.name)
+            self.assertIn("_234", path.name)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            rows = [json.loads(line) for line in lines]
+            self.assertEqual(rows[0]["event"], "start")
+            self.assertEqual(rows[-1]["event"], "stop")
+            self.assertEqual([row.get("reason") for row in rows if row.get("event") == "frame"], [
+                "state_change",
+                "slow",
+                "heartbeat",
+            ])
+
+    def test_debug_timing_log_frame_keeps_lightweight_backend_timing(self) -> None:
+        pose = np.eye(4)
+        channel = ObservationChannel(
+            channel_name="left_wrist_pose",
+            capability="pose",
+            side="left",
+            value=pose,
+            frame_name="world",
+            timestamp=9.95,
+            source_name="vive",
+            valid=True,
+            metadata={
+                "sender_timestamp": 9.90,
+                "receiver_timestamp": 9.94,
+                "tracker_name": "tracker_1",
+                "tracker_role": "left_wrist",
+                "seq": 42,
+            },
+        )
+        step_result = SimpleNamespace(
+            timestamp=10.0,
+            observation=SimpleNamespace(timestamp=9.98),
+            command=SimpleNamespace(timestamp=9.99),
+            state=SimpleNamespace(value="RUNNING"),
+            control_hz=12.5,
+            faults=[
+                SimpleNamespace(
+                    code="low_control_rate",
+                    channel_name=None,
+                    component="session",
+                    severity=SimpleNamespace(value="warning"),
+                    message="slow frame",
+                    timestamp=10.0,
+                    metadata={"hz": 12.5},
+                )
+            ],
+            channels={"left_wrist_pose": channel},
+        )
+        backend_state = {
+            "hardware_result_code": 0,
+            "hardware_result_text": "ok",
+            "send_result_code": 0,
+            "send_result_text": "ok",
+            "effective_step_scale": 1.2,
+            "current_tcp_pose": pose,
+            "last_send_command_timing": {
+                "total_ms": 4.2,
+                "send_lock_wait_ms": 1.1,
+                "sdk_ms": 2.7,
+            },
+            "last_impedance_loop_timing": {
+                "total_ms": 6.0,
+                "lock_wait_ms": 0.4,
+            },
+            "last_impedance_record": {
+                "step": 7,
+                "dt_sec": 0.04,
+                "force_norm_n": 0.1,
+                "rm65_controller_timing": {"step_total_ms": 2.3, "sdk_read_ms": 0.8},
+                "rm65_backend_loop_timing": {"total_ms": 6.0},
+                "ik_timing": {"solve_total_ms": 1.5},
+            },
+        }
+
+        frame = real_teleop._build_debug_timing_log_frame(
+            components=SimpleNamespace(active_sides=("left", "right")),
+            step_index=11,
+            loop_start=10.0,
+            elapsed_sec=0.09,
+            phases=(("loop.session_run_step", 0.08), ("loop.status_emit", 0.002)),
+            reason="slow",
+            step_result=step_result,
+            active_command=None,
+            left_command_state=backend_state,
+            right_command_state={},
+            left_hw_state=backend_state,
+            right_hw_state={},
+            ik_timing_payload={"available": True, "frame_total_ms": 3.0},
+            target_step_scale=1.2,
+            left_clutch=False,
+            right_clutch=True,
+            camera_sources={},
+            preview_camera_sources={},
+            camera_previewer=None,
+            hand_input_status={"left": "ok"},
+            gripper_status={"left": "control_disabled"},
+            recording_status={"active": True, "frame_count": 3},
+        )
+
+        encoded = json.dumps(real_teleop._json_safe(frame), ensure_ascii=False)
+        self.assertEqual(frame["schema"], "dexteleop_debug_timing_v1")
+        self.assertEqual(frame["reason"], "slow")
+        self.assertIn("send_lock_wait_ms", frame["backend"]["left_command"]["last_send_command_timing"])
+        self.assertIn(
+            "rm65_controller_timing",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertEqual(frame["channels"]["left_wrist_pose"]["metadata"]["seq"], 42)
+        self.assertNotIn('"matrix"', encoded)
+        self.assertNotIn("current_tcp_pose", encoded)
+
+    def test_gui_ik_debug_toggle_creates_log_before_teleop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ui = _FakeUi(["d"])
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=_args(),
+                components=_components(),
+            )
+            recorder = real_teleop.IkDebugLogRecorder(root_dir=tmp_dir)
+
+            control.poll()
+            real_teleop._handle_ik_debug_log_toggle_request(
+                args=_args(),
+                components=_components(),
+                clutch_input=control,
+                ik_debug_log_recorder=recorder,
+                control_ui=ui,
+                ik_debug_profile_base_enabled=False,
+                now=1.25,
+            )
+
+            self.assertTrue(recorder.active)
+            self.assertTrue(ui.published[-1]["debug_ik_logging"])
+            path = Path(ui.published[-1]["ik_debug_log_path"])
+            self.assertEqual(path.parent, Path(tmp_dir))
+            self.assertTrue(path.exists())
+            self.assertIn("_250", path.name)
+            self.assertTrue(any("已开始 IK 记录" in message for _, message in ui.messages))
+            recorder.stop(reason="unit_test", now=2.0)
+
     def test_running_gui_exposes_episode_and_visualization_controls(self) -> None:
         ui = _FakeUi()
         control = real_teleop.RealTeleopControlInput(
@@ -342,6 +689,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("episode_stop", active_controls)
         self.assertIn("toggle_camera_vis", active_controls)
         self.assertIn("toggle_tactile_vis", active_controls)
+        self.assertIn("d", active_controls)
         self.assertNotIn("movement_multiple_down", active_controls)
         self.assertNotIn("movement_multiple_up", active_controls)
         self.assertNotIn("movement_multiple_reset", active_controls)
@@ -351,6 +699,128 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("gripper_open", active_controls)
         self.assertNotIn("gripper_half", active_controls)
         self.assertNotIn("gripper_close", active_controls)
+        self.assertNotIn("record_pose_snapshot", active_controls)
+        self.assertFalse(running_publish["pose_snapshot_available"])
+
+    def test_fix_arm_running_gui_exposes_pose_snapshot_control(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ui = _FakeUi()
+            components = _components()
+            components.fix_arm_controller = SimpleNamespace(
+                status_payload=lambda: {
+                    "fix_arm_available": True,
+                    "fix_arm_selected_side": "left",
+                    "fix_arm_fixed_side": "",
+                    "fix_arm_active": False,
+                    "fix_arm_recalibrating": False,
+                    "fix_arm_status": "",
+                    "fix_arm_sample_count": None,
+                    "fix_arm_min_samples": None,
+                }
+            )
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=_args(),
+                components=components,
+                pose_snapshot_recorder=real_teleop.FixArmPoseSnapshotRecorder(tmp_dir),
+            )
+
+            control.publish_teleop_running()
+
+            running_publish = next(
+                published
+                for published in reversed(ui.published)
+                if published.get("stage") == "RM65 真机遥操运行中"
+            )
+            active_controls = set(running_publish["active_controls"])
+            self.assertIn("record_pose_snapshot", active_controls)
+            self.assertTrue(running_publish["pose_snapshot_available"])
+            self.assertEqual(running_publish["pose_snapshot_dir"], tmp_dir)
+
+    def test_pose_snapshot_request_is_blocked_while_episode_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ui = _FakeUi(["record_pose_snapshot"])
+            components = _components()
+            components.fix_arm_controller = SimpleNamespace(
+                status_payload=lambda: {
+                    "fix_arm_available": True,
+                    "fix_arm_selected_side": "left",
+                    "fix_arm_fixed_side": "",
+                    "fix_arm_active": False,
+                    "fix_arm_recalibrating": False,
+                    "fix_arm_status": "",
+                    "fix_arm_sample_count": None,
+                    "fix_arm_min_samples": None,
+                }
+            )
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=_args(),
+                components=components,
+                pose_snapshot_recorder=real_teleop.FixArmPoseSnapshotRecorder(tmp_dir),
+            )
+            control.publish_teleop_running()
+            control.set_episode_recording_state(active=True)
+
+            control.poll()
+
+            self.assertFalse(control.consume_pose_snapshot_request())
+            self.assertIn("互斥", ui.published[-1]["pose_snapshot_status"])
+
+    def test_episode_countdown_controls_exclude_pose_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ui = _FakeUi()
+            components = _components()
+            components.fix_arm_controller = SimpleNamespace(
+                status_payload=lambda: {
+                    "fix_arm_available": True,
+                    "fix_arm_selected_side": "left",
+                    "fix_arm_fixed_side": "",
+                    "fix_arm_active": False,
+                    "fix_arm_recalibrating": False,
+                    "fix_arm_status": "",
+                    "fix_arm_sample_count": None,
+                    "fix_arm_min_samples": None,
+                }
+            )
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=_args(),
+                components=components,
+                pose_snapshot_recorder=real_teleop.FixArmPoseSnapshotRecorder(tmp_dir),
+            )
+
+            control.publish_teleop_running()
+            control.set_episode_start_countdown_state(remaining_sec=2.0)
+
+            active_controls = set(ui.published[-1]["active_controls"])
+            self.assertIn("episode_stop", active_controls)
+            self.assertNotIn("episode_start", active_controls)
+            self.assertNotIn("record_pose_snapshot", active_controls)
+
+    def test_hold_gui_allows_stopping_active_ik_debug_log(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+        control.set_ik_debug_logging_state(active=True, path="/tmp/ik_debug.jsonl")
+
+        control.request_hold()
+
+        hold_publish = next(
+            published
+            for published in reversed(ui.published)
+            if published.get("stage") == "Hold / 停臂保持"
+        )
+        self.assertIn("d", hold_publish["active_controls"])
+        self.assertTrue(hold_publish["debug_ik_logging"])
 
     def test_ready_gui_exposes_movement_multiple_controls(self) -> None:
         ui = _FakeUi()
@@ -369,6 +839,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             if published.get("stage") == "RM65 真机遥操准备"
         )
         active_controls = set(ready_publish["active_controls"])
+        self.assertIn("d", active_controls)
         self.assertIn("movement_multiple_down", active_controls)
         self.assertIn("movement_multiple_up", active_controls)
         self.assertIn("movement_multiple_reset", active_controls)
@@ -578,6 +1049,77 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         self.assertEqual(task_publish["collection_task_name_zh"], "叠方块")
 
+    def test_gui_round_trip_task_payload_starts_in_and_can_toggle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_root = Path(tmp_dir) / "datasets"
+            task_config = Path(tmp_dir) / "tasks.json"
+            task_config.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "key": "drawer_push_pull",
+                                "task_type": "round_trip",
+                                "english_name": "Drawer Push Pull",
+                                "chinese_name": "抽屉推拉",
+                                "description": "drawer push pull demo",
+                                "gripper_task": "firm_grasp",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ui = _FakeUi(
+                [
+                    "episode_start:"
+                    + json.dumps(
+                        {
+                            "dataset_base_root": str(base_root),
+                            "task_type": "round_trip",
+                            "task_key": "drawer_push_pull",
+                            "task_english_name": "",
+                            "task_chinese_name": "",
+                            "round_trip_phase": "in",
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            args = _args(
+                dataset_root=str(base_root),
+                task_config=str(task_config),
+                gripper_task="",
+            )
+            real_teleop._apply_formal_dataset_layout(args)
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=args,
+                components=_components(),
+            )
+
+            with patch.object(real_teleop, "datetime") as fake_datetime:
+                fake_datetime.now.return_value.strftime.return_value = "2026-07-04"
+                control.poll()
+                self.assertTrue(control.consume_episode_start_request())
+                self.assertEqual(args.collection_round_trip_phase, "in")
+                self.assertEqual(args.collection_task_id, "drawer_push_pull_in")
+                self.assertEqual(args.collection_task_name, "Drawer Push Pull_in")
+                self.assertEqual(Path(args.dataset_root), base_root / "2026-07-04_Drawer_Push_Pull_in")
+
+                ui.events = ["round_trip_toggle"]
+                control.poll()
+
+        self.assertEqual(args.collection_task_type, "round_trip")
+        self.assertEqual(args.collection_round_trip_phase, "out")
+        self.assertEqual(args.collection_task_id, "drawer_push_pull_out")
+        self.assertEqual(args.collection_task_name, "Drawer Push Pull_out")
+        self.assertEqual(args.collection_round_trip_base_id, "drawer_push_pull")
+        self.assertEqual(args.gripper_task, "firm_grasp")
+        self.assertEqual(Path(args.dataset_root), base_root / "2026-07-04_Drawer_Push_Pull_out")
+        self.assertTrue(any("来回任务已手动切换到 _out" in message for _, message in ui.messages))
+
     def test_gui_vive_calibration_button_calibrates_coordinate_profile(self) -> None:
         ui = _FakeUi(["calibrate_vive_coordinate_profile"])
         control = real_teleop.RealTeleopControlInput(
@@ -600,6 +1142,95 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         calibration_publish = next(item for item in ui.published if "control_hint" in item)
         self.assertIn("坐标系已保存", calibration_publish["control_hint"])
         self.assertFalse(calibration_publish["home_ready"])
+
+    def test_gui_vive_calibration_hand_selection_defaults_to_right(self) -> None:
+        ui = _FakeUi(["n"])
+        components = _components()
+        components.active_sides = ("left", "right")
+
+        selected_side, channel_name = real_teleop._select_gui_vive_coordinate_sweep_hand(
+            ui=ui,
+            args=_args(virtual_desk_tracker_role="auto"),
+            components=components,
+            source=_FakeViveSource(),
+        )
+
+        self.assertEqual(selected_side, "right")
+        self.assertEqual(channel_name, "right_wrist_pose")
+        self.assertTrue(any("默认右手" in message for _, message in ui.messages))
+        publish = next(item for item in reversed(ui.published) if item.get("stage") == "VIVE 标定手选择")
+        self.assertEqual(publish["selected_side"], "right")
+
+    def test_gui_vive_calibration_hand_selection_accepts_left(self) -> None:
+        ui = _FakeUi(["1", "n"])
+        components = _components()
+        components.active_sides = ("left", "right")
+
+        selected_side, channel_name = real_teleop._select_gui_vive_coordinate_sweep_hand(
+            ui=ui,
+            args=_args(virtual_desk_tracker_role="auto"),
+            components=components,
+            source=_FakeViveSource(),
+        )
+
+        self.assertEqual(selected_side, "left")
+        self.assertEqual(channel_name, "left_wrist_pose")
+        publish = next(item for item in reversed(ui.published) if item.get("stage") == "VIVE 标定手选择")
+        self.assertEqual(publish["selected_side"], "left")
+
+    def test_gui_vive_axis_capture_waits_for_next_before_starting(self) -> None:
+        ui = _BatchedFakeUi([[], ["n"]])
+        components = _components()
+        components.active_sides = ("left", "right")
+
+        poses = real_teleop._capture_single_vive_channel_from_gui(
+            ui=ui,
+            args=_args(capture_prep_sec=0.0, hz=1000.0),
+            components=components,
+            source=_FakeViveSource(),
+            stage_name="VirtualDeskX",
+            instructions="X",
+            timed_flow_hint="hint",
+            direction_hint="后 -> 前",
+            channel_name="right_wrist_pose",
+            min_samples=1,
+            capture_duration_sec=0.0,
+            validator=lambda captured: None,
+        )
+
+        self.assertEqual(len(poses), 1)
+        ready_publish = next(item for item in ui.published if item.get("capture_phase") == "ready")
+        self.assertIn("n", ready_publish["active_controls"])
+        self.assertNotIn("c", ready_publish["active_controls"])
+        self.assertIn("下一步", ready_publish["control_hint"])
+
+    def test_gui_vive_wrist_offset_capture_waits_for_next_before_starting(self) -> None:
+        ui = _BatchedFakeUi([[], ["n"]])
+        components = _components()
+        components.active_sides = ("left", "right")
+
+        left_poses, right_poses = real_teleop._capture_dual_wrist_offsets_from_gui(
+            ui=ui,
+            args=_args(
+                capture_extra_wait_sec=0.0,
+                hold_capture_sec=0.0,
+                hz=1000.0,
+                min_hold_samples=1,
+                wrist_capture_prep_sec=0.0,
+            ),
+            components=components,
+            source=_FakeViveSource(),
+        )
+
+        self.assertEqual(len(left_poses), 1)
+        self.assertEqual(len(right_poses), 1)
+        ready_publish = next(
+            item for item in ui.published
+            if item.get("capture_stage") == "WristOffset" and item.get("capture_phase") == "ready"
+        )
+        self.assertIn("n", ready_publish["active_controls"])
+        self.assertNotIn("c", ready_publish["active_controls"])
+        self.assertIn("下一步", ready_publish["control_hint"])
 
     def test_gui_does_not_expose_skip_runtime_home_button(self) -> None:
         self.assertNotIn("skip_runtime_home", calibration_web_ui._HTML_PAGE)
@@ -628,6 +1259,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         legacy_script = html[html.rfind("<script>", 0, legacy_index):modern_index]
 
         self.assertIn("renderRawPosesLegacy(state)", legacy_script)
+        self.assertIn("renderEpisodeStateLegacy(state)", legacy_script)
         self.assertIn("renderIkDebugLogButtonLegacy(state)", legacy_script)
         self.assertIn("leftRawPose", legacy_script)
         self.assertIn("rightRawPose", legacy_script)
@@ -642,6 +1274,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("=>", fallback_script)
         self.assertNotIn("const ", fallback_script)
         self.assertNotIn("let ", fallback_script)
+        self.assertIn("renderEpisodeStateFallback(state)", fallback_script)
 
         def code_strings(code: object) -> list[str]:
             found: list[str] = []
@@ -672,6 +1305,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("ikDebugLogTogglePending", html)
         self.assertIn("updateIkDebugLogButton(state)", html)
         self.assertIn("IK 记录切换中...", html)
+        self.assertIn('ikDebugLogButtonEl.disabled = !activeControls.has("d") || ikDebugLogTogglePending', html)
 
     def test_gui_initial_html_is_rendered_from_backend_snapshot(self) -> None:
         html = calibration_web_ui._render_initial_html(
@@ -691,6 +1325,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                         "tracker_role": "left_wrist",
                         "seq": 7,
                         "age_sec": 0.12,
+                        "status_label": "有效",
+                        "status_level": "ok",
                         "xyz_m": [1.0, 2.0, 3.0],
                         "rpy_deg": [4.0, 5.0, 6.0],
                     }
@@ -704,6 +1340,14 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("请选择采集 Home。", html)
         self.assertIn("tracker_1", html)
         self.assertIn("网页脚本尚未接管实时刷新", html)
+
+    def test_gui_raw_tracker_pose_has_stale_warning_styles(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn(".raw-pose-card.stale", html)
+        self.assertIn("leftRawCard", html)
+        self.assertIn("setRawPoseCardClass", html)
+        self.assertIn("status_label", html)
 
     def test_gui_state_json_payload_sanitizes_non_finite_values(self) -> None:
         ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
@@ -817,7 +1461,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 input_channel_name="right_hand_q6",
                 effector_name="right_hand",
                 source_dim=2,
-                output_dim=1,
+                output_dim=0,
             )
         )
         channel = ObservationChannel(
@@ -862,7 +1506,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIsInstance(vis, DMTacDistributedForceVisualizer)
         vis.close()
 
-    def test_dmtac_tactile_visualization_requires_tactile_backend(self) -> None:
+    def test_dmtac_tactile_visualization_requires_distributed_force_backend(self) -> None:
         backend = DMTacGripperBackend(
             DMTacGripperBackendConfig(
                 side="right",
@@ -871,6 +1515,18 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
         )
         components = _components()
+        components.right_hand_backend = backend
+
+        self.assertFalse(real_teleop._tactile_visualization_available(_args(), components))
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=False,
+                connect_tactile=True,
+                tactile_fields=("distributed_force",),
+            )
+        )
         components.right_hand_backend = backend
 
         self.assertTrue(real_teleop._tactile_visualization_available(_args(), components))
@@ -901,9 +1557,24 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 Path(tmp_dir) / "episodes_exact",
             )
 
+    def test_debug_episode_recording_defaults_off_for_formal_dataset(self) -> None:
+        args = _args(no_collection=False, episode_root="", debug_trajectory_recording=False)
+
+        self.assertFalse(real_teleop._debug_episode_recording_enabled(args))
+
+    def test_debug_episode_recording_defaults_on_without_formal_collection(self) -> None:
+        args = _args(no_collection=True, episode_root="", debug_trajectory_recording=False)
+
+        self.assertTrue(real_teleop._debug_episode_recording_enabled(args))
+
+    def test_episode_root_explicitly_enables_debug_episode_recording(self) -> None:
+        args = _args(no_collection=False, episode_root="/tmp/debug_episodes")
+
+        self.assertTrue(real_teleop._debug_episode_recording_enabled(args))
+
     def test_episode_metadata_records_resolved_episode_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            args = _args(session_record_root=tmp_dir)
+            args = _args(session_record_root=tmp_dir, no_collection=True)
             components = _components()
 
             with patch.object(real_teleop.time, "strftime", return_value="20260630_120000"):
@@ -915,7 +1586,42 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
             expected = Path(tmp_dir) / "20260630_120000_vive_rm65_real_teleop" / "trajectories"
             self.assertEqual(metadata["episode_root"], str(expected))
+            self.assertFalse(metadata["session_record_enabled"])
+            self.assertTrue(metadata["debug_episode_recording_enabled"])
             self.assertEqual(metadata["start_reason"], "manual_key_start")
+
+    def test_formal_dataset_metadata_does_not_claim_unused_debug_episode_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(session_record_root=tmp_dir, no_collection=False)
+            components = _components()
+
+            metadata = real_teleop._build_episode_metadata(
+                args,
+                components,
+                start_reason="manual_key_start",
+            )
+
+            self.assertIsNone(metadata["episode_root"])
+            self.assertFalse(metadata["session_record_enabled"])
+            self.assertFalse(metadata["debug_episode_recording_enabled"])
+
+    def test_episode_metadata_records_debug_timing_configuration(self) -> None:
+        args = _args(
+            debug_timing=True,
+            debug_timing_threshold_sec=0.04,
+            debug_timing_report_interval_sec=0.5,
+        )
+        metadata = real_teleop._build_episode_metadata(
+            args,
+            _components(),
+            start_reason="manual_key_start",
+        )
+
+        self.assertTrue(metadata["debug_timing"])
+        self.assertTrue(metadata["debug_timing_light_log"])
+        self.assertTrue(metadata["rm65_backend_debug_timing"])
+        self.assertEqual(metadata["debug_timing_threshold_sec"], 0.04)
+        self.assertEqual(metadata["debug_timing_report_interval_sec"], 0.5)
 
     def test_formal_dataset_layout_uses_dataset_root_and_task_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -937,6 +1643,33 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             self.assertEqual(args.collection_task_id, "chips_v1")
             self.assertEqual(args.dataset_name, "chips_dataset")
 
+    def test_round_trip_dataset_layout_defaults_to_in_and_toggles_to_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(
+                dataset_root=tmp_dir,
+                collection_task_type="round_trip",
+                collection_task_name="Drawer Push Pull",
+                collection_task_id="drawer_push_pull",
+                collection_task_description="drawer demo",
+                gripper_task="firm_grasp",
+            )
+
+            with patch.object(real_teleop, "datetime") as fake_datetime:
+                fake_datetime.now.return_value.strftime.return_value = "2026-07-03"
+                real_teleop._apply_formal_dataset_layout(args)
+
+                self.assertEqual(args.collection_round_trip_phase, "in")
+                self.assertEqual(args.collection_task_id, "drawer_push_pull_in")
+                self.assertEqual(args.collection_task_name, "Drawer Push Pull_in")
+                self.assertEqual(Path(args.dataset_root), Path(tmp_dir) / "2026-07-03_Drawer_Push_Pull_in")
+
+                self.assertTrue(real_teleop._toggle_collection_round_trip_phase(args))
+
+            self.assertEqual(args.collection_round_trip_phase, "out")
+            self.assertEqual(args.collection_task_id, "drawer_push_pull_out")
+            self.assertEqual(args.collection_task_name, "Drawer Push Pull_out")
+            self.assertEqual(Path(args.dataset_root), Path(tmp_dir) / "2026-07-03_Drawer_Push_Pull_out")
+
     def test_preview_defaults_to_all_configured_cameras(self) -> None:
         cameras = {
             "front": object(),
@@ -947,6 +1680,102 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         selected = real_teleop._select_preview_camera_sources(cameras, "")
 
         self.assertEqual(set(selected), set(cameras))
+
+    def test_camera_status_marks_waiting_and_stale_cameras(self) -> None:
+        fresh = _FakeCameraSource(
+            {
+                "camera_key": "front",
+                "serial": "123",
+                "frame_count": 4,
+                "last_frame_age_sec": 0.05,
+                "stale_after_sec": 1.0,
+                "timeout_count": 0,
+                "consecutive_timeout_count": 0,
+                "restart_count": 0,
+            }
+        )
+        waiting = _FakeCameraSource(
+            {
+                "camera_key": "left_wrist",
+                "serial": "456",
+                "frame_count": 0,
+                "last_runtime_error": "Frame did not arrive",
+                "stale_after_sec": 1.0,
+            }
+        )
+        stale = _FakeCameraSource(
+            {
+                "camera_key": "right_wrist",
+                "serial": "789",
+                "frame_count": 9,
+                "last_frame_age_sec": 2.5,
+                "stale_after_sec": 1.0,
+            }
+        )
+
+        status = real_teleop._build_camera_status(
+            {"front": fresh, "left_wrist": waiting, "right_wrist": stale},
+            preview_camera_sources={"front": fresh},
+            camera_previewer=object(),
+            now=10.0,
+        )
+
+        self.assertEqual(status["front"]["status_level"], "ok")
+        self.assertTrue(status["front"]["preview_active"])
+        self.assertEqual(status["left_wrist"]["status_level"], "waiting")
+        self.assertIn("Frame did not arrive", status["left_wrist"]["status_message"])
+        self.assertEqual(status["right_wrist"]["status_level"], "error")
+        self.assertEqual(status["right_wrist"]["status_label"], "数据停滞")
+
+    def test_tactile_camera_status_highlights_partial_ready_and_worker_error(self) -> None:
+        status = real_teleop._build_tactile_camera_status(
+            {
+                "left": {
+                    "configured": True,
+                    "connect_tactile": True,
+                    "is_connected": True,
+                    "tactile_devices": ["dev0", "dev1"],
+                    "tactile_ready": {"dev0": True, "dev1": False},
+                    "tactile_frame_ids": {"dev0": 11},
+                    "tactile_timestamp": 99.5,
+                    "tactile_read_hz": 15.0,
+                    "tactile_process_read": True,
+                    "tactile_worker_alive": True,
+                    "tactile_worker_receiver_alive": True,
+                },
+                "right": {
+                    "configured": True,
+                    "connect_tactile": True,
+                    "is_connected": True,
+                    "tactile_devices": ["dev0"],
+                    "tactile_ready": {"dev0": True},
+                    "tactile_frame_ids": {"dev0": 12},
+                    "tactile_timestamp": 99.9,
+                    "tactile_process_read": True,
+                    "tactile_worker_alive": False,
+                    "tactile_worker_receiver_alive": True,
+                },
+            },
+            now=100.0,
+        )
+
+        self.assertEqual(status["left"]["status_level"], "warn")
+        self.assertEqual(status["left"]["ready_count"], 1)
+        self.assertEqual(status["left"]["ready_total"], 2)
+        self.assertEqual(status["right"]["status_level"], "error")
+        self.assertEqual(status["right"]["status_label"], "worker 异常")
+
+    def test_web_ui_snapshot_includes_camera_status_fields(self) -> None:
+        ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
+        ui.publish(
+            camera_status={"front": {"status_level": "ok"}},
+            tactile_camera_status={"left": {"status_level": "warn"}},
+        )
+
+        snapshot = ui.snapshot()
+
+        self.assertEqual(snapshot["camera_status"]["front"]["status_level"], "ok")
+        self.assertEqual(snapshot["tactile_camera_status"]["left"]["status_level"], "warn")
 
     def test_collection_frequency_warning_trips_below_15hz(self) -> None:
         recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
@@ -993,6 +1822,147 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(published["episode_sample_hz"], 12.25)
         self.assertEqual(published["episode_target_hz"], 15.0)
         self.assertTrue(published["episode_frequency_warning"]["active"])
+
+    def test_episode_start_countdown_state_is_visible_and_blocks_restart(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+
+        control.set_episode_start_countdown_state(remaining_sec=2.4)
+
+        published = ui.published[-1]
+        self.assertEqual(published["episode_event_status"], "preparing")
+        self.assertFalse(published["episode_recording"])
+        self.assertIn("2.4 秒", published["episode_event_message"])
+        self.assertNotIn("episode_start", published["active_controls"])
+        self.assertIn("episode_stop", published["active_controls"])
+
+    def test_episode_start_countdown_runs_in_parallel_with_warmup(self) -> None:
+        deadline = 13.0
+
+        self.assertAlmostEqual(real_teleop._episode_start_countdown_remaining(10.0, deadline), 3.0)
+        self.assertFalse(
+            real_teleop._episode_start_countdown_ready_to_record(
+                now=12.9,
+                deadline=deadline,
+                warmup_ready=True,
+            )
+        )
+        self.assertFalse(
+            real_teleop._episode_start_countdown_ready_to_record(
+                now=14.0,
+                deadline=deadline,
+                warmup_ready=False,
+            )
+        )
+        self.assertTrue(
+            real_teleop._episode_start_countdown_ready_to_record(
+                now=14.0,
+                deadline=deadline,
+                warmup_ready=True,
+            )
+        )
+
+    def test_gui_episode_banner_has_preparing_state(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+        self.assertIn(".episode-banner.preparing", html)
+        self.assertIn("3 秒后开始数采", html)
+
+    def test_gui_c_shortcut_only_sends_capture_not_quit(self) -> None:
+        html_and_fallback = calibration_web_ui._HTML_PAGE + calibration_web_ui._FALLBACK_SCRIPT
+
+        self.assertIn("<kbd>C</kbd><span>开始采集</span>", calibration_web_ui._HTML_PAGE)
+        self.assertNotIn('? "c" : "q"', html_and_fallback)
+        self.assertNotIn(": \"q\";", html_and_fallback)
+        self.assertIn('eventName = "c";', html_and_fallback)
+        self.assertIn("当前不可用", html_and_fallback)
+
+    def test_impedance_guard_holds_all_rig_backends_before_fault(self) -> None:
+        class FakeRig:
+            def __init__(self) -> None:
+                self.holds: list[str] = []
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+
+        class FakeSession:
+            def __init__(self, rig: FakeRig) -> None:
+                self.rig = rig
+                self.state_machine = SimpleNamespace(state=real_teleop.TeleopRunState.RUNNING)
+                self.faults: list[str] = []
+
+            def fault(self, reason: str) -> None:
+                self.faults.append(reason)
+                self.state_machine.state = real_teleop.TeleopRunState.FAULT
+
+        rig = FakeRig()
+        session = FakeSession(rig)
+        components = SimpleNamespace(session=session)
+        issue = "right_arm pose impedance loop stopped before command dispatch"
+        expected_reason = f"main_loop: {issue}"
+
+        with patch.object(real_teleop, "_impedance_force_control_issue", return_value=issue), patch.object(
+            real_teleop,
+            "_log",
+        ):
+            ok = real_teleop._guard_impedance_force_control(
+                SimpleNamespace(),
+                components,
+                context="main_loop",
+                now=1.0,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(rig.holds, [f"control fault: {expected_reason}"])
+        self.assertEqual(session.faults, [expected_reason])
+        self.assertEqual(session.state_machine.state, real_teleop.TeleopRunState.FAULT)
+
+    def test_impedance_guard_faults_even_if_hold_motion_reports_failure(self) -> None:
+        class FailingRig:
+            def __init__(self) -> None:
+                self.holds: list[str] = []
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+                raise RuntimeError("simulated hold failure")
+
+        class FakeSession:
+            def __init__(self, rig: FailingRig) -> None:
+                self.rig = rig
+                self.state_machine = SimpleNamespace(state=real_teleop.TeleopRunState.RUNNING)
+                self.faults: list[str] = []
+
+            def fault(self, reason: str) -> None:
+                self.faults.append(reason)
+                self.state_machine.state = real_teleop.TeleopRunState.FAULT
+
+        rig = FailingRig()
+        session = FakeSession(rig)
+        components = SimpleNamespace(session=session)
+        issue = "left_arm pose impedance is disabled before command dispatch"
+        expected_reason = f"main_loop: {issue}"
+
+        with patch.object(real_teleop, "_impedance_force_control_issue", return_value=issue), patch.object(
+            real_teleop,
+            "_log",
+        ) as log:
+            ok = real_teleop._guard_impedance_force_control(
+                SimpleNamespace(),
+                components,
+                context="main_loop",
+                now=1.0,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(rig.holds, [f"control fault: {expected_reason}"])
+        self.assertEqual(session.faults, [expected_reason])
+        self.assertTrue(
+            any("hold_motion failed" in str(call.args[1]) for call in log.call_args_list)
+        )
 
 
 if __name__ == "__main__":

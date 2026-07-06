@@ -17,7 +17,7 @@
 ```bash
 export REPO=$(pwd)
 export PROFILE=/home/ai/Desktop/DexTeleop/teleop_records/calibration_profiles/20260506_122501_vive_rm65_virtual_desk.json
-export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
+export CAMERA_CONFIG=$REPO/cameras/configs/rm65/devices/realsense.json
 export DATASET_ROOT=$REPO/datasets
 export VIVE_TARGET_HOST=192.168.20.90
 
@@ -183,7 +183,7 @@ python -m teleop_runtime.deploy.run_policy \
   --active-sides left right \
   --enable-hands \
   --camera-mode single \
-  --camera-config /home/ai/Desktop/DexTeleop/teleop_runtime/configs/devices/realsense.json \
+  --camera-config /home/ai/Desktop/DexTeleop/cameras/configs/rm65/devices/realsense.json \
   --require-camera-frame \
   --require-ready-observation \
   --action-queue-policy replace \
@@ -211,7 +211,7 @@ python -m teleop_runtime.deploy.run_policy \
   --active-sides both \
   --enable-hands \
   --camera-mode single \
-  --camera-config /home/ai/Desktop/DexTeleop/teleop_runtime/configs/devices/realsense.json \
+  --camera-config /home/ai/Desktop/DexTeleop/cameras/configs/rm65/devices/realsense.json \
   --require-camera-frame \
   --require-ready-observation \
   --action-queue-policy replace \
@@ -245,7 +245,7 @@ python -m teleop_runtime.deploy.run_policy \
   --active-sides both \
   --enable-hands \
   --camera-mode single \
-  --camera-config /home/ai/Desktop/DexTeleop/teleop_runtime/configs/devices/realsense.json \
+  --camera-config /home/ai/Desktop/DexTeleop/cameras/configs/rm65/devices/realsense.json \
   --require-camera-frame \
   --require-ready-observation \
   --action-queue-policy replace \
@@ -341,7 +341,7 @@ python -m teleop_runtime.deploy.run_policy \
   --active-sides right \
   --enable-hands \
   --camera-mode single \
-  --camera-config /home/ai/Desktop/DexTeleop/teleop_runtime/configs/devices/realsense.json \
+  --camera-config /home/ai/Desktop/DexTeleop/cameras/configs/rm65/devices/realsense.json \
   --require-camera-frame \
   --require-ready-observation \
   --action-queue-policy replace \

@@ -22,6 +22,7 @@ from utils.hand_eye.transforms import (
     rotation_matrix_from_euler_xyz,
     transform_distance,
 )
+from utils.hand_eye.camera import RealSenseCamera, RealSenseConfig, _set_sensor_option
 
 
 class HandEyeEyeInHandTest(unittest.TestCase):
@@ -139,6 +140,94 @@ class HandEyeEyeInHandTest(unittest.TestCase):
                 )
 
 
+class HandEyeRealSenseSettingsTest(unittest.TestCase):
+    def test_fixed_realsense_options_restore_previous_values_on_stop(self) -> None:
+        sensor = _FakeSensor(
+            {
+                "enable_auto_exposure": 1.0,
+                "exposure": 33000.0,
+            }
+        )
+        snapshot = []
+        report = {}
+
+        _set_sensor_option(
+            _FakeRS,
+            sensor,
+            "enable_auto_exposure",
+            False,
+            report,
+            prefix="color",
+            snapshot=snapshot,
+        )
+        _set_sensor_option(
+            _FakeRS,
+            sensor,
+            "exposure",
+            8000.0,
+            report,
+            prefix="color",
+            snapshot=snapshot,
+        )
+
+        self.assertEqual(report["color.enable_auto_exposure.previous"], 1.0)
+        self.assertEqual(report["color.exposure.previous"], 33000.0)
+        self.assertEqual(sensor.values["enable_auto_exposure"], 0.0)
+        self.assertEqual(sensor.values["exposure"], 8000.0)
+
+        camera = object.__new__(RealSenseCamera)
+        camera.config = RealSenseConfig(restore_settings_on_stop=True)
+        pipeline = _FakePipeline()
+        camera._pipeline = pipeline
+        camera._align = object()
+        camera._profile = object()
+        camera._settings_snapshot = snapshot
+        camera.settings_report = {}
+
+        camera.stop()
+
+        self.assertTrue(camera._pipeline is None)
+        self.assertTrue(pipeline.stopped)
+        self.assertTrue(camera.settings_report["restore.enabled"])
+        self.assertEqual(camera.settings_report["restore.count"], 2)
+        self.assertEqual(sensor.values["exposure"], 33000.0)
+        self.assertEqual(sensor.values["enable_auto_exposure"], 1.0)
+        self.assertEqual(
+            sensor.set_history,
+            [
+                ("enable_auto_exposure", 0.0),
+                ("exposure", 8000.0),
+                ("exposure", 33000.0),
+                ("enable_auto_exposure", 1.0),
+            ],
+        )
+
+    def test_realsense_option_restore_can_be_disabled(self) -> None:
+        sensor = _FakeSensor({"exposure": 33000.0})
+        snapshot = []
+        _set_sensor_option(
+            _FakeRS,
+            sensor,
+            "exposure",
+            8000.0,
+            {},
+            prefix="color",
+            snapshot=snapshot,
+        )
+        camera = object.__new__(RealSenseCamera)
+        camera.config = RealSenseConfig(restore_settings_on_stop=False)
+        camera._pipeline = _FakePipeline()
+        camera._align = object()
+        camera._profile = object()
+        camera._settings_snapshot = snapshot
+        camera.settings_report = {}
+
+        camera.stop()
+
+        self.assertEqual(sensor.values["exposure"], 8000.0)
+        self.assertEqual(camera.settings_report["restore.enabled"], False)
+
+
 def _synthetic_samples(count: int) -> list[CalibrationSample]:
     T_camera_to_gripper = make_transform(
         rotation_matrix_from_euler_xyz(0.16, -0.22, 0.31),
@@ -177,6 +266,36 @@ def _synthetic_samples(count: int) -> list[CalibrationSample]:
             )
         )
     return samples
+
+
+class _FakeRS:
+    class option:
+        enable_auto_exposure = "enable_auto_exposure"
+        exposure = "exposure"
+
+
+class _FakeSensor:
+    def __init__(self, values: dict[str, float]):
+        self.values = dict(values)
+        self.set_history: list[tuple[str, float]] = []
+
+    def supports(self, option: str) -> bool:
+        return option in self.values
+
+    def get_option(self, option: str) -> float:
+        return self.values[option]
+
+    def set_option(self, option: str, value: float) -> None:
+        self.values[option] = float(value)
+        self.set_history.append((option, float(value)))
+
+
+class _FakePipeline:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 if __name__ == "__main__":

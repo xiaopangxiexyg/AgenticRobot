@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from portable_dexhand021 import DexHandController
 from portable_dexhand021.tactile_viewer import run_viewer
-from inspire_data_collect.hand.serial_hand_q6_reader import BufferedSerialLineReader
+from hardware.teleop_hand.hand_q6_reader import BufferedSerialLineReader
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:

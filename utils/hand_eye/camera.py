@@ -67,6 +67,15 @@ class RealSenseConfig:
     depth_emitter_enabled: bool | None = False
     depth_laser_power: float | None = 0.0
     auto_select_supported_profile: bool = True
+    restore_settings_on_stop: bool = True
+
+
+@dataclass(frozen=True)
+class _SensorOptionSnapshot:
+    sensor: Any
+    option: Any
+    key: str
+    value: float
 
 
 class RealSenseCamera:
@@ -79,6 +88,7 @@ class RealSenseCamera:
         self.serial: str | None = None
         self.depth_scale_m: float | None = None
         self.settings_report: dict[str, Any] = {}
+        self._settings_snapshot: list[_SensorOptionSnapshot] = []
 
     @staticmethod
     def list_devices() -> list[RealSenseDevice]:
@@ -261,11 +271,23 @@ class RealSenseCamera:
         )
 
     def stop(self) -> None:
-        if self._pipeline is not None:
-            self._pipeline.stop()
-        self._pipeline = None
-        self._align = None
-        self._profile = None
+        pipeline = self._pipeline
+        try:
+            if pipeline is not None and self.config.restore_settings_on_stop:
+                restore_report = self._restore_device_settings()
+                if restore_report:
+                    self.settings_report.update(restore_report)
+            elif pipeline is not None and self._settings_snapshot:
+                self.settings_report["restore.enabled"] = False
+        finally:
+            self._settings_snapshot = []
+            try:
+                if pipeline is not None:
+                    pipeline.stop()
+            finally:
+                self._pipeline = None
+                self._align = None
+                self._profile = None
 
     def __enter__(self) -> "RealSenseCamera":
         return self.start()
@@ -290,6 +312,7 @@ class RealSenseCamera:
                 self.config.color_auto_exposure,
                 report,
                 prefix="color",
+                snapshot=self._settings_snapshot,
             )
             _set_sensor_option(
                 rs,
@@ -298,6 +321,7 @@ class RealSenseCamera:
                 self.config.color_exposure_us,
                 report,
                 prefix="color",
+                snapshot=self._settings_snapshot,
             )
             _set_sensor_option(
                 rs,
@@ -306,6 +330,7 @@ class RealSenseCamera:
                 self.config.color_gain,
                 report,
                 prefix="color",
+                snapshot=self._settings_snapshot,
             )
             _set_sensor_option(
                 rs,
@@ -314,6 +339,7 @@ class RealSenseCamera:
                 self.config.color_auto_white_balance,
                 report,
                 prefix="color",
+                snapshot=self._settings_snapshot,
             )
             _set_sensor_option(
                 rs,
@@ -322,6 +348,7 @@ class RealSenseCamera:
                 self.config.color_white_balance,
                 report,
                 prefix="color",
+                snapshot=self._settings_snapshot,
             )
             _set_sensor_option(
                 rs,
@@ -330,6 +357,7 @@ class RealSenseCamera:
                 self.config.color_focus,
                 report,
                 prefix="color",
+                snapshot=self._settings_snapshot,
             )
         else:
             report["color.sensor"] = "not_found"
@@ -348,6 +376,7 @@ class RealSenseCamera:
                 None if self.config.depth_emitter_enabled is None else int(bool(self.config.depth_emitter_enabled)),
                 report,
                 prefix="depth",
+                snapshot=self._settings_snapshot,
             )
             _set_sensor_option(
                 rs,
@@ -356,9 +385,35 @@ class RealSenseCamera:
                 self.config.depth_laser_power,
                 report,
                 prefix="depth",
+                snapshot=self._settings_snapshot,
             )
         else:
             report["depth.sensor"] = "not_found"
+        return report
+
+    def _restore_device_settings(self) -> dict[str, Any]:
+        report: dict[str, Any] = {"restore.enabled": True}
+        if not self._settings_snapshot:
+            report["restore.count"] = 0
+            return report
+        restored = 0
+        failed = 0
+        for item in reversed(self._settings_snapshot):
+            restore_key = f"restore.{item.key}"
+            try:
+                item.sensor.set_option(item.option, float(item.value))
+                restored += 1
+            except Exception as exc:
+                report[restore_key] = f"set_failed: {exc}"
+                failed += 1
+                continue
+            try:
+                report[restore_key] = float(item.sensor.get_option(item.option))
+            except Exception:
+                report[restore_key] = float(item.value)
+        report["restore.count"] = restored
+        if failed:
+            report["restore.failed_count"] = failed
         return report
 
 
@@ -805,6 +860,7 @@ def _set_sensor_option(
     report: dict[str, Any],
     *,
     prefix: str,
+    snapshot: list[_SensorOptionSnapshot] | None = None,
 ) -> None:
     key = f"{prefix}.{option_name}"
     option = getattr(rs.option, option_name, None)
@@ -820,6 +876,22 @@ def _set_sensor_option(
         report[key] = "unsupported"
         return
     if value is not None:
+        try:
+            previous = float(sensor.get_option(option))
+        except Exception as exc:
+            previous = None
+            report[f"{key}.previous"] = f"read_failed: {exc}"
+        else:
+            report[f"{key}.previous"] = previous
+            if snapshot is not None:
+                snapshot.append(
+                    _SensorOptionSnapshot(
+                        sensor=sensor,
+                        option=option,
+                        key=key,
+                        value=previous,
+                    )
+                )
         try:
             sensor.set_option(option, float(value))
         except Exception as exc:

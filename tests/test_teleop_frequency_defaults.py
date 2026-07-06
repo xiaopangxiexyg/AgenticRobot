@@ -81,6 +81,18 @@ def test_real_teleop_actual_wrist_camera_pose_recording_can_be_disabled() -> Non
     assert args.record_actual_wrist_camera_pose is False
 
 
+def test_real_teleop_legacy_session_recording_defaults_off() -> None:
+    args = _parse_real_teleop_args([])
+
+    assert args.no_record is True
+
+
+def test_real_teleop_legacy_session_recording_can_be_enabled() -> None:
+    args = _parse_real_teleop_args(["--record"])
+
+    assert args.no_record is False
+
+
 def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
     args = _parse_deploy_args(["--active-sides", "both"])
     active_sides = run_policy.validate_args(args)

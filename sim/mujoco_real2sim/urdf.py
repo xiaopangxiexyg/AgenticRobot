@@ -252,6 +252,7 @@ def _registry_camera_mounts(
     default_width: int,
     default_height: int,
     default_fovy_deg: float,
+    camera_intrinsics_by_name: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[CameraMount]:
     if not registry_path.exists():
         return []
@@ -268,6 +269,17 @@ def _registry_camera_mounts(
         width = int(profile.get("width", default_width))
         height = int(profile.get("height", default_height))
         intrinsics = camera_info.get("intrinsics")
+        runtime_intrinsics = (
+            camera_intrinsics_by_name.get(str(camera_key))
+            if isinstance(camera_intrinsics_by_name, Mapping)
+            else None
+        )
+        if isinstance(runtime_intrinsics, Mapping):
+            merged_intrinsics = dict(intrinsics) if isinstance(intrinsics, Mapping) else {}
+            merged_intrinsics.update(dict(runtime_intrinsics))
+            intrinsics = merged_intrinsics
+            width = int(merged_intrinsics.get("width", width))
+            height = int(merged_intrinsics.get("height", height))
         fovy = _fovy_from_intrinsics(width, height, intrinsics) or float(default_fovy_deg)
         extrinsics = camera_info.get("extrinsics")
         frames = extrinsics.get("frames") if isinstance(extrinsics, Mapping) else None
@@ -317,6 +329,7 @@ def discover_camera_mounts(
     default_width: int = 640,
     default_height: int = 480,
     default_fovy_deg: float = 60.0,
+    camera_intrinsics_by_name: Mapping[str, Mapping[str, object]] | None = None,
 ) -> tuple[CameraMount, ...]:
     registry = Path(registry_path).expanduser().resolve() if registry_path else default_camera_registry_path()
     mounts = _registry_camera_mounts(
@@ -325,6 +338,7 @@ def discover_camera_mounts(
         default_width=default_width,
         default_height=default_height,
         default_fovy_deg=default_fovy_deg,
+        camera_intrinsics_by_name=camera_intrinsics_by_name,
     )
     if not mounts:
         mounts = [
@@ -370,4 +384,3 @@ def discover_camera_mounts(
             "Requested camera(s) not found in registry or URDF links: " + ", ".join(missing)
         )
     return tuple(selected)
-

@@ -54,13 +54,13 @@ from ..sources.pose import VivePoseSource, ViveTrackerConfig
 from ..tcp import legacy_tcp_mode_requested
 from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
 from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event
+from robot_motion.rm65 import build_rm65_dual_arm_scene_profile
 from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
 from rm65_inspire_tac.paths import require_asset_path
 from rm65_inspire_tac.pipeline import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     DualArmSceneProfile,
-    build_dual_arm_scene_profile,
 )
 from rm65_inspire_tac.rendering import DebugBoxOverlay, DebugBoxTemplate, SapienArmHandRenderer
 
@@ -69,6 +69,7 @@ _TRACKER_BEFORE_CORRECTION_MARKER_SIZE_M = (0.018, 0.018, 0.018)
 _TRACKER_AFTER_CORRECTION_MARKER_SIZE_M = (0.024, 0.024, 0.024)
 _TRACKER_BEFORE_CORRECTION_COLOR_RGBA = (1.0, 0.55, 0.05, 1.0)
 _TRACKER_AFTER_CORRECTION_COLOR_RGBA = (0.05, 0.75, 1.0, 1.0)
+DEFAULT_RUNTIME_HOME_START_DELAY_SEC = 2.0
 
 
 def _positive_float(text: str) -> float:
@@ -271,7 +272,7 @@ class TerminalClutchInput:
                 self.left_pressed = not self.left_pressed
             elif char == "x":
                 self.right_pressed = not self.right_pressed
-            elif char == "c":
+            elif char == "b":
                 new_state = not (self.left_pressed and self.right_pressed)
                 self.left_pressed = new_state
                 self.right_pressed = new_state
@@ -508,7 +509,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start runtime home calibration immediately without waiting for a key press.",
     )
-    parser.add_argument("--keyboard-clutch", action="store_true", help="Enable terminal clutch toggles: z/x/c/r, q to quit")
+    parser.add_argument("--keyboard-clutch", action="store_true", help="Enable terminal clutch toggles: z/x/b/r, q to quit")
     parser.add_argument("--no-record", action="store_true", help="Disable JSONL recording for this session")
     parser.add_argument(
         "--no-episode-recording",
@@ -592,7 +593,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         dtype=float,
     ).reshape(6)
     realistic_joint_step = tuple((arm_max_angvel * preview_control_dt).tolist())
-    collision_scene_profile = build_dual_arm_scene_profile(args.collision_scene_profile)
+    collision_scene_profile = build_rm65_dual_arm_scene_profile(args.collision_scene_profile)
     ik_tuning = load_ik_tuning_config(args.ik_tuning_json or None)
     initial_alignment = (
         TeleopInitialAlignment.load_json(args.load_initial_alignment)
@@ -1597,6 +1598,7 @@ def _runtime_home_calibration(
             "Calibration",
             "start-pose source=virtual preview defaults/current local state; pressing 'p' will capture tracker home and current preview arm home",
         )
+    calibration_timing_start = time.perf_counter()
     start_time = time.time()
     samples: dict[str, list[np.ndarray]] = {side: [] for side in active_sides}
     observed_channels: set[str] = set()
@@ -1698,30 +1700,67 @@ def _runtime_home_calibration(
             )
             time.sleep(0.01)
 
+    sample_done_perf = time.perf_counter()
+    sample_elapsed_ms = (sample_done_perf - calibration_timing_start) * 1000.0
     publish_progress(now=time.time(), waiting=False)
 
+    sync_elapsed_ms = 0.0
     if _preview_should_follow_live_real_state(arm_mode=arm_mode, components=components):
+        sync_start = time.perf_counter()
         synced = _sync_preview_from_real_state(components, required=False)
-        _log("Calibration", f"locked preview start pose from real state synced={synced}")
+        sync_elapsed_ms = (time.perf_counter() - sync_start) * 1000.0
+        _log(
+            "Calibration",
+            f"locked preview start pose from real state synced={synced} "
+            f"elapsed={sync_elapsed_ms:.1f}ms",
+        )
     home_summaries: list[str] = []
     qpos_summaries: list[str] = []
+    side_timing_summaries: list[str] = []
+    post_sample_start = time.perf_counter()
     for side in active_sides:
+        side_start = time.perf_counter()
+        mean_start = time.perf_counter()
         human_home = _mean_pose(samples[side])
+        mean_elapsed_ms = (time.perf_counter() - mean_start) * 1000.0
+        robot_home_start = time.perf_counter()
         robot_home_desk, qpos, robot_source = _resolve_robot_home_for_side(
             components,
             side=side,
         )
+        robot_home_elapsed_ms = (time.perf_counter() - robot_home_start) * 1000.0
+        anchor_start = time.perf_counter()
         _side_retargeter(components, side).set_home_anchors(
             human_pose_desk=human_home,
             robot_pose_desk=robot_home_desk,
         )
+        anchor_elapsed_ms = (time.perf_counter() - anchor_start) * 1000.0
+        capture_start = time.perf_counter()
         calibration.capture_home_pose(f"{side}_arm", robot_home_desk)
         if qpos is not None:
             calibration.capture_home_qpos(f"{side}_arm", qpos)
+        capture_elapsed_ms = (time.perf_counter() - capture_start) * 1000.0
+        side_elapsed_ms = (time.perf_counter() - side_start) * 1000.0
         home_summaries.append(
             f"{side}_source={robot_source} {side}_xyz={_pose_translation_summary(robot_home_desk)}"
         )
         qpos_summaries.append(f"{side}_q={_qpos_summary(qpos)}")
+        side_timing_summaries.append(
+            f"{side}:total={side_elapsed_ms:.1f}ms "
+            f"mean={mean_elapsed_ms:.1f}ms "
+            f"robot_home={robot_home_elapsed_ms:.1f}ms "
+            f"anchors={anchor_elapsed_ms:.1f}ms "
+            f"capture={capture_elapsed_ms:.1f}ms "
+            f"source={robot_source}"
+        )
+    post_sample_elapsed_ms = (time.perf_counter() - post_sample_start) * 1000.0
+    _log(
+        "CalibrationTiming",
+        f"runtime_home sampling={sample_elapsed_ms:.1f}ms "
+        f"post_sample={post_sample_elapsed_ms:.1f}ms "
+        f"real_state_sync={sync_elapsed_ms:.1f}ms "
+        + " | ".join(side_timing_summaries),
+    )
     _log("Calibration", "robot_home " + " ".join(home_summaries))
     sample_counts = {side: len(values) for side, values in samples.items()}
     _log(
@@ -1764,7 +1803,9 @@ def _wait_for_calibration_start(
     _log("Calibration", "Press 'q' to quit.")
     status_gate = ChangeGate()
 
-    def wait_after_start_request(delay_sec: float = 3.0) -> bool:
+    def wait_after_start_request(
+        delay_sec: float = DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
+    ) -> bool:
         hook = getattr(clutch_input, "before_calibration_start_delay", None)
         if callable(hook):
             return bool(hook(delay_sec, arm_mode=arm_mode))
@@ -2499,7 +2540,7 @@ def main() -> None:
         if args.keyboard_clutch:
             _log(
                 "Keys",
-                "p/Enter=start calibration, t=start episode, s=stop episode, z=left clutch, x=right clutch, c=both, r=release, q=quit",
+                "p/Enter=start calibration, t=start episode, s=stop episode, z=left clutch, x=right clutch, b=both clutch, r=release, q=quit",
             )
         elif args.control_mode == "delta_clutch":
             _log("Info", "delta_clutch is running with both clutch buttons held true by default.")

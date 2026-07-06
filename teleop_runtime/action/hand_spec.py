@@ -97,7 +97,7 @@ class HandActionSpec:
         )
 
     @classmethod
-    def dmtac_gripper(cls, side: str, *, gripper_slot: int = 1) -> "HandActionSpec":
+    def dmtac_gripper(cls, side: str, *, gripper_slot: int = 0) -> "HandActionSpec":
         active_mask = tuple(index == int(gripper_slot) for index in range(INSPIRE_HAND_DOF))
         return cls(
             side=side,
@@ -111,9 +111,9 @@ class HandActionSpec:
             invalid_slot_value="zero_padding",
             semantics=(
                 "DM-Tac gripper uses the fixed 6-wide hand slot for compatibility; "
-                "only gripper_close is a real actuator target and the other slots are padding."
+                "only slot 0 / gripper_close is a real actuator target and the other slots are padding."
             ),
-            metadata={"gripper_slot": int(gripper_slot)},
+            metadata={"gripper_slot": int(gripper_slot), "gripper_action_dim": 1},
         )
 
     @classmethod

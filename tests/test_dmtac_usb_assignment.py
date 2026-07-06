@@ -720,6 +720,15 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertTrue(cfg.include_distributed_force)
         self.assertFalse(cfg.should_read_force())
 
+    def test_tactile_default_fields_read_raw_without_force_pipeline(self) -> None:
+        cfg = tactile_device_config("L_IN", TactileConfig())
+
+        self.assertTrue(cfg.enable_raw)
+        self.assertTrue(cfg.should_read_raw())
+        self.assertFalse(cfg.enable_force)
+        self.assertFalse(cfg.include_distributed_force)
+        self.assertFalse(cfg.should_read_force())
+
     def test_tactile_compute_profile_legacy_matches_old_distributed_force_setup(self) -> None:
         cfg = tactile_device_config(
             "L_IN",

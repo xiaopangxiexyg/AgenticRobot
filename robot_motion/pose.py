@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 
 
 def as_pose_matrix(pose: np.ndarray) -> np.ndarray:
@@ -41,6 +41,22 @@ def matrix_to_pose6(matrix: np.ndarray) -> list[float]:
         float(rpy[1]),
         float(rpy[2]),
     ]
+
+
+def interpolate_pose(start_pose: np.ndarray, end_pose: np.ndarray, alpha: float) -> np.ndarray:
+    start = as_pose_matrix(start_pose)
+    end = as_pose_matrix(end_pose)
+    blend = float(np.clip(alpha, 0.0, 1.0))
+    if blend <= 0.0:
+        return start.copy()
+    if blend >= 1.0:
+        return end.copy()
+
+    out = np.eye(4, dtype=float)
+    out[:3, 3] = (1.0 - blend) * start[:3, 3] + blend * end[:3, 3]
+    key_rots = R.from_matrix(np.stack((start[:3, :3], end[:3, :3]), axis=0))
+    out[:3, :3] = Slerp([0.0, 1.0], key_rots)([blend]).as_matrix()[0]
+    return out
 
 
 def matrix_to_rm_quat_pose(matrix: np.ndarray) -> list[float]:

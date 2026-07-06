@@ -4,10 +4,6 @@ import sys
 import unittest
 from pathlib import Path
 
-import numpy as np
-
-from inspire_data_collect.hand.dexhand_q6_backend import DexHandQ6Backend
-
 
 CONTROL_DIR = (
     Path(__file__).resolve().parents[1]
@@ -22,13 +18,6 @@ from q6_to_dexhand import DexHandQ6Mapper, reorder_q6  # noqa: E402
 
 
 class DexHandQ6ThumbOrderTests(unittest.TestCase):
-    def test_collect_backend_keeps_thumb_dimensions_in_dexhand_order(self) -> None:
-        q6 = np.asarray([0.2, 0.7, 0.3, 0.4, 0.5, 0.6], dtype=np.float32)
-
-        mapped = DexHandQ6Backend._teleop_q6_to_internal_q6(q6)
-
-        np.testing.assert_allclose(mapped, q6)
-
     def test_standalone_mapper_keeps_teleop_thumb_dimensions_in_dexhand_order(self) -> None:
         q6 = (0.2, 0.7, 0.3, 0.4, 0.5, 0.6)
 

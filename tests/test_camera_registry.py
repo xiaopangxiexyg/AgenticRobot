@@ -4,6 +4,11 @@ import math
 import unittest
 from pathlib import Path
 
+from cameras.configs import (
+    DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
+    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
+)
+from sim.mujoco_real2sim.config import default_camera_registry_path
 from teleop_runtime.cameras.registry import (
     build_camera_registry_snapshot,
     camera_matrix_from_intrinsics,
@@ -15,9 +20,7 @@ from teleop_runtime.cameras.registry import (
 
 class CameraRegistryTest(unittest.TestCase):
     def test_default_registry_keeps_extrinsics_by_frame_with_placements(self) -> None:
-        registry = load_camera_registry(
-            Path("teleop_runtime/configs/cameras/realsense_registry.json")
-        )
+        registry = load_camera_registry(DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH)
 
         front_frames = registry["cameras"]["front"]["extrinsics"]["frames"]
         self.assertIn("head_camera_frame", front_frames)
@@ -28,6 +31,29 @@ class CameraRegistryTest(unittest.TestCase):
         left_frames = registry["cameras"]["left_wrist"]["extrinsics"]["frames"]
         self.assertIn("left_camera_rgb", left_frames)
         self.assertGreaterEqual(len(left_frames["left_camera_rgb"]["placements"]), 2)
+
+    def test_canonical_cameras_configs_exist_and_legacy_mirrors_match(self) -> None:
+        legacy_device_config = Path("teleop_runtime/configs/devices/realsense.json")
+        legacy_registry = Path("teleop_runtime/configs/cameras/realsense_registry.json")
+
+        self.assertTrue(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.exists())
+        self.assertTrue(DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.exists())
+        self.assertEqual(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.parts[-3:-1], ("rm65", "devices"))
+        self.assertEqual(
+            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.parts[-3:-1],
+            ("rm65", "cameras"),
+        )
+        self.assertEqual(
+            DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.read_text(encoding="utf-8"),
+            legacy_device_config.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.read_text(encoding="utf-8"),
+            legacy_registry.read_text(encoding="utf-8"),
+        )
+
+    def test_real2sim_default_camera_registry_uses_cameras_config(self) -> None:
+        self.assertEqual(default_camera_registry_path(), DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH)
 
     def test_runtime_intrinsics_overlay_registry_without_losing_urdf_placements(self) -> None:
         registry = normalize_camera_registry(

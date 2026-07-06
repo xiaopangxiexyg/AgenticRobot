@@ -38,6 +38,7 @@ from .writer_v21 import (
     FINALIZE_EPISODE_JOB_KIND,
     ROW_JOB_KIND,
     VIDEO_FRAME_JOB_KIND,
+    WRIST_DEPTH_FRAME_JOB_KIND,
     LeRobotV21Writer,
     LeRobotV21WriterConfig,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "SampleAssemblerConfig",
     "SideTopology",
     "VIDEO_FRAME_JOB_KIND",
+    "WRIST_DEPTH_FRAME_JOB_KIND",
     "VideoFrame",
     "WriteJob",
     "build_end_to_end_latency_breakdown",

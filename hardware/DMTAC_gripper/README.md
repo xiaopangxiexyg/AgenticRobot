@@ -234,7 +234,7 @@ python run_gripper.py visualize-force --config latest --side right --tactile-slo
 python run_gripper.py verify-gripper --port /dev/ttyUSB0 --id 1
 ```
 
-只读两个触觉传感器，默认读取 `distributed_force`：
+只读两个触觉传感器，默认读取 `raw` 原始图像；需要实时力图时显式传 `--tactile_fields distributed_force`：
 
 ```bash
 python run_gripper.py verify-tactile --tactile_ids L25480055 L25480053 --backend cpu --count 10
@@ -425,7 +425,7 @@ joint_pos = 1.0  完全闭合
 
 ## 触觉数据字段
 
-`TactileConfig(fields=...)` 在初始化时决定每帧读取哪些字段。默认只读取 `distributed_force`，避免全量读取拖慢频率。
+`TactileConfig(fields=...)` 在初始化时决定每帧读取哪些字段。默认只读取 `raw` 原始图像，避免实时力解算拖慢频率；需要实时力图时显式配置 `distributed_force`。
 
 | 字段 | SDK 函数 | 数据格式 | 含义 |
 | --- | --- | --- | --- |
@@ -443,13 +443,14 @@ joint_pos = 1.0  完全闭合
 示例：
 
 ```python
+TactileConfig(fields=("raw",))
 TactileConfig(fields=("distributed_force",))
 TactileConfig(fields=("distributed_force", "depth", "shear"))
 TactileConfig(fields=("all",))
 ```
 
 `TactileConfig(compute_profile=...)` 控制 SDK 初始化时启用哪些计算通道。默认
-`"dist-only"` 只为 `distributed_force` 打开最小 force 链路，以减少 SDK 内部队列延迟；
+`"dist-only"` 对 `raw` 默认字段不会启用 force 链路；配合 `distributed_force` 时会打开最小 force 链路；
 `"legacy"` 回到旧的 deformation/shear/depth/force 全链路；`"shear-depth"` 和
 `"requested"` 主要用于定位不同 SDK/固件版本的 getter 延迟。
 

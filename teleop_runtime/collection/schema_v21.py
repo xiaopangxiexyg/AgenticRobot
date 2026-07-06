@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -173,6 +173,60 @@ def _hand_active_masks_from_specs(specs: Mapping[str, Any]) -> dict[str, list[bo
     return masks
 
 
+def _gripper_slot_from_metadata(
+    hand_command_metadata: Mapping[str, Any],
+    hand_spec: Mapping[str, Any] | None,
+) -> int:
+    for key in ("gripper_slot", "output_dim"):
+        value = hand_command_metadata.get(key)
+        try:
+            slot = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= slot < 6:
+            return slot
+    if isinstance(hand_spec, Mapping):
+        metadata = hand_spec.get("metadata")
+        if isinstance(metadata, Mapping):
+            try:
+                slot = int(metadata.get("gripper_slot"))
+            except (TypeError, ValueError):
+                slot = -1
+            if 0 <= slot < 6:
+                return slot
+        slot_map = hand_spec.get("slot_map")
+        if isinstance(slot_map, Mapping):
+            try:
+                slot = int(slot_map.get("gripper_close"))
+            except (TypeError, ValueError):
+                slot = -1
+            if 0 <= slot < 6:
+                return slot
+    return 0
+
+
+def _gripper_target_from_action(
+    target_from_action: Sequence[float] | None,
+    *,
+    slot: int,
+    metadata: Mapping[str, Any],
+) -> float | None:
+    explicit_target = metadata.get("gripper_joint_target")
+    try:
+        value = float(explicit_target)
+    except (TypeError, ValueError):
+        value = float("nan")
+    if np.isfinite(value):
+        return value
+    if target_from_action is None or not 0 <= int(slot) < len(target_from_action):
+        return None
+    try:
+        value = float(target_from_action[int(slot)])
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
 def collector_sample_to_row(
     sample: CollectorSample,
     *,
@@ -185,6 +239,9 @@ def collector_sample_to_row(
     arm_specs = _arm_specs_from_sample_metadata(sample.metadata)
     hand_specs = _hand_specs_from_sample_metadata(sample.metadata)
     hand_active_masks = _hand_active_masks_from_specs(hand_specs)
+    pose_quality = sample.metadata.get("pose_quality", {})
+    if not isinstance(pose_quality, Mapping):
+        pose_quality = {}
     row: dict[str, Any] = {
         "index": int(sample.index),
         "episode_index": int(sample.episode_index),
@@ -241,6 +298,15 @@ def collector_sample_to_row(
             sort_keys=True,
         ),
         "faults_json": json.dumps(_to_serializable(sample.faults), ensure_ascii=True, sort_keys=True),
+        "teleop.pose_quality.score": pose_quality.get("score"),
+        "teleop.pose_quality.status": pose_quality.get("status"),
+        "teleop.pose_quality.bad": int(bool(pose_quality.get("bad", False))),
+        "teleop.pose_quality.available": int(bool(pose_quality.get("available", False))),
+        "teleop.pose_quality_json": json.dumps(
+            _to_serializable(pose_quality),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
     }
     camera_expectations: dict[str, bool] = {}
     command_metadata_by_effector = sample.metadata.get("command_metadata_by_effector", {})
@@ -509,19 +575,20 @@ def collector_sample_to_row(
         row[f"observation.gripper.{side}.measured"] = hand_state.get("gripper_measured_scalar")
         row[f"observation.gripper.{side}.commanded"] = hand_state.get("gripper_commanded_scalar")
         target_from_action = action_split[f"{side}_hand"]
-        output_dim = hand_command_metadata.get("output_dim")
-        try:
-            output_index = int(output_dim)
-        except (TypeError, ValueError):
-            output_index = 1
-        row[f"action.gripper.{side}.target"] = (
-            None
-            if target_from_action is None or not 0 <= output_index < len(target_from_action)
-            else float(target_from_action[output_index])
+        gripper_slot = _gripper_slot_from_metadata(
+            hand_command_metadata,
+            hand_specs.get(side) if isinstance(hand_specs.get(side), Mapping) else None,
+        )
+        row[f"action.gripper.{side}.target"] = _gripper_target_from_action(
+            target_from_action,
+            slot=gripper_slot,
+            metadata=hand_command_metadata,
         )
         row[f"action.gripper.{side}.source_value"] = hand_command_metadata.get("source_value")
         row[f"action.gripper.{side}.source_dim"] = hand_command_metadata.get("source_dim")
         row[f"action.gripper.{side}.output_dim"] = hand_command_metadata.get("output_dim")
+        row[f"action.gripper.{side}.slot_index"] = gripper_slot
+        row[f"action.gripper.{side}.action_dim"] = hand_command_metadata.get("gripper_action_dim", 1)
         row[f"action.gripper.{side}.invert"] = hand_command_metadata.get("invert")
         row[f"teleop.action_source.{side}_hand_q6"] = _command_vector_metadata(
             hand_command,

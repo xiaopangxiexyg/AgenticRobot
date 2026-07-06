@@ -211,12 +211,17 @@ class CollectionWriterObserver:
     def _storage_route_key(self, job: WriteJob) -> str | None:
         if not self.storage_queue_enabled:
             return None
-        if str(job.metadata.get("storage_queue", "")) != "video":
+        storage_queue = str(job.metadata.get("storage_queue", ""))
+        if storage_queue not in {"video", "wrist_depth"}:
             return None
         camera_key = job.metadata.get("camera_key")
         if camera_key is None and isinstance(job.payload, dict):
             camera_key = job.payload.get("camera_key")
-        return None if camera_key is None else str(camera_key)
+        if camera_key is None:
+            return None
+        if storage_queue == "video":
+            return str(camera_key)
+        return f"{storage_queue}:{camera_key}"
 
     def _storage_route(self, key: str) -> _StorageRouteQueue:
         route_key = str(key)
@@ -268,11 +273,16 @@ class CollectionWriterObserver:
         if sample is None:
             return None
         self._last_sample = sample
-        sample.metadata.setdefault("runtime_phase_timings_ms", {}).update(
-            {name: elapsed * 1000.0 for name, elapsed in local_phases}
-        )
+        phase_timings = {name: elapsed * 1000.0 for name, elapsed in local_phases}
+        if hasattr(sample, "metadata"):
+            sample.metadata.setdefault("runtime_phase_timings_ms", {}).update(phase_timings)
+        elif isinstance(sample, dict):
+            sample.setdefault("metadata", {}).setdefault("runtime_phase_timings_ms", {}).update(phase_timings)
         if metadata_extra:
-            sample.metadata.update(dict(metadata_extra))
+            if hasattr(sample, "metadata"):
+                sample.metadata.update(dict(metadata_extra))
+            elif isinstance(sample, dict):
+                sample.setdefault("metadata", {}).update(dict(metadata_extra))
 
         if phase_recorder is None:
             for job in self.write_planner(sample, self.components):

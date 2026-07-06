@@ -796,7 +796,7 @@ dataset_root/
 
 ### 建议新增
 
-- `teleop_runtime/configs/devices/realsense.json`
+- `cameras/configs/rm65/devices/realsense.json`
 - `teleop_runtime/sources/camera/realsense_rgb.py`
 
 ### 建议配置格式

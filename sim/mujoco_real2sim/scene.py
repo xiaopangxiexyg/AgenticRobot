@@ -6,7 +6,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .config import ArmSpec, CameraMount
+from .config import ArmSpec, CameraMount, GripperSpec
 from .mjcf import MJCFConversion, write_mjcf
 from .transforms import pose_to_xyz_quat_xyzw
 from .urdf import discover_camera_mounts, parse_urdf
@@ -17,6 +17,7 @@ class SceneLoadResult:
     conversion: MJCFConversion
     cameras: tuple[CameraMount, ...]
     arms: dict[str, ArmSpec]
+    grippers: dict[str, GripperSpec]
 
 
 def _load_mujoco():
@@ -32,6 +33,16 @@ def _load_mujoco():
 
 def _joint_exists(mujoco, model, name: str) -> bool:
     return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) >= 0
+
+
+def _joint_range(mujoco, model, name: str) -> tuple[float, float] | None:
+    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    if joint_id < 0:
+        return None
+    if not bool(model.jnt_limited[joint_id]):
+        return None
+    lower, upper = model.jnt_range[joint_id]
+    return float(lower), float(upper)
 
 
 def _body_exists(mujoco, model, name: str) -> bool:
@@ -63,6 +74,76 @@ def _infer_arm_spec(mujoco, model, side: str) -> ArmSpec | None:
     )
 
 
+def _parallel_gripper_from_joints(
+    mujoco,
+    model,
+    *,
+    name: str,
+    joint_names: tuple[str, ...],
+    effector_name: str = "gripper",
+    side: str | None = None,
+) -> GripperSpec | None:
+    if not all(_joint_exists(mujoco, model, joint_name) for joint_name in joint_names):
+        return None
+    ranges = [_joint_range(mujoco, model, joint_name) for joint_name in joint_names]
+    if any(item is None for item in ranges):
+        return None
+    # The local gripper URDF convention is viewer-friendly: q=upper is open and
+    # q=lower is closed. Keeping this per spec lets future modules override it.
+    lower = tuple(float(item[0]) for item in ranges if item is not None)
+    upper = tuple(float(item[1]) for item in ranges if item is not None)
+    return GripperSpec(
+        name=name,
+        joint_names=joint_names,
+        open_qpos=upper,
+        closed_qpos=lower,
+        effector_name=effector_name,
+        side=side,
+    )
+
+
+def _infer_gripper_specs(mujoco, model) -> dict[str, GripperSpec]:
+    specs: dict[str, GripperSpec] = {}
+    candidates = (
+        (
+            "eg2_4b2",
+            ("eg2_4b2_left_finger_joint", "eg2_4b2_right_finger_joint"),
+            "gripper",
+            None,
+        ),
+        (
+            "parallel_gripper",
+            ("left_finger_joint", "right_finger_joint"),
+            "gripper",
+            None,
+        ),
+        (
+            "left_gripper",
+            ("left_gripper_left_finger_joint", "left_gripper_right_finger_joint"),
+            "left_hand",
+            "left",
+        ),
+        (
+            "right_gripper",
+            ("right_gripper_left_finger_joint", "right_gripper_right_finger_joint"),
+            "right_hand",
+            "right",
+        ),
+    )
+    for name, joint_names, effector_name, side in candidates:
+        spec = _parallel_gripper_from_joints(
+            mujoco,
+            model,
+            name=name,
+            joint_names=joint_names,
+            effector_name=effector_name,
+            side=side,
+        )
+        if spec is not None:
+            specs[spec.name] = spec
+    return specs
+
+
 class MujocoScene:
     """Position-controlled MuJoCo scene loaded from an explicit URDF."""
 
@@ -81,6 +162,7 @@ class MujocoScene:
         self.conversion = load_result.conversion
         self.camera_mounts = load_result.cameras
         self.arm_specs = load_result.arms
+        self.gripper_specs = load_result.grippers
         self._joint_qpos_addr = self._build_joint_qpos_addr()
         self._joint_dof_addr = self._build_joint_dof_addr()
         self._body_ids = self._build_body_ids()
@@ -97,9 +179,12 @@ class MujocoScene:
         camera_width: int = 640,
         camera_height: int = 480,
         default_camera_fovy_deg: float = 60.0,
+        camera_intrinsics_by_name: Mapping[str, Mapping[str, object]] | None = None,
         timestep: float = 1.0 / 30.0,
         gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
         mjcf_path: str | Path | None = None,
+        debug_proxy_visuals: bool = False,
+        gripper_specs: Mapping[str, GripperSpec] | Sequence[GripperSpec] | None = None,
     ) -> "MujocoScene":
         mujoco = _load_mujoco()
         urdf_model = parse_urdf(urdf_path)
@@ -110,6 +195,7 @@ class MujocoScene:
             default_width=camera_width,
             default_height=camera_height,
             default_fovy_deg=default_camera_fovy_deg,
+            camera_intrinsics_by_name=camera_intrinsics_by_name,
         )
         conversion = write_mjcf(
             urdf_model.path,
@@ -117,6 +203,7 @@ class MujocoScene:
             output_path=mjcf_path,
             timestep=timestep,
             gravity=gravity,
+            debug_proxy_visuals=debug_proxy_visuals,
         )
         model = mujoco.MjModel.from_xml_path(str(conversion.mjcf_path))
         data = mujoco.MjData(model)
@@ -125,11 +212,33 @@ class MujocoScene:
             for side in ("left", "right")
             if (spec := _infer_arm_spec(mujoco, model, side)) is not None
         }
+        inferred_grippers = _infer_gripper_specs(mujoco, model)
+        if gripper_specs is None:
+            grippers = inferred_grippers
+        elif isinstance(gripper_specs, Mapping):
+            grippers = {str(name): spec for name, spec in gripper_specs.items()}
+        else:
+            grippers = {spec.name: spec for spec in gripper_specs}
+        missing_gripper_joints = sorted(
+            {
+                joint_name
+                for spec in grippers.values()
+                for joint_name in spec.joint_names
+                if not _joint_exists(mujoco, model, joint_name)
+            }
+        )
+        if missing_gripper_joints:
+            raise KeyError(f"Gripper spec references missing MuJoCo joints: {missing_gripper_joints}")
         return cls(
             mujoco=mujoco,
             model=model,
             data=data,
-            load_result=SceneLoadResult(conversion=conversion, cameras=cameras, arms=arms),
+            load_result=SceneLoadResult(
+                conversion=conversion,
+                cameras=cameras,
+                arms=arms,
+                grippers=grippers,
+            ),
         )
 
     @property
@@ -211,6 +320,65 @@ class MujocoScene:
             for side in sorted(self.arm_specs)
         }
 
+    def _resolve_gripper_name(self, name: str | None = None) -> str:
+        if name is not None:
+            key = str(name)
+            if key in self.gripper_specs:
+                return key
+            raise KeyError(f"Scene has no gripper spec named {key!r}.")
+        if len(self.gripper_specs) == 1:
+            return next(iter(self.gripper_specs))
+        if not self.gripper_specs:
+            raise KeyError("Scene has no gripper specs.")
+        raise KeyError(
+            "Multiple gripper specs are available; specify one of "
+            f"{sorted(self.gripper_specs)}."
+        )
+
+    def get_gripper_qpos(self, name: str | None = None) -> np.ndarray:
+        spec = self.gripper_specs[self._resolve_gripper_name(name)]
+        return np.asarray(
+            [self.data.qpos[self.joint_qpos_addr(joint)] for joint in spec.joint_names],
+            dtype=float,
+        )
+
+    def set_gripper_qpos(self, name: str | None, qpos: Sequence[float]) -> None:
+        spec = self.gripper_specs[self._resolve_gripper_name(name)]
+        values = np.asarray(qpos, dtype=float).reshape(len(spec.joint_names))
+        for joint_name, value in zip(spec.joint_names, values):
+            self.data.qpos[self.joint_qpos_addr(joint_name)] = float(value)
+        self.forward()
+
+    def get_gripper_close(self, name: str | None = None) -> float:
+        spec = self.gripper_specs[self._resolve_gripper_name(name)]
+        return spec.close_from_qpos(self.get_gripper_qpos(spec.name))
+
+    def set_gripper_close(self, name: str | None, close: float) -> None:
+        spec = self.gripper_specs[self._resolve_gripper_name(name)]
+        self.set_gripper_qpos(spec.name, spec.qpos_from_close(close))
+
+    def gripper_close_by_name(self) -> dict[str, float]:
+        return {
+            name: float(self.get_gripper_close(name))
+            for name in sorted(self.gripper_specs)
+        }
+
+    def gripper_qpos_by_name(self) -> dict[str, list[float]]:
+        return {
+            name: [float(value) for value in self.get_gripper_qpos(name)]
+            for name in sorted(self.gripper_specs)
+        }
+
+    def gripper_metadata(self) -> dict[str, dict[str, object]]:
+        return {
+            name: {
+                **spec.metadata(),
+                "current_qpos": [float(value) for value in self.get_gripper_qpos(name)],
+                "current_close": float(self.get_gripper_close(name)),
+            }
+            for name, spec in sorted(self.gripper_specs.items())
+        }
+
     def body_pose(self, body_name: str) -> np.ndarray:
         body_id = self.body_id(body_name)
         pose = np.eye(4, dtype=float)
@@ -276,4 +444,3 @@ class MujocoCameraRenderer:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-

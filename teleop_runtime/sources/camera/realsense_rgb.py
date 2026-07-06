@@ -42,6 +42,11 @@ class RealSenseRGBCameraConfig:
     restart_after_timeouts: int = 3
     restart_cooldown_sec: float = 0.5
     auto_exposure_priority: int | None = None
+    enable_depth: bool = False
+    depth_width: int | None = None
+    depth_height: int | None = None
+    depth_fps: int = 15
+    align_depth_to_color: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -64,6 +69,14 @@ class RealSenseRGBCameraConfig:
             raise ValueError("restart_after_timeouts must be positive.")
         if float(self.restart_cooldown_sec) < 0.0:
             raise ValueError("restart_cooldown_sec must be >= 0.")
+        if self.depth_width is None:
+            self.depth_width = int(self.width)
+        if self.depth_height is None:
+            self.depth_height = int(self.height)
+        if int(self.depth_width) <= 0 or int(self.depth_height) <= 0:
+            raise ValueError("RealSense depth resolution must be positive.")
+        if int(self.depth_fps) <= 0:
+            raise ValueError("depth_fps must be positive.")
         self.color_space = str(self.color_space).lower()
         if self.color_space not in {"rgb", "bgr"}:
             raise ValueError("color_space must be either 'rgb' or 'bgr'.")
@@ -85,6 +98,11 @@ class RealSenseRGBCameraConfig:
                 "restart_after_timeouts": int(self.restart_after_timeouts),
                 "restart_cooldown_sec": float(self.restart_cooldown_sec),
                 "auto_exposure_priority": self.auto_exposure_priority,
+                "enable_depth": bool(self.enable_depth),
+                "depth_width": int(self.depth_width),
+                "depth_height": int(self.depth_height),
+                "depth_fps": int(self.depth_fps),
+                "align_depth_to_color": bool(self.align_depth_to_color),
                 "metadata": dict(self.metadata),
             }
         )
@@ -132,6 +150,8 @@ class RealSenseRGBSource(ObservationSource):
         self._restart_count = 0
         self._last_restart_timestamp: float | None = None
         self._device_info: dict[str, Any] = {}
+        self._depth_align = None
+        self._depth_scale_m_per_unit: float | None = None
 
     @property
     def name(self) -> str:
@@ -189,9 +209,31 @@ class RealSenseRGBSource(ObservationSource):
             rs.format.bgr8,
             int(self.config.fps),
         )
+        if bool(self.config.enable_depth):
+            stream_config.enable_stream(
+                rs.stream.depth,
+                int(self.config.depth_width),
+                int(self.config.depth_height),
+                rs.format.z16,
+                int(self.config.depth_fps),
+            )
         profile = pipeline.start(stream_config)
         self._configure_sensor_options(profile)
+        self._configure_depth_state(rs, profile)
         return pipeline, profile
+
+    def _configure_depth_state(self, rs: Any, profile: Any) -> None:
+        if not bool(self.config.enable_depth):
+            self._depth_align = None
+            self._depth_scale_m_per_unit = None
+            return
+        self._depth_align = rs.align(rs.stream.color) if bool(self.config.align_depth_to_color) else None
+        try:
+            depth_sensor = profile.get_device().first_depth_sensor()
+            self._depth_scale_m_per_unit = float(depth_sensor.get_depth_scale())
+        except Exception as exc:  # noqa: BLE001
+            self._depth_scale_m_per_unit = None
+            self._last_error = f"depth_scale_failed:{type(exc).__name__}:{exc}"
 
     def _configure_sensor_options(self, profile: Any) -> None:
         rs = _load_pyrealsense2()
@@ -225,6 +267,12 @@ class RealSenseRGBSource(ObservationSource):
             "restart_on_stale_timeout": bool(self.config.restart_on_stale_timeout),
             "restart_after_timeouts": int(self.config.restart_after_timeouts),
             "restart_cooldown_sec": float(self.config.restart_cooldown_sec),
+            "depth_enabled": bool(self.config.enable_depth),
+            "depth_width": int(self.config.depth_width),
+            "depth_height": int(self.config.depth_height),
+            "depth_fps": int(self.config.depth_fps),
+            "align_depth_to_color": bool(self.config.align_depth_to_color),
+            "depth_scale_m_per_unit": self._depth_scale_m_per_unit,
             "intrinsics": {
                 "width": int(intr.width),
                 "height": int(intr.height),
@@ -236,6 +284,21 @@ class RealSenseRGBSource(ObservationSource):
             },
             "metadata": dict(self.config.metadata),
         }
+        if bool(self.config.enable_depth):
+            try:
+                depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+                depth_intr = depth_profile.get_intrinsics()
+                info["depth_intrinsics"] = {
+                    "width": int(depth_intr.width),
+                    "height": int(depth_intr.height),
+                    "fx": float(depth_intr.fx),
+                    "fy": float(depth_intr.fy),
+                    "ppx": float(depth_intr.ppx),
+                    "ppy": float(depth_intr.ppy),
+                    "coeffs": [float(value) for value in depth_intr.coeffs],
+                }
+            except Exception as exc:  # noqa: BLE001
+                info["depth_intrinsics_error"] = f"{type(exc).__name__}: {exc}"
         for key, info_name in {
             "device_name": rs.camera_info.name,
             "product_line": rs.camera_info.product_line,
@@ -340,8 +403,13 @@ class RealSenseRGBSource(ObservationSource):
                     self._restart_pipeline_after_stale_timeout("pipeline_missing")
                     continue
                 frames = pipeline.wait_for_frames(timeout_ms=int(self.config.wait_timeout_ms))
+                if bool(self.config.enable_depth) and self._depth_align is not None:
+                    frames = self._depth_align.process(frames)
                 color_frame = frames.get_color_frame()
                 if not color_frame:
+                    continue
+                depth_frame = frames.get_depth_frame() if bool(self.config.enable_depth) else None
+                if bool(self.config.enable_depth) and not depth_frame:
                     continue
                 received_at = time.time()
                 frame_index = int(self._frame_counter)
@@ -349,6 +417,33 @@ class RealSenseRGBSource(ObservationSource):
                 image = np.asanyarray(color_frame.get_data()).copy()
                 if self.config.color_space == "rgb":
                     image = image[..., ::-1]
+                depth_image = None
+                depth_metadata: dict[str, Any] = {}
+                if depth_frame is not None:
+                    depth_image = np.asanyarray(depth_frame.get_data()).copy()
+                    depth_timestamp_sec = float(depth_frame.get_timestamp()) / 1000.0
+                    try:
+                        depth_sensor_timestamp_ms = float(
+                            depth_frame.get_frame_metadata(rs.frame_metadata_value.sensor_timestamp)
+                        )
+                    except Exception:  # noqa: BLE001
+                        depth_sensor_timestamp_ms = None
+                    try:
+                        depth_frame_number = int(depth_frame.get_frame_number())
+                    except Exception:  # noqa: BLE001
+                        depth_frame_number = None
+                    depth_metadata = {
+                        "enabled": True,
+                        "aligned_to": "color" if bool(self.config.align_depth_to_color) else "none",
+                        "width": int(depth_image.shape[1]),
+                        "height": int(depth_image.shape[0]),
+                        "fps": int(self.config.depth_fps),
+                        "format": "z16",
+                        "depth_scale_m_per_unit": self._depth_scale_m_per_unit,
+                        "camera_timestamp_sec": depth_timestamp_sec,
+                        "sensor_timestamp_ms": depth_sensor_timestamp_ms,
+                        "frame_number": depth_frame_number,
+                    }
                 frame_timestamp_sec = float(color_frame.get_timestamp()) / 1000.0
                 try:
                     timestamp_domain = str(color_frame.get_frame_timestamp_domain())
@@ -360,6 +455,10 @@ class RealSenseRGBSource(ObservationSource):
                     )
                 except Exception:  # noqa: BLE001
                     sensor_timestamp_ms = None
+                try:
+                    color_frame_number = int(color_frame.get_frame_number())
+                except Exception:  # noqa: BLE001
+                    color_frame_number = None
                 frame = VideoFrame(
                     image=np.ascontiguousarray(image),
                     source_timestamp=received_at,
@@ -375,7 +474,10 @@ class RealSenseRGBSource(ObservationSource):
                         "camera_timestamp_sec": frame_timestamp_sec,
                         "timestamp_domain": timestamp_domain,
                         "sensor_timestamp_ms": sensor_timestamp_ms,
+                        "color_frame_number": color_frame_number,
                     },
+                    depth_image=None if depth_image is None else np.ascontiguousarray(depth_image),
+                    depth_metadata=depth_metadata,
                 )
                 with self._lock:
                     self._latest_frame = frame
@@ -411,6 +513,8 @@ class RealSenseRGBSource(ObservationSource):
             receive_timestamp=frame.receive_timestamp,
             frame_index=frame.frame_index,
             metadata=dict(frame.metadata),
+            depth_image=None if frame.depth_image is None else np.asarray(frame.depth_image).copy(),
+            depth_metadata=dict(frame.depth_metadata),
         )
 
     def frame_buffer(self) -> NearestFrameBuffer:
@@ -442,6 +546,7 @@ class RealSenseRGBSource(ObservationSource):
             pipeline = self._pipeline
             self._pipeline = None
             self._profile = None
+            self._depth_align = None
         if pipeline is not None:
             try:
                 pipeline.stop()

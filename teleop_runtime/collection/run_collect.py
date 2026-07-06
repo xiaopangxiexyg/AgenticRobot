@@ -17,6 +17,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from cameras.configs import (
+    DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
+    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
+)
 from project_paths import calibration_profiles_dir, default_dataset_root
 from rm65_inspire_tac.paths import require_asset_path
 
@@ -34,6 +38,7 @@ from ..backends.hands import (
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
 )
+from ..action import HandActionSpec
 from ..calibration import TeleopCalibration
 from ..cameras import build_camera_registry_snapshot, load_camera_registry
 from ..configs import build_annotated_dual_rm65_calibration
@@ -139,10 +144,10 @@ from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 
 
 DEFAULT_CAMERA_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
+    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 )
 DEFAULT_CAMERA_REGISTRY_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "cameras" / "realsense_registry.json"
+    DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH
 )
 DEFAULT_DATASET_ROOT = default_dataset_root()
 DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
@@ -157,7 +162,7 @@ HAND_BACKEND_CHOICES = (
 )
 GRIPPER_POLICY_DEFAULTS = {
     "source_dim": 2,
-    "output_dim": 1,
+    "output_dim": 0,
     "invert": False,
     "alpha": 1.0,
     "input_min": DEFAULT_GRIPPER_INPUT_MIN,
@@ -167,9 +172,18 @@ GRIPPER_POLICY_DEFAULTS = {
     "max_action": GRIPPER_ACTION_MAX,
     "send_threshold": 0.002,
     "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
-    "continuous_grasp": False,
+    "continuous_grasp": True,
     "telemetry_hz": 10.0,
 }
+
+
+def _collection_hand_action_specs(
+    args: argparse.Namespace,
+    active_sides: Sequence[str],
+) -> Mapping[str, HandActionSpec] | None:
+    if _hand_backend_mode(args) != HAND_BACKEND_DMTAC_GRIPPER:
+        return None
+    return {str(side): HandActionSpec.dmtac_gripper(str(side)) for side in active_sides}
 
 
 def _calibration_profile_timestamp(path: Path) -> float | None:
@@ -574,8 +588,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if not 0 <= int(policy["source_dim"]) < 6:
         raise ValueError("gripper source_dim must be in [0, 5].")
-    if not 0 <= int(policy["output_dim"]) < 6:
-        raise ValueError("gripper output_dim must be in [0, 5].")
+    if int(policy["output_dim"]) != 0:
+        raise ValueError("dmtac-gripper output_dim/gripper_slot must be 0.")
     if not 0.0 < float(policy["alpha"]) <= 1.0:
         raise ValueError("gripper alpha must be in (0, 1].")
     if not 0.0 <= float(policy["input_min"]) < float(policy["input_max"]) <= 1.0:
@@ -1109,8 +1123,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="FIELDS",
         help=(
-            "DM-Tac fields to read/store, e.g. 'distributed_force' for the original path "
-            "or 'raw' for raw-image-only collection. Valid fields: "
+            "DM-Tac fields to read/store. Default is raw-image-only collection; pass "
+            "'distributed_force' for real-time force output. Valid fields: "
             + ", ".join(DMTAC_TACTILE_FIELDS)
         ),
     )
@@ -1119,8 +1133,8 @@ def parse_args() -> argparse.Namespace:
         choices=("dist-only", "legacy", "requested", "shear-depth"),
         default=None,
         help=(
-            "SDK compute channels for DMTAC distributed_force telemetry. dist-only is lowest latency; "
-            "legacy matches the old deformation/shear/depth/force setup. Default follows backend config."
+            "SDK compute channels for DMTAC telemetry. Default follows backend config; "
+            "use dist-only with distributed_force for the real-time force path."
         ),
     )
     parser.add_argument(
@@ -1400,6 +1414,15 @@ def parse_args() -> argparse.Namespace:
         ],
         default="dual_arm_hand_proxy_open",
         help="Dual-arm collision scene profile.",
+    )
+    parser.add_argument(
+        "--rm65-ik-framework",
+        choices=["robot_motion"],
+        default="robot_motion",
+        help=(
+            "RM65 IK implementation for arm backends and dual-arm collision IK. "
+            "robot_motion routes all shared RM65 IK construction and solving through robot_motion.rm65."
+        ),
     )
     parser.add_argument(
         "--camera-config",
@@ -1718,6 +1741,15 @@ def parse_args() -> argparse.Namespace:
         action="store_const",
         const="external",
         help="Shortcut for --tactile-storage external.",
+    )
+    parser.add_argument(
+        "--tactile-compression",
+        choices=("zstd", "lz4", "none"),
+        default="lz4",
+        help=(
+            "Compression for external tactile streams. lz4 is the default; use none "
+            "to write legacy raw .bin streams."
+        ),
     )
     parser.add_argument(
         "--calibration-timeout",
@@ -2290,6 +2322,7 @@ def _build_arm_retargeters(
                 scene_profile=str(args.collision_scene_profile),
                 contact_mode=str(args.collision_avoidance_mode),
                 solver_frequency=float(getattr(args, "dual_arm_ik_hz", 15.0)),
+                ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
                 left_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "left"),
                 right_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "right"),
             ),
@@ -2382,6 +2415,7 @@ def _build_backends(
                 max_angvel=tuple(float(value) for value in args.arm_max_angvel),
                 dry_run_fast=False,
                 tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
+                ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
                 background_streaming_enabled=True,
                 background_streaming_hz=arm_control_hz,
             )
@@ -2490,8 +2524,10 @@ def _episode_metadata(
         "control_mode": str(args.control_mode),
         "hz": float(args.hz),
         "arm_control_hz": float(args.arm_control_hz),
+        "rm65_ik_framework": str(getattr(args, "rm65_ik_framework", "robot_motion")),
         "nominal_fps": float(args.nominal_fps),
         "tactile_storage": str(getattr(args, "tactile_storage", "external")),
+        "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
         "storage_queue_size": int(getattr(args, "storage_queue_size", 64)),
         "left_arm_ip": args.left_arm_ip or None,
         "right_arm_ip": args.right_arm_ip or None,
@@ -5040,6 +5076,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             "task_description": str(args.task_description),
             "dataset_name": str(args.dataset_name),
             "active_sides": list(active_sides),
+            "camera_frame_alignment_policy": "latest_before_or_at_sample_timestamp",
+            "hand_tactile_alignment_policy": "backend_latest_snapshot_at_sample_build",
             "moving_arm_sides": list(moving_sides),
             "fixed_arm_sides": list(fixed_sides),
             "jitter_arm_sides": list(jitter_sides),
@@ -5050,6 +5088,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             "actual_wrist_camera_pose_max_age_sec": float(
                 args.actual_wrist_camera_pose_max_age_sec
             ),
+            "tactile_storage": str(getattr(args, "tactile_storage", "external")),
+            "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
             "hand_backend": _hand_backend_mode(args),
             "gripper_policy": dict(getattr(args, "gripper_policy", {}) or _resolved_gripper_policy(args))
             if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
@@ -5067,7 +5107,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             write_parquet=bool(args.write_parquet),
             write_video=bool(args.write_video and not args.no_camera),
             tactile_storage=str(getattr(args, "tactile_storage", "external")),
+            tactile_compression=str(getattr(args, "tactile_compression", "lz4")),
             allow_missing_video_frames=int(getattr(args, "storage_queue_size", 64)) > 0,
+            hand_action_specs=_collection_hand_action_specs(args, active_sides),
         )
     )
     control_state = CollectControlState(
@@ -5083,6 +5125,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 for camera_key, source in camera_sources.items()
             },
             episode_index=writer.next_episode_index,
+            sample_index_start=writer.next_sample_index,
             tactile_array_snapshot_policy=(
                 "always"
                 if str(getattr(args, "tactile_storage", "external")).strip().lower().replace("-", "_") == "parquet"

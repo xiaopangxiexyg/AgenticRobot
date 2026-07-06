@@ -1,0 +1,18 @@
+{
+  "created_at": "2026-07-03T20:37:24+08:00",
+  "path_base": "repo_root",
+  "video_path": "datasets/2026-07-03_vive_rm65_real_teleop/videos/observation.images.right_wrist/chunk-000/episode_000001.mp4",
+  "video_name": "episode_000001.mp4",
+  "frame_index": 0,
+  "frame_count": 167,
+  "fps": 15.0,
+  "frame_shape_hw": [
+    480,
+    640
+  ],
+  "mask_path": "utils/wrist_cam_mask/painting/right_dmtac_m_mask_01.png",
+  "source_frame_path": null,
+  "output_name": "right_dmtac_m_mask",
+  "mask_semantics": "uint8 PNG; 255 means painted robot body/self area, 0 means background",
+  "painted_pixels": 69749
+}

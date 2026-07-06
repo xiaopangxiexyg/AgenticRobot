@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -26,6 +27,15 @@ class SaveResult:
 
 
 @dataclass
+class LoadRequest:
+    mask_path: Path | None = None
+    video_path: Path | None = None
+    frame_index: int | None = None
+    output_name: str = ""
+    metadata_path: Path | None = None
+
+
+@dataclass
 class PaintState:
     cv2: Any
     video_path: Path
@@ -37,6 +47,7 @@ class PaintState:
     window_name: str
     max_display_width: int
     max_display_height: int
+    output_name: str = ""
     save_frame: bool = False
     frame_index: int = 0
     frame_bgr: np.ndarray | None = None
@@ -72,6 +83,17 @@ class PaintState:
 
 def repo_default_dir() -> Path:
     return Path(__file__).resolve().parent
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def metadata_path_string(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    relative = os.path.relpath(Path(path).expanduser().resolve(), repo_root())
+    return Path(relative).as_posix()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -133,6 +155,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--save-frame",
         action="store_true",
         help="Also save the selected source frame next to the mask for visual reference.",
+    )
+    parser.add_argument(
+        "--output-name",
+        default="",
+        help=(
+            "Custom output file stem. For example, 'right_dmtac_m_mask' saves "
+            "painting/right_dmtac_m_mask.png and configs/right_dmtac_m_mask.json. "
+            "Leave empty to use the video/frame-based name."
+        ),
+    )
+    parser.add_argument(
+        "--load",
+        type=Path,
+        default=None,
+        help=(
+            "Load an existing mask PNG or saved metadata JSON to continue editing. "
+            "A JSON file can restore its video path and frame index."
+        ),
     )
     parser.add_argument(
         "--window-name",
@@ -214,6 +254,95 @@ def _sanitize_stem(name: str) -> str:
     return stem or "wrist_camera_video"
 
 
+def _custom_output_stem(output_name: str | None) -> str:
+    raw = str(output_name or "").strip()
+    if not raw:
+        return ""
+    name = Path(raw).name.strip()
+    for suffix in (".png", ".json", ".jpg", ".jpeg"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return _sanitize_stem(name)
+
+
+def _path_from_metadata(value: object, *, base_dir: Path) -> Path | None:
+    if value in (None, ""):
+        return None
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    candidates = [
+        repo_root() / path,
+        base_dir / path,
+        Path.cwd() / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def load_request_from_path(path: Path, *, metadata_dir: Path) -> LoadRequest:
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(f"Load target does not exist: {target}")
+
+    if target.suffix.lower() == ".json":
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Metadata JSON must contain an object: {target}")
+        base_dir = target.parent
+        mask_path = _path_from_metadata(data.get("mask_path"), base_dir=base_dir)
+        video_path = _path_from_metadata(data.get("video_path"), base_dir=base_dir)
+        frame_index = data.get("frame_index")
+        output_name = str(data.get("output_name") or "")
+        if not output_name and mask_path is not None:
+            output_name = mask_path.stem
+        return LoadRequest(
+            mask_path=mask_path,
+            video_path=video_path,
+            frame_index=None if frame_index is None else int(frame_index),
+            output_name=output_name,
+            metadata_path=target,
+        )
+
+    if target.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+        metadata_path = Path(metadata_dir).expanduser().resolve() / f"{target.stem}.json"
+        if metadata_path.exists():
+            request = load_request_from_path(metadata_path, metadata_dir=metadata_dir)
+            request.mask_path = target
+            if not request.output_name:
+                request.output_name = target.stem
+            return request
+        return LoadRequest(mask_path=target, output_name=target.stem)
+
+    raise ValueError(f"Expected a .json metadata file or image mask, got: {target}")
+
+
+def load_mask_image(cv2: Any, mask_path: Path, *, expected_shape: tuple[int, int]) -> np.ndarray:
+    path = Path(mask_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Mask file does not exist: {path}")
+    mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise RuntimeError(f"Failed to read mask image: {path}")
+    expected_height, expected_width = expected_shape
+    if tuple(mask.shape[:2]) != (int(expected_height), int(expected_width)):
+        raise ValueError(
+            "Loaded mask shape does not match the selected frame: "
+            f"mask={tuple(mask.shape[:2])} frame={(int(expected_height), int(expected_width))}. "
+            "Load the matching video/frame metadata JSON or select the correct frame first."
+        )
+    return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+
+def default_output_stem(video_path: Path, frame_index: int) -> str:
+    stem = _sanitize_stem(Path(video_path).stem)
+    return f"{stem}_frame_{int(frame_index):06d}_robot_body_mask"
+
+
 def unique_artifact_paths(
     *,
     video_path: Path,
@@ -221,9 +350,11 @@ def unique_artifact_paths(
     output_dir: Path,
     metadata_dir: Path,
     save_frame: bool,
+    output_name: str | None = None,
 ) -> tuple[Path, Path, Path | None]:
-    stem = _sanitize_stem(Path(video_path).stem)
-    base = f"{stem}_frame_{int(frame_index):06d}_robot_body_mask"
+    base = _custom_output_stem(output_name)
+    if not base:
+        base = default_output_stem(video_path, frame_index)
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
@@ -250,6 +381,7 @@ def save_mask_artifacts(state: PaintState) -> SaveResult:
         output_dir=state.output_dir,
         metadata_dir=state.metadata_dir,
         save_frame=state.save_frame,
+        output_name=state.output_name,
     )
     if not bool(state.cv2.imwrite(str(mask_path), mask_binary)):
         raise RuntimeError(f"Failed to write mask: {mask_path}")
@@ -260,14 +392,16 @@ def save_mask_artifacts(state: PaintState) -> SaveResult:
     height, width = mask_binary.shape
     metadata = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "video_path": str(state.video_path),
+        "path_base": "repo_root",
+        "video_path": metadata_path_string(state.video_path),
         "video_name": state.video_path.name,
         "frame_index": int(state.frame_index),
         "frame_count": int(state.frame_count),
         "fps": float(state.fps),
         "frame_shape_hw": [int(height), int(width)],
-        "mask_path": str(mask_path),
-        "source_frame_path": str(frame_path) if frame_path is not None else None,
+        "mask_path": metadata_path_string(mask_path),
+        "source_frame_path": metadata_path_string(frame_path),
+        "output_name": _custom_output_stem(state.output_name),
         "mask_semantics": "uint8 PNG; 255 means painted robot body/self area, 0 means background",
         "painted_pixels": int(np.count_nonzero(mask_binary)),
     }
@@ -337,6 +471,7 @@ class MaskPainterApp:
         state: PaintState,
         start_frame: int,
         brush: int,
+        initial_load: LoadRequest | None,
         tk: Any,
         ttk: Any,
         filedialog: Any,
@@ -360,6 +495,7 @@ class MaskPainterApp:
         self.alpha_var = tk.IntVar(value=45)
         self.frame_var = tk.IntVar(value=0)
         self.save_frame_var = tk.BooleanVar(value=bool(state.save_frame))
+        self.output_name_var = tk.StringVar(value=str(state.output_name or ""))
         self.status_var = tk.StringVar(value="")
         self.video_var = tk.StringVar(value="")
         self.original_photo: Any | None = None
@@ -375,6 +511,8 @@ class MaskPainterApp:
         self._build_widgets()
         self._install_bindings()
         self._sync_video_label()
+        if initial_load is not None and initial_load.mask_path is not None:
+            self.apply_load_request(initial_load)
         self._render()
 
     def _build_widgets(self) -> None:
@@ -386,12 +524,16 @@ class MaskPainterApp:
 
         top = ttk.Frame(self.root, padding=(10, 8))
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(1, weight=1)
+        top.columnconfigure(2, weight=1)
 
         ttk.Button(top, text="选择视频", command=self.choose_video).grid(row=0, column=0, padx=(0, 8))
-        ttk.Label(top, textvariable=self.video_var).grid(row=0, column=1, sticky="w")
-        ttk.Button(top, text="保存 Mask", command=self.save).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(top, text="退出", command=self.root.destroy).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(top, text="加载 Mask/配置", command=self.load_mask_or_config).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(top, textvariable=self.video_var).grid(row=0, column=2, sticky="w")
+        ttk.Button(top, text="保存 Mask", command=self.save).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(top, text="退出", command=self.root.destroy).grid(row=0, column=4, padx=(8, 0))
+        ttk.Label(top, text="保存文件名(留空自动)").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        output_entry = ttk.Entry(top, textvariable=self.output_name_var)
+        output_entry.grid(row=1, column=1, columnspan=4, sticky="ew", pady=(8, 0))
 
         self.image_area = ttk.Frame(self.root, padding=(10, 0, 10, 8))
         self.image_area.grid(row=1, column=0, sticky="nsew")
@@ -563,6 +705,58 @@ class MaskPainterApp:
         except Exception as exc:  # noqa: BLE001
             self.messagebox.showerror("Failed to open video", str(exc), parent=self.root)
 
+    def load_mask_or_config(self) -> None:
+        selected = self.filedialog.askopenfilename(
+            title="Load an existing mask PNG or metadata JSON",
+            initialdir=str(self.state.metadata_dir),
+            filetypes=[
+                ("Mask metadata or image", "*.json *.png *.jpg *.jpeg"),
+                ("Metadata JSON", "*.json"),
+                ("Mask images", "*.png *.jpg *.jpeg"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        try:
+            request = load_request_from_path(Path(selected), metadata_dir=self.state.metadata_dir)
+            self.apply_load_request(request)
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Failed to load mask", str(exc), parent=self.root)
+
+    def apply_load_request(self, request: LoadRequest) -> None:
+        if request.video_path is not None:
+            video_path = Path(request.video_path).expanduser().resolve()
+            if video_path != self.state.video_path:
+                capture, frame_count, fps = open_video(self.state.cv2, video_path)
+                self.state.capture.release()
+                self.state.video_path = video_path
+                self.state.capture = capture
+                self.state.frame_count = int(frame_count)
+                self.state.fps = float(fps)
+                self.frame_scale.configure(to=max(0, self.state.frame_count - 1))
+
+        frame_index = self.state.frame_index
+        if request.frame_index is not None:
+            frame_index = int(max(0, min(int(request.frame_index), self.state.frame_count - 1)))
+        read_frame(self.state, frame_index)
+        self.frame_var.set(self.state.frame_index)
+
+        if request.mask_path is None:
+            raise ValueError("Loaded metadata does not include mask_path.")
+        self.state.mask = load_mask_image(
+            self.state.cv2,
+            request.mask_path,
+            expected_shape=self.state.frame_bgr.shape[:2],
+        )
+        self.state.undo_stack.clear()
+        self.state.mouse_point = None
+        self.output_name_var.set(request.output_name or Path(request.mask_path).stem)
+        self.state.output_name = str(self.output_name_var.get()).strip()
+        self._sync_video_label()
+        self.set_status(f"loaded mask {Path(request.mask_path).name}")
+        self._render()
+
     def on_frame_change(self, value: str) -> None:
         if self.state.drawing:
             return
@@ -671,6 +865,7 @@ class MaskPainterApp:
     def save(self) -> None:
         try:
             self.state.save_frame = bool(self.save_frame_var.get())
+            self.state.output_name = str(self.output_name_var.get()).strip()
             result = save_mask_artifacts(self.state)
             self.set_status(f"saved {result.mask_path.name}")
             self.messagebox.showinfo(
@@ -776,7 +971,12 @@ class MaskPainterApp:
         canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=color, width=2)
 
 
-def run_gui(state: PaintState, start_frame: int, brush: int) -> None:
+def run_gui(
+    state: PaintState,
+    start_frame: int,
+    brush: int,
+    initial_load: LoadRequest | None = None,
+) -> None:
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
@@ -788,6 +988,7 @@ def run_gui(state: PaintState, start_frame: int, brush: int) -> None:
         state=state,
         start_frame=int(start_frame),
         brush=int(brush),
+        initial_load=initial_load,
         tk=tk,
         ttk=ttk,
         filedialog=filedialog,
@@ -800,7 +1001,18 @@ def run_gui(state: PaintState, start_frame: int, brush: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    metadata_dir = Path(args.metadata_dir).expanduser().resolve()
+    initial_load = None
+    if args.load is not None:
+        try:
+            initial_load = load_request_from_path(Path(args.load), metadata_dir=metadata_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to load --load target: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+
     video_path = args.video
+    if video_path is None and initial_load is not None and initial_load.video_path is not None:
+        video_path = initial_load.video_path
     if video_path is None:
         video_path = choose_video_with_dialog(Path.cwd())
     if video_path is None:
@@ -816,6 +1028,12 @@ def main(argv: list[str] | None = None) -> int:
     capture = None
     try:
         capture, frame_count, fps = open_video(cv2, Path(video_path))
+        output_name = str(args.output_name)
+        if not output_name and initial_load is not None:
+            output_name = str(initial_load.output_name)
+        start_frame = int(args.start_frame)
+        if initial_load is not None and initial_load.frame_index is not None:
+            start_frame = int(initial_load.frame_index)
         state = PaintState(
             cv2=cv2,
             video_path=Path(video_path).expanduser().resolve(),
@@ -823,13 +1041,19 @@ def main(argv: list[str] | None = None) -> int:
             frame_count=int(frame_count),
             fps=float(fps),
             output_dir=Path(args.output_dir).expanduser().resolve(),
-            metadata_dir=Path(args.metadata_dir).expanduser().resolve(),
+            metadata_dir=metadata_dir,
             window_name=str(args.window_name),
             max_display_width=int(args.max_display_width),
             max_display_height=int(args.max_display_height),
+            output_name=output_name,
             save_frame=bool(args.save_frame),
         )
-        run_gui(state, start_frame=int(args.start_frame), brush=int(args.brush))
+        run_gui(
+            state,
+            start_frame=start_frame,
+            brush=int(args.brush),
+            initial_load=initial_load,
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"Mask painter failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

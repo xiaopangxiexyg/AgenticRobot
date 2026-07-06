@@ -5,14 +5,31 @@
 - RealSense 相机固定安装在 RM65 手腕或末端执行器上。
 - ArUco/ChArUco 标定板固定在场景中，采样期间不要移动。
 - 不断移动机械臂末端，让相机从不同位置和角度观察标定板。
-- 求解 `T_camera_to_gripper` 和 `T_gripper_to_camera`。
+- 求解相机相对 RM65 当前 active tool/TCP 的手眼矩阵，并在可读取 active tool pose
+  时额外换算出相对机械臂裸末端/flange/link6 的矩阵。
 - 平移单位统一为米，RM65 姿态使用 `[x, y, z, rx, ry, rz]`，角度为弧度。
 
 矩阵约定：
 
-- `T_camera_to_gripper`：`p_gripper = T_camera_to_gripper @ p_camera`。这是 OpenCV hand-eye 的直接输出，也是把相机点云落到机械臂 base 时最常用的矩阵。
-- `T_gripper_to_camera` / `T_end_effector_to_camera`：`p_camera = T_gripper_to_camera @ p_gripper`。这是上面的逆矩阵，也就是“末端到摄像机”的变换。
-- 当前时刻相机到 base：`T_camera_to_base = T_gripper_to_base @ T_camera_to_gripper`。
+- `T_camera_to_gripper` / `T_camera_to_active_tool`：`p_active_tool = T_camera_to_gripper @ p_camera`。
+  这里的 `gripper` 是历史字段名，实际 frame 是 RM65 `Get_Current_Arm_State`
+  返回 pose 所使用的 active tool/TCP，不一定是机械臂裸末端。
+- `T_gripper_to_camera` / `T_active_tool_to_camera`：上面的逆矩阵。
+- `T_active_tool_to_arm_end`：`p_arm_end = T_active_tool_to_arm_end @ p_active_tool`。
+  该矩阵来自当前 active tool frame 的 `pose`，也就是 tool TCP 在 RM65
+  flange/link6 下的固定偏置。
+- `T_camera_to_arm_end` / `T_camera_to_end_effector`：`p_arm_end = T_camera_to_arm_end @ p_camera`。
+  这是相机相对机械臂裸末端/flange/link6 的矩阵，优先给 URDF/sim/裸末端 IK 使用。
+- 当前时刻相机到 base：如果读取的是 RM65 当前 active tool pose，用
+  `T_camera_to_base = T_gripper_to_base @ T_camera_to_gripper`；如果手里是
+  arm-end/flange pose，用 `T_camera_to_base = T_arm_end_to_base @ T_camera_to_arm_end`。
+
+兼容提醒：
+
+- 2026-07-04 之前的结果文件中，`T_camera_to_end_effector` 与
+  `T_camera_to_gripper` 等价，实际相对 active tool/TCP。
+- 新结果文件会写入 `metadata.frame_compatibility`。读取旧文件时不要只看
+  `end_effector` 字段名；优先检查 `T_camera_to_arm_end` 是否存在。
 
 代码使用 `hardware.rm65.rm_api2_adapter.Arm` 读取 API2 固件下的 RM65 状态。命令支持 `--arm left/right` 自动选择左右臂 IP，也可以用 `--arm-ip` 手动覆盖。
 
@@ -70,6 +87,11 @@ python -m utils.hand_eye \
 
 - color auto exposure 关闭，默认 `--color-exposure-us 8000`、`--color-gain 16`。
 - color auto white balance 关闭，默认 `--color-white-balance 4600`。
+- 程序会在写入这些固定 RealSense option 前保存原值，并在正常退出时默认恢复：
+  `--restore-camera-settings`。如果进程被 `kill -9`、机器断电、USB 断开，恢复逻辑来不及执行，
+  需要在 `realsense-viewer` 中手动重新打开 auto exposure/auto white balance，或重新运行一个
+  显式恢复脚本。
+- 如需调试并故意保留固定曝光，可加 `--no-restore-camera-settings`。
 - depth 默认关闭：`--no-enable-depth`。标定板识别只用 RGB；需要同时看深度流时再加 `--enable-depth`。
 - depth emitter/projector 默认关闭：`--no-depth-emitter-enabled --depth-laser-power 0`。
 - 单样本 burst 默认 2 秒，至少保留 20 帧有效检测。
@@ -104,8 +126,14 @@ python -m utils.hand_eye \
 
 - `<name>.json`：主结果，包含矩阵、质量指标、全部 raw samples。
 - `<name>.npz`：程序读取更方便的矩阵包。
-- `<name>_gripper2camera.npy`：单矩阵文件，保存 `T_gripper_to_camera`。
-- `<name>_cam2gripper.npy`：单矩阵文件，保存 `T_camera_to_gripper`。
+- `<name>_gripper2camera.npy`：兼容旧名，保存 active tool/TCP 到相机的
+  `T_gripper_to_camera`。
+- `<name>_cam2gripper.npy`：兼容旧名，保存相机到 active tool/TCP 的
+  `T_camera_to_gripper`。
+- `<name>_arm_end2camera.npy`：保存机械臂裸末端/flange/link6 到相机的
+  `T_arm_end_to_camera`。
+- `<name>_cam2arm_end.npy`：保存相机到机械臂裸末端/flange/link6 的
+  `T_camera_to_arm_end`。
 - `<name>_samples.json`：自动保存的原始采样，可离线重算。
 
 离线重算：
@@ -189,8 +217,11 @@ python -m utils.hand_eye \
 
 JSON 中的关键矩阵：
 
-- `T_camera_to_gripper`：相机坐标到 RM65 末端坐标。
-- `T_gripper_to_camera` / `T_end_effector_to_camera`：RM65 末端坐标到相机坐标。
+- `T_camera_to_gripper` / `T_camera_to_active_tool`：相机坐标到 RM65 active tool/TCP。
+- `T_gripper_to_camera` / `T_active_tool_to_camera`：RM65 active tool/TCP 到相机坐标。
+- `T_camera_to_arm_end` / `T_camera_to_end_effector`：相机坐标到机械臂裸末端/flange/link6。
+- `T_arm_end_to_camera` / `T_end_effector_to_camera`：机械臂裸末端/flange/link6 到相机坐标。
+- `T_active_tool_to_arm_end`：active tool/TCP 到机械臂裸末端/flange/link6。
 - `T_target_to_base`：固定标定板坐标到 RM65 base 坐标的估计，只用于质量评估和排查。
 
 质量指标：

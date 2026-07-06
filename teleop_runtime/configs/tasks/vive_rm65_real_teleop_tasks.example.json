@@ -4,6 +4,7 @@
   "tasks": [
     {
       "key": "soft_grasp",
+      "task_type": "general",
       "english_name": "Soft Grasp",
       "chinese_name": "轻柔抓取",
       "description": "Low force DMTAC gripper setting for fragile objects.",
@@ -11,9 +12,18 @@
     },
     {
       "key": "firm_grasp",
+      "task_type": "general",
       "english_name": "Firm Grasp",
       "chinese_name": "稳定抓取",
       "description": "Higher force DMTAC gripper setting for rigid objects.",
+      "gripper_task": "firm_grasp"
+    },
+    {
+      "key": "drawer_push_pull",
+      "task_type": "round_trip",
+      "english_name": "Drawer Push Pull",
+      "chinese_name": "抽屉推拉",
+      "description": "Round-trip collection task. Episodes alternate Drawer Push Pull_in and Drawer Push Pull_out.",
       "gripper_task": "firm_grasp"
     }
   ]

@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-focus", type=float, default=None, help="Set fixed focus if the RealSense color sensor exposes it.")
     parser.add_argument("--depth-emitter-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--depth-laser-power", type=float, default=0.0)
+    parser.add_argument(
+        "--restore-camera-settings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Snapshot RealSense options before applying fixed calibration settings "
+            "and restore them on normal exit."
+        ),
+    )
     parser.add_argument("--auto-select-supported-profile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--arm", choices=("left", "right"), default="left")
     parser.add_argument("--arm-ip", default="", help="Override the IP selected by --arm.")
@@ -176,6 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         depth_emitter_enabled=args.depth_emitter_enabled,
         depth_laser_power=args.depth_laser_power,
         auto_select_supported_profile=args.auto_select_supported_profile,
+        restore_settings_on_stop=bool(args.restore_camera_settings),
     )
     burst_config = CaptureBurstConfig(
         duration_sec=args.capture_seconds,
@@ -497,10 +507,17 @@ def _print_sample_plan(samples: Sequence[CalibrationSample]) -> None:
 def _print_result(result, paths: dict[str, Path]) -> None:
     metrics = result.metrics
     print("\nCalibration complete")
-    print("T_camera_to_gripper (meters):")
+    print("T_camera_to_gripper / T_camera_to_active_tool (legacy active TCP, meters):")
     print(np.array2string(result.T_camera_to_gripper, precision=8, suppress_small=False))
-    print("T_gripper_to_camera / T_end_effector_to_camera (meters):")
+    print("T_gripper_to_camera / T_active_tool_to_camera (legacy active TCP, meters):")
     print(np.array2string(result.T_gripper_to_camera, precision=8, suppress_small=False))
+    if result.has_arm_end_transform:
+        print("T_camera_to_arm_end / T_camera_to_end_effector (mechanical flange/link6, meters):")
+        print(np.array2string(result.T_camera_to_arm_end, precision=8, suppress_small=False))
+        print("T_arm_end_to_camera / T_end_effector_to_camera (mechanical flange/link6, meters):")
+        print(np.array2string(result.T_arm_end_to_camera, precision=8, suppress_small=False))
+    else:
+        print("WARNING: active tool pose was unavailable; arm-end matrices equal legacy active TCP matrices.")
     print(
         "Residual: "
         f"{metrics['target_in_base_translation_rms_m'] * 1000.0:.2f} mm RMS, "
@@ -684,6 +701,7 @@ def _session_metadata(
         "outlier_reject_fraction": args.outlier_reject_fraction,
         "outlier_min_samples": args.outlier_min_samples,
         "auto_select_supported_profile": args.auto_select_supported_profile,
+        "restore_camera_settings": args.restore_camera_settings,
         "realsense_settings_report": dict(getattr(args, "_camera_settings_report", {}) or {}),
         "calibration_setup": "eye_in_hand_wrist_camera_fixed_scene_target",
         "units": "meters/radians",

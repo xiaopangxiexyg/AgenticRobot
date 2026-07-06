@@ -11,15 +11,19 @@ conda activate dexteleop310
 ```
 
 ## 00. 机械臂末端重力标定和TCP标定见 hardware/rm65/utils/README.md
-## 01. 遥操作开始时用 hardware/rm65/utils/init_arm/README.md 让双臂归位，起始状态手部自然贴合机械臂姿态双手与肩同宽
+## 01. 遥操作开始前用 QPOS init 主线生成双臂归位计划
 
 ```bash
-python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py \
+PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
+  --current-qpos current_qpos.json \
+  --qpos-target robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json \
   --arm both \
-  --pose-json hardware/rm65/utils/init_arm/standard_pose.json \
-  --execute \
-  --confirm INIT_RM65_STANDARD_POSE
+  --output /tmp/rm65_qpos_init_plan.json \
+  --include-steps
 ```
+
+该命令只生成初始化 QPOS plan，不连接真机、不下发运动。真机执行器应消费该 plan，
+不要重新使用旧的 `hardware/rm65/utils/init_arm` Cartesian standard-pose 脚本。
 
 ## 02. Q6 控制双臂 1D 夹爪
 
@@ -33,7 +37,7 @@ Q6 夹爪控制已接入 `teleop_runtime.debug.run_vive_rm65_real_teleop` 和 `t
 --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
 ```
 
-如果没有 DM TAC 触觉，只接 1D gripper，追加 `--dmtac-no-tactile`。夹爪默认读取 Q6 `source_dim=2`，把 Q6 的 `0.1..0.9` 映射到夹爪 `0..0.99`，并写到 hand action `output_dim=1`；可用 `--gripper-source-dim` / `--gripper-output-dim` 调整。
+如果没有 DM TAC 触觉，只接 1D gripper，追加 `--dmtac-no-tactile`。夹爪默认读取 Q6 `source_dim=2`，把 Q6 的 `0.1..0.9` 映射到夹爪 `0..1.0`；训练使用 `action.gripper.<side>.target` 的 1D 标量，兼容 hand action 只允许写入 slot 0。
 
 ### 03. USB 权限修复和 GUI 启动预检
 
@@ -106,7 +110,7 @@ cp local_paths.example.json local_paths.json
 ```bash
 export REPO=$(pwd)
 export PROFILE=$REPO/teleop_records/calibration_profiles/your_profile.json
-export CAMERA_CONFIG=$REPO/teleop_runtime/configs/devices/realsense.json
+export CAMERA_CONFIG=$REPO/cameras/configs/rm65/devices/realsense.json
 export DATASET_ROOT=$REPO/datasets
 export VIVE_TARGET_HOST=192.168.20.90
 
@@ -185,7 +189,7 @@ python hardware/teleop_hand/check_zero_pose_calibration.py \
 默认 RealSense 配置文件已经固定到：
 
 ```text
-teleop_runtime/configs/devices/realsense.json
+cameras/configs/rm65/devices/realsense.json
 ```
 
 当前内容是三路 `front`、`left_wrist`、`right_wrist`：
@@ -252,7 +256,7 @@ cd "$REPO"
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate dexteleop310
 
-python hardware/VIVE/VIVE_sender/data_sender_new.py \
+python hardware/VIVE/mocap/vive_data_sender.py \
   --host "$VIVE_TARGET_HOST" \
   --port 9999 \
   --hz 60 \
@@ -260,7 +264,7 @@ python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --tracker tracker_2:right_wrist
 ```
 
-推荐使用 `hardware/VIVE/VIVE_sender/data_sender_new.py`：它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。第三只 `auxiliary` tracker 需要时再显式追加。不要用 `hardware/VIVE/VIVE_sender/data_sender.py` 跑当前 teleop；它近似满速发 UDP，容易让 receiver 忙于清包。`data_time_sender.py` 发送的是 `double timestamp + 36 float` 到默认 `6666`，不是当前主链路协议。
+仓库只保留一个 VIVE sender 入口：`hardware/VIVE/mocap/vive_data_sender.py`。它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。第三只 `auxiliary` tracker 需要时再显式追加。
 
 如果 sender 和 receiver 在同一台机器上临时自测，可以把 `VIVE_TARGET_HOST` 改成 `127.0.0.1`。
 

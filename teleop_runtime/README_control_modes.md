@@ -33,7 +33,7 @@
 
 当前相对控制和绝对控制，主链路是下面这条：
 
-1. [hardware/VIVE/VIVE_sender/data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py)
+1. [hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py)
    每帧取一次 OpenVR pose snapshot，给所有 tracker 复用后发 UDP JSON。
 2. [teleop_runtime/sources/pose/vive.py](./sources/pose/vive.py)  
    接收 UDP，解析成 `ObservationChannel`。
@@ -46,22 +46,11 @@
 6. [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)  
    当前现成入口。它每一帧从 `session.run_step()` 取命令，再喂给虚拟 RM65 backend 和 SAPIEN 渲染器。
 
-### 2.2 `vive_data_receiver.py` 在当前链路里的位置
+### 2.2 VIVE 接收器在当前链路里的位置
 
-[hardware/VIVE/mocap/vive_data_receiver.py](../hardware/VIVE/mocap/vive_data_receiver.py) 是**旧版/独立工具式接收器**，主要特点是：
-
-- 只接收固定长度的 `36` 个 float UDP 数据包
-- 主要给 [hardware/VIVE/mocap/vive_visualizer.py](../hardware/VIVE/mocap/vive_visualizer.py) 这类工具使用
-- **当前 teleop 主链路并不直接使用它**
-
-这点要特别注意，因为：
-
-- 当前推荐的 [data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py) 发送的是 JSON UDP
-- 当前真正参与控制闭环的接收器是 [teleop_runtime/sources/pose/vive.py](./sources/pose/vive.py)
-- `teleop_runtime` 的 `VivePoseSource` 同时兼容 JSON 包和 legacy float 包
-- 但 `hardware/VIVE/mocap/vive_data_receiver.py` 本身仍然是 legacy float-only
-
-所以如果你现在把推荐 sender 直接对着 `vive_data_receiver.py` 发，**它们并不是当前推荐的主控配对**。
+仓库只保留一个 VIVE sender 入口：[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py)。
+当前真正参与控制闭环的接收器是 [teleop_runtime/sources/pose/vive.py](./sources/pose/vive.py)；
+旧的 float-only `vive_data_receiver.py` / `vive_visualizer.py` 已移除，避免和 JSON UDP 主链路混用。
 
 ## 3. 共享的数据流和坐标变换
 
@@ -69,7 +58,7 @@
 
 ### 3.1 VIVE 发送端
 
-[hardware/VIVE/VIVE_sender/data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py) 默认发送两个 wrist tracker：
+[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 默认发送两个 wrist tracker：
 
 - `tracker_1:left_wrist`
 - `tracker_2:right_wrist`
@@ -377,7 +366,7 @@ conda activate dexteleop310
 同机调试：
 
 ```bash
-python hardware/VIVE/VIVE_sender/data_sender_new.py \
+python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
   --hz 60 \
@@ -529,7 +518,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 
 建议按这个顺序排查：
 
-1. 先跑 `hardware/VIVE/VIVE_sender/data_sender_new.py`，确认 VIVE tracker 本身正常输出
+1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py`，确认 VIVE tracker 本身正常输出
 2. 再跑 `run_vive_sapien_virtual.py --control-mode absolute`
 3. 确认左右 tracker 映射、坐标方向、TCP frame 都合理
 4. 再切到 `--control-mode delta_clutch --keyboard-clutch`

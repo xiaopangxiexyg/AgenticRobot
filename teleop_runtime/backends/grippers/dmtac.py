@@ -21,7 +21,7 @@ DEFAULT_DMTAC_GRIPPER_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 DEFAULT_DMTAC_GRIPPER_SPEED = 1.0
 DEFAULT_DMTAC_GRIPPER_TORQUE = 0.2
 DEFAULT_DMTAC_GRIPPER_COMMAND_HZ = 20.0
-GRIPPER_ACTION_MAX = 0.99
+GRIPPER_ACTION_MAX = 1.0
 DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S = 0.15
 DMTAC_DISTRIBUTED_FORCE_SHAPE = (288, 384, 3)
 DMTAC_RAW_IMAGE_SHAPE = (480, 640)
@@ -46,7 +46,7 @@ DMTAC_TACTILE_ARRAY_FIELDS = (
     "force",
     "distributed_force",
 )
-DMTAC_DEFAULT_TACTILE_FIELDS = ("distributed_force",)
+DMTAC_DEFAULT_TACTILE_FIELDS = ("raw",)
 DMTAC_TACTILE_FIELD_DEFAULT_SHAPES = {
     "raw": DMTAC_RAW_IMAGE_SHAPE,
     "infer": (288, 384),
@@ -79,6 +79,48 @@ def _tactile_process_gate(ctx: Any) -> Any:
     if _DMTAC_TACTILE_PROCESS_GATE is None:
         _DMTAC_TACTILE_PROCESS_GATE = ctx.Semaphore(1)
     return _DMTAC_TACTILE_PROCESS_GATE
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _set_worker_process_name(name: str) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    text = str(name or "dmtac_tactile")[:15]
+    try:
+        Path("/proc/self/comm").write_text(text)
+    except OSError:
+        pass
+
+
+def _start_parent_watchdog(stop_event: Any, parent_pid: int, *, poll_s: float = 0.5) -> None:
+    if int(parent_pid) <= 0:
+        return
+
+    def _watch_parent() -> None:
+        while not stop_event.wait(float(poll_s)):
+            if os.getppid() != int(parent_pid) or not _process_exists(int(parent_pid)):
+                stop_event.set()
+                return
+
+    thread = threading.Thread(
+        target=_watch_parent,
+        name="dmtac_parent_watchdog",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _put_latest(queue_out: Any, payload: dict[str, Any]) -> None:
@@ -237,6 +279,11 @@ def _dmtac_tactile_worker_main(
     stop_event: Any,
     read_gate: Any,
 ) -> None:
+    _set_worker_process_name(str(config_payload.get("worker_name") or "dmtac_tactile"))
+    _start_parent_watchdog(
+        stop_event,
+        int(config_payload.get("parent_pid") or 0),
+    )
     try:
         os.nice(int(config_payload.get("tactile_process_nice", 12)))
     except Exception:
@@ -336,7 +383,7 @@ def _dmtac_tactile_worker_main(
                     frames,
                     fields=tactile_fields,
                 )
-                if frames:
+                if tactile_dict:
                     version += 1
                 _put_latest(
                     queue_out,
@@ -383,14 +430,14 @@ class DMTacGripperBackendConfig:
     gripper_timeout: float = 0.03
     max_open_mm: float = 70.0
     connect_hardware: bool = True
-    command_dim: int = 1
+    command_dim: int = 0
     send_commands: bool = True
     send_threshold: float = 0.002
     command_hz: float = DEFAULT_DMTAC_GRIPPER_COMMAND_HZ
     max_action: float = GRIPPER_ACTION_MAX
     speed: float = DEFAULT_DMTAC_GRIPPER_SPEED
     torque: float = DEFAULT_DMTAC_GRIPPER_TORQUE
-    continuous_grasp: bool = False
+    continuous_grasp: bool = True
     clear_fault_on_start: bool = True
     open_on_start: bool = False
     enable_telemetry: bool = True
@@ -437,8 +484,8 @@ class DMTacGripperBackendConfig:
             raise ValueError("gripper_timeout must be positive.")
         if float(self.max_open_mm) <= 0.0:
             raise ValueError("max_open_mm must be positive.")
-        if not 0 <= int(self.command_dim) < 6:
-            raise ValueError("command_dim must be in [0, 5].")
+        if int(self.command_dim) != 0:
+            raise ValueError("DM-Tac gripper command_dim is fixed to hand slot 0.")
         if not 0.0 <= float(self.max_action) <= GRIPPER_ACTION_MAX:
             raise ValueError(f"max_action must be in [0, {GRIPPER_ACTION_MAX}].")
         if float(self.command_hz) <= 0.0:
@@ -603,6 +650,8 @@ class DMTacGripperBackend(EffectorBackend):
 
     def _tactile_worker_config_payload(self) -> dict[str, Any]:
         return {
+            "parent_pid": os.getpid(),
+            "worker_name": f"dmtac_{self.config.side}_tac",
             "dmtac_root": str(self.config.dmtac_root),
             "tactile_ids": list(self.config.tactile_ids),
             "tactile_backend": str(self.config.tactile_backend),
@@ -1104,7 +1153,7 @@ class DMTacGripperBackend(EffectorBackend):
                 }
                 self._latest_tactile_field_by_key = field_by_key
                 self._latest_tactile_timings_ms = self._frame_timings_ms(tactile_frames)
-                if tactile_frames:
+                if tactile_dict:
                     self._latest_tactile_version += 1
         self._latest_telemetry_timestamp = time.time()
         self._latest_gripper_read_elapsed_s = gripper_read_elapsed_s

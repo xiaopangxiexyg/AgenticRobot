@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
 from .config import IKConfig, default_camera_registry_path
-from .controllers import PoseIKController, QposController
+from .controllers import GripperController, PoseIKController, QposController
 from .ik import DampedLeastSquaresIK
 from .recorder import Real2SimRecorder
 from .scene import MujocoCameraRenderer, MujocoScene
@@ -36,6 +37,27 @@ def _parse_pose(values: Sequence[float] | None) -> np.ndarray | None:
     raise argparse.ArgumentTypeError("pose must contain 7 xyz+qx+qy+qz+qw values or 16 matrix values.")
 
 
+def _parse_gripper_close_items(values: Sequence[str] | None, scene: MujocoScene) -> dict[str, float]:
+    if not values:
+        return {}
+    targets: dict[str, float] = {}
+    for item in values:
+        text = str(item).strip()
+        if not text:
+            continue
+        if "=" in text:
+            name, value_text = text.split("=", 1)
+            gripper_name = name.strip()
+        else:
+            gripper_name = scene._resolve_gripper_name(None)
+            value_text = text
+        close = float(value_text)
+        if close < 0.0 or close > 1.0:
+            raise argparse.ArgumentTypeError("--gripper-close values must be in [0, 1].")
+        targets[gripper_name] = close
+    return targets
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="MuJoCo real2sim qpos / pose-IK control and camera recording."
@@ -49,7 +71,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--control",
-        choices=("qpos", "pose-ik"),
+        choices=("none", "qpos", "pose-ik"),
         default="qpos",
         help="Control input type.",
     )
@@ -100,6 +122,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hide-left-ui", action="store_true", help="Hide MuJoCo viewer left UI panel.")
     parser.add_argument("--hide-right-ui", action="store_true", help="Hide MuJoCo viewer right UI panel.")
+    parser.add_argument(
+        "--gripper-close",
+        action="append",
+        default=None,
+        help=(
+            "Normalized gripper close command in [0, 1]. Use VALUE for the only "
+            "gripper or NAME=VALUE when multiple grippers exist. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--animate-gripper",
+        action="store_true",
+        help="In viewer mode, continuously animate selected gripper(s) open/closed.",
+    )
+    parser.add_argument("--gripper-period", type=float, default=3.0, help="Gripper animation period in seconds.")
+    parser.add_argument("--gripper-min-close", type=float, default=0.0, help="Animation minimum close value.")
+    parser.add_argument("--gripper-max-close", type=float, default=1.0, help="Animation maximum close value.")
+    parser.add_argument(
+        "--debug-proxy-visuals",
+        action="store_true",
+        help="Highlight URDF proxy geoms and place them in MuJoCo geom group 4.",
+    )
     parser.add_argument("--print-camera-poses", action="store_true", help="Print camera world poses as JSON.")
     parser.add_argument("--ik-max-iterations", type=int, default=80)
     parser.add_argument("--ik-position-tolerance", type=float, default=2e-3)
@@ -151,8 +195,33 @@ def _print_scene_summary(scene: MujocoScene) -> None:
             for side, spec in sorted(scene.arm_specs.items())
         },
         "cameras": scene.camera_metadata(),
+        "grippers": scene.gripper_metadata(),
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+def _gripper_animation_callback(
+    scene: MujocoScene,
+    *,
+    names: Sequence[str],
+    period_s: float,
+    min_close: float,
+    max_close: float,
+):
+    gripper_names = tuple(str(name) for name in names)
+    if not gripper_names:
+        raise ValueError("No grippers available for animation.")
+    period = max(float(period_s), 1e-6)
+    lower = float(np.clip(float(min_close), 0.0, 1.0))
+    upper = float(np.clip(float(max_close), 0.0, 1.0))
+
+    def _on_step(elapsed_s: float) -> None:
+        alpha = 0.5 - 0.5 * math.cos(2.0 * math.pi * float(elapsed_s) / period)
+        close = lower + alpha * (upper - lower)
+        for name in gripper_names:
+            scene.set_gripper_close(name, close)
+
+    return _on_step
 
 
 def run(args: argparse.Namespace) -> None:
@@ -167,9 +236,10 @@ def run(args: argparse.Namespace) -> None:
         timestep=float(args.dt),
         gravity=(0.0, 0.0, 0.0),
         mjcf_path=args.mjcf_out,
+        debug_proxy_visuals=bool(args.debug_proxy_visuals),
     )
     missing = sorted(set(_active_sides(args.mode)) - set(scene.arm_specs))
-    if missing:
+    if args.control != "none" and missing:
         raise SystemExit(f"URDF/MJCF is missing arm specs for active side(s): {missing}")
 
     _print_scene_summary(scene)
@@ -188,7 +258,7 @@ def run(args: argparse.Namespace) -> None:
     if args.control == "qpos":
         qpos_result = QposController(scene).apply(_qpos_targets(args, scene))
         extra["qpos_result"] = qpos_result
-    else:
+    elif args.control == "pose-ik":
         ik_result = PoseIKController(scene, DampedLeastSquaresIK(scene, ik_config)).apply(
             _pose_targets(args, scene)
         )
@@ -202,17 +272,40 @@ def run(args: argparse.Namespace) -> None:
         }
         print(json.dumps(extra["ik_result"], indent=2, ensure_ascii=False))
 
+    gripper_targets = _parse_gripper_close_items(args.gripper_close, scene)
+    if gripper_targets:
+        extra["gripper_result"] = GripperController(scene).apply(gripper_targets)
+
     if args.print_camera_poses:
         print(json.dumps(scene.camera_metadata(), indent=2, ensure_ascii=False))
 
     if args.viewer:
+        animate_names: tuple[str, ...] = ()
+        on_step = None
+        if bool(args.animate_gripper):
+            animate_names = tuple(gripper_targets) if gripper_targets else tuple(sorted(scene.gripper_specs))
+            on_step = _gripper_animation_callback(
+                scene,
+                names=animate_names,
+                period_s=float(args.gripper_period),
+                min_close=float(args.gripper_min_close),
+                max_close=float(args.gripper_max_close),
+            )
         launch_passive_viewer(
             scene,
             duration_sec=None if float(args.viewer_duration) <= 0.0 else float(args.viewer_duration),
             realtime_hz=1.0 / float(args.dt),
             show_left_ui=not bool(args.hide_left_ui),
             show_right_ui=not bool(args.hide_right_ui),
+            on_step=on_step,
         )
+        if animate_names:
+            extra["gripper_animation"] = {
+                "names": list(animate_names),
+                "period_s": float(args.gripper_period),
+                "min_close": float(args.gripper_min_close),
+                "max_close": float(args.gripper_max_close),
+            }
 
     renderer = None
     recorder = None
@@ -250,6 +343,8 @@ def run(args: argparse.Namespace) -> None:
             side: pose_to_xyz_quat_xyzw(scene.body_pose(spec.controlled_body))
             for side, spec in sorted(scene.arm_specs.items())
         },
+        "gripper_close_by_name": scene.gripper_close_by_name(),
+        "gripper_qpos_by_name": scene.gripper_qpos_by_name(),
     }
     print(json.dumps(final, indent=2, ensure_ascii=False))
 

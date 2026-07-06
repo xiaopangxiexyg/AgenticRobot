@@ -31,7 +31,7 @@ TACTILE_FIELDS: Tuple[str, ...] = (
     "events",
 )
 
-DEFAULT_TACTILE_FIELDS: Tuple[str, ...] = ("distributed_force",)
+DEFAULT_TACTILE_FIELDS: Tuple[str, ...] = ("raw",)
 TACTILE_COMPUTE_PROFILES: Tuple[str, ...] = (
     "dist-only",
     "legacy",

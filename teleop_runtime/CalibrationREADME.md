@@ -84,7 +84,7 @@
 ```bash
 conda activate dexteleop310
 
-python hardware/VIVE/VIVE_sender/data_sender_new.py \
+python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
   --hz 60 \

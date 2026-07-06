@@ -19,7 +19,6 @@ from ...arm_frames import (
     EMPTY_TOOL_FRAME,
     TOOL_TCP_FRAME,
     canonical_arm_controlled_frame,
-    rm65_urdf_frame_for_controlled_frame,
 )
 from rm65_inspire_tac.ik_tuning import (
     RM65IKTuningConfig,
@@ -28,13 +27,20 @@ from rm65_inspire_tac.ik_tuning import (
     load_ik_tuning_config,
     pose_delta_metrics,
 )
+from robot_motion.rm65 import (
+    RM65SingleArmIKConfig,
+    build_rm65_single_arm_ik_solver,
+    rm65_single_arm_candidate_frames,
+    solve_rm65_single_arm_ik,
+)
 
 from ...interfaces import EffectorBackend
 from ...registry import register_backend
 from ...schemas import EffectorCommand
-from ...tcp import HAND_BASE_TCP_FRAME
 
 
+RM65_IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
+RM65_IK_FRAMEWORK_CHOICES = (RM65_IK_FRAMEWORK_ROBOT_MOTION,)
 HAND_BASE_POSE_FLANGE_M_RAD = (0.0, 0.0, 0.009, 0.0, 0.0, 0.0)
 _SINGULARITY_WARNING_INTERVAL_SEC = 1.0
 _SINGULARITY_LABELS = {
@@ -43,6 +49,22 @@ _SINGULARITY_LABELS = {
     -2: "elbow_singularity",
     -3: "wrist_singularity",
 }
+
+
+def normalize_rm65_ik_framework(value: object) -> str:
+    text = str(value or RM65_IK_FRAMEWORK_ROBOT_MOTION).strip().lower().replace("-", "_")
+    aliases = {
+        "default": RM65_IK_FRAMEWORK_ROBOT_MOTION,
+        "shared": RM65_IK_FRAMEWORK_ROBOT_MOTION,
+        "robotmotion": RM65_IK_FRAMEWORK_ROBOT_MOTION,
+        "robot_motion": RM65_IK_FRAMEWORK_ROBOT_MOTION,
+    }
+    resolved = aliases.get(text, text)
+    if resolved not in RM65_IK_FRAMEWORK_CHOICES:
+        raise ValueError(
+            f"Unsupported RM65 IK framework {value!r}. Expected one of {RM65_IK_FRAMEWORK_CHOICES}."
+        )
+    return resolved
 
 
 def _is_empty_tool_frame_name(value: object) -> bool:
@@ -224,6 +246,7 @@ class RM65ArmBackendConfig:
     singularity_shoulder_threshold_m: float = 0.05
     ik_tuning_json_path: str | None = None
     ik_tuning: RM65IKTuningConfig | None = field(default=None, repr=False)
+    ik_framework: str = RM65_IK_FRAMEWORK_ROBOT_MOTION
     builtin_empty_tool_frame: bool = field(default=False, init=False, repr=False)
     position_endpoint_profile: bool = field(default=False, init=False, repr=False)
 
@@ -259,6 +282,7 @@ class RM65ArmBackendConfig:
             raise ValueError("singularity_wrist_threshold_deg must be >= 0.")
         if float(self.singularity_shoulder_threshold_m) < 0.0:
             raise ValueError("singularity_shoulder_threshold_m must be >= 0.")
+        self.ik_framework = normalize_rm65_ik_framework(self.ik_framework)
         if self.ik_tuning is None:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
         if _is_empty_tool_frame_name(self.tool_profile):
@@ -667,6 +691,7 @@ class RM65ArmBackend(EffectorBackend):
                 **dict(self._last_ik_metadata),
                 "ik_status": dict(self._last_ik_metadata).get("ik_jump_gate_status", "pass"),
                 "ik_backend_source": "rm65_arm_backend",
+                "ik_framework": self.config.ik_framework,
                 "ik_backend_solve_ms": float(ik_solve_elapsed_ms),
                 "ik_frame_total_ms": float(ik_solve_elapsed_ms),
                 "ik_solve_total_ms": float(ik_solve_elapsed_ms),
@@ -712,32 +737,25 @@ class RM65ArmBackend(EffectorBackend):
     def _solver_for_tcp_frame(self, tcp_frame: str):
         tcp_frame = canonical_arm_controlled_frame(tcp_frame)
         if tcp_frame not in self._solvers:
-            from rm65_inspire_tac.ik import SingleArmIKSolver
-
-            last_error: Exception | None = None
-            for candidate in self._candidate_tcp_frames(tcp_frame):
-                try:
-                    self._solvers[tcp_frame] = SingleArmIKSolver(
-                        urdf_path=self.config.arm_urdf_path,
-                        eef_name=candidate,
+            try:
+                self._solvers[tcp_frame] = build_rm65_single_arm_ik_solver(
+                    RM65SingleArmIKConfig(
+                        arm_urdf_path=self.config.arm_urdf_path,
+                        controlled_frame=tcp_frame,
                         ik_tuning=self._ik_tuning,
+                        dry_run_max_iterations=int(self.config.dry_run_max_iterations),
+                        dry_run_max_joint_step_rad=tuple(self.config.dry_run_max_joint_step),
+                        dry_run_damping=float(self.config.dry_run_damping),
                     )
-                    break
-                except ValueError as exc:
-                    last_error = exc
-            else:
+                )
+            except ValueError as exc:
                 raise ValueError(
                     f"{self.name} could not resolve tcp_frame '{tcp_frame}' against the arm URDF."
-                ) from last_error
+                ) from exc
         return self._solvers[tcp_frame]
 
     def _candidate_tcp_frames(self, tcp_frame: str) -> tuple[str, ...]:
-        tcp_frame = canonical_arm_controlled_frame(tcp_frame)
-        if tcp_frame == ARM_ENDPOINT_FRAME:
-            return (rm65_urdf_frame_for_controlled_frame(tcp_frame), HAND_BASE_TCP_FRAME)
-        if tcp_frame in {TOOL_TCP_FRAME, HAND_BASE_TCP_FRAME}:
-            return (HAND_BASE_TCP_FRAME, "arm_link6")
-        return (tcp_frame, HAND_BASE_TCP_FRAME, "arm_link6")
+        return rm65_single_arm_candidate_frames(canonical_arm_controlled_frame(tcp_frame))
 
     def _build_hand_base_to_configured_tcp(self) -> np.ndarray:
         pose_flange_m_rad = self._active_tcp_pose_flange_m_rad()
@@ -881,26 +899,16 @@ class RM65ArmBackend(EffectorBackend):
             if max_joint_step is not None
             else self.get_effective_max_joint_step()
         )
-        if not self.config.connect_hardware and self.config.dry_run_fast:
-            qpos_target = solver.solve_iterative(
-                target_pose=target_pose,
-                q_init=current_qpos,
-                max_iterations=int(self.config.dry_run_max_iterations),
-                max_joint_step=np.asarray(self.config.dry_run_max_joint_step, dtype=float),
-                damping=float(self.config.dry_run_damping),
-                tolerance=1e-5,
-            )
-            return self._apply_jump_gate(
-                solver=solver,
-                target_pose=target_pose,
-                current_qpos=current_qpos,
-                candidate_qpos=np.asarray(qpos_target, dtype=float),
-            )
-        qpos_target = solver.solve_step(
-            target_pose=target_pose,
-            current_qpos=current_qpos,
-            max_joint_step=command_max_joint_step,
-        )
+        solve_kwargs = {
+            "target_pose": target_pose,
+            "current_qpos": current_qpos,
+            "fast_iterative": bool(not self.config.connect_hardware and self.config.dry_run_fast),
+            "max_joint_step_rad": command_max_joint_step,
+            "dry_run_max_iterations": int(self.config.dry_run_max_iterations),
+            "dry_run_max_joint_step_rad": tuple(self.config.dry_run_max_joint_step),
+            "dry_run_damping": float(self.config.dry_run_damping),
+        }
+        qpos_target = solve_rm65_single_arm_ik(solver, **solve_kwargs)
         return self._apply_jump_gate(
             solver=solver,
             target_pose=target_pose,
@@ -1022,6 +1030,7 @@ class RM65ArmBackend(EffectorBackend):
                 "ik_branch_selection": getattr(solver, "last_branch_selection", "unknown"),
                 "ik_jump_gate_status": "disabled",
                 "configured_tcp_enabled": self._configured_tcp_enabled,
+                "ik_framework": self.config.ik_framework,
             }
             return candidate_qpos
 
@@ -1126,6 +1135,7 @@ class RM65ArmBackend(EffectorBackend):
             "ik_hard_branch_exceeded": bool(hard_branch_exceeded),
             "ik_release_ready": release_ready,
             "configured_tcp_enabled": self._configured_tcp_enabled,
+            "ik_framework": self.config.ik_framework,
         }
 
         should_hold = bool(

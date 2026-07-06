@@ -107,7 +107,7 @@ hand16 中的空槽必须按无效值处理，而不是按 0 处理：
 
 ## VIVE 发送端
 
-推荐发送端在 [hardware/VIVE/VIVE_sender/data_sender_new.py](../hardware/VIVE/VIVE_sender/data_sender_new.py)。它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。
+推荐发送端在 [hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py)。它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。
 
 默认 tracker 映射：
 
@@ -120,7 +120,7 @@ virtual desk 扫动可以用 `left_wrist` 或 `right_wrist` 代替 auxiliary。
 示例：
 
 ```bash
-python hardware/VIVE/VIVE_sender/data_sender_new.py \
+python hardware/VIVE/mocap/vive_data_sender.py \
   --host 192.168.20.90 \
   --port 9999 \
   --hz 60 \
@@ -128,8 +128,7 @@ python hardware/VIVE/VIVE_sender/data_sender_new.py \
   --tracker tracker_2:right_wrist
 ```
 
-发送协议是结构化 JSON UDP，`teleop_runtime` 也保留了 legacy float 包兼容。
-不要用 `hardware/VIVE/VIVE_sender/data_sender.py` 跑当前 teleop；它近似满速发送并且逐 tracker 读取 OpenVR，容易造成 receiver 积压。`data_time_sender.py` 发送 `double timestamp + 36 float` 到默认 `6666`，不是当前主链路协议。
+发送协议是结构化 JSON UDP，`teleop_runtime` 也保留了 legacy float 包兼容。仓库里只保留这一个 sender 入口，避免误跑旧的 float/满速 UDP sender。
 
 ## Calibration Tool
 
@@ -528,7 +527,7 @@ from teleop_runtime import RM65ArmBackendConfig, InspireTacHandBackendConfig
 VIVE 发送端：
 
 ```bash
-python hardware/VIVE/VIVE_sender/data_sender_new.py \
+python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
   --hz 60 \
@@ -748,7 +747,8 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 ## 录制与安全
 
-默认会生成：
+`run_vive_rm65_real_teleop.py` 默认不再写 legacy session JSONL；只有显式传入
+`--record` 时才会生成：
 
 - `teleop_records/<timestamp>/raw_inputs.jsonl`
 - `teleop_records/<timestamp>/commands.jsonl`
@@ -756,7 +756,13 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - `teleop_records/<timestamp>/state_transitions.jsonl`
 - `teleop_records/<timestamp>/calibration.json`
 
-如果在 `run_vive_sapien_virtual.py` 里用 `t` 或 `--record-auto-start` 开启 episode 录制，还会额外生成：
+GUI 里的 IK debug 记录单独保存到：
+
+- `teleop_records/ik_debug/ik_debug_<timestamp>.jsonl`
+
+正式 dataset collection 会写入 `datasets/<date>_<task>/` 下的 LeRobot 数据集。轻量
+debug trajectory 不会在正式 dataset 采集中默认重复保存；仅在 `--no-collection`、
+`--episode-root` 或 `--debug-trajectory-recording` 时生成：
 
 - `teleop_records/<timestamp>/trajectories/episode_000001/manifest.json`
 - `teleop_records/<timestamp>/trajectories/episode_000001/frames.jsonl`
@@ -792,7 +798,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 ## 建议的当前工作流
 
-1. 先跑 `hardware/VIVE/VIVE_sender/data_sender_new.py --hz 60`
+1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py --hz 60`
 2. 跑 `run_vive_rm65_calibration_debug.py` 完成 `LINK_CHECK -> virtual desk -> wrist offset -> save profile`
 3. 启动 `run_vive_sapien_virtual.py`，读取 profile，并在当前真机/虚拟起始姿态上做 session `home capture`
 4. 用 `control_mode="absolute"` 做虚拟验收，确认前/左/上和双臂相对关系

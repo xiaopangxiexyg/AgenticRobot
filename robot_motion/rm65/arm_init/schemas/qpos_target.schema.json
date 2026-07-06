@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dexteleop.local/schemas/rm65_arm_init_qpos_target.schema.json",
+  "title": "RM65 arm-init qpos target",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["data_type", "schema_version", "arms"],
+  "properties": {
+    "data_type": {
+      "const": "rm65_arm_init_qpos_target"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "name": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "arms": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left": {
+          "$ref": "#/$defs/arm_qpos"
+        },
+        "right": {
+          "$ref": "#/$defs/arm_qpos"
+        }
+      },
+      "anyOf": [
+        {
+          "required": ["left"]
+        },
+        {
+          "required": ["right"]
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "qpos": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 6,
+      "maxItems": 6
+    },
+    "arm_qpos": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["qpos"],
+      "properties": {
+        "qpos": {
+          "$ref": "#/$defs/qpos"
+        },
+        "qpos_units": {
+          "const": "rad",
+          "default": "rad"
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

@@ -445,6 +445,9 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertTrue(args.minimum_control_hz_auto)
         self.assertAlmostEqual(args.arm_step_dt_max_scale, 50.0 / 15.0 * 1.1)
         self.assertTrue(args.arm_step_dt_max_scale_auto)
+        self.assertAlmostEqual(args.dual_arm_temp_max_xyz_step_m, 0.03)
+        self.assertAlmostEqual(args.dual_arm_temp_max_rot_step_deg, 8.0)
+        self.assertAlmostEqual(args.dual_arm_temp_max_joint_step_deg, 6.0)
 
     def test_real_teleop_parse_keeps_explicit_real_loop_timing_limits(self) -> None:
         argv = [

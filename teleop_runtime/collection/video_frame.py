@@ -13,10 +13,12 @@ class VideoFrame:
     receive_timestamp: float | None = None
     frame_index: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    depth_image: Any | None = None
+    depth_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class NearestFrameBuffer:
-    """Keeps only a tiny sliding window so each sample can select the nearest frame."""
+    """Keeps a tiny sliding window of camera frames for timestamped sample matching."""
 
     def __init__(self, *, keep_last: int = 2):
         if int(keep_last) <= 0:
@@ -42,6 +44,15 @@ class NearestFrameBuffer:
                 self._frames,
                 key=lambda frame: abs(float(frame.source_timestamp) - float(timestamp)),
             )
+
+    def get_latest_before_or_at(self, timestamp: float) -> VideoFrame | None:
+        """Return the newest frame whose source timestamp does not look ahead."""
+        target = float(timestamp)
+        with self._lock:
+            for frame in reversed(self._frames):
+                if float(frame.source_timestamp) <= target:
+                    return frame
+            return None
 
     def clear(self) -> None:
         with self._lock:

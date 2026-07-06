@@ -43,7 +43,7 @@ class ScalarToGripperRetargeterConfig:
     input_channel_name: str
     effector_name: str | None = None
     source_dim: int = 2
-    output_dim: int = 1
+    output_dim: int = 0
     invert: bool = False
     alpha: float = 1.0
     input_min: float = DEFAULT_GRIPPER_INPUT_MIN
@@ -56,8 +56,8 @@ class ScalarToGripperRetargeterConfig:
             object.__setattr__(self, "effector_name", f"{self.side}_hand")
         if not 0 <= int(self.source_dim) < 6:
             raise ValueError("source_dim must be in [0, 5].")
-        if not 0 <= int(self.output_dim) < 6:
-            raise ValueError("output_dim must be in [0, 5].")
+        if int(self.output_dim) != 0:
+            raise ValueError("DM-Tac gripper output_dim is fixed to hand slot 0.")
         if not 0.0 < float(self.alpha) <= 1.0:
             raise ValueError("alpha must be in (0, 1].")
         if not 0.0 <= float(self.input_min) < float(self.input_max) <= 1.0:
@@ -72,7 +72,7 @@ class ScalarToGripperRetargeterConfig:
 
 @register_retargeter("scalar_to_gripper")
 class ScalarToGripperRetargeter(Retargeter):
-    """Map one q6 source dimension into a 6-wide gripper command slot."""
+    """Map one q6 source dimension into the 1D DM-Tac gripper target slot."""
 
     def __init__(self, config: ScalarToGripperRetargeterConfig):
         self.config = config
@@ -123,7 +123,8 @@ class ScalarToGripperRetargeter(Retargeter):
         )
 
         command_value = np.zeros(6, dtype=np.float32)
-        command_value[int(self.config.output_dim)] = float(self._filtered_value)
+        gripper_slot = int(self.config.output_dim)
+        command_value[gripper_slot] = float(self._filtered_value)
         command.add_command(
             EffectorCommand(
                 effector_name=str(self.config.effector_name),
@@ -134,7 +135,9 @@ class ScalarToGripperRetargeter(Retargeter):
                 metadata={
                     "input_channel": self.config.input_channel_name,
                     "source_dim": int(self.config.source_dim),
-                    "output_dim": int(self.config.output_dim),
+                    "output_dim": gripper_slot,
+                    "gripper_slot": gripper_slot,
+                    "gripper_action_dim": 1,
                     "invert": bool(self.config.invert),
                     "alpha": float(self.config.alpha),
                     "input_min": float(self.config.input_min),
@@ -145,10 +148,10 @@ class ScalarToGripperRetargeter(Retargeter):
                     "gripper_joint_target": float(self._filtered_value),
                     "hand_action_spec": HandActionSpec.dmtac_gripper(
                         self.config.side,
-                        gripper_slot=int(self.config.output_dim),
+                        gripper_slot=gripper_slot,
                     ).to_metadata(),
                     "gripper_command_semantics": (
-                        "Six-wide compatibility vector; only output_dim is a gripper actuator."
+                        "Six-wide compatibility vector; only gripper_slot is a 1D gripper actuator."
                     ),
                 },
             )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import math
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from .transforms import (
     average_transforms,
     invert_transform,
     make_transform,
+    pose6_xyz_rpy_to_matrix,
     transform_distance,
     transform_to_list,
 )
@@ -94,6 +96,7 @@ class CalibrationResult:
     metrics: dict[str, Any]
     samples: list[CalibrationSample]
     created_at_utc: str
+    T_active_tool_to_arm_end: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -105,32 +108,82 @@ class CalibrationResult:
             self.T_target_to_base,
             name="T_target_to_base",
         )
+        if self.T_active_tool_to_arm_end is not None:
+            self.T_active_tool_to_arm_end = as_transform(
+                self.T_active_tool_to_arm_end,
+                name="T_active_tool_to_arm_end",
+            )
 
     @property
     def T_gripper_to_camera(self) -> np.ndarray:
         return invert_transform(self.T_camera_to_gripper)
 
     @property
-    def T_end_effector_to_camera(self) -> np.ndarray:
+    def T_camera_to_active_tool(self) -> np.ndarray:
+        return self.T_camera_to_gripper
+
+    @property
+    def T_active_tool_to_camera(self) -> np.ndarray:
         return self.T_gripper_to_camera
 
     @property
+    def has_arm_end_transform(self) -> bool:
+        return self.T_active_tool_to_arm_end is not None
+
+    @property
+    def T_arm_end_to_active_tool(self) -> np.ndarray | None:
+        if self.T_active_tool_to_arm_end is None:
+            return None
+        return invert_transform(self.T_active_tool_to_arm_end)
+
+    @property
+    def T_camera_to_arm_end(self) -> np.ndarray:
+        if self.T_active_tool_to_arm_end is None:
+            return self.T_camera_to_gripper
+        return self.T_active_tool_to_arm_end @ self.T_camera_to_gripper
+
+    @property
+    def T_arm_end_to_camera(self) -> np.ndarray:
+        return invert_transform(self.T_camera_to_arm_end)
+
+    @property
+    def T_end_effector_to_camera(self) -> np.ndarray:
+        return self.T_arm_end_to_camera
+
+    @property
     def T_camera_to_end_effector(self) -> np.ndarray:
-        return self.T_camera_to_gripper
+        return self.T_camera_to_arm_end
 
     def camera_to_base_for_pose(self, T_gripper_to_base: object) -> np.ndarray:
         return as_transform(T_gripper_to_base, name="T_gripper_to_base") @ self.T_camera_to_gripper
 
     def to_dict(self, *, include_samples: bool = True) -> dict[str, Any]:
+        metadata = _result_metadata_with_frame_compatibility(self)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "created_at_utc": self.created_at_utc,
             "matrix_convention": {
                 "T_camera_to_gripper": (
-                    "p_gripper = T_camera_to_gripper @ p_camera; "
-                    "use T_gripper_to_base @ T_camera_to_gripper for camera points in base"
+                    "legacy name: p_active_tool = T_camera_to_gripper @ p_camera; "
+                    "the gripper frame is the RM65 active tool/TCP returned by Get_Current_Arm_State"
                 ),
-                "T_gripper_to_camera": "p_camera = T_gripper_to_camera @ p_gripper",
+                "T_gripper_to_camera": "legacy name: p_camera = T_gripper_to_camera @ p_active_tool",
+                "T_camera_to_active_tool": "same matrix as T_camera_to_gripper, with explicit frame name",
+                "T_active_tool_to_camera": "same matrix as T_gripper_to_camera, with explicit frame name",
+                "T_active_tool_to_arm_end": (
+                    "p_arm_end = T_active_tool_to_arm_end @ p_active_tool; "
+                    "derived from the active tool pose in the RM65 flange/link6 frame"
+                ),
+                "T_camera_to_arm_end": (
+                    "p_arm_end = T_camera_to_arm_end @ p_camera; "
+                    "mechanical arm endpoint/flange/link6 camera extrinsic"
+                ),
+                "T_arm_end_to_camera": "p_camera = T_arm_end_to_camera @ p_arm_end",
+                "T_camera_to_end_effector": (
+                    "alias of T_camera_to_arm_end for new files; older files may have used this "
+                    "name for the active tool/TCP, so check metadata.frame_compatibility"
+                ),
+                "T_end_effector_to_camera": "alias of T_arm_end_to_camera for new files",
                 "T_target_to_base": "p_base = T_target_to_base @ p_target; fixed scene target estimate",
                 "translation_unit": "meters",
             },
@@ -138,12 +191,28 @@ class CalibrationResult:
             "sample_count": len(self.samples),
             "T_camera_to_gripper": transform_to_list(self.T_camera_to_gripper),
             "T_gripper_to_camera": transform_to_list(self.T_gripper_to_camera),
+            "T_camera_to_active_tool": transform_to_list(self.T_camera_to_active_tool),
+            "T_active_tool_to_camera": transform_to_list(self.T_active_tool_to_camera),
             "T_end_effector_to_camera": transform_to_list(self.T_gripper_to_camera),
             "T_camera_to_end_effector": transform_to_list(self.T_camera_to_gripper),
             "T_target_to_base": transform_to_list(self.T_target_to_base),
             "metrics": _jsonable(self.metrics),
-            "metadata": _jsonable(self.metadata),
+            "metadata": _jsonable(metadata),
         }
+        if self.T_active_tool_to_arm_end is not None:
+            T_arm_end_to_active_tool = invert_transform(self.T_active_tool_to_arm_end)
+            payload.update(
+                {
+                    "T_active_tool_to_arm_end": transform_to_list(self.T_active_tool_to_arm_end),
+                    "T_arm_end_to_active_tool": transform_to_list(T_arm_end_to_active_tool),
+                    "T_camera_to_arm_end": transform_to_list(self.T_camera_to_arm_end),
+                    "T_arm_end_to_camera": transform_to_list(self.T_arm_end_to_camera),
+                    "T_camera_to_flange": transform_to_list(self.T_camera_to_arm_end),
+                    "T_flange_to_camera": transform_to_list(self.T_arm_end_to_camera),
+                    "T_camera_to_end_effector": transform_to_list(self.T_camera_to_end_effector),
+                    "T_end_effector_to_camera": transform_to_list(self.T_end_effector_to_camera),
+                }
+            )
         if include_samples:
             payload["samples"] = [sample.to_dict() for sample in self.samples]
         return payload
@@ -159,6 +228,11 @@ class CalibrationResult:
             )
         else:
             raise ValueError("calibration JSON must contain T_camera_to_gripper or T_gripper_to_camera.")
+        metadata = dict(payload.get("metadata") or {})
+        frame_info = _infer_active_tool_frame_info(samples, metadata)
+        T_active_tool_to_arm_end = _active_tool_to_arm_end_from_payload(payload, samples)
+        if T_active_tool_to_arm_end is not None:
+            metadata = _metadata_with_active_tool_frame_info(metadata, frame_info)
         return cls(
             T_camera_to_gripper=T_camera_to_gripper,
             T_target_to_base=np.asarray(
@@ -169,7 +243,8 @@ class CalibrationResult:
             metrics=dict(payload.get("metrics") or {}),
             samples=samples,
             created_at_utc=str(payload.get("created_at_utc") or _now_utc()),
-            metadata=dict(payload.get("metadata") or {}),
+            T_active_tool_to_arm_end=T_active_tool_to_arm_end,
+            metadata=metadata,
         )
 
 
@@ -182,6 +257,156 @@ def _require_cv2():
             "Install opencv-contrib-python in the calibration environment."
         ) from exc
     return cv2
+
+
+def _tool_frame_record(value: object) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = ast.literal_eval(text)
+    except Exception:
+        return None
+    if isinstance(parsed, Mapping):
+        return dict(parsed)
+    return None
+
+
+def _finite_pose6(value: object) -> list[float] | None:
+    try:
+        pose = np.asarray(value, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        return None
+    return [float(item) for item in pose]
+
+
+def _infer_active_tool_frame_info(
+    samples: Sequence[CalibrationSample],
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = dict(metadata or {})
+    metadata_pose = _finite_pose6(metadata.get("active_tool_pose_flange_m_rad"))
+    if metadata_pose is not None:
+        return {
+            "status": "ok",
+            "source": "metadata.active_tool_pose_flange_m_rad",
+            "name": metadata.get("active_tool_frame_name", ""),
+            "pose_flange_m_rad": metadata_pose,
+            "T_active_tool_to_arm_end": pose6_xyz_rpy_to_matrix(metadata_pose),
+        }
+
+    records: list[dict[str, Any]] = []
+    for sample in samples:
+        record = _tool_frame_record(sample.metadata.get("robot_tool_frame"))
+        pose = _finite_pose6(record.get("pose") if record is not None else None)
+        if record is not None and pose is not None:
+            record = dict(record)
+            record["pose"] = pose
+            records.append(record)
+    if not records:
+        return {
+            "status": "unavailable",
+            "reason": "sample metadata does not contain a parseable robot_tool_frame.pose",
+        }
+
+    poses = [np.asarray(record["pose"], dtype=np.float64).reshape(6) for record in records]
+    first_pose = poses[0]
+    if any(not np.allclose(pose, first_pose, atol=1e-9, rtol=0.0) for pose in poses[1:]):
+        return {
+            "status": "mixed_tool_poses",
+            "reason": "samples were captured with different active tool frame poses",
+            "sample_count": len(records),
+        }
+
+    names = [str(record.get("name", "")).strip() for record in records if record.get("name")]
+    pose = [float(item) for item in first_pose]
+    return {
+        "status": "ok",
+        "source": "sample.metadata.robot_tool_frame.pose",
+        "name": _most_common_text(names),
+        "pose_flange_m_rad": pose,
+        "record": records[0],
+        "T_active_tool_to_arm_end": pose6_xyz_rpy_to_matrix(pose),
+    }
+
+
+def _active_tool_to_arm_end_from_payload(
+    payload: Mapping[str, Any],
+    samples: Sequence[CalibrationSample],
+) -> np.ndarray | None:
+    if payload.get("T_active_tool_to_arm_end") is not None:
+        return as_transform(payload["T_active_tool_to_arm_end"], name="T_active_tool_to_arm_end")
+    metadata = dict(payload.get("metadata") or {})
+    info = _infer_active_tool_frame_info(samples, metadata)
+    transform = info.get("T_active_tool_to_arm_end")
+    if transform is None:
+        return None
+    return as_transform(transform, name="inferred_T_active_tool_to_arm_end")
+
+
+def _metadata_with_active_tool_frame_info(
+    metadata: Mapping[str, Any] | None,
+    frame_info: Mapping[str, Any],
+) -> dict[str, Any]:
+    out = dict(metadata or {})
+    status = str(frame_info.get("status") or "unknown")
+    out.setdefault("robot_pose_frame", "active_tool_tcp")
+    out.setdefault("mechanical_arm_end_frame", "arm_link6/flange")
+    out["active_tool_frame_inference"] = {
+        "status": status,
+        "source": frame_info.get("source", ""),
+        "reason": frame_info.get("reason", ""),
+    }
+    if status == "ok":
+        out["active_tool_frame_name"] = str(frame_info.get("name", "") or "")
+        out["active_tool_pose_flange_m_rad"] = _jsonable(frame_info.get("pose_flange_m_rad"))
+        record = frame_info.get("record")
+        if record is not None:
+            out["active_tool_frame_record"] = _jsonable(record)
+    return out
+
+
+def _result_metadata_with_frame_compatibility(result: CalibrationResult) -> dict[str, Any]:
+    metadata = dict(result.metadata)
+    metadata.setdefault("robot_pose_frame", "active_tool_tcp")
+    metadata.setdefault("mechanical_arm_end_frame", "arm_link6/flange")
+    metadata["frame_compatibility"] = {
+        "legacy_gripper_fields_frame": "active_tool_tcp",
+        "legacy_end_effector_fields_before_2026_07_04": "active_tool_tcp",
+        "new_end_effector_fields_frame": (
+            "mechanical_arm_end_flange_link6"
+            if result.has_arm_end_transform
+            else "same_as_legacy_gripper_frame_transform_unavailable"
+        ),
+        "preferred_mechanical_arm_end_fields": [
+            "T_camera_to_arm_end",
+            "T_arm_end_to_camera",
+            "T_camera_to_end_effector",
+            "T_end_effector_to_camera",
+        ],
+        "preferred_active_tool_tcp_fields": [
+            "T_camera_to_active_tool",
+            "T_active_tool_to_camera",
+            "T_camera_to_gripper",
+            "T_gripper_to_camera",
+        ],
+    }
+    return metadata
+
+
+def _most_common_text(values: Sequence[str]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda item: item[1])[0]
 
 
 def _hand_eye_methods(cv2: Any) -> dict[str, int]:
@@ -291,6 +516,15 @@ def _solve_eye_in_hand_once(
     else:
         raise ValueError(f"unknown hand-eye method {method!r}; available: {sorted(methods)}")
 
+    frame_info = _infer_active_tool_frame_info(samples, metadata)
+    result_metadata = _metadata_with_active_tool_frame_info(metadata, frame_info)
+    T_active_tool_to_arm_end = frame_info.get("T_active_tool_to_arm_end")
+    if T_active_tool_to_arm_end is not None:
+        T_active_tool_to_arm_end = as_transform(
+            T_active_tool_to_arm_end,
+            name="T_active_tool_to_arm_end",
+        )
+
     attempts: list[tuple[float, CalibrationResult]] = []
     failures: dict[str, str] = {}
     for name in candidates:
@@ -325,7 +559,8 @@ def _solve_eye_in_hand_once(
                 metrics=metrics,
                 samples=list(samples),
                 created_at_utc=_now_utc(),
-                metadata=dict(metadata or {}),
+                T_active_tool_to_arm_end=T_active_tool_to_arm_end,
+                metadata=dict(result_metadata),
             )
             attempts.append((_method_score(metrics), result))
         except Exception as exc:
@@ -861,18 +1096,40 @@ def save_result(
         json.dumps(result.to_dict(include_samples=True), indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    np.savez(
-        paths["npz"],
-        T_camera_to_gripper=result.T_camera_to_gripper,
-        T_gripper_to_camera=result.T_gripper_to_camera,
-        T_target_to_base=result.T_target_to_base,
-        metrics_json=json.dumps(_jsonable(result.metrics), sort_keys=True),
-    )
+    npz_payload: dict[str, Any] = {
+        "T_camera_to_gripper": result.T_camera_to_gripper,
+        "T_gripper_to_camera": result.T_gripper_to_camera,
+        "T_camera_to_active_tool": result.T_camera_to_active_tool,
+        "T_active_tool_to_camera": result.T_active_tool_to_camera,
+        "T_target_to_base": result.T_target_to_base,
+        "metrics_json": json.dumps(_jsonable(result.metrics), sort_keys=True),
+        "metadata_json": json.dumps(
+            _jsonable(_result_metadata_with_frame_compatibility(result)),
+            sort_keys=True,
+        ),
+    }
+    if result.T_active_tool_to_arm_end is not None:
+        npz_payload.update(
+            {
+                "T_active_tool_to_arm_end": result.T_active_tool_to_arm_end,
+                "T_arm_end_to_active_tool": result.T_arm_end_to_active_tool,
+                "T_camera_to_arm_end": result.T_camera_to_arm_end,
+                "T_arm_end_to_camera": result.T_arm_end_to_camera,
+                "T_camera_to_end_effector": result.T_camera_to_end_effector,
+                "T_end_effector_to_camera": result.T_end_effector_to_camera,
+            }
+        )
+    np.savez(paths["npz"], **npz_payload)
     if save_legacy_npy:
         paths["legacy_npy"] = output / f"{stem}_gripper2camera.npy"
         np.save(paths["legacy_npy"], result.T_gripper_to_camera)
         paths["camera_to_gripper_npy"] = output / f"{stem}_cam2gripper.npy"
         np.save(paths["camera_to_gripper_npy"], result.T_camera_to_gripper)
+        if result.T_active_tool_to_arm_end is not None:
+            paths["arm_end_to_camera_npy"] = output / f"{stem}_arm_end2camera.npy"
+            np.save(paths["arm_end_to_camera_npy"], result.T_arm_end_to_camera)
+            paths["camera_to_arm_end_npy"] = output / f"{stem}_cam2arm_end.npy"
+            np.save(paths["camera_to_arm_end_npy"], result.T_camera_to_arm_end)
     return paths
 
 
@@ -888,6 +1145,12 @@ def load_result(path: str | Path) -> CalibrationResult:
             if hasattr(raw_metrics, "item"):
                 raw_metrics = raw_metrics.item()
             metrics = json.loads(str(raw_metrics))
+        metadata = {"source": str(path)}
+        if "metadata_json" in data.files:
+            raw_metadata = data["metadata_json"]
+            if hasattr(raw_metadata, "item"):
+                raw_metadata = raw_metadata.item()
+            metadata.update(json.loads(str(raw_metadata)))
         if "T_camera_to_gripper" in data.files:
             T_camera_to_gripper = np.asarray(data["T_camera_to_gripper"], dtype=np.float64)
         elif "T_gripper_to_camera" in data.files:
@@ -901,6 +1164,11 @@ def load_result(path: str | Path) -> CalibrationResult:
             if "T_target_to_base" in data.files
             else np.eye(4)
         )
+        T_active_tool_to_arm_end = (
+            np.asarray(data["T_active_tool_to_arm_end"], dtype=np.float64)
+            if "T_active_tool_to_arm_end" in data.files
+            else None
+        )
         return CalibrationResult(
             T_camera_to_gripper=T_camera_to_gripper,
             T_target_to_base=T_target_to_base,
@@ -908,12 +1176,25 @@ def load_result(path: str | Path) -> CalibrationResult:
             metrics=metrics,
             samples=[],
             created_at_utc=_now_utc(),
-            metadata={"source": str(path)},
+            T_active_tool_to_arm_end=T_active_tool_to_arm_end,
+            metadata=metadata,
         )
     if path.suffix.lower() == ".npy":
         matrix = np.load(path)
         lower_name = path.stem.lower()
-        if "cam2gripper" in lower_name or "camera_to_gripper" in lower_name:
+        is_arm_end_matrix = (
+            "arm_end" in lower_name
+            or "flange" in lower_name
+            or "end_effector" in lower_name
+        )
+        if (
+            "cam2gripper" in lower_name
+            or "camera_to_gripper" in lower_name
+            or "cam2arm_end" in lower_name
+            or "camera_to_arm_end" in lower_name
+            or "cam2flange" in lower_name
+            or "camera_to_flange" in lower_name
+        ):
             T_camera_to_gripper = matrix
         else:
             T_camera_to_gripper = invert_transform(matrix)
@@ -924,7 +1205,13 @@ def load_result(path: str | Path) -> CalibrationResult:
             metrics={},
             samples=[],
             created_at_utc=_now_utc(),
-            metadata={"source": str(path), "legacy": True},
+            T_active_tool_to_arm_end=np.eye(4) if is_arm_end_matrix else None,
+            metadata={
+                "source": str(path),
+                "legacy": not is_arm_end_matrix,
+                "robot_pose_frame": "arm_link6/flange" if is_arm_end_matrix else "active_tool_tcp",
+                "npy_frame": "mechanical_arm_end" if is_arm_end_matrix else "active_tool_tcp",
+            },
         )
     raise ValueError(f"unsupported calibration file: {path}")
 

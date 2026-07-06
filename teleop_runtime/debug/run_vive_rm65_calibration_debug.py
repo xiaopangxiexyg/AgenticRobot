@@ -1333,7 +1333,7 @@ class CalibrationApp:
     ) -> list[np.ndarray]:
         self._log(stage_name, instructions)
         self._log(stage_name, timed_flow_hint)
-        self._log(stage_name, "READY: PRESS C TO START TIMED CAPTURE.")
+        self._log(stage_name, "READY: timed capture auto-starts; press r to reset, then c to recapture.")
         self._log(
             stage_name,
             f"c=start {self.args.capture_prep_sec:.1f}s prep, then timed capture ({capture_duration_sec:.1f}s); "
@@ -1342,6 +1342,7 @@ class CalibrationApp:
         poses: list[np.ndarray] = []
         preparing = False
         capturing = False
+        auto_start_pending = True
         capture_start_time = 0.0
         capture_deadline = 0.0
         capture_extension_deadline = 0.0
@@ -1360,10 +1361,14 @@ class CalibrationApp:
                 poses = []
                 preparing = False
                 capturing = False
+                auto_start_pending = False
                 min_samples_reported = False
                 waiting_for_samples_reported = False
                 self._log(stage_name, "reset", now=loop_start)
-            if "c" in events:
+            start_requested = bool(auto_start_pending or "c" in events)
+            if start_requested:
+                requested_by_auto = bool(auto_start_pending)
+                auto_start_pending = False
                 if not capturing and not preparing:
                     poses = []
                     preparing = True
@@ -1376,7 +1381,7 @@ class CalibrationApp:
                     waiting_for_samples_reported = False
                     self._log(
                         stage_name,
-                        f"CAPTURE PREP prep={self.args.capture_prep_sec:.1f}s "
+                        f"{'AUTO ' if requested_by_auto else ''}CAPTURE PREP prep={self.args.capture_prep_sec:.1f}s "
                         f"start_at={_format_wall_time(capture_start_time)} "
                         f"auto_end_at={_format_wall_time(capture_deadline)}",
                         now=loop_start,

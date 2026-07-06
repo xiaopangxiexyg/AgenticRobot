@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "data_type": {
+      "const": "rm65_arm_init_qpos_test_sequence"
+    },
+    "entries": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "qpos_by_side": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "left": {
+                "$ref": "#/$defs/rm65_qpos"
+              },
+              "right": {
+                "$ref": "#/$defs/rm65_qpos"
+              }
+            },
+            "type": "object"
+          },
+          "qpos_units": {
+            "const": "rad"
+          },
+          "source": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "index",
+          "name",
+          "qpos_by_side",
+          "qpos_units"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "entry_count": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "data_type",
+    "schema_version",
+    "name",
+    "entry_count",
+    "entries"
+  ],
+  "title": "RM65 qpos init test sequence",
+  "type": "object",
+  "$defs": {
+    "rm65_qpos": {
+      "items": {
+        "type": "number"
+      },
+      "maxItems": 6,
+      "minItems": 6,
+      "type": "array"
+    }
+  }
+}

@@ -214,6 +214,53 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
         self.assertNotIn("ik_candidate_selection", left_arm_metadata)
         self.assertNotIn("joint_limit_margin", left_arm_metadata)
         self.assertNotIn("command", metadata["canonical_action_record"]["execution"])
+        pose_quality = metadata["pose_quality"]
+        self.assertTrue(pose_quality["available"])
+        self.assertEqual(pose_quality["status"], "good")
+        self.assertEqual(
+            pose_quality["metrics"]["collision_avoidance_status"],
+            "tracking",
+        )
+
+    def test_default_sample_metadata_records_bad_pose_quality_summary(self) -> None:
+        command = TeleopCommand(
+            timestamp=4.5,
+            metadata={
+                "collision_avoidance_status": "hold_last_safe",
+                "collision_avoidance_fallback_reason": "collision_margin_low",
+                "collision_distance_m": 0.01,
+                "collision_min_distance_m": 0.03,
+                "ik_solve_pose_error": {
+                    "left": {"translation_m": 0.03, "rotation_deg": 6.0},
+                    "right": {"translation_m": 0.001, "rotation_deg": 0.2},
+                },
+                "joint_limit_margin": {
+                    "left": {"nearest_margin_deg": 2.0, "near_limit": True},
+                    "right": {"nearest_margin_deg": 12.0, "near_limit": False},
+                },
+            },
+        )
+        step = SessionStepResult(
+            timestamp=4.5,
+            state=TeleopRunState.RUNNING,
+            control_hz=30.0,
+            observation=TeleopObservation(timestamp=4.4),
+            command=command,
+        )
+
+        metadata = CollectorSampleBuilder._default_metadata(
+            step,
+            None,
+            {},
+            {},
+            {},
+        )
+
+        pose_quality = metadata["pose_quality"]
+        self.assertEqual(pose_quality["status"], "bad")
+        self.assertTrue(pose_quality["bad"])
+        self.assertIn("collision_distance_below_min", pose_quality["bad_reasons"])
+        self.assertLess(pose_quality["score"], 0.5)
 
     def test_debug_sample_metadata_keeps_ik_collision_metadata(self) -> None:
         command = TeleopCommand(

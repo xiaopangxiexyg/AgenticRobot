@@ -3,13 +3,29 @@ from __future__ import annotations
 import argparse
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ..deploy.schema import ACTION_ARM_POSE_SLICES, ARM_JOINT_DOF
+from ..deploy.schema import ARM_JOINT_DOF
+from .arm_init.qpos_execute import (
+    DEFAULT_QPOS_INIT_BRANCH_SEARCH,
+    DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES,
+    DEFAULT_QPOS_INIT_COLLISION_SCENE,
+    DEFAULT_QPOS_INIT_COLLISION_HOLD_DISTANCE_M,
+    DEFAULT_QPOS_INIT_COLLISION_SLOW_DISTANCE_M,
+    DEFAULT_QPOS_INIT_COLLISION_STOP_DISTANCE_M,
+    DEFAULT_QPOS_INIT_JOINT_HOLD_MARGIN_DEG,
+    DEFAULT_QPOS_INIT_JOINT_SLOW_MARGIN_DEG,
+    DEFAULT_QPOS_INIT_MAX_JOINT_ABS_DEG,
+    DEFAULT_SINGLE_ARM_MAX_QPOS_DELTA_DEG,
+    DEFAULT_QPOS_TARGET_PATH,
+    build_rm65_qpos_init_plan,
+    load_qpos_target,
+    _require_plan_completed,
+)
 from .checks import ReplayPreflightReport, run_replay_preflight
 from .dataset import LoadedReplayEpisode
 from .hardware import ReplayHardwareConfig, ReplayHardwareRig, normalize_active_sides
@@ -95,6 +111,20 @@ class ReplayExecutionSettings:
     tcp_pos_tolerance_m: float = 1e-4
     tcp_rot_tolerance_rad: float = 1e-3
     max_qpos_init_delta_rad: float = float(np.pi)
+    qpos_init_dt_sec: float = 0.05
+    qpos_init_joint_velocity_profile: str = "rm65_init_slow"
+    qpos_init_max_steps_per_side: int = 10000
+    qpos_init_collision_check: bool = True
+    qpos_init_collision_scene_profile: str = DEFAULT_QPOS_INIT_COLLISION_SCENE
+    qpos_init_collision_slow_distance_m: float = DEFAULT_QPOS_INIT_COLLISION_SLOW_DISTANCE_M
+    qpos_init_collision_hold_distance_m: float = DEFAULT_QPOS_INIT_COLLISION_HOLD_DISTANCE_M
+    qpos_init_collision_stop_distance_m: float = DEFAULT_QPOS_INIT_COLLISION_STOP_DISTANCE_M
+    qpos_init_max_joint_abs_deg: float = DEFAULT_QPOS_INIT_MAX_JOINT_ABS_DEG
+    qpos_init_joint_slow_margin_deg: float = DEFAULT_QPOS_INIT_JOINT_SLOW_MARGIN_DEG
+    qpos_init_joint_hold_margin_deg: float = DEFAULT_QPOS_INIT_JOINT_HOLD_MARGIN_DEG
+    qpos_init_single_arm_max_qpos_delta_deg: float = DEFAULT_SINGLE_ARM_MAX_QPOS_DELTA_DEG
+    qpos_init_branch_search: bool = DEFAULT_QPOS_INIT_BRANCH_SEARCH
+    qpos_init_branch_search_max_branches: int = DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any], current: "ReplayExecutionSettings") -> "ReplayExecutionSettings":
@@ -130,6 +160,76 @@ class ReplayExecutionSettings:
                 or payload.get("maxQposInitDeltaRad")
                 or current.max_qpos_init_delta_rad
             ),
+            qpos_init_dt_sec=float(
+                payload.get("qpos_init_dt_sec")
+                or payload.get("qposInitDtSec")
+                or current.qpos_init_dt_sec
+            ),
+            qpos_init_joint_velocity_profile=str(
+                payload.get("qpos_init_joint_velocity_profile")
+                or payload.get("qposInitJointVelocityProfile")
+                or current.qpos_init_joint_velocity_profile
+            ),
+            qpos_init_max_steps_per_side=int(
+                payload.get("qpos_init_max_steps_per_side")
+                or payload.get("qposInitMaxStepsPerSide")
+                or current.qpos_init_max_steps_per_side
+            ),
+            qpos_init_collision_check=bool(
+                payload.get("qpos_init_collision_check")
+                if "qpos_init_collision_check" in payload
+                else payload.get("qposInitCollisionCheck", current.qpos_init_collision_check)
+            ),
+            qpos_init_collision_scene_profile=str(
+                payload.get("qpos_init_collision_scene_profile")
+                or payload.get("qposInitCollisionSceneProfile")
+                or current.qpos_init_collision_scene_profile
+            ),
+            qpos_init_collision_slow_distance_m=float(
+                payload.get("qpos_init_collision_slow_distance_m")
+                or payload.get("qposInitCollisionSlowDistanceM")
+                or current.qpos_init_collision_slow_distance_m
+            ),
+            qpos_init_collision_hold_distance_m=float(
+                payload.get("qpos_init_collision_hold_distance_m")
+                or payload.get("qposInitCollisionHoldDistanceM")
+                or current.qpos_init_collision_hold_distance_m
+            ),
+            qpos_init_collision_stop_distance_m=float(
+                payload.get("qpos_init_collision_stop_distance_m")
+                or payload.get("qposInitCollisionStopDistanceM")
+                or current.qpos_init_collision_stop_distance_m
+            ),
+            qpos_init_max_joint_abs_deg=float(
+                payload.get("qpos_init_max_joint_abs_deg")
+                or payload.get("qposInitMaxJointAbsDeg")
+                or current.qpos_init_max_joint_abs_deg
+            ),
+            qpos_init_joint_slow_margin_deg=float(
+                payload.get("qpos_init_joint_slow_margin_deg")
+                or payload.get("qposInitJointSlowMarginDeg")
+                or current.qpos_init_joint_slow_margin_deg
+            ),
+            qpos_init_joint_hold_margin_deg=float(
+                payload.get("qpos_init_joint_hold_margin_deg")
+                or payload.get("qposInitJointHoldMarginDeg")
+                or current.qpos_init_joint_hold_margin_deg
+            ),
+            qpos_init_single_arm_max_qpos_delta_deg=float(
+                payload.get("qpos_init_single_arm_max_qpos_delta_deg")
+                or payload.get("qposInitSingleArmMaxQposDeltaDeg")
+                or current.qpos_init_single_arm_max_qpos_delta_deg
+            ),
+            qpos_init_branch_search=bool(
+                payload.get("qpos_init_branch_search")
+                if "qpos_init_branch_search" in payload
+                else payload.get("qposInitBranchSearch", current.qpos_init_branch_search)
+            ),
+            qpos_init_branch_search_max_branches=int(
+                payload.get("qpos_init_branch_search_max_branches")
+                or payload.get("qposInitBranchSearchMaxBranches")
+                or current.qpos_init_branch_search_max_branches
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,6 +241,20 @@ class ReplayExecutionSettings:
             "tcp_pos_tolerance_m": float(self.tcp_pos_tolerance_m),
             "tcp_rot_tolerance_rad": float(self.tcp_rot_tolerance_rad),
             "max_qpos_init_delta_rad": float(self.max_qpos_init_delta_rad),
+            "qpos_init_dt_sec": float(self.qpos_init_dt_sec),
+            "qpos_init_joint_velocity_profile": str(self.qpos_init_joint_velocity_profile),
+            "qpos_init_max_steps_per_side": int(self.qpos_init_max_steps_per_side),
+            "qpos_init_collision_check": bool(self.qpos_init_collision_check),
+            "qpos_init_collision_scene_profile": str(self.qpos_init_collision_scene_profile),
+            "qpos_init_collision_slow_distance_m": float(self.qpos_init_collision_slow_distance_m),
+            "qpos_init_collision_hold_distance_m": float(self.qpos_init_collision_hold_distance_m),
+            "qpos_init_collision_stop_distance_m": float(self.qpos_init_collision_stop_distance_m),
+            "qpos_init_max_joint_abs_deg": float(self.qpos_init_max_joint_abs_deg),
+            "qpos_init_joint_slow_margin_deg": float(self.qpos_init_joint_slow_margin_deg),
+            "qpos_init_joint_hold_margin_deg": float(self.qpos_init_joint_hold_margin_deg),
+            "qpos_init_single_arm_max_qpos_delta_deg": float(self.qpos_init_single_arm_max_qpos_delta_deg),
+            "qpos_init_branch_search": bool(self.qpos_init_branch_search),
+            "qpos_init_branch_search_max_branches": int(self.qpos_init_branch_search_max_branches),
         }
 
 
@@ -163,6 +277,9 @@ class ReplayExecutionController:
         self._last_message = ""
         self._started_at: float | None = None
         self._finished_at: float | None = None
+        self._qpos_init_plan_summary: dict[str, Any] | None = None
+        self._qpos_init_step_index = 0
+        self._qpos_init_step_count = 0
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
 
@@ -192,6 +309,7 @@ class ReplayExecutionController:
             self._group = None
             self._preflight_report = None
             self._frame_index = 0
+            self._clear_qpos_init_status_locked()
             self._last_error = ""
             self._last_message = "hardware replay configured"
             self._state = "configured"
@@ -213,15 +331,7 @@ class ReplayExecutionController:
     def set_send_actions(self, enabled: bool) -> dict[str, Any]:
         with self._lock:
             self._ensure_idle_locked(allow_ready=True)
-            self._settings = ReplayExecutionSettings(
-                send_actions_enabled=bool(enabled),
-                action_column=self._settings.action_column,
-                qpos_reached_tolerance_rad=self._settings.qpos_reached_tolerance_rad,
-                move_to_start_timeout_s=self._settings.move_to_start_timeout_s,
-                tcp_pos_tolerance_m=self._settings.tcp_pos_tolerance_m,
-                tcp_rot_tolerance_rad=self._settings.tcp_rot_tolerance_rad,
-                max_qpos_init_delta_rad=self._settings.max_qpos_init_delta_rad,
-            )
+            self._settings = replace(self._settings, send_actions_enabled=bool(enabled))
             self._last_message = f"arm output {'enabled' if enabled else 'disabled'}"
             return self.status()
 
@@ -231,6 +341,7 @@ class ReplayExecutionController:
             self._group = None
             self._preflight_report = None
             self._frame_index = 0
+            self._clear_qpos_init_status_locked()
             self._last_error = ""
             self._last_message = "preflight cleared"
             if self._rig is not None and self._rig.connected:
@@ -283,6 +394,7 @@ class ReplayExecutionController:
             self._group = group
             self._preflight_report = report
             self._frame_index = 0
+            self._clear_qpos_init_status_locked()
             self._last_message = "preflight ok" if report.ok else "preflight failed"
             self._last_error = "" if report.ok else "preflight failed"
             self._state = "preflight_ok" if report.ok else "preflight_failed"
@@ -298,6 +410,7 @@ class ReplayExecutionController:
             self._stop_event.clear()
             self._state = "moving_to_start"
             self._frame_index = 0
+            self._clear_qpos_init_status_locked()
             self._last_error = ""
             self._started_at = time.time()
             self._finished_at = None
@@ -340,14 +453,25 @@ class ReplayExecutionController:
         with self._lock:
             self._stop_event.set()
             worker = self._worker
-            if self._state in {"moving_to_start", "replaying", "connecting"}:
+            if self._state in {"moving_to_start", "start_ready", "replaying", "connecting"}:
                 self._state = "aborted"
                 self._last_message = "hardware replay aborted"
             rig = self._rig
+        hold_error = ""
         if rig is not None:
-            rig.restore_replay_speed()
+            try:
+                rig.hold_motion("hardware replay abort")
+            except Exception as exc:  # noqa: BLE001
+                hold_error = str(exc)
+            finally:
+                rig.restore_replay_speed()
         if wait and worker is not None and worker.is_alive():
             worker.join(timeout=2.0)
+        if hold_error:
+            with self._lock:
+                self._state = "fault"
+                self._last_error = hold_error
+                self._last_message = "hardware replay abort hold failed"
         return self.status()
 
     def status(self) -> dict[str, Any]:
@@ -376,6 +500,11 @@ class ReplayExecutionController:
                 "preflight": None
                 if self._preflight_report is None
                 else self._preflight_report.to_dict(),
+                "qpos_init": {
+                    "plan_summary": self._qpos_init_plan_summary,
+                    "step_index": int(self._qpos_init_step_index),
+                    "step_count": int(self._qpos_init_step_count),
+                },
                 "last_error": self._last_error,
                 "last_message": self._last_message,
                 "started_at": self._started_at,
@@ -391,9 +520,36 @@ class ReplayExecutionController:
     ) -> None:
         del group
         deadline = time.monotonic() + float(self._settings.move_to_start_timeout_s)
-        period = 1.0 / float(self._hardware_config.arm_control_hz)
+        period = float(self._settings.qpos_init_dt_sec)
         try:
             rig.begin_replay_speed()
+            plan = self._build_qpos_init_plan(rig, target_qpos)
+            steps = tuple(getattr(plan, "steps", ()))
+            summary = plan.summary() if hasattr(plan, "summary") else {"type": type(plan).__name__}
+            with self._lock:
+                self._qpos_init_plan_summary = _serializable(summary)
+                self._qpos_init_step_count = len(steps)
+                self._qpos_init_step_index = 0
+                self._last_message = f"qpos init plan ready steps={len(steps)}"
+            next_time = time.monotonic()
+            for step in steps:
+                if self._stop_event.is_set():
+                    with self._lock:
+                        self._state = "aborted"
+                        self._finished_at = time.time()
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out while moving to replay start qpos; "
+                        "verify robot state and replay_arm_max_angvel."
+                    )
+                rig.send_joint_targets(step.qpos_by_side, source="replay_qpos_init")
+                with self._lock:
+                    self._qpos_init_step_index = int(getattr(step, "index", self._qpos_init_step_index + 1))
+                next_time += max(0.001, period)
+                sleep_s = next_time - time.monotonic()
+                if sleep_s > 0.0:
+                    time.sleep(sleep_s)
             while not self._stop_event.is_set():
                 if rig.qpos_reached(
                     target_qpos,
@@ -406,15 +562,18 @@ class ReplayExecutionController:
                     return
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        "Timed out while moving to replay start qpos; "
-                        "verify robot state and replay_arm_max_angvel."
+                        "Timed out while waiting for replay start qpos after qpos init plan."
                     )
-                rig.send_joint_targets(target_qpos, source="replay_move_to_start")
-                time.sleep(max(0.001, period))
+                rig.send_joint_targets(target_qpos, source="replay_qpos_init_final_hold")
+                time.sleep(max(0.001, min(period, 0.05)))
             with self._lock:
                 self._state = "aborted"
                 self._finished_at = time.time()
         except Exception as exc:  # noqa: BLE001
+            try:
+                rig.hold_motion("hardware replay move_to_start fault")
+            except Exception as hold_exc:  # noqa: BLE001
+                exc = RuntimeError(f"{exc}; hold failed: {hold_exc}")
             with self._lock:
                 self._state = "fault"
                 self._last_error = str(exc)
@@ -433,12 +592,10 @@ class ReplayExecutionController:
                         self._state = "aborted"
                         self._finished_at = time.time()
                     return
-                action = group.actions[index]
-                action_by_side = {
-                    side: action[ACTION_ARM_POSE_SLICES[side]].astype(np.float32, copy=True)
-                    for side in self._hardware_config.active_sides
-                }
-                rig.send_action_poses(action_by_side, source="replay_trajectory")
+                rig.send_joint_targets(
+                    self._qpos_targets_at_index(group, index),
+                    source="replay_trajectory",
+                )
                 with self._lock:
                     self._frame_index = int(index)
                 next_time += period
@@ -451,6 +608,10 @@ class ReplayExecutionController:
                 self._finished_at = time.time()
                 self._last_message = "hardware replay finished"
         except Exception as exc:  # noqa: BLE001
+            try:
+                rig.hold_motion("hardware replay fault")
+            except Exception as hold_exc:  # noqa: BLE001
+                exc = RuntimeError(f"{exc}; hold failed: {hold_exc}")
             with self._lock:
                 self._state = "fault"
                 self._last_error = str(exc)
@@ -487,15 +648,69 @@ class ReplayExecutionController:
         if not self._settings.send_actions_enabled:
             raise RuntimeError("Arm output is disabled. Enable send_actions before robot motion.")
 
+    def _clear_qpos_init_status_locked(self) -> None:
+        self._qpos_init_plan_summary = None
+        self._qpos_init_step_index = 0
+        self._qpos_init_step_count = 0
+
+    def _default_branch_neutral_qpos(self) -> dict[str, np.ndarray] | None:
+        sides = tuple(self._hardware_config.active_sides)
+        if sides != ("left", "right") or not bool(self._settings.qpos_init_branch_search):
+            return None
+        target = load_qpos_target(DEFAULT_QPOS_TARGET_PATH).qpos_by_side()
+        return {side: np.asarray(target[side], dtype=float).reshape(ARM_JOINT_DOF) for side in sides}
+
+    def _build_qpos_init_plan(
+        self,
+        rig: ReplayHardwareRig,
+        target_qpos: Mapping[str, np.ndarray],
+    ) -> Any:
+        current_raw = rig.current_qpos_by_side()
+        current: dict[str, np.ndarray] = {}
+        for side in self._hardware_config.active_sides:
+            qpos = current_raw.get(side)
+            if qpos is None:
+                raise RuntimeError(f"{side} current hardware qpos is unavailable for qpos init.")
+            current[side] = np.asarray(qpos, dtype=float).reshape(ARM_JOINT_DOF)
+        plan = build_rm65_qpos_init_plan(
+            start_qpos_by_side=current,
+            target_qpos_by_side=target_qpos,
+            active_sides=self._hardware_config.active_sides,
+            qpos_dt_sec=float(self._settings.qpos_init_dt_sec),
+            joint_velocity_profile=str(self._settings.qpos_init_joint_velocity_profile),
+            max_steps_per_side=int(self._settings.qpos_init_max_steps_per_side),
+            collision_check=bool(self._settings.qpos_init_collision_check),
+            collision_scene_profile=str(self._settings.qpos_init_collision_scene_profile),
+            collision_slow_distance_m=float(self._settings.qpos_init_collision_slow_distance_m),
+            collision_hold_distance_m=float(self._settings.qpos_init_collision_hold_distance_m),
+            collision_stop_distance_m=float(self._settings.qpos_init_collision_stop_distance_m),
+            max_joint_abs_deg=float(self._settings.qpos_init_max_joint_abs_deg),
+            joint_slow_margin_deg=float(self._settings.qpos_init_joint_slow_margin_deg),
+            joint_hold_margin_deg=float(self._settings.qpos_init_joint_hold_margin_deg),
+            single_arm_max_qpos_delta_deg=float(self._settings.qpos_init_single_arm_max_qpos_delta_deg),
+            branch_search=bool(self._settings.qpos_init_branch_search),
+            branch_search_max_branches=int(self._settings.qpos_init_branch_search_max_branches),
+            branch_neutral_qpos_by_side=self._default_branch_neutral_qpos(),
+        )
+        _require_plan_completed(plan)
+        return plan
+
     def _first_qpos_targets_locked(self) -> dict[str, np.ndarray]:
         group = self._require_checked_group_locked()
+        return self._qpos_targets_at_index(group, 0)
+
+    def _qpos_targets_at_index(
+        self,
+        group: ReplayTrajectoryGroup,
+        index: int,
+    ) -> dict[str, np.ndarray]:
         targets: dict[str, np.ndarray] = {}
         for side in self._hardware_config.active_sides:
             values = group.arm_joint_targets.get(side)
-            if values is None or np.asarray(values).shape[0] <= 0:
+            if values is None or np.asarray(values).shape[0] <= int(index):
                 raise RuntimeError(f"{side} replay is missing arm joint targets.")
-            target = np.asarray(values[0], dtype=float).reshape(-1)
+            target = np.asarray(values[int(index)], dtype=float).reshape(-1)
             if target.shape != (ARM_JOINT_DOF,) or not np.all(np.isfinite(target)):
-                raise RuntimeError(f"{side} first replay qpos target is invalid.")
+                raise RuntimeError(f"{side} replay qpos target at frame {int(index)} is invalid.")
             targets[side] = target.astype(float, copy=True)
         return targets

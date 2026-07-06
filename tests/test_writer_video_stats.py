@@ -17,7 +17,12 @@ from teleop_runtime.collection.writer_v21 import (
 )
 
 
-def _camera_sample() -> CollectorSample:
+def _camera_sample(
+    *,
+    index: int = 0,
+    episode_index: int = 0,
+    frame_index: int = 0,
+) -> CollectorSample:
     frame = VideoFrame(
         image=np.zeros((2, 2, 3), dtype=np.uint8),
         source_timestamp=1.0,
@@ -26,9 +31,9 @@ def _camera_sample() -> CollectorSample:
         metadata={"color_space": "rgb"},
     )
     return CollectorSample(
-        index=0,
-        episode_index=0,
-        frame_index=0,
+        index=int(index),
+        episode_index=int(episode_index),
+        frame_index=int(frame_index),
         timestamp=1.0,
         session_state="running",
         control_hz=30.0,
@@ -49,6 +54,34 @@ def _camera_sample() -> CollectorSample:
 
 
 class WriterVideoStatsTest(unittest.TestCase):
+    def test_finalize_rewrites_dataset_global_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_parquet=True,
+                    write_video=False,
+                )
+            )
+            writer.start_episode(episode_index=0)
+            sample0 = _camera_sample(index=100, episode_index=0, frame_index=0)
+            row_job0 = next(job for job in writer.plan_sample_jobs(sample0) if job.kind == ROW_JOB_KIND)
+            writer.handle_job(row_job0)
+            writer.finalize_episode(0)
+
+            writer.start_episode(episode_index=1)
+            sample1 = _camera_sample(index=0, episode_index=1, frame_index=0)
+            row_job1 = next(job for job in writer.plan_sample_jobs(sample1) if job.kind == ROW_JOB_KIND)
+            writer.handle_job(row_job1)
+            writer.finalize_episode(1)
+
+            pq = __import__("pyarrow.parquet", fromlist=["read_table"])
+            row0 = pq.read_table(Path(tmpdir) / "data/chunk-000/episode_000000.parquet").to_pylist()[0]
+            row1 = pq.read_table(Path(tmpdir) / "data/chunk-000/episode_000001.parquet").to_pylist()[0]
+            self.assertEqual(row0["index"], 0)
+            self.assertEqual(row1["index"], 1)
+            self.assertEqual(writer.next_sample_index, 2)
+
     def test_finalize_summary_records_video_dropped_and_missing_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(
@@ -83,6 +116,54 @@ class WriterVideoStatsTest(unittest.TestCase):
             self.assertEqual(stats["written"], 0)
             self.assertEqual(stats["dropped"], 1)
             self.assertEqual(stats["missing"], 1)
+            quality = record["summary"]["trajectory_quality"]
+            self.assertFalse(quality["force_collision_detected"])
+            self.assertEqual(quality["force_collision_label"], "clean")
+
+    def test_finalize_records_trajectory_force_collision_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_parquet=False,
+                    write_video=False,
+                )
+            )
+            sample = _camera_sample()
+            sample.metadata.update(
+                {
+                    "pose_quality": {
+                        "available": True,
+                        "status": "warning",
+                        "score": 0.7,
+                        "bad": False,
+                    },
+                }
+            )
+            sample.arm_states["left"] = {
+                "actual_hardware_result_text": (
+                    "RuntimeError: left: force 55.0000N > hard_stop_force_n"
+                )
+            }
+            writer.start_episode(episode_index=0)
+            row_job = next(job for job in writer.plan_sample_jobs(sample) if job.kind == ROW_JOB_KIND)
+            writer.handle_job(row_job)
+
+            writer.finalize_episode(0)
+
+            episodes_path = Path(tmpdir) / "meta" / "episodes.jsonl"
+            record = json.loads(episodes_path.read_text(encoding="utf-8").splitlines()[0])
+            quality = record["summary"]["trajectory_quality"]
+            self.assertTrue(quality["force_collision_detected"])
+            self.assertEqual(quality["force_collision_label"], "detected_collision")
+            self.assertNotIn("force_limit_exceeded_count", quality)
+            self.assertNotIn("max_force_norm_n", quality)
+
+            stats_path = Path(tmpdir) / "meta" / "episodes_stats.jsonl"
+            stats = json.loads(stats_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertTrue(stats["force_collision_detected"])
+            self.assertEqual(stats["force_collision_label"], "detected_collision")
+            self.assertEqual(stats["pose_quality_warning_count"], 1)
 
 
 if __name__ == "__main__":

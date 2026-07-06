@@ -1,5 +1,0 @@
-name: vanilla-tactile
-input_adapter: vanilla_tactile
-loss_weights:
-  action: 1.0
-  med: 0.0

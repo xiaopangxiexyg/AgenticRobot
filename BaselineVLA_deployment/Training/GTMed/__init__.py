@@ -1,1 +1,0 @@
-"""GTMed experiment entrypoint."""

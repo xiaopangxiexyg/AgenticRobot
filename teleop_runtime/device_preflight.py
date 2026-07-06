@@ -11,6 +11,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from serial.tools import list_ports
 
+from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+
 from .sources.camera import load_realsense_camera_config_map
 
 
@@ -25,7 +27,7 @@ class DevicePreflightError(RuntimeError):
 @dataclass
 class DevicePreflightOptions:
     active_sides: tuple[str, ...] = ("left", "right")
-    camera_config: str | Path = "teleop_runtime/configs/devices/realsense.json"
+    camera_config: str | Path = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
     require_camera: bool = True
     require_q6: bool = True
     require_dmtac_gripper: bool = True
@@ -1260,7 +1262,7 @@ def prepare_device_permissions(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare DexTeleop USB permissions and optional device assignments.")
     parser.add_argument("--active-sides", default="both", choices=("left", "right", "both"))
-    parser.add_argument("--camera-config", default="teleop_runtime/configs/devices/realsense.json")
+    parser.add_argument("--camera-config", default=str(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH))
     parser.add_argument(
         "--check-devices",
         action="store_true",

@@ -263,7 +263,7 @@ python -m teleop_runtime.collection \
   --right-arm-ip 192.168.1.20 \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense.json \
   --replay-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard \
   --replay-group a:0-8 \
   --replay-group d:9-17 \
@@ -281,7 +281,7 @@ python -m teleop_runtime.collection \
   --active-sides both \
   --right-arm-ip 192.168.1.20 \
   --right-hand-ip 192.168.11.210 \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense.json \
   --replay-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard \
   --replay-group a:0-8 \
   --replay-group d:9-17 \
@@ -358,7 +358,7 @@ python -m teleop_runtime.collection \
   --active-sides right \
   --right-arm-ip 192.168.1.20 \
   --right-hand-ip 192.168.11.210 \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense.json \
   --replay-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_arm_dual_data_soft_hard \
   --replay-init-dataset /home/ai/Desktop/DexTeleop/datasets/2026-05-06_right_fixed_flip_hand \
   --replay-init-episode 0:0:end \
@@ -523,7 +523,7 @@ collector 不为旧 state/action 维度做额外兼容语义。
 - `--no-camera`
   完全禁用相机链路。
 - `--camera-config`
-  RealSense 配置 JSON，默认读取 `teleop_runtime/configs/devices/realsense.json`。
+  RealSense 配置 JSON，默认读取 `cameras/configs/rm65/devices/realsense.json`。
 - `--vis_cam`
   采集时弹出 RealSense RGB 预览窗口；默认预览 `front`，没有 `front` 时预览配置里的第一路。如果当前 OpenCV/显示环境不可用，会在终端打印原因并继续采集。
 - `--vis-cam-key`
@@ -542,6 +542,9 @@ collector 不为旧 state/action 维度做额外兼容语义。
   `observation.hand.<side>.tactile` 作为向量写入 parquet。
 - `--external-tactile`
   `--tactile-storage external` 的快捷写法。
+- `--tactile-compression zstd|lz4|none`
+  外置触觉 stream 的无损压缩方式。默认 `lz4`，在 writer 后台线程按 chunk 压缩；
+  `none` 写旧式裸 `.bin`，用于兼容旧工具或做低层调试。
 - `--calibration-timeout`
   runtime home capture 超时时间。
 - `--calibration-samples`
@@ -578,8 +581,8 @@ dataset_root/
       chunk-000/
         episode_000000/
           manifest.json
-          L_IN.float32.bin
-          L_OUT.float32.bin
+          L_IN.float32.bin.lz4
+          L_OUT.float32.bin.lz4
 ```
 
 说明：
@@ -593,7 +596,9 @@ dataset_root/
 - `videos/observation.images.<camera_key>/...` 是每路 RGB 的 mp4。
 - `tactile/observation.hand.<side>.tactile/...` 只在 `--tactile-storage external`
   且该侧有触觉帧时写出。`manifest.json` 记录 sensor key、shape、dtype、frame
-  对齐关系；`.float32.bin` 是按 frame 顺序追加的原始 float32 数组。
+  对齐关系。默认压缩时每个 stream spec 还包含 `encoding=chunked_lz4`、`compression`
+  和 `chunks` 索引；`--tactile-compression none` 时 `.float32.bin`/`.uint8.bin`
+  是按 frame 顺序追加的原始数组。
 
 ## 10. SAPIEN 数据集回放
 
@@ -744,7 +749,7 @@ collector 启动后会打印按键输入来源：
   已支持 async row/video/finalize job、episode parquet、meta 文件、dataset 续写，以及 active episode discard
 - [realsense_rgb.py](../sources/camera/realsense_rgb.py)
   已支持 RealSense RGB 后台采集与 nearest-frame buffer
-- [realsense.json](../configs/devices/realsense.json)
+- [realsense.json](../../cameras/configs/rm65/devices/realsense.json)
   已提供默认单相机配置
 - [replay_dataset_sapien.py](replay_dataset_sapien.py)
   已支持读取 LeRobot 风格采集 dataset，并用 SAPIEN 复刻双臂双手动作，同时打印触觉总和
@@ -916,7 +921,7 @@ python -m teleop_runtime.collection \
   --right-hand-port /dev/ttyUSB1 \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
-  --camera-config teleop_runtime/configs/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense.json \
   --vis_cam \
   --vis-cam-key front \
   --max-steps 30

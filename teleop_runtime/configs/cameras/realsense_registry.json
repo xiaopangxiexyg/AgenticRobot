@@ -55,6 +55,11 @@
                 "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf",
                 "frame": "head_camera_frame",
                 "parent_frame": "right_arm_base_link"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf",
+                "frame": "head_camera_frame",
+                "parent_frame": "right_arm_base_link"
               }
             ]
           }
@@ -86,6 +91,16 @@
               {
                 "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf",
                 "frame": "left_camera_rgb"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
               }
             ]
           },
@@ -129,6 +144,16 @@
               {
                 "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf",
                 "frame": "right_camera_rgb"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
               }
             ]
           },

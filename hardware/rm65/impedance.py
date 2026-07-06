@@ -271,8 +271,13 @@ class RM65ImpedanceConfig:
     ik_seed_expansion_json: str | None = None
     direct_joint_hint_max_linear_offset_m: float = 1e-3
     direct_joint_hint_max_angular_offset_rad: float = 2e-3
+    direct_joint_hint_force_guard_enabled: bool = True
+    direct_joint_hint_force_guard_force_n: float = 20.0
+    direct_joint_hint_force_guard_torque_nm: float = 5.0
+    direct_joint_hint_force_guard_reset_admittance: bool = True
     hold_last_safe_on_ik_failure: bool = False
     debug_arm_endpoint_tcp: bool = False
+    debug_timing: bool = False
     debug_tool_frame_name: str = ""
     tare_sec: float = 1.0
     state_read_every: int = 1
@@ -363,6 +368,10 @@ class RM65ImpedanceConfig:
             raise ValueError("direct_joint_hint_max_linear_offset_m must be non-negative")
         if self.direct_joint_hint_max_angular_offset_rad < 0.0:
             raise ValueError("direct_joint_hint_max_angular_offset_rad must be non-negative")
+        if self.direct_joint_hint_force_guard_force_n < 0.0:
+            raise ValueError("direct_joint_hint_force_guard_force_n must be non-negative")
+        if self.direct_joint_hint_force_guard_torque_nm < 0.0:
+            raise ValueError("direct_joint_hint_force_guard_torque_nm must be non-negative")
         if self.tcp_pose_flange_m_rad is not None:
             self.tcp_pose_flange_m_rad = finite_list(
                 self.tcp_pose_flange_m_rad,
@@ -2091,6 +2100,51 @@ class RM65BaseImpedanceController:
         self._last_step_time = time.perf_counter()
         self._started = True
 
+    def reset_motion_state(self, joint_rad: Iterable[float] | None = None) -> None:
+        if joint_rad is None:
+            if self.robot is None:
+                return
+            state = _read_state(self.robot, self.side)
+            state["pose"] = normalize_pose(state["pose"])
+        else:
+            if self.robot is None:
+                raise RuntimeError(f"{self.side}: cannot reset motion state without an RM65 robot")
+            joint_values = finite_list(joint_rad, expected_len=6, label="joint_rad")
+            joint_deg = [float(math.degrees(value)) for value in joint_values]
+            state = {
+                "joint_deg": joint_deg,
+                "pose": self._forward_pose(joint_deg),
+            }
+
+        self._state = {
+            "joint_deg": list(state["joint_deg"]),
+            "pose": normalize_pose(state["pose"]),
+        }
+        initial_reference = self._initial_reference(self._state)
+        self._reference = _ReferenceInterpolator(
+            initial_reference,
+            kind=self.reference_kind,
+            action_hz=self.config.action_hz,
+        )
+        self._joint_hint_reference = _ReferenceInterpolator(
+            list(self._state["joint_deg"]),
+            kind="joint",
+            action_hz=self.config.action_hz,
+        )
+        self._previous_command_joint = list(self._state["joint_deg"])
+        self._previous_command_pose = list(self._state["pose"])
+        self._ik_seed = list(self._state["joint_deg"])
+        self._model_fk_pose = self._forward_pose(self._state["joint_deg"])
+        self._admittance = self.config.make_admittance()
+        if self._joint_rate_limiter is not None:
+            self._joint_rate_limiter.reset(
+                _joint_deg_to_rad(self._previous_command_joint, label="previous_command_joint")
+            )
+        self._latest_wrench_context = None
+        self._last_step_time = time.perf_counter()
+        self._current_step_dt = None
+        self._step_index = 0
+
     def set_target(self, target: Iterable[float], *, duration_sec: float | None = None) -> None:
         self.start()
         assert self._reference is not None
@@ -2109,6 +2163,40 @@ class RM65BaseImpedanceController:
         assert self._admittance is not None
         assert self._reference is not None
         assert self._previous_command_joint is not None
+        timing_enabled = bool(self.config.debug_timing)
+        timing_started_at = time.perf_counter()
+        timing_last_at = timing_started_at
+        timing_phases: list[dict[str, object]] = []
+
+        def mark_timing(name: str) -> None:
+            nonlocal timing_last_at
+            if not timing_enabled:
+                return
+            now_timing = time.perf_counter()
+            timing_phases.append(
+                {
+                    "name": name,
+                    "dt_ms": (now_timing - timing_last_at) * 1000.0,
+                    "elapsed_ms": (now_timing - timing_started_at) * 1000.0,
+                }
+            )
+            timing_last_at = now_timing
+
+        def timing_payload(*, state_read_performed: bool) -> dict[str, object] | None:
+            if not timing_enabled:
+                return None
+            now_timing = time.perf_counter()
+            return {
+                "enabled": True,
+                "side": self.side,
+                "step": int(self._step_index),
+                "total_ms": (now_timing - timing_started_at) * 1000.0,
+                "dt_sec": float(self._current_step_dt),
+                "state_read_performed": bool(state_read_performed),
+                "pose_command_transport": self.config.pose_command_transport,
+                "phases": timing_phases,
+            }
+
         now = time.perf_counter()
         dt = now - self._last_step_time if self._last_step_time is not None else 1.0 / self.config.control_hz
         self._last_step_time = now
@@ -2124,8 +2212,10 @@ class RM65BaseImpedanceController:
             if not has_preferred_joint or self._joint_hint_reference is None
             else self._joint_hint_reference.advance(dt)
         )
+        mark_timing("reference")
 
         readings = _read_force(self.robot, self.side)
+        mark_timing("read_force")
         processed = self._processor.process(readings[self.config.force_source])
         raw_deadbanded = list(processed["deadbanded"])
         admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, self.side)
@@ -2138,11 +2228,13 @@ class RM65BaseImpedanceController:
             "offset": list(update["offset"]),
             "preferred_joint_deg": [] if preferred_joint is None else list(preferred_joint),
         }
+        mark_timing("process_force_admittance")
         command_pose, command_joint = self._command_from_reference(
             reference,
             update["offset"],
             preferred_joint=preferred_joint,
         )
+        mark_timing("command_from_reference")
 
         command_step = _joint_delta_deg(self._previous_command_joint, command_joint)
         allowed_command_step = self._max_allowed_command_joint_step_deg()
@@ -2160,6 +2252,7 @@ class RM65BaseImpedanceController:
             raise RuntimeError(f"{self.side}: force {force_norm:.4f}N > hard_stop_force_n")
         if torque_norm > self.config.hard_stop_torque_nm:
             raise RuntimeError(f"{self.side}: torque {torque_norm:.4f}Nm > hard_stop_torque_nm")
+        mark_timing("safety_checks")
 
         try:
             self._send(command_pose, command_joint)
@@ -2174,8 +2267,10 @@ class RM65BaseImpedanceController:
                     allowed_command_step=allowed_command_step,
                 )
             ) from exc
+        mark_timing("send")
         self._step_index += 1
-        if self._step_index % self.config.state_read_every == 0:
+        state_read_performed = self._step_index % self.config.state_read_every == 0
+        if state_read_performed:
             try:
                 self._state = _read_state(self.robot, self.side)
             except Exception as exc:
@@ -2189,6 +2284,9 @@ class RM65BaseImpedanceController:
                         allowed_command_step=allowed_command_step,
                     )
                 ) from exc
+            mark_timing("state_read_after_send")
+        else:
+            mark_timing("state_read_skipped")
         self._previous_command_joint = list(command_joint)
         self._previous_command_pose = list(command_pose)
         pose_delta = _pose_delta(command_pose, self._state["pose"]) if self._state else (math.nan, math.nan)
@@ -2221,7 +2319,8 @@ class RM65BaseImpedanceController:
         ik_metadata.setdefault("ik_resolver_init", dict(self._ik_resolver_init_metadata))
         self._latest_wrench_context["ik_metadata"] = ik_metadata
         ik_timing = dict(self._latest_wrench_context.get("ik_timing", {}))
-        return {
+        mark_timing("metadata")
+        record = {
             "step": self._step_index,
             "dt_sec": dt,
             "reference": reference,
@@ -2305,6 +2404,10 @@ class RM65BaseImpedanceController:
             "pose_tracking_linear_m": pose_delta[0],
             "pose_tracking_angular_rad": pose_delta[1],
         }
+        controller_timing = timing_payload(state_read_performed=state_read_performed)
+        if controller_timing is not None:
+            record["rm65_controller_timing"] = controller_timing
+        return record
 
     def _print_progress(self, record: dict[str, object]) -> None:
         active = finite_list(record["active_wrench"], expected_len=6, label="active_wrench")
@@ -2394,6 +2497,44 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 ),
             )
 
+    def _direct_joint_hint_force_guard_state(self) -> tuple[bool, dict[str, object]]:
+        enabled = bool(
+            self.config.direct_joint_hint_force_guard_enabled
+            and self.config.pose_command_transport == "joint"
+        )
+        metadata: dict[str, object] = {
+            "enabled": enabled,
+            "active": False,
+            "force_threshold_n": float(self.config.direct_joint_hint_force_guard_force_n),
+            "torque_threshold_nm": float(self.config.direct_joint_hint_force_guard_torque_nm),
+            "force_norm_n": None,
+            "torque_norm_nm": None,
+        }
+        if not enabled:
+            return False, metadata
+        context = self._latest_wrench_context if isinstance(self._latest_wrench_context, dict) else {}
+        wrench = _coerce_float_list(context.get("tare_corrected"), expected_len=6)
+        if wrench is None:
+            metadata["reason"] = "wrench_unavailable"
+            return False, metadata
+        force_norm = norm(wrench[:3])
+        torque_norm = norm(wrench[3:])
+        force_threshold = float(self.config.direct_joint_hint_force_guard_force_n)
+        torque_threshold = float(self.config.direct_joint_hint_force_guard_torque_nm)
+        force_active = bool(force_threshold > 0.0 and force_norm >= force_threshold)
+        torque_active = bool(torque_threshold > 0.0 and torque_norm >= torque_threshold)
+        active = bool(force_active or torque_active)
+        metadata.update(
+            {
+                "active": active,
+                "force_norm_n": float(force_norm),
+                "torque_norm_nm": float(torque_norm),
+                "force_active": force_active,
+                "torque_active": torque_active,
+            }
+        )
+        return active, metadata
+
     def _command_from_reference(
         self,
         reference: list[float],
@@ -2410,20 +2551,33 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         offset_values = finite_list(offset, expected_len=6, label="pose_offset")
         linear_offset_m = norm(offset_values[:3])
         angular_offset_rad = norm(offset_values[3:])
+        force_guard_active, force_guard_metadata = self._direct_joint_hint_force_guard_state()
+        offset_within_direct_hint = bool(
+            linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
+            and angular_offset_rad <= float(self.config.direct_joint_hint_max_angular_offset_rad)
+        )
         direct_joint_hint = bool(
             preferred is not None
-            and linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
-            and angular_offset_rad <= float(self.config.direct_joint_hint_max_angular_offset_rad)
+            and (offset_within_direct_hint or force_guard_active)
         )
         if direct_joint_hint:
             command_pose = normalize_pose(reference)
             command_joint = list(preferred)
+            if (
+                force_guard_active
+                and bool(self.config.direct_joint_hint_force_guard_reset_admittance)
+                and self._admittance is not None
+            ):
+                self._admittance.reset()
             if self._latest_wrench_context is not None:
                 self._latest_wrench_context["ik_method"] = ["dual_arm_joint_hint"]
                 self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata({
                     "status": "pass",
                     "method": "dual_arm_joint_hint",
                     "source": "retargeter_solver_output_qpos",
+                    "direct_joint_hint_reason": (
+                        "force_guard" if force_guard_active and not offset_within_direct_hint else "offset_threshold"
+                    ),
                     "seed_joint_deg": list(preferred),
                     "direct_joint_hint_linear_offset_m": float(linear_offset_m),
                     "direct_joint_hint_angular_offset_rad": float(angular_offset_rad),
@@ -2435,6 +2589,11 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     ),
                     "direct_joint_hint_offset_ignored": bool(
                         linear_offset_m > 1e-9 or angular_offset_rad > 1e-9
+                    ),
+                    "direct_joint_hint_force_guard": dict(force_guard_metadata),
+                    "direct_joint_hint_force_guard_reset_admittance": bool(
+                        force_guard_active
+                        and self.config.direct_joint_hint_force_guard_reset_admittance
                     ),
                 }, source="retargeter_solver_output_qpos", elapsed_ms=0.0)
             try:

@@ -7,16 +7,17 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from cameras.configs import (
+    DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
+    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
+)
+
 from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
 from .registry import build_camera_registry_snapshot, load_camera_registry
 
 
-DEFAULT_CAMERA_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
-)
-DEFAULT_CAMERA_REGISTRY_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "cameras" / "realsense_registry.json"
-)
+DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+DEFAULT_CAMERA_REGISTRY_PATH = DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from robot_motion.joint_limits import JointVelocityLimitProfile
 from robot_motion.profiles import IKSafetyProfile
 from robot_motion.types import PoseTolerance
+import teleop_runtime.retargeters.dual_arm_collision_aware as dual_module
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
@@ -143,6 +146,18 @@ def _velocity() -> JointVelocityLimitProfile:
     )
 
 
+def _scene_profile() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="dual_arm_hand_proxy_open",
+        urdf_path="dual.urdf",
+        package_dirs=("assets",),
+        collision_pairs=(("left", "right"),),
+        left_frame_name="arm_link6",
+        right_frame_name="right_arm_link6",
+        solution_layout="dual_arm",
+    )
+
+
 def _retargeter(
     solver: _FakeDualArmSolver,
     *,
@@ -165,6 +180,59 @@ def _retargeter(
         ),
         ik_solver=solver,
     )
+
+
+def test_dual_arm_reset_target_pose_smoothing_clears_target_history() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    targets = retargeter.current_world_targets()
+    retargeter._last_target_poses = {
+        "left": targets["left"].copy(),
+        "right": targets["right"].copy(),
+    }
+
+    retargeter.reset_target_pose_smoothing()
+
+    assert retargeter._last_target_poses == {"left": None, "right": None}
+
+
+def test_dual_arm_collision_retargeter_defaults_to_robot_motion_builder(monkeypatch) -> None:
+    scene = _scene_profile()
+    solver = _FakeDualArmSolver()
+    calls: list[str] = []
+
+    def fake_robot_motion_builder(config):
+        calls.append(config.scene_profile)
+        return SimpleNamespace(solver=solver, scene_profile=scene)
+
+    monkeypatch.setattr(dual_module, "build_rm65_dual_arm_scene_profile", lambda _name: scene)
+    monkeypatch.setattr(dual_module, "build_rm65_dual_arm_collision_ik_solver", fake_robot_motion_builder)
+
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            scene_profile="dual_arm_hand_proxy_open",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        )
+    )
+
+    assert retargeter.config.ik_framework == "robot_motion"
+    assert retargeter.ik_solver is solver
+    assert retargeter.profile is scene
+    assert calls == ["dual_arm_hand_proxy_open"]
+
+
+def test_dual_arm_collision_retargeter_rejects_legacy_framework() -> None:
+    try:
+        DualArmCollisionAwareRetargeterConfig(
+            ik_framework="legacy",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        )
+    except ValueError as exc:
+        assert "Unsupported dual-arm IK framework" in str(exc)
+    else:
+        raise AssertionError("legacy IK framework should not be accepted")
 
 
 def test_dual_arm_candidate_layer_generates_joint_limit_escape_for_left_arm() -> None:
@@ -323,14 +391,43 @@ def test_dual_arm_activity_hold_reduces_unmoved_side_motion() -> None:
     )
 
     assert name == "original"
-    assert np.isclose(qpos[0], 0.025)
-    assert np.isclose(qpos[6], 0.025)
+    assert np.isclose(qpos[0], np.deg2rad(0.5))
+    assert np.isclose(qpos[6], 0.050)
     assert metadata["inactive_side_hold_active"] is True
     selected = metadata["selected_metadata"]
-    assert selected["step_scale"] == 0.5
+    assert selected["step_scale"] == 1.0
+    assert selected["inactive_side_hold_execution_cap"]["applied"] is True
+    assert selected["inactive_side_hold_execution_cap"]["sides"]["left"]["applied"] is True
     assert selected["inactive_side_hold"]["sides"]["left"]["hold_weight"] == 1.0
     assert selected["inactive_side_hold"]["sides"]["left"]["unexplained_position_m"] <= 0.025
-    assert metadata["last_rejections"][-1]["reject_reason"] == "inactive_side_unexplained_motion:left"
+
+
+def test_dual_arm_inactive_execution_step_cap_limits_stationary_side() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[6] = np.deg2rad(3.0)
+    target_activity = {
+        "enabled": True,
+        "right": {"inactive": True, "hold_weight": 1.0},
+        "left": {"inactive": False, "hold_weight": 0.0},
+    }
+    solver.set_configuration_q(reference)
+    retargeter.set_execution_dt_sec(1.0)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        target_activity=target_activity,
+    )
+
+    assert np.isclose(qpos[6], np.deg2rad(0.5))
+    assert metadata["step_limited"] is True
+    cap = metadata["inactive_side_hold_execution_cap"]
+    assert cap["applied"] is True
+    assert np.isclose(cap["sides"]["right"]["requested_max_abs_delta_deg"], 3.0)
+    assert np.isclose(cap["sides"]["right"]["capped_max_abs_delta_deg"], 0.5)
 
 
 def test_dual_arm_activity_hold_allows_unmoved_side_to_reduce_existing_error() -> None:

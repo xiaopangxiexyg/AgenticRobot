@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -39,6 +40,22 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
         "tcp_frame",
     }
 )
+
+_POSE_QUALITY_SCHEMA = "dexteleop_pose_quality_v1"
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def _nan_vector(length: int) -> np.ndarray:
@@ -230,6 +247,209 @@ def _compact_command_metadata(metadata: Mapping[str, Any] | None) -> dict[str, A
     }
 
 
+def _command_metadata_values(command: TeleopCommand | None, key: str) -> list[Any]:
+    if command is None:
+        return []
+    values: list[Any] = []
+    if key in (command.metadata or {}):
+        values.append(command.metadata.get(key))
+    for effector_command in command.commands.values():
+        metadata = effector_command.metadata or {}
+        if key in metadata:
+            values.append(metadata.get(key))
+    return values
+
+
+def _first_command_metadata(command: TeleopCommand | None, key: str) -> Any:
+    for value in _command_metadata_values(command, key):
+        if value is not None:
+            return value
+    return None
+
+
+def _pose_error_summary(value: Any) -> dict[str, float | None]:
+    if not isinstance(value, Mapping):
+        return {"max_translation_m": None, "max_rotation_deg": None}
+    translations: list[float] = []
+    rotations: list[float] = []
+    for metrics in value.values():
+        if not isinstance(metrics, Mapping):
+            continue
+        translation = _finite_float(metrics.get("translation_m"))
+        rotation = _finite_float(metrics.get("rotation_deg"))
+        if translation is not None:
+            translations.append(translation)
+        if rotation is not None:
+            rotations.append(rotation)
+    return {
+        "max_translation_m": max(translations) if translations else None,
+        "max_rotation_deg": max(rotations) if rotations else None,
+    }
+
+
+def _joint_margin_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"nearest_margin_deg": None, "near_limit": False}
+    margins: list[float] = []
+    near_limit = False
+    by_side: dict[str, Any] = {}
+    for side, payload in value.items():
+        if not isinstance(payload, Mapping):
+            continue
+        margin = _finite_float(payload.get("nearest_margin_deg"))
+        if margin is not None:
+            margins.append(margin)
+        side_near = _boolish(payload.get("near_limit", False))
+        near_limit = near_limit or side_near
+        by_side[str(side)] = {
+            "nearest_margin_deg": margin,
+            "nearest_joint": payload.get("nearest_joint"),
+            "near_limit": side_near,
+        }
+    return {
+        "nearest_margin_deg": min(margins) if margins else None,
+        "near_limit": near_limit,
+        "by_side": by_side,
+    }
+
+
+def _build_pose_quality_metadata(command: TeleopCommand | None) -> dict[str, Any]:
+    if command is None:
+        return {
+            "schema": _POSE_QUALITY_SCHEMA,
+            "available": False,
+            "status": "unknown",
+            "score": None,
+            "source": "no_command",
+            "bad": False,
+            "reasons": ["no_command"],
+            "metrics": {},
+        }
+
+    collision_status = _first_command_metadata(command, "collision_avoidance_status")
+    collision_distance_m = _finite_float(_first_command_metadata(command, "collision_distance_m"))
+    collision_min_distance_m = _finite_float(
+        _first_command_metadata(command, "collision_min_distance_m")
+    )
+    fallback_reason = _first_command_metadata(command, "collision_avoidance_fallback_reason")
+    branch_candidate = _first_command_metadata(command, "ik_branch_candidate")
+    jump_gate_status = _first_command_metadata(command, "ik_jump_gate_status")
+    time_budget_exceeded = _boolish(
+        _first_command_metadata(command, "ik_time_budget_exceeded")
+    )
+    execution_step = _first_command_metadata(command, "execution_step_metadata")
+    execution_step_limited = (
+        isinstance(execution_step, Mapping)
+        and _boolish(execution_step.get("step_limited"))
+    )
+    pose_error = _pose_error_summary(_first_command_metadata(command, "ik_solve_pose_error"))
+    joint_margin = _joint_margin_summary(_first_command_metadata(command, "joint_limit_margin"))
+
+    has_signal = any(
+        value is not None
+        for value in (
+            collision_status,
+            collision_distance_m,
+            collision_min_distance_m,
+            fallback_reason,
+            branch_candidate,
+            jump_gate_status,
+            pose_error["max_translation_m"],
+            joint_margin["nearest_margin_deg"],
+        )
+    )
+    if not has_signal:
+        return {
+            "schema": _POSE_QUALITY_SCHEMA,
+            "available": False,
+            "status": "unknown",
+            "score": None,
+            "source": "command_without_quality_metadata",
+            "bad": False,
+            "reasons": ["quality_metadata_unavailable"],
+            "metrics": {},
+        }
+
+    bad_reasons: list[str] = []
+    warning_reasons: list[str] = []
+    status_text = "" if collision_status is None else str(collision_status)
+    if status_text in {"hold_last_safe", "unsafe_candidate", "jump_gate_hold"}:
+        bad_reasons.append(f"collision_status:{status_text}")
+    elif status_text == "boundary_active":
+        warning_reasons.append("collision_boundary_active")
+    if fallback_reason:
+        bad_reasons.append(f"fallback:{fallback_reason}")
+    if jump_gate_status not in {None, "pass"}:
+        warning_reasons.append(f"jump_gate:{jump_gate_status}")
+    if collision_distance_m is not None and collision_min_distance_m is not None:
+        margin = collision_distance_m - collision_min_distance_m
+        if margin < 0.0:
+            bad_reasons.append("collision_distance_below_min")
+        elif margin <= 0.02:
+            warning_reasons.append("collision_distance_near_min")
+    nearest_margin = _finite_float(joint_margin.get("nearest_margin_deg"))
+    if nearest_margin is not None:
+        if nearest_margin < 3.0:
+            bad_reasons.append("joint_limit_margin_lt_3deg")
+        elif nearest_margin < 10.0 or _boolish(joint_margin.get("near_limit")):
+            warning_reasons.append("joint_limit_margin_low")
+    max_translation = _finite_float(pose_error.get("max_translation_m"))
+    max_rotation = _finite_float(pose_error.get("max_rotation_deg"))
+    if max_translation is not None:
+        if max_translation > 0.02:
+            bad_reasons.append("ik_translation_error_gt_2cm")
+        elif max_translation > 0.005:
+            warning_reasons.append("ik_translation_error_gt_5mm")
+    if max_rotation is not None:
+        if max_rotation > 5.0:
+            bad_reasons.append("ik_rotation_error_gt_5deg")
+        elif max_rotation > 2.0:
+            warning_reasons.append("ik_rotation_error_gt_2deg")
+    if execution_step_limited:
+        warning_reasons.append("execution_step_limited")
+    if time_budget_exceeded:
+        warning_reasons.append("ik_time_budget_exceeded")
+
+    score = 1.0
+    score -= 0.35 * len(bad_reasons)
+    score -= 0.12 * len(warning_reasons)
+    score = max(0.0, min(1.0, float(score)))
+    if bad_reasons:
+        quality_status = "bad"
+    elif warning_reasons:
+        quality_status = "warning"
+    else:
+        quality_status = "good"
+    return {
+        "schema": _POSE_QUALITY_SCHEMA,
+        "available": True,
+        "status": quality_status,
+        "score": score,
+        "bad": bool(bad_reasons),
+        "source": "existing_command_metadata",
+        "reasons": bad_reasons + warning_reasons,
+        "bad_reasons": bad_reasons,
+        "warning_reasons": warning_reasons,
+        "metrics": {
+            "collision_avoidance_status": collision_status,
+            "collision_distance_m": collision_distance_m,
+            "collision_min_distance_m": collision_min_distance_m,
+            "collision_margin_m": (
+                None
+                if collision_distance_m is None or collision_min_distance_m is None
+                else float(collision_distance_m - collision_min_distance_m)
+            ),
+            "collision_avoidance_fallback_reason": fallback_reason,
+            "ik_branch_candidate": branch_candidate,
+            "ik_jump_gate_status": jump_gate_status,
+            "ik_solve_pose_error": pose_error,
+            "joint_limit_margin": joint_margin,
+            "execution_step_limited": execution_step_limited,
+            "ik_time_budget_exceeded": time_budget_exceeded,
+        },
+    }
+
+
 def _vector_or_nan(value: Any, *, length: int) -> np.ndarray:
     if value is None:
         return _nan_vector(length)
@@ -258,7 +478,24 @@ def _pose_xyz_quat_or_nan(value: Any) -> np.ndarray:
 def _command_joint_or_nan(command: EffectorCommand | None, *, length: int = 6) -> np.ndarray:
     if command is None or command.command_type != "joint_vector":
         return _nan_vector(length)
-    return _vector_or_nan(command.value, length=length)
+    array = _vector_or_nan(command.value, length=length)
+    if np.all(np.isfinite(array)):
+        return array
+    raw = np.asarray(command.value, dtype=np.float32).reshape(-1)
+    if raw.shape != (1,) or not np.all(np.isfinite(raw)):
+        return _nan_vector(length)
+    spec_payload = (command.metadata or {}).get("hand_action_spec")
+    if not isinstance(spec_payload, Mapping):
+        return _nan_vector(length)
+    active_mask = spec_payload.get("active_mask")
+    if not isinstance(active_mask, Sequence) or len(active_mask) != int(length):
+        return _nan_vector(length)
+    active_indices = [index for index, enabled in enumerate(active_mask) if bool(enabled)]
+    if len(active_indices) != 1:
+        return _nan_vector(length)
+    padded = np.zeros(int(length), dtype=np.float32)
+    padded[int(active_indices[0])] = float(raw[0])
+    return padded
 
 
 def _command_pose_or_nan(command: EffectorCommand | None) -> np.ndarray:
@@ -646,7 +883,7 @@ class CollectorSampleBuilder:
     def _snapshot_camera_frames(self, timestamp: float) -> dict[str, VideoFrame | None]:
         frames: dict[str, VideoFrame | None] = {}
         for camera_key, buffer in self.config.camera_buffers.items():
-            frames[str(camera_key)] = buffer.get_nearest(timestamp)
+            frames[str(camera_key)] = buffer.get_latest_before_or_at(timestamp)
         return frames
 
     @staticmethod
@@ -700,6 +937,7 @@ class CollectorSampleBuilder:
                 step_result,
                 include_debug_metadata=include_debug_metadata,
             ),
+            "pose_quality": _build_pose_quality_metadata(command),
             "command_metadata": command_metadata,
             "command_metadata_by_effector": command_metadata_by_effector,
             "channel_metadata": channel_metadata,

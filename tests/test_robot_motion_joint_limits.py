@@ -71,7 +71,15 @@ def test_default_rm65_joint_velocity_profile_loads():
     rm65 = profiles["rm65"]
     assert rm65.dof == 6
     assert rm65.max_dt_sec == 1.0
-    assert np.allclose(rm65.max_velocity_deg_s, [45.0, 55.0, 60.0, 75.0, 75.0, 80.0])
+    assert np.allclose(rm65.max_velocity_deg_s, [85.0, 85.0, 95.0, 105.0, 120.0, 120.0])
     assert rm65.max_step_deg(0.05).shape == (6,)
-    assert np.isclose(rm65.max_step_deg(0.2)[3], 15.0)
-    assert np.isclose(rm65.max_step_deg(1.0)[3], 75.0)
+    assert np.isclose(rm65.max_step_deg(0.2)[3], 21.0)
+    assert np.isclose(rm65.max_step_deg(1.0)[3], 105.0)
+
+    assert "rm65_init_slow" in profiles
+    rm65_init_slow = profiles["rm65_init_slow"]
+    assert rm65_init_slow.dof == 6
+    assert rm65_init_slow.max_dt_sec == 0.25
+    assert np.allclose(rm65_init_slow.max_velocity_deg_s, [12.0, 12.0, 14.0, 16.0, 20.0, 20.0])
+    assert np.isclose(rm65_init_slow.max_step_deg(0.05)[0], 0.6)
+    assert np.isclose(rm65_init_slow.max_step_deg(1.0)[5], 5.0)

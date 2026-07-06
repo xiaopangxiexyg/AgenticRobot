@@ -180,8 +180,8 @@
 
 当前仓库已经有三块非常有价值的底层能力：
 
-1. `VIVE/mocap/vive_data_receiver.py`
-   提供了线程安全的 UDP 最新帧接收逻辑。
+1. `teleop_runtime/sources/pose/vive.py`
+   提供当前 VIVE JSON UDP 主链路的最新帧接收逻辑。
 
 2. `teleop_hand/hand_q6_reader.py`
    已经提供了单手/双手 `q6` 读取、自动零位标定和归一化输出。
@@ -200,8 +200,8 @@
 
 #### VIVE 链路的问题
 
-- `VIVE/utils.py` 当前只暴露一个 `get_wrist_pose()`，并硬编码取 `latest_data[12:24]`
-- 默认端口写的是 `6666`，而 `vive_data_sender.py` 实际发送到 `9999`
+- `VIVE/utils.py` 里的旧 float receiver wrapper 已不再作为 VIVE 主链路使用
+- 当前唯一 sender 是 `hardware/VIVE/mocap/vive_data_sender.py`，默认发送到 `9999`
 - 没有 side、tracker 名称、丢包超时、有效性检查等概念
 - 没有显式区分 `W`、`O`、`D`、`B` 坐标系
 
@@ -542,7 +542,7 @@ $$\Delta E = (T_D^{E_L})^{-1} \cdot T_D^{E_R} = (T_O^{H_L})^{-1} \cdot T_O^{H_R}
 
 这个模式必须优先复用现有的：
 
-- `VIVE/mocap/vive_visualizer.py` 的 tracker frame 绘制思路
+- VIVE tracker frame 的调试绘制思路
 - `rm65_inspire_tac/rendering.py` 的 SAPIEN 机器人可视化
 
 但不要求兼容现有 demo 结构，可以直接重写成新的统一 debug app。
@@ -829,7 +829,7 @@ class TeleopCalibration:
 - `rm65_inspire_tac/multitask_ik.py`
 - `rm65_inspire_tac/hardware.py`
 - `teleop_hand/hand_q6_reader.py`
-- `VIVE/mocap/vive_data_receiver.py`
+- `teleop_runtime/sources/pose/vive.py`
 
 这些都更适合作为新架构里的 backend/source 实现来源，而不是最终顶层组织方式。
 

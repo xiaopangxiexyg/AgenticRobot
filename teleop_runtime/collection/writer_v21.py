@@ -10,6 +10,14 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from dataset_postprocess.wrist_cam_adjust.depth import (
+    DepthRangeMaskConfig,
+    depth_range_mask,
+    mask_manifest_payload,
+    pack_binary_mask,
+    raw_depth_manifest_payload,
+)
+
 from ..action import (
     arm_action_specs_metadata,
     hand_action_specs_metadata,
@@ -31,11 +39,52 @@ from .stats import EpisodeStatsAccumulator
 
 ROW_JOB_KIND = "lerobot_v21.row"
 VIDEO_FRAME_JOB_KIND = "lerobot_v21.video_frame"
+WRIST_DEPTH_FRAME_JOB_KIND = "lerobot_v21.wrist_depth_frame"
 TACTILE_FRAME_JOB_KIND = "lerobot_v21.tactile_frame"
 FINALIZE_EPISODE_JOB_KIND = "lerobot_v21.finalize_episode"
 TACTILE_STORAGE_EXTERNAL = "external"
 TACTILE_STORAGE_PARQUET = "parquet"
 TACTILE_STREAM_FORMAT = "binary_stream_v1"
+WRIST_DEPTH_STREAM_FORMAT = "binary_stream_v1"
+TACTILE_COMPRESSION_NONE = "none"
+TACTILE_COMPRESSION_LZ4 = "lz4"
+TACTILE_COMPRESSION_ZSTD = "zstd"
+TACTILE_CHUNK_FRAME_COUNT = 32
+
+
+def _normalize_tactile_compression(value: Any) -> str:
+    text = str(value or TACTILE_COMPRESSION_NONE).strip().lower().replace("-", "_")
+    if text in {"", "raw", "uncompressed"}:
+        text = TACTILE_COMPRESSION_NONE
+    if text not in {
+        TACTILE_COMPRESSION_NONE,
+        TACTILE_COMPRESSION_LZ4,
+        TACTILE_COMPRESSION_ZSTD,
+    }:
+        raise ValueError("tactile_compression must be one of: none, lz4, zstd.")
+    return text
+
+
+def _compress_tactile_chunk(payload: bytes, *, compression: str) -> bytes:
+    if compression == TACTILE_COMPRESSION_NONE:
+        return payload
+    if compression == TACTILE_COMPRESSION_LZ4:
+        try:
+            import lz4.frame
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "tactile_compression='lz4' requires the lz4 Python package."
+            ) from exc
+        return lz4.frame.compress(payload, compression_level=0)
+    if compression == TACTILE_COMPRESSION_ZSTD:
+        try:
+            import zstandard as zstd
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "tactile_compression='zstd' requires the zstandard Python package."
+            ) from exc
+        return zstd.ZstdCompressor(level=1).compress(payload)
+    raise ValueError(f"Unsupported tactile compression '{compression}'.")
 
 
 def _require_cv2():
@@ -116,9 +165,15 @@ class LeRobotV21WriterConfig:
     write_parquet: bool = True
     write_video: bool = True
     tactile_storage: str = TACTILE_STORAGE_EXTERNAL
+    tactile_compression: str = TACTILE_COMPRESSION_LZ4
     allow_missing_video_frames: bool = False
     arm_action_specs: Mapping[str, Any] | None = None
     hand_action_specs: Mapping[str, Any] | None = None
+    write_wrist_depth_mask: bool = False
+    write_wrist_depth_raw: bool = False
+    wrist_depth_camera_keys: tuple[str, ...] = ("left_wrist", "right_wrist")
+    wrist_depth_min_m: float = 0.05
+    wrist_depth_max_m: float = 0.5
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
@@ -126,10 +181,18 @@ class LeRobotV21WriterConfig:
             raise ValueError("chunk_size must be positive.")
         if float(self.nominal_fps) <= 0.0:
             raise ValueError("nominal_fps must be positive.")
+        self.write_wrist_depth_mask = bool(self.write_wrist_depth_mask)
+        self.write_wrist_depth_raw = bool(self.write_wrist_depth_raw)
+        self.wrist_depth_camera_keys = tuple(str(key) for key in self.wrist_depth_camera_keys)
+        self.wrist_depth_mask_config = DepthRangeMaskConfig(
+            depth_min_m=float(self.wrist_depth_min_m),
+            depth_max_m=float(self.wrist_depth_max_m),
+        )
         storage = str(self.tactile_storage).strip().lower().replace("-", "_")
         if storage not in {TACTILE_STORAGE_PARQUET, TACTILE_STORAGE_EXTERNAL}:
             raise ValueError("tactile_storage must be parquet or external.")
         self.tactile_storage = storage
+        self.tactile_compression = _normalize_tactile_compression(self.tactile_compression)
         self.arm_action_specs = normalize_arm_action_specs(self.arm_action_specs)
         self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
 
@@ -155,10 +218,49 @@ class _TactileSensorStream:
     sensor_key: str
     relative_path: str
     path: Path
+    compression: str = TACTILE_COMPRESSION_NONE
+    chunk_frame_count: int = TACTILE_CHUNK_FRAME_COUNT
     dtype: str | None = None
     shape: tuple[int, ...] | None = None
     frame_count: int = 0
     handle: Any | None = None
+    chunks: list[dict[str, Any]] = field(default_factory=list)
+    _chunk_start_frame: int | None = None
+    _chunk_frame_count: int = 0
+    _chunk_raw_bytes: bytearray = field(default_factory=bytearray)
+
+    @property
+    def encoding(self) -> str:
+        if self.compression == TACTILE_COMPRESSION_NONE:
+            return "raw_c_order"
+        return f"chunked_{self.compression}"
+
+    def _ensure_handle(self) -> None:
+        if self.handle is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = self.path.open("ab")
+
+    def _flush_chunk(self) -> None:
+        if self._chunk_frame_count <= 0:
+            return
+        self._ensure_handle()
+        assert self.handle is not None
+        raw_payload = bytes(self._chunk_raw_bytes)
+        compressed = _compress_tactile_chunk(raw_payload, compression=self.compression)
+        offset = int(self.handle.tell())
+        self.handle.write(compressed)
+        self.chunks.append(
+            {
+                "frame_start": int(self._chunk_start_frame or 0),
+                "frame_count": int(self._chunk_frame_count),
+                "offset": offset,
+                "compressed_bytes": len(compressed),
+                "raw_bytes": len(raw_payload),
+            }
+        )
+        self._chunk_raw_bytes.clear()
+        self._chunk_start_frame = None
+        self._chunk_frame_count = 0
 
     def append(self, value: Any) -> None:
         array = np.asarray(value)
@@ -179,14 +281,23 @@ class _TactileSensorStream:
                 f"Tactile sensor '{self.sensor_key}' shape changed from "
                 f"{self.shape} to {tuple(array.shape)}."
             )
-        if self.handle is None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.handle = self.path.open("ab")
         contiguous = np.ascontiguousarray(array)
-        self.handle.write(contiguous.tobytes(order="C"))
+        payload = contiguous.tobytes(order="C")
+        if self.compression == TACTILE_COMPRESSION_NONE:
+            self._ensure_handle()
+            assert self.handle is not None
+            self.handle.write(payload)
+        else:
+            if self._chunk_start_frame is None:
+                self._chunk_start_frame = int(self.frame_count)
+            self._chunk_raw_bytes.extend(payload)
+            self._chunk_frame_count += 1
+            if self._chunk_frame_count >= int(self.chunk_frame_count):
+                self._flush_chunk()
         self.frame_count += 1
 
     def close(self) -> None:
+        self._flush_chunk()
         if self.handle is not None:
             self.handle.close()
             self.handle = None
@@ -209,6 +320,33 @@ class _TactileSideState:
 
 
 @dataclass
+class _WristDepthStreamState:
+    camera_key: str
+    stream_kind: str
+    relative_dir: str
+    path_dir: Path
+    manifest_relative_path: str
+    manifest_path: Path
+    stream_relative_path: str
+    stream_path: Path
+    expected_by_sample: dict[int, bool] = field(default_factory=dict)
+    pending_frames: dict[int, Mapping[str, Any]] = field(default_factory=dict)
+    next_sample_index: int = 0
+    next_depth_frame_index: int = 0
+    missing_frame_count: int = 0
+    handle: Any | None = None
+    shape: tuple[int, int] | None = None
+    frame_records: list[dict[str, Any]] = field(default_factory=list)
+    foreground_fraction_sum: float = 0.0
+    valid_fraction_sum: float = 0.0
+
+    def close_handle(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+@dataclass
 class _EpisodeState:
     episode_index: int
     episode_id: str
@@ -218,6 +356,7 @@ class _EpisodeState:
     stats: EpisodeStatsAccumulator | None = None
     video_states: dict[str, _VideoState] = field(default_factory=dict)
     tactile_states: dict[str, _TactileSideState] = field(default_factory=dict)
+    wrist_depth_states: dict[tuple[str, str], _WristDepthStreamState] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.stats is None:
@@ -258,6 +397,11 @@ class LeRobotV21Writer:
     def next_episode_index(self) -> int:
         with self._lock:
             return int(self._next_episode_index)
+
+    @property
+    def next_sample_index(self) -> int:
+        with self._lock:
+            return int(self._finalized_frame_count)
 
     def _prepare_dataset_root(self) -> None:
         self.meta_dir.mkdir(parents=True, exist_ok=True)
@@ -322,11 +466,25 @@ class LeRobotV21Writer:
                 "write_parquet": bool(self.config.write_parquet),
                 "write_video": bool(self.config.write_video),
                 "tactile_storage": str(self.config.tactile_storage),
+                "tactile_compression": (
+                    str(self.config.tactile_compression)
+                    if self.config.tactile_storage == TACTILE_STORAGE_EXTERNAL
+                    else None
+                ),
                 "tactile_stream_format": (
                     TACTILE_STREAM_FORMAT
                     if self.config.tactile_storage == TACTILE_STORAGE_EXTERNAL
                     else None
                 ),
+                "wrist_depth_mask": bool(self.config.write_wrist_depth_mask),
+                "wrist_depth_raw": bool(self.config.write_wrist_depth_raw),
+                "wrist_depth_camera_keys": list(self.config.wrist_depth_camera_keys),
+                "wrist_depth_stream_format": (
+                    WRIST_DEPTH_STREAM_FORMAT
+                    if self.config.write_wrist_depth_mask or self.config.write_wrist_depth_raw
+                    else None
+                ),
+                "wrist_depth_mask_config": self.config.wrist_depth_mask_config.to_dict(),
                 "task_id": self.config.task_id,
                 "task_description": self.config.task_description,
                 "arm_action_specs_by_side": arm_specs,
@@ -486,6 +644,39 @@ class LeRobotV21Writer:
     def _episode_tactile_manifest_relative_path(self, episode_index: int, side: str) -> str:
         return str(Path(self._episode_tactile_relative_dir(episode_index, side)) / "manifest.json")
 
+    def _episode_wrist_depth_relative_dir(self, episode_index: int, camera_key: str, stream_kind: str) -> str:
+        chunk_id = chunk_id_from_episode_index(
+            episode_index,
+            chunk_size=self.config.chunk_size,
+        )
+        return str(
+            Path("wrist_depth")
+            / str(stream_kind)
+            / camera_video_channel(camera_key)
+            / chunk_id
+            / episode_id_from_index(episode_index)
+        )
+
+    def _episode_wrist_depth_manifest_relative_path(
+        self,
+        episode_index: int,
+        camera_key: str,
+        stream_kind: str,
+    ) -> str:
+        return str(Path(self._episode_wrist_depth_relative_dir(episode_index, camera_key, stream_kind)) / "manifest.json")
+
+    def _episode_wrist_depth_stream_relative_path(
+        self,
+        episode_index: int,
+        camera_key: str,
+        stream_kind: str,
+    ) -> str:
+        suffix = "bitpack.bin" if stream_kind == "mask" else "uint16.bin"
+        return str(
+            Path(self._episode_wrist_depth_relative_dir(episode_index, camera_key, stream_kind))
+            / f"stream.{suffix}"
+        )
+
     def _ensure_video_state(self, episode: _EpisodeState, camera_key: str) -> _VideoState:
         if camera_key in episode.video_states:
             return episode.video_states[camera_key]
@@ -515,6 +706,43 @@ class LeRobotV21Writer:
             manifest_path=self.root_dir / manifest_relative_path,
         )
         episode.tactile_states[side] = state
+        return state
+
+    def _ensure_wrist_depth_state(
+        self,
+        episode: _EpisodeState,
+        camera_key: str,
+        stream_kind: str,
+    ) -> _WristDepthStreamState:
+        key = (str(camera_key), str(stream_kind))
+        if key in episode.wrist_depth_states:
+            return episode.wrist_depth_states[key]
+        relative_dir = self._episode_wrist_depth_relative_dir(
+            episode.episode_index,
+            key[0],
+            key[1],
+        )
+        manifest_relative_path = self._episode_wrist_depth_manifest_relative_path(
+            episode.episode_index,
+            key[0],
+            key[1],
+        )
+        stream_relative_path = self._episode_wrist_depth_stream_relative_path(
+            episode.episode_index,
+            key[0],
+            key[1],
+        )
+        state = _WristDepthStreamState(
+            camera_key=key[0],
+            stream_kind=key[1],
+            relative_dir=relative_dir,
+            path_dir=self.root_dir / relative_dir,
+            manifest_relative_path=manifest_relative_path,
+            manifest_path=self.root_dir / manifest_relative_path,
+            stream_relative_path=stream_relative_path,
+            stream_path=self.root_dir / stream_relative_path,
+        )
+        episode.wrist_depth_states[key] = state
         return state
 
     def _tactile_arrays_from_hand_state(
@@ -589,6 +817,68 @@ class LeRobotV21Writer:
             )
         return jobs, refs, expectations
 
+    def _wrist_depth_enabled(self) -> bool:
+        return bool(self.config.write_wrist_depth_mask or self.config.write_wrist_depth_raw)
+
+    def _wrist_depth_camera_selected(self, camera_key: str) -> bool:
+        return str(camera_key) in set(self.config.wrist_depth_camera_keys)
+
+    @staticmethod
+    def _depth_scale_from_metadata(metadata: Mapping[str, Any]) -> float | None:
+        value = metadata.get("depth_scale_m_per_unit")
+        try:
+            scale = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(scale) or scale <= 0.0:
+            return None
+        return float(scale)
+
+    def _plan_wrist_depth_jobs(
+        self,
+        sample: CollectorSample,
+    ) -> tuple[list[WriteJob], dict[str, dict[str, bool]]]:
+        if not self._wrist_depth_enabled():
+            return [], {}
+        jobs: list[WriteJob] = []
+        expectations: dict[str, dict[str, bool]] = {}
+        for camera_key, match in sample.camera_frames.items():
+            camera_name = str(camera_key)
+            if not self._wrist_depth_camera_selected(camera_name):
+                continue
+            frame = match.frame
+            has_depth = frame is not None and frame.depth_image is not None
+            depth_metadata = {} if frame is None else dict(frame.depth_metadata)
+            has_scale = self._depth_scale_from_metadata(depth_metadata) is not None
+            expectations[camera_name] = {
+                "mask": bool(self.config.write_wrist_depth_mask and has_depth and has_scale),
+                "raw": bool(self.config.write_wrist_depth_raw and has_depth),
+            }
+            if not has_depth:
+                continue
+            assert frame is not None
+            jobs.append(
+                WriteJob(
+                    kind=WRIST_DEPTH_FRAME_JOB_KIND,
+                    payload={
+                        "episode_index": int(sample.episode_index),
+                        "frame_index": int(sample.frame_index),
+                        "camera_key": camera_name,
+                        "depth_image": frame.depth_image,
+                        "depth_metadata": depth_metadata,
+                        "source_timestamp": match.selected_timestamp,
+                        "receive_timestamp": frame.receive_timestamp,
+                        "source_frame_index": frame.frame_index,
+                    },
+                    critical=False,
+                    metadata={
+                        "storage_queue": "wrist_depth",
+                        "camera_key": camera_name,
+                    },
+                )
+            )
+        return jobs, expectations
+
     def plan_sample_jobs(self, sample: CollectorSample) -> list[WriteJob]:
         with self._lock:
             self._ensure_episode_state(sample.episode_index)
@@ -608,6 +898,7 @@ class LeRobotV21Writer:
             tactile_jobs, tactile_refs, tactile_expectations = self._plan_external_tactile_jobs(
                 sample
             )
+        wrist_depth_jobs, wrist_depth_expectations = self._plan_wrist_depth_jobs(sample)
         row, camera_expectations = collector_sample_to_row(
             sample,
             camera_video_paths=camera_video_paths,
@@ -625,10 +916,12 @@ class LeRobotV21Writer:
                     "row": row,
                     "camera_expectations": dict(camera_expectations),
                     "tactile_expectations": dict(tactile_expectations),
+                    "wrist_depth_expectations": dict(wrist_depth_expectations),
                 },
             )
         ]
         jobs.extend(tactile_jobs)
+        jobs.extend(wrist_depth_jobs)
         if self.config.write_video:
             for camera_key, match in sample.camera_frames.items():
                 if match.frame is None:
@@ -676,6 +969,9 @@ class LeRobotV21Writer:
             if job.kind == VIDEO_FRAME_JOB_KIND:
                 self._handle_video_frame_job(job.payload)
                 return
+            if job.kind == WRIST_DEPTH_FRAME_JOB_KIND:
+                self._handle_wrist_depth_frame_job(job.payload)
+                return
             if job.kind == TACTILE_FRAME_JOB_KIND:
                 self._handle_tactile_frame_job(job.payload)
                 return
@@ -705,6 +1001,22 @@ class LeRobotV21Writer:
             tactile_state.expected_by_sample[frame_index] = bool(expects_frame)
             self._drain_tactile_state(episode, tactile_state)
             self._apply_latest_tactile_ref_to_row(row, tactile_state)
+        for camera_key, expectations in dict(payload.get("wrist_depth_expectations", {})).items():
+            if not isinstance(expectations, Mapping):
+                continue
+            for stream_kind in ("mask", "raw"):
+                if stream_kind == "mask" and not self.config.write_wrist_depth_mask:
+                    continue
+                if stream_kind == "raw" and not self.config.write_wrist_depth_raw:
+                    continue
+                expects_frame = bool(expectations.get(stream_kind))
+                depth_state = self._ensure_wrist_depth_state(
+                    episode,
+                    str(camera_key),
+                    stream_kind,
+                )
+                depth_state.expected_by_sample[frame_index] = expects_frame
+                self._drain_wrist_depth_state(episode, depth_state)
 
     def _handle_video_frame_job(self, payload: Mapping[str, Any]) -> None:
         episode = self._ensure_episode_state(int(payload["episode_index"]))
@@ -722,6 +1034,22 @@ class LeRobotV21Writer:
         tactile_state = self._ensure_tactile_state(episode, side)
         tactile_state.pending_frames[int(payload["frame_index"])] = payload
         self._drain_tactile_state(episode, tactile_state)
+
+    def _handle_wrist_depth_frame_job(self, payload: Mapping[str, Any]) -> None:
+        episode = self._ensure_episode_state(int(payload["episode_index"]))
+        camera_key = str(payload["camera_key"])
+        if not self._wrist_depth_camera_selected(camera_key):
+            return
+        if self.config.write_wrist_depth_mask and self._depth_scale_from_metadata(
+            dict(payload.get("depth_metadata", {}) or {})
+        ) is not None:
+            mask_state = self._ensure_wrist_depth_state(episode, camera_key, "mask")
+            mask_state.pending_frames[int(payload["frame_index"])] = payload
+            self._drain_wrist_depth_state(episode, mask_state)
+        if self.config.write_wrist_depth_raw:
+            raw_state = self._ensure_wrist_depth_state(episode, camera_key, "raw")
+            raw_state.pending_frames[int(payload["frame_index"])] = payload
+            self._drain_wrist_depth_state(episode, raw_state)
 
     def _open_video_writer(self, state: _VideoState, frame: np.ndarray) -> None:
         cv2 = _require_cv2()
@@ -784,21 +1112,33 @@ class LeRobotV21Writer:
         if sensor_key in state.streams:
             return state.streams[sensor_key]
         safe_name = _safe_path_token(sensor_key)
-        used_names = {
-            Path(stream.relative_path).name.rsplit(".", 2)[0]
-            for stream in state.streams.values()
-        }
+        used_names: set[str] = set()
+        for stream in state.streams.values():
+            name = Path(stream.relative_path).name
+            for suffix_text in (".bin.lz4", ".bin.zst", ".bin"):
+                if name.endswith(suffix_text):
+                    name = name[: -len(suffix_text)]
+                    break
+            used_names.add(name.rsplit(".", 1)[0])
         base_name = safe_name
         suffix = 1
         while safe_name in used_names:
             suffix += 1
             safe_name = f"{base_name}_{suffix}"
         safe_dtype = _safe_path_token(dtype)
-        relative_path = str(Path(state.relative_dir) / f"{safe_name}.{safe_dtype}.bin")
+        compression = str(self.config.tactile_compression)
+        extension = "bin"
+        if compression == TACTILE_COMPRESSION_LZ4:
+            extension = "bin.lz4"
+        elif compression == TACTILE_COMPRESSION_ZSTD:
+            extension = "bin.zst"
+        relative_path = str(Path(state.relative_dir) / f"{safe_name}.{safe_dtype}.{extension}")
         stream = _TactileSensorStream(
             sensor_key=str(sensor_key),
             relative_path=relative_path,
             path=self.root_dir / relative_path,
+            compression=compression,
+            chunk_frame_count=TACTILE_CHUNK_FRAME_COUNT,
             dtype=str(dtype),
         )
         state.streams[sensor_key] = stream
@@ -896,6 +1236,128 @@ class LeRobotV21Writer:
             state.next_tactile_frame_index += 1
             state.next_sample_index += 1
 
+    def _append_wrist_depth_payload(
+        self,
+        state: _WristDepthStreamState,
+        *,
+        sample_index: int,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        depth = np.asarray(payload.get("depth_image"))
+        if depth.ndim != 2:
+            raise ValueError(
+                f"Wrist depth frame for camera '{state.camera_key}' must be 2D, got {depth.shape!r}."
+            )
+        if depth.dtype != np.uint16:
+            depth = depth.astype(np.uint16, copy=False)
+        depth = np.ascontiguousarray(depth)
+        height, width = (int(depth.shape[0]), int(depth.shape[1]))
+        shape = (height, width)
+        if state.shape is None:
+            state.shape = shape
+        elif state.shape != shape:
+            raise ValueError(
+                f"Wrist depth frame for camera '{state.camera_key}' changed shape "
+                f"from {state.shape} to {shape}."
+            )
+        if state.handle is None:
+            state.stream_path.parent.mkdir(parents=True, exist_ok=True)
+            state.handle = state.stream_path.open("ab")
+
+        depth_metadata = dict(payload.get("depth_metadata", {}) or {})
+        depth_frame_index = int(state.next_depth_frame_index)
+        record: dict[str, Any] = {
+            "sample_frame_index": int(sample_index),
+            "depth_frame_index": depth_frame_index,
+            "source_timestamp": payload.get("source_timestamp"),
+            "receive_timestamp": payload.get("receive_timestamp"),
+            "source_frame_index": payload.get("source_frame_index"),
+            "depth_camera_timestamp_sec": depth_metadata.get("camera_timestamp_sec"),
+            "depth_sensor_timestamp_ms": depth_metadata.get("sensor_timestamp_ms"),
+            "depth_frame_number": depth_metadata.get("frame_number"),
+            "depth_scale_m_per_unit": depth_metadata.get("depth_scale_m_per_unit"),
+            "shape": [height, width],
+        }
+        if state.stream_kind == "mask":
+            depth_scale = self._depth_scale_from_metadata(depth_metadata)
+            if depth_scale is None:
+                raise ValueError(
+                    f"Wrist depth mask for camera '{state.camera_key}' is missing a valid depth scale."
+                )
+            result = depth_range_mask(
+                depth,
+                depth_scale_m_per_unit=depth_scale,
+                config=self.config.wrist_depth_mask_config,
+            )
+            assert state.handle is not None
+            state.handle.write(pack_binary_mask(result.mask))
+            record.update(result.stats_dict())
+            state.valid_fraction_sum += float(result.valid_fraction)
+            state.foreground_fraction_sum += float(result.foreground_fraction)
+        elif state.stream_kind == "raw":
+            assert state.handle is not None
+            state.handle.write(depth.tobytes(order="C"))
+            total = int(depth.size)
+            valid_count = int(np.count_nonzero(depth))
+            valid_fraction = 0.0 if total <= 0 else float(valid_count) / float(total)
+            record["valid_fraction"] = valid_fraction
+            state.valid_fraction_sum += float(valid_fraction)
+        else:
+            raise ValueError(f"Unsupported wrist depth stream kind '{state.stream_kind}'.")
+
+        state.frame_records.append(record)
+        return depth_frame_index, record
+
+    def _apply_wrist_depth_ref_to_row(
+        self,
+        row: dict[str, Any],
+        state: _WristDepthStreamState,
+        *,
+        depth_frame_index: int,
+        record: Mapping[str, Any],
+    ) -> None:
+        prefix = f"{camera_video_channel(state.camera_key)}.wrist_depth_{state.stream_kind}"
+        row[f"{prefix}_storage_format"] = WRIST_DEPTH_STREAM_FORMAT
+        row[f"{prefix}_path"] = state.manifest_relative_path
+        row[f"{prefix}_frame_index"] = int(depth_frame_index)
+        row[f"{prefix}_source_timestamp"] = record.get("source_timestamp")
+        row[f"{prefix}_receive_timestamp"] = record.get("receive_timestamp")
+        row[f"{prefix}_source_frame_index"] = record.get("source_frame_index")
+        row[f"{prefix}_depth_camera_timestamp_sec"] = record.get("depth_camera_timestamp_sec")
+        row[f"{prefix}_depth_sensor_timestamp_ms"] = record.get("depth_sensor_timestamp_ms")
+        row[f"{prefix}_valid_fraction"] = record.get("valid_fraction")
+        if state.stream_kind == "mask":
+            row[f"{prefix}_foreground_fraction"] = record.get("foreground_fraction")
+
+    def _drain_wrist_depth_state(self, episode: _EpisodeState, state: _WristDepthStreamState) -> None:
+        while state.next_sample_index in state.expected_by_sample:
+            sample_index = int(state.next_sample_index)
+            expects_frame = bool(state.expected_by_sample[sample_index])
+            if not expects_frame:
+                del state.expected_by_sample[sample_index]
+                state.pending_frames.pop(sample_index, None)
+                state.next_sample_index += 1
+                continue
+            if sample_index not in state.pending_frames:
+                return
+            payload = state.pending_frames.pop(sample_index)
+            depth_frame_index, record = self._append_wrist_depth_payload(
+                state,
+                sample_index=sample_index,
+                payload=payload,
+            )
+            row = episode.rows_by_frame.get(sample_index)
+            if row is not None:
+                self._apply_wrist_depth_ref_to_row(
+                    row,
+                    state,
+                    depth_frame_index=depth_frame_index,
+                    record=record,
+                )
+            del state.expected_by_sample[sample_index]
+            state.next_depth_frame_index += 1
+            state.next_sample_index += 1
+
     def _close_tactile_state(self, state: _TactileSideState) -> str | None:
         for stream in state.streams.values():
             stream.close()
@@ -907,6 +1369,18 @@ class LeRobotV21Writer:
                 "dtype": stream.dtype,
                 "shape": [] if stream.shape is None else list(stream.shape),
                 "frame_count": int(stream.frame_count),
+                "encoding": stream.encoding,
+                "compression": stream.compression,
+                "chunk_frame_count": (
+                    int(stream.chunk_frame_count)
+                    if stream.compression != TACTILE_COMPRESSION_NONE
+                    else None
+                ),
+                "chunks": (
+                    list(stream.chunks)
+                    if stream.compression != TACTILE_COMPRESSION_NONE
+                    else []
+                ),
             }
             for sensor_key, stream in state.streams.items()
         }
@@ -922,6 +1396,37 @@ class LeRobotV21Writer:
                 "frames": list(state.frame_records),
             },
         )
+        return state.manifest_relative_path
+
+    def _close_wrist_depth_state(self, state: _WristDepthStreamState) -> str | None:
+        state.close_handle()
+        if not state.frame_records or state.shape is None:
+            return None
+        height, width = state.shape
+        if state.stream_kind == "mask":
+            payload = mask_manifest_payload(
+                camera_key=state.camera_key,
+                relative_dir=state.relative_dir,
+                stream_path=state.stream_relative_path,
+                frame_count=len(state.frame_records),
+                height=height,
+                width=width,
+                records=state.frame_records,
+                config=self.config.wrist_depth_mask_config,
+            )
+        elif state.stream_kind == "raw":
+            payload = raw_depth_manifest_payload(
+                camera_key=state.camera_key,
+                relative_dir=state.relative_dir,
+                stream_path=state.stream_relative_path,
+                frame_count=len(state.frame_records),
+                height=height,
+                width=width,
+                records=state.frame_records,
+            )
+        else:
+            raise ValueError(f"Unsupported wrist depth stream kind '{state.stream_kind}'.")
+        _write_json(state.manifest_path, payload)
         return state.manifest_relative_path
 
     def _recompute_next_episode_index_locked(self) -> None:
@@ -949,6 +1454,9 @@ class LeRobotV21Writer:
                     pass
             for state in episode.tactile_states.values():
                 self._close_tactile_state(state)
+                shutil.rmtree(state.path_dir, ignore_errors=True)
+            for state in episode.wrist_depth_states.values():
+                state.close_handle()
                 shutil.rmtree(state.path_dir, ignore_errors=True)
             self._recompute_next_episode_index_locked()
             return True
@@ -993,10 +1501,47 @@ class LeRobotV21Writer:
             manifest_path = self._close_tactile_state(state)
             if manifest_path is not None:
                 tactile_paths[state.side] = manifest_path
+        wrist_depth_mask_paths: dict[str, str] = {}
+        wrist_depth_raw_paths: dict[str, str] = {}
+        wrist_depth_frame_stats: dict[str, dict[str, Any]] = {}
+        for state in episode.wrist_depth_states.values():
+            self._drain_wrist_depth_state(episode, state)
+            unresolved = [
+                sample_index
+                for sample_index, expects_frame in sorted(state.expected_by_sample.items())
+                if expects_frame
+            ]
+            if unresolved:
+                state.missing_frame_count += len(unresolved)
+                for sample_index in unresolved:
+                    state.expected_by_sample.pop(sample_index, None)
+            manifest_path = self._close_wrist_depth_state(state)
+            if manifest_path is not None:
+                if state.stream_kind == "mask":
+                    wrist_depth_mask_paths[state.camera_key] = manifest_path
+                elif state.stream_kind == "raw":
+                    wrist_depth_raw_paths[state.camera_key] = manifest_path
+            key = f"{state.camera_key}.{state.stream_kind}"
+            frame_count = int(state.next_depth_frame_index)
+            wrist_depth_frame_stats[key] = {
+                "expected": int(frame_count + state.missing_frame_count),
+                "written": frame_count,
+                "missing": int(state.missing_frame_count),
+                "path": manifest_path,
+                "valid_fraction_mean": (
+                    0.0 if frame_count <= 0 else float(state.valid_fraction_sum) / float(frame_count)
+                ),
+            }
+            if state.stream_kind == "mask":
+                wrist_depth_frame_stats[key]["foreground_fraction_mean"] = (
+                    0.0 if frame_count <= 0 else float(state.foreground_fraction_sum) / float(frame_count)
+                )
 
         rows = [episode.rows_by_frame[index] for index in sorted(episode.rows_by_frame)]
         if not rows:
             raise RuntimeError(f"Episode {episode.episode_id} does not contain any rows.")
+        for offset, row in enumerate(rows):
+            row["index"] = int(self._finalized_frame_count + offset)
         parquet_relative_path = self._episode_parquet_relative_path(episode.episode_index)
         if self.config.write_parquet:
             write_rows_to_parquet(
@@ -1019,9 +1564,20 @@ class LeRobotV21Writer:
             if isinstance(storage_queue_stats, Mapping)
             else {}
         )
+        if wrist_depth_frame_stats:
+            for stat_key, stat_payload in wrist_depth_frame_stats.items():
+                camera_key = stat_key.rsplit(".", 1)[0]
+                route_stats = storage_routes.get(f"wrist_depth:{camera_key}", {})
+                stat_payload["dropped"] = (
+                    int(route_stats.get("dropped", 0) or 0)
+                    if isinstance(route_stats, Mapping)
+                    else 0
+                )
         video_frame_stats = {}
         for camera_key, state in episode.video_states.items():
             route_stats = storage_routes.get(camera_key, {})
+            if not isinstance(route_stats, Mapping):
+                route_stats = storage_routes.get(f"video:{camera_key}", {})
             dropped = (
                 int(route_stats.get("dropped", 0) or 0)
                 if isinstance(route_stats, Mapping)
@@ -1036,6 +1592,23 @@ class LeRobotV21Writer:
             }
         if video_frame_stats:
             summary_payload.setdefault("video_frame_stats", video_frame_stats)
+        if wrist_depth_frame_stats:
+            summary_payload.setdefault("wrist_depth_frame_stats", wrist_depth_frame_stats)
+        trajectory_quality = {
+            "pose_quality_status_counts": dict(stats.pose_quality_status_counts),
+            "pose_quality_bad_count": int(stats.pose_quality_bad_count),
+            "pose_quality_warning_count": int(stats.pose_quality_warning_count),
+            "pose_quality_min_score": stats.pose_quality_min_score,
+            "pose_quality_mean_score": stats.pose_quality_mean_score,
+            "force_collision_detected": bool(stats.force_collision_detected),
+            "force_collision_label": stats.force_collision_label,
+        }
+        summary_payload.setdefault("trajectory_quality", trajectory_quality)
+        summary_payload.setdefault(
+            "force_collision_detected",
+            bool(stats.force_collision_detected),
+        )
+        summary_payload.setdefault("force_collision_label", stats.force_collision_label)
         episode_record = {
             "episode_index": int(episode.episode_index),
             "episode_id": episode.episode_id,
@@ -1046,6 +1619,8 @@ class LeRobotV21Writer:
             "parquet_path": parquet_relative_path if self.config.write_parquet else None,
             "video_paths": video_paths,
             "tactile_paths": tactile_paths,
+            "wrist_depth_mask_paths": wrist_depth_mask_paths,
+            "wrist_depth_raw_paths": wrist_depth_raw_paths,
             "metadata": dict(episode.metadata),
             "summary": summary_payload,
         }
@@ -1063,6 +1638,13 @@ class LeRobotV21Writer:
             "arm_state_source": stats.arm_state_source,
             "camera_keys": list(stats.camera_keys),
             "fault_count": int(stats.fault_count),
+            "pose_quality_status_counts": dict(stats.pose_quality_status_counts),
+            "pose_quality_bad_count": int(stats.pose_quality_bad_count),
+            "pose_quality_warning_count": int(stats.pose_quality_warning_count),
+            "pose_quality_min_score": stats.pose_quality_min_score,
+            "pose_quality_mean_score": stats.pose_quality_mean_score,
+            "force_collision_detected": bool(stats.force_collision_detected),
+            "force_collision_label": stats.force_collision_label,
         }
         _append_jsonl(self.episodes_path, episode_record)
         _append_jsonl(self.episode_stats_path, episode_stats_record)

@@ -648,7 +648,18 @@ class TeleopRecoveryTests(unittest.TestCase):
         self.assertEqual(state["right"]["tracker_name"], "tracker_right")
         self.assertEqual(state["right"]["seq"], 42)
         self.assertAlmostEqual(state["right"]["age_sec"], 0.5)
+        self.assertFalse(state["right"]["stale"])
+        self.assertEqual(state["right"]["status_level"], "warn")
         self.assertEqual(state["right"]["xyz_m"], [0.1, -0.2, 0.3])
+
+        stale_state = _raw_tracker_pose_state_from_channels(
+            channels,
+            active_sides=("right",),
+            now=10.1,
+        )
+        self.assertTrue(stale_state["right"]["stale"])
+        self.assertEqual(stale_state["right"]["status_level"], "stale")
+        self.assertIn("STALE", stale_state["right"]["status_label"])
 
     def test_hand_source_recovers_after_transient_read_error(self) -> None:
         created_readers = []
@@ -1920,6 +1931,42 @@ class TeleopRecoveryTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_safety_freeze_resets_retargeter_target_pose_smoothing(self) -> None:
+        class ResetAwareRetargeter:
+            name = "reset_aware"
+
+            def __init__(self) -> None:
+                self.reset_count = 0
+
+            def reset_target_pose_smoothing(self) -> None:
+                self.reset_count += 1
+
+            def retarget(self, observation, calibration):
+                del calibration
+                return TeleopCommand(timestamp=observation.timestamp)
+
+        source = StubPoseSource()
+        source.right_valid = False
+        retargeter = ResetAwareRetargeter()
+        session = TeleopSession(
+            config=TeleopSessionConfig(record_enabled=False, allow_hardware_after_debug_pass=False),
+            sources=[source],
+            retargeters=[retargeter],
+            safety_config=TeleopSafetyConfig(
+                freeze_on_fault=True,
+                required_channels=("left_wrist_pose", "right_wrist_pose"),
+                invalid_frame_limit=1,
+            ),
+        )
+        try:
+            step = session.run_step(now=0.0)
+
+            self.assertEqual(step.state, TeleopRunState.FROZEN)
+            self.assertEqual([fault.code for fault in step.faults], ["invalid_channel"])
+            self.assertEqual(retargeter.reset_count, 1)
+        finally:
+            session.close()
+
     def test_session_hold_calls_rig_hold_and_stops_dispatching_commands(self) -> None:
         class FakeRig:
             name = "fake_rig"
@@ -1983,6 +2030,129 @@ class TeleopRecoveryTests(unittest.TestCase):
         step = session.run_step(now=0.1)
         self.assertEqual(step.state, TeleopRunState.DEBUG_ONLY)
         self.assertEqual(rig.sent, 1)
+        session.close()
+
+    def test_session_hold_resets_pose_jump_baseline_before_rearming(self) -> None:
+        class FakeRig:
+            name = "fake_rig"
+
+            def __init__(self) -> None:
+                self.sent = 0
+                self.holds: list[str] = []
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+                self.sent += 1
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+
+            def close(self) -> None:
+                pass
+
+        class ResetAwareRetargeter:
+            name = "reset_aware"
+
+            def __init__(self) -> None:
+                self.reset_count = 0
+
+            def reset_target_pose_smoothing(self) -> None:
+                self.reset_count += 1
+
+            def retarget(self, observation, calibration):
+                del calibration
+                command = TeleopCommand(timestamp=observation.timestamp)
+                command.add_command(
+                    EffectorCommand(
+                        effector_name="left_arm",
+                        side="left",
+                        command_type="joint_vector",
+                        value=np.zeros(6, dtype=float),
+                    )
+                )
+                return command
+
+        source = StubPoseSource()
+        rig = FakeRig()
+        retargeter = ResetAwareRetargeter()
+        session = TeleopSession(
+            config=TeleopSessionConfig(record_enabled=False, allow_hardware_after_debug_pass=False),
+            sources=[source],
+            retargeters=[retargeter],
+            rig=rig,
+            safety_config=TeleopSafetyConfig(
+                max_translation_jump_m=0.05,
+                required_channels=("left_wrist_pose", "right_wrist_pose"),
+            ),
+        )
+        try:
+            session.start()
+            session.set_calibration_ready()
+            session.mark_debug_passed()
+            session.arm_hardware()
+            step = session.run_step(now=0.0)
+            self.assertEqual(step.state, TeleopRunState.RUNNING)
+            self.assertEqual(rig.sent, 1)
+
+            session.hold_hardware("unit test hold")
+            self.assertEqual(rig.holds, ["unit test hold"])
+            self.assertEqual(retargeter.reset_count, 1)
+
+            source.left_pose = _pose(tx=0.20)
+            source.right_pose = _pose(tx=-0.20)
+            source.timestamp = 0.1
+            session.arm_hardware()
+            step = session.run_step(now=0.1)
+
+            self.assertEqual(step.state, TeleopRunState.RUNNING)
+            self.assertEqual([fault.code for fault in step.faults], [])
+            self.assertEqual(rig.sent, 2)
+        finally:
+            session.close()
+
+    def test_session_hold_enters_debug_only_when_rig_hold_reports_failure(self) -> None:
+        class FailingRig:
+            name = "failing_rig"
+
+            def __init__(self) -> None:
+                self.holds: list[str] = []
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+                raise RuntimeError("simulated hold failure")
+
+            def close(self) -> None:
+                pass
+
+        rig = FailingRig()
+        session = TeleopSession(
+            config=TeleopSessionConfig(record_enabled=False, allow_hardware_after_debug_pass=False),
+            rig=rig,
+        )
+        session.start()
+        session.set_calibration_ready()
+        session.mark_debug_passed()
+        session.arm_hardware()
+
+        session.hold_hardware("unit test hold")
+
+        self.assertEqual(rig.holds, ["unit test hold"])
+        self.assertEqual(session.state_machine.state, TeleopRunState.DEBUG_ONLY)
         session.close()
 
     def test_real_runtime_restart_resets_command_start_from_live_qpos(self) -> None:

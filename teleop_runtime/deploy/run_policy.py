@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from rm65_inspire_tac.paths import require_asset_path
 from robot_motion.runtime_gate import IKActionChunkGate
 
@@ -64,19 +65,19 @@ from .startup_init import StartupInitializer, resolve_startup_init_action
 
 
 DEFAULT_CAMERA_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
+    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 )
 HAND_BACKEND_INSPIRE = "inspire"
 HAND_BACKEND_DMTAC_GRIPPER = "dmtac-gripper"
 HAND_BACKEND_CHOICES = (HAND_BACKEND_INSPIRE, HAND_BACKEND_DMTAC_GRIPPER)
 GRIPPER_POLICY_DEFAULTS = {
-    "output_dim": 1,
+    "output_dim": 0,
     "speed": 0.2,
     "torque": 0.2,
     "max_action": GRIPPER_ACTION_MAX,
     "send_threshold": 0.002,
     "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
-    "continuous_grasp": False,
+    "continuous_grasp": True,
     "telemetry_hz": 10.0,
 }
 
@@ -378,8 +379,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
     if policy.get("tactile_compute_profile") is not None:
         policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
-    if not 0 <= int(policy["output_dim"]) < 6:
-        raise ValueError("gripper output_dim must be in [0, 5].")
+    if int(policy["output_dim"]) != 0:
+        raise ValueError("dmtac-gripper output_dim/gripper_slot must be 0.")
     if float(policy["send_threshold"]) < 0.0:
         raise ValueError("gripper send_threshold must be >= 0.")
     if float(policy["command_hz"]) <= 0.0:
@@ -682,6 +683,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--arm-urdf-path", type=str, default="")
+    parser.add_argument(
+        "--rm65-ik-framework",
+        choices=["robot_motion"],
+        default="robot_motion",
+        help=(
+            "RM65 IK implementation for position arm backends. "
+            "robot_motion routes shared RM65 IK construction and solving through robot_motion.rm65."
+        ),
+    )
     parser.add_argument("--arm-max-angvel", type=_parse_arm_max_angvel, default=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5))
     parser.add_argument("--arm-state-refresh-hz", type=float, default=10.0)
     parser.add_argument("--rm65-hardware-read-retries", type=_non_negative_int, default=1)
@@ -784,8 +794,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="FIELDS",
         help=(
-            "DM-Tac fields to read/store, e.g. 'distributed_force' for the original path "
-            "or 'raw' for raw-image-only collection. Valid fields: "
+            "DM-Tac fields to read/store. Default is raw-image-only collection; pass "
+            "'distributed_force' for real-time force output. Valid fields: "
             + ", ".join(DMTAC_TACTILE_FIELDS)
         ),
     )
@@ -1021,6 +1031,7 @@ def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...], 
                 hardware_read_retry_delay_sec=float(args.rm65_hardware_read_retry_delay_sec),
                 initial_qpos=getattr(args, f"{side}_initial_qpos"),
                 tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
+                ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
                 background_streaming_enabled=bool(arm_ip),
                 background_streaming_hz=float(control_hz),
             )
@@ -1139,18 +1150,10 @@ def hand_action_specs_for_backends(
     active_sides: tuple[str, ...],
 ) -> dict[str, Any]:
     specs = {}
-    policy = _resolved_gripper_policy(args) if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER else {}
+    hand_backend_mode = _hand_backend_mode(args)
     for side in active_sides:
-        backend = backends.get(side)
-        if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
-            specs[side] = HandActionSpec.dmtac_gripper(
-                side,
-                gripper_slot=(
-                    int(backend.config.command_dim)
-                    if isinstance(backend, DMTacGripperBackend)
-                    else int(policy.get("output_dim", 1))
-                ),
-            )
+        if hand_backend_mode == HAND_BACKEND_DMTAC_GRIPPER:
+            specs[side] = HandActionSpec.dmtac_gripper(side)
         else:
             specs[side] = HandActionSpec.inspire_tac(side)
     return hand_action_specs_metadata(specs)

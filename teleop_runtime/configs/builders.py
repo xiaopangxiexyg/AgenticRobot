@@ -102,7 +102,7 @@ def _build_hand_retargeter(
                 input_channel_name=input_channel_name,
                 effector_name=effector_name,
                 source_dim=2,
-                output_dim=1,
+                output_dim=0,
                 output_max=float(config.max_action),
             )
         )
@@ -132,6 +132,7 @@ def build_bimanual_session(
     keyboard_source: KeyboardButtonSource | None = None,
     enable_dual_arm_collision_avoidance: bool = True,
     dual_arm_collision_config: DualArmCollisionAwareRetargeterConfig | None = None,
+    rm65_ik_framework: str = "robot_motion",
     vive_tracker_height_correction: bool = (
         DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_enabled
     ),
@@ -241,6 +242,7 @@ def build_bimanual_session(
                     if right_arm_backend_config is None
                     else right_arm_backend_config.tcp_pose_flange_m_rad
                 ),
+                ik_framework=str(rm65_ik_framework),
                 target_pose_smoother=build_bimanual_pose_smoother(
                     load_default_pose_smoothing_config()
                 ),

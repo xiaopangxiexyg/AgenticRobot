@@ -11,6 +11,10 @@ from hardware.rm65.force_compensation import (
     apply_pose_offset_work_rotvec,
 )
 from hardware.rm65.impedance import RM65ImpedanceConfig, RM65JointImpedanceController, RM65PoseImpedanceController
+from teleop_runtime.backends.arms.rm65_impedance import (
+    RM65ImpedanceArmBackend,
+    RM65ImpedanceArmBackendConfig,
+)
 
 
 class _FakeRobot:
@@ -337,6 +341,119 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertEqual(record["ik_reference_backoff_scale"], 0.5)
         self.assertEqual(record["ik_method"], "euler")
 
+    def test_pose_controller_reset_motion_state_reanchors_reference_to_current_qpos(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        reset_joint_deg = [1.0, 2.0, 21.0, 4.0, 5.0, 6.0]
+        reset_pose = [0.03, -0.02, 0.36, 0.01, 0.02, -0.03]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=current_pose,
+            ik_retry_pose=current_pose,
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller._reference.set_target([0.2, 0.0, 0.35, 0.0, 0.0, 0.0])
+        controller._joint_hint_reference.set_target([10.0, 0.0, 20.0, 0.0, 0.0, 0.0])
+        controller._latest_wrench_context = {"stale": True}
+        controller._step_index = 7
+        robot.model_fk_pose = reset_pose
+
+        controller.reset_motion_state(np.deg2rad(reset_joint_deg))
+
+        np.testing.assert_allclose(controller._previous_command_joint, reset_joint_deg)
+        np.testing.assert_allclose(controller._ik_seed, reset_joint_deg)
+        self.assertEqual(controller._previous_command_pose, reset_pose)
+        self.assertEqual(controller._reference.current, reset_pose)
+        self.assertEqual(controller._reference.target, reset_pose)
+        np.testing.assert_allclose(controller._joint_hint_reference.current, reset_joint_deg)
+        np.testing.assert_allclose(controller._joint_hint_reference.target, reset_joint_deg)
+        self.assertIsNone(controller._latest_wrench_context)
+        self.assertEqual(controller._step_index, 0)
+
+    def test_impedance_backend_reset_motion_state_clears_targets_and_resets_controller(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.reset_qpos: np.ndarray | None = None
+
+            def reset_motion_state(self, qpos) -> None:
+                self.reset_qpos = np.asarray(qpos, dtype=float).copy()
+
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="192.0.2.10",
+                side="right",
+                connect_hardware=False,
+            )
+        )
+        controller = FakeController()
+        backend._controller = controller
+        backend._latest_target_pose6 = [0.1] * 6
+        backend._latest_target_joint_deg = [1.0] * 6
+        backend._last_command = object()
+        backend._last_command_timestamp = 123.0
+        backend._last_step_record = {"old": True}
+        backend._last_send_time = 456.0
+        qpos = np.linspace(0.0, 0.5, 6)
+
+        backend.reset_motion_state(qpos)
+
+        self.assertIsNone(backend._latest_target_pose6)
+        self.assertIsNone(backend._latest_target_joint_deg)
+        self.assertIsNone(backend._last_command)
+        self.assertIsNone(backend._last_command_timestamp)
+        self.assertIsNone(backend._last_step_record)
+        self.assertIsNone(backend._last_send_time)
+        self.assertEqual(backend._last_send_result_text, "reset_motion_state")
+        np.testing.assert_allclose(controller.reset_qpos, qpos)
+
+    def test_impedance_backend_warm_start_initializes_controller_without_enabling_loop(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self._started = False
+                self.start_count = 0
+
+            def start(self) -> None:
+                self.start_count += 1
+                self._started = True
+
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="192.0.2.10",
+                side="right",
+                connect_hardware=True,
+            )
+        )
+        controller = FakeController()
+        backend.arm = object()
+        backend._controller = controller
+
+        self.assertFalse(backend.force_control_warm_started())
+        backend.warm_start_force_control()
+
+        state = backend.get_state()
+        self.assertTrue(backend.force_control_warm_started())
+        self.assertFalse(state["impedance_enabled"])
+        self.assertEqual(state["impedance_loop_state"], "not_started")
+        self.assertEqual(state["send_result_text"], "warm_started")
+
+        backend.warm_start_force_control()
+        self.assertEqual(controller.start_count, 1)
+
     def test_pose_controller_can_hold_last_safe_when_runtime_ik_fails(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
         current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
@@ -514,6 +631,52 @@ class RM65ImpedanceTest(unittest.TestCase):
         )
         self.assertEqual(len(robot.ik_calls), preflight_ik_calls)
 
+    def test_pose_controller_force_guard_prefers_joint_hint_over_backend_ik(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_pose = [0.02, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_joint = [1.0, 2.0, 20.0, 3.0, 4.0, 5.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=current_pose,
+            ik_retry_pose=current_pose,
+            force_sequence=[[0.0] * 6, [30.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                force_deadband_n=0.0,
+                linear_compliance_m_per_n=0.004,
+                max_linear_velocity_m_s=1.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+                direct_joint_hint_max_linear_offset_m=1e-3,
+                direct_joint_hint_force_guard_force_n=20.0,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        preflight_ik_calls = len(robot.ik_calls)
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(target_pose, target_joint_deg=target_joint)
+
+        self.assertEqual(record["command_joint_deg"], target_joint)
+        self.assertEqual(record["ik_method"], "dual_arm_joint_hint")
+        self.assertEqual(len(robot.ik_calls), preflight_ik_calls)
+        metadata = record["ik_metadata"]
+        self.assertEqual(metadata["direct_joint_hint_reason"], "force_guard")
+        self.assertTrue(metadata["direct_joint_hint_force_guard"]["active"])
+        self.assertGreater(record["offset"][0], 0.001)
+
     def test_pose_controller_backs_off_when_ik_joint_step_exceeds_limit(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
         current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
@@ -590,13 +753,13 @@ class RM65ImpedanceTest(unittest.TestCase):
 
         self.assertTrue(record["joint_rate_limited"])
         self.assertEqual(record["joint_velocity_limit_profile"], "rm65")
-        self.assertTrue(np.allclose(record["command_joint_deg"], [0.0, 0.0, 20.0, 15.0, 0.0, 0.0], atol=1e-2))
-        self.assertAlmostEqual(record["command_joint_step_deg"], 15.0, places=2)
+        self.assertTrue(np.allclose(record["command_joint_deg"], [0.0, 0.0, 20.0, 21.0, 0.0, 0.0], atol=1e-2))
+        self.assertAlmostEqual(record["command_joint_step_deg"], 21.0, places=2)
         self.assertAlmostEqual(record["joint_velocity_limit_observed_dt_sec"], 0.2, places=2)
         self.assertAlmostEqual(record["joint_velocity_limit_effective_dt_sec"], 0.2, places=2)
         self.assertEqual(record["joint_velocity_limit_max_dt_sec"], 1.0)
         self.assertEqual(record["joint_safety"]["status_text"], "position_limit=ok self_collision=ok")
-        self.assertTrue(np.allclose(robot.movej_calls[-1], [0.0, 0.0, 20.0, 15.0, 0.0, 0.0], atol=1e-2))
+        self.assertTrue(np.allclose(robot.movej_calls[-1], [0.0, 0.0, 20.0, 21.0, 0.0, 0.0], atol=1e-2))
 
     def test_pose_controller_caps_runtime_rate_limit_dt_at_profile_max(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
@@ -609,7 +772,7 @@ class RM65ImpedanceTest(unittest.TestCase):
             current_pose=current_pose,
             model_fk_pose=current_pose,
             ik_success_pose=target_pose,
-            ik_success_joint=[0.0, 0.0, 20.0, 80.0, 0.0, 0.0],
+            ik_success_joint=[0.0, 0.0, 20.0, 140.0, 0.0, 0.0],
             ik_retry_pose=current_pose,
         )
         controller = RM65PoseImpedanceController(
@@ -629,7 +792,7 @@ class RM65ImpedanceTest(unittest.TestCase):
         record = controller.step(target_pose)
 
         self.assertTrue(record["joint_rate_limited"])
-        self.assertTrue(np.allclose(record["command_joint_deg"], [0.0, 0.0, 20.0, 75.0, 0.0, 0.0], atol=1e-6))
+        self.assertTrue(np.allclose(record["command_joint_deg"], [0.0, 0.0, 20.0, 105.0, 0.0, 0.0], atol=1e-6))
         self.assertAlmostEqual(record["joint_velocity_limit_observed_dt_sec"], 2.0, places=2)
         self.assertEqual(record["joint_velocity_limit_effective_dt_sec"], 1.0)
         self.assertEqual(record["joint_velocity_limit_max_dt_sec"], 1.0)
@@ -716,6 +879,51 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertEqual(record["command_joint_deg"], target_joint)
         self.assertEqual(robot.movej_calls[-1], target_joint)
         self.assertEqual(robot.movep_calls, [])
+
+    def test_pose_controller_debug_timing_records_sdk_phases(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_pose = [0.01, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_joint = [1.0, 2.0, 20.0, 3.0, 4.0, 5.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=target_pose,
+            ik_success_joint=target_joint,
+            ik_retry_pose=current_pose,
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+                debug_timing=True,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(target_pose)
+
+        timing = record["rm65_controller_timing"]
+        self.assertTrue(timing["enabled"])
+        self.assertGreaterEqual(timing["total_ms"], 0.0)
+        phase_names = [phase["name"] for phase in timing["phases"]]
+        for expected in (
+            "read_force",
+            "command_from_reference",
+            "send",
+            "state_read_after_send",
+        ):
+            self.assertIn(expected, phase_names)
 
     def test_pose_controller_can_opt_into_pose_transport(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]

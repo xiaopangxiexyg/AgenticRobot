@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as SciPyRotation
 
+from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from ..backends.arms import (
     RM65ArmBackend,
     RM65ArmBackendConfig,
@@ -40,6 +41,7 @@ from ..backends.hands import (
     InspireTacHandBackendConfig,
 )
 from ..arm_frames import TOOL_TCP_FRAME
+from ..action import HandActionSpec
 from ..calibration import TeleopCalibration
 from ..collection.diagnostics import (
     PhaseTimer,
@@ -54,7 +56,11 @@ from ..collection.camera_preview import CameraPreviewConfig, CameraPreviewer
 from ..collection.build_collect_components import CollectorComponents
 from ..collection.observers import CollectionWriterObserver, CollectionWriterObserverConfig
 from ..collection.preview_rate import PreviewRateLimiter
-from ..collection.sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
+from ..collection.sample_assembler import (
+    CollectorSampleBuilder,
+    CollectorSampleBuilderConfig,
+    _build_pose_quality_metadata as _collection_build_pose_quality_metadata,
+)
 from ..collection.status_snapshot import (
     camera_debug_text as _collection_camera_debug_text,
     hand_debug_text as _collection_hand_debug_text,
@@ -124,6 +130,12 @@ from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_ma
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..special_tasks.fix_arm import (
+    FixArmCommandController,
+    FixArmPoseSnapshotRecorder,
+    advance_fix_arm_home_capture,
+    build_fix_arm_pose_snapshot_payload,
+)
 from ..tactile_visualizer import (
     AsyncTactileUVVisualizer,
     DMTacDistributedForceVisualizer,
@@ -143,9 +155,11 @@ from .calibration_flow import (
     pose_from_rotation_translation,
     tracker_offset_from_neutral_pose,
 )
+from ..gui import collection_tasks as gui_collection_tasks
 from ..gui.calibration_web_ui import CalibrationWebUi
 from .log_utils import ChangeGate
 from .run_vive_sapien_virtual import (
+    DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
     RecoveryPlan,
     TerminalClutchInput,
     _active_sides_from_args,
@@ -153,6 +167,7 @@ from .run_vive_sapien_virtual import (
     _build_episode_frame,
     _build_renderer_debug_boxes,
     _build_renderer_debug_frames,
+    _channel_pose_in_desk,
     _collision_debug_box_templates,
     _emit_collision_proxy_logs,
     _emit_home_alignment_logs,
@@ -160,6 +175,7 @@ from .run_vive_sapien_virtual import (
     _emit_tracker_axis_mapping_logs,
     _log,
     _manual_calibration_confirmation_required,
+    _mean_pose,
     _non_negative_int,
     _alpha_float,
     _parse_active_sides,
@@ -167,7 +183,9 @@ from .run_vive_sapien_virtual import (
     _parse_joint_order,
     _positive_float,
     _qpos_summary,
+    _resolve_robot_home_for_side,
     _runtime_home_calibration,
+    _side_retargeter,
     _start_recovery_plan,
     _state_qpos,
     _sync_dual_arm_retargeter_from_preview,
@@ -184,11 +202,11 @@ from rm65_inspire_tac.pipeline import (
     build_dual_arm_scene_profile,
 )
 from rm65_inspire_tac.rendering import SapienArmHandRenderer
-from project_paths import calibration_profiles_dir, default_dataset_root
+from project_paths import calibration_profiles_dir, default_dataset_root, teleop_records_root
 
 
 DEFAULT_CAMERA_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "devices" / "realsense.json"
+    DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 )
 DEFAULT_DATASET_ROOT = default_dataset_root()
 DEFAULT_DMTAC_ROOT = Path(__file__).resolve().parents[2] / "hardware" / "DMTAC_gripper"
@@ -199,6 +217,34 @@ DEFAULT_TASKS_CONFIG_PATH = (
     / "tasks"
     / "vive_rm65_real_teleop_tasks.json"
 )
+WRIST_DEPTH_CAMERA_KEYS = ("left_wrist", "right_wrist")
+DEFAULT_WRIST_DEPTH_SAVE_FPS = 15
+DEFAULT_WRIST_DEPTH_STREAM_FPS = 30
+DEFAULT_WRIST_DEPTH_FPS = DEFAULT_WRIST_DEPTH_SAVE_FPS
+DEFAULT_WRIST_DEPTH_MIN_M = 0.05
+DEFAULT_WRIST_DEPTH_MAX_M = 0.5
+DEFAULT_EPISODE_START_COUNTDOWN_SEC = 3.0
+DEFAULT_IK_DEBUG_LOG_ROOT = teleop_records_root() / "ik_debug"
+DEFAULT_DEBUG_TIMING_LOG_ROOT = teleop_records_root() / "debug_timing"
+
+
+def _episode_start_countdown_remaining(now: float, deadline: float | None) -> float:
+    if deadline is None:
+        return 0.0
+    return max(0.0, float(deadline) - float(now))
+
+
+def _episode_start_countdown_ready_to_record(
+    *,
+    now: float,
+    deadline: float | None,
+    warmup_ready: bool,
+) -> bool:
+    return bool(
+        warmup_ready
+        and deadline is not None
+        and _episode_start_countdown_remaining(now, deadline) <= 0.0
+    )
 
 
 HAND_BACKEND_INSPIRE = "inspire"
@@ -211,7 +257,7 @@ HAND_BACKEND_CHOICES = (
 )
 GRIPPER_POLICY_DEFAULTS = {
     "source_dim": 2,
-    "output_dim": 1,
+    "output_dim": 0,
     "invert": False,
     "alpha": 1.0,
     "input_min": DEFAULT_GRIPPER_INPUT_MIN,
@@ -221,13 +267,14 @@ GRIPPER_POLICY_DEFAULTS = {
     "max_action": GRIPPER_ACTION_MAX,
     "send_threshold": 0.002,
     "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
-    "continuous_grasp": False,
+    "continuous_grasp": True,
     "telemetry_hz": 10.0,
 }
 EPISODE_GUI_EVENTS = (
     "episode_start",
     "episode_stop",
 )
+POSE_SNAPSHOT_GUI_EVENT = "record_pose_snapshot"
 VISUALIZATION_GUI_EVENTS = (
     "toggle_camera_vis",
     "toggle_tactile_vis",
@@ -250,6 +297,8 @@ MOVEMENT_MULTIPLE_GUI_EVENTS = (
 VIRTUAL_DESK_SWEEP_CONVENTION_VERSION = 2
 DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M = 0.45
 DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG = 160.0
+TRACKER_GUI_WARN_AGE_SEC = 0.25
+TRACKER_GUI_STALE_AGE_SEC = 0.50
 
 
 @dataclass(frozen=True)
@@ -287,6 +336,7 @@ class RealTeleopComponents:
     arm_state_read_executor: ThreadPoolExecutor | None
     arm_loop_step_dt_tracker: dict[str, float | None]
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None
+    fix_arm_controller: FixArmCommandController | None
 
 
 @dataclass
@@ -442,9 +492,9 @@ class Q6HoldRecalibrationGesture:
 class TemporaryDualArmSafetyConfig:
     enabled: bool = True
     active_sides: tuple[str, ...] = ("left", "right")
-    max_xyz_step_m: float = 0.015
-    max_rot_step_deg: float = 5.0
-    max_joint_step_deg: float = 4.0
+    max_xyz_step_m: float = 0.03
+    max_rot_step_deg: float = 8.0
+    max_joint_step_deg: float = 6.0
     command_scale: float = 1.0
 
 
@@ -643,6 +693,73 @@ class TemporaryDualArmSafetyLimiter:
             "max_rot_step_deg": float(self.config.max_rot_step_deg),
             "command_scale": float(self.config.command_scale),
         }
+
+
+def _compose_real_command_filter(
+    *,
+    temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None,
+    fix_arm_controller: FixArmCommandController | None,
+):
+    if temporary_safety_limiter is None and fix_arm_controller is None:
+        return None
+
+    def filter_command(command: TeleopCommand, observation, now: float) -> TeleopCommand:
+        filtered = command
+        if temporary_safety_limiter is not None:
+            filtered = temporary_safety_limiter.filter_command(filtered, observation, now)
+        if fix_arm_controller is not None:
+            filtered = fix_arm_controller.filter_command(filtered, observation, now)
+        if temporary_safety_limiter is not None and fix_arm_controller is not None:
+            temporary_safety_limiter.sync_from_command(filtered)
+        return filtered
+
+    return filter_command
+
+
+def _filter_manual_real_command(
+    components: "RealTeleopComponents",
+    command: TeleopCommand | None,
+    observation,
+    now: float,
+) -> TeleopCommand | None:
+    if command is None or observation is None:
+        return command
+    filter_command = _compose_real_command_filter(
+        temporary_safety_limiter=components.temporary_safety_limiter,
+        fix_arm_controller=components.fix_arm_controller,
+    )
+    if filter_command is None:
+        return command
+    return filter_command(command, observation, now)
+
+
+def _fix_arm_required_effectors_by_side(
+    *,
+    active_sides: Sequence[str],
+    left_hand_control_via_rig: bool,
+    right_hand_control_via_rig: bool,
+    left_gripper_retargeter: ScalarToGripperRetargeter | None,
+    right_gripper_retargeter: ScalarToGripperRetargeter | None,
+    left_hand_backend: InspireTacHandBackend | DMTacGripperBackend | None,
+    right_hand_backend: InspireTacHandBackend | DMTacGripperBackend | None,
+) -> dict[str, tuple[str, ...]]:
+    required: dict[str, tuple[str, ...]] = {}
+    for side in active_sides:
+        names = [f"{side}_arm"]
+        if side == "left":
+            hand_controlled = bool(
+                left_hand_control_via_rig
+                or (left_gripper_retargeter is not None and left_hand_backend is not None)
+            )
+        else:
+            hand_controlled = bool(
+                right_hand_control_via_rig
+                or (right_gripper_retargeter is not None and right_hand_backend is not None)
+            )
+        if hand_controlled:
+            names.append(f"{side}_hand")
+        required[str(side)] = tuple(names)
+    return required
 
 
 def _non_negative_float(text: str) -> float:
@@ -882,8 +999,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if not 0 <= int(policy["source_dim"]) < 6:
         raise ValueError("gripper source_dim must be in [0, 5].")
-    if not 0 <= int(policy["output_dim"]) < 6:
-        raise ValueError("gripper output_dim must be in [0, 5].")
+    if int(policy["output_dim"]) != 0:
+        raise ValueError("dmtac-gripper output_dim/gripper_slot must be 0.")
     if not 0.0 < float(policy["alpha"]) <= 1.0:
         raise ValueError("gripper alpha must be in (0, 1].")
     if not 0.0 <= float(policy["input_min"]) < float(policy["input_max"]) <= 1.0:
@@ -959,8 +1076,8 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
         policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
     if not 0 <= int(policy["source_dim"]) < 6:
         raise ValueError("gripper source_dim must be in [0, 5].")
-    if not 0 <= int(policy["output_dim"]) < 6:
-        raise ValueError("gripper output_dim must be in [0, 5].")
+    if int(policy["output_dim"]) != 0:
+        raise ValueError("dmtac-gripper output_dim/gripper_slot must be 0.")
     if not 0.0 < float(policy["alpha"]) <= 1.0:
         raise ValueError("gripper alpha must be in (0, 1].")
     if not 0.0 <= float(policy["input_min"]) < float(policy["input_max"]) <= 1.0:
@@ -1418,6 +1535,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-hand-port", type=str, default="", help="Optional left hand teleop serial port")
     parser.add_argument("--right-hand-port", type=str, default="", help="Optional right hand teleop serial port")
     parser.add_argument(
+        "--fix-arm",
+        action="store_true",
+        help=(
+            "Enable fixed-arm collection mode. In this mode GUI C freezes the selected "
+            "arm/hand at the last dispatched action, and C again recaptures that side's "
+            "runtime home before releasing it."
+        ),
+    )
+    parser.add_argument(
+        "--fix-arm-side",
+        choices=("left", "right"),
+        default="left",
+        help="Initial side selected by --fix-arm. The GUI can switch it while no side is fixed.",
+    )
+    parser.add_argument(
         "--hand-backend",
         choices=HAND_BACKEND_CHOICES,
         default=HAND_BACKEND_INSPIRE,
@@ -1623,8 +1755,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="FIELDS",
         help=(
-            "DM-Tac fields to read/store, e.g. 'distributed_force' for the original path "
-            "or 'raw' for raw-image-only collection. Valid fields: "
+            "DM-Tac fields to read/store. Default is raw-image-only collection; pass "
+            "'distributed_force' for real-time force output. Valid fields: "
             + ", ".join(DMTAC_TACTILE_FIELDS)
         ),
     )
@@ -1632,7 +1764,10 @@ def parse_args() -> argparse.Namespace:
         "--dmtac-tactile-compute-profile",
         choices=("dist-only", "legacy", "requested", "shear-depth"),
         default=None,
-        help="SDK compute channels for DMTAC telemetry. Default follows backend config.",
+        help=(
+            "SDK compute channels for DMTAC telemetry. Default follows backend config; "
+            "use dist-only with distributed_force for the real-time force path."
+        ),
     )
     parser.add_argument(
         "--dmtac-tactile-denoise",
@@ -2039,7 +2174,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help=(
             "Tracker role used by the GUI VIVE coordinate calibration sweeps. "
-            "auto prefers auxiliary when present, then left_wrist, then right_wrist."
+            "auto asks in the GUI and defaults to right_wrist; auxiliary explicitly skips the hand prompt."
         ),
     )
     parser.add_argument(
@@ -2147,6 +2282,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rm65-ik-framework",
+        choices=["robot_motion"],
+        default="robot_motion",
+        help=(
+            "RM65 IK implementation used by real/sim arm backends and dual-arm collision IK. "
+            "robot_motion routes all shared RM65 IK construction and solving through robot_motion.rm65."
+        ),
+    )
+    parser.add_argument(
         "--dual-arm-temporary-safety",
         dest="dual_arm_temporary_safety",
         action=argparse.BooleanOptionalAction,
@@ -2159,19 +2303,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dual-arm-temp-max-xyz-step-m",
         type=_positive_float,
-        default=0.1,
+        default=0.03,
         help="Temporary dual-arm safety max per-frame TCP translation step in meters.",
     )
     parser.add_argument(
         "--dual-arm-temp-max-rot-step-deg",
         type=_positive_float,
-        default=15.0,
+        default=8.0,
         help="Temporary dual-arm safety max per-frame TCP rotation step in degrees.",
     )
     parser.add_argument(
         "--dual-arm-temp-max-joint-step-deg",
         type=_positive_float,
-        default=15.0,
+        default=6.0,
         help="Temporary dual-arm safety max per-frame joint-vector step in degrees.",
     )
     parser.add_argument(
@@ -2340,8 +2484,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start runtime home calibration immediately without waiting for a key press.",
     )
-    parser.add_argument("--keyboard-clutch", action="store_true", help="Enable terminal clutch toggles: z/x/c/r, q to quit")
-    parser.add_argument("--no-record", action="store_true", help="Disable JSONL recording for this session")
+    parser.add_argument("--keyboard-clutch", action="store_true", help="Enable terminal clutch toggles: z/x/b/r, q to quit")
+    parser.add_argument(
+        "--record",
+        dest="no_record",
+        action="store_false",
+        help=(
+            "Enable legacy debug session JSONL recording. This writes raw_inputs/faults/"
+            "state_transitions/calibration under --session-record-root when provided, or "
+            "teleop_records/<timestamp> otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--no-record",
+        dest="no_record",
+        action="store_true",
+        help="Disable legacy debug session JSONL recording. This is the default for real teleop.",
+    )
+    parser.set_defaults(no_record=True)
     parser.add_argument(
         "--no-session-record-commands",
         action="store_true",
@@ -2408,8 +2568,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help=(
-            "Optional base directory for debug JSONL session output. When set, session JSONL is "
-            "written to <session-record-root>/<timestamp>_vive_rm65_real_teleop."
+            "Optional base directory for legacy debug JSONL session output when --record is set. "
+            "Session JSONL is written to <session-record-root>/<timestamp>_vive_rm65_real_teleop."
         ),
     )
     parser.add_argument(
@@ -2424,12 +2584,62 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-video", dest="write_video", action="store_false")
     parser.set_defaults(write_video=True)
     parser.add_argument(
+        "--wrist-depth-mask",
+        "--wrsit-depth-mask",
+        dest="wrist_depth_mask",
+        action="store_true",
+        help=(
+            "Save 15 Hz bit-packed 0/1 depth-range masks for left/right D405 wrist cameras only. "
+            "The front camera depth stream is not enabled by this option."
+        ),
+    )
+    parser.add_argument(
+        "--wrist-depth-raw",
+        "--wrsit-depth-raw",
+        dest="wrist_depth_raw",
+        action="store_true",
+        help=(
+            "Debug mode: save 15 Hz aligned raw z16 depth for left/right D405 wrist cameras only. "
+            "This can be large; the front camera depth stream is not enabled."
+        ),
+    )
+    parser.add_argument(
+        "--wrist-depth-min-m",
+        type=_positive_float,
+        default=DEFAULT_WRIST_DEPTH_MIN_M,
+        help="Minimum metric depth included in --wrist-depth-mask.",
+    )
+    parser.add_argument(
+        "--wrist-depth-max-m",
+        type=_positive_float,
+        default=DEFAULT_WRIST_DEPTH_MAX_M,
+        help="Maximum metric depth included in --wrist-depth-mask.",
+    )
+    parser.add_argument(
+        "--wrist-depth-stream-fps",
+        type=_positive_int,
+        default=DEFAULT_WRIST_DEPTH_STREAM_FPS,
+        help=(
+            "RealSense depth stream fps for left/right D405 wrist cameras. "
+            "Saved wrist-depth mask/raw frames follow the 15 Hz collection sample rate."
+        ),
+    )
+    parser.add_argument(
         "--tactile-storage",
         choices=("external", "parquet"),
         default="external",
         help="How high-dimensional tactile frames are stored in the formal dataset.",
     )
     parser.add_argument("--external-tactile", dest="tactile_storage", action="store_const", const="external")
+    parser.add_argument(
+        "--tactile-compression",
+        choices=("zstd", "lz4", "none"),
+        default="lz4",
+        help=(
+            "Compression for external tactile streams. lz4 is the default; use none "
+            "to write legacy raw .bin streams."
+        ),
+    )
     parser.add_argument(
         "--writer-workers",
         type=_positive_int,
@@ -2492,7 +2702,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-episode-recording",
         action="store_true",
-        help="Disable episode trajectory recording support for this run.",
+        help="Disable lightweight debug trajectory recording support for this run.",
+    )
+    parser.add_argument(
+        "--debug-trajectory-recording",
+        action="store_true",
+        help=(
+            "Also save lightweight debug trajectory episode files. Formal LeRobot dataset "
+            "collection remains independent; debug trajectories still default on when "
+            "--no-collection is used."
+        ),
     )
     parser.add_argument(
         "--episode-root",
@@ -2500,8 +2719,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Optional directory used to store episode_XXXXXX subdirectories. "
-            "Defaults to <session_record_root>/trajectories when session recording is enabled; "
-            "overrides --dataset-root for episode trajectory files only."
+            "Providing this option also enables lightweight debug trajectory recording; "
+            "it overrides --dataset-root for episode trajectory files only."
         ),
     )
     parser.add_argument(
@@ -2513,7 +2732,10 @@ def parse_args() -> argparse.Namespace:
         "--load-profile",
         type=str,
         default="",
-        help="Optional calibration profile to load before runtime home calibration.",
+        help=(
+            "Calibration profile to load before runtime home calibration. "
+            "When omitted, the newest JSON under teleop_records/calibration_profiles is loaded."
+        ),
     )
     parser.add_argument(
         "--load-initial-alignment",
@@ -2655,6 +2877,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("--tactile-vis-size must be positive.")
     if bool(args.no_camera) and bool(args.vis_cam):
         parser.error("--vis_cam requires cameras; remove --no-camera.")
+    if float(args.wrist_depth_max_m) <= float(args.wrist_depth_min_m):
+        parser.error("--wrist-depth-max-m must be greater than --wrist-depth-min-m.")
+    if bool(args.no_camera) and (bool(args.wrist_depth_mask) or bool(args.wrist_depth_raw)):
+        parser.error("--wrist-depth-mask/--wrist-depth-raw require cameras; remove --no-camera.")
+    if not str(getattr(args, "load_profile", "") or "").strip():
+        latest_profile = _latest_vive_calibration_profile_path()
+        if latest_profile is None:
+            parser.error(
+                "--load-profile was not provided and no calibration profile JSON was found in "
+                f"{DEFAULT_CALIBRATION_PROFILE_DIR}"
+            )
+        args.load_profile = str(latest_profile)
     args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
     args.tcp_mode = TOOL_TCP_FRAME
     active_sides = _active_sides_from_args(args)
@@ -2844,6 +3078,25 @@ def _apply_vive_tracker_mapping(
     )
 
 
+def _tracker_gui_status(
+    *,
+    enabled: bool,
+    valid: bool,
+    age_sec: float | None,
+) -> tuple[str, str, bool]:
+    if not enabled:
+        return "disabled", "未启用", False
+    if age_sec is None:
+        return "no-data", "无数据", False
+    if not valid:
+        return "invalid", "无效", False
+    if age_sec > TRACKER_GUI_STALE_AGE_SEC:
+        return "stale", f"STALE {age_sec:.2f}s", True
+    if age_sec >= TRACKER_GUI_WARN_AGE_SEC:
+        return "warn", f"延迟 {age_sec:.2f}s", False
+    return "ok", "有效", False
+
+
 def _pose_xyz_rpy_summary(
     channel: object | None,
     *,
@@ -2851,23 +3104,41 @@ def _pose_xyz_rpy_summary(
     enabled: bool = True,
 ) -> dict[str, object]:
     if not enabled:
+        status_level, status_label, stale = _tracker_gui_status(
+            enabled=False,
+            valid=False,
+            age_sec=None,
+        )
         return {
             "enabled": False,
             "valid": False,
             "xyz_m": None,
             "rpy_deg": None,
             "age_sec": None,
+            "stale": stale,
+            "status_level": status_level,
+            "status_label": status_label,
+            "stale_timeout_sec": TRACKER_GUI_STALE_AGE_SEC,
             "tracker_name": "",
             "tracker_role": "",
             "seq": None,
         }
     if channel is None:
+        status_level, status_label, stale = _tracker_gui_status(
+            enabled=True,
+            valid=False,
+            age_sec=None,
+        )
         return {
             "enabled": True,
             "valid": False,
             "xyz_m": None,
             "rpy_deg": None,
             "age_sec": None,
+            "stale": stale,
+            "status_level": status_level,
+            "status_label": status_label,
+            "stale_timeout_sec": TRACKER_GUI_STALE_AGE_SEC,
             "tracker_name": "",
             "tracker_role": "",
             "seq": None,
@@ -2886,12 +3157,22 @@ def _pose_xyz_rpy_summary(
     if timestamp is None:
         timestamp = getattr(channel, "timestamp", None)
     age_sec = max(0.0, now - float(timestamp)) if timestamp is not None else None
+    valid = bool(getattr(channel, "valid", False))
+    status_level, status_label, stale = _tracker_gui_status(
+        enabled=True,
+        valid=valid,
+        age_sec=age_sec,
+    )
     return {
         "enabled": True,
-        "valid": bool(getattr(channel, "valid", False)),
+        "valid": valid,
         "xyz_m": np.round(pose[:3, 3].astype(float), 4).tolist(),
         "rpy_deg": rpy_values,
         "age_sec": round(age_sec, 3) if age_sec is not None else None,
+        "stale": stale,
+        "status_level": status_level,
+        "status_label": status_label,
+        "stale_timeout_sec": TRACKER_GUI_STALE_AGE_SEC,
         "tracker_name": str(metadata.get("tracker_name") or ""),
         "tracker_role": str(metadata.get("tracker_role") or ""),
         "seq": metadata.get("seq"),
@@ -3002,24 +3283,31 @@ def _vive_calibration_profile_ui_state(
     }
 
 
+def _calibration_profile_latest_sort_key(path: Path) -> tuple[int, str, float, str]:
+    match = re.match(r"^(\d{8}_\d{6})", path.name)
+    timestamp_key = match.group(1) if match else ""
+    return (
+        1 if timestamp_key else 0,
+        timestamp_key,
+        path.stat().st_mtime,
+        path.name,
+    )
+
+
 def _latest_vive_calibration_profile_path() -> Path | None:
     if not DEFAULT_CALIBRATION_PROFILE_DIR.exists():
         return None
     candidates: list[Path] = []
     seen: set[Path] = set()
-    for pattern in (
-        "*_vive_rm65_real_teleop.json",
-        "*_vive_rm65_virtual_desk.json",
-    ):
-        for path in DEFAULT_CALIBRATION_PROFILE_DIR.glob(pattern):
-            resolved = path.resolve()
-            if resolved in seen or not path.is_file():
-                continue
-            seen.add(resolved)
-            candidates.append(path)
+    for path in DEFAULT_CALIBRATION_PROFILE_DIR.glob("*.json"):
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        candidates.append(path)
     if not candidates:
         return None
-    return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+    return max(candidates, key=_calibration_profile_latest_sort_key)
 
 
 def _gui_vive_calibration_load_path(args: argparse.Namespace) -> Path:
@@ -3107,6 +3395,18 @@ def _format_vive_source_rates(
     return f"source_udp_hz={packet_hz:.1f} packet_age={packet_age:.2f}s " + " ".join(channel_parts)
 
 
+def _format_vive_sweep_quality(poses: list[np.ndarray]) -> str:
+    try:
+        quality = fit_signed_axis_from_poses(poses).quality
+    except Exception as exc:  # noqa: BLE001
+        return f"quality=unavailable({type(exc).__name__}: {exc})"
+    return (
+        f"quality extent={quality.extent_m:.3f}m "
+        f"variance_ratio={quality.variance_ratio:.3f} "
+        f"start_end_distance={quality.start_end_distance_m:.3f}m"
+    )
+
+
 def _virtual_desk_post_rotation_pose(yaw_deg: float) -> np.ndarray:
     return pose_from_rotation_translation(
         euler_xyz_deg_to_matrix([0.0, 0.0, float(yaw_deg)]),
@@ -3134,13 +3434,126 @@ def _resolve_virtual_desk_channel_name(args: argparse.Namespace, channels: Mappi
     requested = str(getattr(args, "virtual_desk_tracker_role", "auto") or "auto")
     if requested != "auto":
         return _channel_for_tracker_role(requested)
-    for candidate in ("auxiliary_tracker_pose", "left_wrist_pose", "right_wrist_pose"):
+    for candidate in ("right_wrist_pose", "left_wrist_pose", "auxiliary_tracker_pose"):
         channel = channels.get(candidate)
         if channel is not None and bool(getattr(channel, "valid", False)):
             return candidate
     if str(getattr(args, "aux_tracker_name", "") or "").strip():
         return "auxiliary_tracker_pose"
-    return "left_wrist_pose"
+    return "right_wrist_pose"
+
+
+def _default_gui_vive_calibration_side(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "virtual_desk_tracker_role", "auto") or "auto")
+    return "left" if requested == "left_wrist" else "right"
+
+
+def _select_gui_vive_coordinate_sweep_hand(
+    *,
+    ui: CalibrationWebUi,
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    source: VivePoseSource,
+) -> tuple[str, str]:
+    requested = str(getattr(args, "virtual_desk_tracker_role", "auto") or "auto")
+    if requested == "auxiliary":
+        channel_name = _channel_for_tracker_role("auxiliary")
+        ui.append_message(
+            "ViveCalibration",
+            f"已通过 --virtual-desk-tracker-role auxiliary 指定 {channel_name} 做三轴 sweep。",
+        )
+        _log("ViveCalibration", f"using explicit auxiliary tracker channel={channel_name}")
+        return "auxiliary", channel_name
+
+    stage_name = "VIVE 标定手选择"
+    stage_id = "ViveCalibrationHand"
+    selected_side = _default_gui_vive_calibration_side(args)
+    last_status_hint = ""
+    ui.append_message(
+        "ViveCalibration",
+        "请选择用于 VIVE 坐标系三轴 sweep 的手：默认右手。点击“左手/右手”或按 1/2，点击“下一步”或按 n 确认。",
+    )
+    _log(
+        "ViveCalibration",
+        f"hand selection ready default={selected_side}; press 1/2 then n to continue",
+    )
+    while True:
+        loop_start = time.time()
+        channels = source.get_latest_channels()
+        events = _consume_vive_capture_events(ui)
+        if "q" in events:
+            raise KeyboardInterrupt
+        for event in events:
+            if event == "1":
+                selected_side = "left"
+                last_status_hint = "已选择左手；点击“下一步”或按 n 开始三轴 sweep。"
+                ui.append_message("ViveCalibration", "已选择左手进行 VIVE 坐标系标定。")
+            elif event == "2":
+                selected_side = "right"
+                last_status_hint = "已选择右手；点击“下一步”或按 n 开始三轴 sweep。"
+                ui.append_message("ViveCalibration", "已选择右手进行 VIVE 坐标系标定。")
+
+        channel_name = f"{selected_side}_wrist_pose"
+        channel = channels.get(channel_name)
+        channel_valid = bool(channel is not None and getattr(channel, "valid", False))
+        side_text = "左手" if selected_side == "left" else "右手"
+        if last_status_hint:
+            control_hint = last_status_hint
+        else:
+            control_hint = f"请选择用于三轴 sweep 的手；默认右手，当前为{side_text}。点击“下一步”或按 n 确认。"
+        if not channel_valid:
+            control_hint += f" 当前 {channel_name} 暂无有效数据。"
+
+        ui.publish(
+            stage=stage_name,
+            selected_side=selected_side,
+            active_controls=["1", "2", "n", "q"],
+            control_hint=control_hint,
+            capture_stage=stage_id,
+            capture_phase="ready",
+            capturing=False,
+            capture_channel=channel_name,
+            capture_samples=None,
+            capture_left_samples=None,
+            capture_right_samples=None,
+            capture_min_samples=None,
+            capture_valid=channel_valid,
+            capture_left_valid=None,
+            capture_right_valid=None,
+            capture_elapsed_sec=None,
+            capture_duration_sec=None,
+            capture_prep_remaining_sec=None,
+            capture_prep_total_sec=float(getattr(args, "capture_prep_sec", 3.0)),
+            capture_waiting_for_samples=False,
+            teleop_running=False,
+            home_ready=False,
+            gripper_control_enabled=False,
+            raw_tracker_poses=_raw_tracker_pose_state_from_channels(
+                dict(channels),
+                active_sides=components.active_sides,
+                now=loop_start,
+            ),
+            **_vive_calibration_profile_ui_state(args, components),
+        )
+        if "n" in events:
+            if channel_valid:
+                ui.append_message(
+                    "ViveCalibration",
+                    f"将使用{side_text} {channel_name} 做 VIVE 坐标系三轴 sweep。",
+                )
+                _log(
+                    "ViveCalibration",
+                    f"selected {selected_side} hand for coordinate sweep channel={channel_name}",
+                    now=loop_start,
+                )
+                return selected_side, channel_name
+            last_status_hint = (
+                f"{side_text} {channel_name} 当前无有效数据；请等待 tracker 在线，"
+                "或选择另一只手后再点“下一步”。"
+            )
+            ui.append_message("ViveCalibration", last_status_hint)
+
+        time.sleep(max(0.0, min(0.02, (1.0 / float(args.hz)) - (time.time() - loop_start))))
 
 
 def _publish_vive_capture_state(
@@ -3223,7 +3636,14 @@ def _capture_single_vive_channel_from_gui(
 ) -> list[np.ndarray]:
     ui.append_message(stage_name, instructions)
     ui.append_message(stage_name, timed_flow_hint)
-    ui.append_message(stage_name, "点击“开始采集”或按 c 开始定时采集；r 重置当前阶段，q 取消。")
+    ui.append_message(stage_name, "本阶段需要点击“下一步”或按 n 才开始准备倒计时；r 重置当前阶段，q 取消。")
+    _log(
+        "ViveCalibration",
+        f"{stage_name} ready channel={channel_name} direction={direction_hint} "
+        f"prep={float(getattr(args, 'capture_prep_sec', 3.0)):.1f}s "
+        f"window={float(capture_duration_sec):.1f}s min_samples={int(min_samples)}; wait_for_next=true; "
+        f"{instructions}",
+    )
     poses: list[np.ndarray] = []
     preparing = False
     capturing = False
@@ -3235,6 +3655,7 @@ def _capture_single_vive_channel_from_gui(
     stage_gate = ChangeGate()
     min_samples_reported = False
     waiting_for_samples_reported = False
+    last_status_hint = ""
     while True:
         loop_start = time.time()
         channels = source.get_latest_channels()
@@ -3248,11 +3669,14 @@ def _capture_single_vive_channel_from_gui(
             min_samples_reported = False
             waiting_for_samples_reported = False
             last_sample_key = None
+            last_status_hint = f"已重置；点击“下一步”或按 n 重采，方向仍为 {direction_hint}。"
             ui.append_message(stage_name, "当前阶段已重置。")
-        if "c" in events or "p" in events:
+        start_requested = bool("n" in events)
+        if start_requested:
             if not capturing and not preparing:
                 poses = []
                 preparing = True
+                last_status_hint = ""
                 capture_start_time = loop_start + float(getattr(args, "capture_prep_sec", 3.0))
                 capture_deadline = capture_start_time + float(capture_duration_sec)
                 capture_extension_deadline = capture_deadline + float(getattr(args, "capture_extra_wait_sec", 0.0))
@@ -3276,6 +3700,7 @@ def _capture_single_vive_channel_from_gui(
             source_stats_at_start = _source_debug_stats(source)
             if channel_valid:
                 last_sample_key = _channel_sample_key(channel)
+                poses.append(as_pose_matrix(getattr(channel, "value")))
             ui.append_message(
                 stage_name,
                 f"采集开始，窗口 {float(capture_duration_sec):.1f}s，"
@@ -3293,6 +3718,17 @@ def _capture_single_vive_channel_from_gui(
             if capturing
             else "ready"
         )
+        if preparing:
+            control_hint = f"{direction_hint}；准备中，{max(0.0, capture_start_time - loop_start):.1f}s 后开始。"
+        elif waiting_for_samples:
+            control_hint = (
+                f"{direction_hint}；样本不足 {len(poses)}/{int(min_samples)}，"
+                "继续等待 fresh samples。"
+            )
+        elif capturing:
+            control_hint = f"{direction_hint}；采集中 {len(poses)}/{int(min_samples)}，请按方向扫动。"
+        else:
+            control_hint = last_status_hint or f"{direction_hint}；点击“下一步”或按 n 开始本阶段。"
         _publish_vive_capture_state(
             ui,
             args,
@@ -3300,8 +3736,8 @@ def _capture_single_vive_channel_from_gui(
             channels,
             now=loop_start,
             stage=stage_name,
-            active_controls=["c", "r", "q"] if not capture_active else ["r", "q"],
-            control_hint=direction_hint,
+            active_controls=["n", "r", "q"] if not capture_active else ["r", "q"],
+            control_hint=control_hint,
             capture_stage=stage_name,
             capture_phase=capture_phase,
             capturing=capture_active,
@@ -3356,17 +3792,94 @@ def _capture_single_vive_channel_from_gui(
                         )
                     time.sleep(max(0.0, min(0.02, (1.0 / float(args.hz)) - (time.time() - loop_start))))
                     continue
-                ui.append_message(stage_name, f"样本不足 {len(poses)}/{int(min_samples)}，请按 c 重新采集。")
+                last_status_hint = (
+                    f"未通过：样本不足 {len(poses)}/{int(min_samples)}。"
+                    f"当前仍在 {stage_name}，不会进入下一轴；请重采，方向仍为 {direction_hint}。"
+                )
+                _log(
+                    "ViveCalibration",
+                    f"{stage_name} AUTO-END INSUFFICIENT samples={len(poses)} need>={int(min_samples)} "
+                    f"effective_hz={effective_hz:.1f}; stay_on={stage_name}; direction={direction_hint}; "
+                    f"{_format_vive_source_rates(source, start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
+                    now=loop_start,
+                )
+                ui.append_message(stage_name, f"{last_status_hint}")
+                _publish_vive_capture_state(
+                    ui,
+                    args,
+                    components,
+                    channels,
+                    now=loop_start,
+                    stage=stage_name,
+                    active_controls=["n", "r", "q"],
+                    control_hint=last_status_hint,
+                    capture_stage=stage_name,
+                    capture_phase="ready",
+                    capturing=False,
+                    capture_channel=channel_name,
+                    capture_samples=0,
+                    capture_min_samples=int(min_samples),
+                    capture_valid=channel_valid,
+                    capture_waiting_for_samples=False,
+                )
                 poses = []
                 min_samples_reported = False
                 waiting_for_samples_reported = False
                 last_sample_key = None
             else:
+                quality_text = _format_vive_sweep_quality(poses)
                 error = validator(poses) if validator is not None else None
                 if error is None:
-                    ui.append_message(stage_name, f"采集接受：samples={len(poses)} hz={effective_hz:.1f}。")
+                    _log(
+                        "ViveCalibration",
+                        f"{stage_name} AUTO-END ACCEPTED samples={len(poses)} effective_hz={effective_hz:.1f}; "
+                        f"{quality_text}; "
+                        f"{_format_vive_source_rates(source, start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
+                        now=loop_start,
+                    )
+                    ui.append_message(
+                        stage_name,
+                        f"采集接受：samples={len(poses)} hz={effective_hz:.1f}；{quality_text}。",
+                    )
+                    ui.publish(
+                        stage=stage_name,
+                        active_controls=[],
+                        control_hint=f"{stage_name} 已接受，正在进入下一阶段。",
+                        capture_phase="ready",
+                        capturing=False,
+                    )
                     return poses
-                ui.append_message(stage_name, f"采集质量不合格：{error}。请按 c 重新采集。")
+                last_status_hint = (
+                    f"未通过：{error}。当前仍在 {stage_name}，"
+                    f"不会进入下一轴；请重采，方向仍为 {direction_hint}。{quality_text}。"
+                )
+                _log(
+                    "ViveCalibration",
+                    f"{stage_name} AUTO-END REJECTED: {error}; samples={len(poses)} "
+                    f"effective_hz={effective_hz:.1f}; {quality_text}; "
+                    f"stay_on={stage_name}; direction={direction_hint}; "
+                    f"{_format_vive_source_rates(source, start_stats=source_stats_at_start, channel_names=(channel_name,), elapsed_sec=elapsed, now=loop_start)}",
+                    now=loop_start,
+                )
+                ui.append_message(stage_name, f"{last_status_hint}")
+                _publish_vive_capture_state(
+                    ui,
+                    args,
+                    components,
+                    channels,
+                    now=loop_start,
+                    stage=stage_name,
+                    active_controls=["n", "r", "q"],
+                    control_hint=last_status_hint,
+                    capture_stage=stage_name,
+                    capture_phase="ready",
+                    capturing=False,
+                    capture_channel=channel_name,
+                    capture_samples=0,
+                    capture_min_samples=int(min_samples),
+                    capture_valid=channel_valid,
+                    capture_waiting_for_samples=False,
+                )
                 poses = []
                 min_samples_reported = False
                 waiting_for_samples_reported = False
@@ -3387,7 +3900,7 @@ def _capture_dual_wrist_offsets_from_gui(
         stage_id,
         "把左右 wrist tracker 放到标准中立姿态：前臂朝前、手背朝上、手指大致沿 desk +X。"
     )
-    ui.append_message(stage_id, "点击“开始采集”或按 c 开始定时采集；这里只写 tracker offset，不保存 runtime Home。")
+    ui.append_message(stage_id, "点击“下一步”或按 n 开始定时采集；这里只写 tracker offset，不保存 runtime Home。")
     left_poses: list[np.ndarray] = []
     right_poses: list[np.ndarray] = []
     preparing = False
@@ -3420,7 +3933,7 @@ def _capture_dual_wrist_offsets_from_gui(
             left_last_sample_key = None
             right_last_sample_key = None
             ui.append_message(stage_id, "当前 wrist offset 阶段已重置。")
-        if "c" in events or "p" in events:
+        if "n" in events:
             if not capturing and not preparing:
                 left_poses = []
                 right_poses = []
@@ -3453,8 +3966,14 @@ def _capture_dual_wrist_offsets_from_gui(
             source_stats_at_start = _source_debug_stats(source)
             if left_valid:
                 left_last_sample_key = _channel_sample_key(left_channel)
+                left_poses.append(
+                    components.session.calibration.world_to_desk(as_pose_matrix(getattr(left_channel, "value")))
+                )
             if right_valid:
                 right_last_sample_key = _channel_sample_key(right_channel)
+                right_poses.append(
+                    components.session.calibration.world_to_desk(as_pose_matrix(getattr(right_channel, "value")))
+                )
             ui.append_message(stage_id, f"采集开始，窗口 {float(getattr(args, 'hold_capture_sec', 4.0)):.1f}s。")
         elapsed = max(0.0, loop_start - capture_start_time) if capturing else 0.0
         waiting_for_samples = bool(
@@ -3479,8 +3998,12 @@ def _capture_dual_wrist_offsets_from_gui(
             channels,
             now=loop_start,
             stage=stage_name,
-            active_controls=["c", "r", "q"] if not capture_active else ["r", "q"],
-            control_hint="左右手中立姿态；该阶段只标定 tracker offset，不保存 runtime Home。",
+            active_controls=["n", "r", "q"] if not capture_active else ["r", "q"],
+            control_hint=(
+                "左右手中立姿态；点击“下一步”或按 n 开始本阶段。"
+                if not capture_active
+                else "左右手中立姿态；该阶段只标定 tracker offset，不保存 runtime Home。"
+            ),
             capture_stage=stage_id,
             capture_phase=capture_phase,
             capturing=capture_active,
@@ -3548,7 +4071,7 @@ def _capture_dual_wrist_offsets_from_gui(
             ui.append_message(
                 stage_id,
                 f"样本不足 left={len(left_poses)} right={len(right_poses)} "
-                f"need>={min_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f}，请按 c 重采。",
+                f"need>={min_samples} left_hz={left_hz:.1f} right_hz={right_hz:.1f}，请按 n 重采。",
             )
             left_poses = []
             right_poses = []
@@ -3591,8 +4114,12 @@ def _calibrate_gui_vive_coordinate_profile(
             )
         return None
 
-    channels = source.get_latest_channels()
-    desk_channel_name = _resolve_virtual_desk_channel_name(args, channels)
+    _, desk_channel_name = _select_gui_vive_coordinate_sweep_hand(
+        ui=ui,
+        args=args,
+        components=components,
+        source=source,
+    )
     desk_tracker_role = _tracker_role_for_channel(desk_channel_name)
     ui.append_message("ViveCalibration", f"使用 {desk_channel_name} ({desk_tracker_role}) 做 VIVE 坐标系三轴 sweep。")
 
@@ -3838,6 +4365,35 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
         _log("Camera", f"optional camera config not found; preview disabled: {config_path}")
         return {}
     camera_configs = load_realsense_camera_config_map(config_path)
+    wrist_depth_requested = bool(getattr(args, "wrist_depth_mask", False)) or bool(
+        getattr(args, "wrist_depth_raw", False)
+    )
+    if wrist_depth_requested:
+        available_wrist_keys = sorted(set(camera_configs) & set(WRIST_DEPTH_CAMERA_KEYS))
+        missing_wrist_keys = sorted(set(WRIST_DEPTH_CAMERA_KEYS) - set(camera_configs))
+        if missing_wrist_keys:
+            _log(
+                "Camera",
+                "wrist depth requested but some wrist cameras are absent from config: "
+                f"missing={missing_wrist_keys}",
+            )
+        for camera_key, config in camera_configs.items():
+            if camera_key in WRIST_DEPTH_CAMERA_KEYS:
+                config.enable_depth = True
+                config.depth_width = int(config.width)
+                config.depth_height = int(config.height)
+                config.depth_fps = int(getattr(args, "wrist_depth_stream_fps", DEFAULT_WRIST_DEPTH_STREAM_FPS))
+                config.align_depth_to_color = True
+            else:
+                config.enable_depth = False
+        _log(
+            "Camera",
+            "wrist depth enabled for D405 wrist cameras only: "
+            f"keys={available_wrist_keys} save_fps={DEFAULT_WRIST_DEPTH_SAVE_FPS} "
+            f"depth_stream_fps={int(getattr(args, 'wrist_depth_stream_fps', DEFAULT_WRIST_DEPTH_STREAM_FPS))} "
+            f"mask={bool(getattr(args, 'wrist_depth_mask', False))} "
+            f"raw={bool(getattr(args, 'wrist_depth_raw', False))}",
+        )
     return {
         camera_key: RealSenseRGBSource(config)
         for camera_key, config in camera_configs.items()
@@ -3952,170 +4508,79 @@ def _expand_cli_path(path_text: str) -> Path:
 
 
 def _sanitize_dataset_name_for_path(text: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text).strip())
-    slug = re.sub(r"_+", "_", slug).strip("._-")
-    return slug or "task"
+    return gui_collection_tasks.sanitize_dataset_name_for_path(text)
 
 
 def _default_task_id_from_name(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", str(text).strip().lower())
-    slug = re.sub(r"_+", "_", slug).strip("_")
-    return slug or "task"
+    return gui_collection_tasks.default_task_id_from_name(text)
 
 
 def _load_task_registry(args: argparse.Namespace) -> list[dict[str, str]]:
-    cached = getattr(args, "_task_registry", None)
-    if isinstance(cached, list):
-        return [dict(item) for item in cached if isinstance(item, Mapping)]
-    path_text = str(getattr(args, "task_config", "") or "").strip()
-    if not path_text:
-        setattr(args, "_task_registry", [])
-        return []
-    path = _expand_cli_path(path_text)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        setattr(args, "_task_registry", [])
-        return []
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Task config {path} must contain a JSON object.")
-    raw_tasks = payload.get("tasks", [])
-    if isinstance(raw_tasks, Mapping):
-        iterable = []
-        for key, value in raw_tasks.items():
-            if isinstance(value, Mapping):
-                item = dict(value)
-                item.setdefault("key", str(key))
-                iterable.append(item)
-    elif isinstance(raw_tasks, Sequence) and not isinstance(raw_tasks, (str, bytes)):
-        iterable = list(raw_tasks)
-    else:
-        raise ValueError(f"Task config {path} field 'tasks' must be an array or object.")
-    tasks: list[dict[str, str]] = []
-    for raw in iterable:
-        if not isinstance(raw, Mapping):
-            continue
-        key = str(raw.get("key") or raw.get("task_id") or raw.get("gripper_task") or "").strip()
-        english_name = str(raw.get("english_name") or raw.get("name_en") or key).strip()
-        chinese_name = str(raw.get("chinese_name") or raw.get("name_zh") or "").strip()
-        gripper_task = str(raw.get("gripper_task") or key).strip()
-        if not key:
-            continue
-        tasks.append(
-            {
-                "key": key,
-                "english_name": english_name or key,
-                "chinese_name": chinese_name,
-                "description": str(raw.get("description") or "").strip(),
-                "gripper_task": gripper_task,
-            }
-        )
-    setattr(args, "_task_registry", [dict(item) for item in tasks])
-    return tasks
+    return gui_collection_tasks.load_task_registry(args, expand_path=_expand_cli_path)
 
 
 def _task_definition_for_key(args: argparse.Namespace, key: str) -> dict[str, str] | None:
-    key_text = str(key or "").strip()
-    if not key_text:
-        return None
-    for item in _load_task_registry(args):
-        if key_text in {item.get("key", ""), item.get("gripper_task", "")}:
-            return dict(item)
-    return None
+    return gui_collection_tasks.task_definition_for_key(args, key, expand_path=_expand_cli_path)
 
 
 def _resolve_formal_dataset_layout(args: argparse.Namespace) -> tuple[Path, str, str, str, str, str]:
-    configured_task_id = str(getattr(args, "collection_task_id", "") or "").strip()
-    gripper_task = str(getattr(args, "gripper_task", "") or "").strip()
-    task_def = _task_definition_for_key(args, configured_task_id or gripper_task)
-    default_task_name = ""
-    default_task_name_zh = ""
-    default_task_description = ""
-    default_task_id = gripper_task
-    if task_def is not None:
-        default_task_id = str(task_def.get("key") or default_task_id).strip()
-        default_task_name = str(task_def.get("english_name") or "").strip()
-        default_task_name_zh = str(task_def.get("chinese_name") or "").strip()
-        default_task_description = (
-            str(task_def.get("description") or "").strip()
-            or default_task_name_zh
-        )
-    task_name = (
-        str(getattr(args, "collection_task_name", "") or "").strip()
-        or default_task_name
-        or gripper_task
-        or "vive_rm65_real_teleop"
+    layout = gui_collection_tasks.resolve_formal_dataset_layout(
+        args,
+        expand_path=_expand_cli_path,
+        date_prefix=datetime.now().strftime("%Y-%m-%d"),
     )
-    task_id = (
-        configured_task_id
-        or default_task_id
-        or _default_task_id_from_name(task_name)
+    return (
+        layout.dataset_root,
+        layout.task_name,
+        layout.task_name_zh,
+        layout.task_id,
+        layout.task_description,
+        layout.dataset_name,
     )
-    task_name_zh = (
-        str(getattr(args, "collection_task_name_zh", "") or "").strip()
-        or default_task_name_zh
-    )
-    task_description = (
-        str(getattr(args, "collection_task_description", "") or "").strip()
-        or default_task_description
-        or task_name_zh
-        or task_name
-    )
-    date_prefix = datetime.now().strftime("%Y-%m-%d")
-    dataset_dir_name = f"{date_prefix}_{_sanitize_dataset_name_for_path(task_name)}"
-    dataset_root = _expand_cli_path(str(args.dataset_root)) / dataset_dir_name
-    dataset_name_text = str(getattr(args, "dataset_name", "") or "").strip()
-    explicit_dataset_name = getattr(args, "_dataset_name_explicit", None)
-    dataset_name_is_explicit = (
-        bool(dataset_name_text)
-        if explicit_dataset_name is None
-        else bool(explicit_dataset_name)
-    )
-    dataset_name = dataset_name_text if dataset_name_is_explicit and dataset_name_text else dataset_dir_name
-    return dataset_root, task_name, task_name_zh, task_id, task_description, dataset_name
 
 
 def _apply_formal_dataset_layout(args: argparse.Namespace) -> None:
-    if not hasattr(args, "_dataset_name_explicit"):
-        args._dataset_name_explicit = bool(str(getattr(args, "dataset_name", "") or "").strip())
-    dataset_base_root = _expand_cli_path(str(args.dataset_root))
-    (
-        dataset_root,
-        task_name,
-        task_name_zh,
-        task_id,
-        task_description,
-        dataset_name,
-    ) = _resolve_formal_dataset_layout(args)
-    args.dataset_base_root = str(dataset_base_root)
-    args.dataset_root = str(dataset_root)
-    args.dataset_dir_name = dataset_root.name
-    args.collection_task_name = task_name
-    args.collection_task_name_zh = task_name_zh
-    args.collection_task_id = task_id
-    args.collection_task_description = task_description
-    args.dataset_name = dataset_name
+    gui_collection_tasks.apply_formal_dataset_layout(
+        args,
+        expand_path=_expand_cli_path,
+        date_prefix=datetime.now().strftime("%Y-%m-%d"),
+    )
 
 
 def _refresh_formal_dataset_layout(args: argparse.Namespace) -> None:
-    base = str(getattr(args, "dataset_base_root", "") or "").strip()
-    if base:
-        args.dataset_root = base
-    _apply_formal_dataset_layout(args)
+    gui_collection_tasks.refresh_formal_dataset_layout(
+        args,
+        expand_path=_expand_cli_path,
+        date_prefix=datetime.now().strftime("%Y-%m-%d"),
+    )
+
+
+def _toggle_collection_round_trip_phase(args: argparse.Namespace) -> bool:
+    return gui_collection_tasks.toggle_round_trip_phase(
+        args,
+        expand_path=_expand_cli_path,
+        date_prefix=datetime.now().strftime("%Y-%m-%d"),
+    )
 
 
 def _collection_task_ui_state(args: argparse.Namespace) -> dict[str, object]:
-    return {
-        "dataset_base_root": str(getattr(args, "dataset_base_root", "") or getattr(args, "dataset_root", "") or ""),
-        "dataset_root": str(getattr(args, "dataset_root", "") or ""),
-        "dataset_dir_name": str(getattr(args, "dataset_dir_name", "") or ""),
-        "collection_task_id": str(getattr(args, "collection_task_id", "") or ""),
-        "collection_task_name": str(getattr(args, "collection_task_name", "") or ""),
-        "collection_task_name_zh": str(getattr(args, "collection_task_name_zh", "") or ""),
-        "collection_task_description": str(getattr(args, "collection_task_description", "") or ""),
-        "gripper_task": str(getattr(args, "gripper_task", "") or ""),
-        "task_registry": _load_task_registry(args),
-    }
+    return gui_collection_tasks.collection_task_ui_state(args, expand_path=_expand_cli_path)
+
+
+def _fix_arm_ui_state(components: RealTeleopComponents) -> dict[str, object]:
+    controller = getattr(components, "fix_arm_controller", None)
+    if controller is None:
+        return {
+            "fix_arm_available": False,
+            "fix_arm_selected_side": "",
+            "fix_arm_fixed_side": "",
+            "fix_arm_active": False,
+            "fix_arm_recalibrating": False,
+            "fix_arm_status": "",
+            "fix_arm_sample_count": None,
+            "fix_arm_min_samples": None,
+        }
+    return controller.status_payload()
 
 
 def _session_record_root_dir(args: argparse.Namespace) -> Path | None:
@@ -4134,6 +4599,10 @@ def _session_record_root_dir(args: argparse.Namespace) -> Path | None:
     return root_dir
 
 
+def _session_recording_enabled(args: argparse.Namespace) -> bool:
+    return not bool(getattr(args, "no_record", True))
+
+
 def _session_recording_config(args: argparse.Namespace) -> RecordingConfig:
     return RecordingConfig(
         enabled=True,
@@ -4141,6 +4610,16 @@ def _session_recording_config(args: argparse.Namespace) -> RecordingConfig:
         flush_every=max(1, int(getattr(args, "session_record_flush_every", 1) or 1)),
         compact_json=bool(getattr(args, "session_record_compact_json", False)),
     )
+
+
+def _debug_episode_recording_enabled(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "no_episode_recording", False)):
+        return False
+    if bool(getattr(args, "no_collection", False)):
+        return True
+    if bool(getattr(args, "debug_trajectory_recording", False)):
+        return True
+    return bool(str(getattr(args, "episode_root", "") or "").strip())
 
 
 def _episode_root_dir(
@@ -4158,6 +4637,17 @@ def _episode_root_dir(
     return None
 
 
+def _fix_arm_pose_snapshot_recorder(
+    components: RealTeleopComponents,
+) -> FixArmPoseSnapshotRecorder | None:
+    if getattr(components, "fix_arm_controller", None) is None:
+        return None
+    session_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return FixArmPoseSnapshotRecorder(
+        teleop_records_root() / "fix_arm_pose_snapshots" / session_name
+    )
+
+
 def _build_episode_metadata(
     args: argparse.Namespace,
     components: RealTeleopComponents,
@@ -4166,10 +4656,12 @@ def _build_episode_metadata(
 ) -> dict[str, object]:
     calibration = components.session.calibration
     assert calibration is not None
+    session_record_enabled = _session_recording_enabled(args)
     session_record_root = (
         None if components.session.recorder is None else str(components.session.recorder.root_dir)
     )
-    episode_root = _episode_root_dir(args, components)
+    debug_episode_enabled = _debug_episode_recording_enabled(args)
+    episode_root = _episode_root_dir(args, components) if debug_episode_enabled else None
     return {
         "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
         "start_reason": start_reason,
@@ -4178,6 +4670,13 @@ def _build_episode_metadata(
         "impedance_mode": _impedance_mode_arg(args),
         "strict_tool_profile": _strict_tool_profile_arg(args),
         "force_tare_sec": _force_tare_sec_arg(args),
+        "debug_timing": bool(getattr(args, "debug_timing", False)),
+        "debug_timing_threshold_sec": float(getattr(args, "debug_timing_threshold_sec", 0.025)),
+        "debug_timing_report_interval_sec": float(
+            getattr(args, "debug_timing_report_interval_sec", 1.0)
+        ),
+        "debug_timing_light_log": bool(getattr(args, "debug_timing", False)),
+        "rm65_backend_debug_timing": bool(getattr(args, "debug_timing", False)),
         "arm_mode": "real",
         "active_sides": list(components.active_sides),
         "runtime_arm_state_source": "last_commanded_action",
@@ -4200,10 +4699,22 @@ def _build_episode_metadata(
         "collision_guard_requested": bool(components.collision_guard_requested),
         "collision_guard_enabled": bool(components.dual_arm_retargeter is not None),
         "dataset_root": str(getattr(args, "dataset_root", "") or "") or None,
+        "wrist_depth_mask": bool(getattr(args, "wrist_depth_mask", False)),
+        "wrist_depth_raw": bool(getattr(args, "wrist_depth_raw", False)),
+        "wrist_depth_camera_keys": list(WRIST_DEPTH_CAMERA_KEYS),
+        "wrist_depth_fps": DEFAULT_WRIST_DEPTH_FPS,
+        "wrist_depth_save_fps": DEFAULT_WRIST_DEPTH_SAVE_FPS,
+        "wrist_depth_stream_fps": int(getattr(args, "wrist_depth_stream_fps", DEFAULT_WRIST_DEPTH_STREAM_FPS)),
+        "wrist_depth_min_m": float(getattr(args, "wrist_depth_min_m", DEFAULT_WRIST_DEPTH_MIN_M)),
+        "wrist_depth_max_m": float(getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)),
+        "session_record_enabled": session_record_enabled,
         "session_record_root": session_record_root,
-        "session_record_commands": not bool(getattr(args, "no_session_record_commands", False)),
+        "session_record_commands": (
+            session_record_enabled and not bool(getattr(args, "no_session_record_commands", False))
+        ),
         "session_record_flush_every": int(getattr(args, "session_record_flush_every", 1) or 1),
         "session_record_compact_json": bool(getattr(args, "session_record_compact_json", False)),
+        "debug_episode_recording_enabled": debug_episode_enabled,
         "episode_root": None if episode_root is None else str(episode_root),
         "load_profile": args.load_profile or None,
         "load_initial_alignment": args.load_initial_alignment or None,
@@ -4365,6 +4876,15 @@ def _collection_sources_from_components(
     return sources
 
 
+def _collection_hand_action_specs(
+    args: argparse.Namespace,
+    active_sides: Sequence[str],
+) -> Mapping[str, HandActionSpec] | None:
+    if _hand_backend_mode(args) != HAND_BACKEND_DMTAC_GRIPPER:
+        return None
+    return {str(side): HandActionSpec.dmtac_gripper(str(side)) for side in active_sides}
+
+
 def _collection_step_result(
     step_result: SessionStepResult,
     *,
@@ -4414,7 +4934,14 @@ class RealTeleopDatasetRecorder:
                 write_parquet=bool(args.write_parquet),
                 write_video=bool(args.write_video and not args.no_camera),
                 tactile_storage=str(args.tactile_storage),
+                tactile_compression=str(getattr(args, "tactile_compression", "lz4")),
                 allow_missing_video_frames=int(args.storage_queue_size) > 0,
+                write_wrist_depth_mask=bool(getattr(args, "wrist_depth_mask", False)),
+                write_wrist_depth_raw=bool(getattr(args, "wrist_depth_raw", False)),
+                hand_action_specs=_collection_hand_action_specs(args, components.active_sides),
+                wrist_depth_camera_keys=WRIST_DEPTH_CAMERA_KEYS,
+                wrist_depth_min_m=float(getattr(args, "wrist_depth_min_m", DEFAULT_WRIST_DEPTH_MIN_M)),
+                wrist_depth_max_m=float(getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)),
             )
         )
         self.writer_pool = AsyncWriterPool(
@@ -4437,7 +4964,18 @@ class RealTeleopDatasetRecorder:
             metadata={
                 "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
                 "active_sides": list(components.active_sides),
+                "camera_frame_alignment_policy": "latest_before_or_at_sample_timestamp",
+                "hand_tactile_alignment_policy": "backend_latest_snapshot_at_sample_build",
                 "movement_multiple": _movement_multiple_value(args),
+                "debug_timing": bool(getattr(args, "debug_timing", False)),
+                "debug_timing_threshold_sec": float(
+                    getattr(args, "debug_timing_threshold_sec", 0.025)
+                ),
+                "debug_timing_report_interval_sec": float(
+                    getattr(args, "debug_timing_report_interval_sec", 1.0)
+                ),
+                "debug_timing_light_log": bool(getattr(args, "debug_timing", False)),
+                "rm65_backend_debug_timing": bool(getattr(args, "debug_timing", False)),
                 "record_actual_wrist_camera_pose": bool(self.arm_state_poller is not None),
                 "actual_wrist_camera_pose_hz": float(
                     getattr(args, "actual_wrist_camera_pose_hz", 30.0)
@@ -4445,6 +4983,15 @@ class RealTeleopDatasetRecorder:
                 "actual_wrist_camera_pose_max_age_sec": float(
                     getattr(args, "actual_wrist_camera_pose_max_age_sec", 0.2)
                 ),
+                "wrist_depth_mask": bool(getattr(args, "wrist_depth_mask", False)),
+                "wrist_depth_raw": bool(getattr(args, "wrist_depth_raw", False)),
+                "wrist_depth_camera_keys": list(WRIST_DEPTH_CAMERA_KEYS),
+                "wrist_depth_fps": DEFAULT_WRIST_DEPTH_FPS,
+                "wrist_depth_save_fps": DEFAULT_WRIST_DEPTH_SAVE_FPS,
+                "wrist_depth_stream_fps": int(getattr(args, "wrist_depth_stream_fps", DEFAULT_WRIST_DEPTH_STREAM_FPS)),
+                "wrist_depth_min_m": float(getattr(args, "wrist_depth_min_m", DEFAULT_WRIST_DEPTH_MIN_M)),
+                "wrist_depth_max_m": float(getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)),
+                "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
             },
         )
         self.sample_builder = CollectorSampleBuilder(
@@ -4455,6 +5002,7 @@ class RealTeleopDatasetRecorder:
                     for camera_key, source in self.camera_sources.items()
                 },
                 episode_index=self.writer.next_episode_index,
+                sample_index_start=self.writer.next_sample_index,
                 tactile_array_snapshot_policy=(
                     "always"
                     if str(args.tactile_storage).strip().lower().replace("-", "_") == "parquet"
@@ -5053,12 +5601,14 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "arm_step_dt_alpha": float(args.arm_step_dt_alpha),
             "arm_step_dt_max_scale": float(args.arm_step_dt_max_scale),
             "arm_step_dt_stall_reset_sec": float(args.arm_step_dt_stall_reset_sec),
+            "rm65_backend_debug_timing": bool(getattr(args, "debug_timing", False)),
+            "rm65_ik_framework": str(getattr(args, "rm65_ik_framework", "robot_motion")),
             "dual_arm_collision_avoidance_requested": collision_guard_requested,
             "dual_arm_temporary_safety_enabled": bool(temporary_safety_limiter is not None),
             "dual_arm_temporary_safety": {
-                "max_xyz_step_m": float(getattr(args, "dual_arm_temp_max_xyz_step_m", 0.015)),
-                "max_rot_step_deg": float(getattr(args, "dual_arm_temp_max_rot_step_deg", 5.0)),
-                "max_joint_step_deg": float(getattr(args, "dual_arm_temp_max_joint_step_deg", 4.0)),
+                "max_xyz_step_m": float(getattr(args, "dual_arm_temp_max_xyz_step_m", 0.03)),
+                "max_rot_step_deg": float(getattr(args, "dual_arm_temp_max_rot_step_deg", 8.0)),
+                "max_joint_step_deg": float(getattr(args, "dual_arm_temp_max_joint_step_deg", 6.0)),
                 "command_scale": float(getattr(args, "dual_arm_temp_command_scale", 1.0)),
             },
             "target_pose_smoothing": target_pose_smoothing_config.to_metadata(),
@@ -5157,6 +5707,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                         enforce_realistic_joint_step=bool(
                             str(getattr(args, "arm_mode", "real")) == "real"
                         ),
+                        ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
                         left_execution_max_joint_step_rad=realistic_joint_step,
                         right_execution_max_joint_step_rad=realistic_joint_step,
                         left_tool_tcp_pose_flange_m_rad=_tool_tcp_pose_flange_arg(args, "left"),
@@ -5373,6 +5924,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             use_actual_send_dt_scaling=False,
             tool_profile=_tool_profile_arg(args, "left"),
             ik_tuning=ik_tuning,
+            ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
         )
     )
     right_preview_backend = RM65ArmBackend(
@@ -5389,6 +5941,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             use_actual_send_dt_scaling=False,
             tool_profile=_tool_profile_arg(args, "right"),
             ik_tuning=ik_tuning,
+            ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
         )
     )
     for _source_name, (logical_side, arm_ip) in side_assignments.items():
@@ -5412,6 +5965,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                     actual_send_dt_min_scale=1.0,
                     actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
                     actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
+                    debug_timing=bool(getattr(args, "debug_timing", False)),
                 )
             )
         else:
@@ -5437,6 +5991,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                     background_streaming_hz=arm_control_hz,
                     tool_profile=_tool_profile_arg(args, logical_side),
                     ik_tuning=ik_tuning,
+                    ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
                 )
             )
         state_backend = RM65ArmBackend(
@@ -5455,6 +6010,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 use_actual_send_dt_scaling=False,
                 tool_profile=_tool_profile_arg(args, logical_side),
                 ik_tuning=ik_tuning,
+                ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
             )
         )
         logical_arm_ip_mapping[logical_side] = arm_ip
@@ -5472,6 +6028,31 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
 
     left_hand_control_via_rig = left_hand_retargeter is not None and left_hand_backend is not None
     right_hand_control_via_rig = right_hand_retargeter is not None and right_hand_backend is not None
+    fix_arm_controller = None
+    if bool(getattr(args, "fix_arm", False)):
+        if set(active_sides) != {"left", "right"}:
+            raise ValueError("--fix-arm requires --active-sides both.")
+        fix_arm_controller = FixArmCommandController(
+            active_sides=active_sides,
+            required_effectors_by_side=_fix_arm_required_effectors_by_side(
+                active_sides=active_sides,
+                left_hand_control_via_rig=left_hand_control_via_rig,
+                right_hand_control_via_rig=right_hand_control_via_rig,
+                left_gripper_retargeter=left_gripper_retargeter,
+                right_gripper_retargeter=right_gripper_retargeter,
+                left_hand_backend=left_hand_backend,
+                right_hand_backend=right_hand_backend,
+            ),
+            selected_side=str(getattr(args, "fix_arm_side", "left") or "left"),
+        )
+        calibration.metadata["fix_arm_mode"] = {
+            "enabled": True,
+            "initial_selected_side": fix_arm_controller.selected_side,
+            "required_effectors_by_side": {
+                side: list(effectors)
+                for side, effectors in fix_arm_controller.required_effectors_by_side.items()
+            },
+        }
     rig_backends = {}
     if "left" in active_sides and left_command_backend is not None:
         rig_backends["left_arm"] = left_command_backend
@@ -5487,23 +6068,24 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         parallel_dispatch=arm_io_threads > 1,
         parallel_workers=max(arm_io_threads, len(rig_backends)),
     )
-    session_record_root = _session_record_root_dir(args)
+    session_record_enabled = _session_recording_enabled(args)
+    session_record_root = _session_record_root_dir(args) if session_record_enabled else None
     session_recorder = (
         SessionRecorder(
             root_dir=session_record_root,
             config=_session_recording_config(args),
         )
-        if not args.no_record
+        if session_record_enabled
         else None
     )
     session = TeleopSession(
         config=TeleopSessionConfig(
             mode="vive_rm65_real_teleop",
             tcp_mode=args.tcp_mode,
-            record_enabled=not args.no_record,
+            record_enabled=session_record_enabled,
             auto_recovery_enabled=True,
             recovery_healthy_frame_count=max(1, int(args.recovery_healthy_frames)),
-            hold_motion_on_freeze=False,
+            hold_motion_on_freeze=True,
             non_freezing_fault_codes=("low_control_rate",),
         ),
         sources=session_sources,
@@ -5532,16 +6114,25 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             minimum_control_hz=float(args.minimum_control_hz),
             target_control_hz=float(args.hz),
         ),
-        command_filter=(
-            temporary_safety_limiter.filter_command
-            if temporary_safety_limiter is not None
+        channel_filter=(
+            fix_arm_controller.filter_channels
+            if fix_arm_controller is not None
+            else None
+        ),
+        command_filter=_compose_real_command_filter(
+            temporary_safety_limiter=temporary_safety_limiter,
+            fix_arm_controller=fix_arm_controller,
+        ),
+        fault_filter=(
+            fix_arm_controller.filter_faults
+            if fix_arm_controller is not None
             else None
         ),
     )
     _log(
         "Safety",
-        "safety_freeze_hold=off auto_recovery=on for RM65 real teleop; "
-        "FROZEN stops new command dispatch until healthy frames enter RECOVERING. "
+        "safety_freeze_hold=on auto_recovery=on for RM65 real teleop; "
+        "FROZEN requests rig hold_motion and stops new command dispatch until healthy frames enter RECOVERING. "
         f"tracker_jump_limits={float(getattr(args, 'max_tracker_translation_jump_m', DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M)):.3f}m/"
         f"{float(getattr(args, 'max_tracker_rotation_jump_deg', DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG)):.1f}deg",
     )
@@ -5637,6 +6228,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "smoothed_loop_dt": action_dt,
         },
         temporary_safety_limiter=temporary_safety_limiter,
+        fix_arm_controller=fix_arm_controller,
     )
 
 
@@ -5750,22 +6342,29 @@ def _reset_runtime_motion_state_from_real_qpos(
     *,
     required: bool,
 ) -> dict[str, bool]:
+    reset_start = time.perf_counter()
     synced = {side: False for side in components.active_sides}
+    timing_parts: list[str] = []
     for side in components.active_sides:
+        side_start = time.perf_counter()
         state_backend = components.left_state_backend if side == "left" else components.right_state_backend
         preview_backend = components.left_preview_backend if side == "left" else components.right_preview_backend
         command_backend = _command_backend_for_side(components, side)
         if state_backend is None:
             if required:
                 raise RuntimeError(f"{side}_arm has no real state backend for runtime restart.")
+            timing_parts.append(f"{side}:missing_state_backend")
             continue
+        refresh_start = time.perf_counter()
         state = state_backend.refresh_state_from_hardware()
+        refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
         qpos = state.get("current_qpos")
         if qpos is None:
             if required:
                 raise RuntimeError(
                     f"{side}_arm runtime restart failed: no current_qpos available from hardware."
                 )
+            timing_parts.append(f"{side}:refresh={refresh_elapsed_ms:.1f}ms no_qpos")
             continue
         try:
             qpos_array = np.asarray(qpos, dtype=float).reshape(6)
@@ -5781,11 +6380,27 @@ def _reset_runtime_motion_state_from_real_qpos(
                     f"{side}_arm runtime restart failed: non-finite current_qpos from hardware."
                 )
             continue
+        reset_side_start = time.perf_counter()
         preview_backend.set_local_qpos(qpos_array)
         if command_backend is not None:
             command_backend.reset_motion_state(qpos_array)
+        reset_side_elapsed_ms = (time.perf_counter() - reset_side_start) * 1000.0
         synced[side] = True
+        timing_parts.append(
+            f"{side}:total={(time.perf_counter() - side_start) * 1000.0:.1f}ms "
+            f"refresh={refresh_elapsed_ms:.1f}ms "
+            f"reset={reset_side_elapsed_ms:.1f}ms"
+        )
+    sync_start = time.perf_counter()
     _sync_dual_arm_retargeter_from_preview(components)
+    sync_elapsed_ms = (time.perf_counter() - sync_start) * 1000.0
+    _log(
+        "CalibrationTiming",
+        "runtime_restart_state "
+        f"total={(time.perf_counter() - reset_start) * 1000.0:.1f}ms "
+        f"retargeter_sync={sync_elapsed_ms:.1f}ms "
+        + " | ".join(timing_parts),
+    )
     return synced
 
 
@@ -5864,6 +6479,141 @@ def _active_command_backend(components: RealTeleopComponents) -> RM65ArmBackend 
     return None
 
 
+def _active_impedance_force_backends(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> list[tuple[str, RM65ImpedanceArmBackend]]:
+    if _arm_control_mode_arg(args) != "impedance":
+        return []
+    backends: list[tuple[str, RM65ImpedanceArmBackend]] = []
+    for side in components.active_sides:
+        backend = _command_backend_for_side(components, side)
+        if not isinstance(backend, RM65ImpedanceArmBackend):
+            raise RuntimeError(f"{side}_arm command backend is not RM65ImpedanceArmBackend.")
+        backends.append((side, backend))
+    return backends
+
+
+def _impedance_force_control_warmup_backends(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> list[tuple[str, RM65ImpedanceArmBackend]]:
+    backends = []
+    for side, backend in _active_impedance_force_backends(args, components):
+        if not bool(getattr(backend.config, "connect_hardware", True)):
+            continue
+        if not backend.force_control_warm_started():
+            backends.append((side, backend))
+    return backends
+
+
+def _estimate_impedance_force_control_warmup_sec(
+    args: argparse.Namespace,
+    backends: Sequence[tuple[str, RM65ImpedanceArmBackend]],
+) -> float:
+    if not backends:
+        return 0.0
+    tare_sec = max(0.0, _force_tare_sec_arg(args))
+    parallel = len(backends) > 1 and int(getattr(args, "arm_io_threads", 1)) > 1
+    tare_total_sec = tare_sec if parallel else tare_sec * len(backends)
+    return max(0.5, tare_total_sec + 0.5)
+
+
+def _warm_start_impedance_force_control_before_home(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    clutch_input: "RealTeleopControlInput",
+) -> bool:
+    backends = _impedance_force_control_warmup_backends(args, components)
+    if not backends:
+        return True
+    total_estimate_sec = _estimate_impedance_force_control_warmup_sec(args, backends)
+    active_sides = tuple(side for side, _ in backends)
+    warmup_started_perf = time.perf_counter()
+    _log(
+        "ForceControlWarmup",
+        "cold_start required before runtime home "
+        f"sides={list(active_sides)} estimated={total_estimate_sec:.2f}s "
+        f"tare_sec={_force_tare_sec_arg(args):.2f} "
+        f"io_threads={max(1, int(getattr(args, 'arm_io_threads', 1)))}",
+    )
+
+    def warm_start_one(item: tuple[str, RM65ImpedanceArmBackend]) -> tuple[str, dict[str, object], dict[str, float]]:
+        side, backend = item
+        side_start = time.perf_counter()
+        warm_start = time.perf_counter()
+        backend.warm_start_force_control()
+        warm_elapsed_ms = (time.perf_counter() - warm_start) * 1000.0
+        return (
+            side,
+            backend.get_state(),
+            {
+                "warm_start_ms": warm_elapsed_ms,
+                "total_ms": (time.perf_counter() - side_start) * 1000.0,
+            },
+        )
+
+    def run_warmup() -> list[tuple[str, dict[str, object], dict[str, float]]]:
+        if len(backends) > 1 and int(getattr(args, "arm_io_threads", 1)) > 1:
+            with ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="rm65_warmup_arm") as executor:
+                return [future.result() for future in (executor.submit(warm_start_one, item) for item in backends)]
+        return [warm_start_one(item) for item in backends]
+
+    clutch_input.publish_force_control_warmup_progress(
+        elapsed_sec=0.0,
+        total_sec=total_estimate_sec,
+        active_sides=active_sides,
+    )
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="rm65_warmup_gate") as executor:
+        future = executor.submit(run_warmup)
+        while not future.done():
+            elapsed_sec = time.perf_counter() - warmup_started_perf
+            clutch_input.publish_force_control_warmup_progress(
+                elapsed_sec=elapsed_sec,
+                total_sec=total_estimate_sec,
+                active_sides=active_sides,
+            )
+            clutch_input.terminal.poll()
+            clutch_input.terminal.consume_calibration_request()
+            clutch_input.terminal.consume_episode_start_request()
+            clutch_input.terminal.consume_episode_stop_request()
+            if clutch_input.terminal.should_quit:
+                clutch_input.should_quit = True
+            if clutch_input.ui is not None:
+                for event in clutch_input.ui.consume_events():
+                    if event == "q":
+                        clutch_input.should_quit = True
+            time.sleep(0.05)
+        try:
+            results = future.result()
+        except Exception as exc:  # noqa: BLE001
+            message = f"力控冷启动失败: {type(exc).__name__}: {exc}"
+            _log("ForceControlWarmup", message)
+            clutch_input.publish_calibration_waiting(message)
+            return False
+
+    elapsed_ms = (time.perf_counter() - warmup_started_perf) * 1000.0
+    timing_parts = []
+    for side, state, timing in results:
+        timing_parts.append(
+            f"{side}:total={timing['total_ms']:.1f}ms "
+            f"warm_start={timing['warm_start_ms']:.1f}ms "
+            f"status={state.get('send_result_text')}"
+        )
+    _log(
+        "ForceControlWarmup",
+        f"cold_start completed total={elapsed_ms:.1f}ms " + " | ".join(timing_parts),
+    )
+    clutch_input.publish_force_control_warmup_progress(
+        elapsed_sec=total_estimate_sec,
+        total_sec=total_estimate_sec,
+        active_sides=active_sides,
+    )
+    if clutch_input.should_quit:
+        return False
+    return True
+
+
 def _emergency_stop_real_arms(
     components: RealTeleopComponents,
     *,
@@ -5898,14 +6648,10 @@ def _enable_impedance_force_control_after_runtime_home(
     *,
     home_captured: bool = True,
 ) -> None:
-    if _arm_control_mode_arg(args) != "impedance":
+    force_control_start = time.perf_counter()
+    backends = _active_impedance_force_backends(args, components)
+    if not backends:
         return
-    backends: list[tuple[str, RM65ImpedanceArmBackend]] = []
-    for side in components.active_sides:
-        backend = _command_backend_for_side(components, side)
-        if not isinstance(backend, RM65ImpedanceArmBackend):
-            raise RuntimeError(f"{side}_arm command backend is not RM65ImpedanceArmBackend.")
-        backends.append((side, backend))
     _log(
         "ForceControl",
         f"runtime home {'captured' if home_captured else 'skipped'}; "
@@ -5913,18 +6659,40 @@ def _enable_impedance_force_control_after_runtime_home(
         f"before enabling pose impedance.",
     )
 
-    def enable_one(item: tuple[str, RM65ImpedanceArmBackend]) -> tuple[str, dict[str, object]]:
+    def enable_one(
+        item: tuple[str, RM65ImpedanceArmBackend],
+    ) -> tuple[str, dict[str, object], dict[str, float]]:
         side, backend = item
+        side_start = time.perf_counter()
+        enable_start = time.perf_counter()
         backend.enable_force_control()
+        enable_elapsed_ms = (time.perf_counter() - enable_start) * 1000.0
         timeout_sec = max(1.0, 3.0 * float(backend.config.control_dt))
-        return side, backend.wait_until_force_control_ready(timeout_sec=timeout_sec)
+        wait_start = time.perf_counter()
+        state = backend.wait_until_force_control_ready(timeout_sec=timeout_sec)
+        wait_elapsed_ms = (time.perf_counter() - wait_start) * 1000.0
+        return (
+            side,
+            state,
+            {
+                "enable_ms": enable_elapsed_ms,
+                "wait_ready_ms": wait_elapsed_ms,
+                "total_ms": (time.perf_counter() - side_start) * 1000.0,
+            },
+        )
 
     if len(backends) > 1 and int(getattr(args, "arm_io_threads", 1)) > 1:
         with ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="rm65_tare") as executor:
             results = [future.result() for future in (executor.submit(enable_one, item) for item in backends)]
     else:
         results = [enable_one(item) for item in backends]
-    for side, state in results:
+    timing_parts = []
+    for side, state, timing in results:
+        timing_parts.append(
+            f"{side}:total={timing['total_ms']:.1f}ms "
+            f"enable={timing['enable_ms']:.1f}ms "
+            f"wait_ready={timing['wait_ready_ms']:.1f}ms"
+        )
         record = state.get("last_impedance_record")
         step = record.get("step") if isinstance(record, dict) else None
         force_norm = record.get("force_norm_n") if isinstance(record, dict) else None
@@ -5950,6 +6718,13 @@ def _enable_impedance_force_control_after_runtime_home(
             f"send={state.get('send_result_text')}"
             f"{wrench_text}",
         )
+    _log(
+        "CalibrationTiming",
+        "force_control_after_home "
+        f"total={(time.perf_counter() - force_control_start) * 1000.0:.1f}ms "
+        f"tare_sec={_force_tare_sec_arg(args):.2f} "
+        + " | ".join(timing_parts),
+    )
 
 
 def _short_status_text(value: object, *, max_len: int = 160) -> str:
@@ -6012,6 +6787,37 @@ def _impedance_force_control_issue(
     return None
 
 
+def _hold_motion_after_impedance_guard_issue(
+    components: RealTeleopComponents,
+    *,
+    reason: str,
+    now: float,
+) -> None:
+    rig = components.session.rig
+    if rig is None:
+        _log(
+            "ForceControl",
+            f"control fault hold_motion skipped because session has no rig: {_short_status_text(reason)}",
+            now=now,
+        )
+        return
+    try:
+        rig.hold_motion(f"control fault: {reason}")
+    except Exception as exc:  # noqa: BLE001
+        _log(
+            "ForceControl",
+            "control fault hold_motion failed: "
+            f"{type(exc).__name__}: {exc}; reason={_short_status_text(reason)}",
+            now=now,
+        )
+    else:
+        _log(
+            "ForceControl",
+            f"control fault hold_motion requested for all rig backends: {_short_status_text(reason)}",
+            now=now,
+        )
+
+
 def _guard_impedance_force_control(
     args: argparse.Namespace,
     components: RealTeleopComponents,
@@ -6031,6 +6837,7 @@ def _guard_impedance_force_control(
     reason = f"{context}: {issue}"
     if components.session.state_machine.state != TeleopRunState.FAULT:
         _log("ForceControl", reason, now=now)
+        _hold_motion_after_impedance_guard_issue(components, reason=reason, now=now)
         components.session.fault(reason)
     return False
 
@@ -6429,15 +7236,22 @@ def _gripper_status_for_side(
         "gripper_read_elapsed_s": state.get("gripper_read_elapsed_s"),
         "tactile_read_elapsed_s": state.get("tactile_read_elapsed_s"),
         "tactile_gate_wait_s": state.get("tactile_gate_wait_s"),
+        "tactile_timestamp": state.get("tactile_timestamp"),
         "telemetry_elapsed_s": state.get("telemetry_elapsed_s"),
         "tactile_fields": _json_safe_value(state.get("tactile_fields") or ()),
         "tactile_devices": _json_safe_value(state.get("tactile_devices") or ()),
+        "tactile_frame_ids": _json_safe_value(state.get("tactile_frame_ids") or {}),
+        "tactile_field_by_key": _json_safe_value(state.get("tactile_field_by_key") or {}),
         "tactile_shapes": _json_safe_value(state.get("tactile_shapes") or {}),
+        "tactile_raw_shape_per_sensor": _json_safe_value(
+            state.get("tactile_raw_shape_per_sensor") or {}
+        ),
         "tactile_timings_ms": _json_safe_value(state.get("tactile_timings_ms") or {}),
         "tactile_read_hz": state.get("tactile_read_hz"),
         "tactile_read_skipped": state.get("tactile_read_skipped"),
         "tactile_process_read": state.get("tactile_process_read"),
         "tactile_worker_alive": state.get("tactile_worker_alive"),
+        "tactile_worker_receiver_alive": state.get("tactile_worker_receiver_alive"),
         "tactile_process_nice": state.get("tactile_process_nice"),
         "tactile_process_cpu_affinity": _json_safe_value(
             state.get("tactile_process_cpu_affinity") or ()
@@ -6471,6 +7285,279 @@ def _build_gripper_status(
             command_status=command_status,
         )
         for side in ("left", "right")
+    }
+
+
+def _as_status_error_text(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text and text.lower() not in {"none", "false"} else ""
+
+
+def _camera_status_for_source(
+    camera_key: str,
+    source: RealSenseRGBSource,
+    *,
+    now: float,
+    preview_selected: bool,
+    preview_active: bool,
+) -> dict[str, object]:
+    config = getattr(source, "config", None)
+    fallback_serial = getattr(config, "serial", None)
+    try:
+        info = source.device_info()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "camera_key": str(camera_key),
+            "status_level": "error",
+            "status_label": "状态读取失败",
+            "status_message": f"{type(exc).__name__}: {exc}",
+            "serial": fallback_serial,
+            "preview_selected": bool(preview_selected),
+            "preview_active": bool(preview_active and preview_selected),
+        }
+    if not isinstance(info, Mapping):
+        info = {}
+
+    frame_count = _safe_int_value(info.get("frame_count"))
+    frame_count = 0 if frame_count is None else max(0, int(frame_count))
+    timeout_count = _safe_int_value(info.get("timeout_count"))
+    consecutive_timeout_count = _safe_int_value(info.get("consecutive_timeout_count"))
+    restart_count = _safe_int_value(info.get("restart_count"))
+    last_frame_age_sec = _safe_float_value(info.get("last_frame_age_sec"))
+    stale_after_sec = _safe_float_value(info.get("stale_after_sec"))
+    if stale_after_sec is None or stale_after_sec <= 0.0:
+        stale_after_sec = 2.0
+    last_error = _as_status_error_text(info.get("last_error"))
+    last_runtime_error = _as_status_error_text(info.get("last_runtime_error"))
+
+    status_level = "ok"
+    status_label = "正常"
+    status_message = ""
+    if last_error:
+        status_level = "error"
+        status_label = "异常"
+        status_message = last_error
+    elif frame_count <= 0:
+        status_level = "waiting"
+        status_label = "等待首帧"
+        status_message = last_runtime_error
+    elif last_frame_age_sec is None:
+        status_level = "warn"
+        status_label = "缺少时间戳"
+    elif last_frame_age_sec >= stale_after_sec:
+        status_level = "error"
+        status_label = "数据停滞"
+        status_message = f"last frame age {last_frame_age_sec:.2f}s >= stale {stale_after_sec:.2f}s"
+    elif last_frame_age_sec >= max(0.5, stale_after_sec * 0.5):
+        status_level = "warn"
+        status_label = "帧延迟"
+        status_message = f"last frame age {last_frame_age_sec:.2f}s"
+    elif (consecutive_timeout_count or 0) > 0 or last_runtime_error:
+        status_level = "warn"
+        status_label = "临时 timeout"
+        status_message = last_runtime_error
+
+    metadata = info.get("metadata") if isinstance(info.get("metadata"), Mapping) else {}
+    return {
+        "camera_key": str(camera_key),
+        "status_level": status_level,
+        "status_label": status_label,
+        "status_message": status_message,
+        "name": info.get("name") or getattr(source, "name", str(camera_key)),
+        "serial": info.get("serial") or fallback_serial,
+        "serial_number": info.get("serial_number"),
+        "device_name": info.get("device_name"),
+        "product_line": info.get("product_line"),
+        "firmware_version": info.get("firmware_version"),
+        "width": info.get("width") if info.get("width") is not None else getattr(config, "width", None),
+        "height": info.get("height") if info.get("height") is not None else getattr(config, "height", None),
+        "fps": info.get("fps") if info.get("fps") is not None else getattr(config, "fps", None),
+        "color_space": info.get("color_space") or getattr(config, "color_space", None),
+        "frame_count": frame_count,
+        "last_frame_age_sec": last_frame_age_sec,
+        "stale_after_sec": stale_after_sec,
+        "timeout_count": timeout_count,
+        "consecutive_timeout_count": consecutive_timeout_count,
+        "restart_count": restart_count,
+        "last_error": last_error,
+        "last_runtime_error": last_runtime_error,
+        "last_restart_timestamp": info.get("last_restart_timestamp"),
+        "preview_selected": bool(preview_selected),
+        "preview_active": bool(preview_active and preview_selected),
+        "metadata": _json_safe_value(metadata),
+        "updated_at": float(now),
+    }
+
+
+def _build_camera_status(
+    camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    *,
+    preview_camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
+    camera_previewer: CameraPreviewer | None = None,
+    now: float | None = None,
+) -> dict[str, object]:
+    if not camera_sources:
+        return {}
+    current_time = time.time() if now is None else float(now)
+    preview_keys = set(preview_camera_sources or {})
+    preview_active = camera_previewer is not None
+    return {
+        str(camera_key): _camera_status_for_source(
+            str(camera_key),
+            source,
+            now=current_time,
+            preview_selected=str(camera_key) in preview_keys,
+            preview_active=preview_active,
+        )
+        for camera_key, source in sorted(camera_sources.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _tactile_ready_counts(value: object) -> tuple[int, int]:
+    if not isinstance(value, Mapping):
+        return 0, 0
+    total = len(value)
+    ready = sum(1 for item in value.values() if bool(item))
+    return ready, total
+
+
+def _tactile_device_count(value: object) -> int:
+    if isinstance(value, Mapping):
+        return len(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return len(value)
+    return 0
+
+
+def _tactile_frame_count(value: object) -> int:
+    if isinstance(value, Mapping):
+        return len(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return len(value)
+    return 0
+
+
+def _tactile_camera_status_for_side(
+    side: str,
+    item: Mapping[str, object],
+    *,
+    now: float,
+) -> dict[str, object]:
+    configured = bool(item.get("configured", False))
+    connect_tactile = bool(item.get("connect_tactile", False))
+    is_connected = bool(item.get("is_connected", False))
+    telemetry_error = _as_status_error_text(item.get("telemetry_error"))
+    devices = item.get("tactile_devices") or ()
+    ready = item.get("tactile_ready") or {}
+    frame_ids = item.get("tactile_frame_ids") or {}
+    ready_count, ready_total = _tactile_ready_counts(ready)
+    device_count = _tactile_device_count(devices)
+    frame_count = _tactile_frame_count(frame_ids)
+    expected_count = max(device_count, ready_total, frame_count)
+    tactile_timestamp = _safe_float_value(item.get("tactile_timestamp"))
+    tactile_age_sec = None if tactile_timestamp is None else max(0.0, float(now) - tactile_timestamp)
+    tactile_read_hz = _safe_float_value(item.get("tactile_read_hz"))
+    tactile_max_fps = _safe_float_value(item.get("tactile_max_fps"))
+    reference_hz = tactile_read_hz if tactile_read_hz and tactile_read_hz > 0.0 else tactile_max_fps
+    stale_after_sec = 2.0
+    if reference_hz is not None and reference_hz > 0.0:
+        stale_after_sec = max(1.0, min(3.0, 3.0 / float(reference_hz)))
+    process_read = bool(item.get("tactile_process_read", False))
+    worker_alive = item.get("tactile_worker_alive")
+    receiver_alive = item.get("tactile_worker_receiver_alive")
+
+    status_level = "ok"
+    status_label = "正常"
+    status_message = ""
+    if not configured:
+        status_level = "off"
+        status_label = "未配置"
+    elif not connect_tactile:
+        status_level = "off"
+        status_label = "未启用"
+    elif telemetry_error:
+        status_level = "error"
+        status_label = "连接/读取异常"
+        status_message = telemetry_error
+    elif not is_connected:
+        status_level = "error"
+        status_label = "夹爪未连接"
+    elif process_read and worker_alive is False:
+        status_level = "error"
+        status_label = "worker 异常"
+        status_message = "tactile worker is not alive"
+    elif process_read and receiver_alive is False:
+        status_level = "error"
+        status_label = "接收进程异常"
+        status_message = "tactile worker receiver is not alive"
+    elif expected_count <= 0:
+        status_level = "waiting"
+        status_label = "等待触觉设备"
+    elif ready_total > 0 and ready_count <= 0:
+        status_level = "error"
+        status_label = "设备无有效数据"
+    elif ready_total > 0 and ready_count < ready_total:
+        status_level = "warn"
+        status_label = "部分设备异常"
+    elif tactile_age_sec is None:
+        status_level = "waiting"
+        status_label = "等待触觉帧"
+    elif tactile_age_sec >= stale_after_sec * 2.0:
+        status_level = "error"
+        status_label = "数据停滞"
+        status_message = f"last tactile frame age {tactile_age_sec:.2f}s"
+    elif tactile_age_sec >= stale_after_sec:
+        status_level = "warn"
+        status_label = "触觉帧延迟"
+        status_message = f"last tactile frame age {tactile_age_sec:.2f}s"
+
+    return {
+        "side": str(side),
+        "configured": configured,
+        "connect_tactile": connect_tactile,
+        "is_connected": is_connected,
+        "status_level": status_level,
+        "status_label": status_label,
+        "status_message": status_message,
+        "telemetry_error": telemetry_error,
+        "device_count": device_count,
+        "ready_count": ready_count,
+        "ready_total": ready_total,
+        "frame_count": frame_count,
+        "tactile_devices": _json_safe_value(devices),
+        "tactile_ready": _json_safe_value(ready),
+        "tactile_frame_ids": _json_safe_value(frame_ids),
+        "tactile_field_by_key": _json_safe_value(item.get("tactile_field_by_key") or {}),
+        "tactile_shapes": _json_safe_value(item.get("tactile_shapes") or {}),
+        "tactile_timings_ms": _json_safe_value(item.get("tactile_timings_ms") or {}),
+        "tactile_timestamp": tactile_timestamp,
+        "tactile_age_sec": tactile_age_sec,
+        "stale_after_sec": stale_after_sec,
+        "tactile_version": item.get("tactile_version"),
+        "tactile_read_hz": tactile_read_hz,
+        "tactile_max_fps": tactile_max_fps,
+        "tactile_read_elapsed_s": item.get("tactile_read_elapsed_s"),
+        "tactile_gate_wait_s": item.get("tactile_gate_wait_s"),
+        "tactile_read_skipped": item.get("tactile_read_skipped"),
+        "tactile_process_read": process_read,
+        "tactile_worker_alive": worker_alive,
+        "tactile_worker_receiver_alive": receiver_alive,
+        "updated_at": float(now),
+    }
+
+
+def _build_tactile_camera_status(
+    gripper_status: Mapping[str, Mapping[str, object]] | None,
+    *,
+    now: float | None = None,
+) -> dict[str, object]:
+    if not gripper_status:
+        return {}
+    current_time = time.time() if now is None else float(now)
+    return {
+        str(side): _tactile_camera_status_for_side(str(side), item, now=current_time)
+        for side, item in gripper_status.items()
+        if isinstance(item, Mapping)
     }
 
 
@@ -6526,12 +7613,24 @@ def _dispatch_q6_gripper_control(
         if retargeter is None:
             finish("no_retargeter")
             continue
-        try:
-            command = retargeter.retarget(observation, components.session.calibration)
-        except Exception as exc:  # noqa: BLE001
-            finish("retarget_exception", error=f"{type(exc).__name__}: {exc}")
-            _log("Gripper", f"{side} Q6 retarget failed: {exc}", now=now)
-            continue
+        fix_arm_controller = getattr(components, "fix_arm_controller", None)
+        fixed_side_active = bool(
+            fix_arm_controller is not None
+            and fix_arm_controller.fixed
+            and fix_arm_controller.fixed_side == side
+        )
+        if fixed_side_active:
+            command = TeleopCommand(timestamp=float(now))
+            command = fix_arm_controller.filter_command(command, observation, now)
+        else:
+            try:
+                command = retargeter.retarget(observation, components.session.calibration)
+            except Exception as exc:  # noqa: BLE001
+                finish("retarget_exception", error=f"{type(exc).__name__}: {exc}")
+                _log("Gripper", f"{side} Q6 retarget failed: {exc}", now=now)
+                continue
+            if fix_arm_controller is not None:
+                command = fix_arm_controller.filter_command(command, observation, now)
         if not command.commands:
             finish(
                 "no_retarget_command",
@@ -6546,26 +7645,32 @@ def _dispatch_q6_gripper_control(
             )
             continue
         metadata = effector_command.metadata or {}
-        finish(
-            "retargeted",
-            source_dim=_safe_int_value(metadata.get("source_dim")),
-            output_dim=_safe_int_value(metadata.get("output_dim")),
-            source_value=_safe_float_value(metadata.get("source_value")),
-            target=_safe_float_value(metadata.get("gripper_joint_target")),
-        )
+        if fixed_side_active:
+            finish(
+                "fixed_command",
+                target=_safe_float_value(metadata.get("gripper_joint_target")),
+            )
+        else:
+            finish(
+                "retargeted",
+                source_dim=_safe_int_value(metadata.get("source_dim")),
+                output_dim=_safe_int_value(metadata.get("output_dim")),
+                source_value=_safe_float_value(metadata.get("source_value")),
+                target=_safe_float_value(metadata.get("gripper_joint_target")),
+            )
         try:
             sent_ok = bool(backend.send_command(effector_command))
         except Exception as exc:  # noqa: BLE001
             finish("send_exception", error=f"{type(exc).__name__}: {exc}")
             _log("Gripper", f"{side} Q6 command failed: {exc}", now=now)
             continue
+        commands.append(command)
         if not sent_ok:
             fields = backend_send_fields(backend)
             backend_status = str(fields.get("backend_status") or "send_returned_false")
             finish(backend_status, **fields)
             continue
         finish("sent", sent=True, **backend_send_fields(backend))
-        commands.append(command)
     if not commands:
         return None
     return merge_teleop_commands(commands)
@@ -6685,6 +7790,94 @@ def _debug_timing_fault_text(result) -> str:
     return "faults=" + ",".join(codes)
 
 
+def _pose_quality_reason_list(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [str(item) for item in value if item is not None]
+
+
+def _pose_quality_level(status: object, *, available: bool, bad: bool) -> str:
+    status_text = str(status or "unknown")
+    if bad or status_text == "bad":
+        return "error"
+    if status_text == "warning":
+        return "warn"
+    if not available or status_text == "unknown":
+        return "off"
+    return "ok"
+
+
+def _build_pose_quality_display_payload(active_command: TeleopCommand | None) -> dict[str, object]:
+    quality = _collection_build_pose_quality_metadata(active_command)
+    if not isinstance(quality, Mapping):
+        quality = {}
+    metrics = quality.get("metrics")
+    metrics_dict = dict(metrics) if isinstance(metrics, Mapping) else {}
+    pose_error = metrics_dict.get("ik_solve_pose_error")
+    pose_error_dict = dict(pose_error) if isinstance(pose_error, Mapping) else {}
+    joint_margin = metrics_dict.get("joint_limit_margin")
+    joint_margin_dict = dict(joint_margin) if isinstance(joint_margin, Mapping) else {}
+    available = bool(quality.get("available", False))
+    status = str(quality.get("status") or "unknown")
+    bad = bool(quality.get("bad", False))
+    score = _float_or_none(quality.get("score"))
+    return {
+        "available": available,
+        "status": status,
+        "score": score,
+        "bad": bad,
+        "level": _pose_quality_level(status, available=available, bad=bad),
+        "source": str(quality.get("source") or ""),
+        "reasons": _pose_quality_reason_list(quality.get("reasons")),
+        "bad_reasons": _pose_quality_reason_list(quality.get("bad_reasons")),
+        "warning_reasons": _pose_quality_reason_list(quality.get("warning_reasons")),
+        "metrics": {
+            "collision_avoidance_status": metrics_dict.get("collision_avoidance_status"),
+            "collision_distance_m": _float_or_none(metrics_dict.get("collision_distance_m")),
+            "collision_min_distance_m": _float_or_none(metrics_dict.get("collision_min_distance_m")),
+            "collision_margin_m": _float_or_none(metrics_dict.get("collision_margin_m")),
+            "ik_jump_gate_status": metrics_dict.get("ik_jump_gate_status"),
+            "ik_branch_candidate": metrics_dict.get("ik_branch_candidate"),
+            "ik_translation_error_m": _float_or_none(pose_error_dict.get("max_translation_m")),
+            "ik_rotation_error_deg": _float_or_none(pose_error_dict.get("max_rotation_deg")),
+            "joint_nearest_margin_deg": _float_or_none(joint_margin_dict.get("nearest_margin_deg")),
+            "joint_near_limit": bool(joint_margin_dict.get("near_limit", False)),
+            "execution_step_limited": bool(metrics_dict.get("execution_step_limited", False)),
+            "ik_time_budget_exceeded": bool(metrics_dict.get("ik_time_budget_exceeded", False)),
+        },
+    }
+
+
+def _pose_quality_status_text(payload: Mapping[str, object] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return "pose_quality=unavailable"
+    status = str(payload.get("status") or "unknown")
+    score = _compact_runtime_float(payload.get("score"), digits=2)
+    bits = [f"pose_quality={status}", f"score={score}"]
+    if not bool(payload.get("available", False)):
+        bits.append("available=0")
+    reasons = _pose_quality_reason_list(payload.get("reasons"))
+    if reasons:
+        bits.append("reason=" + ",".join(reasons[:3]))
+    metrics = payload.get("metrics")
+    if isinstance(metrics, Mapping):
+        collision_margin = _float_or_none(metrics.get("collision_margin_m"))
+        joint_margin = _float_or_none(metrics.get("joint_nearest_margin_deg"))
+        translation = _float_or_none(metrics.get("ik_translation_error_m"))
+        rotation = _float_or_none(metrics.get("ik_rotation_error_deg"))
+        if collision_margin is not None:
+            bits.append(f"col_margin={collision_margin:.3f}m")
+        if joint_margin is not None:
+            bits.append(f"joint_margin={joint_margin:.1f}deg")
+        if translation is not None or rotation is not None:
+            bits.append(
+                "pose_err="
+                f"{0.0 if translation is None else translation:.3f}m/"
+                f"{0.0 if rotation is None else rotation:.1f}deg"
+            )
+    return " ".join(bits)
+
+
 def _runtime_fault_label(fault: object) -> str:
     code = str(getattr(fault, "code", "unknown"))
     channel_name = getattr(fault, "channel_name", None)
@@ -6713,7 +7906,19 @@ def _debug_timing_arm_text(
         text = state.get("hardware_result_text")
         return f"{code}:{text}" if text is not None else str(code)
 
-    return (
+    def timing_text(state: dict[str, object]) -> str:
+        bits: list[str] = []
+        send_timing = state.get("last_send_command_timing")
+        if isinstance(send_timing, Mapping):
+            bits.append(f"send={_compact_runtime_float(send_timing.get('total_ms'), digits=1)}ms")
+            bits.append(f"lock={_compact_runtime_float(send_timing.get('send_lock_wait_ms'), digits=1)}ms")
+        loop_timing = state.get("last_impedance_loop_timing")
+        if isinstance(loop_timing, Mapping):
+            bits.append(f"loop={_compact_runtime_float(loop_timing.get('total_ms'), digits=1)}ms")
+            bits.append(f"lag={_compact_runtime_float(loop_timing.get('deadline_lag_ms'), digits=1)}ms")
+        return ",".join(bits)
+
+    base = (
         "arms="
         f"left_hw={code_text(left_hw_state)} "
         f"right_hw={code_text(right_hw_state)} "
@@ -6723,6 +7928,14 @@ def _debug_timing_arm_text(
         f"right_step_scale={float(right_command_state.get('effective_step_scale', 1.0)):.2f} "
         f"target_step_scale={float(target_step_scale):.2f}"
     )
+    timing_bits = []
+    left_timing = timing_text(left_command_state)
+    if left_timing:
+        timing_bits.append(f"left_timing={left_timing}")
+    right_timing = timing_text(right_command_state)
+    if right_timing:
+        timing_bits.append(f"right_timing={right_timing}")
+    return base if not timing_bits else base + " " + " ".join(timing_bits)
 
 
 def _debug_timing_ik_text(active_command) -> str:
@@ -7601,6 +8814,8 @@ def _impedance_record_compact_debug(record: object) -> dict[str, object] | None:
         "ik_command_step_applied_deg",
         "ik_resolver_tolerance_fraction",
         "ik_timing",
+        "rm65_controller_timing",
+        "rm65_backend_loop_timing",
         "singularity",
         "joint_limit_margin",
         "pose_tracking_linear_m",
@@ -7670,6 +8885,8 @@ def _backend_compact_debug_payload(state: Mapping[str, object] | None) -> dict[s
         "last_impedance_record": _impedance_record_compact_debug(
             state.get("last_impedance_record")
         ),
+        "last_send_command_timing": _compact_debug_value(state.get("last_send_command_timing")),
+        "last_impedance_loop_timing": _compact_debug_value(state.get("last_impedance_loop_timing")),
     }
     return {key: value for key, value in out.items() if value is not None}
 
@@ -7810,6 +9027,8 @@ def _impedance_record_debug(record: object) -> dict[str, object] | None:
         "ik_command_step_applied_deg",
         "ik_resolver_tolerance_fraction",
         "ik_timing",
+        "rm65_controller_timing",
+        "rm65_backend_loop_timing",
         "singularity",
         "joint_limit_margin",
         "ik_metadata",
@@ -7837,6 +9056,8 @@ def _backend_debug_payload(state: Mapping[str, object] | None) -> dict[str, obje
         "last_target_tcp_pose": _pose_matrix_debug(state.get("last_target_tcp_pose")),
         "ik_metadata": state.get("ik_metadata"),
         "last_impedance_record": _impedance_record_debug(state.get("last_impedance_record")),
+        "last_send_command_timing": state.get("last_send_command_timing"),
+        "last_impedance_loop_timing": state.get("last_impedance_loop_timing"),
     }
 
 
@@ -7939,9 +9160,474 @@ def _build_ik_debug_log_frame(
     }
 
 
+def _state_value(value: object) -> str:
+    return str(getattr(value, "value", value))
+
+
+def _fault_signature(faults: Sequence[object]) -> tuple[str, ...]:
+    labels: list[str] = []
+    for fault in faults:
+        code = str(getattr(fault, "code", fault) or "")
+        channel_name = str(getattr(fault, "channel_name", "") or "")
+        labels.append(f"{code}:{channel_name}" if channel_name else code)
+    return tuple(labels)
+
+
+def _phase_timings_log_payload(phases: Sequence[tuple[str, float]]) -> dict[str, object]:
+    items = [
+        {"name": str(name), "elapsed_ms": float(elapsed) * 1000.0}
+        for name, elapsed in phases
+    ]
+    top = sorted(items, key=lambda item: float(item["elapsed_ms"]), reverse=True)[:16]
+    return {
+        "total_marked_ms": sum(float(item["elapsed_ms"]) for item in items),
+        "items": items,
+        "top": top,
+    }
+
+
+def _latency_items_log_payload(items: Sequence[object]) -> list[dict[str, object]]:
+    return [
+        {"name": str(getattr(item, "name", "")), "age_ms": float(getattr(item, "age_sec", 0.0)) * 1000.0}
+        for item in sorted(items, key=lambda item: float(getattr(item, "age_sec", 0.0)), reverse=True)
+    ]
+
+
+def _latency_log_payload(result: object, *, now: float) -> dict[str, object]:
+    breakdown = build_end_to_end_latency_breakdown(result, reference_time=float(now))
+    return {
+        "reference_time": float(breakdown.reference_time),
+        "step_age_ms": None if breakdown.step_age_sec is None else float(breakdown.step_age_sec) * 1000.0,
+        "observation_age_ms": (
+            None
+            if breakdown.observation_age_sec is None
+            else float(breakdown.observation_age_sec) * 1000.0
+        ),
+        "command_age_ms": (
+            None if breakdown.command_age_sec is None else float(breakdown.command_age_sec) * 1000.0
+        ),
+        "channel_age": _latency_items_log_payload(breakdown.channel_age_sec),
+        "receiver_age": _latency_items_log_payload(breakdown.receiver_age_sec),
+        "sender_age": _latency_items_log_payload(breakdown.sender_age_sec),
+    }
+
+
+def _faults_log_payload(result: object) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    for fault in getattr(result, "faults", ()) or ():
+        severity = getattr(fault, "severity", None)
+        payload.append(
+            {
+                "code": str(getattr(fault, "code", fault) or ""),
+                "channel_name": getattr(fault, "channel_name", None),
+                "component": getattr(fault, "component", None),
+                "severity": str(getattr(severity, "value", severity) or ""),
+                "message": str(getattr(fault, "message", "") or ""),
+                "timestamp": _float_or_none(getattr(fault, "timestamp", None)),
+                "metadata": _compact_debug_value(
+                    getattr(fault, "metadata", {}) or {},
+                    max_items=12,
+                ),
+            }
+        )
+    return payload
+
+
+def _channels_log_payload(result: object, *, now: float) -> dict[str, object]:
+    channels = getattr(result, "channels", {}) or {}
+    if not isinstance(channels, Mapping):
+        return {}
+    metadata_keys = (
+        "sender_timestamp",
+        "receiver_timestamp",
+        "tracker_name",
+        "tracker_role",
+        "seq",
+        "port",
+        "baudrate",
+        "stale_q6_frames_dropped",
+        "reader_error_count",
+        "reader_recovery_count",
+        "read_error",
+        "error",
+    )
+    out: dict[str, object] = {}
+    for channel_name, channel in sorted(channels.items(), key=lambda item: str(item[0])):
+        timestamp = _float_or_none(getattr(channel, "timestamp", None))
+        metadata = getattr(channel, "metadata", {}) or {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        out[str(channel_name)] = {
+            "valid": bool(getattr(channel, "valid", False)),
+            "critical": bool(getattr(channel, "critical", False)),
+            "capability": getattr(channel, "capability", None),
+            "side": getattr(channel, "side", None),
+            "frame_name": getattr(channel, "frame_name", None),
+            "source_name": getattr(channel, "source_name", None),
+            "timestamp": timestamp,
+            "age_ms": None if timestamp is None else (float(now) - timestamp) * 1000.0,
+            "metadata": {
+                key: _compact_debug_value(metadata.get(key), max_items=8)
+                for key in metadata_keys
+                if key in metadata
+            },
+        }
+    return out
+
+
+def _camera_status_log_payload(
+    camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    *,
+    preview_camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    camera_previewer: CameraPreviewer | None,
+    now: float,
+) -> dict[str, object]:
+    statuses = _build_camera_status(
+        camera_sources,
+        preview_camera_sources=preview_camera_sources,
+        camera_previewer=camera_previewer,
+        now=now,
+    )
+    selected_keys = (
+        "status_level",
+        "status_label",
+        "status_message",
+        "serial",
+        "width",
+        "height",
+        "fps",
+        "frame_count",
+        "last_frame_age_sec",
+        "stale_after_sec",
+        "timeout_count",
+        "consecutive_timeout_count",
+        "restart_count",
+        "last_error",
+        "last_runtime_error",
+        "preview_active",
+    )
+    return {
+        str(camera_key): {
+            key: _compact_debug_value(status.get(key), max_items=8)
+            for key in selected_keys
+            if key in status
+        }
+        for camera_key, status in statuses.items()
+        if isinstance(status, Mapping)
+    }
+
+
+def _backend_timing_log_payload(state: Mapping[str, object] | None) -> dict[str, object]:
+    if not isinstance(state, Mapping):
+        return {}
+    selected_keys = (
+        "hardware_result_code",
+        "hardware_result_text",
+        "send_result_code",
+        "send_result_text",
+        "effective_control_dt_sec",
+        "effective_step_scale",
+        "impedance_enabled",
+        "impedance_loop_state",
+        "fault",
+    )
+    out: dict[str, object] = {
+        key: _compact_debug_value(state.get(key), max_items=12)
+        for key in selected_keys
+        if key in state and state.get(key) is not None
+    }
+    if state.get("last_send_command_timing") is not None:
+        out["last_send_command_timing"] = _compact_debug_value(
+            state.get("last_send_command_timing"),
+            max_items=24,
+        )
+    if state.get("last_impedance_loop_timing") is not None:
+        out["last_impedance_loop_timing"] = _compact_debug_value(
+            state.get("last_impedance_loop_timing"),
+            max_items=24,
+        )
+    impedance_record = _impedance_record_compact_debug(state.get("last_impedance_record"))
+    if impedance_record:
+        out["last_impedance_record"] = impedance_record
+    ik_metadata = _backend_ik_metadata_compact_debug(state.get("ik_metadata"))
+    if ik_metadata:
+        out["ik_metadata"] = ik_metadata
+    return out
+
+
+def _build_debug_timing_log_frame(
+    *,
+    components: RealTeleopComponents,
+    step_index: int,
+    loop_start: float,
+    elapsed_sec: float,
+    phases: Sequence[tuple[str, float]],
+    reason: str,
+    step_result: object,
+    active_command: TeleopCommand | None,
+    left_command_state: Mapping[str, object] | None,
+    right_command_state: Mapping[str, object] | None,
+    left_hw_state: Mapping[str, object] | None,
+    right_hw_state: Mapping[str, object] | None,
+    ik_timing_payload: Mapping[str, object] | None,
+    target_step_scale: float,
+    left_clutch: bool,
+    right_clutch: bool,
+    camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    preview_camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    camera_previewer: CameraPreviewer | None,
+    hand_input_status: object,
+    gripper_status: object,
+    recording_status: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    faults = tuple(getattr(step_result, "faults", ()) or ())
+    return {
+        "schema": "dexteleop_debug_timing_v1",
+        "event": "frame",
+        "reason": str(reason),
+        "step_index": int(step_index),
+        "timestamp": float(loop_start),
+        "loop_elapsed_ms": float(elapsed_sec) * 1000.0,
+        "control_hz": float(getattr(step_result, "control_hz", 0.0) or 0.0),
+        "state": _state_value(getattr(step_result, "state", "")),
+        "fault_codes": list(_fault_signature(faults)),
+        "faults": _faults_log_payload(step_result),
+        "clutch": {"left": bool(left_clutch), "right": bool(right_clutch)},
+        "target_step_scale": float(target_step_scale),
+        "recording": _compact_debug_value(dict(recording_status or {}), max_items=16),
+        "phases": _phase_timings_log_payload(phases),
+        "latency": _latency_log_payload(step_result, now=loop_start),
+        "channels": _channels_log_payload(step_result, now=loop_start),
+        "camera_status": _camera_status_log_payload(
+            camera_sources,
+            preview_camera_sources=preview_camera_sources,
+            camera_previewer=camera_previewer,
+            now=loop_start,
+        ),
+        "ik_timing": _compact_debug_value(dict(ik_timing_payload or {}), max_items=24),
+        "retargeter_command": {
+            "metadata": _teleop_command_metadata_compact_debug(active_command),
+        },
+        "backend": {
+            "left_command": _backend_timing_log_payload(left_command_state),
+            "right_command": _backend_timing_log_payload(right_command_state),
+            "left_hardware": _backend_timing_log_payload(left_hw_state),
+            "right_hardware": _backend_timing_log_payload(right_hw_state),
+        },
+        "hand_input_status": _compact_debug_value(hand_input_status, max_items=16),
+        "gripper_status": _compact_debug_value(gripper_status, max_items=16),
+        "active_sides": list(getattr(components, "active_sides", ()) or ()),
+    }
+
+
+class DebugTimingLogRecorder:
+    def __init__(
+        self,
+        *,
+        root_dir: Path | str | None = None,
+        max_queue_size: int = 512,
+        heartbeat_sec: float = 1.0,
+    ) -> None:
+        self.root_dir = Path(root_dir) if root_dir is not None else DEFAULT_DEBUG_TIMING_LOG_ROOT
+        self.path: Path | None = None
+        self._queue: queue.Queue[Mapping[str, object] | None] | None = None
+        self._writer_thread: threading.Thread | None = None
+        self._max_queue_size = max(16, int(max_queue_size))
+        self.heartbeat_sec = max(0.05, float(heartbeat_sec))
+        self.frame_count = 0
+        self.dropped_frame_count = 0
+        self.dropped_event_count = 0
+        self._last_logged_at = 0.0
+        self._last_state: str | None = None
+        self._last_fault_signature: tuple[str, ...] | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._queue is not None
+
+    def start(self, *, now: float | None = None) -> Path:
+        if self.active and self.path is not None:
+            return self.path
+        timestamp_time = time.time() if now is None else float(now)
+        timestamp = (
+            time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp_time))
+            + f"_{int((timestamp_time % 1.0) * 1000):03d}"
+        )
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.root_dir / f"debug_timing_{timestamp}.jsonl"
+        log_file = self.path.open("a", encoding="utf-8")
+        log_queue: queue.Queue[Mapping[str, object] | None] = queue.Queue(maxsize=self._max_queue_size)
+        self._queue = log_queue
+        self.frame_count = 0
+        self.dropped_frame_count = 0
+        self.dropped_event_count = 0
+        self._last_logged_at = 0.0
+        self._last_state = None
+        self._last_fault_signature = None
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            args=(log_queue, log_file, self.path),
+            daemon=True,
+            name="debug_timing_log_writer",
+        )
+        self._writer_thread.start()
+        self.write_event("start", {"path": str(self.path), "heartbeat_sec": self.heartbeat_sec}, now=now)
+        return self.path
+
+    def _writer_loop(
+        self,
+        log_queue: queue.Queue[Mapping[str, object] | None],
+        log_file,
+        path: Path,
+    ) -> None:
+        pending_frames = 0
+        try:
+            while True:
+                row = log_queue.get()
+                if row is None:
+                    break
+                log_file.write(json.dumps(_json_safe(row), ensure_ascii=False, separators=(",", ":")) + "\n")
+                if row.get("event") == "frame":
+                    pending_frames += 1
+                    if pending_frames % 10 == 0:
+                        log_file.flush()
+                else:
+                    log_file.flush()
+            log_file.flush()
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not break teleop.
+            print(f"WARNING: debug timing log writer failed for {path}: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
+    def select_frame_reason(
+        self,
+        *,
+        now: float,
+        elapsed_sec: float,
+        phases: Sequence[tuple[str, float]],
+        state: object,
+        fault_codes: Sequence[object],
+        threshold_sec: float,
+        force: bool = False,
+    ) -> str | None:
+        if not self.active:
+            return None
+        state_value = _state_value(state)
+        fault_signature = tuple(str(item) for item in fault_codes)
+        reasons: list[str] = []
+        if should_report_debug_frozen(
+            elapsed_sec=elapsed_sec,
+            phases=phases,
+            threshold_sec=float(threshold_sec),
+            force=force,
+        ):
+            reasons.append("slow")
+        if self._last_state != state_value:
+            reasons.append("state_change")
+        if self._last_fault_signature is not None and self._last_fault_signature != fault_signature:
+            reasons.append("fault_change" if fault_signature else "fault_clear")
+        elif self._last_fault_signature is None and fault_signature:
+            reasons.append("fault_change")
+        if (
+            not reasons
+            and self._last_logged_at > 0.0
+            and (float(now) - self._last_logged_at) >= self.heartbeat_sec
+        ):
+            reasons.append("heartbeat")
+        if not reasons:
+            return None
+        self._last_logged_at = float(now)
+        self._last_state = state_value
+        self._last_fault_signature = fault_signature
+        return "+".join(reasons)
+
+    def _enqueue_row(self, row: Mapping[str, object], *, kind: str) -> bool:
+        log_queue = self._queue
+        if log_queue is None:
+            return False
+        try:
+            log_queue.put_nowait(dict(row))
+            return True
+        except queue.Full:
+            if kind == "frame":
+                self.dropped_frame_count += 1
+            else:
+                self.dropped_event_count += 1
+            return False
+
+    def write_event(self, event: str, payload: Mapping[str, object] | None = None, *, now: float | None = None) -> None:
+        if self._queue is None:
+            return
+        row = {
+            "schema": "dexteleop_debug_timing_v1",
+            "event": str(event),
+            "timestamp": float(time.time() if now is None else now),
+            "payload": dict(payload or {}),
+        }
+        try:
+            self._queue.put(row, timeout=0.02)
+        except queue.Full:
+            self.dropped_event_count += 1
+
+    def record_frame(self, payload: Mapping[str, object]) -> None:
+        if self._queue is None:
+            return
+        if self._enqueue_row(payload, kind="frame"):
+            self.frame_count += 1
+
+    def stop(
+        self,
+        *,
+        reason: str,
+        now: float | None = None,
+        join_timeout_sec: float = 0.5,
+    ) -> Path | None:
+        log_queue = self._queue
+        if log_queue is None:
+            return self.path
+        stop_row = {
+            "schema": "dexteleop_debug_timing_v1",
+            "event": "stop",
+            "timestamp": float(time.time() if now is None else now),
+            "payload": {
+                "reason": str(reason),
+                "frame_count": int(self.frame_count),
+                "dropped_frame_count": int(self.dropped_frame_count),
+                "dropped_event_count": int(self.dropped_event_count),
+            },
+        }
+        try:
+            log_queue.put(stop_row, timeout=0.1)
+        except queue.Full:
+            self.dropped_event_count += 1
+        writer_thread = self._writer_thread
+        stop_sent = False
+        try:
+            log_queue.put(None, timeout=0.1)
+            stop_sent = True
+        except queue.Full:
+            threading.Thread(
+                target=lambda: log_queue.put(None),
+                daemon=True,
+                name="debug_timing_log_stop",
+            ).start()
+        self._queue = None
+        if stop_sent and writer_thread is not None:
+            writer_thread.join(timeout=max(0.0, float(join_timeout_sec)))
+            if not writer_thread.is_alive():
+                self._writer_thread = None
+        return self.path
+
+    def close(self) -> None:
+        self.stop(reason="close")
+
+
 class IkDebugLogRecorder:
-    def __init__(self, *, root_dir: Path | str = "logs", max_queue_size: int = 256) -> None:
-        self.root_dir = Path(root_dir)
+    def __init__(self, *, root_dir: Path | str | None = None, max_queue_size: int = 256) -> None:
+        self.root_dir = Path(root_dir) if root_dir is not None else DEFAULT_IK_DEBUG_LOG_ROOT
         self.path: Path | None = None
         self._queue: queue.Queue[Mapping[str, object] | None] | None = None
         self._writer_thread: threading.Thread | None = None
@@ -7956,7 +9642,11 @@ class IkDebugLogRecorder:
     def start(self, *, now: float | None = None) -> Path:
         if self.active and self.path is not None:
             return self.path
-        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time() if now is None else now))
+        timestamp_time = time.time() if now is None else float(now)
+        timestamp = (
+            time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp_time))
+            + f"_{int((timestamp_time % 1.0) * 1000):03d}"
+        )
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.root_dir / f"ik_debug_{timestamp}.jsonl"
         log_file = self.path.open("a", encoding="utf-8")
@@ -8034,21 +9724,35 @@ class IkDebugLogRecorder:
         if self._enqueue_row(payload, kind="frame"):
             self.frame_count += 1
 
-    def stop(self, *, reason: str, now: float | None = None) -> Path | None:
+    def stop(
+        self,
+        *,
+        reason: str,
+        now: float | None = None,
+        join_timeout_sec: float = 0.5,
+    ) -> Path | None:
         log_queue = self._queue
         if log_queue is None:
             return self.path
-        self.write_event(
-            "stop",
-            {
+        stop_row = {
+            "schema": "dexteleop_ik_debug_v1",
+            "event": "stop",
+            "timestamp": float(time.time() if now is None else now),
+            "payload": {
                 "reason": str(reason),
                 "frame_count": int(self.frame_count),
                 "dropped_frame_count": int(self.dropped_frame_count),
             },
-            now=now,
-        )
+        }
         try:
-            log_queue.put_nowait(None)
+            log_queue.put(stop_row, timeout=0.1)
+        except queue.Full:
+            self.dropped_frame_count += 1
+        writer_thread = self._writer_thread
+        stop_sent = False
+        try:
+            log_queue.put(None, timeout=0.1)
+            stop_sent = True
         except queue.Full:
             threading.Thread(
                 target=lambda: log_queue.put(None),
@@ -8056,6 +9760,10 @@ class IkDebugLogRecorder:
                 name="ik_debug_log_stop",
             ).start()
         self._queue = None
+        if stop_sent and writer_thread is not None:
+            writer_thread.join(timeout=max(0.0, float(join_timeout_sec)))
+            if not writer_thread.is_alive():
+                self._writer_thread = None
         return self.path
 
     def close(self) -> None:
@@ -8070,6 +9778,7 @@ class RealTeleopControlInput:
         ui: CalibrationWebUi | None,
         args: argparse.Namespace,
         components: RealTeleopComponents,
+        pose_snapshot_recorder: FixArmPoseSnapshotRecorder | None = None,
     ) -> None:
         self.terminal = terminal
         self.ui = ui
@@ -8093,6 +9802,8 @@ class RealTeleopControlInput:
         self._last_ik_warning_publish_at = 0.0
         self._ik_warning_publish_interval_sec = 0.2
         self._last_ik_warning_signature: tuple[object, ...] | None = None
+        self._last_pose_quality_publish_at = 0.0
+        self._pose_quality_publish_interval_sec = 0.2
         self._ik_debug_log_toggle_requested = False
         self._ik_debug_logging_active = False
         self._ik_debug_log_path = ""
@@ -8108,12 +9819,22 @@ class RealTeleopControlInput:
         )
         self._last_gripper_status_publish_at = 0.0
         self._gripper_status_publish_interval_sec = 0.2
+        self._last_camera_status_publish_at = 0.0
+        self._camera_status_publish_interval_sec = 0.2
         self._episode_start_requested = False
         self._episode_stop_requested = False
+        self._episode_last_episode_index: int | None = None
+        self._episode_last_frame_count: int | None = None
+        self._episode_recording_ui_active = False
+        self._episode_countdown_ui_active = False
         self._camera_visualization_toggle_requested = False
         self._tactile_visualization_toggle_requested = False
         self._camera_visualization_active = bool(getattr(args, "vis_cam", False))
         self._tactile_visualization_active = bool(getattr(args, "visualize_tactile", False))
+        self._pose_snapshot_recorder = pose_snapshot_recorder
+        self._pose_snapshot_requested = False
+        self._pose_snapshot_last_path = ""
+        self._pose_snapshot_status = ""
 
     def _episode_recording_available(self) -> bool:
         return (
@@ -8147,10 +9868,40 @@ class RealTeleopControlInput:
     def _movement_multiple_controls(self) -> list[str]:
         return list(MOVEMENT_MULTIPLE_GUI_EVENTS)
 
+    def _collection_task_controls(self) -> list[str]:
+        return ["round_trip_toggle"] if self._episode_recording_available() else []
+
+    def _fix_arm_available(self) -> bool:
+        return getattr(self.components, "fix_arm_controller", None) is not None
+
+    def _fix_arm_controls(self) -> list[str]:
+        return ["fix_arm_select"] if self._fix_arm_available() else []
+
+    def _pose_snapshot_available(self) -> bool:
+        return self._fix_arm_available() and self._pose_snapshot_recorder is not None
+
+    def _pose_snapshot_controls(self) -> list[str]:
+        return [POSE_SNAPSHOT_GUI_EVENT] if self._pose_snapshot_available() else []
+
+    def _pose_snapshot_ui_state(self) -> dict[str, object]:
+        recorder = self._pose_snapshot_recorder
+        return {
+            "pose_snapshot_available": self._pose_snapshot_available(),
+            "pose_snapshot_dir": "" if recorder is None else str(recorder.root_dir),
+            "pose_snapshot_count": 0 if recorder is None else int(recorder.count),
+            "pose_snapshot_last_path": self._pose_snapshot_last_path,
+            "pose_snapshot_status": self._pose_snapshot_status,
+        }
+
     def _teleop_controls(self) -> list[str]:
         controls = ["q", "d", "h"]
+        if self._fix_arm_available():
+            controls.append("c")
+            controls.extend(self._fix_arm_controls())
+        controls.extend(self._pose_snapshot_controls())
         if self._episode_recording_available():
             controls.extend(EPISODE_GUI_EVENTS)
+            controls.extend(self._collection_task_controls())
         controls.extend(self._visualization_controls())
         controls.extend(self._vive_calibration_controls(allow_load=False))
         return controls
@@ -8161,20 +9912,24 @@ class RealTeleopControlInput:
         )
 
     def _pre_home_controls(self) -> list[str]:
-        controls = ["p", "w", "q"]
+        controls = ["p", "w", "d", "q"]
+        controls.extend(self._fix_arm_controls())
         controls.extend(self._visualization_controls())
         controls.extend(self._vive_calibration_controls(allow_load=True))
         controls.extend(self._movement_multiple_controls())
+        controls.extend(self._collection_task_controls())
         return controls
 
     def _hold_controls(self) -> list[str]:
-        controls = ["p", "c"]
+        controls = ["p", "c", "d"]
+        controls.extend(self._fix_arm_controls())
         if len(tuple(self.components.active_sides)) == 1:
             controls.append("w")
         controls.append("q")
         controls.extend(self._visualization_controls())
         controls.extend(self._vive_calibration_controls(allow_load=True))
         controls.extend(self._movement_multiple_controls())
+        controls.extend(self._collection_task_controls())
         return controls
 
     def start(self) -> None:
@@ -8182,6 +9937,7 @@ class RealTeleopControlInput:
         if self.ui is None:
             self.enabled = bool(self.terminal.enabled)
             return
+        gripper_status = _build_gripper_status(self.components)
         self.ui.publish(
             stage="RM65 真机遥操准备",
             selected_side="",
@@ -8201,10 +9957,12 @@ class RealTeleopControlInput:
                 "message": "等待遥操启动后接收 IK timing 元数据。",
             },
             ik_warning=_build_ik_warning_payload(active_command=None),
+            pose_quality=_build_pose_quality_display_payload(None),
             gripper_control_available=_gripper_gui_available(self.components),
             gripper_q6_available=_has_q6_gripper_control(self.components),
             gripper_control_enabled=False,
-            gripper_status=_build_gripper_status(self.components),
+            gripper_status=gripper_status,
+            tactile_camera_status=_build_tactile_camera_status(gripper_status),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
             episode_dir="",
@@ -8212,7 +9970,19 @@ class RealTeleopControlInput:
             episode_sample_hz=None,
             episode_target_hz=float(getattr(self.args, "collection_warning_hz", 15.0)),
             episode_frequency_warning={"active": False, "message": ""},
+            episode_event_status=(
+                "idle" if self._episode_recording_available() else "unavailable"
+            ),
+            episode_event_message=(
+                "点击“开始数采”或按 A 开始；再次按 A 停止。"
+                if self._episode_recording_available()
+                else "当前启动参数禁用了正式数据集和 debug episode 录制。"
+            ),
+            episode_last_episode_index=None,
+            episode_last_frame_count=None,
             **_collection_task_ui_state(self.args),
+            **_fix_arm_ui_state(self.components),
+            **self._pose_snapshot_ui_state(),
             camera_visualization_available=self._camera_visualization_available(),
             camera_visualization_active=self._camera_visualization_active,
             tactile_visualization_available=self._tactile_visualization_available(),
@@ -8221,7 +9991,7 @@ class RealTeleopControlInput:
             **_movement_multiple_ui_state(self.args),
             **_vive_calibration_profile_ui_state(self.args, self.components),
             capture_prep_remaining_sec=None,
-            capture_prep_total_sec=3.0,
+            capture_prep_total_sec=DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
             capture_waiting_for_samples=False,
         )
         self.ui.start()
@@ -8266,6 +10036,8 @@ class RealTeleopControlInput:
                         )
                         self.ui.append_message("EmergencyStop", "网页退出已触发机械臂停臂请求。")
                 elif event in {"p", "c"}:
+                    if event == "c" and self._handle_fix_arm_c_event(now=current_time):
+                        continue
                     self._calibration_requested = True
                     self._calibration_request_from_hold = bool(self._hold_active)
                 elif event == "h":
@@ -8280,6 +10052,12 @@ class RealTeleopControlInput:
                     self._episode_start_requested = True
                 elif event == "episode_stop":
                     self._episode_stop_requested = True
+                elif event == "round_trip_toggle":
+                    self._toggle_round_trip_collection_task(source="manual")
+                elif event.startswith("fix_arm_select:"):
+                    self._set_fix_arm_side_from_gui(event.split(":", 1)[1])
+                elif event == POSE_SNAPSHOT_GUI_EVENT:
+                    self.request_pose_snapshot()
                 elif event == "toggle_camera_vis":
                     self._camera_visualization_toggle_requested = True
                 elif event == "toggle_tactile_vis":
@@ -8298,6 +10076,115 @@ class RealTeleopControlInput:
         if self.ui is not None:
             self.publish_raw_tracker_pose_state(now=current_time)
             self.publish_gripper_status(now=current_time)
+
+    def _publish_fix_arm_state(self, *, message: str = "", control_hint: str = "") -> None:
+        if self.ui is None:
+            return
+        updates = {
+            **_fix_arm_ui_state(self.components),
+            **self._pose_snapshot_ui_state(),
+            "active_controls": (
+                self._teleop_controls()
+                if self._teleop_started and not self._hold_active
+                else self._hold_controls()
+                if self._teleop_started
+                else self._pre_home_controls()
+            ),
+        }
+        if control_hint:
+            updates["control_hint"] = control_hint
+        self.ui.publish(**updates)
+        if message:
+            self.ui.append_message("FixArm", message)
+
+    def _set_fix_arm_side_from_gui(self, side: str) -> None:
+        controller = getattr(self.components, "fix_arm_controller", None)
+        if controller is None:
+            return
+        transition = controller.select_side(side)
+        side_label = "左臂" if transition.side == "left" else "右臂"
+        if transition.ok:
+            message = f"固定侧已选择: {side_label}"
+        else:
+            message = f"固定侧切换失败: {transition.message}"
+        self._publish_fix_arm_state(message=message, control_hint=message)
+
+    def _handle_fix_arm_c_event(self, *, now: float) -> bool:
+        controller = getattr(self.components, "fix_arm_controller", None)
+        if controller is None:
+            return False
+        if not self._teleop_started or self._hold_active:
+            return False
+        if controller.recapturing:
+            message = "固定臂正在重采 home，请保持姿态直到样本采满。"
+            self._publish_fix_arm_state(message=message, control_hint=message)
+            return True
+        if controller.fixed:
+            transition = controller.start_recalibration(
+                now=now,
+                timeout_sec=float(getattr(self.args, "calibration_timeout", 10.0)),
+                min_samples=int(getattr(self.args, "calibration_samples", 20)),
+            )
+            side_label = "左臂" if transition.side == "left" else "右臂"
+            if transition.ok:
+                message = f"{side_label}保持固定，开始逐帧重采该侧 tracker home。"
+            else:
+                message = f"固定臂重采失败: {transition.message}"
+            self._publish_fix_arm_state(message=message, control_hint=message)
+            return True
+        transition = controller.freeze_selected(now=now)
+        side_label = "左臂" if transition.side == "left" else "右臂"
+        if transition.ok:
+            message = f"{side_label}已固定：固定侧输入快照保持不动，IK/防碰撞继续正常运行；再次按 C 重采该侧 home。"
+        else:
+            missing = ", ".join(transition.missing_effectors)
+            missing_channels = ", ".join(getattr(transition, "missing_channels", ()))
+            details = []
+            if missing:
+                details.append(f"缺少上一帧命令: {missing}")
+            if missing_channels:
+                details.append(f"缺少有效输入快照: {missing_channels}")
+            detail = " " + "；".join(details) if details else ""
+            message = f"{side_label}固定失败: {transition.message}.{detail}"
+        self._publish_fix_arm_state(message=message, control_hint=message)
+        return True
+
+    def request_pose_snapshot(self) -> None:
+        if not self._pose_snapshot_available():
+            message = "Pose 抽帧仅在 --fix-arm 遥操模式可用。"
+            self.set_pose_snapshot_state(status=message, append_message=True)
+            return
+        if self._episode_recording_ui_active or self._episode_countdown_ui_active:
+            message = "Pose 抽帧与正式数采互斥；请先停止数采或取消倒计时。"
+            self.set_pose_snapshot_state(status=message, append_message=True)
+            return
+        if not self._teleop_started or self._hold_active:
+            message = "Pose 抽帧只能在遥操运行中执行。"
+            self.set_pose_snapshot_state(status=message, append_message=True)
+            return
+        self._pose_snapshot_requested = True
+        self.set_pose_snapshot_state(status="已请求抽帧；等待下一帧遥操状态。")
+
+    def consume_pose_snapshot_request(self) -> bool:
+        requested = bool(self._pose_snapshot_requested)
+        self._pose_snapshot_requested = False
+        return requested
+
+    def set_pose_snapshot_state(
+        self,
+        *,
+        last_path: str | Path | None = None,
+        status: str | None = None,
+        append_message: bool = False,
+    ) -> None:
+        if last_path is not None:
+            self._pose_snapshot_last_path = str(last_path)
+        if status is not None:
+            self._pose_snapshot_status = str(status)
+        if self.ui is not None:
+            self.ui.publish(**self._pose_snapshot_ui_state())
+            if append_message and status:
+                self.ui.append_message("PoseSnapshot", str(status))
 
     def consume_calibration_request(self) -> bool:
         requested = bool(self._calibration_requested)
@@ -8325,7 +10212,10 @@ class RealTeleopControlInput:
             if self.ui is not None:
                 self.ui.publish(
                     active_controls=["q"],
-                    control_hint="已确认开始，VIVE tracker 左右映射已锁定；3 秒后采集 runtime home。",
+                    control_hint=(
+                        "已确认开始，VIVE tracker 左右映射已锁定；"
+                        f"{DEFAULT_RUNTIME_HOME_START_DELAY_SEC:.0f} 秒后采集 runtime home。"
+                    ),
                     teleop_running=False,
                     home_ready=False,
                     gripper_control_enabled=False,
@@ -8425,6 +10315,8 @@ class RealTeleopControlInput:
         task_key = str(payload.get("task_key") or "").strip()
         english_name = str(payload.get("task_english_name") or "").strip()
         chinese_name = str(payload.get("task_chinese_name") or "").strip()
+        payload_task_type = str(payload.get("task_type") or "").strip()
+        payload_round_trip_phase = str(payload.get("round_trip_phase") or "").strip()
         task_def = _task_definition_for_key(self.args, task_key)
         if task_def is not None:
             if not english_name:
@@ -8432,25 +10324,61 @@ class RealTeleopControlInput:
             if not chinese_name:
                 chinese_name = str(task_def.get("chinese_name") or "")
             gripper_task = str(task_def.get("gripper_task") or task_key)
+            task_type = (
+                gui_collection_tasks.normalize_task_type(payload_task_type)
+                if payload_task_type
+                else gui_collection_tasks.normalize_task_type(task_def.get("task_type", ""))
+            )
         else:
             gripper_task = task_key
+            task_type = (
+                gui_collection_tasks.normalize_task_type(payload_task_type)
+                if payload_task_type
+                else gui_collection_tasks.normalize_task_type(getattr(self.args, "collection_task_type", ""))
+            )
         if dataset_base_root:
             self.args.dataset_root = dataset_base_root
             self.args.dataset_base_root = str(_expand_cli_path(dataset_base_root))
         if gripper_task:
             self.args.gripper_task = gripper_task
-        task_name = english_name or gripper_task or str(getattr(self.args, "collection_task_name", "") or "")
+        task_name = (
+            english_name
+            or gripper_task
+            or gui_collection_tasks.strip_round_trip_suffix(
+                str(getattr(self.args, "collection_task_name", "") or "")
+            )
+        )
         if task_name:
             self.args.collection_task_name = task_name
         if chinese_name:
             self.args.collection_task_name_zh = chinese_name
-        self.args.collection_task_id = task_key or _default_task_id_from_name(task_name or gripper_task)
+        base_task_id = task_key or _default_task_id_from_name(task_name or gripper_task)
+        self.args.collection_task_id = base_task_id
+        self.args.collection_task_key = task_key
+        self.args.collection_task_type = task_type
         task_description = (
             str(task_def.get("description") or "").strip()
             if task_def is not None
             else ""
         )
         self.args.collection_task_description = task_description or chinese_name or task_name
+        if task_type == gui_collection_tasks.ROUND_TRIP_TASK_TYPE:
+            phase = (
+                gui_collection_tasks.normalize_round_trip_phase(payload_round_trip_phase)
+                if payload_round_trip_phase
+                else gui_collection_tasks.ROUND_TRIP_IN
+            )
+            self.args.collection_round_trip_phase = phase
+            self.args.collection_round_trip_base_name = task_name
+            self.args.collection_round_trip_base_id = base_task_id
+            self.args.collection_round_trip_base_name_zh = chinese_name
+            self.args.collection_round_trip_base_description = self.args.collection_task_description
+        else:
+            self.args.collection_round_trip_phase = gui_collection_tasks.ROUND_TRIP_IN
+            self.args.collection_round_trip_base_name = gui_collection_tasks.strip_round_trip_suffix(task_name)
+            self.args.collection_round_trip_base_id = gui_collection_tasks.strip_round_trip_suffix(base_task_id)
+            self.args.collection_round_trip_base_name_zh = chinese_name
+            self.args.collection_round_trip_base_description = self.args.collection_task_description
         _refresh_formal_dataset_layout(self.args)
         self._apply_current_gripper_task_policy()
         if self.ui is not None:
@@ -8462,6 +10390,37 @@ class RealTeleopControlInput:
                     f"({self.args.collection_task_id}) -> {self.args.dataset_root}"
                 ),
             )
+
+    def _toggle_round_trip_collection_task(self, *, source: str) -> bool:
+        if self._episode_recording_ui_active or self._episode_countdown_ui_active:
+            if self.ui is not None:
+                self.ui.append_message("Dataset", "数采录制或倒计时中不切换 in/out；请先停止当前 episode。")
+                self.ui.publish(**_collection_task_ui_state(self.args))
+            return False
+        if (
+            gui_collection_tasks.normalize_task_type(getattr(self.args, "collection_task_type", ""))
+            != gui_collection_tasks.ROUND_TRIP_TASK_TYPE
+        ):
+            if self.ui is not None:
+                self.ui.append_message("Dataset", "当前是一般类任务，不需要切换 in/out。")
+                self.ui.publish(**_collection_task_ui_state(self.args))
+            return False
+        if not _toggle_collection_round_trip_phase(self.args):
+            return False
+        phase = str(getattr(self.args, "collection_round_trip_phase", "") or "")
+        label = "自动" if source == "auto_after_episode" else "手动"
+        message = (
+            f"来回任务已{label}切换到 _{phase}: "
+            f"{self.args.collection_task_name} ({self.args.collection_task_id}) -> {self.args.dataset_root}"
+        )
+        _log("Dataset", message)
+        if self.ui is not None:
+            self.ui.publish(**_collection_task_ui_state(self.args))
+            self.ui.append_message("Dataset", message)
+        return True
+
+    def advance_round_trip_task_after_saved_episode(self) -> bool:
+        return self._toggle_round_trip_collection_task(source="auto_after_episode")
 
     def _apply_current_gripper_task_policy(self) -> None:
         _clear_gripper_policy_cache(self.args)
@@ -8513,6 +10472,9 @@ class RealTeleopControlInput:
                 capture_phase="ready",
                 teleop_running=False,
                 capture_waiting_for_samples=False,
+                debug_ik_timing=self.ik_debug_timing_enabled(),
+                debug_ik_logging=self._ik_debug_logging_active,
+                ik_debug_log_path=self._ik_debug_log_path,
                 gripper_control_enabled=False,
                 **_movement_multiple_ui_state(self.args),
             )
@@ -8564,6 +10526,13 @@ class RealTeleopControlInput:
 
     def gripper_control_enabled(self) -> bool:
         return bool(self._gripper_control_enabled and _has_q6_gripper_control(self.components))
+
+    def _episode_countdown_controls(self) -> list[str]:
+        return [
+            control
+            for control in self._teleop_controls()
+            if control not in {"episode_start", POSE_SNAPSHOT_GUI_EVENT}
+        ]
 
     def _poll_q6_hold_recalibration_gesture(self, *, now: float) -> None:
         gesture = self._q6_hold_recalibration_gesture
@@ -8636,6 +10605,35 @@ class RealTeleopControlInput:
                 ik_debug_log_path=self._ik_debug_log_path,
             )
 
+    def set_episode_start_countdown_state(self, *, remaining_sec: float, message: str | None = None) -> None:
+        if self.ui is None:
+            return
+        remaining = max(0.0, float(remaining_sec))
+        self._episode_countdown_ui_active = True
+        self._episode_recording_ui_active = False
+        self.ui.publish(
+            active_controls=self._episode_countdown_controls(),
+            episode_recording_available=self._episode_recording_available(),
+            episode_recording=False,
+            episode_dir="",
+            episode_frame_count=None,
+            episode_sample_hz=None,
+            episode_target_hz=float(getattr(self.args, "collection_warning_hz", 15.0)),
+            episode_tactile_write_hz={},
+            episode_tactile_write_hz_mean=None,
+            episode_tactile_frame_counts={},
+            episode_frequency_warning={"active": False, "message": ""},
+            episode_event_status="preparing",
+            episode_event_message=(
+                message
+                or f"准备开始数采：{remaining:.1f} 秒后开始写入，请保持当前动作和画面稳定。"
+            ),
+            episode_last_episode_index=self._episode_last_episode_index,
+            episode_last_frame_count=self._episode_last_frame_count,
+            **_collection_task_ui_state(self.args),
+            **self._pose_snapshot_ui_state(),
+        )
+
     def set_episode_recording_state(
         self,
         *,
@@ -8643,9 +10641,18 @@ class RealTeleopControlInput:
         episode_dir: str | Path | None = None,
         frame_count: int | None = None,
         frequency_status: Mapping[str, object] | None = None,
+        event_status: str | None = None,
+        event_message: str | None = None,
+        episode_index: int | None = None,
     ) -> None:
         if self.ui is None:
             return
+        self._episode_recording_ui_active = bool(active)
+        self._episode_countdown_ui_active = False
+        if episode_index is not None:
+            self._episode_last_episode_index = int(episode_index)
+        if frame_count is not None:
+            self._episode_last_frame_count = int(frame_count)
         frequency_payload = dict(frequency_status or {})
         warning_payload = dict(frequency_payload.get("warning") or {})
         if not active:
@@ -8665,7 +10672,52 @@ class RealTeleopControlInput:
             ),
             episode_tactile_frame_counts=tactile_frame_counts_payload if active else {},
             episode_frequency_warning=warning_payload,
+            episode_event_status=event_status or ("recording" if active else "idle"),
+            episode_event_message=event_message or (
+                "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
+                if active
+                else "点击“开始数采”或按 A 开始；再次按 A 停止。"
+            ),
+            episode_last_episode_index=self._episode_last_episode_index,
+            episode_last_frame_count=self._episode_last_frame_count,
             **_collection_task_ui_state(self.args),
+            **_fix_arm_ui_state(self.components),
+            **self._pose_snapshot_ui_state(),
+        )
+
+    def set_episode_finalize_state(
+        self,
+        *,
+        status: str,
+        message: str,
+        episode_index: int | None = None,
+        frame_count: int | None = None,
+    ) -> None:
+        if self.ui is None:
+            return
+        self._episode_recording_ui_active = False
+        self._episode_countdown_ui_active = False
+        if episode_index is not None:
+            self._episode_last_episode_index = int(episode_index)
+        if frame_count is not None:
+            self._episode_last_frame_count = int(frame_count)
+        self.ui.publish(
+            episode_recording_available=self._episode_recording_available(),
+            episode_recording=False,
+            episode_frame_count=frame_count,
+            episode_sample_hz=None,
+            episode_target_hz=float(getattr(self.args, "collection_warning_hz", 15.0)),
+            episode_tactile_write_hz={},
+            episode_tactile_write_hz_mean=None,
+            episode_tactile_frame_counts={},
+            episode_frequency_warning={"active": False, "message": ""},
+            episode_event_status=str(status),
+            episode_event_message=str(message),
+            episode_last_episode_index=self._episode_last_episode_index,
+            episode_last_frame_count=self._episode_last_frame_count,
+            **_collection_task_ui_state(self.args),
+            **_fix_arm_ui_state(self.components),
+            **self._pose_snapshot_ui_state(),
         )
 
     def set_visualization_state(
@@ -8690,14 +10742,12 @@ class RealTeleopControlInput:
             active_controls=(
                 self._teleop_controls()
                 if self._teleop_started and not self._hold_active
-                else [
-                    *(["p", "c", "q"] if self._teleop_started else ["p", "w", "q"]),
-                    *self._visualization_controls(),
-                    *self._vive_calibration_controls(allow_load=True),
-                    *self._movement_multiple_controls(),
-                ]
+                else self._hold_controls()
+                if self._teleop_started
+                else self._pre_home_controls()
             ),
             **_movement_multiple_ui_state(self.args),
+            **_fix_arm_ui_state(self.components),
         )
 
     def before_calibration_start_delay(
@@ -8759,6 +10809,37 @@ class RealTeleopControlInput:
         self.publish_raw_tracker_pose_state(force=True)
         return True
 
+    def publish_force_control_warmup_progress(
+        self,
+        *,
+        elapsed_sec: float,
+        total_sec: float,
+        active_sides: Sequence[str],
+    ) -> None:
+        if self.ui is None:
+            return
+        total = max(0.1, float(total_sec))
+        elapsed = max(0.0, float(elapsed_sec))
+        remaining = max(0.0, total - elapsed)
+        side_text = "/".join(str(side) for side in active_sides) or "arm"
+        self.ui.publish(
+            stage="预热 RM65 力控",
+            active_controls=["q"],
+            control_hint=(
+                f"首次启动正在预热 {side_text} pose impedance；"
+                "完成后请再次点击“开始遥操”进入准备和 Home 标定。"
+            ),
+            capture_stage="force_control_warmup",
+            capture_phase="preparing",
+            teleop_running=False,
+            home_ready=False,
+            capturing=False,
+            capture_prep_total_sec=total,
+            capture_prep_remaining_sec=remaining,
+            capture_waiting_for_samples=False,
+            gripper_control_enabled=False,
+        )
+
     def publish_teleop_running(self, *, home_ready: bool = True, message: str | None = None) -> None:
         was_hold_active = bool(self._hold_active)
         was_hold_restart = bool(self._last_calibration_started_from_hold)
@@ -8778,6 +10859,7 @@ class RealTeleopControlInput:
                 "遥操已开始；Q6 手势模式已开启：双手后三维握紧 1 秒进入 Hold，"
                 "松开到释放区间 1 秒后再次握紧 1 秒会重采 runtime home。"
             )
+        gripper_status = _build_gripper_status(self.components)
         self.ui.publish(
             stage="RM65 真机遥操运行中",
             active_controls=self._teleop_controls(),
@@ -8807,12 +10889,16 @@ class RealTeleopControlInput:
                 "message": "等待第一帧 IK timing 元数据。",
             },
             ik_warning=_build_ik_warning_payload(active_command=None),
+            pose_quality=_build_pose_quality_display_payload(None),
             gripper_control_available=_gripper_gui_available(self.components),
             gripper_q6_available=_has_q6_gripper_control(self.components),
             gripper_control_enabled=self.gripper_control_enabled(),
-            gripper_status=_build_gripper_status(self.components),
+            gripper_status=gripper_status,
+            tactile_camera_status=_build_tactile_camera_status(gripper_status),
             episode_recording_available=self._episode_recording_available(),
             **_collection_task_ui_state(self.args),
+            **_fix_arm_ui_state(self.components),
+            **self._pose_snapshot_ui_state(),
             camera_visualization_available=self._camera_visualization_available(),
             camera_visualization_active=self._camera_visualization_active,
             tactile_visualization_available=self._tactile_visualization_available(),
@@ -8866,11 +10952,14 @@ class RealTeleopControlInput:
             capture_right_valid=None,
             capture_elapsed_sec=None,
             capture_duration_sec=None,
+            capture_prep_remaining_sec=None,
+            capture_prep_total_sec=DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
             capture_waiting_for_samples=False,
             gripper_control_enabled=False,
             **_collection_task_ui_state(self.args),
             **_movement_multiple_ui_state(self.args),
             **_vive_calibration_profile_ui_state(self.args, self.components),
+            **_fix_arm_ui_state(self.components),
         )
 
     def publish_runtime_home_progress(
@@ -8920,6 +11009,27 @@ class RealTeleopControlInput:
                 else "runtime home 样本已采满，正在完成标定。"
             ),
         )
+
+    def publish_fix_arm_home_capture_progress(self, progress) -> None:
+        if self.ui is None or not progress.active:
+            return
+        side_label = "左臂" if progress.side == "left" else "右臂"
+        if progress.completed:
+            message = progress.message or f"{side_label} home 重采完成，已恢复遥操。"
+        elif progress.failed:
+            message = progress.message or f"{side_label} home 重采失败，保持固定。"
+        else:
+            message = (
+                f"{side_label}保持固定并重采 home: "
+                f"{progress.sample_count}/{progress.min_samples} samples"
+            )
+        self.ui.publish(
+            **_fix_arm_ui_state(self.components),
+            active_controls=self._teleop_controls(),
+            control_hint=message,
+        )
+        if progress.completed or progress.failed:
+            self.ui.append_message("FixArm", message)
 
     def _calibrate_vive_coordinate_profile(self) -> None:
         if self.ui is None:
@@ -9131,6 +11241,24 @@ class RealTeleopControlInput:
         self._last_ik_warning_publish_at = current_time
         self.ui.publish(ik_warning=warning)
 
+    def publish_pose_quality_state(
+        self,
+        payload: Mapping[str, object],
+        *,
+        now: float | None = None,
+        force: bool = False,
+    ) -> None:
+        if self.ui is None:
+            return
+        current_time = time.time() if now is None else float(now)
+        if (
+            not force
+            and current_time - self._last_pose_quality_publish_at < self._pose_quality_publish_interval_sec
+        ):
+            return
+        self._last_pose_quality_publish_at = current_time
+        self.ui.publish(pose_quality=dict(payload))
+
     def publish_gripper_status(
         self,
         *,
@@ -9151,14 +11279,45 @@ class RealTeleopControlInput:
             source = _hand_q6_source_from_components(self.components)
             channels = {} if source is None else source.get_latest_channels()
         self._last_gripper_status_publish_at = current_time
+        gripper_status = _build_gripper_status(
+            self.components,
+            channels=channels,
+            command_status=command_status,
+            now=current_time,
+        )
         self.ui.publish(
             gripper_control_available=_gripper_gui_available(self.components),
             gripper_q6_available=_has_q6_gripper_control(self.components),
             gripper_control_enabled=self.gripper_control_enabled(),
-            gripper_status=_build_gripper_status(
-                self.components,
-                channels=channels,
-                command_status=command_status,
+            gripper_status=gripper_status,
+            tactile_camera_status=_build_tactile_camera_status(gripper_status, now=current_time),
+        )
+
+    def publish_camera_status(
+        self,
+        *,
+        camera_sources: Mapping[str, RealSenseRGBSource] | None,
+        preview_camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
+        camera_previewer: CameraPreviewer | None = None,
+        now: float | None = None,
+        force: bool = False,
+    ) -> None:
+        if self.ui is None:
+            return
+        current_time = time.time() if now is None else float(now)
+        if (
+            not force
+            and current_time - self._last_camera_status_publish_at < self._camera_status_publish_interval_sec
+        ):
+            return
+        self._last_camera_status_publish_at = current_time
+        self.ui.publish(
+            camera_visualization_available=self._camera_visualization_available(),
+            camera_visualization_active=self._camera_visualization_active,
+            camera_status=_build_camera_status(
+                camera_sources,
+                preview_camera_sources=preview_camera_sources,
+                camera_previewer=camera_previewer,
                 now=current_time,
             ),
         )
@@ -9309,11 +11468,84 @@ def _log_dual_arm_readiness(
     )
 
 
+def _handle_ik_debug_log_toggle_request(
+    *,
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    clutch_input: RealTeleopControlInput,
+    ik_debug_log_recorder: IkDebugLogRecorder,
+    control_ui: CalibrationWebUi | None,
+    ik_debug_profile_base_enabled: bool,
+    now: float,
+) -> None:
+    if not clutch_input.consume_ik_debug_log_toggle_request():
+        return
+    if ik_debug_log_recorder.active:
+        stopped_path = ik_debug_log_recorder.stop(reason="gui_toggle_stop", now=now)
+        if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
+            components.dual_arm_retargeter.config.debug_profile = ik_debug_profile_base_enabled
+            components.dual_arm_retargeter.ik_solver.debug_profile = ik_debug_profile_base_enabled
+        clutch_input.set_ik_debug_logging_state(
+            active=False,
+            path="" if stopped_path is None else str(stopped_path),
+        )
+        _log(
+            "IKDebugLog",
+            (
+                f"stopped path={stopped_path} frames={ik_debug_log_recorder.frame_count} "
+                f"dropped={ik_debug_log_recorder.dropped_frame_count}"
+            ),
+            now=now,
+        )
+        if control_ui is not None:
+            control_ui.append_message(
+                "IKDebugLog",
+                f"已停止 IK 记录：{stopped_path}",
+            )
+        return
+
+    try:
+        started_path = ik_debug_log_recorder.start(now=now)
+    except Exception as exc:  # noqa: BLE001 - debug logging must not break teleop.
+        clutch_input.set_ik_debug_logging_state(active=False, path="")
+        message = f"IK 记录启动失败：{type(exc).__name__}: {exc}"
+        _log("IKDebugLog", message, now=now)
+        if control_ui is not None:
+            control_ui.append_message("IKDebugLog", message)
+        return
+    ik_debug_log_mode = (
+        "full" if bool(getattr(args, "ik_debug_log_full", False)) else "compact"
+    )
+    ik_debug_log_recorder.write_event(
+        "mode",
+        {"mode": ik_debug_log_mode},
+        now=now,
+    )
+    if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
+        components.dual_arm_retargeter.config.debug_profile = True
+        components.dual_arm_retargeter.ik_solver.debug_profile = True
+    clutch_input.set_ik_debug_logging_state(active=True, path=str(started_path))
+    _log(
+        "IKDebugLog",
+        f"started path={started_path} mode={ik_debug_log_mode}",
+        now=now,
+    )
+    if control_ui is not None:
+        control_ui.append_message(
+            "IKDebugLog",
+            f"已开始 IK 记录：{started_path} mode={ik_debug_log_mode}",
+        )
+
+
 def _wait_for_real_teleop_start_request(
     components: RealTeleopComponents,
     clutch_input: RealTeleopControlInput,
     *,
     arm_mode: str,
+    args: argparse.Namespace,
+    control_ui: CalibrationWebUi | None,
+    ik_debug_log_recorder: IkDebugLogRecorder,
+    ik_debug_profile_base_enabled: bool,
 ) -> str | None:
     if not clutch_input.enabled:
         _log(
@@ -9330,10 +11562,31 @@ def _wait_for_real_teleop_start_request(
     while True:
         loop_start = time.time()
         clutch_input.poll()
+        _handle_ik_debug_log_toggle_request(
+            args=args,
+            components=components,
+            clutch_input=clutch_input,
+            ik_debug_log_recorder=ik_debug_log_recorder,
+            control_ui=control_ui,
+            ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
+            now=loop_start,
+        )
         if clutch_input.should_quit:
             return None
         if clutch_input.consume_calibration_request():
-            if clutch_input.before_calibration_start_delay(3.0, arm_mode=arm_mode):
+            if _impedance_force_control_warmup_backends(args, components):
+                if _warm_start_impedance_force_control_before_home(args, components, clutch_input):
+                    clutch_input.publish_calibration_waiting(
+                        "力控冷启动完成；请再次点击“开始遥操”进入准备、采集 runtime home 并开始遥操。"
+                    )
+                    continue
+                if clutch_input.should_quit:
+                    return None
+                continue
+            if clutch_input.before_calibration_start_delay(
+                DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
+                arm_mode=arm_mode,
+            ):
                 return "home"
             if clutch_input.should_quit:
                 return None
@@ -9378,17 +11631,28 @@ def _arm_after_start_calibration(
     *,
     home_captured: bool,
 ) -> None:
+    arm_after_start = time.perf_counter()
+    reset_elapsed_ms = 0.0
     if home_captured:
+        reset_start = time.perf_counter()
         synced = _reset_runtime_motion_state_from_real_qpos(components, required=True)
+        reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
+    state_machine_start = time.perf_counter()
     components.session.set_calibration_ready()
     components.session.mark_debug_passed()
+    state_machine_elapsed_ms = (time.perf_counter() - state_machine_start) * 1000.0
+    force_control_start = time.perf_counter()
     _enable_impedance_force_control_after_runtime_home(
         args,
         components,
         home_captured=home_captured,
     )
+    force_control_elapsed_ms = (time.perf_counter() - force_control_start) * 1000.0
+    arm_hardware_start = time.perf_counter()
     components.session.arm_hardware()
+    arm_hardware_elapsed_ms = (time.perf_counter() - arm_hardware_start) * 1000.0
+    publish_start = time.perf_counter()
     clutch_input.publish_teleop_running(
         home_ready=home_captured,
         message=(
@@ -9396,6 +11660,16 @@ def _arm_after_start_calibration(
             if home_captured
             else "runtime home 未就绪，未进入正常真机遥操。"
         ),
+    )
+    publish_elapsed_ms = (time.perf_counter() - publish_start) * 1000.0
+    _log(
+        "CalibrationTiming",
+        f"arm_after_home total={(time.perf_counter() - arm_after_start) * 1000.0:.1f}ms "
+        f"reset_motion={reset_elapsed_ms:.1f}ms "
+        f"state_machine={state_machine_elapsed_ms:.1f}ms "
+        f"force_control={force_control_elapsed_ms:.1f}ms "
+        f"arm_hardware={arm_hardware_elapsed_ms:.1f}ms "
+        f"publish_gui={publish_elapsed_ms:.1f}ms",
     )
 
 
@@ -9459,15 +11733,18 @@ def main() -> None:
         if bool(getattr(args, "gui_requested", False))
         else None
     )
+    pose_snapshot_recorder = _fix_arm_pose_snapshot_recorder(components)
     clutch_input = RealTeleopControlInput(
         terminal=TerminalClutchInput(components.keyboard_source),
         ui=control_ui,
         args=args,
         components=components,
+        pose_snapshot_recorder=pose_snapshot_recorder,
     )
+    debug_episode_recording_enabled = _debug_episode_recording_enabled(args)
     episode_recorder = EpisodeRecorder(
-        root_dir=_episode_root_dir(args, components),
-        config=EpisodeRecorderConfig(enabled=not args.no_episode_recording),
+        root_dir=_episode_root_dir(args, components) if debug_episode_recording_enabled else None,
+        config=EpisodeRecorderConfig(enabled=debug_episode_recording_enabled),
     )
     dataset_recorder = (
         None
@@ -9511,6 +11788,12 @@ def main() -> None:
             camera_active=False,
             tactile_active=tactile_visualizer is not None,
             status="",
+        )
+        clutch_input.publish_camera_status(
+            camera_sources=camera_sources,
+            preview_camera_sources=preview_camera_sources,
+            camera_previewer=camera_previewer,
+            force=True,
         )
         if camera_sources:
             _log(
@@ -9684,6 +11967,39 @@ def main() -> None:
             _log("CollisionGuard", "disabled; using two independent arm retargeters.")
         _log_dual_arm_readiness(args, components)
         _emit_collision_proxy_logs(components)
+        debug_timing_state = RealDebugTimingState(
+            enabled=bool(getattr(args, "debug_timing", False)),
+            threshold_sec=float(getattr(args, "debug_timing_threshold_sec", 0.025)),
+            report_interval_sec=float(getattr(args, "debug_timing_report_interval_sec", 1.0)),
+        )
+        ik_debug_profile_base_enabled = bool(
+            getattr(args, "debug_timing", False)
+            or getattr(args, "debug_ik_timing", False)
+        )
+        ik_debug_log_recorder = IkDebugLogRecorder()
+        debug_timing_log_recorder = DebugTimingLogRecorder(
+            heartbeat_sec=max(0.1, float(getattr(args, "debug_timing_report_interval_sec", 1.0))),
+        )
+        if debug_timing_state.enabled:
+            try:
+                debug_timing_path = debug_timing_log_recorder.start(now=time.time())
+                debug_timing_log_recorder.write_event(
+                    "config",
+                    {
+                        "threshold_sec": float(debug_timing_state.threshold_sec),
+                        "report_interval_sec": float(debug_timing_state.report_interval_sec),
+                        "rm65_backend_debug_timing": True,
+                    },
+                    now=time.time(),
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not block teleop.
+                debug_timing_path = None
+                _log(
+                    "DebugTiming",
+                    f"light log disabled: {type(exc).__name__}: {exc}",
+                )
+        else:
+            debug_timing_path = None
         startup_home_captured = False
         manual_startup_request = _manual_calibration_confirmation_required(args, components)
         while True:
@@ -9693,6 +12009,10 @@ def main() -> None:
                     components,
                     clutch_input,
                     arm_mode="real",
+                    args=args,
+                    control_ui=control_ui,
+                    ik_debug_log_recorder=ik_debug_log_recorder,
+                    ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
                 )
                 if requested is None:
                     return
@@ -9743,7 +12063,7 @@ def main() -> None:
         if args.keyboard_clutch:
             _log(
                 "Keys",
-                "p/Enter=start calibration, t=start episode, s=stop episode, z=left clutch, x=right clutch, c=both, r=release, q=quit",
+                "p/Enter=start calibration, t=start episode, s=stop episode, z=left clutch, x=right clutch, b=both clutch, r=release, q=quit",
             )
         elif args.control_mode == "delta_clutch":
             _log("Info", "delta_clutch is running with both clutch buttons held true by default.")
@@ -9759,28 +12079,21 @@ def main() -> None:
                 "Dataset",
                 f"formal collection ready root={dataset_recorder.dataset_root} "
                 f"cameras={sorted(camera_sources)} write_video={bool(args.write_video and not args.no_camera)} "
-                f"tactile_storage={args.tactile_storage} start_key='t' stop_key='s'",
+                f"tactile_storage={args.tactile_storage} "
+                f"tactile_compression={getattr(args, 'tactile_compression', 'lz4')} "
+                f"start_key='t' stop_key='s'",
             )
 
         status_gate = ChangeGate()
         orientation_gate = ChangeGate()
         tactile_sum_gate = ChangeGate()
-        debug_timing_state = RealDebugTimingState(
-            enabled=bool(getattr(args, "debug_timing", False)),
-            threshold_sec=float(getattr(args, "debug_timing_threshold_sec", 0.025)),
-            report_interval_sec=float(getattr(args, "debug_timing_report_interval_sec", 1.0)),
-        )
-        ik_debug_profile_base_enabled = bool(
-            getattr(args, "debug_timing", False)
-            or getattr(args, "debug_ik_timing", False)
-        )
-        ik_debug_log_recorder = IkDebugLogRecorder()
         if debug_timing_state.enabled:
             _log(
                 "DebugTiming",
                 "enabled "
                 f"threshold={debug_timing_state.threshold_sec:.3f}s "
-                f"report_interval={debug_timing_state.report_interval_sec:.3f}s",
+                f"report_interval={debug_timing_state.report_interval_sec:.3f}s "
+                f"light_log={debug_timing_path}",
             )
         if bool(getattr(args, "debug_ik_timing", False)):
             budget = getattr(args, "ik_time_budget_ms", None)
@@ -9797,6 +12110,10 @@ def main() -> None:
         episode_last_state: str | None = None
         last_collection_frequency_warning_active = False
         last_collection_frequency_debug_at = 0.0
+        episode_start_countdown_deadline: float | None = None
+        episode_start_countdown_reason = "manual_key_start"
+        episode_start_warmup_ready_since: float | None = None
+        episode_start_warmup_last_message: str | None = None
         tactile_preview_rate = PreviewRateLimiter(float(getattr(args, "tactile_vis_hz", 5.0)))
         camera_preview_rate = PreviewRateLimiter(float(getattr(args, "vis_cam_hz", 10.0)))
 
@@ -9933,6 +12250,54 @@ def main() -> None:
                 )
             last_collection_frequency_warning_active = warning_active
 
+        def recording_auto_stop_reason(state: TeleopRunState | str) -> str | None:
+            state_value = str(getattr(state, "value", state)).upper()
+            if state_value == TeleopRunState.FAULT.value:
+                return "runtime_fault"
+            if state_value == TeleopRunState.ESTOP.value:
+                return "runtime_estop"
+            if clutch_input.hold_active():
+                return "runtime_hold"
+            return None
+
+        def recording_warmup_status(
+            now: float,
+            *,
+            step_result: SessionStepResult | None,
+        ) -> tuple[bool, str]:
+            if step_result is None:
+                return False, "等待首个控制帧。"
+            stop_reason = recording_auto_stop_reason(step_result.state)
+            if stop_reason is not None:
+                return False, f"等待恢复，当前状态会自动停止数采：{stop_reason}。"
+            if step_result.state != TeleopRunState.RUNNING:
+                return False, f"等待遥操进入 RUNNING，当前状态：{step_result.state.value}。"
+            if step_result.observation is None:
+                return False, "等待 observation 可用。"
+            if step_result.command is None:
+                return False, "等待 action command 可用。"
+            if not bool(getattr(args, "no_camera", False)):
+                for camera_key, source in camera_sources.items():
+                    frame = source.frame_buffer().get_latest()
+                    if frame is None:
+                        return False, f"等待相机 {camera_key} 首帧。"
+                    camera_age = float(now) - float(frame.source_timestamp)
+                    if camera_age < -0.05:
+                        return False, f"等待相机 {camera_key} 时间戳稳定。"
+                    if camera_age > 1.0:
+                        return False, f"等待相机 {camera_key} 最新帧，当前 age={camera_age:.2f}s。"
+            if _hand_backend_mode(args) != HAND_BACKEND_NONE:
+                for side in components.active_sides:
+                    channel = step_result.channels.get(f"{side}_hand_q6")
+                    if channel is None or not bool(getattr(channel, "valid", False)):
+                        return False, f"等待 {side} hand_q6 输入有效。"
+                    hand_age = float(now) - float(getattr(channel, "timestamp", now))
+                    if hand_age < -0.05:
+                        return False, f"等待 {side} hand_q6 时间戳稳定。"
+                    if hand_age > 0.5:
+                        return False, f"等待 {side} hand_q6 最新输入，当前 age={hand_age:.2f}s。"
+            return True, "warmup 输入稳定。"
+
         def start_recording(now: float, *, start_reason: str) -> bool:
             nonlocal episode_last_state, last_collection_frequency_debug_at, last_collection_frequency_warning_active
             if recording_active():
@@ -9974,6 +12339,7 @@ def main() -> None:
                         "camera_config_path": None if args.no_camera else str(args.camera_config),
                         "write_video": bool(args.write_video and not args.no_camera),
                         "tactile_storage": str(args.tactile_storage),
+                        "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
                         "storage_queue_size": int(args.storage_queue_size),
                     }
                 )
@@ -10010,8 +12376,129 @@ def main() -> None:
                 episode_dir=recording_path(),
                 frame_count=recording_frame_count(),
                 frequency_status=recording_frequency_status(),
+                event_status="recording",
+                event_message=(
+                    "正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。"
+                    if dataset_recorder is not None
+                    else "Debug trajectory 正在写入。"
+                ),
+                episode_index=(
+                    int(dataset_recorder.active_episode_index)
+                    if dataset_recorder is not None
+                    and getattr(dataset_recorder, "active_episode_index", None) is not None
+                    else None
+                ),
             )
             return True
+
+        def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
+            nonlocal episode_start_countdown_deadline, episode_start_countdown_reason
+            nonlocal episode_start_warmup_ready_since, episode_start_warmup_last_message
+            if recording_active():
+                return False
+            if episode_start_countdown_deadline is not None:
+                return False
+            if dataset_recorder is None and not episode_recorder.config.enabled:
+                message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
+                _log("Dataset", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", message)
+                return False
+            countdown_sec = float(DEFAULT_EPISODE_START_COUNTDOWN_SEC)
+            episode_start_countdown_deadline = float(now) + countdown_sec
+            episode_start_countdown_reason = str(start_reason)
+            episode_start_warmup_ready_since = None
+            episode_start_warmup_last_message = None
+            message = (
+                f"准备开始数采：warmup 与 {countdown_sec:.1f} 秒倒计时同时进行；"
+                "两者都完成后开始写入。"
+            )
+            clutch_input.set_episode_start_countdown_state(remaining_sec=countdown_sec, message=message)
+            _log("Dataset", f"recording warmup/countdown started delay={countdown_sec:.1f}s reason={start_reason}", now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            return True
+
+        def cancel_recording_countdown(now: float, *, reason: str) -> bool:
+            nonlocal episode_start_countdown_deadline, episode_start_warmup_ready_since
+            nonlocal episode_start_warmup_last_message
+            if episode_start_countdown_deadline is None:
+                return False
+            episode_start_countdown_deadline = None
+            episode_start_warmup_ready_since = None
+            episode_start_warmup_last_message = None
+            message = f"数采倒计时已取消：{reason}。"
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                event_status="idle",
+                event_message="数采倒计时已取消；点击“开始数采”或按 A 重新开始。",
+            )
+            return True
+
+        def advance_recording_countdown(
+            now: float,
+            *,
+            step_result: SessionStepResult | None,
+        ) -> None:
+            nonlocal episode_start_countdown_deadline, episode_start_warmup_ready_since
+            nonlocal episode_start_warmup_last_message
+            if episode_start_countdown_deadline is None:
+                return
+            if recording_active():
+                episode_start_countdown_deadline = None
+                episode_start_warmup_ready_since = None
+                episode_start_warmup_last_message = None
+                return
+            ready, warmup_message = recording_warmup_status(now, step_result=step_result)
+            remaining_sec = _episode_start_countdown_remaining(now, episode_start_countdown_deadline)
+            if not ready:
+                episode_start_warmup_ready_since = None
+                if warmup_message != episode_start_warmup_last_message:
+                    episode_start_warmup_last_message = warmup_message
+                    _log("Dataset", f"recording warmup waiting: {warmup_message}", now=now)
+                countdown_text = (
+                    f"倒计时还需 {remaining_sec:.1f}s。"
+                    if remaining_sec > 0.0
+                    else "倒计时已完成，warmup 完成后立即开始。"
+                )
+                clutch_input.set_episode_start_countdown_state(
+                    remaining_sec=remaining_sec,
+                    message=f"数采 warmup 等待中：{warmup_message}；{countdown_text}",
+                )
+                return
+            if episode_start_warmup_ready_since is None:
+                episode_start_warmup_ready_since = float(now)
+                _log("Dataset", "recording warmup ready; waiting for countdown if needed", now=now)
+            if not _episode_start_countdown_ready_to_record(
+                now=now,
+                deadline=episode_start_countdown_deadline,
+                warmup_ready=True,
+            ):
+                clutch_input.set_episode_start_countdown_state(
+                    remaining_sec=remaining_sec,
+                    message=f"数采准备中：warmup 已就绪，倒计时还需 {remaining_sec:.1f}s。",
+                )
+                return
+            start_reason = episode_start_countdown_reason
+            episode_start_countdown_deadline = None
+            episode_start_warmup_ready_since = None
+            episode_start_warmup_last_message = None
+            _log("Dataset", "recording warmup finished; starting collection", now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", "warmup 完成，正式开始数采写入。")
+            if not start_recording(now, start_reason=start_reason):
+                clutch_input.set_episode_recording_state(
+                    active=False,
+                    episode_dir=recording_path(),
+                    frame_count=recording_frame_count(),
+                    event_status="error",
+                    event_message="数采启动失败；请查看 Dataset 日志后重新点击“开始数采”。",
+                )
 
         def stop_recording(
             now: float,
@@ -10022,6 +12509,7 @@ def main() -> None:
             nonlocal episode_last_state, last_collection_frequency_warning_active
             stopped_any = False
             frame_count = recording_frame_count()
+            advance_round_trip_after_stop = False
             if dataset_recorder is not None and dataset_recorder.is_recording:
                 task = dataset_recorder.stop_episode(
                     reason=end_reason,
@@ -10036,6 +12524,7 @@ def main() -> None:
                         f"正式数采已停止：episode {task.episode_index} "
                         f"{task.frame_count} 帧，正在后台收尾。"
                     )
+                    advance_round_trip_after_stop = True
                 _log("Dataset", message, now=now)
                 if control_ui is not None:
                     control_ui.append_message("Dataset", message)
@@ -10048,13 +12537,34 @@ def main() -> None:
                 )
                 stopped_any = True
             if stopped_any:
+                event_status = "idle"
+                event_message = "数采已停止。"
+                stopped_episode_index: int | None = None
+                stopped_frame_count: int | None = frame_count
+                if dataset_recorder is not None:
+                    if "task" in locals() and task is not None:
+                        event_status = "finalizing"
+                        event_message = (
+                            f"正式数采已停止：episode {task.episode_index} "
+                            f"{task.frame_count} 帧，正在后台保存。"
+                        )
+                        stopped_episode_index = int(task.episode_index)
+                        stopped_frame_count = int(task.frame_count)
+                    elif "task" in locals() and task is None:
+                        event_status = "discarded"
+                        event_message = "正式数采已停止：当前 episode 没有样本，已丢弃。"
                 clutch_input.set_episode_recording_state(
                     active=False,
                     episode_dir=recording_path(),
-                    frame_count=frame_count,
+                    frame_count=stopped_frame_count,
+                    event_status=event_status,
+                    event_message=event_message,
+                    episode_index=stopped_episode_index,
                 )
                 episode_last_state = None
                 last_collection_frequency_warning_active = False
+                if advance_round_trip_after_stop:
+                    clutch_input.advance_round_trip_task_after_saved_episode()
 
         def poll_dataset_finalize(now: float) -> None:
             if dataset_recorder is None:
@@ -10069,14 +12579,26 @@ def main() -> None:
                     _log("Dataset", message, now=now)
                     if control_ui is not None:
                         control_ui.append_message("Dataset", message)
+                    clutch_input.set_episode_finalize_state(
+                        status="saved",
+                        message=message,
+                        episode_index=int(task.episode_index),
+                        frame_count=int(task.frame_count),
+                    )
                 else:
                     message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
                     _log("Dataset", message, now=now)
                     if control_ui is not None:
                         control_ui.append_message("Dataset", message)
+                    clutch_input.set_episode_finalize_state(
+                        status="error",
+                        message=message,
+                        episode_index=int(task.episode_index),
+                        frame_count=int(task.frame_count),
+                    )
 
         if args.record_auto_start:
-            start_recording(time.time(), start_reason="auto_start")
+            schedule_recording_countdown(time.time(), start_reason="auto_start")
 
         emergency_stop_sent = False
         while True:
@@ -10093,53 +12615,15 @@ def main() -> None:
 
             clutch_input.poll()
             poll_dataset_finalize(loop_start)
-            if clutch_input.consume_ik_debug_log_toggle_request():
-                if ik_debug_log_recorder.active:
-                    stopped_path = ik_debug_log_recorder.stop(reason="gui_toggle_stop", now=loop_start)
-                    if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
-                        components.dual_arm_retargeter.config.debug_profile = ik_debug_profile_base_enabled
-                        components.dual_arm_retargeter.ik_solver.debug_profile = ik_debug_profile_base_enabled
-                    clutch_input.set_ik_debug_logging_state(
-                        active=False,
-                        path="" if stopped_path is None else str(stopped_path),
-                    )
-                    _log(
-                        "IKDebugLog",
-                        (
-                            f"stopped path={stopped_path} frames={ik_debug_log_recorder.frame_count} "
-                            f"dropped={ik_debug_log_recorder.dropped_frame_count}"
-                        ),
-                        now=loop_start,
-                    )
-                    if control_ui is not None:
-                        control_ui.append_message(
-                            "IKDebugLog",
-                            f"已停止 IK 记录：{stopped_path}",
-                        )
-                else:
-                    started_path = ik_debug_log_recorder.start(now=loop_start)
-                    ik_debug_log_mode = (
-                        "full" if bool(getattr(args, "ik_debug_log_full", False)) else "compact"
-                    )
-                    ik_debug_log_recorder.write_event(
-                        "mode",
-                        {"mode": ik_debug_log_mode},
-                        now=loop_start,
-                    )
-                    if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
-                        components.dual_arm_retargeter.config.debug_profile = True
-                        components.dual_arm_retargeter.ik_solver.debug_profile = True
-                    clutch_input.set_ik_debug_logging_state(active=True, path=str(started_path))
-                    _log(
-                        "IKDebugLog",
-                        f"started path={started_path} mode={ik_debug_log_mode}",
-                        now=loop_start,
-                    )
-                    if control_ui is not None:
-                        control_ui.append_message(
-                            "IKDebugLog",
-                            f"已开始 IK 记录：{started_path} mode={ik_debug_log_mode}",
-                        )
+            _handle_ik_debug_log_toggle_request(
+                args=args,
+                components=components,
+                clutch_input=clutch_input,
+                ik_debug_log_recorder=ik_debug_log_recorder,
+                control_ui=control_ui,
+                ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
+                now=loop_start,
+            )
             if clutch_input.consume_camera_visualization_toggle_request():
                 if camera_preview_active or camera_previewer is not None:
                     close_camera_preview("图像窗口已关闭")
@@ -10162,6 +12646,7 @@ def main() -> None:
                         now=loop_start,
                     )
                     emergency_stop_sent = True
+                cancel_recording_countdown(loop_start, reason="quit_requested")
                 if recording_active():
                     stop_recording(
                         loop_start,
@@ -10188,6 +12673,7 @@ def main() -> None:
                             "last_state": episode_last_state,
                         },
                     )
+                cancel_recording_countdown(loop_start, reason="hold_requested")
                 recovery_plan = None
                 components.session.hold_hardware(hold_hardware_reason)
                 _log(
@@ -10213,11 +12699,15 @@ def main() -> None:
                             "last_state": episode_last_state,
                         },
                     )
+                cancel_recording_countdown(loop_start, reason="runtime_recalibration_requested")
                 recovery_plan = None
                 if components.session.state_machine.state != TeleopRunState.DEBUG_ONLY:
                     components.session.hold_hardware("runtime home recalibration requested")
                 _log("Calibration", "explicit runtime home recalibration requested from hold", now=loop_start)
-                if not clutch_input.before_calibration_start_delay(3.0, arm_mode="real"):
+                if not clutch_input.before_calibration_start_delay(
+                    DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
+                    arm_mode="real",
+                ):
                     continue
                 try:
                     _runtime_home_calibration(
@@ -10252,9 +12742,11 @@ def main() -> None:
                             "last_state": episode_last_state,
                         },
                     )
+                else:
+                    cancel_recording_countdown(loop_start, reason="manual_key_stop")
             if clutch_input.consume_episode_start_request():
                 if not recording_active():
-                    start_recording(loop_start, start_reason="manual_key_start")
+                    schedule_recording_countdown(loop_start, start_reason="manual_key_start")
             mark_loop_phase("loop.keys")
 
             if (
@@ -10271,11 +12763,21 @@ def main() -> None:
                         teleop_running=False,
                         capturing=False,
                         capture_waiting_for_samples=False,
+                        debug_ik_timing=clutch_input.ik_debug_timing_enabled(),
+                        debug_ik_logging=clutch_input._ik_debug_logging_active,
+                        ik_debug_log_path=clutch_input._ik_debug_log_path,
                         gripper_control_enabled=False,
                         **_movement_multiple_ui_state(args),
+                        **_fix_arm_ui_state(components),
                     )
                 if loop_phase_timer is not None:
                     mark_loop_phase("loop.hold_idle")
+                clutch_input.publish_camera_status(
+                    camera_sources=camera_sources,
+                    preview_camera_sources=preview_camera_sources,
+                    camera_previewer=camera_previewer,
+                    now=loop_start,
+                )
                 time.sleep(max(0.0, min(0.02, (1.0 / float(args.hz)) - (time.time() - loop_start))))
                 continue
 
@@ -10298,8 +12800,13 @@ def main() -> None:
                 phase_recorder=phase_recorder,
             )
             mark_loop_phase("loop.session_run_step")
+            raw_step_channels = (
+                step_result.raw_channels
+                if step_result.raw_channels
+                else step_result.channels
+            )
             clutch_input.publish_raw_tracker_pose_state(
-                channels=step_result.channels,
+                channels=raw_step_channels,
                 now=loop_start,
             )
             gripper_command = None
@@ -10323,6 +12830,31 @@ def main() -> None:
                 command_status=gripper_command_status,
                 now=loop_start,
             )
+            fix_arm_progress = advance_fix_arm_home_capture(
+                controller=getattr(components, "fix_arm_controller", None),
+                channels=raw_step_channels,
+                calibration=components.session.calibration,
+                now=loop_start,
+                pose_from_channel=_channel_pose_in_desk,
+                mean_pose=_mean_pose,
+                resolve_robot_home=lambda side: _resolve_robot_home_for_side(components, side=side),
+                side_retargeter=lambda side: _side_retargeter(components, side),
+                tcp_mode=args.tcp_mode,
+                log=lambda tag, message: _log(tag, message, now=loop_start),
+            )
+            if fix_arm_progress.active:
+                if fix_arm_progress.completed and fix_arm_progress.side:
+                    components.session.safety_monitor.request_pose_baseline_reset_many(
+                        (f"{fix_arm_progress.side}_wrist_pose",)
+                    )
+                clutch_input.publish_fix_arm_home_capture_progress(fix_arm_progress)
+            clutch_input.publish_camera_status(
+                camera_sources=camera_sources,
+                preview_camera_sources=preview_camera_sources,
+                camera_previewer=camera_previewer,
+                now=loop_start,
+            )
+            advance_recording_countdown(loop_start, step_result=step_result)
             mark_loop_phase("loop.gripper_control")
             active_command = step_result.command
             hand_command = _extract_hand_command_from_command(step_result.command)
@@ -10356,6 +12888,12 @@ def main() -> None:
                                 now=loop_start,
                             )
                     active_command = _merge_runtime_hand_command(active_command, hand_command)
+                    active_command = _filter_manual_real_command(
+                        components,
+                        active_command,
+                        step_result.observation,
+                        loop_start,
+                    )
                     if active_command is not None:
                         if _guard_impedance_force_control(
                             args,
@@ -10380,6 +12918,12 @@ def main() -> None:
                         now=loop_start,
                     )
                     active_command = _merge_runtime_hand_command(active_command, hand_command)
+                    active_command = _filter_manual_real_command(
+                        components,
+                        active_command,
+                        step_result.observation,
+                        loop_start,
+                    )
                     if active_command is not None:
                         if _guard_impedance_force_control(
                             args,
@@ -10511,6 +13055,18 @@ def main() -> None:
             right_clutch_channel = clutch_channels.get("right_clutch_button")
             left_clutch = bool(left_clutch_channel.value) if left_clutch_channel is not None else False
             right_clutch = bool(right_clutch_channel.value) if right_clutch_channel is not None else False
+            auto_stop_reason = recording_auto_stop_reason(step_result.state)
+            if auto_stop_reason is not None:
+                cancel_recording_countdown(loop_start, reason=auto_stop_reason)
+                if recording_active():
+                    stop_recording(
+                        loop_start,
+                        end_reason=auto_stop_reason,
+                        summary={
+                            "last_step_index": step_index,
+                            "last_state": step_result.state.value,
+                        },
+                    )
             if recording_active():
                 if episode_last_state != step_result.state.value:
                     if episode_recorder.is_recording:
@@ -10564,6 +13120,8 @@ def main() -> None:
                     episode_dir=recording_path(),
                     frame_count=recording_frame_count(),
                     frequency_status=frequency_status,
+                    event_status="recording",
+                    event_message="正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。",
                 )
             mark_loop_phase("loop.episode_record")
 
@@ -10601,6 +13159,11 @@ def main() -> None:
                 ik_warning_payload,
                 now=loop_start,
             )
+            pose_quality_payload = _build_pose_quality_display_payload(active_command)
+            clutch_input.publish_pose_quality_state(
+                pose_quality_payload,
+                now=loop_start,
+            )
             ik_timing_payload = None
             if clutch_input.ik_debug_timing_enabled():
                 ik_timing_payload = _build_ik_timing_payload(
@@ -10622,6 +13185,68 @@ def main() -> None:
                 float(components.arm_loop_step_dt_tracker.get("smoothed_loop_dt", base_control_dt))
                 / base_control_dt
             )
+            if clutch_input.consume_pose_snapshot_request():
+                if pose_snapshot_recorder is None:
+                    message = "Pose 抽帧不可用：当前未启用 --fix-arm。"
+                    clutch_input.set_pose_snapshot_state(status=message, append_message=True)
+                elif recording_active() or episode_start_countdown_deadline is not None:
+                    message = "Pose 抽帧与正式数采互斥；本次请求已忽略。"
+                    clutch_input.set_pose_snapshot_state(status=message, append_message=True)
+                else:
+                    try:
+                        payload = build_fix_arm_pose_snapshot_payload(
+                            timestamp=loop_start,
+                            monotonic_time=time.monotonic(),
+                            step_index=step_index,
+                            active_sides=components.active_sides,
+                            teleop_state=step_result.state.value,
+                            control_hz=float(step_result.control_hz),
+                            movement_multiple=_movement_multiple_value(args),
+                            tcp_mode=str(args.tcp_mode),
+                            calibration=components.session.calibration,
+                            raw_channels=raw_step_channels,
+                            filtered_channels=step_result.channels,
+                            observation=step_result.observation,
+                            step_command=step_result.command,
+                            active_command=active_command,
+                            hand_command=hand_command,
+                            gripper_command=gripper_command,
+                            command_dispatched=bool(
+                                step_result.command_dispatched or active_command is not None
+                            ),
+                            faults=step_result.faults,
+                            fix_arm_state=_fix_arm_ui_state(components),
+                            left_retargeter=components.left_retargeter,
+                            right_retargeter=components.right_retargeter,
+                            left_preview_qpos=left_qpos,
+                            right_preview_qpos=right_qpos,
+                            left_hardware_state=left_hw_state,
+                            right_hardware_state=right_hw_state,
+                            left_command_state=left_command_state,
+                            right_command_state=right_command_state,
+                            gripper_status=gripper_status,
+                            pose_quality=pose_quality_payload,
+                            ik_timing=ik_timing_payload,
+                            extra={
+                                "recording_active": False,
+                                "episode_countdown_active": False,
+                            },
+                        )
+                        record = pose_snapshot_recorder.record(payload, now=loop_start)
+                        message = f"Pose 抽帧已保存 #{record.sequence}: {record.path}"
+                        _log("PoseSnapshot", message, now=loop_start)
+                        clutch_input.set_pose_snapshot_state(
+                            last_path=record.path,
+                            status=message,
+                            append_message=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        message = f"Pose 抽帧保存失败: {type(exc).__name__}: {exc}"
+                        _log("PoseSnapshot", message, now=loop_start)
+                        clutch_input.set_pose_snapshot_state(
+                            status=message,
+                            append_message=True,
+                        )
             if ik_debug_log_recorder.active:
                 if ik_timing_payload is None:
                     ik_timing_payload = _build_ik_timing_payload(
@@ -10663,6 +13288,14 @@ def main() -> None:
                 _command_backend_status_text(left_command_state),
                 _command_backend_status_text(right_command_state),
             )
+            pose_quality_snapshot = (
+                pose_quality_payload.get("status"),
+                None
+                if pose_quality_payload.get("score") is None
+                else round(float(pose_quality_payload.get("score")), 2),
+                bool(pose_quality_payload.get("bad", False)),
+                tuple(_pose_quality_reason_list(pose_quality_payload.get("reasons"))[:3]),
+            )
             status_snapshot = (
                 step_result.state.value,
                 fault_codes,
@@ -10677,6 +13310,7 @@ def main() -> None:
                 hardware_snapshot,
                 command_backend_snapshot,
                 step_scale_snapshot,
+                pose_quality_snapshot,
                 hand_input_status,
                 gripper_status,
                 clutch_input.gripper_control_enabled(),
@@ -10702,6 +13336,7 @@ def main() -> None:
                     collision_bits += f" temp_safety={'limited' if temp_limited else 'on'}"
                 if clutch_input.ik_debug_timing_enabled():
                     collision_bits += f" {_ik_timing_status_text(ik_timing_payload)}"
+                pose_quality_bits = f" {_pose_quality_status_text(pose_quality_payload)}"
                 hand_bits = "" if not hand_input_status else f" hand_q6={list(hand_input_status)}"
                 gripper_bits = ""
                 if gripper_status:
@@ -10724,6 +13359,7 @@ def main() -> None:
                     f"right_clutch={right_clutch} "
                     f"faults={list(fault_codes)}"
                     f"{collision_bits}"
+                    f"{pose_quality_bits}"
                     f"{hand_bits}"
                     f"{gripper_bits}",
                     now=loop_start,
@@ -10731,6 +13367,55 @@ def main() -> None:
             mark_loop_phase("loop.status_emit")
             if loop_phase_timer is not None:
                 active_elapsed_sec = loop_phase_timer.elapsed_sec()
+                if debug_timing_log_recorder.active:
+                    timing_log_reason = debug_timing_log_recorder.select_frame_reason(
+                        now=loop_start,
+                        elapsed_sec=active_elapsed_sec,
+                        phases=loop_phase_timer.phases,
+                        state=step_result.state,
+                        fault_codes=fault_codes,
+                        threshold_sec=float(debug_timing_state.threshold_sec),
+                    )
+                    if timing_log_reason is not None:
+                        if ik_timing_payload is None:
+                            ik_timing_payload = _build_ik_timing_payload(
+                                active_command=active_command,
+                                left_command_state=left_command_state,
+                                right_command_state=right_command_state,
+                            )
+                        debug_recording_status: dict[str, object] = {
+                            "active": bool(recording_active()),
+                            "path": recording_path(),
+                            "frame_count": int(recording_frame_count()),
+                        }
+                        if recording_active():
+                            debug_recording_status["frequency"] = recording_frequency_status()
+                        debug_timing_log_recorder.record_frame(
+                            _build_debug_timing_log_frame(
+                                components=components,
+                                step_index=step_index,
+                                loop_start=loop_start,
+                                elapsed_sec=active_elapsed_sec,
+                                phases=loop_phase_timer.phases,
+                                reason=timing_log_reason,
+                                step_result=step_result,
+                                active_command=active_command,
+                                left_command_state=left_command_state,
+                                right_command_state=right_command_state,
+                                left_hw_state=left_hw_state,
+                                right_hw_state=right_hw_state,
+                                ik_timing_payload=ik_timing_payload,
+                                target_step_scale=target_step_scale,
+                                left_clutch=left_clutch,
+                                right_clutch=right_clutch,
+                                camera_sources=camera_sources,
+                                preview_camera_sources=preview_camera_sources,
+                                camera_previewer=camera_previewer,
+                                hand_input_status=hand_input_status,
+                                gripper_status=gripper_status,
+                                recording_status=debug_recording_status,
+                            )
+                        )
                 _debug_timing_maybe_report(
                     debug_timing_state,
                     reason="main_loop",
@@ -10754,6 +13439,8 @@ def main() -> None:
             if remaining > 0:
                 time.sleep(remaining)
     finally:
+        if "debug_timing_log_recorder" in locals():
+            debug_timing_log_recorder.stop(reason="finally", now=time.time())
         if "ik_debug_log_recorder" in locals():
             ik_debug_log_recorder.stop(reason="finally", now=time.time())
         if "recording_active" in locals() and recording_active():

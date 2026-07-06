@@ -65,14 +65,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend", default="cpu", choices=["cpu", "cuda", "Flux", "flux"])
     parser.add_argument("--mode", default="standard", choices=["standard", "high"])
     parser.add_argument("--max_fps", type=int, default=120)
-    parser.add_argument("--tactile_fields", nargs="*", default=["distributed_force"])
+    parser.add_argument("--tactile_fields", nargs="*", default=["raw"])
     parser.add_argument(
         "--tactile-compute-profile",
         choices=TACTILE_COMPUTE_PROFILES,
         default="dist-only",
         help=(
-            "SDK compute channels to enable for tactile reads. dist-only is lowest latency for "
-            "distributed_force; legacy matches the old deformation/shear/depth/force setup."
+            "SDK compute channels to enable for tactile reads. Default fields are raw images; "
+            "use tactile_fields distributed_force for real-time force output."
         ),
     )
     parser.add_argument(

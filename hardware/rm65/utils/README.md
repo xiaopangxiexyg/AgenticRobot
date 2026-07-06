@@ -37,19 +37,19 @@ active.
 
 ## Main Commands
 
-### Vive Teleoperation Init Pose
+### QPOS Init Planning
 
-Record a standard bare-end pose in the controller `empty` frame and move one or
-both arms back to it slowly with pose position control before Vive tracker
-teleoperation. Details and safety knobs are in `init_arm/README.md`.
+The old hardware-side Cartesian standard-pose init scripts were removed. Build
+an RM65 qpos init plan through `robot_motion` instead; runtime code should
+consume that plan instead of duplicating planning logic here.
 
 ```bash
-python hardware/rm65/utils/init_arm/rm65_record_standard_pose.py --arm both --overwrite
-python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py --arm both
-python hardware/rm65/utils/init_arm/rm65_move_to_standard_pose.py \
+PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
+  --current-qpos current_qpos.json \
+  --qpos-target robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json \
   --arm both \
-  --execute \
-  --confirm INIT_RM65_STANDARD_POSE
+  --output /tmp/rm65_qpos_init_plan.json \
+  --include-steps
 ```
 
 ### Record Four Calibration Poses

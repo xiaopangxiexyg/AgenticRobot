@@ -3,8 +3,10 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import queue
 import threading
+from urllib.parse import parse_qs, urlparse
 import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -178,6 +180,19 @@ button.warn {
 button.danger {
   background: #ffe9e9;
 }
+button.recording-active {
+  background: #dff5ed;
+  border-color: #54b88d;
+  box-shadow: 0 0 0 3px rgba(24, 121, 78, 0.16);
+  color: #064d33;
+  font-weight: 900;
+}
+button.stop-ready {
+  background: #ffe9e9;
+  border-color: #e38c8c;
+  color: #8e1f1f;
+  font-weight: 900;
+}
 .numeric-control {
   display: grid;
   grid-template-columns: auto minmax(110px, 1fr) auto auto;
@@ -222,6 +237,20 @@ button.danger {
   font: inherit;
   color: var(--text);
   background: #fff;
+}
+.path-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.path-control button {
+  white-space: nowrap;
+  padding: 10px 12px;
+}
+.round-trip-status {
+  margin-top: 8px;
+  min-height: 18px;
 }
 .section { margin-top: 14px; }
 .hint {
@@ -337,6 +366,82 @@ button.danger {
   font-size: 13px;
   line-height: 1.45;
 }
+.episode-banner {
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #f5f8fb;
+  padding: 14px 16px;
+  margin-top: 14px;
+}
+.episode-banner.recording {
+  background: #dff5ed;
+  border-color: #54b88d;
+  color: #064d33;
+  box-shadow: 0 0 0 3px rgba(24, 121, 78, 0.10);
+}
+.episode-banner.preparing {
+  background: #fff5e5;
+  border-color: #d99525;
+  color: #643600;
+  box-shadow: 0 0 0 3px rgba(217, 149, 37, 0.16);
+}
+.episode-banner.finalizing {
+  background: #fff5e5;
+  border-color: #dfa855;
+  color: #643600;
+}
+.episode-banner.saved {
+  background: #e8f5f3;
+  border-color: rgba(20, 122, 116, 0.42);
+  color: #075238;
+}
+.episode-banner.error {
+  background: #ffe9e9;
+  border-color: #e38c8c;
+  color: #832020;
+}
+.episode-banner.unavailable {
+  background: #eef0f3;
+  border-color: #c8ced8;
+  color: var(--muted);
+}
+.episode-banner-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 24px;
+  font-weight: 950;
+  line-height: 1.15;
+}
+.episode-banner-state {
+  white-space: nowrap;
+}
+.episode-banner-counter {
+  font-size: 15px;
+  font-weight: 900;
+}
+.episode-banner-detail {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.episode-banner-meta {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.episode-banner-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 8px;
+  border: 1px solid rgba(29, 39, 53, 0.14);
+  background: rgba(255, 255, 255, 0.55);
+  padding: 6px 9px;
+  font-size: 12px;
+  font-weight: 800;
+}
 .capture-status-row {
   display: flex;
   flex-wrap: wrap;
@@ -400,6 +505,19 @@ button.danger {
   padding: 10px 12px;
   min-height: 128px;
 }
+.raw-pose-card.warn {
+  background: #38250a;
+  border-color: #dfa855;
+  color: #fff7e6;
+}
+.raw-pose-card.stale,
+.raw-pose-card.invalid,
+.raw-pose-card.no-data {
+  background: #3a1515;
+  border-color: #e38c8c;
+  color: #ffecec;
+  box-shadow: 0 0 0 2px rgba(191, 46, 46, 0.18);
+}
 .raw-pose-title {
   display: flex;
   justify-content: space-between;
@@ -409,6 +527,10 @@ button.danger {
   font-weight: 700;
   margin-bottom: 8px;
 }
+.raw-pose-card.warn .raw-pose-title { color: #ffd28a; }
+.raw-pose-card.stale .raw-pose-title,
+.raw-pose-card.invalid .raw-pose-title,
+.raw-pose-card.no-data .raw-pose-title { color: #ffb4b4; }
 .raw-pose-body {
   margin: 0;
   font-size: 12px;
@@ -461,33 +583,48 @@ button.danger {
   font-size: 12px;
   line-height: 1.45;
 }
-.gripper-grid {
+.gripper-grid,
+.device-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
-.gripper-card {
+.gripper-card,
+.device-card {
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
 }
-.gripper-card.connected {
+.gripper-card.connected,
+.device-card.ok {
   background: #e4f5ef;
   border-color: #8fd1b8;
 }
-.gripper-card.error {
+.device-card.waiting,
+.device-card.warn {
+  background: #fff3d6;
+  border-color: #e0b35b;
+}
+.device-card.off {
+  background: #eef0f3;
+  border-color: #c8ced8;
+}
+.gripper-card.error,
+.device-card.error {
   background: #ffe9e9;
   border-color: #e38c8c;
 }
-.gripper-title {
+.gripper-title,
+.device-title {
   display: flex;
   justify-content: space-between;
   gap: 8px;
   font-size: 13px;
   font-weight: 800;
 }
-.gripper-body {
+.gripper-body,
+.device-body {
   margin-top: 8px;
   color: var(--muted);
   font-size: 12px;
@@ -530,9 +667,11 @@ button.danger {
 }
 @media (max-width: 760px) {
   main { padding: 12px; }
-  .status-grid, .capture-grid, .button-grid, .raw-pose-grid, .ik-timing-grid, .gripper-grid, .shortcut-strip { grid-template-columns: 1fr; }
+  .status-grid, .capture-grid, .button-grid, .raw-pose-grid, .ik-timing-grid, .gripper-grid, .device-grid, .shortcut-strip { grid-template-columns: 1fr; }
   .numeric-control { grid-template-columns: auto minmax(92px, 1fr) auto; }
   .numeric-control button[data-event="movement_multiple_reset"] { grid-column: 1 / -1; }
+  .episode-banner-title { flex-direction: column; align-items: flex-start; }
+  .episode-banner-state { white-space: normal; }
 }
 </style>
 </head>
@@ -557,10 +696,25 @@ button.danger {
         <div id="captureModeDetail" class="capture-mode-detail">__INITIAL_CAPTURE_DETAIL__</div>
         <div class="capture-progress"><div id="captureProgressBar" style="width: __INITIAL_CAPTURE_PROGRESS__%;"></div></div>
       </div>
+      <div id="episodeBanner" class="episode-banner unavailable">
+        <div class="episode-banner-title">
+          <span id="episodeBannerState" class="episode-banner-state">数采未启用</span>
+          <span id="episodeBannerCounter" class="episode-banner-counter">-</span>
+        </div>
+        <div id="episodeBannerDetail" class="episode-banner-detail mono">等待状态更新</div>
+        <div id="episodeBannerMeta" class="episode-banner-meta"></div>
+      </div>
       <div id="scriptHealth" class="script-health">网页脚本尚未接管实时刷新；如果这里长期存在，请打开终端输出的 state_url/debug_url 检查后端状态，或硬刷新当前页面。</div>
       <div id="ikWarningBanner" class="ik-warning-banner" hidden>
         <div class="ik-warning-title">IK WARNING</div>
         <div id="ikWarningText" class="ik-warning-text mono">-</div>
+      </div>
+      <div id="poseQualitySection" class="section">
+        <div class="label">Pose Quality</div>
+        <div id="poseQualityCard" class="device-card off">
+          <div class="device-title"><span id="poseQualityStatus">等待</span><span id="poseQualityScore">-</span></div>
+          <div id="poseQualityDetail" class="device-body mono">等待遥操命令元数据</div>
+        </div>
       </div>
       <div class="capture-grid section">
         <div class="metric"><div class="label">采集阶段</div><div id="captureStage" class="value">__INITIAL_CAPTURE_STAGE__</div></div>
@@ -571,6 +725,14 @@ button.danger {
       <div id="gripperStatusSection" class="section" hidden>
         <div class="label">Q6 夹爪设备</div>
         <div id="gripperCards" class="gripper-grid"></div>
+      </div>
+      <div id="cameraStatusSection" class="section">
+        <div class="label">RealSense 相机</div>
+        <div id="cameraCards" class="device-grid"></div>
+      </div>
+      <div id="tactileCameraStatusSection" class="section">
+        <div class="label">视触觉相机</div>
+        <div id="tactileCameraCards" class="device-grid"></div>
       </div>
       <div id="ikTimingSection" class="section" hidden>
         <div class="label">IK 耗时诊断</div>
@@ -585,11 +747,11 @@ button.danger {
       <div class="section">
         <div class="label">左右原始位姿（VIVE world）</div>
         <div class="raw-pose-grid">
-          <div class="raw-pose-card">
+          <div id="leftRawCard" class="raw-pose-card">
             <div class="raw-pose-title"><span>左 wrist</span><span id="leftRawStatus">__INITIAL_LEFT_RAW_STATUS__</span></div>
             <pre id="leftRawPose" class="raw-pose-body mono">__INITIAL_LEFT_RAW_POSE__</pre>
           </div>
-          <div class="raw-pose-card">
+          <div id="rightRawCard" class="raw-pose-card">
             <div class="raw-pose-title"><span>右 wrist</span><span id="rightRawStatus">__INITIAL_RIGHT_RAW_STATUS__</span></div>
             <pre id="rightRawPose" class="raw-pose-body mono">__INITIAL_RIGHT_RAW_POSE__</pre>
           </div>
@@ -607,7 +769,7 @@ button.danger {
       <div class="shortcut-strip" aria-label="快捷键">
         <div class="shortcut-item"><kbd>A</kbd><span>开始 / 停止数采</span></div>
         <div class="shortcut-item"><kbd>B</kbd><span>开始遥操 / Hold</span></div>
-        <div class="shortcut-item"><kbd>C</kbd><span>急停</span></div>
+        <div class="shortcut-item"><kbd>C</kbd><span>开始采集</span></div>
       </div>
       <div id="sendStatus" class="send-status"></div>
       <div class="control-title">标定 / 坐标系</div>
@@ -636,10 +798,31 @@ button.danger {
         <button class="secondary" data-event="s">保存</button>
         <button class="secondary" data-event="h">Hold / 冻结</button>
       </div>
+      <div id="fixArmSection" hidden>
+        <div class="control-title">固定臂</div>
+        <div class="form-grid">
+          <label>固定侧
+            <select id="fixArmSideSelect">
+              <option value="left">左臂</option>
+              <option value="right">右臂</option>
+            </select>
+          </label>
+        </div>
+        <div id="fixArmStatus" class="numeric-value mono">-</div>
+      </div>
       <div class="control-title">数采</div>
       <div class="form-grid">
         <label>保存根目录
-          <input id="datasetBaseRootInput" type="text" autocomplete="off">
+          <div class="path-control">
+            <input id="datasetBaseRootInput" type="text" autocomplete="off">
+            <button id="datasetChooseRootButton" class="secondary" type="button">选择文件夹</button>
+          </div>
+        </label>
+        <label>任务类型
+          <select id="taskTypeSelect">
+            <option value="general">一般类</option>
+            <option value="round_trip">来回类</option>
+          </select>
         </label>
         <label>Task
           <select id="taskSelect"></select>
@@ -654,7 +837,9 @@ button.danger {
       <div class="button-grid">
         <button id="episodeStartButton" data-event="episode_start">开始数采</button>
         <button id="episodeStopButton" class="secondary" data-event="episode_stop">停止数采</button>
+        <button id="roundTripToggleButton" class="secondary" data-event="round_trip_toggle">切换 in/out</button>
       </div>
+      <div id="roundTripStatus" class="numeric-value mono round-trip-status">-</div>
       <div id="episodeStatus" class="gripper-status mono">-</div>
       <div id="episodeWarningBanner" class="ik-warning-banner" hidden>
         <div class="ik-warning-title">DATA WARNING</div>
@@ -684,6 +869,13 @@ button.danger {
         <button data-event="k">Pitch -</button>
         <button data-event="u">Roll -</button>
         <button data-event="o">Roll +</button>
+      </div>
+      <div id="poseSnapshotSection" hidden>
+        <div class="control-title">Pose 抽帧</div>
+        <div class="button-grid">
+          <button id="poseSnapshotButton" class="secondary" data-event="record_pose_snapshot">录制当前 Pose</button>
+        </div>
+        <div id="poseSnapshotStatus" class="gripper-status mono">-</div>
       </div>
     </div>
   </section>
@@ -735,6 +927,15 @@ button.danger {
       teleop: "遥操中"
     };
     return labels[value] || value || "-";
+  }
+
+  function normalizeTaskTypeLegacy(value) {
+    var text = String(value || "").trim().toLowerCase().replace(/[-\\s]+/g, "_");
+    return /^(roundtrip|round_trip|back_and_forth|in_out|inout|往返|来回)$/.test(text) ? "round_trip" : "general";
+  }
+
+  function normalizeRoundTripPhaseLegacy(value) {
+    return String(value || "").trim().toLowerCase() === "out" ? "out" : "in";
   }
 
   function setCaptureClass(phase) {
@@ -794,7 +995,7 @@ button.danger {
     if (!pose) {
       return {status: "无数据", text: "未收到 channel"};
     }
-    var status = pose.valid ? "有效" : "无效";
+    var status = pose.status_label || (pose.valid ? "有效" : "无效");
     var tracker = pose.tracker_name || "-";
     var role = pose.tracker_role || "-";
     var age = pose.age_sec == null ? "-" : legacyNumberText(pose.age_sec, 2) + " s";
@@ -808,8 +1009,15 @@ button.danger {
         "age:     " + age,
         "xyz(m):  " + legacyVectorText(pose.xyz_m, 4),
         "rpy(deg):" + legacyVectorText(pose.rpy_deg, 1)
-      ].join("\n")
+      ].join("\\n")
     };
+  }
+
+  function setLegacyRawPoseClass(id, pose) {
+    var el = byId(id);
+    if (!el) return;
+    var level = pose && pose.status_level ? String(pose.status_level) : "ok";
+    el.className = "raw-pose-card " + level;
   }
 
   function renderRawPosesLegacy(state) {
@@ -820,6 +1028,63 @@ button.danger {
     setText("rightRawStatus", right.status);
     setText("leftRawPose", left.text);
     setText("rightRawPose", right.text);
+    setLegacyRawPoseClass("leftRawCard", poses.left);
+    setLegacyRawPoseClass("rightRawCard", poses.right);
+  }
+
+  function poseQualityLevelLegacy(quality) {
+    quality = quality || {};
+    var level = String(quality.level || "");
+    if (/^(ok|warn|error|off)$/.test(level)) return level;
+    var status = String(quality.status || "unknown");
+    if (status === "bad" || quality.bad) return "error";
+    if (status === "warning") return "warn";
+    if (status === "good") return "ok";
+    return "off";
+  }
+
+  function formatPoseQualityMetricLegacy(value, digits, unit) {
+    var numeric = Number(value);
+    if (!isFinite(numeric)) return "-";
+    return numeric.toFixed(digits) + unit;
+  }
+
+  function renderPoseQualityLegacy(state) {
+    var quality = state.pose_quality || {};
+    var metrics = quality.metrics || {};
+    var card = byId("poseQualityCard");
+    if (card) card.className = "device-card " + poseQualityLevelLegacy(quality);
+    var score = quality.score == null || !isFinite(Number(quality.score)) ? "-" : Number(quality.score).toFixed(2);
+    setText("poseQualityStatus", quality.status || "unknown");
+    setText("poseQualityScore", "score " + score);
+    var reasons = Array.isArray(quality.reasons) ? quality.reasons : [];
+    var badReasons = Array.isArray(quality.bad_reasons) ? quality.bad_reasons : [];
+    var warningReasons = Array.isArray(quality.warning_reasons) ? quality.warning_reasons : [];
+    var lines = [];
+    lines.push("available: " + (quality.available ? "yes" : "no"));
+    if (badReasons.length) lines.push("bad: " + badReasons.join(", "));
+    if (warningReasons.length) lines.push("warning: " + warningReasons.join(", "));
+    if (!badReasons.length && !warningReasons.length) {
+      lines.push("reasons: " + (reasons.length ? reasons.join(", ") : "none"));
+    }
+    lines.push("source: " + (quality.source || "-"));
+    lines.push(
+      "collision: " + (metrics.collision_avoidance_status || "-") +
+      " dist=" + formatPoseQualityMetricLegacy(metrics.collision_distance_m, 3, "m") +
+      " min=" + formatPoseQualityMetricLegacy(metrics.collision_min_distance_m, 3, "m") +
+      " margin=" + formatPoseQualityMetricLegacy(metrics.collision_margin_m, 3, "m")
+    );
+    lines.push(
+      "ik: jump=" + (metrics.ik_jump_gate_status || "-") +
+      " branch=" + (metrics.ik_branch_candidate || "-") +
+      " err=" + formatPoseQualityMetricLegacy(metrics.ik_translation_error_m, 3, "m") +
+      "/" + formatPoseQualityMetricLegacy(metrics.ik_rotation_error_deg, 1, "deg")
+    );
+    lines.push(
+      "joint: nearest_margin=" + formatPoseQualityMetricLegacy(metrics.joint_nearest_margin_deg, 1, "deg") +
+      " near_limit=" + (metrics.joint_near_limit ? "yes" : "no")
+    );
+    setText("poseQualityDetail", lines.join("\\n"));
   }
 
   function renderIkDebugLogButtonLegacy(state) {
@@ -851,13 +1116,16 @@ button.danger {
     var minSamples = Number(state.capture_min_samples || 0);
     var leftSamples = Number(state.capture_left_samples || 0);
     var rightSamples = Number(state.capture_right_samples || 0);
-    var sampleLabel = String(state.capture_stage || "") === "runtime_home" ? "Home 样本" : "标定样本";
+    var captureStage = String(state.capture_stage || "");
+    var sampleLabel = captureStage === "runtime_home" ? "Home 样本" : (captureStage === "force_control_warmup" ? "力控预热" : "标定样本");
 
     if (phase === "ready") {
       detail = "按“开始采集”后会先进入准备倒计时";
     } else if (phase === "preparing") {
       progress = prepTotal > 0 ? (1 - prepRemaining / prepTotal) * 100 : 100;
-      detail = "倒计时 " + prepRemaining.toFixed(1) + "s，当前还未写入" + sampleLabel;
+      detail = captureStage === "force_control_warmup"
+        ? "正在预热 RM65 力控，预计剩余 " + prepRemaining.toFixed(1) + "s"
+        : "倒计时 " + prepRemaining.toFixed(1) + "s，当前还未写入" + sampleLabel;
     } else if (phase === "capturing") {
       if (minSamples > 0 && (state.capture_left_samples != null || state.capture_right_samples != null)) {
         progress = Math.min(leftSamples, rightSamples) / minSamples * 100;
@@ -889,9 +1157,111 @@ button.danger {
       var eventName = buttons[i].getAttribute("data-event");
       buttons[i].disabled = !active[eventName];
       if (eventName === "c") {
-        buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+        if (state.fix_arm_available && state.teleop_running) {
+          var side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+          var label = side === "right" ? "右臂" : "左臂";
+          buttons[i].textContent = state.fix_arm_recalibrating
+            ? "重采 " + label + " Home..."
+            : state.fix_arm_active
+              ? "重采 " + label + " Home"
+              : "固定 " + label;
+        } else {
+          buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+        }
       }
     }
+  }
+
+  function renderEpisodeStateLegacy(state) {
+    var available = Boolean(state.episode_recording_available);
+    var recording = Boolean(state.episode_recording);
+    var preparing = String(state.episode_event_status || "") === "preparing";
+    var startButton = byId("episodeStartButton");
+    var stopButton = byId("episodeStopButton");
+    var statusEl = byId("episodeStatus");
+    var warning = state.episode_frequency_warning || {};
+    var warningBanner = byId("episodeWarningBanner");
+    var warningText = byId("episodeWarningText");
+    var status = String(state.episode_event_status || "");
+    var statusLabels = {
+      unavailable: "数采不可用",
+      idle: "未开始数采",
+      preparing: "3 秒后开始数采",
+      recording: "正在数采",
+      finalizing: "停止中 / 后台保存",
+      saved: "已保存",
+      discarded: "已停止 / 无样本",
+      error: "保存失败"
+    };
+    if (!available) {
+      status = "unavailable";
+    } else if (recording) {
+      status = "recording";
+    } else if (!status) {
+      status = "idle";
+    }
+    if (startButton) {
+      startButton.textContent = recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采");
+      startButton.disabled = !legacyActiveControls.episode_start || recording || preparing;
+    }
+    if (stopButton) {
+      stopButton.disabled = !legacyActiveControls.episode_stop || (!recording && !preparing);
+    }
+    var locked = recording || preparing;
+    var fields = ["datasetBaseRootInput", "datasetChooseRootButton", "taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = byId(fields[i]);
+      if (field) field.disabled = locked;
+    }
+    var roundTripButton = byId("roundTripToggleButton");
+    if (roundTripButton) {
+      roundTripButton.disabled = locked || normalizeTaskTypeLegacy(state.collection_task_type) !== "round_trip" || !legacyActiveControls.round_trip_toggle;
+    }
+    var roundTripStatus = byId("roundTripStatus");
+    if (roundTripStatus) {
+      roundTripStatus.textContent = normalizeTaskTypeLegacy(state.collection_task_type) === "round_trip"
+        ? "来回类: 当前将采 _" + normalizeRoundTripPhaseLegacy(state.collection_round_trip_phase)
+        : "一般类任务：每次采集使用同一个 task 标签。";
+    }
+    if (statusEl) {
+      var lines = [
+        available ? "episode 录制可用" : "episode 录制不可用",
+        recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")
+      ];
+      if (state.episode_dir) lines.push("路径: " + state.episode_dir);
+      if (state.dataset_root) lines.push("保存根目录: " + state.dataset_root);
+      if (state.episode_frame_count != null) lines.push("帧数: " + state.episode_frame_count);
+      statusEl.textContent = lines.join("\\n");
+    }
+    if (warningBanner) warningBanner.hidden = !Boolean(warning.active);
+    if (warningText) warningText.textContent = warning.message || "采集频率低于目标值";
+    var banner = byId("episodeBanner");
+    if (banner) {
+      var bannerClass = "episode-banner";
+      if (/^(preparing|recording|finalizing|saved|discarded|error|unavailable)$/.test(status)) {
+        bannerClass += " " + (status === "discarded" ? "finalizing" : status);
+      }
+      banner.className = bannerClass;
+    }
+    setText("episodeBannerState", statusLabels[status] || status || "未开始数采");
+    var frameText = state.episode_frame_count == null ? "-" : String(state.episode_frame_count) + " 帧";
+    var hzText = "";
+    var sampleHz = Number(state.episode_sample_hz);
+    var targetHz = Number(state.episode_target_hz);
+    if (isFinite(sampleHz)) {
+      hzText = sampleHz.toFixed(1) + " Hz" + (isFinite(targetHz) ? " / " + targetHz.toFixed(1) + " Hz" : "");
+    }
+    setText("episodeBannerCounter", hzText ? frameText + " · " + hzText : frameText);
+    var detail = state.episode_event_message || (
+      recording
+        ? "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
+        : available
+          ? "点击“开始数采”或按 A 开始；再次按 A 停止。"
+          : "当前启动参数禁用了正式数据集和 debug episode 录制。"
+    );
+    var path = state.episode_dir || state.dataset_root || "";
+    setText("episodeBannerDetail", detail + (path ? "\\n路径: " + path : ""));
+    setText("episodeBannerMeta", state.collection_task_name || state.collection_task_id || "");
   }
 
   function renderMessages(messages) {
@@ -925,6 +1295,8 @@ button.danger {
     renderCaptureMode(state);
     renderButtons(state);
     renderRawPosesLegacy(state);
+    renderPoseQualityLegacy(state);
+    renderEpisodeStateLegacy(state);
     renderIkDebugLogButtonLegacy(state);
     renderMessages(state.messages || []);
   }
@@ -957,9 +1329,11 @@ button.danger {
   function collectEpisodeStartPayloadLegacy() {
     return {
       dataset_base_root: byId("datasetBaseRootInput") ? byId("datasetBaseRootInput").value : "",
+      task_type: byId("taskTypeSelect") ? byId("taskTypeSelect").value : normalizeTaskTypeLegacy(legacyLatestState.collection_task_type),
       task_key: byId("taskSelect") ? byId("taskSelect").value : "",
       task_english_name: byId("taskEnglishNameInput") ? byId("taskEnglishNameInput").value : "",
-      task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : ""
+      task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : "",
+      round_trip_phase: normalizeRoundTripPhaseLegacy(legacyLatestState.collection_round_trip_phase)
     };
   }
 
@@ -978,6 +1352,11 @@ button.danger {
       }
       xhr.open("POST", "/event", true);
       xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState === 4 && xhr.status >= 400) {
+          setText("sendStatus", "事件未生效: HTTP " + xhr.status);
+        }
+      };
       xhr.send(JSON.stringify(payload));
       if (eventName === "d") {
         var button = byId("ikDebugLogButton");
@@ -986,6 +1365,35 @@ button.danger {
     } catch (error) {
       setText("captureModeDetail", "legacy 发送按钮事件失败: " + error);
     }
+  }
+
+  function chooseDatasetDirectoryLegacy() {
+    var input = byId("datasetBaseRootInput");
+    var button = byId("datasetChooseRootButton");
+    if (!input || !button || button.disabled) return;
+    var xhr = new XMLHttpRequest();
+    button.disabled = true;
+    xhr.open("GET", "/choose-directory?initial=" + encodeURIComponent(input.value || ""), true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) return;
+      button.disabled = false;
+      if (xhr.status !== 200) {
+        setText("sendStatus", "选择文件夹失败: HTTP " + xhr.status);
+        return;
+      }
+      try {
+        var result = JSON.parse(xhr.responseText);
+        if (result.path) {
+          input.value = result.path;
+          setText("sendStatus", "已选择文件夹: " + result.path);
+        } else {
+          setText("sendStatus", result.message || "未选择文件夹");
+        }
+      } catch (error) {
+        setText("sendStatus", "选择文件夹结果解析失败: " + error);
+      }
+    };
+    xhr.send(null);
   }
 
   function isEditableTargetLegacy(target) {
@@ -998,14 +1406,22 @@ button.danger {
     var eventName = "";
     var payload = null;
     if (key === "a") {
-      eventName = state.episode_recording ? "episode_stop" : "episode_start";
+      eventName = (state.episode_recording || String(state.episode_event_status || "") === "preparing") ? "episode_stop" : "episode_start";
       if (eventName === "episode_start") payload = collectEpisodeStartPayloadLegacy();
     } else if (key === "b") {
       eventName = state.teleop_running ? "h" : "p";
     } else if (key === "c") {
-      eventName = "q";
+      if (state.fix_arm_available && state.teleop_running && legacyActiveControls["c"]) {
+        eventName = "c";
+      } else if (!state.teleop_running && String(state.capture_stage || "") && legacyActiveControls["c"]) {
+        eventName = "c";
+      }
     } else {
       return false;
+    }
+    if (!eventName) {
+      setText("sendStatus", "快捷键 " + key.toUpperCase() + " 当前不可用");
+      return true;
     }
     if (!legacyActiveControls[eventName]) {
       setText("sendStatus", "快捷键 " + key.toUpperCase() + " 当前不可用");
@@ -1037,6 +1453,8 @@ button.danger {
         postEvent(eventName, eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null);
       };
     }
+    var chooseButton = byId("datasetChooseRootButton");
+    if (chooseButton) chooseButton.onclick = chooseDatasetDirectoryLegacy;
   }
 
   window.__calibrationWebUiLegacyPollActive = true;
@@ -1069,6 +1487,11 @@ const viveCalibrationLoadButtonEl = document.getElementById("viveCalibrationLoad
 const viveCalibrationStatusEl = document.getElementById("viveCalibrationStatus");
 const movementMultipleInputEl = document.getElementById("movementMultipleInput");
 const movementMultipleStatusEl = document.getElementById("movementMultipleStatus");
+const fixArmSectionEl = document.getElementById("fixArmSection");
+const fixArmSideSelectEl = document.getElementById("fixArmSideSelect");
+const fixArmStatusEl = document.getElementById("fixArmStatus");
+const leftRawCardEl = document.getElementById("leftRawCard");
+const rightRawCardEl = document.getElementById("rightRawCard");
 const leftRawPoseEl = document.getElementById("leftRawPose");
 const rightRawPoseEl = document.getElementById("rightRawPose");
 const leftRawStatusEl = document.getElementById("leftRawStatus");
@@ -1079,6 +1502,10 @@ const captureModeDetailEl = document.getElementById("captureModeDetail");
 const captureProgressBarEl = document.getElementById("captureProgressBar");
 const ikWarningBannerEl = document.getElementById("ikWarningBanner");
 const ikWarningTextEl = document.getElementById("ikWarningText");
+const poseQualityCardEl = document.getElementById("poseQualityCard");
+const poseQualityStatusEl = document.getElementById("poseQualityStatus");
+const poseQualityScoreEl = document.getElementById("poseQualityScore");
+const poseQualityDetailEl = document.getElementById("poseQualityDetail");
 const ikTimingSectionEl = document.getElementById("ikTimingSection");
 const ikTimingTotalMetricEl = document.getElementById("ikTimingTotalMetric");
 const ikTimingTotalEl = document.getElementById("ikTimingTotal");
@@ -1089,18 +1516,34 @@ const ikTimingStatusEl = document.getElementById("ikTimingStatus");
 const ikDebugLogButtonEl = document.getElementById("ikDebugLogButton");
 const episodeStartButtonEl = document.getElementById("episodeStartButton");
 const episodeStopButtonEl = document.getElementById("episodeStopButton");
+const episodeBannerEl = document.getElementById("episodeBanner");
+const episodeBannerStateEl = document.getElementById("episodeBannerState");
+const episodeBannerCounterEl = document.getElementById("episodeBannerCounter");
+const episodeBannerDetailEl = document.getElementById("episodeBannerDetail");
+const episodeBannerMetaEl = document.getElementById("episodeBannerMeta");
 const episodeStatusEl = document.getElementById("episodeStatus");
 const datasetBaseRootInputEl = document.getElementById("datasetBaseRootInput");
+const datasetChooseRootButtonEl = document.getElementById("datasetChooseRootButton");
+const taskTypeSelectEl = document.getElementById("taskTypeSelect");
 const taskSelectEl = document.getElementById("taskSelect");
 const taskEnglishNameInputEl = document.getElementById("taskEnglishNameInput");
 const taskChineseNameInputEl = document.getElementById("taskChineseNameInput");
+const roundTripToggleButtonEl = document.getElementById("roundTripToggleButton");
+const roundTripStatusEl = document.getElementById("roundTripStatus");
 const episodeWarningBannerEl = document.getElementById("episodeWarningBanner");
 const episodeWarningTextEl = document.getElementById("episodeWarningText");
 const cameraVisButtonEl = document.getElementById("cameraVisButton");
 const tactileVisButtonEl = document.getElementById("tactileVisButton");
 const visualizationStatusEl = document.getElementById("visualizationStatus");
+const poseSnapshotSectionEl = document.getElementById("poseSnapshotSection");
+const poseSnapshotButtonEl = document.getElementById("poseSnapshotButton");
+const poseSnapshotStatusEl = document.getElementById("poseSnapshotStatus");
 const gripperStatusSectionEl = document.getElementById("gripperStatusSection");
 const gripperCardsEl = document.getElementById("gripperCards");
+const cameraStatusSectionEl = document.getElementById("cameraStatusSection");
+const cameraCardsEl = document.getElementById("cameraCards");
+const tactileCameraStatusSectionEl = document.getElementById("tactileCameraStatusSection");
+const tactileCameraCardsEl = document.getElementById("tactileCameraCards");
 const shutdownOverlayEl = document.getElementById("shutdownOverlay");
 const shutdownMessageEl = document.getElementById("shutdownMessage");
 const scriptHealthEl = document.getElementById("scriptHealth");
@@ -1113,6 +1556,8 @@ let ikDebugLogToggleExpected = null;
 let ikDebugLogToggleRequestedAt = 0;
 let stateRefreshFailureCount = 0;
 let latestState = {};
+let taskTypeOverride = null;
+let roundTripPhaseOverride = null;
 
 const stageLabels = {
   "Starting...": "启动中...",
@@ -1145,9 +1590,23 @@ const phaseLabels = {
   waiting: "等待样本",
   teleop: "遥操中",
 };
+const taskTypeLabels = {general: "一般类", round_trip: "来回类"};
+const roundTripPhaseLabels = {in: "_in", out: "_out"};
 
 function labelFor(mapping, value) {
   return mapping[value] || value || "-";
+}
+
+function normalizeTaskType(value) {
+  const text = String(value || "").trim().toLowerCase().replace(/[-\\s]+/g, "_");
+  if (["roundtrip", "round_trip", "back_and_forth", "in_out", "inout", "往返", "来回"].includes(text)) {
+    return "round_trip";
+  }
+  return "general";
+}
+
+function normalizeRoundTripPhase(value) {
+  return String(value || "").trim().toLowerCase() === "out" ? "out" : "in";
 }
 
 function showShutdown(message) {
@@ -1232,16 +1691,46 @@ function updateIkDebugLogButton(state) {
   } else {
     ikDebugLogButtonEl.textContent = logging ? "停止 IK 记录" : "开始 IK 记录";
   }
+  ikDebugLogButtonEl.disabled = !activeControls.has("d") || ikDebugLogTogglePending;
   ikDebugLogButtonEl.classList.toggle("active", logging);
 }
 
 function collectEpisodeStartPayload() {
+  const selectedTaskType = taskTypeSelectEl
+    ? taskTypeSelectEl.value
+    : normalizeTaskType(taskTypeOverride || latestState.collection_task_type);
   return {
     dataset_base_root: datasetBaseRootInputEl ? datasetBaseRootInputEl.value : "",
+    task_type: selectedTaskType,
     task_key: taskSelectEl ? taskSelectEl.value : "",
     task_english_name: taskEnglishNameInputEl ? taskEnglishNameInputEl.value : "",
     task_chinese_name: taskChineseNameInputEl ? taskChineseNameInputEl.value : "",
+    round_trip_phase: normalizeRoundTripPhase(roundTripPhaseOverride || latestState.collection_round_trip_phase),
   };
+}
+
+async function chooseDatasetDirectory() {
+  if (!datasetBaseRootInputEl || !datasetChooseRootButtonEl || datasetChooseRootButtonEl.disabled) return;
+  const originalText = datasetChooseRootButtonEl.textContent;
+  datasetChooseRootButtonEl.disabled = true;
+  datasetChooseRootButtonEl.textContent = "选择中...";
+  try {
+    const initial = encodeURIComponent(datasetBaseRootInputEl.value || latestState.dataset_base_root || "");
+    const response = await fetch("/choose-directory?initial=" + initial, {cache: "no-store"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const result = await response.json();
+    if (result && result.path) {
+      datasetBaseRootInputEl.value = result.path;
+      sendStatusEl.textContent = "已选择文件夹: " + result.path;
+    } else {
+      sendStatusEl.textContent = (result && result.message) || "未选择文件夹";
+    }
+  } catch (error) {
+    sendStatusEl.textContent = "选择文件夹失败: " + String(error);
+  } finally {
+    datasetChooseRootButtonEl.textContent = originalText || "选择文件夹";
+    datasetChooseRootButtonEl.disabled = Boolean(latestState.episode_recording) || String(latestState.episode_event_status || "") === "preparing";
+  }
 }
 
 function isEditableTarget(target) {
@@ -1265,14 +1754,24 @@ async function sendGuiShortcut(key) {
   let eventName = "";
   let payload = null;
   if (key === "a") {
-    eventName = state.episode_recording ? "episode_stop" : "episode_start";
+    eventName = (state.episode_recording || String(state.episode_event_status || "") === "preparing") ? "episode_stop" : "episode_start";
     if (eventName === "episode_start") payload = collectEpisodeStartPayload();
   } else if (key === "b") {
     eventName = state.teleop_running ? "h" : "p";
   } else if (key === "c") {
-    eventName = "q";
+    const captureStage = String(state.capture_stage || "");
+    if (state.fix_arm_available && state.teleop_running && canSendEvent("c")) {
+      eventName = "c";
+    } else if (!state.teleop_running && captureStage && canSendEvent("c")) {
+      eventName = "c";
+    }
   } else {
     return false;
+  }
+  if (!eventName) {
+    const label = key.toUpperCase();
+    sendStatusEl.textContent = `快捷键 ${label} 当前不可用`;
+    return true;
   }
   if (!canSendEvent(eventName)) {
     const label = key.toUpperCase();
@@ -1307,6 +1806,26 @@ buttons.forEach((button) => {
     if (button.disabled) return;
     try {
       const eventName = button.dataset.event;
+      if (eventName === "round_trip_toggle") {
+        const selectedType = normalizeTaskType(
+          taskTypeSelectEl ? taskTypeSelectEl.value : taskTypeOverride || latestState.collection_task_type
+        );
+        const backendRoundTripReady = (
+          normalizeTaskType(latestState.collection_task_type) === "round_trip" &&
+          !taskTypeOverride
+        );
+        if (selectedType === "round_trip" && !backendRoundTripReady) {
+          const current = normalizeRoundTripPhase(roundTripPhaseOverride || latestState.collection_round_trip_phase);
+          roundTripPhaseOverride = current === "in" ? "out" : "in";
+          renderTaskForm(Object.assign({}, latestState, {
+            collection_task_type: "round_trip",
+            collection_round_trip_phase: roundTripPhaseOverride,
+            collection_round_trip_next_phase: current,
+          }), false);
+          sendStatusEl.textContent = `已切换待采方向: ${roundTripPhaseLabels[roundTripPhaseOverride] || "_" + roundTripPhaseOverride}`;
+          return;
+        }
+      }
       if (eventName === "episode_start") {
         await sendEvent(eventName, collectEpisodeStartPayload());
       } else {
@@ -1327,6 +1846,27 @@ if (movementMultipleInputEl) {
   });
 }
 
+if (datasetChooseRootButtonEl) {
+  datasetChooseRootButtonEl.addEventListener("click", async () => {
+    await chooseDatasetDirectory();
+  });
+}
+
+if (taskTypeSelectEl) {
+  taskTypeSelectEl.addEventListener("change", () => {
+    const nextType = normalizeTaskType(taskTypeSelectEl.value);
+    taskTypeOverride = nextType;
+    roundTripPhaseOverride = nextType === "round_trip" ? "in" : null;
+    const draftState = Object.assign({}, latestState, {
+      collection_task_type: nextType,
+      collection_task_key: "",
+      collection_task_id: "",
+      collection_round_trip_phase: roundTripPhaseOverride || "in",
+    });
+    renderTaskForm(draftState, false);
+  });
+}
+
 if (taskSelectEl) {
   taskSelectEl.addEventListener("change", () => {
     const selectedKey = taskSelectEl.value;
@@ -1335,8 +1875,24 @@ if (taskSelectEl) {
       (entry.key || entry.gripper_task || "") === selectedKey
     ));
     if (!item) return;
+    if (taskTypeSelectEl) {
+      taskTypeOverride = normalizeTaskType(item.task_type);
+      roundTripPhaseOverride = taskTypeOverride === "round_trip" ? "in" : null;
+      taskTypeSelectEl.value = taskTypeOverride;
+    }
     if (taskEnglishNameInputEl) taskEnglishNameInputEl.value = item.english_name || item.key || "";
     if (taskChineseNameInputEl) taskChineseNameInputEl.value = item.chinese_name || "";
+  });
+}
+
+if (fixArmSideSelectEl) {
+  fixArmSideSelectEl.addEventListener("change", async () => {
+    if (fixArmSideSelectEl.disabled) return;
+    try {
+      await sendEvent("fix_arm_select:" + fixArmSideSelectEl.value);
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
   });
 }
 
@@ -1364,12 +1920,14 @@ document.addEventListener("keydown", async (event) => {
 
 function updateButtons(state) {
   activeControls = new Set(state.active_controls || []);
+  const episodePreparing = String(state.episode_event_status || "") === "preparing";
   buttons.forEach((button) => {
     const eventName = button.dataset.event;
     button.disabled = !activeControls.has(eventName);
     if (state.capturing && eventName === "c") button.disabled = true;
-    if (state.episode_recording && eventName === "episode_start") button.disabled = true;
-    if (!state.episode_recording && eventName === "episode_stop") button.disabled = true;
+    if ((state.episode_recording || episodePreparing) && eventName === "episode_start") button.disabled = true;
+    if (!state.episode_recording && !episodePreparing && eventName === "episode_stop") button.disabled = true;
+    if ((state.episode_recording || episodePreparing) && eventName === "record_pose_snapshot") button.disabled = true;
     const isSelectedSideButton =
       (eventName === "1" && state.selected_side === "left") ||
       (eventName === "2" && state.selected_side === "right");
@@ -1391,7 +1949,17 @@ function updateButtons(state) {
   const captureButton = Array.from(buttons).find((button) => button.dataset.event === "c");
   if (captureButton) {
     const captureStage = String(state.capture_stage || "");
-    captureButton.textContent = captureStage === "runtime_home" ? "采集 Home" : "开始采集";
+    if (state.fix_arm_available && state.teleop_running) {
+      const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+      const label = side === "right" ? "右臂" : "左臂";
+      captureButton.textContent = state.fix_arm_recalibrating
+        ? `重采 ${label} Home...`
+        : state.fix_arm_active
+          ? `重采 ${label} Home`
+          : `固定 ${label}`;
+    } else {
+      captureButton.textContent = captureStage === "runtime_home" ? "采集 Home" : "开始采集";
+    }
   }
 }
 
@@ -1408,6 +1976,36 @@ function renderMovementMultiple(state) {
     movementMultipleInputEl.value = value.toFixed(3);
   }
   movementMultipleStatusEl.textContent = `movement_multiple=${Number.isFinite(value) ? value.toFixed(3) : "-"}`;
+}
+
+function renderFixArm(state) {
+  const available = Boolean(state.fix_arm_available);
+  if (fixArmSectionEl) fixArmSectionEl.hidden = !available;
+  if (!available) return;
+  const selected = state.fix_arm_selected_side || "left";
+  const fixed = state.fix_arm_fixed_side || "";
+  const recalibrating = Boolean(state.fix_arm_recalibrating);
+  if (fixArmSideSelectEl) {
+    fixArmSideSelectEl.disabled = !activeControls.has("fix_arm_select") || Boolean(fixed);
+    if (document.activeElement !== fixArmSideSelectEl) {
+      fixArmSideSelectEl.value = selected;
+    }
+  }
+  if (!fixArmStatusEl) return;
+  const side = fixed || selected;
+  const label = side === "right" ? "右臂" : "左臂";
+  const lines = [];
+  if (recalibrating) {
+    const count = state.fix_arm_sample_count == null ? "-" : String(state.fix_arm_sample_count);
+    const total = state.fix_arm_min_samples == null ? "-" : String(state.fix_arm_min_samples);
+    lines.push(`${label}: 重采 home ${count}/${total}`);
+  } else if (fixed) {
+    lines.push(`${label}: 固定中`);
+  } else {
+    lines.push(`${label}: 待固定`);
+  }
+  if (state.fix_arm_status) lines.push(String(state.fix_arm_status));
+  fixArmStatusEl.textContent = lines.join("\\n");
 }
 
 function formatCapture(state) {
@@ -1476,12 +2074,14 @@ function renderCaptureMode(state) {
   let progress = 0;
   let detail = "等待流程进入采集阶段";
   const captureStage = String(state.capture_stage || "");
-  const sampleLabel = captureStage === "runtime_home" ? "Home 样本" : "标定样本";
+  const sampleLabel = captureStage === "runtime_home" ? "Home 样本" : (captureStage === "force_control_warmup" ? "力控预热" : "标定样本");
   if (phase === "ready") {
     detail = "按“开始采集”后会先进入准备倒计时";
   } else if (phase === "preparing") {
     progress = prepTotal > 0 ? (1 - prepRemaining / prepTotal) * 100 : 100;
-    detail = `倒计时 ${prepRemaining.toFixed(1)}s，当前还未写入标定样本`;
+    detail = captureStage === "force_control_warmup"
+      ? `正在预热 RM65 力控，预计剩余 ${prepRemaining.toFixed(1)}s`
+      : `倒计时 ${prepRemaining.toFixed(1)}s，当前还未写入${sampleLabel}`;
   } else if (phase === "capturing") {
     const minSamples = Number(state.capture_min_samples || 0);
     const leftSamples = state.capture_left_samples == null ? null : Number(state.capture_left_samples);
@@ -1542,7 +2142,7 @@ function formatVector(values, unit) {
 function formatRawPose(pose) {
   if (pose && pose.enabled === false) return {status: "未启用", text: "当前 logical side 未启用"};
   if (!pose) return {status: "无数据", text: "未收到 channel"};
-  const status = pose.valid ? "有效" : "无效";
+  const status = pose.status_label || (pose.valid ? "有效" : "无效");
   const tracker = pose.tracker_name || "-";
   const role = pose.tracker_role || "-";
   const age = pose.age_sec == null ? "-" : Number(pose.age_sec).toFixed(2) + " s";
@@ -1562,6 +2162,12 @@ function formatRawPose(pose) {
   };
 }
 
+function setRawPoseCardClass(el, pose) {
+  if (!el) return;
+  const level = pose && pose.status_level ? String(pose.status_level) : "ok";
+  el.className = `raw-pose-card ${level}`;
+}
+
 function renderRawPoses(state) {
   const poses = state.raw_tracker_poses || {};
   const left = formatRawPose(poses.left);
@@ -1570,6 +2176,8 @@ function renderRawPoses(state) {
   rightRawStatusEl.textContent = right.status;
   leftRawPoseEl.textContent = left.text;
   rightRawPoseEl.textContent = right.text;
+  setRawPoseCardClass(leftRawCardEl, poses.left);
+  setRawPoseCardClass(rightRawCardEl, poses.right);
 }
 
 function formatMs(value) {
@@ -1590,6 +2198,12 @@ function formatAge(value) {
 function formatCount(value) {
   if (value == null || !Number.isFinite(Number(value))) return "-";
   return String(Number(value));
+}
+
+function formatFlag(value) {
+  if (value === true) return "yes";
+  if (value === false) return "no";
+  return "-";
 }
 
 function formatQ6Values(values) {
@@ -1625,6 +2239,159 @@ function escapeHtml(value) {
 
 function sideLabel(side) {
   return sideLabels[side] || side;
+}
+
+function formatTactileReady(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "-";
+  const entries = Object.entries(value);
+  if (entries.length === 0) return "-";
+  const readyCount = entries.filter(([, ready]) => Boolean(ready)).length;
+  return `${readyCount}/${entries.length}`;
+}
+
+function formatTactileStatus(item) {
+  if (!item.connect_tactile) return "disabled";
+  const mode = item.tactile_process_read ? "process" : "inline";
+  const worker = item.tactile_process_read ? formatFlag(item.tactile_worker_alive) : "-";
+  const readMs = item.tactile_read_elapsed_s == null
+    ? "-"
+    : formatMs(Number(item.tactile_read_elapsed_s) * 1000.0);
+  return [
+    `ready=${formatTactileReady(item.tactile_ready)}`,
+    `ver=${formatCount(item.tactile_version)}`,
+    `mode=${mode}`,
+    `worker=${worker}`,
+    `read=${readMs}`,
+    `skip=${formatFlag(item.tactile_read_skipped)}`,
+  ].join(" ");
+}
+
+function statusLevelClass(value) {
+  const level = String(value || "ok");
+  return ["ok", "warn", "error", "waiting", "off"].includes(level) ? level : "ok";
+}
+
+function formatProfile(item) {
+  const width = item.width == null ? "-" : String(item.width);
+  const height = item.height == null ? "-" : String(item.height);
+  const fps = item.fps == null ? "-" : String(item.fps);
+  return `${width}x${height}@${fps} ${item.color_space || ""}`.trim();
+}
+
+function formatBrief(value, maxItems = 4) {
+  if (value == null) return "-";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "-";
+    const items = value.slice(0, maxItems).map((item) => {
+      if (Array.isArray(item)) return "[" + item.join(",") + "]";
+      if (item && typeof item === "object") return JSON.stringify(item);
+      return String(item);
+    });
+    if (value.length > maxItems) items.push("...");
+    return items.join(", ");
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value);
+    if (entries.length === 0) return "-";
+    const items = entries.slice(0, maxItems).map(([key, item]) => {
+      const rendered = Array.isArray(item)
+        ? "[" + item.join(",") + "]"
+        : (item && typeof item === "object" ? JSON.stringify(item) : String(item));
+      return `${key}:${rendered}`;
+    });
+    if (entries.length > maxItems) items.push("...");
+    return items.join(" ");
+  }
+  return String(value);
+}
+
+function renderCameraStatus(state) {
+  if (!cameraStatusSectionEl || !cameraCardsEl) return;
+  const cameraStatus = state.camera_status || {};
+  const entries = Object.entries(cameraStatus).sort(([left], [right]) => left.localeCompare(right));
+  cameraStatusSectionEl.hidden = false;
+  if (entries.length === 0) {
+    cameraCardsEl.innerHTML = `
+      <div class="device-card off">
+        <div class="device-title"><span>未配置</span><span>off</span></div>
+        <div class="device-body mono">当前没有 RealSense camera_sources。</div>
+      </div>
+    `;
+    return;
+  }
+  cameraCardsEl.innerHTML = entries.map(([key, item]) => {
+    const level = statusLevelClass(item.status_level);
+    const serial = item.serial_number || item.serial || "-";
+    const device = item.device_name || item.product_line || item.name || "-";
+    const preview = item.preview_selected
+      ? (item.preview_active ? "active" : "selected")
+      : "not selected";
+    const lines = [
+      `serial: ${serial}`,
+      `device: ${device}`,
+      `profile: ${formatProfile(item)}`,
+      `frames: ${formatCount(item.frame_count)} age=${formatAge(item.last_frame_age_sec)}`,
+      `timeout: ${formatCount(item.timeout_count)} consecutive=${formatCount(item.consecutive_timeout_count)}`,
+      `restart: ${formatCount(item.restart_count)} preview=${preview}`,
+    ];
+    if (item.status_message) lines.push(`status: ${item.status_message}`);
+    if (item.last_runtime_error && item.last_runtime_error !== item.last_error) {
+      lines.push(`runtime: ${item.last_runtime_error}`);
+    }
+    if (item.last_error) lines.push(`error: ${item.last_error}`);
+    return `
+      <div class="device-card ${level}">
+        <div class="device-title">
+          <span>${escapeHtml(key)}</span>
+          <span>${escapeHtml(item.status_label || level)}</span>
+        </div>
+        <div class="device-body mono">${escapeHtml(lines.join("\\n"))}</div>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderTactileCameraStatus(state) {
+  if (!tactileCameraStatusSectionEl || !tactileCameraCardsEl) return;
+  const tactileStatus = state.tactile_camera_status || {};
+  const entries = Object.entries(tactileStatus).sort(([left], [right]) => left.localeCompare(right));
+  tactileCameraStatusSectionEl.hidden = false;
+  if (entries.length === 0) {
+    tactileCameraCardsEl.innerHTML = `
+      <div class="device-card off">
+        <div class="device-title"><span>未配置</span><span>off</span></div>
+        <div class="device-body mono">当前没有 DMTac 视触觉状态。</div>
+      </div>
+    `;
+    return;
+  }
+  tactileCameraCardsEl.innerHTML = entries.map(([side, item]) => {
+    const level = statusLevelClass(item.status_level);
+    const mode = item.tactile_process_read ? "process" : "inline";
+    const readyTotal = item.ready_total || item.device_count || "-";
+    const lines = [
+      `connected/tactile: ${formatFlag(item.is_connected)} / ${formatFlag(item.connect_tactile)}`,
+      `devices: ${formatBrief(item.tactile_devices)}`,
+      `ready: ${formatCount(item.ready_count)}/${readyTotal}`,
+      `frame ids: ${formatBrief(item.tactile_frame_ids)}`,
+      `age/version: ${formatAge(item.tactile_age_sec)} / ${formatCount(item.tactile_version)}`,
+      `mode: ${mode} worker=${formatFlag(item.tactile_worker_alive)} receiver=${formatFlag(item.tactile_worker_receiver_alive)}`,
+      `read/gate: ${formatMs(item.tactile_read_elapsed_s == null ? null : Number(item.tactile_read_elapsed_s) * 1000.0)} / ${formatMs(item.tactile_gate_wait_s == null ? null : Number(item.tactile_gate_wait_s) * 1000.0)}`,
+      `hz/max_fps: ${formatScalar(item.tactile_read_hz)} / ${formatScalar(item.tactile_max_fps)} skip=${formatFlag(item.tactile_read_skipped)}`,
+      `shapes: ${formatBrief(item.tactile_shapes)}`,
+    ];
+    if (item.status_message) lines.push(`status: ${item.status_message}`);
+    if (item.telemetry_error) lines.push(`error: ${item.telemetry_error}`);
+    return `
+      <div class="device-card ${level}">
+        <div class="device-title">
+          <span>${escapeHtml(sideLabel(side))}视触觉</span>
+          <span>${escapeHtml(item.status_label || level)}</span>
+        </div>
+        <div class="device-body mono">${escapeHtml(lines.join("\\n"))}</div>
+      </div>
+    `;
+  }).join("");
 }
 
 function renderGripper(state) {
@@ -1665,6 +2432,7 @@ function renderGripper(state) {
       `state: ${formatScalar(item.state)}  max: ${formatScalar(item.max_action)}`,
       `speed/force: ${formatScalar(item.speed)} / ${formatScalar(item.torque)}`,
       `tactile: ${tactileDevices}`,
+      `tactile status: ${formatTactileStatus(item)}`,
     ];
     if (item.q6_read_error) lines.push(`q6 error: ${item.q6_read_error}`);
     if (command.error) lines.push(`cmd error: ${command.error}`);
@@ -1687,22 +2455,29 @@ function renderGripper(state) {
 function renderEpisode(state) {
   const available = Boolean(state.episode_recording_available);
   const recording = Boolean(state.episode_recording);
+  const preparing = String(state.episode_event_status || "") === "preparing";
   if (episodeStartButtonEl) {
-    episodeStartButtonEl.textContent = recording ? "数采进行中" : "开始数采";
-    episodeStartButtonEl.classList.toggle("active", recording);
+    episodeStartButtonEl.textContent = recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采");
+    episodeStartButtonEl.classList.toggle("active", recording || preparing);
+    episodeStartButtonEl.classList.toggle("recording-active", recording || preparing);
   }
   if (episodeStopButtonEl) {
-    episodeStopButtonEl.classList.toggle("active", recording);
+    episodeStopButtonEl.classList.toggle("active", recording || preparing);
+    episodeStopButtonEl.classList.toggle("stop-ready", recording || preparing);
   }
-  renderTaskForm(state, recording);
+  renderEpisodeBanner(state);
+  renderTaskForm(state, recording || preparing);
   const lines = [
     available ? "episode 录制可用" : "episode 录制不可用",
-    recording ? "状态: 录制中" : "状态: 未录制",
+    recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"),
   ];
   if (state.episode_dir) lines.push(`路径: ${state.episode_dir}`);
   if (state.dataset_root) lines.push(`保存根目录: ${state.dataset_root}`);
   if (state.collection_task_name || state.collection_task_id) {
     lines.push(`task: ${state.collection_task_name || "-"} (${state.collection_task_id || "-"})`);
+  }
+  if (normalizeTaskType(state.collection_task_type) === "round_trip") {
+    lines.push(`来回方向: ${roundTripPhaseLabels[normalizeRoundTripPhase(state.collection_round_trip_phase)] || "-"}`);
   }
   if (state.collection_task_name_zh) lines.push(`中文名: ${state.collection_task_name_zh}`);
   if (state.episode_frame_count != null) lines.push(`帧数: ${state.episode_frame_count}`);
@@ -1735,26 +2510,127 @@ function renderEpisode(state) {
   }
 }
 
+function renderEpisodeBanner(state) {
+  if (!episodeBannerEl || !episodeBannerStateEl || !episodeBannerCounterEl || !episodeBannerDetailEl || !episodeBannerMetaEl) {
+    return;
+  }
+  const available = Boolean(state.episode_recording_available);
+  const recording = Boolean(state.episode_recording);
+  let status = String(state.episode_event_status || "");
+  if (!available) {
+    status = "unavailable";
+  } else if (recording) {
+    status = "recording";
+  } else if (!status) {
+    status = "idle";
+  }
+  const statusLabels = {
+    unavailable: "数采不可用",
+    idle: "未开始数采",
+    preparing: "3 秒后开始数采",
+    recording: "● 正在数采",
+    finalizing: "停止中 / 后台保存",
+    saved: "已保存",
+    discarded: "已停止 / 无样本",
+    error: "保存失败",
+  };
+  const className = ["episode-banner"];
+  if (["preparing", "recording", "finalizing", "saved", "discarded", "error", "unavailable"].includes(status)) {
+    className.push(status === "discarded" ? "finalizing" : status);
+  }
+  episodeBannerEl.className = className.join(" ");
+  episodeBannerStateEl.textContent = statusLabels[status] || status || "未开始数采";
+
+  const frameCount = state.episode_frame_count;
+  const frameText = frameCount == null ? "-" : `${frameCount} 帧`;
+  const sampleHz = state.episode_sample_hz == null ? null : Number(state.episode_sample_hz);
+  const targetHz = state.episode_target_hz == null ? null : Number(state.episode_target_hz);
+  const hzText = Number.isFinite(sampleHz)
+    ? `${sampleHz.toFixed(1)} Hz${Number.isFinite(targetHz) ? " / " + targetHz.toFixed(1) + " Hz" : ""}`
+    : "";
+  episodeBannerCounterEl.textContent = hzText ? `${frameText} · ${hzText}` : frameText;
+
+  const message = state.episode_event_message || "";
+  const detailFallback = recording
+    ? "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
+    : available
+      ? "点击“开始数采”或按 A 开始；再次按 A 停止。"
+      : "当前启动参数禁用了正式数据集和 debug episode 录制。";
+  const path = state.episode_dir || state.dataset_root || "";
+  episodeBannerDetailEl.textContent = [
+    message || detailFallback,
+    path ? `路径: ${path}` : "",
+  ].filter(Boolean).join("\\n");
+
+  const chips = [];
+  if (state.collection_task_name || state.collection_task_id) {
+    chips.push(["Task", state.collection_task_name || state.collection_task_id]);
+  }
+  if (normalizeTaskType(state.collection_task_type) === "round_trip") {
+    chips.push(["方向", roundTripPhaseLabels[normalizeRoundTripPhase(state.collection_round_trip_phase)] || "-"]);
+  }
+  if (state.collection_task_name_zh) {
+    chips.push(["中文", state.collection_task_name_zh]);
+  }
+  if (state.episode_last_episode_index != null) {
+    chips.push(["Episode", `#${state.episode_last_episode_index}`]);
+  }
+  const tactileWriteHz = state.episode_tactile_write_hz || {};
+  const tactileSides = ["left", "right"].filter((side) => tactileWriteHz[side] != null);
+  if (tactileSides.length > 0) {
+    chips.push([
+      "触觉",
+      tactileSides.map((side) => `${side === "left" ? "L" : "R"} ${Number(tactileWriteHz[side]).toFixed(1)}Hz`).join(" / "),
+    ]);
+  }
+  const warning = state.episode_frequency_warning || {};
+  if (warning.active) {
+    chips.push(["频率", "低于目标"]);
+  }
+  episodeBannerMetaEl.innerHTML = chips.map(([label, value]) => (
+    `<span class="episode-banner-chip">${escapeHtml(label)}: ${escapeHtml(value)}</span>`
+  )).join("");
+}
+
 function renderTaskForm(state, recording) {
   window.__latestTaskRegistry = Array.isArray(state.task_registry) ? state.task_registry : [];
+  const preparing = String(state.episode_event_status || "") === "preparing";
+  const locked = Boolean(recording || preparing);
+  const selectedType = normalizeTaskType(
+    taskTypeOverride
+      ? taskTypeOverride
+      : taskTypeSelectEl && document.activeElement === taskTypeSelectEl
+      ? taskTypeSelectEl.value
+      : state.collection_task_type
+  );
   if (datasetBaseRootInputEl) {
-    datasetBaseRootInputEl.disabled = recording;
+    datasetBaseRootInputEl.disabled = locked;
     if (document.activeElement !== datasetBaseRootInputEl) {
       datasetBaseRootInputEl.value = state.dataset_base_root || "";
     }
   }
+  if (datasetChooseRootButtonEl) {
+    datasetChooseRootButtonEl.disabled = locked;
+  }
+  if (taskTypeSelectEl) {
+    taskTypeSelectEl.disabled = locked;
+    if (document.activeElement !== taskTypeSelectEl) {
+      taskTypeSelectEl.value = selectedType;
+    }
+  }
   const registry = Array.isArray(state.task_registry) ? state.task_registry : [];
   if (taskSelectEl) {
-    taskSelectEl.disabled = recording;
-    const current = state.collection_task_id || state.gripper_task || "";
-    const existing = Array.from(taskSelectEl.options).map((option) => option.value).join("\n");
-    const desiredItems = [{key: "", label: "自定义"}].concat(registry.map((item) => ({
+    taskSelectEl.disabled = locked;
+    const current = state.collection_task_key || state.collection_task_id || state.gripper_task || "";
+    const existing = Array.from(taskSelectEl.options).map((option) => option.value).join("\\n");
+    const filteredRegistry = registry.filter((item) => normalizeTaskType(item.task_type) === selectedType);
+    const desiredItems = [{key: "", label: "自定义"}].concat(filteredRegistry.map((item) => ({
       key: item.key || item.gripper_task || "",
       label: `${item.chinese_name || item.english_name || item.key || ""} / ${item.english_name || item.key || ""}`,
     })));
-    const existingLabels = Array.from(taskSelectEl.options).map((option) => option.textContent || "").join("\n");
-    const desiredValues = desiredItems.map((item) => item.key).join("\n");
-    const desiredLabels = desiredItems.map((item) => item.label).join("\n");
+      const existingLabels = Array.from(taskSelectEl.options).map((option) => option.textContent || "").join("\\n");
+      const desiredValues = desiredItems.map((item) => item.key).join("\\n");
+      const desiredLabels = desiredItems.map((item) => item.label).join("\\n");
     if (existing !== desiredValues || existingLabels !== desiredLabels) {
       taskSelectEl.innerHTML = desiredItems.map((item) => (
         `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`
@@ -1765,15 +2641,42 @@ function renderTaskForm(state, recording) {
     }
   }
   if (taskEnglishNameInputEl) {
-    taskEnglishNameInputEl.disabled = recording;
+    taskEnglishNameInputEl.disabled = locked;
     if (document.activeElement !== taskEnglishNameInputEl) {
-      taskEnglishNameInputEl.value = state.collection_task_name || "";
+      taskEnglishNameInputEl.value = selectedType === "round_trip"
+        ? (state.collection_round_trip_base_name || state.collection_task_name || "").replace(/_(in|out)$/i, "")
+        : state.collection_task_name || "";
     }
   }
   if (taskChineseNameInputEl) {
-    taskChineseNameInputEl.disabled = recording;
+    taskChineseNameInputEl.disabled = locked;
     if (document.activeElement !== taskChineseNameInputEl) {
       taskChineseNameInputEl.value = state.collection_task_name_zh || "";
+    }
+  }
+  const roundTripActive = selectedType === "round_trip";
+  const phase = normalizeRoundTripPhase(roundTripPhaseOverride || state.collection_round_trip_phase);
+  const nextPhase = roundTripPhaseOverride
+    ? (phase === "in" ? "out" : "in")
+    : normalizeRoundTripPhase(state.collection_round_trip_next_phase || (phase === "in" ? "out" : "in"));
+  if (roundTripToggleButtonEl) {
+    roundTripToggleButtonEl.disabled = locked || !roundTripActive || !activeControls.has("round_trip_toggle");
+    roundTripToggleButtonEl.classList.toggle("active", roundTripActive);
+    roundTripToggleButtonEl.textContent = roundTripActive
+      ? `切换到 ${roundTripPhaseLabels[nextPhase] || "_" + nextPhase}`
+      : "切换 in/out";
+  }
+  if (roundTripStatusEl) {
+    if (roundTripActive) {
+      const baseName = state.collection_round_trip_base_name || (state.collection_task_name || "").replace(/_(in|out)$/i, "");
+      const baseId = state.collection_round_trip_base_id || (state.collection_task_id || "").replace(/_(in|out)$/i, "");
+      roundTripStatusEl.textContent = [
+        `来回类: 当前将采 ${roundTripPhaseLabels[phase] || "_" + phase}`,
+        `task=${state.collection_task_name || baseName || "-"}`,
+        `id=${state.collection_task_id || baseId || "-"}`,
+      ].join("  ");
+    } else {
+      roundTripStatusEl.textContent = "一般类任务：每次采集使用同一个 task 标签。";
     }
   }
 }
@@ -1797,6 +2700,105 @@ function renderVisualization(state) {
   ];
   if (state.visualization_status) lines.push(String(state.visualization_status));
   visualizationStatusEl.textContent = lines.join("\\n");
+}
+
+function renderPoseSnapshot(state) {
+  const available = Boolean(state.pose_snapshot_available);
+  const recording = Boolean(state.episode_recording);
+  const preparing = String(state.episode_event_status || "") === "preparing";
+  if (poseSnapshotSectionEl) {
+    poseSnapshotSectionEl.hidden = !available;
+  }
+  if (poseSnapshotButtonEl) {
+    poseSnapshotButtonEl.disabled = !available || recording || preparing || !activeControls.has("record_pose_snapshot");
+  }
+  if (!poseSnapshotStatusEl) return;
+  if (!available) {
+    poseSnapshotStatusEl.textContent = "-";
+    return;
+  }
+  const lines = [
+    recording || preparing ? "状态: 与正式数采互斥，当前不可抽帧" : "状态: 可抽帧",
+    `数量: ${state.pose_snapshot_count == null ? 0 : state.pose_snapshot_count}`,
+  ];
+  if (state.pose_snapshot_dir) lines.push(`目录: ${state.pose_snapshot_dir}`);
+  if (state.pose_snapshot_last_path) lines.push(`最近: ${state.pose_snapshot_last_path}`);
+  if (state.pose_snapshot_status) lines.push(String(state.pose_snapshot_status));
+  poseSnapshotStatusEl.textContent = lines.join("\\n");
+}
+
+const poseQualityLabels = {
+  good: "good",
+  warning: "warning",
+  bad: "bad",
+  unknown: "unknown",
+};
+
+function poseQualityCardLevel(quality) {
+  const level = String(quality.level || "");
+  if (["ok", "warn", "error", "off"].includes(level)) return level;
+  const status = String(quality.status || "unknown");
+  if (status === "bad" || quality.bad) return "error";
+  if (status === "warning") return "warn";
+  if (status === "good") return "ok";
+  return "off";
+}
+
+function formatPoseQualityMetric(value, digits, unit) {
+  if (value == null || !Number.isFinite(Number(value))) return "-";
+  return Number(value).toFixed(digits) + unit;
+}
+
+function renderPoseQuality(state) {
+  const quality = state.pose_quality || {};
+  const metrics = quality.metrics || {};
+  const status = String(quality.status || "unknown");
+  const score = quality.score == null || !Number.isFinite(Number(quality.score))
+    ? "-"
+    : Number(quality.score).toFixed(2);
+  const reasons = Array.isArray(quality.reasons) ? quality.reasons : [];
+  const badReasons = Array.isArray(quality.bad_reasons) ? quality.bad_reasons : [];
+  const warningReasons = Array.isArray(quality.warning_reasons) ? quality.warning_reasons : [];
+  if (poseQualityCardEl) {
+    poseQualityCardEl.className = `device-card ${poseQualityCardLevel(quality)}`;
+  }
+  if (poseQualityStatusEl) {
+    poseQualityStatusEl.textContent = poseQualityLabels[status] || status;
+  }
+  if (poseQualityScoreEl) {
+    poseQualityScoreEl.textContent = `score ${score}`;
+  }
+  if (!poseQualityDetailEl) return;
+  const lines = [];
+  lines.push(`available: ${quality.available ? "yes" : "no"}`);
+  if (badReasons.length) lines.push(`bad: ${badReasons.join(", ")}`);
+  if (warningReasons.length) lines.push(`warning: ${warningReasons.join(", ")}`);
+  if (!badReasons.length && !warningReasons.length) {
+    lines.push(`reasons: ${reasons.length ? reasons.join(", ") : "none"}`);
+  }
+  lines.push(`source: ${quality.source || "-"}`);
+  lines.push(
+    `collision: ${metrics.collision_avoidance_status || "-"} ` +
+    `dist=${formatPoseQualityMetric(metrics.collision_distance_m, 3, "m")} ` +
+    `min=${formatPoseQualityMetric(metrics.collision_min_distance_m, 3, "m")} ` +
+    `margin=${formatPoseQualityMetric(metrics.collision_margin_m, 3, "m")}`
+  );
+  lines.push(
+    `ik: jump=${metrics.ik_jump_gate_status || "-"} branch=${metrics.ik_branch_candidate || "-"} ` +
+    `err=${formatPoseQualityMetric(metrics.ik_translation_error_m, 3, "m")}/` +
+    `${formatPoseQualityMetric(metrics.ik_rotation_error_deg, 1, "deg")}`
+  );
+  lines.push(
+    `joint: nearest_margin=${formatPoseQualityMetric(metrics.joint_nearest_margin_deg, 1, "deg")} ` +
+    `near_limit=${metrics.joint_near_limit ? "yes" : "no"}`
+  );
+  if (metrics.execution_step_limited || metrics.ik_time_budget_exceeded) {
+    lines.push(
+      `runtime: step_limited=${metrics.execution_step_limited ? "yes" : "no"} ` +
+      `time_budget_exceeded=${metrics.ik_time_budget_exceeded ? "yes" : "no"}`
+    );
+  }
+  poseQualityDetailEl.textContent = lines.join("\\n");
 }
 
 function renderIkWarning(state) {
@@ -1854,7 +2856,7 @@ function renderIkTiming(state) {
     `status=${timing.status || "-"}`,
     `jump=${timing.jump_gate_status || "-"}`,
     `branch=${timing.branch_candidate || "-"}`,
-    state.debug_ik_logging ? `记录=${state.ik_debug_log_path || "logs"}` : "",
+    state.debug_ik_logging ? `记录=${state.ik_debug_log_path || "teleop_records/ik_debug"}` : "",
     budgetText,
     timing.message || "",
   ].filter(Boolean).join("  ");
@@ -1890,6 +2892,16 @@ async function refresh() {
     if (!response.ok) throw new Error("state fetch failed: " + response.status);
     const state = await response.json();
     latestState = state || {};
+    if (taskTypeOverride && normalizeTaskType(state.collection_task_type) === taskTypeOverride) {
+      taskTypeOverride = null;
+    }
+    if (
+      roundTripPhaseOverride &&
+      normalizeTaskType(state.collection_task_type) === "round_trip" &&
+      normalizeRoundTripPhase(state.collection_round_trip_phase) === roundTripPhaseOverride
+    ) {
+      roundTripPhaseOverride = null;
+    }
     stageEl.textContent = labelFor(stageLabels, state.stage || "Starting...");
     pillsEl.innerHTML = formatPills(state);
     selectedSideEl.textContent = labelFor(sideLabels, state.selected_side);
@@ -1905,11 +2917,16 @@ async function refresh() {
     updateButtons(state);
     renderViveCalibrationProfile(state);
     renderMovementMultiple(state);
+    renderFixArm(state);
     renderRawPoses(state);
     renderEpisode(state);
     renderVisualization(state);
+    renderPoseSnapshot(state);
     renderGripper(state);
+    renderCameraStatus(state);
+    renderTactileCameraStatus(state);
     renderIkWarning(state);
+    renderPoseQuality(state);
     renderIkTiming(state);
     renderMessages(state.messages || []);
     window.__calibrationWebUiModernRefreshOk = true;
@@ -1959,6 +2976,15 @@ _FALLBACK_SCRIPT = r"""
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
+  }
+
+  function normalizeTaskTypeFallback(value) {
+    var text = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+    return /^(roundtrip|round_trip|back_and_forth|in_out|inout|往返|来回)$/.test(text) ? "round_trip" : "general";
+  }
+
+  function normalizeRoundTripPhaseFallback(value) {
+    return String(value || "").trim().toLowerCase() === "out" ? "out" : "in";
   }
 
   function labelStage(value) {
@@ -2041,7 +3067,7 @@ _FALLBACK_SCRIPT = r"""
     if (!pose) {
       return {status: "无数据", text: "未收到 channel"};
     }
-    var status = pose.valid ? "有效" : "无效";
+    var status = pose.status_label || (pose.valid ? "有效" : "无效");
     return {
       status: status,
       text: [
@@ -2053,6 +3079,13 @@ _FALLBACK_SCRIPT = r"""
         "rpy(deg):" + vectorText(pose.rpy_deg, 1)
       ].join("\n")
     };
+  }
+
+  function setRawPoseClass(id, pose) {
+    var el = byId(id);
+    if (!el) return;
+    var level = pose && pose.status_level ? String(pose.status_level) : "ok";
+    el.className = "raw-pose-card " + level;
   }
 
   function renderCaptureMode(state) {
@@ -2067,12 +3100,15 @@ _FALLBACK_SCRIPT = r"""
     var minSamples = Number(state.capture_min_samples || 0);
     var leftSamples = Number(state.capture_left_samples || 0);
     var rightSamples = Number(state.capture_right_samples || 0);
-    var sampleLabel = String(state.capture_stage || "") === "runtime_home" ? "Home 样本" : "标定样本";
+    var captureStage = String(state.capture_stage || "");
+    var sampleLabel = captureStage === "runtime_home" ? "Home 样本" : (captureStage === "force_control_warmup" ? "力控预热" : "标定样本");
     if (phase === "ready") {
       detail = "按“开始采集”后会先进入准备倒计时";
     } else if (phase === "preparing") {
       progress = prepTotal > 0 ? (1 - prepRemaining / prepTotal) * 100 : 100;
-      detail = "倒计时 " + prepRemaining.toFixed(1) + "s，当前还未写入" + sampleLabel;
+      detail = captureStage === "force_control_warmup"
+        ? "正在预热 RM65 力控，预计剩余 " + prepRemaining.toFixed(1) + "s"
+        : "倒计时 " + prepRemaining.toFixed(1) + "s，当前还未写入" + sampleLabel;
     } else if (phase === "capturing") {
       if (minSamples > 0 && (state.capture_left_samples != null || state.capture_right_samples != null)) {
         progress = Math.min(leftSamples, rightSamples) / minSamples * 100;
@@ -2105,9 +3141,111 @@ _FALLBACK_SCRIPT = r"""
       var eventName = buttons[i].getAttribute("data-event");
       buttons[i].disabled = !active[eventName];
       if (eventName === "c") {
-        buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+        if (state.fix_arm_available && state.teleop_running) {
+          var side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+          var label = side === "right" ? "右臂" : "左臂";
+          buttons[i].textContent = state.fix_arm_recalibrating
+            ? "重采 " + label + " Home..."
+            : state.fix_arm_active
+              ? "重采 " + label + " Home"
+              : "固定 " + label;
+        } else {
+          buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+        }
       }
     }
+  }
+
+  function renderEpisodeStateFallback(state) {
+    var available = Boolean(state.episode_recording_available);
+    var recording = Boolean(state.episode_recording);
+    var preparing = String(state.episode_event_status || "") === "preparing";
+    var startButton = byId("episodeStartButton");
+    var stopButton = byId("episodeStopButton");
+    var statusEl = byId("episodeStatus");
+    var warning = state.episode_frequency_warning || {};
+    var warningBanner = byId("episodeWarningBanner");
+    var warningText = byId("episodeWarningText");
+    var status = String(state.episode_event_status || "");
+    var statusLabels = {
+      unavailable: "数采不可用",
+      idle: "未开始数采",
+      preparing: "3 秒后开始数采",
+      recording: "正在数采",
+      finalizing: "停止中 / 后台保存",
+      saved: "已保存",
+      discarded: "已停止 / 无样本",
+      error: "保存失败"
+    };
+    if (!available) {
+      status = "unavailable";
+    } else if (recording) {
+      status = "recording";
+    } else if (!status) {
+      status = "idle";
+    }
+    if (startButton) {
+      startButton.textContent = recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采");
+      startButton.disabled = !fallbackActiveControls.episode_start || recording || preparing;
+    }
+    if (stopButton) {
+      stopButton.disabled = !fallbackActiveControls.episode_stop || (!recording && !preparing);
+    }
+    var locked = recording || preparing;
+    var fields = ["datasetBaseRootInput", "datasetChooseRootButton", "taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = byId(fields[i]);
+      if (field) field.disabled = locked;
+    }
+    var roundTripButton = byId("roundTripToggleButton");
+    if (roundTripButton) {
+      roundTripButton.disabled = locked || normalizeTaskTypeFallback(state.collection_task_type) !== "round_trip" || !fallbackActiveControls.round_trip_toggle;
+    }
+    var roundTripStatus = byId("roundTripStatus");
+    if (roundTripStatus) {
+      roundTripStatus.textContent = normalizeTaskTypeFallback(state.collection_task_type) === "round_trip"
+        ? "来回类: 当前将采 _" + normalizeRoundTripPhaseFallback(state.collection_round_trip_phase)
+        : "一般类任务：每次采集使用同一个 task 标签。";
+    }
+    if (statusEl) {
+      var lines = [
+        available ? "episode 录制可用" : "episode 录制不可用",
+        recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")
+      ];
+      if (state.episode_dir) lines.push("路径: " + state.episode_dir);
+      if (state.dataset_root) lines.push("保存根目录: " + state.dataset_root);
+      if (state.episode_frame_count != null) lines.push("帧数: " + state.episode_frame_count);
+      statusEl.textContent = lines.join("\n");
+    }
+    if (warningBanner) warningBanner.hidden = !Boolean(warning.active);
+    if (warningText) warningText.textContent = warning.message || "采集频率低于目标值";
+    var banner = byId("episodeBanner");
+    if (banner) {
+      var bannerClass = "episode-banner";
+      if (/^(preparing|recording|finalizing|saved|discarded|error|unavailable)$/.test(status)) {
+        bannerClass += " " + (status === "discarded" ? "finalizing" : status);
+      }
+      banner.className = bannerClass;
+    }
+    setText("episodeBannerState", statusLabels[status] || status || "未开始数采");
+    var frameText = state.episode_frame_count == null ? "-" : String(state.episode_frame_count) + " 帧";
+    var hzText = "";
+    var sampleHz = Number(state.episode_sample_hz);
+    var targetHz = Number(state.episode_target_hz);
+    if (isFinite(sampleHz)) {
+      hzText = sampleHz.toFixed(1) + " Hz" + (isFinite(targetHz) ? " / " + targetHz.toFixed(1) + " Hz" : "");
+    }
+    setText("episodeBannerCounter", hzText ? frameText + " · " + hzText : frameText);
+    var detail = state.episode_event_message || (
+      recording
+        ? "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
+        : available
+          ? "点击“开始数采”或按 A 开始；再次按 A 停止。"
+          : "当前启动参数禁用了正式数据集和 debug episode 录制。"
+    );
+    var path = state.episode_dir || state.dataset_root || "";
+    setText("episodeBannerDetail", detail + (path ? "\n路径: " + path : ""));
+    setText("episodeBannerMeta", state.collection_task_name || state.collection_task_id || "");
   }
 
   function renderMessages(messages) {
@@ -2138,6 +3276,104 @@ _FALLBACK_SCRIPT = r"""
     setText("rightRawStatus", right.status);
     setText("leftRawPose", left.text);
     setText("rightRawPose", right.text);
+    setRawPoseClass("leftRawCard", poses.left);
+    setRawPoseClass("rightRawCard", poses.right);
+  }
+
+  function poseQualityLevelFallback(quality) {
+    quality = quality || {};
+    var level = String(quality.level || "");
+    if (/^(ok|warn|error|off)$/.test(level)) return level;
+    var status = String(quality.status || "unknown");
+    if (status === "bad" || quality.bad) return "error";
+    if (status === "warning") return "warn";
+    if (status === "good") return "ok";
+    return "off";
+  }
+
+  function formatPoseQualityMetricFallback(value, digits, unit) {
+    var numeric = Number(value);
+    if (!isFinite(numeric)) return "-";
+    return numeric.toFixed(digits) + unit;
+  }
+
+  function renderPoseQualityFallback(state) {
+    var quality = state.pose_quality || {};
+    var metrics = quality.metrics || {};
+    var card = byId("poseQualityCard");
+    if (card) card.className = "device-card " + poseQualityLevelFallback(quality);
+    var score = quality.score == null || !isFinite(Number(quality.score)) ? "-" : Number(quality.score).toFixed(2);
+    setText("poseQualityStatus", quality.status || "unknown");
+    setText("poseQualityScore", "score " + score);
+    var reasons = Array.isArray(quality.reasons) ? quality.reasons : [];
+    var badReasons = Array.isArray(quality.bad_reasons) ? quality.bad_reasons : [];
+    var warningReasons = Array.isArray(quality.warning_reasons) ? quality.warning_reasons : [];
+    var lines = [];
+    lines.push("available: " + (quality.available ? "yes" : "no"));
+    if (badReasons.length) lines.push("bad: " + badReasons.join(", "));
+    if (warningReasons.length) lines.push("warning: " + warningReasons.join(", "));
+    if (!badReasons.length && !warningReasons.length) {
+      lines.push("reasons: " + (reasons.length ? reasons.join(", ") : "none"));
+    }
+    lines.push("source: " + (quality.source || "-"));
+    lines.push(
+      "collision: " + (metrics.collision_avoidance_status || "-") +
+      " dist=" + formatPoseQualityMetricFallback(metrics.collision_distance_m, 3, "m") +
+      " min=" + formatPoseQualityMetricFallback(metrics.collision_min_distance_m, 3, "m") +
+      " margin=" + formatPoseQualityMetricFallback(metrics.collision_margin_m, 3, "m")
+    );
+    lines.push(
+      "ik: jump=" + (metrics.ik_jump_gate_status || "-") +
+      " branch=" + (metrics.ik_branch_candidate || "-") +
+      " err=" + formatPoseQualityMetricFallback(metrics.ik_translation_error_m, 3, "m") +
+      "/" + formatPoseQualityMetricFallback(metrics.ik_rotation_error_deg, 1, "deg")
+    );
+    lines.push(
+      "joint: nearest_margin=" + formatPoseQualityMetricFallback(metrics.joint_nearest_margin_deg, 1, "deg") +
+      " near_limit=" + (metrics.joint_near_limit ? "yes" : "no")
+    );
+    setText("poseQualityDetail", lines.join("\n"));
+  }
+
+  function statusLevelClass(value) {
+    var level = String(value || "ok");
+    return /^(ok|warn|error|waiting|off)$/.test(level) ? level : "ok";
+  }
+
+  function renderDeviceStatus(containerId, status, emptyText, titlePrefix) {
+    var el = byId(containerId);
+    if (!el) return;
+    var entries = [];
+    var key;
+    status = status || {};
+    for (key in status) {
+      if (Object.prototype.hasOwnProperty.call(status, key)) entries.push([key, status[key] || {}]);
+    }
+    entries.sort(function (a, b) { return String(a[0]).localeCompare(String(b[0])); });
+    if (!entries.length) {
+      el.innerHTML = '<div class="device-card off"><div class="device-title"><span>未配置</span><span>off</span></div><div class="device-body mono">' +
+        escapeHtml(emptyText) + '</div></div>';
+      return;
+    }
+    var html = [];
+    for (var i = 0; i < entries.length; i += 1) {
+      var name = entries[i][0];
+      var item = entries[i][1] || {};
+      var lines = [];
+      if (item.serial || item.serial_number) lines.push("serial: " + (item.serial_number || item.serial));
+      if (item.frame_count != null) lines.push("frames: " + item.frame_count + " age=" + (item.last_frame_age_sec == null ? "-" : Number(item.last_frame_age_sec).toFixed(2) + " s"));
+      if (item.device_count != null || item.ready_count != null) lines.push("ready: " + (item.ready_count == null ? "-" : item.ready_count) + "/" + (item.ready_total || item.device_count || "-"));
+      if (item.status_message) lines.push("status: " + item.status_message);
+      if (item.last_error) lines.push("error: " + item.last_error);
+      if (item.telemetry_error) lines.push("error: " + item.telemetry_error);
+      html.push(
+        '<div class="device-card ' + statusLevelClass(item.status_level) + '">' +
+        '<div class="device-title"><span>' + escapeHtml(titlePrefix ? titlePrefix + name : name) + '</span><span>' +
+        escapeHtml(item.status_label || item.status_level || "-") + '</span></div>' +
+        '<div class="device-body mono">' + escapeHtml(lines.join("\n") || "-") + '</div></div>'
+      );
+    }
+    el.innerHTML = html.join("");
   }
 
   function renderState(state) {
@@ -2155,6 +3391,10 @@ _FALLBACK_SCRIPT = r"""
     renderCaptureMode(state);
     renderButtons(state);
     renderRawPoses(state);
+    renderPoseQualityFallback(state);
+    renderEpisodeStateFallback(state);
+    renderDeviceStatus("cameraCards", state.camera_status, "当前没有 RealSense camera_sources。", "");
+    renderDeviceStatus("tactileCameraCards", state.tactile_camera_status, "当前没有 DMTac 视触觉状态。", "");
     renderMessages(state.messages || []);
     setHealth("外部兼容脚本正在刷新 state.json；主内联脚本未接管，通常是浏览器策略、扩展或嵌入式页面拦截了 inline script。");
   }
@@ -2185,9 +3425,11 @@ _FALLBACK_SCRIPT = r"""
   function collectEpisodeStartPayloadFallback() {
     return {
       dataset_base_root: byId("datasetBaseRootInput") ? byId("datasetBaseRootInput").value : "",
+      task_type: byId("taskTypeSelect") ? byId("taskTypeSelect").value : normalizeTaskTypeFallback(fallbackLatestState.collection_task_type),
       task_key: byId("taskSelect") ? byId("taskSelect").value : "",
       task_english_name: byId("taskEnglishNameInput") ? byId("taskEnglishNameInput").value : "",
-      task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : ""
+      task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : "",
+      round_trip_phase: normalizeRoundTripPhaseFallback(fallbackLatestState.collection_round_trip_phase)
     };
   }
 
@@ -2205,10 +3447,44 @@ _FALLBACK_SCRIPT = r"""
       }
       xhr.open("POST", "/event", true);
       xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState === 4 && xhr.status >= 400) {
+          setText("sendStatus", "事件未生效: HTTP " + xhr.status);
+        }
+      };
       xhr.send(JSON.stringify(payload));
     } catch (error) {
       setHealth("外部兼容脚本发送按钮事件失败: " + error);
     }
+  }
+
+  function chooseDatasetDirectoryFallback() {
+    var input = byId("datasetBaseRootInput");
+    var button = byId("datasetChooseRootButton");
+    if (!input || !button || button.disabled) return;
+    var xhr = new XMLHttpRequest();
+    button.disabled = true;
+    xhr.open("GET", "/choose-directory?initial=" + encodeURIComponent(input.value || ""), true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) return;
+      button.disabled = false;
+      if (xhr.status !== 200) {
+        setText("sendStatus", "选择文件夹失败: HTTP " + xhr.status);
+        return;
+      }
+      try {
+        var result = JSON.parse(xhr.responseText);
+        if (result.path) {
+          input.value = result.path;
+          setText("sendStatus", "已选择文件夹: " + result.path);
+        } else {
+          setText("sendStatus", result.message || "未选择文件夹");
+        }
+      } catch (error) {
+        setText("sendStatus", "选择文件夹结果解析失败: " + error);
+      }
+    };
+    xhr.send(null);
   }
 
   function isEditableTargetFallback(target) {
@@ -2221,14 +3497,22 @@ _FALLBACK_SCRIPT = r"""
     var eventName = "";
     var payload = null;
     if (key === "a") {
-      eventName = state.episode_recording ? "episode_stop" : "episode_start";
+      eventName = (state.episode_recording || String(state.episode_event_status || "") === "preparing") ? "episode_stop" : "episode_start";
       if (eventName === "episode_start") payload = collectEpisodeStartPayloadFallback();
     } else if (key === "b") {
       eventName = state.teleop_running ? "h" : "p";
     } else if (key === "c") {
-      eventName = "q";
+      if (state.fix_arm_available && state.teleop_running && fallbackActiveControls["c"]) {
+        eventName = "c";
+      } else if (!state.teleop_running && String(state.capture_stage || "") && fallbackActiveControls["c"]) {
+        eventName = "c";
+      }
     } else {
       return false;
+    }
+    if (!eventName) {
+      setText("sendStatus", "快捷键 " + key.toUpperCase() + " 当前不可用");
+      return true;
     }
     if (!fallbackActiveControls[eventName]) {
       setText("sendStatus", "快捷键 " + key.toUpperCase() + " 当前不可用");
@@ -2259,6 +3543,8 @@ _FALLBACK_SCRIPT = r"""
         postEvent(eventName, eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null);
       };
     }
+    var chooseButton = byId("datasetChooseRootButton");
+    if (chooseButton) chooseButton.onclick = chooseDatasetDirectoryFallback;
   }
 
   if (window.__calibrationWebUiModernRefreshOk || window.__calibrationWebUiLegacyPollActive) {
@@ -2274,7 +3560,7 @@ _FALLBACK_SCRIPT = r"""
 """
 
 
-_PAGE_VERSION = "real_teleop_gui_external_fallback_v2"
+_PAGE_VERSION = "real_teleop_gui_collection_tasks_fix_arm_pose_snapshot_v1"
 
 
 def _html_text(value: Any) -> str:
@@ -2316,6 +3602,39 @@ def _json_safe_value(value: Any) -> Any:
 def _json_response_payload(value: Any) -> bytes:
     safe_value = _json_safe_value(value)
     return json.dumps(safe_value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def _choose_directory_payload(initial_dir: str = "") -> dict[str, Any]:
+    initial_text = os.path.expandvars(str(initial_dir or "")).strip()
+    initial_path = Path(initial_text).expanduser() if initial_text else Path.home()
+    if not initial_path.exists():
+        initial_path = initial_path.parent if initial_path.parent.exists() else Path.home()
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        selected = filedialog.askdirectory(
+            parent=root,
+            title="选择数据集保存根目录",
+            initialdir=str(initial_path),
+            mustexist=False,
+        )
+        root.destroy()
+    except Exception as exc:  # noqa: BLE001 - GUI folder dialog is optional.
+        return {
+            "ok": False,
+            "path": "",
+            "message": f"无法打开文件夹选择器，请手动填写路径: {type(exc).__name__}: {exc}",
+        }
+    if not selected:
+        return {"ok": False, "path": "", "message": "已取消文件夹选择。"}
+    return {"ok": True, "path": str(Path(selected).expanduser()), "message": ""}
 
 
 def _label_stage(value: Any) -> str:
@@ -2366,13 +3685,22 @@ def _initial_capture_phase(snapshot: dict[str, Any]) -> str:
 
 def _initial_capture_progress_and_detail(snapshot: dict[str, Any]) -> tuple[float, str]:
     phase = _initial_capture_phase(snapshot)
-    sample_label = "Home 样本" if str(snapshot.get("capture_stage") or "") == "runtime_home" else "标定样本"
+    capture_stage = str(snapshot.get("capture_stage") or "")
+    sample_label = (
+        "Home 样本"
+        if capture_stage == "runtime_home"
+        else "力控预热"
+        if capture_stage == "force_control_warmup"
+        else "标定样本"
+    )
     if phase == "ready":
         return 0.0, "按“开始采集”后会先进入准备倒计时"
     if phase == "preparing":
         total = float(snapshot.get("capture_prep_total_sec") or 0.0)
         remaining = float(snapshot.get("capture_prep_remaining_sec") or 0.0)
         progress = (1.0 - remaining / total) * 100.0 if total > 0.0 else 100.0
+        if capture_stage == "force_control_warmup":
+            return progress, f"正在预热 RM65 力控，预计剩余 {remaining:.1f}s"
         return progress, f"倒计时 {remaining:.1f}s，当前还未写入{sample_label}"
     if phase == "capturing":
         min_samples = int(snapshot.get("capture_min_samples") or 0)
@@ -2444,7 +3772,7 @@ def _initial_raw_pose_text(pose: Any) -> tuple[str, str]:
         return "未启用", "当前 logical side 未启用"
     if not isinstance(pose, dict) or not pose:
         return "无数据", "未收到 channel"
-    status = "有效" if bool(pose.get("valid")) else "无效"
+    status = str(pose.get("status_label") or ("有效" if bool(pose.get("valid")) else "无效"))
     age = pose.get("age_sec")
     try:
         age_text = "-" if age is None else f"{float(age):.2f} s"
@@ -2517,12 +3845,15 @@ class CalibrationWebUiState:
     debug_ik_timing: bool = False
     ik_timing: dict[str, Any] = field(default_factory=dict)
     ik_warning: dict[str, Any] = field(default_factory=dict)
+    pose_quality: dict[str, Any] = field(default_factory=dict)
     debug_ik_logging: bool = False
     ik_debug_log_path: str = ""
     gripper_control_available: bool = False
     gripper_q6_available: bool = False
     gripper_control_enabled: bool = False
     gripper_status: dict[str, Any] = field(default_factory=dict)
+    camera_status: dict[str, Any] = field(default_factory=dict)
+    tactile_camera_status: dict[str, Any] = field(default_factory=dict)
     episode_recording_available: bool = False
     episode_recording: bool = False
     episode_dir: str = ""
@@ -2533,13 +3864,24 @@ class CalibrationWebUiState:
     episode_tactile_write_hz_mean: float | None = None
     episode_tactile_frame_counts: dict[str, Any] = field(default_factory=dict)
     episode_frequency_warning: dict[str, Any] = field(default_factory=dict)
+    episode_event_status: str = "unavailable"
+    episode_event_message: str = ""
+    episode_last_episode_index: int | None = None
+    episode_last_frame_count: int | None = None
     dataset_base_root: str = ""
     dataset_root: str = ""
     dataset_dir_name: str = ""
     collection_task_id: str = ""
+    collection_task_key: str = ""
     collection_task_name: str = ""
     collection_task_name_zh: str = ""
     collection_task_description: str = ""
+    collection_task_type: str = "general"
+    collection_round_trip_phase: str = "in"
+    collection_round_trip_next_phase: str = "out"
+    collection_round_trip_base_name: str = ""
+    collection_round_trip_base_id: str = ""
+    collection_round_trip_active: bool = False
     gripper_task: str = ""
     task_registry: list[dict[str, Any]] = field(default_factory=list)
     camera_visualization_available: bool = False
@@ -2555,6 +3897,19 @@ class CalibrationWebUiState:
     movement_multiple_min: float = 0.05
     movement_multiple_max: float = 10.0
     movement_multiple_step: float = 0.1
+    fix_arm_available: bool = False
+    fix_arm_selected_side: str = ""
+    fix_arm_fixed_side: str = ""
+    fix_arm_active: bool = False
+    fix_arm_recalibrating: bool = False
+    fix_arm_status: str = ""
+    fix_arm_sample_count: int | None = None
+    fix_arm_min_samples: int | None = None
+    pose_snapshot_available: bool = False
+    pose_snapshot_dir: str = ""
+    pose_snapshot_count: int = 0
+    pose_snapshot_last_path: str = ""
+    pose_snapshot_status: str = ""
     active_controls: list[str] = field(default_factory=lambda: ["q"])
     control_hint: str = ""
     capture_stage: str = ""
@@ -2626,6 +3981,13 @@ class CalibrationWebUi:
                     payload = _json_response_payload(ui.snapshot())
                     self._send(200, "application/json; charset=utf-8", payload)
                     return
+                if self.path.startswith("/choose-directory"):
+                    parsed = urlparse(self.path)
+                    params = parse_qs(parsed.query)
+                    initial = params.get("initial", [""])[0]
+                    payload = _json_response_payload(_choose_directory_payload(initial))
+                    self._send(200, "application/json; charset=utf-8", payload)
+                    return
                 if self.path.startswith("/calibration-web-ui-fallback.js"):
                     payload = _FALLBACK_SCRIPT.encode("utf-8")
                     self._send(200, "application/javascript; charset=utf-8", payload)
@@ -2665,9 +4027,11 @@ class CalibrationWebUi:
                             key: str(payload.get(key, "") or "").strip()
                             for key in (
                                 "dataset_base_root",
+                                "task_type",
                                 "task_key",
                                 "task_english_name",
                                 "task_chinese_name",
+                                "round_trip_phase",
                             )
                         }
                         event = "episode_start:" + json.dumps(
@@ -2710,7 +4074,7 @@ class CalibrationWebUi:
     def push_event(self, event: str) -> bool:
         event_name = str(event)
         event_control = event_name.split(":", 1)[0]
-        if ":" in event_name and event_control not in {"movement_multiple_set", "episode_start"}:
+        if ":" in event_name and event_control not in {"movement_multiple_set", "episode_start", "fix_arm_select"}:
             return False
         with self._state_lock:
             active_controls = set(self._state.active_controls)
@@ -2764,12 +4128,15 @@ class CalibrationWebUi:
                 "debug_ik_timing": self._state.debug_ik_timing,
                 "ik_timing": dict(self._state.ik_timing),
                 "ik_warning": dict(self._state.ik_warning),
+                "pose_quality": dict(self._state.pose_quality),
                 "debug_ik_logging": self._state.debug_ik_logging,
                 "ik_debug_log_path": self._state.ik_debug_log_path,
                 "gripper_control_available": self._state.gripper_control_available,
                 "gripper_q6_available": self._state.gripper_q6_available,
                 "gripper_control_enabled": self._state.gripper_control_enabled,
                 "gripper_status": dict(self._state.gripper_status),
+                "camera_status": dict(self._state.camera_status),
+                "tactile_camera_status": dict(self._state.tactile_camera_status),
                 "episode_recording_available": self._state.episode_recording_available,
                 "episode_recording": self._state.episode_recording,
                 "episode_dir": self._state.episode_dir,
@@ -2780,13 +4147,24 @@ class CalibrationWebUi:
                 "episode_tactile_write_hz_mean": self._state.episode_tactile_write_hz_mean,
                 "episode_tactile_frame_counts": dict(self._state.episode_tactile_frame_counts),
                 "episode_frequency_warning": dict(self._state.episode_frequency_warning),
+                "episode_event_status": self._state.episode_event_status,
+                "episode_event_message": self._state.episode_event_message,
+                "episode_last_episode_index": self._state.episode_last_episode_index,
+                "episode_last_frame_count": self._state.episode_last_frame_count,
                 "dataset_base_root": self._state.dataset_base_root,
                 "dataset_root": self._state.dataset_root,
                 "dataset_dir_name": self._state.dataset_dir_name,
                 "collection_task_id": self._state.collection_task_id,
+                "collection_task_key": self._state.collection_task_key,
                 "collection_task_name": self._state.collection_task_name,
                 "collection_task_name_zh": self._state.collection_task_name_zh,
                 "collection_task_description": self._state.collection_task_description,
+                "collection_task_type": self._state.collection_task_type,
+                "collection_round_trip_phase": self._state.collection_round_trip_phase,
+                "collection_round_trip_next_phase": self._state.collection_round_trip_next_phase,
+                "collection_round_trip_base_name": self._state.collection_round_trip_base_name,
+                "collection_round_trip_base_id": self._state.collection_round_trip_base_id,
+                "collection_round_trip_active": self._state.collection_round_trip_active,
                 "gripper_task": self._state.gripper_task,
                 "task_registry": [dict(item) for item in self._state.task_registry],
                 "camera_visualization_available": self._state.camera_visualization_available,
@@ -2802,6 +4180,19 @@ class CalibrationWebUi:
                 "movement_multiple_min": self._state.movement_multiple_min,
                 "movement_multiple_max": self._state.movement_multiple_max,
                 "movement_multiple_step": self._state.movement_multiple_step,
+                "fix_arm_available": self._state.fix_arm_available,
+                "fix_arm_selected_side": self._state.fix_arm_selected_side,
+                "fix_arm_fixed_side": self._state.fix_arm_fixed_side,
+                "fix_arm_active": self._state.fix_arm_active,
+                "fix_arm_recalibrating": self._state.fix_arm_recalibrating,
+                "fix_arm_status": self._state.fix_arm_status,
+                "fix_arm_sample_count": self._state.fix_arm_sample_count,
+                "fix_arm_min_samples": self._state.fix_arm_min_samples,
+                "pose_snapshot_available": self._state.pose_snapshot_available,
+                "pose_snapshot_dir": self._state.pose_snapshot_dir,
+                "pose_snapshot_count": self._state.pose_snapshot_count,
+                "pose_snapshot_last_path": self._state.pose_snapshot_last_path,
+                "pose_snapshot_status": self._state.pose_snapshot_status,
                 "active_controls": list(self._state.active_controls),
                 "control_hint": self._state.control_hint,
                 "capture_stage": self._state.capture_stage,

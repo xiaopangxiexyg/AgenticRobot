@@ -55,6 +55,7 @@ class SessionStepResult:
     state: TeleopRunState
     control_hz: float
     channels: dict[str, ObservationChannel] = field(default_factory=dict)
+    raw_channels: dict[str, ObservationChannel] = field(default_factory=dict)
     observation: TeleopObservation | None = None
     command: TeleopCommand | None = None
     command_dispatched: bool = False
@@ -74,7 +75,15 @@ class TeleopSession:
         safety_config: TeleopSafetyConfig | None = None,
         recorder: SessionRecorder | None = None,
         state_machine: TeleopStateMachine | None = None,
+        channel_filter: Callable[
+            [dict[str, ObservationChannel], float], dict[str, ObservationChannel]
+        ]
+        | None = None,
         command_filter: Callable[[TeleopCommand, TeleopObservation, float], TeleopCommand] | None = None,
+        fault_filter: Callable[
+            [Sequence[FaultEvent], dict[str, ObservationChannel], float], Sequence[FaultEvent]
+        ]
+        | None = None,
     ):
         self.config = config
         self.sources = list(sources or [])
@@ -83,7 +92,9 @@ class TeleopSession:
         self.calibration = calibration
         self.safety_monitor = SafetyMonitor(safety_config)
         self.recorder = recorder
+        self.channel_filter = channel_filter
         self.command_filter = command_filter
+        self.fault_filter = fault_filter
         if self.recorder is None and config.record_enabled:
             self.recorder = SessionRecorder(config=RecordingConfig(enabled=True))
         self.state_machine = state_machine if state_machine is not None else TeleopStateMachine()
@@ -129,10 +140,22 @@ class TeleopSession:
             raise RuntimeError("Rig is not ready.")
         self._transition(TeleopRunState.ARMED, "hardware armed")
 
+    def _hold_rig_motion(self, reason: str, *, context: str) -> None:
+        if self.rig is not None:
+            try:
+                self.rig.hold_motion(reason)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "\033[1;31;40m"
+                    + f"[Debug Info] {context} hold_motion failed: {type(exc).__name__}: {exc}"
+                    + "\033[0m"
+                )
+
     def hold_hardware(self, reason: str = "manual hold") -> None:
         self._clear_recovery_context()
-        if self.rig is not None:
-            self.rig.hold_motion(reason)
+        self.safety_monitor.request_pose_baseline_reset_many(self.safety_monitor.config.required_channels)
+        self._reset_retargeter_tracking()
+        self._hold_rig_motion(reason, context="manual hold")
         self._transition(TeleopRunState.DEBUG_ONLY, reason)
 
     def freeze(self, reason: str) -> None:
@@ -140,14 +163,7 @@ class TeleopSession:
         print("\033[1;31;40m" + f"[Debug Info] FROZEN triggered due to: {reason}" + "\033[0m")
         self._transition(TeleopRunState.FROZEN, reason)
         if self.config.hold_motion_on_freeze and self.rig is not None and not already_frozen:
-            try:
-                self.rig.hold_motion(f"safety freeze: {reason}")
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    "\033[1;31;40m"
-                    + f"[Debug Info] safety freeze hold_motion failed: {type(exc).__name__}: {exc}"
-                    + "\033[0m"
-                )
+            self._hold_rig_motion(f"safety freeze: {reason}", context="safety freeze")
 
     def fault(self, reason: str) -> None:
         print("\033[1;31;40m" + f"[Debug Info] FAULT triggered due to: {reason}" + "\033[0m")
@@ -177,6 +193,13 @@ class TeleopSession:
         )
         self._healthy_frames_since_fault_clear = 0
         self.safety_monitor.request_pose_baseline_reset_many(self._freeze_channel_names)
+        self._reset_retargeter_tracking()
+
+    def _reset_retargeter_tracking(self) -> None:
+        for retargeter in self.retargeters:
+            reset = getattr(retargeter, "reset_target_pose_smoothing", None)
+            if callable(reset):
+                reset()
 
     def _freeze_is_auto_recoverable(self) -> bool:
         if not self.config.auto_recovery_enabled:
@@ -278,7 +301,11 @@ class TeleopSession:
         mark_phase("session.rate_tracker")
 
         channels, faults = self.poll_sources(current_time)
+        raw_channels = {name: channel.copy() for name, channel in channels.items()}
         mark_phase("session.poll_sources")
+        if self.channel_filter is not None:
+            channels = dict(self.channel_filter(channels, current_time))
+            mark_phase("session.filter_channels")
         if self.recorder is not None:
             self.recorder.record_channels(channels, timestamp=current_time)
             mark_phase("session.record_channels")
@@ -286,6 +313,10 @@ class TeleopSession:
         for violation in self.safety_monitor.evaluate_channels(channels, current_time):
             faults.append(self._fault_from_violation(violation, current_time))
         mark_phase("session.evaluate_channels")
+
+        if self.fault_filter is not None and faults:
+            faults = list(self.fault_filter(faults, channels, current_time))
+            mark_phase("session.filter_faults")
 
         if (
             self.state_machine.state == TeleopRunState.RUNNING
@@ -313,6 +344,7 @@ class TeleopSession:
                 state=self.state_machine.state,
                 control_hz=control_hz,
                 channels=channels,
+                raw_channels=raw_channels,
                 faults=faults,
             )
 
@@ -324,6 +356,7 @@ class TeleopSession:
                 state=self.state_machine.state,
                 control_hz=control_hz,
                 channels=channels,
+                raw_channels=raw_channels,
                 faults=faults,
             )
 
@@ -334,6 +367,7 @@ class TeleopSession:
                     state=self.state_machine.state,
                     control_hz=control_hz,
                     channels=channels,
+                    raw_channels=raw_channels,
                     faults=faults,
                 )
             self._healthy_frames_since_fault_clear += 1
@@ -345,6 +379,7 @@ class TeleopSession:
                     state=self.state_machine.state,
                     control_hz=control_hz,
                     channels=channels,
+                    raw_channels=raw_channels,
                     faults=faults,
                 )
             observation = self._build_observation(channels, current_time)
@@ -357,6 +392,7 @@ class TeleopSession:
                 state=self.state_machine.state,
                 control_hz=control_hz,
                 channels=channels,
+                raw_channels=raw_channels,
                 observation=observation,
                 faults=faults,
             )
@@ -369,6 +405,7 @@ class TeleopSession:
                 state=self.state_machine.state,
                 control_hz=control_hz,
                 channels=channels,
+                raw_channels=raw_channels,
                 observation=observation,
                 faults=faults,
             )
@@ -402,6 +439,7 @@ class TeleopSession:
             state=self.state_machine.state,
             control_hz=control_hz,
             channels=channels,
+            raw_channels=raw_channels,
             observation=observation,
             command=command,
             command_dispatched=command_dispatched,

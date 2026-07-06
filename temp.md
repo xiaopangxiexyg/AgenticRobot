@@ -1,269 +1,31 @@
-我按当前代码读了一遍，没有改代码。现在的主线流程是：VIVE 输出 `left_wrist/right_wrist`，retarget 生成统一 `tool_tcp` action，真机默认用外环 pose impedance 执行；TCP、payload/CoM、重力补偿相关配置和 impedance 参数都来自 RM65 tool profile。
+我建议把它做成一个 pose-aware reachability atlas，不是简单的 3D 位置盒子。当前代码里已有很好的基础：双臂基座间距约 0.525m，左右基座在 desk/world 下偏 ±0.2625m，见 [rm65_dual_arm_hand.urdf (line 8)](/home/zc/HandMotion/Developing/DexTeleop/assets/rm65_inspire_tac/rm65_dual_arm_hand.urdf:8)；当前运行时双臂碰撞 IK 已经用 dual_arm_hand_proxy_open 场景、手部 proxy、桌面/相机杆碰撞，见 [pipeline.py (line 287)](/home/zc/HandMotion/Developing/DexTeleop/rm65_inspire_tac/pipeline.py:287) 和 [dual_arm_collision_aware.py (line 209)](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/retargeters/dual_arm_collision_aware.py:209)。所以可达空间最好直接复用这套 URDF + IK + collision profile。
+核心定义
+输入不要只设为 xyz，而应是：
+query(left_pose, right_pose, frame="tool_tcp/arm_endpoint", current_q optional)
+=> reachability_status + score + metrics + nearest_safe_pose
+其中每个 pose 是 6D/7D 位姿，统一转换到 desk/world 坐标；内部评估用当前 solver frame，例如 arm_link6 或 tool_tcp 经过 TCP 标定后的 frame。现有 arm_link6 -> hand_base 有 +0.009m 偏移，见 [arm_frames.py (line 14)](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/arm_frames.py:14)，这个必须固定，否则 UMI 采集区会和机器人真实控制点错位。
+三色分区建议
+绿色：高质量可达区。IK 能稳定收敛，末端误差建议 <5mm / <2deg，关节余量 >10deg，最小碰撞距离 >5cm，附近网格的 IK 分支连续，没有明显奇异或大关节跳变。UMI 采集主工作区只允许绿色。
+黄色：可过渡区。目标可以通过小偏差投影到安全 pose，例如平移修正 <3cm、姿态修正 <10deg；或关节余量 3-10deg、碰撞距离 3-5cm。黄色可允许短时经过，但数据要打标，训练集里可降权或剔除。
+红色：不可采集区。IK 无解、投影距离过大、碰撞距离 <3cm、接近奇异、需要跨 IK 分支跳变、或者左右臂互相遮挡/碰撞。在线采集时应阻止、冻结、reanchor 或把 UMI 映射 scale 降低。
+离线构建流程
+固定模型版本：使用 assets/rm65_inspire_tac/rm65_dual_arm_hand_proxy_open.urdf 作为采集 atlas 的默认场景，记录 URDF hash、scene profile、TCP profile、base distance、joint limit、碰撞阈值。
 
-**当前 Action 语义**
-现在 arm action 主 frame 是 `tool_tcp`，不是 `arm_endpoint`：
+单臂 atlas：对左右臂分别采样 xyz + orientation_bin。位置网格可先 2-3cm 粗采样，边界处细化到 1cm；姿态不要全 SO(3) 暴力均匀采样，优先采 UMI 常见手腕朝向、抓取 approach cone、roll 离散角。
 
-- 统一 action：`T_arm_base_tool_tcp`
-- VIVE retarget、数据集、policy 输出、真机执行都按 `tool_tcp` 理解
-- `arm_endpoint` 只是兼容机械臂末端 frame
-- profile 里的 `tcp.pose_flange_m_rad` 定义 flange 到 tool TCP
-- 真机 impedance 后端要求 `cartesian_pose`，默认 `--arm-control-mode impedance --impedance-mode pose`
+每个 pose 多种 seed 解 IK：home seed、邻近 voxel 最优 q、随机低差异 seed、wrist flip/branch seed。保存最优解，而不是只保存 bool。
 
-对应代码主要在 [arm_frames.py](/home/password-1/DexTeleop/teleop_runtime/arm_frames.py:1)、[pose_to_arm.py](/home/password-1/DexTeleop/teleop_runtime/retargeters/pose_to_arm.py:1)、[rm65_impedance.py](/home/password-1/DexTeleop/teleop_runtime/backends/arms/rm65_impedance.py:1)。
+双臂 atlas 分两层：先查左右单臂是否可达，再用现有 dual-arm collision IK 对 (left_pose, right_pose) 做 coupled 评估。完整 12D pose 空间不能密铺，建议对常见 UMI 任务区、双手相对距离、跨中线动作、handover/双手抓取姿态做重点采样，并在线缓存真实查询结果。
 
-**1. VIVE Sender**
-只需要两个 tracker：
+每个采样点保存指标：status, score, q_best, pose_error, joint_margin, collision_min_distance, manipulability, branch_id, nearest_safe_pose, failure_reason。格式可用 zarr/hdf5/npz + metadata.json，在线查询用 KD-tree 或规则网格插值。
 
-```bash
-python hardware/VIVE/mocap/vive_data_sender.py \
-  --host <teleop_runtime机器IP> \
-  --port 9999 \
-  --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist
-```
-
-第三个 `tracker_3:auxiliary` 仍可选，但 virtual desk 标定可以直接用 left/right wrist tracker。
-
-**2. VIVE/工位标定**
-第一次上手先跑 station/tracker 标定，不下发真机动作：
-
-```bash
-python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
-  --host 0.0.0.0 \
-  --port 9999
-```
-
-流程按终端提示走：
-
-1. `LINK_CHECK`：确认左右 wrist channel 都有数据，按 `n`
-2. `VIRTUAL_DESK_X/Y/Z`：按 `c` 后分别做后到前、右到左、低到高 sweep
-3. `WRIST_COARSE`：双手放 canonical neutral pose，按 `c` 静止采样
-4. 可选 `--show-tracker-frame-viz` 后用 `j/l/i/k/u/o` 微调 wrist 姿态
-5. `SAVE` 写出 `teleop_records/calibration_profiles/<timestamp>_vive_rm65_virtual_desk.json`
-
-之后复用：
-
-```bash
-python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --load-profile teleop_records/calibration_profiles/your_profile.json
-```
-
-注意：这个 profile 只包含 virtual desk 和 wrist tracker 外参，不包含每次 session 的 home。
-
-**3. RM65 Tool Profile/TCP/重力补偿准备**
-每个 arm + tool 都需要一个独立 profile：`hardware/rm65/utils/configs/calibrations/rm65_{arm}_{tool}.json`。
-
-推荐顺序：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_official_force_sensor_calibrate.py \
-  --arm right \
-  --expected-tool empty \
-  --check-current \
-  --move-to-first \
-  --execute \
-  --confirm CALIBRATE_RM65_FORCE_SENSOR
-```
-
-然后做 payload/CoM 拟合、写入 controller/tool profile、验证：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_force_payload_calibrate.py \
-  --arm right \
-  --expected-tool empty
-
-python hardware/rm65/utils/scripts/rm65_apply_tool_payload_from_fit.py \
-  --arm right \
-  --expected-tool empty \
-  --execute \
-  --confirm APPLY_RM65_TOOL_PAYLOAD
-
-python hardware/rm65/utils/scripts/rm65_validate_tool_payload.py \
-  --arm right \
-  --expected-tool empty \
-  --checkpoints 4 \
-  --samples 20 \
-  --interval-sec 0.05 \
-  --evaluate-source tool
-```
-
-再确认/调整 TCP：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_tool_tcp_adjust.py \
-  --profile empty \
-  --arm right
-```
-
-最后建议做 pose impedance 固定点调参并保存到 profile：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_fixed_point_impedance_tune.py \
-  --profile empty \
-  --arm right \
-  --mode pose \
-  --axes all \
-  --control-hz 40 \
-  --action-hz 20 \
-  --save-to-profile \
-  --execute \
-  --confirm TEST_RM65_FIXED_POINT_IMPEDANCE
-```
-
-当前 strict impedance 要求 profile 里有：`tool_name`、`tcp.pose_flange_m_rad`、`tcp.confirmed=true`、`payload.mass_kg`、`payload.com_tool_m`、`impedance.pose`。
-
-**4. 仿真/只读验证**
-先用真实 VIVE 输入跑 SAPIEN，不给真机下发动作：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --arm-mode virtual \
-  --control-mode absolute \
-  --load-profile teleop_records/calibration_profiles/your_profile.json
-```
-
-如果要读取真机当前姿态作为 preview 起点，但仍不下发：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --arm-mode real \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --active-sides right \
-  --control-mode absolute \
-  --load-profile teleop_records/calibration_profiles/your_profile.json
-```
-
-启动后按 `p` 或回车做 runtime home。这里验证前/左/上方向、左右映射、姿态跟随、workspace、碰撞规避。再切 `--control-mode delta_clutch --keyboard-clutch` 验证相对控制手感。
-
-特殊位控 --right-tool-profile position_endpoint
-
-**5. 真机单臂测试**
-先右臂、低速、小范围、不接手部末端控制：
-
-```bash
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  --active-sides right \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260627_125700_vive_rm65_virtual_desk.json \
-  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_L.json \
-  --no-collision
-```
-
-流程：
-
-1. 程序连接 RM65，strict 校验 active tool/profile
-2. 按 `p` 或回车做 runtime home：采当前 wrist home + 当前真机 tool TCP home
-3. 程序提示保持末端静止
-4. 执行 `--force-tare-sec 3.0` 的 force tare
-5. 启动 pose impedance loop
-6. `arm_hardware()` 后开始真正下发
-
-旧位控 fallback 是：
-
-```bash
---arm-control-mode position
-```
-
-但这不走默认外环力控/impedance。
-
-**6. 真机双臂测试**
-双臂需要左右两边 profile 都齐全：
-
-export LEFT_ARM_IP=192.168.101.21
-export RIGHT_ARM_IP=192.168.1.20
-
-```bash
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  --active-sides both \
-  --left-arm-ip "$LEFT_ARM_IP" \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --load-profile teleop_records/calibration_profiles/your_profile.json \
-  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_<tool>.json \
-  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_<tool>.json
-```
-
-默认双臂会尝试 collision-aware retargeter；如果环境缺 `pinocchio/pink/qpsolvers` 或先做保守测试，加 `--no-collision`。
-
-**当前明显阻塞点**
-我在当前仓库只看到一个正式 tool profile：
-
-```text
-hardware/rm65/utils/configs/calibrations/rm65_right_empty.json
-```
-
-你 IDE 里开的 `rm65_right_inspire.json` 当前路径下不存在。也就是说：按默认 strict profile，右臂 empty 可以走；right inspire、left inspire、双臂都需要先生成/确认对应 `rm65_{arm}_{tool}.json`，否则真机 impedance 入口会在启动阶段拒绝。
-
-
-
-
-`left_inspire` 的重力标定本身看起来不是问题，问题是它没有形成当前真机遥操 strict 模式要加载的运行时 profile。
-
-我看到已有这些结果：
-
-- `hardware/rm65/utils/results/rm65_left_inspire_force_measurements_calibration_fit.json`
-  - `mass_kg_abs = 0.933815`
-  - `com_tool_m = [0.001263, -0.001820, 0.101409]`
-  - corrected force/torque residual很小，fit 质量看起来正常
-- `hardware/rm65/utils/results/rm65_left_inspire_tool_payload_validation.json`
-  - controller 当前 tool 是 `inspire`
-  - payload readback `0.933`
-  - CoM readback 和 fit 误差约 `1e-6 m`
-- `hardware/rm65/utils/results/rm65_left_inspire_official_force_sensor_calibration_report.json`
-  - official force sensor calibration 也有记录，`Manual_Set_Force` return code 都是 0
-
-缺的是：
-
-1. **没有 `hardware/rm65/utils/configs/calibrations/rm65_left_inspire.json`**
-   当前 `configs/calibrations/` 里只有 `rm65_right_empty.json`。真机 impedance backend strict 模式会按 active tool name `inspire` 去加载 `rm65_left_inspire.json`，找不到就启动不了。
-
-2. **没有已确认的 profile TCP**
-   即使生成 profile，`inspire` 的 TCP 初值默认会偏向 `hand_base`，还需要用 TCP GUI 保存确认，让：
-   ```json
-   "tcp": {
-     "frame_name": "tool_tcp",
-     "pose_flange_m_rad": [...],
-     "confirmed": true
-   }
-   ```
-
-3. **profile 里需要汇总 payload 和 impedance.pose**
-   payload 数据已有，但还没写进 `rm65_left_inspire.json`。`impedance.pose` profile 创建后会有默认值，但如果要更稳，最好再跑一次 fixed-point pose impedance tune 并 `--save-to-profile`。
-
-建议补齐顺序：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_apply_tool_payload_from_fit.py \
-  --arm left \
-  --expected-tool inspire \
-  --fit-json hardware/rm65/utils/results/rm65_left_inspire_force_measurements_calibration_fit.json \
-  --execute \
-  --confirm APPLY_RM65_TOOL_PAYLOAD
-```
-
-然后确认 TCP：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_tool_tcp_adjust.py \
-  --profile inspire \
-  --arm left
-```
-
-保存后再检查：
-
-```bash
-python hardware/rm65/utils/scripts/rm65_calibration_profile.py show \
-  --name inspire \
-  --arm left
-```
-
-一句话：`left_inspire` 的重力/载荷标定已经做过，缺的是把这些结果落到 `rm65_left_inspire.json`，并确认 `tool_tcp`。
+在线使用
+现有 workspace_clip 只是 AABB，默认大约 x[-0.60,0.60], y[-0.80,0.80], z[0,0.90]，见 [presets.py (line 34)](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/presets.py:34)。新的 atlas 应替代或补强它：
+UMI pose -> desk/tool_tcp pose
+        -> atlas 快速查色
+        -> 黄色/边界时跑精确 dual IK
+        -> 绿色通过，黄色投影/警告，红色阻止或 reanchor
+        -> 写入 dataset metadata
+数据集里建议记录 reachability_status、reachability_score、projection_delta_m/deg、min_collision_distance_m、nearest_joint_margin_deg。这样后处理时可以直接过滤“红色”和长时间“黄色”的片段。
+我会优先落地的版本
+先做一个 workspace_atlas 离线生成器，只支持 dual_arm_hand_proxy_open + arm_link6/tool_tcp，输出左右单臂 atlas 和在线双臂 evaluator。第一版不追求把全空间采满，而是覆盖 UMI 采集盒、桌面上方主操作区、左右手交互区。等采集几批数据后，再用真实 UMI 轨迹反向加密采样边界区。这样最实用，也最容易和现有双臂 IK/回放诊断对齐。
