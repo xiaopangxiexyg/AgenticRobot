@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -397,6 +397,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 )
             )
         )
+        self.target_override_filter: Callable[
+            [dict[str, np.ndarray], TeleopObservation, TeleopCalibration | None],
+            dict[str, np.ndarray] | None,
+        ] | None = None
         if ik_solver is not None:
             self.ik_solver = ik_solver
             self.profile = build_rm65_dual_arm_scene_profile(config.scene_profile)
@@ -1255,7 +1259,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self, observation: TeleopObservation, calibration: TeleopCalibration | None = None
     ) -> TeleopCommand:
         context = self.build_target_context(observation, calibration)
-        return self.build_command_for_context(context)
+        targets = None
+        if self.target_override_filter is not None:
+            maybe_targets = self.target_override_filter(
+                {
+                    "left": context.left_target.copy(),
+                    "right": context.right_target.copy(),
+                },
+                observation,
+                calibration,
+            )
+            if maybe_targets is not None:
+                targets = {
+                    "left": as_pose_matrix(maybe_targets["left"]).copy(),
+                    "right": as_pose_matrix(maybe_targets["right"]).copy(),
+                }
+        return self.build_command_for_context(context, targets=targets)
 
     def _target_pose_world(
         self,

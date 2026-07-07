@@ -16,6 +16,7 @@ from hardware.rm65.force_compensation import (
     admittance_wrench_for_arm,
     angle_delta,
     apply_pose_offset,
+    clamp_norm,
     finite_list,
     mean_wrench,
     normalize_pose,
@@ -122,9 +123,57 @@ def _tool_payload(frame_result: object) -> tuple[float, list[float]] | None:
 
 
 def _pose_delta(a: list[float], b: list[float]) -> tuple[float, float]:
-    linear = norm(a[index] - b[index] for index in range(3))
-    angular = norm(angle_delta(a[index], b[index]) for index in range(3, 6))
+    linear_vector, angular_rotvec = _pose_delta_vectors(source=a, target=b)
+    linear = norm(linear_vector)
+    angular = norm(angular_rotvec)
     return linear, angular
+
+
+def _pose_delta_vectors(*, source: Iterable[float], target: Iterable[float]) -> tuple[list[float], list[float]]:
+    source_pose = normalize_pose(finite_list(source, expected_len=6, label="source_pose"))
+    target_pose = normalize_pose(finite_list(target, expected_len=6, label="target_pose"))
+    source_matrix = pose6_to_matrix(source_pose)
+    target_matrix = pose6_to_matrix(target_pose)
+    linear = target_matrix[:3, 3] - source_matrix[:3, 3]
+    angular = (
+        R.from_matrix(target_matrix[:3, :3])
+        * R.from_matrix(source_matrix[:3, :3]).inv()
+    ).as_rotvec()
+    return [float(value) for value in linear.tolist()], [float(value) for value in angular.tolist()]
+
+
+def _pose_offset_from_reference(*, reference_pose: Iterable[float], command_pose: Iterable[float]) -> list[float]:
+    linear, angular = _pose_delta_vectors(source=reference_pose, target=command_pose)
+    return linear + angular
+
+
+def _scaled_vector(values: Iterable[float], scale: float) -> list[float]:
+    return [float(value) * float(scale) for value in values]
+
+
+def _vector_error_norm(a: Iterable[float], b: Iterable[float]) -> float:
+    left = list(a)
+    right = list(b)
+    return norm([float(left[index]) - float(right[index]) for index in range(min(len(left), len(right)))])
+
+
+def _fraction_or_none(numerator: float, denominator: float, *, eps: float = 1e-9) -> float | None:
+    if abs(float(denominator)) <= eps:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _directional_speed(velocity: Iterable[float] | None, error: Iterable[float] | None) -> float | None:
+    if velocity is None or error is None:
+        return None
+    velocity_arr = np.asarray(list(velocity), dtype=float).reshape(-1)
+    error_arr = np.asarray(list(error), dtype=float).reshape(-1)
+    if velocity_arr.shape != error_arr.shape or not np.all(np.isfinite(velocity_arr)) or not np.all(np.isfinite(error_arr)):
+        return None
+    error_norm = float(np.linalg.norm(error_arr))
+    if error_norm <= 1e-12:
+        return 0.0
+    return float(np.dot(velocity_arr, error_arr) / error_norm)
 
 
 def _joint_delta_deg(a: list[float], b: list[float]) -> float:
@@ -220,9 +269,12 @@ class RM65ImpedanceConfig:
     force_sign: float = 1.0
     angular_force_sign: float = -1.0
     angular_axis_signs: list[float] = field(default_factory=lambda: [1.0, 1.0, -1.0])
+    angular_axis_velocity_scales: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
     lowpass_alpha: float = 0.95
     force_deadband_n: float = 0.30
     torque_deadband_nm: float = 0.03
+    return_force_deadband_n: float | None = None
+    return_torque_deadband_nm: float | None = None
     linear_gain_m_s_per_n: float = 0.0
     angular_gain_rad_s_per_nm: float = 0.0
     linear_damping_n_s_per_m: float = 0.0
@@ -231,6 +283,8 @@ class RM65ImpedanceConfig:
     angular_compliance_rad_per_nm: float = 0.04
     max_linear_velocity_m_s: float = 0.4
     max_angular_velocity_rad_s: float = 0.4
+    max_linear_return_velocity_m_s: float | None = None
+    max_angular_return_velocity_rad_s: float | None = None
     max_linear_offset_m: float = 0.05
     max_angular_offset_rad: float = 0.4
     return_rate_s: float = 0.35
@@ -266,6 +320,8 @@ class RM65ImpedanceConfig:
     ik_resolver_local_step_provider_names: list[str] = field(default_factory=lambda: ["rm65_pinocchio"])
     ik_resolver_local_step_max_iterations: int | None = None
     ik_resolver_local_step_trigger_ratio: float | None = None
+    ik_resolver_local_step_max_position_worsen_m: float | None = None
+    ik_resolver_local_step_component_progress_max_position_worsen_m: float | None = None
     ik_seed_expansion_enabled: bool = True
     ik_seed_expansion_profile: str = "rm65"
     ik_seed_expansion_json: str | None = None
@@ -314,6 +370,23 @@ class RM65ImpedanceConfig:
             raise ValueError("action_hz must not exceed control_hz")
         if self.force_source not in ("zero", "work", "tool"):
             raise ValueError("force_source must be zero, work, or tool")
+        if self.force_deadband_n < 0.0 or self.torque_deadband_nm < 0.0:
+            raise ValueError("force and torque deadbands must be non-negative")
+        if self.return_force_deadband_n is not None and self.return_force_deadband_n < 0.0:
+            raise ValueError("return_force_deadband_n must be non-negative")
+        if self.return_torque_deadband_nm is not None and self.return_torque_deadband_nm < 0.0:
+            raise ValueError("return_torque_deadband_nm must be non-negative")
+        self.angular_axis_velocity_scales = finite_list(
+            self.angular_axis_velocity_scales,
+            expected_len=3,
+            label="angular_axis_velocity_scales",
+        )
+        if any(value < 0.0 for value in self.angular_axis_velocity_scales):
+            raise ValueError("angular_axis_velocity_scales values must be non-negative")
+        if self.max_linear_return_velocity_m_s is not None and self.max_linear_return_velocity_m_s < 0.0:
+            raise ValueError("max_linear_return_velocity_m_s must be non-negative")
+        if self.max_angular_return_velocity_rad_s is not None and self.max_angular_return_velocity_rad_s < 0.0:
+            raise ValueError("max_angular_return_velocity_rad_s must be non-negative")
         if self.state_read_every < 1:
             raise ValueError("state_read_every must be >= 1")
         if self.max_command_joint_step_deg <= 0.0:
@@ -362,6 +435,18 @@ class RM65ImpedanceConfig:
             raise ValueError("ik_resolver_local_step_max_iterations must be >= 1")
         if self.ik_resolver_local_step_trigger_ratio is not None and float(self.ik_resolver_local_step_trigger_ratio) < 1.0:
             raise ValueError("ik_resolver_local_step_trigger_ratio must be >= 1")
+        if (
+            self.ik_resolver_local_step_max_position_worsen_m is not None
+            and float(self.ik_resolver_local_step_max_position_worsen_m) < 0.0
+        ):
+            raise ValueError("ik_resolver_local_step_max_position_worsen_m must be non-negative")
+        if (
+            self.ik_resolver_local_step_component_progress_max_position_worsen_m is not None
+            and float(self.ik_resolver_local_step_component_progress_max_position_worsen_m) < 0.0
+        ):
+            raise ValueError(
+                "ik_resolver_local_step_component_progress_max_position_worsen_m must be non-negative"
+            )
         if self.ik_seed_expansion_enabled and not str(self.ik_seed_expansion_profile).strip():
             raise ValueError("ik_seed_expansion_profile must not be empty when ik_seed_expansion_enabled")
         if self.direct_joint_hint_max_linear_offset_m < 0.0:
@@ -389,18 +474,33 @@ class RM65ImpedanceConfig:
         if self.angular_damping_nm_s_per_rad > 0.0:
             self.angular_gain_rad_s_per_nm = 1.0 / self.angular_damping_nm_s_per_rad
 
+    @property
+    def effective_return_force_deadband_n(self) -> float:
+        if self.return_force_deadband_n is None:
+            return float(self.force_deadband_n)
+        return float(self.return_force_deadband_n)
+
+    @property
+    def effective_return_torque_deadband_nm(self) -> float:
+        if self.return_torque_deadband_nm is None:
+            return float(self.torque_deadband_nm)
+        return float(self.return_torque_deadband_nm)
+
     def make_admittance(self) -> PoseAdmittance:
         return PoseAdmittance(
             enabled_axes=parse_axes(self.axes, allow_rotation=True),
             force_sign=self.force_sign,
             angular_force_sign=self.angular_force_sign,
             angular_axis_signs=self.angular_axis_signs,
+            angular_axis_velocity_scales=self.angular_axis_velocity_scales,
             linear_gain_m_s_per_n=self.linear_gain_m_s_per_n,
             angular_gain_rad_s_per_nm=self.angular_gain_rad_s_per_nm,
             linear_compliance_m_per_n=self.linear_compliance_m_per_n,
             angular_compliance_rad_per_nm=self.angular_compliance_rad_per_nm,
             max_linear_velocity_m_s=self.max_linear_velocity_m_s,
             max_angular_velocity_rad_s=self.max_angular_velocity_rad_s,
+            max_linear_return_velocity_m_s=self.max_linear_return_velocity_m_s,
+            max_angular_return_velocity_rad_s=self.max_angular_return_velocity_rad_s,
             max_linear_offset_m=self.max_linear_offset_m,
             max_angular_offset_rad=self.max_angular_offset_rad,
             return_rate_s=self.return_rate_s,
@@ -491,6 +591,9 @@ class RM65BaseImpedanceController:
         self._last_step_time: float | None = None
         self._current_step_dt: float | None = None
         self._previous_command_pose: list[float] | None = None
+        self._previous_measured_pose: list[float] | None = None
+        self._previous_measured_joint: list[float] | None = None
+        self._previous_measured_sample_time: float | None = None
         self._step_index = 0
         self._last_ik_hold_warning_time = 0.0
         self._last_ik_hold_warning_key: str | None = None
@@ -645,6 +748,14 @@ class RM65BaseImpedanceController:
             replace_kwargs["local_step_iteration_counts"] = (local_step_iterations,)
         if self.config.ik_resolver_local_step_trigger_ratio is not None:
             replace_kwargs["local_step_trigger_ratio"] = float(self.config.ik_resolver_local_step_trigger_ratio)
+        if self.config.ik_resolver_local_step_max_position_worsen_m is not None:
+            replace_kwargs["local_step_max_position_worsen_m"] = float(
+                self.config.ik_resolver_local_step_max_position_worsen_m
+            )
+        if self.config.ik_resolver_local_step_component_progress_max_position_worsen_m is not None:
+            replace_kwargs["local_step_component_progress_max_position_worsen_m"] = float(
+                self.config.ik_resolver_local_step_component_progress_max_position_worsen_m
+            )
         if replace_kwargs:
             profile = replace(profile, **replace_kwargs)
 
@@ -798,6 +909,25 @@ class RM65BaseImpedanceController:
             ),
             "local_step_orientation_recovery_max_after_position_error_m": float(
                 profile.local_step_orientation_recovery_max_after_position_error_m
+            ),
+            "local_step_component_progress_enabled": bool(profile.local_step_component_progress_enabled),
+            "local_step_component_progress_min_position_m": float(
+                profile.local_step_component_progress_min_position_m
+            ),
+            "local_step_component_progress_min_orientation_deg": float(
+                profile.local_step_component_progress_min_orientation_deg
+            ),
+            "local_step_component_progress_max_score_regression": float(
+                profile.local_step_component_progress_max_score_regression
+            ),
+            "local_step_component_progress_max_position_worsen_m": float(
+                profile.local_step_component_progress_max_position_worsen_m
+            ),
+            "local_step_component_progress_max_orientation_worsen_deg": float(
+                profile.local_step_component_progress_max_orientation_worsen_deg
+            ),
+            "local_step_component_progress_max_after_position_error_m": float(
+                profile.local_step_component_progress_max_after_position_error_m
             ),
             "local_step_limit_escape_enabled": bool(profile.local_step_limit_escape_enabled),
             "local_step_limit_escape_activation_margin_deg": float(profile.local_step_limit_escape_activation_margin_deg),
@@ -1881,7 +2011,7 @@ class RM65BaseImpedanceController:
                     + _format_vector(deadbanded, precision=5)
                     + f" |F|={norm(deadbanded[:3]):.5f}N |T|={norm(deadbanded[3:]):.5f}Nm"
                 )
-            if raw_deadbanded is not None and raw_deadbanded != deadbanded:
+            if raw_deadbanded is not None:
                 lines.append(
                     "raw_deadbanded_wrench="
                     + _format_vector(raw_deadbanded, precision=5)
@@ -2097,7 +2227,11 @@ class RM65BaseImpedanceController:
         self._initialize_ik_resolver()
         self._latest_wrench_context = None
         self._post_start_preflight()
-        self._last_step_time = time.perf_counter()
+        initial_sample_time = time.perf_counter()
+        self._previous_measured_pose = list(self._state["pose"])
+        self._previous_measured_joint = list(self._state["joint_deg"])
+        self._previous_measured_sample_time = initial_sample_time
+        self._last_step_time = initial_sample_time
         self._started = True
 
     def reset_motion_state(self, joint_rad: Iterable[float] | None = None) -> None:
@@ -2141,7 +2275,11 @@ class RM65BaseImpedanceController:
                 _joint_deg_to_rad(self._previous_command_joint, label="previous_command_joint")
             )
         self._latest_wrench_context = None
-        self._last_step_time = time.perf_counter()
+        reset_sample_time = time.perf_counter()
+        self._previous_measured_pose = list(self._state["pose"])
+        self._previous_measured_joint = list(self._state["joint_deg"])
+        self._previous_measured_sample_time = reset_sample_time
+        self._last_step_time = reset_sample_time
         self._current_step_dt = None
         self._step_index = 0
 
@@ -2219,13 +2357,46 @@ class RM65BaseImpedanceController:
         processed = self._processor.process(readings[self.config.force_source])
         raw_deadbanded = list(processed["deadbanded"])
         admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, self.side)
-        update = self._admittance.update(admittance_wrench, dt)
+        return_activity_wrench = admittance_wrench_for_arm(processed["filtered"], self.side)
+        return_force_deadband_n = self.config.effective_return_force_deadband_n
+        return_torque_deadband_nm = self.config.effective_return_torque_deadband_nm
+        update = self._admittance.update(
+            admittance_wrench,
+            dt,
+            return_activity_wrench=return_activity_wrench,
+            return_force_deadband_n=return_force_deadband_n,
+            return_torque_deadband_nm=return_torque_deadband_nm,
+        )
         self._latest_wrench_context = {
             "tare_corrected": list(processed["tare_corrected"]),
+            "active_wrench": list(update["active_wrench"]),
             "deadbanded": list(admittance_wrench),
             "raw_deadbanded": raw_deadbanded,
+            "return_activity_wrench": list(return_activity_wrench),
+            "return_force_deadband_n": return_force_deadband_n,
+            "return_torque_deadband_nm": return_torque_deadband_nm,
+            "target_offset_unclamped": list(update["target_offset_unclamped"]),
+            "target_offset_after_return": list(update["target_offset_after_return"]),
+            "target_offset_after_offset_limit": list(update["target_offset_after_offset_limit"]),
             "target_offset": list(update["target_offset"]),
             "offset": list(update["offset"]),
+            "offset_delta_before_velocity_limit": list(update["offset_delta_before_velocity_limit"]),
+            "offset_step_after_velocity_limit": list(update["offset_step_after_velocity_limit"]),
+            "return_applied_axes": list(update["return_applied_axes"]),
+            "return_paused_axes": list(update["return_paused_axes"]),
+            "linear_return_paused": bool(update["linear_return_paused"]),
+            "angular_return_paused": bool(update["angular_return_paused"]),
+            "linear_offset_limit_applied": bool(update["linear_offset_limit_applied"]),
+            "angular_offset_limit_applied": bool(update["angular_offset_limit_applied"]),
+            "linear_velocity_limit_applied": bool(update["linear_velocity_limit_applied"]),
+            "angular_velocity_limit_applied": bool(update["angular_velocity_limit_applied"]),
+            "angular_axis_velocity_limit_applied": bool(update["angular_axis_velocity_limit_applied"]),
+            "linear_return_velocity_limit_applied": bool(update["linear_return_velocity_limit_applied"]),
+            "angular_return_velocity_limit_applied": bool(update["angular_return_velocity_limit_applied"]),
+            "linear_step_velocity_limit_m_s": float(update["linear_step_velocity_limit_m_s"]),
+            "angular_step_velocity_limit_rad_s": float(update["angular_step_velocity_limit_rad_s"]),
+            "angular_axis_velocity_scales": list(update["angular_axis_velocity_scales"]),
+            "angular_axis_step_velocity_limits_rad_s": list(update["angular_axis_step_velocity_limits_rad_s"]),
             "preferred_joint_deg": [] if preferred_joint is None else list(preferred_joint),
         }
         mark_timing("process_force_admittance")
@@ -2234,6 +2405,13 @@ class RM65BaseImpedanceController:
             update["offset"],
             preferred_joint=preferred_joint,
         )
+        realized_offset = (
+            None
+            if self._latest_wrench_context is None
+            else self._latest_wrench_context.get("offset")
+        )
+        if realized_offset is not None:
+            update["offset"] = finite_list(realized_offset, expected_len=6, label="realized_offset")
         mark_timing("command_from_reference")
 
         command_step = _joint_delta_deg(self._previous_command_joint, command_joint)
@@ -2270,9 +2448,14 @@ class RM65BaseImpedanceController:
         mark_timing("send")
         self._step_index += 1
         state_read_performed = self._step_index % self.config.state_read_every == 0
+        state_sample_time: float | None = None
+        previous_measured_pose = None if self._previous_measured_pose is None else list(self._previous_measured_pose)
+        previous_measured_joint = None if self._previous_measured_joint is None else list(self._previous_measured_joint)
+        previous_measured_sample_time = self._previous_measured_sample_time
         if state_read_performed:
             try:
                 self._state = _read_state(self.robot, self.side)
+                state_sample_time = time.perf_counter()
             except Exception as exc:
                 raise RuntimeError(
                     self._hardware_command_failure_message(
@@ -2289,8 +2472,97 @@ class RM65BaseImpedanceController:
             mark_timing("state_read_skipped")
         self._previous_command_joint = list(command_joint)
         self._previous_command_pose = list(command_pose)
-        pose_delta = _pose_delta(command_pose, self._state["pose"]) if self._state else (math.nan, math.nan)
+        measured_pose = None if self._state is None else list(self._state["pose"])
+        pose_delta = _pose_delta(command_pose, measured_pose) if measured_pose is not None else (math.nan, math.nan)
         measured_joint = None if self._state is None else list(self._state["joint_deg"])
+        reference_to_command_linear, reference_to_command_angular = _pose_delta_vectors(
+            source=reference,
+            target=command_pose,
+        )
+        applied_offset = finite_list(
+            self._latest_wrench_context.get("applied_offset", update["offset"]),
+            expected_len=6,
+            label="applied_offset",
+        )
+        target_offset = finite_list(update["target_offset"], expected_len=6, label="target_offset")
+        admittance_target_linear_norm = norm(target_offset[:3])
+        admittance_target_angular_norm = norm(target_offset[3:])
+        admittance_offset_linear_norm = norm(applied_offset[:3])
+        admittance_offset_angular_norm = norm(applied_offset[3:])
+        commanded_offset_linear_norm = norm(reference_to_command_linear)
+        commanded_offset_angular_norm = norm(reference_to_command_angular)
+        offset_to_command_linear_error = _vector_error_norm(applied_offset[:3], reference_to_command_linear)
+        offset_to_command_angular_error = _vector_error_norm(applied_offset[3:], reference_to_command_angular)
+        target_to_command_linear_error = _vector_error_norm(target_offset[:3], reference_to_command_linear)
+        target_to_command_angular_error = _vector_error_norm(target_offset[3:], reference_to_command_angular)
+        reference_to_measured_linear = None
+        reference_to_measured_angular = None
+        command_to_measured_linear = None
+        command_to_measured_angular = None
+        measured_to_command_linear = None
+        measured_to_command_angular = None
+        measured_pose_velocity_linear = None
+        measured_pose_velocity_angular = None
+        measured_joint_velocity = None
+        measured_velocity_dt_sec = None
+        command_to_measured_joint = None
+        measured_to_command_joint = None
+        if measured_pose is not None:
+            reference_to_measured_linear, reference_to_measured_angular = _pose_delta_vectors(
+                source=reference,
+                target=measured_pose,
+            )
+            command_to_measured_linear, command_to_measured_angular = _pose_delta_vectors(
+                source=command_pose,
+                target=measured_pose,
+            )
+            measured_to_command_linear, measured_to_command_angular = _pose_delta_vectors(
+                source=measured_pose,
+                target=command_pose,
+            )
+        if measured_joint is not None:
+            command_to_measured_joint = [
+                float(measured_joint[index] - command_joint[index])
+                for index in range(6)
+            ]
+            measured_to_command_joint = [
+                float(command_joint[index] - measured_joint[index])
+                for index in range(6)
+            ]
+        if (
+            state_read_performed
+            and state_sample_time is not None
+            and measured_pose is not None
+            and previous_measured_pose is not None
+            and previous_measured_joint is not None
+            and previous_measured_sample_time is not None
+        ):
+            measured_velocity_dt_sec = max(0.0, state_sample_time - previous_measured_sample_time)
+            if measured_velocity_dt_sec > 1e-9:
+                prev_to_measured_linear, prev_to_measured_angular = _pose_delta_vectors(
+                    source=previous_measured_pose,
+                    target=measured_pose,
+                )
+                measured_pose_velocity_linear = _scaled_vector(
+                    prev_to_measured_linear,
+                    1.0 / measured_velocity_dt_sec,
+                )
+                measured_pose_velocity_angular = _scaled_vector(
+                    prev_to_measured_angular,
+                    1.0 / measured_velocity_dt_sec,
+                )
+                if measured_joint is not None:
+                    measured_joint_velocity = [
+                        float(measured_joint[index] - previous_measured_joint[index])
+                        / measured_velocity_dt_sec
+                        for index in range(6)
+                    ]
+        if state_read_performed and measured_pose is not None and measured_joint is not None:
+            self._previous_measured_pose = list(measured_pose)
+            self._previous_measured_joint = list(measured_joint)
+            self._previous_measured_sample_time = (
+                state_sample_time if state_sample_time is not None else time.perf_counter()
+            )
         command_singularity = self._singularity_metadata(command_joint)
         measured_singularity = (
             {"available": False, "label": "unavailable", "error": "state_unavailable"}
@@ -2324,16 +2596,75 @@ class RM65BaseImpedanceController:
             "step": self._step_index,
             "dt_sec": dt,
             "reference": reference,
+            "force_source": self.config.force_source,
+            "force_readings": {key: list(value) for key, value in readings.items()},
+            "selected_force_wrench": list(readings[self.config.force_source]),
             "command_pose": command_pose,
             "command_joint_deg": command_joint,
             "measured_pose": None if self._state is None else list(self._state["pose"]),
             "measured_joint_deg": measured_joint,
             "offset": update["offset"],
+            "applied_offset": applied_offset,
+            "requested_offset_before_command_realization": self._latest_wrench_context.get(
+                "requested_offset_before_command_realization"
+            ),
+            "admittance_offset_before_antiwindup": self._latest_wrench_context.get(
+                "admittance_offset_before_antiwindup"
+            ),
+            "applied_offset_source": self._latest_wrench_context.get("applied_offset_source"),
+            "admittance_offset_antiwindup_applied": self._latest_wrench_context.get(
+                "admittance_offset_antiwindup_applied"
+            ),
+            "admittance_offset_antiwindup_skip_reason": self._latest_wrench_context.get(
+                "admittance_offset_antiwindup_skip_reason"
+            ),
+            "admittance_offset_antiwindup_guarded_axes": self._latest_wrench_context.get(
+                "admittance_offset_antiwindup_guarded_axes"
+            ),
+            "admittance_offset_antiwindup_active_axes": self._latest_wrench_context.get(
+                "admittance_offset_antiwindup_active_axes"
+            ),
+            "admittance_offset_antiwindup_guard_reason": self._latest_wrench_context.get(
+                "admittance_offset_antiwindup_guard_reason"
+            ),
+            "admittance_offset_realized_before_guard": self._latest_wrench_context.get(
+                "admittance_offset_realized_before_guard"
+            ),
+            "applied_offset_realization_linear_error_m": self._latest_wrench_context.get(
+                "applied_offset_realization_linear_error_m"
+            ),
+            "applied_offset_realization_angular_error_rad": self._latest_wrench_context.get(
+                "applied_offset_realization_angular_error_rad"
+            ),
+            "target_offset_unclamped": update["target_offset_unclamped"],
+            "target_offset_after_return": update["target_offset_after_return"],
+            "target_offset_after_offset_limit": update["target_offset_after_offset_limit"],
             "target_offset": update["target_offset"],
+            "offset_delta_before_velocity_limit": update["offset_delta_before_velocity_limit"],
+            "offset_step_after_velocity_limit": update["offset_step_after_velocity_limit"],
+            "return_applied_axes": update["return_applied_axes"],
+            "linear_offset_limit_applied": update["linear_offset_limit_applied"],
+            "angular_offset_limit_applied": update["angular_offset_limit_applied"],
+            "linear_velocity_limit_applied": update["linear_velocity_limit_applied"],
+            "angular_velocity_limit_applied": update["angular_velocity_limit_applied"],
+            "angular_axis_velocity_limit_applied": update["angular_axis_velocity_limit_applied"],
+            "linear_return_velocity_limit_applied": update["linear_return_velocity_limit_applied"],
+            "angular_return_velocity_limit_applied": update["angular_return_velocity_limit_applied"],
+            "linear_step_velocity_limit_m_s": update["linear_step_velocity_limit_m_s"],
+            "angular_step_velocity_limit_rad_s": update["angular_step_velocity_limit_rad_s"],
+            "angular_axis_velocity_scales": update["angular_axis_velocity_scales"],
+            "angular_axis_step_velocity_limits_rad_s": update["angular_axis_step_velocity_limits_rad_s"],
             "active_wrench": update["active_wrench"],
             "tare_corrected_wrench": processed["tare_corrected"],
+            "filtered_wrench": processed["filtered"],
             "raw_deadbanded_wrench": raw_deadbanded,
             "admittance_wrench": admittance_wrench,
+            "return_activity_wrench": update["return_activity_wrench"],
+            "return_force_deadband_n": return_force_deadband_n,
+            "return_torque_deadband_nm": return_torque_deadband_nm,
+            "return_paused_axes": update["return_paused_axes"],
+            "linear_return_paused": update["linear_return_paused"],
+            "angular_return_paused": update["angular_return_paused"],
             "force_norm_n": force_norm,
             "torque_norm_nm": torque_norm,
             "command_joint_step_deg": command_step,
@@ -2357,6 +2688,70 @@ class RM65BaseImpedanceController:
             ),
             "joint_velocity_limit_ratio": self._latest_wrench_context.get("joint_velocity_limit_ratio"),
             "joint_safety": self._latest_wrench_context.get("joint_safety"),
+            "reference_to_command_linear_m": reference_to_command_linear,
+            "reference_to_command_angular_rotvec_rad": reference_to_command_angular,
+            "admittance_target_linear_norm_m": admittance_target_linear_norm,
+            "admittance_target_angular_norm_rad": admittance_target_angular_norm,
+            "admittance_offset_linear_norm_m": admittance_offset_linear_norm,
+            "admittance_offset_angular_norm_rad": admittance_offset_angular_norm,
+            "commanded_offset_linear_norm_m": commanded_offset_linear_norm,
+            "commanded_offset_angular_norm_rad": commanded_offset_angular_norm,
+            "offset_to_command_linear_error_m": offset_to_command_linear_error,
+            "offset_to_command_angular_error_rad": offset_to_command_angular_error,
+            "offset_to_command_linear_fraction": _fraction_or_none(
+                commanded_offset_linear_norm,
+                admittance_offset_linear_norm,
+            ),
+            "offset_to_command_angular_fraction": _fraction_or_none(
+                commanded_offset_angular_norm,
+                admittance_offset_angular_norm,
+            ),
+            "target_to_command_linear_error_m": target_to_command_linear_error,
+            "target_to_command_angular_error_rad": target_to_command_angular_error,
+            "target_to_command_linear_fraction": _fraction_or_none(
+                commanded_offset_linear_norm,
+                admittance_target_linear_norm,
+            ),
+            "target_to_command_angular_fraction": _fraction_or_none(
+                commanded_offset_angular_norm,
+                admittance_target_angular_norm,
+            ),
+            "reference_to_measured_linear_m": reference_to_measured_linear,
+            "reference_to_measured_angular_rotvec_rad": reference_to_measured_angular,
+            "measured_offset_linear_norm_m": (
+                None if reference_to_measured_linear is None else norm(reference_to_measured_linear)
+            ),
+            "measured_offset_angular_norm_rad": (
+                None if reference_to_measured_angular is None else norm(reference_to_measured_angular)
+            ),
+            "command_to_measured_linear_m": command_to_measured_linear,
+            "command_to_measured_angular_rotvec_rad": command_to_measured_angular,
+            "command_to_measured_linear_norm_m": (
+                None if command_to_measured_linear is None else norm(command_to_measured_linear)
+            ),
+            "command_to_measured_angular_norm_rad": (
+                None if command_to_measured_angular is None else norm(command_to_measured_angular)
+            ),
+            "measured_to_command_linear_m": measured_to_command_linear,
+            "measured_to_command_angular_rotvec_rad": measured_to_command_angular,
+            "command_to_measured_joint_deg": command_to_measured_joint,
+            "measured_to_command_joint_deg": measured_to_command_joint,
+            "measured_velocity_dt_sec": measured_velocity_dt_sec,
+            "measured_pose_velocity_linear_m_s": measured_pose_velocity_linear,
+            "measured_pose_velocity_angular_rad_s": measured_pose_velocity_angular,
+            "measured_joint_velocity_deg_s": measured_joint_velocity,
+            "tracking_error_closing_linear_m_s": _directional_speed(
+                measured_pose_velocity_linear,
+                measured_to_command_linear,
+            ),
+            "tracking_error_closing_angular_rad_s": _directional_speed(
+                measured_pose_velocity_angular,
+                measured_to_command_angular,
+            ),
+            "tracking_error_closing_joint_deg_s": _directional_speed(
+                measured_joint_velocity,
+                measured_to_command_joint,
+            ),
             "ik_method": (
                 None
                 if self._latest_wrench_context.get("ik_method") is None
@@ -2478,6 +2873,130 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
     def _initial_reference(self, state: dict[str, list[float]]) -> list[float]:
         return normalize_pose(state["pose"])
 
+    def _sync_admittance_to_realized_pose_offset(
+        self,
+        *,
+        reference_pose: Iterable[float],
+        command_pose: Iterable[float],
+        requested_offset: Iterable[float],
+        require_active_wrench: bool = True,
+    ) -> list[float]:
+        requested = finite_list(requested_offset, expected_len=6, label="requested_offset")
+        realized = _pose_offset_from_reference(
+            reference_pose=reference_pose,
+            command_pose=command_pose,
+        )
+        realized[:3] = clamp_norm(realized[:3], float(self.config.max_linear_offset_m))
+        if float(self.config.max_angular_offset_rad) > 0.0:
+            realized[3:] = clamp_norm(realized[3:], float(self.config.max_angular_offset_rad))
+        else:
+            realized[3:] = [0.0, 0.0, 0.0]
+        context = self._latest_wrench_context if isinstance(self._latest_wrench_context, dict) else {}
+        active_wrench = _coerce_float_list(context.get("active_wrench"), expected_len=6)
+        target_offset = _coerce_float_list(context.get("target_offset_after_offset_limit"), expected_len=6)
+        if target_offset is None:
+            target_offset = _coerce_float_list(context.get("target_offset"), expected_len=6)
+        realized_before_guard = list(realized)
+        axis_labels = ("x", "y", "z", "rx", "ry", "rz")
+        axis_thresholds = (1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9)
+        active_axes = [False] * 6
+        if not require_active_wrench:
+            active_axes = [
+                abs(requested[index]) > axis_thresholds[index]
+                for index in range(6)
+            ]
+        elif active_wrench is not None:
+            offset_for_activity = target_offset if target_offset is not None else requested
+            active_axes = [
+                abs(active_wrench[index]) > 1e-12
+                and abs(offset_for_activity[index]) > axis_thresholds[index]
+                for index in range(6)
+            ]
+
+        for index, active in enumerate(active_axes):
+            if not active:
+                realized[index] = requested[index]
+
+        guarded_axes: list[str] = []
+        if active_wrench is not None and target_offset is not None:
+            for index, axis in enumerate(("x", "y", "z")):
+                if not active_axes[index]:
+                    continue
+                if target_offset[index] * realized[index] >= -1e-9:
+                    continue
+                replacement = requested[index]
+                if target_offset[index] * replacement < -1e-9:
+                    replacement = 0.0
+                realized[index] = replacement
+                guarded_axes.append(axis)
+        previous = None if self._admittance is None else list(self._admittance.offset)
+        linear_error = _vector_error_norm(requested[:3], realized[:3])
+        angular_error = _vector_error_norm(requested[3:], realized[3:])
+        active_wrench_norm = 0.0 if active_wrench is None else norm(active_wrench)
+        returning_to_neutral = bool(
+            active_wrench_norm <= 1e-12
+            and (
+                context.get("return_applied_axes")
+                or context.get("linear_return_velocity_limit_applied")
+                or context.get("angular_return_velocity_limit_applied")
+            )
+        )
+        if returning_to_neutral:
+            active_axes = [False] * 6
+        active_for_antiwindup = (
+            any(active_axes)
+            and not returning_to_neutral
+        )
+        antiwindup_applied = bool(
+            active_for_antiwindup
+            and (linear_error > 1e-6 or angular_error > 1e-6)
+        )
+        skip_reason = ""
+        if not active_for_antiwindup:
+            skip_reason = (
+                "returning_to_neutral"
+                if returning_to_neutral
+                else (
+                    "active_wrench_zero"
+                    if require_active_wrench and active_wrench_norm <= 1e-12
+                    else "no_active_offset_axis"
+                )
+            )
+        if antiwindup_applied and self._admittance is not None:
+            self._admittance.offset = list(realized)
+        if self._latest_wrench_context is not None:
+            if previous is not None:
+                self._latest_wrench_context["admittance_offset_before_antiwindup"] = list(previous)
+            self._latest_wrench_context["requested_offset_before_command_realization"] = list(requested)
+            if antiwindup_applied:
+                self._latest_wrench_context["applied_offset"] = list(realized)
+                self._latest_wrench_context["offset"] = list(realized)
+                self._latest_wrench_context["applied_offset_source"] = (
+                    "guarded_final_command_pose" if guarded_axes else "final_command_pose"
+                )
+            else:
+                self._latest_wrench_context["applied_offset_source"] = (
+                    "requested_offset:antiwindup_guarded"
+                    if guarded_axes
+                    else ("requested_offset" if not skip_reason else f"requested_offset:{skip_reason}")
+                )
+            self._latest_wrench_context["admittance_offset_antiwindup_applied"] = antiwindup_applied
+            self._latest_wrench_context["admittance_offset_antiwindup_skip_reason"] = skip_reason
+            self._latest_wrench_context["admittance_offset_antiwindup_guarded_axes"] = list(guarded_axes)
+            self._latest_wrench_context["admittance_offset_antiwindup_active_axes"] = [
+                axis
+                for axis, active in zip(axis_labels, active_axes)
+                if active
+            ]
+            if guarded_axes:
+                self._latest_wrench_context["admittance_offset_realized_before_guard"] = list(realized_before_guard)
+                self._latest_wrench_context["admittance_offset_antiwindup_guard_reason"] = (
+                    "realized_linear_offset_opposes_active_target"
+                )
+            self._latest_wrench_context["applied_offset_realization_linear_error_m"] = float(linear_error)
+            self._latest_wrench_context["applied_offset_realization_angular_error_rad"] = float(angular_error)
+        return realized
+
     def _post_start_preflight(self) -> None:
         assert self.robot is not None
         assert self._state is not None
@@ -2563,6 +3082,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         if direct_joint_hint:
             command_pose = normalize_pose(reference)
             command_joint = list(preferred)
+            applied_offset = [0.0] * 6
             if (
                 force_guard_active
                 and bool(self.config.direct_joint_hint_force_guard_reset_admittance)
@@ -2570,6 +3090,13 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             ):
                 self._admittance.reset()
             if self._latest_wrench_context is not None:
+                self._latest_wrench_context["applied_offset"] = list(applied_offset)
+                self._latest_wrench_context["requested_offset_before_command_realization"] = list(offset_values)
+                self._latest_wrench_context["applied_offset_source"] = "direct_joint_hint"
+                self._latest_wrench_context["admittance_offset_antiwindup_applied"] = False
+                self._latest_wrench_context["admittance_offset_antiwindup_skip_reason"] = "direct_joint_hint"
+                if force_guard_active and bool(self.config.direct_joint_hint_force_guard_reset_admittance):
+                    self._latest_wrench_context["offset"] = list(applied_offset)
                 self._latest_wrench_context["ik_method"] = ["dual_arm_joint_hint"]
                 self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata({
                     "status": "pass",
@@ -2628,6 +3155,8 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     seed_joint_override=preferred,
                 )
             )
+            if self._latest_wrench_context is not None:
+                self._latest_wrench_context["applied_offset"] = list(applied_offset)
         except RuntimeError as exc:
             held = self._hold_last_safe_command_after_ik_failure(
                 reason="ik_exception",
@@ -2682,6 +3211,11 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 self._ik_seed = list(held[1])
                 return held
             raise
+        self._sync_admittance_to_realized_pose_offset(
+            reference_pose=reference,
+            command_pose=command_pose,
+            requested_offset=applied_offset,
+        )
         self._ik_seed = list(command_joint)
         return command_pose, command_joint
 

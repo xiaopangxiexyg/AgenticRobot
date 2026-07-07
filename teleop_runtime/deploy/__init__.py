@@ -5,8 +5,13 @@ from .actions import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
     DeploymentAction,
+    FilteredNormalizedAction,
     NormalizedAction,
     normalize_policy_output,
+)
+from .canonical_action import (
+    CanonicalDeployActionPipeline,
+    CanonicalDeployActionResult,
 )
 from .observation import DeploymentObservation, build_deployment_observation
 from .policy import HoldPolicy, LoadedPolicy, load_policy
@@ -15,8 +20,11 @@ __all__ = [
     "ActionChunkBuffer",
     "ActionSafetyFilter",
     "ActionSafetyFilterConfig",
+    "CanonicalDeployActionPipeline",
+    "CanonicalDeployActionResult",
     "DeploymentAction",
     "DeploymentObservation",
+    "FilteredNormalizedAction",
     "HoldPolicy",
     "LoadedPolicy",
     "NormalizedAction",

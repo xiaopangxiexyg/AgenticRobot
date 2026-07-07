@@ -1,0 +1,17 @@
+{
+  "schema_version": "teleop_runtime.arm_workspace.v1",
+  "frame": "desk",
+  "axes": {
+    "x": "forward",
+    "y": "left",
+    "z": "up"
+  },
+  "default": {
+    "workspace_min": [-0.80, -0.80, 0.00],
+    "workspace_max": [0.80, 0.80, 0.90]
+  },
+  "sides": {
+    "left": {},
+    "right": {}
+  }
+}

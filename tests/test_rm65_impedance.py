@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 
 import numpy as np
 
 from hardware.rm65.force_compensation import (
+    PoseAdmittance,
     admittance_wrench_for_arm,
     apply_pose_offset,
     apply_pose_offset_work_rotvec,
@@ -15,6 +17,7 @@ from teleop_runtime.backends.arms.rm65_impedance import (
     RM65ImpedanceArmBackend,
     RM65ImpedanceArmBackendConfig,
 )
+from teleop_runtime.schemas import EffectorCommand
 
 
 class _FakeRobot:
@@ -151,21 +154,24 @@ class _FakeRobot:
 
 
 class RM65ImpedanceTest(unittest.TestCase):
-    def test_right_arm_admittance_wrench_swaps_rx_ry(self) -> None:
+    def test_right_arm_admittance_wrench_keeps_raw_tx_ty_order(self) -> None:
         wrench = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
         self.assertEqual(admittance_wrench_for_arm(wrench, "left"), wrench)
-        self.assertEqual(admittance_wrench_for_arm(wrench, "right"), [1.0, 2.0, 3.0, 5.0, 4.0, 6.0])
+        self.assertEqual(admittance_wrench_for_arm(wrench, "right"), wrench)
 
-    def test_apply_pose_offset_uses_direct_euler_channel_offsets(self) -> None:
+    def test_apply_pose_offset_uses_work_frame_rotation_vector_offsets(self) -> None:
         pose = [-0.165333, 0.196294, 0.637266, 1.494, 0.449, -1.619]
         offset = [0.0, 0.0, 0.0, 0.0, 0.001, 0.0]
 
         shifted = apply_pose_offset(pose, offset)
+        work_rotvec_shifted = apply_pose_offset_work_rotvec(pose, offset)
 
-        self.assertAlmostEqual(shifted[3], pose[3], places=9)
-        self.assertAlmostEqual(shifted[4], pose[4] + 0.001, places=9)
-        self.assertAlmostEqual(shifted[5], pose[5], places=9)
+        for actual, expected in zip(shifted, work_rotvec_shifted):
+            self.assertAlmostEqual(actual, expected, places=9)
+        self.assertLess(shifted[4] - pose[4], 2e-4)
+        self.assertGreater(abs(shifted[3] - pose[3]), 1e-4)
+        self.assertGreater(abs(shifted[5] - pose[5]), 1e-4)
 
     def test_work_rotvec_offset_still_exhibits_pose_dependent_axis_coupling(self) -> None:
         pose = [-0.165333, 0.196294, 0.637266, 1.494, 0.449, -1.619]
@@ -194,6 +200,371 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertAlmostEqual(thresholds["linear_filtered_force_n_for_max_offset"], 0.55)
         self.assertAlmostEqual(thresholds["angular_deadbanded_torque_nm_for_max_offset"], 0.1)
         self.assertAlmostEqual(thresholds["angular_filtered_torque_nm_for_max_offset"], 0.13)
+
+    def test_return_deadbands_default_to_active_deadbands(self) -> None:
+        config = RM65ImpedanceConfig(
+            tool_name="DMTAC_L",
+            force_deadband_n=0.42,
+            torque_deadband_nm=0.07,
+        )
+
+        self.assertIsNone(config.return_force_deadband_n)
+        self.assertIsNone(config.return_torque_deadband_nm)
+        self.assertAlmostEqual(config.effective_return_force_deadband_n, 0.42)
+        self.assertAlmostEqual(config.effective_return_torque_deadband_nm, 0.07)
+
+    def test_pose_admittance_angular_axis_velocity_scales_limit_rz_only(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_axis_velocity_scales=[1.0, 1.0, 0.2],
+            angular_compliance_rad_per_nm=1.0,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_offset_rad=2.0,
+            return_rate_s=0.0,
+        )
+
+        update = admittance.update([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 0.1)
+
+        self.assertTrue(update["angular_axis_velocity_limit_applied"])
+        self.assertTrue(update["angular_velocity_limit_applied"])
+        self.assertEqual(update["angular_axis_velocity_scales"], [1.0, 1.0, 0.2])
+        self.assertEqual(update["angular_axis_step_velocity_limits_rad_s"], [1.0, 1.0, 0.2])
+        self.assertAlmostEqual(update["offset"][5], 0.02)
+        self.assertAlmostEqual(update["velocity"][5], 0.2)
+
+    def test_impedance_config_local_step_position_worsen_override_reaches_resolver_profile(self) -> None:
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=[0.0] * 6,
+            current_pose=[0.0, 0.0, 0.35, 0.0, 0.0, 0.0],
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                ik_resolver_include_pinocchio=False,
+                ik_resolver_local_step_max_position_worsen_m=0.025,
+                ik_resolver_local_step_component_progress_max_position_worsen_m=0.03,
+            ),
+            robot=robot,
+        )
+
+        controller._initialize_ik_resolver()
+
+        self.assertAlmostEqual(
+            controller._ik_resolver_init_metadata["local_step_max_position_worsen_m"],
+            0.025,
+        )
+        self.assertAlmostEqual(
+            controller._ik_resolver_init_metadata[
+                "local_step_component_progress_max_position_worsen_m"
+            ],
+            0.03,
+        )
+
+    def test_pose_admittance_compliance_releases_by_return_rate_after_deadband(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.35,
+            offset=[0.0, 0.0, 0.0, 0.0, 0.0, 0.6],
+        )
+
+        update = admittance.update([0.0] * 6, 0.025)
+
+        expected = 0.6 * (1.0 - 0.35 * 0.025)
+        self.assertEqual(update["target_offset_unclamped"][3:], [0.0, 0.0, 0.0])
+        self.assertEqual(update["return_applied_axes"], ["rx", "ry", "rz"])
+        self.assertEqual(update["target_offset_after_return"][:5], [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertAlmostEqual(update["target_offset"][5], expected)
+        self.assertAlmostEqual(update["target_offset_after_return"][5], expected)
+        self.assertAlmostEqual(update["target_offset_after_offset_limit"][5], expected)
+        self.assertAlmostEqual(update["offset"][5], expected)
+        self.assertAlmostEqual(update["offset_step_after_velocity_limit"][5], expected - 0.6)
+        self.assertAlmostEqual(update["velocity"][5], (expected - 0.6) / 0.025)
+
+    def test_pose_admittance_compliance_can_hold_after_deadband(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.0,
+            offset=[0.0, 0.0, 0.0, 0.2, -0.1, 0.3],
+        )
+
+        update = admittance.update([0.0] * 6, 0.025)
+
+        self.assertEqual(update["return_applied_axes"], ["rx", "ry", "rz"])
+        self.assertEqual(update["target_offset"][3:], [0.2, -0.1, 0.3])
+        self.assertEqual(update["offset"][3:], [0.2, -0.1, 0.3])
+        self.assertEqual(update["velocity"][3:], [0.0, 0.0, 0.0])
+
+    def test_pose_admittance_compliance_force_resumes_target_tracking(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.35,
+            offset=[0.0, 0.0, 0.0, 0.2, -0.1, 0.6],
+        )
+
+        update = admittance.update([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 0.025)
+
+        self.assertEqual(update["return_applied_axes"], ["rx", "ry"])
+        self.assertEqual(update["return_paused_axes"], [])
+        self.assertFalse(update["linear_return_paused"])
+        self.assertFalse(update["angular_return_paused"])
+        self.assertEqual(update["target_offset_unclamped"][3:], [0.0, 0.0, 0.1])
+        self.assertAlmostEqual(update["target_offset_after_return"][3], 0.2 * (1.0 - 0.35 * 0.025))
+        self.assertAlmostEqual(update["target_offset_after_return"][4], -0.1 * (1.0 - 0.35 * 0.025))
+        self.assertAlmostEqual(update["target_offset_after_return"][5], 0.1)
+        self.assertAlmostEqual(update["target_offset"][3], 0.2 * (1.0 - 0.35 * 0.025))
+        self.assertAlmostEqual(update["target_offset"][4], -0.1 * (1.0 - 0.35 * 0.025))
+        self.assertAlmostEqual(update["target_offset"][5], 0.1)
+        self.assertLess(update["offset"][3], 0.2)
+        self.assertGreater(update["offset"][4], -0.1)
+        self.assertAlmostEqual(update["offset"][5], 0.575, places=6)
+        self.assertAlmostEqual(update["offset_delta_before_velocity_limit"][5], -0.5)
+        self.assertAlmostEqual(update["offset_step_after_velocity_limit"][5], -0.025, places=6)
+        self.assertTrue(update["angular_velocity_limit_applied"])
+        self.assertAlmostEqual(update["velocity"][5], -1.0, delta=1e-5)
+
+    def test_pose_admittance_compliance_caps_unloading_toward_zero(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_return_velocity_rad_s=0.05,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.35,
+            offset=[0.0, 0.0, 0.0, 0.0, 0.0, 0.2],
+        )
+
+        update = admittance.update([0.0] * 6, 0.1)
+
+        expected_target = 0.2 * (1.0 - 0.35 * 0.1)
+        self.assertEqual(update["return_applied_axes"], ["rx", "ry", "rz"])
+        self.assertAlmostEqual(update["target_offset"][5], expected_target)
+        self.assertAlmostEqual(update["offset_delta_before_velocity_limit"][5], expected_target - 0.2)
+        self.assertAlmostEqual(update["offset_step_after_velocity_limit"][5], -0.005)
+        self.assertAlmostEqual(update["offset"][5], 0.195)
+        self.assertAlmostEqual(update["velocity"][5], -0.05)
+        self.assertTrue(update["angular_velocity_limit_applied"])
+        self.assertTrue(update["angular_return_velocity_limit_applied"])
+        self.assertAlmostEqual(update["angular_step_velocity_limit_rad_s"], 0.05)
+
+    def test_pose_admittance_compliance_does_not_cap_larger_force_reversal(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_return_velocity_rad_s=0.05,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.35,
+            offset=[0.0, 0.0, 0.0, 0.0, 0.0, 0.2],
+        )
+
+        update = admittance.update([0.0, 0.0, 0.0, 0.0, 0.0, -3.0], 0.1)
+
+        self.assertAlmostEqual(update["target_offset"][5], -0.3)
+        self.assertAlmostEqual(update["offset_delta_before_velocity_limit"][5], -0.5)
+        self.assertAlmostEqual(update["offset_step_after_velocity_limit"][5], -0.1)
+        self.assertAlmostEqual(update["offset"][5], 0.1)
+        self.assertTrue(update["angular_velocity_limit_applied"])
+        self.assertFalse(update["angular_return_velocity_limit_applied"])
+        self.assertAlmostEqual(update["angular_step_velocity_limit_rad_s"], 1.0)
+
+    def test_pose_admittance_compliance_does_not_cap_active_force_reversal_toward_zero(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_return_velocity_rad_s=0.05,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.35,
+            offset=[0.0, 0.0, 0.0, 0.0, 0.0, 0.3],
+        )
+
+        update = admittance.update([0.0, 0.0, 0.0, 0.0, 0.0, -1.0], 0.1)
+
+        self.assertEqual(update["return_applied_axes"], ["rx", "ry"])
+        self.assertAlmostEqual(update["target_offset"][5], -0.1)
+        self.assertAlmostEqual(update["offset_delta_before_velocity_limit"][5], -0.4)
+        self.assertAlmostEqual(update["offset_step_after_velocity_limit"][5], -0.1)
+        self.assertAlmostEqual(update["offset"][5], 0.2)
+        self.assertTrue(update["angular_velocity_limit_applied"])
+        self.assertFalse(update["angular_return_velocity_limit_applied"])
+        self.assertAlmostEqual(update["angular_step_velocity_limit_rad_s"], 1.0)
+
+    def test_pose_admittance_compliance_pauses_return_from_filtered_activity(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[False, False, False, True, True, True],
+            angular_force_sign=1.0,
+            angular_axis_signs=[1.0, 1.0, 1.0],
+            angular_compliance_rad_per_nm=0.1,
+            max_angular_velocity_rad_s=1.0,
+            max_angular_offset_rad=1.2,
+            return_rate_s=0.35,
+            offset=[0.0, 0.0, 0.0, 0.2, -0.1, 0.6],
+        )
+
+        update = admittance.update(
+            [0.0] * 6,
+            0.025,
+            return_activity_wrench=[0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+            return_torque_deadband_nm=0.03,
+        )
+
+        self.assertEqual(update["return_applied_axes"], ["rx", "ry"])
+        self.assertEqual(update["return_paused_axes"], ["rz"])
+        self.assertTrue(update["angular_return_paused"])
+        self.assertEqual(update["target_offset_unclamped"][3:], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(update["target_offset_after_return"][3], 0.2 * (1.0 - 0.35 * 0.025))
+        self.assertAlmostEqual(update["target_offset_after_return"][4], -0.1 * (1.0 - 0.35 * 0.025))
+        self.assertAlmostEqual(update["target_offset_after_return"][5], 0.6)
+        self.assertLess(update["offset"][3], 0.2)
+        self.assertGreater(update["offset"][4], -0.1)
+        self.assertAlmostEqual(update["offset"][5], 0.6)
+
+    def test_pose_admittance_compliance_return_pause_is_per_axis(self) -> None:
+        admittance = PoseAdmittance(
+            enabled_axes=[True, True, True, False, False, False],
+            force_sign=1.0,
+            linear_compliance_m_per_n=0.004,
+            max_linear_velocity_m_s=1.0,
+            max_linear_offset_m=1.0,
+            return_rate_s=1.0,
+            offset=[0.02, -0.02, 0.01, 0.0, 0.0, 0.0],
+        )
+
+        update = admittance.update(
+            [0.0] * 6,
+            0.025,
+            return_activity_wrench=[0.3, 0.3, 0.3, 0.0, 0.0, 0.0],
+            return_force_deadband_n=0.45,
+        )
+
+        self.assertEqual(update["return_paused_axes"], [])
+        self.assertEqual(update["return_applied_axes"], ["x", "y", "z"])
+        self.assertFalse(update["linear_return_paused"])
+        self.assertLess(abs(update["offset"][0]), 0.02)
+        self.assertLess(abs(update["offset"][1]), 0.02)
+        self.assertLess(abs(update["offset"][2]), 0.01)
+
+    def test_impedance_backend_control_dt_overrides_profile_control_hz(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0 / 30.0,
+                action_hz=30.0,
+            )
+        )
+        config = backend._build_impedance_config(
+            {
+                "tool_name": "DMTAC_M",
+                "impedance": {
+                    "pose": {
+                        "mode": "pose",
+                        "control_hz": 40.0,
+                        "action_hz": 20.0,
+                    }
+                },
+            }
+        )
+
+        self.assertAlmostEqual(config.control_hz, 30.0)
+        self.assertAlmostEqual(config.action_hz, 30.0)
+        self.assertIsNotNone(backend._active_impedance_config)
+        self.assertAlmostEqual(backend._active_impedance_config["requested_control_hz"], 30.0)
+        self.assertIn("control_hz", backend._active_impedance_config["override_keys"])
+
+    def test_impedance_backend_caps_requested_control_hz_to_rm65_limit(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0 / 50.0,
+                action_hz=50.0,
+            )
+        )
+        config = backend._build_impedance_config(
+            {
+                "tool_name": "DMTAC_M",
+                "impedance": {
+                    "pose": {
+                        "mode": "pose",
+                        "control_hz": 40.0,
+                        "action_hz": 20.0,
+                    }
+                },
+            }
+        )
+
+        self.assertAlmostEqual(config.control_hz, 40.0)
+        self.assertAlmostEqual(config.action_hz, 40.0)
+        self.assertIsNotNone(backend._active_impedance_config)
+        self.assertAlmostEqual(backend._active_impedance_config["requested_control_hz"], 50.0)
+        self.assertAlmostEqual(backend._active_impedance_config["effective_control_hz"], 40.0)
+        self.assertTrue(backend._active_impedance_config["control_hz_clamped"])
+
+    def test_impedance_backend_caps_control_hz_override_to_rm65_limit(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0 / 30.0,
+                action_hz=30.0,
+                impedance_overrides={
+                    "control_hz": 50.0,
+                    "action_hz": 50.0,
+                    "return_torque_deadband_nm": 0.005,
+                },
+            )
+        )
+        config = backend._build_impedance_config(
+            {
+                "tool_name": "DMTAC_M",
+                "impedance": {
+                    "pose": {
+                        "mode": "pose",
+                        "control_hz": 40.0,
+                        "action_hz": 20.0,
+                    }
+                },
+            }
+        )
+
+        self.assertAlmostEqual(config.control_hz, 40.0)
+        self.assertAlmostEqual(config.action_hz, 40.0)
+        self.assertAlmostEqual(config.return_torque_deadband_nm, 0.005)
+        self.assertAlmostEqual(backend._active_impedance_config["requested_control_hz"], 50.0)
+        self.assertAlmostEqual(backend._active_impedance_config["effective_control_hz"], 40.0)
+        self.assertAlmostEqual(backend._active_impedance_config["return_torque_deadband_nm"], 0.005)
+        self.assertAlmostEqual(backend._active_impedance_config["effective_return_torque_deadband_nm"], 0.005)
+        self.assertTrue(backend._active_impedance_config["control_hz_clamped"])
 
     def test_pose_controller_preflight_reports_state_pose_vs_local_fk_mismatch(self) -> None:
         robot = _FakeRobot(
@@ -263,9 +634,9 @@ class RM65ImpedanceTest(unittest.TestCase):
         text = str(ctx.exception)
         self.assertIn("step=1 tool=DMTAC_L", text)
         self.assertIn("target_offset=[0.050000, 0.000000, 0.000000", text)
-        self.assertIn("-0.040000, 0.000000]", text)
+        self.assertIn("-0.040000, 0.000000, 0.000000]", text)
         self.assertRegex(text, r"offset_norms=linear:0\.01000[0-9]m angular:0\.01000[0-9]rad")
-        self.assertIn("deadbanded_wrench=[0.60000, 0.00000, 0.00000, 0.00000, 0.10000, 0.00000]", text)
+        self.assertIn("deadbanded_wrench=[0.60000, 0.00000, 0.00000, 0.10000, 0.00000, 0.00000]", text)
         self.assertIn("raw_deadbanded_wrench=[0.60000, 0.00000, 0.00000, 0.10000, 0.00000, 0.00000]", text)
         self.assertIn("linear target offset is saturating the configured limit", text)
         self.assertIn("filtered force above about 0.550N saturates max_linear_offset_m", text)
@@ -453,6 +824,60 @@ class RM65ImpedanceTest(unittest.TestCase):
 
         backend.warm_start_force_control()
         self.assertEqual(controller.start_count, 1)
+
+    def test_impedance_backend_send_command_does_not_wait_for_step_lock(self) -> None:
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="192.0.2.10",
+                side="right",
+                connect_hardware=False,
+                debug_timing=True,
+            )
+        )
+        command = EffectorCommand(
+            effector_name="right_arm",
+            side="right",
+            command_type="cartesian_pose",
+            value=np.eye(4),
+            metadata={"solver_output_qpos": [0.0] * 6},
+        )
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def send_in_thread() -> None:
+            try:
+                backend.send_command(command)
+            except BaseException as exc:  # noqa: BLE001 - propagate from worker.
+                errors.append(exc)
+            finally:
+                done.set()
+
+        backend._send_lock.acquire()
+        try:
+            thread = threading.Thread(target=send_in_thread)
+            start = time.perf_counter()
+            thread.start()
+            completed_while_locked = done.wait(timeout=0.1)
+            elapsed = time.perf_counter() - start
+        finally:
+            backend._send_lock.release()
+        thread.join(timeout=1.0)
+
+        if errors:
+            raise errors[0]
+        self.assertTrue(completed_while_locked, "send_command waited for the impedance step lock")
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(backend._latest_target_pose6, [0.0] * 6)
+        self.assertEqual(backend._latest_target_joint_deg, [0.0] * 6)
+        state = backend.get_state()
+        timing = state["last_send_command_timing"]
+        self.assertIsNotNone(timing)
+        self.assertEqual(timing["send_lock_wait_ms"], 0.0)
+        self.assertIn("send_lock_wait", [phase["name"] for phase in timing["phases"]])
+        self.assertEqual(state["last_command_controlled_frame"], "tool_tcp")
+        self.assertEqual(state["latest_target_tcp_pose6"], [0.0] * 6)
+        self.assertEqual(state["latest_target_joint_deg"], [0.0] * 6)
+        self.assertIsNotNone(state["last_command"])
 
     def test_pose_controller_can_hold_last_safe_when_runtime_ik_fails(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
@@ -675,7 +1100,64 @@ class RM65ImpedanceTest(unittest.TestCase):
         metadata = record["ik_metadata"]
         self.assertEqual(metadata["direct_joint_hint_reason"], "force_guard")
         self.assertTrue(metadata["direct_joint_hint_force_guard"]["active"])
-        self.assertGreater(record["offset"][0], 0.001)
+        self.assertAlmostEqual(record["requested_offset_before_command_realization"][0], 0.05)
+        self.assertEqual(record["applied_offset"], [0.0] * 6)
+        self.assertEqual(record["offset"], [0.0] * 6)
+        self.assertFalse(record["admittance_offset_antiwindup_applied"])
+        self.assertEqual(record["admittance_offset_antiwindup_skip_reason"], "direct_joint_hint")
+
+    def test_pose_controller_can_pause_return_below_active_deadband(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        held_offset = [0.0, 0.0, 0.0, 0.0, 0.0, 0.2]
+        held_pose = apply_pose_offset(current_pose, held_offset)
+        held_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 2.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=held_pose,
+            ik_success_joint=held_joint,
+            ik_retry_pose=current_pose,
+            force_sequence=[
+                [0.0] * 6,
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.01],
+            ],
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                axes="rz",
+                lowpass_alpha=1.0,
+                torque_deadband_nm=0.03,
+                return_torque_deadband_nm=0.005,
+                angular_compliance_rad_per_nm=0.1,
+                max_angular_velocity_rad_s=1.0,
+                max_angular_offset_rad=1.2,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller._admittance.offset = list(held_offset)
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(current_pose)
+
+        self.assertEqual(record["active_wrench"], [0.0] * 6)
+        self.assertAlmostEqual(record["filtered_wrench"][5], 0.01)
+        self.assertAlmostEqual(record["return_activity_wrench"][5], 0.01)
+        self.assertAlmostEqual(record["return_torque_deadband_nm"], 0.005)
+        self.assertEqual(record["return_applied_axes"], [])
+        self.assertEqual(record["return_paused_axes"], ["rz"])
+        self.assertAlmostEqual(record["offset"][5], 0.2)
+        self.assertEqual(record["command_joint_deg"], held_joint)
 
     def test_pose_controller_backs_off_when_ik_joint_step_exceeds_limit(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
@@ -925,6 +1407,57 @@ class RM65ImpedanceTest(unittest.TestCase):
         ):
             self.assertIn(expected, phase_names)
 
+    def test_pose_controller_records_tracking_direction_and_closing_speed(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        measured_joint = [0.2, 0.0, 20.0, 0.0, 0.0, 0.0]
+        measured_pose = [0.01, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_pose = [0.03, 0.0, 0.35, 0.0, 0.0, 0.0]
+        command_joint = [1.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=target_pose,
+            ik_success_joint=command_joint,
+            ik_retry_pose=current_pose,
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        robot.current_joint = list(measured_joint)
+        robot.current_pose = list(measured_pose)
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(target_pose)
+
+        np.testing.assert_allclose(record["measured_to_command_linear_m"], [0.02, 0.0, 0.0])
+        self.assertEqual(record["force_source"], "work")
+        self.assertIn("work", record["force_readings"])
+        np.testing.assert_allclose(record["selected_force_wrench"], [0.0] * 6)
+        np.testing.assert_allclose(record["filtered_wrench"], [0.0] * 6)
+        np.testing.assert_allclose(record["command_to_measured_linear_m"], [-0.02, 0.0, 0.0])
+        np.testing.assert_allclose(record["reference_to_command_linear_m"], [0.0, 0.0, 0.0])
+        np.testing.assert_allclose(record["reference_to_measured_linear_m"], [-0.02, 0.0, 0.0])
+        np.testing.assert_allclose(
+            record["measured_to_command_joint_deg"],
+            [0.8, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        self.assertGreater(record["tracking_error_closing_linear_m_s"], 0.0)
+        self.assertGreater(record["tracking_error_closing_joint_deg_s"], 0.0)
+
     def test_pose_controller_can_opt_into_pose_transport(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
         current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
@@ -959,6 +1492,330 @@ class RM65ImpedanceTest(unittest.TestCase):
 
         self.assertEqual(robot.movep_calls[-1], target_pose)
         self.assertEqual(robot.movej_calls, [])
+
+    def test_pose_controller_records_offset_command_realization_metrics(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        offset = [0.02, 0.0, 0.0, 0.0, 0.0, 0.0]
+        command_pose = apply_pose_offset(current_pose, offset)
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=command_pose,
+            ik_success_joint=[1.0, 0.0, 20.0, 0.0, 0.0, 0.0],
+            ik_retry_pose=current_pose,
+            force_sequence=[
+                [0.0] * 6,
+                [2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                force_deadband_n=0.0,
+                linear_compliance_m_per_n=0.01,
+                max_linear_velocity_m_s=1.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(current_pose)
+
+        np.testing.assert_allclose(record["applied_offset"], offset)
+        self.assertAlmostEqual(record["admittance_offset_linear_norm_m"], 0.02)
+        self.assertAlmostEqual(record["commanded_offset_linear_norm_m"], 0.02)
+        self.assertAlmostEqual(record["offset_to_command_linear_error_m"], 0.0)
+        self.assertAlmostEqual(record["offset_to_command_linear_fraction"], 1.0)
+        self.assertAlmostEqual(record["target_to_command_linear_fraction"], 1.0)
+        self.assertAlmostEqual(record["measured_offset_linear_norm_m"], 0.0)
+        self.assertAlmostEqual(record["command_to_measured_linear_norm_m"], 0.02)
+
+    def test_pose_controller_syncs_admittance_to_relaxed_command_offset(self) -> None:
+        reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        requested_offset = [0.05, 0.0, 0.0, 0.0, 0.0, 0.4]
+        realized_offset = [0.03, 0.0, 0.0, 0.0, 0.0, 0.8]
+        clamped_realized_offset = [0.03, 0.0, 0.0, 0.0, 0.0, 0.4]
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                max_command_joint_velocity_deg_s=1000.0,
+                max_linear_offset_m=0.05,
+                max_angular_offset_rad=0.6,
+            ),
+            robot=None,
+        )
+        controller._ik_resolver = object()
+        controller._ik_seed = [0.0] * 6
+        controller._previous_command_joint = [0.0] * 6
+        controller._previous_command_pose = list(reference)
+        controller._current_step_dt = 0.1
+        controller._admittance = PoseAdmittance(
+            enabled_axes=[True] * 6,
+            max_angular_offset_rad=1.0,
+            offset=list(requested_offset),
+        )
+        controller._latest_wrench_context = {
+            "offset": list(requested_offset),
+            "active_wrench": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "return_applied_axes": ["ry"],
+        }
+
+        def relaxed_solver(**kwargs):
+            return (
+                apply_pose_offset(kwargs["reference_pose"], realized_offset),
+                [0.0] * 6,
+                [0.0] * 6,
+                1.0,
+                list(kwargs["offset"]),
+                0,
+            )
+
+        controller._command_from_pose_with_resolver = relaxed_solver  # type: ignore[method-assign]
+
+        command_pose, command_joint = controller._command_from_reference(reference, requested_offset)
+
+        self.assertEqual(command_joint, [0.0] * 6)
+        np.testing.assert_allclose(command_pose, apply_pose_offset(reference, realized_offset))
+        np.testing.assert_allclose(controller._admittance.offset, clamped_realized_offset, atol=1e-9)
+        np.testing.assert_allclose(
+            controller._latest_wrench_context["applied_offset"],
+            clamped_realized_offset,
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            controller._latest_wrench_context["requested_offset_before_command_realization"],
+            requested_offset,
+            atol=1e-9,
+        )
+        self.assertTrue(controller._latest_wrench_context["admittance_offset_antiwindup_applied"])
+        self.assertEqual(controller._latest_wrench_context["admittance_offset_antiwindup_skip_reason"], "")
+        self.assertEqual(
+            controller._latest_wrench_context["admittance_offset_antiwindup_active_axes"],
+            ["x"],
+        )
+        self.assertEqual(controller._latest_wrench_context["applied_offset_source"], "final_command_pose")
+        self.assertGreater(
+            controller._latest_wrench_context["applied_offset_realization_linear_error_m"],
+            0.01,
+        )
+        self.assertAlmostEqual(
+            controller._latest_wrench_context["applied_offset_realization_angular_error_rad"],
+            0.0,
+        )
+
+    def test_pose_controller_antiwindup_syncs_only_active_axes(self) -> None:
+        reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        requested_offset = [0.02, 0.0, 0.0, 0.0, 0.0, 0.2]
+        realized_offset = [-0.04, 0.03, 0.0, 0.0, 0.0, 0.3]
+        expected_offset = [0.02, 0.0, 0.0, 0.0, 0.0, 0.3]
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                max_command_joint_velocity_deg_s=1000.0,
+                max_linear_offset_m=0.08,
+                max_angular_offset_rad=0.6,
+            ),
+            robot=None,
+        )
+        controller._admittance = PoseAdmittance(
+            enabled_axes=[True] * 6,
+            max_angular_offset_rad=1.0,
+            offset=list(requested_offset),
+        )
+        controller._latest_wrench_context = {
+            "active_wrench": [0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+            "target_offset_after_offset_limit": list(requested_offset),
+        }
+
+        realized = controller._sync_admittance_to_realized_pose_offset(
+            reference_pose=reference,
+            command_pose=apply_pose_offset(reference, realized_offset),
+            requested_offset=requested_offset,
+        )
+
+        np.testing.assert_allclose(realized, expected_offset, atol=1e-9)
+        np.testing.assert_allclose(controller._admittance.offset, expected_offset, atol=1e-9)
+        np.testing.assert_allclose(
+            controller._latest_wrench_context["applied_offset"],
+            expected_offset,
+            atol=1e-9,
+        )
+        self.assertTrue(controller._latest_wrench_context["admittance_offset_antiwindup_applied"])
+        self.assertEqual(
+            controller._latest_wrench_context["admittance_offset_antiwindup_active_axes"],
+            ["rz"],
+        )
+        self.assertEqual(
+            controller._latest_wrench_context["admittance_offset_antiwindup_guarded_axes"],
+            [],
+        )
+        self.assertEqual(controller._latest_wrench_context["applied_offset_source"], "final_command_pose")
+
+    def test_pose_controller_does_not_sync_reference_tracking_lag_without_force(self) -> None:
+        reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        requested_offset = [0.0] * 6
+        lagged_pose_offset = [-0.01, 0.0, 0.0, 0.0, 0.0, -0.08]
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                max_command_joint_velocity_deg_s=1000.0,
+            ),
+            robot=None,
+        )
+        controller._ik_resolver = object()
+        controller._ik_seed = [0.0] * 6
+        controller._previous_command_joint = [0.0] * 6
+        controller._previous_command_pose = list(reference)
+        controller._current_step_dt = 0.1
+        controller._admittance = PoseAdmittance(
+            enabled_axes=[True] * 6,
+            max_angular_offset_rad=1.0,
+            offset=list(requested_offset),
+        )
+        controller._latest_wrench_context = {
+            "offset": list(requested_offset),
+            "active_wrench": [0.0] * 6,
+        }
+
+        def lagged_solver(**kwargs):
+            return (
+                apply_pose_offset(kwargs["reference_pose"], lagged_pose_offset),
+                [0.0] * 6,
+                [0.0] * 6,
+                1.0,
+                list(kwargs["offset"]),
+                0,
+            )
+
+        controller._command_from_pose_with_resolver = lagged_solver  # type: ignore[method-assign]
+
+        controller._command_from_reference(reference, requested_offset)
+
+        np.testing.assert_allclose(controller._admittance.offset, requested_offset, atol=1e-9)
+        np.testing.assert_allclose(controller._latest_wrench_context["applied_offset"], requested_offset, atol=1e-9)
+        self.assertFalse(controller._latest_wrench_context["admittance_offset_antiwindup_applied"])
+        self.assertEqual(
+            controller._latest_wrench_context["admittance_offset_antiwindup_skip_reason"],
+            "active_wrench_zero",
+        )
+
+    def test_pose_controller_does_not_sync_admittance_while_returning_to_neutral(self) -> None:
+        reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        requested_offset = [0.04, 0.0, 0.0, 0.0, 0.0, 0.2]
+        lagged_pose_offset = [0.01, 0.0, 0.0, 0.0, 0.0, 0.04]
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                max_command_joint_velocity_deg_s=1000.0,
+            ),
+            robot=None,
+        )
+        controller._ik_resolver = object()
+        controller._ik_seed = [0.0] * 6
+        controller._previous_command_joint = [0.0] * 6
+        controller._previous_command_pose = list(reference)
+        controller._current_step_dt = 0.1
+        controller._admittance = PoseAdmittance(
+            enabled_axes=[True] * 6,
+            max_angular_offset_rad=1.0,
+            offset=list(requested_offset),
+        )
+        controller._latest_wrench_context = {
+            "offset": list(requested_offset),
+            "active_wrench": [0.0] * 6,
+            "linear_return_velocity_limit_applied": True,
+        }
+
+        def lagged_solver(**kwargs):
+            return (
+                apply_pose_offset(kwargs["reference_pose"], lagged_pose_offset),
+                [0.0] * 6,
+                [0.0] * 6,
+                1.0,
+                list(kwargs["offset"]),
+                0,
+            )
+
+        controller._command_from_pose_with_resolver = lagged_solver  # type: ignore[method-assign]
+
+        controller._command_from_reference(reference, requested_offset)
+
+        np.testing.assert_allclose(controller._admittance.offset, requested_offset, atol=1e-9)
+        np.testing.assert_allclose(controller._latest_wrench_context["applied_offset"], requested_offset, atol=1e-9)
+        self.assertFalse(controller._latest_wrench_context["admittance_offset_antiwindup_applied"])
+        self.assertEqual(
+            controller._latest_wrench_context["admittance_offset_antiwindup_skip_reason"],
+            "returning_to_neutral",
+        )
+
+    def test_pose_controller_guards_antiwindup_against_force_opposing_linear_realization(self) -> None:
+        reference = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        requested_offset = [0.0, -0.01, 0.0, 0.0, 0.0, 0.0]
+        realized_pose_offset = [0.0, -0.025, 0.0, 0.0, 0.0, 0.0]
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                joint_rate_limiter_enabled=False,
+                max_command_joint_velocity_deg_s=1000.0,
+            ),
+            robot=None,
+        )
+        controller._admittance = PoseAdmittance(
+            enabled_axes=[True] * 6,
+            max_angular_offset_rad=1.0,
+            offset=list(requested_offset),
+        )
+        controller._latest_wrench_context = {
+            "active_wrench": [0.0, 12.0, 0.0, 0.0, 0.0, 0.0],
+            "target_offset_after_offset_limit": [0.0, 0.048, 0.0, 0.0, 0.0, 0.0],
+        }
+
+        realized = controller._sync_admittance_to_realized_pose_offset(
+            reference_pose=reference,
+            command_pose=apply_pose_offset(reference, realized_pose_offset),
+            requested_offset=requested_offset,
+        )
+
+        self.assertAlmostEqual(realized[1], 0.0)
+        self.assertAlmostEqual(controller._admittance.offset[1], 0.0)
+        self.assertTrue(controller._latest_wrench_context["admittance_offset_antiwindup_applied"])
+        self.assertEqual(
+            controller._latest_wrench_context["applied_offset_source"],
+            "guarded_final_command_pose",
+        )
+        self.assertEqual(
+            controller._latest_wrench_context["admittance_offset_antiwindup_guarded_axes"],
+            ["y"],
+        )
+        self.assertAlmostEqual(
+            controller._latest_wrench_context["admittance_offset_realized_before_guard"][1],
+            -0.025,
+        )
 
     def test_joint_controller_retries_ik_with_current_state_seed(self) -> None:
         current_joint = [-88.66, 6.76, 44.49, 91.72, 85.81, 12.80]

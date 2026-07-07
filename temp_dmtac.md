@@ -32,7 +32,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both  
 
 taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --active-sides both   --right-arm-ip "$RIGHT_ARM_IP" --left-arm-ip "$LEFT_ARM_IP"  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json   --load-profile /home/password-1/DexTeleop/teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json   --gui --hand-backend dmtac-gripper --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json --q6-hold-recalibration-gesture --no-episode-recording --dmtac-with-tactile \
 --hz 15 \
---arm-control-hz 50 \
+--arm-control-hz 40 \
 --arm-io-threads 4 \
 --dual-arm-ik-hz 15 \
 --dmtac-with-tactile \
@@ -96,7 +96,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --q6-hold-recalibration-gesture \
   --no-episode-recording \
   --hz 15 \
-  --arm-control-hz 50 \
+  --arm-control-hz 40 \
   --arm-io-threads 4 \
   --dual-arm-ik-hz 15 \
   --dmtac-with-tactile \
@@ -131,7 +131,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --q6-hold-recalibration-gesture \
   --no-episode-recording \
   --hz 15 \
-  --arm-control-hz 50 \
+  --arm-control-hz 40 \
   --arm-io-threads 4 \
   --dual-arm-ik-hz 15 \
   --no-session-record-commands \
@@ -176,7 +176,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --q6-hold-recalibration-gesture \
   --no-episode-recording \
   --hz 15 \
-  --arm-control-hz 50 \
+  --arm-control-hz 40 \
   --arm-io-threads 4 \
   --dual-arm-ik-hz 15 \
   --dmtac-with-tactile \
@@ -329,7 +329,7 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json \
   --q6-hold-recalibration-gesture \
   --hz 15 \
-  --arm-control-hz 50 \
+  --arm-control-hz 40 \
   --arm-io-threads 4 \
   --dual-arm-ik-hz 15 \
   --dmtac-with-tactile \

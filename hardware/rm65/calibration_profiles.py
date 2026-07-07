@@ -333,6 +333,7 @@ def default_impedance(mode: str = "pose") -> dict[str, Any]:
         "force_sign": 1.0,
         "angular_force_sign": -1.0,
         "angular_axis_signs": [1.0, 1.0, -1.0],
+        "angular_axis_velocity_scales": [1.0, 1.0, 1.0],
         "control_hz": 40.0,
         "action_hz": 20.0,
         "lowpass_alpha": 0.85,

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .dataset import LoadedReplayEpisode, ReplayDatasetIndex
-from .executor import ReplayExecutionController
+from .executor import ReplayExecutionController, ReplayExecutionSettings
 from .hardware import ReplayHardwareConfig
 from .media import (
     CameraVideoTrack,
@@ -19,13 +19,18 @@ from .media import (
 )
 
 
+_HARDWARE_BUSY_STATES = frozenset({"connecting", "moving_to_start", "replaying"})
+
+
 class ReplayGuiSession:
     def __init__(
         self,
         dataset_root: str | Path | None = None,
         *,
         hardware_config: ReplayHardwareConfig | None = None,
+        execution_settings: ReplayExecutionSettings | None = None,
         send_actions: bool = False,
+        end_effectors_enabled: bool = False,
     ):
         self._lock = threading.RLock()
         self.dataset_root: Path | None = None
@@ -39,7 +44,12 @@ class ReplayGuiSession:
         self._camera_tracks: dict[str, CameraVideoTrack] = {}
         self._tactile_readers: dict[str, TactileEpisodeReader] = {}
         self._messages: list[str] = []
-        self.executor = ReplayExecutionController(hardware_config=hardware_config)
+        self.executor = ReplayExecutionController(
+            hardware_config=hardware_config,
+            settings=execution_settings
+            if execution_settings is not None
+            else ReplayExecutionSettings(end_effectors_enabled=bool(end_effectors_enabled)),
+        )
         if send_actions:
             self.executor.set_send_actions(True)
         if dataset_root is not None:
@@ -59,11 +69,94 @@ class ReplayGuiSession:
         self._tactile_readers.clear()
 
     def _log_locked(self, message: str) -> None:
-        self._messages.append(str(message))
+        timestamp = time.strftime("%H:%M:%S")
+        self._messages.append(f"[{timestamp}] {message}")
         self._messages = self._messages[-80:]
+
+    @staticmethod
+    def _payload_has_hardware_config(payload: Mapping[str, Any]) -> bool:
+        keys = {
+            "active_sides",
+            "activeSides",
+            "left_arm_ip",
+            "leftArmIp",
+            "right_arm_ip",
+            "rightArmIp",
+            "left_tool_profile",
+            "leftToolProfile",
+            "right_tool_profile",
+            "rightToolProfile",
+            "arm_control_hz",
+            "armControlHz",
+            "connect_hardware",
+            "connectHardware",
+            "end_effectors_enabled",
+            "endEffectorsEnabled",
+            "end_effector_backend_by_side",
+            "endEffectorBackendBySide",
+            "left_end_effector_backend",
+            "leftEndEffectorBackend",
+            "right_end_effector_backend",
+            "rightEndEffectorBackend",
+            "left_hand_ip",
+            "leftHandIp",
+            "right_hand_ip",
+            "rightHandIp",
+            "left_gripper_port",
+            "leftGripperPort",
+            "right_gripper_port",
+            "rightGripperPort",
+        }
+        return any(key in payload for key in keys)
+
+    @staticmethod
+    def _preflight_log_message(status: Mapping[str, Any]) -> str:
+        report = status.get("preflight") if isinstance(status, Mapping) else None
+        if not isinstance(report, Mapping):
+            return "hardware preflight finished without report"
+        checks = report.get("checks")
+        checks = checks if isinstance(checks, list) else []
+        blocked = [
+            check
+            for check in checks
+            if isinstance(check, Mapping) and not bool(check.get("ok"))
+        ]
+        warnings = [
+            check
+            for check in checks
+            if isinstance(check, Mapping) and bool(check.get("ok")) and check.get("level") == "warning"
+        ]
+        if report.get("ok"):
+            suffix = f" checks={len(checks)}"
+            if warnings:
+                suffix += f" warnings={len(warnings)}"
+            return "hardware preflight ok" + suffix
+        names = ", ".join(str(check.get("name")) for check in blocked[:5])
+        if len(blocked) > 5:
+            names += f", ... +{len(blocked) - 5}"
+        first_message = str(blocked[0].get("message") or "") if blocked else ""
+        return f"hardware preflight failed blocked={len(blocked)} [{names}] {first_message}".strip()
+
+    def _configure_connect_for_preflight(self, payload: Mapping[str, Any]) -> None:
+        if self._payload_has_hardware_config(payload):
+            self.executor.configure_from_payload(payload)
+            with self._lock:
+                self._log_locked("hardware replay configured for preflight")
+        status = self.executor.status()
+        if not bool(status.get("connected")):
+            connect_status = self.executor.connect()
+            with self._lock:
+                self._log_locked(connect_status.get("last_message") or "hardware connected")
+
+    def _require_hardware_not_busy_locked(self, action: str) -> None:
+        status = self.executor.status()
+        state = str(status.get("state") or "")
+        if state in _HARDWARE_BUSY_STATES or bool(status.get("worker_alive")):
+            raise RuntimeError(f"Abort or wait for hardware replay before {action}; current state is {state!r}.")
 
     def load_dataset(self, dataset_root: str | Path, *, episode: str | int | None = None) -> dict[str, Any]:
         with self._lock:
+            self._require_hardware_not_busy_locked("loading a dataset")
             self._close_media_locked()
             self.playing = False
             self.dataset_root = Path(dataset_root).expanduser().resolve()
@@ -85,6 +178,7 @@ class ReplayGuiSession:
     def _select_episode_locked(self, episode: str | int) -> None:
         if self.index is None:
             raise RuntimeError("Load a replay dataset before selecting an episode.")
+        self._require_hardware_not_busy_locked("selecting an episode")
         self._close_media_locked()
         self.episode = self.index.load_episode(episode)
         self.frame_index = 0
@@ -180,10 +274,15 @@ class ReplayGuiSession:
                 episode = self.episode
             if episode is None:
                 raise RuntimeError("Select an episode before hardware replay preflight.")
-            status = self.executor.preflight(episode)
+            try:
+                self._configure_connect_for_preflight(payload)
+                status = self.executor.preflight(episode)
+            except Exception as exc:
+                with self._lock:
+                    self._log_locked(f"hardware preflight failed before checks: {exc}")
+                raise
             with self._lock:
-                report = status.get("preflight") or {}
-                self._log_locked("hardware preflight ok" if report.get("ok") else "hardware preflight failed")
+                self._log_locked(self._preflight_log_message(status))
             return self.state()
         if action == "move_to_start":
             self.executor.move_to_start()

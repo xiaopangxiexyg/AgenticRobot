@@ -440,6 +440,8 @@ class DMTacGripperBackendConfig:
     continuous_grasp: bool = True
     clear_fault_on_start: bool = True
     open_on_start: bool = False
+    reconnect_on_error: bool = True
+    reconnect_cooldown_sec: float = 1.0
     enable_telemetry: bool = True
     telemetry_hz: float = 10.0
     gripper_telemetry_command_grace_s: float = DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S
@@ -494,6 +496,8 @@ class DMTacGripperBackendConfig:
             raise ValueError("telemetry_hz must be positive.")
         if float(self.gripper_telemetry_command_grace_s) < 0.0:
             raise ValueError("gripper_telemetry_command_grace_s must be non-negative.")
+        if float(self.reconnect_cooldown_sec) < 0.0:
+            raise ValueError("reconnect_cooldown_sec must be non-negative.")
         if int(self.tactile_max_fps) <= 0:
             raise ValueError("tactile_max_fps must be positive.")
         self.tactile_fields = normalize_dmtac_tactile_fields(self.tactile_fields)
@@ -592,6 +596,9 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_send_status: str | None = None
         self._last_send_skip_reason: str | None = None
         self._last_send_target_scalar: float | None = None
+        self._last_reconnect_attempt_at: float | None = None
+        self._last_reconnect_error: str | None = None
+        self._reconnect_count = 0
 
     @property
     def name(self) -> str:
@@ -647,6 +654,104 @@ class DMTacGripperBackend(EffectorBackend):
                 and not self.config.tactile_process_read
             ),
         ).connect()
+
+    def _create_gripper(self) -> Any:
+        self._ensure_import_path()
+        from portable_dmtac_gripper import InspireGripper
+
+        return InspireGripper(
+            port=str(self.config.gripper_port),
+            gripper_id=int(self.config.gripper_id),
+            baudrate=int(self.config.gripper_baudrate),
+            timeout=float(self.config.gripper_timeout),
+            max_open_mm=float(self.config.max_open_mm),
+            debug=bool(self.config.debug),
+        )
+
+    def _reset_applied_motion_config_locked(self) -> None:
+        self._applied_speed = None
+        self._applied_torque = None
+        self._applied_continuous_grasp = None
+
+    def _apply_gripper_start_config_locked(self, *, open_on_start: bool) -> None:
+        if (
+            not self.config.connect_hardware
+            or self.device is None
+            or getattr(self.device, "gripper", None) is None
+        ):
+            return
+        self._reset_applied_motion_config_locked()
+        if self.config.clear_fault_on_start:
+            self.device.clear_fault()
+        self.device.set_speed(float(self.config.speed))
+        self._applied_speed = float(self.config.speed)
+        self.device.set_torque(float(self.config.torque))
+        self._applied_torque = float(self.config.torque)
+        if bool(open_on_start) and self.config.open_on_start:
+            self.device.open(wait=False)
+
+    def _close_gripper_locked(self) -> None:
+        device = self.device
+        if device is None:
+            self._reset_applied_motion_config_locked()
+            return
+        gripper = getattr(device, "gripper", None)
+        if gripper is not None:
+            try:
+                close = getattr(gripper, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                try:
+                    setattr(device, "gripper", None)
+                except Exception:
+                    self.device = None
+        self._reset_applied_motion_config_locked()
+
+    def _close_device_locked(self) -> None:
+        device = self.device
+        self.device = None
+        self._reset_applied_motion_config_locked()
+        if device is not None:
+            device.close()
+
+    def _connect_gripper_locked(self) -> None:
+        if self.device is None:
+            self.device = self._create_device()
+        elif hasattr(self.device, "gripper"):
+            self._close_gripper_locked()
+            setattr(self.device, "gripper", self._create_gripper())
+        else:
+            self._close_device_locked()
+            self.device = self._create_device()
+        self._apply_gripper_start_config_locked(open_on_start=False)
+
+    def _handle_gripper_io_error_locked(self, prefix: str, exc: BaseException) -> bool:
+        error_text = f"{prefix}: {exc}"
+        self._telemetry_error = error_text
+        self._close_gripper_locked()
+        if not self.config.connect_hardware or not self.config.reconnect_on_error:
+            self._last_reconnect_error = error_text
+            return False
+        now = time.time()
+        if (
+            self._last_reconnect_attempt_at is not None
+            and now - self._last_reconnect_attempt_at < float(self.config.reconnect_cooldown_sec)
+        ):
+            self._last_reconnect_error = error_text
+            return False
+        self._last_reconnect_attempt_at = now
+        try:
+            self._connect_gripper_locked()
+        except Exception as reconnect_exc:  # noqa: BLE001
+            self._close_gripper_locked()
+            self._last_reconnect_error = f"reconnect_failed: {reconnect_exc}"
+            self._telemetry_error = f"{error_text}; {self._last_reconnect_error}"
+            return False
+        self._reconnect_count += 1
+        self._last_reconnect_error = None
+        self._telemetry_error = None
+        return True
 
     def _tactile_worker_config_payload(self) -> dict[str, Any]:
         return {
@@ -741,15 +846,7 @@ class DMTacGripperBackend(EffectorBackend):
         try:
             with self._lock:
                 self.device = self._create_device()
-                if self.config.connect_hardware and self.device.gripper is not None:
-                    if self.config.clear_fault_on_start:
-                        self.device.clear_fault()
-                    self.device.set_speed(float(self.config.speed))
-                    self._applied_speed = float(self.config.speed)
-                    self.device.set_torque(float(self.config.torque))
-                    self._applied_torque = float(self.config.torque)
-                    if self.config.open_on_start:
-                        self.device.open(wait=False)
+                self._apply_gripper_start_config_locked(open_on_start=True)
                 if (
                     self.config.connect_tactile
                     and self.config.tactile_process_read
@@ -785,7 +882,9 @@ class DMTacGripperBackend(EffectorBackend):
             self._telemetry_thread.start()
 
     def is_ready(self) -> bool:
-        if self.config.connect_hardware or self.config.connect_tactile:
+        if self.config.connect_hardware:
+            return self.device is not None and getattr(self.device, "gripper", None) is not None
+        if self.config.connect_tactile:
             return self.device is not None
         return True
 
@@ -861,40 +960,60 @@ class DMTacGripperBackend(EffectorBackend):
         ):
             return finish("rate_limited", sent=False, skip_reason="command_hz")
         if self.config.connect_hardware:
-            if self.device is None:
-                self._telemetry_error = "send_failed: device is not connected"
-                return finish("not_connected", sent=False, skip_reason="not_connected")
+            lock_started_perf = time.perf_counter()
+            self._lock.acquire()
+            lock_wait_s = time.perf_counter() - lock_started_perf
             try:
-                lock_started_perf = time.perf_counter()
-                self._lock.acquire()
-                lock_wait_s = time.perf_counter() - lock_started_perf
-                try:
-                    if self.device is None:
-                        self._telemetry_error = "send_failed: device is not connected"
-                        return finish("not_connected", sent=False, skip_reason="not_connected")
-                    speed, torque, continuous = self._move_parameters_for_current_config()
-                    self.device.move(
-                        float(np.clip(target_scalar, 0.0, float(self.config.max_action))),
-                        speed=speed,
-                        torque=torque,
-                        continuous=continuous,
-                        wait=False,
+                if self.device is None or getattr(self.device, "gripper", None) is None:
+                    reconnected = self._handle_gripper_io_error_locked(
+                        "send_no_connection",
+                        RuntimeError("device is not connected"),
                     )
-                    if speed is not None:
-                        self._applied_speed = float(speed)
-                    if torque is not None:
-                        self._applied_torque = float(torque)
-                    if continuous is not None:
-                        self._applied_continuous_grasp = bool(continuous)
-                finally:
-                    self._lock.release()
-            except Exception as exc:  # noqa: BLE001
-                self._telemetry_error = f"send_failed: {exc}"
-                return finish("send_exception", sent=False, skip_reason=f"{type(exc).__name__}: {exc}")
+                    if not reconnected:
+                        return finish("not_connected", sent=False, skip_reason="not_connected")
+                try:
+                    self._move_gripper_locked(target_scalar)
+                except Exception as exc:  # noqa: BLE001
+                    reconnected = self._handle_gripper_io_error_locked("send_failed", exc)
+                    if not reconnected:
+                        return finish(
+                            "send_exception",
+                            sent=False,
+                            skip_reason=f"{type(exc).__name__}: {exc}",
+                        )
+                    try:
+                        self._move_gripper_locked(target_scalar)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        self._handle_gripper_io_error_locked("send_retry_failed", retry_exc)
+                        return finish(
+                            "send_retry_exception",
+                            sent=False,
+                            skip_reason=f"{type(retry_exc).__name__}: {retry_exc}",
+                        )
+            finally:
+                self._lock.release()
         self._latest_joint_pos = target.copy()
         self._last_sent_command = target.copy()
         self._last_sent_command_timestamp = command_time
         return finish("sent", sent=True)
+
+    def _move_gripper_locked(self, target_scalar: float) -> None:
+        if self.device is None:
+            raise RuntimeError("device is not connected")
+        speed, torque, continuous = self._move_parameters_for_current_config()
+        self.device.move(
+            float(np.clip(target_scalar, 0.0, float(self.config.max_action))),
+            speed=speed,
+            torque=torque,
+            continuous=continuous,
+            wait=False,
+        )
+        if speed is not None:
+            self._applied_speed = float(speed)
+        if torque is not None:
+            self._applied_torque = float(torque)
+        if continuous is not None:
+            self._applied_continuous_grasp = bool(continuous)
 
     def _move_parameters_for_current_config(self) -> tuple[float | None, float | None, bool | None]:
         speed = float(self.config.speed)
@@ -1043,11 +1162,18 @@ class DMTacGripperBackend(EffectorBackend):
     def _read_telemetry_once(self) -> None:
         device = self.device
         if device is None:
-            if self.config.connect_hardware or self.config.connect_tactile:
+            if self.config.connect_hardware:
+                with self._lock:
+                    self._handle_gripper_io_error_locked(
+                        "telemetry_no_connection",
+                        RuntimeError("device is not connected"),
+                    )
+            elif self.config.connect_tactile:
                 self._telemetry_error = "device is not connected"
             return
 
         gripper_state = None
+        gripper_fault_unrecovered = False
         tactile_frames = {}
         read_started_at = time.time()
         telemetry_started_at = time.perf_counter()
@@ -1075,7 +1201,16 @@ class DMTacGripperBackend(EffectorBackend):
                         if self.device is not device:
                             return
                         gripper_read_started_at = time.perf_counter()
-                        gripper_state = device.read_gripper_state()
+                        try:
+                            gripper_state = device.read_gripper_state()
+                        except Exception as exc:  # noqa: BLE001
+                            gripper_read_skipped = True
+                            gripper_read_skip_reason = "read_failed"
+                            recovered = self._handle_gripper_io_error_locked(
+                                "telemetry_failed",
+                                exc,
+                            )
+                            gripper_fault_unrecovered = not recovered
                         gripper_read_elapsed_s = time.perf_counter() - gripper_read_started_at
                     finally:
                         self._lock.release()
@@ -1165,7 +1300,7 @@ class DMTacGripperBackend(EffectorBackend):
                 self._latest_tactile_gate_wait_s = tactile_gate_wait_s
                 self._latest_tactile_read_skipped = bool(tactile_read_skipped)
         self._latest_telemetry_elapsed_s = time.perf_counter() - telemetry_started_at
-        if not (
+        if not gripper_fault_unrecovered and not (
             self._telemetry_error
             and str(self._telemetry_error).startswith("tactile_worker")
         ):
@@ -1360,7 +1495,13 @@ class DMTacGripperBackend(EffectorBackend):
             "connect_tactile": bool(self.config.connect_tactile),
             "send_commands": bool(self.config.send_commands),
             "is_connected": self.device is not None,
-            "reconnect_count": 0,
+            "gripper_is_connected": self.device is not None
+            and getattr(self.device, "gripper", None) is not None,
+            "reconnect_count": int(self._reconnect_count),
+            "gripper_reconnect_on_error": bool(self.config.reconnect_on_error),
+            "gripper_reconnect_cooldown_sec": float(self.config.reconnect_cooldown_sec),
+            "gripper_last_reconnect_attempt_timestamp": self._last_reconnect_attempt_at,
+            "gripper_last_reconnect_error": self._last_reconnect_error,
             "backend_type": "dmtac_gripper",
             "gripper_port": str(self.config.gripper_port),
             "gripper_id": int(self.config.gripper_id),

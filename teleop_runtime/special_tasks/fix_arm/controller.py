@@ -284,20 +284,44 @@ class FixArmCommandController:
                 filtered[channel_name] = next_channel
         return filtered
 
-    def filter_command(self, command: TeleopCommand, _observation, _now: float) -> TeleopCommand:
+    def filter_command(
+        self,
+        command: TeleopCommand,
+        _observation,
+        _now: float,
+        *,
+        include_missing_fixed_effectors: bool = False,
+        allowed_effectors: Sequence[str] | None = None,
+    ) -> TeleopCommand:
         fixed_side = self._fixed_side if self.fixed else ""
+        allowed = (
+            None
+            if allowed_effectors is None
+            else {str(name) for name in allowed_effectors if str(name)}
+        )
         filtered = TeleopCommand(timestamp=command.timestamp, metadata=dict(command.metadata))
         for effector_name, effector_command in command.commands.items():
             next_command = effector_command.copy()
             filtered.commands[effector_name] = next_command
-            self._latest_by_effector[effector_name] = next_command.copy()
+            if not fixed_side or effector_name not in self.required_effectors_by_side.get(
+                fixed_side, ()
+            ):
+                self._latest_by_effector[effector_name] = next_command.copy()
         if fixed_side:
             for effector_name in self.required_effectors_by_side.get(fixed_side, ()):
-                if effector_name not in filtered.commands:
-                    fixed_command = self._fixed_by_effector.get(effector_name)
-                    if fixed_command is None:
-                        continue
-                    filtered.commands[effector_name] = fixed_command.copy()
+                if allowed is not None and effector_name not in allowed:
+                    continue
+                if (
+                    not include_missing_fixed_effectors
+                    and effector_name not in filtered.commands
+                ):
+                    continue
+                fixed_command = self._fixed_by_effector.get(effector_name)
+                if fixed_command is None:
+                    continue
+                filtered_command = fixed_command.copy()
+                filtered.commands[effector_name] = filtered_command
+                self._latest_by_effector[effector_name] = filtered_command.copy()
         return filtered
 
     def filter_faults(

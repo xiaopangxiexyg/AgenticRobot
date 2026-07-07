@@ -268,6 +268,175 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_parse_args_accepts_init_arm_available_typo_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            calibration_profile = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
+            init_profile = profile_dir / "init_arm.json"
+            calibration_profile.write_text("{}", encoding="utf-8")
+            init_profile.write_text("{}", encoding="utf-8")
+            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--active-sides",
+                    "both",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--right-arm-ip",
+                    "192.0.2.11",
+                    "--no-arm-ip-save-latest",
+                    "--no-camera",
+                    "--no-video",
+                    "--headless",
+                    "--no-gui",
+                    "--init-arm-availabe",
+                    "--init-arm-profile",
+                    str(init_profile),
+                ],
+            ):
+                args = real_teleop.parse_args()
+
+        self.assertTrue(args.init_arm_available)
+        self.assertEqual(args.init_arm_profile, str(init_profile))
+
+    def test_parse_args_accepts_workspace_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            profile = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
+            profile.write_text("{}", encoding="utf-8")
+            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--active-sides",
+                    "left",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--no-arm-ip-save-latest",
+                    "--no-camera",
+                    "--no-video",
+                    "--headless",
+                    "--no-gui",
+                    "--arm-workspace-min",
+                    "-0.65",
+                    "-0.80",
+                    "0.00",
+                    "--arm-workspace-max=0.80,0.80,0.95",
+                    "--left-arm-workspace-max",
+                    "0.75",
+                    "0.70",
+                    "0.90",
+                ],
+            ):
+                args = real_teleop.parse_args()
+
+        self.assertEqual(args.arm_workspace_min, (-0.65, -0.80, 0.00))
+        self.assertEqual(args.arm_workspace_max, (0.80, 0.80, 0.95))
+        self.assertEqual(args.left_arm_workspace_max, (0.75, 0.70, 0.90))
+
+    def test_workspace_override_applies_side_specific_bounds(self) -> None:
+        calibration = real_teleop.build_annotated_dual_rm65_calibration()
+        args = SimpleNamespace(
+            arm_workspace_min=(-0.65, -0.80, 0.00),
+            arm_workspace_max=(0.80, 0.80, 0.95),
+            left_arm_workspace_min=None,
+            left_arm_workspace_max=(0.75, 0.70, 0.90),
+            right_arm_workspace_min=None,
+            right_arm_workspace_max=None,
+        )
+
+        applied = real_teleop._apply_workspace_overrides(args, calibration)
+
+        self.assertIn("left_arm", applied)
+        self.assertIn("right_arm", applied)
+        np.testing.assert_allclose(
+            calibration.arms["left_arm"].workspace_min,
+            np.array([-0.65, -0.80, 0.00]),
+        )
+        np.testing.assert_allclose(
+            calibration.arms["left_arm"].workspace_max,
+            np.array([0.75, 0.70, 0.90]),
+        )
+        np.testing.assert_allclose(
+            calibration.arms["right_arm"].workspace_max,
+            np.array([0.80, 0.80, 0.95]),
+        )
+        self.assertTrue(calibration.arms["left_arm"].metadata["workspace_override_runtime"])
+
+    def test_workspace_config_applies_default_bounds(self) -> None:
+        calibration = real_teleop.build_annotated_dual_rm65_calibration()
+        args = SimpleNamespace(
+            arm_workspace_config=str(real_teleop.DEFAULT_ARM_WORKSPACE_CONFIG_PATH),
+        )
+
+        applied = real_teleop._apply_workspace_config(args, calibration)
+
+        self.assertIn("left_arm", applied)
+        np.testing.assert_allclose(
+            calibration.arms["left_arm"].workspace_max,
+            np.array([0.80, 0.80, 0.90]),
+        )
+        np.testing.assert_allclose(
+            calibration.arms["right_arm"].workspace_max,
+            np.array([0.80, 0.80, 0.90]),
+        )
+
+    def test_load_profile_does_not_override_workspace_config(self) -> None:
+        loaded = real_teleop.build_annotated_dual_rm65_calibration()
+        loaded.arms["left_arm"].workspace_max = np.array([0.60, 0.80, 0.90])
+        loaded.arms["right_arm"].workspace_max = np.array([0.60, 0.80, 0.90])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_path = Path(tmp_dir) / "old_profile.json"
+            loaded.save_json(profile_path)
+
+            current = real_teleop.build_annotated_dual_rm65_calibration()
+            left_retargeter = SimpleNamespace(clear_home_anchors=lambda: None)
+            right_retargeter = SimpleNamespace(clear_home_anchors=lambda: None)
+            components = SimpleNamespace(
+                session=SimpleNamespace(calibration=current),
+                left_retargeter=left_retargeter,
+                right_retargeter=right_retargeter,
+            )
+            args = SimpleNamespace(
+                load_profile=str(profile_path),
+                arm_workspace_config=str(real_teleop.DEFAULT_ARM_WORKSPACE_CONFIG_PATH),
+                arm_workspace_min=None,
+                arm_workspace_max=None,
+                left_arm_workspace_min=None,
+                left_arm_workspace_max=None,
+                right_arm_workspace_min=None,
+                right_arm_workspace_max=None,
+            )
+
+            real_teleop._load_gui_vive_calibration_profile(args, components)
+
+        np.testing.assert_allclose(
+            components.session.calibration.arms["left_arm"].workspace_max,
+            np.array([0.80, 0.80, 0.90]),
+        )
+        np.testing.assert_allclose(
+            components.session.calibration.arms["right_arm"].workspace_max,
+            np.array([0.80, 0.80, 0.90]),
+        )
+
+    def test_saved_calibration_profile_payload_omits_workspace_bounds(self) -> None:
+        calibration = real_teleop.build_annotated_dual_rm65_calibration()
+        payload = real_teleop._calibration_profile_payload_without_workspace(
+            calibration,
+            workspace_config_path=real_teleop.DEFAULT_ARM_WORKSPACE_CONFIG_PATH,
+        )
+
+        for arm_payload in payload["arms"].values():
+            self.assertNotIn("workspace_min", arm_payload)
+            self.assertNotIn("workspace_max", arm_payload)
+        self.assertEqual(
+            payload["metadata"]["workspace_policy"],
+            "managed_by_teleop_runtime_config",
+        )
+
     def test_ik_debug_log_defaults_to_compact_payload(self) -> None:
         pose = np.eye(4)
         target_pose = np.eye(4)
@@ -581,6 +750,17 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             "send_result_text": "ok",
             "effective_step_scale": 1.2,
             "current_tcp_pose": pose,
+            "active_tool_name": "DMTAC_M",
+            "active_tool_profile_path": "tests/debug/rm65_left_DMTAC_M_angular_debug.json",
+            "active_impedance_config": {
+                "profile_path": "tests/debug/rm65_left_DMTAC_M_angular_debug.json",
+                "mode": "pose",
+                "axes": "rxyz",
+                "angular_axis_signs": [-1.0, -1.0, -1.0],
+                "angular_compliance_rad_per_nm": 0.1,
+                "max_angular_offset_rad": 1.2,
+                "direct_joint_hint_force_guard_enabled": False,
+            },
             "last_send_command_timing": {
                 "total_ms": 4.2,
                 "send_lock_wait_ms": 1.1,
@@ -593,15 +773,97 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             "last_impedance_record": {
                 "step": 7,
                 "dt_sec": 0.04,
+                "active_wrench": [1.0, 2.0, 3.0, 0.1, 0.2, 0.3],
+                "tare_corrected_wrench": [1.3, 2.2, 3.1, 0.3, 0.2, 0.4],
+                "raw_deadbanded_wrench": [1.0, 2.0, 3.0, 0.2, 0.1, 0.3],
+                "admittance_wrench": [1.0, 2.0, 3.0, 0.1, 0.2, 0.3],
+                "return_activity_wrench": [1.3, 2.2, 3.1, 0.3, 0.2, 0.4],
+                "target_offset_unclamped": [0.01, 0.0, 0.0, 0.0, 0.02, 0.0],
+                "target_offset_after_return": [0.01, 0.0, 0.0, 0.0, 0.02, 0.0],
+                "target_offset_after_offset_limit": [0.01, 0.0, 0.0, 0.0, 0.02, 0.0],
+                "target_offset": [0.01, 0.0, 0.0, 0.0, 0.02, 0.0],
+                "offset": [0.005, 0.0, 0.0, 0.0, 0.01, 0.0],
+                "applied_offset": [0.004, 0.0, 0.0, 0.0, 0.008, 0.0],
+                "offset_delta_before_velocity_limit": [0.006, 0.0, 0.0, 0.0, 0.012, 0.0],
+                "offset_step_after_velocity_limit": [0.001, 0.0, 0.0, 0.0, 0.002, 0.0],
+                "return_applied_axes": [],
+                "return_paused_axes": [],
+                "linear_return_paused": True,
+                "angular_return_paused": True,
+                "linear_offset_limit_applied": False,
+                "angular_offset_limit_applied": False,
+                "linear_velocity_limit_applied": False,
+                "angular_velocity_limit_applied": False,
                 "force_norm_n": 0.1,
+                "reference_to_command_linear_m": [0.0, 0.0, 0.0],
+                "reference_to_command_angular_rotvec_rad": [0.0, 0.02, 0.0],
+                "reference_to_measured_linear_m": [-0.01, 0.0, 0.0],
+                "reference_to_measured_angular_rotvec_rad": [0.0, -0.01, 0.0],
+                "command_to_measured_linear_m": [-0.01, 0.0, 0.0],
+                "command_to_measured_angular_rotvec_rad": [0.0, -0.03, 0.0],
+                "measured_to_command_linear_m": [0.01, 0.0, 0.0],
+                "measured_to_command_angular_rotvec_rad": [0.0, 0.03, 0.0],
+                "command_to_measured_joint_deg": [-0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "measured_to_command_joint_deg": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "measured_velocity_dt_sec": 0.05,
+                "measured_pose_velocity_linear_m_s": [0.1, 0.0, 0.0],
+                "measured_pose_velocity_angular_rad_s": [0.0, 0.2, 0.0],
+                "measured_joint_velocity_deg_s": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "tracking_error_closing_linear_m_s": 0.1,
+                "tracking_error_closing_angular_rad_s": 0.2,
+                "tracking_error_closing_joint_deg_s": 2.0,
+                "ik_metadata": {
+                    "status": "pass",
+                    "method": "dual_arm_joint_hint",
+                    "direct_joint_hint_reason": "offset_threshold",
+                    "direct_joint_hint_offset_ignored": True,
+                    "direct_joint_hint_force_guard": {"active": False},
+                },
                 "rm65_controller_timing": {"step_total_ms": 2.3, "sdk_read_ms": 0.8},
                 "rm65_backend_loop_timing": {"total_ms": 6.0},
                 "ik_timing": {"solve_total_ms": 1.5},
             },
+            "recent_impedance_records": [
+                {
+                    "step": 6,
+                    "dt_sec": 0.04,
+                    "force_source": "work",
+                    "force_readings": {
+                        "raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        "zero": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        "work": [0.0, 0.0, 0.0, 0.2, 0.1, 0.3],
+                        "tool": [0.0, 0.0, 0.0, 0.2, 0.1, 0.3],
+                    },
+                    "selected_force_wrench": [0.0, 0.0, 0.0, 0.2, 0.1, 0.3],
+                    "tare_corrected_wrench": [0.0, 0.0, 0.0, 0.2, 0.1, 0.3],
+                    "filtered_wrench": [0.0, 0.0, 0.0, 0.18, 0.09, 0.27],
+                    "raw_deadbanded_wrench": [0.0, 0.0, 0.0, 0.15, 0.06, 0.24],
+                    "return_activity_wrench": [0.0, 0.0, 0.0, 0.18, 0.09, 0.27],
+                    "target_offset_unclamped": [0.0, 0.0, 0.0, 0.015, 0.006, 0.024],
+                    "target_offset_after_return": [0.0, 0.0, 0.0, 0.015, 0.006, 0.024],
+                    "target_offset_after_offset_limit": [0.0, 0.0, 0.0, 0.015, 0.006, 0.024],
+                    "target_offset": [0.0, 0.0, 0.0, 0.015, 0.006, 0.024],
+                    "offset": [0.0, 0.0, 0.0, 0.01, 0.004, 0.02],
+                    "applied_offset": [0.0, 0.0, 0.0, 0.01, 0.004, 0.02],
+                    "offset_delta_before_velocity_limit": [0.0, 0.0, 0.0, 0.005, 0.002, 0.004],
+                    "offset_step_after_velocity_limit": [0.0, 0.0, 0.0, 0.005, 0.002, 0.004],
+                    "return_applied_axes": [],
+                    "return_paused_axes": [],
+                    "linear_return_paused": False,
+                    "angular_return_paused": True,
+                    "linear_offset_limit_applied": False,
+                    "angular_offset_limit_applied": False,
+                    "linear_velocity_limit_applied": False,
+                    "angular_velocity_limit_applied": False,
+                }
+            ],
         }
 
         frame = real_teleop._build_debug_timing_log_frame(
-            components=SimpleNamespace(active_sides=("left", "right")),
+            components=SimpleNamespace(
+                active_sides=("left", "right"),
+                session=SimpleNamespace(last_fault_reason="main_loop: right_arm impedance fault"),
+            ),
             step_index=11,
             loop_start=10.0,
             elapsed_sec=0.09,
@@ -628,10 +890,118 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         encoded = json.dumps(real_teleop._json_safe(frame), ensure_ascii=False)
         self.assertEqual(frame["schema"], "dexteleop_debug_timing_v1")
         self.assertEqual(frame["reason"], "slow")
+        self.assertEqual(
+            frame["session_fault_reason"],
+            "main_loop: right_arm impedance fault",
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["active_tool_profile_path"],
+            "tests/debug/rm65_left_DMTAC_M_angular_debug.json",
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["active_impedance_config"]["axes"],
+            "rxyz",
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["active_impedance_config"][
+                "angular_axis_signs"
+            ],
+            [-1.0, -1.0, -1.0],
+        )
         self.assertIn("send_lock_wait_ms", frame["backend"]["left_command"]["last_send_command_timing"])
         self.assertIn(
             "rm65_controller_timing",
             frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "active_wrench",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "raw_deadbanded_wrench",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "tare_corrected_wrench",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["recent_impedance_records"][0]["force_source"],
+            "work",
+        )
+        self.assertIn(
+            "filtered_wrench",
+            frame["backend"]["left_command"]["recent_impedance_records"][0],
+        )
+        self.assertIn(
+            "force_readings",
+            frame["backend"]["left_command"]["recent_impedance_records"][0],
+        )
+        self.assertIn(
+            "return_applied_axes",
+            frame["backend"]["left_command"]["recent_impedance_records"][0],
+        )
+        self.assertIn(
+            "return_paused_axes",
+            frame["backend"]["left_command"]["recent_impedance_records"][0],
+        )
+        self.assertIn(
+            "admittance_wrench",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "return_activity_wrench",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "target_offset",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "target_offset_unclamped",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "target_offset_after_return",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "offset_step_after_velocity_limit",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "angular_return_paused",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "offset",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertIn(
+            "applied_offset",
+            frame["backend"]["left_command"]["last_impedance_record"],
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["last_impedance_record"][
+                "measured_to_command_linear_m"
+            ],
+            [0.01, 0.0, 0.0],
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["last_impedance_record"][
+                "tracking_error_closing_linear_m_s"
+            ],
+            0.1,
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["last_impedance_record"]["ik_metadata"]["status"],
+            "pass",
+        )
+        self.assertEqual(
+            frame["backend"]["left_command"]["last_impedance_record"]["ik_metadata"][
+                "direct_joint_hint_reason"
+            ],
+            "offset_threshold",
         )
         self.assertEqual(frame["channels"]["left_wrist_pose"]["metadata"]["seq"], 42)
         self.assertNotIn('"matrix"', encoded)
@@ -690,6 +1060,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("toggle_camera_vis", active_controls)
         self.assertIn("toggle_tactile_vis", active_controls)
         self.assertIn("d", active_controls)
+        self.assertNotIn("g", active_controls)
+        self.assertNotIn("init_arm_toggle", active_controls)
         self.assertNotIn("movement_multiple_down", active_controls)
         self.assertNotIn("movement_multiple_up", active_controls)
         self.assertNotIn("movement_multiple_reset", active_controls)
@@ -734,9 +1106,51 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 if published.get("stage") == "RM65 真机遥操运行中"
             )
             active_controls = set(running_publish["active_controls"])
+            self.assertIn("c", active_controls)
+            self.assertIn("fix_arm_toggle", active_controls)
             self.assertIn("record_pose_snapshot", active_controls)
             self.assertTrue(running_publish["pose_snapshot_available"])
             self.assertEqual(running_publish["pose_snapshot_dir"], tmp_dir)
+
+    def test_init_arm_running_gui_exposes_g_without_stealing_d(self) -> None:
+        ui = _FakeUi()
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            status_payload=lambda: {
+                "init_arm_available": True,
+                "init_arm_selected_side": "right",
+                "init_arm_active_side": "",
+                "init_arm_active": False,
+                "init_arm_recalibrating": False,
+                "init_arm_status": "ready",
+                "init_arm_sample_count": None,
+                "init_arm_min_samples": None,
+                "init_arm_profile_path": "profile.json",
+            }
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=components,
+        )
+
+        control.publish_teleop_running()
+
+        running_publish = next(
+            published
+            for published in reversed(ui.published)
+            if published.get("stage") == "RM65 真机遥操运行中"
+        )
+        active_controls = set(running_publish["active_controls"])
+        self.assertIn("d", active_controls)
+        self.assertIn("g", active_controls)
+        self.assertIn("init_arm_toggle", active_controls)
+        self.assertIn("init_arm_select", active_controls)
+        self.assertNotIn("c", active_controls)
+        self.assertFalse(running_publish["fix_arm_available"])
+        self.assertTrue(running_publish["init_arm_available"])
+        self.assertEqual(running_publish["init_arm_selected_side"], "right")
 
     def test_pose_snapshot_request_is_blocked_while_episode_recording(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -800,6 +1214,110 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             self.assertIn("episode_stop", active_controls)
             self.assertNotIn("episode_start", active_controls)
             self.assertNotIn("record_pose_snapshot", active_controls)
+
+    def test_fix_arm_c_resets_fixed_side_safety_baseline(self) -> None:
+        class FakeSafetyMonitor:
+            def __init__(self) -> None:
+                self.reset_channels: list[tuple[str, ...]] = []
+
+            def request_pose_baseline_reset_many(self, channels) -> None:
+                self.reset_channels.append(tuple(channels))
+
+        class FakeFixArmController:
+            recapturing = False
+            fixed = False
+
+            def freeze_selected(self, *, now: float):
+                return SimpleNamespace(
+                    ok=True,
+                    side="left",
+                    mode="fixed",
+                    message="left fixed",
+                    missing_effectors=(),
+                    missing_channels=(),
+                )
+
+            def status_payload(self) -> dict[str, object]:
+                return {
+                    "fix_arm_available": True,
+                    "fix_arm_selected_side": "left",
+                    "fix_arm_fixed_side": "left",
+                    "fix_arm_active": True,
+                    "fix_arm_recalibrating": False,
+                    "fix_arm_status": "left fixed",
+                    "fix_arm_sample_count": None,
+                    "fix_arm_min_samples": None,
+                }
+
+        safety_monitor = FakeSafetyMonitor()
+        dual_arm_retargeter = SimpleNamespace(reset_count=0)
+
+        def reset_target_pose_smoothing() -> None:
+            dual_arm_retargeter.reset_count += 1
+
+        dual_arm_retargeter.reset_target_pose_smoothing = reset_target_pose_smoothing
+        ui = _FakeUi()
+        components = _components()
+        components.fix_arm_controller = FakeFixArmController()
+        components.session.safety_monitor = safety_monitor
+        components.dual_arm_retargeter = dual_arm_retargeter
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=components,
+        )
+        control.publish_teleop_running()
+
+        handled = control._handle_fix_arm_c_event(now=10.0)
+
+        self.assertTrue(handled)
+        self.assertEqual(safety_monitor.reset_channels, [("left_wrist_pose",)])
+        self.assertEqual(dual_arm_retargeter.reset_count, 1)
+        self.assertFalse(control.consume_calibration_request())
+
+    def test_fix_arm_c_failure_is_consumed_without_runtime_home_request(self) -> None:
+        class FakeFixArmController:
+            recapturing = False
+            fixed = False
+            selected_side = "left"
+            fixed_side = ""
+
+            def freeze_selected(self, *, now: float):
+                raise RuntimeError("freeze boom")
+
+            def status_payload(self) -> dict[str, object]:
+                return {
+                    "fix_arm_available": True,
+                    "fix_arm_selected_side": "left",
+                    "fix_arm_fixed_side": "",
+                    "fix_arm_active": False,
+                    "fix_arm_recalibrating": False,
+                    "fix_arm_status": "ready",
+                    "fix_arm_sample_count": None,
+                    "fix_arm_min_samples": None,
+                }
+
+        ui = _FakeUi(["c"])
+        components = _components()
+        components.fix_arm_controller = FakeFixArmController()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=components,
+        )
+        control.publish_teleop_running()
+
+        control.poll()
+
+        self.assertFalse(control.consume_calibration_request())
+        self.assertTrue(
+            any(
+                title == "FixArm" and "freeze boom" in message
+                for title, message in ui.messages
+            )
+        )
 
     def test_hold_gui_allows_stopping_active_ik_debug_log(self) -> None:
         ui = _FakeUi()
@@ -945,6 +1463,35 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         event = 'episode_start:{"task_key":"soft_grasp"}'
         self.assertTrue(ui.push_event(event))
         self.assertEqual(ui.consume_events(), [event])
+
+    def test_web_ui_accepts_fix_arm_toggle_when_control_active(self) -> None:
+        ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
+        ui.publish(active_controls=["fix_arm_toggle"])
+
+        self.assertTrue(ui.push_event("fix_arm_toggle"))
+        self.assertEqual(ui.consume_events(), ["fix_arm_toggle"])
+        self.assertTrue(
+            any(
+                item.get("tag") == "WebGUIEvent"
+                and "accepted: fix_arm_toggle" in item.get("message", "")
+                for item in ui.snapshot()["messages"]
+            )
+        )
+
+    def test_web_ui_accepts_init_arm_toggle_and_side_when_control_active(self) -> None:
+        ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
+        ui.publish(active_controls=["init_arm_toggle", "init_arm_select"])
+
+        self.assertTrue(ui.push_event("init_arm_toggle"))
+        self.assertTrue(ui.push_event("init_arm_select:right"))
+        self.assertEqual(ui.consume_events(), ["init_arm_toggle", "init_arm_select:right"])
+        self.assertTrue(
+            any(
+                item.get("tag") == "WebGUIEvent"
+                and "accepted: init_arm_toggle" in item.get("message", "")
+                for item in ui.snapshot()["messages"]
+            )
+        )
 
     def test_gui_episode_start_payload_updates_task_path_and_gripper_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1875,11 +2422,28 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_gui_c_shortcut_only_sends_capture_not_quit(self) -> None:
         html_and_fallback = calibration_web_ui._HTML_PAGE + calibration_web_ui._FALLBACK_SCRIPT
 
-        self.assertIn("<kbd>C</kbd><span>开始采集</span>", calibration_web_ui._HTML_PAGE)
+        self.assertIn('id="shortcutCLabel"', calibration_web_ui._HTML_PAGE)
+        self.assertIn('id="shortcutGLabel"', calibration_web_ui._HTML_PAGE)
+        self.assertIn('data-event="fix_arm_toggle"', calibration_web_ui._HTML_PAGE)
+        self.assertIn('data-event="init_arm_toggle"', calibration_web_ui._HTML_PAGE)
+        self.assertIn("固定 ", calibration_web_ui._HTML_PAGE)
+        self.assertIn("归位", calibration_web_ui._HTML_PAGE)
+        self.assertNotIn("固定/急停", html_and_fallback)
+        self.assertIn("无 fix-arm 时不可用", calibration_web_ui._HTML_PAGE)
         self.assertNotIn('? "c" : "q"', html_and_fallback)
         self.assertNotIn(": \"q\";", html_and_fallback)
+        self.assertIn('eventName = "fix_arm_toggle";', html_and_fallback)
+        self.assertIn('eventName = "init_arm_toggle";', html_and_fallback)
         self.assertIn('eventName = "c";', html_and_fallback)
         self.assertIn("当前不可用", html_and_fallback)
+
+    def test_gui_keeps_fix_arm_c_enabled_during_collection(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn("state.capturing &&", html)
+        self.assertIn('eventName === "c"', html)
+        self.assertIn("state.fix_arm_available && state.teleop_running", html)
+        self.assertIn("fix_arm_toggle", html)
 
     def test_impedance_guard_holds_all_rig_backends_before_fault(self) -> None:
         class FakeRig:

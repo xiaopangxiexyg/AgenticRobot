@@ -19,6 +19,7 @@ from robot_motion.arm_init import (
     plan_slow_qpos_transition,
     qpos_transition_plan_to_dict,
 )
+from robot_motion.joint_limits import JointVelocityLimitProfile
 from robot_motion.rm65.constrained_transition import (
     RM65ConstrainedTransitionConfig,
     RM65ConstrainedTransitionPlan,
@@ -49,6 +50,8 @@ DEFAULT_QPOS_INIT_JOINT_HOLD_MARGIN_DEG = 1.0
 DEFAULT_SINGLE_ARM_MAX_QPOS_DELTA_DEG = 120.0
 DEFAULT_QPOS_INIT_BRANCH_SEARCH = True
 DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES = 8
+CUSTOM_QPOS_INIT_VELOCITY_PROFILE_NAME = "custom_qpos_init_max_angvel"
+RM65_ARM_JOINT_DOF = 6
 DOCUMENTATION_IP_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in (
@@ -295,13 +298,17 @@ def build_rm65_qpos_init_plan(
     branch_search_max_branches: int = DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES,
     branch_neutral_qpos_by_side: Mapping[str, Any] | None = None,
     collision_model: Any | None = None,
+    qpos_init_max_angvel_rad_s: Any = None,
 ) -> Any:
     sides = normalize_sides(tuple(active_sides))
+    velocity_profile = qpos_init_velocity_profile_from_max_angvel(qpos_init_max_angvel_rad_s)
     qpos_config = ArmQposTransitionConfig(
         dt_sec=float(qpos_dt_sec),
         joint_velocity_profile_name=str(joint_velocity_profile),
+        joint_velocity_profile=velocity_profile,
         max_steps_per_side=int(max_steps_per_side),
     )
+    profile_name = velocity_profile.name if velocity_profile is not None else str(joint_velocity_profile)
     start = {side: validate_qpos_by_side(start_qpos_by_side)[side] for side in sides}
     target = {side: validate_qpos_by_side(target_qpos_by_side)[side] for side in sides}
     if _should_use_dual_arm_collision_qpos_init(collision_check=collision_check, sides=sides):
@@ -331,9 +338,13 @@ def build_rm65_qpos_init_plan(
                 "planner": "plan_dual_arm_constrained_qpos_transition",
                 "qpos_init_collision_check": "enabled",
                 "collision_scene_profile": str(collision_scene_profile),
-                "joint_velocity_profile": str(joint_velocity_profile),
+                "joint_velocity_profile": profile_name,
             }
         )
+        if velocity_profile is not None:
+            plan.metadata["qpos_init_max_angvel_rad_s"] = list(
+                normalize_qpos_init_max_angvel(qpos_init_max_angvel_rad_s) or ()
+            )
         if _should_try_dual_arm_branch_search(
             plan,
             branch_search=bool(branch_search),
@@ -380,7 +391,46 @@ def build_rm65_qpos_init_plan(
             "collision_scene_profile": str(collision_scene_profile),
         }
     )
+    if velocity_profile is not None:
+        plan.metadata["qpos_init_max_angvel_rad_s"] = list(
+            normalize_qpos_init_max_angvel(qpos_init_max_angvel_rad_s) or ()
+        )
     return plan
+
+
+def normalize_qpos_init_max_angvel(value: Any) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"default", "profile", "none", "off"}:
+            return None
+        raw_parts: Sequence[Any] = [part for part in text.replace(",", " ").split() if part]
+    else:
+        raw_parts = list(np.asarray(value, dtype=float).reshape(-1))
+        if not raw_parts:
+            return None
+    try:
+        values = [float(part) for part in raw_parts]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("qpos init max angvel must contain 1 or 6 finite positive values in rad/s.") from exc
+    if len(values) == 1:
+        values = values * RM65_ARM_JOINT_DOF
+    if len(values) != RM65_ARM_JOINT_DOF or not np.all(np.isfinite(values)) or any(value <= 0.0 for value in values):
+        raise ValueError("qpos init max angvel must contain 1 or 6 finite positive values in rad/s.")
+    return tuple(float(value) for value in values)
+
+
+def qpos_init_velocity_profile_from_max_angvel(value: Any) -> JointVelocityLimitProfile | None:
+    max_angvel = normalize_qpos_init_max_angvel(value)
+    if max_angvel is None:
+        return None
+    return JointVelocityLimitProfile(
+        name=CUSTOM_QPOS_INIT_VELOCITY_PROFILE_NAME,
+        max_velocity_deg_s=tuple(float(np.rad2deg(value)) for value in max_angvel),
+        max_dt_sec=1.0,
+        metadata={"max_angvel_rad_s": list(max_angvel)},
+    )
 
 
 def build_rm65_qpos_init_collision_model(

@@ -60,6 +60,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=0.03)
     parser.add_argument("--max_open_mm", type=float, default=70.0)
+    parser.add_argument(
+        "--no-gripper-reconnect",
+        action="store_true",
+        help="Disable one-shot gripper serial reconnect/retry after transient Modbus I/O errors.",
+    )
+    parser.add_argument("--gripper-reconnect-attempts", type=int, default=1)
+    parser.add_argument("--gripper-reconnect-delay", type=float, default=0.05)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--tactile_ids", nargs="*", default=None)
     parser.add_argument("--backend", default="cpu", choices=["cpu", "cuda", "Flux", "flux"])
@@ -115,6 +122,9 @@ def _gripper_config(args) -> GripperConfig:
         baudrate=args.baudrate,
         timeout=args.timeout,
         max_open_mm=args.max_open_mm,
+        reconnect_on_error=not bool(args.no_gripper_reconnect),
+        reconnect_attempts=args.gripper_reconnect_attempts,
+        reconnect_delay=args.gripper_reconnect_delay,
         debug=args.debug,
     )
 

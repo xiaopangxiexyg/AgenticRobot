@@ -33,6 +33,10 @@
   （兼容旧入口 `python -m teleop_runtime.deploy.run_policy`）
 - 策略部署使用说明：
   [teleop_runtime/deploy/README.md](./deploy/README.md)
+- 部署动作链路现在以 `RobotAction` 为 sim/real 通用语义边界，以
+  `TeleopCommand` 为 launcher/backend 下发边界；真机分发逻辑只保留在
+  `teleop_runtime.deploy.dispatch`。后续硬件无关 action/deploy preparation 目标是
+  迁到 `robot_motion/action` 和 `robot_motion/deploy`。
 - 交互式 calibration debug app：
   [teleop_runtime/debug/run_vive_rm65_calibration_debug.py](./debug/run_vive_rm65_calibration_debug.py)
 - 默认录制：`teleop_records/<timestamp>/`
@@ -189,6 +193,27 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 - 所有共享 SAPIEN viewer 统一使用“从 `desk +x` 看向原点”的视角，因此屏幕左边就是逻辑 `left_arm(-y)`，屏幕右边就是逻辑 `right_arm(+y)`
 
 如果机器人底座、桌面定义或 workspace 变了，这部分要单独重新确认。
+
+workspace 现在由独立配置文件管理，不需要手改 calibration profile：
+
+- [teleop_runtime/configs/arm_workspace.json](./configs/arm_workspace.json)
+
+其中 desk `+x` 是 forward；如果只是前伸被卡住，通常先把
+`default.workspace_max` 的第一个值调大，例如从 `0.60` 调到 `0.75` 或 `0.80`。
+左右臂需要不同范围时，在 `sides.left` 或 `sides.right` 里覆盖单侧。
+
+真机遥操作入口也支持临时命令行覆盖，方便现场试值：
+
+```bash
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
+  --load-profile teleop_records/calibration_profiles/your_profile.json \
+  --arm-workspace-min -0.60 -0.80 0.00 \
+  --arm-workspace-max 0.80 0.80 0.90
+```
+
+启动优先级是：命令行 `--arm-workspace-*` > `--arm-workspace-config` 指定的 JSON >
+calibration profile 里的历史 workspace 字段。新保存的 calibration profile 不再写入
+workspace 数值，只保留 tracker/desk 标定。
 
 ### 2. 输入映射层
 

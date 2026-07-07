@@ -141,7 +141,7 @@ class WriterVideoStatsTest(unittest.TestCase):
                 }
             )
             sample.arm_states["left"] = {
-                "actual_hardware_result_text": (
+                "hardware_result_text": (
                     "RuntimeError: left: force 55.0000N > hard_stop_force_n"
                 )
             }
@@ -158,12 +158,48 @@ class WriterVideoStatsTest(unittest.TestCase):
             self.assertEqual(quality["force_collision_label"], "detected_collision")
             self.assertNotIn("force_limit_exceeded_count", quality)
             self.assertNotIn("max_force_norm_n", quality)
+            self.assertTrue(record["metadata"]["force_collision_detected"])
+            self.assertEqual(record["metadata"]["force_collision_label"], "detected_collision")
+            self.assertEqual(
+                record["metadata"]["trajectory_quality"]["force_collision_label"],
+                "detected_collision",
+            )
 
             stats_path = Path(tmpdir) / "meta" / "episodes_stats.jsonl"
             stats = json.loads(stats_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertTrue(stats["force_collision_detected"])
             self.assertEqual(stats["force_collision_label"], "detected_collision")
             self.assertEqual(stats["pose_quality_warning_count"], 1)
+
+    def test_emergency_stop_state_is_recorded_without_force_collision_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_parquet=False,
+                    write_video=False,
+                )
+            )
+            sample = _camera_sample()
+            sample.arm_states["left"] = {
+                "send_result_code": 0,
+                "send_result_text": "emergency_stop:Arm_Stop:0",
+                "emergency_stopped": True,
+            }
+            writer.start_episode(episode_index=0)
+            row_job = next(job for job in writer.plan_sample_jobs(sample) if job.kind == ROW_JOB_KIND)
+            row = row_job.payload["row"]
+            self.assertEqual(row["observation.arm.left.send_result_text"], "emergency_stop:Arm_Stop:0")
+            self.assertEqual(row["observation.arm.left.emergency_stopped"], 1)
+            writer.handle_job(row_job)
+
+            writer.finalize_episode(0)
+
+            episodes_path = Path(tmpdir) / "meta" / "episodes.jsonl"
+            record = json.loads(episodes_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertFalse(record["summary"]["force_collision_detected"])
+            self.assertEqual(record["summary"]["force_collision_label"], "clean")
+            self.assertFalse(record["metadata"]["force_collision_detected"])
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ IMPEDANCE_FIELDS = {
     "force_sign",
     "angular_force_sign",
     "angular_axis_signs",
+    "angular_axis_velocity_scales",
     "control_hz",
     "action_hz",
     "lowpass_alpha",
@@ -56,6 +57,8 @@ IMPEDANCE_FIELDS = {
     "hard_stop_force_n",
     "hard_stop_torque_nm",
     "max_command_joint_step_deg",
+    "ik_resolver_local_step_max_position_worsen_m",
+    "ik_resolver_local_step_component_progress_max_position_worsen_m",
 }
 
 

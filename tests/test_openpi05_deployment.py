@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("openpi05_deployment", reason="legacy openpi05_deployment package was removed")
+
 import unittest
 from unittest import mock
 import argparse

@@ -62,7 +62,16 @@ datasets/<dataset_name>/
 - `video_paths`: 各相机 mp4 相对路径。
 - `tactile_paths`: 左/右触觉 manifest 相对路径。
 - `wrist_depth_mask_paths`: 腕部相机 depth mask manifest 相对路径。
+- `wrist_depth_raw_paths`: 腕部相机 raw depth manifest 相对路径。
 - `metadata`, `summary`: 采集配置、频率统计、停止原因、故障状态等辅助信息。
+
+启用 wrist depth mask/raw 采集时，`metadata.wrist_depth_integrity` 和
+`summary.wrist_depth_integrity` 会记录 episode 级完整性标注。核心字段包括
+`ok`, `failure_count`, `unseen_camera_keys`，以及每个 wrist camera 的
+`missing_frame_count`, `missing_depth_image_count`, `missing_depth_scale_count`,
+`mask_ready_count`, `raw_ready_count`, `failure_reason_counts`,
+`failure_frame_indices_first`。读取端应将 `ok=false` 或任一 missing 计数大于
+0 的 episode 视为 wrist depth 不完整样本。
 
 `meta/episodes_stats.jsonl` 是每个 episode 的统计摘要，常用字段包括 `frame_count`, `average_dt_sec`, `average_hz`, `mean_control_hz`, `fault_count`。
 如果数据包含 pose/碰撞质量标注，还会包含 `pose_quality_*`,
@@ -88,6 +97,16 @@ datasets/<dataset_name>/
 
 - `action.<side>_arm.pose`: 单侧手臂目标 pose，通常 `[x, y, z, qx, qy, qz, qw]`。
 - `action.<side>_hand.joint_target`: 单侧手/夹爪目标。有效维度以 `hand_action_specs_by_side` 为准。
+- `action.replay.<side>_arm_joint_target`: 6 维机械臂关节目标，语义是采集时实际发送给
+  RM65 backend 的 joint target。它是低层 `qpos_target` replay 的必需字段，也是默认真机 replay
+  首帧 qpos init 的优先来源；若缺失，默认 replay 可退回
+  `observation.arm.<side>.current_qpos` 或 `observation.arm.<side>.actual_hardware_qpos` 做首帧初始化。
+  `Start` 阶段默认仍以 26 维 `action` 中的 7D arm pose 作为下游接口验证输入，不用该字段逐帧下发。
+- `action.replay.<side>_hand_joint_target`: replay/可视化用的手部目标。手部实际维度仍以
+  `hand_action_specs_by_side` 为准。
+- 通用 replay 与后续模型部署应优先读取 26 维 `action` 和 action spec，
+  再经同一套 `RobotAction`/`TeleopCommand` 解析路径下发。首帧 qpos init
+  是机械臂定位辅助，不是模型 action schema 的一部分。
 - `action.gripper.<side>.target`: DMTAC gripper 的标量夹爪目标，适合后续按 1 维 gripper 训练。
 - DMTAC gripper 历史数据可能同时保留 6-slot hand 兼容向量；训练时应以
   `action.gripper.<side>.target` 作为每侧 1 维夹爪目标。其余 5 个 hand slot
@@ -130,6 +149,10 @@ datasets/<dataset_name>/
 - `index` 是当前 dataset 的扁平 row id；复制式后处理产物应重建 `index`，保证当前输出 dataset 内唯一且连续。需要追溯原始编号时，应使用派生 metadata 或额外 source 字段，而不是复用 `index`。
 - `features` 和 action spec 是维度权威来源，不要硬编码 `action` 维度。
 - 对 DMTAC gripper，新数据应按每侧 1 维 gripper target 训练；历史数据如果仍保留 6 slot hand target，需要通过 `action.gripper.<side>.target`、action spec 或后处理转换到训练所需格式。每侧未使用的 5 个 hand slot 是 padding，不应当作训练 action 维度。
+- replay、部署和模型推理应共享同一个 action contract：arm 使用 7D pose，
+  hand/gripper 使用 `hand_action_specs_by_side` 声明的 active slots。末端类型变化时，
+  优先新增或更新 action spec 与后端适配器，不应在 replay、训练 reader 或 deploy
+  入口分别硬编码维度。
 - `FAULT/HOLD` 后继续写入的尾段、长时间卡顿分段、以及人工标记的碰撞 episode，应通过 `dataset_postprocess` 生成新的 clean/collision dataset，而不是原地改写原始数据。
 - 后处理产物应更新 `meta/info.json`, `episodes.jsonl`, `episodes_stats.jsonl`，并保留 `postprocess_history`。
 

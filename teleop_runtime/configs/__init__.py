@@ -1,4 +1,9 @@
 """Configuration profiles for teleop_runtime."""
+from .arm_workspace import (
+    ArmWorkspaceBounds,
+    DEFAULT_ARM_WORKSPACE_CONFIG_PATH,
+    load_arm_workspace_config,
+)
 from .pose_smoothing import (
     BimanualPoseSmoother,
     PoseSmoother,
@@ -26,6 +31,8 @@ from ..sources.camera import load_realsense_camera_config_map
 
 __all__ = [
     "ANNOTATED_DUAL_RM65_BASE_DISTANCE_M",
+    "ArmWorkspaceBounds",
+    "DEFAULT_ARM_WORKSPACE_CONFIG_PATH",
     "build_annotated_dual_rm65_calibration",
     "BimanualPoseSmoother",
     "build_bimanual_session",
@@ -36,6 +43,7 @@ __all__ = [
     "load_latest_dmtac_backend_configs",
     "load_latest_q6_ports",
     "load_default_pose_smoothing_config",
+    "load_arm_workspace_config",
     "load_pose_smoothing_config",
     "load_q6_hardware_assignment",
     "load_realsense_camera_config_map",

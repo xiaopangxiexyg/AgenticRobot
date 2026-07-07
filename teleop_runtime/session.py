@@ -104,6 +104,7 @@ class TeleopSession:
         self._freeze_fault_codes: tuple[str, ...] = ()
         self._freeze_channel_names: tuple[str, ...] = ()
         self._healthy_frames_since_fault_clear = 0
+        self.last_fault_reason = ""
 
     def _transition(self, new_state: TeleopRunState, reason: str = "") -> None:
         old_state = self.state_machine.state
@@ -166,6 +167,7 @@ class TeleopSession:
             self._hold_rig_motion(f"safety freeze: {reason}", context="safety freeze")
 
     def fault(self, reason: str) -> None:
+        self.last_fault_reason = str(reason)
         print("\033[1;31;40m" + f"[Debug Info] FAULT triggered due to: {reason}" + "\033[0m")
         self._transition(TeleopRunState.FAULT, reason)
 

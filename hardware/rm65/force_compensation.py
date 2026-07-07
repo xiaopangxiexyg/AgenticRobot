@@ -46,16 +46,9 @@ def axis_index(axis: str) -> int:
 
 
 def admittance_wrench_for_arm(wrench: Iterable[float], arm: str) -> list[float]:
-    """Return the user-facing wrench channels used by RM65 admittance.
-
-    The right-arm force data exposes the first two angular channels opposite to
-    the Euler pose axes used by the admittance UI: sensor rx drives pose ry, and
-    sensor ry drives pose rx. Swap those channels before applying rx/ry tuning.
-    """
+    """Return the user-facing wrench channels used by RM65 admittance."""
     values = finite_list(wrench, expected_len=6, label="wrench")
-    if arm == "right":
-        values[3], values[4] = values[4], values[3]
-    elif arm != "left":
+    if arm not in ("left", "right"):
         raise ValueError("arm must be left or right")
     return values
 
@@ -112,6 +105,30 @@ def clamp_norm(values: list[float], max_norm: float) -> list[float]:
         return list(values)
     scale = max_norm / current
     return [value * scale for value in values]
+
+
+def clamp_components(values: Iterable[float], limits: Iterable[float]) -> list[float]:
+    return [
+        clamp(float(value), abs(float(limit)))
+        for value, limit in zip(values, limits)
+    ]
+
+
+def dot(a: Iterable[float], b: Iterable[float]) -> float:
+    return sum(float(left) * float(right) for left, right in zip(a, b))
+
+
+def moving_toward_zero(previous: Iterable[float], delta: Iterable[float]) -> bool:
+    previous_values = [float(value) for value in previous]
+    delta_values = [float(value) for value in delta]
+    previous_norm = norm(previous_values)
+    if previous_norm <= 1e-12 or dot(previous_values, delta_values) >= -1e-12:
+        return False
+    target_values = [
+        previous_values[index] + delta_values[index]
+        for index in range(min(len(previous_values), len(delta_values)))
+    ]
+    return norm(target_values) < previous_norm - 1e-12
 
 
 def deadband_value(value: float, deadband: float) -> float:
@@ -176,12 +193,15 @@ class PoseAdmittance:
     force_sign: float = 1.0
     angular_force_sign: float = -1.0
     angular_axis_signs: list[float] = field(default_factory=lambda: [1.0, 1.0, -1.0])
+    angular_axis_velocity_scales: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
     linear_gain_m_s_per_n: float = 0.006
     angular_gain_rad_s_per_nm: float = 0.0
     linear_compliance_m_per_n: float = 0.0
     angular_compliance_rad_per_nm: float = 0.0
     max_linear_velocity_m_s: float = 0.03
     max_angular_velocity_rad_s: float = 0.0
+    max_linear_return_velocity_m_s: float | None = None
+    max_angular_return_velocity_rad_s: float | None = None
     max_linear_offset_m: float = 0.03
     max_angular_offset_rad: float = 0.0
     return_rate_s: float = 0.35
@@ -205,6 +225,13 @@ class PoseAdmittance:
         ):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
+        for name in (
+            "max_linear_return_velocity_m_s",
+            "max_angular_return_velocity_rad_s",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0.0:
+                raise ValueError(f"{name} must be non-negative")
         if self.force_sign == 0.0:
             raise ValueError("force_sign must be nonzero")
         if self.angular_force_sign == 0.0:
@@ -213,18 +240,56 @@ class PoseAdmittance:
         for value in self.angular_axis_signs:
             if value not in (-1.0, 1.0):
                 raise ValueError("angular_axis_signs values must be -1 or 1")
+        self.angular_axis_velocity_scales = finite_list(
+            self.angular_axis_velocity_scales,
+            expected_len=3,
+            label="angular_axis_velocity_scales",
+        )
+        for value in self.angular_axis_velocity_scales:
+            if value < 0.0:
+                raise ValueError("angular_axis_velocity_scales values must be non-negative")
 
     def reset(self) -> None:
         self.offset = [0.0] * 6
 
-    def update(self, wrench: Iterable[float], dt: float) -> dict[str, list[float] | float]:
+    def update(
+        self,
+        wrench: Iterable[float],
+        dt: float,
+        *,
+        return_activity_wrench: Iterable[float] | None = None,
+        return_force_deadband_n: float = 0.0,
+        return_torque_deadband_nm: float = 0.0,
+    ) -> dict[str, object]:
         if dt <= 0.0 or not math.isfinite(dt):
             raise ValueError("dt must be positive and finite")
         wrench_values = finite_list(wrench, expected_len=6, label="wrench")
+        activity_values = (
+            wrench_values
+            if return_activity_wrench is None
+            else finite_list(return_activity_wrench, expected_len=6, label="return_activity_wrench")
+        )
+        if return_force_deadband_n < 0.0 or return_torque_deadband_nm < 0.0:
+            raise ValueError("return deadbands must be non-negative")
+        previous_offset = list(self.offset)
         active_wrench = [
             wrench_values[index] if self.enabled_axes[index] else 0.0
             for index in range(6)
         ]
+        return_activity = [
+            activity_values[index] if self.enabled_axes[index] else 0.0
+            for index in range(6)
+        ]
+        linear_return_pause_flags = [
+            abs(return_activity[index]) > return_force_deadband_n + 1e-12
+            for index in range(3)
+        ]
+        angular_return_pause_flags = [
+            abs(return_activity[index]) > return_torque_deadband_nm + 1e-12
+            for index in range(3, 6)
+        ]
+        linear_return_paused = any(linear_return_pause_flags)
+        angular_return_paused = any(angular_return_pause_flags)
         velocity = [0.0] * 6
         for index in range(3):
             velocity[index] = self.force_sign * self.linear_gain_m_s_per_n * active_wrench[index]
@@ -233,35 +298,167 @@ class PoseAdmittance:
             velocity[index] = axis_sign * self.angular_gain_rad_s_per_nm * active_wrench[index]
 
         target_offset = [0.0] * 6
+        target_offset_unclamped = [0.0] * 6
+        target_offset_after_return = [0.0] * 6
+        target_offset_after_offset_limit = [0.0] * 6
+        offset_delta_before_velocity_limit = [0.0] * 6
+        return_applied_flags = [False] * 6
+        return_paused_flags = [False] * 6
+        linear_offset_limit_applied = False
+        angular_offset_limit_applied = False
+        linear_velocity_limit_applied = False
+        angular_velocity_limit_applied = False
+        linear_return_velocity_limit_applied = False
+        angular_return_velocity_limit_applied = False
+        angular_axis_velocity_limit_applied = False
+        linear_step_velocity_limit_m_s = self.max_linear_velocity_m_s
+        angular_step_velocity_limit_rad_s = self.max_angular_velocity_rad_s
+        angular_axis_step_velocity_limits_rad_s = [
+            angular_step_velocity_limit_rad_s * scale
+            for scale in self.angular_axis_velocity_scales
+        ]
         if self.linear_compliance_m_per_n > 0.0 or self.angular_compliance_rad_per_nm > 0.0:
             for index in range(3):
-                target_offset[index] = self.force_sign * self.linear_compliance_m_per_n * active_wrench[index]
+                target_offset_unclamped[index] = (
+                    self.force_sign * self.linear_compliance_m_per_n * active_wrench[index]
+                )
             for index in range(3, 6):
                 axis_sign = self.angular_force_sign * self.angular_axis_signs[index - 3]
-                target_offset[index] = axis_sign * self.angular_compliance_rad_per_nm * active_wrench[index]
+                target_offset_unclamped[index] = (
+                    axis_sign * self.angular_compliance_rad_per_nm * active_wrench[index]
+                )
+            target_offset = list(target_offset_unclamped)
+            decay = max(0.0, 1.0 - self.return_rate_s * dt) if self.return_rate_s > 0.0 else 1.0
+            for index in range(3):
+                if (
+                    self.linear_compliance_m_per_n > 0.0
+                    and self.enabled_axes[index]
+                    and abs(active_wrench[index]) <= 1e-12
+                ):
+                    if linear_return_pause_flags[index]:
+                        target_offset[index] = self.offset[index]
+                        return_paused_flags[index] = True
+                    else:
+                        target_offset[index] = self.offset[index] * decay
+                        return_applied_flags[index] = True
+            for index in range(3, 6):
+                if (
+                    self.angular_compliance_rad_per_nm > 0.0
+                    and self.enabled_axes[index]
+                    and abs(active_wrench[index]) <= 1e-12
+                ):
+                    if angular_return_pause_flags[index - 3]:
+                        target_offset[index] = self.offset[index]
+                        return_paused_flags[index] = True
+                    else:
+                        target_offset[index] = self.offset[index] * decay
+                        return_applied_flags[index] = True
+            linear_return_paused = any(return_paused_flags[:3])
+            angular_return_paused = any(return_paused_flags[3:])
+            target_offset_after_return = list(target_offset)
+            linear_limit = self.max_linear_offset_m
+            linear_offset_limit_applied = linear_limit > 0.0 and norm(target_offset[:3]) > linear_limit + 1e-12
             target_offset[:3] = clamp_norm(target_offset[:3], self.max_linear_offset_m)
             if self.max_angular_offset_rad > 0.0:
+                angular_offset_limit_applied = norm(target_offset[3:]) > self.max_angular_offset_rad + 1e-12
                 target_offset[3:] = clamp_norm(target_offset[3:], self.max_angular_offset_rad)
             else:
                 target_offset[3:] = [0.0, 0.0, 0.0]
+            target_offset_after_offset_limit = list(target_offset)
 
             delta = [target_offset[index] - self.offset[index] for index in range(6)]
+            offset_delta_before_velocity_limit = list(delta)
             step = [0.0] * 6
-            step[:3] = clamp_norm(delta[:3], self.max_linear_velocity_m_s * dt)
+            passive_linear_return = bool(
+                any(return_applied_flags[:3])
+                and not any(abs(active_wrench[index]) > 1e-12 for index in range(3))
+            )
+            if (
+                self.max_linear_return_velocity_m_s is not None
+                and passive_linear_return
+                and moving_toward_zero(self.offset[:3], delta[:3])
+            ):
+                linear_step_velocity_limit_m_s = min(
+                    self.max_linear_velocity_m_s,
+                    self.max_linear_return_velocity_m_s,
+                )
+                linear_return_velocity_limit_applied = (
+                    norm(delta[:3]) > linear_step_velocity_limit_m_s * dt + 1e-12
+                )
+            linear_velocity_limit_applied = norm(delta[:3]) > linear_step_velocity_limit_m_s * dt + 1e-12
+            step[:3] = clamp_norm(delta[:3], linear_step_velocity_limit_m_s * dt)
             if self.max_angular_velocity_rad_s > 0.0:
-                step[3:] = clamp_norm(delta[3:], self.max_angular_velocity_rad_s * dt)
+                passive_angular_return = bool(
+                    any(return_applied_flags[3:])
+                    and not any(abs(active_wrench[index]) > 1e-12 for index in range(3, 6))
+                )
+                if (
+                    self.max_angular_return_velocity_rad_s is not None
+                    and passive_angular_return
+                    and moving_toward_zero(self.offset[3:], delta[3:])
+                ):
+                    angular_step_velocity_limit_rad_s = min(
+                        self.max_angular_velocity_rad_s,
+                        self.max_angular_return_velocity_rad_s,
+                    )
+                    angular_return_velocity_limit_applied = (
+                        norm(delta[3:]) > angular_step_velocity_limit_rad_s * dt + 1e-12
+                    )
+                angular_axis_step_velocity_limits_rad_s = [
+                    angular_step_velocity_limit_rad_s * scale
+                    for scale in self.angular_axis_velocity_scales
+                ]
+                angular_component_step_limits = [
+                    limit * dt
+                    for limit in angular_axis_step_velocity_limits_rad_s
+                ]
+                angular_step = clamp_norm(delta[3:], angular_step_velocity_limit_rad_s * dt)
+                angular_axis_velocity_limit_applied = any(
+                    abs(angular_step[index]) > angular_component_step_limits[index] + 1e-12
+                    for index in range(3)
+                )
+                angular_velocity_limit_applied = (
+                    norm(delta[3:]) > angular_step_velocity_limit_rad_s * dt + 1e-12
+                    or angular_axis_velocity_limit_applied
+                )
+                step[3:] = clamp_components(angular_step, angular_component_step_limits)
+            else:
+                angular_axis_step_velocity_limits_rad_s = [0.0, 0.0, 0.0]
             self.offset = [self.offset[index] + step[index] for index in range(6)]
             velocity = [step[index] / dt for index in range(6)]
         else:
             velocity[:3] = clamp_norm(velocity[:3], self.max_linear_velocity_m_s)
             if self.max_angular_velocity_rad_s > 0.0:
-                velocity[3:] = clamp_norm(velocity[3:], self.max_angular_velocity_rad_s)
+                angular_axis_step_velocity_limits_rad_s = [
+                    self.max_angular_velocity_rad_s * scale
+                    for scale in self.angular_axis_velocity_scales
+                ]
+                angular_velocity = clamp_norm(velocity[3:], self.max_angular_velocity_rad_s)
+                angular_axis_velocity_limit_applied = any(
+                    abs(angular_velocity[index]) > angular_axis_step_velocity_limits_rad_s[index] + 1e-12
+                    for index in range(3)
+                )
+                angular_velocity_limit_applied = (
+                    norm(velocity[3:]) > self.max_angular_velocity_rad_s + 1e-12
+                    or angular_axis_velocity_limit_applied
+                )
+                velocity[3:] = clamp_components(angular_velocity, angular_axis_step_velocity_limits_rad_s)
             else:
                 velocity[3:] = [0.0, 0.0, 0.0]
+                angular_axis_step_velocity_limits_rad_s = [0.0, 0.0, 0.0]
 
             if norm(active_wrench[:3]) <= 1e-9 and norm(active_wrench[3:]) <= 1e-9 and self.return_rate_s > 0.0:
                 decay = max(0.0, 1.0 - self.return_rate_s * dt)
-                self.offset = [value * decay for value in self.offset]
+                self.offset[:3] = (
+                    list(self.offset[:3])
+                    if linear_return_paused
+                    else [value * decay for value in self.offset[:3]]
+                )
+                self.offset[3:] = (
+                    list(self.offset[3:])
+                    if angular_return_paused
+                    else [value * decay for value in self.offset[3:]]
+                )
             else:
                 self.offset = [
                     self.offset[index] + velocity[index] * dt
@@ -274,11 +471,45 @@ class PoseAdmittance:
         else:
             self.offset[3:] = [0.0, 0.0, 0.0]
 
+        offset_step_after_velocity_limit = [
+            self.offset[index] - previous_offset[index]
+            for index in range(6)
+        ]
+
         return {
             "active_wrench": active_wrench,
+            "target_offset_unclamped": target_offset_unclamped,
+            "target_offset_after_return": target_offset_after_return,
+            "target_offset_after_offset_limit": target_offset_after_offset_limit,
             "target_offset": target_offset,
             "velocity": velocity,
             "offset": list(self.offset),
+            "offset_delta_before_velocity_limit": offset_delta_before_velocity_limit,
+            "offset_step_after_velocity_limit": offset_step_after_velocity_limit,
+            "return_applied_axes": [
+                AXES[index]
+                for index, applied in enumerate(return_applied_flags)
+                if applied
+            ],
+            "return_paused_axes": [
+                AXES[index]
+                for index, paused in enumerate(return_paused_flags)
+                if paused
+            ],
+            "return_activity_wrench": return_activity,
+            "linear_return_paused": linear_return_paused,
+            "angular_return_paused": angular_return_paused,
+            "linear_offset_limit_applied": linear_offset_limit_applied,
+            "angular_offset_limit_applied": angular_offset_limit_applied,
+            "linear_velocity_limit_applied": linear_velocity_limit_applied,
+            "angular_velocity_limit_applied": angular_velocity_limit_applied,
+            "angular_axis_velocity_limit_applied": angular_axis_velocity_limit_applied,
+            "linear_return_velocity_limit_applied": linear_return_velocity_limit_applied,
+            "angular_return_velocity_limit_applied": angular_return_velocity_limit_applied,
+            "linear_step_velocity_limit_m_s": linear_step_velocity_limit_m_s,
+            "angular_step_velocity_limit_rad_s": angular_step_velocity_limit_rad_s,
+            "angular_axis_velocity_scales": list(self.angular_axis_velocity_scales),
+            "angular_axis_step_velocity_limits_rad_s": angular_axis_step_velocity_limits_rad_s,
             "linear_offset_norm_m": norm(self.offset[:3]),
             "angular_offset_norm_rad": norm(self.offset[3:]),
         }
@@ -373,18 +604,8 @@ def apply_pose_offset_work_rotvec(pose: Iterable[float], offset: Iterable[float]
 def apply_pose_offset(pose: Iterable[float], offset: Iterable[float]) -> list[float]:
     """Apply a 6D offset to a controller pose.
 
-    User-facing impedance axes are named x, y, z, rx, ry, rz, so the angular part
-    is applied directly to the controller pose's Euler channels. This keeps single-axis
-    tuning intuitive even when the current pose has a large yaw/pitch offset.
-
-    For physical work/base-frame rotation-vector semantics, use
-    ``apply_pose_offset_work_rotvec`` instead.
+    The linear part is added directly. The angular part is interpreted as a
+    work/base-frame rotation vector and composed with the current pose rotation,
+    instead of being added directly to the Euler channels.
     """
-    pose_values = finite_list(pose, expected_len=6, label="pose")
-    offset_values = finite_list(offset, expected_len=6, label="offset")
-    return normalize_pose(
-        [
-            pose_values[index] + offset_values[index]
-            for index in range(6)
-        ]
-    )
+    return normalize_pose(apply_pose_offset_work_rotvec(pose, offset))

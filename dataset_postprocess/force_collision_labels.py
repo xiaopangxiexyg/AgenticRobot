@@ -24,6 +24,12 @@ _QUALITY_COLUMNS = (
     "teleop.force_limit_exceeded",
     "teleop.force_collision_detected",
     "faults_json",
+    "observation.arm.left.hardware_result_text",
+    "observation.arm.left.send_result_text",
+    "observation.arm.left.fault",
+    "observation.arm.right.hardware_result_text",
+    "observation.arm.right.send_result_text",
+    "observation.arm.right.fault",
     "observation.arm.left.actual_hardware_result_text",
     "observation.arm.left.actual_state_error",
     "observation.arm.right.actual_hardware_result_text",
@@ -177,6 +183,17 @@ def _update_episode_record(
     summary["force_collision_detected"] = bool(label.force_collision_detected)
     summary["force_collision_label"] = label.force_collision_label
     record["summary"] = summary
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata_quality = metadata.get("trajectory_quality")
+    if not isinstance(metadata_quality, dict):
+        metadata_quality = {}
+    metadata_quality.update(_quality_payload(label))
+    metadata["trajectory_quality"] = metadata_quality
+    metadata["force_collision_detected"] = bool(label.force_collision_detected)
+    metadata["force_collision_label"] = label.force_collision_label
+    record["metadata"] = metadata
 
 
 def _update_stats_record(

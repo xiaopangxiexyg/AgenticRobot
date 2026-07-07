@@ -48,8 +48,11 @@ python -m pip install --no-cache-dir \
   pyrealsense2 \
   pandas \
   pytest \
+  pyarrow \
   scipy \
-  pyyaml
+  pyyaml \
+  websockets \
+  msgpack
 python -m pip install --no-cache-dir \
   -c "$DEXTELEOP_CONSTRAINTS" \
   "qpsolvers==4.11.0" \

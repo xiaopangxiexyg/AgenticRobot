@@ -11,7 +11,11 @@ if str(DMTAC_ROOT) not in sys.path:
     sys.path.insert(0, str(DMTAC_ROOT))
 
 from portable_dmtac_gripper import gripper_driver  # noqa: E402
-from portable_dmtac_gripper.gripper_driver import InspireGripper  # noqa: E402
+from portable_dmtac_gripper.gripper_driver import (  # noqa: E402
+    GripperError,
+    InspireGripper,
+    InspireGripperModbus,
+)
 
 
 class _State:
@@ -44,6 +48,51 @@ class _FakeGripper(InspireGripper):
             self._last_state = self._states.pop(0)
         self.read_labels.append(self._last_state.label)
         return self._last_state
+
+
+class _ScriptedSerial:
+    scripts: list[bytes] = []
+    instances: list["_ScriptedSerial"] = []
+    clock: _FakeClock | None = None
+
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        self.args = args
+        self.kwargs = kwargs
+        self.timeout = float(kwargs.get("timeout", 0.03))
+        self.is_open = True
+        self.writes: list[bytes] = []
+        self._rx = bytearray(self.scripts.pop(0) if self.scripts else b"")
+        self.close_count = 0
+        self.instances.append(self)
+
+    def reset_input_buffer(self) -> None:
+        return
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        return
+
+    def read(self, n: int) -> bytes:
+        if not self._rx:
+            if self.clock is not None:
+                self.clock.now += self.timeout + 0.001
+            return b""
+        out = bytes(self._rx[:n])
+        del self._rx[:n]
+        return out
+
+    def close(self) -> None:
+        self.close_count += 1
+        self.is_open = False
+
+
+def _read_register_response(slave_id: int, *regs: int) -> bytes:
+    payload = b"".join(int(value).to_bytes(2, byteorder="big") for value in regs)
+    frame = bytes([int(slave_id), 0x03, len(payload)]) + payload
+    return InspireGripperModbus._append_crc(frame)
 
 
 class DMTacGripperDriverTest(unittest.TestCase):
@@ -99,6 +148,64 @@ class DMTacGripperDriverTest(unittest.TestCase):
 
         self.assertEqual(result.label, "idle_3")
         self.assertEqual(gripper.read_labels, ["idle_1", "idle_2", "idle_3"])
+
+    def test_modbus_reconnects_and_retries_after_read_timeout(self) -> None:
+        clock = _FakeClock()
+        old_time, old_sleep = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = [b"", _read_register_response(1, 1234)]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            mb = InspireGripperModbus(
+                port="/dev/fake0",
+                slave_id=1,
+                timeout=0.01,
+                reconnect_on_error=True,
+                reconnect_attempts=1,
+                reconnect_delay=0.0,
+            )
+            regs = mb.read_holding_registers(61, 1)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            gripper_driver.time.time = old_time
+            gripper_driver.time.sleep = old_sleep
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(regs, [1234])
+        self.assertEqual(len(_ScriptedSerial.instances), 2)
+        self.assertEqual(_ScriptedSerial.instances[0].close_count, 1)
+        self.assertEqual(mb.reconnect_count, 1)
+        self.assertEqual(len(_ScriptedSerial.instances[1].writes), 1)
+
+    def test_modbus_does_not_reconnect_on_unexpected_slave_id(self) -> None:
+        clock = _FakeClock()
+        old_time, old_sleep = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = [_read_register_response(2, 1234)]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            mb = InspireGripperModbus(
+                port="/dev/fake0",
+                slave_id=1,
+                timeout=0.01,
+                reconnect_on_error=True,
+                reconnect_attempts=1,
+                reconnect_delay=0.0,
+            )
+            with self.assertRaisesRegex(GripperError, "Unexpected slave id"):
+                mb.read_holding_registers(61, 1)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            gripper_driver.time.time = old_time
+            gripper_driver.time.sleep = old_sleep
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(len(_ScriptedSerial.instances), 1)
+        self.assertEqual(mb.reconnect_count, 0)
 
 
 if __name__ == "__main__":

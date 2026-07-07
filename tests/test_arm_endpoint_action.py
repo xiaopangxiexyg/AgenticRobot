@@ -330,7 +330,15 @@ class ArmEndpointActionTest(unittest.TestCase):
         self.assertEqual(fake_arm.current_tool, "DMTAC_L")
         self.assertEqual(fake_arm.updated[0][0], "DMTAC_L")
         np.testing.assert_allclose(fake_arm.updated[0][1], [0.02, 0.0, 0.18, 0.0, 0.0, 0.0])
-        self.assertEqual(backend.get_state()["active_tool_name"], "DMTAC_L")
+        state = backend.get_state()
+        self.assertEqual(state["active_tool_name"], "DMTAC_L")
+        self.assertEqual(state["active_impedance_config"]["tool_name"], "DMTAC_L")
+        self.assertEqual(state["active_impedance_config"]["mode"], "pose")
+        self.assertEqual(state["active_impedance_config"]["linear_compliance_m_per_n"], 0.005)
+        self.assertIn(
+            "linear_compliance_m_per_n",
+            state["active_impedance_config"]["profile_section_keys"],
+        )
 
     def test_impedance_backend_preserves_solver_output_qpos_hint(self) -> None:
         backend = RM65ImpedanceArmBackend(
@@ -599,6 +607,104 @@ class ArmEndpointActionTest(unittest.TestCase):
         self.assertEqual(fake_arm.thresholds, (3.0, 3.0, 0.05))
         self.assertEqual(backend.get_state()["singularity_metadata"]["singularity_gate_status"], "hold_entry")
         self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 4.0, places=6)
+
+    def test_rm65_backend_slows_qpos_init_when_command_enters_singularity(self) -> None:
+        for source in ("replay_qpos_init", "replay_qpos_init_final_hold", "deploy_fixed_init_qpos"):
+            with self.subTest(source=source):
+                backend = RM65ArmBackend(
+                    RM65ArmBackendConfig(
+                        arm_ip="0.0.0.0",
+                        side="left",
+                        connect_hardware=False,
+                        control_dt=1.0,
+                        max_angvel=(0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
+                        singularity_qpos_init_slowdown=0.2,
+                        initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                    )
+                )
+                fake_arm = _SingularityFakeArm()
+                backend.arm = fake_arm
+                command = EffectorCommand(
+                    effector_name="left_arm",
+                    side="left",
+                    command_type="joint_vector",
+                    value=np.asarray([0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0], dtype=float),
+                    metadata={"source": source},
+                )
+
+                backend.send_command(command)
+
+                metadata = backend.get_state()["singularity_metadata"]
+                self.assertEqual(
+                    metadata["singularity_gate_status"],
+                    "slow_qpos_init_entering_singularity",
+                )
+                self.assertEqual(metadata["source"], source)
+                self.assertAlmostEqual(float(metadata["singularity_qpos_init_slowdown"]), 0.2)
+                self.assertLess(fake_arm.sent_joint_deg[-1][2], 4.0)
+                self.assertGreater(fake_arm.sent_joint_deg[-1][2], 1.0)
+                self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], np.rad2deg(np.deg2rad(4.0) - 0.02))
+
+    def test_rm65_backend_still_holds_replay_qpos_trajectory_entering_singularity(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.asarray([0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0], dtype=float),
+            metadata={"source": "replay_qpos_trajectory"},
+        )
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(metadata["singularity_gate_status"], "hold_entry")
+        self.assertEqual(metadata["source"], "replay_qpos_trajectory")
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 4.0, places=6)
+
+    def test_rm65_backend_uses_robot_action_source_for_qpos_init_slowdown(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
+                singularity_qpos_init_slowdown=0.2,
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.asarray([0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0], dtype=float),
+            metadata={
+                "source": "robot_action",
+                "action_source": "deploy_fixed_init_qpos",
+            },
+        )
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(metadata["singularity_gate_status"], "slow_qpos_init_entering_singularity")
+        self.assertEqual(metadata["source"], "deploy_fixed_init_qpos")
+        self.assertLess(fake_arm.sent_joint_deg[-1][2], 4.0)
+        self.assertGreater(fake_arm.sent_joint_deg[-1][2], 1.0)
 
     def test_rm65_backend_allows_motion_when_current_is_already_singular(self) -> None:
         backend = RM65ArmBackend(

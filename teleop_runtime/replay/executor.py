@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -24,12 +24,24 @@ from .arm_init.qpos_execute import (
     DEFAULT_QPOS_TARGET_PATH,
     build_rm65_qpos_init_plan,
     load_qpos_target,
+    normalize_qpos_init_max_angvel,
     _require_plan_completed,
 )
+from .action_frame import replay_teleop_command_at_index
 from .checks import ReplayPreflightReport, run_replay_preflight
 from .dataset import LoadedReplayEpisode
 from .hardware import ReplayHardwareConfig, ReplayHardwareRig, normalize_active_sides
-from .trajectory import ReplayGroupSpec, ReplayTrajectoryGroup, build_replay_group_for_episode
+from .trajectory import (
+    QPOS_INIT_AUTO,
+    REPLAY_TRAJECTORY_ACTION_POSE,
+    REPLAY_TRAJECTORY_QPOS_TARGET,
+    ReplayGroupSpec,
+    ReplayTrajectoryGroup,
+    build_replay_group_for_episode,
+    normalize_qpos_init_source,
+    normalize_replay_trajectory_source,
+    select_replay_qpos_init_targets,
+)
 
 
 def _serializable(value: Any) -> Any:
@@ -44,10 +56,21 @@ def _serializable(value: Any) -> Any:
     return value
 
 
+def _print_worker_fault(stage: str, exc: BaseException) -> None:
+    print(f"[ReplayHardware][ERROR] {stage} failed: {exc}", file=sys.stderr, flush=True)
+
+
 def _episode_index_or_zero(episode: LoadedReplayEpisode) -> int:
     if episode.summary.episode_index is None:
         return 0
     return int(episode.summary.episode_index)
+
+
+def _payload_value(payload: Mapping[str, Any], keys: Sequence[str], default: Any) -> Any:
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return default
 
 
 def _episode_group_args(
@@ -106,6 +129,9 @@ def build_episode_replay_group(
 class ReplayExecutionSettings:
     send_actions_enabled: bool = False
     action_column: str = "action"
+    trajectory_source: str = REPLAY_TRAJECTORY_ACTION_POSE
+    qpos_init_source: str = QPOS_INIT_AUTO
+    end_effectors_enabled: bool = False
     qpos_reached_tolerance_rad: float = 0.01
     move_to_start_timeout_s: float = 30.0
     tcp_pos_tolerance_m: float = 1e-4
@@ -113,6 +139,7 @@ class ReplayExecutionSettings:
     max_qpos_init_delta_rad: float = float(np.pi)
     qpos_init_dt_sec: float = 0.05
     qpos_init_joint_velocity_profile: str = "rm65_init_slow"
+    qpos_init_max_angvel_rad_s: tuple[float, ...] | None = None
     qpos_init_max_steps_per_side: int = 10000
     qpos_init_collision_check: bool = True
     qpos_init_collision_scene_profile: str = DEFAULT_QPOS_INIT_COLLISION_SCENE
@@ -135,6 +162,27 @@ class ReplayExecutionSettings:
                 else payload.get("sendActions", current.send_actions_enabled)
             ),
             action_column=str(payload.get("action_column") or payload.get("actionColumn") or current.action_column),
+            trajectory_source=normalize_replay_trajectory_source(
+                payload.get("trajectory_source")
+                or payload.get("trajectorySource")
+                or current.trajectory_source
+            ),
+            qpos_init_source=normalize_qpos_init_source(
+                payload.get("qpos_init_source")
+                or payload.get("qposInitSource")
+                or current.qpos_init_source
+            ),
+            end_effectors_enabled=bool(
+                payload.get("end_effectors_enabled")
+                if "end_effectors_enabled" in payload
+                else payload.get(
+                    "endEffectorsEnabled",
+                    payload.get(
+                        "hands_enabled",
+                        payload.get("handsEnabled", current.end_effectors_enabled),
+                    ),
+                )
+            ),
             qpos_reached_tolerance_rad=float(
                 payload.get("qpos_reached_tolerance_rad")
                 or payload.get("qposReachedToleranceRad")
@@ -169,6 +217,18 @@ class ReplayExecutionSettings:
                 payload.get("qpos_init_joint_velocity_profile")
                 or payload.get("qposInitJointVelocityProfile")
                 or current.qpos_init_joint_velocity_profile
+            ),
+            qpos_init_max_angvel_rad_s=normalize_qpos_init_max_angvel(
+                _payload_value(
+                    payload,
+                    (
+                        "qpos_init_max_angvel_rad_s",
+                        "qposInitMaxAngvelRadS",
+                        "qpos_init_arm_max_angvel",
+                        "qposInitArmMaxAngvel",
+                    ),
+                    current.qpos_init_max_angvel_rad_s,
+                )
             ),
             qpos_init_max_steps_per_side=int(
                 payload.get("qpos_init_max_steps_per_side")
@@ -236,6 +296,9 @@ class ReplayExecutionSettings:
         return {
             "send_actions_enabled": bool(self.send_actions_enabled),
             "action_column": str(self.action_column),
+            "trajectory_source": normalize_replay_trajectory_source(self.trajectory_source),
+            "qpos_init_source": normalize_qpos_init_source(self.qpos_init_source),
+            "end_effectors_enabled": bool(self.end_effectors_enabled),
             "qpos_reached_tolerance_rad": float(self.qpos_reached_tolerance_rad),
             "move_to_start_timeout_s": float(self.move_to_start_timeout_s),
             "tcp_pos_tolerance_m": float(self.tcp_pos_tolerance_m),
@@ -243,6 +306,11 @@ class ReplayExecutionSettings:
             "max_qpos_init_delta_rad": float(self.max_qpos_init_delta_rad),
             "qpos_init_dt_sec": float(self.qpos_init_dt_sec),
             "qpos_init_joint_velocity_profile": str(self.qpos_init_joint_velocity_profile),
+            "qpos_init_max_angvel_rad_s": (
+                None
+                if self.qpos_init_max_angvel_rad_s is None
+                else [float(value) for value in self.qpos_init_max_angvel_rad_s]
+            ),
             "qpos_init_max_steps_per_side": int(self.qpos_init_max_steps_per_side),
             "qpos_init_collision_check": bool(self.qpos_init_collision_check),
             "qpos_init_collision_scene_profile": str(self.qpos_init_collision_scene_profile),
@@ -299,7 +367,8 @@ class ReplayExecutionController:
     ) -> dict[str, Any]:
         with self._lock:
             self._ensure_idle_locked()
-            if self._rig is not None:
+            config_changed = hardware_config is not None and hardware_config != self._hardware_config
+            if self._rig is not None and config_changed:
                 self._rig.close()
                 self._rig = None
             if hardware_config is not None:
@@ -312,7 +381,7 @@ class ReplayExecutionController:
             self._clear_qpos_init_status_locked()
             self._last_error = ""
             self._last_message = "hardware replay configured"
-            self._state = "configured"
+            self._state = "connected" if self._rig is not None and self._rig.connected else "configured"
             return self.status()
 
     def configure_from_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -356,14 +425,22 @@ class ReplayExecutionController:
             if self._rig is not None:
                 self._rig.close()
             self._rig = ReplayHardwareRig(self._hardware_config)
+            rig = self._rig
             self._state = "connecting"
             self._last_error = ""
         try:
-            self._rig.connect()
+            rig.connect()
         except Exception as exc:
+            try:
+                rig.close()
+            except Exception:
+                pass
             with self._lock:
+                if self._rig is rig:
+                    self._rig = None
                 self._state = "fault"
                 self._last_error = str(exc)
+                self._last_message = "hardware connect failed"
             raise
         with self._lock:
             self._state = "connected"
@@ -389,6 +466,10 @@ class ReplayExecutionController:
             tcp_pos_tolerance_m=float(settings.tcp_pos_tolerance_m),
             tcp_rot_tolerance_rad=float(settings.tcp_rot_tolerance_rad),
             max_qpos_init_delta_rad=float(settings.max_qpos_init_delta_rad),
+            trajectory_source=settings.trajectory_source,
+            qpos_init_source=settings.qpos_init_source,
+            end_effectors_enabled=bool(settings.end_effectors_enabled),
+            end_effector_backend_sides=rig.end_effector_backend_sides(),
         )
         with self._lock:
             self._group = group
@@ -488,6 +569,11 @@ class ReplayExecutionController:
                     "frame_count": int(self._group.frame_count),
                     "action_hz": float(self._group.action_hz),
                     "arm_joint_target_sides": sorted(self._group.arm_joint_targets),
+                    "arm_observation_current_qpos_sides": sorted(self._group.arm_observation_current_qpos),
+                    "arm_observation_actual_qpos_sides": sorted(self._group.arm_observation_actual_qpos),
+                    "trajectory_source": normalize_replay_trajectory_source(self._settings.trajectory_source),
+                    "qpos_init_source": normalize_qpos_init_source(self._settings.qpos_init_source),
+                    "end_effectors_enabled": bool(self._settings.end_effectors_enabled),
                 }
             return {
                 "state": self._state,
@@ -574,6 +660,7 @@ class ReplayExecutionController:
                 rig.hold_motion("hardware replay move_to_start fault")
             except Exception as hold_exc:  # noqa: BLE001
                 exc = RuntimeError(f"{exc}; hold failed: {hold_exc}")
+            _print_worker_fault("move_to_start", exc)
             with self._lock:
                 self._state = "fault"
                 self._last_error = str(exc)
@@ -584,18 +671,34 @@ class ReplayExecutionController:
     def _replay_worker(self, rig: ReplayHardwareRig, group: ReplayTrajectoryGroup) -> None:
         period = 1.0 / max(1e-6, float(group.action_hz))
         next_time = time.monotonic()
+        trajectory_source = normalize_replay_trajectory_source(self._settings.trajectory_source)
+        current_index: int | None = None
         try:
             rig.begin_replay_speed()
             for index in range(int(group.frame_count)):
+                current_index = int(index)
                 if self._stop_event.is_set():
                     with self._lock:
                         self._state = "aborted"
                         self._finished_at = time.time()
                     return
-                rig.send_joint_targets(
-                    self._qpos_targets_at_index(group, index),
-                    source="replay_trajectory",
-                )
+                if trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
+                    rig.send_joint_targets(
+                        self._qpos_targets_at_index(group, index),
+                        source="replay_qpos_trajectory",
+                    )
+                else:
+                    rig.send_commands(
+                        replay_teleop_command_at_index(
+                            group,
+                            self._hardware_config.active_sides,
+                            index=index,
+                            include_arms=True,
+                            include_end_effectors=bool(self._settings.end_effectors_enabled),
+                            source="replay_action_pose",
+                            resolver=rig.action_resolver,
+                        )
+                    )
                 with self._lock:
                     self._frame_index = int(index)
                 next_time += period
@@ -612,6 +715,13 @@ class ReplayExecutionController:
                 rig.hold_motion("hardware replay fault")
             except Exception as hold_exc:  # noqa: BLE001
                 exc = RuntimeError(f"{exc}; hold failed: {hold_exc}")
+            if current_index is not None:
+                exc = RuntimeError(
+                    f"replay frame_index={current_index} "
+                    f"trajectory_source={trajectory_source} "
+                    f"source={group.source_path}: {exc}"
+                )
+            _print_worker_fault("replay", exc)
             with self._lock:
                 self._state = "fault"
                 self._last_error = str(exc)
@@ -678,6 +788,7 @@ class ReplayExecutionController:
             active_sides=self._hardware_config.active_sides,
             qpos_dt_sec=float(self._settings.qpos_init_dt_sec),
             joint_velocity_profile=str(self._settings.qpos_init_joint_velocity_profile),
+            qpos_init_max_angvel_rad_s=self._settings.qpos_init_max_angvel_rad_s,
             max_steps_per_side=int(self._settings.qpos_init_max_steps_per_side),
             collision_check=bool(self._settings.qpos_init_collision_check),
             collision_scene_profile=str(self._settings.qpos_init_collision_scene_profile),
@@ -697,7 +808,23 @@ class ReplayExecutionController:
 
     def _first_qpos_targets_locked(self) -> dict[str, np.ndarray]:
         group = self._require_checked_group_locked()
-        return self._qpos_targets_at_index(group, 0)
+        targets, sources = select_replay_qpos_init_targets(
+            group,
+            self._hardware_config.active_sides,
+            index=0,
+            source=self._settings.qpos_init_source,
+        )
+        missing = [side for side in self._hardware_config.active_sides if side not in targets]
+        if missing:
+            raise RuntimeError(
+                "Replay start is missing finite qpos init target(s) for "
+                f"{missing}; qpos_init_source={self._settings.qpos_init_source!r}."
+            )
+        self._last_message = (
+            "qpos init targets selected: "
+            + ", ".join(f"{side}={sources.get(side)}" for side in self._hardware_config.active_sides)
+        )
+        return {side: target.astype(float, copy=True) for side, target in targets.items()}
 
     def _qpos_targets_at_index(
         self,

@@ -92,6 +92,9 @@ def _row_has_force_limit_collision(row: Mapping[str, Any]) -> bool:
         prefix = f"observation.arm.{side}"
         values.extend(
             [
+                row.get(f"{prefix}.hardware_result_text"),
+                row.get(f"{prefix}.send_result_text"),
+                row.get(f"{prefix}.fault"),
                 row.get(f"{prefix}.actual_hardware_result_text"),
                 row.get(f"{prefix}.actual_state_error"),
             ]

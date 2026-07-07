@@ -10,6 +10,7 @@ import numpy as np
 from teleop_runtime.replay.dataset import ReplayDatasetIndex
 from teleop_runtime.replay.media import TactileEpisodeReader, tactile_frame_jpeg
 from teleop_runtime.replay.session import ReplayGuiSession
+from teleop_runtime.replay.web_gui import _should_log_http_message
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -113,6 +114,26 @@ def _build_dataset(root: Path) -> np.ndarray:
 
 
 class ReplayGuiDatasetTest(unittest.TestCase):
+    def test_replay_gui_suppresses_successful_access_logs_by_default(self) -> None:
+        self.assertFalse(
+            _should_log_http_message(
+                False,
+                ('GET /media/camera/front.jpg?frame=0 HTTP/1.1', "200", "-"),
+            )
+        )
+        self.assertFalse(
+            _should_log_http_message(False, ('GET /api/state HTTP/1.1', "200", "-"))
+        )
+        self.assertTrue(
+            _should_log_http_message(False, ('GET /missing HTTP/1.1', "404", "-"))
+        )
+        self.assertTrue(
+            _should_log_http_message(
+                True,
+                ('GET /media/camera/front.jpg?frame=0 HTTP/1.1', "200", "-"),
+            )
+        )
+
     def test_dataset_index_and_external_tactile_reader(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -138,6 +159,30 @@ class ReplayGuiDatasetTest(unittest.TestCase):
             jpeg = tactile_frame_jpeg(frame)
             self.assertTrue(jpeg.startswith(b"\xff\xd8"))
 
+    def test_missing_episode_error_lists_available_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_json(root / "meta" / "info.json", {"chunk_size": 1000})
+            parquet_path = root / "data" / "chunk-000" / "episode_000010.parquet"
+            parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            parquet_path.write_bytes(b"")
+            _append_jsonl(
+                root / "meta" / "episodes.jsonl",
+                {
+                    "episode_index": 10,
+                    "episode_id": "episode_000010",
+                    "parquet_path": "data/chunk-000/episode_000010.parquet",
+                },
+            )
+
+            index = ReplayDatasetIndex(root)
+            with self.assertRaises(FileNotFoundError) as context:
+                index.load_episode("0")
+
+            message = str(context.exception)
+            self.assertIn("Could not resolve replay episode '0'", message)
+            self.assertIn("Available episode indices: 10", message)
+
     def test_replay_session_seek_step_and_media_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -158,6 +203,81 @@ class ReplayGuiDatasetTest(unittest.TestCase):
 
             self.assertTrue(session.camera_jpeg("front").startswith(b"\xff\xd8"))
             self.assertTrue(session.tactile_jpeg("left").startswith(b"\xff\xd8"))
+            session.close()
+
+    def test_preflight_dispatch_auto_configures_and_connects(self) -> None:
+        class _FakeEpisode:
+            frame_count = 0
+            rows = []
+            frame_times_sec = []
+            summary = type("_Summary", (), {"camera_keys": (), "tactile_sides": ()})()
+
+            def to_dict(self):
+                return {"episode_id": "episode_fake"}
+
+        class _FakeExecutor:
+            def __init__(self) -> None:
+                self.connected = False
+                self.calls: list[str] = []
+
+            def configure_from_payload(self, payload):
+                self.calls.append(f"configure:{payload.get('active_sides')}")
+                self.connected = False
+                return self.status()
+
+            def connect(self):
+                self.calls.append("connect")
+                self.connected = True
+                return {"last_message": "hardware connected"}
+
+            def preflight(self, episode):
+                self.calls.append(f"preflight:{episode.to_dict()['episode_id']}")
+                return {
+                    "preflight": {
+                        "ok": True,
+                        "checks": [{"name": "fake_check", "ok": True, "level": "info"}],
+                    }
+                }
+
+            def clear_preflight(self):
+                self.calls.append("clear")
+                return self.status()
+
+            def close(self):
+                self.calls.append("close")
+
+            def status(self):
+                return {
+                    "state": "connected" if self.connected else "configured",
+                    "connected": self.connected,
+                    "settings": {},
+                    "hardware_config": {},
+                    "frame_index": 0,
+                    "group": None,
+                    "preflight": None,
+                    "qpos_init": {},
+                    "last_error": "",
+                    "last_message": "",
+                    "worker_alive": False,
+                }
+
+        session = ReplayGuiSession()
+        fake = _FakeExecutor()
+        try:
+            session.executor = fake  # type: ignore[assignment]
+            session.episode = _FakeEpisode()  # type: ignore[assignment]
+
+            state = session.dispatch(
+                {
+                    "type": "preflight_hardware",
+                    "active_sides": "right",
+                    "connect_hardware": False,
+                }
+            )
+
+            self.assertEqual(fake.calls, ["configure:right", "connect", "preflight:episode_fake"])
+            self.assertTrue(any("hardware preflight ok" in message for message in state["messages"]))
+        finally:
             session.close()
 
 

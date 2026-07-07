@@ -441,12 +441,22 @@ def _probe_gripper(
         attempted_baudrates.append(current_baudrate)
         attempted_pairs.append({"baudrate": int(current_baudrate), "gripper_id": int(current_id)})
         try:
-            with InspireGripper(
-                port=port,
-                gripper_id=current_id,
-                baudrate=current_baudrate,
-                timeout=timeout,
-            ) as gripper:
+            gripper_kwargs = {
+                "port": port,
+                "gripper_id": current_id,
+                "baudrate": current_baudrate,
+                "timeout": timeout,
+            }
+            try:
+                gripper_ctx = InspireGripper(
+                    **gripper_kwargs,
+                    reconnect_on_error=False,
+                )
+            except TypeError as exc:
+                if "reconnect_on_error" not in str(exc):
+                    raise
+                gripper_ctx = InspireGripper(**gripper_kwargs)
+            with gripper_ctx as gripper:
                 state = gripper.get_state()
             result = {
                 "reachable": True,

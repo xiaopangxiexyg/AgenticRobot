@@ -67,6 +67,39 @@ def _sample_with_depth(camera_key: str = "left_wrist") -> CollectorSample:
     )
 
 
+def _sample_without_depth(camera_key: str = "left_wrist") -> CollectorSample:
+    frame = VideoFrame(
+        image=np.zeros((2, 4, 3), dtype=np.uint8),
+        source_timestamp=1.0,
+        receive_timestamp=1.01,
+        frame_index=7,
+        metadata={"color_space": "rgb"},
+        depth_image=None,
+        depth_metadata={},
+    )
+    return CollectorSample(
+        index=0,
+        episode_index=0,
+        frame_index=0,
+        timestamp=1.0,
+        session_state="running",
+        control_hz=30.0,
+        action=np.zeros(26, dtype=np.float32),
+        observation_state=np.zeros(38, dtype=np.float32),
+        observation_last_action=np.zeros(26, dtype=np.float32),
+        arm_state_source="unit",
+        active_sides=("left",),
+        camera_frames={
+            camera_key: CameraFrameMatch(
+                camera_key=camera_key,
+                frame=frame,
+                selected_timestamp=1.0,
+                age_sec=0.0,
+            )
+        },
+    )
+
+
 class WristDepthStorageTest(unittest.TestCase):
     def test_depth_range_mask_uses_inclusive_metric_bounds(self) -> None:
         result = depth_range_mask(
@@ -139,6 +172,46 @@ class WristDepthStorageTest(unittest.TestCase):
             jobs = writer.plan_sample_jobs(_sample_with_depth(camera_key="front"))
             self.assertFalse(any(job.kind == WRIST_DEPTH_FRAME_JOB_KIND for job in jobs))
             self.assertTrue(any(job.kind == ROW_JOB_KIND for job in jobs))
+
+    def test_writer_marks_wrist_depth_missing_in_episode_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_parquet=False,
+                    write_video=False,
+                    write_wrist_depth_mask=True,
+                    write_wrist_depth_raw=True,
+                    wrist_depth_camera_keys=("left_wrist", "right_wrist"),
+                )
+            )
+            writer.start_episode(episode_index=0)
+            jobs = writer.plan_sample_jobs(_sample_without_depth())
+            self.assertFalse(any(job.kind == WRIST_DEPTH_FRAME_JOB_KIND for job in jobs))
+            for job in jobs:
+                writer.handle_job(job)
+
+            writer.finalize_episode(0)
+            episodes_path = Path(tmpdir) / "meta" / "episodes.jsonl"
+            record = json.loads(episodes_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(record["wrist_depth_mask_paths"], {})
+            self.assertEqual(record["wrist_depth_raw_paths"], {})
+
+            integrity = record["metadata"]["wrist_depth_integrity"]
+            self.assertFalse(integrity["ok"])
+            self.assertEqual(integrity["failure_count"], 1)
+            self.assertEqual(record["summary"]["wrist_depth_integrity"], integrity)
+            camera_integrity = integrity["cameras"]["left_wrist"]
+            self.assertFalse(camera_integrity["ok"])
+            self.assertEqual(camera_integrity["samples"], 1)
+            self.assertEqual(camera_integrity["frame_present_count"], 1)
+            self.assertEqual(camera_integrity["depth_present_count"], 0)
+            self.assertEqual(camera_integrity["missing_depth_image_count"], 1)
+            self.assertEqual(camera_integrity["failure_frame_indices_first"], [0])
+            self.assertEqual(
+                camera_integrity["failure_reason_counts"],
+                {"missing_depth_image": 1},
+            )
 
 
 if __name__ == "__main__":

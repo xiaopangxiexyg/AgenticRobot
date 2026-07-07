@@ -835,6 +835,136 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(backend.get_state()["gripper_last_send_status"], "rate_limited")
         self.assertTrue(backend.send_fixed_joint_pos(0.0))
 
+    def test_dmtac_backend_reconnects_and_retries_failed_send(self) -> None:
+        created_grippers = []
+
+        class _FakeGripper:
+            def __init__(self) -> None:
+                self.index = len(created_grippers) + 1
+                self.closed = False
+                created_grippers.append(self)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _FakeDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = _FakeGripper()
+                self.moves: list[float] = []
+                self.speed_values: list[float] = []
+                self.torque_values: list[float] = []
+
+            def clear_fault(self) -> None:
+                pass
+
+            def set_speed(self, speed: float) -> None:
+                self.speed_values.append(float(speed))
+
+            def set_torque(self, torque: float) -> None:
+                self.torque_values.append(float(torque))
+
+            def move(self, joint_pos: float, **_kwargs: object) -> None:
+                if self.gripper.index == 1:
+                    raise RuntimeError("serial write failed")
+                self.moves.append(float(joint_pos))
+
+            def close(self) -> None:
+                self.gripper.close()
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="left",
+                connect_hardware=True,
+                connect_tactile=False,
+                reconnect_cooldown_sec=0.0,
+                speed=0.7,
+                torque=0.6,
+            )
+        )
+        backend._create_device = lambda: fake  # type: ignore[method-assign]
+        backend._create_gripper = _FakeGripper  # type: ignore[method-assign]
+
+        backend.start()
+        self.assertTrue(backend.send_fixed_joint_pos(np.asarray([0.5], dtype=np.float32)))
+        state = backend.get_state(include_tactile_arrays=False)
+
+        self.assertEqual(len(created_grippers), 2)
+        self.assertTrue(created_grippers[0].closed)
+        self.assertFalse(created_grippers[1].closed)
+        self.assertEqual(fake.moves, [0.5])
+        self.assertEqual(fake.speed_values, [0.7, 0.7])
+        self.assertEqual(fake.torque_values, [0.6, 0.6])
+        self.assertEqual(state["reconnect_count"], 1)
+        self.assertIsNone(state["telemetry_error"])
+        self.assertTrue(state["gripper_is_connected"])
+
+    def test_dmtac_backend_reconnects_after_gripper_telemetry_failure(self) -> None:
+        created_grippers = []
+
+        class _FakeGripper:
+            def __init__(self) -> None:
+                self.index = len(created_grippers) + 1
+                self.closed = False
+                created_grippers.append(self)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _FakeGripperState:
+            joint_pos = 0.42
+            timestamp = 123.0
+
+        class _FakeDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = _FakeGripper()
+
+            def clear_fault(self) -> None:
+                pass
+
+            def set_speed(self, _speed: float) -> None:
+                pass
+
+            def set_torque(self, _torque: float) -> None:
+                pass
+
+            def read_gripper_state(self):
+                if self.gripper.index == 1:
+                    raise RuntimeError("serial read failed")
+                return _FakeGripperState()
+
+            def close(self) -> None:
+                self.gripper.close()
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="left",
+                connect_hardware=True,
+                connect_tactile=False,
+                reconnect_cooldown_sec=0.0,
+            )
+        )
+        backend.device = fake
+        backend._create_gripper = _FakeGripper  # type: ignore[method-assign]
+
+        backend._read_telemetry_once()
+        after_reconnect = backend.get_state(include_tactile_arrays=False)
+        backend._read_telemetry_once()
+        after_read = backend.get_state(include_tactile_arrays=False)
+
+        self.assertEqual(len(created_grippers), 2)
+        self.assertTrue(created_grippers[0].closed)
+        self.assertEqual(after_reconnect["reconnect_count"], 1)
+        self.assertIsNone(after_reconnect["telemetry_error"])
+        self.assertTrue(after_reconnect["gripper_read_skipped"])
+        self.assertEqual(after_reconnect["gripper_read_skip_reason"], "read_failed")
+        self.assertAlmostEqual(after_read["gripper_measured_scalar"], 0.42)
+
     def test_dmtac_gripper_telemetry_skips_recent_command_window(self) -> None:
         class _FakeDevice:
             gripper = object()

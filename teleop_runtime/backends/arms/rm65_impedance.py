@@ -30,6 +30,179 @@ from ...transforms import as_pose_matrix
 from .rm65 import _load_rm65_sdk, _parse_rm65_result, _pose6_to_matrix
 
 
+_IMPEDANCE_CONFIG_DEBUG_KEYS = (
+    "tool_name",
+    "control_hz",
+    "action_hz",
+    "force_source",
+    "axes",
+    "force_sign",
+    "angular_force_sign",
+    "angular_axis_signs",
+    "angular_axis_velocity_scales",
+    "lowpass_alpha",
+    "force_deadband_n",
+    "torque_deadband_nm",
+    "return_force_deadband_n",
+    "return_torque_deadband_nm",
+    "effective_return_force_deadband_n",
+    "effective_return_torque_deadband_nm",
+    "linear_gain_m_s_per_n",
+    "angular_gain_rad_s_per_nm",
+    "linear_damping_n_s_per_m",
+    "angular_damping_nm_s_per_rad",
+    "linear_compliance_m_per_n",
+    "angular_compliance_rad_per_nm",
+    "max_linear_velocity_m_s",
+    "max_angular_velocity_rad_s",
+    "max_linear_return_velocity_m_s",
+    "max_angular_return_velocity_rad_s",
+    "max_linear_offset_m",
+    "max_angular_offset_rad",
+    "return_rate_s",
+    "pose_command_transport",
+    "max_command_joint_step_deg",
+    "max_command_joint_velocity_deg_s",
+    "joint_rate_limiter_enabled",
+    "joint_velocity_limit_profile",
+    "ik_safety_profile",
+    "ik_resolver_local_step_max_iterations",
+    "ik_resolver_local_step_trigger_ratio",
+    "ik_resolver_local_step_max_position_worsen_m",
+    "ik_resolver_local_step_component_progress_max_position_worsen_m",
+    "direct_joint_hint_max_linear_offset_m",
+    "direct_joint_hint_max_angular_offset_rad",
+    "direct_joint_hint_force_guard_enabled",
+    "direct_joint_hint_force_guard_force_n",
+    "direct_joint_hint_force_guard_torque_nm",
+    "direct_joint_hint_force_guard_reset_admittance",
+    "hold_last_safe_on_ik_failure",
+    "debug_timing",
+    "tcp_pose_flange_m_rad",
+    "tcp_confirmed",
+    "payload_mass_kg",
+    "payload_com_tool_m",
+)
+_RM65_IMPEDANCE_MAX_CONTROL_HZ = 40.0
+
+
+def _debug_config_value(value: object) -> object:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return [float(item) for item in value.reshape(-1).tolist()]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_debug_config_value(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _debug_config_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _coerce_float_vector(value: object, *, expected_len: int) -> list[float] | None:
+    if value is None:
+        return None
+    try:
+        out = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    if out.shape != (expected_len,) or not np.all(np.isfinite(out)):
+        return None
+    return [float(item) for item in out.tolist()]
+
+
+def _tool_frame_debug_snapshot(frame: object) -> dict[str, object]:
+    out: dict[str, object] = {"name": _tool_name_from_frame_result(frame)}
+    payload = frame[1] if isinstance(frame, tuple) and len(frame) >= 2 else frame
+    if isinstance(payload, Mapping):
+        pose = _coerce_float_vector(payload.get("pose"), expected_len=6)
+        if pose is not None:
+            out["pose_flange_m_rad"] = pose
+            out["endpoint_delta"] = tcp_endpoint_delta(pose)
+        try:
+            mass = float(payload.get("payload"))
+        except (TypeError, ValueError):
+            mass = None
+        if mass is not None and np.isfinite(mass):
+            out["payload_mass_kg"] = mass
+        com = []
+        for key in ("x", "y", "z"):
+            try:
+                value = float(payload.get(key))
+            except (TypeError, ValueError):
+                com = []
+                break
+            com.append(value)
+        if len(com) == 3 and all(np.isfinite(value) for value in com):
+            if np.linalg.norm(np.asarray(com, dtype=float)) > 1.0:
+                com = [value * 0.001 for value in com]
+            out["payload_com_tool_m"] = [float(value) for value in com]
+    return out
+
+
+def _profile_tcp_debug_snapshot(profile: Mapping[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(profile, Mapping):
+        return None
+    tcp = profile.get("tcp") if isinstance(profile.get("tcp"), Mapping) else {}
+    pose = _coerce_float_vector(tcp.get("pose_flange_m_rad") if isinstance(tcp, Mapping) else None, expected_len=6)
+    if pose is None:
+        return None
+    payload = profile.get("payload") if isinstance(profile.get("payload"), Mapping) else {}
+    out: dict[str, object] = {
+        "pose_flange_m_rad": pose,
+        "confirmed": bool(tcp.get("confirmed")) if isinstance(tcp, Mapping) else False,
+        "endpoint_delta": tcp_endpoint_delta(pose),
+        "frame_name": str(tcp.get("frame_name") or "") if isinstance(tcp, Mapping) else "",
+    }
+    if isinstance(payload, Mapping):
+        try:
+            mass = float(payload.get("mass_kg"))
+        except (TypeError, ValueError):
+            mass = None
+        if mass is not None and np.isfinite(mass):
+            out["payload_mass_kg"] = mass
+        com = _coerce_float_vector(payload.get("com_tool_m"), expected_len=3)
+        if com is not None:
+            out["payload_com_tool_m"] = com
+        warnings = payload.get("warnings")
+        if isinstance(warnings, (list, tuple)):
+            out["payload_warnings"] = [str(item) for item in warnings]
+    return out
+
+
+def _impedance_config_debug_snapshot(
+    *,
+    profile: Mapping[str, Any],
+    mode: str,
+    config: RM65ImpedanceConfig,
+    overrides: Mapping[str, Any],
+    requested_control_hz: float,
+    effective_control_hz: float,
+    requested_action_hz: float,
+) -> dict[str, object]:
+    section = _profile_impedance_section(profile, mode)
+    out: dict[str, object] = {
+        "profile_path": str(profile.get("_profile_path") or ""),
+        "profile_name": str(profile.get("name") or ""),
+        "profile_arm": str(profile.get("arm") or ""),
+        "profile_tool_name": str(profile.get("tool_name") or ""),
+        "mode": str(mode),
+        "requested_control_hz": float(requested_control_hz),
+        "effective_control_hz": float(effective_control_hz),
+        "control_hz_clamped": bool(abs(float(requested_control_hz) - float(effective_control_hz)) > 1e-9),
+        "requested_action_hz": float(requested_action_hz),
+        "profile_section_keys": sorted(str(key) for key in section.keys()),
+        "override_keys": sorted(str(key) for key in overrides.keys()),
+    }
+    for key in _IMPEDANCE_CONFIG_DEBUG_KEYS:
+        if hasattr(config, key):
+            out[key] = _debug_config_value(getattr(config, key))
+    return out
+
+
 def _tool_name_from_frame_result(frame_result: object) -> str:
     if isinstance(frame_result, tuple) and len(frame_result) >= 2:
         frame = frame_result[1]
@@ -220,12 +393,16 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._profile: dict[str, Any] | None = None
         self._active_tool_name: str | None = None
         self._active_tool_profile_path: str | None = None
+        self._active_impedance_config: dict[str, object] | None = None
+        self._active_tool_frame_snapshot: dict[str, object] | None = None
+        self._profile_tcp_snapshot: dict[str, object] | None = None
         self._endpoint_to_tool_tcp = np.eye(4, dtype=float)
         self._latest_target_pose6: list[float] | None = None
         self._latest_target_joint_deg: list[float] | None = None
         self._last_command: EffectorCommand | None = None
         self._last_command_timestamp: float | None = None
         self._last_step_record: dict[str, object] | None = None
+        self._recent_step_records: list[dict[str, object]] = []
         self._last_fault: str | None = None
         self._last_send_result_code: int | None = None
         self._last_send_result_text: str | None = None
@@ -258,6 +435,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._profile = self._load_profile(self._active_tool_name)
         self._validate_profile(self._profile, self._active_tool_name, check_active_tool=False)
         self._active_tool_name = self._sync_profile_tool_frame(self._profile, self._active_tool_name)
+        self._active_tool_frame_snapshot = self._read_active_tool_frame_snapshot()
         self._validate_profile(self._profile, self._active_tool_name)
         tcp = self._profile.get("tcp") if isinstance(self._profile.get("tcp"), Mapping) else {}
         self._endpoint_to_tool_tcp = _pose6_to_matrix(tcp.get("pose_flange_m_rad", [0.0] * 6))
@@ -267,6 +445,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             f"{tcp_metrics['translation_m']:.4f}m/{tcp_metrics['rotation_deg']:.2f}deg"
         )
         self._active_tool_profile_path = str(self._profile.get("_profile_path") or "")
+        self._profile_tcp_snapshot = _profile_tcp_debug_snapshot(self._profile)
         impedance_config = self._build_impedance_config(self._profile)
         self._controller = RM65PoseImpedanceController(
             arm=self.config.side,
@@ -290,6 +469,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._last_command = None
                 self._last_command_timestamp = None
                 self._last_step_record = None
+                self._recent_step_records = []
                 self._last_send_command_timing = None
                 self._last_impedance_loop_timing = None
                 self._last_send_result_code = 0
@@ -335,6 +515,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._last_command = None
                 self._last_command_timestamp = None
                 self._last_step_record = None
+                self._recent_step_records = []
                 self._last_send_command_timing = None
                 self._last_impedance_loop_timing = None
                 self._last_send_time = None
@@ -369,6 +550,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             self._last_send_result_code = None
             self._last_send_result_text = "starting"
             self._last_step_record = None
+            self._recent_step_records = []
         self._controller.start()
         self._loop_stop_event.clear()
         with self._state_lock:
@@ -480,24 +662,20 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         target_pose6 = self._command_to_tool_tcp_pose6(command)
         target_joint_deg = self._command_solver_output_joint_deg(command)
         mark_timing("command_conversion")
-        send_lock_wait_started_at = time.perf_counter()
         send_lock_wait_ms = 0.0
-        with self._send_lock:
-            send_lock_acquired_at = time.perf_counter()
-            send_lock_wait_ms = (send_lock_acquired_at - send_lock_wait_started_at) * 1000.0
-            mark_timing("send_lock_wait")
-            with self._state_lock:
-                if self._emergency_stopped:
-                    raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
-                self._latest_target_pose6 = list(target_pose6)
-                self._latest_target_joint_deg = None if target_joint_deg is None else list(target_joint_deg)
-                self._last_command = command.copy()
-                self._last_command_timestamp = now
-                self._update_dt_scale(now)
-                if not self.config.connect_hardware:
-                    self._last_send_result_code = 0
-                    self._last_send_result_text = "dry_run"
-            mark_timing("state_update")
+        mark_timing("send_lock_wait")
+        with self._state_lock:
+            if self._emergency_stopped:
+                raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
+            self._latest_target_pose6 = list(target_pose6)
+            self._latest_target_joint_deg = None if target_joint_deg is None else list(target_joint_deg)
+            self._last_command = command.copy()
+            self._last_command_timestamp = now
+            self._update_dt_scale(now)
+            if not self.config.connect_hardware:
+                self._last_send_result_code = 0
+                self._last_send_result_text = "dry_run"
+        mark_timing("state_update")
         if timing_enabled:
             timing_finished_at = time.perf_counter()
             timing = {
@@ -520,6 +698,14 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         if int(code) != 0:
             raise RuntimeError(f"{self.name} Get_Current_Tool_Frame failed: {code}")
         return _tool_name_from_frame_result((code, frame)) or None
+
+    def _read_active_tool_frame_snapshot(self) -> dict[str, object] | None:
+        if self.arm is None:
+            return None
+        code, frame = self.arm.Get_Current_Tool_Frame()
+        if int(code) != 0:
+            raise RuntimeError(f"{self.name} Get_Current_Tool_Frame failed: {code}")
+        return _tool_frame_debug_snapshot((code, frame))
 
     def _load_profile(self, active_tool_name: str | None) -> dict[str, Any]:
         requested = self.config.tool_profile
@@ -602,32 +788,54 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             raise RuntimeError(f"{self.name} strict impedance profile validation failed: " + "; ".join(errors))
 
     def _build_impedance_config(self, profile: Mapping[str, Any]) -> RM65ImpedanceConfig:
-        section = _profile_impedance_section(profile, self.config.impedance_mode)
-        control_hz = float(section.get("control_hz", 40.0) or 40.0)
+        user_overrides = dict(self.config.impedance_overrides)
+        requested_control_hz = float(
+            user_overrides.get("control_hz", 1.0 / float(self.config.control_dt))
+        )
+        effective_control_hz = min(requested_control_hz, _RM65_IMPEDANCE_MAX_CONTROL_HZ)
         requested_action_hz = (
-            float(self.config.action_hz)
-            if self.config.action_hz is not None
-            else 1.0 / float(self.config.control_dt)
+            float(user_overrides.get("action_hz"))
+            if user_overrides.get("action_hz") is not None
+            else (
+                float(self.config.action_hz)
+                if self.config.action_hz is not None
+                else requested_control_hz
+            )
         )
         overrides = {
             "tare_sec": float(self.config.force_tare_sec),
-            "action_hz": min(requested_action_hz, control_hz),
             "hold_last_safe_on_ik_failure": True,
             "debug_timing": bool(self.config.debug_timing),
-            **dict(self.config.impedance_overrides),
+            **user_overrides,
         }
-        return RM65ImpedanceConfig.from_profile(
+        overrides["control_hz"] = effective_control_hz
+        overrides["action_hz"] = min(requested_action_hz, effective_control_hz)
+        impedance_config = RM65ImpedanceConfig.from_profile(
             dict(profile),
             mode=self.config.impedance_mode,
             **overrides,
         )
+        self._active_impedance_config = _impedance_config_debug_snapshot(
+            profile=profile,
+            mode=self.config.impedance_mode,
+            config=impedance_config,
+            overrides=overrides,
+            requested_control_hz=requested_control_hz,
+            effective_control_hz=effective_control_hz,
+            requested_action_hz=requested_action_hz,
+        )
+        return impedance_config
 
-    def _command_to_tool_tcp_pose6(self, command: EffectorCommand) -> list[float]:
-        controlled_frame = canonical_arm_controlled_frame(
+    def _command_controlled_frame(self, command: EffectorCommand) -> str:
+        return canonical_arm_controlled_frame(
             command.metadata.get("arm_controlled_frame")
             or command.metadata.get("target_pose_controlled_frame")
+            or command.metadata.get("controlled_frame")
             or TOOL_TCP_FRAME
         )
+
+    def _command_to_tool_tcp_pose6(self, command: EffectorCommand) -> list[float]:
+        controlled_frame = self._command_controlled_frame(command)
         if controlled_frame == TOOL_TCP_FRAME:
             return _matrix_to_pose6(as_pose_matrix(command.value))
         endpoint_pose = convert_pose_between_arm_control_frames(
@@ -748,6 +956,9 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                         if self._emergency_stopped or self._loop_stop_event.is_set():
                             break
                         self._last_step_record = dict(record)
+                        if self.config.debug_timing:
+                            self._recent_step_records.append(dict(record))
+                            self._recent_step_records = self._recent_step_records[-8:]
                         if loop_timing is not None:
                             self._last_impedance_loop_timing = loop_timing
                         self._last_send_result_code = 0
@@ -772,12 +983,31 @@ class RM65ImpedanceArmBackend(EffectorBackend):
     def get_state(self) -> dict[str, Any]:
         with self._state_lock:
             command = None if self._last_command is None else self._last_command.copy()
+            latest_target_pose6 = (
+                None if self._latest_target_pose6 is None else list(self._latest_target_pose6)
+            )
+            latest_target_joint_deg = (
+                None if self._latest_target_joint_deg is None else list(self._latest_target_joint_deg)
+            )
+            last_command_controlled_frame = (
+                None if command is None else self._command_controlled_frame(command)
+            )
             record = None if self._last_step_record is None else dict(self._last_step_record)
+            recent_records = [dict(item) for item in self._recent_step_records]
             send_command_timing = (
                 None if self._last_send_command_timing is None else dict(self._last_send_command_timing)
             )
             impedance_loop_timing = (
                 None if self._last_impedance_loop_timing is None else dict(self._last_impedance_loop_timing)
+            )
+            active_impedance_config = (
+                None if self._active_impedance_config is None else dict(self._active_impedance_config)
+            )
+            active_tool_frame = (
+                None if self._active_tool_frame_snapshot is None else dict(self._active_tool_frame_snapshot)
+            )
+            profile_tcp = (
+                None if self._profile_tcp_snapshot is None else dict(self._profile_tcp_snapshot)
             )
             if self._loop_thread is None:
                 loop_state = "not_started"
@@ -811,7 +1041,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 "last_target_qpos": target_qpos if target_qpos is not None else current_qpos,
                 "last_target_tcp_pose": target_pose,
                 "last_command": command,
+                "last_command_controlled_frame": last_command_controlled_frame,
                 "last_command_timestamp": self._last_command_timestamp,
+                "latest_target_tcp_pose6": latest_target_pose6,
+                "latest_target_joint_deg": latest_target_joint_deg,
                 "arm_state_source": "pose_impedance_command",
                 "hardware_result_code": 0 if self._last_fault is None else -1,
                 "hardware_result_text": self._last_fault or "ok",
@@ -826,9 +1059,13 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 "force_tare_sec": float(self.config.force_tare_sec),
                 "active_tool_name": self._active_tool_name,
                 "active_tool_profile_path": self._active_tool_profile_path,
+                "active_tool_frame": active_tool_frame,
+                "profile_tcp": profile_tcp,
+                "active_impedance_config": active_impedance_config,
                 "last_send_command_timing": send_command_timing,
                 "last_impedance_loop_timing": impedance_loop_timing,
                 "last_impedance_record": record,
+                "recent_impedance_records": recent_records,
                 "ik_metadata": (
                     dict(record.get("ik_metadata", {}))
                     if isinstance(record, Mapping)

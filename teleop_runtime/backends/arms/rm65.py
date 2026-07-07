@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import threading
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import time
@@ -43,6 +43,14 @@ RM65_IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
 RM65_IK_FRAMEWORK_CHOICES = (RM65_IK_FRAMEWORK_ROBOT_MOTION,)
 HAND_BASE_POSE_FLANGE_M_RAD = (0.0, 0.0, 0.009, 0.0, 0.0, 0.0)
 _SINGULARITY_WARNING_INTERVAL_SEC = 1.0
+DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN = 0.2
+_SINGULARITY_QPOS_INIT_SLOW_SOURCES = frozenset(
+    {
+        "replay_qpos_init",
+        "replay_qpos_init_final_hold",
+        "deploy_fixed_init_qpos",
+    }
+)
 _SINGULARITY_LABELS = {
     0: "normal",
     -1: "shoulder_singularity",
@@ -103,6 +111,19 @@ def _singularity_status_label(status_code: int | None) -> str:
     if status_code is None:
         return "unavailable"
     return _SINGULARITY_LABELS.get(int(status_code), f"unknown_status_{int(status_code)}")
+
+
+def _command_source(command: EffectorCommand) -> str:
+    metadata = command.metadata if isinstance(command.metadata, Mapping) else {}
+    source_text = str(metadata.get("source") or "").strip()
+    action_source_text = str(metadata.get("action_source") or "").strip()
+    if source_text == "robot_action" and action_source_text:
+        return action_source_text
+    return source_text or action_source_text or str(command.command_type)
+
+
+def _is_qpos_init_slow_singularity_source(source: object) -> bool:
+    return str(source or "").strip() in _SINGULARITY_QPOS_INIT_SLOW_SOURCES
 
 
 def _joint_now_to_qpos(joint_now: object) -> np.ndarray | None:
@@ -244,6 +265,7 @@ class RM65ArmBackendConfig:
     singularity_elbow_threshold_deg: float = 3.0
     singularity_wrist_threshold_deg: float = 3.0
     singularity_shoulder_threshold_m: float = 0.05
+    singularity_qpos_init_slowdown: float = DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN
     ik_tuning_json_path: str | None = None
     ik_tuning: RM65IKTuningConfig | None = field(default=None, repr=False)
     ik_framework: str = RM65_IK_FRAMEWORK_ROBOT_MOTION
@@ -282,6 +304,8 @@ class RM65ArmBackendConfig:
             raise ValueError("singularity_wrist_threshold_deg must be >= 0.")
         if float(self.singularity_shoulder_threshold_m) < 0.0:
             raise ValueError("singularity_shoulder_threshold_m must be >= 0.")
+        if not 0.0 < float(self.singularity_qpos_init_slowdown) <= 1.0:
+            raise ValueError("singularity_qpos_init_slowdown must be in (0, 1].")
         self.ik_framework = normalize_rm65_ik_framework(self.ik_framework)
         if self.ik_tuning is None:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
@@ -357,6 +381,7 @@ class RM65ArmBackend(EffectorBackend):
         self._send_lock = threading.RLock()
         self._emergency_stopped = False
         self._stream_target_qpos: np.ndarray | None = None
+        self._stream_target_source = ""
         self._stream_stop_event = threading.Event()
         self._stream_thread: threading.Thread | None = None
         self._force_position_active = False
@@ -416,6 +441,7 @@ class RM65ArmBackend(EffectorBackend):
         with self._send_lock:
             with self._state_lock:
                 self._stream_target_qpos = None
+                self._stream_target_source = ""
                 self._last_target_qpos = None
                 self._last_target_pose = None
                 self._jump_gate_active = False
@@ -453,6 +479,7 @@ class RM65ArmBackend(EffectorBackend):
                     self._current_qpos = qpos_array.copy()
                     self._last_hardware_qpos = qpos_array.copy()
                 self._stream_target_qpos = None
+                self._stream_target_source = ""
                 self._last_target_qpos = None
                 self._last_target_pose = None
                 self._last_command = None
@@ -582,6 +609,7 @@ class RM65ArmBackend(EffectorBackend):
         *,
         reference_qpos: np.ndarray,
         source: str,
+        max_joint_step: Sequence[float] | np.ndarray | None = None,
     ) -> np.ndarray:
         target = np.asarray(qpos_target, dtype=float).reshape(6)
         reference = np.asarray(reference_qpos, dtype=float).reshape(6)
@@ -615,15 +643,29 @@ class RM65ArmBackend(EffectorBackend):
         target_status = self._analyze_singularity(target)
         target_code = target_status.get("status_code")
         target_singular = target_code not in (0, None)
+        qpos_init_slow_source = _is_qpos_init_slow_singularity_source(source)
         current_status = (
             self._analyze_singularity(reference)
-            if target_singular
+            if target_singular or qpos_init_slow_source
             else {"status_code": 0, "label": "normal"}
         )
         current_code = current_status.get("status_code")
+        current_singular = current_code not in (0, None)
         entering_singularity = bool(target_singular and current_code == 0)
         gate_status = "hold_entry" if entering_singularity else "pass"
-        if target_singular and current_code not in (0, None):
+        slow_qpos_init = bool(
+            qpos_init_slow_source
+            and target_code is not None
+            and (target_singular or current_singular)
+        )
+        if slow_qpos_init:
+            if entering_singularity:
+                gate_status = "slow_qpos_init_entering_singularity"
+            elif target_singular:
+                gate_status = "slow_qpos_init_current_singular"
+            else:
+                gate_status = "slow_qpos_init_exiting_singularity"
+        elif target_singular and current_code not in (0, None):
             gate_status = "allow_current_singular"
         elif target_code is None:
             gate_status = "analysis_unavailable"
@@ -638,12 +680,25 @@ class RM65ArmBackend(EffectorBackend):
             "configured_wrist_threshold_deg": float(self.config.singularity_wrist_threshold_deg),
             "configured_shoulder_threshold_m": float(self.config.singularity_shoulder_threshold_m),
         }
+        if slow_qpos_init:
+            slowdown = float(self.config.singularity_qpos_init_slowdown)
+            if max_joint_step is None:
+                slow_target = target.copy()
+            else:
+                step_limit = np.asarray(max_joint_step, dtype=float).reshape(6)
+                step_limit = np.maximum(0.0, step_limit) * slowdown
+                slow_target = reference + np.clip(target - reference, -step_limit, step_limit)
+            metadata["singularity_qpos_init_slowdown"] = slowdown
+            metadata["singularity_qpos_init_slow_source"] = True
+            metadata["singularity_qpos_init_requested_target"] = target.tolist()
+            metadata["singularity_qpos_init_slow_target"] = slow_target.tolist()
+            target = slow_target
         if "wrist_center_distance_m" in target_status:
             metadata["target_wrist_center_distance_m"] = target_status["wrist_center_distance_m"]
         if "wrist_center_distance_m" in current_status:
             metadata["current_wrist_center_distance_m"] = current_status["wrist_center_distance_m"]
         self._record_singularity_metadata(metadata)
-        if entering_singularity:
+        if entering_singularity and not slow_qpos_init:
             self._emit_singularity_warning(metadata)
             return reference.copy()
         return target
@@ -659,6 +714,7 @@ class RM65ArmBackend(EffectorBackend):
             if self._current_qpos is None:
                 self._current_qpos = np.zeros(6, dtype=float)
         command_start_time = time.time()
+        command_source = _command_source(command)
         max_joint_step = self._resolve_effective_max_joint_step(
             now=command_start_time,
             update_state=True,
@@ -702,7 +758,8 @@ class RM65ArmBackend(EffectorBackend):
         qpos_target = self._apply_singularity_protection(
             qpos_target,
             reference_qpos=reference_qpos,
-            source=command.command_type,
+            source=command_source,
+            max_joint_step=max_joint_step,
         )
 
         if self.arm is not None and self.config.background_streaming_enabled:
@@ -711,6 +768,7 @@ class RM65ArmBackend(EffectorBackend):
                     if self._emergency_stopped:
                         raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
                     self._stream_target_qpos = qpos_target.copy()
+                    self._stream_target_source = command_source
                     self._last_target_qpos = qpos_target.copy()
                     self._last_command = command.copy()
                     self._last_command_timestamp = command_start_time
@@ -974,6 +1032,7 @@ class RM65ArmBackend(EffectorBackend):
                 target_qpos = (
                     None if self._stream_target_qpos is None else self._stream_target_qpos.copy()
                 )
+                target_source = self._stream_target_source or "background_stream"
                 current_qpos = (
                     None if self._current_qpos is None else self._current_qpos.copy()
                 )
@@ -993,7 +1052,8 @@ class RM65ArmBackend(EffectorBackend):
                 next_qpos = self._apply_singularity_protection(
                     next_qpos,
                     reference_qpos=current_qpos,
-                    source="background_stream",
+                    source=target_source,
+                    max_joint_step=max_joint_step,
                 )
                 if self.arm is not None and not np.allclose(next_qpos, current_qpos, atol=1e-10):
                     with self._send_lock:
@@ -1378,6 +1438,7 @@ class RM65ArmBackend(EffectorBackend):
             with self._state_lock:
                 self._emergency_stopped = True
                 self._stream_target_qpos = None
+                self._stream_target_source = ""
             if self.arm is None:
                 with self._state_lock:
                     self._last_send_result_code = 0

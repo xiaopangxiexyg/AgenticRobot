@@ -357,6 +357,7 @@ class _EpisodeState:
     video_states: dict[str, _VideoState] = field(default_factory=dict)
     tactile_states: dict[str, _TactileSideState] = field(default_factory=dict)
     wrist_depth_states: dict[tuple[str, str], _WristDepthStreamState] = field(default_factory=dict)
+    wrist_depth_integrity: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.stats is None:
@@ -837,22 +838,41 @@ class LeRobotV21Writer:
     def _plan_wrist_depth_jobs(
         self,
         sample: CollectorSample,
-    ) -> tuple[list[WriteJob], dict[str, dict[str, bool]]]:
+    ) -> tuple[list[WriteJob], dict[str, dict[str, bool]], dict[str, dict[str, Any]]]:
         if not self._wrist_depth_enabled():
-            return [], {}
+            return [], {}, {}
         jobs: list[WriteJob] = []
         expectations: dict[str, dict[str, bool]] = {}
+        status_by_camera: dict[str, dict[str, Any]] = {}
         for camera_key, match in sample.camera_frames.items():
             camera_name = str(camera_key)
             if not self._wrist_depth_camera_selected(camera_name):
                 continue
             frame = match.frame
-            has_depth = frame is not None and frame.depth_image is not None
+            has_frame = frame is not None
+            has_depth = has_frame and frame.depth_image is not None
             depth_metadata = {} if frame is None else dict(frame.depth_metadata)
             has_scale = self._depth_scale_from_metadata(depth_metadata) is not None
+            failure_reasons: list[str] = []
+            if not has_frame:
+                failure_reasons.append("missing_frame")
+            elif not has_depth:
+                failure_reasons.append("missing_depth_image")
+            elif self.config.write_wrist_depth_mask and not has_scale:
+                failure_reasons.append("missing_depth_scale")
             expectations[camera_name] = {
                 "mask": bool(self.config.write_wrist_depth_mask and has_depth and has_scale),
                 "raw": bool(self.config.write_wrist_depth_raw and has_depth),
+            }
+            status_by_camera[camera_name] = {
+                "frame_present": bool(has_frame),
+                "depth_present": bool(has_depth),
+                "depth_scale_present": bool(has_scale),
+                "mask_requested": bool(self.config.write_wrist_depth_mask),
+                "raw_requested": bool(self.config.write_wrist_depth_raw),
+                "mask_ready": bool(self.config.write_wrist_depth_mask and has_depth and has_scale),
+                "raw_ready": bool(self.config.write_wrist_depth_raw and has_depth),
+                "failure_reasons": list(failure_reasons),
             }
             if not has_depth:
                 continue
@@ -877,7 +897,7 @@ class LeRobotV21Writer:
                     },
                 )
             )
-        return jobs, expectations
+        return jobs, expectations, status_by_camera
 
     def plan_sample_jobs(self, sample: CollectorSample) -> list[WriteJob]:
         with self._lock:
@@ -898,7 +918,7 @@ class LeRobotV21Writer:
             tactile_jobs, tactile_refs, tactile_expectations = self._plan_external_tactile_jobs(
                 sample
             )
-        wrist_depth_jobs, wrist_depth_expectations = self._plan_wrist_depth_jobs(sample)
+        wrist_depth_jobs, wrist_depth_expectations, wrist_depth_status = self._plan_wrist_depth_jobs(sample)
         row, camera_expectations = collector_sample_to_row(
             sample,
             camera_video_paths=camera_video_paths,
@@ -917,6 +937,7 @@ class LeRobotV21Writer:
                     "camera_expectations": dict(camera_expectations),
                     "tactile_expectations": dict(tactile_expectations),
                     "wrist_depth_expectations": dict(wrist_depth_expectations),
+                    "wrist_depth_status": dict(wrist_depth_status),
                 },
             )
         ]
@@ -990,6 +1011,11 @@ class LeRobotV21Writer:
         episode.rows_by_frame[frame_index] = row
         assert episode.stats is not None
         episode.stats.update(row)
+        self._record_wrist_depth_status(
+            episode,
+            frame_index=frame_index,
+            status_by_camera=payload.get("wrist_depth_status", {}),
+        )
         for camera_key, expects_frame in dict(payload.get("camera_expectations", {})).items():
             video_state = self._ensure_video_state(episode, str(camera_key))
             video_state.expected_by_sample[frame_index] = bool(expects_frame)
@@ -1017,6 +1043,129 @@ class LeRobotV21Writer:
                 )
                 depth_state.expected_by_sample[frame_index] = expects_frame
                 self._drain_wrist_depth_state(episode, depth_state)
+
+    @staticmethod
+    def _new_wrist_depth_integrity_stats(camera_key: str) -> dict[str, Any]:
+        return {
+            "camera_key": str(camera_key),
+            "samples": 0,
+            "ok_samples": 0,
+            "failure_count": 0,
+            "frame_present_count": 0,
+            "depth_present_count": 0,
+            "depth_scale_present_count": 0,
+            "mask_requested": False,
+            "raw_requested": False,
+            "mask_ready_count": 0,
+            "raw_ready_count": 0,
+            "missing_frame_count": 0,
+            "missing_depth_image_count": 0,
+            "missing_depth_scale_count": 0,
+            "failure_reason_counts": {},
+            "first_failure_frame_index": None,
+            "first_failure_reasons": [],
+            "last_failure_frame_index": None,
+            "last_failure_reasons": [],
+            "failure_frame_indices_first": [],
+            "failure_frame_indices_truncated": False,
+        }
+
+    def _record_wrist_depth_status(
+        self,
+        episode: _EpisodeState,
+        *,
+        frame_index: int,
+        status_by_camera: object,
+    ) -> None:
+        if not self._wrist_depth_enabled() or not isinstance(status_by_camera, Mapping):
+            return
+        for camera_key, raw_status in dict(status_by_camera).items():
+            if not isinstance(raw_status, Mapping):
+                continue
+            camera_name = str(camera_key)
+            stats = episode.wrist_depth_integrity.setdefault(
+                camera_name,
+                self._new_wrist_depth_integrity_stats(camera_name),
+            )
+            stats["samples"] = int(stats.get("samples", 0)) + 1
+            frame_present = bool(raw_status.get("frame_present"))
+            depth_present = bool(raw_status.get("depth_present"))
+            depth_scale_present = bool(raw_status.get("depth_scale_present"))
+            mask_requested = bool(raw_status.get("mask_requested"))
+            raw_requested = bool(raw_status.get("raw_requested"))
+            mask_ready = bool(raw_status.get("mask_ready"))
+            raw_ready = bool(raw_status.get("raw_ready"))
+            stats["mask_requested"] = bool(stats.get("mask_requested")) or mask_requested
+            stats["raw_requested"] = bool(stats.get("raw_requested")) or raw_requested
+            if frame_present:
+                stats["frame_present_count"] = int(stats.get("frame_present_count", 0)) + 1
+            if depth_present:
+                stats["depth_present_count"] = int(stats.get("depth_present_count", 0)) + 1
+            if depth_scale_present:
+                stats["depth_scale_present_count"] = int(stats.get("depth_scale_present_count", 0)) + 1
+            if mask_ready:
+                stats["mask_ready_count"] = int(stats.get("mask_ready_count", 0)) + 1
+            if raw_ready:
+                stats["raw_ready_count"] = int(stats.get("raw_ready_count", 0)) + 1
+
+            raw_reasons = raw_status.get("failure_reasons", ())
+            if isinstance(raw_reasons, str):
+                reasons = [raw_reasons]
+            elif isinstance(raw_reasons, (list, tuple)):
+                reasons = [str(reason) for reason in raw_reasons if str(reason)]
+            else:
+                reasons = []
+            if not reasons:
+                stats["ok_samples"] = int(stats.get("ok_samples", 0)) + 1
+                continue
+
+            stats["failure_count"] = int(stats.get("failure_count", 0)) + 1
+            reason_counts = stats.setdefault("failure_reason_counts", {})
+            if not isinstance(reason_counts, dict):
+                reason_counts = {}
+                stats["failure_reason_counts"] = reason_counts
+            for reason in reasons:
+                reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+            if "missing_frame" in reasons:
+                stats["missing_frame_count"] = int(stats.get("missing_frame_count", 0)) + 1
+            if "missing_depth_image" in reasons:
+                stats["missing_depth_image_count"] = int(stats.get("missing_depth_image_count", 0)) + 1
+            if "missing_depth_scale" in reasons:
+                stats["missing_depth_scale_count"] = int(stats.get("missing_depth_scale_count", 0)) + 1
+            if stats.get("first_failure_frame_index") is None:
+                stats["first_failure_frame_index"] = int(frame_index)
+                stats["first_failure_reasons"] = list(reasons)
+            stats["last_failure_frame_index"] = int(frame_index)
+            stats["last_failure_reasons"] = list(reasons)
+            failure_indices = stats.setdefault("failure_frame_indices_first", [])
+            if isinstance(failure_indices, list) and len(failure_indices) < 64:
+                failure_indices.append(int(frame_index))
+            else:
+                stats["failure_frame_indices_truncated"] = True
+
+    def _wrist_depth_integrity_payload(self, episode: _EpisodeState) -> dict[str, Any] | None:
+        if not self._wrist_depth_enabled() and not episode.wrist_depth_integrity:
+            return None
+        cameras: dict[str, dict[str, Any]] = {}
+        for camera_key, raw_stats in sorted(episode.wrist_depth_integrity.items()):
+            stats = dict(raw_stats)
+            stats["failure_reason_counts"] = dict(stats.get("failure_reason_counts", {}) or {})
+            stats["ok"] = int(stats.get("failure_count", 0)) == 0
+            cameras[str(camera_key)] = stats
+        configured_keys = [str(key) for key in self.config.wrist_depth_camera_keys]
+        total_samples = sum(int(stats.get("samples", 0)) for stats in cameras.values())
+        total_failures = sum(int(stats.get("failure_count", 0)) for stats in cameras.values())
+        return {
+            "enabled": bool(self._wrist_depth_enabled()),
+            "mask_requested": bool(self.config.write_wrist_depth_mask),
+            "raw_requested": bool(self.config.write_wrist_depth_raw),
+            "camera_keys": list(configured_keys),
+            "unseen_camera_keys": [key for key in configured_keys if key not in cameras],
+            "sample_observations": int(total_samples),
+            "failure_count": int(total_failures),
+            "ok": int(total_failures) == 0,
+            "cameras": cameras,
+        }
 
     def _handle_video_frame_job(self, payload: Mapping[str, Any]) -> None:
         episode = self._ensure_episode_state(int(payload["episode_index"]))
@@ -1594,6 +1743,10 @@ class LeRobotV21Writer:
             summary_payload.setdefault("video_frame_stats", video_frame_stats)
         if wrist_depth_frame_stats:
             summary_payload.setdefault("wrist_depth_frame_stats", wrist_depth_frame_stats)
+        wrist_depth_integrity = self._wrist_depth_integrity_payload(episode)
+        if wrist_depth_integrity is not None:
+            summary_payload["wrist_depth_integrity"] = wrist_depth_integrity
+            episode.metadata["wrist_depth_integrity"] = wrist_depth_integrity
         trajectory_quality = {
             "pose_quality_status_counts": dict(stats.pose_quality_status_counts),
             "pose_quality_bad_count": int(stats.pose_quality_bad_count),
@@ -1603,12 +1756,22 @@ class LeRobotV21Writer:
             "force_collision_detected": bool(stats.force_collision_detected),
             "force_collision_label": stats.force_collision_label,
         }
-        summary_payload.setdefault("trajectory_quality", trajectory_quality)
-        summary_payload.setdefault(
-            "force_collision_detected",
-            bool(stats.force_collision_detected),
-        )
-        summary_payload.setdefault("force_collision_label", stats.force_collision_label)
+        summary_trajectory_quality = summary_payload.get("trajectory_quality")
+        if isinstance(summary_trajectory_quality, dict):
+            summary_trajectory_quality.update(trajectory_quality)
+        else:
+            summary_trajectory_quality = dict(trajectory_quality)
+        summary_payload["trajectory_quality"] = summary_trajectory_quality
+        summary_payload["force_collision_detected"] = bool(stats.force_collision_detected)
+        summary_payload["force_collision_label"] = stats.force_collision_label
+        episode_trajectory_quality = episode.metadata.get("trajectory_quality")
+        if isinstance(episode_trajectory_quality, dict):
+            episode_trajectory_quality.update(trajectory_quality)
+        else:
+            episode_trajectory_quality = dict(trajectory_quality)
+        episode.metadata["trajectory_quality"] = episode_trajectory_quality
+        episode.metadata["force_collision_detected"] = bool(stats.force_collision_detected)
+        episode.metadata["force_collision_label"] = stats.force_collision_label
         episode_record = {
             "episode_index": int(episode.episode_index),
             "episode_id": episode.episode_id,

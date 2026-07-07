@@ -128,7 +128,7 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertEqual(filtered_channels["left_wrist_pose"].timestamp, 1.2)
         self.assertTrue(filtered_channels["left_wrist_pose"].metadata["fix_arm_frozen"])
 
-    def test_freeze_keeps_pipeline_command_when_present(self) -> None:
+    def test_freeze_overrides_pipeline_command_when_present(self) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -152,14 +152,14 @@ class FixArmCommandControllerTests(unittest.TestCase):
             {"left_arm", "right_arm", "left_hand", "right_hand"},
         )
         self.assertEqual(filtered.metadata, {})
-        np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 10.0))
-        np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 30.0))
+        np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
+        np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 3.0))
         np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 20.0))
         np.testing.assert_allclose(filtered.commands["right_hand"].value, np.full(6, 40.0))
         for effector_command in filtered.commands.values():
             np.testing.assert_equal(np.asarray(effector_command.value).shape, (6,))
 
-    def test_freeze_injects_last_fixed_command_when_pipeline_omits_it(self) -> None:
+    def test_freeze_does_not_inject_fixed_command_when_pipeline_omits_it_by_default(self) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -184,9 +184,32 @@ class FixArmCommandControllerTests(unittest.TestCase):
 
         filtered = controller.filter_command(right_only, None, 1.2)
 
-        np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
-        np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 3.0))
+        self.assertEqual(set(filtered.commands), {"right_arm"})
         np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 20.0))
+
+    def test_freeze_can_inject_allowed_fixed_effector_for_out_of_band_dispatch(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+
+        hand_only = controller.filter_command(
+            TeleopCommand(timestamp=1.2),
+            None,
+            1.2,
+            include_missing_fixed_effectors=True,
+            allowed_effectors=("left_hand",),
+        )
+
+        self.assertEqual(set(hand_only.commands), {"left_hand"})
+        np.testing.assert_allclose(hand_only.commands["left_hand"].value, np.full(6, 3.0))
 
     def test_freeze_requires_previous_commands_for_all_required_effectors(self) -> None:
         controller = _controller("right")

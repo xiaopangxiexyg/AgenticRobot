@@ -418,6 +418,30 @@ class ReplayDatasetIndex:
     def available_episodes(self) -> list[EpisodeSummary]:
         return list(self._episodes)
 
+    def _available_episode_hint(self) -> str:
+        if not self._episodes:
+            return " No replay episodes are indexed."
+        indices = sorted(
+            {
+                int(summary.episode_index)
+                for summary in self._episodes
+                if summary.episode_index is not None
+            }
+        )
+        if indices:
+            if len(indices) <= 12:
+                text = ", ".join(str(index) for index in indices)
+            elif all((right - left) == 1 for left, right in zip(indices, indices[1:])):
+                text = f"{indices[0]}..{indices[-1]} ({len(indices)} episodes)"
+            else:
+                head = ", ".join(str(index) for index in indices[:8])
+                tail = ", ".join(str(index) for index in indices[-3:])
+                text = f"{head}, ..., {tail} ({len(indices)} episodes)"
+            return f" Available episode indices: {text}."
+        ids = [summary.episode_id for summary in self._episodes[:12]]
+        suffix = "" if len(self._episodes) <= 12 else f", ... ({len(self._episodes)} episodes)"
+        return f" Available episode ids: {', '.join(ids)}{suffix}."
+
     def resolve_episode(self, token: Any) -> EpisodeSummary:
         text = str(token).strip()
         if not text:
@@ -462,7 +486,9 @@ class ReplayDatasetIndex:
                     parquet_path=fallback,
                     source="fallback_path",
                 )
-        raise FileNotFoundError(f"Could not resolve replay episode {text!r} under {self.root}")
+        raise FileNotFoundError(
+            f"Could not resolve replay episode {text!r} under {self.root}.{self._available_episode_hint()}"
+        )
 
     def load_episode(self, token: Any) -> LoadedReplayEpisode:
         summary = self.resolve_episode(token)

@@ -124,3 +124,19 @@ def test_deploy_dry_run_arm_backend_uses_40hz_control_default() -> None:
     backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
 
     assert backends["right"].config.control_dt == 1.0 / DEFAULT_RM65_ARM_CONTROL_HZ
+
+
+def test_deploy_arm_backend_accepts_qpos_init_singularity_slowdown() -> None:
+    args = _parse_deploy_args(
+        [
+            "--active-sides",
+            "right",
+            "--singularity-qpos-init-slowdown",
+            "0.35",
+        ]
+    )
+    active_sides = run_policy.validate_args(args)
+
+    backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
+
+    assert backends["right"].config.singularity_qpos_init_slowdown == 0.35

@@ -11,9 +11,74 @@ from ..deploy.replay import (
     infer_replay_action_hz,
     load_replay_actions_from_parquet,
     load_replay_arm_joint_targets_from_parquet,
+    load_replay_arm_observation_qpos_from_parquet,
     resolve_replay_parquet_path,
 )
-from ..deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
+from ..deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM, ARM_JOINT_DOF
+
+
+REPLAY_TRAJECTORY_ACTION_POSE = "action_pose"
+REPLAY_TRAJECTORY_QPOS_TARGET = "qpos_target"
+REPLAY_TRAJECTORY_SOURCES = (
+    REPLAY_TRAJECTORY_ACTION_POSE,
+    REPLAY_TRAJECTORY_QPOS_TARGET,
+)
+
+QPOS_INIT_AUTO = "auto"
+QPOS_INIT_REPLAY_QPOS = "replay_qpos"
+QPOS_INIT_OBSERVATION_CURRENT_QPOS = "observation_current_qpos"
+QPOS_INIT_OBSERVATION_ACTUAL_QPOS = "observation_actual_qpos"
+QPOS_INIT_SOURCES = (
+    QPOS_INIT_AUTO,
+    QPOS_INIT_REPLAY_QPOS,
+    QPOS_INIT_OBSERVATION_CURRENT_QPOS,
+    QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
+)
+
+
+def normalize_replay_trajectory_source(value: str | None) -> str:
+    source = str(value or REPLAY_TRAJECTORY_ACTION_POSE).strip().lower()
+    aliases = {
+        "action": REPLAY_TRAJECTORY_ACTION_POSE,
+        "pose": REPLAY_TRAJECTORY_ACTION_POSE,
+        "action-pose": REPLAY_TRAJECTORY_ACTION_POSE,
+        "cartesian_pose": REPLAY_TRAJECTORY_ACTION_POSE,
+        "cartesian-pose": REPLAY_TRAJECTORY_ACTION_POSE,
+        "qpos": REPLAY_TRAJECTORY_QPOS_TARGET,
+        "joint": REPLAY_TRAJECTORY_QPOS_TARGET,
+        "joint_vector": REPLAY_TRAJECTORY_QPOS_TARGET,
+        "joint-vector": REPLAY_TRAJECTORY_QPOS_TARGET,
+        "qpos-target": REPLAY_TRAJECTORY_QPOS_TARGET,
+    }
+    source = aliases.get(source, source)
+    if source not in REPLAY_TRAJECTORY_SOURCES:
+        raise ValueError(
+            "trajectory_source must be one of "
+            f"{REPLAY_TRAJECTORY_SOURCES}, got {value!r}."
+        )
+    return source
+
+
+def normalize_qpos_init_source(value: str | None) -> str:
+    source = str(value or QPOS_INIT_AUTO).strip().lower()
+    aliases = {
+        "replay": QPOS_INIT_REPLAY_QPOS,
+        "qpos": QPOS_INIT_REPLAY_QPOS,
+        "joint": QPOS_INIT_REPLAY_QPOS,
+        "current": QPOS_INIT_OBSERVATION_CURRENT_QPOS,
+        "current_qpos": QPOS_INIT_OBSERVATION_CURRENT_QPOS,
+        "observation_current": QPOS_INIT_OBSERVATION_CURRENT_QPOS,
+        "actual": QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
+        "actual_qpos": QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
+        "hardware_qpos": QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
+        "actual_hardware_qpos": QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
+    }
+    source = aliases.get(source, source)
+    if source not in QPOS_INIT_SOURCES:
+        raise ValueError(
+            f"qpos_init_source must be one of {QPOS_INIT_SOURCES}, got {value!r}."
+        )
+    return source
 
 
 def parse_replay_group_key(text: str) -> str:
@@ -180,10 +245,99 @@ class ReplayTrajectoryGroup:
     action_hz: float
     actions: np.ndarray
     arm_joint_targets: dict[str, np.ndarray] = field(default_factory=dict)
+    arm_observation_current_qpos: dict[str, np.ndarray] = field(default_factory=dict)
+    arm_observation_actual_qpos: dict[str, np.ndarray] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def first_action(self) -> np.ndarray:
         return self.actions[0].astype(np.float32, copy=True)
+
+
+def _finite_qpos_row(values: Any, index: int) -> np.ndarray | None:
+    try:
+        array = np.asarray(values, dtype=float)
+    except Exception:
+        return None
+    if array.ndim != 2 or array.shape[1] != ARM_JOINT_DOF or array.shape[0] <= int(index):
+        return None
+    row = np.asarray(array[int(index)], dtype=float).reshape(-1)
+    if row.shape != (ARM_JOINT_DOF,) or not np.all(np.isfinite(row)):
+        return None
+    return row.astype(float, copy=True)
+
+
+def replay_qpos_init_candidates_at_index(
+    group: ReplayTrajectoryGroup,
+    side: str,
+    index: int = 0,
+    *,
+    source: str = QPOS_INIT_AUTO,
+) -> list[tuple[str, np.ndarray]]:
+    normalized_source = normalize_qpos_init_source(source)
+    source_arrays = {
+        QPOS_INIT_REPLAY_QPOS: group.arm_joint_targets,
+        QPOS_INIT_OBSERVATION_CURRENT_QPOS: group.arm_observation_current_qpos,
+        QPOS_INIT_OBSERVATION_ACTUAL_QPOS: group.arm_observation_actual_qpos,
+    }
+    order = (
+        (QPOS_INIT_REPLAY_QPOS, QPOS_INIT_OBSERVATION_CURRENT_QPOS, QPOS_INIT_OBSERVATION_ACTUAL_QPOS)
+        if normalized_source == QPOS_INIT_AUTO
+        else (normalized_source,)
+    )
+    candidates: list[tuple[str, np.ndarray]] = []
+    for candidate_source in order:
+        values = source_arrays.get(candidate_source, {}).get(str(side))
+        row = _finite_qpos_row(values, int(index))
+        if row is not None:
+            candidates.append((candidate_source, row))
+    return candidates
+
+
+def select_replay_qpos_init_targets(
+    group: ReplayTrajectoryGroup,
+    active_sides: Sequence[str],
+    *,
+    index: int = 0,
+    source: str = QPOS_INIT_AUTO,
+) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    targets: dict[str, np.ndarray] = {}
+    sources: dict[str, str] = {}
+    for side in active_sides:
+        candidates = replay_qpos_init_candidates_at_index(
+            group,
+            str(side),
+            index=int(index),
+            source=source,
+        )
+        if not candidates:
+            continue
+        selected_source, target = candidates[0]
+        targets[str(side)] = target
+        sources[str(side)] = selected_source
+    return targets, sources
+
+
+def replay_action_poses_at_index(
+    group: ReplayTrajectoryGroup,
+    active_sides: Sequence[str],
+    *,
+    index: int,
+) -> dict[str, np.ndarray]:
+    actions = np.asarray(group.actions, dtype=np.float32)
+    if actions.ndim != 2 or actions.shape[1] != ACTION_DIM or actions.shape[0] <= int(index):
+        raise RuntimeError(
+            f"Replay action trajectory has invalid shape {actions.shape}; "
+            f"expected (N, {ACTION_DIM})."
+        )
+    poses: dict[str, np.ndarray] = {}
+    for side in active_sides:
+        pose = np.asarray(actions[int(index), ACTION_ARM_POSE_SLICES[str(side)]], dtype=np.float32).reshape(-1)
+        if pose.shape != (7,) or not np.all(np.isfinite(pose)):
+            raise RuntimeError(f"{side} replay action pose at frame {int(index)} is invalid.")
+        if float(np.linalg.norm(np.asarray(pose[3:7], dtype=float))) <= 1e-12:
+            raise RuntimeError(f"{side} replay action pose at frame {int(index)} has zero quaternion.")
+        poses[str(side)] = pose.astype(np.float32, copy=True)
+    return poses
 
 
 @dataclass
@@ -313,6 +467,20 @@ def build_replay_group_for_episode(
         end_index=end_index,
         required=bool(require_arm_joint_targets),
     )
+    arm_observation_current_qpos = load_replay_arm_observation_qpos_from_parquet(
+        source_path,
+        active_sides=args.active_sides,
+        field_name="current_qpos",
+        start_index=start_index,
+        end_index=end_index,
+    )
+    arm_observation_actual_qpos = load_replay_arm_observation_qpos_from_parquet(
+        source_path,
+        active_sides=args.active_sides,
+        field_name="actual_hardware_qpos",
+        start_index=start_index,
+        end_index=end_index,
+    )
     source_episode_index = int(resolved_metadata.get("episode_index", int(episode_index)))
     return ReplayTrajectoryGroup(
         key=group_spec.key,
@@ -325,6 +493,8 @@ def build_replay_group_for_episode(
         action_hz=float(action_hz_info["hz"]),
         actions=actions,
         arm_joint_targets=arm_joint_targets,
+        arm_observation_current_qpos=arm_observation_current_qpos,
+        arm_observation_actual_qpos=arm_observation_actual_qpos,
         metadata={
             "action_hz_estimate": dict(action_hz_info),
             "source_metadata": dict(resolved_metadata),

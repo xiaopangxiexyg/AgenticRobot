@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from .hardware import ReplayHardwareConfig
+from .arm_init.qpos_execute import normalize_qpos_init_max_angvel
+from .executor import ReplayExecutionSettings
+from .hardware import DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN, ReplayHardwareConfig
 from .session import ReplayGuiSession
 
 
@@ -65,6 +67,16 @@ INDEX_HTML = r"""<!doctype html>
     button.danger {
       color: var(--danger);
     }
+    button:disabled,
+    button.primary:disabled,
+    button.danger:disabled {
+      background: #e8ecea;
+      border-color: #d4dbd8;
+      color: #87918f;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+    button:disabled:hover { border-color: #d4dbd8; }
     input, select {
       border: 1px solid var(--line);
       background: var(--surface);
@@ -73,6 +85,11 @@ INDEX_HTML = r"""<!doctype html>
       padding: 0 10px;
       color: var(--ink);
       width: 100%;
+    }
+    input:disabled, select:disabled {
+      background: #edf0ee;
+      color: #87918f;
+      cursor: not-allowed;
     }
     input[type="range"] {
       padding: 0;
@@ -113,7 +130,12 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 190px;
       text-align: right;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 360px;
     }
+    .status.notice { color: var(--accent-2); }
+    .status.error { color: var(--danger); }
     .workspace {
       display: grid;
       grid-template-columns: 320px minmax(0, 1fr) 340px;
@@ -300,7 +322,16 @@ INDEX_HTML = r"""<!doctype html>
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
       color: #27313a;
+      max-height: 300px;
+      overflow: auto;
+      align-content: start;
     }
+    .message {
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(201, 209, 207, 0.55);
+      overflow-wrap: anywhere;
+    }
+    .message.error { color: var(--danger); }
     .empty {
       color: var(--muted);
       padding: 10px 0;
@@ -427,6 +458,10 @@ INDEX_HTML = r"""<!doctype html>
               <span class="label">Hz</span>
               <input id="armControlHz" type="number" min="1" step="1" value="50">
             </div>
+            <div class="form-row">
+              <span class="label">QPOS Init Vel</span>
+              <input id="qposInitArmMaxAngvel" autocomplete="off" spellcheck="false" placeholder="profile">
+            </div>
             <label class="check-row">
               <input id="sendActions" type="checkbox">
               <span>Arm Output</span>
@@ -489,6 +524,7 @@ INDEX_HTML = r"""<!doctype html>
       leftToolProfile: document.getElementById("leftToolProfile"),
       rightToolProfile: document.getElementById("rightToolProfile"),
       armControlHz: document.getElementById("armControlHz"),
+      qposInitArmMaxAngvel: document.getElementById("qposInitArmMaxAngvel"),
       sendActions: document.getElementById("sendActions"),
       connectHardware: document.getElementById("connectHardware"),
       configureHardwareBtn: document.getElementById("configureHardwareBtn"),
@@ -504,6 +540,9 @@ INDEX_HTML = r"""<!doctype html>
     };
     let latest = null;
     let dragging = false;
+    let notice = {text: "", kind: "notice", until: 0};
+    let clientMessages = [];
+    let lastPollError = "";
 
     function text(value) {
       if (value === null || value === undefined) return "";
@@ -528,9 +567,39 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const data = await api("/api/control", payload);
         render(data.state || data);
+        const state = data.state || data;
+        const execution = state.execution || {};
+        const message = execution.last_error || execution.last_message || newestServerMessage(state);
+        if (message) setNotice(message, execution.last_error ? "error" : "notice", execution.last_error ? 30000 : 15000);
+        return true;
       } catch (err) {
-        els.status.textContent = err.message;
+        addClientMessage(err.message, "error");
+        return false;
       }
+    }
+
+    function newestServerMessage(state) {
+      const messages = state && Array.isArray(state.messages) ? state.messages : [];
+      return messages.length ? messages[messages.length - 1] : "";
+    }
+
+    function setNotice(message, kind = "notice", durationMs = 15000) {
+      const textValue = text(message).trim();
+      if (!textValue) return;
+      notice = {
+        text: textValue,
+        kind: kind === "error" ? "error" : "notice",
+        until: Date.now() + Math.max(1000, Number(durationMs || 15000)),
+      };
+      renderStatus(latest);
+    }
+
+    function addClientMessage(message, kind = "notice") {
+      const stamp = new Date().toLocaleTimeString();
+      clientMessages.push({text: `[${stamp}] ${message}`, kind: kind === "error" ? "error" : "notice"});
+      clientMessages = clientMessages.slice(-80);
+      setNotice(message, kind, kind === "error" ? 30000 : 15000);
+      renderMessages(latest);
     }
 
     function kv(container, payload) {
@@ -637,9 +706,14 @@ INDEX_HTML = r"""<!doctype html>
         left_tool_profile: els.leftToolProfile.value.trim(),
         right_tool_profile: els.rightToolProfile.value.trim(),
         arm_control_hz: Number(els.armControlHz.value || 50),
+        qpos_init_max_angvel_rad_s: els.qposInitArmMaxAngvel.value.trim(),
         send_actions: els.sendActions.checked,
         connect_hardware: els.connectHardware.checked,
       };
+    }
+
+    function hardwarePayloadFor(type) {
+      return {...hardwarePayload(), type};
     }
 
     function renderChecks(execution) {
@@ -666,6 +740,12 @@ INDEX_HTML = r"""<!doctype html>
       fieldValue(els.leftToolProfile, profiles.left || "");
       fieldValue(els.rightToolProfile, profiles.right || "");
       fieldValue(els.armControlHz, config.arm_control_hz || 50);
+      fieldValue(
+        els.qposInitArmMaxAngvel,
+        Array.isArray(settings.qpos_init_max_angvel_rad_s)
+          ? settings.qpos_init_max_angvel_rad_s.join(",")
+          : ""
+      );
       if (document.activeElement !== els.sendActions) els.sendActions.checked = !!settings.send_actions_enabled;
       if (document.activeElement !== els.connectHardware) els.connectHardware.checked = config.connect_hardware !== false;
       const stateText = execution.state || "configured";
@@ -674,6 +754,11 @@ INDEX_HTML = r"""<!doctype html>
       kv(els.execInfo, {
         connected: execution.connected,
         output: settings.send_actions_enabled ? "enabled" : "disabled",
+        end_effectors: settings.end_effectors_enabled ? "enabled" : "disabled",
+        end_effector_backends: JSON.stringify(config.end_effector_backend_by_side || {}),
+        qpos_init_vel: Array.isArray(settings.qpos_init_max_angvel_rad_s)
+          ? settings.qpos_init_max_angvel_rad_s.join(",")
+          : (settings.qpos_init_joint_velocity_profile || ""),
         frame: execution.frame_index || 0,
         group: execution.group ? execution.group.source_episode_index : "",
         hz: execution.group ? Number(execution.group.action_hz || 0).toFixed(3) : "",
@@ -681,6 +766,88 @@ INDEX_HTML = r"""<!doctype html>
         error: execution.last_error || "",
       });
       renderChecks(execution);
+    }
+
+    function isExecutionBusy(execution) {
+      const stateText = execution && execution.state ? execution.state : "";
+      return !!(execution && execution.worker_alive) || ["connecting", "moving_to_start", "replaying"].includes(stateText);
+    }
+
+    function setDisabled(elements, disabled) {
+      for (const element of elements) element.disabled = !!disabled;
+    }
+
+    function updateControls(state) {
+      const execution = state.execution || {};
+      const execState = execution.state || "configured";
+      const settings = execution.settings || {};
+      const hasEpisode = !!state.episode;
+      const hasFrames = Number(state.frame_count || 0) > 0;
+      const busy = isExecutionBusy(execution);
+      const connected = !!execution.connected;
+      const outputEnabled = !!settings.send_actions_enabled;
+      const canMoveStart = hasEpisode && connected && outputEnabled && execState === "preflight_ok" && !busy;
+      const canStart = hasEpisode && connected && outputEnabled && execState === "start_ready" && !busy;
+      const canAbort = busy || execState === "start_ready";
+
+      setDisabled([els.firstBtn, els.prevBtn, els.nextBtn, els.lastBtn, els.timeline], !hasFrames);
+      els.playBtn.disabled = !hasFrames || !!state.playing;
+      els.pauseBtn.disabled = !hasFrames || !state.playing;
+      els.loadBtn.disabled = busy;
+      els.configureHardwareBtn.disabled = busy;
+      els.connectHardwareBtn.disabled = busy || connected;
+      els.preflightHardwareBtn.disabled = !hasEpisode || busy;
+      els.moveStartBtn.disabled = !canMoveStart;
+      els.startHardwareBtn.disabled = !canStart;
+      els.abortHardwareBtn.disabled = !canAbort;
+      els.sendActions.disabled = busy;
+      setDisabled(
+        [
+          els.activeSides,
+          els.leftArmIp,
+          els.rightArmIp,
+          els.leftToolProfile,
+          els.rightToolProfile,
+          els.armControlHz,
+          els.qposInitArmMaxAngvel,
+          els.connectHardware,
+        ],
+        busy,
+      );
+    }
+
+    function renderStatus(state) {
+      const execution = state && state.execution ? state.execution : {};
+      const now = Date.now();
+      const noticeActive = notice.text && now < notice.until;
+      if (noticeActive) {
+        els.status.textContent = notice.text;
+        els.status.title = notice.text;
+        els.status.className = `status ${notice.kind}`;
+        return;
+      }
+      if (execution.last_error) {
+        els.status.textContent = execution.last_error;
+        els.status.title = execution.last_error;
+        els.status.className = "status error";
+        return;
+      }
+      const fallback = state && state.episode ? state.episode.episode_id : "ready";
+      els.status.textContent = fallback;
+      els.status.title = fallback;
+      els.status.className = "status";
+    }
+
+    function renderMessages(state) {
+      const server = state && Array.isArray(state.messages) ? state.messages.map(message => ({text: message, kind: "notice"})) : [];
+      const combined = server.concat(clientMessages).slice(-60).reverse();
+      els.messages.innerHTML = "";
+      for (const message of combined) {
+        const div = document.createElement("div");
+        div.className = "message" + (message.kind === "error" ? " error" : "");
+        div.textContent = message.text;
+        els.messages.appendChild(div);
+      }
     }
 
     function render(state) {
@@ -699,7 +866,7 @@ INDEX_HTML = r"""<!doctype html>
       els.speedText.textContent = `${Number(state.speed || 1).toFixed(1)}x`;
       els.playState.textContent = state.playing ? "playing" : "paused";
       els.playState.className = "pill" + (state.playing ? " live" : "");
-      els.status.textContent = state.episode ? state.episode.episode_id : "ready";
+      renderStatus(state);
       renderEpisodes(state);
       els.cameraCount.textContent = String((state.camera_keys || []).length);
       els.tactileCount.textContent = String((state.tactile_sides || []).length);
@@ -721,20 +888,22 @@ INDEX_HTML = r"""<!doctype html>
       }
       renderExecution(state);
       kv(els.rowInfo, state.row || {});
-      els.messages.innerHTML = "";
-      for (const message of (state.messages || []).slice(-12).reverse()) {
-        const div = document.createElement("div");
-        div.textContent = message;
-        els.messages.appendChild(div);
-      }
+      renderMessages(state);
+      updateControls(state);
     }
 
     async function poll() {
       try {
         const data = await api("/api/state");
+        lastPollError = "";
         render(data.state || data);
       } catch (err) {
-        els.status.textContent = err.message;
+        if (err.message !== lastPollError) {
+          lastPollError = err.message;
+          addClientMessage(err.message, "error");
+        } else {
+          setNotice(err.message, "error", 30000);
+        }
       } finally {
         const execState = latest && latest.execution ? latest.execution.state : "";
         const busy = execState === "replaying" || execState === "moving_to_start";
@@ -758,15 +927,16 @@ INDEX_HTML = r"""<!doctype html>
       control({type: "seek", frame: Number(els.timeline.value)});
     });
     els.speed.addEventListener("change", () => control({type: "speed", speed: Number(els.speed.value)}));
+    els.sendActions.addEventListener("change", () => {
+      control({type: "set_send_actions", enabled: els.sendActions.checked});
+    });
     els.configureHardwareBtn.onclick = () => control(hardwarePayload());
     els.connectHardwareBtn.onclick = async () => {
-      await control(hardwarePayload());
-      await control({type: "connect_hardware"});
+      if (await control(hardwarePayload())) {
+        await control({type: "connect_hardware"});
+      }
     };
-    els.preflightHardwareBtn.onclick = async () => {
-      await control(hardwarePayload());
-      await control({type: "preflight_hardware"});
-    };
+    els.preflightHardwareBtn.onclick = () => control(hardwarePayloadFor("preflight_hardware"));
     els.moveStartBtn.onclick = () => control({type: "move_to_start"});
     els.startHardwareBtn.onclick = () => control({type: "start_hardware_replay"});
     els.abortHardwareBtn.onclick = () => control({type: "abort_hardware_replay"});
@@ -792,11 +962,36 @@ def _parse_float_csv(text: str | None, *, default: tuple[float, ...]) -> tuple[f
     return parsed
 
 
-def make_handler(session: ReplayGuiSession) -> type[BaseHTTPRequestHandler]:
+def _parse_unit_interval_float(text: str) -> float:
+    value = float(text)
+    if not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError("value must be in (0, 1]")
+    return value
+
+
+def _should_log_http_message(access_log: bool, args: tuple[Any, ...]) -> bool:
+    if access_log:
+        return True
+    if len(args) >= 2:
+        try:
+            status = int(args[1])
+        except (TypeError, ValueError):
+            return True
+        return status >= 400
+    return True
+
+
+def make_handler(
+    session: ReplayGuiSession,
+    *,
+    access_log: bool = False,
+) -> type[BaseHTTPRequestHandler]:
     class ReplayRequestHandler(BaseHTTPRequestHandler):
         server_version = "DexTeleopReplay/1.0"
 
         def log_message(self, format: str, *args: Any) -> None:
+            if not _should_log_http_message(bool(access_log), args):
+                return
             sys.stderr.write("[ReplayGUI] " + format % args + "\n")
 
         def _send(
@@ -865,21 +1060,26 @@ def run_server(
     dataset_root: str | Path | None = None,
     episode: str | int | None = None,
     hardware_config: ReplayHardwareConfig | None = None,
+    execution_settings: ReplayExecutionSettings | None = None,
     send_actions: bool = False,
+    end_effectors_enabled: bool = False,
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
     start_playing: bool = False,
+    access_log: bool = False,
 ) -> ThreadingHTTPServer:
     session = ReplayGuiSession(
         hardware_config=hardware_config,
+        execution_settings=execution_settings,
         send_actions=bool(send_actions),
+        end_effectors_enabled=bool(end_effectors_enabled),
     )
     if dataset_root is not None and str(dataset_root):
         session.load_dataset(dataset_root, episode=episode)
     if start_playing:
         session.play()
-    server = ThreadingHTTPServer((str(host), int(port)), make_handler(session))
+    server = ThreadingHTTPServer((str(host), int(port)), make_handler(session, access_log=bool(access_log)))
     server.replay_session = session  # type: ignore[attr-defined]
     url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
     print(f"[ReplayGUI] serving {url}", flush=True)
@@ -921,6 +1121,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start playback immediately after loading the selected episode.",
     )
     parser.add_argument(
+        "--access-log",
+        action="store_true",
+        help="Log every HTTP request. By default only 4xx/5xx replay GUI requests are logged.",
+    )
+    parser.add_argument(
         "--active-sides",
         choices=("left", "right", "both"),
         default="right",
@@ -937,6 +1142,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated 6D joint velocity limits while replay is active.",
     )
     parser.add_argument(
+        "--qpos-init-arm-max-angvel",
+        default="",
+        help=(
+            "Optional first-frame QPOS init joint velocity limit in rad/s. "
+            "Accepts one value or six comma-separated values; empty keeps the configured velocity profile."
+        ),
+    )
+    parser.add_argument(
+        "--singularity-qpos-init-slowdown",
+        type=_parse_unit_interval_float,
+        default=DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
+        help=(
+            "Scale joint steps when replay move-to-start QPOS init crosses RM65 singularity. "
+            "Must be in (0, 1]."
+        ),
+    )
+    parser.add_argument(
         "--send-actions",
         action="store_true",
         help="Enable robot arm command output at startup. Defaults to disabled.",
@@ -947,6 +1169,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Connect to real RM65 hardware. Use --no-connect-hardware for dry-run checks.",
     )
+    parser.add_argument(
+        "--end-effectors-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Replay active-side end-effector targets together with arm actions.",
+    )
+    parser.add_argument(
+        "--hand-backend",
+        choices=("none", "inspire_tac", "dmtac_gripper"),
+        default="none",
+        help="Default active-side end-effector backend for hardware replay.",
+    )
+    parser.add_argument("--left-hand-backend", default="", help="Optional left end-effector backend override.")
+    parser.add_argument("--right-hand-backend", default="", help="Optional right end-effector backend override.")
+    parser.add_argument("--left-hand-ip", default="", help="Left Inspire hand IP for end-effector replay.")
+    parser.add_argument("--right-hand-ip", default="", help="Right Inspire hand IP for end-effector replay.")
+    parser.add_argument("--left-hand-port", type=int, default=6000, help="Left Inspire hand port.")
+    parser.add_argument("--right-hand-port", type=int, default=6000, help="Right Inspire hand port.")
+    parser.add_argument("--left-gripper-port", default="", help="Left DMTAC gripper serial port.")
+    parser.add_argument("--right-gripper-port", default="", help="Right DMTAC gripper serial port.")
+    parser.add_argument("--left-gripper-id", type=int, default=1, help="Left DMTAC gripper Modbus id.")
+    parser.add_argument("--right-gripper-id", type=int, default=1, help="Right DMTAC gripper Modbus id.")
+    parser.add_argument("--gripper-speed", type=float, default=1.0, help="DMTAC gripper speed for replay.")
+    parser.add_argument("--gripper-torque", type=float, default=1.0, help="DMTAC gripper torque/force for replay.")
+    parser.add_argument("--gripper-max-action", type=float, default=1.0, help="DMTAC max normalized close command.")
     return parser
 
 
@@ -963,22 +1210,54 @@ def main(argv: list[str] | None = None) -> None:
             "left": str(args.left_tool_profile or ""),
             "right": str(args.right_tool_profile or ""),
         },
+        end_effectors_enabled=bool(args.end_effectors_enabled),
+        end_effector_backend_by_side={
+            "left": str(args.left_hand_backend or args.hand_backend or "none"),
+            "right": str(args.right_hand_backend or args.hand_backend or "none"),
+        },
+        hand_ip_by_side={
+            "left": str(args.left_hand_ip or ""),
+            "right": str(args.right_hand_ip or ""),
+        },
+        hand_port_by_side={
+            "left": int(args.left_hand_port),
+            "right": int(args.right_hand_port),
+        },
+        gripper_port_by_side={
+            "left": str(args.left_gripper_port or ""),
+            "right": str(args.right_gripper_port or ""),
+        },
+        gripper_id_by_side={
+            "left": int(args.left_gripper_id),
+            "right": int(args.right_gripper_id),
+        },
+        gripper_speed=float(args.gripper_speed),
+        gripper_torque=float(args.gripper_torque),
+        gripper_max_action=float(args.gripper_max_action),
         arm_control_hz=float(args.arm_control_hz),
         replay_arm_max_angvel=_parse_float_csv(
             args.replay_arm_max_angvel,
             default=(3.0, 3.0, 3.0, 4.0, 4.0, 4.0),
         ),
+        singularity_qpos_init_slowdown=float(args.singularity_qpos_init_slowdown),
         connect_hardware=bool(args.connect_hardware),
+    )
+    execution_settings = ReplayExecutionSettings(
+        end_effectors_enabled=bool(args.end_effectors_enabled),
+        qpos_init_max_angvel_rad_s=normalize_qpos_init_max_angvel(args.qpos_init_arm_max_angvel),
     )
     run_server(
         dataset_root=args.dataset_root,
         episode=args.episode,
         hardware_config=hardware_config,
+        execution_settings=execution_settings,
         send_actions=bool(args.send_actions),
+        end_effectors_enabled=bool(args.end_effectors_enabled),
         host=args.host,
         port=args.port,
         open_browser=bool(args.open_browser),
         start_playing=bool(args.start_playing),
+        access_log=bool(args.access_log),
     )
 
 

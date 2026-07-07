@@ -53,6 +53,11 @@ from .schema import (
 )
 from .sources import CallableActionSource, RobotActionSource, StaticActionSource
 from .teleop_source import TeleopRetargeterActionSource, TeleopRetargeterActionSourceConfig
+from .vector_pipeline import (
+    VectorActionLayout,
+    VectorRobotActionBuildResult,
+    robot_action_from_vector_action,
+)
 
 __all__ = [
     "ActionExecutionResult",
@@ -85,6 +90,8 @@ __all__ = [
     "TeleopCommandActionAdapterConfig",
     "TeleopRetargeterActionSource",
     "TeleopRetargeterActionSourceConfig",
+    "VectorActionLayout",
+    "VectorRobotActionBuildResult",
     "default_arm_frame",
     "default_arm_controlled_frame",
     "decode_robot_action",
@@ -99,6 +106,7 @@ __all__ = [
     "normalize_arm_action_specs",
     "normalize_hand_action_specs",
     "robot_action_from_teleop_command",
+    "robot_action_from_vector_action",
     "split_effector_name",
     "xyzquat_to_matrix",
 ]

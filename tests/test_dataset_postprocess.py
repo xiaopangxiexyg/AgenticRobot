@@ -343,15 +343,10 @@ def test_label_force_collisions_updates_episode_and_stats_meta(tmp_path) -> None
         [
             {
                 "timestamp": 1.0,
-                "faults_json": json.dumps(
-                    [
-                        {
-                            "message": (
-                                "RuntimeError: left: force 55.0000N > "
-                                "hard_stop_force_n"
-                            )
-                        }
-                    ]
+                "faults_json": json.dumps([]),
+                "observation.arm.left.hardware_result_text": (
+                    "RuntimeError: left: force 55.0000N > "
+                    "hard_stop_force_n"
                 ),
                 "teleop.pose_quality.status": "warning",
                 "teleop.pose_quality.score": 0.7,
@@ -387,6 +382,9 @@ def test_label_force_collisions_updates_episode_and_stats_meta(tmp_path) -> None
     assert updated_episodes[0]["summary"]["force_collision_detected"] is True
     assert updated_episodes[0]["summary"]["force_collision_label"] == "detected_collision"
     assert updated_episodes[0]["summary"]["trajectory_quality"]["pose_quality_warning_count"] == 1
+    assert updated_episodes[0]["metadata"]["force_collision_detected"] is True
+    assert updated_episodes[0]["metadata"]["force_collision_label"] == "detected_collision"
+    assert updated_episodes[0]["metadata"]["trajectory_quality"]["force_collision_label"] == "detected_collision"
     assert updated_stats[0]["force_collision_detected"] is True
     assert updated_stats[1]["force_collision_label"] == "clean"
     info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))

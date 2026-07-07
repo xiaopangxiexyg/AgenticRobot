@@ -99,6 +99,9 @@ class InspireGripperModbus:
         baudrate: int = 115200,
         timeout: float = 0.03,
         inter_command_delay: float = 0.001,
+        reconnect_on_error: bool = True,
+        reconnect_attempts: int = 1,
+        reconnect_delay: float = 0.05,
         debug: bool = False,
     ) -> None:
         self.port = port
@@ -106,9 +109,18 @@ class InspireGripperModbus:
         self.baudrate = int(baudrate)
         self.timeout = float(timeout)
         self.inter_command_delay = float(inter_command_delay)
+        self.reconnect_on_error = bool(reconnect_on_error)
+        self.reconnect_attempts = max(0, int(reconnect_attempts))
+        self.reconnect_delay = max(0.0, float(reconnect_delay))
         self.debug = bool(debug)
         self._io_lock = threading.Lock()
+        self.reconnect_count = 0
+        self.last_reconnect_error: Optional[str] = None
 
+        self.ser: serial.Serial | None = None
+        self._open_serial()
+
+    def _open_serial(self) -> None:
         self.ser = serial.Serial(
             port=self.port,
             baudrate=self.baudrate,
@@ -121,6 +133,17 @@ class InspireGripperModbus:
     def close(self) -> None:
         if self.ser and self.ser.is_open:
             self.ser.close()
+
+    def _reopen_serial_locked(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+        if self.reconnect_delay > 0.0:
+            time.sleep(self.reconnect_delay)
+        self._open_serial()
+        self.reconnect_count += 1
+        self.last_reconnect_error = None
 
     def __enter__(self) -> "InspireGripperModbus":
         return self
@@ -164,6 +187,8 @@ class InspireGripperModbus:
             )
 
     def _read_exact(self, n: int) -> bytes:
+        if self.ser is None or not self.ser.is_open:
+            raise GripperError(f"Serial port is not open: {self.port}")
         data = bytearray()
         t0 = time.time()
 
@@ -182,60 +207,101 @@ class InspireGripperModbus:
 
         return bytes(data)
 
-    def _transact(self, function_code: int, payload: bytes) -> bytes:
+    @staticmethod
+    def _is_reconnectable_error(exc: BaseException) -> bool:
+        if isinstance(exc, (serial.SerialException, OSError)):
+            return True
+        if not isinstance(exc, GripperError):
+            return False
+        text = str(exc).lower()
+        if "unexpected slave id" in text or "modbus exception response" in text:
+            return False
+        return any(
+            token in text
+            for token in (
+                "timeout",
+                "crc mismatch",
+                "frame too short",
+                "echo mismatch",
+                "serial port is not open",
+            )
+        )
+
+    def _transact_once_locked(self, function_code: int, payload: bytes) -> bytes:
+        if self.ser is None or not self.ser.is_open:
+            raise GripperError(f"Serial port is not open: {self.port}")
         req = bytes([self.slave_id, function_code]) + payload
         req = self._append_crc(req)
 
-        with self._io_lock:
-            self.ser.reset_input_buffer()
-            self.ser.write(req)
-            self.ser.flush()
-            self._log(f"[TX] {req.hex(' ')}")
+        self.ser.reset_input_buffer()
+        self.ser.write(req)
+        self.ser.flush()
+        self._log(f"[TX] {req.hex(' ')}")
 
-            head = self._read_exact(2)
-            addr, func = head[0], head[1]
+        head = self._read_exact(2)
+        addr, func = head[0], head[1]
 
-            if addr != self.slave_id:
-                raise GripperError(
-                    f"Unexpected slave id in response: {addr}, expect {self.slave_id}"
-                )
+        if addr != self.slave_id:
+            raise GripperError(
+                f"Unexpected slave id in response: {addr}, expect {self.slave_id}"
+            )
 
-            if func == (function_code | 0x80):
-                tail = self._read_exact(3)
-                frame = head + tail
-                self._check_crc(frame)
-                exc_code = frame[2]
-                raise GripperError(
-                    f"Modbus exception response: func=0x{function_code:02X}, "
-                    f"exc=0x{exc_code:02X}"
-                )
-
-            if func != function_code:
-                raise GripperError(
-                    f"Unexpected function code in response: "
-                    f"got 0x{func:02X}, expect 0x{function_code:02X}"
-                )
-
-            if function_code == 0x03:
-                byte_count = self._read_exact(1)
-                n = byte_count[0]
-                tail = self._read_exact(n + 2)
-                frame = head + byte_count + tail
-            elif function_code in (0x06, 0x10):
-                tail = self._read_exact(6)
-                frame = head + tail
-            else:
-                raise NotImplementedError(
-                    f"Unsupported function code: 0x{function_code:02X}"
-                )
-
+        if func == (function_code | 0x80):
+            tail = self._read_exact(3)
+            frame = head + tail
             self._check_crc(frame)
-            self._log(f"[RX] {frame.hex(' ')}")
+            exc_code = frame[2]
+            raise GripperError(
+                f"Modbus exception response: func=0x{function_code:02X}, "
+                f"exc=0x{exc_code:02X}"
+            )
 
-            if self.inter_command_delay > 0:
-                time.sleep(self.inter_command_delay)
+        if func != function_code:
+            raise GripperError(
+                f"Unexpected function code in response: "
+                f"got 0x{func:02X}, expect 0x{function_code:02X}"
+            )
 
-            return frame
+        if function_code == 0x03:
+            byte_count = self._read_exact(1)
+            n = byte_count[0]
+            tail = self._read_exact(n + 2)
+            frame = head + byte_count + tail
+        elif function_code in (0x06, 0x10):
+            tail = self._read_exact(6)
+            frame = head + tail
+        else:
+            raise NotImplementedError(
+                f"Unsupported function code: 0x{function_code:02X}"
+            )
+
+        self._check_crc(frame)
+        self._log(f"[RX] {frame.hex(' ')}")
+
+        if self.inter_command_delay > 0:
+            time.sleep(self.inter_command_delay)
+
+        return frame
+
+    def _transact(self, function_code: int, payload: bytes) -> bytes:
+        with self._io_lock:
+            attempts_remaining = self.reconnect_attempts if self.reconnect_on_error else 0
+            while True:
+                try:
+                    return self._transact_once_locked(function_code, payload)
+                except Exception as exc:  # noqa: BLE001
+                    if attempts_remaining <= 0 or not self._is_reconnectable_error(exc):
+                        raise
+                    attempts_remaining -= 1
+                    self.last_reconnect_error = f"{type(exc).__name__}: {exc}"
+                    self._log(f"[RECONNECT] {self.port}: {self.last_reconnect_error}")
+                    try:
+                        self._reopen_serial_locked()
+                    except Exception as reopen_exc:  # noqa: BLE001
+                        raise GripperError(
+                            f"Serial reconnect failed after {self.last_reconnect_error}: "
+                            f"{type(reopen_exc).__name__}: {reopen_exc}"
+                        ) from reopen_exc
 
     def read_holding_registers(self, start_addr: int, count: int) -> list[int]:
         if not (1 <= int(count) <= 125):
@@ -318,6 +384,9 @@ class InspireGripper:
         speed_raw_max: int = 1000,
         torque_raw_min: int = 50,
         torque_raw_max: int = 1000,
+        reconnect_on_error: bool = True,
+        reconnect_attempts: int = 1,
+        reconnect_delay: float = 0.05,
         debug: bool = False,
     ):
         self.mb = InspireGripperModbus(
@@ -326,6 +395,9 @@ class InspireGripper:
             baudrate=baudrate,
             timeout=timeout,
             inter_command_delay=0.001,
+            reconnect_on_error=reconnect_on_error,
+            reconnect_attempts=reconnect_attempts,
+            reconnect_delay=reconnect_delay,
             debug=debug,
         )
         self.num_joints = 1
@@ -717,6 +789,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=0.03)
     parser.add_argument("--max_open_mm", type=float, default=70.0)
+    parser.add_argument(
+        "--no-reconnect",
+        action="store_true",
+        help="Disable one-shot serial reconnect/retry after transient Modbus I/O errors",
+    )
+    parser.add_argument("--reconnect-attempts", type=int, default=1)
+    parser.add_argument("--reconnect-delay", type=float, default=0.05)
     parser.add_argument("--debug", action="store_true", help="Print raw Modbus TX/RX frames")
     parser.add_argument("--json", action="store_true", help="Print state as JSON")
 
@@ -795,6 +874,9 @@ def main(argv=None) -> None:
         baudrate=args.baudrate,
         timeout=args.timeout,
         max_open_mm=args.max_open_mm,
+        reconnect_on_error=not bool(args.no_reconnect),
+        reconnect_attempts=args.reconnect_attempts,
+        reconnect_delay=args.reconnect_delay,
         debug=args.debug,
     ) as gripper:
         if command == "state":

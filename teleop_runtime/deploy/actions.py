@@ -46,6 +46,13 @@ class DeploymentAction:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class FilteredNormalizedAction:
+    action: NormalizedAction
+    faults: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 def _base_action(observation: DeploymentObservation) -> np.ndarray:
     base = observation.hold_action()
     if base.shape != (ACTION_DIM,):
@@ -81,6 +88,26 @@ def _normalized_action_metadata(
     )
     metadata.setdefault("hand_spec_required", True)
     return metadata
+
+
+def _with_extra_metadata(
+    actions: list[NormalizedAction],
+    extra: Mapping[str, Any] | None,
+) -> list[NormalizedAction]:
+    if not isinstance(extra, Mapping):
+        return actions
+    output: list[NormalizedAction] = []
+    for action in actions:
+        metadata = dict(action.metadata)
+        metadata.update(dict(extra))
+        output.append(
+            NormalizedAction(
+                vector=action.vector,
+                arm_joint_targets=dict(action.arm_joint_targets),
+                metadata=metadata,
+            )
+        )
+    return output
 
 
 def _replace_vector_slice(
@@ -231,12 +258,15 @@ def _mapping_to_action_chunk(
 ) -> list[NormalizedAction]:
     for key in ("action_chunk", "actions", "action"):
         if key in mapping:
-            return normalize_policy_output(
-                mapping[key],
-                observation,
-                active_sides=active_sides,
-                arms_enabled=arms_enabled,
-                hands_enabled=hands_enabled,
+            return _with_extra_metadata(
+                normalize_policy_output(
+                    mapping[key],
+                    observation,
+                    active_sides=active_sides,
+                    arms_enabled=arms_enabled,
+                    hands_enabled=hands_enabled,
+                ),
+                mapping.get("metadata") if isinstance(mapping.get("metadata"), Mapping) else None,
             )
 
     active = _ordered_active_sides(active_sides)
@@ -343,6 +373,17 @@ def normalize_policy_output(
         return []
     if isinstance(output, NormalizedAction):
         return [output]
+    if hasattr(output, "actions") and hasattr(output, "metadata"):
+        return _with_extra_metadata(
+            normalize_policy_output(
+                getattr(output, "actions"),
+                observation,
+                active_sides=active,
+                arms_enabled=use_arms,
+                hands_enabled=use_hands,
+            ),
+            getattr(output, "metadata"),
+        )
     for attr in ("action_chunk", "actions", "action"):
         if hasattr(output, attr):
             return normalize_policy_output(
@@ -423,6 +464,7 @@ class ActionSafetyFilterConfig:
     max_arm_xyz_step_m: float = 0.08
     max_arm_rot_step_deg: float = 20.0
     max_arm_joint_step_rad: float = 0.20
+    # Reserved for future hand q6 rate limiting; current deploy only clips hand q6 to [0, 1].
     max_hand_step: float = 0.0
 
 
@@ -458,16 +500,15 @@ class ActionSafetyFilter:
             return last[target_slice].copy()
         return fallback.astype(np.float32, copy=True)
 
-    def _filter_arm_pose(
+    def _filter_arm_pose_value(
         self,
         *,
         side: str,
         target: np.ndarray,
         observation: DeploymentObservation,
-        raw: np.ndarray,
         max_arm_xyz_step_m: float,
         max_arm_rot_step_deg: float,
-    ) -> tuple[np.ndarray, EffectorCommand | None, list[str], dict[str, Any]]:
+    ) -> tuple[np.ndarray, bool, list[str], dict[str, Any]]:
         faults: list[str] = []
         metadata: dict[str, Any] = {
             "workspace_clipped": False,
@@ -476,7 +517,7 @@ class ActionSafetyFilter:
         }
         pose = vector_or_none(target, length=ARM_POSE_DOF)
         if pose is None:
-            return target, None, [f"{side}_arm_pose_invalid"], metadata
+            return target, False, [f"{side}_arm_pose_invalid"], metadata
 
         workspace_min = np.asarray(self.config.workspace_min, dtype=np.float32).reshape(3)
         workspace_max = np.asarray(self.config.workspace_max, dtype=np.float32).reshape(3)
@@ -500,7 +541,7 @@ class ActionSafetyFilter:
         quat = np.asarray(pose[3:7], dtype=float)
         quat_norm = float(np.linalg.norm(quat))
         if quat_norm <= 1e-12:
-            return target, None, [f"{side}_arm_quat_invalid"], metadata
+            return target, False, [f"{side}_arm_quat_invalid"], metadata
         pose[3:7] = (quat / quat_norm).astype(np.float32)
         if (
             float(max_arm_rot_step_deg) > 0.0
@@ -519,6 +560,30 @@ class ActionSafetyFilter:
 
         pose_matrix = xyzquat_to_pose_matrix(pose)
         if pose_matrix is None:
+            return target, False, [f"{side}_arm_pose_invalid"], metadata
+        return pose.astype(np.float32, copy=True), True, faults, metadata
+
+    def _filter_arm_pose(
+        self,
+        *,
+        side: str,
+        target: np.ndarray,
+        observation: DeploymentObservation,
+        raw: np.ndarray,
+        max_arm_xyz_step_m: float,
+        max_arm_rot_step_deg: float,
+    ) -> tuple[np.ndarray, EffectorCommand | None, list[str], dict[str, Any]]:
+        pose, valid, faults, metadata = self._filter_arm_pose_value(
+            side=side,
+            target=target,
+            observation=observation,
+            max_arm_xyz_step_m=max_arm_xyz_step_m,
+            max_arm_rot_step_deg=max_arm_rot_step_deg,
+        )
+        if not valid:
+            return pose, None, faults, metadata
+        pose_matrix = xyzquat_to_pose_matrix(pose)
+        if pose_matrix is None:
             return target, None, [f"{side}_arm_pose_invalid"], metadata
         command = EffectorCommand(
             effector_name=f"{side}_arm",
@@ -535,19 +600,19 @@ class ActionSafetyFilter:
         )
         return pose.astype(np.float32, copy=True), command, faults, metadata
 
-    def _filter_arm_qpos(
+    def _filter_arm_qpos_value(
         self,
         *,
         side: str,
         target: np.ndarray,
         observation: DeploymentObservation,
         max_arm_joint_step_rad: float,
-    ) -> tuple[np.ndarray, EffectorCommand | None, list[str], dict[str, Any]]:
+    ) -> tuple[np.ndarray, bool, list[str], dict[str, Any]]:
         faults: list[str] = []
         metadata = {"joint_rate_limited": False}
         qpos = vector_or_none(target, length=ARM_JOINT_DOF)
         if qpos is None:
-            return target, None, [f"{side}_arm_qpos_invalid"], metadata
+            return target, False, [f"{side}_arm_qpos_invalid"], metadata
         reference = np.asarray(observation.state[STATE_ARM_QPOS_SLICES[side]], dtype=np.float32)
         if float(max_arm_joint_step_rad) > 0.0 and not np.all(np.isfinite(reference)):
             faults.append(f"{side}_arm_qpos_reference_unavailable")
@@ -558,6 +623,24 @@ class ActionSafetyFilter:
                 max_step=float(max_arm_joint_step_rad),
             )
             metadata["joint_rate_limited"] = bool(limited)
+        return qpos.astype(np.float32, copy=True), True, faults, metadata
+
+    def _filter_arm_qpos(
+        self,
+        *,
+        side: str,
+        target: np.ndarray,
+        observation: DeploymentObservation,
+        max_arm_joint_step_rad: float,
+    ) -> tuple[np.ndarray, EffectorCommand | None, list[str], dict[str, Any]]:
+        qpos, valid, faults, metadata = self._filter_arm_qpos_value(
+            side=side,
+            target=target,
+            observation=observation,
+            max_arm_joint_step_rad=max_arm_joint_step_rad,
+        )
+        if not valid:
+            return qpos, None, faults, metadata
         command = EffectorCommand(
             effector_name=f"{side}_arm",
             side=side,
@@ -572,6 +655,156 @@ class ActionSafetyFilter:
         )
         return qpos.astype(np.float32, copy=True), command, faults, metadata
 
+    def filter_normalized(
+        self,
+        action: NormalizedAction | Any,
+        observation: DeploymentObservation,
+        *,
+        policy_name: str = "",
+    ) -> FilteredNormalizedAction:
+        """Filter an action without creating backend commands.
+
+        This is the canonical deploy path: policy outputs are safety-filtered
+        as NormalizedAction values and are then lifted to RobotAction. The older
+        filter() method below is retained only for legacy command-path callers.
+
+        Migration target: the value-level safety logic in this method should
+        move to robot_motion/deploy with the canonical action pipeline. The
+        direct EffectorCommand-producing filter() method should remain archived
+        in teleop_runtime or be deleted after all old callers are gone.
+        """
+
+        normalized = (
+            action
+            if isinstance(action, NormalizedAction)
+            else NormalizedAction(vector=np.asarray(action, dtype=np.float32).reshape(ACTION_DIM))
+        )
+        raw = np.asarray(normalized.vector, dtype=np.float32).reshape(-1)
+        if raw.shape != (ACTION_DIM,):
+            raise ValueError(f"Expected full action shape {(ACTION_DIM,)}, got {raw.shape}.")
+
+        filtered = raw.astype(np.float32, copy=True)
+        filtered_arm_joint_targets: dict[str, np.ndarray] = {}
+        faults: list[str] = []
+        override_config = {}
+        if isinstance(normalized.metadata, Mapping):
+            raw_overrides = normalized.metadata.get("safety_overrides", {})
+            if isinstance(raw_overrides, Mapping):
+                override_config = dict(raw_overrides)
+
+        def _override_float(name: str, default: float) -> float:
+            if name not in override_config:
+                return float(default)
+            try:
+                return float(override_config[name])
+            except (TypeError, ValueError):
+                return float(default)
+
+        max_arm_xyz_step_m = _override_float("max_arm_xyz_step_m", self.config.max_arm_xyz_step_m)
+        max_arm_rot_step_deg = _override_float("max_arm_rot_step_deg", self.config.max_arm_rot_step_deg)
+        max_arm_joint_step_rad = _override_float("max_arm_joint_step_rad", self.config.max_arm_joint_step_rad)
+        safety_metadata: dict[str, Any] = {
+            "policy_name": policy_name,
+            "arm": {},
+            "arm_action_specs_by_side": {},
+            "hand_rate_limited": {},
+            "hand_rate_limit_enabled": False,
+            "max_hand_step": float(self.config.max_hand_step),
+            "hand_action_specs_by_side": {},
+        }
+
+        active = set(self.config.active_sides)
+        arm_specs = arm_action_specs_from_metadata(normalized.metadata)
+        if not arm_specs:
+            arm_specs = arm_action_specs_from_metadata(observation.metadata)
+        if not arm_specs:
+            arm_specs = arm_action_specs_from_metadata(
+                {"arm_action_specs_by_side": deploy_arm_specs_metadata()}
+            )
+        if self.config.arms_enabled:
+            for side in ALL_SIDES:
+                if side not in active:
+                    continue
+                arm_spec = arm_specs.get(side) or ArmActionSpec.tool_tcp(side)
+                if side in normalized.arm_joint_targets:
+                    qpos, valid, arm_faults, metadata = self._filter_arm_qpos_value(
+                        side=side,
+                        target=np.asarray(normalized.arm_joint_targets[side], dtype=np.float32),
+                        observation=observation,
+                        max_arm_joint_step_rad=max_arm_joint_step_rad,
+                    )
+                    if valid:
+                        filtered_arm_joint_targets[side] = qpos.astype(np.float32, copy=True)
+                else:
+                    pose, valid, arm_faults, metadata = self._filter_arm_pose_value(
+                        side=side,
+                        target=filtered[ACTION_ARM_POSE_SLICES[side]],
+                        observation=observation,
+                        max_arm_xyz_step_m=max_arm_xyz_step_m,
+                        max_arm_rot_step_deg=max_arm_rot_step_deg,
+                    )
+                    if valid:
+                        filtered[ACTION_ARM_POSE_SLICES[side]] = pose
+                faults.extend(arm_faults)
+                safety_metadata["arm"][side] = metadata
+                safety_metadata["arm_action_specs_by_side"][side] = arm_spec.to_metadata()
+
+        if self.config.hands_enabled:
+            hand_specs = hand_action_specs_from_metadata(normalized.metadata)
+            if not hand_specs:
+                hand_specs = hand_action_specs_from_metadata(observation.metadata)
+            if not hand_specs:
+                hand_specs = hand_action_specs_from_metadata(
+                    {"hand_action_specs_by_side": deploy_hand_specs_metadata()}
+                )
+            for side in HAND_VECTOR_ORDER:
+                if side not in active:
+                    continue
+                spec = hand_specs.get(side)
+                if spec is None:
+                    raise ValueError(f"{side}_hand action requires hand_action_specs_by_side metadata.")
+                safety_metadata["hand_action_specs_by_side"][side] = spec.to_metadata()
+                target_slice = ACTION_HAND_SLICES[side]
+                hand_target = vector_or_none(filtered[target_slice], length=HAND_DOF)
+                if hand_target is None:
+                    faults.append(f"{side}_hand_action_invalid")
+                    continue
+                if int(spec.slot_count) != HAND_DOF:
+                    raise ValueError(
+                        f"{side}_hand deploy q6 schema requires HandActionSpec.slot_count={HAND_DOF}, "
+                        f"got {spec.slot_count}. Use a hand adapter for non-q6 embodiments."
+                    )
+                clipped = np.clip(hand_target, 0.0, 1.0).astype(np.float32, copy=True)
+                filtered[target_slice] = clipped
+                safety_metadata["hand_rate_limited"][side] = False
+
+        filtered_metadata = dict(normalized.metadata)
+        filtered_metadata["deploy_safety"] = dict(safety_metadata)
+        if safety_metadata["arm_action_specs_by_side"]:
+            filtered_metadata["arm_action_specs_by_side"] = dict(
+                safety_metadata["arm_action_specs_by_side"]
+            )
+        if safety_metadata["hand_action_specs_by_side"]:
+            filtered_metadata["hand_action_specs_by_side"] = dict(
+                safety_metadata["hand_action_specs_by_side"]
+            )
+            filtered_metadata["hand_active_mask_by_side"] = {
+                side: list(spec.get("active_mask", ()))
+                for side, spec in safety_metadata["hand_action_specs_by_side"].items()
+            }
+        filtered_metadata.setdefault("arm_spec_required", True)
+        filtered_metadata.setdefault("hand_spec_required", True)
+
+        return FilteredNormalizedAction(
+            action=NormalizedAction(
+                vector=filtered,
+                arm_joint_targets=filtered_arm_joint_targets,
+                metadata=filtered_metadata,
+            ),
+            faults=faults,
+            metadata=safety_metadata,
+        )
+
     def filter(
         self,
         action: NormalizedAction | Any,
@@ -579,6 +812,14 @@ class ActionSafetyFilter:
         *,
         policy_name: str = "",
     ) -> DeploymentAction:
+        """Legacy direct-command filter.
+
+        New deploy code should use filter_normalized() and resolve the result
+        through RobotActionResolver. This method is kept for older tests and
+        private callers that still need the archived DeploymentAction command
+        path.
+        """
+
         normalized = (
             action
             if isinstance(action, NormalizedAction)
@@ -613,6 +854,8 @@ class ActionSafetyFilter:
             "arm": {},
             "arm_action_specs_by_side": {},
             "hand_rate_limited": {},
+            "hand_rate_limit_enabled": False,
+            "max_hand_step": float(self.config.max_hand_step),
             "hand_action_specs_by_side": {},
         }
 

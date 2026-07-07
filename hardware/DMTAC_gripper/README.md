@@ -250,6 +250,11 @@ python run_gripper.py move 0.2 --port /dev/ttyUSB0 --id 1 --speed 0.2 --torque 0
 python run_gripper.py stop --port /dev/ttyUSB0 --id 1
 ```
 
+普通 gripper 读写命令默认会在 transient Modbus I/O 错误后重开串口并重试一次，
+可用 `--no-gripper-reconnect` 关闭，或用 `--gripper-reconnect-attempts` /
+`--gripper-reconnect-delay` 调整。`configure-usb` 的 gripper id/baudrate probe
+会关闭这层重试，避免扫描大量错误 id 时被额外重连拖慢。
+
 夹爪和触觉联合读取：
 
 ```bash

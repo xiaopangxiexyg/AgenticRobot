@@ -769,7 +769,8 @@ button.stop-ready {
       <div class="shortcut-strip" aria-label="快捷键">
         <div class="shortcut-item"><kbd>A</kbd><span>开始 / 停止数采</span></div>
         <div class="shortcut-item"><kbd>B</kbd><span>开始遥操 / Hold</span></div>
-        <div class="shortcut-item"><kbd>C</kbd><span>开始采集</span></div>
+        <div class="shortcut-item"><kbd>C</kbd><span id="shortcutCLabel">开始采集</span></div>
+        <div class="shortcut-item"><kbd>G</kbd><span id="shortcutGLabel">归位不可用</span></div>
       </div>
       <div id="sendStatus" class="send-status"></div>
       <div class="control-title">标定 / 坐标系</div>
@@ -808,7 +809,25 @@ button.stop-ready {
             </select>
           </label>
         </div>
+        <div class="button-grid">
+          <button id="fixArmToggleButton" data-event="fix_arm_toggle">固定左臂</button>
+        </div>
         <div id="fixArmStatus" class="numeric-value mono">-</div>
+      </div>
+      <div id="initArmSection" hidden>
+        <div class="control-title">归位</div>
+        <div class="form-grid">
+          <label>归位侧
+            <select id="initArmSideSelect">
+              <option value="left">左臂</option>
+              <option value="right">右臂</option>
+            </select>
+          </label>
+        </div>
+        <div class="button-grid">
+          <button id="initArmToggleButton" data-event="init_arm_toggle">左臂归位</button>
+        </div>
+        <div id="initArmStatus" class="numeric-value mono">-</div>
       </div>
       <div class="control-title">数采</div>
       <div class="form-grid">
@@ -1152,6 +1171,32 @@ button.stop-ready {
     var i;
     for (i = 0; i < controls.length; i += 1) active[String(controls[i])] = true;
     legacyActiveControls = active;
+    var shortcutC = byId("shortcutCLabel");
+    if (shortcutC) {
+      if (state.fix_arm_available && state.teleop_running) {
+        var shortcutSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+        var shortcutLabel = shortcutSide === "right" ? "右臂" : "左臂";
+        shortcutC.textContent = state.fix_arm_recalibrating || state.fix_arm_active
+          ? "重采 " + shortcutLabel + " Home"
+          : "固定 " + shortcutLabel;
+      } else if (state.teleop_running) {
+        shortcutC.textContent = "无 fix-arm 时不可用";
+      } else {
+        shortcutC.textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+      }
+    }
+    var shortcutG = byId("shortcutGLabel");
+    if (shortcutG) {
+      if (state.init_arm_available && state.teleop_running) {
+        var initShortcutSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var initShortcutLabel = initShortcutSide === "right" ? "右臂" : "左臂";
+        shortcutG.textContent = state.init_arm_recalibrating || state.init_arm_active
+          ? "重采 " + initShortcutLabel + " Home"
+          : initShortcutLabel + "归位";
+      } else {
+        shortcutG.textContent = "归位不可用";
+      }
+    }
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (i = 0; i < buttons.length; i += 1) {
       var eventName = buttons[i].getAttribute("data-event");
@@ -1165,9 +1210,27 @@ button.stop-ready {
             : state.fix_arm_active
               ? "重采 " + label + " Home"
               : "固定 " + label;
+        } else if (state.teleop_running) {
+          buttons[i].textContent = "无 fix-arm 时不可用";
         } else {
           buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
         }
+      } else if (eventName === "fix_arm_toggle") {
+        var fixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+        var fixLabel = fixSide === "right" ? "右臂" : "左臂";
+        buttons[i].textContent = state.fix_arm_recalibrating
+          ? "重采 " + fixLabel + " Home..."
+          : state.fix_arm_active
+            ? "重采 " + fixLabel + " Home"
+            : "固定 " + fixLabel;
+      } else if (eventName === "init_arm_toggle") {
+        var initSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var initLabel = initSide === "right" ? "右臂" : "左臂";
+        buttons[i].textContent = state.init_arm_recalibrating
+          ? "重采 " + initLabel + " Home..."
+          : state.init_arm_active
+            ? "重采 " + initLabel + " Home"
+            : initLabel + "归位";
       }
     }
   }
@@ -1411,10 +1474,14 @@ button.stop-ready {
     } else if (key === "b") {
       eventName = state.teleop_running ? "h" : "p";
     } else if (key === "c") {
-      if (state.fix_arm_available && state.teleop_running && legacyActiveControls["c"]) {
-        eventName = "c";
+      if (state.fix_arm_available && state.teleop_running && legacyActiveControls["fix_arm_toggle"]) {
+        eventName = "fix_arm_toggle";
       } else if (!state.teleop_running && String(state.capture_stage || "") && legacyActiveControls["c"]) {
         eventName = "c";
+      }
+    } else if (key === "g") {
+      if (state.init_arm_available && state.teleop_running && legacyActiveControls["init_arm_toggle"]) {
+        eventName = "init_arm_toggle";
       }
     } else {
       return false;
@@ -1438,7 +1505,7 @@ button.stop-ready {
       event = event || window.event;
       if (event.repeat || isEditableTargetLegacy(event.target || event.srcElement)) return;
       var key = String(event.key || "").toLowerCase();
-      if (key !== "a" && key !== "b" && key !== "c") return;
+      if (key !== "a" && key !== "b" && key !== "c" && key !== "g") return;
       if (event.preventDefault) event.preventDefault();
       event.returnValue = false;
       postKeyboardShortcutLegacy(key);
@@ -1450,7 +1517,10 @@ button.stop-ready {
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
         var eventName = this.getAttribute("data-event");
-        postEvent(eventName, eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null);
+        var sendEventName = (
+          eventName === "c" && legacyLatestState.fix_arm_available && legacyLatestState.teleop_running
+        ) ? "fix_arm_toggle" : eventName;
+        postEvent(sendEventName, eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null);
       };
     }
     var chooseButton = byId("datasetChooseRootButton");
@@ -1481,6 +1551,8 @@ const captureSamplesEl = document.getElementById("captureSamples");
 const captureValidEl = document.getElementById("captureValid");
 const captureStatusEl = document.getElementById("captureStatus");
 const sendStatusEl = document.getElementById("sendStatus");
+const shortcutCLabelEl = document.getElementById("shortcutCLabel");
+const shortcutGLabelEl = document.getElementById("shortcutGLabel");
 const viveCalibrationCalibrateButtonEl = document.getElementById("viveCalibrationCalibrateButton");
 const viveCalibrationSaveButtonEl = document.getElementById("viveCalibrationSaveButton");
 const viveCalibrationLoadButtonEl = document.getElementById("viveCalibrationLoadButton");
@@ -1489,7 +1561,12 @@ const movementMultipleInputEl = document.getElementById("movementMultipleInput")
 const movementMultipleStatusEl = document.getElementById("movementMultipleStatus");
 const fixArmSectionEl = document.getElementById("fixArmSection");
 const fixArmSideSelectEl = document.getElementById("fixArmSideSelect");
+const fixArmToggleButtonEl = document.getElementById("fixArmToggleButton");
 const fixArmStatusEl = document.getElementById("fixArmStatus");
+const initArmSectionEl = document.getElementById("initArmSection");
+const initArmSideSelectEl = document.getElementById("initArmSideSelect");
+const initArmToggleButtonEl = document.getElementById("initArmToggleButton");
+const initArmStatusEl = document.getElementById("initArmStatus");
 const leftRawCardEl = document.getElementById("leftRawCard");
 const rightRawCardEl = document.getElementById("rightRawCard");
 const leftRawPoseEl = document.getElementById("leftRawPose");
@@ -1760,10 +1837,14 @@ async function sendGuiShortcut(key) {
     eventName = state.teleop_running ? "h" : "p";
   } else if (key === "c") {
     const captureStage = String(state.capture_stage || "");
-    if (state.fix_arm_available && state.teleop_running && canSendEvent("c")) {
-      eventName = "c";
+    if (state.fix_arm_available && state.teleop_running && canSendEvent("fix_arm_toggle")) {
+      eventName = "fix_arm_toggle";
     } else if (!state.teleop_running && captureStage && canSendEvent("c")) {
       eventName = "c";
+    }
+  } else if (key === "g") {
+    if (state.init_arm_available && state.teleop_running && canSendEvent("init_arm_toggle")) {
+      eventName = "init_arm_toggle";
     }
   } else {
     return false;
@@ -1826,10 +1907,13 @@ buttons.forEach((button) => {
           return;
         }
       }
+      const sendEventName = (
+        eventName === "c" && latestState.fix_arm_available && latestState.teleop_running
+      ) ? "fix_arm_toggle" : eventName;
       if (eventName === "episode_start") {
-        await sendEvent(eventName, collectEpisodeStartPayload());
+        await sendEvent(sendEventName, collectEpisodeStartPayload());
       } else {
-        await sendEvent(eventName);
+        await sendEvent(sendEventName);
       }
     } catch (error) {
       sendStatusEl.textContent = String(error);
@@ -1896,11 +1980,22 @@ if (fixArmSideSelectEl) {
   });
 }
 
+if (initArmSideSelectEl) {
+  initArmSideSelectEl.addEventListener("change", async () => {
+    if (initArmSideSelectEl.disabled) return;
+    try {
+      await sendEvent("init_arm_select:" + initArmSideSelectEl.value);
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+  });
+}
+
 document.addEventListener("keydown", async (event) => {
   if (event.repeat) return;
   if (isEditableTarget(event.target)) return;
   const key = event.key.toLowerCase();
-  if (["a", "b", "c"].includes(key)) {
+  if (["a", "b", "c", "g"].includes(key)) {
     event.preventDefault();
     try {
       await sendGuiShortcut(key);
@@ -1924,7 +2019,13 @@ function updateButtons(state) {
   buttons.forEach((button) => {
     const eventName = button.dataset.event;
     button.disabled = !activeControls.has(eventName);
-    if (state.capturing && eventName === "c") button.disabled = true;
+    if (
+      state.capturing &&
+      eventName === "c" &&
+      !(state.fix_arm_available && state.teleop_running)
+    ) {
+      button.disabled = true;
+    }
     if ((state.episode_recording || episodePreparing) && eventName === "episode_start") button.disabled = true;
     if (!state.episode_recording && !episodePreparing && eventName === "episode_stop") button.disabled = true;
     if ((state.episode_recording || episodePreparing) && eventName === "record_pose_snapshot") button.disabled = true;
@@ -1957,8 +2058,42 @@ function updateButtons(state) {
         : state.fix_arm_active
           ? `重采 ${label} Home`
           : `固定 ${label}`;
+    } else if (state.teleop_running) {
+      captureButton.textContent = "无 fix-arm 时不可用";
     } else {
       captureButton.textContent = captureStage === "runtime_home" ? "采集 Home" : "开始采集";
+    }
+  }
+}
+
+function updateShortcutHints(state) {
+  const captureStage = String(state.capture_stage || "");
+  if (shortcutCLabelEl) {
+    if (state.fix_arm_available && state.teleop_running) {
+      const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+      const label = side === "right" ? "右臂" : "左臂";
+      shortcutCLabelEl.textContent = state.fix_arm_recalibrating
+        ? `重采 ${label} Home`
+        : state.fix_arm_active
+          ? `重采 ${label} Home`
+          : `固定 ${label}`;
+    } else if (state.teleop_running) {
+      shortcutCLabelEl.textContent = "无 fix-arm 时不可用";
+    } else {
+      shortcutCLabelEl.textContent = captureStage === "runtime_home" ? "采集 Home" : "开始采集";
+    }
+  }
+  if (shortcutGLabelEl) {
+    if (state.init_arm_available && state.teleop_running) {
+      const side = state.init_arm_active_side || state.init_arm_selected_side || "left";
+      const label = side === "right" ? "右臂" : "左臂";
+      shortcutGLabelEl.textContent = state.init_arm_recalibrating
+        ? `重采 ${label} Home`
+        : state.init_arm_active
+          ? `重采 ${label} Home`
+          : `${label}归位`;
+    } else {
+      shortcutGLabelEl.textContent = "归位不可用";
     }
   }
 }
@@ -1985,15 +2120,23 @@ function renderFixArm(state) {
   const selected = state.fix_arm_selected_side || "left";
   const fixed = state.fix_arm_fixed_side || "";
   const recalibrating = Boolean(state.fix_arm_recalibrating);
+  const side = fixed || selected;
+  const label = side === "right" ? "右臂" : "左臂";
   if (fixArmSideSelectEl) {
     fixArmSideSelectEl.disabled = !activeControls.has("fix_arm_select") || Boolean(fixed);
     if (document.activeElement !== fixArmSideSelectEl) {
       fixArmSideSelectEl.value = selected;
     }
   }
+  if (fixArmToggleButtonEl) {
+    fixArmToggleButtonEl.disabled = !activeControls.has("fix_arm_toggle");
+    fixArmToggleButtonEl.textContent = recalibrating
+      ? `重采 ${label} Home...`
+      : fixed
+        ? `重采 ${label} Home`
+        : `固定 ${label}`;
+  }
   if (!fixArmStatusEl) return;
-  const side = fixed || selected;
-  const label = side === "right" ? "右臂" : "左臂";
   const lines = [];
   if (recalibrating) {
     const count = state.fix_arm_sample_count == null ? "-" : String(state.fix_arm_sample_count);
@@ -2006,6 +2149,44 @@ function renderFixArm(state) {
   }
   if (state.fix_arm_status) lines.push(String(state.fix_arm_status));
   fixArmStatusEl.textContent = lines.join("\\n");
+}
+
+function renderInitArm(state) {
+  const available = Boolean(state.init_arm_available);
+  if (initArmSectionEl) initArmSectionEl.hidden = !available;
+  if (!available) return;
+  const selected = state.init_arm_selected_side || "left";
+  const activeSide = state.init_arm_active_side || "";
+  const recalibrating = Boolean(state.init_arm_recalibrating);
+  const side = activeSide || selected;
+  const label = side === "right" ? "右臂" : "左臂";
+  if (initArmSideSelectEl) {
+    initArmSideSelectEl.disabled = !activeControls.has("init_arm_select") || Boolean(activeSide);
+    if (document.activeElement !== initArmSideSelectEl) {
+      initArmSideSelectEl.value = selected;
+    }
+  }
+  if (initArmToggleButtonEl) {
+    initArmToggleButtonEl.disabled = !activeControls.has("init_arm_toggle");
+    initArmToggleButtonEl.textContent = recalibrating
+      ? `重采 ${label} Home...`
+      : activeSide
+        ? `重采 ${label} Home`
+        : `${label}归位`;
+  }
+  if (!initArmStatusEl) return;
+  const lines = [];
+  if (recalibrating) {
+    const count = state.init_arm_sample_count == null ? "-" : String(state.init_arm_sample_count);
+    const total = state.init_arm_min_samples == null ? "-" : String(state.init_arm_min_samples);
+    lines.push(`${label}: 重采 home ${count}/${total}`);
+  } else if (activeSide) {
+    lines.push(`${label}: 归位中`);
+  } else {
+    lines.push(`${label}: 待归位`);
+  }
+  if (state.init_arm_status) lines.push(String(state.init_arm_status));
+  initArmStatusEl.textContent = lines.join("\\n");
 }
 
 function formatCapture(state) {
@@ -2334,6 +2515,15 @@ function renderCameraStatus(state) {
       `timeout: ${formatCount(item.timeout_count)} consecutive=${formatCount(item.consecutive_timeout_count)}`,
       `restart: ${formatCount(item.restart_count)} preview=${preview}`,
     ];
+    if (item.depth_required || item.depth_enabled) {
+      const depthWidth = item.depth_width == null ? "-" : String(item.depth_width);
+      const depthHeight = item.depth_height == null ? "-" : String(item.depth_height);
+      const depthFps = item.depth_fps == null ? "-" : String(item.depth_fps);
+      lines.push(
+        `depth: ${item.depth_status_label || "-"} required=${formatFlag(item.depth_required)} present=${formatFlag(item.depth_frame_present)} profile=${depthWidth}x${depthHeight}@${depthFps} scale=${formatScalar(item.depth_scale_m_per_unit)}`
+      );
+      if (item.depth_status_message) lines.push(`depth status: ${item.depth_status_message}`);
+    }
     if (item.status_message) lines.push(`status: ${item.status_message}`);
     if (item.last_runtime_error && item.last_runtime_error !== item.last_error) {
       lines.push(`runtime: ${item.last_runtime_error}`);
@@ -2915,9 +3105,11 @@ async function refresh() {
     captureStatusEl.innerHTML = formatCaptureStatus(state);
     renderCaptureMode(state);
     updateButtons(state);
+    updateShortcutHints(state);
     renderViveCalibrationProfile(state);
     renderMovementMultiple(state);
     renderFixArm(state);
+    renderInitArm(state);
     renderRawPoses(state);
     renderEpisode(state);
     renderVisualization(state);
@@ -3136,6 +3328,32 @@ _FALLBACK_SCRIPT = r"""
     var i;
     for (i = 0; i < controls.length; i += 1) active[String(controls[i])] = true;
     fallbackActiveControls = active;
+    var shortcutC = byId("shortcutCLabel");
+    if (shortcutC) {
+      if (state.fix_arm_available && state.teleop_running) {
+        var shortcutSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+        var shortcutLabel = shortcutSide === "right" ? "右臂" : "左臂";
+        shortcutC.textContent = state.fix_arm_recalibrating || state.fix_arm_active
+          ? "重采 " + shortcutLabel + " Home"
+          : "固定 " + shortcutLabel;
+      } else if (state.teleop_running) {
+        shortcutC.textContent = "无 fix-arm 时不可用";
+      } else {
+        shortcutC.textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+      }
+    }
+    var shortcutG = byId("shortcutGLabel");
+    if (shortcutG) {
+      if (state.init_arm_available && state.teleop_running) {
+        var initShortcutSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var initShortcutLabel = initShortcutSide === "right" ? "右臂" : "左臂";
+        shortcutG.textContent = state.init_arm_recalibrating || state.init_arm_active
+          ? "重采 " + initShortcutLabel + " Home"
+          : initShortcutLabel + "归位";
+      } else {
+        shortcutG.textContent = "归位不可用";
+      }
+    }
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (i = 0; i < buttons.length; i += 1) {
       var eventName = buttons[i].getAttribute("data-event");
@@ -3149,9 +3367,27 @@ _FALLBACK_SCRIPT = r"""
             : state.fix_arm_active
               ? "重采 " + label + " Home"
               : "固定 " + label;
+        } else if (state.teleop_running) {
+          buttons[i].textContent = "无 fix-arm 时不可用";
         } else {
           buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
         }
+      } else if (eventName === "fix_arm_toggle") {
+        var fixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+        var fixLabel = fixSide === "right" ? "右臂" : "左臂";
+        buttons[i].textContent = state.fix_arm_recalibrating
+          ? "重采 " + fixLabel + " Home..."
+          : state.fix_arm_active
+            ? "重采 " + fixLabel + " Home"
+            : "固定 " + fixLabel;
+      } else if (eventName === "init_arm_toggle") {
+        var initSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var initLabel = initSide === "right" ? "右臂" : "左臂";
+        buttons[i].textContent = state.init_arm_recalibrating
+          ? "重采 " + initLabel + " Home..."
+          : state.init_arm_active
+            ? "重采 " + initLabel + " Home"
+            : initLabel + "归位";
       }
     }
   }
@@ -3362,6 +3598,20 @@ _FALLBACK_SCRIPT = r"""
       var lines = [];
       if (item.serial || item.serial_number) lines.push("serial: " + (item.serial_number || item.serial));
       if (item.frame_count != null) lines.push("frames: " + item.frame_count + " age=" + (item.last_frame_age_sec == null ? "-" : Number(item.last_frame_age_sec).toFixed(2) + " s"));
+      if (item.depth_required || item.depth_enabled) {
+        var depthWidth = item.depth_width == null ? "-" : String(item.depth_width);
+        var depthHeight = item.depth_height == null ? "-" : String(item.depth_height);
+        var depthFps = item.depth_fps == null ? "-" : String(item.depth_fps);
+        var depthScale = item.depth_scale_m_per_unit == null ? "-" : Number(item.depth_scale_m_per_unit).toFixed(3);
+        lines.push(
+          "depth: " + (item.depth_status_label || "-") +
+          " required=" + (item.depth_required === true ? "yes" : item.depth_required === false ? "no" : "-") +
+          " present=" + (item.depth_frame_present === true ? "yes" : item.depth_frame_present === false ? "no" : "-") +
+          " profile=" + depthWidth + "x" + depthHeight + "@" + depthFps +
+          " scale=" + depthScale
+        );
+        if (item.depth_status_message) lines.push("depth status: " + item.depth_status_message);
+      }
       if (item.device_count != null || item.ready_count != null) lines.push("ready: " + (item.ready_count == null ? "-" : item.ready_count) + "/" + (item.ready_total || item.device_count || "-"));
       if (item.status_message) lines.push("status: " + item.status_message);
       if (item.last_error) lines.push("error: " + item.last_error);
@@ -3502,10 +3752,14 @@ _FALLBACK_SCRIPT = r"""
     } else if (key === "b") {
       eventName = state.teleop_running ? "h" : "p";
     } else if (key === "c") {
-      if (state.fix_arm_available && state.teleop_running && fallbackActiveControls["c"]) {
-        eventName = "c";
+      if (state.fix_arm_available && state.teleop_running && fallbackActiveControls["fix_arm_toggle"]) {
+        eventName = "fix_arm_toggle";
       } else if (!state.teleop_running && String(state.capture_stage || "") && fallbackActiveControls["c"]) {
         eventName = "c";
+      }
+    } else if (key === "g") {
+      if (state.init_arm_available && state.teleop_running && fallbackActiveControls["init_arm_toggle"]) {
+        eventName = "init_arm_toggle";
       }
     } else {
       return false;
@@ -3528,7 +3782,7 @@ _FALLBACK_SCRIPT = r"""
       event = event || window.event;
       if (event.repeat || isEditableTargetFallback(event.target || event.srcElement)) return;
       var key = String(event.key || "").toLowerCase();
-      if (key !== "a" && key !== "b" && key !== "c") return;
+      if (key !== "a" && key !== "b" && key !== "c" && key !== "g") return;
       if (event.preventDefault) event.preventDefault();
       event.returnValue = false;
       postKeyboardShortcutFallback(key);
@@ -3540,7 +3794,10 @@ _FALLBACK_SCRIPT = r"""
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
         var eventName = this.getAttribute("data-event");
-        postEvent(eventName, eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null);
+        var sendEventName = (
+          eventName === "c" && fallbackLatestState.fix_arm_available && fallbackLatestState.teleop_running
+        ) ? "fix_arm_toggle" : eventName;
+        postEvent(sendEventName, eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null);
       };
     }
     var chooseButton = byId("datasetChooseRootButton");
@@ -3560,7 +3817,7 @@ _FALLBACK_SCRIPT = r"""
 """
 
 
-_PAGE_VERSION = "real_teleop_gui_collection_tasks_fix_arm_pose_snapshot_v1"
+_PAGE_VERSION = "real_teleop_gui_init_arm_v1"
 
 
 def _html_text(value: Any) -> str:
@@ -3905,6 +4162,15 @@ class CalibrationWebUiState:
     fix_arm_status: str = ""
     fix_arm_sample_count: int | None = None
     fix_arm_min_samples: int | None = None
+    init_arm_available: bool = False
+    init_arm_selected_side: str = ""
+    init_arm_active_side: str = ""
+    init_arm_active: bool = False
+    init_arm_recalibrating: bool = False
+    init_arm_status: str = ""
+    init_arm_sample_count: int | None = None
+    init_arm_min_samples: int | None = None
+    init_arm_profile_path: str = ""
     pose_snapshot_available: bool = False
     pose_snapshot_dir: str = ""
     pose_snapshot_count: int = 0
@@ -4074,11 +4340,33 @@ class CalibrationWebUi:
     def push_event(self, event: str) -> bool:
         event_name = str(event)
         event_control = event_name.split(":", 1)[0]
-        if ":" in event_name and event_control not in {"movement_multiple_set", "episode_start", "fix_arm_select"}:
+        if ":" in event_name and event_control not in {
+            "movement_multiple_set",
+            "episode_start",
+            "fix_arm_select",
+            "init_arm_select",
+        }:
             return False
         with self._state_lock:
             active_controls = set(self._state.active_controls)
-        if event_name not in active_controls and event_control not in active_controls:
+            accepted = event_name in active_controls or event_control in active_controls
+            if (
+                event_name in {"c", "fix_arm_toggle", "g", "init_arm_toggle"}
+                or event_control in {"fix_arm_select", "init_arm_select"}
+            ):
+                status = "accepted" if accepted else "rejected"
+                controls = ",".join(sorted(str(item) for item in active_controls))
+                self._state.messages.append(
+                    {
+                        "tag": "WebGUIEvent",
+                        "message": (
+                            f"{status}: {event_name}; active_controls=[{controls}]"
+                        ),
+                    }
+                )
+                if len(self._state.messages) > 48:
+                    self._state.messages = self._state.messages[-48:]
+        if not accepted:
             return False
         self._events.put(event_name)
         return True
@@ -4188,6 +4476,15 @@ class CalibrationWebUi:
                 "fix_arm_status": self._state.fix_arm_status,
                 "fix_arm_sample_count": self._state.fix_arm_sample_count,
                 "fix_arm_min_samples": self._state.fix_arm_min_samples,
+                "init_arm_available": self._state.init_arm_available,
+                "init_arm_selected_side": self._state.init_arm_selected_side,
+                "init_arm_active_side": self._state.init_arm_active_side,
+                "init_arm_active": self._state.init_arm_active,
+                "init_arm_recalibrating": self._state.init_arm_recalibrating,
+                "init_arm_status": self._state.init_arm_status,
+                "init_arm_sample_count": self._state.init_arm_sample_count,
+                "init_arm_min_samples": self._state.init_arm_min_samples,
+                "init_arm_profile_path": self._state.init_arm_profile_path,
                 "pose_snapshot_available": self._state.pose_snapshot_available,
                 "pose_snapshot_dir": self._state.pose_snapshot_dir,
                 "pose_snapshot_count": self._state.pose_snapshot_count,

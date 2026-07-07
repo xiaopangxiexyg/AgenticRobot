@@ -423,24 +423,106 @@ def load_replay_arm_joint_targets_from_parquet(
             f"row_count={len(rows)}."
         )
     targets_by_side: dict[str, list[np.ndarray]] = {side: [] for side in loaded_sides}
+    invalid_sides: set[str] = set()
     for row_index, row in enumerate(rows[start:stop], start=start):
         for side in loaded_sides:
+            if side in invalid_sides:
+                continue
             key = f"action.replay.{side}_arm_joint_target"
             value = row.get(key)
             if value is None:
-                raise ValueError(
+                message = (
                     f"Replay row {row_index} column {key!r} is missing; cannot use qpos init."
                 )
+                if required:
+                    raise ValueError(message)
+                invalid_sides.add(side)
+                continue
             vector = np.asarray(value, dtype=np.float32).reshape(-1)
             if vector.shape != (ARM_JOINT_DOF,) or not np.all(np.isfinite(vector)):
-                raise ValueError(
+                message = (
                     f"Replay row {row_index} column {key!r} must be finite shape ({ARM_JOINT_DOF},), "
                     f"got {vector.shape}."
                 )
+                if required:
+                    raise ValueError(message)
+                invalid_sides.add(side)
+                continue
             targets_by_side[side].append(vector.astype(np.float32, copy=True))
+    for side in invalid_sides:
+        targets_by_side.pop(side, None)
     return {
         side: np.stack(values, axis=0).astype(np.float32, copy=False)
         for side, values in targets_by_side.items()
+        if values
+    }
+
+
+def load_replay_arm_observation_qpos_from_parquet(
+    parquet_path: str | Path,
+    *,
+    active_sides: Sequence[str],
+    field_name: str,
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Load observation arm qpos columns for replay start initialization.
+
+    These columns are state observations, not trajectory commands. Missing or
+    malformed rows are represented as NaN vectors so the caller can choose a
+    valid initialization frame without treating the whole episode as a qpos
+    target replay.
+    """
+
+    field = str(field_name or "").strip()
+    if not field:
+        raise ValueError("field_name must be non-empty.")
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    requested_columns = [
+        f"observation.arm.{side}.{field}"
+        for side in ("left", "right")
+        if side in set(active_sides)
+    ]
+    schema = pq.read_schema(path)
+    available_columns = set(schema.names)
+    columns = [column for column in requested_columns if column in available_columns]
+    if not columns:
+        return {}
+
+    loaded_sides = [
+        side
+        for side in active_sides
+        if f"observation.arm.{side}.{field}" in columns
+    ]
+    rows = pq.read_table(path, columns=columns).to_pylist()
+    if not rows:
+        raise ValueError(f"Replay parquet contains no rows: {path}")
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay frame range is empty: start_index={start}, end_index={end_index}, "
+            f"row_count={len(rows)}."
+        )
+
+    invalid = nan_vector(ARM_JOINT_DOF)
+    qpos_by_side: dict[str, list[np.ndarray]] = {side: [] for side in loaded_sides}
+    for row in rows[start:stop]:
+        for side in loaded_sides:
+            key = f"observation.arm.{side}.{field}"
+            value = row.get(key)
+            try:
+                vector = np.asarray(value, dtype=np.float32).reshape(-1)
+            except Exception:
+                vector = invalid
+            if vector.shape != (ARM_JOINT_DOF,):
+                vector = invalid
+            qpos_by_side[side].append(vector.astype(np.float32, copy=True))
+    return {
+        side: np.stack(values, axis=0).astype(np.float32, copy=False)
+        for side, values in qpos_by_side.items()
+        if values
     }
 
 

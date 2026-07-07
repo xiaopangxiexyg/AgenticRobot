@@ -98,6 +98,26 @@ def test_single_arm_qpos_init_uses_slow_plan_for_moderate_delta() -> None:
     assert plan.completed
 
 
+def test_single_arm_qpos_init_accepts_custom_max_angvel() -> None:
+    plan = build_rm65_qpos_init_plan(
+        start_qpos_by_side={"right": np.zeros(6)},
+        target_qpos_by_side={"right": np.deg2rad([10.0, 0.0, 0.0, 0.0, 0.0, 0.0])},
+        active_sides=("right",),
+        qpos_dt_sec=0.5,
+        joint_velocity_profile="rm65_init_slow",
+        qpos_init_max_angvel_rad_s=0.1,
+        max_steps_per_side=10000,
+    )
+
+    assert plan.metadata["joint_velocity_profile"] == "custom_qpos_init_max_angvel"
+    assert plan.metadata["qpos_init_max_angvel_rad_s"] == [0.1] * 6
+    assert len(plan.steps) > 1
+    np.testing.assert_allclose(
+        plan.steps[0].qpos_by_side["right"],
+        np.asarray([0.05, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    )
+
+
 def test_single_arm_qpos_init_rejects_delta_over_120_deg() -> None:
     with pytest.raises(ValueError, match="delta 121.000deg exceeds 120.000deg"):
         build_rm65_qpos_init_plan(

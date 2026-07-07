@@ -397,6 +397,22 @@ def collector_sample_to_row(
         row[f"observation.arm.{side}.actual_state_provider_error"] = arm_state.get(
             "actual_state_provider_error"
         )
+        row[f"observation.arm.{side}.hardware_result_code"] = arm_state.get(
+            "hardware_result_code"
+        )
+        row[f"observation.arm.{side}.hardware_result_text"] = arm_state.get(
+            "hardware_result_text"
+        )
+        row[f"observation.arm.{side}.send_result_code"] = arm_state.get(
+            "send_result_code"
+        )
+        row[f"observation.arm.{side}.send_result_text"] = arm_state.get(
+            "send_result_text"
+        )
+        row[f"observation.arm.{side}.emergency_stopped"] = int(
+            bool(arm_state.get("emergency_stopped", False))
+        )
+        row[f"observation.arm.{side}.fault"] = arm_state.get("fault")
         row[f"observation.wrist_camera.{side}.pose_base"] = _pose_matrix_to_xyzquat_list(
             arm_state.get("wrist_camera_pose_base")
         )

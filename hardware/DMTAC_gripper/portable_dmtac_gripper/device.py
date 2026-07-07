@@ -64,6 +64,9 @@ class GripperConfig:
     baudrate: int = 115200
     timeout: float = 0.03
     max_open_mm: float = 70.0
+    reconnect_on_error: bool = True
+    reconnect_attempts: int = 1
+    reconnect_delay: float = 0.05
     debug: bool = False
 
 
@@ -228,6 +231,9 @@ class DMTacGripperDevice:
                 baudrate=cfg.baudrate,
                 timeout=cfg.timeout,
                 max_open_mm=cfg.max_open_mm,
+                reconnect_on_error=cfg.reconnect_on_error,
+                reconnect_attempts=cfg.reconnect_attempts,
+                reconnect_delay=cfg.reconnect_delay,
                 debug=cfg.debug,
             )
 

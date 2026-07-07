@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -10,7 +9,16 @@ from scipy.spatial.transform import Rotation as R
 from hardware.rm65.calibration_profiles import ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD, load_profile
 
 from ..deploy.schema import ACTION_ARM_POSE_SLICES, ARM_JOINT_DOF, xyzquat_to_pose_matrix
-from .trajectory import ReplayTrajectoryGroup
+from .action_frame import replay_action_metadata, replay_end_effector_targets_at_index
+from .trajectory import (
+    QPOS_INIT_AUTO,
+    REPLAY_TRAJECTORY_ACTION_POSE,
+    REPLAY_TRAJECTORY_QPOS_TARGET,
+    ReplayTrajectoryGroup,
+    normalize_qpos_init_source,
+    normalize_replay_trajectory_source,
+    select_replay_qpos_init_targets,
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +176,199 @@ def dataset_tcp_by_side(
     return values, checks
 
 
+def _qpos_trajectory_checks(
+    group: ReplayTrajectoryGroup,
+    *,
+    side: str,
+) -> tuple[np.ndarray | None, list[ReplayCheckResult]]:
+    checks: list[ReplayCheckResult] = []
+    targets = group.arm_joint_targets.get(side)
+    if targets is None:
+        checks.append(
+            ReplayCheckResult(
+                name=f"{side}_qpos_targets_present",
+                ok=False,
+                message=(
+                    f"{side} qpos trajectory mode requires "
+                    f"action.replay.{side}_arm_joint_target for every replay frame."
+                ),
+            )
+        )
+        return None, checks
+    target_array = np.asarray(targets, dtype=float)
+    if target_array.ndim != 2 or target_array.shape[1] != ARM_JOINT_DOF:
+        checks.append(
+            ReplayCheckResult(
+                name=f"{side}_qpos_targets_shape",
+                ok=False,
+                message=f"{side} qpos targets must have shape (N, 6).",
+                details={"shape": list(target_array.shape)},
+            )
+        )
+        return None, checks
+    if target_array.shape[0] != int(group.frame_count):
+        checks.append(
+            ReplayCheckResult(
+                name=f"{side}_qpos_targets_frame_count",
+                ok=False,
+                message=(
+                    f"{side} qpos target frame count {target_array.shape[0]} "
+                    f"does not match replay frame count {int(group.frame_count)}."
+                ),
+                details={"shape": list(target_array.shape), "frame_count": int(group.frame_count)},
+            )
+        )
+        return None, checks
+    if not np.all(np.isfinite(target_array)):
+        invalid = np.argwhere(~np.isfinite(target_array))
+        checks.append(
+            ReplayCheckResult(
+                name=f"{side}_qpos_targets_finite",
+                ok=False,
+                message=f"{side} qpos targets contain non-finite values.",
+                details={
+                    "first_invalid": invalid[0].astype(int).tolist() if invalid.size else None,
+                },
+            )
+        )
+        return None, checks
+    checks.append(
+        ReplayCheckResult(
+            name=f"{side}_qpos_targets_present",
+            ok=True,
+            level="info",
+            message=f"{side} qpos targets present",
+            details={"frame_count": int(target_array.shape[0])},
+        )
+    )
+    return target_array, checks
+
+
+def _action_pose_trajectory_checks(
+    group: ReplayTrajectoryGroup,
+    *,
+    side: str,
+) -> list[ReplayCheckResult]:
+    actions = np.asarray(group.actions, dtype=np.float32)
+    required_width = int(ACTION_ARM_POSE_SLICES[side].stop or 0)
+    if actions.ndim != 2 or actions.shape[1] < required_width:
+        return [
+            ReplayCheckResult(
+                name=f"{side}_action_pose_targets_shape",
+                ok=False,
+                message=(
+                    f"{side} action pose replay requires action shape (N, >={required_width}); "
+                    f"got {actions.shape}."
+                ),
+            )
+        ]
+    poses = actions[:, ACTION_ARM_POSE_SLICES[side]]
+    if poses.shape[0] != int(group.frame_count) or poses.shape[1] != 7:
+        return [
+            ReplayCheckResult(
+                name=f"{side}_action_pose_targets_frame_count",
+                ok=False,
+                message=(
+                    f"{side} action pose frame count {poses.shape[0]} "
+                    f"does not match replay frame count {int(group.frame_count)}."
+                ),
+                details={"shape": list(poses.shape), "frame_count": int(group.frame_count)},
+            )
+        ]
+    if not np.all(np.isfinite(poses)):
+        invalid = np.argwhere(~np.isfinite(poses))
+        return [
+            ReplayCheckResult(
+                name=f"{side}_action_pose_targets_finite",
+                ok=False,
+                message=f"{side} action pose targets contain non-finite values.",
+                details={
+                    "first_invalid": invalid[0].astype(int).tolist() if invalid.size else None,
+                },
+            )
+        ]
+    for frame_index, pose in enumerate(poses):
+        if xyzquat_to_pose_matrix(pose) is None:
+            return [
+                ReplayCheckResult(
+                    name=f"{side}_action_pose_targets_valid",
+                    ok=False,
+                    message=f"{side} action pose at frame {frame_index} cannot be converted to a pose matrix.",
+                    details={"frame_index": int(frame_index)},
+                )
+            ]
+    return [
+        ReplayCheckResult(
+            name=f"{side}_action_pose_targets_present",
+            ok=True,
+            level="info",
+            message=f"{side} action pose targets present",
+            details={"frame_count": int(poses.shape[0])},
+        )
+    ]
+
+
+def _end_effector_replay_checks(
+    group: ReplayTrajectoryGroup,
+    *,
+    side: str,
+    backend_present: bool,
+    active_sides: Sequence[str],
+) -> list[ReplayCheckResult]:
+    checks: list[ReplayCheckResult] = [
+        ReplayCheckResult(
+            name=f"{side}_end_effector_backend_present",
+            ok=bool(backend_present),
+            message=(
+                f"{side} replay end-effector backend "
+                f"{'configured' if backend_present else 'is missing'}."
+            ),
+        )
+    ]
+    try:
+        for frame_index in range(int(group.frame_count)):
+            replay_end_effector_targets_at_index(
+                group,
+                (side,),
+                index=frame_index,
+            )
+    except Exception as exc:  # noqa: BLE001
+        checks.append(
+            ReplayCheckResult(
+                name=f"{side}_end_effector_targets_valid",
+                ok=False,
+                message=str(exc),
+            )
+        )
+        return checks
+    checks.append(
+        ReplayCheckResult(
+            name=f"{side}_end_effector_targets_present",
+            ok=True,
+            level="info",
+            message=f"{side} end-effector replay targets present",
+            details={"frame_count": int(group.frame_count)},
+        )
+    )
+    metadata = replay_action_metadata(group, active_sides=active_sides)
+    hand_specs = metadata.get("hand_action_specs_by_side")
+    has_spec = isinstance(hand_specs, Mapping) and side in hand_specs
+    checks.append(
+        ReplayCheckResult(
+            name=f"{side}_end_effector_action_spec",
+            ok=True,
+            level="info" if has_spec else "warning",
+            message=(
+                f"{side} end-effector HandActionSpec loaded"
+                if has_spec
+                else f"{side} end-effector HandActionSpec missing; resolver will use q6 default semantics."
+            ),
+            details={"hand_action_spec": hand_specs.get(side) if isinstance(hand_specs, Mapping) else None},
+        )
+    )
+    return checks
+
+
 def run_replay_preflight(
     *,
     group: ReplayTrajectoryGroup,
@@ -178,8 +379,15 @@ def run_replay_preflight(
     tcp_pos_tolerance_m: float = 1e-4,
     tcp_rot_tolerance_rad: float = 1e-3,
     max_qpos_init_delta_rad: float = float(np.pi),
+    trajectory_source: str = REPLAY_TRAJECTORY_ACTION_POSE,
+    qpos_init_source: str = QPOS_INIT_AUTO,
+    end_effectors_enabled: bool = False,
+    end_effector_backend_sides: Sequence[str] = (),
 ) -> ReplayPreflightReport:
     sides = tuple(str(side) for side in active_sides)
+    trajectory_source = normalize_replay_trajectory_source(trajectory_source)
+    qpos_init_source = normalize_qpos_init_source(qpos_init_source)
+    end_effector_backend_side_set = {str(side) for side in end_effector_backend_sides}
     checks: list[ReplayCheckResult] = []
 
     if group.frame_count <= 0 or group.actions.size <= 0:
@@ -205,65 +413,52 @@ def run_replay_preflight(
 
     first_action = group.actions[0]
     for side in sides:
-        targets = group.arm_joint_targets.get(side)
-        if targets is None:
+        if trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
+            _, qpos_checks = _qpos_trajectory_checks(group, side=side)
+            checks.extend(qpos_checks)
+        else:
+            checks.extend(_action_pose_trajectory_checks(group, side=side))
+
+        qpos_init_targets, qpos_init_sources = select_replay_qpos_init_targets(
+            group,
+            (side,),
+            index=0,
+            source=qpos_init_source,
+        )
+        target = qpos_init_targets.get(side)
+        target_source = qpos_init_sources.get(side)
+        if target is None:
             checks.append(
                 ReplayCheckResult(
-                    name=f"{side}_qpos_targets_present",
+                    name=f"{side}_qpos_init_target_present",
                     ok=False,
                     message=(
-                        f"{side} replay requires action.replay.{side}_arm_joint_target; "
-                        "true hardware replay is disabled for this episode."
+                        f"{side} replay start requires a finite first-frame qpos init target "
+                        f"from source={qpos_init_source!r}."
                     ),
-                )
-            )
-            continue
-        if np.asarray(targets).ndim != 2 or np.asarray(targets).shape[1] != ARM_JOINT_DOF:
-            checks.append(
-                ReplayCheckResult(
-                    name=f"{side}_qpos_targets_shape",
-                    ok=False,
-                    message=f"{side} qpos targets must have shape (N, 6).",
-                    details={"shape": list(np.asarray(targets).shape)},
-                )
-            )
-            continue
-        target_array = np.asarray(targets, dtype=float)
-        if target_array.shape[0] != int(group.frame_count):
-            checks.append(
-                ReplayCheckResult(
-                    name=f"{side}_qpos_targets_frame_count",
-                    ok=False,
-                    message=(
-                        f"{side} qpos target frame count {target_array.shape[0]} "
-                        f"does not match replay frame count {int(group.frame_count)}."
-                    ),
-                    details={"shape": list(target_array.shape), "frame_count": int(group.frame_count)},
-                )
-            )
-            continue
-        if not np.all(np.isfinite(target_array)):
-            invalid = np.argwhere(~np.isfinite(target_array))
-            checks.append(
-                ReplayCheckResult(
-                    name=f"{side}_qpos_targets_finite",
-                    ok=False,
-                    message=f"{side} qpos targets contain non-finite values.",
                     details={
-                        "first_invalid": invalid[0].astype(int).tolist() if invalid.size else None,
+                        "qpos_init_source": qpos_init_source,
+                        "available_sources": sorted(
+                            select_replay_qpos_init_targets(
+                                group,
+                                (side,),
+                                index=0,
+                                source=QPOS_INIT_AUTO,
+                            )[1].values()
+                        ),
                     },
                 )
             )
-            continue
-        checks.append(
-            ReplayCheckResult(
-                name=f"{side}_qpos_targets_present",
-                ok=True,
-                level="info",
-                message=f"{side} qpos targets present",
-                details={"frame_count": int(target_array.shape[0])},
+        else:
+            checks.append(
+                ReplayCheckResult(
+                    name=f"{side}_qpos_init_target_present",
+                    ok=True,
+                    level="info",
+                    message=f"{side} qpos init target selected from {target_source}",
+                    details={"qpos_init_source": target_source},
+                )
             )
-        )
 
         current = _finite_vector(current_qpos_by_side.get(side), length=ARM_JOINT_DOF)
         if current is None:
@@ -274,8 +469,7 @@ def run_replay_preflight(
                     message=f"{side} current hardware qpos is unavailable.",
                 )
             )
-        else:
-            target = np.asarray(targets[0], dtype=float).reshape(ARM_JOINT_DOF)
+        elif target is not None:
             diff = np.abs(target - current)
             max_diff = float(np.max(diff))
             unsafe = np.flatnonzero(diff > float(max_qpos_init_delta_rad))
@@ -290,6 +484,7 @@ def run_replay_preflight(
                         "max_delta_rad": max_diff,
                         "max_delta_deg": float(np.rad2deg(max_diff)),
                         "unsafe_joint_indices": [int(index) for index in unsafe],
+                        "qpos_init_source": target_source,
                     },
                 )
             )
@@ -348,6 +543,16 @@ def run_replay_preflight(
                         "rot_rad": rot_rad,
                         "rot_deg": float(np.rad2deg(rot_rad)),
                     },
+                )
+            )
+
+        if bool(end_effectors_enabled):
+            checks.extend(
+                _end_effector_replay_checks(
+                    group,
+                    side=side,
+                    backend_present=side in end_effector_backend_side_set,
+                    active_sides=sides,
                 )
             )
 

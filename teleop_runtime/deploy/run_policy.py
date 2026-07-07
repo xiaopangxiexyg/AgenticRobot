@@ -16,7 +16,11 @@ from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from rm65_inspire_tac.paths import require_asset_path
 from robot_motion.runtime_gate import IKActionChunkGate
 
-from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from ..backends.arms import (
+    DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
+    RM65ArmBackend,
+    RM65ArmBackendConfig,
+)
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
     DMTAC_TACTILE_FIELDS,
@@ -56,12 +60,20 @@ from .actions import (
     NormalizedAction,
     normalize_policy_output,
 )
+from .canonical_action import CanonicalDeployActionPipeline
+from .dispatch import dispatch_teleop_command
 from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
 from .observation import build_deployment_observation
 from .policy import load_policy
+from .policy_qpos_init import (
+    DeployPolicyQposInitController,
+    DeployPolicyQposInitSettings,
+    load_deploy_policy_qpos_init_plan,
+)
 from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
 from .schema import ACTION_DIM, ALL_SIDES
 from .startup_init import StartupInitializer, resolve_startup_init_action
+from ..replay.trajectory import QPOS_INIT_SOURCES
 
 
 DEFAULT_CAMERA_CONFIG_PATH = (
@@ -171,6 +183,13 @@ def _positive_float(text: str) -> float:
     value = float(text)
     if value <= 0.0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
+def _unit_interval_float(text: str) -> float:
+    value = float(text)
+    if not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError("value must be in (0, 1]")
     return value
 
 
@@ -518,6 +537,7 @@ def _dmtac_backend_configs(
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
+    policy_qpos_defaults = DeployPolicyQposInitSettings()
     parser.add_argument(
         "--policy",
         "--policy-spec",
@@ -639,6 +659,109 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=(4.5, 4.5, 4.5, 6.0, 6.0, 8.0),
     )
     parser.add_argument("--deploy-fixed-init-qpos-tolerance", type=_positive_float, default=0.01)
+    parser.add_argument(
+        "--policy-qpos-init-dataset",
+        type=Path,
+        default=None,
+        help=(
+            "Dataset root used to move to a recorded qpos frame before policy inference. "
+            "This uses the same qpos target selection/planning path as replay init."
+        ),
+    )
+    parser.add_argument("--policy-qpos-init-parquet", type=Path, default=None)
+    parser.add_argument("--policy-qpos-init-episode", type=_non_negative_int, default=0)
+    parser.add_argument("--policy-qpos-init-frame", type=_non_negative_int, default=0)
+    parser.add_argument("--policy-qpos-init-action-column", type=str, default="action")
+    parser.add_argument(
+        "--policy-qpos-init-source",
+        choices=QPOS_INIT_SOURCES,
+        default="auto",
+        help="Recorded qpos source for dataset-frame initialization.",
+    )
+    parser.add_argument(
+        "--policy-qpos-init-timeout-s",
+        type=_positive_float,
+        default=policy_qpos_defaults.move_to_start_timeout_s,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-dt-sec",
+        type=_positive_float,
+        default=policy_qpos_defaults.qpos_init_dt_sec,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-joint-velocity-profile",
+        type=str,
+        default=policy_qpos_defaults.qpos_init_joint_velocity_profile,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-arm-max-angvel",
+        "--qpos-init-arm-max-angvel",
+        dest="policy_qpos_init_arm_max_angvel",
+        type=_parse_arm_max_angvel,
+        default=None,
+        help=(
+            "Optional first-frame QPOS init joint velocity limit in rad/s. "
+            "Accepts one value or six comma-separated values; overrides "
+            "--policy-qpos-init-joint-velocity-profile for qpos init planning."
+        ),
+    )
+    parser.add_argument(
+        "--policy-qpos-init-max-steps-per-side",
+        type=_positive_int,
+        default=policy_qpos_defaults.qpos_init_max_steps_per_side,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-collision-check",
+        dest="policy_qpos_init_collision_check",
+        action="store_true",
+        default=policy_qpos_defaults.qpos_init_collision_check,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-no-collision-check",
+        dest="policy_qpos_init_collision_check",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--policy-qpos-init-collision-scene-profile",
+        type=str,
+        default=policy_qpos_defaults.qpos_init_collision_scene_profile,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-branch-search",
+        dest="policy_qpos_init_branch_search",
+        action="store_true",
+        default=policy_qpos_defaults.qpos_init_branch_search,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-no-branch-search",
+        dest="policy_qpos_init_branch_search",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--policy-qpos-init-branch-search-max-branches",
+        type=_non_negative_int,
+        default=policy_qpos_defaults.qpos_init_branch_search_max_branches,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-branch-neutral-qpos-path",
+        type=Path,
+        default=policy_qpos_defaults.qpos_init_branch_neutral_qpos_path,
+    )
+    parser.add_argument(
+        "--policy-qpos-init-qpos-tolerance",
+        type=_positive_float,
+        default=policy_qpos_defaults.qpos_reached_tolerance_rad,
+    )
+    parser.add_argument(
+        "--start-init_qpos",
+        "--start-init-qpos",
+        dest="start_init_qpos",
+        action="store_true",
+        help=(
+            "Explicit safety override: allow real arm policy execution to start from the "
+            "current qpos without a dataset-frame policy qpos init."
+        ),
+    )
     parser.add_argument("--require-ready-observation", action="store_true")
     parser.add_argument("--pause-on-policy-error", dest="pause_on_policy_error", action="store_true", default=True)
     parser.add_argument("--no-pause-on-policy-error", dest="pause_on_policy_error", action="store_false")
@@ -693,6 +816,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--arm-max-angvel", type=_parse_arm_max_angvel, default=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5))
+    parser.add_argument(
+        "--singularity-qpos-init-slowdown",
+        type=_unit_interval_float,
+        default=DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
+        help=(
+            "Scale RM65 joint steps when first-frame QPOS init crosses singularity. "
+            "Only applies to replay/deploy QPOS initialization sources."
+        ),
+    )
     parser.add_argument("--arm-state-refresh-hz", type=float, default=10.0)
     parser.add_argument("--rm65-hardware-read-retries", type=_non_negative_int, default=1)
     parser.add_argument("--rm65-hardware-read-retry-delay-sec", type=float, default=0.02)
@@ -742,7 +874,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             f"Default: {DEFAULT_INSPIRE_HAND_MAX_FORCE}."
         ),
     )
-    parser.add_argument("--max-hand-step", type=float, default=0.08)
+    parser.add_argument(
+        "--max-hand-step",
+        type=float,
+        default=0.0,
+        help=(
+            "Reserved/no-op for future hand q6 rate limiting. "
+            "Current deploy clips hand q6 to [0, 1] but does not rate-limit it."
+        ),
+    )
     parser.add_argument("--left-gripper-port", type=str, default="", help="Optional left 1D gripper serial port.")
     parser.add_argument("--right-gripper-port", type=str, default="", help="Optional right 1D gripper serial port.")
     parser.add_argument("--left-gripper-id", type=int, default=1, help="Left gripper Modbus id.")
@@ -891,11 +1031,35 @@ def validate_args(args: argparse.Namespace) -> tuple[str, ...]:
         raise ValueError("Use only one of --init-dataset or --init-parquet.")
     if args.deploy_fixed_init_dataset and args.deploy_fixed_init_parquet:
         raise ValueError("Use only one of --deploy-fixed-init-dataset or --deploy-fixed-init-parquet.")
+    if args.policy_qpos_init_dataset and args.policy_qpos_init_parquet:
+        raise ValueError("Use only one of --policy-qpos-init-dataset or --policy-qpos-init-parquet.")
     if args.deploy_fixed_init_dataset or args.deploy_fixed_init_parquet:
+        if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
+            raise ValueError("Use only one of --deploy-fixed-init-* or --policy-qpos-init-*.")
         if active_sides != ("right",):
             raise ValueError("--deploy-fixed-init-* is currently right-arm/right-hand only; use --active-sides right.")
         if not bool(args.arms_enabled):
             raise ValueError("--deploy-fixed-init-* requires arms to be enabled.")
+    if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
+        if not bool(args.arms_enabled):
+            raise ValueError("--policy-qpos-init-* requires arms to be enabled.")
+    has_dataset_qpos_start = bool(
+        args.policy_qpos_init_dataset
+        or args.policy_qpos_init_parquet
+        or args.deploy_fixed_init_dataset
+        or args.deploy_fixed_init_parquet
+    )
+    if (
+        bool(args.send_actions)
+        and bool(args.arms_enabled)
+        and not has_dataset_qpos_start
+        and not bool(args.start_init_qpos)
+    ):
+        raise ValueError(
+            "Real arm policy execution requires dataset-frame qpos initialization "
+            "(--policy-qpos-init-dataset or --policy-qpos-init-parquet). "
+            "To intentionally start from the current qpos, pass --start-init_qpos."
+        )
     if args.debug_replay_end_index is not None and int(args.debug_replay_end_index) <= int(args.debug_replay_start_index):
         raise ValueError("--debug-replay-end-index must be greater than --debug-replay-start-index.")
     action_hz_start = args.debug_replay_start_index if args.action_hz_start_index is None else args.action_hz_start_index
@@ -1026,6 +1190,7 @@ def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...], 
                 connect_hardware=bool(arm_ip),
                 control_dt=control_dt,
                 max_angvel=tuple(float(value) for value in args.arm_max_angvel),
+                singularity_qpos_init_slowdown=float(args.singularity_qpos_init_slowdown),
                 dry_run_fast=not bool(arm_ip),
                 hardware_read_retries=int(args.rm65_hardware_read_retries),
                 hardware_read_retry_delay_sec=float(args.rm65_hardware_read_retry_delay_sec),
@@ -1165,12 +1330,13 @@ def print_controls(
     auto_start: bool,
     wait_for_ready_confirm: bool,
     fixed_init_enabled: bool = False,
+    policy_qpos_init_enabled: bool = False,
 ) -> None:
     print("\n" + "=" * 60)
     print("teleop_runtime policy deployment loop started")
     print(f"  send_actions={'on' if send_actions else 'off(dry-run)'}")
-    if fixed_init_enabled and auto_start:
-        initial_policy_state = "paused(auto-start after fixed-init)"
+    if (fixed_init_enabled or policy_qpos_init_enabled) and auto_start:
+        initial_policy_state = "paused(auto-start after init)"
     else:
         initial_policy_state = "active" if auto_start else "paused"
     print(f"  initial_policy_state={initial_policy_state}")
@@ -1179,6 +1345,9 @@ def print_controls(
     if fixed_init_enabled:
         print("  fixed_init=on(H first-frame qpos, H execute T, then startup init)")
         print("Controls: H=pause policy or fixed-init step, g=start after fixed-init, A=confirm, q=quit")
+    elif policy_qpos_init_enabled:
+        print("  policy_qpos_init=on(g moves to dataset frame qpos, then startup init)")
+        print("Controls: g=start qpos init / resume, A=confirm ready, h=pause+clear queue, q=quit")
     else:
         print("Controls: g=start/resume, A=confirm ready/start policy, h=pause+clear queue, q=quit")
     print("=" * 60 + "\n")
@@ -1210,12 +1379,18 @@ def _resolve_action_queue_policy(args: argparse.Namespace, *, debug_replay: bool
     return policy
 
 
-def _send_commands(
+def _send_legacy_deployment_action_commands(
     commands: Mapping[str, Any],
     *,
     arm_backends: Mapping[str, RM65ArmBackend],
     hand_backends: Mapping[str, EffectorBackend],
 ) -> None:
+    """Archived direct DeploymentAction command dispatcher.
+
+    The active deploy policy path now resolves NormalizedAction through
+    RobotAction/TeleopCommand in teleop_runtime.deploy.canonical_action.
+    """
+
     for side in ALL_SIDES:
         arm_command = commands.get(f"{side}_arm")
         arm_backend = arm_backends.get(side)
@@ -1290,6 +1465,15 @@ def main(argv: list[str] | None = None) -> int:
         action_column=str(args.deploy_fixed_init_action_column),
         active_sides=active_sides,
     )
+    policy_qpos_init_plan = load_deploy_policy_qpos_init_plan(
+        dataset_root=args.policy_qpos_init_dataset,
+        parquet_path=args.policy_qpos_init_parquet,
+        episode_index=int(args.policy_qpos_init_episode),
+        frame_index=int(args.policy_qpos_init_frame),
+        action_column=str(args.policy_qpos_init_action_column),
+        active_sides=active_sides,
+        qpos_init_source=str(args.policy_qpos_init_source),
+    )
 
     effective_action_hz, action_hz_info = resolve_effective_action_hz(args, policy)
     effective_policy_hz, policy_hz_source = resolve_effective_policy_hz(
@@ -1342,6 +1526,12 @@ def main(argv: list[str] | None = None) -> int:
             max_hand_step=float(args.max_hand_step),
         )
     )
+    canonical_action_pipeline = CanonicalDeployActionPipeline(
+        safety_filter=safety_filter,
+        active_sides=active_sides,
+        arms_enabled=bool(args.arms_enabled),
+        hands_enabled=bool(hands_enabled),
+    )
     chunk_buffer = ActionChunkBuffer()
     ik_action_gate = IKActionChunkGate(stable_frames_required=int(args.ik_recovery_stable_frames))
     startup_initializer = StartupInitializer(
@@ -1364,8 +1554,33 @@ def main(argv: list[str] | None = None) -> int:
             qpos_tolerance=float(args.deploy_fixed_init_qpos_tolerance),
         )
     )
+    policy_qpos_init_controller = (
+        None
+        if policy_qpos_init_plan is None
+        else DeployPolicyQposInitController(
+            policy_qpos_init_plan,
+            active_sides=active_sides,
+            settings=DeployPolicyQposInitSettings(
+                qpos_reached_tolerance_rad=float(args.policy_qpos_init_qpos_tolerance),
+                move_to_start_timeout_s=float(args.policy_qpos_init_timeout_s),
+                qpos_init_dt_sec=float(args.policy_qpos_init_dt_sec),
+                qpos_init_joint_velocity_profile=str(args.policy_qpos_init_joint_velocity_profile),
+                qpos_init_max_angvel_rad_s=args.policy_qpos_init_arm_max_angvel,
+                qpos_init_max_steps_per_side=int(args.policy_qpos_init_max_steps_per_side),
+                qpos_init_collision_check=bool(args.policy_qpos_init_collision_check),
+                qpos_init_collision_scene_profile=str(args.policy_qpos_init_collision_scene_profile),
+                qpos_init_branch_search=bool(args.policy_qpos_init_branch_search),
+                qpos_init_branch_search_max_branches=int(args.policy_qpos_init_branch_search_max_branches),
+                qpos_init_branch_neutral_qpos_path=args.policy_qpos_init_branch_neutral_qpos_path,
+            ),
+        )
+    )
 
-    policy_active = bool(args.auto_start) and fixed_init_controller is None
+    policy_active = (
+        bool(args.auto_start)
+        and fixed_init_controller is None
+        and policy_qpos_init_controller is None
+    )
     send_actions = bool(args.send_actions)
     wait_for_ready_confirm = (
         bool(send_actions) and fixed_init_controller is None
@@ -1415,6 +1630,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"hz={fixed_init_plan.action_hz:.3f} "
                 f"after=T_then_startup_init:{startup_init_source}"
             )
+        if policy_qpos_init_plan is not None:
+            print(
+                "[PolicyQposInit] source="
+                f"{policy_qpos_init_plan.source_path} "
+                f"episode={policy_qpos_init_plan.source_episode_index} "
+                f"frame={policy_qpos_init_plan.frame_index} "
+                f"qpos_source={policy_qpos_init_plan.metadata.get('qpos_init_source')} "
+                f"targets={policy_qpos_init_plan.target_sources_by_side} "
+                f"after=startup_init:{startup_init_source}"
+            )
+        elif bool(args.start_init_qpos) and bool(args.send_actions) and bool(args.arms_enabled):
+            print(
+                "[Deploy] start_init_qpos override enabled: "
+                "real arm policy execution may start from current qpos without dataset-frame qpos init."
+            )
         if not send_actions:
             print("[Deploy] dry-run: actions are filtered and logged but not sent to hardware.")
         if (
@@ -1455,7 +1685,15 @@ def main(argv: list[str] | None = None) -> int:
             auto_start=bool(args.auto_start),
             wait_for_ready_confirm=wait_for_ready_confirm,
             fixed_init_enabled=fixed_init_controller is not None,
+            policy_qpos_init_enabled=policy_qpos_init_controller is not None,
         )
+        if policy_qpos_init_controller is not None and bool(args.auto_start):
+            message = policy_qpos_init_controller.begin(
+                arm_backends=arm_backends,
+                now=time.time(),
+            )
+            if message:
+                print(message)
 
         with NonBlockingKeyboard() as keyboard:
             while True:
@@ -1475,6 +1713,14 @@ def main(argv: list[str] | None = None) -> int:
                     ready_confirmed = not wait_for_ready_confirm
                     if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
                         print("[Deploy] ignore g: complete fixed-init H -> H before starting policy.")
+                    elif policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
+                        policy_active = False
+                        message = policy_qpos_init_controller.begin(
+                            arm_backends=arm_backends,
+                            now=loop_started_at,
+                        )
+                        if message:
+                            print(message)
                     else:
                         policy_active = True
                         print("[Deploy] policy active")
@@ -1484,6 +1730,9 @@ def main(argv: list[str] | None = None) -> int:
                     if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
                         policy_active = False
                         print("[Deploy] ready confirm ignored: complete fixed-init H -> H first.")
+                    elif policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
+                        policy_active = False
+                        print("[Deploy] ready confirm ignored: complete policy qpos init first (press g).")
                     elif startup_initializer.enabled and not startup_initializer.completed:
                         print("[Deploy] ready confirm ignored: startup init is not complete yet.")
                     else:
@@ -1504,11 +1753,16 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         if message:
                             print(message)
+                    elif policy_qpos_init_controller is not None and policy_qpos_init_controller.running:
+                        policy_active = False
+                        print("[PolicyQposInit] ignore h while qpos init is running.")
                     else:
                         policy_active = False
                         print("[Deploy] policy paused")
                 elif key == "x" and fixed_init_controller is not None and fixed_init_controller.running:
                     print("[FixedInit] ignore x while fixed trajectory is running.")
+                elif key == "x" and policy_qpos_init_controller is not None and policy_qpos_init_controller.running:
+                    print("[PolicyQposInit] ignore x while qpos init is running.")
                 elif key == "q":
                     print("\n[Deploy] quitting policy deployment loop\n")
                     break
@@ -1577,11 +1831,36 @@ def main(argv: list[str] | None = None) -> int:
                             print("[Deploy] fixed-init complete; press g to run startup init/policy.")
                         fixed_completed_this_step = True
 
+                policy_qpos_completed_this_step = False
+                if policy_qpos_init_controller is not None:
+                    policy_qpos_result = policy_qpos_init_controller.step(
+                        now=loop_started_at,
+                        send_actions=send_actions,
+                        arm_backends=arm_backends,
+                    )
+                    if policy_qpos_result.last_action is not None:
+                        last_action = policy_qpos_result.last_action.astype(np.float32, copy=True)
+                    if policy_qpos_result.message:
+                        print(policy_qpos_result.message)
+                    if policy_qpos_result.completed:
+                        policy.reset()
+                        chunk_buffer.clear()
+                        startup_initializer.reset()
+                        last_policy_at = None
+                        ready_confirmed = not wait_for_ready_confirm
+                        policy_active = True
+                        policy_qpos_completed_this_step = True
+                        print("[Deploy] policy qpos init complete; startup init/policy released.")
+
                 if policy_active:
                     can_run_policy = not (bool(args.require_ready_observation) and faults)
                     if fixed_completed_this_step:
                         can_run_policy = False
+                    if policy_qpos_completed_this_step:
+                        can_run_policy = False
                     if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
+                        can_run_policy = False
+                    if policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
                         can_run_policy = False
                     if startup_initializer.enabled and not startup_initializer.completed:
                         if can_run_policy:
@@ -1591,28 +1870,28 @@ def main(argv: list[str] | None = None) -> int:
                             )
                             faults.extend(init_faults)
                             if init_action is not None:
-                                deployment_action = safety_filter.filter(
+                                canonical_action = canonical_action_pipeline.prepare(
                                     init_action,
                                     observation,
                                     policy_name="startup_init",
                                 )
-                                faults.extend(deployment_action.faults)
+                                faults.extend(canonical_action.faults)
                                 if (
                                     startup_initializer.progress >= 1.0
-                                    and not deployment_action.faults
+                                    and not canonical_action.faults
                                 ):
                                     startup_initializer.update_resolved_target_action(
-                                        deployment_action.vector
+                                        canonical_action.action.vector
                                     )
-                                if deployment_action.commands:
+                                if canonical_action.command is not None and canonical_action.command.commands:
                                     if send_actions:
-                                        _send_commands(
-                                            deployment_action.commands,
+                                        dispatch_teleop_command(
+                                            canonical_action.command,
                                             arm_backends=arm_backends,
                                             hand_backends=hand_backends,
                                         )
-                                    last_action = deployment_action.vector.astype(np.float32, copy=True)
-                                if init_ready and not deployment_action.faults:
+                                    last_action = canonical_action.action.vector.astype(np.float32, copy=True)
+                                if init_ready and not canonical_action.faults:
                                     startup_initializer.mark_complete()
                                     if startup_initializer.source in {"replay:first_frame", "policy:first_frame"}:
                                         skipped = _skip_startup_replay_frames(policy, count=1)
@@ -1672,20 +1951,20 @@ def main(argv: list[str] | None = None) -> int:
                         else None
                     )
                     if raw_action is not None:
-                        deployment_action = safety_filter.filter(
+                        canonical_action = canonical_action_pipeline.prepare(
                             raw_action,
                             observation,
                             policy_name=policy.name,
                         )
-                        faults.extend(deployment_action.faults)
-                        if deployment_action.commands:
+                        faults.extend(canonical_action.faults)
+                        if canonical_action.command is not None and canonical_action.command.commands:
                             if send_actions:
-                                _send_commands(
-                                    deployment_action.commands,
+                                dispatch_teleop_command(
+                                    canonical_action.command,
                                     arm_backends=arm_backends,
                                     hand_backends=hand_backends,
                                 )
-                            last_action = deployment_action.vector.astype(np.float32, copy=True)
+                            last_action = canonical_action.action.vector.astype(np.float32, copy=True)
 
                 fault_text = _compact_faults(faults)
                 if fault_text != last_fault_text:
@@ -1698,6 +1977,11 @@ def main(argv: list[str] | None = None) -> int:
                         text
                         for text in (
                             fixed_init_controller.status_text if fixed_init_controller is not None else "",
+                            (
+                                policy_qpos_init_controller.status_text
+                                if policy_qpos_init_controller is not None
+                                else ""
+                            ),
                             startup_initializer.status_text,
                             "ready=wait:A" if (
                                 wait_for_ready_confirm
@@ -1729,6 +2013,11 @@ def main(argv: list[str] | None = None) -> int:
                 loop_target_hz = float(effective_action_hz)
                 if fixed_init_controller is not None and fixed_init_controller.running:
                     loop_target_hz = max(loop_target_hz, float(fixed_init_controller.plan.action_hz))
+                if policy_qpos_init_controller is not None and policy_qpos_init_controller.running:
+                    loop_target_hz = max(
+                        loop_target_hz,
+                        1.0 / max(0.001, float(args.policy_qpos_init_dt_sec)),
+                    )
                 sleep_time = (1.0 / loop_target_hz) - (time.time() - loop_started_at)
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)

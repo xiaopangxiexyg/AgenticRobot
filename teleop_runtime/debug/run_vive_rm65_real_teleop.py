@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import queue
 from collections import deque
@@ -69,8 +70,10 @@ from ..collection.status_snapshot import (
 from ..collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
+    DEFAULT_ARM_WORKSPACE_CONFIG_PATH,
     build_bimanual_pose_smoother,
     build_annotated_dual_rm65_calibration,
+    load_arm_workspace_config,
     load_default_pose_smoothing_config,
 )
 from ..configs.dmtac_hardware import (
@@ -135,6 +138,11 @@ from ..special_tasks.fix_arm import (
     FixArmPoseSnapshotRecorder,
     advance_fix_arm_home_capture,
     build_fix_arm_pose_snapshot_payload,
+)
+from ..special_tasks.init_arm import (
+    InitArmCommandController,
+    advance_init_arm_home_capture,
+    load_init_arm_targets,
 )
 from ..tactile_visualizer import (
     AsyncTactileUVVisualizer,
@@ -337,6 +345,7 @@ class RealTeleopComponents:
     arm_loop_step_dt_tracker: dict[str, float | None]
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None
     fix_arm_controller: FixArmCommandController | None
+    init_arm_controller: InitArmCommandController | None
 
 
 @dataclass
@@ -699,21 +708,49 @@ def _compose_real_command_filter(
     *,
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None,
     fix_arm_controller: FixArmCommandController | None,
+    init_arm_controller: InitArmCommandController | None,
 ):
-    if temporary_safety_limiter is None and fix_arm_controller is None:
+    if (
+        temporary_safety_limiter is None
+        and fix_arm_controller is None
+        and init_arm_controller is None
+    ):
         return None
 
     def filter_command(command: TeleopCommand, observation, now: float) -> TeleopCommand:
         filtered = command
+        if init_arm_controller is not None:
+            filtered = init_arm_controller.filter_command(filtered, observation, now)
         if temporary_safety_limiter is not None:
             filtered = temporary_safety_limiter.filter_command(filtered, observation, now)
         if fix_arm_controller is not None:
             filtered = fix_arm_controller.filter_command(filtered, observation, now)
-        if temporary_safety_limiter is not None and fix_arm_controller is not None:
+        if temporary_safety_limiter is not None and (
+            fix_arm_controller is not None or init_arm_controller is not None
+        ):
             temporary_safety_limiter.sync_from_command(filtered)
         return filtered
 
     return filter_command
+
+
+def _compose_real_fault_filter(
+    *,
+    fix_arm_controller: FixArmCommandController | None,
+    init_arm_controller: InitArmCommandController | None,
+):
+    if fix_arm_controller is None and init_arm_controller is None:
+        return None
+
+    def filter_faults(faults, channels, now: float):
+        filtered = list(faults)
+        if fix_arm_controller is not None:
+            filtered = fix_arm_controller.filter_faults(filtered, channels, now)
+        if init_arm_controller is not None:
+            filtered = init_arm_controller.filter_faults(filtered, channels, now)
+        return filtered
+
+    return filter_faults
 
 
 def _filter_manual_real_command(
@@ -727,6 +764,7 @@ def _filter_manual_real_command(
     filter_command = _compose_real_command_filter(
         temporary_safety_limiter=components.temporary_safety_limiter,
         fix_arm_controller=components.fix_arm_controller,
+        init_arm_controller=getattr(components, "init_arm_controller", None),
     )
     if filter_command is None:
         return command
@@ -794,6 +832,148 @@ def _resolve_movement_multiple_args(
     setattr(args, "movement_multiple", value)
     setattr(args, "translation_scale", value)
     return value
+
+
+def _parse_vector3_arg(value: object, *, name: str) -> tuple[float, float, float]:
+    if isinstance(value, (list, tuple)):
+        parts = [
+            part.strip()
+            for item in value
+            for part in str(item).replace(",", " ").split()
+            if part.strip()
+        ]
+        text = " ".join(parts)
+    else:
+        text = str(value)
+        parts = [part.strip() for part in text.replace(",", " ").split() if part.strip()]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(f"{name} must contain 3 floats")
+    try:
+        parsed = tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid {name}: {text}") from exc
+    return (parsed[0], parsed[1], parsed[2])
+
+
+def _resolve_workspace_override_args(args: argparse.Namespace) -> None:
+    for attr in (
+        "arm_workspace_min",
+        "arm_workspace_max",
+        "left_arm_workspace_min",
+        "left_arm_workspace_max",
+        "right_arm_workspace_min",
+        "right_arm_workspace_max",
+    ):
+        value = getattr(args, attr, None)
+        if value is None:
+            continue
+        setattr(args, attr, _parse_vector3_arg(value, name=f"--{attr.replace('_', '-')}"))
+
+
+def _workspace_override_for_side(
+    args: argparse.Namespace,
+    side: str,
+    bound: str,
+) -> tuple[float, float, float] | None:
+    side_value = getattr(args, f"{side}_arm_workspace_{bound}", None)
+    if side_value is not None:
+        return side_value
+    return getattr(args, f"arm_workspace_{bound}", None)
+
+
+def _arm_workspace_config_path(args: argparse.Namespace) -> Path | None:
+    value = str(
+        getattr(args, "arm_workspace_config", str(DEFAULT_ARM_WORKSPACE_CONFIG_PATH))
+        or ""
+    ).strip()
+    if value.lower() in {"", "none", "off", "false", "disabled"}:
+        return None
+    return Path(value).expanduser()
+
+
+def _apply_workspace_config(
+    args: argparse.Namespace,
+    calibration: TeleopCalibration,
+) -> dict[str, dict[str, object]]:
+    config_path = _arm_workspace_config_path(args)
+    if config_path is None:
+        calibration.metadata.pop("workspace_config_runtime", None)
+        calibration.metadata["workspace_config_source"] = None
+        return {}
+    bounds_by_side = load_arm_workspace_config(config_path)
+    applied: dict[str, dict[str, object]] = {}
+    for arm_name, arm in calibration.arms.items():
+        side = str(arm.side or "")
+        bounds = bounds_by_side.get(side)
+        if bounds is None:
+            continue
+        arm.workspace_min = np.asarray(bounds.workspace_min, dtype=float)
+        arm.workspace_max = np.asarray(bounds.workspace_max, dtype=float)
+        arm.metadata["workspace_config_source"] = bounds.source_path
+        applied[arm_name] = bounds.to_metadata()
+    calibration.metadata["workspace_config_source"] = str(config_path)
+    if applied:
+        calibration.metadata["workspace_config_runtime"] = applied
+    else:
+        calibration.metadata.pop("workspace_config_runtime", None)
+    return applied
+
+
+def _apply_workspace_overrides(
+    args: argparse.Namespace,
+    calibration: TeleopCalibration,
+) -> dict[str, dict[str, list[float]]]:
+    applied: dict[str, dict[str, list[float]]] = {}
+    for arm_name, arm in calibration.arms.items():
+        side = str(arm.side or "")
+        if side not in {"left", "right"}:
+            continue
+        min_override = _workspace_override_for_side(args, side, "min")
+        max_override = _workspace_override_for_side(args, side, "max")
+        if min_override is None and max_override is None:
+            continue
+        current_min = (
+            None
+            if arm.workspace_min is None
+            else np.asarray(arm.workspace_min, dtype=float)
+        )
+        current_max = (
+            None
+            if arm.workspace_max is None
+            else np.asarray(arm.workspace_max, dtype=float)
+        )
+        workspace_min = (
+            np.asarray(min_override, dtype=float)
+            if min_override is not None
+            else current_min
+        )
+        workspace_max = (
+            np.asarray(max_override, dtype=float)
+            if max_override is not None
+            else current_max
+        )
+        if workspace_min is None or workspace_max is None:
+            raise ValueError(
+                f"Cannot partially override workspace for {arm_name}: existing profile "
+                "must define both workspace_min and workspace_max, or pass both bounds."
+            )
+        if np.any(workspace_min > workspace_max):
+            raise ValueError(
+                f"Invalid workspace override for {arm_name}: workspace_min "
+                f"{workspace_min.tolist()} exceeds workspace_max {workspace_max.tolist()}."
+            )
+        arm.workspace_min = workspace_min.copy()
+        arm.workspace_max = workspace_max.copy()
+        arm.metadata["workspace_override_runtime"] = True
+        applied[arm_name] = {
+            "workspace_min": arm.workspace_min.tolist(),
+            "workspace_max": arm.workspace_max.tolist(),
+        }
+    if applied:
+        calibration.metadata["workspace_override_runtime"] = applied
+    else:
+        calibration.metadata.pop("workspace_override_runtime", None)
+    return applied
 
 
 def _positive_int(text: str) -> int:
@@ -1548,6 +1728,31 @@ def parse_args() -> argparse.Namespace:
         choices=("left", "right"),
         default="left",
         help="Initial side selected by --fix-arm. The GUI can switch it while no side is fixed.",
+    )
+    parser.add_argument(
+        "--init-arm-available",
+        "--init-arm-availabe",
+        dest="init_arm_available",
+        action="store_true",
+        help=(
+            "Enable init-arm mode. GUI G routes the selected arm to the init pose, "
+            "and G again recaptures that side's runtime home before resuming teleop."
+        ),
+    )
+    parser.add_argument(
+        "--init-arm-profile",
+        type=str,
+        default="",
+        help=(
+            "Dual-arm init pose profile JSON used by --init-arm-available. "
+            "Each side may provide arm_qpos, tcp_pose_base, or tcp_pose_desk."
+        ),
+    )
+    parser.add_argument(
+        "--init-arm-side",
+        choices=("left", "right"),
+        default="left",
+        help="Initial side selected by --init-arm-available. The GUI can switch it while init-arm is idle.",
     )
     parser.add_argument(
         "--hand-backend",
@@ -2429,6 +2634,57 @@ def parse_args() -> argparse.Namespace:
         default=ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
         help="Annotated dual-arm base distance used by the SAPIEN scene and default calibration.",
     )
+    parser.add_argument(
+        "--arm-workspace-config",
+        type=str,
+        default=str(DEFAULT_ARM_WORKSPACE_CONFIG_PATH),
+        help=(
+            "Desk-frame arm workspace JSON config. Defaults to "
+            "teleop_runtime/configs/arm_workspace.json; pass 'none' to skip it."
+        ),
+    )
+    parser.add_argument(
+        "--arm-workspace-min",
+        nargs="+",
+        default=None,
+        help=(
+            "Runtime override for both arms' desk-frame workspace minimum xyz. "
+            "Accepts either three values or --arm-workspace-min=x,y,z."
+        ),
+    )
+    parser.add_argument(
+        "--arm-workspace-max",
+        nargs="+",
+        default=None,
+        help=(
+            "Runtime override for both arms' desk-frame workspace maximum xyz. "
+            "Accepts either three values or --arm-workspace-max=x,y,z."
+        ),
+    )
+    parser.add_argument(
+        "--left-arm-workspace-min",
+        nargs="+",
+        default=None,
+        help="Runtime override for the left arm desk-frame workspace minimum xyz.",
+    )
+    parser.add_argument(
+        "--left-arm-workspace-max",
+        nargs="+",
+        default=None,
+        help="Runtime override for the left arm desk-frame workspace maximum xyz.",
+    )
+    parser.add_argument(
+        "--right-arm-workspace-min",
+        nargs="+",
+        default=None,
+        help="Runtime override for the right arm desk-frame workspace minimum xyz.",
+    )
+    parser.add_argument(
+        "--right-arm-workspace-max",
+        nargs="+",
+        default=None,
+        help="Runtime override for the right arm desk-frame workspace maximum xyz.",
+    )
     parser.add_argument("--left-tracker-name", type=str, default="tracker_1", help="Left wrist tracker device name")
     parser.add_argument("--right-tracker-name", type=str, default="tracker_2", help="Right wrist tracker device name")
     parser.add_argument(
@@ -2865,6 +3121,7 @@ def parse_args() -> argparse.Namespace:
     args._dataset_name_explicit = _argv_has_option(raw_argv, "--dataset-name")
     try:
         _resolve_movement_multiple_args(args, raw_arg_set=raw_arg_set)
+        _resolve_workspace_override_args(args)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
     _apply_formal_dataset_layout(args)
@@ -2881,6 +3138,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--wrist-depth-max-m must be greater than --wrist-depth-min-m.")
     if bool(args.no_camera) and (bool(args.wrist_depth_mask) or bool(args.wrist_depth_raw)):
         parser.error("--wrist-depth-mask/--wrist-depth-raw require cameras; remove --no-camera.")
+    if bool(getattr(args, "init_arm_available", False)) and not str(
+        getattr(args, "init_arm_profile", "") or ""
+    ).strip():
+        parser.error("--init-arm-available requires --init-arm-profile.")
     if not str(getattr(args, "load_profile", "") or "").strip():
         latest_profile = _latest_vive_calibration_profile_path()
         if latest_profile is None:
@@ -3332,6 +3593,32 @@ def _runtime_home_was_available(calibration: TeleopCalibration) -> bool:
         if arm.home_qpos is not None or arm.home_pose_for_tcp_mode() is not None:
             return True
     return False
+
+
+def _calibration_profile_payload_without_workspace(
+    calibration: TeleopCalibration,
+    *,
+    workspace_config_path: Path | None,
+) -> dict[str, Any]:
+    payload = calibration.to_dict()
+    for arm_payload in payload.get("arms", {}).values():
+        if not isinstance(arm_payload, dict):
+            continue
+        arm_payload.pop("workspace_min", None)
+        arm_payload.pop("workspace_max", None)
+        metadata = arm_payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.pop("workspace_config_source", None)
+            metadata.pop("workspace_override_runtime", None)
+    metadata = payload.setdefault("metadata", {})
+    if isinstance(metadata, dict):
+        metadata.pop("workspace_config_runtime", None)
+        metadata.pop("workspace_override_runtime", None)
+        metadata["workspace_policy"] = "managed_by_teleop_runtime_config"
+        metadata["workspace_config_path"] = (
+            None if workspace_config_path is None else str(workspace_config_path)
+        )
+    return payload
 
 
 def _clear_runtime_home_state(components: RealTeleopComponents) -> None:
@@ -4297,7 +4584,12 @@ def _save_gui_vive_calibration_profile(
             },
         }
     )
-    profile.save_json(output_path)
+    payload = _calibration_profile_payload_without_workspace(
+        profile,
+        workspace_config_path=_arm_workspace_config_path(args),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     setattr(args, "gui_last_vive_calibration_profile", str(output_path))
     return output_path
 
@@ -4319,6 +4611,20 @@ def _load_gui_vive_calibration_profile(
             str(role): np.asarray(offset, dtype=float).copy()
             for role, offset in loaded.tracker_offsets.items()
         }
+        for arm_name, loaded_arm in loaded.arms.items():
+            current_arm = current.arms.get(arm_name)
+            if current_arm is None:
+                continue
+            current_arm.workspace_min = (
+                None
+                if loaded_arm.workspace_min is None
+                else np.asarray(loaded_arm.workspace_min, dtype=float).copy()
+            )
+            current_arm.workspace_max = (
+                None
+                if loaded_arm.workspace_max is None
+                else np.asarray(loaded_arm.workspace_max, dtype=float).copy()
+            )
         calibration_metadata_keys = (
             "calibration_mode",
             "world_to_desk_mode",
@@ -4331,6 +4637,8 @@ def _load_gui_vive_calibration_profile(
             "tracker_offset_calibration",
             "profile_scope",
             "home_policy",
+            "workspace_policy",
+            "workspace_config_path",
             "saved_at",
         )
         for key in calibration_metadata_keys:
@@ -4345,6 +4653,8 @@ def _load_gui_vive_calibration_profile(
             "runtime_gui_loaded_at": datetime.now().isoformat(timespec="seconds"),
         }
     )
+    _apply_workspace_config(args, current)
+    _apply_workspace_overrides(args, current)
     components.left_retargeter.clear_home_anchors()
     components.right_retargeter.clear_home_anchors()
     setattr(args, "load_profile", str(path))
@@ -4581,6 +4891,79 @@ def _fix_arm_ui_state(components: RealTeleopComponents) -> dict[str, object]:
             "fix_arm_min_samples": None,
         }
     return controller.status_payload()
+
+
+def _init_arm_ui_state(components: RealTeleopComponents) -> dict[str, object]:
+    controller = getattr(components, "init_arm_controller", None)
+    if controller is None:
+        return {
+            "init_arm_available": False,
+            "init_arm_selected_side": "",
+            "init_arm_active_side": "",
+            "init_arm_active": False,
+            "init_arm_recalibrating": False,
+            "init_arm_status": "",
+            "init_arm_sample_count": None,
+            "init_arm_min_samples": None,
+            "init_arm_profile_path": "",
+        }
+    return controller.status_payload()
+
+
+def _fix_arm_debug_state(components: RealTeleopComponents) -> dict[str, object]:
+    state = _fix_arm_ui_state(components)
+    return {
+        "available": bool(state.get("fix_arm_available", False)),
+        "selected_side": str(state.get("fix_arm_selected_side", "") or ""),
+        "fixed_side": str(state.get("fix_arm_fixed_side", "") or ""),
+        "active": bool(state.get("fix_arm_active", False)),
+        "recalibrating": bool(state.get("fix_arm_recalibrating", False)),
+        "status": str(state.get("fix_arm_status", "") or ""),
+        "sample_count": state.get("fix_arm_sample_count"),
+        "min_samples": state.get("fix_arm_min_samples"),
+    }
+
+
+def _fix_arm_status_text(state: Mapping[str, object]) -> str:
+    if not bool(state.get("available", False)):
+        return ""
+    fixed_side = str(state.get("fixed_side", "") or "-")
+    selected_side = str(state.get("selected_side", "") or "-")
+    mode = "recapturing" if state.get("recalibrating") else "fixed" if state.get("active") else "live"
+    sample_count = state.get("sample_count")
+    min_samples = state.get("min_samples")
+    sample_bits = ""
+    if sample_count is not None or min_samples is not None:
+        sample_bits = f",samples={sample_count or 0}/{min_samples or 0}"
+    return f" {mode}(selected={selected_side},fixed={fixed_side}{sample_bits})"
+
+
+def _init_arm_debug_state(components: RealTeleopComponents) -> dict[str, object]:
+    state = _init_arm_ui_state(components)
+    return {
+        "available": bool(state.get("init_arm_available", False)),
+        "selected_side": str(state.get("init_arm_selected_side", "") or ""),
+        "active_side": str(state.get("init_arm_active_side", "") or ""),
+        "active": bool(state.get("init_arm_active", False)),
+        "recalibrating": bool(state.get("init_arm_recalibrating", False)),
+        "status": str(state.get("init_arm_status", "") or ""),
+        "sample_count": state.get("init_arm_sample_count"),
+        "min_samples": state.get("init_arm_min_samples"),
+    }
+
+
+def _init_arm_status_text(state: Mapping[str, object]) -> str:
+    if not bool(state.get("available", False)):
+        return ""
+    active_side = str(state.get("active_side", "") or "-")
+    selected_side = str(state.get("selected_side", "") or "-")
+    mode = "recapturing" if state.get("recalibrating") else "moving" if state.get("active") else "live"
+    sample_count = state.get("sample_count")
+    min_samples = state.get("min_samples")
+    sample_bits = ""
+    if sample_count is not None or min_samples is not None:
+        sample_bits = f",samples={sample_count or 0}/{min_samples or 0}"
+    return f" {mode}(selected={selected_side},active={active_side}{sample_bits})"
 
 
 def _session_record_root_dir(args: argparse.Namespace) -> Path | None:
@@ -5493,6 +5876,18 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         calibration = build_annotated_dual_rm65_calibration(
             left_right_base_distance=args.left_right_base_distance
         )
+    workspace_config = _apply_workspace_config(args, calibration)
+    workspace_overrides = _apply_workspace_overrides(args, calibration)
+    if workspace_config:
+        _log(
+            "Workspace",
+            f"workspace config applied: {json.dumps(workspace_config, sort_keys=True)}",
+        )
+    if workspace_overrides:
+        _log(
+            "Workspace",
+            f"runtime workspace override applied: {json.dumps(workspace_overrides, sort_keys=True)}",
+        )
     if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
         _dmtac_backend_configs(args, active_sides)
     tracker_translation_offset = _vive_tracker_local_translation_offset(args)
@@ -6053,6 +6448,30 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 for side, effectors in fix_arm_controller.required_effectors_by_side.items()
             },
         }
+    init_arm_controller = None
+    if bool(getattr(args, "init_arm_available", False)):
+        if set(active_sides) != {"left", "right"}:
+            raise ValueError("--init-arm-available requires --active-sides both.")
+        init_arm_profile = str(getattr(args, "init_arm_profile", "") or "").strip()
+        init_targets = load_init_arm_targets(
+            init_arm_profile,
+            calibration=calibration,
+            dual_arm_retargeter=dual_arm_retargeter,
+        )
+        init_arm_controller = InitArmCommandController(
+            targets_by_side=init_targets,
+            selected_side=str(getattr(args, "init_arm_side", "left") or "left"),
+            use_dual_target_override=dual_arm_retargeter is not None,
+        )
+        if dual_arm_retargeter is not None:
+            dual_arm_retargeter.target_override_filter = init_arm_controller.filter_dual_arm_targets
+        calibration.metadata["init_arm_mode"] = {
+            "enabled": True,
+            "initial_selected_side": init_arm_controller.selected_side,
+            "profile_path": init_arm_profile,
+            "dual_target_override": dual_arm_retargeter is not None,
+            "resolved_sides": sorted(init_targets),
+        }
     rig_backends = {}
     if "left" in active_sides and left_command_backend is not None:
         rig_backends["left_arm"] = left_command_backend
@@ -6122,11 +6541,11 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         command_filter=_compose_real_command_filter(
             temporary_safety_limiter=temporary_safety_limiter,
             fix_arm_controller=fix_arm_controller,
+            init_arm_controller=init_arm_controller,
         ),
-        fault_filter=(
-            fix_arm_controller.filter_faults
-            if fix_arm_controller is not None
-            else None
+        fault_filter=_compose_real_fault_filter(
+            fix_arm_controller=fix_arm_controller,
+            init_arm_controller=init_arm_controller,
         ),
     )
     _log(
@@ -6229,6 +6648,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         },
         temporary_safety_limiter=temporary_safety_limiter,
         fix_arm_controller=fix_arm_controller,
+        init_arm_controller=init_arm_controller,
     )
 
 
@@ -7329,6 +7749,46 @@ def _camera_status_for_source(
         stale_after_sec = 2.0
     last_error = _as_status_error_text(info.get("last_error"))
     last_runtime_error = _as_status_error_text(info.get("last_runtime_error"))
+    depth_enabled = bool(info.get("depth_enabled") or getattr(config, "enable_depth", False))
+    depth_required = bool(depth_enabled and str(camera_key) in WRIST_DEPTH_CAMERA_KEYS)
+    depth_scale = _safe_float_value(info.get("depth_scale_m_per_unit"))
+    depth_frame_present: bool | None = None
+    depth_status_level = "off"
+    depth_status_label = "未启用"
+    depth_status_message = ""
+    latest_depth_metadata: Mapping[str, object] = {}
+    if depth_required:
+        latest_frame = None
+        try:
+            latest_frame = source.frame_buffer().get_latest()
+        except Exception as exc:  # noqa: BLE001
+            depth_status_level = "error"
+            depth_status_label = "Depth 状态失败"
+            depth_status_message = f"{type(exc).__name__}: {exc}"
+        else:
+            if latest_frame is None:
+                depth_status_level = "waiting"
+                depth_status_label = "等待 Wrist Depth"
+                depth_status_message = "wrist depth 已启用，但还没有 color+depth 同步帧。"
+            else:
+                raw_depth_metadata = getattr(latest_frame, "depth_metadata", {})
+                if isinstance(raw_depth_metadata, Mapping):
+                    latest_depth_metadata = raw_depth_metadata
+                depth_frame_present = getattr(latest_frame, "depth_image", None) is not None
+                frame_depth_scale = _safe_float_value(latest_depth_metadata.get("depth_scale_m_per_unit"))
+                if depth_scale is None and frame_depth_scale is not None:
+                    depth_scale = frame_depth_scale
+                if not depth_frame_present:
+                    depth_status_level = "error"
+                    depth_status_label = "Wrist Depth 失效"
+                    depth_status_message = "最新 wrist 相机帧缺少 depth_image。"
+                elif depth_scale is None and frame_depth_scale is None:
+                    depth_status_level = "warn"
+                    depth_status_label = "Depth scale 缺失"
+                    depth_status_message = "depth frame 存在，但缺少有效 depth_scale_m_per_unit，mask 不能可靠生成。"
+                else:
+                    depth_status_level = "ok"
+                    depth_status_label = "Wrist Depth 正常"
 
     status_level = "ok"
     status_label = "正常"
@@ -7356,6 +7816,18 @@ def _camera_status_for_source(
         status_level = "warn"
         status_label = "临时 timeout"
         status_message = last_runtime_error
+    if depth_required:
+        severity_rank = {"off": 0, "ok": 0, "waiting": 1, "warn": 2, "error": 3}
+        if severity_rank.get(depth_status_level, 0) > severity_rank.get(status_level, 0):
+            status_level = depth_status_level
+            status_label = depth_status_label
+            status_message = depth_status_message
+        elif depth_status_message and depth_status_message not in status_message:
+            status_message = (
+                f"{status_message}; {depth_status_message}"
+                if status_message
+                else depth_status_message
+            )
 
     metadata = info.get("metadata") if isinstance(info.get("metadata"), Mapping) else {}
     return {
@@ -7373,6 +7845,17 @@ def _camera_status_for_source(
         "height": info.get("height") if info.get("height") is not None else getattr(config, "height", None),
         "fps": info.get("fps") if info.get("fps") is not None else getattr(config, "fps", None),
         "color_space": info.get("color_space") or getattr(config, "color_space", None),
+        "depth_enabled": depth_enabled,
+        "depth_required": depth_required,
+        "depth_width": info.get("depth_width") if info.get("depth_width") is not None else getattr(config, "depth_width", None),
+        "depth_height": info.get("depth_height") if info.get("depth_height") is not None else getattr(config, "depth_height", None),
+        "depth_fps": info.get("depth_fps") if info.get("depth_fps") is not None else getattr(config, "depth_fps", None),
+        "depth_scale_m_per_unit": depth_scale,
+        "depth_frame_present": depth_frame_present,
+        "depth_status_level": depth_status_level,
+        "depth_status_label": depth_status_label,
+        "depth_status_message": depth_status_message,
+        "depth_metadata": _json_safe_value(dict(latest_depth_metadata)),
         "frame_count": frame_count,
         "last_frame_age_sec": last_frame_age_sec,
         "stale_after_sec": stale_after_sec,
@@ -7621,7 +8104,13 @@ def _dispatch_q6_gripper_control(
         )
         if fixed_side_active:
             command = TeleopCommand(timestamp=float(now))
-            command = fix_arm_controller.filter_command(command, observation, now)
+            command = fix_arm_controller.filter_command(
+                command,
+                observation,
+                now,
+                include_missing_fixed_effectors=True,
+                allowed_effectors=(f"{side}_hand",),
+            )
         else:
             try:
                 command = retargeter.retarget(observation, components.session.calibration)
@@ -8796,6 +9285,49 @@ def _impedance_record_compact_debug(record: object) -> dict[str, object] | None:
         "step",
         "dt_sec",
         "reference",
+        "force_source",
+        "force_readings",
+        "selected_force_wrench",
+        "active_wrench",
+        "tare_corrected_wrench",
+        "filtered_wrench",
+        "raw_deadbanded_wrench",
+        "admittance_wrench",
+        "return_activity_wrench",
+        "target_offset_unclamped",
+        "target_offset_after_return",
+        "target_offset_after_offset_limit",
+        "target_offset",
+        "offset",
+        "applied_offset",
+        "requested_offset_before_command_realization",
+        "admittance_offset_before_antiwindup",
+        "applied_offset_source",
+        "admittance_offset_antiwindup_applied",
+        "admittance_offset_antiwindup_skip_reason",
+        "admittance_offset_antiwindup_guarded_axes",
+        "admittance_offset_antiwindup_active_axes",
+        "admittance_offset_antiwindup_guard_reason",
+        "admittance_offset_realized_before_guard",
+        "applied_offset_realization_linear_error_m",
+        "applied_offset_realization_angular_error_rad",
+        "offset_delta_before_velocity_limit",
+        "offset_step_after_velocity_limit",
+        "return_applied_axes",
+        "return_paused_axes",
+        "linear_return_paused",
+        "angular_return_paused",
+        "linear_offset_limit_applied",
+        "angular_offset_limit_applied",
+        "linear_velocity_limit_applied",
+        "angular_velocity_limit_applied",
+        "angular_axis_velocity_limit_applied",
+        "linear_return_velocity_limit_applied",
+        "angular_return_velocity_limit_applied",
+        "linear_step_velocity_limit_m_s",
+        "angular_step_velocity_limit_rad_s",
+        "angular_axis_velocity_scales",
+        "angular_axis_step_velocity_limits_rad_s",
         "force_norm_n",
         "torque_norm_nm",
         "command_joint_step_deg",
@@ -8805,6 +9337,41 @@ def _impedance_record_compact_debug(record: object) -> dict[str, object] | None:
         "joint_velocity_limit_dt_sec",
         "joint_velocity_limit_ratio",
         "joint_safety",
+        "reference_to_command_linear_m",
+        "reference_to_command_angular_rotvec_rad",
+        "admittance_target_linear_norm_m",
+        "admittance_target_angular_norm_rad",
+        "admittance_offset_linear_norm_m",
+        "admittance_offset_angular_norm_rad",
+        "commanded_offset_linear_norm_m",
+        "commanded_offset_angular_norm_rad",
+        "offset_to_command_linear_error_m",
+        "offset_to_command_angular_error_rad",
+        "offset_to_command_linear_fraction",
+        "offset_to_command_angular_fraction",
+        "target_to_command_linear_error_m",
+        "target_to_command_angular_error_rad",
+        "target_to_command_linear_fraction",
+        "target_to_command_angular_fraction",
+        "reference_to_measured_linear_m",
+        "reference_to_measured_angular_rotvec_rad",
+        "measured_offset_linear_norm_m",
+        "measured_offset_angular_norm_rad",
+        "command_to_measured_linear_m",
+        "command_to_measured_angular_rotvec_rad",
+        "command_to_measured_linear_norm_m",
+        "command_to_measured_angular_norm_rad",
+        "measured_to_command_linear_m",
+        "measured_to_command_angular_rotvec_rad",
+        "command_to_measured_joint_deg",
+        "measured_to_command_joint_deg",
+        "measured_velocity_dt_sec",
+        "measured_pose_velocity_linear_m_s",
+        "measured_pose_velocity_angular_rad_s",
+        "measured_joint_velocity_deg_s",
+        "tracking_error_closing_linear_m_s",
+        "tracking_error_closing_angular_rad_s",
+        "tracking_error_closing_joint_deg_s",
         "ik_method",
         "ik_backoff_scale",
         "ik_reference_backoff_scale",
@@ -8835,6 +9402,24 @@ def _backend_ik_metadata_compact_debug(metadata: object) -> dict[str, object]:
     if not isinstance(metadata, Mapping):
         return {}
     selected_keys = (
+        "status",
+        "method",
+        "source",
+        "reason",
+        "last_code",
+        "previous_ik_status",
+        "previous_ik_method",
+        "previous_ik_source",
+        "relaxation_type",
+        "scale",
+        "direct_joint_hint_reason",
+        "direct_joint_hint_linear_offset_m",
+        "direct_joint_hint_angular_offset_rad",
+        "direct_joint_hint_max_linear_offset_m",
+        "direct_joint_hint_max_angular_offset_rad",
+        "direct_joint_hint_offset_ignored",
+        "direct_joint_hint_force_guard",
+        "direct_joint_hint_force_guard_reset_admittance",
         "ik_status",
         "ik_jump_gate_status",
         "ik_jump_gate_reason",
@@ -8873,6 +9458,19 @@ def _backend_compact_debug_payload(state: Mapping[str, object] | None) -> dict[s
         "effective_step_scale": state.get("effective_step_scale"),
         "impedance_enabled": state.get("impedance_enabled"),
         "impedance_loop_state": state.get("impedance_loop_state"),
+        "active_tool_name": state.get("active_tool_name"),
+        "active_tool_profile_path": state.get("active_tool_profile_path"),
+        "active_tool_frame": _compact_debug_value(state.get("active_tool_frame")),
+        "profile_tcp": _compact_debug_value(state.get("profile_tcp")),
+        "active_impedance_config": _compact_debug_value(
+            state.get("active_impedance_config"),
+            max_items=80,
+        ),
+        "last_command_controlled_frame": state.get("last_command_controlled_frame"),
+        "last_command": _command_compact_debug_payload(state.get("last_command")),
+        "last_command_timestamp": state.get("last_command_timestamp"),
+        "latest_target_tcp_pose6": _compact_debug_value(state.get("latest_target_tcp_pose6")),
+        "latest_target_joint_deg": _compact_debug_value(state.get("latest_target_joint_deg")),
         "current_qpos": _qpos_compact_debug(state.get("current_qpos")),
         "last_target_qpos": _qpos_compact_debug(state.get("last_target_qpos")),
         "current_tcp_pose": _pose_compact_debug(state.get("current_tcp_pose")),
@@ -8885,6 +9483,14 @@ def _backend_compact_debug_payload(state: Mapping[str, object] | None) -> dict[s
         "last_impedance_record": _impedance_record_compact_debug(
             state.get("last_impedance_record")
         ),
+        "recent_impedance_records": [
+            item
+            for item in (
+                _impedance_record_compact_debug(record)
+                for record in list(state.get("recent_impedance_records") or [])[-4:]
+            )
+            if item
+        ],
         "last_send_command_timing": _compact_debug_value(state.get("last_send_command_timing")),
         "last_impedance_loop_timing": _compact_debug_value(state.get("last_impedance_loop_timing")),
     }
@@ -9004,8 +9610,48 @@ def _impedance_record_debug(record: object) -> dict[str, object] | None:
         "command_joint_deg",
         "measured_pose",
         "measured_joint_deg",
+        "force_source",
+        "force_readings",
+        "selected_force_wrench",
+        "active_wrench",
+        "tare_corrected_wrench",
+        "filtered_wrench",
+        "raw_deadbanded_wrench",
+        "admittance_wrench",
+        "return_activity_wrench",
         "offset",
+        "applied_offset",
+        "target_offset_unclamped",
+        "target_offset_after_return",
+        "target_offset_after_offset_limit",
         "target_offset",
+        "offset_delta_before_velocity_limit",
+        "offset_step_after_velocity_limit",
+        "requested_offset_before_command_realization",
+        "admittance_offset_before_antiwindup",
+        "applied_offset_source",
+        "admittance_offset_antiwindup_applied",
+        "admittance_offset_antiwindup_skip_reason",
+        "admittance_offset_antiwindup_guarded_axes",
+        "admittance_offset_antiwindup_guard_reason",
+        "admittance_offset_realized_before_guard",
+        "applied_offset_realization_linear_error_m",
+        "applied_offset_realization_angular_error_rad",
+        "return_applied_axes",
+        "return_paused_axes",
+        "linear_return_paused",
+        "angular_return_paused",
+        "linear_offset_limit_applied",
+        "angular_offset_limit_applied",
+        "linear_velocity_limit_applied",
+        "angular_velocity_limit_applied",
+        "angular_axis_velocity_limit_applied",
+        "linear_return_velocity_limit_applied",
+        "angular_return_velocity_limit_applied",
+        "linear_step_velocity_limit_m_s",
+        "angular_step_velocity_limit_rad_s",
+        "angular_axis_velocity_scales",
+        "angular_axis_step_velocity_limits_rad_s",
         "force_norm_n",
         "torque_norm_nm",
         "command_joint_step_deg",
@@ -9018,6 +9664,41 @@ def _impedance_record_debug(record: object) -> dict[str, object] | None:
         "joint_velocity_limit_max_step_deg",
         "joint_velocity_limit_ratio",
         "joint_safety",
+        "reference_to_command_linear_m",
+        "reference_to_command_angular_rotvec_rad",
+        "admittance_target_linear_norm_m",
+        "admittance_target_angular_norm_rad",
+        "admittance_offset_linear_norm_m",
+        "admittance_offset_angular_norm_rad",
+        "commanded_offset_linear_norm_m",
+        "commanded_offset_angular_norm_rad",
+        "offset_to_command_linear_error_m",
+        "offset_to_command_angular_error_rad",
+        "offset_to_command_linear_fraction",
+        "offset_to_command_angular_fraction",
+        "target_to_command_linear_error_m",
+        "target_to_command_angular_error_rad",
+        "target_to_command_linear_fraction",
+        "target_to_command_angular_fraction",
+        "reference_to_measured_linear_m",
+        "reference_to_measured_angular_rotvec_rad",
+        "measured_offset_linear_norm_m",
+        "measured_offset_angular_norm_rad",
+        "command_to_measured_linear_m",
+        "command_to_measured_angular_rotvec_rad",
+        "command_to_measured_linear_norm_m",
+        "command_to_measured_angular_norm_rad",
+        "measured_to_command_linear_m",
+        "measured_to_command_angular_rotvec_rad",
+        "command_to_measured_joint_deg",
+        "measured_to_command_joint_deg",
+        "measured_velocity_dt_sec",
+        "measured_pose_velocity_linear_m_s",
+        "measured_pose_velocity_angular_rad_s",
+        "measured_joint_velocity_deg_s",
+        "tracking_error_closing_linear_m_s",
+        "tracking_error_closing_angular_rad_s",
+        "tracking_error_closing_joint_deg_s",
         "ik_method",
         "ik_backoff_scale",
         "ik_reference_backoff_scale",
@@ -9050,12 +9731,30 @@ def _backend_debug_payload(state: Mapping[str, object] | None) -> dict[str, obje
         "effective_step_scale": state.get("effective_step_scale"),
         "impedance_enabled": state.get("impedance_enabled"),
         "impedance_loop_state": state.get("impedance_loop_state"),
+        "active_tool_name": state.get("active_tool_name"),
+        "active_tool_profile_path": state.get("active_tool_profile_path"),
+        "active_tool_frame": state.get("active_tool_frame"),
+        "profile_tcp": state.get("profile_tcp"),
+        "active_impedance_config": state.get("active_impedance_config"),
+        "last_command_controlled_frame": state.get("last_command_controlled_frame"),
+        "last_command": _command_debug_payload(state.get("last_command")),
+        "last_command_timestamp": state.get("last_command_timestamp"),
+        "latest_target_tcp_pose6": state.get("latest_target_tcp_pose6"),
+        "latest_target_joint_deg": state.get("latest_target_joint_deg"),
         "current_qpos": _qpos_debug(state.get("current_qpos")),
         "last_target_qpos": _qpos_debug(state.get("last_target_qpos")),
         "current_tcp_pose": _pose_matrix_debug(state.get("current_tcp_pose")),
         "last_target_tcp_pose": _pose_matrix_debug(state.get("last_target_tcp_pose")),
         "ik_metadata": state.get("ik_metadata"),
         "last_impedance_record": _impedance_record_debug(state.get("last_impedance_record")),
+        "recent_impedance_records": [
+            item
+            for item in (
+                _impedance_record_debug(record)
+                for record in list(state.get("recent_impedance_records") or [])[-4:]
+            )
+            if item
+        ],
         "last_send_command_timing": state.get("last_send_command_timing"),
         "last_impedance_loop_timing": state.get("last_impedance_loop_timing"),
     }
@@ -9114,6 +9813,8 @@ def _build_ik_debug_log_frame(
         "control_hz": float(getattr(step_result, "control_hz", 0.0) or 0.0),
         "faults": fault_codes,
         "clutch": {"left": bool(left_clutch), "right": bool(right_clutch)},
+        "fix_arm": _fix_arm_debug_state(components),
+        "init_arm": _init_arm_debug_state(components),
         "target_step_scale": float(target_step_scale),
         "ik_timing": dict(ik_timing_payload or {}),
     }
@@ -9329,6 +10030,13 @@ def _backend_timing_log_payload(state: Mapping[str, object] | None) -> dict[str,
         "effective_step_scale",
         "impedance_enabled",
         "impedance_loop_state",
+        "active_tool_name",
+        "active_tool_profile_path",
+        "active_tool_frame",
+        "profile_tcp",
+        "last_command_controlled_frame",
+        "latest_target_tcp_pose6",
+        "latest_target_joint_deg",
         "fault",
     )
     out: dict[str, object] = {
@@ -9346,9 +10054,24 @@ def _backend_timing_log_payload(state: Mapping[str, object] | None) -> dict[str,
             state.get("last_impedance_loop_timing"),
             max_items=24,
         )
+    if state.get("active_impedance_config") is not None:
+        out["active_impedance_config"] = _compact_debug_value(
+            state.get("active_impedance_config"),
+            max_items=80,
+        )
     impedance_record = _impedance_record_compact_debug(state.get("last_impedance_record"))
     if impedance_record:
         out["last_impedance_record"] = impedance_record
+    recent_records = [
+        item
+        for item in (
+            _impedance_record_compact_debug(record)
+            for record in list(state.get("recent_impedance_records") or [])[-4:]
+        )
+        if item
+    ]
+    if recent_records:
+        out["recent_impedance_records"] = recent_records
     ik_metadata = _backend_ik_metadata_compact_debug(state.get("ik_metadata"))
     if ik_metadata:
         out["ik_metadata"] = ik_metadata
@@ -9390,9 +10113,15 @@ def _build_debug_timing_log_frame(
         "loop_elapsed_ms": float(elapsed_sec) * 1000.0,
         "control_hz": float(getattr(step_result, "control_hz", 0.0) or 0.0),
         "state": _state_value(getattr(step_result, "state", "")),
+        "session_fault_reason": _short_status_text(
+            getattr(getattr(components, "session", None), "last_fault_reason", ""),
+            max_len=400,
+        ),
         "fault_codes": list(_fault_signature(faults)),
         "faults": _faults_log_payload(step_result),
         "clutch": {"left": bool(left_clutch), "right": bool(right_clutch)},
+        "fix_arm": _fix_arm_debug_state(components),
+        "init_arm": _init_arm_debug_state(components),
         "target_step_scale": float(target_step_scale),
         "recording": _compact_debug_value(dict(recording_status or {}), max_items=16),
         "phases": _phase_timings_log_payload(phases),
@@ -9770,6 +10499,86 @@ class IkDebugLogRecorder:
         self.stop(reason="close")
 
 
+class MainLoopStallWatchdog:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        timeout_sec: float = 5.0,
+        report_interval_sec: float = 5.0,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.timeout_sec = max(1.0, float(timeout_sec))
+        self.report_interval_sec = max(1.0, float(report_interval_sec))
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_beat = time.monotonic()
+        self._last_report = 0.0
+        self._phase = "init"
+        self._step_index = -1
+
+    def start(self) -> None:
+        if not self.enabled or self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._last_beat = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="real_teleop_main_loop_watchdog",
+        )
+        self._thread.start()
+
+    def beat(self, phase: str, step_index: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._last_beat = time.monotonic()
+            self._phase = str(phase)
+            self._step_index = int(step_index)
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=0.5)
+        if not self._thread.is_alive():
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(0.5):
+            now = time.monotonic()
+            with self._lock:
+                elapsed = now - self._last_beat
+                phase = self._phase
+                step_index = self._step_index
+                last_report = self._last_report
+                should_report = (
+                    elapsed >= self.timeout_sec
+                    and (last_report <= 0.0 or now - last_report >= self.report_interval_sec)
+                )
+                if should_report:
+                    self._last_report = now
+            if not should_report:
+                continue
+            print(
+                "WARNING: real teleop main loop appears stalled "
+                f"for {elapsed:.1f}s at step={step_index} phase={phase}; "
+                "dumping Python thread stacks.",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not break teleop.
+                print(
+                    f"WARNING: failed to dump thread stacks: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+
 class RealTeleopControlInput:
     def __init__(
         self,
@@ -9877,6 +10686,12 @@ class RealTeleopControlInput:
     def _fix_arm_controls(self) -> list[str]:
         return ["fix_arm_select"] if self._fix_arm_available() else []
 
+    def _init_arm_available(self) -> bool:
+        return getattr(self.components, "init_arm_controller", None) is not None
+
+    def _init_arm_controls(self) -> list[str]:
+        return ["init_arm_select"] if self._init_arm_available() else []
+
     def _pose_snapshot_available(self) -> bool:
         return self._fix_arm_available() and self._pose_snapshot_recorder is not None
 
@@ -9897,7 +10712,12 @@ class RealTeleopControlInput:
         controls = ["q", "d", "h"]
         if self._fix_arm_available():
             controls.append("c")
+            controls.append("fix_arm_toggle")
             controls.extend(self._fix_arm_controls())
+        if self._init_arm_available():
+            controls.append("g")
+            controls.append("init_arm_toggle")
+            controls.extend(self._init_arm_controls())
         controls.extend(self._pose_snapshot_controls())
         if self._episode_recording_available():
             controls.extend(EPISODE_GUI_EVENTS)
@@ -9914,6 +10734,7 @@ class RealTeleopControlInput:
     def _pre_home_controls(self) -> list[str]:
         controls = ["p", "w", "d", "q"]
         controls.extend(self._fix_arm_controls())
+        controls.extend(self._init_arm_controls())
         controls.extend(self._visualization_controls())
         controls.extend(self._vive_calibration_controls(allow_load=True))
         controls.extend(self._movement_multiple_controls())
@@ -9923,6 +10744,7 @@ class RealTeleopControlInput:
     def _hold_controls(self) -> list[str]:
         controls = ["p", "c", "d"]
         controls.extend(self._fix_arm_controls())
+        controls.extend(self._init_arm_controls())
         if len(tuple(self.components.active_sides)) == 1:
             controls.append("w")
         controls.append("q")
@@ -9982,6 +10804,7 @@ class RealTeleopControlInput:
             episode_last_frame_count=None,
             **_collection_task_ui_state(self.args),
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
             **self._pose_snapshot_ui_state(),
             camera_visualization_available=self._camera_visualization_available(),
             camera_visualization_active=self._camera_visualization_active,
@@ -10035,9 +10858,22 @@ class RealTeleopControlInput:
                             capture_waiting_for_samples=False,
                         )
                         self.ui.append_message("EmergencyStop", "网页退出已触发机械臂停臂请求。")
-                elif event in {"p", "c"}:
-                    if event == "c" and self._handle_fix_arm_c_event(now=current_time):
-                        continue
+                elif event in {"p", "c", "fix_arm_toggle"}:
+                    if event in {"c", "fix_arm_toggle"} and self._fix_arm_available():
+                        if self._handle_fix_arm_c_event(now=current_time):
+                            continue
+                        if self._teleop_started and not self._hold_active:
+                            message = (
+                                "fix-arm C event was received while teleop is running, "
+                                "but no fix-arm transition was available; suppressing "
+                                "runtime home fallback."
+                            )
+                            _log("FixArm", message, now=current_time)
+                            self._publish_fix_arm_state(
+                                message=message,
+                                control_hint=message,
+                            )
+                            continue
                     self._calibration_requested = True
                     self._calibration_request_from_hold = bool(self._hold_active)
                 elif event == "h":
@@ -10046,6 +10882,9 @@ class RealTeleopControlInput:
                     self._toggle_vive_tracker_swap()
                 elif event == "d":
                     self._ik_debug_log_toggle_requested = True
+                elif event in {"g", "init_arm_toggle"}:
+                    if self._init_arm_available():
+                        self._handle_init_arm_g_event(now=current_time)
                 elif event == "episode_start" or event.startswith("episode_start:"):
                     if event.startswith("episode_start:"):
                         self._apply_episode_start_payload(event.split(":", 1)[1])
@@ -10056,6 +10895,8 @@ class RealTeleopControlInput:
                     self._toggle_round_trip_collection_task(source="manual")
                 elif event.startswith("fix_arm_select:"):
                     self._set_fix_arm_side_from_gui(event.split(":", 1)[1])
+                elif event.startswith("init_arm_select:"):
+                    self._set_init_arm_side_from_gui(event.split(":", 1)[1])
                 elif event == POSE_SNAPSHOT_GUI_EVENT:
                     self.request_pose_snapshot()
                 elif event == "toggle_camera_vis":
@@ -10082,6 +10923,7 @@ class RealTeleopControlInput:
             return
         updates = {
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
             **self._pose_snapshot_ui_state(),
             "active_controls": (
                 self._teleop_controls()
@@ -10109,44 +10951,230 @@ class RealTeleopControlInput:
             message = f"固定侧切换失败: {transition.message}"
         self._publish_fix_arm_state(message=message, control_hint=message)
 
+    def _publish_init_arm_state(self, *, message: str = "", control_hint: str = "") -> None:
+        if self.ui is None:
+            return
+        updates = {
+            **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
+            **self._pose_snapshot_ui_state(),
+            "active_controls": (
+                self._teleop_controls()
+                if self._teleop_started and not self._hold_active
+                else self._hold_controls()
+                if self._teleop_started
+                else self._pre_home_controls()
+            ),
+        }
+        if control_hint:
+            updates["control_hint"] = control_hint
+        self.ui.publish(**updates)
+        if message:
+            self.ui.append_message("InitArm", message)
+
+    def _set_init_arm_side_from_gui(self, side: str) -> None:
+        controller = getattr(self.components, "init_arm_controller", None)
+        if controller is None:
+            return
+        transition = controller.select_side(side)
+        side_label = "左臂" if transition.side == "left" else "右臂"
+        if transition.ok:
+            message = f"归位侧已选择: {side_label}"
+        else:
+            message = f"归位侧切换失败: {transition.message}"
+        self._publish_init_arm_state(message=message, control_hint=message)
+
+    def _reset_runtime_tracking_for_side(self, side: str, *, tag: str, now: float) -> None:
+        channel = f"{side}_wrist_pose"
+        try:
+            self.components.session.safety_monitor.request_pose_baseline_reset_many((channel,))
+        except Exception as exc:
+            _log(
+                tag,
+                f"WARNING: safety baseline reset failed for {channel}: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+        reset_smoothing = getattr(
+            getattr(self.components, "dual_arm_retargeter", None),
+            "reset_target_pose_smoothing",
+            None,
+        )
+        if callable(reset_smoothing):
+            try:
+                reset_smoothing()
+            except Exception as exc:
+                _log(
+                    tag,
+                    "WARNING: retargeter target smoothing reset failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    now=now,
+                )
+
+    def _handle_init_arm_g_event(self, *, now: float) -> bool:
+        controller = getattr(self.components, "init_arm_controller", None)
+        if controller is None:
+            return False
+        if not self._teleop_started or self._hold_active:
+            return False
+        try:
+            _log(
+                "InitArm",
+                "G event received "
+                f"selected={getattr(controller, 'selected_side', '') or '-'} "
+                f"active={getattr(controller, 'active_side', '') or '-'} "
+                f"mode={getattr(controller, 'mode', '') or '-'} "
+                f"recapturing={bool(getattr(controller, 'recapturing', False))}",
+                now=now,
+            )
+            if controller.recapturing:
+                message = "归位臂正在重采 home，请保持 tracker 直到样本采满。"
+                self._publish_init_arm_state(message=message, control_hint=message)
+                return True
+            if controller.active:
+                transition = controller.start_recalibration(
+                    now=now,
+                    timeout_sec=float(getattr(self.args, "calibration_timeout", 10.0)),
+                    min_samples=int(getattr(self.args, "calibration_samples", 20)),
+                )
+                side_label = "左臂" if transition.side == "left" else "右臂"
+                if transition.ok:
+                    message = f"{side_label}继续执行 init pose，开始重采该侧 tracker home。"
+                else:
+                    message = f"归位臂重采失败: {transition.message}"
+                self._publish_init_arm_state(message=message, control_hint=message)
+                return True
+
+            side = str(getattr(controller, "selected_side", "left") or "left")
+            fix_controller = getattr(self.components, "fix_arm_controller", None)
+            same_side_fixed = bool(
+                fix_controller is not None
+                and getattr(fix_controller, "fixed", False)
+                and getattr(fix_controller, "fixed_side", "") == side
+            )
+            if same_side_fixed:
+                side_label = "左臂" if side == "left" else "右臂"
+                message = f"{side_label}当前已被 fix-arm 固定；请先完成/释放该侧固定后再归位。"
+                self._publish_init_arm_state(message=message, control_hint=message)
+                return True
+
+            transition = controller.start_init(now=now)
+            side_label = "左臂" if transition.side == "left" else "右臂"
+            if transition.ok:
+                self._reset_runtime_tracking_for_side(transition.side, tag="InitArm", now=now)
+                message = f"{side_label}开始执行 init pose；再次按 G 重采该侧 home 并恢复遥操。"
+            else:
+                message = f"{side_label}归位失败: {transition.message}"
+            self._publish_init_arm_state(message=message, control_hint=message)
+        except Exception as exc:
+            message = (
+                "init-arm G event failed before state transition; "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("InitArm", message, now=now)
+            self._publish_init_arm_state(message=message, control_hint=message)
+        return True
+
     def _handle_fix_arm_c_event(self, *, now: float) -> bool:
         controller = getattr(self.components, "fix_arm_controller", None)
         if controller is None:
             return False
         if not self._teleop_started or self._hold_active:
             return False
-        if controller.recapturing:
-            message = "固定臂正在重采 home，请保持姿态直到样本采满。"
-            self._publish_fix_arm_state(message=message, control_hint=message)
-            return True
-        if controller.fixed:
-            transition = controller.start_recalibration(
+        try:
+            _log(
+                "FixArm",
+                "C event received "
+                f"selected={getattr(controller, 'selected_side', '') or '-'} "
+                f"fixed={getattr(controller, 'fixed_side', '') or '-'} "
+                f"active={bool(getattr(controller, 'fixed', False))} "
+                f"recapturing={bool(getattr(controller, 'recapturing', False))}",
                 now=now,
-                timeout_sec=float(getattr(self.args, "calibration_timeout", 10.0)),
-                min_samples=int(getattr(self.args, "calibration_samples", 20)),
             )
+            if controller.recapturing:
+                message = "固定臂正在重采 home，请保持姿态直到样本采满。"
+                self._publish_fix_arm_state(message=message, control_hint=message)
+                return True
+            if controller.fixed:
+                transition = controller.start_recalibration(
+                    now=now,
+                    timeout_sec=float(getattr(self.args, "calibration_timeout", 10.0)),
+                    min_samples=int(getattr(self.args, "calibration_samples", 20)),
+                )
+                side_label = "左臂" if transition.side == "left" else "右臂"
+                if transition.ok:
+                    message = f"{side_label}保持固定，开始逐帧重采该侧 tracker home。"
+                else:
+                    message = f"固定臂重采失败: {transition.message}"
+                self._publish_fix_arm_state(message=message, control_hint=message)
+                return True
+            init_controller = getattr(self.components, "init_arm_controller", None)
+            init_same_side_active = bool(
+                init_controller is not None
+                and getattr(init_controller, "active", False)
+                and getattr(init_controller, "active_side", "") == getattr(controller, "selected_side", "")
+            )
+            if init_same_side_active:
+                side = str(getattr(controller, "selected_side", "left") or "left")
+                side_label = "左臂" if side == "left" else "右臂"
+                message = f"{side_label}当前正在 init-arm 归位；请先按 G 完成该侧 home 重采后再固定。"
+                self._publish_fix_arm_state(message=message, control_hint=message)
+                return True
+            transition = controller.freeze_selected(now=now)
             side_label = "左臂" if transition.side == "left" else "右臂"
             if transition.ok:
-                message = f"{side_label}保持固定，开始逐帧重采该侧 tracker home。"
+                fixed_channel = f"{transition.side}_wrist_pose"
+                try:
+                    self.components.session.safety_monitor.request_pose_baseline_reset_many(
+                        (fixed_channel,)
+                    )
+                except Exception as exc:
+                    _log(
+                        "FixArm",
+                        f"WARNING: safety baseline reset failed for {fixed_channel}: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=now,
+                    )
+                reset_smoothing = getattr(
+                    getattr(self.components, "dual_arm_retargeter", None),
+                    "reset_target_pose_smoothing",
+                    None,
+                )
+                if callable(reset_smoothing):
+                    try:
+                        reset_smoothing()
+                    except Exception as exc:
+                        _log(
+                            "FixArm",
+                            "WARNING: retargeter target smoothing reset failed: "
+                            f"{type(exc).__name__}: {exc}",
+                            now=now,
+                        )
+                _log(
+                    "FixArm",
+                    f"{side_label} fixed; reset safety baseline for {fixed_channel} "
+                    "and retargeter target smoothing.",
+                    now=now,
+                )
+                message = f"{side_label}已固定：固定侧输入快照保持不动，IK/防碰撞继续正常运行；再次按 C 重采该侧 home。"
             else:
-                message = f"固定臂重采失败: {transition.message}"
+                missing = ", ".join(transition.missing_effectors)
+                missing_channels = ", ".join(getattr(transition, "missing_channels", ()))
+                details = []
+                if missing:
+                    details.append(f"缺少上一帧命令: {missing}")
+                if missing_channels:
+                    details.append(f"缺少有效输入快照: {missing_channels}")
+                detail = " " + "；".join(details) if details else ""
+                message = f"{side_label}固定失败: {transition.message}.{detail}"
             self._publish_fix_arm_state(message=message, control_hint=message)
-            return True
-        transition = controller.freeze_selected(now=now)
-        side_label = "左臂" if transition.side == "left" else "右臂"
-        if transition.ok:
-            message = f"{side_label}已固定：固定侧输入快照保持不动，IK/防碰撞继续正常运行；再次按 C 重采该侧 home。"
-        else:
-            missing = ", ".join(transition.missing_effectors)
-            missing_channels = ", ".join(getattr(transition, "missing_channels", ()))
-            details = []
-            if missing:
-                details.append(f"缺少上一帧命令: {missing}")
-            if missing_channels:
-                details.append(f"缺少有效输入快照: {missing_channels}")
-            detail = " " + "；".join(details) if details else ""
-            message = f"{side_label}固定失败: {transition.message}.{detail}"
-        self._publish_fix_arm_state(message=message, control_hint=message)
+        except Exception as exc:
+            message = (
+                "fix-arm C event failed before state transition; "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("FixArm", message, now=now)
+            self._publish_fix_arm_state(message=message, control_hint=message)
         return True
 
     def request_pose_snapshot(self) -> None:
@@ -10682,6 +11710,7 @@ class RealTeleopControlInput:
             episode_last_frame_count=self._episode_last_frame_count,
             **_collection_task_ui_state(self.args),
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
             **self._pose_snapshot_ui_state(),
         )
 
@@ -10717,6 +11746,7 @@ class RealTeleopControlInput:
             episode_last_frame_count=self._episode_last_frame_count,
             **_collection_task_ui_state(self.args),
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
             **self._pose_snapshot_ui_state(),
         )
 
@@ -10748,6 +11778,7 @@ class RealTeleopControlInput:
             ),
             **_movement_multiple_ui_state(self.args),
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
         )
 
     def before_calibration_start_delay(
@@ -10898,6 +11929,7 @@ class RealTeleopControlInput:
             episode_recording_available=self._episode_recording_available(),
             **_collection_task_ui_state(self.args),
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
             **self._pose_snapshot_ui_state(),
             camera_visualization_available=self._camera_visualization_available(),
             camera_visualization_active=self._camera_visualization_active,
@@ -10960,6 +11992,7 @@ class RealTeleopControlInput:
             **_movement_multiple_ui_state(self.args),
             **_vive_calibration_profile_ui_state(self.args, self.components),
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
         )
 
     def publish_runtime_home_progress(
@@ -11025,11 +12058,34 @@ class RealTeleopControlInput:
             )
         self.ui.publish(
             **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
             active_controls=self._teleop_controls(),
             control_hint=message,
         )
         if progress.completed or progress.failed:
             self.ui.append_message("FixArm", message)
+
+    def publish_init_arm_home_capture_progress(self, progress) -> None:
+        if self.ui is None or not progress.active:
+            return
+        side_label = "左臂" if progress.side == "left" else "右臂"
+        if progress.completed:
+            message = progress.message or f"{side_label} home 重采完成，已恢复遥操。"
+        elif progress.failed:
+            message = progress.message or f"{side_label} home 重采失败，继续保持 init pose。"
+        else:
+            message = (
+                f"{side_label}保持 init pose 并重采 home: "
+                f"{progress.sample_count}/{progress.min_samples} samples"
+            )
+        self.ui.publish(
+            **_fix_arm_ui_state(self.components),
+            **_init_arm_ui_state(self.components),
+            active_controls=self._teleop_controls(),
+            control_hint=message,
+        )
+        if progress.completed or progress.failed:
+            self.ui.append_message("InitArm", message)
 
     def _calibrate_vive_coordinate_profile(self) -> None:
         if self.ui is None:
@@ -11980,6 +13036,11 @@ def main() -> None:
         debug_timing_log_recorder = DebugTimingLogRecorder(
             heartbeat_sec=max(0.1, float(getattr(args, "debug_timing_report_interval_sec", 1.0))),
         )
+        main_loop_watchdog = MainLoopStallWatchdog(
+            enabled=debug_timing_state.enabled,
+            timeout_sec=max(5.0, float(debug_timing_state.report_interval_sec) * 5.0),
+            report_interval_sec=max(5.0, float(debug_timing_state.report_interval_sec) * 5.0),
+        )
         if debug_timing_state.enabled:
             try:
                 debug_timing_path = debug_timing_log_recorder.start(now=time.time())
@@ -11989,6 +13050,7 @@ def main() -> None:
                         "threshold_sec": float(debug_timing_state.threshold_sec),
                         "report_interval_sec": float(debug_timing_state.report_interval_sec),
                         "rm65_backend_debug_timing": True,
+                        "main_loop_watchdog_timeout_sec": float(main_loop_watchdog.timeout_sec),
                     },
                     now=time.time(),
                 )
@@ -12600,9 +13662,11 @@ def main() -> None:
         if args.record_auto_start:
             schedule_recording_countdown(time.time(), start_reason="auto_start")
 
+        main_loop_watchdog.start()
         emergency_stop_sent = False
         while True:
             loop_start = time.time()
+            main_loop_watchdog.beat("loop.start", step_index)
             loop_phase_timer = (
                 PhaseTimer()
                 if (debug_timing_state.enabled or recording_active())
@@ -12610,6 +13674,7 @@ def main() -> None:
             )
 
             def mark_loop_phase(name: str) -> None:
+                main_loop_watchdog.beat(name, step_index)
                 if loop_phase_timer is not None:
                     loop_phase_timer.mark(name)
 
@@ -12769,6 +13834,7 @@ def main() -> None:
                         gripper_control_enabled=False,
                         **_movement_multiple_ui_state(args),
                         **_fix_arm_ui_state(components),
+                        **_init_arm_ui_state(components),
                     )
                 if loop_phase_timer is not None:
                     mark_loop_phase("loop.hold_idle")
@@ -12848,6 +13914,39 @@ def main() -> None:
                         (f"{fix_arm_progress.side}_wrist_pose",)
                     )
                 clutch_input.publish_fix_arm_home_capture_progress(fix_arm_progress)
+            init_arm_progress = advance_init_arm_home_capture(
+                controller=getattr(components, "init_arm_controller", None),
+                channels=raw_step_channels,
+                calibration=components.session.calibration,
+                now=loop_start,
+                pose_from_channel=_channel_pose_in_desk,
+                mean_pose=_mean_pose,
+                resolve_robot_home=lambda side: _resolve_robot_home_for_side(components, side=side),
+                side_retargeter=lambda side: _side_retargeter(components, side),
+                tcp_mode=args.tcp_mode,
+                log=lambda tag, message: _log(tag, message, now=loop_start),
+            )
+            if init_arm_progress.active:
+                if init_arm_progress.completed and init_arm_progress.side:
+                    components.session.safety_monitor.request_pose_baseline_reset_many(
+                        (f"{init_arm_progress.side}_wrist_pose",)
+                    )
+                    reset_smoothing = getattr(
+                        getattr(components, "dual_arm_retargeter", None),
+                        "reset_target_pose_smoothing",
+                        None,
+                    )
+                    if callable(reset_smoothing):
+                        try:
+                            reset_smoothing()
+                        except Exception as exc:
+                            _log(
+                                "InitArm",
+                                "WARNING: retargeter target smoothing reset failed after home recapture: "
+                                f"{type(exc).__name__}: {exc}",
+                                now=loop_start,
+                            )
+                clutch_input.publish_init_arm_home_capture_progress(init_arm_progress)
             clutch_input.publish_camera_status(
                 camera_sources=camera_sources,
                 preview_camera_sources=preview_camera_sources,
@@ -13296,6 +14395,8 @@ def main() -> None:
                 bool(pose_quality_payload.get("bad", False)),
                 tuple(_pose_quality_reason_list(pose_quality_payload.get("reasons"))[:3]),
             )
+            fix_arm_snapshot = _fix_arm_debug_state(components)
+            init_arm_snapshot = _init_arm_debug_state(components)
             status_snapshot = (
                 step_result.state.value,
                 fault_codes,
@@ -13314,6 +14415,8 @@ def main() -> None:
                 hand_input_status,
                 gripper_status,
                 clutch_input.gripper_control_enabled(),
+                tuple(sorted(fix_arm_snapshot.items())),
+                tuple(sorted(init_arm_snapshot.items())),
             )
             mark_loop_phase("loop.status_snapshot")
             if status_gate.should_emit(
@@ -13336,6 +14439,18 @@ def main() -> None:
                     collision_bits += f" temp_safety={'limited' if temp_limited else 'on'}"
                 if clutch_input.ik_debug_timing_enabled():
                     collision_bits += f" {_ik_timing_status_text(ik_timing_payload)}"
+                fault_reason_bits = ""
+                fault_reason = getattr(components.session, "last_fault_reason", "")
+                if fault_reason:
+                    fault_reason_bits = f" fault_reason={_short_status_text(fault_reason, max_len=160)}"
+                fix_arm_bits = ""
+                fix_arm_text = _fix_arm_status_text(fix_arm_snapshot)
+                if fix_arm_text:
+                    fix_arm_bits = f" fix_arm={fix_arm_text.strip()}"
+                init_arm_bits = ""
+                init_arm_text = _init_arm_status_text(init_arm_snapshot)
+                if init_arm_text:
+                    init_arm_bits = f" init_arm={init_arm_text.strip()}"
                 pose_quality_bits = f" {_pose_quality_status_text(pose_quality_payload)}"
                 hand_bits = "" if not hand_input_status else f" hand_q6={list(hand_input_status)}"
                 gripper_bits = ""
@@ -13358,6 +14473,9 @@ def main() -> None:
                     f"left_clutch={left_clutch} "
                     f"right_clutch={right_clutch} "
                     f"faults={list(fault_codes)}"
+                    f"{fault_reason_bits}"
+                    f"{fix_arm_bits}"
+                    f"{init_arm_bits}"
                     f"{collision_bits}"
                     f"{pose_quality_bits}"
                     f"{hand_bits}"
@@ -13439,6 +14557,8 @@ def main() -> None:
             if remaining > 0:
                 time.sleep(remaining)
     finally:
+        if "main_loop_watchdog" in locals():
+            main_loop_watchdog.stop()
         if "debug_timing_log_recorder" in locals():
             debug_timing_log_recorder.stop(reason="finally", now=time.time())
         if "ik_debug_log_recorder" in locals():
