@@ -14,7 +14,7 @@ import numpy as np
 import serial
 from serial.tools import list_ports
 
-from project_paths import teleop_records_root
+from project_paths import hardware_interface_configs_root, teleop_records_root
 
 from .hand_q6_reader import BufferedSerialLineReader, OFFSET, Q6_ORDER, parse_angles_line
 
@@ -32,7 +32,11 @@ DEFAULT_PREVIEW_LOG_HZ = 5.0
 
 
 def default_config_dir() -> Path:
-    return teleop_records_root() / "q6_hardware_configs"
+    return hardware_interface_configs_root() / "q6"
+
+
+def legacy_config_dirs() -> tuple[Path, ...]:
+    return (teleop_records_root() / "q6_hardware_configs",)
 
 
 def hostname() -> str:
@@ -438,15 +442,31 @@ def build_assignment_from_tokens(
     return normalize_assignment(payload)
 
 
-def latest_config_path(config_dir: str | Path | None = None) -> Path:
-    root = Path(config_dir).expanduser().resolve() if config_dir is not None else default_config_dir()
+def _latest_config_path_in_dir(root: Path) -> Path | None:
     explicit = root / LATEST_CONFIG_NAME
     if explicit.exists():
         return explicit
     candidates = sorted(root.glob("*_hand_q6_assignment.json"))
-    if not candidates:
+    if candidates:
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    return None
+
+
+def latest_config_path(config_dir: str | Path | None = None) -> Path:
+    if config_dir is not None:
+        root = Path(config_dir).expanduser().resolve()
+        path = _latest_config_path_in_dir(root)
+        if path is not None:
+            return path
         raise FileNotFoundError(f"No hand Q6 assignment config found in {root}.")
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    searched = [default_config_dir(), *legacy_config_dirs()]
+    for root in searched:
+        path = _latest_config_path_in_dir(root)
+        if path is not None:
+            return path
+    roots = ", ".join(str(root) for root in searched)
+    raise FileNotFoundError(f"No hand Q6 assignment config found in {roots}.")
 
 
 def load_assignment(

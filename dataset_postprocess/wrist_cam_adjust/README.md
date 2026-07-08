@@ -95,8 +95,8 @@ python -m dataset_postprocess.wrist_cam_adjust dataset \
   --dataset-root datasets/2026-07-04_vive_rm65_real_teleop \
   --output-root datasets/2026-07-04_vive_rm65_real_teleop_wrist_masked \
   --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf \
-  --left-body-mask utils/wrist_cam_mask/painting/left_dmtac_m_mask_01.png \
-  --right-body-mask utils/wrist_cam_mask/painting/right_dmtac_m_mask_01.png \
+  --left-body-mask utils/wrist_cam_fix_mask/painting/left_dmtac_m_mask_01.png \
+  --right-body-mask utils/wrist_cam_fix_mask/painting/right_dmtac_m_mask_01.png \
   --output-kind masked \
   --jobs 2 \
   --overwrite
@@ -113,7 +113,7 @@ python -m dataset_postprocess.wrist_cam_adjust dataset \
   --episode 0 \
   --max-frames 80 \
   --output-kind overlay \
-  --right-body-mask utils/wrist_cam_mask/painting/right_dmtac_m_mask_01.png \
+  --right-body-mask utils/wrist_cam_fix_mask/painting/right_dmtac_m_mask_01.png \
   --overwrite
 ```
 

@@ -9,6 +9,7 @@ from scipy.spatial.transform import Rotation as R
 
 from ..recording import _to_serializable
 from ..schemas import EffectorCommand, ObservationChannel
+from .arm_mode_labels import flatten_arm_mode_columns, normalize_arm_mode_metadata
 from .sample_assembler import CollectorSample
 
 
@@ -242,6 +243,7 @@ def collector_sample_to_row(
     pose_quality = sample.metadata.get("pose_quality", {})
     if not isinstance(pose_quality, Mapping):
         pose_quality = {}
+    arm_mode = normalize_arm_mode_metadata(sample.metadata.get("arm_mode"))
     row: dict[str, Any] = {
         "index": int(sample.index),
         "episode_index": int(sample.episode_index),
@@ -307,7 +309,13 @@ def collector_sample_to_row(
             ensure_ascii=True,
             sort_keys=True,
         ),
+        "teleop.arm_mode_json": json.dumps(
+            _to_serializable(arm_mode),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
     }
+    row.update(flatten_arm_mode_columns(arm_mode))
     camera_expectations: dict[str, bool] = {}
     command_metadata_by_effector = sample.metadata.get("command_metadata_by_effector", {})
 

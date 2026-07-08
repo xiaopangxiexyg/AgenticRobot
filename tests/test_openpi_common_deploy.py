@@ -219,6 +219,52 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(kwargs["expected_model_id"], "dual_rm65_dmgripper_latest")
         self.assertIn("--active-sides", launched_args)
 
+    def test_openpi_real_launcher_ignores_empty_optional_contract_args(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(
+                [
+                    "--host",
+                    "127.0.0.2",
+                    "--port",
+                    "9000",
+                    "--model",
+                    "",
+                    "--checkpoint-step",
+                    "",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
+        kwargs = json.loads(kwargs_json)
+        self.assertNotIn("expected_model_id", kwargs)
+        self.assertNotIn("expected_checkpoint_step", kwargs)
+
+    def test_openpi_real_launcher_passes_debug_to_runtime(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(
+                [
+                    "--host",
+                    "127.0.0.2",
+                    "--port",
+                    "9000",
+                    "--api-key",
+                    "secret-token",
+                    "--debug",
+                    "--max-steps",
+                    "1",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
+        kwargs = json.loads(kwargs_json)
+        self.assertEqual(kwargs["api_key"], "secret-token")
+        self.assertIn("--debug", launched_args)
+        self.assertIn("--max-steps", launched_args)
+
 
 if __name__ == "__main__":
     unittest.main()

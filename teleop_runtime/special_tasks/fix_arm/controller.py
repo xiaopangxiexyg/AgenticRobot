@@ -243,6 +243,36 @@ class FixArmCommandController:
         self._status_message = message or f"{side} home recaptured; fix-arm released"
         return FixArmTransition(ok=True, message=self._status_message, side=side, mode=self._mode)
 
+    def cancel_active(
+        self,
+        *,
+        now: float,
+        reason: str = "",
+        clear_snapshots: bool = False,
+    ) -> FixArmTransition:
+        del now
+        side = self._fixed_side
+        was_active = bool(self.fixed)
+        self._mode = "live"
+        self._fixed_side = ""
+        self._fixed_by_effector = {}
+        self._fixed_by_channel = {}
+        self._recalibration = _RecalibrationState()
+        if clear_snapshots:
+            self._latest_by_effector = {}
+            self._latest_by_channel = {}
+        if was_active:
+            suffix = f": {reason}" if reason else ""
+            self._status_message = f"{side} fix-arm stopped{suffix}"
+        else:
+            self._status_message = "fix-arm ready"
+        return FixArmTransition(
+            ok=was_active,
+            message=self._status_message,
+            side=side,
+            mode=self._mode,
+        )
+
     def fail_recalibration(self, *, now: float, message: str) -> FixArmTransition:
         del now
         side = self._fixed_side
@@ -320,8 +350,20 @@ class FixArmCommandController:
                 if fixed_command is None:
                     continue
                 filtered_command = fixed_command.copy()
+                filtered_command.metadata = {
+                    **dict(filtered_command.metadata),
+                    "fix_arm_active": True,
+                    "fix_arm_side": fixed_side,
+                    "fix_arm_mode": self._mode,
+                }
                 filtered.commands[effector_name] = filtered_command
                 self._latest_by_effector[effector_name] = filtered_command.copy()
+            filtered.metadata.update(
+                {
+                    "fix_arm_active_side": fixed_side,
+                    "fix_arm_mode": self._mode,
+                }
+            )
         return filtered
 
     def filter_faults(

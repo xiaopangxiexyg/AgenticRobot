@@ -78,7 +78,6 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop   --act
 
 ```bash
 conda activate dexteleop310
-cd /home/password-1/DexTeleop
 
 export LEFT_ARM_IP=192.168.101.21
 export RIGHT_ARM_IP=192.168.1.20
@@ -90,7 +89,6 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
   --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json \
   --gui \
-  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json \
   --hand-backend dmtac-gripper \
   --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json \
   --q6-hold-recalibration-gesture \

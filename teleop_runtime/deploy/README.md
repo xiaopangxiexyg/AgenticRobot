@@ -41,6 +41,14 @@ policy output
 - 如果提供 `--debug-replay-dataset` / `--debug-replay-parquet`，且没有显式传 `--action-hz`，部署器会优先从数据集实际记录的 action 行间 `timestamp` / episode stats / `control_hz` 推断真实 action 执行频率，并按该频率发送 action。
 - 也可以用 `--action-hz-dataset` 单独指定一个参考数据集来推断发送频率，而不进入 replay 模式。
 - `--policy-hz` 可以省略；省略时，普通部署保持历史默认 `10Hz`，而 replay / 参考数据集频率模式会默认跟随推断出的 action 频率。
+- RM65 策略执行的关节速度/步长默认对齐
+  `run_vive_rm65_real_teleop`：`--arm-max-angvel` 默认为
+  `0.7,0.7,0.9,1.5,1.5,2.0`，`--arm-step-dt-scaling` 默认开启，
+  `--arm-step-dt-max-scale` 未显式指定时按
+  `max(3.0, 1.1 * --arm-control-hz / effective_action_hz)` 自动计算。
+  joint-vector action 的 `--max-arm-joint-step-rad` 默认是 `6deg`。
+  policy action 的 IK 目标步长按 action 间隔计算，RM65 background stream
+  仍按 `--arm-control-hz` 细分发送。
 
 ## Action / Observation Layout
 
@@ -238,7 +246,7 @@ python -m teleop_runtime.deploy \
 ## 双臂 + DMTac Gripper
 
 先按根目录 `README.md` 的“GRIPPER 和 DM TAC 分开标注”保存
-`teleop_records/dmtac_hardware_configs/latest.json`；部署时读取同一份 latest：
+`teleop_runtime/configs/hardware/dmtac/latest.json`；部署时读取同一份 latest：
 
 ```bash
 python -m teleop_runtime.deploy \

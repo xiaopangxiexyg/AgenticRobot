@@ -1,0 +1,883 @@
+{
+  "assignments": {
+    "left": {
+      "baudrate": 115200,
+      "enabled": true,
+      "identity": {
+        "description": "USB Single Serial",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=3-1:1.0",
+        "location": "3-1:1.0",
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137621"
+      },
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+      "port_aliases": [
+        "/dev/ttyACM1",
+        "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+        "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0"
+      ],
+      "probe": {
+        "error": null,
+        "latest_angles_deg": [
+          170.86,
+          200.74,
+          190.11,
+          181.23,
+          172.62,
+          172.35
+        ],
+        "probe_elapsed_s": 0.002953,
+        "reachable": true,
+        "valid_frames": 1
+      },
+      "q6_order": [
+        "thumb_yaw",
+        "thumb_flex",
+        "index",
+        "middle",
+        "ring",
+        "pinky"
+      ],
+      "timeout": 0.05
+    },
+    "right": {
+      "baudrate": 115200,
+      "enabled": true,
+      "identity": {
+        "description": "USB Single Serial",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=3-2:1.0",
+        "location": "3-2:1.0",
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137618"
+      },
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+      "port_aliases": [
+        "/dev/ttyACM0",
+        "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+        "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+      ],
+      "probe": {
+        "error": null,
+        "latest_angles_deg": [
+          168.31,
+          165.67,
+          174.55,
+          183.96,
+          172.18,
+          174.64
+        ],
+        "probe_elapsed_s": 0.000697,
+        "reachable": true,
+        "valid_frames": 1
+      },
+      "q6_order": [
+        "thumb_yaw",
+        "thumb_flex",
+        "index",
+        "middle",
+        "ring",
+        "pinky"
+      ],
+      "timeout": 0.05
+    }
+  },
+  "created_at": "2026-06-28T12:24:50+08:00",
+  "devices_seen": {
+    "baudrate": 115200,
+    "hostname": "1",
+    "probe_timeout_s": 1.5,
+    "q6_devices": [
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM1",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=3-1:1.0",
+        "index": 32,
+        "interface": null,
+        "location": "3-1:1.0",
+        "manufacturer": null,
+        "name": "ttyACM1",
+        "port": "/dev/ttyACM1",
+        "port_aliases": [
+          "/dev/ttyACM1",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+        "probable_q6_serial": true,
+        "probe": {
+          "error": null,
+          "latest_angles_deg": [
+            170.86,
+            200.74,
+            190.11,
+            181.23,
+            172.62,
+            172.35
+          ],
+          "probe_elapsed_s": 0.002953,
+          "reachable": true,
+          "valid_frames": 1
+        },
+        "probe_attempted": true,
+        "product": "USB Single Serial",
+        "q6_index": 0,
+        "serial_number": "5B7A137621"
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM0",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=3-2:1.0",
+        "index": 33,
+        "interface": null,
+        "location": "3-2:1.0",
+        "manufacturer": null,
+        "name": "ttyACM0",
+        "port": "/dev/ttyACM0",
+        "port_aliases": [
+          "/dev/ttyACM0",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+        "probable_q6_serial": true,
+        "probe": {
+          "error": null,
+          "latest_angles_deg": [
+            168.31,
+            165.67,
+            174.55,
+            183.96,
+            172.18,
+            174.64
+          ],
+          "probe_elapsed_s": 0.000697,
+          "reachable": true,
+          "valid_frames": 1
+        },
+        "probe_attempted": true,
+        "product": "USB Single Serial",
+        "q6_index": 1,
+        "serial_number": "5B7A137618"
+      }
+    ],
+    "scanned_at": "2026-06-28T12:24:25+08:00",
+    "schema_version": "hand_q6_scan.v1",
+    "serial_ports": [
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS31",
+        "hwid": "n/a",
+        "index": 0,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS31",
+        "port": "/dev/ttyS31",
+        "port_aliases": [
+          "/dev/ttyS31"
+        ],
+        "preferred_port": "/dev/ttyS31",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS30",
+        "hwid": "n/a",
+        "index": 1,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS30",
+        "port": "/dev/ttyS30",
+        "port_aliases": [
+          "/dev/ttyS30"
+        ],
+        "preferred_port": "/dev/ttyS30",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS29",
+        "hwid": "n/a",
+        "index": 2,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS29",
+        "port": "/dev/ttyS29",
+        "port_aliases": [
+          "/dev/ttyS29"
+        ],
+        "preferred_port": "/dev/ttyS29",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS28",
+        "hwid": "n/a",
+        "index": 3,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS28",
+        "port": "/dev/ttyS28",
+        "port_aliases": [
+          "/dev/ttyS28"
+        ],
+        "preferred_port": "/dev/ttyS28",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS27",
+        "hwid": "n/a",
+        "index": 4,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS27",
+        "port": "/dev/ttyS27",
+        "port_aliases": [
+          "/dev/ttyS27"
+        ],
+        "preferred_port": "/dev/ttyS27",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS26",
+        "hwid": "n/a",
+        "index": 5,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS26",
+        "port": "/dev/ttyS26",
+        "port_aliases": [
+          "/dev/ttyS26"
+        ],
+        "preferred_port": "/dev/ttyS26",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS25",
+        "hwid": "n/a",
+        "index": 6,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS25",
+        "port": "/dev/ttyS25",
+        "port_aliases": [
+          "/dev/ttyS25"
+        ],
+        "preferred_port": "/dev/ttyS25",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS24",
+        "hwid": "n/a",
+        "index": 7,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS24",
+        "port": "/dev/ttyS24",
+        "port_aliases": [
+          "/dev/ttyS24"
+        ],
+        "preferred_port": "/dev/ttyS24",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS23",
+        "hwid": "n/a",
+        "index": 8,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS23",
+        "port": "/dev/ttyS23",
+        "port_aliases": [
+          "/dev/ttyS23"
+        ],
+        "preferred_port": "/dev/ttyS23",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS22",
+        "hwid": "n/a",
+        "index": 9,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS22",
+        "port": "/dev/ttyS22",
+        "port_aliases": [
+          "/dev/ttyS22"
+        ],
+        "preferred_port": "/dev/ttyS22",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS21",
+        "hwid": "n/a",
+        "index": 10,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS21",
+        "port": "/dev/ttyS21",
+        "port_aliases": [
+          "/dev/ttyS21"
+        ],
+        "preferred_port": "/dev/ttyS21",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS20",
+        "hwid": "n/a",
+        "index": 11,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS20",
+        "port": "/dev/ttyS20",
+        "port_aliases": [
+          "/dev/ttyS20"
+        ],
+        "preferred_port": "/dev/ttyS20",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS19",
+        "hwid": "n/a",
+        "index": 12,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS19",
+        "port": "/dev/ttyS19",
+        "port_aliases": [
+          "/dev/ttyS19"
+        ],
+        "preferred_port": "/dev/ttyS19",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS18",
+        "hwid": "n/a",
+        "index": 13,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS18",
+        "port": "/dev/ttyS18",
+        "port_aliases": [
+          "/dev/ttyS18"
+        ],
+        "preferred_port": "/dev/ttyS18",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS17",
+        "hwid": "n/a",
+        "index": 14,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS17",
+        "port": "/dev/ttyS17",
+        "port_aliases": [
+          "/dev/ttyS17"
+        ],
+        "preferred_port": "/dev/ttyS17",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS16",
+        "hwid": "n/a",
+        "index": 15,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS16",
+        "port": "/dev/ttyS16",
+        "port_aliases": [
+          "/dev/ttyS16"
+        ],
+        "preferred_port": "/dev/ttyS16",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS15",
+        "hwid": "n/a",
+        "index": 16,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS15",
+        "port": "/dev/ttyS15",
+        "port_aliases": [
+          "/dev/ttyS15"
+        ],
+        "preferred_port": "/dev/ttyS15",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS14",
+        "hwid": "n/a",
+        "index": 17,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS14",
+        "port": "/dev/ttyS14",
+        "port_aliases": [
+          "/dev/ttyS14"
+        ],
+        "preferred_port": "/dev/ttyS14",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS13",
+        "hwid": "n/a",
+        "index": 18,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS13",
+        "port": "/dev/ttyS13",
+        "port_aliases": [
+          "/dev/ttyS13"
+        ],
+        "preferred_port": "/dev/ttyS13",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS12",
+        "hwid": "n/a",
+        "index": 19,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS12",
+        "port": "/dev/ttyS12",
+        "port_aliases": [
+          "/dev/ttyS12"
+        ],
+        "preferred_port": "/dev/ttyS12",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS11",
+        "hwid": "n/a",
+        "index": 20,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS11",
+        "port": "/dev/ttyS11",
+        "port_aliases": [
+          "/dev/ttyS11"
+        ],
+        "preferred_port": "/dev/ttyS11",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS10",
+        "hwid": "n/a",
+        "index": 21,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS10",
+        "port": "/dev/ttyS10",
+        "port_aliases": [
+          "/dev/ttyS10"
+        ],
+        "preferred_port": "/dev/ttyS10",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS9",
+        "hwid": "n/a",
+        "index": 22,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS9",
+        "port": "/dev/ttyS9",
+        "port_aliases": [
+          "/dev/ttyS9"
+        ],
+        "preferred_port": "/dev/ttyS9",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS8",
+        "hwid": "n/a",
+        "index": 23,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS8",
+        "port": "/dev/ttyS8",
+        "port_aliases": [
+          "/dev/ttyS8"
+        ],
+        "preferred_port": "/dev/ttyS8",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS7",
+        "hwid": "n/a",
+        "index": 24,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS7",
+        "port": "/dev/ttyS7",
+        "port_aliases": [
+          "/dev/ttyS7"
+        ],
+        "preferred_port": "/dev/ttyS7",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS6",
+        "hwid": "n/a",
+        "index": 25,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS6",
+        "port": "/dev/ttyS6",
+        "port_aliases": [
+          "/dev/ttyS6"
+        ],
+        "preferred_port": "/dev/ttyS6",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS5",
+        "hwid": "n/a",
+        "index": 26,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS5",
+        "port": "/dev/ttyS5",
+        "port_aliases": [
+          "/dev/ttyS5"
+        ],
+        "preferred_port": "/dev/ttyS5",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS4",
+        "hwid": "n/a",
+        "index": 27,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS4",
+        "port": "/dev/ttyS4",
+        "port_aliases": [
+          "/dev/ttyS4"
+        ],
+        "preferred_port": "/dev/ttyS4",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS3",
+        "hwid": "n/a",
+        "index": 28,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS3",
+        "port": "/dev/ttyS3",
+        "port_aliases": [
+          "/dev/ttyS3"
+        ],
+        "preferred_port": "/dev/ttyS3",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS2",
+        "hwid": "n/a",
+        "index": 29,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS2",
+        "port": "/dev/ttyS2",
+        "port_aliases": [
+          "/dev/ttyS2"
+        ],
+        "preferred_port": "/dev/ttyS2",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS1",
+        "hwid": "n/a",
+        "index": 30,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS1",
+        "port": "/dev/ttyS1",
+        "port_aliases": [
+          "/dev/ttyS1"
+        ],
+        "preferred_port": "/dev/ttyS1",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS0",
+        "hwid": "n/a",
+        "index": 31,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "name": "ttyS0",
+        "port": "/dev/ttyS0",
+        "port_aliases": [
+          "/dev/ttyS0"
+        ],
+        "preferred_port": "/dev/ttyS0",
+        "probable_q6_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM1",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=3-1:1.0",
+        "index": 32,
+        "interface": null,
+        "location": "3-1:1.0",
+        "manufacturer": null,
+        "name": "ttyACM1",
+        "port": "/dev/ttyACM1",
+        "port_aliases": [
+          "/dev/ttyACM1",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+        "probable_q6_serial": true,
+        "probe": {
+          "error": null,
+          "latest_angles_deg": [
+            170.86,
+            200.74,
+            190.11,
+            181.23,
+            172.62,
+            172.35
+          ],
+          "probe_elapsed_s": 0.002953,
+          "reachable": true,
+          "valid_frames": 1
+        },
+        "probe_attempted": true,
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137621"
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM0",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=3-2:1.0",
+        "index": 33,
+        "interface": null,
+        "location": "3-2:1.0",
+        "manufacturer": null,
+        "name": "ttyACM0",
+        "port": "/dev/ttyACM0",
+        "port_aliases": [
+          "/dev/ttyACM0",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+        "probable_q6_serial": true,
+        "probe": {
+          "error": null,
+          "latest_angles_deg": [
+            168.31,
+            165.67,
+            174.55,
+            183.96,
+            172.18,
+            174.64
+          ],
+          "probe_elapsed_s": 0.000697,
+          "reachable": true,
+          "valid_frames": 1
+        },
+        "probe_attempted": true,
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137618"
+      }
+    ],
+    "timeout": 0.05
+  },
+  "hostname": "1",
+  "saved_at": "2026-06-28T12:24:50+08:00",
+  "schema_version": "hand_q6_assignment.v1",
+  "source_config_path": "/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/hardware/q6/20260628_122450_hand_q6_assignment.json"
+}

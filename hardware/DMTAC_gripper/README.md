@@ -213,7 +213,7 @@ python run_gripper.py configure-usb \
   --save
 ```
 
-配置默认保存到仓库的 `teleop_records/dmtac_hardware_configs/`，同时更新
+配置默认保存到仓库的 `teleop_runtime/configs/hardware/dmtac/`，同时更新
 `latest.json` 并记录 `hostname`。后续独立调试可以直接加载：
 
 ```bash

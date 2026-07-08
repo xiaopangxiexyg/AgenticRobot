@@ -5,7 +5,7 @@ import faulthandler
 import json
 import queue
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import os
@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -227,7 +227,7 @@ DEFAULT_TASKS_CONFIG_PATH = (
 )
 WRIST_DEPTH_CAMERA_KEYS = ("left_wrist", "right_wrist")
 DEFAULT_WRIST_DEPTH_SAVE_FPS = 15
-DEFAULT_WRIST_DEPTH_STREAM_FPS = 30
+DEFAULT_WRIST_DEPTH_STREAM_FPS = 15
 DEFAULT_WRIST_DEPTH_FPS = DEFAULT_WRIST_DEPTH_SAVE_FPS
 DEFAULT_WRIST_DEPTH_MIN_M = 0.05
 DEFAULT_WRIST_DEPTH_MAX_M = 0.5
@@ -307,6 +307,177 @@ DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M = 0.45
 DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG = 160.0
 TRACKER_GUI_WARN_AGE_SEC = 0.25
 TRACKER_GUI_STALE_AGE_SEC = 0.50
+CAMERA_STARTUP_SELF_CHECK_DURATION_SEC = 3.0
+CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC = 0.2
+CAMERA_START_STAGGER_SEC = 0.5
+WRIST_DEPTH_STALE_REPEAT_FAILURE_FRAMES = 3
+WRIST_DEPTH_EPOCH_TIMESTAMP_STALE_SEC = 2.0
+
+
+def _normalize_depth_signature_value(value: object, *, digits: int) -> float | None:
+    numeric = _safe_float_value(value)
+    if numeric is None:
+        return None
+    return round(float(numeric), int(digits))
+
+
+def _wrist_depth_signature(depth_metadata: Mapping[str, object]) -> tuple[tuple[str, object], ...] | None:
+    parts: list[tuple[str, object]] = []
+    frame_number = _safe_int_value(depth_metadata.get("frame_number"))
+    if frame_number is not None:
+        parts.append(("frame_number", int(frame_number)))
+    camera_timestamp_sec = _normalize_depth_signature_value(
+        depth_metadata.get("camera_timestamp_sec"),
+        digits=6,
+    )
+    if camera_timestamp_sec is not None:
+        parts.append(("camera_timestamp_sec", camera_timestamp_sec))
+    sensor_timestamp_ms = _normalize_depth_signature_value(
+        depth_metadata.get("sensor_timestamp_ms"),
+        digits=3,
+    )
+    if sensor_timestamp_ms is not None:
+        parts.append(("sensor_timestamp_ms", sensor_timestamp_ms))
+    return tuple(parts) if parts else None
+
+
+def _frame_source_marker(frame: object) -> tuple[str, object] | None:
+    frame_index = _safe_int_value(getattr(frame, "frame_index", None))
+    if frame_index is not None:
+        return ("frame_index", int(frame_index))
+    source_timestamp = _normalize_depth_signature_value(
+        getattr(frame, "source_timestamp", None),
+        digits=6,
+    )
+    if source_timestamp is not None:
+        return ("source_timestamp", source_timestamp)
+    return None
+
+
+def _epoch_depth_timestamp_age_sec(frame: object, depth_metadata: Mapping[str, object]) -> float | None:
+    source_timestamp = _safe_float_value(getattr(frame, "source_timestamp", None))
+    camera_timestamp_sec = _safe_float_value(depth_metadata.get("camera_timestamp_sec"))
+    if source_timestamp is None or camera_timestamp_sec is None:
+        return None
+    if source_timestamp < 1_000_000_000.0 or camera_timestamp_sec < 1_000_000_000.0:
+        return None
+    return float(source_timestamp) - float(camera_timestamp_sec)
+
+
+@dataclass
+class WristDepthFreshnessState:
+    first_seen_at: float | None = None
+    last_seen_at: float | None = None
+    last_changed_at: float | None = None
+    last_signature: tuple[tuple[str, object], ...] | None = None
+    last_source_marker: tuple[str, object] | None = None
+    seen_signatures: set[tuple[tuple[str, object], ...]] = field(default_factory=set)
+    repeated_source_frame_count: int = 0
+    total_depth_frames_seen: int = 0
+
+
+class WristDepthFreshnessMonitor:
+    def __init__(self, *, stale_repeat_threshold: int = WRIST_DEPTH_STALE_REPEAT_FAILURE_FRAMES) -> None:
+        self.stale_repeat_threshold = max(1, int(stale_repeat_threshold))
+        self._states: dict[str, WristDepthFreshnessState] = {}
+        self._lock = threading.RLock()
+
+    def reset(self, camera_key: str | None = None) -> None:
+        with self._lock:
+            if camera_key is None:
+                self._states.clear()
+            else:
+                self._states.pop(str(camera_key), None)
+
+    def update(
+        self,
+        camera_key: str,
+        frame: object,
+        *,
+        now: float,
+        depth_metadata: Mapping[str, object],
+    ) -> dict[str, object]:
+        signature = _wrist_depth_signature(depth_metadata)
+        source_marker = _frame_source_marker(frame)
+        depth_timestamp_age_sec = _epoch_depth_timestamp_age_sec(frame, depth_metadata)
+        with self._lock:
+            state = self._states.setdefault(str(camera_key), WristDepthFreshnessState())
+            if state.first_seen_at is None:
+                state.first_seen_at = float(now)
+            state.last_seen_at = float(now)
+            state.total_depth_frames_seen += 1
+            source_advanced = (
+                source_marker is not None
+                and state.last_source_marker is not None
+                and source_marker != state.last_source_marker
+            )
+            if signature is not None:
+                if signature != state.last_signature:
+                    state.last_changed_at = float(now)
+                    state.repeated_source_frame_count = 0
+                elif source_advanced:
+                    state.repeated_source_frame_count += 1
+                state.seen_signatures.add(signature)
+                state.last_signature = signature
+            if source_marker is not None:
+                state.last_source_marker = source_marker
+            first_seen_at = state.first_seen_at
+            last_changed_at = state.last_changed_at
+            unique_count = len(state.seen_signatures)
+            repeated_count = int(state.repeated_source_frame_count)
+            total_seen = int(state.total_depth_frames_seen)
+
+        first_seen_age_sec = None if first_seen_at is None else max(0.0, float(now) - float(first_seen_at))
+        last_changed_age_sec = (
+            None
+            if last_changed_at is None
+            else max(0.0, float(now) - float(last_changed_at))
+        )
+        stale_by_repeat = repeated_count >= int(self.stale_repeat_threshold)
+        stale_by_timestamp = (
+            depth_timestamp_age_sec is not None
+            and depth_timestamp_age_sec >= WRIST_DEPTH_EPOCH_TIMESTAMP_STALE_SEC
+        )
+        status_level = "ok"
+        status_label = "Depth 新鲜"
+        status_message = ""
+        if signature is None:
+            status_level = "error"
+            status_label = "Depth metadata 缺失"
+            status_message = "无法读取 depth frame_number/timestamp，不能验证 wrist depth 是否在更新。"
+        elif stale_by_timestamp:
+            status_level = "error"
+            status_label = "Wrist Depth 停滞"
+            status_message = (
+                "depth camera timestamp stale: "
+                f"age={depth_timestamp_age_sec:.2f}s >= {WRIST_DEPTH_EPOCH_TIMESTAMP_STALE_SEC:.2f}s"
+            )
+        elif stale_by_repeat:
+            status_level = "error"
+            status_label = "Wrist Depth 停滞"
+            status_message = (
+                "RGB/source frame 在更新，但 depth frame_number/timestamp 连续 "
+                f"{repeated_count} 帧未变化。"
+            )
+        elif unique_count < 2:
+            status_level = "waiting"
+            status_label = "等待 Depth 更新"
+            status_message = "已收到 wrist depth，正在确认 frame_number/timestamp 是否连续变化。"
+
+        return {
+            "depth_signature_available": signature is not None,
+            "depth_signature_unique_count": int(unique_count),
+            "depth_signature_repeat_count": int(repeated_count),
+            "depth_signature_total_seen": int(total_seen),
+            "depth_signature_first_seen_age_sec": first_seen_age_sec,
+            "depth_signature_last_changed_age_sec": last_changed_age_sec,
+            "depth_source_marker": _json_safe_value(source_marker),
+            "depth_signature": _json_safe_value(signature),
+            "depth_timestamp_age_sec": depth_timestamp_age_sec,
+            "depth_freshness_status_level": status_level,
+            "depth_freshness_status_label": status_label,
+            "depth_freshness_status_message": status_message,
+        }
 
 
 @dataclass(frozen=True)
@@ -355,6 +526,76 @@ class RealDebugTimingState:
     report_interval_sec: float = 1.0
     last_report_at: float = 0.0
     suppressed_reports: int = 0
+
+
+@dataclass(frozen=True)
+class DebugTimingModules:
+    legacy_all: bool = False
+    console: bool = False
+    light_log: bool = False
+    rm65_backend: bool = False
+    ik_profile: bool = False
+    watchdog: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            self.console
+            or self.light_log
+            or self.rm65_backend
+            or self.ik_profile
+            or self.watchdog
+        )
+
+    @property
+    def needs_loop_phase_timer(self) -> bool:
+        return bool(self.console or self.light_log)
+
+    def enabled_names(self) -> tuple[str, ...]:
+        names: list[str] = []
+        if self.console:
+            names.append("console")
+        if self.light_log:
+            names.append("log")
+        if self.rm65_backend:
+            names.append("rm65")
+        if self.ik_profile:
+            names.append("ik")
+        if self.watchdog:
+            names.append("watchdog")
+        return tuple(names)
+
+
+def _debug_timing_modules(args: argparse.Namespace) -> DebugTimingModules:
+    legacy_all = bool(getattr(args, "debug_timing", False))
+    return DebugTimingModules(
+        legacy_all=legacy_all,
+        console=legacy_all or bool(getattr(args, "debug_timing_console", False)),
+        light_log=legacy_all or bool(getattr(args, "debug_timing_log", False)),
+        rm65_backend=legacy_all or bool(getattr(args, "debug_timing_rm65", False)),
+        ik_profile=legacy_all
+        or bool(getattr(args, "debug_timing_ik", False))
+        or bool(getattr(args, "debug_ik_timing", False)),
+        watchdog=legacy_all or bool(getattr(args, "debug_timing_watchdog", False)),
+    )
+
+
+def _debug_timing_metadata(args: argparse.Namespace) -> dict[str, object]:
+    modules = _debug_timing_modules(args)
+    return {
+        "debug_timing": bool(modules.enabled),
+        "debug_timing_legacy_all": bool(modules.legacy_all),
+        "debug_timing_modules": list(modules.enabled_names()),
+        "debug_timing_console": bool(modules.console),
+        "debug_timing_light_log": bool(modules.light_log),
+        "rm65_backend_debug_timing": bool(modules.rm65_backend),
+        "debug_timing_ik_profile": bool(modules.ik_profile),
+        "debug_timing_watchdog": bool(modules.watchdog),
+        "debug_timing_threshold_sec": float(getattr(args, "debug_timing_threshold_sec", 0.025)),
+        "debug_timing_report_interval_sec": float(
+            getattr(args, "debug_timing_report_interval_sec", 1.0)
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -1365,8 +1606,10 @@ def _run_gui_device_preflight(
         require_dmtac_gripper=require_dmtac_stack,
         require_dmtac_tactile=bool(require_dmtac_stack and require_tactile),
         auto_configure=bool(getattr(args, "device_auto_configure", True)),
+        force_reconfigure=bool(getattr(args, "device_preflight_force_reconfigure", False)),
         assume_yes=bool(getattr(args, "device_preflight_yes", False)),
         fix_permissions=bool(getattr(args, "device_fix_permissions", False)),
+        probe_all_serial=bool(getattr(args, "device_preflight_probe_all_serial", False)),
         q6_config=str(getattr(args, "q6_config", "latest") or "latest"),
         dmtac_config=str(getattr(args, "dmtac_config", "latest") or "latest"),
         dmtac_tactile_backend=str(getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"),
@@ -1380,6 +1623,8 @@ def _run_gui_device_preflight(
     for message in result.messages:
         for line in str(message).splitlines():
             _log("DevicePreflight", line)
+    if getattr(result, "dmtac_assignment", None) is not None:
+        args._dmtac_preflight_assignment = result.dmtac_assignment
     if result.q6_ports:
         args.q6_config_loaded_ports = dict(result.q6_ports)
         for side, port in result.q6_ports.items():
@@ -1628,12 +1873,17 @@ def _dmtac_backend_configs(
     policies_by_side = _resolved_gripper_policies_by_side(args, active_sides)
     configs: dict[str, DMTacGripperBackendConfig] = {}
     if bool(getattr(args, "dmtac_default_config", True)):
+        preflight_assignment = getattr(args, "_dmtac_preflight_assignment", None)
         try:
-            assignment = load_dmtac_hardware_assignment(
-                str(getattr(args, "dmtac_config", "latest") or "latest"),
-                validate_current_usb=bool(getattr(args, "dmtac_validate_current_usb", True)),
-                allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
-                assume_yes_for_extra=bool(getattr(args, "dmtac_assume_yes_for_extra", True)),
+            assignment = (
+                dict(preflight_assignment)
+                if isinstance(preflight_assignment, Mapping)
+                else load_dmtac_hardware_assignment(
+                    str(getattr(args, "dmtac_config", "latest") or "latest"),
+                    validate_current_usb=bool(getattr(args, "dmtac_validate_current_usb", True)),
+                    allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
+                    assume_yes_for_extra=bool(getattr(args, "dmtac_assume_yes_for_extra", True)),
+                )
             )
             for side in active_sides:
                 side_policy = policies_by_side.get(side, policy)
@@ -2036,6 +2286,22 @@ def parse_args() -> argparse.Namespace:
         help="Use default left/right assignment choices during GUI device preflight.",
     )
     parser.add_argument(
+        "--device-preflight-probe-all-serial",
+        action="store_true",
+        help=(
+            "Probe all current USB serial ports during GUI device preflight. Useful after USB "
+            "disconnect/reconnect when descriptors or by-id aliases changed."
+        ),
+    )
+    parser.add_argument(
+        "--device-preflight-force-reconfigure",
+        action="store_true",
+        help=(
+            "Ignore existing valid Q6/DMTAC assignments during GUI preflight and re-run "
+            "their selection flows, saving refreshed configs. RealSense and arm IP configs stay unchanged."
+        ),
+    )
+    parser.add_argument(
         "--device-preflight-no-tactile",
         dest="device_preflight_require_tactile",
         action="store_false",
@@ -2107,6 +2373,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-no-continuous", dest="gripper_continuous_grasp", action="store_false")
     parser.add_argument("--gripper-command-hz", type=_positive_float, default=None)
     parser.add_argument("--gripper-telemetry-hz", type=_positive_float, default=None)
+    parser.add_argument(
+        "--gripper-warmup-probe",
+        dest="gripper_warmup_probe",
+        action="store_true",
+        default=True,
+        help=(
+            "During recording warmup, command DMTAC grippers open->half-close->open "
+            "and reconnect any gripper whose measured state does not follow."
+        ),
+    )
+    parser.add_argument(
+        "--no-gripper-warmup-probe",
+        dest="gripper_warmup_probe",
+        action="store_false",
+        help="Disable the DMTAC gripper motion probe during recording warmup.",
+    )
+    parser.add_argument(
+        "--gripper-warmup-probe-tolerance",
+        type=float,
+        default=0.18,
+        help="Allowed normalized error when validating DMTAC gripper warmup motion.",
+    )
+    parser.add_argument(
+        "--gripper-warmup-probe-step-timeout-sec",
+        type=_positive_float,
+        default=2.0,
+        help="Timeout per open/half/open gripper warmup step.",
+    )
+    parser.add_argument(
+        "--gripper-warmup-probe-settle-sec",
+        type=float,
+        default=0.20,
+        help="Settling delay after each gripper warmup command before reading state.",
+    )
+    parser.add_argument(
+        "--gripper-warmup-probe-poll-sec",
+        type=_positive_float,
+        default=0.05,
+        help="Polling interval while waiting for DMTAC gripper warmup state.",
+    )
     parser.add_argument("--hand-reader-baudrate", type=int, default=115200, help="Hand teleop serial baudrate")
     parser.add_argument("--hand-reader-timeout", type=float, default=0.05, help="Hand teleop serial timeout in seconds")
     parser.add_argument(
@@ -2568,9 +2874,49 @@ def parse_args() -> argparse.Namespace:
         dest="debug_timing",
         action="store_true",
         help=(
-            "Enable real-loop phase timing diagnostics. Slow frames print session, IK, "
-            "render, episode-record, and status timing breakdowns."
+            "Compatibility switch that enables all timing debug modules: console slow-frame "
+            "reports, JSONL timing log, RM65 backend timing, IK profiling, and the main-loop "
+            "watchdog. Prefer the narrower --debug-timing-* flags for routine diagnosis."
         ),
+    )
+    parser.add_argument(
+        "--debug-timing-console",
+        action="store_true",
+        help=(
+            "Print slow-frame real-loop phase/latency reports without enabling timing "
+            "JSONL or backend profiling."
+        ),
+    )
+    parser.add_argument(
+        "--debug-timing-log",
+        "--debug-timing-light-log",
+        dest="debug_timing_log",
+        action="store_true",
+        help="Write sampled real-loop timing JSONL frames under teleop_records/debug_timing.",
+    )
+    parser.add_argument(
+        "--debug-timing-rm65",
+        "--rm65-backend-debug-timing",
+        dest="debug_timing_rm65",
+        action="store_true",
+        help=(
+            "Enable RM65 impedance backend timing instrumentation. Combine with "
+            "--debug-timing-console or --debug-timing-log to emit it."
+        ),
+    )
+    parser.add_argument(
+        "--debug-timing-ik",
+        dest="debug_timing_ik",
+        action="store_true",
+        help=(
+            "Enable IK timing/profile collection as a timing debug module. "
+            "--debug-ik-timing remains available for the same IK-focused diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--debug-timing-watchdog",
+        action="store_true",
+        help="Enable the background main-loop stall watchdog without enabling other timing logs.",
     )
     parser.add_argument(
         "--debug-timing-threshold-sec",
@@ -2881,6 +3227,58 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--wrist-cam-width",
+        dest="wrist_cam_width",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Requested native RealSense stream width for left/right D405 wrist cameras when "
+            "wrist depth is enabled. D405 RGB and depth are started at the same resolution. "
+            "Defaults to the configured wrist RGB stream width."
+        ),
+    )
+    parser.add_argument(
+        "--wrist-depth-width",
+        dest="wrist_cam_width",
+        type=_positive_int,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--wrist-cam-height",
+        dest="wrist_cam_height",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Requested native RealSense stream height for left/right D405 wrist cameras when "
+            "wrist depth is enabled. D405 RGB and depth are started at the same resolution. "
+            "Defaults to the configured wrist RGB stream height."
+        ),
+    )
+    parser.add_argument(
+        "--wrist-depth-height",
+        dest="wrist_cam_height",
+        type=_positive_int,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--wrist-depth-align-to-color",
+        dest="wrist_depth_align_to_color",
+        action="store_true",
+        default=True,
+        help="Align wrist depth frames to the RGB stream before saving mask/raw depth.",
+    )
+    parser.add_argument(
+        "--wrist-depth-no-align-to-color",
+        dest="wrist_depth_align_to_color",
+        action="store_false",
+        help=(
+            "Do not align wrist depth to RGB. Use with --wrist-cam-width/--wrist-cam-height "
+            "when the saved mask/raw stream should stay at the lower wrist stream resolution."
+        ),
+    )
+    parser.add_argument(
         "--tactile-storage",
         choices=("external", "parquet"),
         default="external",
@@ -3136,6 +3534,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--vis_cam requires cameras; remove --no-camera.")
     if float(args.wrist_depth_max_m) <= float(args.wrist_depth_min_m):
         parser.error("--wrist-depth-max-m must be greater than --wrist-depth-min-m.")
+    wrist_cam_width = getattr(args, "wrist_cam_width", None)
+    wrist_cam_height = getattr(args, "wrist_cam_height", None)
+    if (wrist_cam_width is None) != (wrist_cam_height is None):
+        parser.error("--wrist-cam-width and --wrist-cam-height must be set together.")
     if bool(args.no_camera) and (bool(args.wrist_depth_mask) or bool(args.wrist_depth_raw)):
         parser.error("--wrist-depth-mask/--wrist-depth-raw require cameras; remove --no-camera.")
     if bool(getattr(args, "init_arm_available", False)) and not str(
@@ -4681,6 +5083,9 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
     if wrist_depth_requested:
         available_wrist_keys = sorted(set(camera_configs) & set(WRIST_DEPTH_CAMERA_KEYS))
         missing_wrist_keys = sorted(set(WRIST_DEPTH_CAMERA_KEYS) - set(camera_configs))
+        requested_wrist_cam_width = getattr(args, "wrist_cam_width", None)
+        requested_wrist_cam_height = getattr(args, "wrist_cam_height", None)
+        align_depth_to_color = bool(getattr(args, "wrist_depth_align_to_color", True))
         if missing_wrist_keys:
             _log(
                 "Camera",
@@ -4690,17 +5095,52 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
         for camera_key, config in camera_configs.items():
             if camera_key in WRIST_DEPTH_CAMERA_KEYS:
                 config.enable_depth = True
-                config.depth_width = int(config.width)
-                config.depth_height = int(config.height)
+                config.depth_width = int(
+                    requested_wrist_cam_width
+                    if requested_wrist_cam_width is not None
+                    else config.width
+                )
+                config.depth_height = int(
+                    requested_wrist_cam_height
+                    if requested_wrist_cam_height is not None
+                    else config.height
+                )
                 config.depth_fps = int(getattr(args, "wrist_depth_stream_fps", DEFAULT_WRIST_DEPTH_STREAM_FPS))
-                config.align_depth_to_color = True
+                config.align_depth_to_color = align_depth_to_color
+                if requested_wrist_cam_width is not None and requested_wrist_cam_height is not None:
+                    old_rgb_resolution = (int(config.width), int(config.height))
+                    new_rgb_resolution = (int(config.depth_width), int(config.depth_height))
+                    if old_rgb_resolution != new_rgb_resolution:
+                        config.metadata = dict(config.metadata)
+                        config.metadata.update(
+                            {
+                                "wrist_cam_original_rgb_width": old_rgb_resolution[0],
+                                "wrist_cam_original_rgb_height": old_rgb_resolution[1],
+                                "wrist_cam_matched_rgb_depth_resolution": True,
+                            }
+                        )
+                        config.width, config.height = new_rgb_resolution
+                        _log(
+                            "Camera",
+                            f"{camera_key} wrist camera stream resolution changed for RGB+depth: "
+                            f"{old_rgb_resolution[0]}x{old_rgb_resolution[1]} -> "
+                            f"{new_rgb_resolution[0]}x{new_rgb_resolution[1]}. "
+                            "D405 color/depth profiles cannot always resolve mixed resolutions.",
+                        )
             else:
                 config.enable_depth = False
+        wrist_cam_resolution_text = (
+            f"{int(requested_wrist_cam_width)}x{int(requested_wrist_cam_height)}"
+            if requested_wrist_cam_width is not None and requested_wrist_cam_height is not None
+            else "match_rgb"
+        )
         _log(
             "Camera",
             "wrist depth enabled for D405 wrist cameras only: "
             f"keys={available_wrist_keys} save_fps={DEFAULT_WRIST_DEPTH_SAVE_FPS} "
             f"depth_stream_fps={int(getattr(args, 'wrist_depth_stream_fps', DEFAULT_WRIST_DEPTH_STREAM_FPS))} "
+            f"wrist_cam_stream_resolution={wrist_cam_resolution_text} "
+            f"align_depth_to_color={align_depth_to_color} "
             f"mask={bool(getattr(args, 'wrist_depth_mask', False))} "
             f"raw={bool(getattr(args, 'wrist_depth_raw', False))}",
         )
@@ -4728,8 +5168,15 @@ def _select_preview_camera_sources(
         return {key: camera_sources[key]}
 
 
-def _start_camera_sources(camera_sources: Mapping[str, RealSenseRGBSource]) -> None:
-    for camera_key, source in camera_sources.items():
+def _start_camera_sources(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+    *,
+    stagger_sec: float = CAMERA_START_STAGGER_SEC,
+) -> None:
+    for index, (camera_key, source) in enumerate(camera_sources.items()):
+        if index > 0 and float(stagger_sec) > 0.0:
+            _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
+            time.sleep(float(stagger_sec))
         _log("Camera", f"starting camera {camera_key}")
         source.start()
 
@@ -4966,6 +5413,48 @@ def _init_arm_status_text(state: Mapping[str, object]) -> str:
     return f" {mode}(selected={selected_side},active={active_side}{sample_bits})"
 
 
+def _cancel_special_arm_modes_for_hold(
+    components: RealTeleopComponents,
+    *,
+    now: float,
+    reason: str,
+) -> list[str]:
+    messages: list[str] = []
+    fix_controller = getattr(components, "fix_arm_controller", None)
+    if fix_controller is not None and bool(getattr(fix_controller, "fixed", False)):
+        transition = fix_controller.cancel_active(
+            now=now,
+            reason=reason,
+            clear_snapshots=True,
+        )
+        if transition.ok:
+            side_label = "左臂" if transition.side == "left" else "右臂"
+            messages.append(f"{side_label} fix-arm 已停止")
+    init_controller = getattr(components, "init_arm_controller", None)
+    if init_controller is not None and bool(getattr(init_controller, "active", False)):
+        transition = init_controller.cancel_active(now=now, reason=reason)
+        if transition.ok:
+            side_label = "左臂" if transition.side == "left" else "右臂"
+            messages.append(f"{side_label} init-arm 已停止")
+    if messages:
+        reset_smoothing = getattr(
+            getattr(components, "dual_arm_retargeter", None),
+            "reset_target_pose_smoothing",
+            None,
+        )
+        if callable(reset_smoothing):
+            try:
+                reset_smoothing()
+            except Exception as exc:
+                _log(
+                    "Hold",
+                    "WARNING: retargeter target smoothing reset failed after special-mode cancel: "
+                    f"{type(exc).__name__}: {exc}",
+                    now=now,
+                )
+    return messages
+
+
 def _session_record_root_dir(args: argparse.Namespace) -> Path | None:
     cached = str(getattr(args, "_session_record_root_dir", "") or "").strip()
     if cached:
@@ -5053,13 +5542,7 @@ def _build_episode_metadata(
         "impedance_mode": _impedance_mode_arg(args),
         "strict_tool_profile": _strict_tool_profile_arg(args),
         "force_tare_sec": _force_tare_sec_arg(args),
-        "debug_timing": bool(getattr(args, "debug_timing", False)),
-        "debug_timing_threshold_sec": float(getattr(args, "debug_timing_threshold_sec", 0.025)),
-        "debug_timing_report_interval_sec": float(
-            getattr(args, "debug_timing_report_interval_sec", 1.0)
-        ),
-        "debug_timing_light_log": bool(getattr(args, "debug_timing", False)),
-        "rm65_backend_debug_timing": bool(getattr(args, "debug_timing", False)),
+        **_debug_timing_metadata(args),
         "arm_mode": "real",
         "active_sides": list(components.active_sides),
         "runtime_arm_state_source": "last_commanded_action",
@@ -5088,6 +5571,9 @@ def _build_episode_metadata(
         "wrist_depth_fps": DEFAULT_WRIST_DEPTH_FPS,
         "wrist_depth_save_fps": DEFAULT_WRIST_DEPTH_SAVE_FPS,
         "wrist_depth_stream_fps": int(getattr(args, "wrist_depth_stream_fps", DEFAULT_WRIST_DEPTH_STREAM_FPS)),
+        "wrist_cam_stream_width": getattr(args, "wrist_cam_width", None),
+        "wrist_cam_stream_height": getattr(args, "wrist_cam_height", None),
+        "wrist_depth_align_to_color": bool(getattr(args, "wrist_depth_align_to_color", True)),
         "wrist_depth_min_m": float(getattr(args, "wrist_depth_min_m", DEFAULT_WRIST_DEPTH_MIN_M)),
         "wrist_depth_max_m": float(getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)),
         "session_record_enabled": session_record_enabled,
@@ -5350,15 +5836,7 @@ class RealTeleopDatasetRecorder:
                 "camera_frame_alignment_policy": "latest_before_or_at_sample_timestamp",
                 "hand_tactile_alignment_policy": "backend_latest_snapshot_at_sample_build",
                 "movement_multiple": _movement_multiple_value(args),
-                "debug_timing": bool(getattr(args, "debug_timing", False)),
-                "debug_timing_threshold_sec": float(
-                    getattr(args, "debug_timing_threshold_sec", 0.025)
-                ),
-                "debug_timing_report_interval_sec": float(
-                    getattr(args, "debug_timing_report_interval_sec", 1.0)
-                ),
-                "debug_timing_light_log": bool(getattr(args, "debug_timing", False)),
-                "rm65_backend_debug_timing": bool(getattr(args, "debug_timing", False)),
+                **_debug_timing_metadata(args),
                 "record_actual_wrist_camera_pose": bool(self.arm_state_poller is not None),
                 "actual_wrist_camera_pose_hz": float(
                     getattr(args, "actual_wrist_camera_pose_hz", 30.0)
@@ -5372,6 +5850,9 @@ class RealTeleopDatasetRecorder:
                 "wrist_depth_fps": DEFAULT_WRIST_DEPTH_FPS,
                 "wrist_depth_save_fps": DEFAULT_WRIST_DEPTH_SAVE_FPS,
                 "wrist_depth_stream_fps": int(getattr(args, "wrist_depth_stream_fps", DEFAULT_WRIST_DEPTH_STREAM_FPS)),
+                "wrist_cam_stream_width": getattr(args, "wrist_cam_width", None),
+                "wrist_cam_stream_height": getattr(args, "wrist_cam_height", None),
+                "wrist_depth_align_to_color": bool(getattr(args, "wrist_depth_align_to_color", True)),
                 "wrist_depth_min_m": float(getattr(args, "wrist_depth_min_m", DEFAULT_WRIST_DEPTH_MIN_M)),
                 "wrist_depth_max_m": float(getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)),
                 "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
@@ -5414,6 +5895,14 @@ class RealTeleopDatasetRecorder:
         self.frequency_min_elapsed_sec = 2.0
         self._record_timestamps: deque[float] = deque()
         self._episode_start_monotonic: float | None = None
+        self._pause_started_at: float | None = None
+        self._pause_started_monotonic: float | None = None
+        self._pause_reason: str | None = None
+        self._pause_started_frame_index: int | None = None
+        self._pause_started_step_index: int | None = None
+        self._pause_started_last_state: str | None = None
+        self._pause_segments: list[dict[str, Any]] = []
+        self._paused_accumulated_sec = 0.0
 
     def _build_arm_state_poller(self) -> ArmHardwareStatePoller | None:
         if not bool(getattr(self.args, "record_actual_wrist_camera_pose", True)):
@@ -5473,6 +5962,18 @@ class RealTeleopDatasetRecorder:
         return self.active_episode_index is not None
 
     @property
+    def is_paused(self) -> bool:
+        return bool(self.is_recording and getattr(self, "_pause_started_at", None) is not None)
+
+    @property
+    def can_record_samples(self) -> bool:
+        return bool(self.is_recording and not self.is_paused)
+
+    @property
+    def pause_reason(self) -> str:
+        return str(getattr(self, "_pause_reason", None) or "")
+
+    @property
     def frame_count(self) -> int:
         return int(self.sample_builder.frame_index)
 
@@ -5507,6 +6008,14 @@ class RealTeleopDatasetRecorder:
         self.active_started_at = float(now)
         self._record_timestamps.clear()
         self._episode_start_monotonic = time.monotonic()
+        self._pause_started_at = None
+        self._pause_started_monotonic = None
+        self._pause_reason = None
+        self._pause_started_frame_index = None
+        self._pause_started_step_index = None
+        self._pause_started_last_state = None
+        self._pause_segments = []
+        self._paused_accumulated_sec = 0.0
         return int(episode_index)
 
     def _note_recorded_sample(self) -> None:
@@ -5516,15 +6025,125 @@ class RealTeleopDatasetRecorder:
         while self._record_timestamps and self._record_timestamps[0] < cutoff:
             self._record_timestamps.popleft()
 
-    def collection_frequency_status(self) -> dict[str, Any]:
-        frame_count = int(self.sample_builder.frame_index)
-        start_time = self._episode_start_monotonic
-        current_time = time.monotonic()
-        elapsed_sec = (
-            max(0.0, current_time - float(start_time))
+    def _current_pause_elapsed_sec(self, *, current_time: float | None = None) -> float:
+        pause_started = getattr(self, "_pause_started_monotonic", None)
+        if pause_started is None:
+            return 0.0
+        now_monotonic = time.monotonic() if current_time is None else float(current_time)
+        return max(0.0, now_monotonic - float(pause_started))
+
+    def _total_paused_sec(self, *, current_time: float | None = None) -> float:
+        accumulated = max(0.0, float(getattr(self, "_paused_accumulated_sec", 0.0) or 0.0))
+        return accumulated + self._current_pause_elapsed_sec(current_time=current_time)
+
+    def _active_elapsed_sec(self, *, current_time: float | None = None) -> tuple[float, float]:
+        start_time = getattr(self, "_episode_start_monotonic", None)
+        now_monotonic = time.monotonic() if current_time is None else float(current_time)
+        wall_elapsed_sec = (
+            max(0.0, now_monotonic - float(start_time))
             if start_time is not None
             else 0.0
         )
+        paused_sec = min(wall_elapsed_sec, self._total_paused_sec(current_time=now_monotonic))
+        return max(0.0, wall_elapsed_sec - paused_sec), wall_elapsed_sec
+
+    def pause_episode(
+        self,
+        *,
+        reason: str,
+        now: float,
+        step_index: int,
+        last_state: str | None,
+    ) -> bool:
+        if not self.is_recording:
+            return False
+        if self.is_paused:
+            return False
+        if not hasattr(self, "_pause_segments"):
+            self._pause_segments = []
+        self._pause_started_at = float(now)
+        self._pause_started_monotonic = time.monotonic()
+        self._pause_reason = str(reason)
+        self._pause_started_frame_index = int(self.sample_builder.frame_index)
+        self._pause_started_step_index = int(step_index)
+        self._pause_started_last_state = last_state
+        self._record_timestamps.clear()
+        return True
+
+    def _close_pause_segment(
+        self,
+        *,
+        resume_reason: str,
+        now: float,
+        step_index: int,
+    ) -> dict[str, Any] | None:
+        if not self.is_paused:
+            return None
+        pause_started_at = self._pause_started_at
+        pause_started_monotonic = self._pause_started_monotonic
+        duration_sec = (
+            max(0.0, time.monotonic() - float(pause_started_monotonic))
+            if pause_started_monotonic is not None
+            else max(0.0, float(now) - float(pause_started_at or now))
+        )
+        segment = {
+            "reason": str(self._pause_reason or ""),
+            "resume_reason": str(resume_reason),
+            "start_timestamp": float(pause_started_at or now),
+            "end_timestamp": float(now),
+            "duration_sec": float(duration_sec),
+            "start_frame_index": self._pause_started_frame_index,
+            "end_frame_index": int(self.sample_builder.frame_index),
+            "start_step_index": self._pause_started_step_index,
+            "end_step_index": int(step_index),
+            "last_state_at_pause": self._pause_started_last_state,
+        }
+        if not hasattr(self, "_pause_segments"):
+            self._pause_segments = []
+        self._pause_segments.append(segment)
+        self._paused_accumulated_sec = max(
+            0.0,
+            float(getattr(self, "_paused_accumulated_sec", 0.0) or 0.0) + float(duration_sec),
+        )
+        self._pause_started_at = None
+        self._pause_started_monotonic = None
+        self._pause_reason = None
+        self._pause_started_frame_index = None
+        self._pause_started_step_index = None
+        self._pause_started_last_state = None
+        self._record_timestamps.clear()
+        return segment
+
+    def resume_episode(
+        self,
+        *,
+        reason: str,
+        now: float,
+        step_index: int,
+    ) -> bool:
+        return self._close_pause_segment(
+            resume_reason=reason,
+            now=now,
+            step_index=step_index,
+        ) is not None
+
+    def pause_summary(self) -> dict[str, Any]:
+        active_elapsed_sec, wall_elapsed_sec = self._active_elapsed_sec()
+        return {
+            "recording_pause_schema": "dexteleop_recording_pause_v1",
+            "recording_paused": bool(self.is_paused),
+            "recording_pause_reason": self.pause_reason,
+            "recording_pause_segments": [dict(segment) for segment in getattr(self, "_pause_segments", [])],
+            "recording_pause_count": len(getattr(self, "_pause_segments", [])) + (1 if self.is_paused else 0),
+            "recording_paused_duration_sec": self._total_paused_sec(),
+            "recording_active_duration_sec": active_elapsed_sec,
+            "recording_wall_duration_sec": wall_elapsed_sec,
+        }
+
+    def collection_frequency_status(self) -> dict[str, Any]:
+        frame_count = int(self.sample_builder.frame_index)
+        current_time = time.monotonic()
+        elapsed_sec, wall_elapsed_sec = self._active_elapsed_sec(current_time=current_time)
         average_hz = (float(frame_count) / elapsed_sec) if elapsed_sec > 0.0 else None
         rolling_hz = None
         if len(self._record_timestamps) >= 2:
@@ -5533,7 +6152,7 @@ class RealTeleopDatasetRecorder:
                 rolling_hz = float(len(self._record_timestamps) - 1) / span
         sample_hz = rolling_hz if rolling_hz is not None else average_hz
         enough_data = (
-            self.is_recording
+            self.can_record_samples
             and frame_count >= 4
             and elapsed_sec >= self.frequency_min_elapsed_sec
             and sample_hz is not None
@@ -5573,6 +6192,10 @@ class RealTeleopDatasetRecorder:
             "rolling_hz": rolling_hz,
             "target_hz": threshold_hz,
             "elapsed_sec": elapsed_sec,
+            "wall_elapsed_sec": wall_elapsed_sec,
+            "paused": bool(self.is_paused),
+            "pause_reason": self.pause_reason,
+            "paused_duration_sec": self._total_paused_sec(current_time=current_time),
             "frame_count": frame_count,
             "tactile_frame_counts": tactile_frame_counts,
             "tactile_write_hz": tactile_write_hz,
@@ -5589,7 +6212,7 @@ class RealTeleopDatasetRecorder:
         phase_recorder: Any | None = None,
         metadata_extra: Mapping[str, Any] | None = None,
     ) -> Any | None:
-        if not self.is_recording:
+        if not self.can_record_samples:
             return None
         previous_include_debug_metadata = bool(self.sample_builder.include_debug_metadata)
         self.sample_builder.include_debug_metadata = bool(include_debug_metadata)
@@ -5625,7 +6248,9 @@ class RealTeleopDatasetRecorder:
         frame_count: int,
         started_at: float,
         frequency_status: Mapping[str, Any] | None = None,
+        pause_summary: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        pause_payload = self.pause_summary() if pause_summary is None else dict(pause_summary)
         return {
             "stop_reason": str(reason),
             "last_step_index": int(step_index),
@@ -5636,6 +6261,7 @@ class RealTeleopDatasetRecorder:
             "writer_pool_stats_at_stop": self._writer_stats_payload(),
             "storage_queue_stats_at_stop": self._storage_queue_stats_payload(),
             "collection_frequency": {} if frequency_status is None else dict(frequency_status),
+            **pause_payload,
             "background_finalize": True,
             "finalize_started_at": float(started_at),
         }
@@ -5666,17 +6292,33 @@ class RealTeleopDatasetRecorder:
     ) -> RealDatasetFinalizeTask | None:
         if self.active_episode_index is None:
             return None
+        stop_time = time.time()
+        if self.is_paused:
+            self._close_pause_segment(
+                resume_reason=f"stop:{reason}",
+                now=stop_time,
+                step_index=step_index,
+            )
         episode_index = int(self.active_episode_index)
         frame_count = int(self.sample_builder.frame_index)
         frequency_status = self.collection_frequency_status()
+        pause_summary = self.pause_summary()
         self.active_episode_index = None
         self.active_started_at = None
         self._episode_start_monotonic = None
+        self._pause_started_at = None
+        self._pause_started_monotonic = None
+        self._pause_reason = None
+        self._pause_started_frame_index = None
+        self._pause_started_step_index = None
+        self._pause_started_last_state = None
         if frame_count <= 0:
             self.writer_observer.flush()
             self.writer.discard_episode(episode_index)
             self.discarded_episodes += 1
             self._record_timestamps.clear()
+            self._pause_segments = []
+            self._paused_accumulated_sec = 0.0
             return None
         task = RealDatasetFinalizeTask(
             episode_index=episode_index,
@@ -5691,6 +6333,7 @@ class RealTeleopDatasetRecorder:
             frame_count=frame_count,
             started_at=task.started_at,
             frequency_status=frequency_status,
+            pause_summary=pause_summary,
         )
         thread = threading.Thread(
             target=self._run_finalize_task,
@@ -5783,6 +6426,7 @@ def _dataset_recording_debug_text(
 
 def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     _resolve_movement_multiple_args(args)
+    debug_timing_modules = _debug_timing_modules(args)
     active_sides = _active_sides_from_args(args)
     arm_control_mode = _arm_control_mode_arg(args)
     impedance_mode = _impedance_mode_arg(args)
@@ -5996,7 +6640,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "arm_step_dt_alpha": float(args.arm_step_dt_alpha),
             "arm_step_dt_max_scale": float(args.arm_step_dt_max_scale),
             "arm_step_dt_stall_reset_sec": float(args.arm_step_dt_stall_reset_sec),
-            "rm65_backend_debug_timing": bool(getattr(args, "debug_timing", False)),
+            **_debug_timing_metadata(args),
             "rm65_ik_framework": str(getattr(args, "rm65_ik_framework", "robot_motion")),
             "dual_arm_collision_avoidance_requested": collision_guard_requested,
             "dual_arm_temporary_safety_enabled": bool(temporary_safety_limiter is not None),
@@ -6078,10 +6722,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
     retargeters = []
     if collision_guard_requested:
         try:
-            debug_ik_profile = bool(
-                getattr(args, "debug_timing", False)
-                or getattr(args, "debug_ik_timing", False)
-            )
+            debug_ik_profile = bool(debug_timing_modules.ik_profile)
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",
@@ -6113,7 +6754,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                         debug_profile=debug_ik_profile,
                         debug_profile_print_every=(
                             int(getattr(args, "debug_ik_timing_print_every", 0))
-                            if bool(getattr(args, "debug_ik_timing", False))
+                            if debug_ik_profile
                             else 0
                         ),
                         solve_time_budget_ms=getattr(args, "ik_time_budget_ms", None),
@@ -6360,7 +7001,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                     actual_send_dt_min_scale=1.0,
                     actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
                     actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
-                    debug_timing=bool(getattr(args, "debug_timing", False)),
+                    debug_timing=bool(debug_timing_modules.rm65_backend),
                 )
             )
         else:
@@ -7376,6 +8017,182 @@ def _gripper_backend_for_side(
     return backend if isinstance(backend, DMTacGripperBackend) else None
 
 
+def _gripper_state_scalar_from_payload(payload: object) -> float | None:
+    if not isinstance(payload, Mapping):
+        return None
+    for key in ("joint_pos", "gripper_measured_scalar", "gripper_state_scalar"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    raw_state = payload.get("raw_gripper_state")
+    if isinstance(raw_state, Mapping):
+        return _gripper_state_scalar_from_payload(raw_state)
+    return None
+
+
+def _read_gripper_backend_scalar_now(backend: object) -> float | None:
+    read_now = getattr(backend, "read_gripper_state_now", None)
+    if callable(read_now):
+        return _gripper_state_scalar_from_payload(read_now())
+    get_state = getattr(backend, "get_state", None)
+    if not callable(get_state):
+        return None
+    try:
+        payload = get_state(
+            include_tactile_arrays=False,
+            include_tactile_vector=False,
+            copy_tactile_arrays=False,
+        )
+    except TypeError:
+        payload = get_state()
+    return _gripper_state_scalar_from_payload(payload)
+
+
+def _probe_gripper_backend_motion(
+    backend: object,
+    *,
+    targets: Sequence[float] = (0.0, 0.5, 0.0),
+    tolerance: float = 0.18,
+    step_timeout_s: float = 2.0,
+    settle_s: float = 0.2,
+    poll_s: float = 0.05,
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    send = getattr(backend, "send_fixed_joint_pos", None)
+    if not callable(send):
+        return {"ok": False, "error": "backend_missing_send_fixed_joint_pos", "samples": []}
+    samples: list[dict[str, object]] = []
+    for index, raw_target in enumerate(targets):
+        if cancelled is not None and cancelled():
+            return {"ok": False, "error": "cancelled", "step": int(index), "samples": samples}
+        target = float(np.clip(float(raw_target), 0.0, 1.0))
+        try:
+            sent = bool(send(target))
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": f"send_failed:{type(exc).__name__}:{exc}",
+                "target": target,
+                "step": int(index),
+                "samples": samples,
+            }
+        if not sent:
+            return {
+                "ok": False,
+                "error": "send_returned_false",
+                "target": target,
+                "step": int(index),
+                "samples": samples,
+            }
+        deadline = time.time() + max(0.0, float(step_timeout_s))
+        if float(settle_s) > 0.0:
+            time.sleep(float(settle_s))
+        last_measured: float | None = None
+        while True:
+            if cancelled is not None and cancelled():
+                return {"ok": False, "error": "cancelled", "step": int(index), "samples": samples}
+            try:
+                measured = _read_gripper_backend_scalar_now(backend)
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": f"read_failed:{type(exc).__name__}:{exc}",
+                    "target": target,
+                    "step": int(index),
+                    "samples": samples,
+                }
+            last_measured = measured
+            sample = {
+                "step": int(index),
+                "target": target,
+                "measured": measured,
+                "error_abs": None if measured is None else abs(float(measured) - target),
+            }
+            samples.append(sample)
+            if measured is not None and abs(float(measured) - target) <= float(tolerance):
+                break
+            if time.time() >= deadline:
+                return {
+                    "ok": False,
+                    "error": "target_not_reached",
+                    "target": target,
+                    "measured": last_measured,
+                    "step": int(index),
+                    "tolerance": float(tolerance),
+                    "samples": samples,
+                }
+            time.sleep(max(0.0, float(poll_s)))
+    return {"ok": True, "error": None, "samples": samples}
+
+
+def _run_gripper_warmup_probe_for_side(
+    side: str,
+    backend: object,
+    *,
+    targets: Sequence[float],
+    tolerance: float,
+    step_timeout_s: float,
+    settle_s: float,
+    poll_s: float,
+    reconnect_on_failure: bool = True,
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    first = _probe_gripper_backend_motion(
+        backend,
+        targets=targets,
+        tolerance=tolerance,
+        step_timeout_s=step_timeout_s,
+        settle_s=settle_s,
+        poll_s=poll_s,
+        cancelled=cancelled,
+    )
+    attempts = [dict(first)]
+    if bool(first.get("ok")):
+        return {"side": str(side), "ok": True, "attempts": attempts, "reconnected": False}
+    reconnected = False
+    reconnect_error = None
+    if reconnect_on_failure:
+        reconnect = getattr(backend, "force_reconnect_gripper", None)
+        if callable(reconnect):
+            try:
+                reconnected = bool(reconnect(f"warmup_probe_failed:{first.get('error')}"))
+            except Exception as exc:  # noqa: BLE001
+                reconnect_error = f"{type(exc).__name__}: {exc}"
+    if reconnected:
+        if cancelled is not None and cancelled():
+            return {
+                "side": str(side),
+                "ok": False,
+                "attempts": attempts,
+                "reconnected": reconnected,
+                "reconnect_error": reconnect_error,
+                "error": "cancelled",
+            }
+        second = _probe_gripper_backend_motion(
+            backend,
+            targets=targets,
+            tolerance=tolerance,
+            step_timeout_s=step_timeout_s,
+            settle_s=settle_s,
+            poll_s=poll_s,
+            cancelled=cancelled,
+        )
+        attempts.append(dict(second))
+        if bool(second.get("ok")):
+            return {"side": str(side), "ok": True, "attempts": attempts, "reconnected": True}
+    return {
+        "side": str(side),
+        "ok": False,
+        "attempts": attempts,
+        "reconnected": reconnected,
+        "reconnect_error": reconnect_error,
+    }
+
+
 def _real_hand_render_qpos(
     backend: InspireTacHandBackend | DMTacGripperBackend | None,
     side: str,
@@ -7720,6 +8537,7 @@ def _camera_status_for_source(
     now: float,
     preview_selected: bool,
     preview_active: bool,
+    depth_monitor: WristDepthFreshnessMonitor | None = None,
 ) -> dict[str, object]:
     config = getattr(source, "config", None)
     fallback_serial = getattr(config, "serial", None)
@@ -7757,6 +8575,7 @@ def _camera_status_for_source(
     depth_status_label = "未启用"
     depth_status_message = ""
     latest_depth_metadata: Mapping[str, object] = {}
+    depth_freshness: dict[str, object] = {}
     if depth_required:
         latest_frame = None
         try:
@@ -7787,8 +8606,23 @@ def _camera_status_for_source(
                     depth_status_label = "Depth scale 缺失"
                     depth_status_message = "depth frame 存在，但缺少有效 depth_scale_m_per_unit，mask 不能可靠生成。"
                 else:
-                    depth_status_level = "ok"
-                    depth_status_label = "Wrist Depth 正常"
+                    if depth_monitor is not None:
+                        depth_freshness = depth_monitor.update(
+                            str(camera_key),
+                            latest_frame,
+                            now=float(now),
+                            depth_metadata=latest_depth_metadata,
+                        )
+                    freshness_level = str(depth_freshness.get("depth_freshness_status_level") or "ok")
+                    freshness_label = str(depth_freshness.get("depth_freshness_status_label") or "")
+                    freshness_message = str(depth_freshness.get("depth_freshness_status_message") or "")
+                    if freshness_level in {"error", "warn", "waiting"}:
+                        depth_status_level = freshness_level
+                        depth_status_label = freshness_label or "Wrist Depth 检查中"
+                        depth_status_message = freshness_message
+                    else:
+                        depth_status_level = "ok"
+                        depth_status_label = "Wrist Depth 正常"
 
     status_level = "ok"
     status_label = "正常"
@@ -7856,6 +8690,10 @@ def _camera_status_for_source(
         "depth_status_label": depth_status_label,
         "depth_status_message": depth_status_message,
         "depth_metadata": _json_safe_value(dict(latest_depth_metadata)),
+        "depth_frame_number": latest_depth_metadata.get("frame_number"),
+        "depth_camera_timestamp_sec": latest_depth_metadata.get("camera_timestamp_sec"),
+        "depth_sensor_timestamp_ms": latest_depth_metadata.get("sensor_timestamp_ms"),
+        **depth_freshness,
         "frame_count": frame_count,
         "last_frame_age_sec": last_frame_age_sec,
         "stale_after_sec": stale_after_sec,
@@ -7878,6 +8716,7 @@ def _build_camera_status(
     preview_camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
     camera_previewer: CameraPreviewer | None = None,
     now: float | None = None,
+    depth_monitor: WristDepthFreshnessMonitor | None = None,
 ) -> dict[str, object]:
     if not camera_sources:
         return {}
@@ -7891,8 +8730,160 @@ def _build_camera_status(
             now=current_time,
             preview_selected=str(camera_key) in preview_keys,
             preview_active=preview_active,
+            depth_monitor=depth_monitor,
         )
         for camera_key, source in sorted(camera_sources.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _wrist_depth_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "wrist_depth_mask", False)) or bool(
+        getattr(args, "wrist_depth_raw", False)
+    )
+
+
+def _with_expected_wrist_depth_camera_statuses(
+    camera_status: Mapping[str, object],
+    *,
+    args: argparse.Namespace,
+    now: float,
+) -> dict[str, object]:
+    merged = dict(camera_status)
+    if not _wrist_depth_requested(args):
+        return merged
+    for camera_key in WRIST_DEPTH_CAMERA_KEYS:
+        if camera_key in merged:
+            continue
+        merged[camera_key] = {
+            "camera_key": camera_key,
+            "status_level": "error",
+            "status_label": "Wrist 相机缺失",
+            "status_message": (
+                f"--wrist-depth-mask/--wrist-depth-raw requested but {camera_key} "
+                "is absent from camera_sources/config."
+            ),
+            "name": camera_key,
+            "serial": None,
+            "depth_enabled": True,
+            "depth_required": True,
+            "depth_frame_present": False,
+            "depth_status_level": "error",
+            "depth_status_label": "Wrist Depth 缺失",
+            "depth_status_message": f"{camera_key} 没有可用 RealSense source，无法生成 wrist depth mask。",
+            "frame_count": 0,
+            "last_frame_age_sec": None,
+            "stale_after_sec": None,
+            "timeout_count": None,
+            "consecutive_timeout_count": None,
+            "restart_count": None,
+            "preview_selected": False,
+            "preview_active": False,
+            "updated_at": float(now),
+        }
+    return merged
+
+
+def _camera_status_blocking_message(
+    camera_status: Mapping[str, Mapping[str, object]] | None,
+    *,
+    require_ok: bool = False,
+) -> str:
+    if not camera_status:
+        return ""
+    blocking_levels = {"error", "waiting"} if not require_ok else {"error", "waiting", "warn", "off"}
+    for camera_key, item in sorted(camera_status.items(), key=lambda pair: str(pair[0])):
+        if not isinstance(item, Mapping):
+            continue
+        level = str(item.get("status_level") or "ok")
+        depth_level = str(item.get("depth_status_level") or "ok")
+        label = str(item.get("status_label") or level)
+        message = str(item.get("status_message") or item.get("depth_status_message") or "")
+        if level in blocking_levels:
+            suffix = f": {message}" if message else ""
+            return f"等待相机 {camera_key} 状态恢复：{label}{suffix}"
+        if bool(item.get("depth_required")) and depth_level in blocking_levels:
+            depth_label = str(item.get("depth_status_label") or depth_level)
+            depth_message = str(item.get("depth_status_message") or "")
+            suffix = f": {depth_message}" if depth_message else ""
+            return f"等待相机 {camera_key} wrist depth 恢复：{depth_label}{suffix}"
+    return ""
+
+
+def _camera_self_check_payload(
+    camera_status: Mapping[str, Mapping[str, object]],
+    *,
+    started_at: float,
+    now: float,
+    duration_sec: float,
+    completed: bool,
+) -> dict[str, object]:
+    entries = {
+        str(key): item
+        for key, item in camera_status.items()
+        if isinstance(item, Mapping)
+    }
+    total = len(entries)
+    elapsed_sec = max(0.0, float(now) - float(started_at))
+    remaining_sec = max(0.0, float(duration_sec) - elapsed_sec)
+    failed_keys: list[str] = []
+    waiting_keys: list[str] = []
+    warn_keys: list[str] = []
+    passed_keys: list[str] = []
+    for key, item in sorted(entries.items()):
+        level = str(item.get("status_level") or "ok")
+        depth_level = str(item.get("depth_status_level") or "ok")
+        if level == "error" or (bool(item.get("depth_required")) and depth_level == "error"):
+            failed_keys.append(key)
+        elif level == "waiting" or (bool(item.get("depth_required")) and depth_level == "waiting"):
+            waiting_keys.append(key)
+        elif level == "warn" or (bool(item.get("depth_required")) and depth_level == "warn"):
+            warn_keys.append(key)
+        else:
+            passed_keys.append(key)
+
+    if total <= 0:
+        status = "skipped"
+        status_level = "off"
+        status_label = "未配置"
+        message = "当前没有 RealSense camera_sources。"
+    elif not completed:
+        status = "running"
+        status_level = "waiting"
+        status_label = "自检中"
+        message = f"启动相机自检 {elapsed_sec:.1f}/{float(duration_sec):.1f}s。"
+    elif failed_keys or waiting_keys:
+        status = "failed"
+        status_level = "error"
+        status_label = "自检失败"
+        problem_keys = failed_keys + waiting_keys
+        message = "启动相机自检失败：" + ", ".join(problem_keys)
+    elif warn_keys:
+        status = "warning"
+        status_level = "warn"
+        status_label = "自检有警告"
+        message = "启动相机自检有警告：" + ", ".join(warn_keys)
+    else:
+        status = "passed"
+        status_level = "ok"
+        status_label = "自检通过"
+        message = f"启动相机自检通过：{len(passed_keys)}/{total} cameras。"
+
+    return {
+        "enabled": total > 0,
+        "status": status,
+        "status_level": status_level,
+        "status_label": status_label,
+        "message": message,
+        "duration_sec": float(duration_sec),
+        "elapsed_sec": elapsed_sec,
+        "remaining_sec": remaining_sec,
+        "started_at": float(started_at),
+        "completed_at": float(now) if completed else None,
+        "camera_count": int(total),
+        "passed_count": int(len(passed_keys)),
+        "failed_keys": failed_keys,
+        "waiting_keys": waiting_keys,
+        "warn_keys": warn_keys,
     }
 
 
@@ -10006,6 +10997,16 @@ def _camera_status_log_payload(
         "last_error",
         "last_runtime_error",
         "preview_active",
+        "depth_required",
+        "depth_status_level",
+        "depth_status_label",
+        "depth_status_message",
+        "depth_frame_number",
+        "depth_camera_timestamp_sec",
+        "depth_sensor_timestamp_ms",
+        "depth_signature_unique_count",
+        "depth_signature_repeat_count",
+        "depth_timestamp_age_sec",
     )
     return {
         str(camera_key): {
@@ -10630,12 +11631,14 @@ class RealTeleopControlInput:
         self._gripper_status_publish_interval_sec = 0.2
         self._last_camera_status_publish_at = 0.0
         self._camera_status_publish_interval_sec = 0.2
+        self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
         self._episode_last_episode_index: int | None = None
         self._episode_last_frame_count: int | None = None
         self._episode_recording_ui_active = False
         self._episode_countdown_ui_active = False
+        self._episode_finalizing_ui_active = False
         self._camera_visualization_toggle_requested = False
         self._tactile_visualization_toggle_requested = False
         self._camera_visualization_active = bool(getattr(args, "vis_cam", False))
@@ -10675,10 +11678,79 @@ class RealTeleopControlInput:
         ]
 
     def _movement_multiple_controls(self) -> list[str]:
+        if self._episode_busy():
+            return []
         return list(MOVEMENT_MULTIPLE_GUI_EVENTS)
 
     def _collection_task_controls(self) -> list[str]:
+        if self._episode_busy():
+            return []
         return ["round_trip_toggle"] if self._episode_recording_available() else []
+
+    def _episode_busy(self) -> bool:
+        return bool(
+            self._episode_recording_ui_active
+            or self._episode_countdown_ui_active
+            or self._episode_finalizing_ui_active
+        )
+
+    def _episode_controls(self) -> list[str]:
+        if not self._episode_recording_available():
+            return []
+        if self._episode_busy():
+            return ["episode_stop"] if (
+                self._episode_recording_ui_active or self._episode_countdown_ui_active
+            ) else []
+        return list(EPISODE_GUI_EVENTS)
+
+    def _fix_init_allowed_in_controls(self) -> bool:
+        return bool(
+            self._teleop_started
+            and not self._hold_active
+            and not self._episode_countdown_ui_active
+            and not self._episode_finalizing_ui_active
+        )
+
+    def _recording_controls(self, *, hold: bool = False) -> list[str]:
+        controls = ["q", "d", "episode_stop"]
+        if hold:
+            controls.append("p")
+            if len(tuple(self.components.active_sides)) == 1:
+                controls.append("w")
+        else:
+            controls.append("h")
+            if self._fix_arm_available() and self._fix_init_allowed_in_controls():
+                controls.append("c")
+                controls.append("fix_arm_toggle")
+                controls.extend(self._fix_arm_controls())
+            if self._init_arm_available() and self._fix_init_allowed_in_controls():
+                controls.append("g")
+                controls.append("init_arm_toggle")
+                controls.extend(self._init_arm_controls())
+        controls.extend(self._visualization_controls())
+        return controls
+
+    def _finalizing_controls(self) -> list[str]:
+        controls = ["q", "d"]
+        if self._teleop_started and not self._hold_active:
+            controls.append("h")
+        controls.extend(self._visualization_controls())
+        return controls
+
+    def _current_active_controls(self) -> list[str]:
+        if self._teleop_started and self._hold_active:
+            return self._hold_controls()
+        if self._episode_finalizing_ui_active:
+            return self._finalizing_controls()
+        if self._episode_recording_ui_active:
+            return self._recording_controls(hold=self._hold_active)
+        if self._episode_countdown_ui_active:
+            return self._episode_countdown_controls()
+        if self._teleop_started and not self._hold_active:
+            return self._teleop_controls()
+        if self._teleop_started:
+            return self._hold_controls()
+        return self._pre_home_controls()
 
     def _fix_arm_available(self) -> bool:
         return getattr(self.components, "fix_arm_controller", None) is not None
@@ -10710,20 +11782,22 @@ class RealTeleopControlInput:
 
     def _teleop_controls(self) -> list[str]:
         controls = ["q", "d", "h"]
-        if self._fix_arm_available():
+        if self._fix_arm_available() and self._fix_init_allowed_in_controls():
             controls.append("c")
             controls.append("fix_arm_toggle")
             controls.extend(self._fix_arm_controls())
-        if self._init_arm_available():
+        if self._init_arm_available() and self._fix_init_allowed_in_controls():
             controls.append("g")
             controls.append("init_arm_toggle")
             controls.extend(self._init_arm_controls())
-        controls.extend(self._pose_snapshot_controls())
+        if not self._episode_busy():
+            controls.extend(self._pose_snapshot_controls())
         if self._episode_recording_available():
-            controls.extend(EPISODE_GUI_EVENTS)
+            controls.extend(self._episode_controls())
             controls.extend(self._collection_task_controls())
         controls.extend(self._visualization_controls())
-        controls.extend(self._vive_calibration_controls(allow_load=False))
+        if not self._episode_busy():
+            controls.extend(self._vive_calibration_controls(allow_load=False))
         return controls
 
     def _single_arm_tracker_swap_allowed_in_hold(self) -> bool:
@@ -10742,14 +11816,17 @@ class RealTeleopControlInput:
         return controls
 
     def _hold_controls(self) -> list[str]:
-        controls = ["p", "c", "d"]
-        controls.extend(self._fix_arm_controls())
-        controls.extend(self._init_arm_controls())
+        controls = ["p", "d"]
+        if not self._episode_busy():
+            controls.extend(self._fix_arm_controls())
+            controls.extend(self._init_arm_controls())
         if len(tuple(self.components.active_sides)) == 1:
             controls.append("w")
+        controls.extend(self._episode_controls())
         controls.append("q")
         controls.extend(self._visualization_controls())
-        controls.extend(self._vive_calibration_controls(allow_load=True))
+        if not self._episode_busy():
+            controls.extend(self._vive_calibration_controls(allow_load=True))
         controls.extend(self._movement_multiple_controls())
         controls.extend(self._collection_task_controls())
         return controls
@@ -10785,6 +11862,13 @@ class RealTeleopControlInput:
             gripper_control_enabled=False,
             gripper_status=gripper_status,
             tactile_camera_status=_build_tactile_camera_status(gripper_status),
+            camera_self_check={
+                "enabled": False,
+                "status": "idle",
+                "status_level": "off",
+                "status_label": "未开始",
+                "message": "",
+            },
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
             episode_dir="",
@@ -10858,24 +11942,30 @@ class RealTeleopControlInput:
                             capture_waiting_for_samples=False,
                         )
                         self.ui.append_message("EmergencyStop", "网页退出已触发机械臂停臂请求。")
-                elif event in {"p", "c", "fix_arm_toggle"}:
-                    if event in {"c", "fix_arm_toggle"} and self._fix_arm_available():
-                        if self._handle_fix_arm_c_event(now=current_time):
-                            continue
-                        if self._teleop_started and not self._hold_active:
-                            message = (
-                                "fix-arm C event was received while teleop is running, "
-                                "but no fix-arm transition was available; suppressing "
-                                "runtime home fallback."
-                            )
-                            _log("FixArm", message, now=current_time)
-                            self._publish_fix_arm_state(
-                                message=message,
-                                control_hint=message,
-                            )
-                            continue
+                elif event == "p":
                     self._calibration_requested = True
                     self._calibration_request_from_hold = bool(self._hold_active)
+                elif event in {"c", "fix_arm_toggle"}:
+                    if (
+                        self._fix_arm_available()
+                        and self._teleop_started
+                        and not self._hold_active
+                    ):
+                        if self._handle_fix_arm_c_event(now=current_time):
+                            continue
+                        message = (
+                            "fix-arm C event was received while teleop is running, "
+                            "but no fix-arm transition was available."
+                        )
+                        _log("FixArm", message, now=current_time)
+                        self._publish_fix_arm_state(
+                            message=message,
+                            control_hint=message,
+                        )
+                    elif self.ui is not None:
+                        message = "C 仅用于运行中的 fix-arm；runtime home 请点击“开始遥操”。"
+                        self.ui.append_message("Calibration", message)
+                        self.ui.publish(control_hint=message)
                 elif event == "h":
                     self.request_hold()
                 elif event == "w":
@@ -11287,6 +12377,11 @@ class RealTeleopControlInput:
             self.ui.append_message("MovementMultiple", message)
 
     def _set_movement_multiple_value(self, value: float, *, source: str) -> float | None:
+        if self._episode_busy():
+            message = "数采录制、暂停、倒计时或保存中不修改 movement_multiple；请先停止当前 episode。"
+            _log("MovementMultiple", f"{source}: rejected while episode busy")
+            self._publish_movement_multiple(message=message)
+            return None
         if self._teleop_started and not self._hold_active:
             message = "运行中不直接修改 movement_multiple；请先 Hold，避免目标位置因倍率变化发生跳变。"
             _log("MovementMultiple", f"{source}: rejected while teleop running")
@@ -11420,9 +12515,9 @@ class RealTeleopControlInput:
             )
 
     def _toggle_round_trip_collection_task(self, *, source: str) -> bool:
-        if self._episode_recording_ui_active or self._episode_countdown_ui_active:
+        if self._episode_busy():
             if self.ui is not None:
-                self.ui.append_message("Dataset", "数采录制或倒计时中不切换 in/out；请先停止当前 episode。")
+                self.ui.append_message("Dataset", "数采录制、暂停、倒计时或保存中不切换 in/out；请先停止当前 episode。")
                 self.ui.publish(**_collection_task_ui_state(self.args))
             return False
         if (
@@ -11488,11 +12583,11 @@ class RealTeleopControlInput:
                     if is_q6_gesture
                     else (
                         "机械臂保持当前位置；单臂模式可先点击“交换 Tracker”，"
-                        "然后重新点击“开始遥操”或“采集 Home”。"
+                            "然后重新点击“开始遥操”。"
                         if len(tuple(self.components.active_sides)) == 1
                         else (
                             "机械臂保持当前位置；需要重新标定时，"
-                            "摆好 VIVE/Q6 后点击“开始遥操”或“采集 Home”。"
+                            "摆好 VIVE/Q6 后点击“开始遥操”。"
                         )
                     )
                 ),
@@ -11550,7 +12645,9 @@ class RealTeleopControlInput:
         return requested
 
     def ik_debug_timing_enabled(self) -> bool:
-        return bool(getattr(self.args, "debug_ik_timing", False)) or bool(self._ik_debug_logging_active)
+        return bool(_debug_timing_modules(self.args).ik_profile) or bool(
+            self._ik_debug_logging_active
+        )
 
     def gripper_control_enabled(self) -> bool:
         return bool(self._gripper_control_enabled and _has_q6_gripper_control(self.components))
@@ -11639,6 +12736,7 @@ class RealTeleopControlInput:
         remaining = max(0.0, float(remaining_sec))
         self._episode_countdown_ui_active = True
         self._episode_recording_ui_active = False
+        self._episode_finalizing_ui_active = False
         self.ui.publish(
             active_controls=self._episode_countdown_controls(),
             episode_recording_available=self._episode_recording_available(),
@@ -11677,6 +12775,7 @@ class RealTeleopControlInput:
             return
         self._episode_recording_ui_active = bool(active)
         self._episode_countdown_ui_active = False
+        self._episode_finalizing_ui_active = bool((event_status or "") == "finalizing")
         if episode_index is not None:
             self._episode_last_episode_index = int(episode_index)
         if frame_count is not None:
@@ -11688,6 +12787,7 @@ class RealTeleopControlInput:
         tactile_write_hz_payload = dict(frequency_payload.get("tactile_write_hz") or {})
         tactile_frame_counts_payload = dict(frequency_payload.get("tactile_frame_counts") or {})
         self.ui.publish(
+            active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=bool(active),
             episode_dir="" if episode_dir is None else str(episode_dir),
@@ -11726,11 +12826,13 @@ class RealTeleopControlInput:
             return
         self._episode_recording_ui_active = False
         self._episode_countdown_ui_active = False
+        self._episode_finalizing_ui_active = False
         if episode_index is not None:
             self._episode_last_episode_index = int(episode_index)
         if frame_count is not None:
             self._episode_last_frame_count = int(frame_count)
         self.ui.publish(
+            active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
             episode_frame_count=frame_count,
@@ -11968,7 +13070,7 @@ class RealTeleopControlInput:
             else self._pre_home_controls(),
             control_hint=(
                 message
-                or "请选择：标定/加载/保存 VIVE 坐标系，或采集 Home 后开始遥操。"
+                or "请选择：标定/加载/保存 VIVE 坐标系，或点击“开始遥操”采集 runtime Home。"
             ),
             capture_stage="runtime_home",
             capture_phase="ready",
@@ -12059,7 +13161,7 @@ class RealTeleopControlInput:
         self.ui.publish(
             **_fix_arm_ui_state(self.components),
             **_init_arm_ui_state(self.components),
-            active_controls=self._teleop_controls(),
+            active_controls=self._current_active_controls(),
             control_hint=message,
         )
         if progress.completed or progress.failed:
@@ -12081,7 +13183,7 @@ class RealTeleopControlInput:
         self.ui.publish(
             **_fix_arm_ui_state(self.components),
             **_init_arm_ui_state(self.components),
-            active_controls=self._teleop_controls(),
+            active_controls=self._current_active_controls(),
             control_hint=message,
         )
         if progress.completed or progress.failed:
@@ -12089,6 +13191,11 @@ class RealTeleopControlInput:
 
     def _calibrate_vive_coordinate_profile(self) -> None:
         if self.ui is None:
+            return
+        if self._episode_busy():
+            message = "数采录制、暂停、倒计时或保存中不能重新标定 VIVE 坐标系；请先停止当前 episode。"
+            self.ui.append_message("ViveCalibration", message)
+            self.ui.publish(control_hint=message)
             return
         if self._teleop_started and not self._hold_active:
             message = "运行中不能重新标定 VIVE 坐标系；请先点击 Hold / 冻结。"
@@ -12104,7 +13211,6 @@ class RealTeleopControlInput:
             self.ui.publish(
                 active_controls=[
                     "p",
-                    "c",
                     "q",
                     *self._visualization_controls(),
                     *self._vive_calibration_controls(allow_load=True),
@@ -12128,10 +13234,9 @@ class RealTeleopControlInput:
         self.ui.append_message("ViveCalibration", message)
         self.ui.publish(
             stage="VIVE 坐标系已保存",
-            active_controls=[
-                "p",
-                "c",
-                "q",
+                active_controls=[
+                    "p",
+                    "q",
                 *self._visualization_controls(),
                 *self._vive_calibration_controls(allow_load=True),
                 *self._movement_multiple_controls(),
@@ -12141,7 +13246,7 @@ class RealTeleopControlInput:
             capture_phase="ready",
             capturing=False,
             capture_waiting_for_samples=False,
-            control_hint="坐标系已保存；请点击“开始遥操”或“采集 Home”重新采集 runtime Home。",
+            control_hint="坐标系已保存；请点击“开始遥操”重新采集 runtime Home。",
             **_movement_multiple_ui_state(self.args),
             **_vive_calibration_profile_ui_state(
                 self.args,
@@ -12154,6 +13259,11 @@ class RealTeleopControlInput:
 
     def _save_vive_calibration_profile(self) -> None:
         if self.ui is None:
+            return
+        if self._episode_busy():
+            message = "数采录制、暂停、倒计时或保存中不保存 VIVE 坐标系 profile；请先停止当前 episode。"
+            self.ui.append_message("ViveCalibration", message)
+            self.ui.publish(control_hint=message)
             return
         try:
             path = _save_gui_vive_calibration_profile(self.args, self.components)
@@ -12186,6 +13296,14 @@ class RealTeleopControlInput:
     def _load_vive_calibration_profile(self) -> None:
         if self.ui is None:
             return
+        if self._episode_busy():
+            message = "数采录制、暂停、倒计时或保存中不能加载 VIVE 坐标系；请先停止当前 episode。"
+            self.ui.append_message("ViveCalibration", message)
+            self.ui.publish(
+                control_hint=message,
+                **_vive_calibration_profile_ui_state(self.args, self.components),
+            )
+            return
         if self._teleop_started and not self._hold_active:
             message = "运行中不能加载 VIVE 坐标系；请先点击 Hold / 冻结。"
             self.ui.append_message("ViveCalibration", message)
@@ -12215,15 +13333,14 @@ class RealTeleopControlInput:
         self.ui.append_message("ViveCalibration", message)
         self.ui.publish(
             stage="已加载 VIVE 坐标系",
-            active_controls=[
-                "p",
-                "c",
-                "q",
+                active_controls=[
+                    "p",
+                    "q",
                 *self._visualization_controls(),
                 *self._vive_calibration_controls(allow_load=True),
                 *self._movement_multiple_controls(),
             ],
-            control_hint="VIVE 坐标系已加载；请点击“开始遥操”或“采集 Home”重新采集 runtime home。",
+            control_hint="VIVE 坐标系已加载；请点击“开始遥操”重新采集 runtime home。",
             capture_stage="runtime_home",
             capture_phase="ready",
             teleop_running=False,
@@ -12357,26 +13474,38 @@ class RealTeleopControlInput:
         camera_previewer: CameraPreviewer | None = None,
         now: float | None = None,
         force: bool = False,
-    ) -> None:
-        if self.ui is None:
-            return
+        camera_self_check: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
         current_time = time.time() if now is None else float(now)
+        status = _build_camera_status(
+            camera_sources,
+            preview_camera_sources=preview_camera_sources,
+            camera_previewer=camera_previewer,
+            now=current_time,
+            depth_monitor=self._camera_depth_monitor,
+        )
+        status = _with_expected_wrist_depth_camera_statuses(
+            status,
+            args=self.args,
+            now=current_time,
+        )
+        if self.ui is None:
+            return status
         if (
             not force
             and current_time - self._last_camera_status_publish_at < self._camera_status_publish_interval_sec
         ):
-            return
+            return status
         self._last_camera_status_publish_at = current_time
-        self.ui.publish(
-            camera_visualization_available=self._camera_visualization_available(),
-            camera_visualization_active=self._camera_visualization_active,
-            camera_status=_build_camera_status(
-                camera_sources,
-                preview_camera_sources=preview_camera_sources,
-                camera_previewer=camera_previewer,
-                now=current_time,
-            ),
-        )
+        updates: dict[str, object] = {
+            "camera_visualization_available": self._camera_visualization_available(),
+            "camera_visualization_active": self._camera_visualization_active,
+            "camera_status": status,
+        }
+        if camera_self_check is not None:
+            updates["camera_self_check"] = dict(camera_self_check)
+        self.ui.publish(**updates)
+        return status
 
     def _toggle_vive_tracker_swap(self) -> None:
         hold_swap_allowed = self._single_arm_tracker_swap_allowed_in_hold()
@@ -12444,6 +13573,83 @@ class RealTeleopControlInput:
             f"VIVE tracker 映射: {mapping}. "
             "点击“交换 Tracker”只会交换 VIVE 输入；机械臂、手套串口、真手和 profile 都不变。"
         )
+
+
+def _run_camera_startup_self_check(
+    *,
+    camera_sources: Mapping[str, RealSenseRGBSource] | None,
+    clutch_input: RealTeleopControlInput,
+    preview_camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
+    camera_previewer: CameraPreviewer | None = None,
+    duration_sec: float = CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
+    interval_sec: float = CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
+) -> dict[str, object]:
+    started_at = time.time()
+    duration_sec = max(0.0, float(duration_sec))
+    interval_sec = max(0.01, float(interval_sec))
+    final_payload: dict[str, object] = {}
+    camera_sources = camera_sources or {}
+    if not camera_sources:
+        expected_status = _with_expected_wrist_depth_camera_statuses(
+            {},
+            args=clutch_input.args,
+            now=started_at,
+        )
+        final_payload = _camera_self_check_payload(
+            expected_status,
+            started_at=started_at,
+            now=started_at,
+            duration_sec=duration_sec,
+            completed=True,
+        )
+        if clutch_input.ui is not None:
+            clutch_input.ui.publish(
+                camera_self_check=dict(final_payload),
+                camera_status=expected_status,
+            )
+        _log("CameraSelfCheck", str(final_payload.get("message") or final_payload), now=started_at)
+        return final_payload
+    _log(
+        "CameraSelfCheck",
+        f"startup self-check duration={duration_sec:.1f}s cameras={sorted(camera_sources)}",
+        now=started_at,
+    )
+    while True:
+        now = time.time()
+        completed = now - started_at >= duration_sec
+        status = clutch_input.publish_camera_status(
+            camera_sources=camera_sources,
+            preview_camera_sources=preview_camera_sources,
+            camera_previewer=camera_previewer,
+            now=now,
+            force=True,
+        )
+        final_payload = _camera_self_check_payload(
+            status,
+            started_at=started_at,
+            now=now,
+            duration_sec=duration_sec,
+            completed=completed,
+        )
+        if clutch_input.ui is not None:
+            updates: dict[str, object] = {"camera_self_check": dict(final_payload)}
+            if completed and final_payload.get("status") in {"failed", "warning"}:
+                updates["control_hint"] = str(final_payload.get("message") or "")
+            clutch_input.ui.publish(**updates)
+        if completed:
+            break
+        clutch_input.poll()
+        if clutch_input.should_quit:
+            break
+        sleep_sec = min(interval_sec, max(0.0, duration_sec - (time.time() - started_at)))
+        if sleep_sec > 0.0:
+            time.sleep(sleep_sec)
+
+    message = str(final_payload.get("message") or "")
+    _log("CameraSelfCheck", message or str(final_payload), now=time.time())
+    if clutch_input.ui is not None and message:
+        clutch_input.ui.append_message("CameraSelfCheck", message)
+    return final_payload
 
 
 def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
@@ -12851,6 +14057,14 @@ def main() -> None:
             camera_previewer=camera_previewer,
             force=True,
         )
+        _run_camera_startup_self_check(
+            camera_sources=camera_sources,
+            clutch_input=clutch_input,
+            preview_camera_sources=preview_camera_sources,
+            camera_previewer=camera_previewer,
+        )
+        if clutch_input.should_quit:
+            return
         if camera_sources:
             _log(
                 "Camera",
@@ -13023,33 +14237,36 @@ def main() -> None:
             _log("CollisionGuard", "disabled; using two independent arm retargeters.")
         _log_dual_arm_readiness(args, components)
         _emit_collision_proxy_logs(components)
+        debug_timing_modules = _debug_timing_modules(args)
         debug_timing_state = RealDebugTimingState(
-            enabled=bool(getattr(args, "debug_timing", False)),
+            enabled=bool(debug_timing_modules.console),
             threshold_sec=float(getattr(args, "debug_timing_threshold_sec", 0.025)),
             report_interval_sec=float(getattr(args, "debug_timing_report_interval_sec", 1.0)),
         )
-        ik_debug_profile_base_enabled = bool(
-            getattr(args, "debug_timing", False)
-            or getattr(args, "debug_ik_timing", False)
-        )
+        ik_debug_profile_base_enabled = bool(debug_timing_modules.ik_profile)
         ik_debug_log_recorder = IkDebugLogRecorder()
         debug_timing_log_recorder = DebugTimingLogRecorder(
             heartbeat_sec=max(0.1, float(getattr(args, "debug_timing_report_interval_sec", 1.0))),
         )
         main_loop_watchdog = MainLoopStallWatchdog(
-            enabled=debug_timing_state.enabled,
+            enabled=bool(debug_timing_modules.watchdog),
             timeout_sec=max(5.0, float(debug_timing_state.report_interval_sec) * 5.0),
             report_interval_sec=max(5.0, float(debug_timing_state.report_interval_sec) * 5.0),
         )
-        if debug_timing_state.enabled:
+        if debug_timing_modules.light_log:
             try:
                 debug_timing_path = debug_timing_log_recorder.start(now=time.time())
                 debug_timing_log_recorder.write_event(
                     "config",
                     {
+                        "modules": list(debug_timing_modules.enabled_names()),
+                        "legacy_all": bool(debug_timing_modules.legacy_all),
                         "threshold_sec": float(debug_timing_state.threshold_sec),
                         "report_interval_sec": float(debug_timing_state.report_interval_sec),
-                        "rm65_backend_debug_timing": True,
+                        "console": bool(debug_timing_modules.console),
+                        "rm65_backend_debug_timing": bool(debug_timing_modules.rm65_backend),
+                        "ik_profile": bool(debug_timing_modules.ik_profile),
+                        "main_loop_watchdog_enabled": bool(debug_timing_modules.watchdog),
                         "main_loop_watchdog_timeout_sec": float(main_loop_watchdog.timeout_sec),
                     },
                     now=time.time(),
@@ -13149,15 +14366,16 @@ def main() -> None:
         status_gate = ChangeGate()
         orientation_gate = ChangeGate()
         tactile_sum_gate = ChangeGate()
-        if debug_timing_state.enabled:
+        if debug_timing_modules.enabled:
             _log(
                 "DebugTiming",
                 "enabled "
+                f"modules={list(debug_timing_modules.enabled_names())} "
                 f"threshold={debug_timing_state.threshold_sec:.3f}s "
                 f"report_interval={debug_timing_state.report_interval_sec:.3f}s "
                 f"light_log={debug_timing_path}",
             )
-        if bool(getattr(args, "debug_ik_timing", False)):
+        if bool(debug_timing_modules.ik_profile):
             budget = getattr(args, "ik_time_budget_ms", None)
             budget_text = "one_control_period" if budget is None else f"{float(budget):.3f}ms"
             _log(
@@ -13176,8 +14394,23 @@ def main() -> None:
         episode_start_countdown_reason = "manual_key_start"
         episode_start_warmup_ready_since: float | None = None
         episode_start_warmup_last_message: str | None = None
+        episode_recording_paused = False
+        episode_recording_pause_reason = ""
+        episode_resume_warmup_ready_count = 0
+        episode_resume_warmup_required_frames = 2
         tactile_preview_rate = PreviewRateLimiter(float(getattr(args, "tactile_vis_hz", 5.0)))
         camera_preview_rate = PreviewRateLimiter(float(getattr(args, "vis_cam_hz", 10.0)))
+        gripper_warmup_probe_lock = threading.Lock()
+        gripper_warmup_probe_thread: threading.Thread | None = None
+        gripper_warmup_probe_generation = 0
+        gripper_warmup_probe_state: dict[str, object] = {
+            "status": "idle",
+            "message": "",
+            "reason": "",
+            "started_at": None,
+            "completed_at": None,
+            "results": {},
+        }
 
         def close_camera_preview(status: str = "") -> None:
             nonlocal camera_previewer, camera_preview_active
@@ -13254,6 +14487,17 @@ def main() -> None:
                 or episode_recorder.is_recording
             )
 
+        def recording_paused() -> bool:
+            return bool(
+                (dataset_recorder is not None and dataset_recorder.is_paused)
+                or episode_recording_paused
+            )
+
+        def recording_pause_reason() -> str:
+            if dataset_recorder is not None and dataset_recorder.is_paused:
+                return dataset_recorder.pause_reason
+            return str(episode_recording_pause_reason or "")
+
         def recording_frame_count() -> int:
             if dataset_recorder is not None and dataset_recorder.is_recording:
                 return int(dataset_recorder.frame_count)
@@ -13272,6 +14516,224 @@ def main() -> None:
                 "target_hz": float(getattr(args, "collection_warning_hz", 15.0)),
                 "warning": {"active": False, "message": ""},
             }
+
+        def gripper_warmup_probe_enabled() -> bool:
+            if not bool(getattr(args, "gripper_warmup_probe", True)):
+                return False
+            backends = [
+                _gripper_backend_for_side(components, side)
+                for side in components.active_sides
+            ]
+            return any(
+                backend is not None
+                and bool(getattr(getattr(backend, "config", None), "connect_hardware", True))
+                for backend in backends
+            )
+
+        def reset_gripper_warmup_probe(reason: str) -> None:
+            nonlocal gripper_warmup_probe_generation, gripper_warmup_probe_state
+            if not gripper_warmup_probe_enabled():
+                return
+            with gripper_warmup_probe_lock:
+                gripper_warmup_probe_generation += 1
+                gripper_warmup_probe_state = {
+                    "status": "idle",
+                    "message": "",
+                    "reason": str(reason),
+                    "started_at": None,
+                    "completed_at": None,
+                    "results": {},
+                }
+
+        def gripper_warmup_probe_running() -> bool:
+            if not gripper_warmup_probe_enabled():
+                return False
+            with gripper_warmup_probe_lock:
+                return str(gripper_warmup_probe_state.get("status") or "") == "running"
+
+        def gripper_warmup_probe_failure_message(results: Mapping[str, object]) -> str:
+            details: list[str] = []
+            for side in components.active_sides:
+                result = results.get(side)
+                if not isinstance(result, Mapping) or bool(result.get("ok")):
+                    continue
+                attempts = result.get("attempts")
+                last_attempt = None
+                if isinstance(attempts, Sequence) and not isinstance(attempts, (str, bytes)) and attempts:
+                    maybe_attempt = attempts[-1]
+                    if isinstance(maybe_attempt, Mapping):
+                        last_attempt = maybe_attempt
+                error = (
+                    str(last_attempt.get("error") or "")
+                    if isinstance(last_attempt, Mapping)
+                    else ""
+                )
+                target = (
+                    last_attempt.get("target")
+                    if isinstance(last_attempt, Mapping)
+                    else None
+                )
+                measured = (
+                    last_attempt.get("measured")
+                    if isinstance(last_attempt, Mapping)
+                    else None
+                )
+                target_f = _safe_float_value(target)
+                measured_f = _safe_float_value(measured)
+                if target_f is not None and measured_f is not None:
+                    details.append(
+                        f"{side}: {error or 'state_mismatch'} "
+                        f"target={target_f:.2f} measured={measured_f:.2f}"
+                    )
+                else:
+                    details.append(f"{side}: {error or 'state_mismatch'}")
+            suffix = "；".join(details) if details else "unknown failure"
+            return f"gripper warmup probe 失败，已尝试重连后仍未通过：{suffix}。"
+
+        def start_gripper_warmup_probe(now: float, *, reason: str) -> tuple[bool, str]:
+            nonlocal gripper_warmup_probe_generation, gripper_warmup_probe_state
+            nonlocal gripper_warmup_probe_thread
+            if not gripper_warmup_probe_enabled():
+                return True, "gripper warmup probe 未启用。"
+            side_backends: list[tuple[str, DMTacGripperBackend]] = []
+            for side in components.active_sides:
+                backend = _gripper_backend_for_side(components, side)
+                if backend is None:
+                    continue
+                if not bool(getattr(getattr(backend, "config", None), "connect_hardware", True)):
+                    continue
+                side_backends.append((side, backend))
+            if not side_backends:
+                return True, "gripper warmup probe 无硬件 backend。"
+            with gripper_warmup_probe_lock:
+                status = str(gripper_warmup_probe_state.get("status") or "idle")
+                if status == "ready":
+                    return True, str(
+                        gripper_warmup_probe_state.get("message") or "gripper warmup probe 已通过。"
+                    )
+                if status == "running":
+                    return False, str(
+                        gripper_warmup_probe_state.get("message") or "等待 gripper warmup probe 完成。"
+                    )
+                if status == "failed":
+                    return False, str(
+                        gripper_warmup_probe_state.get("message") or "gripper warmup probe 失败。"
+                    )
+                gripper_warmup_probe_generation += 1
+                generation = int(gripper_warmup_probe_generation)
+                sides_text = ",".join(side for side, _backend in side_backends)
+                gripper_warmup_probe_state = {
+                    "status": "running",
+                    "message": f"gripper warmup probe 运行中：{sides_text} open->half->open。",
+                    "reason": str(reason),
+                    "started_at": float(now),
+                    "completed_at": None,
+                    "results": {},
+                }
+
+            def cancelled() -> bool:
+                with gripper_warmup_probe_lock:
+                    return int(gripper_warmup_probe_generation) != generation
+
+            def worker() -> None:
+                nonlocal gripper_warmup_probe_state
+                results: dict[str, object] = {}
+                targets = (0.0, 0.5, 0.0)
+                try:
+                    for side, backend in side_backends:
+                        if cancelled():
+                            return
+                        results[side] = _run_gripper_warmup_probe_for_side(
+                            side,
+                            backend,
+                            targets=targets,
+                            tolerance=max(
+                                0.0,
+                                float(getattr(args, "gripper_warmup_probe_tolerance", 0.18)),
+                            ),
+                            step_timeout_s=max(
+                                0.01,
+                                float(getattr(args, "gripper_warmup_probe_step_timeout_sec", 2.0)),
+                            ),
+                            settle_s=max(
+                                0.0,
+                                float(getattr(args, "gripper_warmup_probe_settle_sec", 0.20)),
+                            ),
+                            poll_s=max(
+                                0.01,
+                                float(getattr(args, "gripper_warmup_probe_poll_sec", 0.05)),
+                            ),
+                            reconnect_on_failure=True,
+                            cancelled=cancelled,
+                        )
+                    if cancelled():
+                        return
+                    passed = bool(results) and all(
+                        isinstance(result, Mapping) and bool(result.get("ok"))
+                        for result in results.values()
+                    )
+                    if passed:
+                        reconnected_sides = [
+                            side
+                            for side, result in results.items()
+                            if isinstance(result, Mapping) and bool(result.get("reconnected"))
+                        ]
+                        if reconnected_sides:
+                            message = (
+                                "gripper warmup probe 通过；已自动重连 "
+                                f"{','.join(reconnected_sides)}。"
+                            )
+                        else:
+                            message = "gripper warmup probe 通过：open->half->open state matched。"
+                        status = "ready"
+                    else:
+                        message = gripper_warmup_probe_failure_message(results)
+                        status = "failed"
+                except Exception as exc:  # noqa: BLE001 - warmup must fail closed, not hang forever.
+                    if cancelled():
+                        return
+                    message = f"gripper warmup probe 内部异常：{type(exc).__name__}: {exc}。"
+                    status = "failed"
+                completed_at = time.time()
+                with gripper_warmup_probe_lock:
+                    if int(gripper_warmup_probe_generation) != generation:
+                        return
+                    gripper_warmup_probe_state = {
+                        "status": status,
+                        "message": message,
+                        "reason": str(reason),
+                        "started_at": float(now),
+                        "completed_at": completed_at,
+                        "results": results,
+                    }
+                _log("GripperWarmup", message, now=completed_at)
+
+            gripper_warmup_probe_thread = threading.Thread(
+                target=worker,
+                name="gripper-warmup-probe",
+                daemon=True,
+            )
+            gripper_warmup_probe_thread.start()
+            _log(
+                "GripperWarmup",
+                f"started reason={reason} sides={','.join(side for side, _backend in side_backends)}",
+                now=now,
+            )
+            return False, "等待 gripper warmup probe 完成。"
+
+        def gripper_warmup_probe_status(now: float, *, reason: str) -> tuple[bool, str]:
+            if not gripper_warmup_probe_enabled():
+                return True, ""
+            with gripper_warmup_probe_lock:
+                status = str(gripper_warmup_probe_state.get("status") or "idle")
+                message = str(gripper_warmup_probe_state.get("message") or "")
+            if status == "ready":
+                return True, message or "gripper warmup probe 已通过。"
+            if status == "running":
+                return False, message or "等待 gripper warmup probe 完成。"
+            if status == "failed":
+                return False, message or "gripper warmup probe 失败。"
+            return start_gripper_warmup_probe(now, reason=reason)
 
         def publish_collection_frequency_warning(
             frequency_status: Mapping[str, object],
@@ -13318,8 +14780,6 @@ def main() -> None:
                 return "runtime_fault"
             if state_value == TeleopRunState.ESTOP.value:
                 return "runtime_estop"
-            if clutch_input.hold_active():
-                return "runtime_hold"
             return None
 
         def recording_warmup_status(
@@ -13332,6 +14792,8 @@ def main() -> None:
             stop_reason = recording_auto_stop_reason(step_result.state)
             if stop_reason is not None:
                 return False, f"等待恢复，当前状态会自动停止数采：{stop_reason}。"
+            if clutch_input.hold_active():
+                return False, "等待 hold 解除并重采 runtime home。"
             if step_result.state != TeleopRunState.RUNNING:
                 return False, f"等待遥操进入 RUNNING，当前状态：{step_result.state.value}。"
             if step_result.observation is None:
@@ -13348,6 +14810,16 @@ def main() -> None:
                         return False, f"等待相机 {camera_key} 时间戳稳定。"
                     if camera_age > 1.0:
                         return False, f"等待相机 {camera_key} 最新帧，当前 age={camera_age:.2f}s。"
+                camera_status = clutch_input.publish_camera_status(
+                    camera_sources=camera_sources,
+                    preview_camera_sources=preview_camera_sources,
+                    camera_previewer=camera_previewer,
+                    now=now,
+                    force=False,
+                )
+                camera_blocking_message = _camera_status_blocking_message(camera_status)
+                if camera_blocking_message:
+                    return False, camera_blocking_message
             if _hand_backend_mode(args) != HAND_BACKEND_NONE:
                 for side in components.active_sides:
                     channel = step_result.channels.get(f"{side}_hand_q6")
@@ -13358,6 +14830,9 @@ def main() -> None:
                         return False, f"等待 {side} hand_q6 时间戳稳定。"
                     if hand_age > 0.5:
                         return False, f"等待 {side} hand_q6 最新输入，当前 age={hand_age:.2f}s。"
+            probe_ready, probe_message = gripper_warmup_probe_status(now, reason="recording_warmup")
+            if not probe_ready:
+                return False, probe_message
             return True, "warmup 输入稳定。"
 
         def start_recording(now: float, *, start_reason: str) -> bool:
@@ -13451,6 +14926,7 @@ def main() -> None:
                     else None
                 ),
             )
+            reset_gripper_warmup_probe("recording_started")
             return True
 
         def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
@@ -13459,6 +14935,12 @@ def main() -> None:
             if recording_active():
                 return False
             if episode_start_countdown_deadline is not None:
+                return False
+            if dataset_recorder is not None and dataset_recorder.finalizing:
+                message = "上一个正式 dataset episode 仍在后台保存，暂不开始新的数采。"
+                _log("Dataset", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", message)
                 return False
             if dataset_recorder is None and not episode_recorder.config.enabled:
                 message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
@@ -13471,6 +14953,7 @@ def main() -> None:
             episode_start_countdown_reason = str(start_reason)
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
+            reset_gripper_warmup_probe(f"countdown:{start_reason}")
             message = (
                 f"准备开始数采：warmup 与 {countdown_sec:.1f} 秒倒计时同时进行；"
                 "两者都完成后开始写入。"
@@ -13489,6 +14972,7 @@ def main() -> None:
             episode_start_countdown_deadline = None
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
+            reset_gripper_warmup_probe(f"countdown_cancelled:{reason}")
             message = f"数采倒计时已取消：{reason}。"
             _log("Dataset", message, now=now)
             if control_ui is not None:
@@ -13569,6 +15053,8 @@ def main() -> None:
             summary: Mapping[str, object] | None = None,
         ) -> None:
             nonlocal episode_last_state, last_collection_frequency_warning_active
+            nonlocal episode_recording_paused, episode_recording_pause_reason
+            nonlocal episode_resume_warmup_ready_count
             stopped_any = False
             frame_count = recording_frame_count()
             advance_round_trip_after_stop = False
@@ -13625,8 +15111,179 @@ def main() -> None:
                 )
                 episode_last_state = None
                 last_collection_frequency_warning_active = False
+                episode_recording_paused = False
+                episode_recording_pause_reason = ""
+                episode_resume_warmup_ready_count = 0
+                reset_gripper_warmup_probe(f"recording_stopped:{end_reason}")
                 if advance_round_trip_after_stop:
                     clutch_input.advance_round_trip_task_after_saved_episode()
+
+        def pause_recording(now: float, *, reason: str) -> bool:
+            nonlocal episode_recording_paused, episode_recording_pause_reason
+            nonlocal last_collection_frequency_warning_active
+            nonlocal episode_resume_warmup_ready_count
+            if not recording_active():
+                return False
+            episode_resume_warmup_ready_count = 0
+            reset_gripper_warmup_probe(f"recording_paused:{reason}")
+            newly_paused = False
+            if dataset_recorder is not None and dataset_recorder.is_recording:
+                newly_paused = bool(
+                    dataset_recorder.pause_episode(
+                        reason=reason,
+                        now=now,
+                        step_index=step_index,
+                        last_state=episode_last_state,
+                    )
+                ) or newly_paused
+            if episode_recorder.is_recording and not episode_recording_paused:
+                episode_recorder.record_event(
+                    "recording_paused",
+                    payload={
+                        "reason": str(reason),
+                        "step_index": int(step_index),
+                        "last_state": episode_last_state,
+                        "frame_count": int(episode_recorder.frame_count),
+                    },
+                    timestamp=now,
+                )
+                episode_recording_paused = True
+                episode_recording_pause_reason = str(reason)
+                newly_paused = True
+            if not recording_paused():
+                return False
+            last_collection_frequency_warning_active = False
+            message = (
+                f"数采已暂停：{reason}；当前 episode 保持打开，恢复遥操且输入稳定后会继续写入。"
+            )
+            if newly_paused:
+                _log("Dataset", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_recording_state(
+                active=True,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                frequency_status=recording_frequency_status(),
+                event_status="paused",
+                event_message=message,
+                episode_index=(
+                    int(dataset_recorder.active_episode_index)
+                    if dataset_recorder is not None
+                    and getattr(dataset_recorder, "active_episode_index", None) is not None
+                    else None
+                ),
+            )
+            if control_ui is not None:
+                control_ui.publish(
+                    active_controls=(
+                        clutch_input._hold_controls()
+                        if clutch_input.hold_active()
+                        else clutch_input._teleop_controls()
+                    )
+                )
+            return True
+
+        def resume_recording_if_ready(
+            now: float,
+            *,
+            step_result: SessionStepResult,
+        ) -> bool:
+            nonlocal episode_recording_paused, episode_recording_pause_reason
+            nonlocal episode_resume_warmup_ready_count
+            if not recording_paused():
+                return True
+            ready, warmup_message = recording_warmup_status(now, step_result=step_result)
+            if not ready:
+                episode_resume_warmup_ready_count = 0
+                pause_reason = recording_pause_reason()
+                clutch_input.set_episode_recording_state(
+                    active=True,
+                    episode_dir=recording_path(),
+                    frame_count=recording_frame_count(),
+                    frequency_status=recording_frequency_status(),
+                    event_status="resume_pending",
+                    event_message=(
+                        f"数采暂停中：{pause_reason or 'paused'}；"
+                        f"等待恢复写入：{warmup_message}"
+                    ),
+                    episode_index=(
+                        int(dataset_recorder.active_episode_index)
+                        if dataset_recorder is not None
+                        and getattr(dataset_recorder, "active_episode_index", None) is not None
+                        else None
+                    ),
+                )
+                return False
+            episode_resume_warmup_ready_count += 1
+            if episode_resume_warmup_ready_count < episode_resume_warmup_required_frames:
+                pause_reason = recording_pause_reason()
+                clutch_input.set_episode_recording_state(
+                    active=True,
+                    episode_dir=recording_path(),
+                    frame_count=recording_frame_count(),
+                    frequency_status=recording_frequency_status(),
+                    event_status="resume_pending",
+                    event_message=(
+                        f"数采暂停中：{pause_reason or 'paused'}；"
+                        "遥操输入已恢复，等待连续稳定帧 "
+                        f"{episode_resume_warmup_ready_count}/{episode_resume_warmup_required_frames}。"
+                    ),
+                    episode_index=(
+                        int(dataset_recorder.active_episode_index)
+                        if dataset_recorder is not None
+                        and getattr(dataset_recorder, "active_episode_index", None) is not None
+                        else None
+                    ),
+                )
+                return False
+            resumed_any = False
+            pause_reason = recording_pause_reason()
+            if dataset_recorder is not None and dataset_recorder.is_paused:
+                resumed_any = bool(
+                    dataset_recorder.resume_episode(
+                        reason="runtime_running_warmup_ready",
+                        now=now,
+                        step_index=step_index,
+                    )
+                ) or resumed_any
+            if episode_recording_paused:
+                episode_recorder.record_event(
+                    "recording_resumed",
+                    payload={
+                        "reason": "runtime_running_warmup_ready",
+                        "pause_reason": pause_reason,
+                        "step_index": int(step_index),
+                        "state": step_result.state.value,
+                        "frame_count": int(episode_recorder.frame_count),
+                    },
+                    timestamp=now,
+                )
+                episode_recording_paused = False
+                episode_recording_pause_reason = ""
+                resumed_any = True
+            if resumed_any:
+                episode_resume_warmup_ready_count = 0
+                reset_gripper_warmup_probe("recording_resumed")
+                message = "数采已恢复：遥操 RUNNING 且输入/相机 warmup 已稳定，继续写入同一个 episode。"
+                _log("Dataset", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_recording_state(
+                active=True,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                frequency_status=recording_frequency_status(),
+                event_status="recording",
+                event_message="正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。",
+                episode_index=(
+                    int(dataset_recorder.active_episode_index)
+                    if dataset_recorder is not None
+                    and getattr(dataset_recorder, "active_episode_index", None) is not None
+                    else None
+                ),
+            )
+            return True
 
         def poll_dataset_finalize(now: float) -> None:
             if dataset_recorder is None:
@@ -13669,7 +15326,7 @@ def main() -> None:
             main_loop_watchdog.beat("loop.start", step_index)
             loop_phase_timer = (
                 PhaseTimer()
-                if (debug_timing_state.enabled or recording_active())
+                if (debug_timing_modules.needs_loop_phase_timer or recording_active())
                 else None
             )
 
@@ -13730,14 +15387,12 @@ def main() -> None:
                     else "gui hold requested"
                 )
                 if recording_active():
-                    stop_recording(
-                        loop_start,
-                        end_reason="hold_requested",
-                        summary={
-                            "last_step_index": step_index,
-                            "last_state": episode_last_state,
-                        },
-                    )
+                    pause_recording(loop_start, reason="hold_requested")
+                special_cancel_messages = _cancel_special_arm_modes_for_hold(
+                    components,
+                    now=loop_start,
+                    reason="hold_requested",
+                )
                 cancel_recording_countdown(loop_start, reason="hold_requested")
                 recovery_plan = None
                 components.session.hold_hardware(hold_hardware_reason)
@@ -13750,25 +15405,35 @@ def main() -> None:
                     message = (
                         "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。"
                         if hold_reason == "q6_gesture"
-                        else "机械臂已进入保持状态；点击“开始遥操/开始采集”后才会重新采集 runtime home。"
+                        else "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。"
                     )
                     control_ui.append_message("Hold", message)
+                    if special_cancel_messages:
+                        control_ui.append_message(
+                            "Hold",
+                            "；".join(special_cancel_messages)
+                            + "；重新采集 runtime home 后恢复普通遥操。",
+                        )
                 continue
             if clutch_input.consume_calibration_request():
                 if recording_active():
-                    stop_recording(
-                        loop_start,
-                        end_reason="runtime_recalibration_requested",
-                        summary={
-                            "last_step_index": step_index,
-                            "last_state": episode_last_state,
-                        },
-                    )
+                    pause_recording(loop_start, reason="runtime_recalibration_requested")
+                special_cancel_messages = _cancel_special_arm_modes_for_hold(
+                    components,
+                    now=loop_start,
+                    reason="runtime_recalibration_requested",
+                )
                 cancel_recording_countdown(loop_start, reason="runtime_recalibration_requested")
                 recovery_plan = None
                 if components.session.state_machine.state != TeleopRunState.DEBUG_ONLY:
                     components.session.hold_hardware("runtime home recalibration requested")
                 _log("Calibration", "explicit runtime home recalibration requested from hold", now=loop_start)
+                if control_ui is not None and special_cancel_messages:
+                    control_ui.append_message(
+                        "Calibration",
+                        "；".join(special_cancel_messages)
+                        + "；本次 runtime home 后特殊状态保持关闭。",
+                    )
                 if not clutch_input.before_calibration_start_delay(
                     DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
                     arm_mode="real",
@@ -13877,7 +15542,15 @@ def main() -> None:
             )
             gripper_command = None
             gripper_command_status: dict[str, dict[str, object]] = {}
-            if clutch_input.gripper_control_enabled():
+            if clutch_input.gripper_control_enabled() and gripper_warmup_probe_running():
+                for side in components.active_sides:
+                    gripper_command_status[side] = {
+                        "status": "warmup_probe",
+                        "sent": False,
+                        "reason": "gripper_warmup_probe",
+                        "timestamp": float(loop_start),
+                    }
+            elif clutch_input.gripper_control_enabled():
                 gripper_command = _dispatch_q6_gripper_control(
                     components,
                     step_result.observation,
@@ -14166,6 +15839,8 @@ def main() -> None:
                             "last_state": step_result.state.value,
                         },
                     )
+            if recording_active() and recording_paused():
+                resume_recording_if_ready(loop_start, step_result=step_result)
             if recording_active():
                 if episode_last_state != step_result.state.value:
                     if episode_recorder.is_recording:
@@ -14178,7 +15853,11 @@ def main() -> None:
                             timestamp=loop_start,
                         )
                     episode_last_state = step_result.state.value
-                if dataset_recorder is not None and dataset_recorder.is_recording:
+                if (
+                    dataset_recorder is not None
+                    and dataset_recorder.is_recording
+                    and dataset_recorder.can_record_samples
+                ):
                     collection_metadata_extra = None
                     if loop_phase_timer is not None:
                         collection_metadata_extra = {
@@ -14200,7 +15879,7 @@ def main() -> None:
                     )
                 frequency_status = recording_frequency_status()
                 publish_collection_frequency_warning(frequency_status, now=loop_start)
-                if episode_recorder.is_recording:
+                if episode_recorder.is_recording and not recording_paused():
                     episode_recorder.record_frame(
                         _build_episode_frame(
                             components,
@@ -14214,13 +15893,18 @@ def main() -> None:
                         ),
                         timestamp=loop_start,
                     )
+                paused_now = recording_paused()
                 clutch_input.set_episode_recording_state(
                     active=True,
                     episode_dir=recording_path(),
                     frame_count=recording_frame_count(),
                     frequency_status=frequency_status,
-                    event_status="recording",
-                    event_message="正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。",
+                    event_status="resume_pending" if paused_now else "recording",
+                    event_message=(
+                        f"数采暂停中：{recording_pause_reason() or 'paused'}；等待遥操恢复稳定后继续写入。"
+                        if paused_now
+                        else "正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。"
+                    ),
                 )
             mark_loop_phase("loop.episode_record")
 

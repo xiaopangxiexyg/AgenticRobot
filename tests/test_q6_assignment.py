@@ -18,6 +18,8 @@ from hardware.teleop_hand.q6_assignment import (
 )
 from teleop_runtime.collection.run_collect import _apply_default_q6_ports
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def _serial_ports() -> list[dict[str, object]]:
     return [
@@ -78,6 +80,12 @@ class _NonInteractiveStdin:
 
 
 class Q6AssignmentTest(unittest.TestCase):
+    def test_default_config_dir_lives_under_teleop_runtime_configs(self) -> None:
+        self.assertEqual(
+            q6_assignment.default_config_dir(),
+            ROOT / "teleop_runtime" / "configs" / "hardware" / "q6",
+        )
+
     def test_scan_build_save_and_load_latest_assignment(self) -> None:
         scan = scan_q6_devices(serial_devices=_serial_ports(), probe_func=_probe)
         assignment = build_assignment_from_tokens(scan, left="1", right="0")
@@ -102,6 +110,29 @@ class Q6AssignmentTest(unittest.TestCase):
                 "right": "/dev/serial/by-id/q6-left",
             },
         )
+
+    def test_latest_falls_back_to_legacy_config_dir_but_saves_new_default(self) -> None:
+        scan = scan_q6_devices(serial_devices=_serial_ports(), probe_func=_probe)
+        assignment = build_assignment_from_tokens(scan, left="0", right="1")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new_dir = root / "teleop_runtime" / "configs" / "hardware" / "q6"
+            legacy_dir = root / "teleop_records" / "q6_hardware_configs"
+            save_assignment(assignment, config_dir=legacy_dir)
+
+            with (
+                patch.object(q6_assignment, "default_config_dir", return_value=new_dir),
+                patch.object(q6_assignment, "legacy_config_dirs", return_value=(legacy_dir,)),
+            ):
+                loaded = load_assignment("latest")
+                saved = save_assignment(assignment)
+
+        self.assertEqual(
+            q6_ports_for_sides(loaded),
+            {"left": "/dev/serial/by-id/q6-left", "right": "/dev/serial/by-id/q6-right"},
+        )
+        self.assertEqual(saved.parent, new_dir)
 
     def test_compare_assignment_remaps_by_identity(self) -> None:
         scan = scan_q6_devices(serial_devices=_serial_ports(), probe_func=_probe)

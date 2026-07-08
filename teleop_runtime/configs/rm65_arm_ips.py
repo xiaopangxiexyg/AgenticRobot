@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from project_paths import teleop_records_root
+from project_paths import hardware_interface_configs_root, teleop_records_root
 
 
 SCHEMA_VERSION = "rm65_arm_ip_assignment.v1"
@@ -15,7 +15,11 @@ SIDES = ("left", "right")
 
 
 def default_config_dir() -> Path:
-    return teleop_records_root() / "rm65_arm_ip_configs"
+    return hardware_interface_configs_root() / "rm65_arm_ips"
+
+
+def legacy_config_dirs() -> tuple[Path, ...]:
+    return (teleop_records_root() / "rm65_arm_ip_configs",)
 
 
 def hostname() -> str:
@@ -101,15 +105,31 @@ def build_assignment(
     return normalize_assignment(payload)
 
 
-def latest_config_path(config_dir: str | Path | None = None) -> Path:
-    root = Path(config_dir).expanduser().resolve() if config_dir is not None else default_config_dir()
+def _latest_config_path_in_dir(root: Path) -> Path | None:
     explicit = root / LATEST_CONFIG_NAME
     if explicit.exists():
         return explicit
     candidates = sorted(root.glob("*_rm65_arm_ip_assignment.json"))
-    if not candidates:
+    if candidates:
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    return None
+
+
+def latest_config_path(config_dir: str | Path | None = None) -> Path:
+    if config_dir is not None:
+        root = Path(config_dir).expanduser().resolve()
+        path = _latest_config_path_in_dir(root)
+        if path is not None:
+            return path
         raise FileNotFoundError(f"No RM65 arm IP assignment config found in {root}.")
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    searched = [default_config_dir(), *legacy_config_dirs()]
+    for root in searched:
+        path = _latest_config_path_in_dir(root)
+        if path is not None:
+            return path
+    roots = ", ".join(str(root) for root in searched)
+    raise FileNotFoundError(f"No RM65 arm IP assignment config found in {roots}.")
 
 
 def load_assignment(

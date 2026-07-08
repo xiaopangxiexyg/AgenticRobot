@@ -3,7 +3,7 @@
     "serial": "213222079798",
     "width": 640,
     "height": 480,
-    "fps": 30,
+    "fps": 15,
     "metadata": {
       "mount": "single_front"
     }
@@ -12,7 +12,7 @@
     "serial": "261122273924",
     "width": 640,
     "height": 480,
-    "fps": 30,
+    "fps": 15,
     "metadata": {
       "mount": "single_left_wrist"
     }
@@ -21,7 +21,7 @@
     "serial": "260522278055",
     "width": 640,
     "height": 480,
-    "fps": 30,
+    "fps": 15,
     "metadata": {
       "mount": "single_right_wrist"
     }

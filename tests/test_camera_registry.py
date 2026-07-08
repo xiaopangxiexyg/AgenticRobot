@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import unittest
 from pathlib import Path
@@ -54,6 +55,14 @@ class CameraRegistryTest(unittest.TestCase):
 
     def test_real2sim_default_camera_registry_uses_cameras_config(self) -> None:
         self.assertEqual(default_camera_registry_path(), DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH)
+
+    def test_default_realsense_profiles_are_15hz(self) -> None:
+        devices = json.loads(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+        registry = load_camera_registry(DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH)
+
+        for camera_key in ("front", "left_wrist", "right_wrist"):
+            self.assertEqual(devices[camera_key]["fps"], 15)
+            self.assertEqual(registry["cameras"][camera_key]["profile"]["fps"], 15)
 
     def test_runtime_intrinsics_overlay_registry_without_losing_urdf_placements(self) -> None:
         registry = normalize_camera_registry(

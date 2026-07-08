@@ -30,8 +30,10 @@ from teleop_runtime.debug.run_vive_rm65_real_teleop import (
     DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M,
     _build_components as build_real_components,
     _build_vive_tracker_configs_for_args,
+    _probe_gripper_backend_motion,
     _raw_tracker_pose_state_from_channels,
     _reset_runtime_motion_state_from_real_qpos,
+    _run_gripper_warmup_probe_for_side,
     _tracker_name_for_source_side,
     _tracker_source_side_for_logical_side,
 )
@@ -166,7 +168,64 @@ class StubPoseSource:
         }
 
 
+class StubWarmupGripperBackend:
+    def __init__(self, *, recover_after_reconnect: bool = False) -> None:
+        self.recover_after_reconnect = bool(recover_after_reconnect)
+        self.reconnected = False
+        self.sent: list[float] = []
+        self.reconnect_calls: list[str] = []
+        self._target = 0.0
+
+    def send_fixed_joint_pos(self, value: object) -> bool:
+        self._target = float(value)
+        self.sent.append(self._target)
+        return True
+
+    def read_gripper_state_now(self) -> dict[str, object]:
+        if self.recover_after_reconnect and not self.reconnected:
+            return {"joint_pos": 1.0}
+        return {"joint_pos": self._target}
+
+    def force_reconnect_gripper(self, reason: str) -> bool:
+        self.reconnect_calls.append(str(reason))
+        self.reconnected = True
+        return True
+
+
 class TeleopRecoveryTests(unittest.TestCase):
+    def test_gripper_warmup_probe_validates_open_half_open_sequence(self) -> None:
+        backend = StubWarmupGripperBackend()
+
+        result = _probe_gripper_backend_motion(
+            backend,
+            targets=(0.0, 0.5, 0.0),
+            tolerance=0.01,
+            step_timeout_s=0.0,
+            settle_s=0.0,
+            poll_s=0.0,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(backend.sent, [0.0, 0.5, 0.0])
+
+    def test_gripper_warmup_probe_reconnects_and_retries_on_state_mismatch(self) -> None:
+        backend = StubWarmupGripperBackend(recover_after_reconnect=True)
+
+        result = _run_gripper_warmup_probe_for_side(
+            "left",
+            backend,
+            targets=(0.0, 0.5, 0.0),
+            tolerance=0.01,
+            step_timeout_s=0.0,
+            settle_s=0.0,
+            poll_s=0.0,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["reconnected"])
+        self.assertTrue(backend.reconnect_calls)
+        self.assertEqual(backend.sent, [0.0, 0.0, 0.5, 0.0])
+
     def test_absolute_home_anchor_preserves_full_pose_when_tracker_stays_at_home(self) -> None:
         retargeter = PoseToArmRetargeter(
             PoseToArmRetargeterConfig(

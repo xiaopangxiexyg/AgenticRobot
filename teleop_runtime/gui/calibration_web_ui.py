@@ -385,6 +385,13 @@ button.stop-ready {
   color: #643600;
   box-shadow: 0 0 0 3px rgba(217, 149, 37, 0.16);
 }
+.episode-banner.paused,
+.episode-banner.resume_pending {
+  background: #eaf2ff;
+  border-color: #6b95d8;
+  color: #183f73;
+  box-shadow: 0 0 0 3px rgba(55, 111, 189, 0.14);
+}
 .episode-banner.finalizing {
   background: #fff5e5;
   border-color: #dfa855;
@@ -728,6 +735,12 @@ button.stop-ready {
       </div>
       <div id="cameraStatusSection" class="section">
         <div class="label">RealSense 相机</div>
+        <div id="cameraSelfCheckSection" class="section" hidden>
+          <div id="cameraSelfCheckCard" class="device-card off">
+            <div class="device-title"><span>启动自检</span><span id="cameraSelfCheckStatus">未开始</span></div>
+            <div id="cameraSelfCheckDetail" class="device-body mono">-</div>
+          </div>
+        </div>
         <div id="cameraCards" class="device-grid"></div>
       </div>
       <div id="tactileCameraStatusSection" class="section">
@@ -769,7 +782,7 @@ button.stop-ready {
       <div class="shortcut-strip" aria-label="快捷键">
         <div class="shortcut-item"><kbd>A</kbd><span>开始 / 停止数采</span></div>
         <div class="shortcut-item"><kbd>B</kbd><span>开始遥操 / Hold</span></div>
-        <div class="shortcut-item"><kbd>C</kbd><span id="shortcutCLabel">开始采集</span></div>
+        <div class="shortcut-item"><kbd>C</kbd><span id="shortcutCLabel">固定臂不可用</span></div>
         <div class="shortcut-item"><kbd>G</kbd><span id="shortcutGLabel">归位不可用</span></div>
       </div>
       <div id="sendStatus" class="send-status"></div>
@@ -793,7 +806,7 @@ button.stop-ready {
         <button class="danger" data-event="q">退出 / 停臂</button>
         <button class="warn" data-event="r">重置</button>
         <button data-event="p">开始遥操</button>
-        <button data-event="c">采集 Home</button>
+        <button data-event="c">固定臂不可用</button>
         <button id="ikDebugLogButton" class="secondary" data-event="d">开始 IK 记录</button>
         <button class="secondary" data-event="n">下一步</button>
         <button class="secondary" data-event="s">保存</button>
@@ -1182,7 +1195,7 @@ button.stop-ready {
       } else if (state.teleop_running) {
         shortcutC.textContent = "无 fix-arm 时不可用";
       } else {
-        shortcutC.textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+        shortcutC.textContent = "固定臂不可用";
       }
     }
     var shortcutG = byId("shortcutGLabel");
@@ -1213,7 +1226,7 @@ button.stop-ready {
         } else if (state.teleop_running) {
           buttons[i].textContent = "无 fix-arm 时不可用";
         } else {
-          buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+          buttons[i].textContent = "固定臂不可用";
         }
       } else if (eventName === "fix_arm_toggle") {
         var fixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -1239,6 +1252,7 @@ button.stop-ready {
     var available = Boolean(state.episode_recording_available);
     var recording = Boolean(state.episode_recording);
     var preparing = String(state.episode_event_status || "") === "preparing";
+    var finalizing = String(state.episode_event_status || "") === "finalizing";
     var startButton = byId("episodeStartButton");
     var stopButton = byId("episodeStopButton");
     var statusEl = byId("episodeStatus");
@@ -1246,11 +1260,14 @@ button.stop-ready {
     var warningBanner = byId("episodeWarningBanner");
     var warningText = byId("episodeWarningText");
     var status = String(state.episode_event_status || "");
+    var paused = status === "paused" || status === "resume_pending";
     var statusLabels = {
       unavailable: "数采不可用",
       idle: "未开始数采",
       preparing: "3 秒后开始数采",
       recording: "正在数采",
+      paused: "数采暂停",
+      resume_pending: "等待恢复写入",
       finalizing: "停止中 / 后台保存",
       saved: "已保存",
       discarded: "已停止 / 无样本",
@@ -1258,19 +1275,20 @@ button.stop-ready {
     };
     if (!available) {
       status = "unavailable";
-    } else if (recording) {
+    } else if (recording && !paused) {
       status = "recording";
     } else if (!status) {
       status = "idle";
     }
+    paused = status === "paused" || status === "resume_pending";
     if (startButton) {
-      startButton.textContent = recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采");
-      startButton.disabled = !legacyActiveControls.episode_start || recording || preparing;
+      startButton.textContent = paused ? "数采暂停中" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
+      startButton.disabled = !legacyActiveControls.episode_start || recording || preparing || finalizing;
     }
     if (stopButton) {
       stopButton.disabled = !legacyActiveControls.episode_stop || (!recording && !preparing);
     }
-    var locked = recording || preparing;
+    var locked = recording || preparing || finalizing;
     var fields = ["datasetBaseRootInput", "datasetChooseRootButton", "taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
     for (var i = 0; i < fields.length; i += 1) {
       var field = byId(fields[i]);
@@ -1289,7 +1307,7 @@ button.stop-ready {
     if (statusEl) {
       var lines = [
         available ? "episode 录制可用" : "episode 录制不可用",
-        recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")
+        paused ? "状态: 暂停中" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"))
       ];
       if (state.episode_dir) lines.push("路径: " + state.episode_dir);
       if (state.dataset_root) lines.push("保存根目录: " + state.dataset_root);
@@ -1301,7 +1319,7 @@ button.stop-ready {
     var banner = byId("episodeBanner");
     if (banner) {
       var bannerClass = "episode-banner";
-      if (/^(preparing|recording|finalizing|saved|discarded|error|unavailable)$/.test(status)) {
+      if (/^(preparing|recording|paused|resume_pending|finalizing|saved|discarded|error|unavailable)$/.test(status)) {
         bannerClass += " " + (status === "discarded" ? "finalizing" : status);
       }
       banner.className = bannerClass;
@@ -1476,8 +1494,6 @@ button.stop-ready {
     } else if (key === "c") {
       if (state.fix_arm_available && state.teleop_running && legacyActiveControls["fix_arm_toggle"]) {
         eventName = "fix_arm_toggle";
-      } else if (!state.teleop_running && String(state.capture_stage || "") && legacyActiveControls["c"]) {
-        eventName = "c";
       }
     } else if (key === "g") {
       if (state.init_arm_available && state.teleop_running && legacyActiveControls["init_arm_toggle"]) {
@@ -1517,9 +1533,14 @@ button.stop-ready {
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
         var eventName = this.getAttribute("data-event");
-        var sendEventName = (
-          eventName === "c" && legacyLatestState.fix_arm_available && legacyLatestState.teleop_running
-        ) ? "fix_arm_toggle" : eventName;
+        if (
+          eventName === "c" &&
+          !(legacyLatestState.fix_arm_available && legacyLatestState.teleop_running)
+        ) {
+          setText("sendStatus", "C 仅用于运行中的 fix-arm");
+          return;
+        }
+        var sendEventName = eventName === "c" ? "fix_arm_toggle" : eventName;
         postEvent(sendEventName, eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null);
       };
     }
@@ -1618,6 +1639,10 @@ const poseSnapshotStatusEl = document.getElementById("poseSnapshotStatus");
 const gripperStatusSectionEl = document.getElementById("gripperStatusSection");
 const gripperCardsEl = document.getElementById("gripperCards");
 const cameraStatusSectionEl = document.getElementById("cameraStatusSection");
+const cameraSelfCheckSectionEl = document.getElementById("cameraSelfCheckSection");
+const cameraSelfCheckCardEl = document.getElementById("cameraSelfCheckCard");
+const cameraSelfCheckStatusEl = document.getElementById("cameraSelfCheckStatus");
+const cameraSelfCheckDetailEl = document.getElementById("cameraSelfCheckDetail");
 const cameraCardsEl = document.getElementById("cameraCards");
 const tactileCameraStatusSectionEl = document.getElementById("tactileCameraStatusSection");
 const tactileCameraCardsEl = document.getElementById("tactileCameraCards");
@@ -1806,7 +1831,8 @@ async function chooseDatasetDirectory() {
     sendStatusEl.textContent = "选择文件夹失败: " + String(error);
   } finally {
     datasetChooseRootButtonEl.textContent = originalText || "选择文件夹";
-    datasetChooseRootButtonEl.disabled = Boolean(latestState.episode_recording) || String(latestState.episode_event_status || "") === "preparing";
+    const latestEpisodeStatus = String(latestState.episode_event_status || "");
+    datasetChooseRootButtonEl.disabled = Boolean(latestState.episode_recording) || latestEpisodeStatus === "preparing" || latestEpisodeStatus === "finalizing";
   }
 }
 
@@ -1828,19 +1854,17 @@ function canSendEvent(eventName) {
 
 async function sendGuiShortcut(key) {
   const state = latestState || {};
+  const shortcutStatus = String(state.episode_event_status || "");
   let eventName = "";
   let payload = null;
   if (key === "a") {
-    eventName = (state.episode_recording || String(state.episode_event_status || "") === "preparing") ? "episode_stop" : "episode_start";
+    eventName = (state.episode_recording || shortcutStatus === "preparing") ? "episode_stop" : "episode_start";
     if (eventName === "episode_start") payload = collectEpisodeStartPayload();
   } else if (key === "b") {
     eventName = state.teleop_running ? "h" : "p";
   } else if (key === "c") {
-    const captureStage = String(state.capture_stage || "");
     if (state.fix_arm_available && state.teleop_running && canSendEvent("fix_arm_toggle")) {
       eventName = "fix_arm_toggle";
-    } else if (!state.teleop_running && captureStage && canSendEvent("c")) {
-      eventName = "c";
     }
   } else if (key === "g") {
     if (state.init_arm_available && state.teleop_running && canSendEvent("init_arm_toggle")) {
@@ -1907,9 +1931,14 @@ buttons.forEach((button) => {
           return;
         }
       }
-      const sendEventName = (
-        eventName === "c" && latestState.fix_arm_available && latestState.teleop_running
-      ) ? "fix_arm_toggle" : eventName;
+      if (
+        eventName === "c" &&
+        !(latestState.fix_arm_available && latestState.teleop_running)
+      ) {
+        sendStatusEl.textContent = "C 仅用于运行中的 fix-arm";
+        return;
+      }
+      const sendEventName = eventName === "c" ? "fix_arm_toggle" : eventName;
       if (eventName === "episode_start") {
         await sendEvent(sendEventName, collectEpisodeStartPayload());
       } else {
@@ -2015,7 +2044,9 @@ document.addEventListener("keydown", async (event) => {
 
 function updateButtons(state) {
   activeControls = new Set(state.active_controls || []);
-  const episodePreparing = String(state.episode_event_status || "") === "preparing";
+  const episodeStatus = String(state.episode_event_status || "");
+  const episodePreparing = episodeStatus === "preparing";
+  const episodeFinalizing = episodeStatus === "finalizing";
   buttons.forEach((button) => {
     const eventName = button.dataset.event;
     button.disabled = !activeControls.has(eventName);
@@ -2026,7 +2057,7 @@ function updateButtons(state) {
     ) {
       button.disabled = true;
     }
-    if ((state.episode_recording || episodePreparing) && eventName === "episode_start") button.disabled = true;
+    if ((state.episode_recording || episodePreparing || episodeFinalizing) && eventName === "episode_start") button.disabled = true;
     if (!state.episode_recording && !episodePreparing && eventName === "episode_stop") button.disabled = true;
     if ((state.episode_recording || episodePreparing) && eventName === "record_pose_snapshot") button.disabled = true;
     const isSelectedSideButton =
@@ -2049,7 +2080,6 @@ function updateButtons(state) {
   }
   const captureButton = Array.from(buttons).find((button) => button.dataset.event === "c");
   if (captureButton) {
-    const captureStage = String(state.capture_stage || "");
     if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
@@ -2061,13 +2091,12 @@ function updateButtons(state) {
     } else if (state.teleop_running) {
       captureButton.textContent = "无 fix-arm 时不可用";
     } else {
-      captureButton.textContent = captureStage === "runtime_home" ? "采集 Home" : "开始采集";
+      captureButton.textContent = "固定臂不可用";
     }
   }
 }
 
 function updateShortcutHints(state) {
-  const captureStage = String(state.capture_stage || "");
   if (shortcutCLabelEl) {
     if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -2080,7 +2109,7 @@ function updateShortcutHints(state) {
     } else if (state.teleop_running) {
       shortcutCLabelEl.textContent = "无 fix-arm 时不可用";
     } else {
-      shortcutCLabelEl.textContent = captureStage === "runtime_home" ? "采集 Home" : "开始采集";
+      shortcutCLabelEl.textContent = "固定臂不可用";
     }
   }
   if (shortcutGLabelEl) {
@@ -2486,6 +2515,36 @@ function formatBrief(value, maxItems = 4) {
   return String(value);
 }
 
+function renderCameraSelfCheck(state) {
+  if (!cameraSelfCheckSectionEl || !cameraSelfCheckCardEl) return;
+  const check = state.camera_self_check || {};
+  const status = String(check.status || "idle");
+  const enabled = Boolean(check.enabled) || status !== "idle";
+  cameraSelfCheckSectionEl.hidden = !enabled;
+  if (!enabled) return;
+  const level = statusLevelClass(check.status_level || (status === "failed" ? "error" : status === "passed" ? "ok" : "waiting"));
+  cameraSelfCheckCardEl.className = `device-card ${level}`;
+  if (cameraSelfCheckStatusEl) {
+    cameraSelfCheckStatusEl.textContent = check.status_label || status;
+  }
+  if (!cameraSelfCheckDetailEl) return;
+  const lines = [
+    `status: ${check.message || "-"}`,
+    `elapsed: ${formatAge(check.elapsed_sec)} / ${formatAge(check.duration_sec)}`,
+    `cameras: ${formatCount(check.passed_count)}/${formatCount(check.camera_count)}`,
+  ];
+  if (Array.isArray(check.failed_keys) && check.failed_keys.length) {
+    lines.push(`failed: ${check.failed_keys.join(", ")}`);
+  }
+  if (Array.isArray(check.waiting_keys) && check.waiting_keys.length) {
+    lines.push(`waiting: ${check.waiting_keys.join(", ")}`);
+  }
+  if (Array.isArray(check.warn_keys) && check.warn_keys.length) {
+    lines.push(`warn: ${check.warn_keys.join(", ")}`);
+  }
+  cameraSelfCheckDetailEl.textContent = lines.join("\\n");
+}
+
 function renderCameraStatus(state) {
   if (!cameraStatusSectionEl || !cameraCardsEl) return;
   const cameraStatus = state.camera_status || {};
@@ -2521,6 +2580,9 @@ function renderCameraStatus(state) {
       const depthFps = item.depth_fps == null ? "-" : String(item.depth_fps);
       lines.push(
         `depth: ${item.depth_status_label || "-"} required=${formatFlag(item.depth_required)} present=${formatFlag(item.depth_frame_present)} profile=${depthWidth}x${depthHeight}@${depthFps} scale=${formatScalar(item.depth_scale_m_per_unit)}`
+      );
+      lines.push(
+        `depth meta: frame=${formatCount(item.depth_frame_number)} ts=${formatScalar(item.depth_camera_timestamp_sec)} sensor_ms=${formatScalar(item.depth_sensor_timestamp_ms)} repeat=${formatCount(item.depth_signature_repeat_count)} unique=${formatCount(item.depth_signature_unique_count)} age=${formatAge(item.depth_timestamp_age_sec)}`
       );
       if (item.depth_status_message) lines.push(`depth status: ${item.depth_status_message}`);
     }
@@ -2645,9 +2707,12 @@ function renderGripper(state) {
 function renderEpisode(state) {
   const available = Boolean(state.episode_recording_available);
   const recording = Boolean(state.episode_recording);
-  const preparing = String(state.episode_event_status || "") === "preparing";
+  const status = String(state.episode_event_status || "");
+  const preparing = status === "preparing";
+  const finalizing = status === "finalizing";
+  const paused = status === "paused" || status === "resume_pending";
   if (episodeStartButtonEl) {
-    episodeStartButtonEl.textContent = recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采");
+    episodeStartButtonEl.textContent = paused ? "数采暂停中" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
     episodeStartButtonEl.classList.toggle("active", recording || preparing);
     episodeStartButtonEl.classList.toggle("recording-active", recording || preparing);
   }
@@ -2656,10 +2721,10 @@ function renderEpisode(state) {
     episodeStopButtonEl.classList.toggle("stop-ready", recording || preparing);
   }
   renderEpisodeBanner(state);
-  renderTaskForm(state, recording || preparing);
+  renderTaskForm(state, recording || preparing || finalizing);
   const lines = [
     available ? "episode 录制可用" : "episode 录制不可用",
-    recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"),
+    paused ? "状态: 暂停中" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")),
   ];
   if (state.episode_dir) lines.push(`路径: ${state.episode_dir}`);
   if (state.dataset_root) lines.push(`保存根目录: ${state.dataset_root}`);
@@ -2707,25 +2772,29 @@ function renderEpisodeBanner(state) {
   const available = Boolean(state.episode_recording_available);
   const recording = Boolean(state.episode_recording);
   let status = String(state.episode_event_status || "");
+  let paused = status === "paused" || status === "resume_pending";
   if (!available) {
     status = "unavailable";
-  } else if (recording) {
+  } else if (recording && !paused) {
     status = "recording";
   } else if (!status) {
     status = "idle";
   }
+  paused = status === "paused" || status === "resume_pending";
   const statusLabels = {
     unavailable: "数采不可用",
     idle: "未开始数采",
     preparing: "3 秒后开始数采",
     recording: "● 正在数采",
+    paused: "Ⅱ 数采暂停",
+    resume_pending: "等待恢复写入",
     finalizing: "停止中 / 后台保存",
     saved: "已保存",
     discarded: "已停止 / 无样本",
     error: "保存失败",
   };
   const className = ["episode-banner"];
-  if (["preparing", "recording", "finalizing", "saved", "discarded", "error", "unavailable"].includes(status)) {
+  if (["preparing", "recording", "paused", "resume_pending", "finalizing", "saved", "discarded", "error", "unavailable"].includes(status)) {
     className.push(status === "discarded" ? "finalizing" : status);
   }
   episodeBannerEl.className = className.join(" ");
@@ -2741,7 +2810,9 @@ function renderEpisodeBanner(state) {
   episodeBannerCounterEl.textContent = hzText ? `${frameText} · ${hzText}` : frameText;
 
   const message = state.episode_event_message || "";
-  const detailFallback = recording
+  const detailFallback = paused
+    ? "当前 episode 保持打开；恢复遥操且输入稳定后会继续写入。"
+    : recording
     ? "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
     : available
       ? "点击“开始数采”或按 A 开始；再次按 A 停止。"
@@ -2785,7 +2856,8 @@ function renderEpisodeBanner(state) {
 function renderTaskForm(state, recording) {
   window.__latestTaskRegistry = Array.isArray(state.task_registry) ? state.task_registry : [];
   const preparing = String(state.episode_event_status || "") === "preparing";
-  const locked = Boolean(recording || preparing);
+  const finalizing = String(state.episode_event_status || "") === "finalizing";
+  const locked = Boolean(recording || preparing || finalizing);
   const selectedType = normalizeTaskType(
     taskTypeOverride
       ? taskTypeOverride
@@ -2896,11 +2968,12 @@ function renderPoseSnapshot(state) {
   const available = Boolean(state.pose_snapshot_available);
   const recording = Boolean(state.episode_recording);
   const preparing = String(state.episode_event_status || "") === "preparing";
+  const finalizing = String(state.episode_event_status || "") === "finalizing";
   if (poseSnapshotSectionEl) {
     poseSnapshotSectionEl.hidden = !available;
   }
   if (poseSnapshotButtonEl) {
-    poseSnapshotButtonEl.disabled = !available || recording || preparing || !activeControls.has("record_pose_snapshot");
+    poseSnapshotButtonEl.disabled = !available || recording || preparing || finalizing || !activeControls.has("record_pose_snapshot");
   }
   if (!poseSnapshotStatusEl) return;
   if (!available) {
@@ -2908,7 +2981,7 @@ function renderPoseSnapshot(state) {
     return;
   }
   const lines = [
-    recording || preparing ? "状态: 与正式数采互斥，当前不可抽帧" : "状态: 可抽帧",
+    recording || preparing || finalizing ? "状态: 与正式数采互斥，当前不可抽帧" : "状态: 可抽帧",
     `数量: ${state.pose_snapshot_count == null ? 0 : state.pose_snapshot_count}`,
   ];
   if (state.pose_snapshot_dir) lines.push(`目录: ${state.pose_snapshot_dir}`);
@@ -3115,6 +3188,7 @@ async function refresh() {
     renderVisualization(state);
     renderPoseSnapshot(state);
     renderGripper(state);
+    renderCameraSelfCheck(state);
     renderCameraStatus(state);
     renderTactileCameraStatus(state);
     renderIkWarning(state);
@@ -3339,7 +3413,7 @@ _FALLBACK_SCRIPT = r"""
       } else if (state.teleop_running) {
         shortcutC.textContent = "无 fix-arm 时不可用";
       } else {
-        shortcutC.textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+        shortcutC.textContent = "固定臂不可用";
       }
     }
     var shortcutG = byId("shortcutGLabel");
@@ -3370,7 +3444,7 @@ _FALLBACK_SCRIPT = r"""
         } else if (state.teleop_running) {
           buttons[i].textContent = "无 fix-arm 时不可用";
         } else {
-          buttons[i].textContent = String(state.capture_stage || "") === "runtime_home" ? "采集 Home" : "开始采集";
+          buttons[i].textContent = "固定臂不可用";
         }
       } else if (eventName === "fix_arm_toggle") {
         var fixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -3396,6 +3470,7 @@ _FALLBACK_SCRIPT = r"""
     var available = Boolean(state.episode_recording_available);
     var recording = Boolean(state.episode_recording);
     var preparing = String(state.episode_event_status || "") === "preparing";
+    var finalizing = String(state.episode_event_status || "") === "finalizing";
     var startButton = byId("episodeStartButton");
     var stopButton = byId("episodeStopButton");
     var statusEl = byId("episodeStatus");
@@ -3403,11 +3478,14 @@ _FALLBACK_SCRIPT = r"""
     var warningBanner = byId("episodeWarningBanner");
     var warningText = byId("episodeWarningText");
     var status = String(state.episode_event_status || "");
+    var paused = status === "paused" || status === "resume_pending";
     var statusLabels = {
       unavailable: "数采不可用",
       idle: "未开始数采",
       preparing: "3 秒后开始数采",
       recording: "正在数采",
+      paused: "数采暂停",
+      resume_pending: "等待恢复写入",
       finalizing: "停止中 / 后台保存",
       saved: "已保存",
       discarded: "已停止 / 无样本",
@@ -3415,19 +3493,20 @@ _FALLBACK_SCRIPT = r"""
     };
     if (!available) {
       status = "unavailable";
-    } else if (recording) {
+    } else if (recording && !paused) {
       status = "recording";
     } else if (!status) {
       status = "idle";
     }
+    paused = status === "paused" || status === "resume_pending";
     if (startButton) {
-      startButton.textContent = recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采");
-      startButton.disabled = !fallbackActiveControls.episode_start || recording || preparing;
+      startButton.textContent = paused ? "数采暂停中" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
+      startButton.disabled = !fallbackActiveControls.episode_start || recording || preparing || finalizing;
     }
     if (stopButton) {
       stopButton.disabled = !fallbackActiveControls.episode_stop || (!recording && !preparing);
     }
-    var locked = recording || preparing;
+    var locked = recording || preparing || finalizing;
     var fields = ["datasetBaseRootInput", "datasetChooseRootButton", "taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
     for (var i = 0; i < fields.length; i += 1) {
       var field = byId(fields[i]);
@@ -3446,7 +3525,7 @@ _FALLBACK_SCRIPT = r"""
     if (statusEl) {
       var lines = [
         available ? "episode 录制可用" : "episode 录制不可用",
-        recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")
+        paused ? "状态: 暂停中" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"))
       ];
       if (state.episode_dir) lines.push("路径: " + state.episode_dir);
       if (state.dataset_root) lines.push("保存根目录: " + state.dataset_root);
@@ -3458,7 +3537,7 @@ _FALLBACK_SCRIPT = r"""
     var banner = byId("episodeBanner");
     if (banner) {
       var bannerClass = "episode-banner";
-      if (/^(preparing|recording|finalizing|saved|discarded|error|unavailable)$/.test(status)) {
+      if (/^(preparing|recording|paused|resume_pending|finalizing|saved|discarded|error|unavailable)$/.test(status)) {
         bannerClass += " " + (status === "discarded" ? "finalizing" : status);
       }
       banner.className = bannerClass;
@@ -3473,7 +3552,9 @@ _FALLBACK_SCRIPT = r"""
     }
     setText("episodeBannerCounter", hzText ? frameText + " · " + hzText : frameText);
     var detail = state.episode_event_message || (
-      recording
+      paused
+        ? "当前 episode 保持打开；恢复遥操且输入稳定后会继续写入。"
+        : recording
         ? "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
         : available
           ? "点击“开始数采”或按 A 开始；再次按 A 停止。"
@@ -3610,6 +3691,14 @@ _FALLBACK_SCRIPT = r"""
           " profile=" + depthWidth + "x" + depthHeight + "@" + depthFps +
           " scale=" + depthScale
         );
+        lines.push(
+          "depth meta: frame=" + (item.depth_frame_number == null ? "-" : item.depth_frame_number) +
+          " ts=" + (item.depth_camera_timestamp_sec == null ? "-" : Number(item.depth_camera_timestamp_sec).toFixed(3)) +
+          " sensor_ms=" + (item.depth_sensor_timestamp_ms == null ? "-" : Number(item.depth_sensor_timestamp_ms).toFixed(3)) +
+          " repeat=" + (item.depth_signature_repeat_count == null ? "-" : item.depth_signature_repeat_count) +
+          " unique=" + (item.depth_signature_unique_count == null ? "-" : item.depth_signature_unique_count) +
+          " age=" + (item.depth_timestamp_age_sec == null ? "-" : Number(item.depth_timestamp_age_sec).toFixed(2) + " s")
+        );
         if (item.depth_status_message) lines.push("depth status: " + item.depth_status_message);
       }
       if (item.device_count != null || item.ready_count != null) lines.push("ready: " + (item.ready_count == null ? "-" : item.ready_count) + "/" + (item.ready_total || item.device_count || "-"));
@@ -3624,6 +3713,34 @@ _FALLBACK_SCRIPT = r"""
       );
     }
     el.innerHTML = html.join("");
+  }
+
+  function renderCameraSelfCheckFallback(state) {
+    var section = byId("cameraSelfCheckSection");
+    var card = byId("cameraSelfCheckCard");
+    var statusEl = byId("cameraSelfCheckStatus");
+    var detailEl = byId("cameraSelfCheckDetail");
+    if (!section || !card) return;
+    var check = state.camera_self_check || {};
+    var status = String(check.status || "idle");
+    var enabled = !!check.enabled || status !== "idle";
+    section.hidden = !enabled;
+    if (!enabled) return;
+    var level = check.status_level || (status === "failed" ? "error" : status === "passed" ? "ok" : "waiting");
+    card.className = "device-card " + statusLevelClass(level);
+    if (statusEl) statusEl.textContent = check.status_label || status;
+    if (!detailEl) return;
+    var lines = [
+      "status: " + (check.message || "-"),
+      "elapsed: " + (check.elapsed_sec == null ? "-" : Number(check.elapsed_sec).toFixed(2) + " s") +
+        " / " + (check.duration_sec == null ? "-" : Number(check.duration_sec).toFixed(2) + " s"),
+      "cameras: " + (check.passed_count == null ? "-" : check.passed_count) +
+        "/" + (check.camera_count == null ? "-" : check.camera_count)
+    ];
+    if (check.failed_keys && check.failed_keys.length) lines.push("failed: " + check.failed_keys.join(", "));
+    if (check.waiting_keys && check.waiting_keys.length) lines.push("waiting: " + check.waiting_keys.join(", "));
+    if (check.warn_keys && check.warn_keys.length) lines.push("warn: " + check.warn_keys.join(", "));
+    detailEl.textContent = lines.join("\n");
   }
 
   function renderState(state) {
@@ -3643,6 +3760,7 @@ _FALLBACK_SCRIPT = r"""
     renderRawPoses(state);
     renderPoseQualityFallback(state);
     renderEpisodeStateFallback(state);
+    renderCameraSelfCheckFallback(state);
     renderDeviceStatus("cameraCards", state.camera_status, "当前没有 RealSense camera_sources。", "");
     renderDeviceStatus("tactileCameraCards", state.tactile_camera_status, "当前没有 DMTac 视触觉状态。", "");
     renderMessages(state.messages || []);
@@ -3754,8 +3872,6 @@ _FALLBACK_SCRIPT = r"""
     } else if (key === "c") {
       if (state.fix_arm_available && state.teleop_running && fallbackActiveControls["fix_arm_toggle"]) {
         eventName = "fix_arm_toggle";
-      } else if (!state.teleop_running && String(state.capture_stage || "") && fallbackActiveControls["c"]) {
-        eventName = "c";
       }
     } else if (key === "g") {
       if (state.init_arm_available && state.teleop_running && fallbackActiveControls["init_arm_toggle"]) {
@@ -3794,9 +3910,14 @@ _FALLBACK_SCRIPT = r"""
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
         var eventName = this.getAttribute("data-event");
-        var sendEventName = (
-          eventName === "c" && fallbackLatestState.fix_arm_available && fallbackLatestState.teleop_running
-        ) ? "fix_arm_toggle" : eventName;
+        if (
+          eventName === "c" &&
+          !(fallbackLatestState.fix_arm_available && fallbackLatestState.teleop_running)
+        ) {
+          setText("sendStatus", "C 仅用于运行中的 fix-arm");
+          return;
+        }
+        var sendEventName = eventName === "c" ? "fix_arm_toggle" : eventName;
         postEvent(sendEventName, eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null);
       };
     }
@@ -4110,6 +4231,7 @@ class CalibrationWebUiState:
     gripper_control_enabled: bool = False
     gripper_status: dict[str, Any] = field(default_factory=dict)
     camera_status: dict[str, Any] = field(default_factory=dict)
+    camera_self_check: dict[str, Any] = field(default_factory=dict)
     tactile_camera_status: dict[str, Any] = field(default_factory=dict)
     episode_recording_available: bool = False
     episode_recording: bool = False
@@ -4424,6 +4546,7 @@ class CalibrationWebUi:
                 "gripper_control_enabled": self._state.gripper_control_enabled,
                 "gripper_status": dict(self._state.gripper_status),
                 "camera_status": dict(self._state.camera_status),
+                "camera_self_check": dict(self._state.camera_self_check),
                 "tactile_camera_status": dict(self._state.tactile_camera_status),
                 "episode_recording_available": self._state.episode_recording_available,
                 "episode_recording": self._state.episode_recording,

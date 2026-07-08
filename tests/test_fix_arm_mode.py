@@ -151,11 +151,14 @@ class FixArmCommandControllerTests(unittest.TestCase):
             set(filtered.commands),
             {"left_arm", "right_arm", "left_hand", "right_hand"},
         )
-        self.assertEqual(filtered.metadata, {})
+        self.assertEqual(filtered.metadata["fix_arm_active_side"], "left")
+        self.assertEqual(filtered.metadata["fix_arm_mode"], "fixed")
         np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
         np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 3.0))
         np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 20.0))
         np.testing.assert_allclose(filtered.commands["right_hand"].value, np.full(6, 40.0))
+        self.assertTrue(filtered.commands["left_arm"].metadata["fix_arm_active"])
+        self.assertEqual(filtered.commands["left_arm"].metadata["fix_arm_side"], "left")
         for effector_command in filtered.commands.values():
             np.testing.assert_equal(np.asarray(effector_command.value).shape, (6,))
 
@@ -279,6 +282,30 @@ class FixArmCommandControllerTests(unittest.TestCase):
         filtered = controller.filter_faults(faults, {}, 1.2)
 
         self.assertEqual([fault.message for fault in filtered], ["right invalid", "slow"])
+
+    def test_cancel_active_releases_fixed_side_for_hold(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+
+        transition = controller.cancel_active(
+            now=1.2,
+            reason="hold_requested",
+            clear_snapshots=True,
+        )
+
+        self.assertTrue(transition.ok)
+        self.assertFalse(controller.fixed)
+        self.assertEqual(controller.fixed_side, "")
+        self.assertIn("stopped", controller.status_message)
 
 
 class FixArmRuntimeHomeTests(unittest.TestCase):

@@ -62,11 +62,13 @@ class GripperConfig:
     port: str = "/dev/ttyUSB0"
     gripper_id: int = 1
     baudrate: int = 115200
-    timeout: float = 0.03
+    timeout: float = 0.10
     max_open_mm: float = 70.0
     reconnect_on_error: bool = True
     reconnect_attempts: int = 1
     reconnect_delay: float = 0.05
+    inter_command_delay: float = 0.005
+    use_write_multiple_registers: bool = False
     debug: bool = False
 
 
@@ -234,6 +236,8 @@ class DMTacGripperDevice:
                 reconnect_on_error=cfg.reconnect_on_error,
                 reconnect_attempts=cfg.reconnect_attempts,
                 reconnect_delay=cfg.reconnect_delay,
+                inter_command_delay=cfg.inter_command_delay,
+                use_write_multiple_registers=cfg.use_write_multiple_registers,
                 debug=cfg.debug,
             )
 

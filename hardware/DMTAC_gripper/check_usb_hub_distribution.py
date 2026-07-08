@@ -52,7 +52,15 @@ def _repo_root() -> Path:
 
 
 def _default_assignment_path() -> Path:
-    return _repo_root() / "teleop_records" / "dmtac_hardware_configs" / "latest.json"
+    try:
+        from portable_dmtac_gripper import usb_assignment
+
+        try:
+            return usb_assignment.latest_config_path()
+        except FileNotFoundError:
+            return usb_assignment.default_config_dir() / usb_assignment.LATEST_CONFIG_NAME
+    except Exception:
+        return _repo_root() / "teleop_runtime" / "configs" / "hardware" / "dmtac" / "latest.json"
 
 
 def _device_path(sys_name: str) -> Path:

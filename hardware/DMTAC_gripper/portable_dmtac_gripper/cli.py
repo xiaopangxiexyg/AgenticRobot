@@ -58,7 +58,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", default="/dev/ttyUSB0")
     parser.add_argument("--id", type=int, default=1, dest="gripper_id")
     parser.add_argument("--baudrate", type=int, default=115200)
-    parser.add_argument("--timeout", type=float, default=0.03)
+    parser.add_argument("--timeout", type=float, default=0.10)
     parser.add_argument("--max_open_mm", type=float, default=70.0)
     parser.add_argument(
         "--no-gripper-reconnect",
@@ -67,6 +67,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--gripper-reconnect-attempts", type=int, default=1)
     parser.add_argument("--gripper-reconnect-delay", type=float, default=0.05)
+    parser.add_argument("--gripper-inter-command-delay", type=float, default=0.005)
+    parser.add_argument(
+        "--gripper-use-write-multiple-registers",
+        action="store_true",
+        help="Use Modbus 0x10 to write position/speed/torque together. Disabled by default for stability.",
+    )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--tactile_ids", nargs="*", default=None)
     parser.add_argument("--backend", default="cpu", choices=["cpu", "cuda", "Flux", "flux"])
@@ -125,6 +131,8 @@ def _gripper_config(args) -> GripperConfig:
         reconnect_on_error=not bool(args.no_gripper_reconnect),
         reconnect_attempts=args.gripper_reconnect_attempts,
         reconnect_delay=args.gripper_reconnect_delay,
+        inter_command_delay=args.gripper_inter_command_delay,
+        use_write_multiple_registers=bool(args.gripper_use_write_multiple_registers),
         debug=args.debug,
     )
 

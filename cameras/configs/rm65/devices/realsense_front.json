@@ -1,0 +1,11 @@
+{
+  "front": {
+    "serial": "213222079798",
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "metadata": {
+      "mount": "single_front"
+    }
+  }
+}

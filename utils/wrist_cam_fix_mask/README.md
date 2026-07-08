@@ -6,24 +6,24 @@ robot body/self area, and saves a binary PNG mask for that painted area.
 Run from the repository root:
 
 ```bash
-python utils/wrist_cam_mask/painting/paint_video_mask.py /path/to/episode_000000.mp4
+python utils/wrist_cam_fix_mask/painting/paint_video_mask.py /path/to/episode_000000.mp4
 ```
 
 If the video path is omitted, the tool opens a file picker:
 
 ```bash
-python utils/wrist_cam_mask/painting/paint_video_mask.py
+python utils/wrist_cam_fix_mask/painting/paint_video_mask.py
 ```
 
 To continue editing an existing mask, load its saved metadata JSON:
 
 ```bash
-python utils/wrist_cam_mask/painting/paint_video_mask.py --load utils/wrist_cam_mask/configs/right_dmtac_m_mask.json
+python utils/wrist_cam_fix_mask/painting/paint_video_mask.py --load utils/wrist_cam_fix_mask/configs/right_dmtac_m_mask.json
 ```
 
 You can also open the GUI first and click `加载 Mask/配置`, then choose either
-the saved JSON in `utils/wrist_cam_mask/configs/` or the mask PNG in
-`utils/wrist_cam_mask/painting/`.
+the saved JSON in `utils/wrist_cam_fix_mask/configs/` or the mask PNG in
+`utils/wrist_cam_fix_mask/painting/`.
 
 Controls:
 
@@ -47,18 +47,18 @@ Controls:
 
 Outputs default to:
 
-- GUI / masks: `utils/wrist_cam_mask/painting/`
-- Metadata configs: `utils/wrist_cam_mask/configs/`
+- GUI / masks: `utils/wrist_cam_fix_mask/painting/`
+- Metadata configs: `utils/wrist_cam_fix_mask/configs/`
 - Paths written inside metadata JSON are relative to the repository root.
 
 Custom output names can also be passed from the command line:
 
 ```bash
-python utils/wrist_cam_mask/painting/paint_video_mask.py /path/to/video.mp4 --output-name right_dmtac_m_mask
+python utils/wrist_cam_fix_mask/painting/paint_video_mask.py /path/to/video.mp4 --output-name right_dmtac_m_mask
 ```
 
-This writes `utils/wrist_cam_mask/painting/right_dmtac_m_mask.png` and
-`utils/wrist_cam_mask/configs/right_dmtac_m_mask.json` unless those names
+This writes `utils/wrist_cam_fix_mask/painting/right_dmtac_m_mask.png` and
+`utils/wrist_cam_fix_mask/configs/right_dmtac_m_mask.json` unless those names
 already exist, in which case `_01`, `_02`, ... is appended.
 
 The PNG mask is `uint8`: `255` means the painted robot body/self region, and

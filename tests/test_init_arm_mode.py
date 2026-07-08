@@ -218,6 +218,37 @@ class InitArmModeTests(unittest.TestCase):
 
         self.assertEqual([fault.channel_name for fault in filtered], ["right_wrist_pose"])
 
+    def test_cancel_active_releases_init_side_for_hold(self) -> None:
+        controller = InitArmCommandController(
+            targets_by_side={
+                "left": SimpleNamespace(
+                    side="left",
+                    tcp_pose_base=np.eye(4),
+                    tcp_pose_desk=np.eye(4),
+                    solver_pose_desk=np.eye(4),
+                    arm_qpos=None,
+                    source_path="profile.json",
+                ),
+                "right": SimpleNamespace(
+                    side="right",
+                    tcp_pose_base=np.eye(4),
+                    tcp_pose_desk=np.eye(4),
+                    solver_pose_desk=np.eye(4),
+                    arm_qpos=None,
+                    source_path="profile.json",
+                ),
+            },
+            selected_side="right",
+        )
+        self.assertTrue(controller.start_init(now=1.0).ok)
+
+        transition = controller.cancel_active(now=1.1, reason="hold_requested")
+
+        self.assertTrue(transition.ok)
+        self.assertFalse(controller.active)
+        self.assertEqual(controller.active_side, "")
+        self.assertIn("stopped", controller.status_message)
+
 
 if __name__ == "__main__":
     unittest.main()

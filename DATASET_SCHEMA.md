@@ -73,6 +73,17 @@ datasets/<dataset_name>/
 `failure_frame_indices_first`。读取端应将 `ok=false` 或任一 missing 计数大于
 0 的 episode 视为 wrist depth 不完整样本。
 
+遥操中按 hold 暂停正式数采时，当前 episode 会保持打开但暂停写样本；
+resume 后继续写入同一个 episode。原始 `timestamp` 保持真实时间，不压缩
+hold gap。`summary` 可包含以下暂停元信息：
+
+- `recording_pause_schema`: 当前为 `dexteleop_recording_pause_v1`。
+- `recording_pause_segments`: 每次 pause/resume 的起止时间、持续时间、原因、
+  起止 `frame_index` 和 `step_index`。
+- `recording_paused_duration_sec`: episode 内累计暂停时长。
+- `recording_active_duration_sec`: 排除暂停后的有效写入时长，用于采集频率统计。
+- `recording_wall_duration_sec`: episode 打开到停止的真实墙钟时长。
+
 `meta/episodes_stats.jsonl` 是每个 episode 的统计摘要，常用字段包括 `frame_count`, `average_dt_sec`, `average_hz`, `mean_control_hz`, `fault_count`。
 如果数据包含 pose/碰撞质量标注，还会包含 `pose_quality_*`,
 `force_collision_detected`, `force_collision_label` 等字段。
@@ -116,9 +127,12 @@ datasets/<dataset_name>/
 - `observation.images.<camera_key>.*`: 视频帧索引、源时间戳、接收时间戳和视频路径。
 - `teleop.channels.*`: 操作端输入通道时间戳和有效性。
 - `teleop.pose_quality.*`: 从本帧已有 IK/防碰撞 metadata 派生的 pose 质量指标。
+- `teleop.arm_mode.*`: 从本帧 command/session metadata 派生的左右臂语义状态标签。
 
 读取时建议只依赖需要的列；调试/采集列可能随版本增加。
 历史 parquet 可能没有 `teleop.pose_quality.*`，兼容读取时不应把缺失解释为坏样本。
+历史 parquet 也可能没有 `teleop.arm_mode.*`；兼容读取时应按可选标签处理，
+不要把缺失解释为 action/state schema 错误。
 
 ## 外置媒体
 
@@ -155,6 +169,48 @@ datasets/<dataset_name>/
   入口分别硬编码维度。
 - `FAULT/HOLD` 后继续写入的尾段、长时间卡顿分段、以及人工标记的碰撞 episode，应通过 `dataset_postprocess` 生成新的 clean/collision dataset，而不是原地改写原始数据。
 - 后处理产物应更新 `meta/info.json`, `episodes.jsonl`, `episodes_stats.jsonl`，并保留 `postprocess_history`。
+
+## Arm Mode 特殊状态标签
+
+`arm_mode` 是逐帧、逐侧机械臂语义状态标注，用于让模型区分“正常遥操”、
+“人为固定/保持不动”与“执行 init pose”。它是旁路标签，不参与 action
+拼接，不改变 `action`, `observation.state`, `observation.last_action` 的形状或语义。
+
+完整 payload 位于 `sample_metadata_json.arm_mode`，schema 名为
+`dexteleop_arm_mode_v1`。parquet 中同时展开以下常用列：
+
+- `teleop.arm_mode.schema`: 当前为 `dexteleop_arm_mode_v1`。
+- `teleop.arm_mode.available`: `0/1`，表示本帧是否有 arm mode metadata。
+- `teleop.arm_mode.<side>.id`: 训练友好的整数枚举。
+- `teleop.arm_mode.<side>.label`: 字符串枚举。
+- `teleop.arm_mode.<side>.is_special`: `0/1`，`fixed_hold` 和 `init_pose` 为特殊状态。
+- `teleop.arm_mode.<side>.source`: 标签来源，例如 `normal`, `fix_arm`, `init_arm`,
+  `recording_pause`, `session_state`, `inactive_side`。
+- `teleop.arm_mode.<side>.tags`: 可扩展标签列表。当前可能包含 `fix_arm`, `init_arm`, `hold`。
+- `teleop.arm_mode_json`: 完整 JSON，包含每侧 `mode/id/source/tags/detail`。
+
+当前枚举：
+
+- `unknown = 0`: 缺失或无法判断。
+- `teleop = 1`: 正常遥操。
+- `fixed_hold = 2`: fix-arm 固定侧保持上一帧下发目标动作。该标签不是硬件急停。
+- `init_pose = 3`: init-arm 侧正在前往或保持 init pose。
+- `stopped = 4`: hold、非 RUNNING session 或其他停止/暂停路径。
+
+判定优先级：
+
+1. 如果本帧处于 recording pause、hold 或非 `RUNNING` session，左右活动臂标为 `stopped`。
+2. 否则该侧处于 init-arm active/recapturing，标为 `init_pose`。
+3. 否则该侧处于 fix-arm fixed/recapturing，标为 `fixed_hold`。
+4. 否则活动侧标为 `teleop`，非活动侧标为 `unknown`。
+
+正式数采中触发 hold 时，当前 episode 保持打开但暂停写样本；同时 fix/init
+特殊状态会停止。再次 hold/re-home 后恢复普通遥操，后续写入帧应从 `teleop`
+重新开始，而不是继续继承 hold 前的 `fixed_hold` 或 `init_pose`。
+
+兼容旧数据时，如果缺少 `teleop.arm_mode.*`，reader 应允许加载。需要补齐统一字段时，
+推荐策略是：`session_state == RUNNING` 的活动侧按 `teleop` 填充；无法确认活动侧或
+非 RUNNING 行按 `unknown` 或 `stopped` 填充，并在派生 metadata 中记录这是 legacy/default。
 
 ## Pose Quality 与碰撞标签
 

@@ -122,6 +122,21 @@ def _command_source(command: EffectorCommand) -> str:
     return source_text or action_source_text or str(command.command_type)
 
 
+def _command_max_joint_step(command: EffectorCommand) -> np.ndarray | None:
+    metadata = command.metadata if isinstance(command.metadata, Mapping) else {}
+    for key in ("max_joint_step_rad", "deploy_max_joint_step_rad"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            step = np.asarray(value, dtype=float).reshape(6)
+        except Exception:
+            continue
+        if np.all(np.isfinite(step)) and np.all(step >= 0.0):
+            return step
+    return None
+
+
 def _is_qpos_init_slow_singularity_source(source: object) -> bool:
     return str(source or "").strip() in _SINGULARITY_QPOS_INIT_SLOW_SOURCES
 
@@ -719,6 +734,9 @@ class RM65ArmBackend(EffectorBackend):
             now=command_start_time,
             update_state=True,
         )
+        command_max_joint_step = _command_max_joint_step(command)
+        if command_max_joint_step is not None:
+            max_joint_step = command_max_joint_step
         ik_solve_elapsed_ms: float | None = None
 
         if command.command_type == "joint_vector":

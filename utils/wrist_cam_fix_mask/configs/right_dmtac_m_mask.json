@@ -10,7 +10,7 @@
     480,
     640
   ],
-  "mask_path": "utils/wrist_cam_mask/painting/right_dmtac_m_mask.png",
+  "mask_path": "utils/wrist_cam_fix_mask/painting/right_dmtac_m_mask.png",
   "source_frame_path": null,
   "output_name": "right_dmtac_m_mask",
   "mask_semantics": "uint8 PNG; 255 means painted robot body/self area, 0 means background",

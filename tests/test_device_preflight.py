@@ -303,6 +303,63 @@ class DevicePreflightTests(unittest.TestCase):
             },
         )
 
+    def test_q6_preflight_retries_all_serial_before_reassigning(self) -> None:
+        q6 = device_preflight._load_q6_module()
+        first_scan = _q6_scan()
+        first_scan["q6_devices"] = []
+        retry_scan = _q6_scan()
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("left", "right"),
+            assume_yes=True,
+            auto_configure=True,
+        )
+        with (
+            patch.object(q6, "scan_q6_devices", side_effect=[first_scan, retry_scan]) as scan_mock,
+            patch.object(q6, "load_assignment", side_effect=FileNotFoundError),
+            patch.object(q6, "save_assignment", return_value=Path("/tmp/q6.json")),
+        ):
+            device_preflight.prepare_q6(options, result)
+
+        self.assertEqual(scan_mock.call_args_list[0].kwargs["probe_all_serial"], False)
+        self.assertEqual(scan_mock.call_args_list[1].kwargs["probe_all_serial"], True)
+        self.assertEqual(
+            result.q6_ports,
+            {
+                "left": "/dev/serial/by-id/q6-left",
+                "right": "/dev/serial/by-id/q6-right",
+            },
+        )
+        self.assertTrue(any("retrying with all serial ports" in message for message in result.messages))
+
+    def test_q6_force_reconfigure_skips_valid_latest_and_saves(self) -> None:
+        q6 = device_preflight._load_q6_module()
+        scan = _q6_scan()
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("left", "right"),
+            assume_yes=True,
+            auto_configure=True,
+            force_reconfigure=True,
+        )
+        with (
+            patch.object(q6, "scan_q6_devices", return_value=scan),
+            patch.object(q6, "load_assignment", side_effect=AssertionError("should skip latest")) as load_mock,
+            patch.object(q6, "save_assignment", return_value=Path("/tmp/q6.json")) as save_mock,
+        ):
+            device_preflight.prepare_q6(options, result)
+
+        self.assertEqual(load_mock.call_count, 0)
+        self.assertEqual(save_mock.call_count, 1)
+        self.assertEqual(
+            result.q6_ports,
+            {
+                "left": "/dev/serial/by-id/q6-left",
+                "right": "/dev/serial/by-id/q6-right",
+            },
+        )
+        self.assertTrue(any("force reconfigure requested" in message for message in result.messages))
+
     def test_dmtac_partial_config_infers_single_missing_gripper(self) -> None:
         usb_assignment, *_ = device_preflight._load_dmtac_modules()
         scan = _dmtac_scan()
@@ -359,6 +416,115 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertEqual(tokens, {"left": "0", "right": "1"})
         self.assertEqual(calls, ["/dev/serial/by-id/left-gripper", "/dev/serial/by-id/right-gripper"])
 
+    def test_dmtac_preflight_retries_all_serial_before_reassigning(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        first_scan = _dmtac_scan()
+        for item in first_scan["grippers"]:
+            item["probe"] = {"reachable": False, "error": "candidate filter missed device"}
+        retry_scan = _dmtac_scan()
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("left", "right"),
+            require_dmtac_tactile=False,
+            assume_yes=True,
+            auto_configure=True,
+        )
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", side_effect=[first_scan, retry_scan]) as scan_mock,
+            patch.object(usb_assignment, "load_assignment", side_effect=FileNotFoundError),
+            patch.object(usb_assignment, "save_assignment", return_value=Path("/tmp/dmtac.json")),
+        ):
+            device_preflight.prepare_dmtac(options, result)
+
+        self.assertEqual(scan_mock.call_args_list[0].kwargs["probe_all_serial"], False)
+        self.assertEqual(scan_mock.call_args_list[1].kwargs["probe_all_serial"], True)
+        self.assertEqual(
+            result.dmtac_assignment["assignments"]["left"]["gripper"]["port"],
+            "/dev/serial/by-id/left-gripper",
+        )
+        self.assertTrue(any("retrying with all serial ports" in message for message in result.messages))
+
+    def test_dmtac_force_reconfigure_skips_valid_latest_and_saves(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        scan = _dmtac_scan()
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("left", "right"),
+            require_dmtac_tactile=False,
+            assume_yes=True,
+            auto_configure=True,
+            force_reconfigure=True,
+        )
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=scan),
+            patch.object(
+                usb_assignment,
+                "load_assignment",
+                side_effect=AssertionError("should skip latest"),
+            ) as load_mock,
+            patch.object(usb_assignment, "save_assignment", return_value=Path("/tmp/dmtac.json")) as save_mock,
+        ):
+            device_preflight.prepare_dmtac(options, result)
+
+        self.assertEqual(load_mock.call_count, 0)
+        self.assertEqual(save_mock.call_count, 1)
+        self.assertEqual(
+            result.dmtac_assignment["assignments"]["left"]["gripper"]["port"],
+            "/dev/serial/by-id/left-gripper",
+        )
+        self.assertTrue(any("force reconfigure requested" in message for message in result.messages))
+
+    def test_dmtac_preflight_keeps_complete_config_when_gripper_probe_fails(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        base_scan = _dmtac_scan()
+        assignment = usb_assignment.build_assignment_from_tokens(
+            base_scan,
+            left_gripper="0",
+            right_gripper="1",
+        )
+        probe_failed_scan = _dmtac_scan()
+        for item in probe_failed_scan["grippers"]:
+            item["probe"] = {"reachable": False, "error": "serial port busy"}
+
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("left", "right"),
+            require_dmtac_tactile=False,
+            auto_configure=True,
+        )
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=probe_failed_scan),
+            patch.object(usb_assignment, "load_assignment", return_value=assignment),
+        ):
+            device_preflight.prepare_dmtac(options, result)
+
+        self.assertIsNotNone(result.dmtac_assignment)
+        self.assertEqual(
+            result.dmtac_assignment["assignments"]["left"]["gripper"]["port"],
+            "/dev/serial/by-id/left-gripper",
+        )
+        self.assertTrue(any("startup probe failed" in message for message in result.messages))
+        self.assertFalse(any("[DMTAC CONFIG ERROR]" in message for message in result.messages))
+
+    def test_dmtac_preflight_still_fails_without_config_when_no_gripper_reachable(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        scan = _dmtac_scan()
+        for item in scan["grippers"]:
+            item["probe"] = {"reachable": False, "error": "serial port busy"}
+
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("left", "right"),
+            require_dmtac_tactile=False,
+            auto_configure=True,
+        )
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=scan),
+            patch.object(usb_assignment, "load_assignment", side_effect=FileNotFoundError),
+        ):
+            with self.assertRaisesRegex(device_preflight.DevicePreflightError, "reachable 0, expected 2"):
+                device_preflight.prepare_dmtac(options, result)
+
     def test_rm65_arm_ip_assignment_saves_and_loads_latest(self) -> None:
         assignment = rm65_arm_ips.build_assignment(
             left_arm_ip="192.168.10.21",
@@ -373,6 +539,72 @@ class DevicePreflightTests(unittest.TestCase):
             rm65_arm_ips.arm_ips_for_sides(loaded),
             {"left": "192.168.10.21", "right": "192.168.10.22"},
         )
+
+    def test_rm65_arm_ip_default_config_dir_lives_under_teleop_runtime_configs(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            rm65_arm_ips.default_config_dir(),
+            root / "teleop_runtime" / "configs" / "hardware" / "rm65_arm_ips",
+        )
+
+    def test_rm65_arm_ip_latest_falls_back_to_legacy_config_dir_but_saves_new_default(self) -> None:
+        assignment = rm65_arm_ips.build_assignment(
+            left_arm_ip="192.168.10.21",
+            right_arm_ip="192.168.10.22",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new_dir = root / "teleop_runtime" / "configs" / "hardware" / "rm65_arm_ips"
+            legacy_dir = root / "teleop_records" / "rm65_arm_ip_configs"
+            rm65_arm_ips.save_assignment(assignment, config_dir=legacy_dir)
+
+            with (
+                patch.object(rm65_arm_ips, "default_config_dir", return_value=new_dir),
+                patch.object(rm65_arm_ips, "legacy_config_dirs", return_value=(legacy_dir,)),
+            ):
+                loaded = rm65_arm_ips.load_assignment("latest")
+                saved = rm65_arm_ips.save_assignment(assignment)
+
+        self.assertEqual(
+            rm65_arm_ips.arm_ips_for_sides(loaded),
+            {"left": "192.168.10.21", "right": "192.168.10.22"},
+        )
+        self.assertEqual(saved.parent, new_dir)
+
+    def test_force_reconfigure_does_not_rewrite_matching_realsense_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "realsense.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "front": {"serial": "OLD_FRONT", "width": 640, "height": 480, "fps": 30},
+                        "left_wrist": {"serial": "OLD_LEFT", "width": 640, "height": 480, "fps": 30},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = device_preflight.DevicePreflightResult(ok=True)
+            options = device_preflight.DevicePreflightOptions(
+                active_sides=("left", "right"),
+                camera_config=path,
+                assume_yes=True,
+                force_reconfigure=True,
+            )
+
+            device_preflight.prepare_cameras(
+                options,
+                result,
+                discover=lambda: [
+                    {"index": 0, "serial": "OLD_FRONT", "name": "front"},
+                    {"index": 1, "serial": "OLD_LEFT", "name": "left"},
+                ],
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["front"]["serial"], "OLD_FRONT")
+        self.assertEqual(payload["left_wrist"]["serial"], "OLD_LEFT")
+        self.assertTrue(any("RealSense config ok" in message for message in result.messages))
 
     def test_real_teleop_parse_loads_missing_arm_ips_from_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -483,6 +715,7 @@ class DevicePreflightTests(unittest.TestCase):
             return SimpleNamespace(
                 messages=["ok"],
                 q6_ports={"left": "/dev/q6-left", "right": "/dev/q6-right"},
+                dmtac_assignment={"assignments": {"left": {"gripper": {"port": "/dev/gripper-left"}}}},
                 permission_fixes=[],
             )
 
@@ -500,6 +733,8 @@ class DevicePreflightTests(unittest.TestCase):
             "dmtac-gripper",
             "--no-camera",
             "--device-preflight-yes",
+            "--device-preflight-probe-all-serial",
+            "--device-preflight-force-reconfigure",
         ]
         with patch.object(sys, "argv", argv), patch.object(real_teleop, "prepare_devices_for_teleop", fake_prepare):
             args = real_teleop.parse_args()
@@ -511,6 +746,12 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertTrue(seen_options[0].require_q6)
         self.assertTrue(seen_options[0].require_dmtac_gripper)
         self.assertFalse(seen_options[0].require_dmtac_tactile)
+        self.assertTrue(seen_options[0].probe_all_serial)
+        self.assertTrue(seen_options[0].force_reconfigure)
+        self.assertEqual(
+            args._dmtac_preflight_assignment["assignments"]["left"]["gripper"]["port"],
+            "/dev/gripper-left",
+        )
 
     def test_real_teleop_gui_parse_requires_dmtac_tactile_when_explicitly_enabled(self) -> None:
         seen_options: list[device_preflight.DevicePreflightOptions] = []

@@ -12,6 +12,7 @@ from ..recording import _to_serializable
 from ..schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from ..session import SessionStepResult
 from .action_record import collection_action_record_metadata
+from .arm_mode_labels import build_arm_mode_metadata
 from .build_collect_components import CollectorComponents
 from .video_frame import NearestFrameBuffer, VideoFrame
 
@@ -23,7 +24,16 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
         "controlled_frame",
         "frame_name",
         "hand_action_spec",
+        "fix_arm_active",
+        "fix_arm_active_side",
+        "fix_arm_mode",
+        "fix_arm_side",
+        "fix_arm_original_timestamp",
         "invert",
+        "init_arm_active",
+        "init_arm_active_side",
+        "init_arm_mode",
+        "init_arm_side",
         "output_dim",
         "source_command_type",
         "source_dim",
@@ -938,6 +948,11 @@ class CollectorSampleBuilder:
                 include_debug_metadata=include_debug_metadata,
             ),
             "pose_quality": _build_pose_quality_metadata(command),
+            "arm_mode": build_arm_mode_metadata(
+                command=command,
+                session_state=str(step_result.state.value),
+                active_sides=tuple(getattr(_components, "active_sides", ("left", "right"))),
+            ),
             "command_metadata": command_metadata,
             "command_metadata_by_effector": command_metadata_by_effector,
             "channel_metadata": channel_metadata,
@@ -980,6 +995,14 @@ class CollectorSampleBuilder:
                 camera_frames,
             )
         metadata = {} if metadata is None else dict(metadata)
+        metadata.setdefault(
+            "arm_mode",
+            build_arm_mode_metadata(
+                command=step_result.command,
+                session_state=str(step_result.state.value),
+                active_sides=tuple(getattr(components, "active_sides", self.config.active_sides)),
+            ),
+        )
         metadata["sample_builder_debug"] = {
             "arm_snapshot_s": float(arm_snapshot_s),
             "hand_snapshot_s": float(hand_snapshot_s),

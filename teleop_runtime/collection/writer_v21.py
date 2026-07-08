@@ -25,6 +25,7 @@ from ..action import (
     normalize_hand_action_specs,
 )
 from ..recording import _to_serializable
+from .arm_mode_labels import ARM_MODE_IDS, ARM_MODE_SCHEMA
 from .async_writer import WriteJob
 from .sample_assembler import CollectorSample
 from .schema_v21 import (
@@ -50,6 +51,7 @@ TACTILE_COMPRESSION_NONE = "none"
 TACTILE_COMPRESSION_LZ4 = "lz4"
 TACTILE_COMPRESSION_ZSTD = "zstd"
 TACTILE_CHUNK_FRAME_COUNT = 32
+WRIST_DEPTH_STALE_REPEAT_FAILURE_STREAK = 8
 
 
 def _normalize_tactile_compression(value: Any) -> str:
@@ -155,7 +157,7 @@ def _safe_path_token(value: Any) -> str:
 class LeRobotV21WriterConfig:
     root_dir: str | Path
     chunk_size: int = 1000
-    nominal_fps: float = 30.0
+    nominal_fps: float = 15.0
     parquet_compression: str = "zstd"
     video_codec: str = "mp4v"
     task_id: str = "default"
@@ -501,6 +503,16 @@ class LeRobotV21Writer:
                     side: list(spec["active_mask"]) for side, spec in hand_specs.items()
                 },
                 "hand_spec_required": True,
+                "label_specs": {
+                    "teleop.arm_mode": {
+                        "schema": ARM_MODE_SCHEMA,
+                        "columns_optional": True,
+                        "sides": ["left", "right"],
+                        "mode_ids": dict(ARM_MODE_IDS),
+                        "legacy_default_policy": "missing_columns_running_rows_are_teleop_else_unknown",
+                        "json_column": "teleop.arm_mode_json",
+                    }
+                },
                 "features": {
                     "action": {"shape": [26], "dtype": "float32"},
                     "observation.state": {"shape": [38], "dtype": "float32"},
@@ -868,6 +880,11 @@ class LeRobotV21Writer:
                 "frame_present": bool(has_frame),
                 "depth_present": bool(has_depth),
                 "depth_scale_present": bool(has_scale),
+                "source_timestamp": match.selected_timestamp if frame is not None else None,
+                "source_frame_index": frame.frame_index if frame is not None else None,
+                "depth_camera_timestamp_sec": depth_metadata.get("camera_timestamp_sec"),
+                "depth_sensor_timestamp_ms": depth_metadata.get("sensor_timestamp_ms"),
+                "depth_frame_number": depth_metadata.get("frame_number"),
                 "mask_requested": bool(self.config.write_wrist_depth_mask),
                 "raw_requested": bool(self.config.write_wrist_depth_raw),
                 "mask_ready": bool(self.config.write_wrist_depth_mask and has_depth and has_scale),
@@ -1061,6 +1078,16 @@ class LeRobotV21Writer:
             "missing_frame_count": 0,
             "missing_depth_image_count": 0,
             "missing_depth_scale_count": 0,
+            "depth_frame_number_present_count": 0,
+            "depth_camera_timestamp_present_count": 0,
+            "repeated_depth_frame_count": 0,
+            "stale_depth_frame_count": 0,
+            "repeated_depth_frame_streak": 0,
+            "max_repeated_depth_frame_streak": 0,
+            "last_depth_frame_number": None,
+            "last_depth_camera_timestamp_sec": None,
+            "last_depth_sensor_timestamp_ms": None,
+            "last_depth_source_frame_index": None,
             "failure_reason_counts": {},
             "first_failure_frame_index": None,
             "first_failure_reasons": [],
@@ -1115,6 +1142,60 @@ class LeRobotV21Writer:
                 reasons = [str(reason) for reason in raw_reasons if str(reason)]
             else:
                 reasons = []
+            if depth_present:
+                depth_frame_number = raw_status.get("depth_frame_number")
+                depth_camera_timestamp_sec = raw_status.get("depth_camera_timestamp_sec")
+                depth_sensor_timestamp_ms = raw_status.get("depth_sensor_timestamp_ms")
+                source_frame_index = raw_status.get("source_frame_index")
+                if depth_frame_number is not None:
+                    stats["depth_frame_number_present_count"] = (
+                        int(stats.get("depth_frame_number_present_count", 0)) + 1
+                    )
+                if depth_camera_timestamp_sec is not None:
+                    stats["depth_camera_timestamp_present_count"] = (
+                        int(stats.get("depth_camera_timestamp_present_count", 0)) + 1
+                    )
+                previous_signature = (
+                    stats.get("last_depth_frame_number"),
+                    stats.get("last_depth_camera_timestamp_sec"),
+                    stats.get("last_depth_sensor_timestamp_ms"),
+                )
+                current_signature = (
+                    depth_frame_number,
+                    depth_camera_timestamp_sec,
+                    depth_sensor_timestamp_ms,
+                )
+                signature_present = any(value is not None for value in current_signature)
+                previous_present = any(value is not None for value in previous_signature)
+                source_changed = (
+                    source_frame_index is None
+                    or stats.get("last_depth_source_frame_index") is None
+                    or source_frame_index != stats.get("last_depth_source_frame_index")
+                )
+                repeated = bool(
+                    signature_present
+                    and previous_present
+                    and source_changed
+                    and current_signature == previous_signature
+                )
+                if repeated:
+                    repeat_streak = int(stats.get("repeated_depth_frame_streak", 0)) + 1
+                    stats["repeated_depth_frame_count"] = (
+                        int(stats.get("repeated_depth_frame_count", 0)) + 1
+                    )
+                else:
+                    repeat_streak = 0
+                stats["repeated_depth_frame_streak"] = int(repeat_streak)
+                stats["max_repeated_depth_frame_streak"] = max(
+                    int(stats.get("max_repeated_depth_frame_streak", 0)),
+                    int(repeat_streak),
+                )
+                if repeat_streak >= WRIST_DEPTH_STALE_REPEAT_FAILURE_STREAK:
+                    reasons.append("stale_depth_frame")
+                stats["last_depth_frame_number"] = depth_frame_number
+                stats["last_depth_camera_timestamp_sec"] = depth_camera_timestamp_sec
+                stats["last_depth_sensor_timestamp_ms"] = depth_sensor_timestamp_ms
+                stats["last_depth_source_frame_index"] = source_frame_index
             if not reasons:
                 stats["ok_samples"] = int(stats.get("ok_samples", 0)) + 1
                 continue
@@ -1132,6 +1213,8 @@ class LeRobotV21Writer:
                 stats["missing_depth_image_count"] = int(stats.get("missing_depth_image_count", 0)) + 1
             if "missing_depth_scale" in reasons:
                 stats["missing_depth_scale_count"] = int(stats.get("missing_depth_scale_count", 0)) + 1
+            if "stale_depth_frame" in reasons:
+                stats["stale_depth_frame_count"] = int(stats.get("stale_depth_frame_count", 0)) + 1
             if stats.get("first_failure_frame_index") is None:
                 stats["first_failure_frame_index"] = int(frame_index)
                 stats["first_failure_reasons"] = list(reasons)
@@ -1474,6 +1557,7 @@ class LeRobotV21Writer:
         row[f"{prefix}_source_frame_index"] = record.get("source_frame_index")
         row[f"{prefix}_depth_camera_timestamp_sec"] = record.get("depth_camera_timestamp_sec")
         row[f"{prefix}_depth_sensor_timestamp_ms"] = record.get("depth_sensor_timestamp_ms")
+        row[f"{prefix}_depth_frame_number"] = record.get("depth_frame_number")
         row[f"{prefix}_valid_fraction"] = record.get("valid_fraction")
         if state.stream_kind == "mask":
             row[f"{prefix}_foreground_fraction"] = record.get("foreground_fraction")

@@ -33,6 +33,7 @@ class DevicePreflightOptions:
     require_dmtac_gripper: bool = True
     require_dmtac_tactile: bool = True
     auto_configure: bool = True
+    force_reconfigure: bool = False
     assume_yes: bool = False
     fix_permissions: bool = False
     fix_serial_conflicts: bool = False
@@ -670,28 +671,46 @@ def prepare_q6(
     scan = q6.scan_q6_devices(probe_all_serial=bool(options.probe_all_serial))
     expected = len(options.active_sides)
     devices = list(scan.get("q6_devices") or [])
+    if len(devices) < expected and not bool(options.probe_all_serial):
+        retry_scan = q6.scan_q6_devices(probe_all_serial=True)
+        retry_devices = list(retry_scan.get("q6_devices") or [])
+        if len(retry_devices) > len(devices):
+            result.add(
+                "Q6 default serial scan was insufficient; retrying with all serial ports "
+                f"found {len(retry_devices)} candidate(s)."
+            )
+            scan = retry_scan
+            devices = retry_devices
     result.add(q6.format_scan_summary(scan))
     if len(devices) < expected:
         raise DevicePreflightError(f"Q6 count is insufficient: detected {len(devices)}, expected {expected}.")
 
-    try:
-        assignment = q6.load_assignment(options.q6_config)
-        comparison = q6.compare_assignment_to_scan(assignment, scan)
-        missing = [
-            item for item in comparison.get("missing") or []
-            if str(item.get("side")) in options.active_sides
-        ]
-        effective = comparison["effective_assignment"]
-        ports = q6.q6_ports_for_sides(effective, active_sides=options.active_sides)
-        if not missing and all(side in ports for side in options.active_sides):
-            if comparison.get("remapped"):
-                saved = q6.save_assignment(effective)
-                result.add(f"Q6 paths changed; saved remapped latest config: {saved}")
-            result.q6_ports = dict(ports)
-            return
-        result.add("Q6 latest assignment is missing active sides or no longer matches current USB scan.")
-    except FileNotFoundError:
-        result.add("No latest Q6 assignment found.")
+    if options.force_reconfigure:
+        result.add(
+            "Q6 force reconfigure requested; entering reassignment flow and saving a refreshed config."
+        )
+    else:
+        try:
+            assignment = q6.load_assignment(options.q6_config)
+            comparison = q6.compare_assignment_to_scan(assignment, scan)
+            missing = [
+                item for item in comparison.get("missing") or []
+                if str(item.get("side")) in options.active_sides
+            ]
+            effective = comparison["effective_assignment"]
+            ports = q6.q6_ports_for_sides(effective, active_sides=options.active_sides)
+            if not missing and all(side in ports for side in options.active_sides):
+                if comparison.get("remapped"):
+                    saved = q6.save_assignment(effective)
+                    result.add(f"Q6 paths changed; saved remapped latest config: {saved}")
+                result.q6_ports = dict(ports)
+                return
+            result.add(
+                "Q6 latest assignment is missing active sides or no longer matches current USB scan; "
+                "entering reassignment flow and saving a refreshed config."
+            )
+        except FileNotFoundError:
+            result.add("No latest Q6 assignment found.")
 
     if not options.auto_configure:
         raise DevicePreflightError("Q6 assignment is not ready; run `python -m teleop_runtime.configure_devices --configure`.")
@@ -751,6 +770,40 @@ def _configured_dmtac_complete(
         if require_tactile and len(usb_assignment.tactile_ids_for_side(assignment, side)) < 2:
             return False
     return True
+
+
+def _missing_dmtac_active_items(
+    comparison: Mapping[str, Any],
+    *,
+    active_sides: Sequence[str],
+    require_tactile: bool,
+) -> list[dict[str, Any]]:
+    missing: list[dict[str, Any]] = []
+    active = {str(side) for side in active_sides}
+    for item in comparison.get("missing") or []:
+        if str(item.get("side")) not in active:
+            continue
+        if item.get("kind") == "tactile" and not bool(require_tactile):
+            continue
+        missing.append(dict(item))
+    return missing
+
+
+def _missing_dmtac_only_gripper_probe_failed(
+    comparison: Mapping[str, Any],
+    *,
+    active_sides: Sequence[str],
+    require_tactile: bool,
+) -> bool:
+    missing = _missing_dmtac_active_items(
+        comparison,
+        active_sides=active_sides,
+        require_tactile=require_tactile,
+    )
+    return bool(missing) and all(
+        item.get("kind") == "gripper" and item.get("reason") == "probe_failed"
+        for item in missing
+    )
 
 
 def _dmtac_gripper_token(item: Mapping[str, Any]) -> str:
@@ -1040,67 +1093,166 @@ def _known_dmtac_gripper_tokens_from_comparison(
     return tokens
 
 
+def _print_dmtac_scan_progress(payload: Mapping[str, Any]) -> None:
+    event = str(payload.get("event") or "")
+    if event == "serial_scan_ready":
+        print(
+            "[DevicePreflight] DMTAC USB scan: "
+            f"{int(payload.get('serial_count') or 0)} serial port(s), "
+            f"probing {int(payload.get('probe_count') or 0)} gripper candidate(s)"
+            + (" with all-serial fallback" if payload.get("probe_all_serial") else ""),
+            flush=True,
+        )
+        return
+    if event == "gripper_probe_start":
+        label = str(payload.get("preferred_port") or payload.get("port") or "")
+        description = str(payload.get("description") or payload.get("product") or "").strip()
+        suffix = f" ({description})" if description else ""
+        print(
+            "[DevicePreflight] DMTAC gripper probe "
+            f"{int(payload.get('index') or 0)}/{int(payload.get('total') or 0)}: "
+            f"{label}{suffix}",
+            flush=True,
+        )
+        return
+    if event == "gripper_setting_probe":
+        scan_ids = "full-id-scan" if payload.get("scan_ids") else "quick"
+        print(
+            "[DevicePreflight] DMTAC gripper probe "
+            f"{int(payload.get('index') or 0)}/{int(payload.get('total_ports') or 0)} "
+            f"{scan_ids}: attempt {int(payload.get('attempt') or 0)}/"
+            f"{int(payload.get('total') or 0)} id={payload.get('gripper_id')} "
+            f"baud={payload.get('baudrate')}",
+            flush=True,
+        )
+        return
+    if event == "gripper_probe_done":
+        label = str(payload.get("preferred_port") or payload.get("port") or "")
+        status = "reachable" if payload.get("reachable") else "not reachable"
+        elapsed = payload.get("probe_elapsed_s")
+        attempts = payload.get("attempted_setting_count")
+        extra = []
+        if elapsed not in (None, ""):
+            extra.append(f"{elapsed}s")
+        if attempts not in (None, ""):
+            extra.append(f"{attempts} attempt(s)")
+        print(
+            "[DevicePreflight] DMTAC gripper probe done "
+            f"{int(payload.get('index') or 0)}/{int(payload.get('total') or 0)}: "
+            f"{label} -> {status}"
+            + (f" ({', '.join(extra)})" if extra else ""),
+            flush=True,
+        )
+
+
 def prepare_dmtac(
     options: DevicePreflightOptions,
     result: DevicePreflightResult,
 ) -> None:
     usb_assignment, gui_config_cls, run_tactile_gui, tactile_tokens_from_assignment = _load_dmtac_modules()
-    scan = usb_assignment.scan_usb_devices(probe_grippers=True)
+    scan = usb_assignment.scan_usb_devices(
+        probe_grippers=True,
+        probe_all_serial=bool(options.probe_all_serial),
+        progress_callback=_print_dmtac_scan_progress,
+    )
     expected_grippers = len(options.active_sides)
     expected_tactile = 2 * len(options.active_sides) if options.require_dmtac_tactile else 0
     reachable_grippers = _reachable_grippers(scan)
-    tactile_devices = list(scan.get("tactile") or [])
-    if len(reachable_grippers) < expected_grippers:
-        raise DevicePreflightError(
-            f"DMTAC gripper count is insufficient: reachable {len(reachable_grippers)}, expected {expected_grippers}."
+    if len(reachable_grippers) < expected_grippers and not bool(options.probe_all_serial):
+        retry_scan = usb_assignment.scan_usb_devices(
+            probe_grippers=True,
+            probe_all_serial=True,
+            progress_callback=_print_dmtac_scan_progress,
         )
+        retry_reachable = _reachable_grippers(retry_scan)
+        if len(retry_reachable) > len(reachable_grippers):
+            result.add(
+                "DMTAC default gripper scan was insufficient; retrying with all serial ports "
+                f"found {len(retry_reachable)} reachable gripper(s)."
+            )
+            scan = retry_scan
+            reachable_grippers = retry_reachable
+    tactile_devices = list(scan.get("tactile") or [])
     if len(tactile_devices) < expected_tactile:
         raise DevicePreflightError(
             f"DMTAC tactile count is insufficient: detected {len(tactile_devices)}, expected {expected_tactile}."
         )
 
-    try:
-        assignment = usb_assignment.load_assignment(options.dmtac_config)
-        comparison = usb_assignment.compare_assignment_to_scan(assignment, scan)
-        text = usb_assignment.format_comparison(comparison)
-        if text:
-            result.add(text)
-        effective = comparison["effective_assignment"]
-        if not comparison.get("missing") and _configured_dmtac_complete(
-            usb_assignment,
-            effective,
-            active_sides=options.active_sides,
-            require_tactile=options.require_dmtac_tactile,
-        ):
-            if comparison.get("remapped"):
-                saved = usb_assignment.save_assignment(effective)
-                result.add(f"DMTAC paths changed; saved remapped latest config: {saved}")
-            result.dmtac_assignment = effective
-            return
-        inferred = _infer_dmtac_assignment_from_partial_config(
-            usb_assignment,
-            scan,
-            assignment,
-            comparison,
-            active_sides=options.active_sides,
-            require_tactile=options.require_dmtac_tactile,
-            assume_yes=bool(options.assume_yes),
+    assignment = None
+    comparison = None
+    if options.force_reconfigure:
+        result.add(
+            "DMTAC force reconfigure requested; entering reassignment flow and saving a refreshed config."
         )
-        if inferred is not None and _configured_dmtac_complete(
-            usb_assignment,
-            inferred,
-            active_sides=options.active_sides,
-            require_tactile=options.require_dmtac_tactile,
-        ):
-            saved = usb_assignment.save_assignment(inferred)
-            result.dmtac_assignment = inferred
-            result.add(f"DMTAC partial assignment inferred and saved: {saved}")
-            return
-        result.add("DMTAC latest assignment is incomplete or no longer matches current USB scan.")
-    except FileNotFoundError:
-        result.add("No latest DMTAC assignment found.")
-        assignment = None
-        comparison = None
+    else:
+        try:
+            assignment = usb_assignment.load_assignment(options.dmtac_config)
+            comparison = usb_assignment.compare_assignment_to_scan(assignment, scan)
+            text = usb_assignment.format_comparison(comparison)
+            effective = comparison["effective_assignment"]
+            if not comparison.get("missing") and _configured_dmtac_complete(
+                usb_assignment,
+                effective,
+                active_sides=options.active_sides,
+                require_tactile=options.require_dmtac_tactile,
+            ):
+                if comparison.get("remapped"):
+                    saved = usb_assignment.save_assignment(effective)
+                    result.add(f"DMTAC paths changed; saved remapped latest config: {saved}")
+                result.dmtac_assignment = effective
+                return
+            if (
+                _configured_dmtac_complete(
+                    usb_assignment,
+                    effective,
+                    active_sides=options.active_sides,
+                    require_tactile=options.require_dmtac_tactile,
+                )
+                and _missing_dmtac_only_gripper_probe_failed(
+                    comparison,
+                    active_sides=options.active_sides,
+                    require_tactile=options.require_dmtac_tactile,
+                )
+                and not _dmtac_extra_devices_by_kind(comparison, "gripper")
+            ):
+                result.dmtac_assignment = effective
+                result.add(
+                    "WARNING: configured DMTAC gripper port(s) were detected but startup probe failed; "
+                    "continuing with saved assignment so runtime reconnect and warmup probe can recover."
+                )
+                return
+            if text:
+                result.add(text)
+            inferred = _infer_dmtac_assignment_from_partial_config(
+                usb_assignment,
+                scan,
+                assignment,
+                comparison,
+                active_sides=options.active_sides,
+                require_tactile=options.require_dmtac_tactile,
+                assume_yes=bool(options.assume_yes),
+            )
+            if inferred is not None and _configured_dmtac_complete(
+                usb_assignment,
+                inferred,
+                active_sides=options.active_sides,
+                require_tactile=options.require_dmtac_tactile,
+            ):
+                saved = usb_assignment.save_assignment(inferred)
+                result.dmtac_assignment = inferred
+                result.add(f"DMTAC partial assignment inferred and saved: {saved}")
+                return
+            result.add(
+                "DMTAC latest assignment is incomplete or no longer matches current USB scan; "
+                "entering reassignment flow and saving a refreshed config."
+            )
+        except FileNotFoundError:
+            result.add("No latest DMTAC assignment found.")
+
+    if len(reachable_grippers) < expected_grippers:
+        raise DevicePreflightError(
+            f"DMTAC gripper count is insufficient: reachable {len(reachable_grippers)}, expected {expected_grippers}."
+        )
 
     if not options.auto_configure:
         raise DevicePreflightError("DMTAC assignment is not ready; run `python -m teleop_runtime.configure_devices --configure`.")
@@ -1221,6 +1373,8 @@ def prepare_cameras(
 
 def prepare_devices_for_teleop(options: DevicePreflightOptions) -> DevicePreflightResult:
     options.active_sides = _active_sides(options.active_sides)
+    if bool(options.force_reconfigure) and not bool(options.auto_configure):
+        raise DevicePreflightError("Q6/DMTAC force reconfigure requires auto-configure; remove --check-only.")
     result = DevicePreflightResult(ok=True)
     _append_serial_conflict_report(result, fix_serial_conflicts=bool(options.fix_serial_conflicts))
     permission_paths = [*_serial_device_paths(), *_video_device_paths(), *_usb_bus_device_paths()]
@@ -1294,6 +1448,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="When --check-devices is used, validate only and do not enter assignment flows.",
     )
+    parser.add_argument(
+        "--force-reconfigure",
+        action="store_true",
+        help=(
+            "Ignore existing valid Q6/DMTAC assignments and re-run their selection flows, "
+            "then save refreshed configs. RealSense and arm IP configs are left unchanged."
+        ),
+    )
     parser.add_argument("--yes", action="store_true", help="Use default left/right assignment without prompts.")
     parser.add_argument(
         "--fix-permissions",
@@ -1348,6 +1510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_dmtac_gripper=bool(args.require_dmtac_gripper),
         require_dmtac_tactile=bool(args.require_dmtac_tactile),
         auto_configure=bool(args.auto_configure),
+        force_reconfigure=bool(args.force_reconfigure),
         assume_yes=bool(args.yes),
         fix_permissions=bool(args.fix_permissions),
         fix_serial_conflicts=bool(args.fix_serial_conflicts),

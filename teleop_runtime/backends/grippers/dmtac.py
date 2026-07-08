@@ -427,7 +427,7 @@ class DMTacGripperBackendConfig:
     gripper_port: str = DEFAULT_DMTAC_GRIPPER_PORT
     gripper_id: int = 1
     gripper_baudrate: int = 115200
-    gripper_timeout: float = 0.03
+    gripper_timeout: float = 0.10
     max_open_mm: float = 70.0
     connect_hardware: bool = True
     command_dim: int = 0
@@ -903,6 +903,49 @@ class DMTacGripperBackend(EffectorBackend):
 
     def send_fixed_joint_pos(self, joint_pos: object) -> bool:
         return self._send_joint_pos(joint_pos, bypass_send_commands=True, force=True)
+
+    def force_reconnect_gripper(self, reason: str = "manual_reconnect") -> bool:
+        with self._lock:
+            previous_attempt_at = self._last_reconnect_attempt_at
+            self._last_reconnect_attempt_at = None
+            try:
+                return self._handle_gripper_io_error_locked(
+                    f"force_reconnect:{reason}",
+                    RuntimeError(str(reason)),
+                )
+            finally:
+                if self._last_reconnect_attempt_at is None:
+                    self._last_reconnect_attempt_at = previous_attempt_at
+
+    def read_gripper_state_now(self) -> dict[str, object] | None:
+        if not self.config.connect_hardware:
+            return None
+        with self._lock:
+            if self.device is None or getattr(self.device, "gripper", None) is None:
+                recovered = self._handle_gripper_io_error_locked(
+                    "read_now_no_connection",
+                    RuntimeError("device is not connected"),
+                )
+                if not recovered:
+                    return None
+            assert self.device is not None
+            try:
+                gripper_state = self.device.read_gripper_state()
+            except Exception as exc:  # noqa: BLE001
+                recovered = self._handle_gripper_io_error_locked("read_now_failed", exc)
+                if not recovered:
+                    raise
+                assert self.device is not None
+                gripper_state = self.device.read_gripper_state()
+            joint_value = float(getattr(gripper_state, "joint_pos"))
+            self._latest_joint_pos = self._q6_from_scalar(
+                joint_value,
+                dim=int(self.config.command_dim),
+                max_value=float(self.config.max_action),
+            )
+            self._latest_measured_joint_pos = self._latest_joint_pos.copy()
+            self._latest_joint_timestamp = float(getattr(gripper_state, "timestamp", time.time()))
+            return gripper_state.to_dict()
 
     def _extract_gripper_scalar(self, joint_pos: object) -> float:
         target = np.asarray(joint_pos, dtype=np.float32).reshape(-1)

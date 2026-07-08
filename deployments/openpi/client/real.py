@@ -5,6 +5,13 @@ import json
 from typing import Any
 
 
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Launch the OpenPI client through the real teleop_runtime backend.",
@@ -21,24 +28,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--required-camera-slot", action="append", dest="required_camera_slots", default=None)
     parser.add_argument("--required-image-key", action="append", dest="required_image_keys", default=None)
     parser.add_argument("--hand-layout", default="q6_slot0_gripper")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write deploy action/pose debug JSONL through teleop_runtime.deploy.",
+    )
     args, teleop_args = parser.parse_known_args(argv)
 
     policy_kwargs: dict[str, Any] = {
         "host": args.host,
         "port": int(args.port),
-        "api_key": args.api_key,
-        "prompt": args.prompt,
-        "expected_model_id": args.expected_model_id,
-        "expected_checkpoint_step": args.expected_checkpoint_step,
+        "api_key": _optional_text(args.api_key),
+        "prompt": _optional_text(args.prompt),
+        "expected_model_id": _optional_text(args.expected_model_id),
+        "expected_checkpoint_step": _optional_text(args.expected_checkpoint_step),
         "action_dim": int(args.action_dim),
         "action_key": str(args.action_key),
         "required_camera_slots": tuple(args.required_camera_slots or ("base_0_rgb",)),
         "required_image_keys": tuple(args.required_image_keys or ("front",)),
-        "hand_layout": args.hand_layout,
+        "hand_layout": _optional_text(args.hand_layout),
     }
     policy_kwargs = {key: value for key, value in policy_kwargs.items() if value is not None}
 
     from teleop_runtime.deploy.run_policy import main as run_real_policy
+
+    runtime_args = list(teleop_args)
+    if args.debug:
+        runtime_args.append("--debug")
 
     return run_real_policy(
         [
@@ -46,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             "deployments.openpi.client.policy:create_policy",
             "--policy-kwargs-json",
             json.dumps(policy_kwargs, separators=(",", ":")),
-            *teleop_args,
+            *runtime_args,
         ]
     )
 

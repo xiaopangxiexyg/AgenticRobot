@@ -32,6 +32,9 @@ class _FakeClock:
     def time(self) -> float:
         return self.now
 
+    def monotonic(self) -> float:
+        return self.now
+
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(float(seconds))
         self.now += float(seconds)
@@ -59,14 +62,21 @@ class _ScriptedSerial:
         self.args = args
         self.kwargs = kwargs
         self.timeout = float(kwargs.get("timeout", 0.03))
+        self.write_timeout = kwargs.get("write_timeout")
         self.is_open = True
         self.writes: list[bytes] = []
         self._rx = bytearray(self.scripts.pop(0) if self.scripts else b"")
         self.close_count = 0
+        self.open_count = 0
+        self.reset_input_count = 0
+        self.reset_output_count = 0
         self.instances.append(self)
 
     def reset_input_buffer(self) -> None:
-        return
+        self.reset_input_count += 1
+
+    def reset_output_buffer(self) -> None:
+        self.reset_output_count += 1
 
     def write(self, data: bytes) -> int:
         self.writes.append(bytes(data))
@@ -88,6 +98,10 @@ class _ScriptedSerial:
         self.close_count += 1
         self.is_open = False
 
+    def open(self) -> None:
+        self.open_count += 1
+        self.is_open = True
+
 
 def _read_register_response(slave_id: int, *regs: int) -> bytes:
     payload = b"".join(int(value).to_bytes(2, byteorder="big") for value in regs)
@@ -95,17 +109,43 @@ def _read_register_response(slave_id: int, *regs: int) -> bytes:
     return InspireGripperModbus._append_crc(frame)
 
 
+def _write_single_response(slave_id: int, reg_addr: int, value: int) -> bytes:
+    frame = (
+        bytes([int(slave_id), 0x06])
+        + int(reg_addr).to_bytes(2, byteorder="big")
+        + int(value).to_bytes(2, byteorder="big")
+    )
+    return InspireGripperModbus._append_crc(frame)
+
+
+def _write_multiple_response(slave_id: int, start_addr: int, count: int) -> bytes:
+    frame = (
+        bytes([int(slave_id), 0x10])
+        + int(start_addr).to_bytes(2, byteorder="big")
+        + int(count).to_bytes(2, byteorder="big")
+    )
+    return InspireGripperModbus._append_crc(frame)
+
+
 class DMTacGripperDriverTest(unittest.TestCase):
     def _patch_clock(self, clock: _FakeClock):
         old_time = gripper_driver.time.time
         old_sleep = gripper_driver.time.sleep
+        old_monotonic = gripper_driver.time.monotonic
         gripper_driver.time.time = clock.time
         gripper_driver.time.sleep = clock.sleep
-        return old_time, old_sleep
+        gripper_driver.time.monotonic = clock.monotonic
+        return old_time, old_sleep, old_monotonic
+
+    def _restore_clock(self, patched_clock) -> None:
+        old_time, old_sleep, old_monotonic = patched_clock
+        gripper_driver.time.time = old_time
+        gripper_driver.time.sleep = old_sleep
+        gripper_driver.time.monotonic = old_monotonic
 
     def test_wait_until_idle_allows_device_to_enter_moving(self) -> None:
         clock = _FakeClock()
-        old_time, old_sleep = self._patch_clock(clock)
+        patched_clock = self._patch_clock(clock)
         try:
             gripper = _FakeGripper(
                 [
@@ -120,15 +160,14 @@ class DMTacGripperDriverTest(unittest.TestCase):
                 start_grace=0.1,
             )
         finally:
-            gripper_driver.time.time = old_time
-            gripper_driver.time.sleep = old_sleep
+            self._restore_clock(patched_clock)
 
         self.assertEqual(result.label, "final_idle")
         self.assertEqual(gripper.read_labels, ["initial_idle", "moving", "final_idle"])
 
     def test_wait_until_idle_returns_after_grace_for_no_motion(self) -> None:
         clock = _FakeClock()
-        old_time, old_sleep = self._patch_clock(clock)
+        patched_clock = self._patch_clock(clock)
         try:
             gripper = _FakeGripper(
                 [
@@ -143,15 +182,14 @@ class DMTacGripperDriverTest(unittest.TestCase):
                 start_grace=0.1,
             )
         finally:
-            gripper_driver.time.time = old_time
-            gripper_driver.time.sleep = old_sleep
+            self._restore_clock(patched_clock)
 
         self.assertEqual(result.label, "idle_3")
         self.assertEqual(gripper.read_labels, ["idle_1", "idle_2", "idle_3"])
 
     def test_modbus_reconnects_and_retries_after_read_timeout(self) -> None:
         clock = _FakeClock()
-        old_time, old_sleep = self._patch_clock(clock)
+        patched_clock = self._patch_clock(clock)
         old_serial = gripper_driver.serial.Serial
         _ScriptedSerial.scripts = [b"", _read_register_response(1, 1234)]
         _ScriptedSerial.instances = []
@@ -169,8 +207,7 @@ class DMTacGripperDriverTest(unittest.TestCase):
             regs = mb.read_holding_registers(61, 1)
         finally:
             gripper_driver.serial.Serial = old_serial
-            gripper_driver.time.time = old_time
-            gripper_driver.time.sleep = old_sleep
+            self._restore_clock(patched_clock)
             _ScriptedSerial.clock = None
 
         self.assertEqual(regs, [1234])
@@ -181,7 +218,7 @@ class DMTacGripperDriverTest(unittest.TestCase):
 
     def test_modbus_does_not_reconnect_on_unexpected_slave_id(self) -> None:
         clock = _FakeClock()
-        old_time, old_sleep = self._patch_clock(clock)
+        patched_clock = self._patch_clock(clock)
         old_serial = gripper_driver.serial.Serial
         _ScriptedSerial.scripts = [_read_register_response(2, 1234)]
         _ScriptedSerial.instances = []
@@ -200,12 +237,196 @@ class DMTacGripperDriverTest(unittest.TestCase):
                 mb.read_holding_registers(61, 1)
         finally:
             gripper_driver.serial.Serial = old_serial
-            gripper_driver.time.time = old_time
-            gripper_driver.time.sleep = old_sleep
+            self._restore_clock(patched_clock)
             _ScriptedSerial.clock = None
 
         self.assertEqual(len(_ScriptedSerial.instances), 1)
         self.assertEqual(mb.reconnect_count, 0)
+
+    def test_modbus_sets_write_timeout_and_resets_output_buffer(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = [_read_register_response(1, 1234)]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            mb = InspireGripperModbus(
+                port="/dev/fake0",
+                slave_id=1,
+                timeout=0.02,
+                inter_command_delay=0.0,
+                reconnect_on_error=False,
+            )
+            regs = mb.read_holding_registers(61, 1)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(regs, [1234])
+        self.assertEqual(_ScriptedSerial.instances[0].write_timeout, 0.02)
+        self.assertEqual(_ScriptedSerial.instances[0].reset_input_count, 1)
+        self.assertEqual(_ScriptedSerial.instances[0].reset_output_count, 1)
+
+    def test_set_joint_pos_resends_same_target_by_default(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        response = _write_single_response(1, InspireGripperModbus.REG_OPENLEN_SET, 500)
+        _ScriptedSerial.scripts = [response + response]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            gripper = InspireGripper(
+                port="/dev/fake0",
+                gripper_id=1,
+                timeout=0.01,
+                inter_command_delay=0.0,
+                reconnect_on_error=False,
+            )
+            gripper.set_joint_pos(0.5)
+            gripper.set_joint_pos(0.5)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(len(_ScriptedSerial.instances), 1)
+        self.assertEqual(len(_ScriptedSerial.instances[0].writes), 2)
+        self.assertTrue(
+            all(req[1] == 0x06 for req in _ScriptedSerial.instances[0].writes)
+        )
+
+    def test_set_joint_pos_can_skip_same_target_when_force_send_false(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        response = _write_single_response(1, InspireGripperModbus.REG_OPENLEN_SET, 500)
+        _ScriptedSerial.scripts = [response]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            gripper = InspireGripper(
+                port="/dev/fake0",
+                gripper_id=1,
+                timeout=0.01,
+                inter_command_delay=0.0,
+                reconnect_on_error=False,
+            )
+            gripper.set_joint_pos(0.5)
+            gripper.set_joint_pos(0.5, force_send=False)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        self.assertEqual(len(_ScriptedSerial.instances), 1)
+        self.assertEqual(len(_ScriptedSerial.instances[0].writes), 1)
+
+    def test_set_joint_pos_splits_speed_torque_position_by_default(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        speed_raw = 201
+        torque_raw = 335
+        target_raw = 500
+        response = b"".join(
+            [
+                _write_single_response(
+                    1,
+                    InspireGripperModbus.REG_SPEED_SET,
+                    speed_raw,
+                ),
+                _write_single_response(
+                    1,
+                    InspireGripperModbus.REG_FORCE_SET,
+                    torque_raw,
+                ),
+                _write_single_response(
+                    1,
+                    InspireGripperModbus.REG_OPENLEN_SET,
+                    target_raw,
+                ),
+            ]
+        )
+        _ScriptedSerial.scripts = [response]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            gripper = InspireGripper(
+                port="/dev/fake0",
+                gripper_id=1,
+                timeout=0.01,
+                inter_command_delay=0.0,
+                reconnect_on_error=False,
+            )
+            gripper.set_joint_pos(0.5, speed=0.2, torque=0.3)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        serial_instance = _ScriptedSerial.instances[0]
+        self.assertEqual(
+            [req[1] for req in serial_instance.writes],
+            [0x06, 0x06, 0x06],
+        )
+        self.assertEqual(
+            [
+                int.from_bytes(req[2:4], byteorder="big")
+                for req in serial_instance.writes
+            ],
+            [
+                InspireGripperModbus.REG_SPEED_SET,
+                InspireGripperModbus.REG_FORCE_SET,
+                InspireGripperModbus.REG_OPENLEN_SET,
+            ],
+        )
+        self.assertEqual(
+            [
+                int.from_bytes(req[4:6], byteorder="big")
+                for req in serial_instance.writes
+            ],
+            [speed_raw, torque_raw, target_raw],
+        )
+
+    def test_set_joint_pos_can_use_multi_register_fast_path(self) -> None:
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = [
+            _write_multiple_response(1, InspireGripperModbus.REG_OPENLEN_SET, 3)
+        ]
+        _ScriptedSerial.instances = []
+        _ScriptedSerial.clock = clock
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            gripper = InspireGripper(
+                port="/dev/fake0",
+                gripper_id=1,
+                timeout=0.01,
+                inter_command_delay=0.0,
+                reconnect_on_error=False,
+                use_write_multiple_registers=True,
+            )
+            gripper.set_joint_pos(0.5, speed=0.2, torque=0.3)
+        finally:
+            gripper_driver.serial.Serial = old_serial
+            self._restore_clock(patched_clock)
+            _ScriptedSerial.clock = None
+
+        serial_instance = _ScriptedSerial.instances[0]
+        self.assertEqual(len(serial_instance.writes), 1)
+        self.assertEqual(serial_instance.writes[0][1], 0x10)
+        self.assertEqual(
+            int.from_bytes(serial_instance.writes[0][2:4], byteorder="big"),
+            InspireGripperModbus.REG_OPENLEN_SET,
+        )
 
 
 if __name__ == "__main__":

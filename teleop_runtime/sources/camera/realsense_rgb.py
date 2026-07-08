@@ -41,6 +41,15 @@ class RealSenseRGBCameraConfig:
     restart_on_stale_timeout: bool = True
     restart_after_timeouts: int = 3
     restart_cooldown_sec: float = 0.5
+    startup_reset: bool = True
+    startup_reset_sleep_sec: float = 0.2
+    startup_warmup_frames: int = 10
+    startup_hardware_reset: bool = False
+    startup_hardware_reset_on_failure: bool = True
+    startup_hardware_reset_retry_attempts: int = 1
+    startup_hardware_reset_sleep_sec: float = 2.0
+    startup_hardware_reset_reconnect_timeout_sec: float = 6.0
+    startup_hardware_reset_reconnect_poll_sec: float = 0.25
     auto_exposure_priority: int | None = None
     enable_depth: bool = False
     depth_width: int | None = None
@@ -69,6 +78,18 @@ class RealSenseRGBCameraConfig:
             raise ValueError("restart_after_timeouts must be positive.")
         if float(self.restart_cooldown_sec) < 0.0:
             raise ValueError("restart_cooldown_sec must be >= 0.")
+        if float(self.startup_reset_sleep_sec) < 0.0:
+            raise ValueError("startup_reset_sleep_sec must be >= 0.")
+        if int(self.startup_warmup_frames) < 0:
+            raise ValueError("startup_warmup_frames must be >= 0.")
+        if int(self.startup_hardware_reset_retry_attempts) < 0:
+            raise ValueError("startup_hardware_reset_retry_attempts must be >= 0.")
+        if float(self.startup_hardware_reset_sleep_sec) < 0.0:
+            raise ValueError("startup_hardware_reset_sleep_sec must be >= 0.")
+        if float(self.startup_hardware_reset_reconnect_timeout_sec) < 0.0:
+            raise ValueError("startup_hardware_reset_reconnect_timeout_sec must be >= 0.")
+        if float(self.startup_hardware_reset_reconnect_poll_sec) <= 0.0:
+            raise ValueError("startup_hardware_reset_reconnect_poll_sec must be positive.")
         if self.depth_width is None:
             self.depth_width = int(self.width)
         if self.depth_height is None:
@@ -97,6 +118,19 @@ class RealSenseRGBCameraConfig:
                 "restart_on_stale_timeout": bool(self.restart_on_stale_timeout),
                 "restart_after_timeouts": int(self.restart_after_timeouts),
                 "restart_cooldown_sec": float(self.restart_cooldown_sec),
+                "startup_reset": bool(self.startup_reset),
+                "startup_reset_sleep_sec": float(self.startup_reset_sleep_sec),
+                "startup_warmup_frames": int(self.startup_warmup_frames),
+                "startup_hardware_reset": bool(self.startup_hardware_reset),
+                "startup_hardware_reset_on_failure": bool(self.startup_hardware_reset_on_failure),
+                "startup_hardware_reset_retry_attempts": int(self.startup_hardware_reset_retry_attempts),
+                "startup_hardware_reset_sleep_sec": float(self.startup_hardware_reset_sleep_sec),
+                "startup_hardware_reset_reconnect_timeout_sec": float(
+                    self.startup_hardware_reset_reconnect_timeout_sec
+                ),
+                "startup_hardware_reset_reconnect_poll_sec": float(
+                    self.startup_hardware_reset_reconnect_poll_sec
+                ),
                 "auto_exposure_priority": self.auto_exposure_priority,
                 "enable_depth": bool(self.enable_depth),
                 "depth_width": int(self.depth_width),
@@ -174,6 +208,12 @@ class RealSenseRGBSource(ObservationSource):
         with self._lock:
             self._last_error = None
             self._last_runtime_error = None
+        with self._pipeline_lock:
+            leftover_pipeline = self._pipeline
+            self._pipeline = None
+            self._profile = None
+            self._depth_align = None
+        self._stop_pipeline_quietly(leftover_pipeline)
         pipeline, profile = self._start_pipeline(rs)
         with self._pipeline_lock:
             self._pipeline = pipeline
@@ -199,6 +239,36 @@ class RealSenseRGBSource(ObservationSource):
         self._thread.start()
 
     def _start_pipeline(self, rs: Any) -> tuple[Any, Any]:
+        self._hardware_reset_device_if_requested(rs, reason="configured_startup_reset")
+        attempts = 1
+        if bool(self.config.startup_hardware_reset_on_failure):
+            attempts += int(self.config.startup_hardware_reset_retry_attempts)
+        last_error: RuntimeError | None = None
+        for attempt_index in range(attempts):
+            try:
+                return self._start_pipeline_once(rs)
+            except RuntimeError as exc:
+                last_error = exc
+                if (
+                    attempt_index + 1 >= attempts
+                    or not self._is_startup_connection_error(str(exc))
+                ):
+                    raise
+                with self._lock:
+                    self._last_runtime_error = (
+                        "startup_connection_error_reset_retry:"
+                        f"attempt={attempt_index + 1}/{attempts}:{exc}"
+                    )
+                self._hardware_reset_device(
+                    rs,
+                    reason="startup_connection_error",
+                    force=True,
+                )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("RealSense pipeline start failed without an exception.")
+
+    def _start_pipeline_once(self, rs: Any) -> tuple[Any, Any]:
         pipeline = rs.pipeline()
         stream_config = rs.config()
         stream_config.enable_device(self.config.serial)
@@ -217,10 +287,153 @@ class RealSenseRGBSource(ObservationSource):
                 rs.format.z16,
                 int(self.config.depth_fps),
             )
-        profile = pipeline.start(stream_config)
-        self._configure_sensor_options(profile)
-        self._configure_depth_state(rs, profile)
+        if bool(self.config.startup_reset):
+            self._stop_pipeline_quietly(pipeline)
+            reset_sleep_sec = float(self.config.startup_reset_sleep_sec)
+            if reset_sleep_sec > 0.0:
+                time.sleep(reset_sleep_sec)
+        try:
+            profile = pipeline.start(stream_config)
+        except RuntimeError as exc:
+            self._stop_pipeline_quietly(pipeline)
+            request = self._requested_stream_profile_text()
+            raise RuntimeError(
+                f"RealSense pipeline start failed for camera_key={self.config.camera_key!r} "
+                f"serial={self.config.serial!r} request={request}: {exc}. "
+                "If this is a D405 wrist camera with depth enabled, color and depth may need "
+                "matching resolutions, for example color=480x270@15 and depth=480x270@15."
+            ) from exc
+        try:
+            self._configure_sensor_options(profile)
+            self._configure_depth_state(rs, profile)
+            self._warmup_pipeline(pipeline)
+        except RuntimeError:
+            self._stop_pipeline_quietly(pipeline)
+            raise
         return pipeline, profile
+
+    def _requested_stream_profile_text(self) -> str:
+        color = (
+            f"color={int(self.config.width)}x{int(self.config.height)}"
+            f"@{int(self.config.fps)} bgr8"
+        )
+        if not bool(self.config.enable_depth):
+            return color
+        depth = (
+            f"depth={int(self.config.depth_width)}x{int(self.config.depth_height)}"
+            f"@{int(self.config.depth_fps)} z16"
+        )
+        return f"{color}, {depth}, align_depth_to_color={bool(self.config.align_depth_to_color)}"
+
+    @staticmethod
+    def _stop_pipeline_quietly(pipeline: Any | None) -> None:
+        if pipeline is None:
+            return
+        try:
+            pipeline.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _warmup_pipeline(self, pipeline: Any) -> None:
+        warmup_frames = int(self.config.startup_warmup_frames)
+        if warmup_frames <= 0:
+            return
+        timeout_ms = int(self.config.wait_timeout_ms)
+        success_count = 0
+        failure_count = 0
+        last_error: str | None = None
+        for _ in range(warmup_frames):
+            try:
+                pipeline.wait_for_frames(timeout_ms=timeout_ms)
+                success_count += 1
+            except Exception as exc:  # noqa: BLE001
+                failure_count += 1
+                last_error = f"{type(exc).__name__}: {exc}"
+        if success_count <= 0 and failure_count > 0:
+            raise RuntimeError(
+                "startup_warmup_failed:"
+                f"no_frames_after={warmup_frames}:timeout_ms={timeout_ms}:last_error={last_error}"
+            )
+
+    def _hardware_reset_device_if_requested(self, rs: Any, *, reason: str) -> None:
+        if not bool(self.config.startup_hardware_reset):
+            return
+        self._hardware_reset_device(rs, reason=reason, force=True)
+
+    def _hardware_reset_device(self, rs: Any, *, reason: str, force: bool = False) -> bool:
+        if not force and not bool(self.config.startup_hardware_reset):
+            return False
+        try:
+            target_device = self._find_device_by_serial(rs)
+            if target_device is None:
+                with self._lock:
+                    self._last_runtime_error = (
+                        f"{reason}_hardware_reset_device_not_found:{self.config.serial}"
+                    )
+                return False
+            target_device.hardware_reset()
+            reset_sleep_sec = float(self.config.startup_hardware_reset_sleep_sec)
+            if reset_sleep_sec > 0.0:
+                time.sleep(reset_sleep_sec)
+            reconnected = self._wait_for_device_reconnect(rs)
+            if not reconnected:
+                with self._lock:
+                    self._last_runtime_error = (
+                        f"{reason}_hardware_reset_reconnect_timeout:{self.config.serial}"
+                    )
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._last_runtime_error = (
+                    f"{reason}_hardware_reset_failed:{type(exc).__name__}:{exc}"
+                )
+            return False
+
+    def _find_device_by_serial(self, rs: Any) -> Any | None:
+        context = rs.context()
+        for device in context.query_devices():
+            try:
+                serial = str(device.get_info(rs.camera_info.serial_number))
+            except Exception:  # noqa: BLE001
+                continue
+            if serial == str(self.config.serial):
+                return device
+        return None
+
+    def _wait_for_device_reconnect(self, rs: Any) -> bool:
+        timeout_sec = float(self.config.startup_hardware_reset_reconnect_timeout_sec)
+        deadline = time.time() + timeout_sec
+        while True:
+            if self._find_device_by_serial(rs) is not None:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(float(self.config.startup_hardware_reset_reconnect_poll_sec))
+
+    @staticmethod
+    def _is_startup_connection_error(message: str) -> bool:
+        lowered = str(message).lower()
+        if "couldn't resolve requests" in lowered or "could not resolve requests" in lowered:
+            return False
+        return any(
+            token in lowered
+            for token in (
+                "startup_warmup_failed",
+                "frame didn't arrive",
+                "frame did not arrive",
+                "device or resource busy",
+                "no device connected",
+                "failed to set power state",
+                "failed to open",
+                "device disconnected",
+                "uvc",
+                "usb",
+                "backend",
+                "ioctl",
+                "resource busy",
+            )
+        )
 
     def _configure_depth_state(self, rs: Any, profile: Any) -> None:
         if not bool(self.config.enable_depth):
@@ -236,10 +449,10 @@ class RealSenseRGBSource(ObservationSource):
             self._last_error = f"depth_scale_failed:{type(exc).__name__}:{exc}"
 
     def _configure_sensor_options(self, profile: Any) -> None:
-        rs = _load_pyrealsense2()
         option_value = self.config.auto_exposure_priority
         if option_value is None:
             return
+        rs = _load_pyrealsense2()
         try:
             device = profile.get_device()
             for sensor in device.query_sensors():
@@ -267,6 +480,19 @@ class RealSenseRGBSource(ObservationSource):
             "restart_on_stale_timeout": bool(self.config.restart_on_stale_timeout),
             "restart_after_timeouts": int(self.config.restart_after_timeouts),
             "restart_cooldown_sec": float(self.config.restart_cooldown_sec),
+            "startup_reset": bool(self.config.startup_reset),
+            "startup_reset_sleep_sec": float(self.config.startup_reset_sleep_sec),
+            "startup_warmup_frames": int(self.config.startup_warmup_frames),
+            "startup_hardware_reset": bool(self.config.startup_hardware_reset),
+            "startup_hardware_reset_on_failure": bool(self.config.startup_hardware_reset_on_failure),
+            "startup_hardware_reset_retry_attempts": int(self.config.startup_hardware_reset_retry_attempts),
+            "startup_hardware_reset_sleep_sec": float(self.config.startup_hardware_reset_sleep_sec),
+            "startup_hardware_reset_reconnect_timeout_sec": float(
+                self.config.startup_hardware_reset_reconnect_timeout_sec
+            ),
+            "startup_hardware_reset_reconnect_poll_sec": float(
+                self.config.startup_hardware_reset_reconnect_poll_sec
+            ),
             "depth_enabled": bool(self.config.enable_depth),
             "depth_width": int(self.config.depth_width),
             "depth_height": int(self.config.depth_height),

@@ -156,7 +156,7 @@ PYTHONPATH=. uv run python -m deployments.openpi.client.real \
   --hand-backend dmtac-gripper \
   --dmtac-config latest \
   --camera-mode single \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense_front.json \
   --require-camera-frame \
   --require-ready-observation \
   --action-queue-policy replace \
@@ -176,6 +176,8 @@ For multi-camera deployment, change only the camera mode/config:
 The OpenPI client expects a `front` image by default. If the local camera config
 uses a different key, either rename it to `front` in the camera config or use
 the direct policy-spec form with an explicit `image_key_map`.
+`--camera-mode single` expects the camera config JSON to contain exactly one
+entry, so use `realsense_front.json` for front-only runs.
 
 ## 5. Client Real Execution
 
@@ -252,7 +254,7 @@ PYTHONPATH=. uv run python -m deployments.openpi.client.real \
   --enable-hands \
   --hand-backend inspire \
   --camera-mode single \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense_front.json \
   --require-camera-frame \
   --require-ready-observation \
   --init-source current \
@@ -292,7 +294,193 @@ use `--auto-start --no-wait-for-ready-confirm`. For real execution without a
 dataset-frame qpos init, add `--start-init_qpos` only after manually confirming
 the current qpos is a safe policy start state.
 
-## 6. Direct Policy-Spec Form
+## 6. Front-Only DMTAC Checkpoint
+
+The front-camera-only DMTAC gripper model is registered as
+`dual_rm65_dmgripper_front`. Its default checkpoint is:
+
+```text
+/home/zc/HandMotion/openpi/checkpoints/dual_rm65_dmgripper_front/dual_rm65_dmgripper_front_lora_b2_lr5e-5_100k_20260708/120000
+```
+
+The checkpoint directory currently contains `40000`, `80000`, `120000`, and
+`160000`. To use a different step, change both `CKPT_DIR` on the server and
+`--checkpoint-step` on the client.
+
+On the OpenPI server machine:
+
+```bash
+cd /home/zc/HandMotion/Developing/DexTeleop/deployments/openpi/src
+
+export OPENPI_PORT=8078
+export OPENPI_MODEL=dual_rm65_dmgripper_front
+export CKPT_STEP=120000
+export CKPT_DIR=/home/zc/HandMotion/openpi/checkpoints/dual_rm65_dmgripper_front/dual_rm65_dmgripper_front_lora_b2_lr5e-5_100k_20260708/$CKPT_STEP
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.70 uv run scripts/serve_dexteleop_policy.py \
+  --model "$OPENPI_MODEL" \
+  --checkpoint-dir "$CKPT_DIR" \
+  --host 0.0.0.0 \
+  --port "$OPENPI_PORT"
+```
+
+Verify the server metadata:
+
+```bash
+curl http://127.0.0.1:8078/metadata
+```
+
+Confirm `model_id=dual_rm65_dmgripper_front`,
+`deployment.config_name=dual_rm65_dmgripper_front`,
+`deployment.checkpoint_step=120000`, and
+`dataset_adapter.camera_slots=["base_0_rgb"]`.
+
+On the DexTeleop client machine:
+
+```bash
+cd /home/zc/HandMotion/Developing/DexTeleop
+
+export SERVER_IP=<server_lan_ip>
+export OPENPI_PORT=8078
+export OPENPI_MODEL=dual_rm65_dmgripper_front
+export CKPT_STEP=120000
+
+echo "SERVER_IP=$SERVER_IP OPENPI_PORT=$OPENPI_PORT OPENPI_MODEL=$OPENPI_MODEL CKPT_STEP=$CKPT_STEP"
+```
+
+Check connectivity and contract validation:
+
+```bash
+curl "http://$SERVER_IP:$OPENPI_PORT/healthz"
+curl "http://$SERVER_IP:$OPENPI_PORT/metadata"
+
+PYTHONPATH=. uv run python -c 'import os; from deployments.openpi.client.policy import create_policy; p=create_policy(host=os.environ["SERVER_IP"], port=int(os.environ["OPENPI_PORT"]), expected_model_id=os.environ["OPENPI_MODEL"], expected_checkpoint_step=os.environ["CKPT_STEP"], required_camera_slots=("base_0_rgb",), required_image_keys=("front",)); print(p.name); print(p.metadata["validation"])'
+```
+
+Front-only dry-run:
+
+```bash
+PYTHONPATH=. uv run python -m deployments.openpi.client.real \
+  --host "$SERVER_IP" \
+  --port "$OPENPI_PORT" \
+  --model "$OPENPI_MODEL" \
+  --checkpoint-step "$CKPT_STEP" \
+  --active-sides both \
+  --enable-hands \
+  --hand-backend dmtac-gripper \
+  --dmtac-config latest \
+  --camera-mode single \
+  --camera-key front \
+  --camera-config cameras/configs/rm65/devices/realsense_front.json \
+  --required-camera-slot base_0_rgb \
+  --required-image-key front \
+  --require-camera-frame \
+  --require-ready-observation \
+  --debug \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --init-source none \
+  --auto-start \
+  --max-steps 100
+```
+
+Front-only real execution:
+
+```bash
+export LEFT_ARM_IP=192.168.101.21
+export RIGHT_ARM_IP=192.168.1.20
+
+PYTHONPATH=. uv run python -m deployments.openpi.client.real \
+  --host "$SERVER_IP" \
+  --port "$OPENPI_PORT" \
+  --model "$OPENPI_MODEL" \
+  --checkpoint-step "$CKPT_STEP" \
+  --active-sides both \
+  --enable-hands \
+  --hand-backend dmtac-gripper \
+  --dmtac-config latest \
+  --camera-mode single \
+  --camera-key front \
+  --camera-config cameras/configs/rm65/devices/realsense_front.json \
+  --required-camera-slot base_0_rgb \
+  --required-image-key front \
+  --require-camera-frame \
+  --require-ready-observation \
+  --debug \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --init-source current \
+  --wait-for-ready-confirm \
+  --policy-qpos-init-dataset /home/zc/HandMotion/Developing/DexTeleop/datasets/2026-07-06_vive_rm65_real_teleop \
+  --policy-qpos-init-episode 20 \
+  --policy-qpos-init-frame 1 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-arm-max-angvel 0.25,0.25,0.25,0.35,0.35,0.35 \
+  --arm-workspace-min -0.80 -0.80 0.00 \
+  --arm-workspace-max 0.80 0.80 0.90 \
+  --left-arm-ip "$LEFT_ARM_IP" \
+  --right-arm-ip "$RIGHT_ARM_IP" \
+  --send-actions
+```
+
+Start sequence is unchanged: press `g` for dataset-frame qpos init, wait for
+`policy_qpos_init=released` and `ready=wait:A`, then press `A` to release policy
+inference/action execution.
+
+With `--debug`, the client writes JSONL logs to:
+
+```text
+/home/zc/HandMotion/Developing/DexTeleop/teleop_records/deployment_debug/
+```
+
+Each run records `startup`, `policy_chunk`, and `action_step` events. For action
+amplitude checks, compare `raw_action`, `filtered_action`, `command`,
+`raw_to_filtered_pose_delta`, `filtered_to_command_pose_delta`, backend
+`effective_max_joint_step_rad`, command
+`commands.*_arm.metadata.max_joint_step_rad`, and
+`post_arm_state_by_side.*.last_target_qpos`.
+Use `--debug-dir /abs/path` to override the output directory.
+
+Deploy arm execution defaults are aligned with
+`run_vive_rm65_real_teleop`: `--arm-max-angvel` defaults to
+`0.7,0.7,0.9,1.5,1.5,2.0`, arm step-dt scaling is enabled, and joint-vector
+action safety defaults to `6deg` per step. The policy action IK target uses the
+effective action interval, while the RM65 background stream still sends at
+`--arm-control-hz`.
+
+## 7. Action Chunk Execution Control
+
+OpenPI returns an action chunk shaped `[horizon, action_dim]`. The real runtime
+normalizes that chunk into a FIFO queue of single-step actions, then each deploy
+loop pops at most one action and sends it through the canonical
+`RobotAction -> TeleopCommand -> backend` path.
+
+Use these flags to control the timing:
+
+- `--action-hz`: action execution/control frequency. One queued action is popped
+  and dispatched per deploy loop. This is the most direct way to control how fast
+  a returned chunk is consumed.
+- `--policy-hz`: policy inference frequency. If omitted, it follows
+  `--action-hz`.
+- `--min-action-queue`: low-water mark for requesting the next policy chunk.
+  Default `0` means infer again only when the queue is empty.
+- `--action-queue-policy replace|append|auto`: how a newly predicted chunk is
+  inserted. For normal OpenPI deployment, `auto` resolves to `replace`; debug
+  replay uses `append`.
+
+For strict chunk-by-chunk execution, keep:
+
+```bash
+--action-queue-policy replace \
+--min-action-queue 0
+```
+
+With this setting, the runtime normally consumes the whole current chunk before
+requesting another one. Set `--action-hz` to the dataset/control rate you want
+to reproduce. Use `--min-action-queue > 0` only when intentionally prefetching
+the next chunk before the current queue is empty.
+
+## 8. Direct Policy-Spec Form
 
 The OpenPI launcher is a convenience wrapper. It expands to the normal
 `teleop_runtime` policy loader:
@@ -306,7 +494,7 @@ PYTHONPATH=. uv run python -m teleop_runtime.deploy \
   --hand-backend dmtac-gripper \
   --dmtac-config latest \
   --camera-mode single \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config cameras/configs/rm65/devices/realsense_front.json \
   --require-camera-frame \
   --require-ready-observation
 ```
@@ -314,7 +502,7 @@ PYTHONPATH=. uv run python -m teleop_runtime.deploy \
 Prefer `python -m deployments.openpi.client.real` for normal use because it
 keeps OpenPI-specific arguments separate from real-runtime arguments.
 
-## 7. Troubleshooting
+## 9. Troubleshooting
 
 If `curl http://$SERVER_IP:$OPENPI_PORT/healthz` fails:
 

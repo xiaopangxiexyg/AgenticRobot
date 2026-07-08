@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 import sys
 
@@ -79,6 +80,12 @@ def _scan():
 
 
 class DMTacUsbAssignmentTest(unittest.TestCase):
+    def test_default_config_dir_lives_under_teleop_runtime_configs(self) -> None:
+        self.assertEqual(
+            usb_assignment.default_config_dir(),
+            ROOT / "teleop_runtime" / "configs" / "hardware" / "dmtac",
+        )
+
     def test_probe_gripper_retries_detected_slave_id(self) -> None:
         class FakeState:
             def to_dict(self):
@@ -284,6 +291,79 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertFalse(scan["grippers"][0]["probe_attempted"])
         self.assertTrue(scan["grippers"][1]["probe_attempted"])
 
+    def test_probe_all_serial_skips_q6_usb_single_serial(self) -> None:
+        calls: list[str] = []
+
+        def fake_ports():
+            return [
+                {
+                    "device": "/dev/ttyACM0",
+                    "description": "USB Single Serial",
+                    "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621",
+                    "manufacturer": None,
+                    "product": "USB Single Serial",
+                    "serial_number": "5B7A137621",
+                },
+                {
+                    "device": "/dev/ttyUSB0",
+                    "description": "USB Serial",
+                    "hwid": "USB VID:PID=1A86:7523 LOCATION=5-2.4.4",
+                    "manufacturer": None,
+                    "product": "USB Serial",
+                    "serial_number": None,
+                },
+            ]
+
+        def fake_probe(port: str, **kwargs):
+            calls.append(port)
+            return {"reachable": True, "error": None}
+
+        with (
+            patch.object(usb_assignment, "list_serial_devices", fake_ports),
+            patch.object(usb_assignment, "_probe_gripper", fake_probe),
+            patch.object(usb_assignment, "discover_devices", lambda: []),
+            patch.object(usb_assignment, "discover_device_candidates", lambda: []),
+        ):
+            scan = scan_usb_devices(probe_all_serial=True)
+
+        self.assertEqual(calls, ["/dev/ttyUSB0"])
+        self.assertTrue(scan["grippers"][0]["known_q6_serial"])
+        self.assertFalse(scan["grippers"][0]["probe_attempted"])
+        self.assertTrue(scan["grippers"][1]["probe_attempted"])
+
+    def test_scan_progress_callback_reports_probe_start_and_done(self) -> None:
+        events: list[dict[str, object]] = []
+
+        def fake_ports():
+            return [
+                {
+                    "device": "/dev/ttyUSB0",
+                    "description": "USB Serial",
+                    "hwid": "USB VID:PID=1A86:7523",
+                    "manufacturer": None,
+                    "product": "USB Serial",
+                },
+            ]
+
+        def fake_probe(port: str, **kwargs):
+            return {"reachable": False, "error": "timeout", "probe_elapsed_s": 0.03, "attempted_setting_count": 1}
+
+        with (
+            patch.object(usb_assignment, "list_serial_devices", fake_ports),
+            patch.object(usb_assignment, "_probe_gripper", fake_probe),
+            patch.object(usb_assignment, "discover_devices", lambda: []),
+            patch.object(usb_assignment, "discover_device_candidates", lambda: []),
+        ):
+            scan_usb_devices(progress_callback=lambda payload: events.append(dict(payload)))
+
+        self.assertEqual([event["event"] for event in events], [
+            "serial_scan_ready",
+            "gripper_probe_start",
+            "gripper_probe_done",
+        ])
+        self.assertEqual(events[0]["probe_count"], 1)
+        self.assertEqual(events[1]["port"], "/dev/ttyUSB0")
+
     def test_gripper_assignment_uses_detected_modbus_id(self) -> None:
         scan = _scan()
         scan["grippers"][0]["probe"] = {
@@ -318,6 +398,33 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertTrue(path.name.endswith("_dmtac_usb_assignment.json"))
         self.assertEqual(loaded["hostname"], assignment["hostname"])
         self.assertEqual(tactile_ids_for_side(loaded, "right"), ("R_IN", "R_OUT"))
+
+    def test_latest_falls_back_to_legacy_config_dir_but_saves_new_default(self) -> None:
+        assignment = build_assignment_from_tokens(
+            _scan(),
+            left_gripper="0",
+            left_inner="0",
+            left_outer="1",
+            right_gripper="1",
+            right_inner="2",
+            right_outer="3",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new_dir = root / "teleop_runtime" / "configs" / "hardware" / "dmtac"
+            legacy_dir = root / "teleop_records" / "dmtac_hardware_configs"
+            save_assignment(assignment, config_dir=legacy_dir)
+
+            with (
+                patch.object(usb_assignment, "default_config_dir", return_value=new_dir),
+                patch.object(usb_assignment, "legacy_config_dirs", return_value=(legacy_dir,)),
+            ):
+                loaded = load_assignment("latest")
+                saved = save_assignment(assignment)
+
+        self.assertEqual(tactile_ids_for_side(loaded, "left"), ("L_IN", "L_OUT"))
+        self.assertEqual(saved.parent, new_dir)
 
     def test_auto_gripper_assignment_tokens_match_q6_style_defaults(self) -> None:
         tokens = build_gripper_auto_assignment_tokens(_scan())

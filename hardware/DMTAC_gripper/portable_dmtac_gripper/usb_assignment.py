@@ -41,11 +41,26 @@ def default_config_dir() -> Path:
         root_text = str(root)
         if root_text not in sys.path:
             sys.path.insert(0, root_text)
+        from project_paths import hardware_interface_configs_root
+
+        return hardware_interface_configs_root() / "dmtac"
+    except Exception:
+        return repo_root() / "teleop_runtime" / "configs" / "hardware" / "dmtac"
+
+
+def legacy_config_dirs() -> tuple[Path, ...]:
+    try:
+        import sys
+
+        root = repo_root()
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
         from project_paths import teleop_records_root
 
-        return teleop_records_root() / "dmtac_hardware_configs"
+        return (teleop_records_root() / "dmtac_hardware_configs",)
     except Exception:
-        return repo_root() / "teleop_records" / "dmtac_hardware_configs"
+        return (repo_root() / "teleop_records" / "dmtac_hardware_configs",)
 
 
 def hostname() -> str:
@@ -204,15 +219,31 @@ def preferred_port(port: str | None, port_info: Mapping[str, Any] | None = None)
     return _preferred_port_from_aliases(aliases, fallback=str(port or ""), port_info=port_info)
 
 
-def latest_config_path(config_dir: str | Path | None = None) -> Path:
-    root = Path(config_dir).expanduser().resolve() if config_dir is not None else default_config_dir()
+def _latest_config_path_in_dir(root: Path) -> Path | None:
     explicit = root / LATEST_CONFIG_NAME
     if explicit.exists():
         return explicit
     candidates = sorted(root.glob("*_dmtac_usb_assignment.json"))
-    if not candidates:
+    if candidates:
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    return None
+
+
+def latest_config_path(config_dir: str | Path | None = None) -> Path:
+    if config_dir is not None:
+        root = Path(config_dir).expanduser().resolve()
+        path = _latest_config_path_in_dir(root)
+        if path is not None:
+            return path
         raise FileNotFoundError(f"No DMTac USB assignment config found in {root}.")
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    searched = [default_config_dir(), *legacy_config_dirs()]
+    for root in searched:
+        path = _latest_config_path_in_dir(root)
+        if path is not None:
+            return path
+    roots = ", ".join(str(root) for root in searched)
+    raise FileNotFoundError(f"No DMTac USB assignment config found in {roots}.")
 
 
 def load_assignment(path: str | Path = "latest", *, config_dir: str | Path | None = None) -> dict[str, Any]:
@@ -265,7 +296,18 @@ def merge_assignment(
     return normalize_assignment(merged)
 
 
+def _looks_like_q6_serial_adapter(port: Mapping[str, Any]) -> bool:
+    hwid = str(port.get("hwid") or "").upper()
+    description = str(port.get("description") or "").strip().lower()
+    product = str(port.get("product") or "").strip().lower()
+    if "VID:PID=1A86:55D3" in hwid:
+        return True
+    return description == "usb single serial" or product == "usb single serial"
+
+
 def _looks_like_gripper_serial(port: Mapping[str, Any]) -> bool:
+    if _looks_like_q6_serial_adapter(port):
+        return False
     text = " ".join(
         str(port.get(key) or "")
         for key in ("device", "description", "hwid", "manufacturer", "product")
@@ -284,7 +326,6 @@ def _looks_like_gripper_serial(port: Mapping[str, Any]) -> bool:
         "usb serial",
         "usb-serial",
         "serial converter",
-        "usb single serial",
         "qinhen",
     )
     return any(keyword in text for keyword in keywords)
@@ -418,6 +459,7 @@ def _probe_gripper(
     timeout: float,
     scan_ids: bool = True,
     scan_baudrates: Sequence[int] | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     started_at = time.time()
     requested_id = int(gripper_id)
@@ -428,6 +470,7 @@ def _probe_gripper(
         scan_ids=bool(scan_ids),
         scan_baudrates=scan_baudrates,
     )
+    total_pairs = len(candidate_pairs)
     attempted_ids: list[int] = []
     attempted_baudrates: list[int] = []
     attempted_pairs: list[dict[str, int]] = []
@@ -440,6 +483,21 @@ def _probe_gripper(
         attempted_ids.append(current_id)
         attempted_baudrates.append(current_baudrate)
         attempted_pairs.append({"baudrate": int(current_baudrate), "gripper_id": int(current_id)})
+        attempt_no = len(attempted_pairs)
+        if attempt_no == 1 or attempt_no % 16 == 0 or not candidate_pairs:
+            _emit_scan_progress(
+                progress_callback,
+                {
+                    "event": "gripper_setting_probe",
+                    "port": str(port),
+                    "attempt": int(attempt_no),
+                    "total": int(max(total_pairs, attempt_no)),
+                    "baudrate": int(current_baudrate),
+                    "gripper_id": int(current_id),
+                    "scan_ids": bool(scan_ids),
+                    "scan_baudrates": list(scan_baudrates or ()),
+                },
+            )
         try:
             gripper_kwargs = {
                 "port": port,
@@ -538,6 +596,18 @@ def _probe_gripper(
     }
 
 
+def _emit_scan_progress(
+    callback: Callable[[Mapping[str, Any]], None] | None,
+    payload: Mapping[str, Any],
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(dict(payload))
+    except Exception:
+        return
+
+
 def scan_usb_devices(
     *,
     probe_grippers: bool = True,
@@ -548,6 +618,7 @@ def scan_usb_devices(
     timeout: float = 0.03,
     scan_gripper_ids: bool = True,
     scan_baudrates: Sequence[int] | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     serial_ports = []
     for index, item in enumerate(list_serial_devices()):
@@ -560,16 +631,50 @@ def scan_usb_devices(
             fallback=port["port"],
             port_info=port,
         )
+        port["known_q6_serial"] = _looks_like_q6_serial_adapter(port)
         port["probable_gripper_serial"] = _looks_like_gripper_serial(port)
         system_tty = _is_system_tty_port(port["port"])
         port["system_tty"] = bool(system_tty)
         should_probe = bool(
             probe_grippers
             and not (system_tty and not bool(probe_system_ttys))
+            and not port["known_q6_serial"]
             and (probe_all_serial or port["probable_gripper_serial"])
         )
         port["probe_attempted"] = should_probe
+        port["probe"] = None
+        serial_ports.append(port)
+
+    probe_ports = [port for port in serial_ports if bool(port.get("probe_attempted")) and port.get("port")]
+    _emit_scan_progress(
+        progress_callback,
+        {
+            "event": "serial_scan_ready",
+            "serial_count": int(len(serial_ports)),
+            "probe_count": int(len(probe_ports)),
+            "probe_all_serial": bool(probe_all_serial),
+        },
+    )
+    probe_index = 0
+    for port in serial_ports:
+        should_probe = bool(port.get("probe_attempted") and port.get("port"))
         if should_probe and port["port"]:
+            probe_index += 1
+            _emit_scan_progress(
+                progress_callback,
+                {
+                    "event": "gripper_probe_start",
+                    "index": int(probe_index),
+                    "total": int(len(probe_ports)),
+                    "port": str(port.get("port") or ""),
+                    "preferred_port": str(port.get("preferred_port") or ""),
+                    "description": str(port.get("description") or ""),
+                    "product": str(port.get("product") or ""),
+                    "hwid": str(port.get("hwid") or ""),
+                    "scan_gripper_ids": bool(scan_gripper_ids),
+                    "probe_all_serial": bool(probe_all_serial),
+                },
+            )
             port["probe"] = _probe_gripper(
                 port["port"],
                 gripper_id=int(gripper_id),
@@ -577,10 +682,31 @@ def scan_usb_devices(
                 timeout=float(timeout),
                 scan_ids=bool(scan_gripper_ids),
                 scan_baudrates=scan_baudrates,
+                progress_callback=lambda payload, port=port, probe_index=probe_index: _emit_scan_progress(
+                    progress_callback,
+                    {
+                        **dict(payload),
+                        "index": int(probe_index),
+                        "total_ports": int(len(probe_ports)),
+                        "preferred_port": str(port.get("preferred_port") or ""),
+                    },
+                ),
             )
-        else:
-            port["probe"] = None
-        serial_ports.append(port)
+            probe = port.get("probe") if isinstance(port.get("probe"), Mapping) else {}
+            _emit_scan_progress(
+                progress_callback,
+                {
+                    "event": "gripper_probe_done",
+                    "index": int(probe_index),
+                    "total": int(len(probe_ports)),
+                    "port": str(port.get("port") or ""),
+                    "preferred_port": str(port.get("preferred_port") or ""),
+                    "reachable": bool(probe.get("reachable")),
+                    "error": probe.get("error"),
+                    "probe_elapsed_s": probe.get("probe_elapsed_s"),
+                    "attempted_setting_count": probe.get("attempted_setting_count"),
+                },
+            )
 
     tactile_devices = []
     for index, item in enumerate(discover_devices()):

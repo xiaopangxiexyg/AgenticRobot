@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+from project_paths import repo_path
 from rm65_inspire_tac.paths import require_asset_path
 from robot_motion.runtime_gate import IKActionChunkGate
 
@@ -71,7 +72,14 @@ from .policy_qpos_init import (
     load_deploy_policy_qpos_init_plan,
 )
 from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
-from .schema import ACTION_DIM, ALL_SIDES
+from .schema import (
+    ACTION_ARM_POSE_SLICES,
+    ACTION_DIM,
+    ACTION_HAND_SLICES,
+    ALL_SIDES,
+    pose_matrix_to_xyzquat,
+    to_serializable,
+)
 from .startup_init import StartupInitializer, resolve_startup_init_action
 from ..replay.trajectory import QPOS_INIT_SOURCES
 
@@ -92,6 +100,11 @@ GRIPPER_POLICY_DEFAULTS = {
     "continuous_grasp": True,
     "telemetry_hz": 10.0,
 }
+DEPLOY_RM65_ARM_MAX_ANGVEL = (0.7, 0.7, 0.9, 1.5, 1.5, 2.0)
+DEPLOY_ARM_STEP_DT_ALPHA = 0.25
+DEPLOY_ARM_STEP_DT_MAX_SCALE = 3.0
+DEPLOY_ARM_STEP_DT_STALL_RESET_SEC = 0.25
+DEPLOY_MAX_ARM_JOINT_STEP_RAD = float(np.deg2rad(6.0))
 
 
 class NonBlockingKeyboard:
@@ -131,6 +144,554 @@ class LoopRate:
             self.hz = instant if self.hz <= 0.0 else 0.2 * instant + 0.8 * self.hz
         self._last = float(now)
         return float(self.hz)
+
+
+_DEBUG_REDACT_KEYS = {
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "password",
+    "secret",
+}
+
+
+def _debug_redact(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.lower() in _DEBUG_REDACT_KEYS:
+                redacted[key_text] = "<redacted>"
+            else:
+                redacted[key_text] = _debug_redact(item)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_debug_redact(item) for item in value]
+    return value
+
+
+def _debug_args_payload(args: argparse.Namespace) -> dict[str, Any]:
+    payload = dict(vars(args))
+    policy_kwargs_text = payload.get("policy_kwargs_json")
+    if isinstance(policy_kwargs_text, str):
+        try:
+            policy_kwargs = json.loads(policy_kwargs_text or "{}")
+        except json.JSONDecodeError:
+            policy_kwargs = policy_kwargs_text
+        payload["policy_kwargs_json"] = _debug_redact(policy_kwargs)
+    return _debug_redact(payload)
+
+
+def _debug_vector(
+    value: Any,
+    *,
+    length: int | None = None,
+    require_finite: bool = True,
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        vector = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    if length is not None and vector.shape != (int(length),):
+        return None
+    if require_finite and not np.all(np.isfinite(vector)):
+        return None
+    return vector.astype(np.float32, copy=True)
+
+
+def _debug_xyzquat(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value, dtype=float)
+    except Exception:
+        return None
+    if array.shape == (4, 4):
+        pose = pose_matrix_to_xyzquat(array)
+        return None if pose is None else pose.astype(np.float32, copy=True)
+    vector = _debug_vector(array, length=7)
+    if vector is None:
+        return None
+    quat = np.asarray(vector[3:7], dtype=float)
+    norm = float(np.linalg.norm(quat))
+    if norm <= 1e-12:
+        return None
+    vector = vector.astype(np.float32, copy=True)
+    vector[3:7] = (quat / norm).astype(np.float32)
+    return vector
+
+
+def _debug_action_vector(action: Any) -> np.ndarray | None:
+    vector = getattr(action, "vector", action)
+    return _debug_vector(vector, length=ACTION_DIM, require_finite=False)
+
+
+def _debug_pose_by_side_from_vector(
+    vector: np.ndarray | None,
+    active_sides: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    if vector is None:
+        return {}
+    poses: dict[str, np.ndarray] = {}
+    for side in active_sides:
+        target_slice = ACTION_ARM_POSE_SLICES[side]
+        pose = _debug_xyzquat(vector[target_slice])
+        if pose is not None:
+            poses[side] = pose
+    return poses
+
+
+def _debug_hand_by_side_from_vector(
+    vector: np.ndarray | None,
+    active_sides: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    if vector is None:
+        return {}
+    hands: dict[str, np.ndarray] = {}
+    for side in active_sides:
+        target_slice = ACTION_HAND_SLICES[side]
+        target = _debug_vector(vector[target_slice])
+        if target is not None:
+            hands[side] = target
+    return hands
+
+
+def _debug_arm_joint_targets(action: Any, active_sides: tuple[str, ...]) -> dict[str, np.ndarray]:
+    targets = getattr(action, "arm_joint_targets", {}) or {}
+    if not isinstance(targets, Mapping):
+        return {}
+    resolved: dict[str, np.ndarray] = {}
+    for side in active_sides:
+        target = _debug_vector(targets.get(side), length=6)
+        if target is not None:
+            resolved[side] = target
+    return resolved
+
+
+def _debug_action_summary(action: Any, active_sides: tuple[str, ...]) -> dict[str, Any] | None:
+    vector = _debug_action_vector(action)
+    if vector is None:
+        return None
+    metadata = getattr(action, "metadata", {})
+    return {
+        "source": str(metadata.get("source", "")) if isinstance(metadata, Mapping) else "",
+        "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+        "vector": vector,
+        "arm_pose_by_side": _debug_pose_by_side_from_vector(vector, active_sides),
+        "arm_joint_targets_by_side": _debug_arm_joint_targets(action, active_sides),
+        "hand_by_side": _debug_hand_by_side_from_vector(vector, active_sides),
+    }
+
+
+def _debug_quat_delta_deg(reference: np.ndarray, candidate: np.ndarray) -> float | None:
+    ref_quat = np.asarray(reference[3:7], dtype=float)
+    candidate_quat = np.asarray(candidate[3:7], dtype=float)
+    ref_norm = float(np.linalg.norm(ref_quat))
+    candidate_norm = float(np.linalg.norm(candidate_quat))
+    if ref_norm <= 1e-12 or candidate_norm <= 1e-12:
+        return None
+    ref_quat = ref_quat / ref_norm
+    candidate_quat = candidate_quat / candidate_norm
+    dot = float(np.clip(abs(np.dot(ref_quat, candidate_quat)), -1.0, 1.0))
+    return float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def _debug_pose_delta(reference: Any, candidate: Any) -> dict[str, Any] | None:
+    ref_pose = _debug_xyzquat(reference)
+    candidate_pose = _debug_xyzquat(candidate)
+    if ref_pose is None or candidate_pose is None:
+        return None
+    xyz_delta = np.asarray(candidate_pose[:3] - ref_pose[:3], dtype=np.float32)
+    return {
+        "xyz_delta_m": xyz_delta,
+        "xyz_norm_m": float(np.linalg.norm(xyz_delta)),
+        "rot_delta_deg": _debug_quat_delta_deg(ref_pose, candidate_pose),
+    }
+
+
+def _debug_pose_delta_by_side(
+    reference_by_side: Mapping[str, Any],
+    candidate_by_side: Mapping[str, Any],
+) -> dict[str, Any]:
+    deltas: dict[str, Any] = {}
+    for side in ALL_SIDES:
+        if side not in reference_by_side or side not in candidate_by_side:
+            continue
+        delta = _debug_pose_delta(reference_by_side[side], candidate_by_side[side])
+        if delta is not None:
+            deltas[side] = delta
+    return deltas
+
+
+def _debug_command_arm_pose_by_side(command: Any, active_sides: tuple[str, ...]) -> dict[str, np.ndarray]:
+    if command is None:
+        return {}
+    commands = getattr(command, "commands", {}) or {}
+    poses: dict[str, np.ndarray] = {}
+    for side in active_sides:
+        effector_command = commands.get(f"{side}_arm")
+        if effector_command is None or getattr(effector_command, "command_type", "") != "cartesian_pose":
+            continue
+        metadata = getattr(effector_command, "metadata", {}) or {}
+        pose = None
+        if isinstance(metadata, Mapping):
+            pose = _debug_xyzquat(metadata.get("target_xyzquat"))
+            if pose is None:
+                pose = _debug_xyzquat(metadata.get("target_pose_base"))
+        if pose is None:
+            pose = _debug_xyzquat(getattr(effector_command, "value", None))
+        if pose is not None:
+            poses[side] = pose
+    return poses
+
+
+def _debug_command_summary(command: Any, active_sides: tuple[str, ...]) -> dict[str, Any] | None:
+    if command is None:
+        return None
+    commands = getattr(command, "commands", {}) or {}
+    command_payload: dict[str, Any] = {}
+    for effector_name, effector_command in commands.items():
+        metadata = getattr(effector_command, "metadata", {}) or {}
+        item: dict[str, Any] = {
+            "command_type": getattr(effector_command, "command_type", ""),
+            "side": getattr(effector_command, "side", None),
+            "frame_name": getattr(effector_command, "frame_name", None),
+            "value": getattr(effector_command, "value", None),
+            "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+        }
+        if item["command_type"] == "cartesian_pose":
+            item["target_xyzquat"] = _debug_xyzquat(
+                item["metadata"].get("target_xyzquat")
+                if isinstance(item["metadata"], Mapping)
+                else None
+            )
+            if item["target_xyzquat"] is None:
+                item["target_xyzquat"] = _debug_xyzquat(getattr(effector_command, "value", None))
+        command_payload[str(effector_name)] = item
+    return {
+        "timestamp": getattr(command, "timestamp", None),
+        "metadata": dict(getattr(command, "metadata", {}) or {}),
+        "commands": command_payload,
+        "arm_pose_by_side": _debug_command_arm_pose_by_side(command, active_sides),
+    }
+
+
+def _debug_arm_state_summary(states: Mapping[str, Mapping[str, Any]] | None) -> dict[str, Any]:
+    if not states:
+        return {}
+    keys = (
+        "current_qpos",
+        "current_tcp_pose",
+        "hardware_qpos",
+        "last_target_qpos",
+        "last_command",
+        "last_command_timestamp",
+        "hardware_pose_6d",
+        "hardware_refresh_time",
+        "hardware_result_code",
+        "hardware_result_text",
+        "hardware_arm_err",
+        "hardware_sys_err",
+        "send_result_code",
+        "send_result_text",
+        "emergency_stopped",
+        "effective_control_dt_sec",
+        "effective_step_scale",
+        "ik_metadata",
+        "singularity_metadata",
+        "tcp_pose_source",
+        "state_error",
+        "pose_error",
+        "active_tool_name",
+        "configured_tcp_enabled",
+        "tool_tcp_source",
+        "tool_tcp_endpoint_delta_m",
+        "tool_tcp_endpoint_delta_deg",
+    )
+    payload: dict[str, Any] = {}
+    for side, state in states.items():
+        side_payload = {key: state.get(key) for key in keys if key in state}
+        pose = _debug_xyzquat(side_payload.get("current_tcp_pose"))
+        if pose is not None:
+            side_payload["current_tcp_xyzquat"] = pose
+        payload[str(side)] = side_payload
+    return payload
+
+
+def _debug_state_pose_by_side(states: Mapping[str, Mapping[str, Any]] | None) -> dict[str, np.ndarray]:
+    poses: dict[str, np.ndarray] = {}
+    if not states:
+        return poses
+    for side, state in states.items():
+        pose = _debug_xyzquat(state.get("current_tcp_pose"))
+        if pose is not None:
+            poses[str(side)] = pose
+    return poses
+
+
+def _debug_backend_arm_states(backends: Mapping[str, RM65ArmBackend]) -> dict[str, dict[str, Any]]:
+    states: dict[str, dict[str, Any]] = {}
+    for side, backend in backends.items():
+        try:
+            states[side] = dict(backend.get_state())
+        except Exception as exc:  # noqa: BLE001
+            states[side] = {"state_error": f"{type(exc).__name__}: {exc}"}
+    return states
+
+
+def _debug_backend_limits(
+    backends: Mapping[str, RM65ArmBackend],
+    *,
+    now: float,
+) -> dict[str, Any]:
+    limits: dict[str, Any] = {}
+    for side, backend in backends.items():
+        try:
+            effective_step = backend.get_effective_max_joint_step(now=now)
+        except Exception as exc:  # noqa: BLE001
+            effective_step = None
+            error = f"{type(exc).__name__}: {exc}"
+        else:
+            error = ""
+        config = backend.config
+        limits[side] = {
+            "control_dt_sec": float(config.control_dt),
+            "max_angvel_rad_s": tuple(float(value) for value in config.max_angvel),
+            "effective_max_joint_step_rad": effective_step,
+            "background_streaming_enabled": bool(config.background_streaming_enabled),
+            "background_streaming_hz": float(config.background_streaming_hz),
+            "error": error,
+        }
+    return limits
+
+
+class DeploymentDebugLogger:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        root_dir: Path | None,
+        active_sides: tuple[str, ...],
+    ):
+        self.enabled = bool(enabled)
+        self.active_sides = tuple(active_sides)
+        self.path: Path | None = None
+        self._handle: Any = None
+        self._write_failed = False
+        if not self.enabled:
+            return
+        debug_root = root_dir if root_dir is not None else repo_path("teleop_records", "deployment_debug")
+        debug_root = Path(debug_root).expanduser()
+        if not debug_root.is_absolute():
+            debug_root = repo_path(debug_root)
+        debug_root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        millis = int((time.time() % 1.0) * 1000.0)
+        self.path = debug_root / f"deploy_debug_{stamp}_{millis:03d}.jsonl"
+        self._handle = self.path.open("a", encoding="utf-8")
+        print(f"[DeployDebug] writing action/pose debug JSONL to {self.path}", flush=True)
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        self._handle.flush()
+        self._handle.close()
+        self._handle = None
+
+    def log_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        if not self.enabled or self._handle is None:
+            return
+        record = {
+            "event": str(event),
+            "wall_time": time.time(),
+            **dict(payload),
+        }
+        try:
+            self._handle.write(
+                json.dumps(
+                    to_serializable(record),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            self._handle.flush()
+        except Exception as exc:  # noqa: BLE001
+            if not self._write_failed:
+                print(f"[DeployDebug] disabled after write failure: {type(exc).__name__}: {exc}", flush=True)
+            self._write_failed = True
+            self.enabled = False
+
+    def log_startup(
+        self,
+        *,
+        args: argparse.Namespace,
+        policy: Any,
+        active_sides: tuple[str, ...],
+        hands_enabled: bool,
+        effective_action_hz: float,
+        action_hz_info: Mapping[str, Any],
+        effective_policy_hz: float,
+        policy_hz_source: str,
+        backend_control_hz: float,
+        action_queue_policy: str,
+        send_actions: bool,
+        arm_backends: Mapping[str, RM65ArmBackend],
+    ) -> None:
+        if not self.enabled:
+            return
+        self.log_event(
+            "startup",
+            {
+                "args": _debug_args_payload(args),
+                "policy_name": getattr(policy, "name", ""),
+                "policy_metadata": _debug_redact(getattr(policy, "metadata", {})),
+                "active_sides": tuple(active_sides),
+                "arms_enabled": bool(args.arms_enabled),
+                "hands_enabled": bool(hands_enabled),
+                "send_actions": bool(send_actions),
+                "effective_action_hz": float(effective_action_hz),
+                "effective_policy_hz": float(effective_policy_hz),
+                "action_hz_info": dict(action_hz_info),
+                "policy_hz_source": str(policy_hz_source),
+                "backend_control_hz": float(backend_control_hz),
+                "action_queue_policy": str(action_queue_policy),
+                "safety_limits": {
+                    "arm_workspace_min": tuple(float(value) for value in args.arm_workspace_min),
+                    "arm_workspace_max": tuple(float(value) for value in args.arm_workspace_max),
+                    "max_arm_xyz_step_m": float(args.max_arm_xyz_step_m),
+                    "max_arm_rot_step_deg": float(args.max_arm_rot_step_deg),
+                    "max_arm_joint_step_rad": float(args.max_arm_joint_step_rad),
+                    "max_hand_step": float(args.max_hand_step),
+                },
+                "backend_limits_by_side": _debug_backend_limits(arm_backends, now=time.time()),
+            },
+        )
+
+    def log_policy_chunk(
+        self,
+        *,
+        timestamp: float,
+        step_index: int,
+        policy_name: str,
+        policy_output: Any,
+        actions: list[NormalizedAction],
+        accepted: bool,
+        discarded_by_ik: bool,
+        queue_policy: str,
+        queue_len_before: int,
+        queue_len_after: int,
+        faults: list[str],
+    ) -> None:
+        if not self.enabled:
+            return
+        self.log_event(
+            "policy_chunk",
+            {
+                "timestamp": float(timestamp),
+                "step_index": int(step_index),
+                "policy_name": str(policy_name),
+                "policy_output_type": type(policy_output).__name__,
+                "chunk_size": int(len(actions)),
+                "accepted": bool(accepted),
+                "discarded_by_ik": bool(discarded_by_ik),
+                "queue_policy": str(queue_policy),
+                "queue_len_before": int(queue_len_before),
+                "queue_len_after": int(queue_len_after),
+                "faults": list(faults),
+                "actions": [
+                    _debug_action_summary(action, self.active_sides)
+                    for action in actions
+                ],
+            },
+        )
+
+    def log_policy_error(
+        self,
+        *,
+        timestamp: float,
+        step_index: int,
+        policy_name: str,
+        exc: BaseException,
+        queue_len_before: int,
+    ) -> None:
+        if not self.enabled:
+            return
+        self.log_event(
+            "policy_error",
+            {
+                "timestamp": float(timestamp),
+                "step_index": int(step_index),
+                "policy_name": str(policy_name),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "queue_len_before": int(queue_len_before),
+            },
+        )
+
+    def log_action_step(
+        self,
+        *,
+        timestamp: float,
+        step_index: int,
+        policy_name: str,
+        raw_action: NormalizedAction,
+        canonical_action: Any,
+        pre_arm_states: Mapping[str, Mapping[str, Any]],
+        post_arm_states: Mapping[str, Mapping[str, Any]] | None,
+        arm_backends: Mapping[str, RM65ArmBackend],
+        send_actions: bool,
+        queue_len_before_pop: int,
+        queue_len_after_pop: int,
+        faults: list[str],
+        dispatch_error: BaseException | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        raw_summary = _debug_action_summary(raw_action, self.active_sides)
+        filtered_summary = _debug_action_summary(getattr(canonical_action, "action", None), self.active_sides)
+        command_summary = _debug_command_summary(getattr(canonical_action, "command", None), self.active_sides)
+        raw_pose = {} if raw_summary is None else raw_summary.get("arm_pose_by_side", {})
+        filtered_pose = {} if filtered_summary is None else filtered_summary.get("arm_pose_by_side", {})
+        command_pose = {} if command_summary is None else command_summary.get("arm_pose_by_side", {})
+        pre_tcp_pose = _debug_state_pose_by_side(pre_arm_states)
+        post_tcp_pose = _debug_state_pose_by_side(post_arm_states)
+        command = getattr(canonical_action, "command", None)
+        command_count = len(getattr(command, "commands", {}) or {}) if command is not None else 0
+        dispatch_attempted = bool(command_count and send_actions)
+        self.log_event(
+            "action_step",
+            {
+                "timestamp": float(timestamp),
+                "step_index": int(step_index),
+                "policy_name": str(policy_name),
+                "send_actions": bool(send_actions),
+                "dispatch_attempted": bool(dispatch_attempted),
+                "dispatch_mode": "send_actions" if send_actions else "dry_run",
+                "dispatch_error": (
+                    None
+                    if dispatch_error is None
+                    else {"type": type(dispatch_error).__name__, "message": str(dispatch_error)}
+                ),
+                "queue_len_before_pop": int(queue_len_before_pop),
+                "queue_len_after_pop": int(queue_len_after_pop),
+                "faults": list(faults),
+                "raw_action": raw_summary,
+                "filtered_action": filtered_summary,
+                "command": command_summary,
+                "canonical_metadata": getattr(canonical_action, "metadata", {}),
+                "raw_to_filtered_pose_delta": _debug_pose_delta_by_side(raw_pose, filtered_pose),
+                "filtered_to_command_pose_delta": _debug_pose_delta_by_side(filtered_pose, command_pose),
+                "command_to_pre_tcp_delta": _debug_pose_delta_by_side(command_pose, pre_tcp_pose),
+                "command_to_post_tcp_delta": _debug_pose_delta_by_side(command_pose, post_tcp_pose),
+                "pre_arm_state_by_side": _debug_arm_state_summary(pre_arm_states),
+                "post_arm_state_by_side": _debug_arm_state_summary(post_arm_states),
+                "backend_limits_by_side": _debug_backend_limits(arm_backends, now=time.time()),
+            },
+        )
 
 
 class ArmStateReader:
@@ -600,6 +1161,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-steps", type=_non_negative_int, default=0)
     parser.add_argument("--status-sec", type=_positive_float, default=1.0)
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Write deployment action/pose debug JSONL under "
+            "teleop_records/deployment_debug by default."
+        ),
+    )
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="Directory for --debug JSONL logs. Relative paths resolve under the DexTeleop repo.",
+    )
+    parser.add_argument(
         "--ik-recovery-stable-frames",
         type=_positive_int,
         default=3,
@@ -815,7 +1390,49 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "robot_motion routes shared RM65 IK construction and solving through robot_motion.rm65."
         ),
     )
-    parser.add_argument("--arm-max-angvel", type=_parse_arm_max_angvel, default=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5))
+    parser.add_argument(
+        "--arm-max-angvel",
+        type=_parse_arm_max_angvel,
+        default=DEPLOY_RM65_ARM_MAX_ANGVEL,
+        help=(
+            "Scalar or 6 comma-separated RM65 joint velocity limits in rad/s. "
+            "Default matches run_vive_rm65_real_teleop."
+        ),
+    )
+    parser.add_argument(
+        "--arm-step-dt-scaling",
+        dest="arm_step_dt_scaling",
+        action="store_true",
+        default=True,
+        help="Enable real-arm step scaling based on deploy action dt. Default matches real teleop.",
+    )
+    parser.add_argument(
+        "--disable-arm-step-dt-scaling",
+        dest="arm_step_dt_scaling",
+        action="store_false",
+        help="Disable deploy arm step scaling and use one backend control tick per policy action.",
+    )
+    parser.add_argument(
+        "--arm-step-dt-alpha",
+        type=_unit_interval_float,
+        default=DEPLOY_ARM_STEP_DT_ALPHA,
+        help="EMA factor for RM65 backend measured-send-dt scaling. Default matches real teleop.",
+    )
+    parser.add_argument(
+        "--arm-step-dt-max-scale",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Maximum multiplier for arm step limits when action dt is slower than backend control dt. "
+            "Omit to use max(3.0, 1.1 * --arm-control-hz / effective_action_hz), matching real teleop."
+        ),
+    )
+    parser.add_argument(
+        "--arm-step-dt-stall-reset-sec",
+        type=_positive_float,
+        default=DEPLOY_ARM_STEP_DT_STALL_RESET_SEC,
+        help="Stall threshold for RM65 backend measured-send-dt scaling. Default matches real teleop.",
+    )
     parser.add_argument(
         "--singularity-qpos-init-slowdown",
         type=_unit_interval_float,
@@ -844,7 +1461,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-arm-xyz-step-m", type=float, default=0.1)
     parser.add_argument("--max-arm-rot-step-deg", type=float, default=15.0)
-    parser.add_argument("--max-arm-joint-step-rad", type=float, default=0.08)
+    parser.add_argument(
+        "--max-arm-joint-step-rad",
+        type=float,
+        default=DEPLOY_MAX_ARM_JOINT_STEP_RAD,
+        help=(
+            "Per-action joint-vector safety limit in rad. "
+            "Default is 6deg, matching real teleop temporary joint-step limit."
+        ),
+    )
 
     parser.add_argument("--enable-hands", dest="hands_enabled", action="store_true", default=None)
     parser.add_argument("--no-hands", dest="hands_enabled", action="store_false")
@@ -1174,11 +1799,118 @@ def resolve_effective_policy_hz(args: argparse.Namespace, *, action_hz: float, a
     return float(action_hz), "action_hz"
 
 
-def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...], *, control_hz: float) -> dict[str, RM65ArmBackend]:
+def resolve_arm_step_dt_max_scale(
+    args: argparse.Namespace,
+    *,
+    control_hz: float,
+    action_hz: float | None = None,
+) -> tuple[float, bool]:
+    explicit = getattr(args, "arm_step_dt_max_scale", None)
+    if explicit is not None:
+        return float(explicit), False
+    target_hz = float(action_hz or 0.0)
+    if target_hz <= 0.0:
+        target_hz = float(getattr(args, "hz", DEFAULT_TELEOP_SAMPLE_HZ) or DEFAULT_TELEOP_SAMPLE_HZ)
+    target_hz = max(1e-6, target_hz)
+    required_scale = 1.1 * max(1e-6, float(control_hz)) / target_hz
+    return max(DEPLOY_ARM_STEP_DT_MAX_SCALE, required_scale), True
+
+
+def apply_arm_step_dt_defaults(
+    args: argparse.Namespace,
+    *,
+    control_hz: float,
+    action_hz: float | None = None,
+) -> None:
+    max_scale, auto = resolve_arm_step_dt_max_scale(
+        args,
+        control_hz=float(control_hz),
+        action_hz=action_hz,
+    )
+    setattr(args, "arm_step_dt_max_scale", float(max_scale))
+    setattr(args, "arm_step_dt_max_scale_auto", bool(auto))
+
+
+def deploy_arm_command_step_dt_sec(
+    args: argparse.Namespace,
+    *,
+    control_hz: float,
+    action_hz: float,
+) -> float:
+    base_dt = 1.0 / max(1e-6, float(control_hz))
+    if not bool(getattr(args, "arm_step_dt_scaling", True)):
+        return base_dt
+    action_dt = 1.0 / max(1e-6, float(action_hz))
+    max_scale = float(getattr(args, "arm_step_dt_max_scale", DEPLOY_ARM_STEP_DT_MAX_SCALE))
+    return float(np.clip(action_dt, base_dt, base_dt * max_scale))
+
+
+def deploy_arm_command_max_joint_step(
+    args: argparse.Namespace,
+    *,
+    control_hz: float,
+    action_hz: float,
+) -> np.ndarray:
+    step_dt = deploy_arm_command_step_dt_sec(
+        args,
+        control_hz=float(control_hz),
+        action_hz=float(action_hz),
+    )
+    return np.asarray(args.arm_max_angvel, dtype=float).reshape(6) * step_dt
+
+
+def annotate_deploy_arm_command_limits(
+    command: Any,
+    *,
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+    control_hz: float,
+    action_hz: float,
+) -> None:
+    if command is None:
+        return
+    commands = getattr(command, "commands", {}) or {}
+    if not commands:
+        return
+    step_dt = deploy_arm_command_step_dt_sec(
+        args,
+        control_hz=float(control_hz),
+        action_hz=float(action_hz),
+    )
+    max_joint_step = deploy_arm_command_max_joint_step(
+        args,
+        control_hz=float(control_hz),
+        action_hz=float(action_hz),
+    )
+    base_dt = 1.0 / max(1e-6, float(control_hz))
+    for side in active_sides:
+        effector_command = commands.get(f"{side}_arm")
+        if effector_command is None:
+            continue
+        effector_command.metadata["max_joint_step_rad"] = max_joint_step.copy()
+        effector_command.metadata["deploy_max_joint_step_rad"] = max_joint_step.copy()
+        effector_command.metadata["deploy_action_step_dt_sec"] = float(step_dt)
+        effector_command.metadata["deploy_backend_control_dt_sec"] = float(base_dt)
+        effector_command.metadata["deploy_arm_step_dt_scaling"] = bool(
+            getattr(args, "arm_step_dt_scaling", True)
+        )
+        effector_command.metadata["deploy_arm_step_dt_max_scale"] = float(
+            getattr(args, "arm_step_dt_max_scale", DEPLOY_ARM_STEP_DT_MAX_SCALE)
+        )
+
+
+def build_arm_backends(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+    *,
+    control_hz: float,
+    action_hz: float | None = None,
+) -> dict[str, RM65ArmBackend]:
     if not bool(args.arms_enabled):
         return {}
     arm_urdf_path = str(args.arm_urdf_path or require_asset_path("rm65_arm.urdf"))
     control_dt = 1.0 / float(control_hz)
+    apply_arm_step_dt_defaults(args, control_hz=float(control_hz), action_hz=action_hz)
     backends: dict[str, RM65ArmBackend] = {}
     for side in active_sides:
         arm_ip = str(getattr(args, f"{side}_arm_ip") or "")
@@ -1197,6 +1929,11 @@ def build_arm_backends(args: argparse.Namespace, active_sides: tuple[str, ...], 
                 initial_qpos=getattr(args, f"{side}_initial_qpos"),
                 tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
                 ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
+                use_actual_send_dt_scaling=bool(getattr(args, "arm_step_dt_scaling", True)),
+                actual_send_dt_alpha=float(args.arm_step_dt_alpha),
+                actual_send_dt_min_scale=1.0,
+                actual_send_dt_max_scale=float(args.arm_step_dt_max_scale),
+                actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
                 background_streaming_enabled=bool(arm_ip),
                 background_streaming_hz=float(control_hz),
             )
@@ -1483,7 +2220,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     backend_control_hz = float(args.arm_control_hz)
-    arm_backends = build_arm_backends(args, active_sides, control_hz=backend_control_hz)
+    arm_backends = build_arm_backends(
+        args,
+        active_sides,
+        control_hz=backend_control_hz,
+        action_hz=float(effective_action_hz),
+    )
     hand_backends = build_hand_backends(args, active_sides)
     hand_action_specs = (
         hand_action_specs_for_backends(args, hand_backends, active_sides)
@@ -1595,6 +2337,11 @@ def main(argv: list[str] | None = None) -> int:
     last_status_at = 0.0
     last_fault_text: str | None = None
     started_at = time.time()
+    debug_logger = DeploymentDebugLogger(
+        enabled=bool(args.debug),
+        root_dir=args.debug_dir,
+        active_sides=active_sides,
+    )
 
     try:
         print(
@@ -1658,6 +2405,20 @@ def main(argv: list[str] | None = None) -> int:
                     "DMTAC gripper backend config is missing for active side(s): "
                     + ",".join(missing_hand_sides)
                 )
+        debug_logger.log_startup(
+            args=args,
+            policy=policy,
+            active_sides=active_sides,
+            hands_enabled=hands_enabled,
+            effective_action_hz=float(effective_action_hz),
+            action_hz_info=action_hz_info,
+            effective_policy_hz=float(effective_policy_hz),
+            policy_hz_source=policy_hz_source,
+            backend_control_hz=backend_control_hz,
+            action_queue_policy=action_queue_policy,
+            send_actions=send_actions,
+            arm_backends=arm_backends,
+        )
 
         for side, backend in arm_backends.items():
             backend.start()
@@ -1916,6 +2677,7 @@ def main(argv: list[str] | None = None) -> int:
                         chunk_buffer=chunk_buffer,
                         min_action_queue=int(args.min_action_queue),
                     ):
+                        queue_len_before_update = len(chunk_buffer)
                         try:
                             policy_output = policy.predict(observation)
                             actions = normalize_policy_output(
@@ -1930,26 +2692,74 @@ def main(argv: list[str] | None = None) -> int:
                                 if ik_action_gate.discards_policy_output:
                                     chunk_buffer.clear()
                                     print("[Deploy] IK recovery active; discarded predicted action chunk.")
+                                    debug_logger.log_policy_chunk(
+                                        timestamp=loop_started_at,
+                                        step_index=step_index,
+                                        policy_name=policy.name,
+                                        policy_output=policy_output,
+                                        actions=actions,
+                                        accepted=False,
+                                        discarded_by_ik=True,
+                                        queue_policy=action_queue_policy,
+                                        queue_len_before=queue_len_before_update,
+                                        queue_len_after=len(chunk_buffer),
+                                        faults=faults,
+                                    )
                                 else:
                                     if action_queue_policy == "append":
                                         chunk_buffer.append(actions)
                                     else:
                                         chunk_buffer.replace(actions)
                                     ik_action_gate.mark_policy_output_accepted()
+                                    debug_logger.log_policy_chunk(
+                                        timestamp=loop_started_at,
+                                        step_index=step_index,
+                                        policy_name=policy.name,
+                                        policy_output=policy_output,
+                                        actions=actions,
+                                        accepted=True,
+                                        discarded_by_ik=False,
+                                        queue_policy=action_queue_policy,
+                                        queue_len_before=queue_len_before_update,
+                                        queue_len_after=len(chunk_buffer),
+                                        faults=faults,
+                                    )
                             else:
                                 faults.append("policy_empty_action")
+                                debug_logger.log_policy_chunk(
+                                    timestamp=loop_started_at,
+                                    step_index=step_index,
+                                    policy_name=policy.name,
+                                    policy_output=policy_output,
+                                    actions=[],
+                                    accepted=False,
+                                    discarded_by_ik=False,
+                                    queue_policy=action_queue_policy,
+                                    queue_len_before=queue_len_before_update,
+                                    queue_len_after=len(chunk_buffer),
+                                    faults=faults,
+                                )
                         except Exception as exc:  # noqa: BLE001
                             print(f"[Deploy] policy error: {type(exc).__name__}: {exc}")
                             chunk_buffer.clear()
                             faults.append(f"policy_error:{type(exc).__name__}")
+                            debug_logger.log_policy_error(
+                                timestamp=loop_started_at,
+                                step_index=step_index,
+                                policy_name=policy.name,
+                                exc=exc,
+                                queue_len_before=queue_len_before_update,
+                            )
                             if bool(args.pause_on_policy_error):
                                 policy_active = False
 
+                    queue_len_before_pop = len(chunk_buffer)
                     raw_action = (
                         chunk_buffer.pop(default=_default_action(observation))
                         if can_run_policy and not ik_action_gate.blocks_action_output
                         else None
                     )
+                    queue_len_after_pop = len(chunk_buffer)
                     if raw_action is not None:
                         canonical_action = canonical_action_pipeline.prepare(
                             raw_action,
@@ -1957,14 +2767,61 @@ def main(argv: list[str] | None = None) -> int:
                             policy_name=policy.name,
                         )
                         faults.extend(canonical_action.faults)
-                        if canonical_action.command is not None and canonical_action.command.commands:
-                            if send_actions:
-                                dispatch_teleop_command(
-                                    canonical_action.command,
+                        dispatch_error: BaseException | None = None
+                        post_arm_states: dict[str, dict[str, Any]] | None = None
+                        annotate_deploy_arm_command_limits(
+                            canonical_action.command,
+                            args=args,
+                            active_sides=active_sides,
+                            control_hz=backend_control_hz,
+                            action_hz=float(effective_action_hz),
+                        )
+                        try:
+                            if canonical_action.command is not None and canonical_action.command.commands:
+                                if send_actions:
+                                    dispatch_teleop_command(
+                                        canonical_action.command,
+                                        arm_backends=arm_backends,
+                                        hand_backends=hand_backends,
+                                    )
+                                last_action = canonical_action.action.vector.astype(np.float32, copy=True)
+                            if debug_logger.enabled:
+                                post_arm_states = _debug_backend_arm_states(arm_backends)
+                        except Exception as exc:  # noqa: BLE001
+                            dispatch_error = exc
+                            if debug_logger.enabled:
+                                post_arm_states = _debug_backend_arm_states(arm_backends)
+                                debug_logger.log_action_step(
+                                    timestamp=loop_started_at,
+                                    step_index=step_index,
+                                    policy_name=policy.name,
+                                    raw_action=raw_action,
+                                    canonical_action=canonical_action,
+                                    pre_arm_states=arm_states,
+                                    post_arm_states=post_arm_states,
                                     arm_backends=arm_backends,
-                                    hand_backends=hand_backends,
+                                    send_actions=send_actions,
+                                    queue_len_before_pop=queue_len_before_pop,
+                                    queue_len_after_pop=queue_len_after_pop,
+                                    faults=faults,
+                                    dispatch_error=dispatch_error,
                                 )
-                            last_action = canonical_action.action.vector.astype(np.float32, copy=True)
+                            raise
+                        debug_logger.log_action_step(
+                            timestamp=loop_started_at,
+                            step_index=step_index,
+                            policy_name=policy.name,
+                            raw_action=raw_action,
+                            canonical_action=canonical_action,
+                            pre_arm_states=arm_states,
+                            post_arm_states=post_arm_states,
+                            arm_backends=arm_backends,
+                            send_actions=send_actions,
+                            queue_len_before_pop=queue_len_before_pop,
+                            queue_len_after_pop=queue_len_after_pop,
+                            faults=faults,
+                            dispatch_error=dispatch_error,
+                        )
 
                 fault_text = _compact_faults(faults)
                 if fault_text != last_fault_text:
@@ -2036,6 +2893,7 @@ def main(argv: list[str] | None = None) -> int:
             camera_previewer.close()
         if visualizer is not None:
             visualizer.close()
+        debug_logger.close()
     return 0
 
 

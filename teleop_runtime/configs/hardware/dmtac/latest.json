@@ -1,0 +1,4495 @@
+{
+  "_config_path": "/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/hardware/dmtac/latest.json",
+  "assignments": {
+    "left": {
+      "gripper": {
+        "baudrate": 115200,
+        "enabled": true,
+        "gripper_id": 1,
+        "identity": {
+          "description": "USB Serial",
+          "hwid": "USB VID:PID=1A86:7523 LOCATION=5-2.4.4",
+          "location": "5-2.4.4",
+          "product": "USB Serial"
+        },
+        "port": "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0",
+        "port_aliases": [
+          "/dev/ttyUSB0",
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0"
+        ],
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.019783,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 0,
+            "is_moving": false,
+            "joint_pos": 0.0,
+            "opening_mm": 70.0,
+            "opening_raw": 1000,
+            "status_code": 1,
+            "status_text": "\u5f20\u5f00\u4fa7\u7a7a\u95f2/\u505c\u6b62",
+            "temperature_c": 32,
+            "timestamp": 1782904951.6121163
+          },
+          "timeout": 0.03
+        },
+        "timeout": 0.03
+      },
+      "tactile": {
+        "inner": {
+          "dev_id": "M26190023",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190023",
+            "device_index": 0,
+            "serial": "M26190023"
+          },
+          "slot": "inner"
+        },
+        "outer": {
+          "dev_id": "M26190018",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190018",
+            "device_index": 2,
+            "serial": "M26190018"
+          },
+          "slot": "outer"
+        }
+      }
+    },
+    "right": {
+      "gripper": {
+        "baudrate": 115200,
+        "enabled": true,
+        "gripper_id": 1,
+        "identity": {
+          "description": "USB Serial",
+          "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.1.4.4",
+          "location": "1-4.1.4.4",
+          "product": "USB Serial"
+        },
+        "port": "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0",
+        "port_aliases": [
+          "/dev/ttyUSB1",
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0"
+        ],
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.007233,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 16,
+            "is_moving": true,
+            "joint_pos": 0.999,
+            "opening_mm": 0.07,
+            "opening_raw": 1,
+            "status_code": 5,
+            "status_text": "\u6b63\u5728\u5f20\u5f00",
+            "temperature_c": 36,
+            "timestamp": 1782960068.1386383
+          },
+          "timeout": 0.03
+        },
+        "timeout": 0.03
+      },
+      "tactile": {
+        "inner": {
+          "dev_id": "M26190173",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190173",
+            "device_index": 12,
+            "serial": "M26190173"
+          },
+          "slot": "inner"
+        },
+        "outer": {
+          "dev_id": "M26190034",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190034",
+            "device_index": 14,
+            "serial": "M26190034"
+          },
+          "slot": "outer"
+        }
+      }
+    }
+  },
+  "created_at": "2026-06-30T12:48:09+08:00",
+  "devices_seen": {
+    "grippers": [
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS31",
+        "hwid": "n/a",
+        "index": 0,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS31",
+        "port_aliases": [
+          "/dev/ttyS31"
+        ],
+        "preferred_port": "/dev/ttyS31",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS30",
+        "hwid": "n/a",
+        "index": 1,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS30",
+        "port_aliases": [
+          "/dev/ttyS30"
+        ],
+        "preferred_port": "/dev/ttyS30",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS29",
+        "hwid": "n/a",
+        "index": 2,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS29",
+        "port_aliases": [
+          "/dev/ttyS29"
+        ],
+        "preferred_port": "/dev/ttyS29",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS28",
+        "hwid": "n/a",
+        "index": 3,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS28",
+        "port_aliases": [
+          "/dev/ttyS28"
+        ],
+        "preferred_port": "/dev/ttyS28",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS27",
+        "hwid": "n/a",
+        "index": 4,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS27",
+        "port_aliases": [
+          "/dev/ttyS27"
+        ],
+        "preferred_port": "/dev/ttyS27",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS26",
+        "hwid": "n/a",
+        "index": 5,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS26",
+        "port_aliases": [
+          "/dev/ttyS26"
+        ],
+        "preferred_port": "/dev/ttyS26",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS25",
+        "hwid": "n/a",
+        "index": 6,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS25",
+        "port_aliases": [
+          "/dev/ttyS25"
+        ],
+        "preferred_port": "/dev/ttyS25",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS24",
+        "hwid": "n/a",
+        "index": 7,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS24",
+        "port_aliases": [
+          "/dev/ttyS24"
+        ],
+        "preferred_port": "/dev/ttyS24",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS23",
+        "hwid": "n/a",
+        "index": 8,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS23",
+        "port_aliases": [
+          "/dev/ttyS23"
+        ],
+        "preferred_port": "/dev/ttyS23",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS22",
+        "hwid": "n/a",
+        "index": 9,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS22",
+        "port_aliases": [
+          "/dev/ttyS22"
+        ],
+        "preferred_port": "/dev/ttyS22",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS21",
+        "hwid": "n/a",
+        "index": 10,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS21",
+        "port_aliases": [
+          "/dev/ttyS21"
+        ],
+        "preferred_port": "/dev/ttyS21",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS20",
+        "hwid": "n/a",
+        "index": 11,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS20",
+        "port_aliases": [
+          "/dev/ttyS20"
+        ],
+        "preferred_port": "/dev/ttyS20",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS19",
+        "hwid": "n/a",
+        "index": 12,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS19",
+        "port_aliases": [
+          "/dev/ttyS19"
+        ],
+        "preferred_port": "/dev/ttyS19",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS18",
+        "hwid": "n/a",
+        "index": 13,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS18",
+        "port_aliases": [
+          "/dev/ttyS18"
+        ],
+        "preferred_port": "/dev/ttyS18",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS17",
+        "hwid": "n/a",
+        "index": 14,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS17",
+        "port_aliases": [
+          "/dev/ttyS17"
+        ],
+        "preferred_port": "/dev/ttyS17",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS16",
+        "hwid": "n/a",
+        "index": 15,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS16",
+        "port_aliases": [
+          "/dev/ttyS16"
+        ],
+        "preferred_port": "/dev/ttyS16",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS15",
+        "hwid": "n/a",
+        "index": 16,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS15",
+        "port_aliases": [
+          "/dev/ttyS15"
+        ],
+        "preferred_port": "/dev/ttyS15",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS14",
+        "hwid": "n/a",
+        "index": 17,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS14",
+        "port_aliases": [
+          "/dev/ttyS14"
+        ],
+        "preferred_port": "/dev/ttyS14",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS13",
+        "hwid": "n/a",
+        "index": 18,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS13",
+        "port_aliases": [
+          "/dev/ttyS13"
+        ],
+        "preferred_port": "/dev/ttyS13",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS12",
+        "hwid": "n/a",
+        "index": 19,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS12",
+        "port_aliases": [
+          "/dev/ttyS12"
+        ],
+        "preferred_port": "/dev/ttyS12",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS11",
+        "hwid": "n/a",
+        "index": 20,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS11",
+        "port_aliases": [
+          "/dev/ttyS11"
+        ],
+        "preferred_port": "/dev/ttyS11",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS10",
+        "hwid": "n/a",
+        "index": 21,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS10",
+        "port_aliases": [
+          "/dev/ttyS10"
+        ],
+        "preferred_port": "/dev/ttyS10",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS9",
+        "hwid": "n/a",
+        "index": 22,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS9",
+        "port_aliases": [
+          "/dev/ttyS9"
+        ],
+        "preferred_port": "/dev/ttyS9",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS8",
+        "hwid": "n/a",
+        "index": 23,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS8",
+        "port_aliases": [
+          "/dev/ttyS8"
+        ],
+        "preferred_port": "/dev/ttyS8",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS7",
+        "hwid": "n/a",
+        "index": 24,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS7",
+        "port_aliases": [
+          "/dev/ttyS7"
+        ],
+        "preferred_port": "/dev/ttyS7",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS6",
+        "hwid": "n/a",
+        "index": 25,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS6",
+        "port_aliases": [
+          "/dev/ttyS6"
+        ],
+        "preferred_port": "/dev/ttyS6",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS5",
+        "hwid": "n/a",
+        "index": 26,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS5",
+        "port_aliases": [
+          "/dev/ttyS5"
+        ],
+        "preferred_port": "/dev/ttyS5",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS4",
+        "hwid": "n/a",
+        "index": 27,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS4",
+        "port_aliases": [
+          "/dev/ttyS4"
+        ],
+        "preferred_port": "/dev/ttyS4",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS3",
+        "hwid": "n/a",
+        "index": 28,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS3",
+        "port_aliases": [
+          "/dev/ttyS3"
+        ],
+        "preferred_port": "/dev/ttyS3",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS2",
+        "hwid": "n/a",
+        "index": 29,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS2",
+        "port_aliases": [
+          "/dev/ttyS2"
+        ],
+        "preferred_port": "/dev/ttyS2",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS1",
+        "hwid": "n/a",
+        "index": 30,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS1",
+        "port_aliases": [
+          "/dev/ttyS1"
+        ],
+        "preferred_port": "/dev/ttyS1",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS0",
+        "hwid": "n/a",
+        "index": 31,
+        "interface": null,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS0",
+        "port_aliases": [
+          "/dev/ttyS0"
+        ],
+        "preferred_port": "/dev/ttyS0",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "USB Serial",
+        "device": "/dev/ttyUSB1",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.1.4.4",
+        "index": 32,
+        "interface": null,
+        "location": "1-4.1.4.4",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o666",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 29987,
+        "port": "/dev/ttyUSB1",
+        "port_aliases": [
+          "/dev/ttyUSB1",
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0"
+        ],
+        "preferred_port": "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0",
+        "probable_gripper_serial": true,
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.007233,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 16,
+            "is_moving": true,
+            "joint_pos": 0.999,
+            "opening_mm": 0.07,
+            "opening_raw": 1,
+            "status_code": 5,
+            "status_text": "\u6b63\u5728\u5f20\u5f00",
+            "temperature_c": 36,
+            "timestamp": 1782960068.1386383
+          },
+          "timeout": 0.03
+        },
+        "probe_attempted": true,
+        "product": "USB Serial",
+        "serial_number": null,
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0"
+        ],
+        "vid": 6790
+      },
+      {
+        "description": "USB Serial",
+        "device": "/dev/ttyUSB0",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=5-2.4.4",
+        "index": 33,
+        "interface": null,
+        "location": "5-2.4.4",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o666",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 29987,
+        "port": "/dev/ttyUSB0",
+        "port_aliases": [
+          "/dev/ttyUSB0",
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0"
+        ],
+        "preferred_port": "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0",
+        "probable_gripper_serial": true,
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.019734,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 0,
+            "is_moving": false,
+            "joint_pos": 0.07799999999999996,
+            "opening_mm": 64.54,
+            "opening_raw": 922,
+            "status_code": 1,
+            "status_text": "\u5f20\u5f00\u4fa7\u7a7a\u95f2/\u505c\u6b62",
+            "temperature_c": 32,
+            "timestamp": 1782960068.1589181
+          },
+          "timeout": 0.03
+        },
+        "probe_attempted": true,
+        "product": "USB Serial",
+        "serial_number": null,
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0"
+        ],
+        "vid": 6790
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM1",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=7-1.2:1.0",
+        "index": 34,
+        "interface": null,
+        "location": "7-1.2:1.0",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o666",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 21971,
+        "port": "/dev/ttyACM1",
+        "port_aliases": [
+          "/dev/ttyACM1",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+        "probable_gripper_serial": true,
+        "probe": {
+          "attempted_baudrates": [
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200
+          ],
+          "attempted_gripper_id_count": 247,
+          "attempted_gripper_ids": [
+            1,
+            32,
+            46,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79,
+            80,
+            81,
+            82,
+            83,
+            84,
+            85,
+            86,
+            87,
+            88,
+            89,
+            90,
+            91,
+            92,
+            93,
+            94,
+            95,
+            96,
+            97,
+            98,
+            99,
+            100,
+            101,
+            102,
+            103,
+            104,
+            105,
+            106,
+            107,
+            108,
+            109,
+            110,
+            111,
+            112,
+            113,
+            114,
+            115,
+            116,
+            117,
+            118,
+            119,
+            120,
+            121,
+            122,
+            123,
+            124,
+            125,
+            126,
+            127,
+            128,
+            129,
+            130,
+            131,
+            132,
+            133,
+            134,
+            135,
+            136,
+            137,
+            138,
+            139,
+            140,
+            141,
+            142,
+            143,
+            144,
+            145,
+            146,
+            147,
+            148,
+            149,
+            150,
+            151,
+            152,
+            153,
+            154,
+            155,
+            156,
+            157,
+            158,
+            159,
+            160,
+            161,
+            162,
+            163,
+            164,
+            165,
+            166,
+            167,
+            168,
+            169,
+            170,
+            171,
+            172,
+            173,
+            174,
+            175,
+            176,
+            177,
+            178,
+            179,
+            180,
+            181,
+            182,
+            183,
+            184,
+            185,
+            186,
+            187,
+            188,
+            189,
+            190,
+            191,
+            192,
+            193,
+            194,
+            195,
+            196,
+            197,
+            198,
+            199,
+            200,
+            201,
+            202,
+            203,
+            204,
+            205,
+            206,
+            207,
+            208,
+            209,
+            210,
+            211,
+            212,
+            213,
+            214,
+            215,
+            216,
+            217,
+            218,
+            219,
+            220,
+            221,
+            222,
+            223,
+            224,
+            225,
+            226,
+            227,
+            228,
+            229,
+            230,
+            231,
+            232,
+            233,
+            234,
+            235,
+            236,
+            237,
+            238,
+            239,
+            240,
+            241,
+            242,
+            243,
+            244,
+            245,
+            246,
+            247
+          ],
+          "attempted_setting_count": 247,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 32
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 46
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 2
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 3
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 4
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 5
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 6
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 7
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 8
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 9
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 10
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 11
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 12
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 13
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 14
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 15
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 16
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 17
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 18
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 19
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 20
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 21
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 22
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 23
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 24
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 25
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 26
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 27
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 28
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 29
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 30
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 31
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 33
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 34
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 35
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 36
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 37
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 38
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 39
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 40
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 41
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 42
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 43
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 44
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 45
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 47
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 48
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 49
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 50
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 51
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 52
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 53
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 54
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 55
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 56
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 57
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 58
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 59
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 60
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 61
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 62
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 63
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 64
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 65
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 66
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 67
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 68
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 69
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 70
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 71
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 72
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 73
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 74
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 75
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 76
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 77
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 78
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 79
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 80
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 81
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 82
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 83
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 84
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 85
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 86
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 87
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 88
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 89
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 90
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 91
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 92
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 93
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 94
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 95
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 96
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 97
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 98
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 99
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 100
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 101
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 102
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 103
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 104
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 105
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 106
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 107
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 108
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 109
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 110
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 111
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 112
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 113
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 114
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 115
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 116
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 117
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 118
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 119
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 120
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 121
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 122
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 123
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 124
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 125
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 126
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 127
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 128
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 129
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 130
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 131
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 132
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 133
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 134
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 135
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 136
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 137
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 138
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 139
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 140
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 141
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 142
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 143
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 144
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 145
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 146
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 147
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 148
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 149
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 150
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 151
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 152
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 153
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 154
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 155
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 156
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 157
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 158
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 159
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 160
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 161
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 162
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 163
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 164
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 165
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 166
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 167
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 168
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 169
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 170
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 171
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 172
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 173
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 174
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 175
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 176
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 177
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 178
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 179
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 180
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 181
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 182
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 183
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 184
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 185
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 186
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 187
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 188
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 189
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 190
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 191
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 192
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 193
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 194
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 195
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 196
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 197
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 198
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 199
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 200
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 201
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 202
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 203
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 204
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 205
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 206
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 207
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 208
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 209
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 210
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 211
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 212
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 213
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 214
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 215
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 216
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 217
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 218
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 219
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 220
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 221
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 222
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 223
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 224
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 225
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 226
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 227
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 228
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 229
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 230
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 231
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 232
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 233
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 234
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 235
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 236
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 237
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 238
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 239
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 240
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 241
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 242
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 243
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 244
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 245
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 246
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 247
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "error": "GripperError: Serial read timeout, expect 2 bytes, got 0: ",
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 6.177063,
+          "reachable": false,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": null,
+          "suggested_gripper_id": 65,
+          "suggested_gripper_ids": [
+            65
+          ],
+          "timeout": 0.03
+        },
+        "probe_attempted": true,
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137618",
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
+        ],
+        "vid": 6790
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM0",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=7-1.4:1.0",
+        "index": 35,
+        "interface": null,
+        "location": "7-1.4:1.0",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o666",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 21971,
+        "port": "/dev/ttyACM0",
+        "port_aliases": [
+          "/dev/ttyACM0",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.4:1.0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+        "probable_gripper_serial": true,
+        "probe": {
+          "attempted_baudrates": [
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200,
+            115200
+          ],
+          "attempted_gripper_id_count": 247,
+          "attempted_gripper_ids": [
+            1,
+            32,
+            46,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79,
+            80,
+            81,
+            82,
+            83,
+            84,
+            85,
+            86,
+            87,
+            88,
+            89,
+            90,
+            91,
+            92,
+            93,
+            94,
+            95,
+            96,
+            97,
+            98,
+            99,
+            100,
+            101,
+            102,
+            103,
+            104,
+            105,
+            106,
+            107,
+            108,
+            109,
+            110,
+            111,
+            112,
+            113,
+            114,
+            115,
+            116,
+            117,
+            118,
+            119,
+            120,
+            121,
+            122,
+            123,
+            124,
+            125,
+            126,
+            127,
+            128,
+            129,
+            130,
+            131,
+            132,
+            133,
+            134,
+            135,
+            136,
+            137,
+            138,
+            139,
+            140,
+            141,
+            142,
+            143,
+            144,
+            145,
+            146,
+            147,
+            148,
+            149,
+            150,
+            151,
+            152,
+            153,
+            154,
+            155,
+            156,
+            157,
+            158,
+            159,
+            160,
+            161,
+            162,
+            163,
+            164,
+            165,
+            166,
+            167,
+            168,
+            169,
+            170,
+            171,
+            172,
+            173,
+            174,
+            175,
+            176,
+            177,
+            178,
+            179,
+            180,
+            181,
+            182,
+            183,
+            184,
+            185,
+            186,
+            187,
+            188,
+            189,
+            190,
+            191,
+            192,
+            193,
+            194,
+            195,
+            196,
+            197,
+            198,
+            199,
+            200,
+            201,
+            202,
+            203,
+            204,
+            205,
+            206,
+            207,
+            208,
+            209,
+            210,
+            211,
+            212,
+            213,
+            214,
+            215,
+            216,
+            217,
+            218,
+            219,
+            220,
+            221,
+            222,
+            223,
+            224,
+            225,
+            226,
+            227,
+            228,
+            229,
+            230,
+            231,
+            232,
+            233,
+            234,
+            235,
+            236,
+            237,
+            238,
+            239,
+            240,
+            241,
+            242,
+            243,
+            244,
+            245,
+            246,
+            247
+          ],
+          "attempted_setting_count": 247,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 32
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 46
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 2
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 3
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 4
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 5
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 6
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 7
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 8
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 9
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 10
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 11
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 12
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 13
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 14
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 15
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 16
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 17
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 18
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 19
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 20
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 21
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 22
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 23
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 24
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 25
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 26
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 27
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 28
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 29
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 30
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 31
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 33
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 34
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 35
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 36
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 37
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 38
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 39
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 40
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 41
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 42
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 43
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 44
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 45
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 47
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 48
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 49
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 50
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 51
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 52
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 53
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 54
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 55
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 56
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 57
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 58
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 59
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 60
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 61
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 62
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 63
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 64
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 65
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 66
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 67
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 68
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 69
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 70
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 71
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 72
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 73
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 74
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 75
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 76
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 77
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 78
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 79
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 80
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 81
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 82
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 83
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 84
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 85
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 86
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 87
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 88
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 89
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 90
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 91
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 92
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 93
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 94
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 95
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 96
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 97
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 98
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 99
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 100
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 101
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 102
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 103
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 104
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 105
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 106
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 107
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 108
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 109
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 110
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 111
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 112
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 113
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 114
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 115
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 116
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 117
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 118
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 119
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 120
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 121
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 122
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 123
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 124
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 125
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 126
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 127
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 128
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 129
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 130
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 131
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 132
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 133
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 134
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 135
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 136
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 137
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 138
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 139
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 140
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 141
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 142
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 143
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 144
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 145
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 146
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 147
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 148
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 149
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 150
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 151
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 152
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 153
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 154
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 155
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 156
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 157
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 158
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 159
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 160
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 161
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 162
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 163
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 164
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 165
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 166
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 167
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 168
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 169
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 170
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 171
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 172
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 173
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 174
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 175
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 176
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 177
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 178
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 179
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 180
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 181
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 182
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 183
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 184
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 185
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 186
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 187
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 188
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 189
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 190
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 191
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 192
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 193
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 194
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 195
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 196
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 197
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 198
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 199
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 200
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 201
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 202
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 203
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 204
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 205
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 206
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 207
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 208
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 209
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 210
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 211
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 212
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 213
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 214
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 215
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 216
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 217
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 218
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 219
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 220
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 221
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 222
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 223
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 224
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 225
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 226
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 227
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 228
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 229
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 230
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 231
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 232
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 233
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 234
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 235
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 236
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 237
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 238
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 239
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 240
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 241
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 242
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 243
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 244
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 245
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 246
+            },
+            {
+              "baudrate": 115200,
+              "gripper_id": 247
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "error": "GripperError: Unexpected slave id in response: 65, expect 247",
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 6.168975,
+          "reachable": false,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": null,
+          "suggested_gripper_id": 65,
+          "suggested_gripper_ids": [
+            65
+          ],
+          "timeout": 0.03
+        },
+        "probe_attempted": true,
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137621",
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.4:1.0"
+        ],
+        "vid": 6790
+      }
+    ],
+    "hostname": "user-B650M-AORUS-PRO-AX",
+    "scanned_at": "2026-07-02T10:41:21+08:00",
+    "schema_version": "dmtac_usb_scan.v1",
+    "tactile": [
+      {
+        "dev_id": "M26190023",
+        "device_index": 0,
+        "index": 0,
+        "serial": "M26190023"
+      },
+      {
+        "dev_id": "M26190018",
+        "device_index": 2,
+        "index": 1,
+        "serial": "M26190018"
+      },
+      {
+        "dev_id": "M26190173",
+        "device_index": 4,
+        "index": 2,
+        "serial": "M26190173"
+      },
+      {
+        "dev_id": "M26190034",
+        "device_index": 6,
+        "index": 3,
+        "serial": "M26190034"
+      }
+    ],
+    "tactile_candidates": [
+      {
+        "device_node": "/dev/video4",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190173",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video5",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190173",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video6",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190034",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video7",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190034",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video0",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190023",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video1",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190023",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video2",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190018",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video3",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190018",
+        "writable": true
+      }
+    ]
+  },
+  "hostname": "1",
+  "merged_at": "2026-07-02T10:41:32+08:00",
+  "saved_at": "2026-07-02T10:41:32+08:00",
+  "schema_version": "dmtac_usb_assignment.v1",
+  "source_config_path": "/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/hardware/dmtac/20260702_104132_dmtac_usb_assignment.json"
+}

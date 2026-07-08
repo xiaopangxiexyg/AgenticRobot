@@ -78,6 +78,14 @@ def teleop_records_root() -> Path:
     return local_path("teleop_records_root", "teleop_records")
 
 
+def teleop_runtime_configs_root() -> Path:
+    return repo_path("teleop_runtime", "configs")
+
+
+def hardware_interface_configs_root() -> Path:
+    return teleop_runtime_configs_root() / "hardware"
+
+
 def calibration_profiles_dir() -> Path:
     return local_path("calibration_profiles_dir", teleop_records_root() / "calibration_profiles")
 

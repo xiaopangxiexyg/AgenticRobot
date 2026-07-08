@@ -495,6 +495,25 @@ class InitArmCommandController:
         self._status_message = message or f"{side} home recaptured; init-arm released"
         return InitArmTransition(ok=True, message=self._status_message, side=side, mode=self._mode)
 
+    def cancel_active(self, *, now: float, reason: str = "") -> InitArmTransition:
+        del now
+        side = self._active_side
+        was_active = bool(self.active)
+        self._mode = "live"
+        self._active_side = ""
+        self._recalibration = _RecalibrationState()
+        if was_active:
+            suffix = f": {reason}" if reason else ""
+            self._status_message = f"{side} init-arm stopped{suffix}"
+        else:
+            self._status_message = "init-arm ready"
+        return InitArmTransition(
+            ok=was_active,
+            message=self._status_message,
+            side=side,
+            mode=self._mode,
+        )
+
     def fail_recalibration(self, *, now: float, message: str) -> InitArmTransition:
         del now
         side = self._active_side

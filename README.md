@@ -126,7 +126,7 @@ RM65 arm IP 也会像 Q6 / DMTAC 一样保存 latest：第一次启动时显式�
 `--left-arm-ip` / `--right-arm-ip`，程序会自动更新：
 
 ```text
-teleop_records/rm65_arm_ip_configs/latest.json
+teleop_runtime/configs/hardware/rm65_arm_ips/latest.json
 ```
 
 后续同一台设备可以省略 arm IP 参数，默认从 latest 读取。需要临时禁用时使用
@@ -200,7 +200,7 @@ cameras/configs/rm65/devices/realsense.json
     "serial": "213222079798",
     "width": 640,
     "height": 480,
-    "fps": 30,
+    "fps": 15,
     "metadata": {
       "mount": "single_front"
     }
@@ -209,7 +209,7 @@ cameras/configs/rm65/devices/realsense.json
     "serial": "261122273924",
     "width": 640,
     "height": 480,
-    "fps": 30,
+    "fps": 15,
     "metadata": {
       "mount": "single_left_wrist"
     }
@@ -218,7 +218,7 @@ cameras/configs/rm65/devices/realsense.json
     "serial": "260522278055",
     "width": 640,
     "height": 480,
-    "fps": 30,
+    "fps": 15,
     "metadata": {
       "mount": "single_right_wrist"
     }

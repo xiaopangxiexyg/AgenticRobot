@@ -94,19 +94,64 @@ class _FakeCalibration:
 
 
 class _FakeCameraSource:
-    def __init__(self, info: dict[str, object]) -> None:
+    def __init__(
+        self,
+        info: dict[str, object],
+        *,
+        enable_depth: bool = False,
+        frames: list[object] | None = None,
+    ) -> None:
         self._info = dict(info)
+        self._frames = list(frames or [])
+        self._frame_cursor = 0
         self.config = SimpleNamespace(
             serial="CONFIG_SERIAL",
             width=640,
             height=480,
             fps=30,
             color_space="bgr",
+            enable_depth=bool(enable_depth),
+            depth_width=640,
+            depth_height=480,
+            depth_fps=30,
         )
         self.name = "fake_camera"
 
     def device_info(self) -> dict[str, object]:
         return dict(self._info)
+
+    def frame_buffer(self) -> object:
+        return self
+
+    def get_latest(self) -> object | None:
+        if not self._frames:
+            return None
+        frame = self._frames[min(self._frame_cursor, len(self._frames) - 1)]
+        if self._frame_cursor < len(self._frames) - 1:
+            self._frame_cursor += 1
+            self._info["frame_count"] = int(self._info.get("frame_count", 0) or 0) + 1
+        return frame
+
+
+def _fake_depth_frame(
+    *,
+    frame_index: int,
+    source_timestamp: float = 100.0,
+    depth_frame_number: int = 13,
+    depth_camera_timestamp_sec: float = 99.0,
+    depth_sensor_timestamp_ms: float = 123.0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        frame_index=int(frame_index),
+        source_timestamp=float(source_timestamp),
+        depth_image=np.ones((4, 4), dtype=np.uint16),
+        depth_metadata={
+            "depth_scale_m_per_unit": 0.001,
+            "frame_number": int(depth_frame_number),
+            "camera_timestamp_sec": float(depth_camera_timestamp_sec),
+            "sensor_timestamp_ms": float(depth_sensor_timestamp_ms),
+        },
+    )
 
 
 class _FakeViveSource:
@@ -1168,6 +1213,19 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     "fix_arm_min_samples": None,
                 }
             )
+            components.init_arm_controller = SimpleNamespace(
+                status_payload=lambda: {
+                    "init_arm_available": True,
+                    "init_arm_selected_side": "right",
+                    "init_arm_active_side": "",
+                    "init_arm_active": False,
+                    "init_arm_recalibrating": False,
+                    "init_arm_status": "ready",
+                    "init_arm_sample_count": None,
+                    "init_arm_min_samples": None,
+                    "init_arm_profile_path": "profile.json",
+                }
+            )
             control = real_teleop.RealTeleopControlInput(
                 terminal=_FakeTerminal(),
                 ui=ui,
@@ -1199,6 +1257,19 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     "fix_arm_min_samples": None,
                 }
             )
+            components.init_arm_controller = SimpleNamespace(
+                status_payload=lambda: {
+                    "init_arm_available": True,
+                    "init_arm_selected_side": "right",
+                    "init_arm_active_side": "",
+                    "init_arm_active": False,
+                    "init_arm_recalibrating": False,
+                    "init_arm_status": "ready",
+                    "init_arm_sample_count": None,
+                    "init_arm_min_samples": None,
+                    "init_arm_profile_path": "profile.json",
+                }
+            )
             control = real_teleop.RealTeleopControlInput(
                 terminal=_FakeTerminal(),
                 ui=ui,
@@ -1214,6 +1285,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             self.assertIn("episode_stop", active_controls)
             self.assertNotIn("episode_start", active_controls)
             self.assertNotIn("record_pose_snapshot", active_controls)
+            self.assertNotIn("fix_arm_toggle", active_controls)
+            self.assertNotIn("init_arm_toggle", active_controls)
 
     def test_fix_arm_c_resets_fixed_side_safety_baseline(self) -> None:
         class FakeSafetyMonitor:
@@ -1318,6 +1391,64 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 for title, message in ui.messages
             )
         )
+
+    def test_stale_c_event_without_running_fix_arm_does_not_request_runtime_home(self) -> None:
+        ui = _FakeUi(["c"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+
+        control.poll()
+
+        self.assertFalse(control.consume_calibration_request())
+        self.assertTrue(
+            any("C 仅用于运行中的 fix-arm" in message for _title, message in ui.messages)
+        )
+
+    def test_hold_cancel_helper_stops_fix_and_init_modes(self) -> None:
+        class FakeController:
+            def __init__(self, *, side: str, active_attr: str) -> None:
+                self.side = side
+                setattr(self, active_attr, True)
+                self.cancel_calls: list[dict[str, object]] = []
+
+            def cancel_active(self, **kwargs):
+                self.cancel_calls.append(dict(kwargs))
+                self.fixed = False
+                self.active = False
+                return SimpleNamespace(ok=True, side=self.side)
+
+        class FakeRetargeter:
+            def __init__(self) -> None:
+                self.reset_count = 0
+
+            def reset_target_pose_smoothing(self) -> None:
+                self.reset_count += 1
+
+        fix_controller = FakeController(side="left", active_attr="fixed")
+        init_controller = FakeController(side="right", active_attr="active")
+        retargeter = FakeRetargeter()
+        components = SimpleNamespace(
+            fix_arm_controller=fix_controller,
+            init_arm_controller=init_controller,
+            dual_arm_retargeter=retargeter,
+        )
+
+        messages = real_teleop._cancel_special_arm_modes_for_hold(
+            components,
+            now=1.0,
+            reason="hold_requested",
+        )
+
+        self.assertEqual(messages, ["左臂 fix-arm 已停止", "右臂 init-arm 已停止"])
+        self.assertFalse(fix_controller.fixed)
+        self.assertFalse(init_controller.active)
+        self.assertTrue(fix_controller.cancel_calls[0]["clear_snapshots"])
+        self.assertEqual(init_controller.cancel_calls[0]["reason"], "hold_requested")
+        self.assertEqual(retargeter.reset_count, 1)
 
     def test_hold_gui_allows_stopping_active_ik_debug_log(self) -> None:
         ui = _FakeUi()
@@ -2165,10 +2296,41 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
         self.assertTrue(metadata["debug_timing"])
+        self.assertTrue(metadata["debug_timing_legacy_all"])
+        self.assertEqual(
+            metadata["debug_timing_modules"],
+            ["console", "log", "rm65", "ik", "watchdog"],
+        )
+        self.assertTrue(metadata["debug_timing_console"])
         self.assertTrue(metadata["debug_timing_light_log"])
         self.assertTrue(metadata["rm65_backend_debug_timing"])
+        self.assertTrue(metadata["debug_timing_ik_profile"])
+        self.assertTrue(metadata["debug_timing_watchdog"])
         self.assertEqual(metadata["debug_timing_threshold_sec"], 0.04)
         self.assertEqual(metadata["debug_timing_report_interval_sec"], 0.5)
+
+    def test_episode_metadata_records_specific_debug_timing_modules(self) -> None:
+        args = _args(
+            debug_timing_log=True,
+            debug_timing_threshold_sec=0.066,
+            debug_timing_report_interval_sec=2.0,
+        )
+        metadata = real_teleop._build_episode_metadata(
+            args,
+            _components(),
+            start_reason="manual_key_start",
+        )
+
+        self.assertTrue(metadata["debug_timing"])
+        self.assertFalse(metadata["debug_timing_legacy_all"])
+        self.assertEqual(metadata["debug_timing_modules"], ["log"])
+        self.assertFalse(metadata["debug_timing_console"])
+        self.assertTrue(metadata["debug_timing_light_log"])
+        self.assertFalse(metadata["rm65_backend_debug_timing"])
+        self.assertFalse(metadata["debug_timing_ik_profile"])
+        self.assertFalse(metadata["debug_timing_watchdog"])
+        self.assertEqual(metadata["debug_timing_threshold_sec"], 0.066)
+        self.assertEqual(metadata["debug_timing_report_interval_sec"], 2.0)
 
     def test_formal_dataset_layout_uses_dataset_root_and_task_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2274,6 +2436,124 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(status["right_wrist"]["status_level"], "error")
         self.assertEqual(status["right_wrist"]["status_label"], "数据停滞")
 
+    def test_wrist_depth_status_detects_repeated_depth_metadata(self) -> None:
+        repeated_frames = [
+            _fake_depth_frame(frame_index=1, source_timestamp=100.0),
+            _fake_depth_frame(frame_index=2, source_timestamp=100.1),
+            _fake_depth_frame(frame_index=3, source_timestamp=100.2),
+            _fake_depth_frame(frame_index=4, source_timestamp=100.3),
+        ]
+        left_wrist = _FakeCameraSource(
+            {
+                "camera_key": "left_wrist",
+                "serial": "456",
+                "frame_count": 1,
+                "last_frame_age_sec": 0.01,
+                "stale_after_sec": 1.0,
+                "depth_enabled": True,
+                "depth_scale_m_per_unit": 0.001,
+            },
+            enable_depth=True,
+            frames=repeated_frames,
+        )
+        monitor = real_teleop.WristDepthFreshnessMonitor(stale_repeat_threshold=2)
+
+        first = real_teleop._build_camera_status(
+            {"left_wrist": left_wrist},
+            now=100.0,
+            depth_monitor=monitor,
+        )
+        self.assertEqual(first["left_wrist"]["depth_status_level"], "waiting")
+
+        real_teleop._build_camera_status(
+            {"left_wrist": left_wrist},
+            now=100.1,
+            depth_monitor=monitor,
+        )
+        stale = real_teleop._build_camera_status(
+            {"left_wrist": left_wrist},
+            now=100.2,
+            depth_monitor=monitor,
+        )
+
+        self.assertEqual(stale["left_wrist"]["status_level"], "error")
+        self.assertEqual(stale["left_wrist"]["depth_status_label"], "Wrist Depth 停滞")
+        self.assertGreaterEqual(stale["left_wrist"]["depth_signature_repeat_count"], 2)
+
+    def test_wrist_depth_status_marks_missing_expected_wrist_cameras(self) -> None:
+        status = real_teleop._with_expected_wrist_depth_camera_statuses(
+            {"front": {"status_level": "ok"}},
+            args=_args(wrist_depth_mask=True),
+            now=100.0,
+        )
+
+        self.assertEqual(status["left_wrist"]["status_level"], "error")
+        self.assertEqual(status["right_wrist"]["depth_status_level"], "error")
+        self.assertIn("front", status)
+
+    def test_camera_startup_self_check_publishes_failed_depth_payload(self) -> None:
+        repeated_frames = [
+            _fake_depth_frame(frame_index=index, source_timestamp=100.0 + index * 0.01)
+            for index in range(1, 8)
+        ]
+        left_wrist = _FakeCameraSource(
+            {
+                "camera_key": "left_wrist",
+                "serial": "456",
+                "frame_count": 1,
+                "last_frame_age_sec": 0.01,
+                "stale_after_sec": 1.0,
+                "depth_enabled": True,
+                "depth_scale_m_per_unit": 0.001,
+            },
+            enable_depth=True,
+            frames=repeated_frames,
+        )
+        ui = _FakeUi()
+        clutch_input = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(wrist_depth_mask=True),
+            components=_components(),
+        )
+        clutch_input.start()
+
+        payload = real_teleop._run_camera_startup_self_check(
+            camera_sources={"left_wrist": left_wrist},
+            clutch_input=clutch_input,
+            duration_sec=0.03,
+            interval_sec=0.01,
+        )
+
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("left_wrist", payload["failed_keys"])
+        published_checks = [
+            item["camera_self_check"]
+            for item in ui.published
+            if "camera_self_check" in item
+        ]
+        self.assertTrue(published_checks)
+        self.assertEqual(published_checks[-1]["status"], "failed")
+
+    def test_camera_startup_self_check_fails_empty_sources_when_wrist_depth_required(self) -> None:
+        ui = _FakeUi()
+        clutch_input = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(wrist_depth_mask=True),
+            components=_components(),
+        )
+
+        payload = real_teleop._run_camera_startup_self_check(
+            camera_sources={},
+            clutch_input=clutch_input,
+            duration_sec=0.0,
+        )
+
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("left_wrist", payload["failed_keys"])
+        self.assertEqual(ui.published[-1]["camera_status"]["left_wrist"]["status_level"], "error")
+
     def test_tactile_camera_status_highlights_partial_ready_and_worker_error(self) -> None:
         status = real_teleop._build_tactile_camera_status(
             {
@@ -2316,12 +2596,14 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
         ui.publish(
             camera_status={"front": {"status_level": "ok"}},
+            camera_self_check={"status": "passed", "status_level": "ok"},
             tactile_camera_status={"left": {"status_level": "warn"}},
         )
 
         snapshot = ui.snapshot()
 
         self.assertEqual(snapshot["camera_status"]["front"]["status_level"], "ok")
+        self.assertEqual(snapshot["camera_self_check"]["status"], "passed")
         self.assertEqual(snapshot["tactile_camera_status"]["left"]["status_level"], "warn")
 
     def test_collection_frequency_warning_trips_below_15hz(self) -> None:
@@ -2344,6 +2626,72 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertLess(status["sample_hz"], 15.0)
         self.assertTrue(status["warning"]["active"])
         self.assertIn("15.0 Hz", status["warning"]["message"])
+
+    def test_dataset_recorder_pause_blocks_samples_and_resumes_same_episode(self) -> None:
+        recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+            real_teleop.RealTeleopDatasetRecorder
+        )
+        current_time = time.monotonic()
+        recorder.active_episode_index = 12
+        recorder.sample_builder = SimpleNamespace(frame_index=4, include_debug_metadata=False)
+        recorder.frequency_warning_hz = 15.0
+        recorder.frequency_window_sec = 3.0
+        recorder.frequency_min_elapsed_sec = 2.0
+        recorder._episode_start_monotonic = current_time - 3.0
+        recorder._record_timestamps = deque(
+            [current_time - 3.0, current_time - 2.0, current_time - 1.0, current_time]
+        )
+        recorder._pause_started_at = None
+        recorder._pause_started_monotonic = None
+        recorder._pause_reason = None
+        recorder._pause_started_frame_index = None
+        recorder._pause_started_step_index = None
+        recorder._pause_started_last_state = None
+        recorder._pause_segments = []
+        recorder._paused_accumulated_sec = 0.0
+        recorder.writer = SimpleNamespace(tactile_frame_counts=lambda _episode_index: {})
+        recorder.camera_sources = {}
+        recorder.dataset_root = Path("/tmp/dataset")
+
+        paused = recorder.pause_episode(
+            reason="hold_requested",
+            now=time.time(),
+            step_index=42,
+            last_state="RUNNING",
+        )
+
+        self.assertTrue(paused)
+        self.assertTrue(recorder.is_paused)
+        self.assertFalse(recorder.can_record_samples)
+        self.assertIsNone(recorder.record_step(SimpleNamespace()))
+        self.assertEqual(recorder.frame_count, 4)
+        paused_status = recorder.collection_frequency_status()
+        self.assertTrue(paused_status["paused"])
+        self.assertFalse(paused_status["warning"]["active"])
+
+        resumed = recorder.resume_episode(
+            reason="runtime_running_warmup_ready",
+            now=time.time(),
+            step_index=45,
+        )
+
+        self.assertTrue(resumed)
+        self.assertFalse(recorder.is_paused)
+        self.assertTrue(recorder.can_record_samples)
+        self.assertEqual(len(recorder.pause_summary()["recording_pause_segments"]), 1)
+        self.assertEqual(
+            recorder.pause_summary()["recording_pause_segments"][0]["start_frame_index"],
+            4,
+        )
+
+        class _Observer:
+            def handle_step(self, _step_result, **_kwargs):
+                recorder.sample_builder.frame_index += 1
+                return "recorded"
+
+        recorder.writer_observer = _Observer()
+        self.assertEqual(recorder.record_step(SimpleNamespace()), "recorded")
+        self.assertEqual(recorder.frame_count, 5)
 
     def test_episode_recording_state_publishes_frequency_warning(self) -> None:
         ui = _FakeUi()
@@ -2370,6 +2718,222 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(published["episode_target_hz"], 15.0)
         self.assertTrue(published["episode_frequency_warning"]["active"])
 
+    def test_episode_recording_state_keeps_fix_init_available_but_blocks_config_controls(self) -> None:
+        ui = _FakeUi()
+        components = _components()
+        components.fix_arm_controller = SimpleNamespace(
+            status_payload=lambda: {
+                "fix_arm_available": True,
+                "fix_arm_selected_side": "left",
+                "fix_arm_fixed_side": "",
+                "fix_arm_active": False,
+                "fix_arm_recalibrating": False,
+                "fix_arm_status": "",
+                "fix_arm_sample_count": None,
+                "fix_arm_min_samples": None,
+            }
+        )
+        components.init_arm_controller = SimpleNamespace(
+            status_payload=lambda: {
+                "init_arm_available": True,
+                "init_arm_selected_side": "right",
+                "init_arm_active_side": "",
+                "init_arm_active": False,
+                "init_arm_recalibrating": False,
+                "init_arm_status": "ready",
+                "init_arm_sample_count": None,
+                "init_arm_min_samples": None,
+                "init_arm_profile_path": "profile.json",
+            }
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=components,
+        )
+        control.publish_teleop_running()
+
+        control.set_episode_recording_state(
+            active=True,
+            episode_dir="/tmp/demo",
+            frame_count=7,
+            frequency_status={
+                "sample_hz": 15.0,
+                "target_hz": 15.0,
+                "warning": {"active": False, "message": ""},
+            },
+        )
+
+        active_controls = set(ui.published[-1]["active_controls"])
+        self.assertIn("episode_stop", active_controls)
+        self.assertIn("h", active_controls)
+        self.assertIn("q", active_controls)
+        self.assertIn("d", active_controls)
+        self.assertIn("c", active_controls)
+        self.assertIn("fix_arm_toggle", active_controls)
+        self.assertIn("fix_arm_select", active_controls)
+        self.assertIn("g", active_controls)
+        self.assertIn("init_arm_toggle", active_controls)
+        self.assertIn("init_arm_select", active_controls)
+        self.assertIn("toggle_camera_vis", active_controls)
+        self.assertIn("toggle_tactile_vis", active_controls)
+        self.assertNotIn("episode_start", active_controls)
+        self.assertNotIn("round_trip_toggle", active_controls)
+        self.assertNotIn("record_pose_snapshot", active_controls)
+        self.assertNotIn("movement_multiple_set", active_controls)
+        self.assertNotIn("save_vive_calibration_profile", active_controls)
+
+    def test_episode_finalizing_state_blocks_restart_controls(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control.set_episode_recording_state(
+            active=False,
+            episode_dir="/tmp/demo",
+            frame_count=7,
+            event_status="finalizing",
+            event_message="正在后台保存。",
+        )
+
+        active_controls = set(ui.published[-1]["active_controls"])
+        self.assertNotIn("episode_start", active_controls)
+        self.assertNotIn("episode_stop", active_controls)
+        self.assertNotIn("round_trip_toggle", active_controls)
+        self.assertNotIn("movement_multiple_set", active_controls)
+        self.assertIn("h", active_controls)
+        self.assertIn("q", active_controls)
+        self.assertIn("d", active_controls)
+
+    def test_episode_finalize_completion_restores_hold_controls(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control.set_episode_recording_state(
+            active=False,
+            episode_dir="/tmp/demo",
+            frame_count=7,
+            event_status="finalizing",
+            event_message="正在后台保存。",
+        )
+        self.assertIn("h", ui.published[-1]["active_controls"])
+
+        control.set_episode_finalize_state(
+            status="saved",
+            message="保存完成。",
+            episode_index=0,
+            frame_count=7,
+        )
+
+        active_controls = set(ui.published[-1]["active_controls"])
+        self.assertIn("h", active_controls)
+        self.assertIn("episode_start", active_controls)
+
+    def test_episode_paused_state_keeps_stop_available_in_hold(self) -> None:
+        ui = _FakeUi()
+        components = _components()
+        components.fix_arm_controller = SimpleNamespace(
+            status_payload=lambda: {
+                "fix_arm_available": True,
+                "fix_arm_selected_side": "left",
+                "fix_arm_fixed_side": "",
+                "fix_arm_active": False,
+                "fix_arm_recalibrating": False,
+                "fix_arm_status": "",
+                "fix_arm_sample_count": None,
+                "fix_arm_min_samples": None,
+            }
+        )
+        components.init_arm_controller = SimpleNamespace(
+            status_payload=lambda: {
+                "init_arm_available": True,
+                "init_arm_selected_side": "right",
+                "init_arm_active_side": "",
+                "init_arm_active": False,
+                "init_arm_recalibrating": False,
+                "init_arm_status": "ready",
+                "init_arm_sample_count": None,
+                "init_arm_min_samples": None,
+                "init_arm_profile_path": "profile.json",
+            }
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=components,
+        )
+        control._teleop_started = True
+
+        control.set_episode_recording_state(
+            active=True,
+            episode_dir="/tmp/demo",
+            frame_count=7,
+            frequency_status={
+                "sample_hz": None,
+                "target_hz": 15.0,
+                "paused": True,
+                "pause_reason": "hold_requested",
+                "warning": {"active": False, "message": ""},
+            },
+            event_status="paused",
+            event_message="数采已暂停：hold_requested。",
+        )
+        control.request_hold()
+
+        published = ui.published[-1]
+        self.assertTrue(ui.published[-2]["episode_recording"])
+        self.assertEqual(ui.published[-2]["episode_event_status"], "paused")
+        self.assertIn("episode_stop", published["active_controls"])
+        self.assertIn("p", published["active_controls"])
+        self.assertNotIn("c", published["active_controls"])
+        self.assertNotIn("episode_start", published["active_controls"])
+        self.assertNotIn("round_trip_toggle", published["active_controls"])
+        self.assertNotIn("movement_multiple_set", published["active_controls"])
+        self.assertNotIn("calibrate_vive_coordinate_profile", published["active_controls"])
+        self.assertNotIn("fix_arm_toggle", published["active_controls"])
+        self.assertNotIn("init_arm_toggle", published["active_controls"])
+
+    def test_episode_hold_can_be_requested_again_after_resume(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+        control.set_episode_recording_state(active=True)
+
+        control.request_hold()
+        self.assertTrue(control.consume_hold_request())
+        self.assertIn("episode_stop", ui.published[-1]["active_controls"])
+        self.assertIn("p", ui.published[-1]["active_controls"])
+        self.assertNotIn("h", ui.published[-1]["active_controls"])
+
+        control.publish_teleop_running()
+        control.set_episode_recording_state(active=True)
+        self.assertIn("h", ui.published[-1]["active_controls"])
+        self.assertNotIn("p", ui.published[-1]["active_controls"])
+
+        control.request_hold()
+        self.assertTrue(control.consume_hold_request())
+        self.assertIn("episode_stop", ui.published[-1]["active_controls"])
+        self.assertIn("p", ui.published[-1]["active_controls"])
+        self.assertNotIn("h", ui.published[-1]["active_controls"])
+
     def test_episode_start_countdown_state_is_visible_and_blocks_restart(self) -> None:
         ui = _FakeUi()
         control = real_teleop.RealTeleopControlInput(
@@ -2387,6 +2951,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("2.4 秒", published["episode_event_message"])
         self.assertNotIn("episode_start", published["active_controls"])
         self.assertIn("episode_stop", published["active_controls"])
+        self.assertIn("h", published["active_controls"])
 
     def test_episode_start_countdown_runs_in_parallel_with_warmup(self) -> None:
         deadline = 13.0
@@ -2419,7 +2984,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn(".episode-banner.preparing", html)
         self.assertIn("3 秒后开始数采", html)
 
-    def test_gui_c_shortcut_only_sends_capture_not_quit(self) -> None:
+    def test_gui_c_shortcut_only_sends_fix_arm_not_runtime_home_or_quit(self) -> None:
         html_and_fallback = calibration_web_ui._HTML_PAGE + calibration_web_ui._FALLBACK_SCRIPT
 
         self.assertIn('id="shortcutCLabel"', calibration_web_ui._HTML_PAGE)
@@ -2434,7 +2999,9 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn(": \"q\";", html_and_fallback)
         self.assertIn('eventName = "fix_arm_toggle";', html_and_fallback)
         self.assertIn('eventName = "init_arm_toggle";', html_and_fallback)
-        self.assertIn('eventName = "c";', html_and_fallback)
+        self.assertNotIn('eventName = "c";', html_and_fallback)
+        self.assertIn("C 仅用于运行中的 fix-arm", html_and_fallback)
+        self.assertIn("固定臂不可用", html_and_fallback)
         self.assertIn("当前不可用", html_and_fallback)
 
     def test_gui_keeps_fix_arm_c_enabled_during_collection(self) -> None:
