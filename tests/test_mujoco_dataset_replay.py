@@ -9,27 +9,28 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sim.mujoco_real2sim.controllers import QposController
-from sim.mujoco_real2sim.replay.dataset import (
+from robot_motion.replay.control_schedule import DEFAULT_REPLAY_REFERENCE_HZ
+from sim.mujoco.controllers import QposController
+from sim.mujoco.replay.dataset import (
     fallback_hz,
     parquet_column_names,
     read_parquet_rows,
     resolve_episode,
 )
-from sim.mujoco_real2sim.replay.runner import (
+from sim.mujoco.replay.runner import (
     _close_viewer,
     _source_camera_intrinsics,
     build_arg_parser,
     run,
 )
-from sim.mujoco_real2sim.replay.trajectory import (
+from sim.mujoco.replay.trajectory import (
     extract_gripper_sample,
     extract_qpos_sample,
     gripper_read_columns,
     qpos_read_columns,
 )
-from sim.mujoco_real2sim.scene import MujocoScene
-from sim.mujoco_real2sim.urdf import discover_camera_mounts, parse_urdf
+from sim.mujoco.scene import MujocoScene
+from sim.mujoco.urdf import discover_camera_mounts, parse_urdf
 
 
 URDF = Path("assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf")
@@ -105,6 +106,39 @@ def test_close_viewer_waits_for_handle_to_stop() -> None:
     assert handle.polls >= 2
 
 
+def test_replay_runner_defaults_to_dataset_action_rate_and_shared_position_rates() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--dataset-root",
+            "dataset",
+            "--episode",
+            "0",
+            "--urdf",
+            "robot.urdf",
+        ]
+    )
+
+    assert args.action_hz == 0.0
+    assert args.reference_hz == pytest.approx(DEFAULT_REPLAY_REFERENCE_HZ)
+    assert args.control_hz == pytest.approx(150.0)
+    assert args.dt == 0.0
+
+    alias_args = parser.parse_args(
+        [
+            "--dataset-root",
+            "dataset",
+            "--episode",
+            "0",
+            "--urdf",
+            "robot.urdf",
+            "--command-hz",
+            "137",
+        ]
+    )
+    assert alias_args.control_hz == pytest.approx(137.0)
+
+
 def test_source_dataset_intrinsics_override_front_camera_fovy() -> None:
     if not DATASET.exists():
         pytest.skip(f"Local replay dataset not found: {DATASET}")
@@ -169,6 +203,9 @@ def test_qpos_replay_runner_no_render_smoke(capsys: pytest.CaptureFixture[str]) 
             "auto",
             "--max-frames",
             "2",
+            "--control-hz",
+            "15",
+            "--no-final-control-settle",
             "--no-render",
             "--no-sleep",
             "--print-every",
@@ -179,7 +216,7 @@ def test_qpos_replay_runner_no_render_smoke(capsys: pytest.CaptureFixture[str]) 
     run(args)
 
     captured = capsys.readouterr()
-    assert '"processed_frames": 2' in captured.out
+    assert '"processed_action_frames": 2' in captured.out
 
 
 def test_qpos_replay_exports_lerobot_style_sim_dataset(
@@ -198,7 +235,7 @@ def test_qpos_replay_exports_lerobot_style_sim_dataset(
         [
             sys.executable,
             "-m",
-            "sim.mujoco_real2sim.replay.runner",
+            "sim.mujoco.replay.runner",
             "--dataset-root",
             str(DATASET),
             "--episode",
@@ -211,6 +248,9 @@ def test_qpos_replay_exports_lerobot_style_sim_dataset(
             "auto",
             "--max-frames",
             "2",
+            "--control-hz",
+            "15",
+            "--no-final-control-settle",
             "--no-sleep",
             "--print-every",
             "0",
@@ -222,6 +262,8 @@ def test_qpos_replay_exports_lerobot_style_sim_dataset(
             str(export_root),
             "--export-fps",
             "15",
+            "--export-wrist-depth-raw",
+            "--export-wrist-depth-mask",
         ],
         cwd=Path.cwd(),
         env=env,
@@ -243,8 +285,24 @@ def test_qpos_replay_exports_lerobot_style_sim_dataset(
     assert set(episode.summary.camera_keys) == {"front", "left_wrist", "right_wrist"}
     assert episode.rows[0]["observation.images.front.video_frame_index"] == 0
     assert (export_root / "videos/observation.images.front/chunk-000/episode_000000.mp4").exists()
+    episode_record = json.loads((export_root / "meta" / "episodes.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    raw_manifest_rel = episode_record["wrist_depth_raw_paths"]["left_wrist"]
+    mask_manifest_rel = episode_record["wrist_depth_mask_paths"]["left_wrist"]
+    raw_manifest = json.loads((export_root / raw_manifest_rel).read_text(encoding="utf-8"))
+    mask_manifest = json.loads((export_root / mask_manifest_rel).read_text(encoding="utf-8"))
+    assert raw_manifest["format"] == "dexteleop_wrist_depth_video_u8_linear_v1"
+    assert raw_manifest["stream"]["shape"] == [120, 160]
+    assert raw_manifest["stream"]["frame_count"] == 2
+    assert raw_manifest["stream"]["path"].endswith("stream.mp4")
+    assert raw_manifest["semantics"]["visible_range_m"] == [0.05, 1.0]
+    assert mask_manifest["stream"]["frame_count"] == 2
+    assert mask_manifest["config"] == {"depth_min_m": 0.05, "depth_max_m": 0.5}
+    assert (export_root / raw_manifest["stream"]["path"]).exists()
+    assert (export_root / mask_manifest["stream"]["path"]).exists()
     info = json.loads((export_root / "meta" / "info.json").read_text(encoding="utf-8"))
     assert info["sim_replay"]["camera_metadata"]["front"]["fovy_deg"] == pytest.approx(
         43.2615,
         abs=1e-3,
     )
+    assert info["sim_replay"]["wrist_depth"]["raw"] is True
+    assert info["sim_replay"]["wrist_depth"]["mask"] is True

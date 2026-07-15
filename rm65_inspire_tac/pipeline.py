@@ -21,6 +21,32 @@ from .schemas import (
 DEFAULT_LEFT_ARM_QPOS = np.array([1.57, -0.47, 1.94, 0.0, 0.70, -1.57], dtype=float)
 DEFAULT_RIGHT_ARM_QPOS = np.array([-1.57, -0.47, 1.94, 3.10, -0.70, -1.57], dtype=float)
 
+# Explicit collision-pair set for both hand-proxy profiles. Keep this as the
+# set of pairs to check rather than deriving it from broad link cross-products:
+# adding or removing a checked pair is a safety-policy change that needs an
+# accompanying scene review, documentation update, and golden-test update.
+DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS: tuple[tuple[str, str], ...] = (
+    ("arm_link3_proxy_0", "right_arm_link3_proxy_0"),
+    ("arm_link3_proxy_0", "right_hand_proxy_0"),
+    ("left_hand_proxy_0", "right_arm_link3_proxy_0"),
+    ("left_hand_proxy_0", "right_hand_proxy_0"),
+    ("left_hand_proxy_0", "camera_pole_0"),
+    ("right_hand_proxy_0", "camera_pole_0"),
+    ("left_hand_proxy_0", "table_0"),
+    ("right_hand_proxy_0", "table_0"),
+    ("arm_link3_proxy_0", "table_0"),
+    ("right_arm_link3_proxy_0", "table_0"),
+    ("arm_link3_proxy_0", "left_camera_pole_0"),
+    ("right_arm_link3_proxy_0", "right_camera_pole_0"),
+)
+# Fixed geometries participating in the configured collision checks.
+DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES = (
+    "camera_pole_0",
+    "left_camera_pole_0",
+    "right_camera_pole_0",
+    "table_0",
+)
+
 _POSE_TRANSFORM_LEFT = np.array(
     [
         [0, 1, 0, 0],
@@ -296,82 +322,31 @@ def build_dual_arm_scene_profile(name: str) -> DualArmSceneProfile:
         profile_proxy_boxes = (*hand_proxy_boxes, *link3_proxy_boxes)
         camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="camera_pole")
         left_camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="left_camera_pole")
+        right_camera_pole_box = _load_fixed_scene_box(urdf_path, link_name="right_camera_pole")
         table_box = _load_fixed_scene_box(urdf_path, link_name="table")
-        left_links = (
-            "arm_link1_0",
-            "arm_link2_0",
-            "arm_link3_proxy_0",
-            "arm_link4_0",
-            "arm_link5_0",
-            "left_hand_proxy_0",
+        fixed_scene_boxes = (
+            camera_pole_box,
+            left_camera_pole_box,
+            right_camera_pole_box,
+            table_box,
         )
-        right_links = (
-            "right_arm_link1_0",
-            "right_arm_link2_0",
-            "right_arm_link3_proxy_0",
-            "right_arm_link4_0",
-            "right_arm_link5_0",
-            "right_hand_proxy_0",
-        )
-        collision_pairs = list((left, right) for left in left_links for right in right_links)
-        collision_pairs.extend(
-            (
-                spec.geometry_name,
-                "arm_link2_0" if spec.side == "left" else "right_arm_link2_0",
+        if tuple(box.geometry_name for box in fixed_scene_boxes) != (
+            DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES
+        ):
+            raise ValueError(
+                "Hand-proxy collision scene URDF no longer exposes the required collision "
+                "fixed geometry set "
+                f"{DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES}."
             )
-            for spec in hand_proxy_boxes
-        )
-        collision_pairs.extend(
-            (spec.geometry_name, camera_pole_box.geometry_name) for spec in hand_proxy_boxes
-        )
-        collision_pairs.extend(
-            (spec.geometry_name, table_box.geometry_name) for spec in hand_proxy_boxes
-        )
-        collision_pairs.extend(
-            (
-                ("arm_link3_proxy_0", table_box.geometry_name),
-                ("right_arm_link3_proxy_0", table_box.geometry_name),
-            )
-        )
-        collision_pairs.append(("arm_link3_proxy_0", left_camera_pole_box.geometry_name))
-        collision_pairs.extend(
-            (
-                ("arm_link2_0", camera_pole_box.geometry_name),
-                ("right_arm_link2_0", camera_pole_box.geometry_name),
-            )
-        )
-        disabled_geometries = {
-            "arm_link1_0",
-            "right_arm_link1_0",
-            "arm_link2_0",
-            "right_arm_link2_0",
-            "arm_link3_0",
-            "right_arm_link3_0",
-            "arm_link4_0",
-            "right_arm_link4_0",
-            "arm_link5_0",
-            "right_arm_link5_0",
-        }
-        disabled_pairs = {
-            frozenset(("arm_link5_0", camera_pole_box.geometry_name)),
-            frozenset(("right_arm_link5_0", camera_pole_box.geometry_name)),
-        }
-        collision_pairs = [
-            pair
-            for pair in collision_pairs
-            if pair[0] not in disabled_geometries
-            and pair[1] not in disabled_geometries
-            and frozenset(pair) not in disabled_pairs
-        ]
         return DualArmSceneProfile(
             name=name,
             urdf_path=urdf_path,
             package_dirs=(asset_dir,),
             left_frame_name="arm_link6",
             right_frame_name="right_arm_link6",
-            collision_pairs=tuple(collision_pairs),
+            collision_pairs=DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
             hand_proxy_boxes=profile_proxy_boxes,
-            fixed_scene_boxes=(camera_pole_box, left_camera_pole_box, table_box),
+            fixed_scene_boxes=fixed_scene_boxes,
             left_pose_transform=_POSE_TRANSFORM_LEFT,
             right_pose_transform=_POSE_TRANSFORM_RIGHT,
             solution_layout="auto",

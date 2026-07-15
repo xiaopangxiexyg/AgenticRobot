@@ -1,13 +1,30 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-from utils.handeye.calibration import CalibrationResult, CalibrationSample, load_result, save_result
-from utils.handeye.transforms import (
+from utils.head_eye.calibration import (
+    CalibrationResult,
+    CalibrationSample,
+    load_result,
+    load_samples,
+    load_samples_with_metadata,
+    save_result,
+    save_samples,
+)
+from utils.head_eye.camera import (
+    VideoStreamProfileInfo,
+    _choose_compatible_video_profile_pair,
+)
+from utils.head_eye.dual_arm import build_parser as build_dual_arm_parser
+from utils.head_eye.run_calibrate_handeye import build_parser as build_calibration_parser
+from utils.head_eye.transforms import (
     average_transforms,
     compose_transforms,
     invert_transform,
@@ -16,6 +33,75 @@ from utils.handeye.transforms import (
     rotation_matrix_from_euler_xyz,
     transform_distance,
 )
+from utils.head_eye.visualize_handeye import build_parser as build_visualizer_parser
+from utils.hand_eye.run_calibrate_handeye import build_parser as build_wrist_calibration_parser
+from utils.hand_eye.visualize_handeye import build_parser as build_wrist_visualizer_parser
+
+
+class HeadEyePackageTest(unittest.TestCase):
+    def test_cli_modules_import_from_canonical_package(self) -> None:
+        for build_parser in (
+            build_calibration_parser,
+            build_dual_arm_parser,
+            build_visualizer_parser,
+            build_wrist_calibration_parser,
+            build_wrist_visualizer_parser,
+        ):
+            self.assertIsNotNone(build_parser())
+
+    def test_fixed_camera_profile_fallback_defaults_to_compatible_opt_in(self) -> None:
+        args = build_calibration_parser().parse_args([])
+        self.assertTrue(args.auto_select_supported_profile)
+        self.assertFalse(args.show_profiles)
+
+        profiles = [
+            VideoStreamProfileInfo("color", "bgr8", 640, 480, 15),
+            VideoStreamProfileInfo("depth", "z16", 640, 480, 15),
+            VideoStreamProfileInfo("color", "bgr8", 1280, 720, 30),
+            VideoStreamProfileInfo("depth", "z16", 1280, 720, 30),
+        ]
+        pair = _choose_compatible_video_profile_pair(
+            profiles,
+            requested_width=1280,
+            requested_height=720,
+            requested_fps=15,
+        )
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual((pair[0].width, pair[0].height, pair[0].fps), (1280, 720, 30))
+        self.assertEqual(pair[0].describe(), "color 1280x720@30 bgr8")
+
+    def test_module_and_direct_script_help_entrypoints(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        commands = [
+            [sys.executable, "-m", "utils.head_eye", "--help"],
+            [sys.executable, "-m", "utils.head_eye.dual_arm", "--help"],
+            [sys.executable, "-m", "utils.head_eye.visualize_handeye", "--help"],
+            [sys.executable, str(repo_root / "utils/head_eye/run_calibrate_handeye.py"), "--help"],
+            [sys.executable, str(repo_root / "utils/head_eye/dual_arm.py"), "--help"],
+            [sys.executable, str(repo_root / "utils/head_eye/visualize_handeye.py"), "--help"],
+            [sys.executable, "-m", "utils.hand_eye", "--help"],
+            [sys.executable, "-m", "utils.hand_eye.visualize_handeye", "--help"],
+            [sys.executable, str(repo_root / "utils/hand_eye/run_calibrate_handeye.py"), "--help"],
+            [sys.executable, str(repo_root / "utils/hand_eye/visualize_handeye.py"), "--help"],
+        ]
+        environment = os.environ.copy()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=repo_root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"command failed: {command!r}\n{completed.stdout}{completed.stderr}",
+            )
 
 
 class HandeyeTransformTest(unittest.TestCase):
@@ -56,16 +142,32 @@ class HandeyeSerializationTest(unittest.TestCase):
             metrics={"sample_count": 1},
             samples=[sample],
             created_at_utc="2026-06-20T00:00:00Z",
-            metadata={"camera_serial": "serial"},
+            metadata={
+                "camera_serial": "serial",
+                "realsense_settings_report": {
+                    "fallback_used": True,
+                    "fallback_color_profile": "color 640x480@15 bgr8",
+                },
+            },
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = save_result(result, Path(tmpdir), name="unit", save_legacy_npy=True)
             for path in paths.values():
                 loaded = load_result(path)
                 np.testing.assert_allclose(loaded.T_camera_to_base, result.T_camera_to_base)
+            self.assertTrue(load_result(paths["json"]).metadata["realsense_settings_report"]["fallback_used"])
             self.assertIn("json", paths)
             self.assertIn("npz", paths)
             self.assertIn("legacy_npy", paths)
+
+            samples_path = save_samples(
+                Path(tmpdir) / "unit_samples.json",
+                [sample],
+                metadata=result.metadata,
+            )
+            self.assertEqual(len(load_samples(samples_path)), 1)
+            _, sample_metadata = load_samples_with_metadata(samples_path)
+            self.assertEqual(sample_metadata["realsense_settings_report"], result.metadata["realsense_settings_report"])
 
 
 if __name__ == "__main__":

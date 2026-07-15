@@ -120,6 +120,7 @@ def build_bimanual_session(
     calibration: TeleopCalibration,
     session_config: TeleopSessionConfig | None = None,
     vive_port: int = 9999,
+    vive_clock_sync_port: int | None = None,
     vive_tracker_configs: list[ViveTrackerConfig] | None = None,
     left_hand_serial_port: str | None = None,
     right_hand_serial_port: str | None = None,
@@ -162,6 +163,7 @@ def build_bimanual_session(
     vive_source = VivePoseSource(
         tracker_configs=vive_tracker_configs or default_vive_tracker_configs(),
         port=vive_port,
+        clock_sync_port=vive_clock_sync_port,
     )
     sources.append(vive_source)
 
@@ -185,6 +187,7 @@ def build_bimanual_session(
             effector_name="left_arm",
             input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
+            tracker_motion_intent_enabled=True,
         )
     )
     right_pose_retargeter = PoseToArmRetargeter(
@@ -194,6 +197,7 @@ def build_bimanual_session(
             effector_name="right_arm",
             input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
+            tracker_motion_intent_enabled=True,
         )
     )
     if enable_dual_arm_collision_avoidance and both_arm_backends_present:

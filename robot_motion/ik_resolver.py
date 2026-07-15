@@ -24,6 +24,78 @@ class _EvaluatedCandidate:
     metadata: dict[str, Any]
 
 
+def _hard_deadline_monotonic(request: IKResolveRequest) -> float | None:
+    if not bool(request.metadata.get("hard_deadline_enabled", False)):
+        return None
+    return _finite_float(request.metadata.get("hard_deadline_monotonic"), default=None)
+
+
+def _hard_deadline_expired(deadline_monotonic: float | None) -> bool:
+    return bool(
+        deadline_monotonic is not None
+        and time.perf_counter() >= float(deadline_monotonic)
+    )
+
+
+def _hard_deadline_metadata(
+    request: IKResolveRequest,
+    *,
+    deadline_monotonic: float | None,
+    expired: bool,
+    phase: str,
+) -> dict[str, Any]:
+    if deadline_monotonic is None:
+        return {"hard_deadline_enabled": False}
+    remaining_ms = max(
+        0.0,
+        (float(deadline_monotonic) - time.perf_counter()) * 1000.0,
+    )
+    return {
+        "hard_deadline_enabled": True,
+        "hard_deadline_budget_ms": _finite_float(
+            request.metadata.get("hard_deadline_budget_ms"),
+            default=None,
+        ),
+        "hard_deadline_expired": bool(expired),
+        "hard_deadline_phase": str(phase),
+        "hard_deadline_remaining_ms": float(remaining_ms),
+    }
+
+
+def _provider_options_with_hard_deadline(
+    options: dict[str, Any],
+    *,
+    hard_deadline: float | None,
+) -> dict[str, Any]:
+    """Propagate the earliest resolver deadline to cooperative providers.
+
+    A provider cannot preempt an SDK call already in progress, but it must not
+    start another solve/seed-expansion stage after the resolver deadline.  Keep
+    an upstream provider deadline when it is earlier than the force-control
+    deadline.
+    """
+
+    out = dict(options)
+    provider_deadline = _finite_float(
+        out.get("provider_deadline_monotonic"),
+        default=None,
+    )
+    deadlines = [
+        value
+        for value in (provider_deadline, hard_deadline)
+        if value is not None and float(value) > 0.0
+    ]
+    if not deadlines:
+        return out
+    effective_deadline = min(float(value) for value in deadlines)
+    out["provider_deadline_monotonic"] = effective_deadline
+    out["provider_remaining_time_budget_ms"] = max(
+        0.0,
+        (effective_deadline - time.perf_counter()) * 1000.0,
+    )
+    return out
+
+
 class IKSafetyResolver:
     def __init__(
         self,
@@ -52,6 +124,35 @@ class IKSafetyResolver:
         own_timing_profile = timing_profile is None
         if timing_profile is None:
             timing_profile = _new_timing_profile("resolve")
+        hard_deadline = _hard_deadline_monotonic(request)
+        hard_deadline_expired = False
+        if hard_deadline is not None:
+            timing_profile["hard_deadline_enabled"] = True
+            timing_profile["hard_deadline_budget_ms"] = _finite_float(
+                request.metadata.get("hard_deadline_budget_ms"),
+                default=None,
+            )
+            hard_budget_ms = _finite_float(
+                request.metadata.get("hard_deadline_budget_ms"),
+                default=None,
+            )
+            existing_budget_ms = _finite_float(timing_profile.get("time_budget_ms"), default=None)
+            if hard_budget_ms is not None:
+                timing_profile["time_budget_ms"] = (
+                    hard_budget_ms
+                    if existing_budget_ms is None
+                    else min(existing_budget_ms, hard_budget_ms)
+                )
+            if _hard_deadline_expired(hard_deadline):
+                result = self._hard_deadline_hold_result(
+                    request=request,
+                    phase="resolve_entry",
+                )
+                return (
+                    self._with_timing_metadata(result, timing_profile, started_at)
+                    if own_timing_profile
+                    else result
+                )
         target_pose = np.asarray(request.target_pose, dtype=float).reshape(4, 4)
         reference_qpos = np.asarray(request.reference_qpos, dtype=float).reshape(-1)
         if request.reference_pose is not None:
@@ -60,6 +161,16 @@ class IKSafetyResolver:
             reference_fk_started = time.perf_counter()
             reference_pose = self.provider.forward_kinematics(reference_qpos)
             _timing_add(timing_profile, "reference_fk_ms", _elapsed_ms(reference_fk_started))
+        if _hard_deadline_expired(hard_deadline):
+            result = self._hard_deadline_hold_result(
+                request=request,
+                phase="reference_pose",
+            )
+            return (
+                self._with_timing_metadata(result, timing_profile, started_at)
+                if own_timing_profile
+                else result
+            )
         if reference_pose is None:
             result = self._failed_result(
                 request,
@@ -77,10 +188,23 @@ class IKSafetyResolver:
         seed_started = time.perf_counter()
         seeds, seed_labels, seed_expansion_metadata = self._seed_tuple(request, reference_qpos)
         _timing_add(timing_profile, "seed_ms", _elapsed_ms(seed_started))
+        if _hard_deadline_expired(hard_deadline):
+            result = self._hard_deadline_hold_result(
+                request=request,
+                phase="seed_expansion",
+            )
+            return (
+                self._with_timing_metadata(result, timing_profile, started_at)
+                if own_timing_profile
+                else result
+            )
         rejection_log: list[dict[str, Any]] = []
         best_rejected: dict[str, Any] | None = None
 
         for raw_fraction in self.profile.relaxation_fractions:
+            if _hard_deadline_expired(hard_deadline):
+                hard_deadline_expired = True
+                break
             fraction = max(0.0, min(1.0, float(raw_fraction)))
             _timing_inc(timing_profile, "full_relaxation_attempts")
             tolerance = self.profile.target_tolerance.scaled(fraction)
@@ -99,14 +223,17 @@ class IKSafetyResolver:
                 target_pose=effective_target,
                 seeds=seeds,
                 seed_labels=seed_labels,
-                options={
-                    "enable_expensive_seed_expansion": bool(self.profile.enable_expensive_seed_expansion),
-                    "allow_parallel": bool(self.profile.allow_parallel_candidate_generation),
-                    "max_candidate_count": int(self.profile.max_candidate_count),
-                    "provider_time_budget_ms": self.profile.provider_time_budget_ms,
-                    "tolerance_fraction": fraction,
-                    **request.metadata,
-                },
+                options=_provider_options_with_hard_deadline(
+                    {
+                        "enable_expensive_seed_expansion": bool(self.profile.enable_expensive_seed_expansion),
+                        "allow_parallel": bool(self.profile.allow_parallel_candidate_generation),
+                        "max_candidate_count": int(self.profile.max_candidate_count),
+                        "provider_time_budget_ms": self.profile.provider_time_budget_ms,
+                        "tolerance_fraction": fraction,
+                        **request.metadata,
+                    },
+                    hard_deadline=hard_deadline,
+                ),
             )
             provider_elapsed_ms = _elapsed_ms(provider_started)
             _record_provider_call(
@@ -120,6 +247,9 @@ class IKSafetyResolver:
             evaluated: list[_EvaluatedCandidate] = []
             evaluate_started = time.perf_counter()
             for candidate in candidates:
+                if _hard_deadline_expired(hard_deadline):
+                    hard_deadline_expired = True
+                    break
                 accepted, metadata = self._evaluate_candidate(
                     candidate=candidate,
                     reference_qpos=reference_qpos,
@@ -129,6 +259,9 @@ class IKSafetyResolver:
                     timing_profile=timing_profile,
                     timing_phase="full",
                 )
+                if _hard_deadline_expired(hard_deadline):
+                    hard_deadline_expired = True
+                    break
                 if accepted:
                     evaluated.append(
                         _EvaluatedCandidate(
@@ -184,6 +317,12 @@ class IKSafetyResolver:
                         "target_relaxation_fraction": fraction,
                         "rejection_count": len(rejection_log),
                         "seed_expansion": seed_expansion_metadata,
+                        **_hard_deadline_metadata(
+                            request,
+                            deadline_monotonic=hard_deadline,
+                            expired=hard_deadline_expired,
+                            phase="full_candidate_evaluation",
+                        ),
                         **selected.metadata,
                     },
                 )
@@ -192,6 +331,8 @@ class IKSafetyResolver:
                     if own_timing_profile
                     else result
                 )
+            if hard_deadline_expired:
+                break
 
         metadata = {
             "profile": self.profile.name,
@@ -203,6 +344,12 @@ class IKSafetyResolver:
             "best_rejected": best_rejected,
             "seed_expansion": seed_expansion_metadata,
             "provider": dict(getattr(self.provider, "last_metadata", {})),
+            **_hard_deadline_metadata(
+                request,
+                deadline_monotonic=hard_deadline,
+                expired=hard_deadline_expired,
+                phase="full_candidate_evaluation",
+            ),
         }
         status = (
             IKResolveStatus.SMOOTHING_REQUIRED
@@ -236,6 +383,7 @@ class IKSafetyResolver:
         dt_sec: float,
         local_provider_names: tuple[str, ...] | list[str] = (),
         local_options: dict[str, Any] | None = None,
+        allow_full_solve: bool = True,
     ) -> IKResolveResult:
         """Resolve IK for a realtime command step.
 
@@ -244,7 +392,10 @@ class IKSafetyResolver:
         therefore enable a local-first receding-horizon path: try one bounded
         local step toward the latest pose target, and only fall back to the full
         multi-provider search when the local step cannot make safe progress or
-        when a periodic full solve is due.
+        when a periodic full solve is due. ``allow_full_solve=False`` is for a
+        caller that owns full solves on a separate scheduler: this method then
+        performs only the bounded local attempt and returns a safe hold rather
+        than unexpectedly starting an expensive search on the realtime thread.
         """
         started_at = time.perf_counter()
         timing_profile = _new_timing_profile("resolve_step")
@@ -257,18 +408,37 @@ class IKSafetyResolver:
             and bool(local_provider_names_tuple)
         )
         full_solve_interval = max(0, int(getattr(self.profile, "local_step_first_full_solve_interval", 0) or 0))
-        periodic_full_solve = (
+        periodic_full_solve = bool(allow_full_solve) and (
             full_solve_interval > 0
             and self._resolve_step_counter % full_solve_interval == 0
         )
+        hard_deadline = _hard_deadline_monotonic(request)
         frame_budget_ms = _finite_float(self.profile.provider_time_budget_ms, default=None)
+        if hard_deadline is not None:
+            frame_deadline = float(hard_deadline)
+            frame_budget_ms = _finite_float(
+                request.metadata.get("hard_deadline_budget_ms"),
+                default=frame_budget_ms,
+            )
+            timing_profile["hard_deadline_enabled"] = True
+            timing_profile["hard_deadline_budget_ms"] = frame_budget_ms
+        else:
+            frame_deadline = (
+                None
+                if frame_budget_ms is None
+                else started_at + max(0.0, float(frame_budget_ms)) / 1000.0
+            )
         if frame_budget_ms is not None:
             timing_profile["time_budget_ms"] = float(frame_budget_ms)
-        frame_deadline = (
-            None
-            if frame_budget_ms is None
-            else started_at + max(0.0, float(frame_budget_ms)) / 1000.0
-        )
+        if _hard_deadline_expired(hard_deadline):
+            return self._with_timing_metadata(
+                self._hard_deadline_hold_result(
+                    request=request,
+                    phase="resolve_step_entry",
+                ),
+                timing_profile,
+                started_at,
+            )
         local_first_metadata: dict[str, Any] = {
             "local_step_first_enabled": bool(getattr(self.profile, "local_step_first_enabled", False)),
             "local_step_first_full_solve_interval": full_solve_interval,
@@ -302,6 +472,29 @@ class IKSafetyResolver:
                 timing_profile=timing_profile,
                 timing_phase="local_first",
             )
+            if _hard_deadline_expired(hard_deadline):
+                if local_result is not None:
+                    return self._with_timing_metadata(
+                        self._with_step_metadata(
+                            local_result,
+                            _hard_deadline_metadata(
+                                request,
+                                deadline_monotonic=hard_deadline,
+                                expired=True,
+                                phase="local_first",
+                            ),
+                        ),
+                        timing_profile,
+                        started_at,
+                    )
+                return self._with_timing_metadata(
+                    self._hard_deadline_hold_result(
+                        request=request,
+                        phase="local_first",
+                    ),
+                    timing_profile,
+                    started_at,
+                )
             if local_result is not None:
                 skip_reason = self._local_first_full_solve_skip_reason(
                     local_result=local_result,
@@ -354,6 +547,48 @@ class IKSafetyResolver:
                 "local_step_first_periodic_full_solve": bool(periodic_full_solve),
             }
 
+        if not bool(allow_full_solve):
+            hold = self._hard_deadline_hold_result(
+                request=request,
+                phase="local_only_no_safe_candidate",
+            )
+            return self._with_timing_metadata(
+                self._with_step_metadata(
+                    hold,
+                    {
+                        **local_first_metadata,
+                        "local_step_status": "no_safe_local_candidate_hold_reference",
+                        "full_solve_deferred_to_external_scheduler": True,
+                    },
+                ),
+                timing_profile,
+                started_at,
+            )
+
+        if _hard_deadline_expired(hard_deadline):
+            if local_fallback_result is not None:
+                return self._with_timing_metadata(
+                    self._with_step_metadata(
+                        local_fallback_result,
+                        _hard_deadline_metadata(
+                            request,
+                            deadline_monotonic=hard_deadline,
+                            expired=True,
+                            phase="before_full_resolve",
+                        ),
+                    ),
+                    timing_profile,
+                    started_at,
+                )
+            return self._with_timing_metadata(
+                self._hard_deadline_hold_result(
+                    request=request,
+                    phase="before_full_resolve",
+                ),
+                timing_profile,
+                started_at,
+            )
+
         full_started = time.perf_counter()
         full_request = request
         full_provider_budget_ms = frame_budget_ms
@@ -383,6 +618,43 @@ class IKSafetyResolver:
             timing_profile["full_provider_remaining_time_budget_ms"] = float(remaining_ms)
         full_result = self.resolve(full_request, timing_profile=timing_profile)
         _timing_add(timing_profile, "full_solve_wall_ms", _elapsed_ms(full_started))
+        if _hard_deadline_expired(hard_deadline):
+            if full_result.accepted and full_result.qpos is not None:
+                return self._with_timing_metadata(
+                    self._with_step_metadata(
+                        full_result,
+                        _hard_deadline_metadata(
+                            request,
+                            deadline_monotonic=hard_deadline,
+                            expired=True,
+                            phase="full_resolve",
+                        ),
+                    ),
+                    timing_profile,
+                    started_at,
+                )
+            if local_fallback_result is not None:
+                return self._with_timing_metadata(
+                    self._with_step_metadata(
+                        local_fallback_result,
+                        _hard_deadline_metadata(
+                            request,
+                            deadline_monotonic=hard_deadline,
+                            expired=True,
+                            phase="full_resolve_fallback",
+                        ),
+                    ),
+                    timing_profile,
+                    started_at,
+                )
+            return self._with_timing_metadata(
+                self._hard_deadline_hold_result(
+                    request=request,
+                    phase="full_resolve",
+                ),
+                timing_profile,
+                started_at,
+            )
         if not full_result.accepted or full_result.qpos is None:
             if local_fallback_result is not None:
                 return self._with_timing_metadata(
@@ -481,6 +753,21 @@ class IKSafetyResolver:
             timing_profile=timing_profile,
             timing_phase="local_recovery",
         )
+        if _hard_deadline_expired(hard_deadline):
+            selected = full_result if local_result is None else local_result
+            return self._with_timing_metadata(
+                self._with_step_metadata(
+                    selected,
+                    _hard_deadline_metadata(
+                        request,
+                        deadline_monotonic=hard_deadline,
+                        expired=True,
+                        phase="local_recovery",
+                    ),
+                ),
+                timing_profile,
+                started_at,
+            )
         if local_result is not None:
             return self._with_timing_metadata(local_result, timing_profile, started_at)
         if local_fallback_result is not None:
@@ -516,6 +803,56 @@ class IKSafetyResolver:
             ),
             timing_profile,
             started_at,
+        )
+
+    def _hard_deadline_hold_result(
+        self,
+        *,
+        request: IKResolveRequest,
+        phase: str,
+    ) -> IKResolveResult:
+        """Return the last known-safe qpos when no candidate was ready in time."""
+
+        reference_qpos = np.asarray(request.reference_qpos, dtype=float).reshape(-1)
+        previous_safe_qpos = (
+            None
+            if request.previous_safe_qpos is None
+            else np.asarray(request.previous_safe_qpos, dtype=float).reshape(-1)
+        )
+        use_previous_safe = bool(
+            previous_safe_qpos is not None
+            and previous_safe_qpos.shape == reference_qpos.shape
+            and np.all(np.isfinite(previous_safe_qpos))
+        )
+        hold_qpos = previous_safe_qpos if use_previous_safe else reference_qpos
+        reference_pose = (
+            np.asarray(request.reference_pose, dtype=float).reshape(4, 4)
+            if request.reference_pose is not None
+            else np.asarray(request.target_pose, dtype=float).reshape(4, 4)
+        )
+        return IKResolveResult(
+            status=IKResolveStatus.RELAXED,
+            qpos=np.asarray(hold_qpos, dtype=float).copy(),
+            requested_target_pose=np.asarray(request.target_pose, dtype=float).reshape(4, 4),
+            effective_target_pose=reference_pose.copy(),
+            tolerance_fraction=1.0,
+            candidate_source="hard_deadline_hold_reference",
+            message="ik_hard_deadline_hold_reference",
+            metadata={
+                "profile": self.profile.name,
+                "status": IKResolveStatus.RELAXED.value,
+                "candidate_source": "hard_deadline_hold_reference",
+                "seed_source": "previous_safe" if use_previous_safe else "reference",
+                "method": "hold_previous_safe" if use_previous_safe else "hold_reference",
+                "hard_deadline_hold_qpos_source": "previous_safe" if use_previous_safe else "reference",
+                "local_step_status": "hard_deadline_hold_reference",
+                **_hard_deadline_metadata(
+                    request,
+                    deadline_monotonic=_hard_deadline_monotonic(request),
+                    expired=True,
+                    phase=phase,
+                ),
+            },
         )
 
     def _seed_tuple(
@@ -796,6 +1133,8 @@ class IKSafetyResolver:
     ) -> IKResolveResult | None:
         target_pose = np.asarray(request.target_pose, dtype=float).reshape(4, 4)
         reference_qpos = np.asarray(request.reference_qpos, dtype=float).reshape(-1)
+        hard_deadline = _hard_deadline_monotonic(request)
+        hard_deadline_expired = False
         if request.reference_pose is not None:
             reference_pose = np.asarray(request.reference_pose, dtype=float).reshape(4, 4)
         else:
@@ -840,6 +1179,9 @@ class IKSafetyResolver:
         candidates: list[IKCandidate] = []
         provider_metadata_by_horizon: list[dict[str, Any]] = []
         for iteration_count in _local_step_iteration_counts(self.profile):
+            if _hard_deadline_expired(hard_deadline):
+                hard_deadline_expired = True
+                break
             options = {
                 **base_options,
                 "pinocchio_max_iterations": int(iteration_count),
@@ -874,6 +1216,9 @@ class IKSafetyResolver:
                     }
                 )
             for candidate in horizon_candidates:
+                if _hard_deadline_expired(hard_deadline):
+                    hard_deadline_expired = True
+                    break
                 candidates.append(
                     IKCandidate(
                         qpos=np.asarray(candidate.qpos, dtype=float).reshape(reference_qpos.shape),
@@ -886,8 +1231,11 @@ class IKSafetyResolver:
                         },
                     )
                 )
+            if hard_deadline_expired:
+                break
         if (
-            full_result is not None
+            not hard_deadline_expired
+            and full_result is not None
             and bool(self.profile.local_step_full_target_step_enabled)
             and full_result.qpos is not None
         ):
@@ -905,38 +1253,98 @@ class IKSafetyResolver:
                     },
                 )
             )
-        limit_escape_candidates, limit_escape_metadata = self._local_step_limit_escape_candidates(
-            reference_qpos=reference_qpos,
-            target_pose=target_pose,
-            reference_pose=reference_pose,
-            joint_velocity_profile=joint_velocity_profile,
-            dt_sec=dt_sec,
-            timing_profile=timing_profile,
-            timing_phase=timing_phase,
-        )
-        candidates.extend(limit_escape_candidates)
-        singularity_escape_candidates, singularity_escape_metadata = self._local_step_singularity_escape_candidates(
-            reference_qpos=reference_qpos,
-            target_pose=target_pose,
-            reference_pose=reference_pose,
-            joint_velocity_profile=joint_velocity_profile,
-            dt_sec=dt_sec,
-            timing_profile=timing_profile,
-            timing_phase=timing_phase,
-        )
-        candidates.extend(singularity_escape_candidates)
-        posture_escape_candidates, posture_escape_metadata = self._local_step_posture_escape_candidates(
-            reference_qpos=reference_qpos,
-            joint_velocity_profile=joint_velocity_profile,
-            dt_sec=dt_sec,
-        )
-        candidates.extend(posture_escape_candidates)
-        wrist_unload_candidates, wrist_unload_metadata = self._local_step_wrist_unload_candidates(
-            reference_qpos=reference_qpos,
-            joint_velocity_profile=joint_velocity_profile,
-            dt_sec=dt_sec,
-        )
-        candidates.extend(wrist_unload_candidates)
+        if hard_deadline is not None:
+            return self._resolve_local_step_with_hard_deadline(
+                request=request,
+                full_result=full_result,
+                reference_qpos=reference_qpos,
+                target_pose=target_pose,
+                reference_pose=reference_pose,
+                joint_velocity_profile=joint_velocity_profile,
+                dt_sec=dt_sec,
+                base_candidates=candidates,
+                seed_expansion_metadata=seed_expansion_metadata,
+                provider_metadata_by_horizon=provider_metadata_by_horizon,
+                rate_metadata=rate_metadata,
+                hard_deadline=hard_deadline,
+                already_expired=hard_deadline_expired,
+                timing_profile=timing_profile,
+                timing_phase=timing_phase,
+            )
+        if _hard_deadline_expired(hard_deadline):
+            hard_deadline_expired = True
+        if hard_deadline_expired:
+            skipped_auxiliary = {
+                "enabled": False,
+                "status": "skipped_hard_deadline",
+                "candidate_count": 0,
+            }
+            limit_escape_candidates, limit_escape_metadata = [], dict(skipped_auxiliary)
+            singularity_escape_candidates, singularity_escape_metadata = [], dict(skipped_auxiliary)
+            posture_escape_candidates, posture_escape_metadata = [], dict(skipped_auxiliary)
+            wrist_unload_candidates, wrist_unload_metadata = [], dict(skipped_auxiliary)
+        else:
+            limit_escape_candidates, limit_escape_metadata = self._local_step_limit_escape_candidates(
+                reference_qpos=reference_qpos,
+                target_pose=target_pose,
+                reference_pose=reference_pose,
+                joint_velocity_profile=joint_velocity_profile,
+                dt_sec=dt_sec,
+                timing_profile=timing_profile,
+                timing_phase=timing_phase,
+            )
+            candidates.extend(limit_escape_candidates)
+            if _hard_deadline_expired(hard_deadline):
+                hard_deadline_expired = True
+                skipped_auxiliary = {
+                    "enabled": False,
+                    "status": "skipped_hard_deadline",
+                    "candidate_count": 0,
+                }
+                singularity_escape_candidates, singularity_escape_metadata = [], dict(skipped_auxiliary)
+                posture_escape_candidates, posture_escape_metadata = [], dict(skipped_auxiliary)
+                wrist_unload_candidates, wrist_unload_metadata = [], dict(skipped_auxiliary)
+            else:
+                singularity_escape_candidates, singularity_escape_metadata = self._local_step_singularity_escape_candidates(
+                    reference_qpos=reference_qpos,
+                    target_pose=target_pose,
+                    reference_pose=reference_pose,
+                    joint_velocity_profile=joint_velocity_profile,
+                    dt_sec=dt_sec,
+                    timing_profile=timing_profile,
+                    timing_phase=timing_phase,
+                )
+                candidates.extend(singularity_escape_candidates)
+                if _hard_deadline_expired(hard_deadline):
+                    hard_deadline_expired = True
+                    skipped_auxiliary = {
+                        "enabled": False,
+                        "status": "skipped_hard_deadline",
+                        "candidate_count": 0,
+                    }
+                    posture_escape_candidates, posture_escape_metadata = [], dict(skipped_auxiliary)
+                    wrist_unload_candidates, wrist_unload_metadata = [], dict(skipped_auxiliary)
+                else:
+                    posture_escape_candidates, posture_escape_metadata = self._local_step_posture_escape_candidates(
+                        reference_qpos=reference_qpos,
+                        joint_velocity_profile=joint_velocity_profile,
+                        dt_sec=dt_sec,
+                    )
+                    candidates.extend(posture_escape_candidates)
+                    if _hard_deadline_expired(hard_deadline):
+                        hard_deadline_expired = True
+                        wrist_unload_candidates, wrist_unload_metadata = [], {
+                            "enabled": False,
+                            "status": "skipped_hard_deadline",
+                            "candidate_count": 0,
+                        }
+                    else:
+                        wrist_unload_candidates, wrist_unload_metadata = self._local_step_wrist_unload_candidates(
+                            reference_qpos=reference_qpos,
+                            joint_velocity_profile=joint_velocity_profile,
+                            dt_sec=dt_sec,
+                        )
+                        candidates.extend(wrist_unload_candidates)
         evaluated: list[_EvaluatedCandidate] = []
         rejection_log: list[dict[str, Any]] = []
         step_scales = _local_step_scale_factors(self.profile)
@@ -958,7 +1366,7 @@ class IKSafetyResolver:
             fallback_reason: str | None = None,
             allow_pose_nonprogress_transition: bool = False,
         ) -> None:
-            nonlocal eval_count
+            nonlocal eval_count, hard_deadline_expired
             if not scales or not indexed_candidates:
                 return
             pass_started = time.perf_counter()
@@ -966,6 +1374,9 @@ class IKSafetyResolver:
             pass_accept_before = len(evaluated)
             for candidate_index, candidate in indexed_candidates:
                 for step_scale in scales:
+                    if _hard_deadline_expired(hard_deadline):
+                        hard_deadline_expired = True
+                        break
                     eval_count += 1
                     accepted, metadata = self._evaluate_local_step_candidate(
                         candidate=candidate,
@@ -1002,6 +1413,8 @@ class IKSafetyResolver:
                         )
                     else:
                         rejection_log.append(metadata)
+                if hard_deadline_expired:
+                    break
             pass_elapsed_ms = _elapsed_ms(pass_started)
             _timing_add(timing_profile, f"{timing_phase}_{name}_evaluate_ms", pass_elapsed_ms)
             _timing_inc(timing_profile, f"{timing_phase}_{name}_candidate_eval_count", eval_count - pass_eval_before)
@@ -1025,7 +1438,7 @@ class IKSafetyResolver:
         )
         fallback_reason = None
         fallback_candidates = indexed_candidates
-        if fallback_step_scales:
+        if not hard_deadline_expired and fallback_step_scales:
             if not evaluated:
                 fallback_reason = "primary_failed"
             elif limit_escape_active:
@@ -1070,7 +1483,7 @@ class IKSafetyResolver:
                     for index, candidate in indexed_candidates
                     if int(index) in accepted_candidate_indices
                 ]
-        if fallback_reason and fallback_candidates:
+        if not hard_deadline_expired and fallback_reason and fallback_candidates:
             for fallback_scale in fallback_step_scales:
                 fallback_accept_before = len(evaluated)
                 evaluate_scale_pass(
@@ -1082,7 +1495,8 @@ class IKSafetyResolver:
                 if len(evaluated) > fallback_accept_before:
                     break
         if (
-            not evaluated
+            not hard_deadline_expired
+            and not evaluated
             and full_result is not None
             and full_result.accepted
             and full_result.qpos is not None
@@ -1107,7 +1521,18 @@ class IKSafetyResolver:
         _timing_inc(timing_profile, "local_candidate_eval_count", eval_count)
         _timing_inc(timing_profile, "local_accepted_candidate_count", len(evaluated))
         _timing_inc(timing_profile, f"{timing_phase}_accepted_candidate_count", len(evaluated))
+        if hard_deadline is not None and timing_profile is not None:
+            timing_profile["hard_deadline_enabled"] = True
+            timing_profile["hard_deadline_expired"] = bool(hard_deadline_expired)
         if not evaluated:
+            rate_metadata.update(
+                _hard_deadline_metadata(
+                    request,
+                    deadline_monotonic=hard_deadline,
+                    expired=hard_deadline_expired,
+                    phase=timing_phase,
+                )
+            )
             rate_metadata["local_step_seed_expansion"] = seed_expansion_metadata
             rate_metadata["local_step_limit_escape"] = limit_escape_metadata
             rate_metadata["local_step_singularity_escape"] = singularity_escape_metadata
@@ -1164,6 +1589,12 @@ class IKSafetyResolver:
             "local_step_selection_policy": selection_policy,
             "local_step_rejection_count": len(rejection_log),
             "local_step_first_status": "accepted" if full_result is None else rate_metadata.get("local_step_first_status"),
+            **_hard_deadline_metadata(
+                request,
+                deadline_monotonic=hard_deadline,
+                expired=hard_deadline_expired,
+                phase=timing_phase,
+            ),
         }
         metadata["local_step_recovery_state"] = _local_step_recovery_state(selected.metadata)
         if full_result is not None:
@@ -1188,6 +1619,276 @@ class IKSafetyResolver:
             metadata=metadata,
         )
 
+    def _resolve_local_step_with_hard_deadline(
+        self,
+        *,
+        request: IKResolveRequest,
+        full_result: IKResolveResult | None,
+        reference_qpos: np.ndarray,
+        target_pose: np.ndarray,
+        reference_pose: np.ndarray,
+        joint_velocity_profile: JointVelocityLimitProfile,
+        dt_sec: float,
+        base_candidates: list[IKCandidate],
+        seed_expansion_metadata: dict[str, Any],
+        provider_metadata_by_horizon: list[dict[str, Any]],
+        rate_metadata: dict[str, Any],
+        hard_deadline: float,
+        already_expired: bool,
+        timing_profile: dict[str, Any] | None,
+        timing_phase: str,
+    ) -> IKResolveResult | None:
+        """Evaluate base candidates before spending deadline on recoveries.
+
+        The regular local-step path collects all recovery branches before it
+        evaluates any candidate.  That is useful for offline-quality search,
+        but in a force-control frame it can spend the whole period generating
+        auxiliary candidates and lose an already-safe local result.  This
+        deadline-specific path is deliberately staged: base candidates first,
+        then one recovery family at a time only if no safe result exists.
+        """
+
+        deadline_expired = bool(already_expired or _hard_deadline_expired(hard_deadline))
+        evaluated: list[_EvaluatedCandidate] = []
+        rejection_log: list[dict[str, Any]] = []
+        stage_records: list[dict[str, Any]] = []
+        step_scales = _local_step_scale_factors(self.profile)
+        primary_scales = step_scales[:1]
+        fallback_scales = step_scales[1:]
+        rate_metadata = dict(rate_metadata)
+
+        def skipped_auxiliary(status: str) -> dict[str, Any]:
+            return {
+                "enabled": False,
+                "status": status,
+                "candidate_count": 0,
+            }
+
+        limit_escape_metadata: dict[str, Any] = skipped_auxiliary("not_attempted")
+        singularity_escape_metadata: dict[str, Any] = skipped_auxiliary("not_attempted")
+        posture_escape_metadata: dict[str, Any] = skipped_auxiliary("not_attempted")
+        wrist_unload_metadata: dict[str, Any] = skipped_auxiliary("not_attempted")
+
+        def evaluate_stage(name: str, candidates: list[IKCandidate]) -> None:
+            nonlocal deadline_expired
+            if deadline_expired:
+                return
+            stage_started = time.perf_counter()
+            stage_evaluations = 0
+            stage_accepted_before = len(evaluated)
+            for pass_name, scales in (("primary", primary_scales), ("fallback", fallback_scales)):
+                if deadline_expired or not scales:
+                    break
+                if pass_name == "fallback" and len(evaluated) > stage_accepted_before:
+                    break
+                for candidate in candidates:
+                    for step_scale in scales:
+                        if _hard_deadline_expired(hard_deadline):
+                            deadline_expired = True
+                            break
+                        stage_evaluations += 1
+                        accepted, metadata = self._evaluate_local_step_candidate(
+                            candidate=candidate,
+                            reference_qpos=reference_qpos,
+                            target_pose=target_pose,
+                            reference_pose=reference_pose,
+                            request_metadata=request.metadata,
+                            joint_velocity_profile=joint_velocity_profile,
+                            dt_sec=dt_sec,
+                            step_scale=step_scale,
+                            allow_pose_nonprogress_transition=(
+                                candidate.source == "rate_limited_full_target"
+                            ),
+                            timing_profile=timing_profile,
+                            timing_phase=timing_phase,
+                        )
+                        metadata["local_step_scale_pass"] = f"hard_deadline_{pass_name}"
+                        if _hard_deadline_expired(hard_deadline):
+                            # A candidate that only completed after the cap was
+                            # crossed was not known-safe at the deadline.
+                            deadline_expired = True
+                            break
+                        if accepted:
+                            evaluated.append(
+                                _EvaluatedCandidate(
+                                    candidate=IKCandidate(
+                                        qpos=np.asarray(
+                                            metadata["local_step_output_qpos"],
+                                            dtype=float,
+                                        ).reshape(reference_qpos.shape),
+                                        source=candidate.source,
+                                        seed_source=candidate.seed_source,
+                                        method=candidate.method,
+                                        metadata=dict(candidate.metadata),
+                                    ),
+                                    pose_error_m=metadata.get("pose_error_m"),
+                                    pose_error_deg=metadata.get("pose_error_deg"),
+                                    score=float(metadata.get("score", 0.0)),
+                                    metadata=metadata,
+                                )
+                            )
+                        else:
+                            rejection_log.append(metadata)
+                    if deadline_expired:
+                        break
+                if deadline_expired:
+                    break
+            stage_records.append(
+                {
+                    "name": name,
+                    "candidate_count": len(candidates),
+                    "evaluation_count": stage_evaluations,
+                    "accepted_count": len(evaluated) - stage_accepted_before,
+                    "elapsed_ms": _elapsed_ms(stage_started),
+                    "deadline_expired": bool(deadline_expired),
+                }
+            )
+
+        def selected_result() -> IKResolveResult | None:
+            if not evaluated:
+                return None
+            selection_pool, selection_policy = _local_step_stable_selection_pool(evaluated)
+            selected = min(selection_pool, key=lambda item: item.score)
+            full_metadata = dict(full_result.metadata) if full_result is not None else {}
+            metadata = {
+                **full_metadata,
+                **rate_metadata,
+                **selected.metadata,
+                "status": IKResolveStatus.RELAXED.value,
+                "source": "generic_ik_resolver",
+                "result_message": "ik_local_step_hard_deadline",
+                "local_step_status": "active",
+                "local_step_recovery": True,
+                "local_step_seed_expansion": seed_expansion_metadata,
+                "local_step_limit_escape": limit_escape_metadata,
+                "local_step_singularity_escape": singularity_escape_metadata,
+                "local_step_posture_escape": posture_escape_metadata,
+                "local_step_wrist_unload": wrist_unload_metadata,
+                "local_step_scale_strategy": {
+                    "hard_deadline_staged": True,
+                    "configured_scales": [float(scale) for scale in step_scales],
+                    "primary_scales": [float(scale) for scale in primary_scales],
+                    "fallback_scales": [float(scale) for scale in fallback_scales],
+                    "stages": list(stage_records),
+                },
+                "local_step_selection_policy": selection_policy,
+                "local_step_rejection_count": len(rejection_log),
+                "local_step_last_rejections": rejection_log[-8:],
+                **_hard_deadline_metadata(
+                    request,
+                    deadline_monotonic=hard_deadline,
+                    expired=deadline_expired,
+                    phase=timing_phase,
+                ),
+            }
+            if provider_metadata_by_horizon:
+                metadata["local_step_provider_horizons"] = list(provider_metadata_by_horizon)
+            elif hasattr(self.provider, "last_metadata"):
+                metadata["local_step_provider"] = dict(getattr(self.provider, "last_metadata", {}))
+            metadata["local_step_recovery_state"] = _local_step_recovery_state(selected.metadata)
+            return IKResolveResult(
+                status=IKResolveStatus.RELAXED,
+                qpos=selected.candidate.qpos.copy(),
+                requested_target_pose=target_pose,
+                effective_target_pose=np.asarray(
+                    selected.metadata.get("local_step_output_pose"),
+                    dtype=float,
+                ).reshape(4, 4),
+                tolerance_fraction=max(
+                    0.0 if full_result is None else float(full_result.tolerance_fraction),
+                    float(selected.metadata.get("pose_slack_tier", 1.0)),
+                ),
+                pose_error_m=selected.pose_error_m,
+                pose_error_deg=selected.pose_error_deg,
+                candidate_source=selected.candidate.source,
+                message="ik_local_step_hard_deadline",
+                metadata=metadata,
+            )
+
+        # Base candidates are already generated by the local provider.  Evaluate
+        # them before any escape expansion so a deadline never discards a safe
+        # candidate that was available in the current frame.
+        evaluate_stage("base", list(base_candidates))
+        result = selected_result()
+        if result is not None:
+            return result
+        if deadline_expired:
+            return None
+
+        limit_candidates, limit_escape_metadata = self._local_step_limit_escape_candidates(
+            reference_qpos=reference_qpos,
+            target_pose=target_pose,
+            reference_pose=reference_pose,
+            joint_velocity_profile=joint_velocity_profile,
+            dt_sec=dt_sec,
+            deadline_monotonic=hard_deadline,
+            timing_profile=timing_profile,
+            timing_phase=timing_phase,
+        )
+        if _hard_deadline_expired(hard_deadline):
+            deadline_expired = True
+            singularity_escape_metadata = skipped_auxiliary("skipped_hard_deadline")
+            posture_escape_metadata = skipped_auxiliary("skipped_hard_deadline")
+            wrist_unload_metadata = skipped_auxiliary("skipped_hard_deadline")
+            return selected_result()
+        evaluate_stage("joint_limit_escape", limit_candidates)
+        result = selected_result()
+        if result is not None:
+            return result
+        if deadline_expired:
+            return None
+
+        singularity_candidates, singularity_escape_metadata = self._local_step_singularity_escape_candidates(
+            reference_qpos=reference_qpos,
+            target_pose=target_pose,
+            reference_pose=reference_pose,
+            joint_velocity_profile=joint_velocity_profile,
+            dt_sec=dt_sec,
+            deadline_monotonic=hard_deadline,
+            timing_profile=timing_profile,
+            timing_phase=timing_phase,
+        )
+        if _hard_deadline_expired(hard_deadline):
+            deadline_expired = True
+            posture_escape_metadata = skipped_auxiliary("skipped_hard_deadline")
+            wrist_unload_metadata = skipped_auxiliary("skipped_hard_deadline")
+            return selected_result()
+        evaluate_stage("singularity_escape", singularity_candidates)
+        result = selected_result()
+        if result is not None:
+            return result
+        if deadline_expired:
+            return None
+
+        posture_candidates, posture_escape_metadata = self._local_step_posture_escape_candidates(
+            reference_qpos=reference_qpos,
+            joint_velocity_profile=joint_velocity_profile,
+            dt_sec=dt_sec,
+            deadline_monotonic=hard_deadline,
+        )
+        if _hard_deadline_expired(hard_deadline):
+            deadline_expired = True
+            wrist_unload_metadata = skipped_auxiliary("skipped_hard_deadline")
+            return selected_result()
+        evaluate_stage("posture_escape", posture_candidates)
+        result = selected_result()
+        if result is not None:
+            return result
+        if deadline_expired:
+            return None
+
+        wrist_candidates, wrist_unload_metadata = self._local_step_wrist_unload_candidates(
+            reference_qpos=reference_qpos,
+            joint_velocity_profile=joint_velocity_profile,
+            dt_sec=dt_sec,
+            deadline_monotonic=hard_deadline,
+        )
+        if _hard_deadline_expired(hard_deadline):
+            deadline_expired = True
+            return selected_result()
+        evaluate_stage("wrist_unload", wrist_candidates)
+        return selected_result()
+
     def _local_step_limit_escape_candidates(
         self,
         *,
@@ -1196,6 +1897,7 @@ class IKSafetyResolver:
         reference_pose: np.ndarray,
         joint_velocity_profile: JointVelocityLimitProfile,
         dt_sec: float,
+        deadline_monotonic: float | None = None,
         timing_profile: dict[str, Any] | None = None,
         timing_phase: str = "local_step",
     ) -> tuple[list[IKCandidate], dict[str, Any]]:
@@ -1205,6 +1907,10 @@ class IKSafetyResolver:
         }
         if not bool(getattr(self.profile, "local_step_limit_escape_enabled", False)):
             metadata["status"] = "disabled"
+            return [], metadata
+        if _hard_deadline_expired(deadline_monotonic):
+            metadata["status"] = "skipped_hard_deadline"
+            metadata["hard_deadline_expired"] = True
             return [], metadata
         limits = _joint_position_limits_from_provider(self.provider, reference_qpos.shape)
         if limits is None:
@@ -1258,7 +1964,15 @@ class IKSafetyResolver:
         scored: list[tuple[float, float, float, int, int, np.ndarray, dict[str, Any]]] = []
         eps = 1e-9
         for joint_index in range(q.size):
+            if _hard_deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             for direction in (-1, 1):
+                if _hard_deadline_expired(deadline_monotonic):
+                    metadata["status"] = "interrupted_hard_deadline"
+                    metadata["hard_deadline_expired"] = True
+                    return [], metadata
                 if direction < 0 and q[joint_index] <= q_min[joint_index] + eps:
                     continue
                 if direction > 0 and q[joint_index] >= q_max[joint_index] - eps:
@@ -1280,6 +1994,10 @@ class IKSafetyResolver:
                 _timing_add(timing_profile, "fk_ms", fk_elapsed_ms)
                 _timing_add(timing_profile, f"{timing_phase}_fk_ms", fk_elapsed_ms)
                 _timing_add(timing_profile, "local_limit_escape_fk_ms", fk_elapsed_ms)
+                if _hard_deadline_expired(deadline_monotonic):
+                    metadata["status"] = "interrupted_hard_deadline"
+                    metadata["hard_deadline_expired"] = True
+                    return [], metadata
                 if candidate_pose is None:
                     pose_progress = -1e9
                     after_m = None
@@ -1328,6 +2046,10 @@ class IKSafetyResolver:
         candidates: list[IKCandidate] = []
         seen: list[np.ndarray] = []
         for _non_active, _margin, _score, joint_index, direction, candidate_qpos, candidate_metadata in scored:
+            if _hard_deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             if len(candidates) >= max_candidates:
                 break
             if any(np.allclose(candidate_qpos, existing, atol=1e-9) for existing in seen):
@@ -1360,6 +2082,7 @@ class IKSafetyResolver:
         reference_pose: np.ndarray,
         joint_velocity_profile: JointVelocityLimitProfile,
         dt_sec: float,
+        deadline_monotonic: float | None = None,
         timing_profile: dict[str, Any] | None = None,
         timing_phase: str = "local_step",
     ) -> tuple[list[IKCandidate], dict[str, Any]]:
@@ -1370,9 +2093,17 @@ class IKSafetyResolver:
         if not bool(getattr(self.profile, "local_step_singularity_escape_enabled", False)):
             metadata["status"] = "disabled"
             return [], metadata
+        if _hard_deadline_expired(deadline_monotonic):
+            metadata["status"] = "skipped_hard_deadline"
+            metadata["hard_deadline_expired"] = True
+            return [], metadata
 
         q = np.asarray(reference_qpos, dtype=float).reshape(-1)
         reference_report = self.provider.analyze_singularity(q)
+        if _hard_deadline_expired(deadline_monotonic):
+            metadata["status"] = "interrupted_hard_deadline"
+            metadata["hard_deadline_expired"] = True
+            return [], metadata
         metadata["reference_singularity"] = _singularity_metadata(reference_report)
         if not reference_report.is_singular:
             metadata["status"] = "inactive_reference_not_singular"
@@ -1405,10 +2136,18 @@ class IKSafetyResolver:
         )
         scored: list[tuple[int, float, float, int, int, np.ndarray, dict[str, Any]]] = []
         for joint_index in range(q.size):
+            if _hard_deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             step = float(max_step_rad[joint_index])
             if step <= 1e-12:
                 continue
             for direction in (-1, 1):
+                if _hard_deadline_expired(deadline_monotonic):
+                    metadata["status"] = "interrupted_hard_deadline"
+                    metadata["hard_deadline_expired"] = True
+                    return [], metadata
                 candidate_qpos = q.copy()
                 candidate_qpos[joint_index] += float(direction) * step
                 if q_min is not None and q_max is not None:
@@ -1417,7 +2156,15 @@ class IKSafetyResolver:
                     if candidate_qpos[joint_index] > q_max[joint_index] + 1e-9:
                         continue
                 candidate_report = self.provider.analyze_singularity(candidate_qpos)
+                if _hard_deadline_expired(deadline_monotonic):
+                    metadata["status"] = "interrupted_hard_deadline"
+                    metadata["hard_deadline_expired"] = True
+                    return [], metadata
                 candidate_pose = self.provider.forward_kinematics(candidate_qpos)
+                if _hard_deadline_expired(deadline_monotonic):
+                    metadata["status"] = "interrupted_hard_deadline"
+                    metadata["hard_deadline_expired"] = True
+                    return [], metadata
                 if candidate_pose is None:
                     continue
                 after_m, after_deg = pose_delta_metrics(candidate_pose, target_pose)
@@ -1458,6 +2205,10 @@ class IKSafetyResolver:
         candidates: list[IKCandidate] = []
         seen: list[np.ndarray] = []
         for _rank, _metric, _pose, joint_index, direction, candidate_qpos, candidate_metadata in scored:
+            if _hard_deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             if len(candidates) >= max_candidates:
                 break
             if any(np.allclose(candidate_qpos, existing, atol=1e-9) for existing in seen):
@@ -1489,6 +2240,7 @@ class IKSafetyResolver:
         reference_qpos: np.ndarray,
         joint_velocity_profile: JointVelocityLimitProfile,
         dt_sec: float,
+        deadline_monotonic: float | None = None,
     ) -> tuple[list[IKCandidate], dict[str, Any]]:
         metadata: dict[str, Any] = {
             "enabled": bool(
@@ -1501,6 +2253,10 @@ class IKSafetyResolver:
         if self.posture_preference is None or not self.posture_preference.local_escape_enabled:
             metadata["status"] = "disabled"
             return [], metadata
+        if _hard_deadline_expired(deadline_monotonic):
+            metadata["status"] = "skipped_hard_deadline"
+            metadata["hard_deadline_expired"] = True
+            return [], metadata
         q = np.asarray(reference_qpos, dtype=float).reshape(-1)
         limits = _joint_position_limits_from_provider(self.provider, q.shape)
         q_min = q_max = None
@@ -1512,10 +2268,15 @@ class IKSafetyResolver:
             max_step_rad=max_step_rad,
             q_min=q_min,
             q_max=q_max,
+            deadline_monotonic=deadline_monotonic,
         )
         metadata.update(preference_metadata)
         candidates: list[IKCandidate] = []
         for label, candidate_qpos, candidate_metadata in targets:
+            if _hard_deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             candidates.append(
                 IKCandidate(
                     qpos=np.asarray(candidate_qpos, dtype=float).reshape(q.shape),
@@ -1534,6 +2295,7 @@ class IKSafetyResolver:
         reference_qpos: np.ndarray,
         joint_velocity_profile: JointVelocityLimitProfile,
         dt_sec: float,
+        deadline_monotonic: float | None = None,
     ) -> tuple[list[IKCandidate], dict[str, Any]]:
         metadata: dict[str, Any] = {
             "enabled": bool(
@@ -1546,6 +2308,10 @@ class IKSafetyResolver:
         if self.posture_preference is None or not self.posture_preference.wrist_unload_enabled:
             metadata["status"] = "disabled"
             return [], metadata
+        if _hard_deadline_expired(deadline_monotonic):
+            metadata["status"] = "skipped_hard_deadline"
+            metadata["hard_deadline_expired"] = True
+            return [], metadata
         q = np.asarray(reference_qpos, dtype=float).reshape(-1)
         limits = _joint_position_limits_from_provider(self.provider, q.shape)
         q_min = q_max = None
@@ -1557,10 +2323,15 @@ class IKSafetyResolver:
             max_step_rad=max_step_rad,
             q_min=q_min,
             q_max=q_max,
+            deadline_monotonic=deadline_monotonic,
         )
         metadata.update(preference_metadata)
         candidates: list[IKCandidate] = []
         for label, candidate_qpos, candidate_metadata in targets:
+            if _hard_deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             candidates.append(
                 IKCandidate(
                     qpos=np.asarray(candidate_qpos, dtype=float).reshape(q.shape),
@@ -2408,9 +3179,16 @@ def _record_provider_call(
     _timing_inc(profile, f"{phase}_provider_call_count")
     _timing_inc(profile, "provider_candidate_count", int(candidate_count))
     _timing_inc(profile, f"{phase}_provider_candidate_count", int(candidate_count))
-    time_budget_ms = _finite_float(metadata.get("provider_time_budget_ms"), default=None)
-    if time_budget_ms is not None:
-        profile["time_budget_ms"] = time_budget_ms
+    provider_time_budget_ms = _finite_float(metadata.get("provider_time_budget_ms"), default=None)
+    configured_budget_ms = _finite_float(profile.get("time_budget_ms"), default=None)
+    if provider_time_budget_ms is not None:
+        profile["provider_time_budget_ms"] = provider_time_budget_ms
+        profile["time_budget_ms"] = (
+            provider_time_budget_ms
+            if configured_budget_ms is None
+            else min(configured_budget_ms, provider_time_budget_ms)
+        )
+    time_budget_ms = _finite_float(profile.get("time_budget_ms"), default=provider_time_budget_ms)
     exceeded = bool(metadata.get("provider_time_budget_exceeded", False))
     profile["time_budget_exceeded"] = bool(profile.get("time_budget_exceeded", False) or exceeded)
     if exceeded:
@@ -2423,6 +3201,7 @@ def _record_provider_call(
         "requested_provider_names": list(metadata.get("requested_provider_names") or []),
         "provider_budget_skipped_names": list(metadata.get("provider_budget_skipped_names") or []),
         "time_budget_ms": time_budget_ms,
+        "provider_time_budget_ms": provider_time_budget_ms,
         "time_budget_exceeded": exceeded,
     }
     if extra:

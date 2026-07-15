@@ -17,13 +17,42 @@ DEFAULT_IMAGE_KEY_MAP: dict[str, str] = {
 class OpenPIObservationAdapterConfig:
     prompt: str | None = None
     image_key_map: Mapping[str, str] | None = None
-    required_image_keys: tuple[str, ...] = ("front",)
+    required_image_keys: tuple[str, ...] | None = None
     include_debug_metadata: bool = True
+    state_key: str = "state"
+    state_discrete_key: str = "state_discrete"
 
     def __post_init__(self) -> None:
         image_key_map = DEFAULT_IMAGE_KEY_MAP if self.image_key_map is None else dict(self.image_key_map)
-        object.__setattr__(self, "image_key_map", dict(image_key_map))
-        object.__setattr__(self, "required_image_keys", tuple(str(key) for key in self.required_image_keys))
+        normalized_map: dict[str, str] = {}
+        for source_key, model_input_key in image_key_map.items():
+            source = str(source_key).strip()
+            destination = str(model_input_key).strip()
+            if not source or not destination:
+                raise ValueError("OpenPI image_key_map keys and values must be non-empty.")
+            normalized_map[source] = destination
+        if len(set(normalized_map.values())) != len(normalized_map):
+            raise ValueError("OpenPI image_key_map model input keys must be unique.")
+        requested_required = self.required_image_keys
+        required_image_keys = (
+            ("front",)
+            if requested_required is None and self.image_key_map is None
+            else tuple(normalized_map)
+            if requested_required is None
+            else tuple(str(key).strip() for key in requested_required)
+        )
+        if any(not key for key in required_image_keys):
+            raise ValueError("OpenPI required_image_keys must be non-empty.")
+        unknown_required = set(required_image_keys).difference(normalized_map)
+        if unknown_required:
+            raise ValueError(
+                "OpenPI required_image_keys are absent from image_key_map: "
+                f"{sorted(unknown_required)}."
+            )
+        object.__setattr__(self, "image_key_map", normalized_map)
+        object.__setattr__(self, "required_image_keys", required_image_keys)
+        object.__setattr__(self, "state_key", str(self.state_key))
+        object.__setattr__(self, "state_discrete_key", str(self.state_discrete_key))
 
 
 def deployment_observation_to_openpi(
@@ -45,7 +74,13 @@ def deployment_observation_to_openpi(
     state = getattr(observation, "state", None)
     if state is None:
         raise ValueError("Deployment observation is missing state.")
-    output["state"] = np.asarray(state, dtype=np.float32).reshape(-1)
+    output[config.state_key] = np.asarray(state, dtype=np.float32).reshape(-1)
+    state_discrete = getattr(observation, "state_discrete", None)
+    if state_discrete is not None:
+        output[config.state_discrete_key] = _as_int64_tokens(
+            state_discrete,
+            key=config.state_discrete_key,
+        )
 
     prompt = _resolve_prompt(observation, config)
     if prompt:
@@ -59,6 +94,7 @@ def deployment_observation_to_openpi(
             "arms_enabled": bool(getattr(observation, "arms_enabled", False)),
             "hands_enabled": bool(getattr(observation, "hands_enabled", False)),
             "faults": list(getattr(observation, "faults", ()) or ()),
+            "policy_io_layout_hash": getattr(observation, "policy_io_layout_hash", None),
         }
     return output
 
@@ -95,3 +131,20 @@ def _as_uint8_hwc(value: Any, *, key: str) -> np.ndarray:
         image = np.clip(image, 0, 255).astype(np.uint8)
     return np.ascontiguousarray(image)
 
+
+def _as_int64_tokens(value: Any, *, key: str) -> np.ndarray:
+    raw = np.asarray(value)
+    if raw.ndim != 1:
+        raise ValueError(f"{key!r} must be a 1D token vector, got shape {raw.shape}.")
+    tokens = np.empty(raw.shape, dtype=np.int64)
+    for index, item in enumerate(raw):
+        if isinstance(item, (bool, np.bool_)):
+            raise ValueError(f"{key!r}[{index}] must be an integer token, not a boolean.")
+        try:
+            token = int(item)
+            if float(item) != float(token):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{key!r}[{index}] must be an exact integer token.") from exc
+        tokens[index] = token
+    return tokens

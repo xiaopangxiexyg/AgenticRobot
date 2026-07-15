@@ -1,0 +1,31 @@
+{
+  "schema": "dexteleop.dataset_organization_manifest.v1",
+  "min_duration_sec": 2.0,
+  "datasets": [
+    {
+      "name": "bimanual-cube-new-success",
+      "output_root": "../../../datasets/sorted_v22/bimanual-cube-new-success",
+      "task": {
+        "id": "bimanual_cube_grasp",
+        "description": "Bimanual cube grasping success demonstrations collected on or after 2026-07-07, with incomplete wrist-depth episodes removed."
+      },
+      "labels": {
+        "task": "cube",
+        "era": "new (2026-07-07 and later)",
+        "quality": "success"
+      },
+      "notes": [
+        "This v2.2 training dataset removes every episode with a wrist-depth stream whose frame count does not equal the episode RGB frame count.",
+        "Wrist final keep-masks are generated externally and used only for training-time background augmentation."
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/sorted_v22/.bimanual-cube-new-success-pre-wrist-mask",
+          "episode_indices": "all",
+          "exclude_episode_indices": [6, 206, 300, 320, 335, 374, 385, 425, 434, 488, 494, 497, 498]
+        }
+      ]
+    }
+  ]
+}
+

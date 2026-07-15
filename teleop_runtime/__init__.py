@@ -39,6 +39,7 @@ from .recording import RecordingConfig, SessionRecorder
 from .retargeters import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
+    DualArmQposCollisionCheck,
     JointsToDexHandRetargeter,
     JointsToDexHandRetargeterConfig,
     PoseToArmRetargeter,
@@ -89,6 +90,7 @@ __all__ = [
     "DMTacGripperBackendConfig",
     "DualArmCollisionAwareRetargeter",
     "DualArmCollisionAwareRetargeterConfig",
+    "DualArmQposCollisionCheck",
     "EpisodeRecorder",
     "EpisodeRecorderConfig",
     "EpisodeStartSideCheck",

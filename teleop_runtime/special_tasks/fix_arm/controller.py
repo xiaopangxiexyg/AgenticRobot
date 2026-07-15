@@ -46,7 +46,7 @@ class _RecalibrationState:
 
 
 class FixArmCommandController:
-    """Freeze one logical side by replaying the last dispatched command."""
+    """Freeze every configured effector on one logical side."""
 
     def __init__(
         self,
@@ -58,13 +58,35 @@ class FixArmCommandController:
         self.active_sides = tuple(normalize_fix_arm_side(side) for side in active_sides)
         if set(self.active_sides) != {"left", "right"}:
             raise ValueError("--fix-arm requires active-sides both.")
-        self.required_effectors_by_side = {
-            normalize_fix_arm_side(side): tuple(str(name) for name in effectors if str(name))
-            for side, effectors in required_effectors_by_side.items()
-        }
+        self.required_effectors_by_side = {}
         for side in self.active_sides:
-            if not self.required_effectors_by_side.get(side):
-                self.required_effectors_by_side[side] = (f"{side}_arm",)
+            configured = tuple(
+                dict.fromkeys(
+                    str(name)
+                    for name in required_effectors_by_side.get(side, ())
+                    if str(name)
+                )
+            )
+            arm_name = f"{side}_arm"
+            if arm_name not in configured:
+                configured = (arm_name, *configured)
+            self.required_effectors_by_side[side] = configured
+        self._scope_by_side = {
+            side: (
+                "arm_and_end_effector"
+                if any(name != f"{side}_arm" for name in effectors)
+                else "arm_only"
+            )
+            for side, effectors in self.required_effectors_by_side.items()
+        }
+        self._warning_by_side = {
+            side: (
+                "end_effector_not_configured; fix_arm is arm_only"
+                if self._scope_by_side[side] == "arm_only"
+                else ""
+            )
+            for side in self.active_sides
+        }
         self._selected_side = normalize_fix_arm_side(selected_side)
         self._mode = "live"
         self._fixed_side = ""
@@ -74,6 +96,12 @@ class FixArmCommandController:
         self._fixed_by_channel: dict[str, ObservationChannel] = {}
         self._recalibration = _RecalibrationState()
         self._status_message = "fix-arm ready"
+
+    def scope_for_side(self, side: str) -> str:
+        return self._scope_by_side.get(normalize_fix_arm_side(side), "arm_only")
+
+    def warning_for_side(self, side: str) -> str:
+        return self._warning_by_side.get(normalize_fix_arm_side(side), "")
 
     @property
     def enabled(self) -> bool:
@@ -193,7 +221,8 @@ class FixArmCommandController:
         }
         self._mode = "fixed"
         self._recalibration = _RecalibrationState()
-        self._status_message = f"{side} fixed"
+        warning = self.warning_for_side(side)
+        self._status_message = f"{side} fixed" if not warning else f"{side} fixed; warning: {warning}"
         return FixArmTransition(ok=True, message=self._status_message, side=side, mode=self._mode)
 
     def start_recalibration(
@@ -355,6 +384,9 @@ class FixArmCommandController:
                     "fix_arm_active": True,
                     "fix_arm_side": fixed_side,
                     "fix_arm_mode": self._mode,
+                    "fix_arm_scope": self.scope_for_side(fixed_side),
+                    "fix_arm_warning": self.warning_for_side(fixed_side),
+                    "fix_arm_effectors": list(self.required_effectors_by_side.get(fixed_side, ())),
                 }
                 filtered.commands[effector_name] = filtered_command
                 self._latest_by_effector[effector_name] = filtered_command.copy()
@@ -362,6 +394,9 @@ class FixArmCommandController:
                 {
                     "fix_arm_active_side": fixed_side,
                     "fix_arm_mode": self._mode,
+                    "fix_arm_scope": self.scope_for_side(fixed_side),
+                    "fix_arm_warning": self.warning_for_side(fixed_side),
+                    "fix_arm_effectors": list(self.required_effectors_by_side.get(fixed_side, ())),
                 }
             )
         return filtered
@@ -391,6 +426,9 @@ class FixArmCommandController:
             "fix_arm_active": bool(fixed_side),
             "fix_arm_recalibrating": self.recapturing,
             "fix_arm_status": self._status_message,
+            "fix_arm_scope": self.scope_for_side(fixed_side) if fixed_side else "",
+            "fix_arm_warning": self.warning_for_side(fixed_side) if fixed_side else "",
+            "fix_arm_effectors": list(self.required_effectors_by_side.get(fixed_side, ())),
             "fix_arm_sample_count": self.sample_count if self.recapturing else None,
             "fix_arm_min_samples": self.min_samples if self.recapturing else None,
         }

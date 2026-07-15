@@ -3,11 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from robot_motion.action import ActionExecutionResult, ActionRecord, encode_robot_action
+
 from ..action import (
-    ActionExecutionResult,
-    ActionRecord,
     TeleopCommandActionAdapterConfig,
-    encode_robot_action,
     robot_action_from_teleop_command,
 )
 from ..recording import _to_serializable
@@ -18,6 +17,7 @@ from ..session import SessionStepResult
 class CollectionActionRecordConfig:
     action_adapter: TeleopCommandActionAdapterConfig = field(
         default_factory=lambda: TeleopCommandActionAdapterConfig(
+            arm_joint_policy="source_pose_when_available",
             include_command_metadata=False
         )
     )

@@ -21,7 +21,7 @@ MODULE_ARGS=()
 usage() {
   cat <<'EOF'
 Usage:
-  remote_module.sh -H dex-remote --project '~/DexTeleop' --env dexteleop310 -- sim.mujoco_real2sim.replay.runner [args...]
+  remote_module.sh -H dex-remote --project '~/DexTeleop' --env dexteleop310 -- sim.mujoco.replay.runner [args...]
 
 Options:
       --project DIR       Remote project directory to cd into before running.

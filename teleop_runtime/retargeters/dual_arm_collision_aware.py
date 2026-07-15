@@ -90,6 +90,17 @@ class _DualArmCandidate:
 
 
 @dataclass(frozen=True)
+class DualArmQposCollisionCheck:
+    """Read-only endpoint check for a concrete pair of arm joint targets."""
+
+    safe: bool
+    reason: str = ""
+    min_distance_m: float | None = None
+    collision_pair_count: int = 0
+    required_min_distance_m: float = 0.0
+
+
+@dataclass(frozen=True)
 class _DualArmEvaluatedCandidate:
     candidate: _DualArmCandidate
     output_qpos: np.ndarray
@@ -124,6 +135,25 @@ def _optional_pose6(value: Sequence[float] | np.ndarray | None) -> np.ndarray | 
     if pose.shape != (6,) or not np.all(np.isfinite(pose)):
         raise ValueError(f"Expected a finite 6D pose, got shape {pose.shape}.")
     return pose.copy()
+
+
+def _linear_release_weight(
+    *,
+    value: float,
+    static_threshold: float,
+    full_threshold: float,
+) -> float:
+    """Map an error to [0, 1] between validated static/full thresholds."""
+    if not np.isfinite(value):
+        return 0.0
+    return float(
+        np.clip(
+            (float(value) - float(static_threshold))
+            / (float(full_threshold) - float(static_threshold)),
+            0.0,
+            1.0,
+        )
+    )
 
 
 def _pose6_to_matrix(pose6: Sequence[float] | np.ndarray | None) -> np.ndarray:
@@ -232,6 +262,12 @@ class DualArmCollisionAwareRetargeterConfig:
     solve_time_budget_ms: float | None = None
     output_command_type: Literal["joint_vector", "cartesian_pose"] = "joint_vector"
     solve_max_iterations: int = 1
+    # Position control may opt into running up to solve_max_iterations while
+    # there is still time left in the frame budget.  The generic retargeter
+    # default remains fixed-one-iteration so force/impedance callers retain
+    # their historical behavior.
+    solve_adaptive_iterations_enabled: bool = False
+    solve_iteration_reserve_ms: float = 5.0
     solve_translation_tolerance_m: float = 2e-3
     solve_orientation_tolerance_deg: float = 0.5
     enforce_realistic_joint_step: bool = True
@@ -250,6 +286,23 @@ class DualArmCollisionAwareRetargeterConfig:
     joint_velocity_limit_profile: str = "rm65"
     joint_velocity_profile: JointVelocityLimitProfile | None = field(default=None, repr=False)
     target_pose_smoother: Any | None = field(default=None, repr=False)
+    output_qpos_smoothing_alpha: float = 1.0
+    output_qpos_smoothing_adaptive_enabled: bool = False
+    output_qpos_smoothing_fast_alpha: float = 0.7
+    output_qpos_smoothing_linear_speed_low_m_s: float = 0.015
+    output_qpos_smoothing_linear_speed_high_m_s: float = 0.25
+    output_qpos_smoothing_angular_speed_low_rad_s: float = 0.08
+    output_qpos_smoothing_angular_speed_high_rad_s: float = 1.5
+    output_qpos_smoothing_attack_sec: float = 0.05
+    output_qpos_smoothing_release_sec: float = 0.20
+    # Zero preserves the historical hard-limit-only behavior. Runtime may set
+    # a mode-specific interior envelope for force control.
+    joint_operating_margin_deg: float = 0.0
+    current_target_hold_enabled: bool = True
+    local_step_candidate_selection_enabled: bool = True
+    # Multiplies only the candidate-local clip used while scoring/selecting an
+    # IK branch. The final qref execution velocity cap remains independent.
+    local_step_candidate_clip_scale: float = 1.0
     inactive_side_hold_enabled: bool = True
     inactive_side_hold_translation_deadband_m: float = 0.003
     inactive_side_hold_rotation_deadband_deg: float = 0.5
@@ -258,6 +311,18 @@ class DualArmCollisionAwareRetargeterConfig:
     inactive_side_hold_score_weight: float = 1_000_000.0
     inactive_side_hold_execution_cap_enabled: bool = True
     inactive_side_hold_execution_cap_deg: float = 0.5
+    # This is opt-in at the position-control entrypoint.  Keeping the generic
+    # retargeter default false guarantees force/impedance callers retain their
+    # existing inactive-side behavior.
+    inactive_side_hold_execution_release_enabled: bool = False
+    # While a VIVE tracker is confirmed inactive, let the robot converge toward
+    # its frozen Cartesian target instead of freezing qref unconditionally.
+    # Translation and rotation releases are linearly normalized independently
+    # and added with equal weight; see _tracker_inactive_execution_release().
+    inactive_side_hold_execution_release_translation_static_m: float = 0.03
+    inactive_side_hold_execution_release_translation_full_m: float = 0.10
+    inactive_side_hold_execution_release_rotation_static_deg: float = 5.0
+    inactive_side_hold_execution_release_rotation_full_deg: float = 30.0
 
     def __post_init__(self) -> None:
         if self.contact_mode not in {"boundary_slide", "freeze_on_contact"}:
@@ -274,6 +339,10 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("collision_distance_epsilon_m must be >= 0.")
         if self.solve_max_iterations <= 0:
             raise ValueError("solve_max_iterations must be positive.")
+        self.solve_adaptive_iterations_enabled = bool(self.solve_adaptive_iterations_enabled)
+        if not np.isfinite(float(self.solve_iteration_reserve_ms)) or self.solve_iteration_reserve_ms < 0.0:
+            raise ValueError("solve_iteration_reserve_ms must be finite and >= 0.")
+        self.solve_iteration_reserve_ms = float(self.solve_iteration_reserve_ms)
         if self.solve_translation_tolerance_m < 0.0:
             raise ValueError("solve_translation_tolerance_m must be >= 0.")
         if self.solve_orientation_tolerance_deg < 0.0:
@@ -286,10 +355,47 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("solve_time_budget_ms must be >= 0.")
         if self.output_command_type not in {"joint_vector", "cartesian_pose"}:
             raise ValueError("output_command_type must be joint_vector or cartesian_pose.")
+        self.local_step_candidate_selection_enabled = bool(
+            self.local_step_candidate_selection_enabled
+        )
+        if (
+            not np.isfinite(float(self.local_step_candidate_clip_scale))
+            or float(self.local_step_candidate_clip_scale) < 1.0
+        ):
+            raise ValueError("local_step_candidate_clip_scale must be finite and >= 1.")
+        self.local_step_candidate_clip_scale = float(self.local_step_candidate_clip_scale)
+        self.current_target_hold_enabled = bool(self.current_target_hold_enabled)
+        self.inactive_side_hold_execution_release_enabled = bool(
+            self.inactive_side_hold_execution_release_enabled
+        )
         if self.target_pose_smoother is not None and not callable(
             getattr(self.target_pose_smoother, "smooth_pair", None)
         ):
             raise ValueError("target_pose_smoother must provide a smooth_pair method.")
+        if not 0.0 <= float(self.output_qpos_smoothing_alpha) <= 1.0:
+            raise ValueError("output_qpos_smoothing_alpha must be in [0, 1].")
+        if not 0.0 <= float(self.output_qpos_smoothing_fast_alpha) <= 1.0:
+            raise ValueError("output_qpos_smoothing_fast_alpha must be in [0, 1].")
+        if bool(self.output_qpos_smoothing_adaptive_enabled) and float(
+            self.output_qpos_smoothing_fast_alpha
+        ) < float(self.output_qpos_smoothing_alpha):
+            raise ValueError("output_qpos_smoothing_fast_alpha must be >= the slow alpha.")
+        for low_name, high_name in (
+            ("output_qpos_smoothing_linear_speed_low_m_s", "output_qpos_smoothing_linear_speed_high_m_s"),
+            ("output_qpos_smoothing_angular_speed_low_rad_s", "output_qpos_smoothing_angular_speed_high_rad_s"),
+        ):
+            low = float(getattr(self, low_name))
+            high = float(getattr(self, high_name))
+            if not np.isfinite(low) or not np.isfinite(high) or low < 0.0 or high <= low:
+                raise ValueError(f"{high_name} must be finite and greater than non-negative {low_name}.")
+        if float(self.output_qpos_smoothing_attack_sec) <= 0.0:
+            raise ValueError("output_qpos_smoothing_attack_sec must be positive.")
+        if float(self.output_qpos_smoothing_release_sec) <= 0.0:
+            raise ValueError("output_qpos_smoothing_release_sec must be positive.")
+        if not np.isfinite(float(self.joint_operating_margin_deg)) or float(
+            self.joint_operating_margin_deg
+        ) < 0.0:
+            raise ValueError("joint_operating_margin_deg must be finite and >= 0.")
         if self.inactive_side_hold_translation_deadband_m < 0.0:
             raise ValueError("inactive_side_hold_translation_deadband_m must be >= 0.")
         if self.inactive_side_hold_rotation_deadband_deg < 0.0:
@@ -302,6 +408,27 @@ class DualArmCollisionAwareRetargeterConfig:
             raise ValueError("inactive_side_hold_score_weight must be >= 0.")
         if self.inactive_side_hold_execution_cap_deg < 0.0:
             raise ValueError("inactive_side_hold_execution_cap_deg must be >= 0.")
+        for static_name, full_name in (
+            (
+                "inactive_side_hold_execution_release_translation_static_m",
+                "inactive_side_hold_execution_release_translation_full_m",
+            ),
+            (
+                "inactive_side_hold_execution_release_rotation_static_deg",
+                "inactive_side_hold_execution_release_rotation_full_deg",
+            ),
+        ):
+            static_value = float(getattr(self, static_name))
+            full_value = float(getattr(self, full_name))
+            if (
+                not np.isfinite(static_value)
+                or not np.isfinite(full_value)
+                or static_value < 0.0
+                or full_value <= static_value
+            ):
+                raise ValueError(
+                    f"{full_name} must be finite and greater than non-negative {static_name}."
+                )
         self.left_execution_max_joint_step_rad = _optional_joint_step(
             self.left_execution_max_joint_step_rad
         )
@@ -480,7 +607,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         self._jump_hold_frames = 0
         self._profile_frame_index = 0
         self._time_budget_warning_frames = 0
+        self._last_solve_iteration_budget_exhausted = False
+        self._last_solve_iteration_stop_reason: str | None = None
         self._target_pose_smoother = config.target_pose_smoother
+        self._last_output_qpos_smoothing_full_q: np.ndarray | None = None
+        self._output_qpos_smoothing_effective_alpha = float(
+            config.output_qpos_smoothing_alpha
+        )
+        self._output_qpos_smoothing_update_time: float | None = None
 
         self.set_current_qpos_pair(
             left_qpos=config.left_initial_qpos,
@@ -497,6 +631,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         if callable(reset):
             reset()
         self._last_target_poses = {"left": None, "right": None}
+        self._last_output_qpos_smoothing_full_q = None
+        self._output_qpos_smoothing_effective_alpha = float(
+            self.config.output_qpos_smoothing_alpha
+        )
+        self._output_qpos_smoothing_update_time = None
         self._clear_hold()
 
     def set_current_qpos_pair(
@@ -504,6 +643,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         *,
         left_qpos: Sequence[float] | np.ndarray | None = None,
         right_qpos: Sequence[float] | np.ndarray | None = None,
+        reset_tracking: bool = True,
     ) -> None:
         left = (
             DEFAULT_LEFT_ARM_QPOS.copy()
@@ -526,13 +666,88 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         self.ik_solver.set_configuration_q(full_q)
         self._last_safe_full_q = full_q.copy()
-        self._clear_hold()
+        if reset_tracking:
+            self._last_output_qpos_smoothing_full_q = None
+            self._output_qpos_smoothing_effective_alpha = float(
+                self.config.output_qpos_smoothing_alpha
+            )
+            self._output_qpos_smoothing_update_time = None
+            self._clear_hold()
 
     def current_world_targets(self) -> dict[str, np.ndarray]:
         return {
             "left": self.ik_solver.compute_frame_pose(self.profile.left_frame_name),
             "right": self.ik_solver.compute_frame_pose(self.profile.right_frame_name),
         }
+
+    def check_qpos_pair_collision(
+        self,
+        *,
+        left_qpos: Sequence[float] | np.ndarray,
+        right_qpos: Sequence[float] | np.ndarray,
+    ) -> DualArmQposCollisionCheck:
+        """Check the configured collision pairs without changing solver state.
+
+        This is used for a final pre-dispatch check when a later command filter
+        replaces one side of a collision-aware IK result (for example fix-arm).
+        A missing, malformed, or non-finite distance is intentionally unsafe.
+        """
+
+        pair_count = len(tuple(getattr(self.profile, "collision_pairs", ()) or ()))
+        required_min_distance_m = float(self.config.collision_min_distance_m)
+        try:
+            left = np.asarray(left_qpos, dtype=float).reshape(6)
+            right = np.asarray(right_qpos, dtype=float).reshape(6)
+        except (TypeError, ValueError):
+            return DualArmQposCollisionCheck(
+                safe=False,
+                reason="invalid_qpos",
+                collision_pair_count=pair_count,
+                required_min_distance_m=required_min_distance_m,
+            )
+        if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+            return DualArmQposCollisionCheck(
+                safe=False,
+                reason="nonfinite_qpos",
+                collision_pair_count=pair_count,
+                required_min_distance_m=required_min_distance_m,
+            )
+        if pair_count <= 0:
+            return DualArmQposCollisionCheck(
+                safe=False,
+                reason="collision_pairs_unavailable",
+                collision_pair_count=pair_count,
+                required_min_distance_m=required_min_distance_m,
+            )
+        try:
+            full_q = self._embed_arm_qpos(
+                current_full_q=np.asarray(self.ik_solver.current_q, dtype=float),
+                left_qpos=left,
+                right_qpos=right,
+            )
+            min_distance_m = float(self.ik_solver.compute_min_collision_distance(full_q))
+        except Exception as exc:  # noqa: BLE001 - pre-dispatch safety must fail closed.
+            return DualArmQposCollisionCheck(
+                safe=False,
+                reason=f"collision_check_exception:{type(exc).__name__}",
+                collision_pair_count=pair_count,
+                required_min_distance_m=required_min_distance_m,
+            )
+        if not np.isfinite(min_distance_m):
+            return DualArmQposCollisionCheck(
+                safe=False,
+                reason="collision_distance_unavailable",
+                collision_pair_count=pair_count,
+                required_min_distance_m=required_min_distance_m,
+            )
+        reason = self._fallback_reason_for_distance(min_distance_m)
+        return DualArmQposCollisionCheck(
+            safe=reason is None,
+            reason="" if reason is None else str(reason),
+            min_distance_m=min_distance_m,
+            collision_pair_count=pair_count,
+            required_min_distance_m=required_min_distance_m,
+        )
 
     def _profile_template(self) -> dict[str, object] | None:
         if not self.config.debug_profile:
@@ -544,6 +759,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "solve_qp_ms": 0.0,
             "solve_integrate_ms": 0.0,
             "solve_set_configuration_ms": 0.0,
+            "solve_iteration_mode": (
+                "adaptive_budget"
+                if bool(self.config.solve_adaptive_iterations_enabled)
+                else "fixed_max"
+            ),
+            "solve_iteration_max": int(self.config.solve_max_iterations),
+            "solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+            "solve_iteration_budget_ms": max(
+                0.0,
+                float(self.config.solve_time_budget_ms or 0.0)
+                - float(self.config.solve_iteration_reserve_ms),
+            ),
+            "solve_iteration_budget_exhausted": False,
+            "solve_iteration_stop_reason": None,
             "min_distance_calls": 0,
             "min_distance_total_ms": 0.0,
             "min_distance_phase_ms": {},
@@ -722,7 +951,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         current_targets = {"left": left_target.copy(), "right": right_target.copy()}
         solver_targets_before_solve = self.current_world_targets()
-        target_activity_metadata = self._target_activity_metadata(current_targets)
+        target_activity_metadata = self._target_activity_metadata(
+            current_targets,
+            cartesian_commands={
+                "left": context.left_cartesian,
+                "right": context.right_cartesian,
+            },
+        )
         left_source_target_pose_base = (
             None
             if context.left_cartesian is None or context.left_cartesian.command_type != "cartesian_pose"
@@ -809,10 +1044,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         }
         solve_iteration_count = 0
         solve_pose_error: dict[str, dict[str, float]] = {}
+        raw_solver_q: np.ndarray | None = None
+        self._last_solve_iteration_budget_exhausted = False
+        self._last_solve_iteration_stop_reason = "not_started"
 
         pre_solve_q = self.ik_solver.current_q.copy()
         active_q = pre_solve_q.copy()
-        target_already_reached = True
+        current_target_hold_enabled = bool(self.config.current_target_hold_enabled)
+        target_already_reached = current_target_hold_enabled
         for side in ("left", "right"):
             translation_m, rotation_deg = pose_delta_metrics(
                 solver_targets_before_solve[side],
@@ -822,12 +1061,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "translation_m": float(translation_m),
                 "rotation_deg": float(rotation_deg),
             }
-            if (
+            if current_target_hold_enabled and (
                 translation_m > _CURRENT_TARGET_HOLD_TRANSLATION_M
                 or rotation_deg > _CURRENT_TARGET_HOLD_ROTATION_DEG
             ):
                 target_already_reached = False
         if profile is not None:
+            profile["current_target_hold_enabled"] = bool(current_target_hold_enabled)
             profile["target_already_reached"] = bool(target_already_reached)
 
         try:
@@ -845,8 +1085,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     left_target=left_target,
                     right_target=right_target,
                     profile=profile,
+                    frame_start_time=frame_start,
                 )
+                raw_solver_q = np.asarray(solved_q, dtype=float).copy()
                 branch_start = time.perf_counter()
+                elapsed_before_selection_ms = (branch_start - frame_start) * 1000.0
                 candidate_q, branch_candidate, branch_score_deg, branch_min_distance, candidate_selection_metadata = (
                     self._select_safe_tracking_candidate(
                         raw_full_q=solved_q,
@@ -854,6 +1097,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                         current_targets=current_targets,
                         target_activity=target_activity_metadata,
                         profile=profile,
+                        elapsed_before_selection_ms=elapsed_before_selection_ms,
                     )
                 )
                 if profile is not None:
@@ -991,6 +1235,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 reference_full_q=pre_solve_q,
                 candidate_full_q=active_q,
                 target_activity=target_activity_metadata,
+                current_targets=current_targets,
             )
             self.ik_solver.set_configuration_q(active_q)
             if bool(execution_step_metadata.get("enabled")):
@@ -1025,8 +1270,23 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             )
             self.ik_solver.set_configuration_q(active_q)
             self._last_safe_full_q = active_q.copy()
+        active_q, left_qpos, right_qpos, output_qpos_smoothing = (
+            self._smooth_output_qpos_before_action(
+                active_q=active_q,
+                left_qpos=left_qpos,
+                right_qpos=right_qpos,
+                target_activity=target_activity_metadata,
+            )
+        )
+        if output_qpos_smoothing.get("enabled", False):
+            self.ik_solver.set_configuration_q(active_q)
+            self._last_safe_full_q = active_q.copy()
         left_limit_margin = self._joint_limit_margin_metadata("left", left_qpos)
         right_limit_margin = self._joint_limit_margin_metadata("right", right_qpos)
+        raw_left_qpos = None
+        raw_right_qpos = None
+        if raw_solver_q is not None:
+            raw_left_qpos, raw_right_qpos = self._split_solution(raw_solver_q)
         frame_total_ms = (time.perf_counter() - frame_start) * 1000.0
         time_budget_ms = float(self.config.solve_time_budget_ms or 0.0)
         time_budget_exceeded = bool(time_budget_ms > 0.0 and frame_total_ms > time_budget_ms)
@@ -1043,6 +1303,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "ik_branch_candidate": branch_candidate,
                 "ik_branch_distance_score_deg": branch_score_deg,
                 "ik_solve_iterations": int(solve_iteration_count),
+                "ik_solve_iteration_mode": (
+                    "adaptive_budget"
+                    if bool(self.config.solve_adaptive_iterations_enabled)
+                    else "fixed_max"
+                ),
+                "ik_solve_iteration_max": int(self.config.solve_max_iterations),
+                "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+                "ik_solve_iteration_budget_ms": max(
+                    0.0,
+                    float(self.config.solve_time_budget_ms or 0.0)
+                    - float(self.config.solve_iteration_reserve_ms),
+                ),
+                "ik_solve_iteration_budget_exhausted": bool(
+                    self._last_solve_iteration_budget_exhausted
+                ),
+                "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
                 "ik_solve_pose_error": {
                     side: dict(metrics) for side, metrics in solve_pose_error.items()
                 },
@@ -1060,6 +1336,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "ik_time_budget_ms": time_budget_ms,
                 "ik_time_budget_exceeded": time_budget_exceeded,
                 "execution_step_metadata": dict(execution_step_metadata),
+                "output_qpos_smoothing": dict(output_qpos_smoothing),
                 "left_inactive_jitter_hold": left_inactive_jitter_hold is not None,
                 "target_pose_smoothing": dict(context.target_smoothing_metadata),
                 "target_activity": dict(target_activity_metadata),
@@ -1086,6 +1363,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_branch_candidate": branch_candidate,
             "ik_branch_distance_score_deg": branch_score_deg,
             "ik_solve_iterations": int(solve_iteration_count),
+            "ik_solve_iteration_mode": (
+                "adaptive_budget"
+                if bool(self.config.solve_adaptive_iterations_enabled)
+                else "fixed_max"
+            ),
+            "ik_solve_iteration_max": int(self.config.solve_max_iterations),
+            "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+            "ik_solve_iteration_budget_ms": max(
+                0.0,
+                float(self.config.solve_time_budget_ms or 0.0)
+                - float(self.config.solve_iteration_reserve_ms),
+            ),
+            "ik_solve_iteration_budget_exhausted": bool(
+                self._last_solve_iteration_budget_exhausted
+            ),
+            "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
             "ik_solve_pose_error": dict(solve_pose_error.get("left", {})),
             "ik_jump_gate_status": jump_gate_status,
             "ik_jump_gate_reason": jump_gate_reason,
@@ -1098,6 +1391,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_time_budget_ms": time_budget_ms,
             "ik_time_budget_exceeded": time_budget_exceeded,
             "execution_step_metadata": dict(execution_step_metadata),
+            "output_qpos_smoothing": dict(output_qpos_smoothing.get("left", {})),
             "inactive_jitter_hold": left_inactive_jitter_hold is not None,
             "target_pose_smoothing": dict(
                 context.target_smoothing_metadata.get("left", {})
@@ -1125,6 +1419,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_branch_candidate": branch_candidate,
             "ik_branch_distance_score_deg": branch_score_deg,
             "ik_solve_iterations": int(solve_iteration_count),
+            "ik_solve_iteration_mode": (
+                "adaptive_budget"
+                if bool(self.config.solve_adaptive_iterations_enabled)
+                else "fixed_max"
+            ),
+            "ik_solve_iteration_max": int(self.config.solve_max_iterations),
+            "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+            "ik_solve_iteration_budget_ms": max(
+                0.0,
+                float(self.config.solve_time_budget_ms or 0.0)
+                - float(self.config.solve_iteration_reserve_ms),
+            ),
+            "ik_solve_iteration_budget_exhausted": bool(
+                self._last_solve_iteration_budget_exhausted
+            ),
+            "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
             "ik_solve_pose_error": dict(solve_pose_error.get("right", {})),
             "ik_jump_gate_status": jump_gate_status,
             "ik_jump_gate_reason": jump_gate_reason,
@@ -1137,26 +1447,49 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "ik_time_budget_ms": time_budget_ms,
             "ik_time_budget_exceeded": time_budget_exceeded,
             "execution_step_metadata": dict(execution_step_metadata),
+            "output_qpos_smoothing": dict(output_qpos_smoothing.get("right", {})),
             "target_pose_smoothing": dict(
                 context.target_smoothing_metadata.get("right", {})
             ),
             "target_activity": dict(target_activity_metadata.get("right", {})),
         }
+        left_world_pose = self.ik_solver.compute_frame_pose(self.profile.left_frame_name, active_q)
+        right_world_pose = self.ik_solver.compute_frame_pose(self.profile.right_frame_name, active_q)
+        left_base_pose = (
+            left_world_pose
+            if context.left_world_to_base is None
+            else context.left_world_to_base @ left_world_pose
+        )
+        right_base_pose = (
+            right_world_pose
+            if context.right_world_to_base is None
+            else context.right_world_to_base @ right_world_pose
+        )
+        left_tcp_base_pose = left_base_pose @ self._tool_tcp_from_solver["left"]
+        right_tcp_base_pose = right_base_pose @ self._tool_tcp_from_solver["right"]
+        left_metadata.update(
+            {
+                "target_pose_base": left_tcp_base_pose.copy(),
+                "target_pose_tcp_base": left_tcp_base_pose.copy(),
+                "target_pose_controlled_frame": TOOL_TCP_FRAME,
+                "solver_output_endpoint_pose_base": left_base_pose.copy(),
+                "solver_output_qpos": left_qpos.copy(),
+                "q_ik_raw": None if raw_left_qpos is None else raw_left_qpos.copy(),
+                "action_pose_source": "limited_solver_output_qpos",
+            }
+        )
+        right_metadata.update(
+            {
+                "target_pose_base": right_tcp_base_pose.copy(),
+                "target_pose_tcp_base": right_tcp_base_pose.copy(),
+                "target_pose_controlled_frame": TOOL_TCP_FRAME,
+                "solver_output_endpoint_pose_base": right_base_pose.copy(),
+                "solver_output_qpos": right_qpos.copy(),
+                "q_ik_raw": None if raw_right_qpos is None else raw_right_qpos.copy(),
+                "action_pose_source": "limited_solver_output_qpos",
+            }
+        )
         if self.config.output_command_type == "cartesian_pose":
-            left_world_pose = self.ik_solver.compute_frame_pose(self.profile.left_frame_name, active_q)
-            right_world_pose = self.ik_solver.compute_frame_pose(self.profile.right_frame_name, active_q)
-            left_base_pose = (
-                left_world_pose
-                if context.left_world_to_base is None
-                else context.left_world_to_base @ left_world_pose
-            )
-            right_base_pose = (
-                right_world_pose
-                if context.right_world_to_base is None
-                else context.right_world_to_base @ right_world_pose
-            )
-            left_tcp_base_pose = left_base_pose @ self._tool_tcp_from_solver["left"]
-            right_tcp_base_pose = right_base_pose @ self._tool_tcp_from_solver["right"]
             left_metadata.update(
                 {
                     "arm_controlled_frame": TOOL_TCP_FRAME,
@@ -1367,6 +1700,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         left_target: np.ndarray,
         right_target: np.ndarray,
         profile: dict[str, object] | None = None,
+        frame_start_time: float | None = None,
     ) -> tuple[np.ndarray, int, dict[str, dict[str, float]]]:
         targets = [
             self._pose_to_target(left_target),
@@ -1375,9 +1709,39 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         last_q = self.ik_solver.current_q.copy()
         pose_error: dict[str, dict[str, float]] = {}
         iterations = 0
+        self._last_solve_iteration_budget_exhausted = False
+        self._last_solve_iteration_stop_reason = None
+        adaptive = bool(self.config.solve_adaptive_iterations_enabled)
+        time_budget_ms = float(self.config.solve_time_budget_ms or 0.0)
+        iteration_budget_ms = (
+            max(0.0, time_budget_ms - float(self.config.solve_iteration_reserve_ms))
+            if adaptive and time_budget_ms > 0.0
+            else None
+        )
+        budget_start = time.perf_counter() if frame_start_time is None else float(frame_start_time)
+        previous_solve_ms: float | None = None
         for iteration in range(1, int(self.config.solve_max_iterations) + 1):
+            if iteration > 1 and iteration_budget_ms is not None:
+                elapsed_ms = (time.perf_counter() - budget_start) * 1000.0
+                estimated_next_ms = max(0.05, float(previous_solve_ms or 0.0))
+                if elapsed_ms + estimated_next_ms > iteration_budget_ms:
+                    self._last_solve_iteration_budget_exhausted = True
+                    self._last_solve_iteration_stop_reason = "iteration_budget_estimate"
+                    break
+            solve_start = time.perf_counter()
             last_q = self.ik_solver.solve(targets=targets)
             self._record_solver_profile(profile)
+            measured_solve_ms = (time.perf_counter() - solve_start) * 1000.0
+            solver_profile = getattr(self.ik_solver, "last_solve_profile", {})
+            profiled_solve_ms = (
+                float(solver_profile.get("total_ms", 0.0))
+                if isinstance(solver_profile, dict)
+                else 0.0
+            )
+            previous_solve_ms = max(
+                0.05,
+                profiled_solve_ms if np.isfinite(profiled_solve_ms) and profiled_solve_ms > 0.0 else measured_solve_ms,
+            )
             iterations = iteration
             current_left = self.ik_solver.compute_frame_pose(
                 self.profile.left_frame_name,
@@ -1405,7 +1769,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 and right_translation_m <= float(self.config.solve_translation_tolerance_m)
                 and right_rotation_deg <= float(self.config.solve_orientation_tolerance_deg)
             ):
+                self._last_solve_iteration_stop_reason = "pose_tolerance"
                 break
+            if iteration_budget_ms is not None:
+                elapsed_ms = (time.perf_counter() - budget_start) * 1000.0
+                if elapsed_ms >= iteration_budget_ms:
+                    self._last_solve_iteration_budget_exhausted = True
+                    self._last_solve_iteration_stop_reason = "iteration_budget_elapsed"
+                    break
+        if iterations >= int(self.config.solve_max_iterations) and self._last_solve_iteration_stop_reason is None:
+            self._last_solve_iteration_stop_reason = "max_iterations"
+        if profile is not None:
+            profile["solve_iteration_budget_exhausted"] = bool(
+                self._last_solve_iteration_budget_exhausted
+            )
+            profile["solve_iteration_stop_reason"] = self._last_solve_iteration_stop_reason
         return last_q.copy(), iterations, pose_error
 
     def _fallback_reason_for_distance(self, min_distance_m: float | None) -> str | None:
@@ -1455,6 +1833,193 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             return qpos[0:6].copy(), qpos[6:12].copy()
         raise ValueError(f"{self.name} received unsupported solver output shape: {qpos.shape}")
 
+    def _smooth_output_qpos_before_action(
+        self,
+        *,
+        active_q: np.ndarray,
+        left_qpos: np.ndarray,
+        right_qpos: np.ndarray,
+        target_activity: dict[str, object] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+        alpha, alpha_metadata = self._effective_output_qpos_smoothing_alpha(
+            target_activity
+        )
+        raw_full_q = self._embed_arm_qpos(
+            current_full_q=active_q,
+            left_qpos=np.asarray(left_qpos, dtype=float).reshape(6),
+            right_qpos=np.asarray(right_qpos, dtype=float).reshape(6),
+        )
+        enabled = bool(self.config.output_command_type == "joint_vector" and alpha < 1.0)
+        metadata: dict[str, object] = {
+            "enabled": enabled,
+            "applied": False,
+            "initialized": False,
+            "alpha": alpha,
+            "adaptive": alpha_metadata,
+            "stage": "post_ik_pre_action_fk",
+            "raw_qpos_source": "post_ik_step_limited_qpos",
+            "final_action_realized_from_joint": True,
+            "downstream_command_stage": "interpolation_only",
+        }
+        if self.config.output_command_type != "joint_vector":
+            metadata["reason"] = "non_joint_vector_output"
+            self._last_output_qpos_smoothing_full_q = None
+            return raw_full_q.copy(), left_qpos.copy(), right_qpos.copy(), metadata
+        if not enabled:
+            metadata["reason"] = "alpha_one"
+            self._last_output_qpos_smoothing_full_q = raw_full_q.copy()
+            return raw_full_q.copy(), left_qpos.copy(), right_qpos.copy(), metadata
+
+        previous = self._last_output_qpos_smoothing_full_q
+        if previous is None or previous.shape != raw_full_q.shape:
+            smoothed_full_q = raw_full_q.copy()
+            metadata["initialized"] = True
+        else:
+            previous = np.asarray(previous, dtype=float).reshape(raw_full_q.shape)
+            smoothed_full_q = previous + alpha * (raw_full_q - previous)
+            metadata["applied"] = not np.allclose(smoothed_full_q, raw_full_q, atol=1e-10)
+            raw_delta_deg = np.rad2deg(raw_full_q - previous)
+            output_delta_deg = np.rad2deg(smoothed_full_q - previous)
+            metadata["raw_max_step_deg"] = float(np.max(np.abs(raw_delta_deg))) if raw_delta_deg.size else 0.0
+            metadata["output_max_step_deg"] = (
+                float(np.max(np.abs(output_delta_deg))) if output_delta_deg.size else 0.0
+            )
+            metadata["raw_to_output_max_delta_deg"] = (
+                float(np.max(np.abs(np.rad2deg(raw_full_q - smoothed_full_q))))
+                if raw_full_q.size
+                else 0.0
+            )
+        self._last_output_qpos_smoothing_full_q = smoothed_full_q.copy()
+        smoothed_left, smoothed_right = self._split_solution(smoothed_full_q)
+        for side, raw_qpos, output_qpos in (
+            ("left", left_qpos, smoothed_left),
+            ("right", right_qpos, smoothed_right),
+        ):
+            raw_q = np.asarray(raw_qpos, dtype=float).reshape(6)
+            out_q = np.asarray(output_qpos, dtype=float).reshape(6)
+            metadata[side] = {
+                "enabled": enabled,
+                "applied": bool(metadata.get("applied", False)),
+                "initialized": bool(metadata.get("initialized", False)),
+                "alpha": alpha,
+                "stage": "post_ik_pre_action_fk",
+                "raw_target_joint_deg": np.rad2deg(raw_q).astype(float).tolist(),
+                "output_target_joint_deg": np.rad2deg(out_q).astype(float).tolist(),
+                "raw_to_output_delta_deg": np.rad2deg(out_q - raw_q).astype(float).tolist(),
+                "raw_to_output_max_delta_deg": float(np.rad2deg(np.max(np.abs(out_q - raw_q)))),
+            }
+        return smoothed_full_q.copy(), smoothed_left, smoothed_right, metadata
+
+    def _effective_output_qpos_smoothing_alpha(
+        self,
+        target_activity: dict[str, object] | None,
+    ) -> tuple[float, dict[str, object]]:
+        slow_alpha = float(self.config.output_qpos_smoothing_alpha)
+        if not bool(self.config.output_qpos_smoothing_adaptive_enabled):
+            return slow_alpha, {
+                "enabled": False,
+                "effective_alpha": slow_alpha,
+                "reason": "disabled",
+            }
+
+        max_linear = 0.0
+        max_angular = 0.0
+        valid_sides: list[str] = []
+        for side in ("left", "right"):
+            side_metadata = (
+                dict(target_activity.get(side, {}) or {})
+                if isinstance(target_activity, dict)
+                else {}
+            )
+            evidence = side_metadata.get("evidence")
+            evidence = dict(evidence) if isinstance(evidence, dict) else {}
+            motion_window = side_metadata.get("motion_window")
+            motion_window = (
+                dict(motion_window) if isinstance(motion_window, dict) else {}
+            )
+            # Tracker motion evidence intentionally carries the speed estimates,
+            # while the validity bit lives in the associated motion-window
+            # diagnostic.  Accept the older combined shape as well.
+            quality_valid = bool(
+                evidence.get("quality_valid", motion_window.get("quality_valid", False))
+            )
+            if not quality_valid:
+                continue
+            linear = evidence.get(
+                "linear_speed_p90_m_s",
+                motion_window.get("linear_speed_p90_m_s"),
+            )
+            angular = evidence.get(
+                "angular_speed_p90_rad_s",
+                motion_window.get("angular_speed_p90_rad_s"),
+            )
+            if linear is None or angular is None:
+                continue
+            linear_value = max(0.0, float(linear))
+            angular_value = max(0.0, float(angular))
+            if not np.isfinite(linear_value) or not np.isfinite(angular_value):
+                continue
+            max_linear = max(max_linear, linear_value)
+            max_angular = max(max_angular, angular_value)
+            valid_sides.append(side)
+
+        def normalized(value: float, low: float, high: float) -> float:
+            return float(np.clip((value - low) / (high - low), 0.0, 1.0))
+
+        if valid_sides:
+            linear_ratio = normalized(
+                max_linear,
+                float(self.config.output_qpos_smoothing_linear_speed_low_m_s),
+                float(self.config.output_qpos_smoothing_linear_speed_high_m_s),
+            )
+            angular_ratio = normalized(
+                max_angular,
+                float(self.config.output_qpos_smoothing_angular_speed_low_rad_s),
+                float(self.config.output_qpos_smoothing_angular_speed_high_rad_s),
+            )
+            raw_ratio = max(linear_ratio, angular_ratio)
+            # Smoothstep avoids a slope discontinuity at both speed thresholds.
+            motion_ratio = raw_ratio * raw_ratio * (3.0 - 2.0 * raw_ratio)
+            requested_alpha = slow_alpha + motion_ratio * (
+                float(self.config.output_qpos_smoothing_fast_alpha) - slow_alpha
+            )
+            reason = "tracker_speed"
+        else:
+            linear_ratio = angular_ratio = motion_ratio = 0.0
+            requested_alpha = slow_alpha
+            reason = "invalid_or_missing_speed"
+
+        now = time.monotonic()
+        previous = float(self._output_qpos_smoothing_effective_alpha)
+        previous_time = self._output_qpos_smoothing_update_time
+        dt = self._execution_dt_sec if previous_time is None else max(0.0, now - previous_time)
+        tau = (
+            float(self.config.output_qpos_smoothing_attack_sec)
+            if requested_alpha >= previous
+            else float(self.config.output_qpos_smoothing_release_sec)
+        )
+        blend = 1.0 - float(np.exp(-min(dt, 0.25) / tau))
+        effective = previous + blend * (requested_alpha - previous)
+        self._output_qpos_smoothing_effective_alpha = effective
+        self._output_qpos_smoothing_update_time = now
+        return effective, {
+            "enabled": True,
+            "reason": reason,
+            "valid_sides": valid_sides,
+            "linear_speed_m_s": max_linear,
+            "angular_speed_rad_s": max_angular,
+            "linear_ratio": linear_ratio,
+            "angular_ratio": angular_ratio,
+            "motion_ratio": motion_ratio,
+            "slow_alpha": slow_alpha,
+            "fast_alpha": float(self.config.output_qpos_smoothing_fast_alpha),
+            "requested_alpha": requested_alpha,
+            "effective_alpha": effective,
+            "transition": "attack" if requested_alpha >= previous else "release",
+            "transition_dt_sec": dt,
+            "transition_tau_sec": tau,
+        }
+
     def _joint_limit_margin_metadata(self, side: str, qpos: np.ndarray) -> dict[str, object]:
         lower, upper = self._left_arm_limits if side == "left" else self._right_arm_limits
         q = np.asarray(qpos, dtype=float).reshape(6)
@@ -1471,6 +2036,68 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "nearest_joint": int(nearest_index + 1),
             "nearest_margin_deg": float(np.rad2deg(min_margin[nearest_index])),
             "near_limit": bool(min_margin[nearest_index] < np.deg2rad(5.0)),
+        }
+
+    def _joint_operating_margin_metadata(
+        self,
+        *,
+        reference_full_q: np.ndarray,
+        output_full_q: np.ndarray,
+    ) -> dict[str, object]:
+        """Check an optional interior envelope before collision evaluation.
+
+        A qpos can be inside the physical URDF envelope but still too close to
+        a joint stop for force control. Once a candidate enters the optional
+        interior envelope, it must strictly improve every offending margin. No
+        qpos is clipped here: recovery remains collision-checked through the
+        normal auxiliary joint-limit-escape candidates.
+        """
+
+        required_margin_deg = float(self.config.joint_operating_margin_deg)
+        if required_margin_deg <= 0.0:
+            return {
+                "enabled": False,
+                "status": "disabled",
+                "required_margin_deg": 0.0,
+                "recovery_only": False,
+                "reject": False,
+                "violations": [],
+            }
+        required_margin_rad = float(np.deg2rad(required_margin_deg))
+        reference_left, reference_right = self._split_solution(reference_full_q)
+        output_left, output_right = self._split_solution(output_full_q)
+        violations: list[dict[str, object]] = []
+        tolerance_rad = 1e-9
+        for side, reference_q, output_q, limits in (
+            ("left", reference_left, output_left, self._left_arm_limits),
+            ("right", reference_right, output_right, self._right_arm_limits),
+        ):
+            lower, upper = (np.asarray(value, dtype=float).reshape(6) for value in limits)
+            reference_margin = np.minimum(reference_q - lower, upper - reference_q)
+            output_margin = np.minimum(output_q - lower, upper - output_q)
+            for local_index in np.flatnonzero(output_margin < required_margin_rad).tolist():
+                before_rad = float(reference_margin[local_index])
+                after_rad = float(output_margin[local_index])
+                progress_rad = after_rad - before_rad
+                violations.append(
+                    {
+                        "side": side,
+                        "joint": int(local_index + 1),
+                        "reference_margin_deg": float(np.rad2deg(before_rad)),
+                        "output_margin_deg": float(np.rad2deg(after_rad)),
+                        "margin_progress_deg": float(np.rad2deg(progress_rad)),
+                        "moving_inward": bool(progress_rad > tolerance_rad),
+                    }
+                )
+        recovery_only = bool(violations)
+        reject = bool(recovery_only and any(not item["moving_inward"] for item in violations))
+        return {
+            "enabled": True,
+            "status": "rejected" if reject else "recovery_only" if recovery_only else "pass",
+            "required_margin_deg": required_margin_deg,
+            "recovery_only": recovery_only,
+            "reject": reject,
+            "violations": violations,
         }
 
     def _pose_to_target(self, pose: np.ndarray) -> np.ndarray:
@@ -1509,16 +2136,30 @@ class DualArmCollisionAwareRetargeter(Retargeter):
     def _make_full_execution_joint_step(self, qpos: np.ndarray) -> np.ndarray | None:
         if not self.config.enforce_realistic_joint_step:
             return None
+        profile_step: np.ndarray | None = None
         if self.joint_velocity_profile is not None:
             dt_sec = max(1e-6, float(self._execution_dt_sec))
-            arm_step = np.deg2rad(self.joint_velocity_profile.max_step_deg(dt_sec))
-            return self._make_full_step_from_arm_steps(
-                qpos,
-                left_step=arm_step,
-                right_step=arm_step,
+            profile_step = np.deg2rad(
+                np.asarray(self.joint_velocity_profile.max_step_deg(dt_sec), dtype=float).reshape(6)
             )
         left_step = self.config.left_execution_max_joint_step_rad
         right_step = self.config.right_execution_max_joint_step_rad
+        if profile_step is not None:
+            left_effective = (
+                profile_step
+                if left_step is None
+                else np.minimum(profile_step, np.asarray(left_step, dtype=float).reshape(6))
+            )
+            right_effective = (
+                profile_step
+                if right_step is None
+                else np.minimum(profile_step, np.asarray(right_step, dtype=float).reshape(6))
+            )
+            return self._make_full_step_from_arm_steps(
+                qpos,
+                left_step=left_effective,
+                right_step=right_effective,
+            )
         if left_step is None or right_step is None:
             return None
         return self._make_full_step_from_arm_steps(
@@ -1554,6 +2195,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             f"{self.name} cannot build execution joint-step limits for solver shape {q.shape}."
         )
 
+    def _execution_step_source(self) -> str | None:
+        has_profile = self.joint_velocity_profile is not None
+        has_explicit = (
+            self.config.left_execution_max_joint_step_rad is not None
+            or self.config.right_execution_max_joint_step_rad is not None
+        )
+        if has_profile and has_explicit:
+            return "joint_velocity_profile+explicit_execution_max_joint_step"
+        if has_profile:
+            return "joint_velocity_profile"
+        if has_explicit:
+            return "explicit_execution_max_joint_step"
+        return None
+
     def set_execution_max_joint_step(
         self,
         *,
@@ -1578,6 +2233,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         reference_full_q: np.ndarray,
         candidate_full_q: np.ndarray,
         target_activity: dict[str, object] | None = None,
+        current_targets: dict[str, np.ndarray] | None = None,
     ) -> tuple[np.ndarray, dict[str, object]]:
         reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
         candidate_q = np.asarray(candidate_full_q, dtype=float).reshape(-1)
@@ -1587,6 +2243,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "weighted_delta_deg": 0.0,
             "left_max_abs_delta_deg": 0.0,
             "right_max_abs_delta_deg": 0.0,
+            "execution_step_source": self._execution_step_source(),
             "joint_velocity_limit_profile": (
                 None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
             ),
@@ -1606,6 +2263,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             reference_full_q=reference_q,
             candidate_full_q=limited_q,
             target_activity=target_activity,
+            current_targets=current_targets,
         )
         step_limited = bool(
             not np.allclose(limited_q, candidate_q, atol=1e-10)
@@ -1651,6 +2309,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         reference_full_q: np.ndarray,
         candidate_full_q: np.ndarray,
         target_activity: dict[str, object] | None,
+        current_targets: dict[str, np.ndarray] | None = None,
     ) -> tuple[np.ndarray, dict[str, object]]:
         reference_q = np.asarray(reference_full_q, dtype=float).reshape(-1)
         output_q = np.asarray(candidate_full_q, dtype=float).reshape(reference_q.shape).copy()
@@ -1670,7 +2329,6 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         if not enabled:
             return output_q.copy(), metadata
 
-        cap_rad = np.deg2rad(cap_deg)
         ref_left, ref_right = self._split_solution(reference_q)
         out_left, out_right = self._split_solution(output_q)
         applied_any = False
@@ -1680,18 +2338,86 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             side_activity = dict(side_activity_raw) if isinstance(side_activity_raw, dict) else {}
             hold_weight = max(0.0, min(1.0, float(side_activity.get("hold_weight", 0.0) or 0.0)))
             inactive = bool(side_activity.get("inactive", False) or hold_weight > 0.0)
+            tracker_confirmed_inactive = bool(
+                side_activity.get("source") == "tracker_motion_state_machine"
+                and side_activity.get("state") == "INACTIVE"
+                and hold_weight >= 0.999
+            )
             ref_arm = ref_left if side == "left" else ref_right
             out_arm = out_left if side == "left" else out_right
             requested_delta = out_arm - ref_arm
             requested_max_deg = float(np.rad2deg(np.max(np.abs(requested_delta))))
+            release_metadata = self._tracker_inactive_execution_release(
+                side=side,
+                reference_full_q=reference_q,
+                current_targets=current_targets,
+            ) if (
+                tracker_confirmed_inactive
+                and self.config.inactive_side_hold_execution_release_enabled
+            ) else None
+            release_scale = (
+                None
+                if release_metadata is None
+                else float(release_metadata["velocity_release_scale"])
+            )
+            effective_cap_deg = (
+                cap_deg
+                if not tracker_confirmed_inactive
+                else (
+                    0.0
+                    if release_scale is None
+                    else requested_max_deg * release_scale
+                )
+            )
             side_metadata = {
                 "inactive": inactive,
                 "hold_weight": float(hold_weight),
+                "source": side_activity.get("source"),
+                "state": side_activity.get("state"),
+                "tracker_inactive": tracker_confirmed_inactive,
+                "tracker_inactive_execution_release_enabled": bool(
+                    self.config.inactive_side_hold_execution_release_enabled
+                ),
+                "tracker_inactive_freeze": bool(
+                    tracker_confirmed_inactive
+                    and (release_scale is None or release_scale <= 1e-12)
+                ),
+                "tracker_inactive_execution_release": release_metadata,
+                "effective_cap_deg": effective_cap_deg,
                 "requested_max_abs_delta_deg": requested_max_deg,
                 "applied": False,
             }
-            if inactive and hold_weight > 0.0 and requested_max_deg > cap_deg + 1e-9:
-                capped_delta = np.clip(requested_delta, -cap_rad, cap_rad)
+            if (
+                tracker_confirmed_inactive
+                and release_scale is not None
+                and release_scale < 1.0 - 1e-12
+            ):
+                capped_delta = requested_delta * release_scale
+                capped_arm = ref_arm + capped_delta
+                side_metadata.update(
+                    {
+                        "applied": True,
+                        "capped_max_abs_delta_deg": float(
+                            np.rad2deg(np.max(np.abs(capped_delta)))
+                        ),
+                    }
+                )
+                applied_any = True
+                if side == "left":
+                    out_left = capped_arm
+                else:
+                    out_right = capped_arm
+            elif (
+                inactive
+                and hold_weight > 0.0
+                and requested_max_deg > effective_cap_deg + 1e-9
+            ):
+                effective_cap_rad = np.deg2rad(effective_cap_deg)
+                capped_delta = np.clip(
+                    requested_delta,
+                    -effective_cap_rad,
+                    effective_cap_rad,
+                )
                 capped_arm = ref_arm + capped_delta
                 side_metadata.update(
                     {
@@ -1717,6 +2443,90 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         metadata["applied"] = bool(applied_any)
         metadata["sides"] = sides
         return output_q.copy(), metadata
+
+    def _tracker_inactive_execution_release(
+        self,
+        *,
+        side: str,
+        reference_full_q: np.ndarray,
+        current_targets: dict[str, np.ndarray] | None,
+    ) -> dict[str, object]:
+        """Compute the inactive convergence release from execution-reference FK.
+
+        ``reference_full_q`` is the qcmd/qref execution anchor selected by the
+        runtime before this IK cycle.  The release is intentionally a pure
+        observation of its FK versus the frozen target: it cannot loosen the
+        normal joint-velocity, collision, jump-gate, or joint-limit checks that
+        ran before this inactive-only cap.
+        """
+        metadata: dict[str, object] = {
+            "available": False,
+            "reference_qpos_source": "execution_reference_qcmd_or_qref",
+            "translation_static_m": float(
+                self.config.inactive_side_hold_execution_release_translation_static_m
+            ),
+            "translation_full_m": float(
+                self.config.inactive_side_hold_execution_release_translation_full_m
+            ),
+            "rotation_static_deg": float(
+                self.config.inactive_side_hold_execution_release_rotation_static_deg
+            ),
+            "rotation_full_deg": float(
+                self.config.inactive_side_hold_execution_release_rotation_full_deg
+            ),
+            "translation_weight": 0.0,
+            "rotation_weight": 0.0,
+            "velocity_release_scale": 0.0,
+        }
+        if current_targets is None or side not in current_targets:
+            metadata["unavailable_reason"] = "missing_current_target"
+            return metadata
+        frame_name = (
+            self.profile.left_frame_name if side == "left" else self.profile.right_frame_name
+        )
+        try:
+            reference_pose = self.ik_solver.compute_frame_pose(
+                frame_name,
+                np.asarray(reference_full_q, dtype=float).reshape(-1),
+            )
+            target_pose = as_pose_matrix(current_targets[side])
+            translation_m, rotation_deg = pose_delta_metrics(reference_pose, target_pose)
+        except Exception as exc:  # noqa: BLE001 - preserve a fail-closed inactive hold.
+            metadata["unavailable_reason"] = f"fk_error:{type(exc).__name__}"
+            return metadata
+
+        translation_weight = _linear_release_weight(
+            value=float(translation_m),
+            static_threshold=float(
+                self.config.inactive_side_hold_execution_release_translation_static_m
+            ),
+            full_threshold=float(
+                self.config.inactive_side_hold_execution_release_translation_full_m
+            ),
+        )
+        rotation_weight = _linear_release_weight(
+            value=float(rotation_deg),
+            static_threshold=float(
+                self.config.inactive_side_hold_execution_release_rotation_static_deg
+            ),
+            full_threshold=float(
+                self.config.inactive_side_hold_execution_release_rotation_full_deg
+            ),
+        )
+        metadata.update(
+            {
+                "available": True,
+                "reference_pose_frame": frame_name,
+                "translation_error_m": float(translation_m),
+                "rotation_error_deg": float(rotation_deg),
+                "translation_weight": float(translation_weight),
+                "rotation_weight": float(rotation_weight),
+                "velocity_release_scale": float(
+                    min(1.0, translation_weight + rotation_weight)
+                ),
+            }
+        )
+        return metadata
 
     def _full_joint_distance_score(self, reference_full_q: np.ndarray, candidate_full_q: np.ndarray) -> float:
         return weighted_joint_distance_score(
@@ -1896,12 +2706,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         current_targets: dict[str, np.ndarray],
         target_activity: dict[str, object] | None = None,
         profile: dict[str, object] | None = None,
+        elapsed_before_selection_ms: float | None = None,
     ) -> tuple[np.ndarray, str, float, float | None, dict[str, object]]:
         safety_profile = self.ik_safety_profile
         if (
             safety_profile is None
             or not bool(safety_profile.local_step_enabled)
             or not bool(self.config.enforce_realistic_joint_step)
+            or not bool(self.config.local_step_candidate_selection_enabled)
         ):
             q, name, score, min_distance = self._select_normalized_candidate(
                 raw_full_q=raw_full_q,
@@ -1913,6 +2725,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "reason": (
                     "execution_step_limit_disabled"
                     if not bool(self.config.enforce_realistic_joint_step)
+                    else "local_step_candidate_selection_disabled"
+                    if not bool(self.config.local_step_candidate_selection_enabled)
                     else "ik_safety_profile_local_step_disabled"
                 ),
                 "selected": name,
@@ -1939,14 +2753,52 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         selection_start = time.perf_counter()
         time_budget_ms = float(self.config.solve_time_budget_ms or 0.0)
-        solve_elapsed_ms = (
-            float(profile.get("solve_total_ms", 0.0))
+        pre_selection_elapsed_ms = (
+            max(0.0, float(elapsed_before_selection_ms))
+            if elapsed_before_selection_ms is not None
+            else float(profile.get("solve_total_ms", 0.0))
             if isinstance(profile, dict)
             else 0.0
         )
-        branch_budget_ms = 0.0
-        if time_budget_ms > 0.0:
-            branch_budget_ms = max(5.0, time_budget_ms - solve_elapsed_ms - 5.0)
+        deadline_enabled = bool(time_budget_ms > 0.0)
+        branch_budget_ms = (
+            max(0.0, time_budget_ms - pre_selection_elapsed_ms - 5.0)
+            if deadline_enabled
+            else 0.0
+        )
+
+        evaluated: list[_DualArmEvaluatedCandidate] = []
+        collision_safe_evaluated: list[_DualArmEvaluatedCandidate] = []
+        rejections: list[dict[str, object]] = []
+        collision_rejections: list[dict[str, object]] = []
+        candidate_eval_stopped_early = False
+        candidate_eval_stop_reason: str | None = None
+        stage_summaries: list[dict[str, object]] = []
+        reference_min_distance: float | None = None
+
+        def deadline_reached() -> bool:
+            if not deadline_enabled:
+                return False
+            elapsed_ms = (time.perf_counter() - selection_start) * 1000.0
+            return elapsed_ms >= branch_budget_ms
+
+        def stop_for_deadline(reason: str) -> None:
+            nonlocal candidate_eval_stopped_early, candidate_eval_stop_reason
+            candidate_eval_stopped_early = True
+            if candidate_eval_stop_reason is None:
+                candidate_eval_stop_reason = reason
+
+        # A deadline fallback must never launch a new collision query after the
+        # candidate budget has elapsed. Certify the current reference up front,
+        # then reuse this value if no budgeted candidate is safe.
+        if deadline_enabled:
+            reference_min_distance = self._profiled_min_collision_distance(
+                reference_full,
+                profile,
+                phase="candidate_selection_reference",
+            )
+            if deadline_reached():
+                stop_for_deadline("branch_budget_exhausted_before_candidates")
 
         base_candidates, limit_escape_metadata = self._dual_arm_tracking_candidates(
             raw_full_q=raw_full_q,
@@ -1957,16 +2809,6 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             include_wrist_unload=False,
         )
         scale_factors = _dual_arm_step_scale_factors(safety_profile)
-        evaluated: list[_DualArmEvaluatedCandidate] = []
-        rejections: list[dict[str, object]] = []
-        candidate_eval_stopped_early = False
-        stage_summaries: list[dict[str, object]] = []
-
-        def deadline_reached() -> bool:
-            if branch_budget_ms <= 0.0:
-                return False
-            elapsed_ms = (time.perf_counter() - selection_start) * 1000.0
-            return elapsed_ms >= branch_budget_ms
 
         def evaluate_stage(
             *,
@@ -1977,11 +2819,17 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         ) -> None:
             nonlocal candidate_eval_stopped_early
             accepted_before = len(evaluated)
+            collision_safe_before = len(collision_safe_evaluated)
             rejected_before = len(rejections)
             attempts = 0
             for candidate in candidates:
-                candidate_accepted = False
+                if deadline_reached():
+                    stop_for_deadline("branch_budget_exhausted_before_candidate")
+                    break
                 for scale in scales:
+                    if deadline_reached():
+                        stop_for_deadline("branch_budget_exhausted_before_scale")
+                        break
                     attempts += 1
                     accepted, output_qpos, metadata = self._evaluate_dual_arm_step_candidate(
                         candidate=candidate,
@@ -1992,6 +2840,19 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     )
                     metadata["candidate_eval_stage"] = stage
                     if accepted:
+                        # Do not start a collision query for a candidate that
+                        # completed only after its budget had expired.
+                        if deadline_reached():
+                            metadata["candidate_eval_discarded_due_deadline"] = True
+                            stop_for_deadline("branch_budget_exhausted_after_candidate")
+                            break
+                        min_distance = self._profiled_min_collision_distance(
+                            output_qpos,
+                            profile,
+                            phase="candidate_selection",
+                        )
+                        metadata["collision_distance_m"] = min_distance
+                        fallback_reason = self._fallback_reason_for_distance(min_distance)
                         evaluated.append(
                             _DualArmEvaluatedCandidate(
                                 candidate=candidate,
@@ -2000,16 +2861,27 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                                 metadata=metadata,
                             )
                         )
-                        candidate_accepted = True
+                        if fallback_reason is None:
+                            collision_safe_evaluated.append(evaluated[-1])
+                        else:
+                            collision_rejections.append(
+                                {
+                                    "candidate": candidate.name,
+                                    "method": candidate.method,
+                                    "scale": metadata.get("step_scale"),
+                                    "collision_distance_m": min_distance,
+                                    "reject_reason": fallback_reason,
+                                    "candidate_eval_stage": stage,
+                                }
+                            )
+                        if deadline_reached():
+                            stop_for_deadline("branch_budget_exhausted_after_collision_check")
+                            break
                         if stop_after_first_accept_per_candidate:
                             break
                     else:
                         rejections.append(metadata)
-                if deadline_reached() and evaluated:
-                    candidate_eval_stopped_early = True
-                    break
-                if candidate_accepted and deadline_reached():
-                    candidate_eval_stopped_early = True
+                if candidate_eval_stopped_early:
                     break
             stage_summaries.append(
                 {
@@ -2018,6 +2890,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     "scale_factors": list(scales),
                     "attempt_count": attempts,
                     "accepted_count": len(evaluated) - accepted_before,
+                    "collision_safe_count": len(collision_safe_evaluated) - collision_safe_before,
                     "rejected_count": len(rejections) - rejected_before,
                     "stopped_early": bool(candidate_eval_stopped_early),
                 }
@@ -2043,15 +2916,22 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "execution_dt_sec": float(self._execution_dt_sec),
                 "candidate_count": len(candidates),
                 "evaluated_count": len(evaluated),
+                "collision_safe_count": len(collision_safe_evaluated),
+                "collision_checked_count": len(evaluated),
                 "rejection_count": len(rejections),
                 "last_rejections": rejections[-8:],
+                "collision_rejection_count": len(collision_rejections),
+                "collision_rejections": collision_rejections[-8:],
                 "scale_factors": list(scale_factors),
                 "candidate_eval_stages": list(stage_summaries),
                 "candidate_eval_elapsed_ms": float(elapsed_ms),
+                "candidate_eval_pre_selection_elapsed_ms": float(pre_selection_elapsed_ms),
                 "candidate_eval_branch_budget_ms": (
-                    None if branch_budget_ms <= 0.0 else float(branch_budget_ms)
+                    float(branch_budget_ms) if deadline_enabled else None
                 ),
                 "candidate_eval_stopped_early": bool(candidate_eval_stopped_early),
+                "candidate_eval_stop_reason": candidate_eval_stop_reason,
+                "reference_collision_distance_m": reference_min_distance,
                 "target_activity": dict(target_activity_metadata),
                 "inactive_side_hold_active": bool(inactive_hold_active),
                 "limit_escape": dict(combined),
@@ -2063,61 +2943,36 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             *,
             metadata: dict[str, object],
         ) -> tuple[np.ndarray, str, float, float | None, dict[str, object]] | None:
-            if not evaluated:
+            if not collision_safe_evaluated:
                 return None
-            selection_pool, selection_policy = self._dual_stable_selection_pool(evaluated)
+            selection_pool, selection_policy = self._dual_stable_selection_pool(collision_safe_evaluated)
             metadata["selection_policy"] = selection_policy
             selection_pool = list(selection_pool)
             selection_pool.sort(key=lambda item: item.score)
-            collision_rejections: list[dict[str, object]] = []
-            max_collision_checks = max(1, int(safety_profile.max_candidate_count))
-            for item in selection_pool[:max_collision_checks]:
-                min_distance = self._profiled_min_collision_distance(
-                    item.output_qpos,
-                    profile,
-                    phase="candidate_selection",
-                )
-                fallback_reason = self._fallback_reason_for_distance(min_distance)
-                if fallback_reason is not None:
-                    collision_rejections.append(
-                        {
-                            "candidate": item.candidate.name,
-                            "method": item.candidate.method,
-                            "scale": item.metadata.get("step_scale"),
-                            "collision_distance_m": min_distance,
-                            "reject_reason": fallback_reason,
-                        }
-                    )
-                    continue
-                selected_metadata = dict(item.metadata)
-                metadata.update(
-                    {
-                        "status": "selected",
-                        "selected": item.candidate.name,
-                        "selected_source": item.candidate.source,
-                        "selected_method": item.candidate.method,
-                        "selected_score": float(item.score),
-                        "selected_step_scale": selected_metadata.get("step_scale"),
-                        "collision_distance_m": min_distance,
-                        "collision_rejection_count": len(collision_rejections),
-                        "collision_rejections": collision_rejections[-8:],
-                        "selected_metadata": selected_metadata,
-                    }
-                )
-                return (
-                    item.output_qpos.copy(),
-                    item.candidate.name,
-                    float(item.score),
-                    min_distance,
-                    metadata,
-                )
+            item = selection_pool[0]
+            selected_metadata = dict(item.metadata)
+            min_distance = selected_metadata.get("collision_distance_m")
             metadata.update(
                 {
                     "collision_rejection_count": len(collision_rejections),
                     "collision_rejections": collision_rejections[-8:],
+                    "status": "selected",
+                    "selected": item.candidate.name,
+                    "selected_source": item.candidate.source,
+                    "selected_method": item.candidate.method,
+                    "selected_score": float(item.score),
+                    "selected_step_scale": selected_metadata.get("step_scale"),
+                    "collision_distance_m": min_distance,
+                    "selected_metadata": selected_metadata,
                 }
             )
-            return None
+            return (
+                item.output_qpos.copy(),
+                item.candidate.name,
+                float(item.score),
+                min_distance,
+                metadata,
+            )
 
         primary_scales = scale_factors if inactive_hold_active else scale_factors[:1]
         fallback_scales = () if inactive_hold_active else scale_factors[1:]
@@ -2127,14 +2982,28 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             scales=primary_scales,
             stop_after_first_accept_per_candidate=not inactive_hold_active,
         )
-        if not evaluated and fallback_scales:
+        if not evaluated and fallback_scales and not candidate_eval_stopped_early:
             evaluate_stage(stage="base_fallback", candidates=base_candidates, scales=fallback_scales)
 
         base_metadata = selection_metadata(candidates=base_candidates)
         base_selection = choose_from_evaluated(metadata=base_metadata)
         if base_selection is not None:
-            base_selection[4]["candidate_eval_mode"] = "base_only"
+            base_selection[4]["candidate_eval_mode"] = (
+                "deadline_partial" if candidate_eval_stopped_early else "base_only"
+            )
             return base_selection
+
+        if candidate_eval_stopped_early:
+            base_metadata.update(
+                {
+                    "status": "hold_reference",
+                    "selected": "local_step_hold",
+                    "reason": "branch_budget_exhausted_no_safe_candidate",
+                    "collision_distance_m": reference_min_distance,
+                    "candidate_eval_mode": "deadline_hold",
+                }
+            )
+            return reference_full.copy(), "local_step_hold", 0.0, reference_min_distance, base_metadata
 
         auxiliary_candidates, auxiliary_metadata = self._dual_arm_tracking_candidates(
             raw_full_q=raw_full_q,
@@ -2166,25 +3035,33 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         )
         auxiliary_selection = choose_from_evaluated(metadata=metadata)
         if auxiliary_selection is not None:
-            auxiliary_selection[4]["candidate_eval_mode"] = "base_then_auxiliary"
+            auxiliary_selection[4]["candidate_eval_mode"] = (
+                "deadline_partial" if candidate_eval_stopped_early else "base_then_auxiliary"
+            )
             return auxiliary_selection
 
-        if candidate_eval_stopped_early and evaluated:
-            metadata["candidate_eval_stopped_with_accepted_candidates"] = True
-            stopped_selection = choose_from_evaluated(metadata=metadata)
-            if stopped_selection is not None:
-                stopped_selection[4]["candidate_eval_mode"] = "deadline_partial"
-                return stopped_selection
-
         if candidate_eval_stopped_early:
-            metadata["candidate_eval_stop_reason"] = "branch_budget_exhausted"
+            metadata.update(
+                {
+                    "status": "hold_reference",
+                    "selected": "local_step_hold",
+                    "reason": "branch_budget_exhausted_no_safe_candidate",
+                    "collision_distance_m": reference_min_distance,
+                    "candidate_eval_mode": "deadline_hold",
+                }
+            )
+            return reference_full.copy(), "local_step_hold", 0.0, reference_min_distance, metadata
 
         if not evaluated:
             hold_q = reference_full.copy()
-            min_distance = self._profiled_min_collision_distance(
-                hold_q,
-                profile,
-                phase="candidate_selection_hold",
+            min_distance = (
+                reference_min_distance
+                if reference_min_distance is not None
+                else self._profiled_min_collision_distance(
+                    hold_q,
+                    profile,
+                    phase="candidate_selection_hold",
+                )
             )
             metadata.update(
                 {
@@ -2197,10 +3074,14 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             return hold_q, "local_step_hold", 0.0, min_distance, metadata
 
         hold_q = reference_full.copy()
-        min_distance = self._profiled_min_collision_distance(
-            hold_q,
-            profile,
-            phase="candidate_selection_collision_hold",
+        min_distance = (
+            reference_min_distance
+            if reference_min_distance is not None
+            else self._profiled_min_collision_distance(
+                hold_q,
+                profile,
+                phase="candidate_selection_collision_hold",
+            )
         )
         metadata.update(
             {
@@ -2699,6 +3580,16 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             metadata["score"] = 1e18
             return False, output_q, metadata
 
+        operating_margin = self._joint_operating_margin_metadata(
+            reference_full_q=reference_full,
+            output_full_q=output_q,
+        )
+        metadata["joint_operating_margin"] = operating_margin
+        if bool(operating_margin["reject"]):
+            metadata["reject_reason"] = "joint_operating_margin"
+            metadata["score"] = 1e18
+            return False, output_q, metadata
+
         before_metrics = self._dual_pose_metrics(reference_full, current_targets)
         after_metrics = self._dual_pose_metrics(output_q, current_targets)
         output_motion_metrics = self._dual_output_motion_metrics(reference_full, output_q)
@@ -3116,6 +4007,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         metadata: dict[str, object] = {
             "step_limited": False,
             "step_scale": float(step_scale),
+            "candidate_local_step_clip_scale": float(
+                self.config.local_step_candidate_clip_scale
+            ),
+            "execution_step_source": self._execution_step_source(),
             "joint_velocity_limit_profile": (
                 None if self.joint_velocity_profile is None else self.joint_velocity_profile.name
             ),
@@ -3124,7 +4019,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         if not self.config.enforce_realistic_joint_step or self._full_execution_joint_step is None:
             metadata["step_limit_enabled"] = False
             return candidate_q.copy(), metadata
-        max_step = np.asarray(self._full_execution_joint_step, dtype=float).reshape(reference_q.shape)
+        max_step = (
+            np.asarray(self._full_execution_joint_step, dtype=float).reshape(reference_q.shape)
+            * float(self.config.local_step_candidate_clip_scale)
+        )
         full_limited = reference_q + np.clip(candidate_q - reference_q, -max_step, max_step)
         full_delta = full_limited - reference_q
         output_q = reference_q + full_delta * max(1e-6, min(1.0, float(step_scale)))
@@ -3188,6 +4086,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
     def _target_activity_metadata(
         self,
         current_targets: dict[str, np.ndarray],
+        *,
+        cartesian_commands: dict[str, EffectorCommand | None] | None = None,
     ) -> dict[str, object]:
         translation_deadband = float(self.config.inactive_side_hold_translation_deadband_m)
         rotation_deadband = float(self.config.inactive_side_hold_rotation_deadband_deg)
@@ -3197,12 +4097,48 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "rotation_deadband_deg": rotation_deadband,
         }
         for side in ("left", "right"):
+            cartesian_command = (
+                None if cartesian_commands is None else cartesian_commands.get(side)
+            )
+            tracker_intent_raw = (
+                None
+                if cartesian_command is None
+                else cartesian_command.metadata.get("tracker_motion_intent")
+            )
+            if (
+                bool(self.config.inactive_side_hold_enabled)
+                and isinstance(tracker_intent_raw, dict)
+                and tracker_intent_raw.get("state") != "DISABLED"
+            ):
+                tracker_intent = dict(tracker_intent_raw)
+                hold_weight = max(
+                    0.0,
+                    min(1.0, float(tracker_intent.get("hold_weight", 0.0) or 0.0)),
+                )
+                metadata[side] = {
+                    "source": "tracker_motion_state_machine",
+                    "previous_target_available": self._last_target_poses.get(side)
+                    is not None,
+                    "translation_m": None,
+                    "rotation_deg": None,
+                    "activity_ratio": None,
+                    "hold_weight": hold_weight,
+                    "inactive": bool(tracker_intent.get("inactive", False)),
+                    "state": tracker_intent.get("state"),
+                    "quiet_dwell_sec": tracker_intent.get("quiet_dwell_sec"),
+                    "exit_dwell_sec": tracker_intent.get("exit_dwell_sec"),
+                    "transition_reason": tracker_intent.get("transition_reason"),
+                    "evidence": tracker_intent.get("evidence"),
+                    "motion_window": tracker_intent.get("motion_window"),
+                }
+                continue
             previous_target = self._last_target_poses.get(side)
             if (
                 not bool(self.config.inactive_side_hold_enabled)
                 or previous_target is None
             ):
                 metadata[side] = {
+                    "source": "target_delta_legacy",
                     "previous_target_available": previous_target is not None,
                     "translation_m": None,
                     "rotation_deg": None,
@@ -3228,6 +4164,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             if np.isfinite(activity_ratio):
                 hold_weight = max(0.0, min(1.0, 1.0 - activity_ratio))
             metadata[side] = {
+                "source": "target_delta_legacy",
                 "previous_target_available": True,
                 "translation_m": float(translation_m),
                 "rotation_deg": float(rotation_deg),

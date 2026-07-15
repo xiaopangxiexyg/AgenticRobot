@@ -4,11 +4,21 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
-from ..action.executor import ActionExecutor
-from ..action.schema import ActionExecutionResult, ActionRecord, RobotAction
-from ..action.sources import RobotActionSource
+from robot_motion.action import (
+    ActionExecutionResult,
+    ActionExecutor,
+    ActionRecord,
+    RobotAction,
+    RobotActionSource,
+)
+from robot_motion.runtime import (
+    LifecycleStartupError,
+    TeleopCommand,
+    collect_lifecycle_failures,
+    run_best_effort_cleanup,
+)
+
 from ..diagnostics import RateTracker
-from ..schemas import TeleopCommand
 from .observers import CompositeRuntimeObserver, NullRuntimeObserver, RuntimeObserver
 from .timing import PhaseTimer
 
@@ -116,14 +126,34 @@ class RuntimeKernel:
     def start(self) -> None:
         if self._started:
             return
-        self.observation_provider.start()
-        start_action_source = getattr(self.action_source, "start", None)
-        if callable(start_action_source):
-            start_action_source()
-        self.executor.start()
-        start_observer = getattr(self.observer, "start", None)
-        if callable(start_observer):
-            start_observer()
+        rollback_steps: list[tuple[str, Any]] = []
+        try:
+            rollback_steps.append(("observation_provider", self.observation_provider.close))
+            self.observation_provider.start()
+            start_action_source = getattr(self.action_source, "start", None)
+            close_action_source = getattr(self.action_source, "close", None)
+            if callable(start_action_source):
+                if callable(close_action_source):
+                    rollback_steps.append(("action_source", close_action_source))
+                start_action_source()
+            rollback_steps.append(("executor", self.executor.close))
+            self.executor.start()
+            start_observer = getattr(self.observer, "start", None)
+            close_observer = getattr(self.observer, "close", None)
+            if callable(start_observer):
+                if callable(close_observer):
+                    rollback_steps.append(("observer", close_observer))
+                start_observer()
+        except BaseException as start_error:  # noqa: BLE001 - rollback before propagating.
+            self._started = False
+            rollback_failures = collect_lifecycle_failures(reversed(rollback_steps))
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    "runtime_kernel.start",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
         self._started = True
 
     def step(
@@ -215,21 +245,19 @@ class RuntimeKernel:
         return result
 
     def close(self) -> None:
+        steps = []
+        close_observer = getattr(self.observer, "close", None)
+        if callable(close_observer):
+            steps.append(("observer", close_observer))
+        steps.append(("executor", self.executor.close))
+        close_action_source = getattr(self.action_source, "close", None)
+        if callable(close_action_source):
+            steps.append(("action_source", close_action_source))
+        steps.append(("observation_provider", self.observation_provider.close))
         try:
-            close_observer = getattr(self.observer, "close", None)
-            if callable(close_observer):
-                close_observer()
+            run_best_effort_cleanup("runtime_kernel.close", steps)
         finally:
-            try:
-                self.executor.close()
-            finally:
-                try:
-                    close_action_source = getattr(self.action_source, "close", None)
-                    if callable(close_action_source):
-                        close_action_source()
-                finally:
-                    self.observation_provider.close()
-                    self._started = False
+            self._started = False
 
     def __enter__(self) -> "RuntimeKernel":
         self.start()

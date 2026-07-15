@@ -1,6 +1,6 @@
 # RM65 与相机手眼标定
 
-这个目录是从 `hardware/old_handeye` 迁移后的新入口，用于 **眼在手外** 标定：
+这个目录是从 `hardware/old_headeye` 迁移后的新入口，用于 **眼在手外** 标定：
 
 - 相机固定在工位上。
 - ArUco/ChArUco 标定板固定在 RM65 末端。
@@ -16,34 +16,40 @@
 先枚举 RealSense：
 
 ```bash
-python -m utils.handeye --list-cameras
+python -m utils.head_eye --list-cameras --show-profiles
 ```
 
 运行标定：
 
 ```bash
-python -m utils.handeye \
+python -m utils.head_eye \
   --camera 0 \
   --arm left \
   --target aruco \
   --marker-length-m 0.10 \
-  --output-dir teleop_records/handeye
+  --output-dir teleop_records/headeye
 ```
 
 自动记录模式：
 
 ```bash
-python -m utils.handeye \
+python -m utils.head_eye \
   --camera 0 \
   --arm left \
   --target aruco \
-  --marker-length-m 0.10 \
+  --marker-length-m 0.0997 \
   --auto-record \
-  --auto-stable-sec 3.0 \
-  --output-dir teleop_records/handeye
+  --auto-stable-sec 4.0 \
+  --output-dir teleop_records/headeye
 ```
 
 自动模式下，拖动机械臂到新姿态后松手；如果机械臂静止超过 `--auto-stable-sec`，并且相机能看到标定板，程序会自动记录一组稳定 burst。窗口底部会显示当前自动记录状态。
+
+### RealSense profile 兼容
+
+默认先严格使用 `--resolution` / `--fps` 请求的 color + depth profile。仅当这个请求被相机拒绝时，才会自动选择一个同时存在的、分辨率和帧率匹配的 `bgr8` color / `z16` depth profile；可用 `--no-auto-select-supported-profile` 关闭该兜底并直接报错。
+
+`--list-cameras --show-profiles` 可在实际设备上列出可用 profile。新保存的 samples 与结果 JSON 会记录请求 profile、是否发生 fallback，以及实际选择的 profile。该字段只用于溯源：不会改写既有 JSON/NPZ/NPY 标定结果，旧结果仍可直接加载。
 
 窗口按键：
 
@@ -60,19 +66,23 @@ python -m utils.handeye \
 - `<name>_cam2base.npy`：兼容旧流程的单矩阵文件。
 - `<name>_samples.json`：自动保存的原始采样，可离线重算。
 
+每份新 JSON 的 `metadata.realsense_settings_report` 还会保存相机 stream 选择记录，便于判断该次标定的内参与 profile 是否与其他结果一致。
+
 离线重算：
 
 ```bash
-python -m utils.handeye \
-  --load-samples teleop_records/handeye/你的_samples.json \
+python -m utils.head_eye \
+  --load-samples teleop_records/headeye/你的_samples.json \
   --method AUTO
 ```
+
+离线重算会保留 samples 中原有的相机 profile 溯源，并在新结果中标记 `source_samples_metadata`；它不会改写输入 samples 或任何既有结果。
 
 可视化点云到 RM65 base 坐标系：
 
 ```bash
-python -m utils.handeye.visualize_handeye \
-  --calibration teleop_records/handeye/你的.json \
+python -m utils.head_eye.visualize_handeye \
+  --calibration teleop_records/headeye/你的.json \
   --camera 0
 ```
 
@@ -81,21 +91,21 @@ python -m utils.handeye.visualize_handeye \
 如果只标定了其中一只机械臂，也可以用双臂 URDF 中的固定 base 外参切换显示坐标系。比如已完成 right 标定，希望按 left base 查看同一个相机点云：
 
 ```bash
-python -m utils.handeye.visualize_handeye \
-  --calibration teleop_records/handeye/你的_right标定.json \
+python -m utils.head_eye.visualize_handeye \
+  --calibration teleop_records/headeye/你的_right标定.json \
   --calibration-arm right \
   --view-arm left \
   --camera 0
 ```
 
-也可以把派生出的 left handeye 结果保存成独立文件：
+也可以把派生出的 left headeye 结果保存成独立文件：
 
 ```bash
-python -m utils.handeye.dual_arm \
-  --calibration teleop_records/handeye/你的_right标定.json \
+python -m utils.head_eye.dual_arm \
+  --calibration teleop_records/headeye/你的_right标定.json \
   --source-arm right \
   --target-arm left \
-  --output-dir teleop_records/handeye
+  --output-dir teleop_records/headeye
 ```
 
 该转换默认读取 `assets/rm65_inspire_tac/rm65_dual_arm.urdf`：`T_camera_to_left_base = T_right_base_to_left_base @ T_camera_to_right_base`。反向同理。
@@ -105,7 +115,7 @@ python -m utils.handeye.dual_arm \
 推荐使用 ChArUco 板，而不是单个 ArUco：
 
 ```bash
-python -m utils.handeye \
+python -m utils.head_eye \
   --camera 0 \
   --arm left \
   --target charuco \

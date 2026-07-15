@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dataset_postprocess.wrist_cam_adjust.depth import (
+from utils.dataset_postprocess.wrist_cam_adjust.depth import (
     DepthRangeMaskConfig,
     depth_range_mask,
     unpack_binary_mask,

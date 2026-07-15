@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from teleop_runtime.collection.sample_assembler import CameraFrameMatch, CollectorSample
 from teleop_runtime.collection.video_frame import VideoFrame
@@ -55,6 +56,7 @@ def _camera_sample(
 
 class WriterVideoStatsTest(unittest.TestCase):
     def test_finalize_rewrites_dataset_global_index(self) -> None:
+        pytest.importorskip("pyarrow.parquet")
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(
                 LeRobotV21WriterConfig(

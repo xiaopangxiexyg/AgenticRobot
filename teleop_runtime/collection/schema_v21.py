@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+from dataset_contracts.layout import (
+    camera_video_channel,
+    chunk_id_from_episode_index,
+    episode_id_from_index,
+)
+from dataset_contracts.parquet import (
+    ARM_MODE_FLOAT64_COLUMNS as _ARM_MODE_FLOAT64_COLUMNS,
+    ARM_MODE_INT64_COLUMNS as _ARM_MODE_INT64_COLUMNS,
+    ARM_MODE_STRING_COLUMNS as _ARM_MODE_STRING_COLUMNS,
+    FLOAT32_LIST_COLUMNS as _FLOAT32_LIST_COLUMNS,
+    INT64_LIST_COLUMNS as _INT64_LIST_COLUMNS,
+    STRING_LIST_COLUMNS as _STRING_LIST_COLUMNS,
+    write_rows_to_parquet,
+)
 
 from ..recording import _to_serializable
 from ..schemas import EffectorCommand, ObservationChannel
@@ -15,20 +29,6 @@ from .sample_assembler import CollectorSample
 
 ACTION_DIM = 26
 OBSERVATION_STATE_DIM = 38
-
-
-def episode_id_from_index(index: int) -> str:
-    return f"episode_{int(index):06d}"
-
-
-def chunk_id_from_episode_index(index: int, *, chunk_size: int) -> str:
-    if int(chunk_size) <= 0:
-        raise ValueError("chunk_size must be positive.")
-    return f"chunk-{int(index) // int(chunk_size):03d}"
-
-
-def camera_video_channel(camera_key: str) -> str:
-    return f"observation.images.{str(camera_key)}"
 
 
 def _vector_list(value: Any, *, length: int | None = None) -> list[float] | None:
@@ -78,11 +78,12 @@ def _command_from_state(state: Mapping[str, Any] | None) -> EffectorCommand | No
 def _command_pose_metadata(command: EffectorCommand | None, metadata_key: str) -> list[float] | None:
     if command is None:
         return None
-    if metadata_key == "source_target_pose_base" and command.command_type == "cartesian_pose":
+    pose = _pose_matrix_to_xyzquat_list(command.metadata.get(metadata_key))
+    if pose is not None:
+        return pose
+    if metadata_key in {"source_target_pose_base", "target_pose_base"} and command.command_type == "cartesian_pose":
         return _pose_matrix_to_xyzquat_list(command.value)
-    if metadata_key == "target_pose_base" and command.command_type == "cartesian_pose":
-        return _pose_matrix_to_xyzquat_list(command.value)
-    return _pose_matrix_to_xyzquat_list(command.metadata.get(metadata_key))
+    return None
 
 
 def _command_vector_metadata(
@@ -244,6 +245,34 @@ def collector_sample_to_row(
     if not isinstance(pose_quality, Mapping):
         pose_quality = {}
     arm_mode = normalize_arm_mode_metadata(sample.metadata.get("arm_mode"))
+    raw_position_reference = sample.metadata.get("position_reference")
+    position_reference = (
+        dict(raw_position_reference) if isinstance(raw_position_reference, Mapping) else {}
+    )
+    reference_reasons = position_reference.get("modification_reasons", ())
+    if isinstance(reference_reasons, str):
+        reference_reasons = [reference_reasons]
+    elif not isinstance(reference_reasons, Sequence):
+        reference_reasons = []
+    reference_reasons = [str(reason) for reason in reference_reasons if str(reason)]
+    reference_q_ref_by_side = position_reference.get("q_ref_by_side", {})
+    if not isinstance(reference_q_ref_by_side, Mapping):
+        reference_q_ref_by_side = {}
+    reference_q_ik_raw_by_side = position_reference.get("q_ik_raw_by_side", {})
+    if not isinstance(reference_q_ik_raw_by_side, Mapping):
+        reference_q_ik_raw_by_side = {}
+    reference_pose_ref_by_side = position_reference.get("pose_ref_by_side", {})
+    if not isinstance(reference_pose_ref_by_side, Mapping):
+        reference_pose_ref_by_side = {}
+    reference_side_valid = position_reference.get("side_valid_by_side", {})
+    if not isinstance(reference_side_valid, Mapping):
+        reference_side_valid = {}
+    reference_side_hold = position_reference.get("side_hold_by_side", {})
+    if not isinstance(reference_side_hold, Mapping):
+        reference_side_hold = {}
+    reference_reasons_by_side = position_reference.get("modification_reasons_by_side", {})
+    if not isinstance(reference_reasons_by_side, Mapping):
+        reference_reasons_by_side = {}
     row: dict[str, Any] = {
         "index": int(sample.index),
         "episode_index": int(sample.episode_index),
@@ -264,6 +293,51 @@ def collector_sample_to_row(
         "action.right_arm.pose": action_split["right_arm"],
         "action.left_hand.joint_target": action_split["left_hand"],
         "action.right_hand.joint_target": action_split["right_hand"],
+        "action.reference.available": int(bool(position_reference)),
+        "action.reference.epoch": position_reference.get("epoch"),
+        "action.reference.sequence": position_reference.get("sequence"),
+        "action.reference.source": position_reference.get("source"),
+        "action.reference.source_timestamp": position_reference.get("source_timestamp"),
+        "action.reference.generated_timestamp": position_reference.get(
+            "generated_timestamp"
+        ),
+        "action.reference.published_timestamp": position_reference.get(
+            "published_timestamp"
+        ),
+        "action.reference.generated_monotonic_timestamp": position_reference.get(
+            "generated_monotonic_timestamp"
+        ),
+        "action.reference.published_monotonic_timestamp": position_reference.get(
+            "published_monotonic_timestamp"
+        ),
+        "action.reference.age_sec": position_reference.get("age_sec"),
+        "action.reference.wall_age_sec": position_reference.get("wall_age_sec"),
+        "action.reference.age_clock": position_reference.get("age_clock"),
+        "action.reference.valid": (
+            int(bool(position_reference.get("valid"))) if position_reference else None
+        ),
+        "action.reference.hold": (
+            int(bool(position_reference.get("hold"))) if position_reference else None
+        ),
+        "action.reference.modification_reason": (
+            reference_reasons[0] if reference_reasons else None
+        ),
+        "action.reference.modification_reasons_json": json.dumps(
+            _to_serializable(reference_reasons),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "action.reference.q_ref_by_side_json": json.dumps(
+            _to_serializable(reference_q_ref_by_side),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "action.reference.q_ik_raw_by_side_json": json.dumps(
+            _to_serializable(reference_q_ik_raw_by_side),
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "action.reference.pipeline_version": position_reference.get("pipeline_version"),
         "observation.state": np.asarray(sample.observation_state, dtype=np.float32).tolist(),
         "observation.last_action": np.asarray(
             sample.observation_last_action, dtype=np.float32
@@ -332,6 +406,35 @@ def collector_sample_to_row(
         hand_command = _command_from_state(hand_state)
         arm_command_metadata = command_metadata_by_effector.get(f"{side}_arm", {})
         hand_command_metadata = command_metadata_by_effector.get(f"{side}_hand", {})
+        reference_q_ref = _vector_list(
+            reference_q_ref_by_side.get(side),
+            length=6,
+        )
+        reference_q_ik_raw = _vector_list(
+            reference_q_ik_raw_by_side.get(side),
+            length=6,
+        )
+        reference_pose_ref = _pose_matrix_to_xyzquat_list(
+            reference_pose_ref_by_side.get(side)
+        )
+        row[f"action.reference.{side}_arm.q_ref"] = reference_q_ref
+        row[f"action.reference.{side}_arm.q_ik_raw"] = reference_q_ik_raw
+        row[f"action.reference.{side}_arm.pose_ref"] = reference_pose_ref
+        row[f"action.reference.{side}_arm.valid"] = (
+            int(bool(reference_side_valid.get(side)))
+            if side in reference_side_valid
+            else None
+        )
+        row[f"action.reference.{side}_arm.hold"] = (
+            int(bool(reference_side_hold.get(side)))
+            if side in reference_side_hold
+            else None
+        )
+        row[f"action.reference.{side}_arm.modification_reasons_json"] = json.dumps(
+            _to_serializable(reference_reasons_by_side.get(side, [])),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
 
         row[f"observation.arm.{side}.current_qpos"] = _vector_list(
             arm_state.get("current_qpos"),
@@ -339,6 +442,16 @@ def collector_sample_to_row(
         )
         row[f"observation.arm.{side}.current_tcp_pose"] = _pose_matrix_to_xyzquat_list(
             arm_state.get("current_tcp_pose")
+        )
+        row[f"observation.arm.{side}.state_source"] = arm_state.get(
+            "runtime_arm_state_source"
+        )
+        row[f"observation.arm.{side}.commanded_qpos"] = _vector_list(
+            arm_state.get("commanded_qpos"),
+            length=6,
+        )
+        row[f"observation.arm.{side}.commanded_tcp_pose"] = _pose_matrix_to_xyzquat_list(
+            arm_state.get("commanded_tcp_pose")
         )
         row[f"observation.arm.{side}.last_target_qpos"] = _vector_list(
             arm_state.get("last_target_qpos"),
@@ -348,6 +461,74 @@ def collector_sample_to_row(
             "last_command_timestamp"
         )
         row[f"observation.arm.{side}.effective_step_scale"] = arm_state.get("effective_step_scale")
+        row[f"position.transport.{side}.last_attempted_qpos"] = _vector_list(
+            arm_state.get("last_attempted_qpos"),
+            length=6,
+        )
+        row[f"position.transport.{side}.last_attempted_timestamp"] = arm_state.get(
+            "last_attempted_timestamp"
+        )
+        row[f"position.transport.{side}.last_attempted_sequence"] = arm_state.get(
+            "last_attempted_sequence"
+        )
+        row[f"position.transport.{side}.last_accepted_qpos"] = _vector_list(
+            arm_state.get("last_accepted_qpos"),
+            length=6,
+        )
+        row[f"position.transport.{side}.last_accepted_timestamp"] = arm_state.get(
+            "last_accepted_timestamp"
+        )
+        row[f"position.transport.{side}.last_accepted_sequence"] = arm_state.get(
+            "last_accepted_sequence"
+        )
+        row[f"position.transport.{side}.measured_qpos"] = _vector_list(
+            arm_state.get("measured_qpos"),
+            length=6,
+        )
+        row[f"position.transport.{side}.measured_timestamp"] = arm_state.get(
+            "measured_timestamp"
+        )
+        row[f"position.transport.{side}.measured_sequence"] = arm_state.get(
+            "measured_sequence"
+        )
+        raw_stream = arm_state.get("background_streaming")
+        stream = dict(raw_stream) if isinstance(raw_stream, Mapping) else {}
+        for field_name in (
+            "enabled",
+            "hz",
+            "thread_alive",
+            "target_active",
+            "target_sequence",
+            "target_age_sec",
+            "target_max_age_sec",
+            "target_stale",
+            "command_control_dt_sec",
+            "segment_duration_sec",
+            "attempted_send_count",
+            "accepted_send_count",
+            "failed_send_count",
+            "deadline_miss_count",
+            "low_rate_count",
+            "last_send_dt_sec",
+            "current_inter_send_gap_sec",
+            "max_inter_send_gap_sec",
+            "actual_hz",
+            "last_call_ms",
+            "last_deadline_lag_ms",
+            "stale_count",
+            "fault",
+            "fault_count",
+            "healthy",
+            "shutdown_requested",
+            "shutdown_complete",
+            "join_timed_out",
+        ):
+            row[f"position.transport.{side}.{field_name}"] = stream.get(field_name)
+        row[f"position.transport.{side}.health_reasons_json"] = json.dumps(
+            _to_serializable(stream.get("health_reasons", [])),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
         row[f"observation.arm.{side}.actual_qpos"] = _vector_list(
             arm_state.get("actual_qpos"),
             length=6,
@@ -384,6 +565,35 @@ def collector_sample_to_row(
         row[f"observation.arm.{side}.actual_state_timestamp"] = arm_state.get(
             "actual_state_timestamp"
         )
+        row[f"observation.arm.{side}.source_timestamp"] = arm_state.get(
+            "source_timestamp"
+        )
+        row[f"observation.arm.{side}.available_timestamp"] = arm_state.get(
+            "available_timestamp"
+        )
+        row[f"observation.arm.{side}.source_clock"] = arm_state.get("source_clock")
+        row[f"observation.arm.{side}.available_clock"] = arm_state.get("available_clock")
+        row[f"observation.arm.{side}.snapshot_sequence"] = arm_state.get(
+            "snapshot_sequence"
+        )
+        row[f"observation.arm.{side}.snapshot_available_age_sec"] = arm_state.get(
+            "actual_snapshot_available_age_sec"
+        )
+        row[f"observation.arm.{side}.causal_snapshot_contract"] = arm_state.get(
+            "causal_snapshot_contract"
+        )
+        row[f"observation.arm.{side}.actual_state_event_timestamp"] = arm_state.get(
+            "actual_state_event_timestamp"
+        )
+        row[f"observation.arm.{side}.actual_state_read_success"] = arm_state.get(
+            "actual_state_read_success"
+        )
+        row[f"observation.arm.{side}.actual_state_valid"] = arm_state.get(
+            "actual_state_valid"
+        )
+        row[f"observation.arm.{side}.actual_state_sequence"] = arm_state.get(
+            "actual_state_sequence"
+        )
         row[f"observation.arm.{side}.actual_state_read_start_time"] = arm_state.get(
             "actual_state_read_start_time"
         )
@@ -404,6 +614,12 @@ def collector_sample_to_row(
         )
         row[f"observation.arm.{side}.actual_state_provider_error"] = arm_state.get(
             "actual_state_provider_error"
+        )
+        row[f"observation.arm.{side}.causal_measured_state_eligible"] = arm_state.get(
+            "causal_measured_state_eligible"
+        )
+        row[f"observation.arm.{side}.causal_measured_state_rejection_reason"] = arm_state.get(
+            "causal_measured_state_rejection_reason"
         )
         row[f"observation.arm.{side}.hardware_result_code"] = arm_state.get(
             "hardware_result_code"
@@ -439,7 +655,20 @@ def collector_sample_to_row(
         row[f"observation.wrist_camera.{side}.source"] = arm_state.get(
             "wrist_camera_pose_source"
         )
-        row[f"action.replay.{side}_arm_joint_target"] = _vector_list(
+        row[f"action.replay.{side}_arm_joint_target"] = reference_q_ref or _command_vector_metadata(
+            arm_command,
+            "solver_output_qpos",
+            length=6,
+        ) or _vector_list(
+            arm_command_metadata.get("solver_output_qpos")
+            if isinstance(arm_command_metadata, Mapping)
+            else None,
+            length=6,
+        ) or _command_vector_metadata(
+            arm_command,
+            "command_value",
+            length=6,
+        ) or _vector_list(
             arm_state.get("last_target_qpos"),
             length=6,
         )
@@ -489,6 +718,36 @@ def collector_sample_to_row(
         )
         row[f"observation.hand.{side}.tactile_timestamp"] = hand_state.get("tactile_timestamp")
         row[f"observation.hand.{side}.telemetry_timestamp"] = hand_state.get("telemetry_timestamp")
+        row[f"observation.hand.{side}.telemetry_snapshot_sequence"] = hand_state.get(
+            "telemetry_snapshot_sequence"
+        )
+        row[f"observation.hand.{side}.telemetry_snapshot_source_timestamp"] = hand_state.get(
+            "telemetry_snapshot_source_timestamp"
+        )
+        row[f"observation.hand.{side}.telemetry_snapshot_available_timestamp"] = hand_state.get(
+            "telemetry_snapshot_available_timestamp"
+        )
+        row[f"observation.hand.{side}.telemetry_snapshot_age_sec"] = hand_state.get(
+            "telemetry_snapshot_age_sec"
+        )
+        row[f"observation.hand.{side}.tactile_snapshot_sequence"] = hand_state.get(
+            "tactile_snapshot_sequence"
+        )
+        row[f"observation.hand.{side}.tactile_snapshot_source_timestamp"] = hand_state.get(
+            "tactile_snapshot_source_timestamp"
+        )
+        row[f"observation.hand.{side}.tactile_snapshot_available_timestamp"] = hand_state.get(
+            "tactile_snapshot_available_timestamp"
+        )
+        row[f"observation.hand.{side}.tactile_snapshot_age_sec"] = hand_state.get(
+            "tactile_snapshot_age_sec"
+        )
+        row[f"observation.hand.{side}.causal_snapshot_cutoff_timestamp"] = hand_state.get(
+            "causal_snapshot_cutoff_timestamp"
+        )
+        row[f"observation.hand.{side}.causal_snapshot_contract"] = hand_state.get(
+            "causal_snapshot_contract"
+        )
         row[f"observation.hand.{side}.gripper_read_elapsed_s"] = hand_state.get(
             "gripper_read_elapsed_s"
         )
@@ -628,6 +887,18 @@ def collector_sample_to_row(
         row[f"teleop.channels.{channel_name}.receiver_timestamp"] = channel.metadata.get(
             "receiver_timestamp"
         )
+        row[f"teleop.channels.{channel_name}.source_timestamp"] = channel.metadata.get(
+            "source_timestamp"
+        )
+        row[f"teleop.channels.{channel_name}.available_timestamp"] = channel.metadata.get(
+            "available_timestamp"
+        )
+        row[f"teleop.channels.{channel_name}.source_clock"] = channel.metadata.get(
+            "source_clock"
+        )
+        row[f"teleop.channels.{channel_name}.available_clock"] = channel.metadata.get(
+            "available_clock"
+        )
         row[f"teleop.channels.{channel_name}.sender_read_elapsed_ms"] = channel.metadata.get(
             "sender_read_elapsed_ms"
         )
@@ -646,24 +917,3 @@ def collector_sample_to_row(
             row[f"{prefix}.path"] = str(camera_video_paths[camera_key])
 
     return row, camera_expectations
-
-
-def write_rows_to_parquet(
-    rows: list[Mapping[str, Any]],
-    path: str | Path,
-    *,
-    compression: str = "zstd",
-) -> None:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "LeRobot parquet export requires pyarrow to be installed."
-        ) from exc
-
-    parquet_path = Path(path)
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    normalized_rows = [_to_serializable(dict(row)) for row in rows]
-    table = pa.Table.from_pylist(normalized_rows)
-    pq.write_table(table, parquet_path, compression=compression)

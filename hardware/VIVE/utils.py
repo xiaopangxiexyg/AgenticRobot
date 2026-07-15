@@ -11,14 +11,16 @@ class VIVEWristProcessor:
     旧版 float UDP VIVE wrapper。
 
     当前 VIVE 主链路已经收敛到：
-    - sender: hardware/VIVE/mocap/vive_data_sender.py
+    - 新 sender: hardware/VIVE/mocap/vive_data_sender.py
+    - 稳定 receiver 兼容 sender: hardware/VIVE/mocap/vive_data_sender_legacy.py
     - receiver: teleop_runtime/sources/pose/vive.py
     """
     def __init__(self, port: int = 6666, num_floats: int = 36):
         raise RuntimeError(
             "VIVEWristProcessor used the removed legacy float UDP receiver. "
             "Use teleop_runtime.sources.pose.vive.VivePoseSource for receiving, "
-            "and hardware/VIVE/mocap/vive_data_sender.py for sending."
+            "and hardware/VIVE/mocap/vive_data_sender.py for current local sending "
+            "(or vive_data_sender_legacy.py for a stable receiver)."
         )
 
 class VDGloveProcessor:

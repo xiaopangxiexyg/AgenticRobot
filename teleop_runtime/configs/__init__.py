@@ -10,6 +10,7 @@ from .pose_smoothing import (
     PoseSmoothingConfig,
     build_bimanual_pose_smoother,
     load_default_pose_smoothing_config,
+    load_impedance_pose_smoothing_config,
     load_pose_smoothing_config,
 )
 from .builders import build_bimanual_session, default_vive_tracker_configs
@@ -43,6 +44,7 @@ __all__ = [
     "load_latest_dmtac_backend_configs",
     "load_latest_q6_ports",
     "load_default_pose_smoothing_config",
+    "load_impedance_pose_smoothing_config",
     "load_arm_workspace_config",
     "load_pose_smoothing_config",
     "load_q6_hardware_assignment",

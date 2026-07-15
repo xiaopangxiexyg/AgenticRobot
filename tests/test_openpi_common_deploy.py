@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+import tempfile
 import unittest
 from unittest import mock
 
@@ -17,12 +19,22 @@ from deployments.client import (
 from deployments.openpi.client import (
     OPENPI_LOCAL_PROTOCOL_VERSION,
     OpenPIClientPolicy,
+    OpenPIClientPolicyConfig,
     OpenPIObservationAdapterConfig,
     deployment_observation_to_openpi,
 )
 from deployments.openpi.client import real as openpi_real_launcher
+from dataset_contracts.v22 import DiscreteCategory, DiscreteTokenSpec, EndEffectorSpec, PolicyIOLayout
+from dataset_contracts import (
+    STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+    PolicyArtifactContract,
+    PolicyCameraInput,
+    PolicyCameraInputContract,
+)
 from teleop_runtime.deploy.actions import normalize_policy_output
+from teleop_runtime.deploy import cli as deploy_cli
 from teleop_runtime.deploy.observation import DeploymentObservation
+from teleop_runtime.deploy import run_policy
 from teleop_runtime.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
 
 
@@ -91,7 +103,162 @@ class _FakeTransport:
         self.reset_count += 1
 
 
+class _V22FakeTransport(_FakeTransport):
+    def __init__(self, layout: PolicyIOLayout) -> None:
+        metadata = _server_metadata()
+        metadata["local_robot"]["output_action_dim"] = layout.action_dim
+        metadata["local_robot"]["output_action_discrete_dim"] = layout.action_discrete_dim
+        metadata["dataset_adapter"]["policy_io_layout_hash"] = layout.layout_hash
+        metadata["model"]["action_discrete_dim"] = layout.action_discrete_dim
+        actions = np.asarray(
+            [[-0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        super().__init__(actions=actions, metadata=metadata)
+        self.discrete_actions = np.asarray([[1]], dtype=np.int64)
+
+    def infer(self, observation: dict) -> dict:
+        response = super().infer(observation)
+        response["actions_discrete"] = self.discrete_actions
+        return response
+
+
 class OpenPICommonDeployTest(unittest.TestCase):
+    def test_openpi_policy_artifact_selects_strict_v22_keys_and_dimensions(self) -> None:
+        layout = PolicyIOLayout.legacy_v21_q6()
+        artifact = PolicyArtifactContract(
+            policy_io_layout=layout,
+            model_id="artifact-model",
+            state_key="robot_state",
+            state_discrete_key="robot_state_tokens",
+            action_key="robot_actions",
+            action_discrete_key="robot_action_tokens",
+        )
+
+        config = OpenPIClientPolicyConfig(policy_artifact=artifact)
+
+        self.assertEqual(config.deploy_schema_version, "dexteleop_deploy_v2")
+        self.assertEqual(config.expected_model_id, "artifact-model")
+        self.assertEqual(config.action_dim, layout.action_dim)
+        self.assertEqual(config.action_key, "robot_actions")
+        self.assertEqual(config.policy_io_layout_hash, layout.layout_hash)
+
+    def test_openpi_policy_artifact_selects_only_declared_wrist_view(self) -> None:
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="left_wrist",
+                        model_input_key="observation.images.base_0_rgb",
+                        server_camera_slot="base_0_rgb",
+                    ),
+                ),
+            ),
+        )
+
+        config = OpenPIClientPolicyConfig(policy_artifact=artifact)
+        adapter = OpenPIObservationAdapterConfig(
+            image_key_map=config.image_key_map,
+            required_image_keys=config.required_image_keys,
+        )
+        base = _observation()
+        observation = DeploymentObservation(
+            timestamp=base.timestamp,
+            step_index=base.step_index,
+            active_sides=base.active_sides,
+            arms_enabled=base.arms_enabled,
+            hands_enabled=base.hands_enabled,
+            images={
+                "front": np.full((8, 10, 3), 1, dtype=np.uint8),
+                "left_wrist": np.full((8, 10, 3), 2, dtype=np.uint8),
+            },
+            state=base.state,
+            metadata=base.metadata,
+        )
+
+        request = deployment_observation_to_openpi(observation, adapter)
+
+        self.assertEqual(config.required_camera_slots, ("base_0_rgb",))
+        self.assertEqual(config.required_image_keys, ("left_wrist",))
+        self.assertIn("observation.images.base_0_rgb", request)
+        self.assertNotIn("observation.images.front", request)
+        np.testing.assert_array_equal(
+            request["observation.images.base_0_rgb"], observation.images["left_wrist"]
+        )
+        with self.assertRaisesRegex(ValueError, "disagrees with policy_artifact"):
+            OpenPIClientPolicyConfig(
+                policy_artifact=artifact,
+                required_image_keys=("front",),
+            )
+
+    def test_artifact_camera_contract_rejects_none_mode_when_required(self) -> None:
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="left_wrist",
+                        model_input_key="observation.images.base_0_rgb",
+                        server_camera_slot="base_0_rgb",
+                    ),
+                ),
+            ),
+        )
+        args = argparse.Namespace(camera_mode="none", camera_serial="", camera_key="front")
+
+        with self.assertRaisesRegex(ValueError, "requires camera inputs"):
+            run_policy.resolve_policy_camera_input_keys(
+                args,
+                artifact,
+                raw_argv=[],
+            )
+
+    def test_artifact_camera_contract_rekeys_serial_camera_for_wrist_only_model(self) -> None:
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="right_wrist",
+                        model_input_key="observation.images.base_0_rgb",
+                        server_camera_slot="base_0_rgb",
+                    ),
+                ),
+            ),
+        )
+        args = argparse.Namespace(camera_mode="single", camera_serial="123", camera_key="front")
+
+        selected = run_policy.resolve_policy_camera_input_keys(args, artifact, raw_argv=[])
+
+        self.assertEqual(selected, ("right_wrist",))
+        self.assertEqual(args.camera_key, "right_wrist")
+
+    def test_runtime_opens_only_artifact_selected_camera_configs(self) -> None:
+        args = argparse.Namespace(
+            camera_mode="multi",
+            camera_serial="",
+            camera_config="unused.json",
+        )
+        configs = {
+            "front": object(),
+            "left_wrist": object(),
+            "right_wrist": object(),
+        }
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.load_realsense_camera_config_map",
+            return_value=configs,
+        ), mock.patch(
+            "teleop_runtime.deploy.run_policy.RealSenseRGBSource",
+            side_effect=lambda config: config,
+        ):
+            sources = run_policy.build_camera_sources(
+                args,
+                selected_camera_keys=("left_wrist",),
+            )
+
+        self.assertEqual(sources, {"left_wrist": configs["left_wrist"]})
+
     def test_validate_server_metadata_accepts_current_dual_rm65_contract(self) -> None:
         result = validate_server_metadata(
             _server_metadata(),
@@ -181,6 +348,139 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(chunk.actions.shape, (2, ACTION_DIM))
         self.assertEqual(policy.name, "openpi:dual_rm65_dmgripper_latest")
 
+    def test_openpi_v22_policy_sends_int64_state_tokens_and_uses_layout_bound_output(self) -> None:
+        token = DiscreteTokenSpec(
+            "mode",
+            (
+                DiscreteCategory(0, "open", backend_value=0.0),
+                DiscreteCategory(1, "close", backend_value=0.9),
+            ),
+            source_metadata_key="mode",
+        )
+        layout = PolicyIOLayout(
+            name="openpi_v22_right_discrete",
+            end_effectors={
+                "left": EndEffectorSpec.none("left"),
+                "right": EndEffectorSpec.discrete(
+                    "right",
+                    adapter="two_state_gripper_v1",
+                    target_tokens=(token,),
+                    target_legacy_q6_slot_indices=(0,),
+                ),
+            },
+        )
+        transport = _V22FakeTransport(layout)
+        remote = RemoteModelPolicy(
+            transport=transport,
+            observation_adapter=lambda observation: deployment_observation_to_openpi(observation),
+            config=RemotePolicyConfig(
+                action_dim=layout.action_dim,
+                action_discrete_key="actions_discrete",
+                action_discrete_dim=layout.action_discrete_dim,
+                contract=DeployPolicyContract(
+                    action_dim=layout.action_dim,
+                    action_discrete_dim=layout.action_discrete_dim,
+                    policy_io_layout_hash=layout.layout_hash,
+                    hand_layout=None,
+                ),
+            ),
+        )
+        policy = OpenPIClientPolicy(
+            OpenPIClientPolicyConfig(policy_io_layout=layout),
+            remote_policy=remote,
+        )
+        base = _observation()
+        observation = DeploymentObservation(
+            timestamp=base.timestamp,
+            step_index=base.step_index,
+            active_sides=base.active_sides,
+            arms_enabled=base.arms_enabled,
+            hands_enabled=base.hands_enabled,
+            images=base.images,
+            state=base.state,
+            state_valid=base.state_valid,
+            hand_states={"right": {"mode": "open"}},
+            metadata=base.metadata,
+        )
+
+        actions = policy.predict(observation)
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].metadata["end_effector_enabled_sides"], ["right"])
+        self.assertEqual(transport.requests[0]["state_discrete"].dtype, np.int64)
+        self.assertEqual(transport.requests[0]["state_discrete"].tolist(), [0])
+
+    def test_openpi_masked_state_artifact_requires_mode_and_sends_all_available_mask(self) -> None:
+        token = DiscreteTokenSpec(
+            "mode",
+            (
+                DiscreteCategory(0, "open", backend_value=0.0),
+                DiscreteCategory(1, "close", backend_value=0.9),
+            ),
+            source_metadata_key="mode",
+        )
+        layout = PolicyIOLayout(
+            name="openpi_masked_right_discrete",
+            end_effectors={
+                "left": EndEffectorSpec.none("left"),
+                "right": EndEffectorSpec.discrete(
+                    "right",
+                    adapter="two_state_gripper_v1",
+                    target_tokens=(token,),
+                    target_legacy_q6_slot_indices=(0,),
+                ),
+            },
+        )
+        artifact = PolicyArtifactContract(
+            policy_io_layout=layout,
+            model_id="masked-state-model",
+            state_input_mode=STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+        )
+        transport = _V22FakeTransport(layout)
+        transport._metadata["deploy_schema_version"] = "dexteleop_deploy_v2"
+        transport._metadata["model_id"] = "masked-state-model"
+        transport._metadata["local_robot"].update(
+            {
+                "input_state_key": "state",
+                "input_state_dim": layout.state_dim * 2,
+                "input_state_mode": STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+                "input_state_discrete_key": "state_discrete",
+                "input_state_discrete_dim": layout.state_discrete_dim,
+            }
+        )
+        remote = RemoteModelPolicy(
+            transport=transport,
+            observation_adapter=lambda observation: deployment_observation_to_openpi(observation),
+            config=RemotePolicyConfig(
+                action_dim=layout.action_dim,
+                action_discrete_key="actions_discrete",
+                action_discrete_dim=layout.action_discrete_dim,
+            ),
+        )
+        policy = OpenPIClientPolicy(
+            OpenPIClientPolicyConfig(policy_artifact=artifact),
+            remote_policy=remote,
+        )
+        base = _observation()
+        observation = DeploymentObservation(
+            timestamp=base.timestamp,
+            step_index=base.step_index,
+            active_sides=base.active_sides,
+            arms_enabled=base.arms_enabled,
+            hands_enabled=base.hands_enabled,
+            images=base.images,
+            state=base.state,
+            state_valid=base.state_valid,
+            hand_states={"right": {"mode": "open"}},
+            metadata=base.metadata,
+        )
+
+        policy.predict(observation)
+
+        request = transport.requests[0]
+        self.assertEqual(request["state"].shape, (layout.state_dim * 2,))
+        np.testing.assert_array_equal(request["state"][layout.state_dim :], np.ones((layout.state_dim,)))
+
     def test_teleop_normalizer_accepts_unified_action_chunk_metadata(self) -> None:
         chunk = UnifiedActionChunk(
             actions=np.zeros((2, ACTION_DIM), dtype=np.float32),
@@ -206,6 +506,14 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "dual_rm65_dmgripper_latest",
                     "--active-sides",
                     "both",
+                    "--arm-control-mode",
+                    "position",
+                    "--position-reference-hz",
+                    "45",
+                    "--arm-control-hz",
+                    "150",
+                    "--arm-canfd-follow",
+                    "--position-collision-check",
                 ]
             )
 
@@ -218,6 +526,165 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(kwargs["port"], 9000)
         self.assertEqual(kwargs["expected_model_id"], "dual_rm65_dmgripper_latest")
         self.assertIn("--active-sides", launched_args)
+        self.assertEqual(
+            launched_args[launched_args.index("--arm-control-mode") + 1],
+            "position",
+        )
+        self.assertEqual(
+            launched_args[launched_args.index("--position-reference-hz") + 1],
+            "45",
+        )
+        self.assertEqual(
+            launched_args[launched_args.index("--arm-control-hz") + 1],
+            "150",
+        )
+        self.assertIn("--arm-canfd-follow", launched_args)
+        self.assertIn("--position-collision-check", launched_args)
+
+    def test_openpi_real_launcher_passes_explicit_wrist_image_map(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(
+                [
+                    "--image-key-map-json",
+                    '{"left_wrist":"observation.images.base_0_rgb"}',
+                    "--required-image-key",
+                    "left_wrist",
+                    "--required-camera-slot",
+                    "base_0_rgb",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
+        kwargs = json.loads(kwargs_json)
+        self.assertEqual(
+            kwargs["image_key_map"],
+            {"left_wrist": "observation.images.base_0_rgb"},
+        )
+        self.assertEqual(kwargs["required_image_keys"], ["left_wrist"])
+
+    def test_openpi_real_launcher_forwards_policy_artifact_to_client_and_runtime(self) -> None:
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            model_id="0712-wrist-cube",
+            checkpoint_step=92599,
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="left_wrist",
+                        model_input_key="observation.images.left_wrist",
+                        server_camera_slot="left_wrist_0_rgb",
+                    ),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            artifact_path = f"{tmp_dir}/policy_artifact.json"
+            with open(artifact_path, "w", encoding="utf-8") as stream:
+                json.dump(artifact.to_dict(), stream)
+            with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+                result = openpi_real_launcher.main(
+                    ["--policy-artifact-json", artifact_path]
+                )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
+        kwargs = json.loads(kwargs_json)
+        self.assertEqual(kwargs["policy_artifact"], artifact.to_dict())
+        self.assertEqual(
+            launched_args[launched_args.index("--policy-artifact-json") + 1],
+            artifact_path,
+        )
+
+    def test_canonical_deploy_cli_delegates_to_supported_run_policy_runtime(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=13) as run_main:
+            result = deploy_cli.main(["--policy", "hold", "--max-steps", "1"])
+
+        self.assertEqual(result, 13)
+        run_main.assert_called_once_with(["--policy", "hold", "--max-steps", "1"])
+
+    def test_openpi_real_launcher_preserves_tested_impedance_overlay(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(
+                [
+                    "--host",
+                    "127.0.0.2",
+                    "--active-sides",
+                    "both",
+                    "--action-hz",
+                    "15",
+                    "--arm-control-mode",
+                    "impedance",
+                    "--arm-control-hz",
+                    "40",
+                    "--no-arm-canfd-follow",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        self.assertEqual(
+            launched_args[launched_args.index("--arm-control-mode") + 1],
+            "impedance",
+        )
+        self.assertEqual(
+            launched_args[launched_args.index("--arm-control-hz") + 1],
+            "40",
+        )
+        self.assertIn("--no-arm-canfd-follow", launched_args)
+
+    def test_openpi_launcher_reaches_shared_execution_profile_resolver(self) -> None:
+        resolved: list[tuple[str, float, float, bool]] = []
+
+        def validate_runtime(argv):
+            parser = argparse.ArgumentParser()
+            run_policy.add_args(parser)
+            args = parser.parse_args(argv)
+            run_policy.validate_args(args, raw_argv=argv)
+            resolved.append(
+                (
+                    args.arm_control_mode,
+                    float(args.position_reference_hz),
+                    float(args.arm_control_hz),
+                    bool(args.arm_canfd_follow),
+                )
+            )
+            return 0
+
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.main",
+            side_effect=validate_runtime,
+        ):
+            openpi_real_launcher.main(
+                [
+                    "--host",
+                    "127.0.0.2",
+                    "--active-sides",
+                    "both",
+                    "--arm-execution-profile",
+                    "position",
+                ]
+            )
+            openpi_real_launcher.main(
+                [
+                    "--host",
+                    "127.0.0.2",
+                    "--active-sides",
+                    "both",
+                    "--arm-execution-profile",
+                    "impedance_40hz",
+                ]
+            )
+
+        self.assertEqual(
+            resolved,
+            [
+                ("position", 75.0, 150.0, True),
+                ("impedance", 75.0, 40.0, False),
+            ],
+        )
 
     def test_openpi_real_launcher_ignores_empty_optional_contract_args(self) -> None:
         with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
@@ -240,6 +707,13 @@ class OpenPICommonDeployTest(unittest.TestCase):
         kwargs = json.loads(kwargs_json)
         self.assertNotIn("expected_model_id", kwargs)
         self.assertNotIn("expected_checkpoint_step", kwargs)
+
+    def test_openpi_real_launcher_can_show_delegated_runtime_help(self) -> None:
+        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+            result = openpi_real_launcher.main(["--runtime-help"])
+
+        self.assertEqual(result, 0)
+        run_main.assert_called_once_with(["--help"])
 
     def test_openpi_real_launcher_passes_debug_to_runtime(self) -> None:
         with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:

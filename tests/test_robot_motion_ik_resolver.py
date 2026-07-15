@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+import robot_motion.ik_resolver as ik_resolver_module
 from robot_motion.ik_resolver import IKSafetyResolver
 from robot_motion.joint_limits import JointVelocityLimitProfile
 from robot_motion.profiles import IKSafetyProfile
@@ -613,6 +616,55 @@ def test_resolve_step_periodic_full_solve_skips_when_far_tracking_is_safe():
     assert result.metadata["local_step_periodic_full_solve_skipped"] is True
     assert result.metadata["local_step_periodic_full_solve_skip_reason"] == "far_tracking_local_step_accepted"
     assert provider.last_metadata["requested_provider_names"] == ["local_provider"]
+
+
+def test_resolve_step_local_only_never_falls_back_to_full_search():
+    class RecordingProvider(CompositeLikeProvider):
+        def __init__(self):
+            super().__init__(
+                providers=(FullTargetProvider(), FullTargetProvider()),
+                names=("full_provider", "local_provider"),
+            )
+            self.requested: list[tuple[bool, tuple[str, ...]]] = []
+
+        def iter_ik_candidates(self, *, target_pose, seeds, seed_labels, options):
+            allow = tuple(options.get("provider_name_allowlist") or ())
+            self.requested.append((bool(options.get("local_step_mode")), allow))
+            return super().iter_ik_candidates(
+                target_pose=target_pose,
+                seeds=seeds,
+                seed_labels=seed_labels,
+                options=options,
+            )
+
+    provider = RecordingProvider()
+    profile = IKSafetyProfile(
+        name="test",
+        target_tolerance=PoseTolerance(position_m=0.05, orientation_deg=10.0),
+        fk_error_tolerance_m=1.0,
+        fk_error_tolerance_deg=180.0,
+        local_step_enabled=True,
+        local_step_first_enabled=True,
+        local_step_first_full_solve_interval=1,
+        local_step_trigger_ratio=4.0,
+        local_step_max_iterations=1,
+    )
+    velocity = JointVelocityLimitProfile(
+        name="test",
+        max_velocity_deg_s=(1000.0,) * 6,
+    )
+
+    result = IKSafetyResolver(profile=profile, provider=provider).resolve_step(
+        _request("local_only"),
+        joint_velocity_profile=velocity,
+        dt_sec=0.1,
+        local_provider_names=("local_provider",),
+        allow_full_solve=False,
+    )
+
+    assert result.metadata["full_solve_deferred_to_external_scheduler"] is True
+    assert result.metadata["local_step_status"] == "no_safe_local_candidate_hold_reference"
+    assert provider.requested == [(True, ("local_provider",))]
 
 
 def test_resolve_step_generates_rm65_posture_escape_candidate_from_bad_branch():
@@ -1527,3 +1579,238 @@ def test_smoothing_required_when_all_candidates_are_unsafe():
     assert result.status is IKResolveStatus.SMOOTHING_REQUIRED
     assert not result.accepted
     assert result.metadata["best_rejected"]["reject_reason"] == "hard_branch_jump"
+
+
+def test_hard_deadline_at_resolve_step_entry_holds_previous_safe_without_provider_work():
+    class CountingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def iter_ik_candidates(self, *, target_pose, seeds, seed_labels, options):
+            del target_pose, seeds, seed_labels, options
+            self.calls += 1
+            return []
+
+        def forward_kinematics(self, qpos):
+            del qpos
+            return np.eye(4)
+
+        def analyze_singularity(self, qpos):
+            del qpos
+            return SingularityReport(status_code=0, label="normal", metric=1.0)
+
+    provider = CountingProvider()
+    previous_safe = np.deg2rad(np.array([1.0, -2.0, 3.0, -4.0, 5.0, -6.0]))
+    result = IKSafetyResolver(
+        profile=IKSafetyProfile(name="hard_deadline"),
+        provider=provider,
+    ).resolve_step(
+        IKResolveRequest(
+            target_pose=np.eye(4),
+            reference_qpos=np.zeros(6),
+            reference_pose=np.eye(4),
+            previous_safe_qpos=previous_safe,
+            metadata={
+                "hard_deadline_enabled": True,
+                "hard_deadline_budget_ms": 25.0,
+                "hard_deadline_monotonic": time.perf_counter() - 1.0,
+            },
+        ),
+        joint_velocity_profile=JointVelocityLimitProfile(
+            name="test",
+            max_velocity_deg_s=(100.0,) * 6,
+        ),
+        dt_sec=0.025,
+        local_provider_names=("local",),
+    )
+
+    assert provider.calls == 0
+    assert result.candidate_source == "hard_deadline_hold_reference"
+    assert result.qpos is not None
+    assert np.allclose(result.qpos, previous_safe)
+    assert result.metadata["hard_deadline_hold_qpos_source"] == "previous_safe"
+    assert result.metadata["hard_deadline_expired"] is True
+
+
+def test_resolve_propagates_hard_deadline_to_provider_options():
+    class DeadlineAwareProvider:
+        def __init__(self):
+            self.options: dict[str, object] | None = None
+
+        def iter_ik_candidates(self, *, target_pose, seeds, seed_labels, options):
+            del target_pose
+            self.options = dict(options)
+            return [
+                IKCandidate(
+                    qpos=np.asarray(seeds[0], dtype=float),
+                    source="deadline_provider",
+                    seed_source=seed_labels[0],
+                    method="identity",
+                )
+            ]
+
+        def forward_kinematics(self, qpos):
+            del qpos
+            return np.eye(4)
+
+        def analyze_singularity(self, qpos):
+            del qpos
+            return SingularityReport(status_code=0, label="normal", metric=1.0)
+
+    provider = DeadlineAwareProvider()
+    deadline = time.perf_counter() + 1.0
+    result = IKSafetyResolver(
+        profile=IKSafetyProfile(
+            name="hard_deadline",
+            fk_error_tolerance_m=1.0,
+            fk_error_tolerance_deg=180.0,
+        ),
+        provider=provider,
+    ).resolve(
+        IKResolveRequest(
+            target_pose=np.eye(4),
+            reference_qpos=np.zeros(6),
+            reference_pose=np.eye(4),
+            metadata={
+                "hard_deadline_enabled": True,
+                "hard_deadline_budget_ms": 25.0,
+                "hard_deadline_monotonic": deadline,
+            },
+        )
+    )
+
+    assert result.accepted
+    assert provider.options is not None
+    assert provider.options["provider_deadline_monotonic"] == deadline
+    assert float(provider.options["provider_remaining_time_budget_ms"]) > 0.0
+
+
+def test_hard_deadline_local_step_evaluates_safe_base_before_escape_expansion():
+    class BaseCandidateProvider:
+        def __init__(self):
+            self.fk_calls = 0
+
+        def iter_ik_candidates(self, *, target_pose, seeds, seed_labels, options):
+            del target_pose
+            if not options.get("local_step_mode"):
+                return []
+            return [
+                IKCandidate(
+                    qpos=np.deg2rad(np.array([0.0, 0.0, 133.9, 1.0, 0.0, 0.0])),
+                    source="base_local",
+                    seed_source=seed_labels[0],
+                    method="base_local",
+                )
+            ]
+
+        def forward_kinematics(self, qpos):
+            self.fk_calls += 1
+            pose = np.eye(4)
+            pose[0, 3] = float(np.rad2deg(np.asarray(qpos)[3])) * 0.01
+            return pose
+
+        def analyze_singularity(self, qpos):
+            del qpos
+            return SingularityReport(status_code=0, label="normal", metric=1.0)
+
+        def joint_position_limits(self):
+            return (
+                np.deg2rad(np.array([-180.0, -180.0, -135.0, -180.0, -180.0, -180.0])),
+                np.deg2rad(np.array([180.0, 180.0, 135.0, 180.0, 180.0, 180.0])),
+            )
+
+    provider = BaseCandidateProvider()
+    target = np.eye(4)
+    target[0, 3] = 0.10
+    profile = IKSafetyProfile(
+        name="hard_deadline_local",
+        target_tolerance=PoseTolerance(position_m=0.05, orientation_deg=10.0),
+        fk_error_tolerance_m=1.0,
+        fk_error_tolerance_deg=180.0,
+        local_step_enabled=True,
+        local_step_first_enabled=True,
+        local_step_limit_escape_enabled=True,
+        local_step_limit_escape_activation_margin_deg=2.0,
+    )
+    result = IKSafetyResolver(profile=profile, provider=provider).resolve_step(
+        IKResolveRequest(
+            target_pose=target,
+            reference_qpos=np.deg2rad(np.array([0.0, 0.0, 133.9, 0.0, 0.0, 0.0])),
+            reference_pose=np.eye(4),
+            metadata={
+                "hard_deadline_enabled": True,
+                "hard_deadline_budget_ms": 1000.0,
+                "hard_deadline_monotonic": time.perf_counter() + 1.0,
+            },
+        ),
+        joint_velocity_profile=JointVelocityLimitProfile(
+            name="test",
+            max_velocity_deg_s=(100.0, 100.0, 100.0, 100.0, 100.0, 100.0),
+        ),
+        dt_sec=0.025,
+        local_provider_names=("local",),
+    )
+
+    assert result.accepted
+    assert result.candidate_source == "base_local"
+    assert result.metadata["local_step_scale_strategy"]["hard_deadline_staged"] is True
+    # Only the accepted base candidate needs FK. A limit-escape expansion
+    # would add up to twelve more FK calls before evaluating this candidate.
+    assert provider.fk_calls == 1
+
+
+def test_limit_escape_stops_after_the_inflight_fk_crosses_hard_deadline(monkeypatch):
+    class Clock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    class SlowFkProvider:
+        def __init__(self, clock):
+            self.clock = clock
+            self.fk_calls = 0
+
+        def forward_kinematics(self, qpos):
+            del qpos
+            self.fk_calls += 1
+            # An SDK/FK call cannot be preempted, but once it returns the
+            # resolver must not launch the next auxiliary candidate.
+            self.clock.value = 0.010
+            return np.eye(4)
+
+        def joint_position_limits(self):
+            return (
+                np.deg2rad(np.array([-180.0, -180.0, -135.0, -180.0, -180.0, -180.0])),
+                np.deg2rad(np.array([180.0, 180.0, 135.0, 180.0, 180.0, 180.0])),
+            )
+
+    clock = Clock()
+    monkeypatch.setattr(ik_resolver_module.time, "perf_counter", clock)
+    provider = SlowFkProvider(clock)
+    resolver = IKSafetyResolver(
+        profile=IKSafetyProfile(
+            name="deadline_escape",
+            local_step_limit_escape_enabled=True,
+            local_step_limit_escape_activation_margin_deg=2.0,
+        ),
+        provider=provider,
+    )
+
+    candidates, metadata = resolver._local_step_limit_escape_candidates(
+        reference_qpos=np.deg2rad(np.array([0.0, 0.0, 133.9, 0.0, 0.0, 0.0])),
+        target_pose=np.eye(4),
+        reference_pose=np.eye(4),
+        joint_velocity_profile=JointVelocityLimitProfile(
+            name="test",
+            max_velocity_deg_s=(100.0,) * 6,
+        ),
+        dt_sec=0.025,
+        deadline_monotonic=0.005,
+    )
+
+    assert candidates == []
+    assert metadata["status"] == "interrupted_hard_deadline"
+    assert metadata["hard_deadline_expired"] is True
+    assert provider.fk_calls == 1

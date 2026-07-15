@@ -9,7 +9,14 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from robot_motion.runtime.lifecycle import (
+    LifecycleFailure,
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+)
+
 from hardware.rm65.calibration_profiles import (
+    ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD,
     is_position_endpoint_profile,
     tcp_endpoint_delta,
     tcp_safety_warnings,
@@ -60,16 +67,36 @@ _IMPEDANCE_CONFIG_DEBUG_KEYS = (
     "max_linear_offset_m",
     "max_angular_offset_rad",
     "return_rate_s",
+    "canfd_follow",
+    "follow_qpos_alpha",
+    "canfd_follow_stream_hz",
+    "canfd_follow_warning_ratio",
+    "passthrough_position_control",
+    "trajectory_mode",
+    "radio",
     "pose_command_transport",
     "max_command_joint_step_deg",
     "max_command_joint_velocity_deg_s",
     "joint_rate_limiter_enabled",
     "joint_velocity_limit_profile",
+    "joint_rate_limit_use_nominal_dt",
+    "admittance_use_nominal_dt",
+    "joint_operating_margin_deg",
+    "observed_joint_tolerance_deg",
     "ik_safety_profile",
     "ik_resolver_local_step_max_iterations",
     "ik_resolver_local_step_trigger_ratio",
     "ik_resolver_local_step_max_position_worsen_m",
+    "ik_resolver_local_step_max_orientation_worsen_deg",
     "ik_resolver_local_step_component_progress_max_position_worsen_m",
+    "ik_resolver_local_step_dynamic_worsen_enabled",
+    "ik_hard_deadline_enabled",
+    "ik_hard_deadline_ms",
+    "deployment_dual_rate_ik_enabled",
+    "deployment_full_ik_hz",
+    "deployment_full_ik_deadline_ms",
+    "deployment_local_ik_deadline_ms",
+    "deployment_full_ik_preempts_local",
     "direct_joint_hint_max_linear_offset_m",
     "direct_joint_hint_max_angular_offset_rad",
     "direct_joint_hint_force_guard_enabled",
@@ -78,12 +105,15 @@ _IMPEDANCE_CONFIG_DEBUG_KEYS = (
     "direct_joint_hint_force_guard_reset_admittance",
     "hold_last_safe_on_ik_failure",
     "debug_timing",
+    "state_read_every",
     "tcp_pose_flange_m_rad",
     "tcp_confirmed",
     "payload_mass_kg",
     "payload_com_tool_m",
 )
 _RM65_IMPEDANCE_MAX_CONTROL_HZ = 40.0
+_RM65_CANFD_FOLLOW_DEFAULT_STATE_READ_EVERY = 4
+_RM65_PASSTHROUGH_POSITION_MAX_COMMAND_STEP_DEG = 1.0e9
 
 
 def _debug_config_value(value: object) -> object:
@@ -360,8 +390,11 @@ class RM65ImpedanceArmBackendConfig:
     max_angvel: tuple[float, ...] = (0.35, 0.35, 0.35, 0.5, 0.5, 0.5)
     actual_send_dt_alpha: float = 0.25
     actual_send_dt_min_scale: float = 1.0
-    actual_send_dt_max_scale: float = 2.0
+    actual_send_dt_max_scale: float = 1.0
     actual_send_dt_stall_reset_sec: float = 0.25
+    # A delayed force-control frame must not enlarge the outer IK step and
+    # create a catch-up motion. Position backends retain their existing policy.
+    scale_outer_execution_step_by_actual_dt: bool = False
     debug_timing: bool = False
     impedance_overrides: Mapping[str, Any] = field(default_factory=dict)
 
@@ -399,10 +432,16 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._endpoint_to_tool_tcp = np.eye(4, dtype=float)
         self._latest_target_pose6: list[float] | None = None
         self._latest_target_joint_deg: list[float] | None = None
+        self._latest_target_sequence: int | None = None
+        self._command_sequence = 0
         self._last_command: EffectorCommand | None = None
         self._last_command_timestamp: float | None = None
         self._last_step_record: dict[str, object] | None = None
         self._recent_step_records: list[dict[str, object]] = []
+        self._last_measured_joint_deg: list[float] | None = None
+        self._last_measured_pose: list[float] | None = None
+        self._last_measurement_timestamp: float | None = None
+        self._last_measurement_sequence: int | None = None
         self._last_fault: str | None = None
         self._last_send_result_code: int | None = None
         self._last_send_result_text: str | None = None
@@ -422,6 +461,35 @@ class RM65ImpedanceArmBackend(EffectorBackend):
     @property
     def name(self) -> str:
         return str(self.config.effector_name)
+
+    def _active_tcp_pose_flange_m_rad(self) -> tuple[float, ...]:
+        """Return the TCP that the active impedance controller actually uses.
+
+        Replay preflight compares this value with the dataset tool profile.  A
+        position backend stores the value directly on its backend config, while
+        the impedance backend resolves it when the calibration profile is
+        loaded.  Exposing the same getter prevents replay from silently falling
+        back to the zero arm-endpoint TCP for an active impedance tool.
+        """
+
+        with self._state_lock:
+            controller = self._controller
+            profile = self._profile
+        candidates: list[object] = []
+        if controller is not None:
+            candidates.append(
+                getattr(controller.config, "tcp_pose_flange_m_rad", None)
+            )
+        if isinstance(profile, Mapping):
+            tcp = profile.get("tcp")
+            if isinstance(tcp, Mapping):
+                candidates.append(tcp.get("pose_flange_m_rad"))
+        candidates.append(ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD)
+        for candidate in candidates:
+            pose = _coerce_float_vector(candidate, expected_len=6)
+            if pose is not None:
+                return tuple(float(value) for value in pose)
+        raise RuntimeError(f"{self.name} active impedance TCP is unavailable.")
 
     def start(self) -> None:
         if not self.config.connect_hardware or self.arm is not None:
@@ -466,6 +534,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._enabled = False
                 self._latest_target_pose6 = None
                 self._latest_target_joint_deg = None
+                self._latest_target_sequence = None
+                self._command_sequence = 0
                 self._last_command = None
                 self._last_command_timestamp = None
                 self._last_step_record = None
@@ -512,6 +582,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             with self._state_lock:
                 self._latest_target_pose6 = None
                 self._latest_target_joint_deg = None
+                self._latest_target_sequence = None
+                self._command_sequence = 0
                 self._last_command = None
                 self._last_command_timestamp = None
                 self._last_step_record = None
@@ -527,6 +599,33 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             controller = self._controller
             if controller is not None and qpos_array is not None:
                 controller.reset_motion_state(qpos_array)
+
+    def set_command_action_dt_sec(self, action_dt_sec: float) -> None:
+        value = float(action_dt_sec)
+        if value <= 0.0:
+            raise ValueError(f"{self.name} command action_dt must be positive.")
+        requested_action_hz = 1.0 / value
+        with self._send_lock:
+            controller = self._controller
+            effective_action_hz = requested_action_hz
+            if controller is not None:
+                effective_action_hz = min(
+                    requested_action_hz,
+                    float(controller.config.control_hz),
+                )
+                controller.config.action_hz = effective_action_hz
+                duration = 1.0 / effective_action_hz
+                reference = getattr(controller, "_reference", None)
+                if reference is not None:
+                    reference.default_duration = duration
+                joint_hint_reference = getattr(controller, "_joint_hint_reference", None)
+                if joint_hint_reference is not None:
+                    joint_hint_reference.default_duration = duration
+            with self._state_lock:
+                self.config.action_hz = effective_action_hz
+                if self._active_impedance_config is not None:
+                    self._active_impedance_config["requested_action_hz"] = requested_action_hz
+                    self._active_impedance_config["action_hz"] = effective_action_hz
 
     def enable_force_control(self) -> None:
         if self._enabled:
@@ -619,9 +718,57 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 )
             time.sleep(0.005)
 
+    def compute_tcp_pose(
+        self,
+        tcp_frame: str | None = None,
+        *,
+        qpos: Sequence[float] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        frame = canonical_arm_controlled_frame(TOOL_TCP_FRAME if tcp_frame is None else tcp_frame)
+        if frame != TOOL_TCP_FRAME:
+            raise ValueError(f"{self.name} impedance backend only exposes {TOOL_TCP_FRAME!r} FK.")
+        if qpos is None:
+            state = self.get_state()
+            pose = state.get("current_tcp_pose")
+            if pose is None:
+                raise RuntimeError(f"{self.name} current TCP pose is unavailable.")
+            return as_pose_matrix(pose)
+        controller = self._controller
+        if controller is None:
+            raise RuntimeError(f"{self.name} cannot compute TCP pose before impedance controller is initialized.")
+        qpos_array = np.asarray(qpos, dtype=float).reshape(-1)
+        if qpos_array.shape != (6,) or not np.all(np.isfinite(qpos_array)):
+            raise ValueError(f"{self.name} qpos must be a finite 6D vector.")
+        pose6 = controller._forward_pose(np.rad2deg(qpos_array).astype(float).tolist())
+        return _pose6_to_matrix(pose6)
+
+    def _joint_vector_command_as_cartesian(self, command: EffectorCommand) -> EffectorCommand:
+        qpos = np.asarray(command.value, dtype=float).reshape(-1)
+        if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
+            raise ValueError(f"{self.name} joint_vector command must be a finite 6D vector.")
+        pose = self.compute_tcp_pose(qpos=qpos)
+        metadata = dict(command.metadata or {})
+        metadata.setdefault("source", metadata.get("source", "joint_vector_fk"))
+        metadata.setdefault("solver_output_qpos", qpos.copy())
+        metadata.setdefault("action_pose_source", "joint_vector_fk")
+        metadata.setdefault("target_pose_base", pose.copy())
+        metadata.setdefault("target_pose_tcp_base", pose.copy())
+        metadata.setdefault("target_pose_controlled_frame", TOOL_TCP_FRAME)
+        metadata.setdefault("arm_controlled_frame", TOOL_TCP_FRAME)
+        return EffectorCommand(
+            effector_name=command.effector_name,
+            side=command.side,
+            command_type="cartesian_pose",
+            value=pose,
+            frame_name=command.frame_name or "arm_base",
+            metadata=metadata,
+        )
+
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
             raise ValueError(f"{self.name} received command for effector '{command.effector_name}'.")
+        if command.command_type == "joint_vector":
+            command = self._joint_vector_command_as_cartesian(command)
         if command.command_type != "cartesian_pose":
             raise ValueError(
                 f"{self.name} pose impedance requires cartesian_pose command, got {command.command_type!r}."
@@ -667,8 +814,11 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         with self._state_lock:
             if self._emergency_stopped:
                 raise RuntimeError(f"{self.name} emergency_stop is latched; refusing command dispatch.")
+            self._command_sequence += 1
+            command_sequence = int(self._command_sequence)
             self._latest_target_pose6 = list(target_pose6)
             self._latest_target_joint_deg = None if target_joint_deg is None else list(target_joint_deg)
+            self._latest_target_sequence = command_sequence
             self._last_command = command.copy()
             self._last_command_timestamp = now
             self._update_dt_scale(now)
@@ -792,7 +942,6 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         requested_control_hz = float(
             user_overrides.get("control_hz", 1.0 / float(self.config.control_dt))
         )
-        effective_control_hz = min(requested_control_hz, _RM65_IMPEDANCE_MAX_CONTROL_HZ)
         requested_action_hz = (
             float(user_overrides.get("action_hz"))
             if user_overrides.get("action_hz") is not None
@@ -802,6 +951,13 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 else requested_control_hz
             )
         )
+        passthrough_position_requested = bool(
+            user_overrides.get("passthrough_position_control", False)
+            and user_overrides.get("canfd_follow", False)
+        )
+        effective_control_hz = min(requested_control_hz, _RM65_IMPEDANCE_MAX_CONTROL_HZ)
+        if passthrough_position_requested:
+            effective_control_hz = min(requested_action_hz, _RM65_IMPEDANCE_MAX_CONTROL_HZ)
         overrides = {
             "tare_sec": float(self.config.force_tare_sec),
             "hold_last_safe_on_ik_failure": True,
@@ -810,6 +966,21 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         }
         overrides["control_hz"] = effective_control_hz
         overrides["action_hz"] = min(requested_action_hz, effective_control_hz)
+        canfd_follow_requested = bool(overrides.get("canfd_follow", False))
+        if passthrough_position_requested:
+            overrides.setdefault("state_read_every", 1)
+            overrides.setdefault("joint_rate_limiter_enabled", False)
+            overrides.setdefault(
+                "max_command_joint_step_deg",
+                _RM65_PASSTHROUGH_POSITION_MAX_COMMAND_STEP_DEG,
+            )
+            overrides.setdefault(
+                "max_command_joint_velocity_deg_s",
+                _RM65_PASSTHROUGH_POSITION_MAX_COMMAND_STEP_DEG,
+            )
+            overrides.setdefault("follow_qpos_alpha", 1.0)
+        elif canfd_follow_requested and "state_read_every" not in user_overrides:
+            overrides["state_read_every"] = _RM65_CANFD_FOLLOW_DEFAULT_STATE_READ_EVERY
         impedance_config = RM65ImpedanceConfig.from_profile(
             dict(profile),
             mode=self.config.impedance_mode,
@@ -885,6 +1056,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         period = 1.0 / float(self._controller.config.control_hz)
         next_deadline = time.perf_counter()
         previous_loop_start: float | None = None
+        last_dispatched_target_sequence: int | None = None
         while not self._loop_stop_event.is_set():
             timing_enabled = bool(self.config.debug_timing)
             timing_started_at = time.perf_counter()
@@ -922,6 +1094,14 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                         if self._latest_target_joint_deg is None
                         else list(self._latest_target_joint_deg)
                     )
+                    target_sequence = self._latest_target_sequence
+                    target_timestamp = self._last_command_timestamp
+                target_snapshot_wall_time = time.time()
+                target_dispatched_this_step = bool(
+                    target is not None and target_sequence != last_dispatched_target_sequence
+                )
+                step_target = target if target_dispatched_this_step else None
+                step_target_joint_deg = target_joint_deg if target_dispatched_this_step else None
                 mark_timing("target_snapshot")
                 send_lock_wait_started_at = time.perf_counter()
                 send_lock_wait_ms = 0.0
@@ -933,7 +1113,41 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                         if self._emergency_stopped or self._loop_stop_event.is_set():
                             break
                     mark_timing("pre_step_check")
-                    record = dict(self._controller.step(target, target_joint_deg=target_joint_deg))
+                    controller_step_start_wall_time = time.time()
+                    record = dict(self._controller.step(step_target, target_joint_deg=step_target_joint_deg))
+                    controller_step_end_wall_time = time.time()
+                    if target_dispatched_this_step:
+                        last_dispatched_target_sequence = target_sequence
+                    record.update(
+                        {
+                            "backend_target_sequence": target_sequence,
+                            "backend_target_timestamp": target_timestamp,
+                            "backend_target_present": target is not None,
+                            "backend_target_joint_hint_present": target_joint_deg is not None,
+                            "backend_target_dispatched_this_step": target_dispatched_this_step,
+                            "backend_last_dispatched_target_sequence": last_dispatched_target_sequence,
+                            "backend_target_snapshot_wall_time": float(target_snapshot_wall_time),
+                            "backend_controller_step_start_wall_time": float(
+                                controller_step_start_wall_time
+                            ),
+                            "backend_controller_step_end_wall_time": float(
+                                controller_step_end_wall_time
+                            ),
+                            "backend_controller_step_wall_duration_sec": float(
+                                controller_step_end_wall_time - controller_step_start_wall_time
+                            ),
+                        }
+                    )
+                    if target_timestamp is not None:
+                        record["backend_target_age_sec_at_snapshot"] = float(
+                            target_snapshot_wall_time - float(target_timestamp)
+                        )
+                        record["backend_target_age_sec_at_step_start"] = float(
+                            controller_step_start_wall_time - float(target_timestamp)
+                        )
+                        record["backend_target_age_sec_at_step_end"] = float(
+                            controller_step_end_wall_time - float(target_timestamp)
+                        )
                     mark_timing("controller_step")
                     loop_timing = None
                     if timing_enabled:
@@ -989,6 +1203,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             latest_target_joint_deg = (
                 None if self._latest_target_joint_deg is None else list(self._latest_target_joint_deg)
             )
+            latest_target_sequence = self._latest_target_sequence
+            command_sequence = int(self._command_sequence)
             last_command_controlled_frame = (
                 None if command is None else self._command_controlled_frame(command)
             )
@@ -1016,12 +1232,39 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             else:
                 loop_state = "stopped"
             emergency_stopped = bool(self._emergency_stopped)
+            measurement_timestamp = (
+                None if record is None else record.get("measurement_timestamp")
+            )
+            measurement_timestamp_monotonic = (
+                None
+                if record is None
+                else record.get("measurement_timestamp_monotonic")
+            )
+            measurement_sequence = None if record is None else record.get("step")
+            measurement_valid = bool(
+                record is not None and record.get("measurement_valid", False)
+            )
+            if measurement_valid:
+                self._last_measured_joint_deg = list(record.get("measured_joint_deg"))
+                self._last_measured_pose = list(record.get("measured_pose"))
+                self._last_measurement_timestamp = float(measurement_timestamp)
+                self._last_measurement_sequence = int(measurement_sequence)
+            if self._last_measurement_timestamp is not None:
+                measurement_timestamp = self._last_measurement_timestamp
+                measurement_sequence = self._last_measurement_sequence
+                measurement_valid = bool(
+                    self._last_measured_joint_deg is not None
+                    and self._last_measured_pose is not None
+                )
             current_qpos = None
+            raw_hardware_qpos = None
+            observed_qpos_normalization = None
             current_pose = None
             target_qpos = None
             target_pose = None
             if record is not None:
                 measured_joint_deg = record.get("measured_joint_deg")
+                measured_joint_deg_raw = record.get("measured_joint_deg_raw")
                 measured_pose6 = record.get("measured_pose")
                 command_joint_deg = record.get("command_joint_deg")
                 command_pose6 = record.get("command_pose")
@@ -1029,23 +1272,55 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 pose6 = measured_pose6 if measured_pose6 is not None else command_pose6
                 if joint_deg is not None:
                     current_qpos = np.asarray(joint_deg, dtype=float).reshape(6) / 180.0 * np.pi
+                if measured_joint_deg_raw is not None:
+                    raw_hardware_qpos = (
+                        np.asarray(measured_joint_deg_raw, dtype=float).reshape(6) / 180.0 * np.pi
+                    )
+                observed_qpos_normalization = record.get("measured_joint_normalization")
                 if pose6 is not None:
                     current_pose = _pose6_to_matrix(pose6)
                 if command_joint_deg is not None:
                     target_qpos = np.asarray(command_joint_deg, dtype=float).reshape(6) / 180.0 * np.pi
                 if command_pose6 is not None:
                     target_pose = _pose6_to_matrix(command_pose6)
+            if measurement_valid:
+                current_qpos = (
+                    np.asarray(self._last_measured_joint_deg, dtype=float).reshape(6)
+                    / 180.0
+                    * np.pi
+                )
+                current_pose = _pose6_to_matrix(self._last_measured_pose)
             return {
                 "current_qpos": current_qpos,
+                # Normalized measured qpos is the only state anchor exposed to
+                # replay/deploy planners.  Preserve the raw SDK feedback for
+                # diagnosis without allowing it to seed a motion command.
+                "hardware_qpos": current_qpos,
+                "hardware_qpos_raw": raw_hardware_qpos,
+                "local_qpos_normalization": observed_qpos_normalization,
                 "current_tcp_pose": current_pose,
                 "last_target_qpos": target_qpos if target_qpos is not None else current_qpos,
                 "last_target_tcp_pose": target_pose,
                 "last_command": command,
                 "last_command_controlled_frame": last_command_controlled_frame,
                 "last_command_timestamp": self._last_command_timestamp,
+                "last_command_sequence": latest_target_sequence,
+                "command_sequence": command_sequence,
                 "latest_target_tcp_pose6": latest_target_pose6,
                 "latest_target_joint_deg": latest_target_joint_deg,
+                "latest_target_sequence": latest_target_sequence,
                 "arm_state_source": "pose_impedance_command",
+                "hardware_refresh_time": measurement_timestamp,
+                "hardware_measurement_timestamp": measurement_timestamp,
+                "hardware_measurement_timestamp_monotonic": measurement_timestamp_monotonic,
+                "hardware_measurement_sequence": measurement_sequence,
+                "hardware_measurement_valid": measurement_valid,
+                "hardware_read_success": measurement_valid,
+                "hardware_pose_6d": (
+                    None
+                    if record is None
+                    else record.get("measured_pose")
+                ),
                 "hardware_result_code": 0 if self._last_fault is None else -1,
                 "hardware_result_text": self._last_fault or "ok",
                 "send_result_code": self._last_send_result_code,
@@ -1082,6 +1357,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 self._emergency_stopped = True
                 self._latest_target_pose6 = None
                 self._latest_target_joint_deg = None
+                self._latest_target_sequence = None
                 self._last_send_result_code = 0
                 self._last_send_result_text = "emergency_stop"
             robot = self.arm
@@ -1106,21 +1382,49 @@ class RM65ImpedanceArmBackend(EffectorBackend):
 
     def close(self) -> None:
         self._loop_stop_event.set()
+        failures: list[LifecycleFailure] = []
         if self._loop_thread is not None:
-            self._loop_thread.join(timeout=1.0)
-            self._loop_thread = None
-        if self._controller is not None:
-            try:
-                if not self._emergency_stopped:
-                    self._controller.stop_motion()
-            except Exception:
-                pass
-            self._controller.close()
+            worker = self._loop_thread
+
+            def join_worker() -> None:
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    raise RuntimeError(
+                        f"{self.name} impedance worker did not stop within 1.000s"
+                    )
+
+            failures.extend(
+                collect_lifecycle_failures(
+                    ((f"worker[{worker.name}].join", join_worker),)
+                )
+            )
+            if not worker.is_alive():
+                self._loop_thread = None
+        controller = self._controller
+        arm = self.arm
+
+        def close_controller() -> None:
+            assert controller is not None
+            controller.close()
             self._controller = None
-        if self.arm is not None:
+
+        def close_arm_socket() -> None:
+            assert arm is not None
             try:
-                self.arm.Arm_Socket_Close()
+                arm.Arm_Socket_Close()
             finally:
                 self.arm = None
-        with self._state_lock:
-            self._enabled = False
+
+        steps = []
+        if controller is not None:
+            if not self._emergency_stopped:
+                steps.append(("controller.stop_motion", controller.stop_motion))
+            steps.append(("controller.close", close_controller))
+        if arm is not None:
+            steps.append(("arm.socket_close", close_arm_socket))
+        try:
+            failures.extend(collect_lifecycle_failures(steps))
+            raise_lifecycle_failures(f"{self.name}.close", failures)
+        finally:
+            with self._state_lock:
+                self._enabled = False

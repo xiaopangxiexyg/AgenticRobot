@@ -10,12 +10,18 @@ import termios
 import threading
 import time
 import tty
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+
+from robot_motion.runtime.lifecycle import (
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    run_best_effort_cleanup,
+)
 
 from cameras.configs import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
@@ -31,6 +37,7 @@ from ..backends.grippers import (
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
     GRIPPER_ACTION_MAX,
+    dmtac_tactile_requires_calibration,
     normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
@@ -47,7 +54,11 @@ from ..configs.dmtac_hardware import (
     load_dmtac_hardware_assignment,
 )
 from ..configs.q6_hardware import load_latest_q6_ports
-from ..defaults import DEFAULT_RM65_ARM_CONTROL_HZ, DEFAULT_TELEOP_SAMPLE_HZ
+from ..defaults import (
+    DEFAULT_RM65_POSITION_ARM_CONTROL_HZ,
+    DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
+    DEFAULT_TELEOP_SAMPLE_HZ,
+)
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER, parse_tactile_regions
 from ..hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
@@ -85,6 +96,10 @@ from ..replay.trajectory import (
     build_replay_init_plan_from_args as _build_replay_init_plan,
     replay_active_arm_poses_are_finite as _replay_active_arm_poses_are_finite,
 )
+from ..position_control import (
+    PositionReferencePublisher,
+    PositionReferencePublisherConfig,
+)
 from ..rigs import BimanualRig
 from ..safety import TeleopSafetyConfig
 from ..schemas import (
@@ -94,11 +109,21 @@ from ..schemas import (
     TeleopObservation,
     merge_teleop_commands,
 )
-from ..session import SessionStepResult, TeleopSession, TeleopSessionConfig
+from ..session import (
+    TRACKER_HOLD_AUTOMATIC,
+    TRACKER_HOLD_GRACE,
+    SessionStepResult,
+    TeleopSession,
+    TeleopSessionConfig,
+)
 from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
-from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..sources.pose import (
+    DEFAULT_VIVE_CLOCK_SYNC_PORT,
+    VivePoseSource,
+    ViveTrackerConfig,
+)
 from ..tactile_visualizer import (
     AsyncTactileUVVisualizer,
     TactileUVVisualizer,
@@ -108,6 +133,7 @@ from ..tactile_visualizer import (
 )
 from ..transforms import as_pose_matrix, interpolate_pose
 from .arm_state_polling import ArmHardwareStatePoller, ArmHardwareStatePollerConfig
+from .hand_state_polling import HandStateHistoryPoller, HandStateHistoryPollerConfig
 from .async_writer import AsyncWriterConfig, AsyncWriterPool
 from .build_collect_components import CollectorComponents
 from .camera_preview import CameraPreviewConfig, CameraPreviewer
@@ -124,10 +150,16 @@ from .modes import (
     moving_arm_sides as _mode_moving_arm_sides,
     resolve_collection_mode,
 )
+from .policy_io_runtime import resolve_collection_policy_io_layout
 from .preview_rate import PreviewRateLimiter
+from .rate_gate import PeriodicRateGate
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .observers import CollectionWriterObserverConfig
-from .sample_assembler import CollectorSampleBuilder, CollectorSampleBuilderConfig
+from .sample_assembler import (
+    DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+    CollectorSampleBuilder,
+    CollectorSampleBuilderConfig,
+)
 from .status_snapshot import (
     arm_debug_text as _snapshot_arm_debug_text,
     camera_debug_text as _snapshot_camera_debug_text,
@@ -164,7 +196,7 @@ GRIPPER_POLICY_DEFAULTS = {
     "source_dim": 2,
     "output_dim": 0,
     "invert": False,
-    "alpha": 1.0,
+    "alpha": 0.95,
     "input_min": DEFAULT_GRIPPER_INPUT_MIN,
     "input_max": DEFAULT_GRIPPER_INPUT_MAX,
     "speed": 0.2,
@@ -181,9 +213,14 @@ def _collection_hand_action_specs(
     args: argparse.Namespace,
     active_sides: Sequence[str],
 ) -> Mapping[str, HandActionSpec] | None:
-    if _hand_backend_mode(args) != HAND_BACKEND_DMTAC_GRIPPER:
+    dmtac_sides = [
+        str(side)
+        for side in active_sides
+        if _hand_backend_mode_for_side(args, str(side)) == HAND_BACKEND_DMTAC_GRIPPER
+    ]
+    if not dmtac_sides:
         return None
-    return {str(side): HandActionSpec.dmtac_gripper(str(side)) for side in active_sides}
+    return {side: HandActionSpec.dmtac_gripper(side) for side in dmtac_sides}
 
 
 def _calibration_profile_timestamp(path: Path) -> float | None:
@@ -474,6 +511,17 @@ def _hand_backend_mode(args: argparse.Namespace) -> str:
     return mode
 
 
+def _hand_backend_mode_for_side(args: argparse.Namespace, side: str) -> str:
+    side = str(side).strip().lower()
+    if side not in {"left", "right"}:
+        raise ValueError(f"Unsupported hand backend side {side!r}.")
+    override = getattr(args, f"{side}_hand_backend", None)
+    mode = _hand_backend_mode(args) if override in (None, "") else str(override)
+    if mode not in HAND_BACKEND_CHOICES:
+        raise ValueError(f"Unsupported {side} hand backend {mode!r}.")
+    return mode
+
+
 def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
     path_text = str(getattr(args, "gripper_task_profile", "") or "").strip()
     if not path_text:
@@ -577,7 +625,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["input_max"] = float(policy["input_max"])
     policy["speed"] = float(policy["speed"])
     policy["torque"] = float(policy["torque"])
-    policy["max_action"] = float(policy["max_action"])
+    # Do not let old 0.9/0.95 task profiles create another policy action space.
+    policy["max_action"] = float(GRIPPER_ACTION_MAX)
     policy["send_threshold"] = float(policy["send_threshold"])
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
@@ -683,6 +732,11 @@ def _apply_gripper_policy_to_dmtac_config(
         config.tactile_compute_profile = str(tactile_compute_profile)
     elif policy.get("tactile_compute_profile"):
         config.tactile_compute_profile = str(policy["tactile_compute_profile"])
+    tactile_calibrate = getattr(args, "dmtac_tactile_calibrate", None)
+    if tactile_calibrate is None:
+        config.tactile_reset_on_start = dmtac_tactile_requires_calibration(config.tactile_fields)
+    else:
+        config.tactile_reset_on_start = bool(tactile_calibrate)
     tactile_max_fps = getattr(args, "dmtac_tactile_max_fps", None)
     if tactile_max_fps is not None:
         config.tactile_max_fps = int(tactile_max_fps)
@@ -717,7 +771,12 @@ def _dmtac_backend_configs(
     cached = getattr(args, "_dmtac_backend_configs", None)
     if isinstance(cached, dict):
         return dict(cached)
-    if _hand_backend_mode(args) != HAND_BACKEND_DMTAC_GRIPPER:
+    dmtac_sides = tuple(
+        side
+        for side in active_sides
+        if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+    )
+    if not dmtac_sides:
         setattr(args, "_dmtac_backend_configs", {})
         return {}
 
@@ -734,7 +793,7 @@ def _dmtac_backend_configs(
             configs.update(
                 dmtac_backend_configs_from_assignment(
                     assignment,
-                    active_sides=active_sides,
+                    active_sides=dmtac_sides,
                     tactile_backend=str(getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"),
                     speed=float(policy["speed"]),
                     torque=float(policy["torque"]),
@@ -748,7 +807,7 @@ def _dmtac_backend_configs(
                 ) from exc
             _log("DMTAC", f"WARNING: could not load DMTAC hardware assignment: {exc}")
 
-    for side in active_sides:
+    for side in dmtac_sides:
         manual = _manual_dmtac_config_for_side(args, side, policy)
         if manual is not None:
             configs[side] = manual
@@ -797,7 +856,10 @@ def _assert_tactile_visualization_config(
         raise ValueError(
             "--visualize-tactile requires tactile polling; remove --without-tactile."
         )
-    if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
+    if any(
+        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+        for side in active_sides
+    ):
         raise ValueError(
             "--visualize-tactile currently supports InspireTac UV tactile only; "
             "DMTAC tactile is recorded but needs a separate visualizer."
@@ -875,6 +937,56 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver.")
     parser.add_argument("--port", type=int, default=9999, help="UDP bind port for the VIVE receiver.")
+    parser.add_argument(
+        "--vive-clock-sync-port",
+        type=int,
+        default=DEFAULT_VIVE_CLOCK_SYNC_PORT,
+        help=(
+            "Separate UDP clock-control bind port for the default new protocol. "
+            "Set 0 to select the legacy v1-only VIVE receiver."
+        ),
+    )
+    parser.add_argument(
+        "--vive-clock-sync-bind-host",
+        type=str,
+        default="",
+        help="Optional bind host for the VIVE clock-control port; defaults to --host.",
+    )
+    parser.add_argument(
+        "--vive-clock-sync-expected-sender-host",
+        type=str,
+        default="",
+        help="Optional VIVE sender IP allowed to submit clock-control results.",
+    )
+    parser.add_argument(
+        "--vive-clock-sync-min-samples",
+        type=int,
+        default=4,
+        help="Accepted four-timestamp samples required before sync is ready.",
+    )
+    parser.add_argument(
+        "--vive-clock-sync-max-rtt-ms",
+        type=float,
+        default=25.0,
+        help="Reject VIVE clock samples above this RTT; <=0 disables the RTT cap.",
+    )
+    parser.add_argument(
+        "--vive-clock-sync-stale-after-sec",
+        type=float,
+        default=15.0,
+        help="Mark mapped remote capture time stale after this many seconds.",
+    )
+    parser.add_argument(
+        "--vive-clock-sync-required",
+        action="store_true",
+        help="Fail startup if optional VIVE clock control does not become ready.",
+    )
+    parser.add_argument(
+        "--vive-clock-sync-startup-timeout-sec",
+        type=float,
+        default=5.0,
+        help="Maximum pre-recording wait for required VIVE clock calibration.",
+    )
     parser.add_argument("--left-tracker-name", type=str, default="tracker_1", help="Left wrist tracker name.")
     parser.add_argument("--right-tracker-name", type=str, default="tracker_2", help="Right wrist tracker name.")
     parser.add_argument("--left-arm-ip", type=str, default="", help="Left RM65 IP.")
@@ -955,6 +1067,18 @@ def parse_args() -> argparse.Namespace:
             "Hand/gripper backend type. Use dmtac-gripper to map Q6 to a generic "
             "1D gripper controller through the DMTAC gripper backend."
         ),
+    )
+    parser.add_argument(
+        "--left-hand-backend",
+        choices=HAND_BACKEND_CHOICES,
+        default=None,
+        help="Optional left-side override for --hand-backend.",
+    )
+    parser.add_argument(
+        "--right-hand-backend",
+        choices=HAND_BACKEND_CHOICES,
+        default=None,
+        help="Optional right-side override for --hand-backend.",
     )
     parser.add_argument(
         "--q6-config",
@@ -1138,6 +1262,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dmtac-tactile-calibrate",
+        dest="dmtac_tactile_calibrate",
+        action="store_true",
+        default=None,
+        help=(
+            "Capture a DM-Tac no-contact base frame before reads. This is enabled automatically "
+            "when requesting solved tactile fields and disabled for raw-image-only collection."
+        ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-no-calibrate",
+        dest="dmtac_tactile_calibrate",
+        action="store_false",
+        help="Do not capture a DM-Tac base frame at startup, even for solved tactile fields.",
+    )
+    parser.add_argument(
         "--dmtac-tactile-denoise",
         dest="dmtac_tactile_denoise",
         action="store_true",
@@ -1307,18 +1447,36 @@ def parse_args() -> argparse.Namespace:
         "--hz",
         type=_positive_float,
         default=DEFAULT_TELEOP_SAMPLE_HZ,
-        help="Dataset sampling/action rate. Defaults to 15 Hz for single-arm and bimanual collection.",
+        help="Dataset sampling rate. Defaults to 15 Hz for single-arm and bimanual collection.",
+    )
+    parser.add_argument(
+        "--position-reference-hz",
+        type=_positive_float,
+        default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
+        help=(
+            "Teleop IK/safety/qpos-reference rate for position control. This clock is "
+            "independent of --hz and defaults to 75 Hz."
+        ),
+    )
+    parser.add_argument(
+        "--position-reference-max-age-sec",
+        type=_positive_float,
+        default=0.2,
+        help=(
+            "Maximum age of the latest causally published qpos reference used for a "
+            "15 Hz action label. Older/missing references drop the training row."
+        ),
     )
     parser.add_argument(
         "--arm-control-hz",
         type=_positive_float,
-        default=DEFAULT_RM65_ARM_CONTROL_HZ,
-        help="RM65 backend streaming/control rate after each sampled action. Defaults to 40 Hz.",
+        default=DEFAULT_RM65_POSITION_ARM_CONTROL_HZ,
+        help="RM65 position command streaming rate beneath each qpos reference. Defaults to 150 Hz.",
     )
     parser.add_argument(
         "--dual-arm-ik-hz",
         type=_positive_float,
-        default=15.0,
+        default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
         help="Target dual-arm MultiTask IK update frequency used for solver dt and default time budget.",
     )
     parser.add_argument(
@@ -1386,6 +1544,22 @@ def parse_args() -> argparse.Namespace:
         type=_positive_int,
         default=10,
         help="Number of consecutive fault-free control frames required before auto recovery starts.",
+    )
+    parser.add_argument(
+        "--tracker-auto-hold-sec",
+        type=_positive_float,
+        default=0.10,
+        help="Automatically hold arm motion after a tracker target is unavailable for this long.",
+    )
+    parser.add_argument(
+        "--tracker-manual-hold-sec",
+        type=_positive_float,
+        default=1.0,
+        help=(
+            "Escalate tracker loss to a latched manual hold after this long; "
+            "a new runtime home capture is then required. The default leaves a 0.1 s "
+            "automatic-hold/recovery window before escalating at 1.0 s."
+        ),
     )
     parser.add_argument(
         "--recovery-ramp-sec",
@@ -1470,6 +1644,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-parquet", dest="write_parquet", action="store_false")
     parser.set_defaults(write_parquet=True)
     parser.add_argument(
+        "--policy-io-layout",
+        type=str,
+        default="",
+        help=(
+            "Optional DexTeleop v2.2 policy-I/O layout JSON, or literal 'auto' to resolve a "
+            "strict layout from the instantiated backend/retargeter pairs. When supplied, "
+            "collection keeps LeRobot-v2.1-style storage but writes typed v2.2 fields."
+        ),
+    )
+    parser.add_argument(
         "--nominal-fps",
         type=_positive_float,
         default=None,
@@ -1506,6 +1690,16 @@ def parse_args() -> argparse.Namespace:
         type=_positive_float,
         default=0.2,
         help="Mark actual wrist camera pose annotations stale when their sample-time age exceeds this value.",
+    )
+    parser.add_argument(
+        "--actual-wrist-camera-pose-warmup-timeout-sec",
+        "--actual-wrist-pose-warmup-timeout-sec",
+        type=_non_negative_float,
+        default=2.0,
+        help=(
+            "Before an episode starts, wait up to this duration for each active arm to have "
+            "a fresh causal actual TCP feedback sample. Set to 0 to only check once."
+        ),
     )
     parser.add_argument(
         "--replay-dataset",
@@ -1745,10 +1939,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tactile-compression",
         choices=("zstd", "lz4", "none"),
-        default="lz4",
+        default="none",
         help=(
-            "Compression for external tactile streams. lz4 is the default; use none "
-            "to write legacy raw .bin streams."
+            "Compression for external tactile streams. none is the default and writes "
+            "raw .bin streams; use lz4 or zstd for lossless chunk compression."
         ),
     )
     parser.add_argument(
@@ -1852,13 +2046,33 @@ def parse_args() -> argparse.Namespace:
     _apply_default_q6_ports(args, parser=parser)
     _apply_collection_layout(args)
     args.dmtac_config_loaded_sides = []
-    if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER:
+    if any(
+        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+        for side in args.active_sides
+    ):
         try:
             args.gripper_policy = _resolved_gripper_policy(args)
         except Exception as exc:  # noqa: BLE001
             parser.error(str(exc))
     else:
         args.gripper_policy = {}
+    if not 0 <= int(args.vive_clock_sync_port) <= 65535:
+        parser.error("--vive-clock-sync-port must be in [0, 65535].")
+    if (
+        int(args.vive_clock_sync_port)
+        and int(args.vive_clock_sync_port) == int(args.port)
+    ):
+        parser.error("--vive-clock-sync-port must differ from the VIVE --port.")
+    if bool(args.vive_clock_sync_required) and int(args.vive_clock_sync_port) <= 0:
+        parser.error("--vive-clock-sync-required requires --vive-clock-sync-port.")
+    if int(args.vive_clock_sync_min_samples) < 1:
+        parser.error("--vive-clock-sync-min-samples must be >= 1.")
+    if float(args.vive_clock_sync_max_rtt_ms) < 0.0:
+        parser.error("--vive-clock-sync-max-rtt-ms must be >= 0.")
+    if float(args.vive_clock_sync_stale_after_sec) < 0.0:
+        parser.error("--vive-clock-sync-stale-after-sec must be >= 0.")
+    if float(args.vive_clock_sync_startup_timeout_sec) < 0.0:
+        parser.error("--vive-clock-sync-startup-timeout-sec must be >= 0.")
     return args
 
 
@@ -1885,6 +2099,8 @@ class CollectApp:
     replay_action_filter: ActionSafetyFilter | None
     replay_init_plan: "ReplayInitEpisodePlan | None"
     arm_state_poller: ArmHardwareStatePoller | None
+    hand_state_poller: HandStateHistoryPoller | None
+    position_reference_publisher: PositionReferencePublisher
 
 
 @dataclass
@@ -1930,6 +2146,8 @@ class CollectControlState:
     debug_frozen_report_interval_sec: float = 1.0
     debug_frozen_last_report_at: float = 0.0
     debug_frozen_suppressed_reports: int = 0
+    recording_paused: bool = False
+    recording_pause_reason: str = ""
 
 
 @dataclass
@@ -2171,6 +2389,18 @@ def _build_vive_source(args: argparse.Namespace, active_sides: tuple[str, ...]) 
         tracker_configs=tracker_configs,
         host=args.host,
         port=int(args.port),
+        clock_sync_bind_host=(
+            str(args.vive_clock_sync_bind_host).strip() or str(args.host)
+        ),
+        clock_sync_port=int(args.vive_clock_sync_port),
+        clock_sync_max_round_trip_sec=(
+            float(args.vive_clock_sync_max_rtt_ms) / 1000.0
+        ),
+        clock_sync_stale_after_sec=float(args.vive_clock_sync_stale_after_sec),
+        clock_sync_min_samples=int(args.vive_clock_sync_min_samples),
+        clock_sync_expected_sender_host=(
+            str(args.vive_clock_sync_expected_sender_host).strip() or None
+        ),
         name="vive_pose_collect",
     )
 
@@ -2235,8 +2465,20 @@ def _select_preview_camera_sources(
 
 
 def _build_hand_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> HandQ6Source | None:
-    left_port = args.left_hand_port if "left" in active_sides and args.left_hand_port else None
-    right_port = args.right_hand_port if "right" in active_sides and args.right_hand_port else None
+    left_port = (
+        args.left_hand_port
+        if "left" in active_sides
+        and _hand_backend_mode_for_side(args, "left") != HAND_BACKEND_NONE
+        and args.left_hand_port
+        else None
+    )
+    right_port = (
+        args.right_hand_port
+        if "right" in active_sides
+        and _hand_backend_mode_for_side(args, "right") != HAND_BACKEND_NONE
+        and args.right_hand_port
+        else None
+    )
     if left_port is None and right_port is None:
         return None
     return HandQ6Source.from_bimanual(
@@ -2302,6 +2544,7 @@ def _build_arm_retargeters(
                 translation_scale=float(args.translation_scale),
                 input_local_translation_offset=tracker_translation_offset,
                 input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
+                tracker_motion_intent_enabled=True,
             )
         )
 
@@ -2346,13 +2589,15 @@ def _build_hand_retargeters(
 ) -> dict[str, Any]:
     topology = CollectionTopology.for_active_sides(active_sides)
     retargeters: dict[str, Any] = {}
-    mode = _hand_backend_mode(args)
-    if mode == HAND_BACKEND_NONE:
-        return retargeters
-    if mode == HAND_BACKEND_DMTAC_GRIPPER:
+    if any(
+        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+        for side in active_sides
+    ):
         policy = _resolved_gripper_policy(args)
         dmtac_configs = _dmtac_backend_configs(args, active_sides)
         for side in active_sides:
+            if _hand_backend_mode_for_side(args, side) != HAND_BACKEND_DMTAC_GRIPPER:
+                continue
             hand_port = getattr(args, f"{side}_hand_port")
             dmtac_config = dmtac_configs.get(side)
             if not hand_port or dmtac_config is None or not bool(dmtac_config.connect_hardware):
@@ -2371,9 +2616,10 @@ def _build_hand_retargeters(
                     output_max=float(policy["max_action"]),
                 )
             )
-        return retargeters
 
     for side in active_sides:
+        if _hand_backend_mode_for_side(args, side) != HAND_BACKEND_INSPIRE:
+            continue
         hand_port = getattr(args, f"{side}_hand_port")
         if not hand_port:
             continue
@@ -2397,12 +2643,18 @@ def _build_backends(
     topology = CollectionTopology.for_active_sides(active_sides)
     arm_urdf_path = require_asset_path("rm65_arm.urdf")
     arm_control_hz = float(args.arm_control_hz)
-    control_dt = 1.0 / arm_control_hz
+    reference_hz = float(
+        getattr(
+            args,
+            "position_reference_hz",
+            DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
+        )
+    )
+    control_dt = 1.0 / reference_hz
     all_backends: dict[str, Any] = {}
     rig_backends: dict[str, Any] = {}
     tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions) if args.with_tactile else ()
-    hand_backend_mode = _hand_backend_mode(args)
-    dmtac_configs = _dmtac_backend_configs(args, active_sides) if hand_backend_mode == HAND_BACKEND_DMTAC_GRIPPER else {}
+    dmtac_configs = _dmtac_backend_configs(args, active_sides)
 
     for side in active_sides:
         arm_backend = RM65ArmBackend(
@@ -2424,6 +2676,7 @@ def _build_backends(
         all_backends[arm_effector] = arm_backend
         rig_backends[arm_effector] = arm_backend
 
+        hand_backend_mode = _hand_backend_mode_for_side(args, side)
         if hand_backend_mode == HAND_BACKEND_NONE:
             continue
         if hand_backend_mode == HAND_BACKEND_DMTAC_GRIPPER:
@@ -2520,14 +2773,19 @@ def _episode_metadata(
             "timeout_sec": float(args.return_home_timeout),
             "key": "r",
         },
-        "runtime_arm_state_source": "last_commanded_action",
+        "runtime_arm_state_source": "causal_measured_hardware_preferred",
+        "runtime_arm_state_fallback": "last_commanded_action",
         "control_mode": str(args.control_mode),
+        "arm_control_mode": "position",
         "hz": float(args.hz),
+        "sample_hz": float(args.hz),
+        "position_reference_hz": float(args.position_reference_hz),
+        "position_reference_max_age_sec": float(args.position_reference_max_age_sec),
         "arm_control_hz": float(args.arm_control_hz),
         "rm65_ik_framework": str(getattr(args, "rm65_ik_framework", "robot_motion")),
         "nominal_fps": float(args.nominal_fps),
         "tactile_storage": str(getattr(args, "tactile_storage", "external")),
-        "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
+        "tactile_compression": str(getattr(args, "tactile_compression", "none")),
         "storage_queue_size": int(getattr(args, "storage_queue_size", 64)),
         "left_arm_ip": args.left_arm_ip or None,
         "right_arm_ip": args.right_arm_ip or None,
@@ -2536,6 +2794,9 @@ def _episode_metadata(
         "left_hand_port": args.left_hand_port or None,
         "right_hand_port": args.right_hand_port or None,
         "hand_backend": _hand_backend_mode(args),
+        "hand_backend_by_side": {
+            side: _hand_backend_mode_for_side(args, side) for side in active_sides
+        },
         "q6_config": str(getattr(args, "q6_config", "latest")),
         "q6_default_config_enabled": bool(getattr(args, "q6_default_config", True)),
         "q6_config_loaded_ports": dict(getattr(args, "q6_config_loaded_ports", {}) or {}),
@@ -2559,7 +2820,10 @@ def _episode_metadata(
         "dmtac_tactile_flat_vector": getattr(args, "dmtac_tactile_flat_vector", None),
         "gripper_task_profile": str(getattr(args, "gripper_task_profile", "") or "") or None,
         "gripper_policy": dict(getattr(args, "gripper_policy", {}) or _resolved_gripper_policy(args))
-        if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
+        if any(
+            _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+            for side in active_sides
+        )
         else {},
         "max_fingertip_force": int(args.max_fingertip_force),
         "hand_tactile_regions": list(_parse_hand_tactile_regions(args.hand_tactile_regions))
@@ -2944,6 +3208,8 @@ def _set_jitter_randomization_enabled(app: CollectApp, enabled: bool) -> None:
 
 
 def _collect_arm_states_for_deployment(app: CollectApp) -> dict[str, dict[str, Any]]:
+    if app.arm_state_poller is not None:
+        return app.arm_state_poller.latest_by_side(sample_timestamp=time.time())
     states: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
         backend = _arm_backend(app, side)
@@ -2963,6 +3229,8 @@ def _collect_arm_states_for_deployment(app: CollectApp) -> dict[str, dict[str, A
 
 
 def _collect_hand_states_for_deployment(app: CollectApp) -> dict[str, dict[str, Any]]:
+    if app.hand_state_poller is not None:
+        return app.hand_state_poller.latest_by_side(sample_timestamp=time.time())
     states: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
         backend = _hand_backend(app, side)
@@ -3496,19 +3764,36 @@ def _resolve_robot_home_for_side(
 
 
 def _start_unmanaged_backends(backends: Mapping[str, Any]) -> None:
-    for backend in backends.values():
-        if hasattr(backend, "start"):
-            backend.start()
+    rollback_steps = []
+    try:
+        for name, backend in backends.items():
+            start = getattr(backend, "start", None)
+            if not callable(start):
+                continue
+            close = getattr(backend, "close", None)
+            if callable(close):
+                rollback_steps.append((f"backend[{name}]", close))
+            start()
+    except BaseException as start_error:  # noqa: BLE001 - rollback before propagating.
+        rollback_failures = collect_lifecycle_failures(reversed(rollback_steps))
+        if rollback_failures:
+            raise LifecycleStartupError(
+                "collection.unmanaged_backends.start",
+                start_error,
+                rollback_failures,
+            ) from start_error
+        raise
 
 
 def _close_unmanaged_backends(backends: Mapping[str, Any]) -> None:
-    for name, backend in reversed(list(backends.items())):
-        if not hasattr(backend, "close"):
-            continue
-        try:
-            backend.close()
-        except Exception as exc:
-            _log("CollectClose", f"backend={name} close_failed={exc}")
+    run_best_effort_cleanup(
+        "collection.unmanaged_backends.close",
+        (
+            (f"backend[{name}]", close)
+            for name, backend in reversed(tuple(backends.items()))
+            if callable(close := getattr(backend, "close", None))
+        ),
+    )
 
 
 def _runtime_home_calibration(
@@ -3794,6 +4079,12 @@ def _sync_teleop_home_after_return(app: CollectApp, *, now: float) -> None:
 
 def _start_return_home(app: CollectApp, args: argparse.Namespace) -> None:
     state = app.control_state
+    if bool(getattr(app.components.session, "home_recalibration_required", False)):
+        _log(
+            "ReturnHome",
+            "ignore r: tracker-loss manual hold is latched; press p to capture runtime home first.",
+        )
+        return
     if state.active_replay_run is not None:
         _log("ReturnHome", "ignore r: trajectory replay episode is active; press x to abort first.")
         return
@@ -3882,6 +4173,7 @@ def _advance_return_home(
     _sync_teleop_home_after_return(app, now=now)
     app.components.session.set_calibration_ready()
     app.components.session.mark_debug_passed()
+    app.position_reference_publisher.reset_epoch()
     app.components.session.arm_hardware()
     app.control_state.return_home_plan = None
     error_summary = {side: round(error, 5) for side, error in errors.items()}
@@ -3897,7 +4189,12 @@ def _advance_return_home(
 
 
 def _run_keyed_home_calibration(app: CollectApp, args: argparse.Namespace) -> None:
-    if app.control_state.recording_active:
+    tracker_hold_resume = bool(
+        app.control_state.recording_active
+        and app.control_state.recording_paused
+        and app.control_state.recording_pause_reason == "tracker_loss/manual_hold"
+    )
+    if app.control_state.recording_active and not tracker_hold_resume:
         _log("Keys", "ignore p: recording is active; press c to save or d to discard first.")
         return
     _log("Keys", "p: calibration requested; holding hardware and syncing arms.")
@@ -3911,9 +4208,18 @@ def _run_keyed_home_calibration(app: CollectApp, args: argparse.Namespace) -> No
         num_samples=int(args.calibration_samples),
     )
     app.writer.write_calibration_snapshot("teleop_profile", app.calibration.to_dict())
+    app.components.session.mark_home_recalibrated("collection runtime home captured")
     app.components.session.set_calibration_ready()
     app.components.session.mark_debug_passed()
+    app.position_reference_publisher.reset_epoch()
     app.components.session.arm_hardware()
+    if tracker_hold_resume:
+        app.control_state.recording_paused = False
+        app.control_state.recording_pause_reason = ""
+        _log(
+            "TrackerHold",
+            "runtime home recaptured; paused episode sampling resumed without starting a new episode",
+        )
     _log("Keys", "p: runtime home captured; arm following is enabled.")
     _print_standby(app)
 
@@ -3932,6 +4238,8 @@ def _start_recording_episode(app: CollectApp, args: argparse.Namespace) -> None:
     if not app.replay_groups and not bool(app.calibration.metadata.get("home_ready")):
         _log("Episode", "ignore z: press p to calibrate home before recording.")
         return
+    if not _wait_for_actual_state_warmup(app, args, context="manual episode"):
+        return
     episode_index = app.writer.start_episode(
         metadata=_episode_metadata(
             args,
@@ -3944,13 +4252,44 @@ def _start_recording_episode(app: CollectApp, args: argparse.Namespace) -> None:
     app.sample_builder.set_episode(episode_index)
     _set_jitter_randomization_enabled(app, True)
     state.recording_active = True
+    state.recording_paused = False
+    state.recording_pause_reason = ""
     state.active_episode_index = int(episode_index)
     state.active_episode_started_at = time.time()
     print(f"\n开始录制片段 Start recording episode: {episode_index}", flush=True)
 
 
+def _wait_for_actual_state_warmup(
+    app: CollectApp,
+    args: argparse.Namespace,
+    *,
+    context: str,
+) -> bool:
+    """Prevent a newly opened episode from receiving an empty feedback first frame."""
+
+    poller = app.arm_state_poller
+    if poller is None:
+        return True
+    timeout_sec = float(getattr(args, "actual_wrist_camera_pose_warmup_timeout_sec", 2.0))
+    readiness = poller.wait_until_ready(
+        required_sides=app.active_sides,
+        timeout_sec=timeout_sec,
+    )
+    pending = {side: reason for side, reason in readiness.items() if reason is not None}
+    if not pending:
+        return True
+    details = ", ".join(f"{side}={reason}" for side, reason in sorted(pending.items()))
+    _log(
+        "Episode",
+        f"do not start {context}: actual TCP feedback not ready after {timeout_sec:.2f}s ({details}).",
+    )
+    return False
+
+
 def _reset_recording_state(state: CollectControlState) -> None:
     state.recording_active = False
+    state.recording_paused = False
+    state.recording_pause_reason = ""
     state.active_episode_index = None
     state.active_episode_started_at = None
     state.active_replay_run = None
@@ -4262,6 +4601,9 @@ def _start_replay_episode(
     startup_duration = float(args.replay_init_time)
     startup_source = "replay:first_frame" if startup_duration > 0.0 else "disabled"
 
+    if not _wait_for_actual_state_warmup(app, args, context="replay episode"):
+        return
+
     episode_index = app.writer.start_episode(
         metadata=_episode_metadata(
             args,
@@ -4358,6 +4700,8 @@ def _start_recorded_replay_run_from_group(
     state = app.control_state
     if state.recording_active or state.active_replay_run is not None or _has_active_finalize_tasks(state):
         _log("Replay", "ignore recorded start: another recorded replay is active.")
+        return
+    if not _wait_for_actual_state_warmup(app, args, context="recorded replay episode"):
         return
     episode_index = app.writer.start_episode(
         metadata=_episode_metadata(
@@ -4690,14 +5034,7 @@ def _advance_unrecorded_replay_run(
             raise RuntimeError("Unrecorded replay action contains invalid active arm pose values.")
         raw_action = NormalizedAction(
             vector=action_vector,
-            metadata={
-                "safety_overrides": {
-                    "max_arm_xyz_step_m": 0.0,
-                    "max_arm_rot_step_deg": 0.0,
-                    "max_arm_joint_step_rad": 0.0,
-                    "max_hand_step": 0.0,
-                }
-            },
+            metadata={},
         )
         run.replay_index += 1
 
@@ -4780,14 +5117,7 @@ def _advance_replay_episode(
             raise RuntimeError("Replay action randomization produced invalid active arm pose values.")
         raw_action = NormalizedAction(
             vector=action_vector,
-            metadata={
-                "safety_overrides": {
-                    "max_arm_xyz_step_m": 0.0,
-                    "max_arm_rot_step_deg": 0.0,
-                    "max_arm_joint_step_rad": 0.0,
-                    "max_hand_step": 0.0,
-                }
-            },
+            metadata={},
         )
         run.replay_index += 1
 
@@ -4984,6 +5314,20 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     retargeters = list(arm_retargeters) + list(hand_retargeters.values())
 
     all_backends, rig_backends = _build_backends(args, active_sides)
+    position_reference_publisher = PositionReferencePublisher(
+        config=PositionReferencePublisherConfig(
+            active_sides=active_sides,
+            source="teleop_runtime.collection.run_collect",
+            reference_max_age_sec=float(args.position_reference_max_age_sec),
+        ),
+        fk_by_side={
+            side: (
+                lambda qpos, backend=all_backends[topology.arm_effector(side)]:
+                backend.compute_tcp_pose(qpos=qpos)
+            )
+            for side in active_sides
+        },
+    )
     arm_state_poller = (
         ArmHardwareStatePoller(
             backends_by_side={
@@ -4996,6 +5340,21 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             ),
         )
         if bool(getattr(args, "record_actual_wrist_camera_pose", True))
+        else None
+    )
+    hand_state_poller = (
+        HandStateHistoryPoller(
+            backends_by_side={
+                side: all_backends.get(topology.hand_effector(side))
+                for side in active_sides
+            },
+            config=HandStateHistoryPollerConfig(
+                # Poll only backend caches; this is cheap and gives the
+                # collector a chance to freeze a result before the next T0.
+                poll_hz=max(60.0, 2.0 * float(args.hz)),
+            ),
+        )
+        if any(all_backends.get(topology.hand_effector(side)) is not None for side in active_sides)
         else None
     )
     tactile_visualizer = _build_tactile_visualizer(args, active_sides)
@@ -5011,7 +5370,11 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             for side in active_sides
             if topology.hand_effector(side) in all_backends
         )
-        if replay_groups or _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
+        if replay_groups
+        or any(
+            _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+            for side in active_sides
+        )
         else tuple(hand_retargeters)
     )
     for side in hand_rig_sides:
@@ -5024,6 +5387,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     rig = BimanualRig(
         backends=rig_backends,
         parallel_dispatch=len(rig_backends) > 1,
+        fail_stop_on_dispatch_error=True,
     )
     replay_hands_enabled = any(topology.hand_effector(side) in rig_backends for side in active_sides)
     replay_action_filter = (
@@ -5048,6 +5412,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             mode="collect_real",
             record_enabled=False,
             recovery_healthy_frame_count=max(1, int(args.recovery_healthy_frames)),
+            tracker_loss_hold_enabled=not bool(replay_groups),
+            tracker_auto_hold_sec=float(getattr(args, "tracker_auto_hold_sec", 0.10)),
+            tracker_manual_hold_sec=float(getattr(args, "tracker_manual_hold_sec", 1.0)),
         ),
         sources=session_sources,
         retargeters=retargeters,
@@ -5060,7 +5427,6 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             else tuple(topology.wrist_pose_channel(side) for side in moving_sides),
             invalid_frame_limit=max(1, int(args.invalid_frame_limit)),
             minimum_control_hz=float(args.minimum_control_hz),
-            target_control_hz=float(args.hz),
         ),
     )
     components = CollectorComponents.from_iterables(
@@ -5077,11 +5443,22 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             "dataset_name": str(args.dataset_name),
             "active_sides": list(active_sides),
             "camera_frame_alignment_policy": "latest_before_or_at_sample_timestamp",
-            "hand_tactile_alignment_policy": "backend_latest_snapshot_at_sample_build",
+            "hand_tactile_alignment_policy": "causal_hand_history_at_T0",
+            "hand_state_alignment_policy": (
+                "source_timestamp<=T0_and_available_timestamp<=T0"
+            ),
+            "causal_snapshot_contract": "dexteleop_causal_snapshot_v1",
+            "hand_state_history_poll_hz": (
+                None if hand_state_poller is None else hand_state_poller.config.poll_hz
+            ),
             "moving_arm_sides": list(moving_sides),
             "fixed_arm_sides": list(fixed_sides),
             "jitter_arm_sides": list(jitter_sides),
-            "runtime_arm_state_source": "last_commanded_action",
+            "runtime_arm_state_source": "causal_measured_hardware_preferred",
+            "runtime_arm_state_fallback": "last_commanded_action",
+            "sample_hz": float(args.hz),
+            "position_reference_hz": float(args.position_reference_hz),
+            "position_command_hz": float(args.arm_control_hz),
             "record_actual_wrist_camera_pose": bool(arm_state_poller is not None),
             "actual_wrist_camera_pose_source": "rm65_feedback_qpos_fk",
             "actual_wrist_camera_pose_hz": float(args.actual_wrist_camera_pose_hz),
@@ -5089,14 +5466,30 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 args.actual_wrist_camera_pose_max_age_sec
             ),
             "tactile_storage": str(getattr(args, "tactile_storage", "external")),
-            "tactile_compression": str(getattr(args, "tactile_compression", "lz4")),
+            "tactile_compression": str(getattr(args, "tactile_compression", "none")),
             "hand_backend": _hand_backend_mode(args),
+            "hand_backend_by_side": {
+                side: _hand_backend_mode_for_side(args, side) for side in active_sides
+            },
             "gripper_policy": dict(getattr(args, "gripper_policy", {}) or _resolved_gripper_policy(args))
-            if _hand_backend_mode(args) == HAND_BACKEND_DMTAC_GRIPPER
+            if any(
+                _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+                for side in active_sides
+            )
             else {},
         },
     )
 
+    policy_io_resolution = resolve_collection_policy_io_layout(
+        getattr(args, "policy_io_layout", ""),
+        active_sides=active_sides,
+        hand_backends_by_side={
+            side: all_backends.get(topology.hand_effector(side)) for side in active_sides
+        },
+        hand_retargeters_by_side={
+            side: hand_retargeters.get(side) for side in active_sides
+        },
+    )
     writer = LeRobotV21Writer(
         LeRobotV21WriterConfig(
             root_dir=args.dataset_root,
@@ -5107,9 +5500,12 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             write_parquet=bool(args.write_parquet),
             write_video=bool(args.write_video and not args.no_camera),
             tactile_storage=str(getattr(args, "tactile_storage", "external")),
-            tactile_compression=str(getattr(args, "tactile_compression", "lz4")),
+            tactile_compression=str(getattr(args, "tactile_compression", "none")),
             allow_missing_video_frames=int(getattr(args, "storage_queue_size", 64)) > 0,
             hand_action_specs=_collection_hand_action_specs(args, active_sides),
+            policy_io_layout=policy_io_resolution.layout,
+            policy_io_layout_provenance=policy_io_resolution.provenance,
+            strict_v22_policy_io=bool(policy_io_resolution.layout is not None),
         )
     )
     control_state = CollectControlState(
@@ -5124,6 +5520,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 camera_key: source.frame_buffer()
                 for camera_key, source in camera_sources.items()
             },
+            require_camera_frames=bool(args.write_video and not args.no_camera),
+            camera_frame_max_age_sec=DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
             episode_index=writer.next_episode_index,
             sample_index_start=writer.next_sample_index,
             tactile_array_snapshot_policy=(
@@ -5131,6 +5529,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 if str(getattr(args, "tactile_storage", "external")).strip().lower().replace("-", "_") == "parquet"
                 else "on_change"
             ),
+            position_reference_max_age_sec=float(args.position_reference_max_age_sec),
+            prefer_causal_measured_arm_state=True,
         ),
         arm_state_metadata_provider=(
             None
@@ -5139,6 +5539,14 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 sample_timestamp=float(sample_timestamp)
             )
         ),
+        hand_state_provider=(
+            None
+            if hand_state_poller is None
+            else lambda _components, sample_timestamp: hand_state_poller.latest_by_side(
+                sample_timestamp=float(sample_timestamp)
+            )
+        ),
+        position_reference_provider=position_reference_publisher.reference_for_sample,
     )
     writer_pool = AsyncWriterPool(
         writer.handle_job,
@@ -5151,13 +5559,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     runtime = CollectionRuntime(
         components=components,
         sample_builder=lambda result, built_components: (
-            None
-            if (
-                not control_state.recording_active
-                or result.command is None
-                or str(result.state.value).lower() not in {"armed", "running"}
-            )
-            else sample_builder(result, built_components)
+            sample_builder(result, built_components)
+            if _collection_step_is_recordable(control_state, result)
+            else None
         ),
         write_planner=lambda sample, _components: writer.plan_sample_jobs(sample),
         writer_pool=writer_pool,
@@ -5195,6 +5599,8 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         replay_action_filter=replay_action_filter,
         replay_init_plan=replay_init_plan,
         arm_state_poller=arm_state_poller,
+        hand_state_poller=hand_state_poller,
+        position_reference_publisher=position_reference_publisher,
     )
 
 
@@ -5220,6 +5626,19 @@ def _fault_status_text(faults: list[Any]) -> str:
     return _snapshot_fault_status_text(faults)
 
 
+def _collection_step_is_recordable(
+    control: CollectControlState,
+    result: SessionStepResult,
+) -> bool:
+    if not control.recording_active or control.recording_paused or result.command is None:
+        return False
+    state_value = str(result.state.value).lower()
+    return bool(
+        state_value in {"armed", "running"}
+        or result.motion_hold_mode in {TRACKER_HOLD_GRACE, TRACKER_HOLD_AUTOMATIC}
+    )
+
+
 def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None, app: CollectApp) -> str:
     topology = CollectionTopology.for_active_sides(app.active_sides)
     state_value = (
@@ -5228,7 +5647,10 @@ def _status_line(step_count: int, runtime: CollectionRuntime, result: Any | None
         else app.components.session.state_machine.state.value
     )
     control = app.control_state
-    recording = "on" if control.recording_active else "off"
+    if control.recording_active and control.recording_paused:
+        recording = f"paused:{control.recording_pause_reason or 'manual'}"
+    else:
+        recording = "on" if control.recording_active else "off"
     home = "ready" if app.calibration.metadata.get("home_ready") else "unset"
     episode = control.active_episode_index
     if result is None and control.active_replay_run is not None:
@@ -5304,9 +5726,12 @@ def main() -> int:
     last_status_at = 0.0
     last_fault_signature: tuple[str, ...] | None = None
     last_camera_state_signature: tuple[str, ...] | None = None
+    last_camera_sample_rejection: str | None = None
     tactile_preview_rate = PreviewRateLimiter(float(args.tactile_vis_hz))
     camera_preview_rate = PreviewRateLimiter(float(args.vis_cam_hz))
-    loop_period_sec = 1.0 / float(args.hz)
+    sample_rate_gate = PeriodicRateGate(float(args.hz))
+    reference_loop_period_sec = 1.0 / float(args.position_reference_hz)
+    legacy_loop_period_sec = 1.0 / float(args.hz)
     should_quit = False
     recovery_plan: RecoveryPlan | None = None
 
@@ -5333,8 +5758,41 @@ def main() -> int:
         runtime.start()
         _start_unmanaged_backends(app.unmanaged_backends)
         app.components.session.start()
+        vive_source = next(
+            (
+                source
+                for source in app.components.sources.values()
+                if isinstance(source, VivePoseSource)
+            ),
+            None,
+        )
+        if vive_source is not None and vive_source.clock_sync_enabled:
+            sync_wait_sec = (
+                float(args.vive_clock_sync_startup_timeout_sec)
+                if bool(args.vive_clock_sync_required)
+                else 0.0
+            )
+            sync_ready = vive_source.wait_for_clock_sync(
+                sync_wait_sec,
+                min_samples=int(args.vive_clock_sync_min_samples),
+            )
+            sync_stats = vive_source.clock_sync_debug_stats()
+            _log(
+                "ViveClockSync",
+                "startup "
+                f"ready={sync_ready} required={bool(args.vive_clock_sync_required)} "
+                f"stats={sync_stats}",
+            )
+            if bool(args.vive_clock_sync_required) and not sync_ready:
+                raise RuntimeError(
+                    "Required VIVE clock synchronization did not become ready before "
+                    "collection startup. Check sender --clock-sync-* settings and the "
+                    "separate UDP control port."
+                )
         if app.arm_state_poller is not None:
             app.arm_state_poller.start()
+        if app.hand_state_poller is not None:
+            app.hand_state_poller.start()
         key_controller.start()
         synced = _sync_arm_backends_from_hardware(app, required=True)
         _log("ArmSync", f"startup hardware sync complete synced={synced}")
@@ -5474,7 +5932,7 @@ def main() -> int:
                 step_count += 1
                 loop_phase_timer.mark("loop.advance_return_home")
             elif app.calibration.metadata.get("home_ready"):
-                result = runtime.step(
+                result = runtime.control_step(
                     now=loop_started_at,
                     phase_recorder=loop_phase_timer.record
                     if app.control_state.debug_frozen_enabled
@@ -5482,6 +5940,54 @@ def main() -> int:
                 )
                 step_count += 1
                 loop_phase_timer.mark("loop.runtime_step")
+                if result.home_recalibration_required:
+                    if app.control_state.recording_active:
+                        app.control_state.recording_paused = True
+                        app.control_state.recording_pause_reason = "tracker_loss/manual_hold"
+                        _log(
+                            "TrackerHold",
+                            "active episode sampling paused; "
+                            "the same episode will resume after p home",
+                        )
+                    _clear_runtime_home(app)
+                    recovery_plan = None
+                    _log(
+                        "TrackerHold",
+                        "tracker target loss exceeded manual-hold threshold; "
+                        "runtime home was cleared and p is required before motion can resume",
+                    )
+                    _print_standby(app)
+                    continue
+                app.position_reference_publisher.publish_step(result)
+                loop_phase_timer.mark("loop.publish_position_reference")
+                if sample_rate_gate.is_due(time.monotonic()):
+                    # ``result.timestamp`` is the action/control cut (T0).
+                    # The sample builder may run later, but must never include
+                    # telemetry that arrived during dispatch or serialization.
+                    sample_cut_timestamp = float(result.timestamp)
+                    recorded_sample = runtime.record_step(
+                        replace(
+                            result,
+                            timestamp=float(sample_cut_timestamp),
+                            action_record=None,
+                        ),
+                        phase_recorder=loop_phase_timer.record
+                        if app.control_state.debug_frozen_enabled
+                        else None,
+                    )
+                    camera_rejection = app.sample_builder.last_camera_rejection
+                    if camera_rejection != last_camera_sample_rejection:
+                        if camera_rejection is not None:
+                            _log(
+                                "Camera",
+                                "sample blocked because a required camera frame is not fresh: "
+                                f"{camera_rejection}; max_age_sec="
+                                f"{DEFAULT_CAMERA_FRAME_MAX_AGE_SEC:.3f}",
+                            )
+                        elif last_camera_sample_rejection is not None and recorded_sample is not None:
+                            _log("Camera", "fresh frames restored; dataset sampling resumed")
+                        last_camera_sample_rejection = camera_rejection
+                    loop_phase_timer.mark("loop.record_sample")
                 recovery_plan = _drive_recovery_step(
                     app,
                     args,
@@ -5567,7 +6073,15 @@ def main() -> int:
             )
             active_replay = app.control_state.active_replay_run
             active_unrecorded = app.control_state.active_unrecorded_replay_run
-            active_period_sec = loop_period_sec
+            active_period_sec = (
+                reference_loop_period_sec
+                if (
+                    active_replay is None
+                    and active_unrecorded is None
+                    and app.control_state.return_home_plan is None
+                )
+                else legacy_loop_period_sec
+            )
             if active_replay is not None and (
                 not active_replay.startup_initializer.enabled
                 or active_replay.startup_initializer.completed
@@ -5583,41 +6097,84 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n键盘中断，停止采集 Keyboard interrupt, stopping collection\n", flush=True)
     finally:
-        try:
-            if app.control_state.active_unrecorded_replay_run is not None:
-                run = app.control_state.active_unrecorded_replay_run
-                purpose = run.purpose
-                _restore_replay_arm_speed_override(app, run.original_max_angvel_by_side)
-                _rollback_pending_replay_pool_selection(app, run)
-                app.control_state.active_unrecorded_replay_run = None
-                app.components.session.hold_hardware("shutdown during unrecorded replay init")
-                _log("ReplayInit", f"shutdown stopped unrecorded run purpose={purpose}.")
-            if app.control_state.recording_active:
-                _save_active_episode(
-                    app,
-                    step_count=step_count,
-                    reason="shutdown/save_active",
-                    show_standby=False,
+        shutdown_steps: list[tuple[str, Any]] = []
+        if app.control_state.active_unrecorded_replay_run is not None:
+            unrecorded_run = app.control_state.active_unrecorded_replay_run
+            shutdown_steps.extend(
+                [
+                    (
+                        "unrecorded_replay.restore_speed",
+                        lambda run=unrecorded_run: _restore_replay_arm_speed_override(
+                            app,
+                            run.original_max_angvel_by_side,
+                        ),
+                    ),
+                    (
+                        "unrecorded_replay.rollback_selection",
+                        lambda run=unrecorded_run: _rollback_pending_replay_pool_selection(
+                            app,
+                            run,
+                        ),
+                    ),
+                    (
+                        "unrecorded_replay.clear_state",
+                        lambda: setattr(
+                            app.control_state,
+                            "active_unrecorded_replay_run",
+                            None,
+                        ),
+                    ),
+                    (
+                        "unrecorded_replay.hold_hardware",
+                        lambda: app.components.session.hold_hardware(
+                            "shutdown during unrecorded replay init"
+                        ),
+                    ),
+                    (
+                        "unrecorded_replay.log",
+                        lambda run=unrecorded_run: _log(
+                            "ReplayInit",
+                            f"shutdown stopped unrecorded run purpose={run.purpose}.",
+                        ),
+                    ),
+                ]
+            )
+        if app.control_state.recording_active:
+            shutdown_steps.append(
+                (
+                    "active_episode",
+                    lambda: _save_active_episode(
+                        app,
+                        step_count=step_count,
+                        reason="shutdown/save_active",
+                        show_standby=False,
+                    ),
                 )
-            _wait_finalize_tasks(app)
-        finally:
-            try:
-                key_controller.close()
-            finally:
-                try:
-                    if app.arm_state_poller is not None:
-                        app.arm_state_poller.close()
-                finally:
-                    try:
-                        if app.tactile_visualizer is not None:
-                            app.tactile_visualizer.close()
-                    finally:
-                        try:
-                            if app.camera_previewer is not None:
-                                app.camera_previewer.close()
-                        finally:
-                            runtime.close()
-                            _close_unmanaged_backends(app.unmanaged_backends)
+            )
+        shutdown_steps.extend(
+            [
+                ("finalize_tasks", lambda: _wait_finalize_tasks(app)),
+                ("key_controller", key_controller.close),
+            ]
+        )
+        if app.arm_state_poller is not None:
+            shutdown_steps.append(("arm_state_poller", app.arm_state_poller.close))
+        if app.hand_state_poller is not None:
+            shutdown_steps.append(("hand_state_poller", app.hand_state_poller.close))
+        if app.tactile_visualizer is not None:
+            shutdown_steps.append(("tactile_visualizer", app.tactile_visualizer.close))
+        if app.camera_previewer is not None:
+            shutdown_steps.append(("camera_previewer", app.camera_previewer.close))
+        shutdown_steps.extend(
+            [
+                (
+                    "unmanaged_backends",
+                    lambda: _close_unmanaged_backends(app.unmanaged_backends),
+                ),
+                ("collection_runtime", runtime.close),
+            ]
+        )
+        run_best_effort_cleanup("run_collect.shutdown", shutdown_steps)
 
     print(
         "采集结束 / Collection done: "

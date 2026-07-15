@@ -3,6 +3,7 @@
 from .dual_arm_collision_aware import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
+    DualArmQposCollisionCheck,
 )
 from .joints_to_dexhand import JointsToDexHandRetargeter, JointsToDexHandRetargeterConfig
 from .non_operator_arm import (
@@ -23,6 +24,7 @@ from .scalar_to_gripper import (
 __all__ = [
     "DualArmCollisionAwareRetargeter",
     "DualArmCollisionAwareRetargeterConfig",
+    "DualArmQposCollisionCheck",
     "FixedArmRetargeter",
     "FixedArmRetargeterConfig",
     "JointsToDexHandRetargeter",

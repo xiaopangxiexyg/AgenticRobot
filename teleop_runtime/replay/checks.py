@@ -8,9 +8,9 @@ from scipy.spatial.transform import Rotation as R
 
 from hardware.rm65.calibration_profiles import ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD, load_profile
 
-from ..deploy.schema import ACTION_ARM_POSE_SLICES, ARM_JOINT_DOF, xyzquat_to_pose_matrix
-from .action_frame import replay_action_metadata, replay_end_effector_targets_at_index
-from .trajectory import (
+from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ARM_JOINT_DOF, xyzquat_to_pose_matrix
+from robot_motion.replay.action_frame import replay_action_metadata, replay_end_effector_targets_at_index
+from robot_motion.replay.trajectory import (
     QPOS_INIT_AUTO,
     REPLAY_TRAJECTORY_ACTION_POSE,
     REPLAY_TRAJECTORY_QPOS_TARGET,

@@ -7,7 +7,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping
 
-from .observation import DeploymentObservation
+from robot_motion.deploy.observation import DeploymentObservation
 
 
 @dataclass

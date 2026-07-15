@@ -47,6 +47,19 @@ DMTAC_TACTILE_ARRAY_FIELDS = (
     "distributed_force",
 )
 DMTAC_DEFAULT_TACTILE_FIELDS = ("raw",)
+# These fields are interpreted relative to a no-contact base frame.  Raw and
+# infer images are camera outputs and remain meaningful without an SDK reset.
+DMTAC_TACTILE_CALIBRATED_FIELDS = frozenset(
+    {
+        "deformation2d",
+        "shear",
+        "depth",
+        "force",
+        "distributed_force",
+        "contact_area",
+        "base_frame",
+    }
+)
 DMTAC_TACTILE_FIELD_DEFAULT_SHAPES = {
     "raw": DMTAC_RAW_IMAGE_SHAPE,
     "infer": (288, 384),
@@ -158,6 +171,12 @@ def _normalize_dmtac_tactile_fields(fields: Any) -> tuple[str, ...]:
 
 
 normalize_dmtac_tactile_fields = _normalize_dmtac_tactile_fields
+
+
+def dmtac_tactile_requires_calibration(fields: Any) -> bool:
+    """Whether requested tactile outputs require a fresh no-contact base frame."""
+
+    return bool(DMTAC_TACTILE_CALIBRATED_FIELDS.intersection(_normalize_dmtac_tactile_fields(fields)))
 
 
 def _dmtac_tactile_array_fields(fields: Any) -> tuple[str, ...]:
@@ -462,7 +481,7 @@ class DMTacGripperBackendConfig:
     tactile_parallel_read: bool = False
     tactile_global_read_lock: bool = True
     tactile_require_ready: bool = True
-    tactile_reset_on_start: bool = False
+    tactile_reset_on_start: bool | None = None
     tactile_ready_timeout_s: float = 10.0
     tactile_warmup_frames: int = 0
     tactile_denoise: bool = False
@@ -488,8 +507,10 @@ class DMTacGripperBackendConfig:
             raise ValueError("max_open_mm must be positive.")
         if int(self.command_dim) != 0:
             raise ValueError("DM-Tac gripper command_dim is fixed to hand slot 0.")
-        if not 0.0 <= float(self.max_action) <= GRIPPER_ACTION_MAX:
-            raise ValueError(f"max_action must be in [0, {GRIPPER_ACTION_MAX}].")
+        # Historical profiles sometimes capped this at 0.9/0.95.  That was a
+        # hardware-era workaround, not a distinct action space.  Keep one
+        # canonical DM-Tac command/state range for collection and deployment.
+        self.max_action = float(GRIPPER_ACTION_MAX)
         if float(self.command_hz) <= 0.0:
             raise ValueError("command_hz must be positive.")
         if float(self.telemetry_hz) <= 0.0:
@@ -501,6 +522,10 @@ class DMTacGripperBackendConfig:
         if int(self.tactile_max_fps) <= 0:
             raise ValueError("tactile_max_fps must be positive.")
         self.tactile_fields = normalize_dmtac_tactile_fields(self.tactile_fields)
+        if self.tactile_reset_on_start is None:
+            self.tactile_reset_on_start = dmtac_tactile_requires_calibration(self.tactile_fields)
+        else:
+            self.tactile_reset_on_start = bool(self.tactile_reset_on_start)
         profile = str(self.tactile_compute_profile).strip().lower().replace("_", "-")
         if profile not in {"dist-only", "legacy", "requested", "shear-depth"}:
             raise ValueError("tactile_compute_profile must be dist-only, legacy, requested, or shear-depth.")
@@ -903,6 +928,39 @@ class DMTacGripperBackend(EffectorBackend):
 
     def send_fixed_joint_pos(self, joint_pos: object) -> bool:
         return self._send_joint_pos(joint_pos, bypass_send_commands=True, force=True)
+
+    def set_torque(self, torque: float) -> float:
+        """Set normalized gripper torque and apply it to an active device now.
+
+        A normal position command can be skipped when its target has not
+        changed, so applying the torque here keeps an explicit runtime update
+        independent of the next gripper position change.  A disconnected or
+        command-disabled backend retains the requested value for its next
+        successful command.
+        """
+
+        value = float(torque)
+        if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("gripper torque must be a finite value in [0, 1].")
+        with self._lock:
+            previous_torque = float(self.config.torque)
+            previous_applied_torque = self._applied_torque
+            self.config.torque = value
+            if (
+                not self.config.connect_hardware
+                or not self.config.send_commands
+                or self.device is None
+                or getattr(self.device, "gripper", None) is None
+            ):
+                return value
+            try:
+                self.device.set_torque(value)
+            except Exception:
+                self.config.torque = previous_torque
+                self._applied_torque = previous_applied_torque
+                raise
+            self._applied_torque = value
+        return value
 
     def force_reconnect_gripper(self, reason: str = "manual_reconnect") -> bool:
         with self._lock:
@@ -1530,6 +1588,7 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_fields": tuple(self.config.tactile_fields),
             "tactile_compute_profile": str(self.config.tactile_compute_profile),
             "tactile_max_fps": int(self.config.tactile_max_fps),
+            "tactile_reset_on_start": bool(self.config.tactile_reset_on_start),
             "tactile_warmup_frames": int(self.config.tactile_warmup_frames),
             "tactile_denoise": bool(self.config.tactile_denoise),
             "tactile_store_flat_vector": bool(self.config.tactile_store_flat_vector),

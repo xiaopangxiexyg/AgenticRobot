@@ -5,6 +5,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from rm65_inspire_tac.pipeline import (
+    DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
+    DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES,
+)
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     as_rm65_qpos,
@@ -25,11 +29,11 @@ def test_default_collision_scene_is_dual_arm_hand_proxy_open():
 
     assert DEFAULT_COLLISION_SCENE == "dual_arm_hand_proxy_open"
     assert profile.name == "dual_arm_hand_proxy_open"
-    assert len(profile.collision_pairs) == 10
-    assert {box.geometry_name for box in profile.fixed_scene_boxes} == {
-        "camera_pole_0",
-        "table_0",
-    }
+    assert profile.collision_pairs == DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS
+    assert len(profile.collision_pairs) == 12
+    assert tuple(box.geometry_name for box in profile.fixed_scene_boxes) == (
+        DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES
+    )
 
 
 def test_tool_profiles_load_from_existing_calibration_directory():

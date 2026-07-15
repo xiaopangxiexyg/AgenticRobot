@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+
+def _deadline_expired(deadline_monotonic: float | None) -> bool:
+    return bool(
+        deadline_monotonic is not None
+        and time.perf_counter() >= float(deadline_monotonic)
+    )
 
 
 @dataclass(frozen=True)
@@ -220,6 +228,7 @@ class JointPosturePreference:
         max_step_rad: np.ndarray,
         q_min: np.ndarray | None = None,
         q_max: np.ndarray | None = None,
+        deadline_monotonic: float | None = None,
     ) -> tuple[list[tuple[str, np.ndarray, dict[str, Any]]], dict[str, Any]]:
         metadata: dict[str, Any] = {
             "enabled": bool(self.enabled and self.local_escape_enabled),
@@ -227,6 +236,10 @@ class JointPosturePreference:
         }
         if not self.enabled or not self.local_escape_enabled:
             metadata["status"] = "disabled"
+            return [], metadata
+        if _deadline_expired(deadline_monotonic):
+            metadata["status"] = "skipped_hard_deadline"
+            metadata["hard_deadline_expired"] = True
             return [], metadata
         q = np.asarray(reference_qpos, dtype=float).reshape(-1)
         step = np.asarray(max_step_rad, dtype=float).reshape(q.shape) * max(
@@ -263,6 +276,10 @@ class JointPosturePreference:
         candidates: list[tuple[str, np.ndarray, dict[str, Any]]] = []
         seen: list[np.ndarray] = []
         for label, directions in actions:
+            if _deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             if len(candidates) >= max(0, int(self.local_escape_max_candidates)):
                 break
             candidate = q.copy()
@@ -285,6 +302,10 @@ class JointPosturePreference:
             if any(np.allclose(candidate, existing, atol=1e-9) for existing in seen):
                 continue
             comparison = self.compare(q, candidate)
+            if _deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             if comparison.improvement_deg < max(0.0, self.local_escape_min_improvement_deg):
                 continue
             seen.append(candidate.copy())
@@ -321,6 +342,7 @@ class JointPosturePreference:
         max_step_rad: np.ndarray,
         q_min: np.ndarray | None = None,
         q_max: np.ndarray | None = None,
+        deadline_monotonic: float | None = None,
     ) -> tuple[list[tuple[str, np.ndarray, dict[str, Any]]], dict[str, Any]]:
         metadata: dict[str, Any] = {
             "enabled": bool(self.enabled and self.wrist_unload_enabled),
@@ -328,6 +350,10 @@ class JointPosturePreference:
         }
         if not self.enabled or not self.wrist_unload_enabled:
             metadata["status"] = "disabled"
+            return [], metadata
+        if _deadline_expired(deadline_monotonic):
+            metadata["status"] = "skipped_hard_deadline"
+            metadata["hard_deadline_expired"] = True
             return [], metadata
         q = np.asarray(reference_qpos, dtype=float).reshape(-1)
         step = np.asarray(max_step_rad, dtype=float).reshape(q.shape) * max(
@@ -346,6 +372,10 @@ class JointPosturePreference:
         candidates: list[tuple[str, np.ndarray, dict[str, Any]]] = []
         seen: list[np.ndarray] = []
         for label, directions in actions:
+            if _deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             if len(candidates) >= max(0, int(self.wrist_unload_max_candidates)):
                 break
             candidate = q.copy()
@@ -366,6 +396,10 @@ class JointPosturePreference:
             if any(np.allclose(candidate, existing, atol=1e-9) for existing in seen):
                 continue
             after = self.wrist_unload_cost(candidate)
+            if _deadline_expired(deadline_monotonic):
+                metadata["status"] = "interrupted_hard_deadline"
+                metadata["hard_deadline_expired"] = True
+                return [], metadata
             improvement = float(before["score_deg"]) - float(after["score_deg"])
             seen.append(candidate.copy())
             candidates.append(

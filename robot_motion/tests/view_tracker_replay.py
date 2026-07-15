@@ -8,8 +8,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from sim.mujoco_real2sim.config import default_camera_registry_path
-from sim.mujoco_real2sim.scene import MujocoScene
+from sim.mujoco.config import default_camera_registry_path
+from sim.mujoco.scene import MujocoScene
 
 from .tracker_replay import (
     OfflineTrackerReplayConfig,

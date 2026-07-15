@@ -14,24 +14,26 @@ if __package__ in (None, ""):
     REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
+    __package__ = "utils.head_eye"
 
-from utils.handeye.calibration import (
+from .calibration import (
     CalibrationSample,
-    load_samples,
+    load_samples_with_metadata,
     save_result,
     save_samples,
     solve_eye_to_hand,
 )
-from utils.handeye.camera import (
+from .camera import (
     DEFAULT_CAMERA_SERIALS,
     RealSenseCamera,
     RealSenseConfig,
     TargetConfig,
     TargetDetector,
+    available_video_profiles,
 )
-from utils.handeye.capture import CaptureBurstConfig, capture_burst
-from utils.handeye.robot import RM65PoseReader
-from utils.handeye.transforms import transform_distance
+from .capture import CaptureBurstConfig, capture_burst
+from .robot import RM65PoseReader
+from .transforms import transform_distance
 
 
 LEFT_ARM_IP = "192.168.101.21"
@@ -43,10 +45,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="Interactive RM65 fixed-camera hand-eye calibration."
     )
     parser.add_argument("--list-cameras", action="store_true", help="List RealSense devices and exit.")
+    parser.add_argument(
+        "--show-profiles",
+        action="store_true",
+        help="When listing cameras, also show supported video profiles.",
+    )
     parser.add_argument("--camera", "--camera-index", dest="camera_index", type=int, default=None)
     parser.add_argument("--camera-serial", default=None)
     parser.add_argument("--resolution", type=int, nargs=2, default=(1280, 720), metavar=("W", "H"))
     parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--auto-select-supported-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If the requested RealSense profile cannot start, select a compatible "
+            "native color/depth profile and record it in new calibration metadata."
+        ),
+    )
     parser.add_argument("--arm", choices=("left", "right"), default="left")
     parser.add_argument("--arm-ip", default="", help="Override the IP selected by --arm.")
     parser.add_argument("--expected-tool", default="", help="Optional active RM65 tool-frame name check.")
@@ -106,14 +122,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arm_ip = _selected_arm_ip(args)
 
     if args.list_cameras:
-        _print_cameras()
+        _print_cameras(show_profiles=args.show_profiles)
         return 0
 
     if args.load_samples:
-        samples = load_samples(args.load_samples)
+        samples, args._loaded_samples_metadata = load_samples_with_metadata(args.load_samples)
         return _solve_and_save(samples, args, output_dir=output_dir, session_name=session_name, arm_ip=arm_ip)
 
-    _print_cameras()
+    _print_cameras(show_profiles=False)
     target_config = TargetConfig(
         target_type=args.target,
         dictionary=args.dictionary,
@@ -131,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolution=tuple(args.resolution),
         fps=args.fps,
         enable_depth=True,
+        auto_select_supported_profile=bool(args.auto_select_supported_profile),
     )
     burst_config = CaptureBurstConfig(
         duration_sec=args.capture_seconds,
@@ -164,6 +181,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as robot:
         tool_text = f"; tool={robot.current_tool}" if robot.current_tool else ""
         print(f"Connected RM65 arm={args.arm} ip={arm_ip}{tool_text}; camera serial={camera.serial or 'auto'}")
+        args._camera_settings_report = dict(camera.settings_report)
+        _print_camera_settings(camera.settings_report)
         auto_state = AutoRecordState(args) if args.auto_record else None
         try:
             while True:
@@ -279,7 +298,7 @@ def _solve_and_save(
     return 0
 
 
-def _print_cameras() -> None:
+def _print_cameras(*, show_profiles: bool = False) -> None:
     try:
         devices = RealSenseCamera.list_devices()
     except Exception as exc:
@@ -294,6 +313,23 @@ def _print_cameras() -> None:
     for device in devices:
         fw = f", fw={device.firmware_version}" if device.firmware_version else ""
         print(f"  [{device.index}] {device.name} serial={device.serial}{fw}")
+        if show_profiles:
+            try:
+                profiles = available_video_profiles(device.serial)
+            except Exception as exc:
+                print(f"    profiles unavailable: {exc}")
+                continue
+            for profile in profiles:
+                print(f"    - {profile.describe()}")
+
+
+def _print_camera_settings(settings: dict[str, object]) -> None:
+    if not settings:
+        print("RealSense stream settings: no report")
+        return
+    print("RealSense stream settings:")
+    for key in sorted(settings):
+        print(f"  {key}: {settings[key]}")
 
 
 class AutoRecordState:
@@ -499,13 +535,25 @@ def _session_metadata(
     *,
     arm_ip: str | None = None,
 ) -> dict[str, object]:
-    return {
+    loaded_samples_metadata = dict(getattr(args, "_loaded_samples_metadata", {}) or {})
+    settings_report = dict(getattr(args, "_camera_settings_report", {}) or {})
+    if not settings_report:
+        settings_report = dict(loaded_samples_metadata.get("realsense_settings_report") or {})
+    metadata: dict[str, object] = {
         "robot": "RM65",
         "arm": args.arm,
         "arm_ip": arm_ip or _selected_arm_ip(args),
         "expected_tool": args.expected_tool,
-        "camera_serial": camera_serial or args.camera_serial,
-        "camera_index": args.camera_index,
+        "camera_serial": (
+            camera_serial
+            or args.camera_serial
+            or loaded_samples_metadata.get("camera_serial")
+        ),
+        "camera_index": (
+            args.camera_index
+            if args.camera_index is not None
+            else loaded_samples_metadata.get("camera_index")
+        ),
         "target": args.target,
         "dictionary": args.dictionary,
         "marker_length_m": args.marker_length_m,
@@ -514,8 +562,20 @@ def _session_metadata(
         "charuco_squares_y": args.charuco_squares_y,
         "charuco_square_length_m": args.charuco_square_length_m,
         "charuco_marker_length_m": args.charuco_marker_length_m,
+        "auto_select_supported_profile": loaded_samples_metadata.get(
+            "auto_select_supported_profile",
+            args.auto_select_supported_profile,
+        ),
+        "realsense_settings_report": settings_report,
         "units": "meters/radians",
     }
+    if loaded_samples_metadata:
+        metadata["source_samples_metadata"] = {
+            key: value
+            for key, value in loaded_samples_metadata.items()
+            if key != "source_samples_metadata"
+        }
+    return metadata
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -286,3 +287,51 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     assert payload["startup_hardware_reset_sleep_sec"] == 2.0
     assert payload["startup_hardware_reset_reconnect_timeout_sec"] == 6.0
     assert payload["startup_hardware_reset_reconnect_poll_sec"] == 0.25
+
+
+def test_realsense_frame_timeouts_mark_stale_and_request_restart() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            enable_depth=True,
+            stale_after_sec=0.01,
+            restart_after_timeouts=2,
+            restart_on_stale_timeout=True,
+        )
+    )
+    with source._lock:
+        source._started_at = time.time() - 1.0
+
+    message = "frame didn't arrive within 1000ms"
+    assert source._set_transient_or_stale_timeout_error(message) is False
+    assert source._set_transient_or_stale_timeout_error(message) is True
+
+    info = source.device_info()
+    assert info["timeout_count"] == 2
+    assert info["consecutive_timeout_count"] == 2
+    assert str(info["last_error"]).startswith("frame_timeout_stale:")
+    assert message in str(info["last_runtime_error"])
+
+
+def test_realsense_frame_timeout_before_stale_is_runtime_warning_only() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="LEFT123",
+            camera_key="left_wrist",
+            stale_after_sec=60.0,
+            restart_after_timeouts=1,
+            restart_on_stale_timeout=True,
+        )
+    )
+    with source._lock:
+        source._started_at = time.time()
+
+    message = "frame didn't arrive within 1000ms"
+    assert source._set_transient_or_stale_timeout_error(message) is False
+
+    info = source.device_info()
+    assert info["timeout_count"] == 1
+    assert info["consecutive_timeout_count"] == 1
+    assert info["last_error"] is None
+    assert message in str(info["last_runtime_error"])

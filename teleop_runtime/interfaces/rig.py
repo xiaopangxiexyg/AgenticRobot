@@ -1,40 +1,5 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, Callable
+from robot_motion.runtime.interfaces import Rig
 
-from ..schemas import TeleopCommand
-
-
-class Rig(ABC):
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        raise NotImplementedError
-
-    def start(self) -> None:
-        """Optional resource allocation hook."""
-
-    def is_ready(self) -> bool:
-        return True
-
-    @abstractmethod
-    def send_commands(
-        self,
-        command: TeleopCommand,
-        phase_recorder: Callable[[str, float], None] | None = None,
-    ) -> None:
-        raise NotImplementedError
-
-    def hold_motion(self, reason: str = "manual hold") -> None:
-        """Optional recoverable motion hold hook."""
-
-    def close(self) -> None:
-        """Optional resource release hook."""
-
-    def __enter__(self) -> "Rig":
-        self.start()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.close()
+__all__ = ["Rig"]

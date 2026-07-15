@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from robot_motion.action import RobotAction
+from robot_motion.runtime import TeleopCommand, TeleopObservation, merge_teleop_commands
+
 from ..calibration import TeleopCalibration
 from ..interfaces import Retargeter
-from ..schemas import TeleopCommand, TeleopObservation, merge_teleop_commands
 from .adapters import TeleopCommandActionAdapterConfig, robot_action_from_teleop_command
-from .schema import RobotAction
 
 
 @dataclass(frozen=True)

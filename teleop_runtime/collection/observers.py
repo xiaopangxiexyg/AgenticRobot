@@ -6,6 +6,12 @@ import threading
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Iterable, Mapping
 
+from robot_motion.runtime.lifecycle import (
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+    run_best_effort_cleanup,
+)
+
 from ..session import SessionStepResult
 from .action_record import build_collection_action_record
 from .async_writer import AsyncWriterPool, WriteJob
@@ -134,9 +140,12 @@ class _StorageRouteQueue:
         if self._closed and not self._started:
             return
         self._closed = True
+        failures = []
         if wait:
-            self.flush()
-        if self._started:
+            failures.extend(
+                collect_lifecycle_failures((("queue_drain", self._queue.join),))
+            )
+        if self._started and self._thread is not None and self._thread.is_alive():
             while True:
                 try:
                     self._queue.put_nowait(_STORAGE_SENTINEL)
@@ -148,12 +157,28 @@ class _StorageRouteQueue:
                         continue
                     self._queue.task_done()
                     self._dropped += 1
-            self._queue.join()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        self._thread = None
-        self._started = False
-        self.raise_if_failed()
+            worker = self._thread
+
+            def join_worker() -> None:
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    raise RuntimeError(
+                        f"storage queue '{self.key}' worker did not stop within 1.000s."
+                    )
+
+            failures.extend(
+                collect_lifecycle_failures(
+                    ((f"worker[{worker.name}].join", join_worker),)
+                )
+            )
+            if not worker.is_alive():
+                self._thread = None
+        self._started = self._thread is not None
+        failures.extend(
+            collect_lifecycle_failures((("submit_failures", self.raise_if_failed),))
+        )
+        raise_lifecycle_failures(f"storage_queue[{self.key}].close", failures)
 
     def stats(self) -> StorageRouteStats:
         return StorageRouteStats(
@@ -302,16 +327,23 @@ class CollectionWriterObserver:
         self.handle_step(result)
 
     def flush(self) -> None:
-        for route in list(self._storage_routes.values()):
-            route.flush()
-        self.writer_pool.join()
+        steps = [
+            (f"storage_route[{key}]", route.flush)
+            for key, route in self._storage_routes.items()
+        ]
+        steps.append(("writer_pool", self.writer_pool.join))
+        run_best_effort_cleanup(f"{self.config.name}.flush", steps)
 
     def close(self, *, flush: bool = True) -> None:
-        if flush:
-            self.flush()
-        for route in list(self._storage_routes.values()):
-            route.close(wait=flush)
-        self.writer_pool.close(wait=flush)
+        steps = [
+            (
+                f"storage_route[{key}]",
+                lambda route=route: route.close(wait=flush),
+            )
+            for key, route in reversed(tuple(self._storage_routes.items()))
+        ]
+        steps.append(("writer_pool", lambda: self.writer_pool.close(wait=flush)))
+        run_best_effort_cleanup(f"{self.config.name}.close", steps)
 
     def storage_stats(self) -> dict[str, Any]:
         return {

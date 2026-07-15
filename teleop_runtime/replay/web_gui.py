@@ -2,16 +2,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
+import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
-from urllib.parse import unquote, urlparse
+from typing import Any, Mapping, Sequence
+from urllib.parse import parse_qs, unquote, urlparse
 
+from ..http_security import (
+    CONTROL_TOKEN_HEADER,
+    DEFAULT_MAX_CONTROL_BODY_BYTES,
+    HttpRequestSecurityError,
+    WebControlSecurity,
+    generate_session_token,
+    validate_bind_host,
+)
+from ..defaults import DEFAULT_TELEOP_POSITION_REFERENCE_HZ
 from .arm_init.qpos_execute import normalize_qpos_init_max_angvel
 from .executor import ReplayExecutionSettings
-from .hardware import DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN, ReplayHardwareConfig
+from .hardware import (
+    DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
+    RM65_ARM_CONTROL_MODE_POSITION,
+    RM65_ARM_CONTROL_MODES,
+    ReplayHardwareConfig,
+)
 from .session import ReplayGuiSession
 
 
@@ -455,13 +471,60 @@ INDEX_HTML = r"""<!doctype html>
               <input id="rightToolProfile" autocomplete="off" spellcheck="false">
             </div>
             <div class="form-row">
-              <span class="label">Hz</span>
-              <input id="armControlHz" type="number" min="1" step="1" value="50">
+              <span class="label">Mode</span>
+              <select id="armControlMode">
+                <option value="position">position</option>
+                <option value="impedance">impedance</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <span class="label">Command Hz</span>
+              <input id="armControlHz" type="number" min="1" step="1" value="150">
+            </div>
+            <div class="form-row">
+              <span class="label">Reference Hz</span>
+              <input id="positionReferenceHz" type="number" min="1" step="1" value="__DEFAULT_POSITION_REFERENCE_HZ__">
+            </div>
+            <div class="form-row">
+              <span class="label">Collision Scene</span>
+              <input id="positionCollisionScene" value="dual_arm_hand_proxy_open" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="form-row">
+              <span class="label">Collision Min m</span>
+              <input id="positionCollisionMinDistance" type="number" min="0" step="0.001" value="0.03">
+            </div>
+            <div class="form-row">
+              <span class="label">Collision Eps m</span>
+              <input id="positionCollisionEpsilon" type="number" min="0" step="0.0001" value="0.0001">
+            </div>
+            <div class="form-row">
+              <span class="label">Reference Max Vel</span>
+              <input id="positionCollisionMaxVelocity" value="0.35,0.35,0.35,0.5,0.5,0.5" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="form-row">
+              <span class="label">Reference Max Step</span>
+              <input id="positionCollisionMaxStep" autocomplete="off" spellcheck="false" placeholder="velocity / Hz">
+            </div>
+            <div class="form-row">
+              <span class="label">Tare Sec</span>
+              <input id="forceTareSec" type="number" min="0.1" step="0.1" value="3">
             </div>
             <div class="form-row">
               <span class="label">QPOS Init Vel</span>
               <input id="qposInitArmMaxAngvel" autocomplete="off" spellcheck="false" placeholder="profile">
             </div>
+            <label class="check-row">
+              <input id="armCanfdFollow" type="checkbox" checked>
+              <span>CANFD Follow</span>
+            </label>
+            <label class="check-row">
+              <input id="positionCollisionRequired" type="checkbox" checked>
+              <span>Reference Collision Required</span>
+            </label>
+            <label class="check-row">
+              <input id="positionCollisionDebug" type="checkbox">
+              <span>Collision Raw Debug</span>
+            </label>
             <label class="check-row">
               <input id="sendActions" type="checkbox">
               <span>Arm Output</span>
@@ -469,6 +532,10 @@ INDEX_HTML = r"""<!doctype html>
             <label class="check-row">
               <input id="connectHardware" type="checkbox" checked>
               <span>Connect Hardware</span>
+            </label>
+            <label class="check-row">
+              <input id="strictToolProfile" type="checkbox" checked>
+              <span>Strict Tool</span>
             </label>
           </div>
           <div class="button-group">
@@ -523,10 +590,22 @@ INDEX_HTML = r"""<!doctype html>
       rightArmIp: document.getElementById("rightArmIp"),
       leftToolProfile: document.getElementById("leftToolProfile"),
       rightToolProfile: document.getElementById("rightToolProfile"),
+      armControlMode: document.getElementById("armControlMode"),
       armControlHz: document.getElementById("armControlHz"),
+      positionReferenceHz: document.getElementById("positionReferenceHz"),
+      positionCollisionScene: document.getElementById("positionCollisionScene"),
+      positionCollisionMinDistance: document.getElementById("positionCollisionMinDistance"),
+      positionCollisionEpsilon: document.getElementById("positionCollisionEpsilon"),
+      positionCollisionMaxVelocity: document.getElementById("positionCollisionMaxVelocity"),
+      positionCollisionMaxStep: document.getElementById("positionCollisionMaxStep"),
+      positionCollisionRequired: document.getElementById("positionCollisionRequired"),
+      positionCollisionDebug: document.getElementById("positionCollisionDebug"),
+      forceTareSec: document.getElementById("forceTareSec"),
       qposInitArmMaxAngvel: document.getElementById("qposInitArmMaxAngvel"),
+      armCanfdFollow: document.getElementById("armCanfdFollow"),
       sendActions: document.getElementById("sendActions"),
       connectHardware: document.getElementById("connectHardware"),
+      strictToolProfile: document.getElementById("strictToolProfile"),
       configureHardwareBtn: document.getElementById("configureHardwareBtn"),
       connectHardwareBtn: document.getElementById("connectHardwareBtn"),
       preflightHardwareBtn: document.getElementById("preflightHardwareBtn"),
@@ -538,6 +617,7 @@ INDEX_HTML = r"""<!doctype html>
       rowInfo: document.getElementById("rowInfo"),
       messages: document.getElementById("messages"),
     };
+    const controlToken = __REPLAY_CONTROL_TOKEN_JSON__;
     let latest = null;
     let dragging = false;
     let notice = {text: "", kind: "notice", until: 0};
@@ -553,7 +633,10 @@ INDEX_HTML = r"""<!doctype html>
     async function api(path, payload) {
       const response = await fetch(path, {
         method: payload ? "POST" : "GET",
-        headers: payload ? {"Content-Type": "application/json"} : {},
+        headers: payload ? {
+          "Content-Type": "application/json",
+          "X-DexTeleop-Control-Token": controlToken,
+        } : {},
         body: payload ? JSON.stringify(payload) : undefined,
       });
       const data = await response.json();
@@ -697,7 +780,15 @@ INDEX_HTML = r"""<!doctype html>
       return "right";
     }
 
+    function defaultHzForMode(mode) {
+      return mode === "impedance" ? 40 : 150;
+    }
+
     function hardwarePayload() {
+      const mode = els.armControlMode.value || "position";
+      const hzText = els.armControlHz.value.trim();
+      const referenceHzText = els.positionReferenceHz.value.trim();
+      const tareText = els.forceTareSec.value.trim();
       return {
         type: "configure_hardware",
         active_sides: els.activeSides.value,
@@ -705,10 +796,28 @@ INDEX_HTML = r"""<!doctype html>
         right_arm_ip: els.rightArmIp.value.trim(),
         left_tool_profile: els.leftToolProfile.value.trim(),
         right_tool_profile: els.rightToolProfile.value.trim(),
-        arm_control_hz: Number(els.armControlHz.value || 50),
+        arm_control_mode: mode,
+        arm_control_hz: Number(hzText || defaultHzForMode(mode)),
+        position_reference_hz: Number(referenceHzText || __DEFAULT_POSITION_REFERENCE_HZ__),
+        position_collision_required: els.positionCollisionRequired.checked,
+        position_collision_scene_profile: els.positionCollisionScene.value.trim(),
+        position_collision_min_distance_m: Number(
+          els.positionCollisionMinDistance.value.trim() || 0.03
+        ),
+        position_collision_distance_epsilon_m: Number(
+          els.positionCollisionEpsilon.value.trim() || 0.0001
+        ),
+        position_collision_max_joint_velocity_rad_s:
+          els.positionCollisionMaxVelocity.value.trim(),
+        position_collision_max_joint_step_rad:
+          els.positionCollisionMaxStep.value.trim(),
+        position_collision_debug: els.positionCollisionDebug.checked,
+        arm_canfd_follow: els.armCanfdFollow.checked,
+        force_tare_sec: Number(tareText || 3),
         qpos_init_max_angvel_rad_s: els.qposInitArmMaxAngvel.value.trim(),
         send_actions: els.sendActions.checked,
         connect_hardware: els.connectHardware.checked,
+        strict_tool_profile: els.strictToolProfile.checked,
       };
     }
 
@@ -739,15 +848,57 @@ INDEX_HTML = r"""<!doctype html>
       fieldValue(els.rightArmIp, ips.right || "");
       fieldValue(els.leftToolProfile, profiles.left || "");
       fieldValue(els.rightToolProfile, profiles.right || "");
-      fieldValue(els.armControlHz, config.arm_control_hz || 50);
+      fieldValue(els.armControlMode, config.arm_control_mode || "position");
+      fieldValue(els.armControlHz, config.arm_control_hz || defaultHzForMode(config.arm_control_mode || "position"));
+      fieldValue(
+        els.positionReferenceHz,
+        config.position_reference_hz || __DEFAULT_POSITION_REFERENCE_HZ__
+      );
+      fieldValue(
+        els.positionCollisionScene,
+        settings.position_collision_scene_profile || "dual_arm_hand_proxy_open"
+      );
+      fieldValue(
+        els.positionCollisionMinDistance,
+        settings.position_collision_min_distance_m == null
+          ? 0.03
+          : settings.position_collision_min_distance_m
+      );
+      fieldValue(
+        els.positionCollisionEpsilon,
+        settings.position_collision_distance_epsilon_m == null
+          ? 0.0001
+          : settings.position_collision_distance_epsilon_m
+      );
+      fieldValue(
+        els.positionCollisionMaxVelocity,
+        Array.isArray(settings.position_collision_max_joint_velocity_rad_s)
+          ? settings.position_collision_max_joint_velocity_rad_s.join(",")
+          : "0.35,0.35,0.35,0.5,0.5,0.5"
+      );
+      fieldValue(
+        els.positionCollisionMaxStep,
+        Array.isArray(settings.position_collision_max_joint_step_rad)
+          ? settings.position_collision_max_joint_step_rad.join(",")
+          : ""
+      );
+      fieldValue(els.forceTareSec, config.force_tare_sec || 3);
       fieldValue(
         els.qposInitArmMaxAngvel,
         Array.isArray(settings.qpos_init_max_angvel_rad_s)
           ? settings.qpos_init_max_angvel_rad_s.join(",")
           : ""
       );
+      if (document.activeElement !== els.armCanfdFollow) els.armCanfdFollow.checked = config.arm_canfd_follow !== false;
+      if (document.activeElement !== els.positionCollisionRequired) {
+        els.positionCollisionRequired.checked = settings.position_collision_required !== false;
+      }
+      if (document.activeElement !== els.positionCollisionDebug) {
+        els.positionCollisionDebug.checked = !!settings.position_collision_debug;
+      }
       if (document.activeElement !== els.sendActions) els.sendActions.checked = !!settings.send_actions_enabled;
       if (document.activeElement !== els.connectHardware) els.connectHardware.checked = config.connect_hardware !== false;
+      if (document.activeElement !== els.strictToolProfile) els.strictToolProfile.checked = config.strict_tool_profile !== false;
       const stateText = execution.state || "configured";
       els.execState.textContent = stateText;
       els.execState.className = "pill" + (stateText === "replaying" || stateText === "moving_to_start" ? " live" : "");
@@ -808,9 +959,21 @@ INDEX_HTML = r"""<!doctype html>
           els.rightArmIp,
           els.leftToolProfile,
           els.rightToolProfile,
+          els.armControlMode,
           els.armControlHz,
+          els.positionReferenceHz,
+          els.positionCollisionScene,
+          els.positionCollisionMinDistance,
+          els.positionCollisionEpsilon,
+          els.positionCollisionMaxVelocity,
+          els.positionCollisionMaxStep,
+          els.positionCollisionRequired,
+          els.positionCollisionDebug,
+          els.forceTareSec,
           els.qposInitArmMaxAngvel,
+          els.armCanfdFollow,
           els.connectHardware,
+          els.strictToolProfile,
         ],
         busy,
       );
@@ -930,6 +1093,14 @@ INDEX_HTML = r"""<!doctype html>
     els.sendActions.addEventListener("change", () => {
       control({type: "set_send_actions", enabled: els.sendActions.checked});
     });
+    els.armControlMode.addEventListener("change", () => {
+      const mode = els.armControlMode.value || "position";
+      els.armControlHz.value = String(defaultHzForMode(mode));
+      if (mode === "position") {
+        els.positionReferenceHz.value = "__DEFAULT_POSITION_REFERENCE_HZ__";
+      }
+      els.armCanfdFollow.checked = mode === "position";
+    });
     els.configureHardwareBtn.onclick = () => control(hardwarePayload());
     els.connectHardwareBtn.onclick = async () => {
       if (await control(hardwarePayload())) {
@@ -962,6 +1133,21 @@ def _parse_float_csv(text: str | None, *, default: tuple[float, ...]) -> tuple[f
     return parsed
 
 
+def _parse_one_or_six_float_csv(text: str | None, *, optional: bool = False) -> tuple[float, ...] | None:
+    value = str(text or "").strip()
+    if not value:
+        if optional:
+            return None
+        raise ValueError("Expected one or six comma-separated values.")
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    parsed = tuple(float(part) for part in parts)
+    if len(parsed) == 1:
+        parsed = parsed * 6
+    if len(parsed) != 6:
+        raise ValueError(f"Expected one or six comma-separated values, got {len(parsed)}.")
+    return parsed
+
+
 def _parse_unit_interval_float(text: str) -> float:
     value = float(text)
     if not 0.0 < value <= 1.0:
@@ -981,13 +1167,61 @@ def _should_log_http_message(access_log: bool, args: tuple[Any, ...]) -> bool:
     return True
 
 
+_HARDWARE_OUTPUT_ACTIONS = frozenset({"move_to_start", "start_hardware_replay"})
+
+
+def _truthy_control_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _payload_requests_hardware_output(payload: Mapping[str, Any]) -> bool:
+    action = str(payload.get("type") or payload.get("action") or "").strip()
+    if action in _HARDWARE_OUTPUT_ACTIONS:
+        return True
+    if action == "set_send_actions":
+        value = payload.get("enabled") if "enabled" in payload else payload.get("send_actions")
+        return _truthy_control_value(value)
+    if "send_actions" in payload:
+        return _truthy_control_value(payload.get("send_actions"))
+    if "sendActions" in payload:
+        return _truthy_control_value(payload.get("sendActions"))
+    return False
+
+
+def _render_index_html(control_token: str) -> bytes:
+    token_json = (
+        json.dumps(str(control_token), ensure_ascii=True)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return (
+        INDEX_HTML.replace("__REPLAY_CONTROL_TOKEN_JSON__", token_json)
+        .replace(
+            "__DEFAULT_POSITION_REFERENCE_HZ__",
+            f"{DEFAULT_TELEOP_POSITION_REFERENCE_HZ:g}",
+        )
+        .encode("utf-8")
+    )
+
+
 def make_handler(
     session: ReplayGuiSession,
     *,
+    security: WebControlSecurity,
+    hardware_output_armed: bool = False,
+    max_concurrent_control_requests: int = 4,
     access_log: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
+    if int(max_concurrent_control_requests) <= 0:
+        raise ValueError("max_concurrent_control_requests must be positive")
+    control_slots = threading.BoundedSemaphore(int(max_concurrent_control_requests))
+    index_html = _render_index_html(security.token)
+
     class ReplayRequestHandler(BaseHTTPRequestHandler):
-        server_version = "DexTeleopReplay/1.0"
+        server_version = "DexTeleopReplay/1.1"
 
         def log_message(self, format: str, *args: Any) -> None:
             if not _should_log_http_message(bool(access_log), args):
@@ -1007,6 +1241,14 @@ def make_handler(
             self.send_header("Content-Length", str(len(body)))
             if not cache:
                 self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            )
             self.end_headers()
             self.wfile.write(body)
 
@@ -1016,15 +1258,50 @@ def make_handler(
         def _send_error_json(self, status: int, exc: BaseException) -> None:
             self._send_json(status, {"ok": False, "error": str(exc)})
 
+        def _server_address(self) -> tuple[str, int]:
+            address = self.server.server_address
+            return str(address[0]), int(address[1])
+
+        def _validate_host(self) -> None:
+            server_host, server_port = self._server_address()
+            security.validate_host(
+                self.headers,
+                server_host=server_host,
+                server_port=server_port,
+            )
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
             try:
+                self._validate_host()
                 if path == "/":
-                    self._send(200, INDEX_HTML.encode("utf-8"), content_type="text/html; charset=utf-8")
+                    self._send(200, index_html, content_type="text/html; charset=utf-8")
                     return
                 if path == "/api/state":
                     self._send_json(200, {"ok": True, "state": session.state()})
+                    return
+                if path == "/api/position-collision-debug":
+                    query = parse_qs(parsed.query, keep_blank_values=False)
+                    raw_limit = query.get("limit", ["100"])[-1]
+                    try:
+                        limit = int(raw_limit)
+                    except (TypeError, ValueError) as exc:
+                        raise HttpRequestSecurityError(
+                            400,
+                            "position collision debug limit must be an integer",
+                        ) from exc
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "position_collision_debug": (
+                                session.position_collision_debug_snapshot(
+                                    limit=limit
+                                )
+                            ),
+                        },
+                    )
                     return
                 if path.startswith("/media/camera/") and path.endswith(".jpg"):
                     camera_key = unquote(path[len("/media/camera/") : -len(".jpg")])
@@ -1035,24 +1312,100 @@ def make_handler(
                     self._send(200, session.tactile_jpeg(side), content_type="image/jpeg")
                     return
                 self._send_json(404, {"ok": False, "error": f"not found: {path}"})
+            except HttpRequestSecurityError as exc:
+                self._send_error_json(exc.status, exc)
             except Exception as exc:  # noqa: BLE001
                 self._send_error_json(500, exc)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(min(length, 1_000_000))
-                payload = json.loads(body.decode("utf-8") or "{}")
-                if path == "/api/control":
-                    self._send_json(200, {"ok": True, "state": session.dispatch(payload)})
-                    return
+            if path != "/api/control":
                 self._send_json(404, {"ok": False, "error": f"not found: {path}"})
-            except Exception as exc:  # noqa: BLE001
+                return
+            try:
+                server_host, server_port = self._server_address()
+                length = security.validate_control_request(
+                    self.headers,
+                    server_host=server_host,
+                    server_port=server_port,
+                )
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    raise HttpRequestSecurityError(400, "incomplete control request body")
+                payload = json.loads(body.decode("utf-8") or "{}")
+                if not isinstance(payload, dict):
+                    raise HttpRequestSecurityError(400, "control request body must be a JSON object")
+                if _payload_requests_hardware_output(payload) and not bool(hardware_output_armed):
+                    raise HttpRequestSecurityError(
+                        403,
+                        "hardware output is not armed by the local replay process",
+                    )
+                if not control_slots.acquire(blocking=False):
+                    raise HttpRequestSecurityError(429, "too many concurrent control requests")
+                try:
+                    state = session.dispatch(payload)
+                finally:
+                    control_slots.release()
+                self._send_json(200, {"ok": True, "state": state})
+            except HttpRequestSecurityError as exc:
+                self.close_connection = True
+                self._send_error_json(exc.status, exc)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                self.close_connection = True
                 self._send_error_json(400, exc)
+            except PermissionError as exc:
+                self.close_connection = True
+                self._send_error_json(403, exc)
+            except RuntimeError as exc:
+                self.close_connection = True
+                self._send_error_json(409, exc)
+            except Exception as exc:  # noqa: BLE001
+                self.close_connection = True
+                self._send_error_json(500, exc)
 
     return ReplayRequestHandler
+
+
+def create_server(
+    session: ReplayGuiSession,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    control_token: str | None = None,
+    hardware_output_armed: bool = False,
+    unsafe_allow_remote_web: bool = False,
+    allowed_web_hosts: Sequence[str] = (),
+    max_control_body_bytes: int = DEFAULT_MAX_CONTROL_BODY_BYTES,
+    max_concurrent_control_requests: int = 4,
+    access_log: bool = False,
+) -> ThreadingHTTPServer:
+    validate_bind_host(
+        str(host),
+        unsafe_allow_remote=bool(unsafe_allow_remote_web),
+        allowed_hosts=tuple(str(value) for value in allowed_web_hosts),
+    )
+    security = WebControlSecurity(
+        token=str(control_token or generate_session_token()),
+        bind_host=str(host),
+        allowed_hosts=tuple(str(value) for value in allowed_web_hosts),
+        max_control_body_bytes=int(max_control_body_bytes),
+    )
+    server = ThreadingHTTPServer(
+        (str(host), int(port)),
+        make_handler(
+            session,
+            security=security,
+            hardware_output_armed=bool(hardware_output_armed),
+            max_concurrent_control_requests=int(max_concurrent_control_requests),
+            access_log=bool(access_log),
+        ),
+    )
+    server.daemon_threads = True
+    server.replay_session = session  # type: ignore[attr-defined]
+    server.replay_control_token = security.token  # type: ignore[attr-defined]
+    server.replay_hardware_output_armed = bool(hardware_output_armed)  # type: ignore[attr-defined]
+    return server
 
 
 def run_server(
@@ -1067,8 +1420,12 @@ def run_server(
     port: int = 8765,
     open_browser: bool = True,
     start_playing: bool = False,
+    hardware_output_armed: bool = False,
+    unsafe_allow_remote_web: bool = False,
+    allowed_web_hosts: Sequence[str] = (),
     access_log: bool = False,
 ) -> ThreadingHTTPServer:
+    local_hardware_output_armed = bool(hardware_output_armed or send_actions)
     session = ReplayGuiSession(
         hardware_config=hardware_config,
         execution_settings=execution_settings,
@@ -1079,10 +1436,24 @@ def run_server(
         session.load_dataset(dataset_root, episode=episode)
     if start_playing:
         session.play()
-    server = ThreadingHTTPServer((str(host), int(port)), make_handler(session, access_log=bool(access_log)))
-    server.replay_session = session  # type: ignore[attr-defined]
+    server = create_server(
+        session,
+        host=str(host),
+        port=int(port),
+        hardware_output_armed=local_hardware_output_armed,
+        unsafe_allow_remote_web=bool(unsafe_allow_remote_web),
+        allowed_web_hosts=allowed_web_hosts,
+        access_log=bool(access_log),
+    )
     url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
     print(f"[ReplayGUI] serving {url}", flush=True)
+    control_token = server.replay_control_token  # type: ignore[attr-defined]
+    print(
+        f"[ReplayGUI] control token ({CONTROL_TOKEN_HEADER}): {control_token}",
+        flush=True,
+    )
+    if not local_hardware_output_armed:
+        print("[ReplayGUI] hardware output is locally disarmed", flush=True)
     if open_browser:
         webbrowser.open(url)
     try:
@@ -1110,6 +1481,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host.")
     parser.add_argument("--port", type=int, default=8765, help="HTTP bind port. Use 0 for any free port.")
     parser.add_argument(
+        "--unsafe-allow-remote-web",
+        action="store_true",
+        help=(
+            "Allow binding the replay control server beyond loopback. Unsafe: token-authenticated "
+            "control traffic is plain HTTP. Wildcard binds also require --web-allowed-host."
+        ),
+    )
+    parser.add_argument(
+        "--web-allowed-host",
+        action="append",
+        default=[],
+        help="Additional exact Host name or IP accepted by the replay server; may be repeated.",
+    )
+    parser.add_argument(
         "--open-browser",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1135,7 +1520,116 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--right-arm-ip", default="", help="RM65 right arm IP for hardware replay.")
     parser.add_argument("--left-tool-profile", default="", help="Left arm tool profile used for TCP checks.")
     parser.add_argument("--right-tool-profile", default="", help="Right arm tool profile used for TCP checks.")
-    parser.add_argument("--arm-control-hz", type=float, default=50.0, help="RM65 replay command/update rate.")
+    parser.add_argument(
+        "--arm-control-mode",
+        choices=RM65_ARM_CONTROL_MODES,
+        default=RM65_ARM_CONTROL_MODE_POSITION,
+        help="RM65 replay execution mode. Position defaults to CANFD follow at 150Hz; impedance defaults to 40Hz.",
+    )
+    parser.add_argument(
+        "--arm-control-hz",
+        type=float,
+        default=None,
+        help="RM65 replay command/update rate. Defaults to 150Hz for position and 40Hz for impedance.",
+    )
+    parser.add_argument(
+        "--position-reference-hz",
+        type=float,
+        default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
+        help="Position replay pose-reference/IK rate between source actions and the command stream.",
+    )
+    parser.add_argument(
+        "--position-workspace-min",
+        type=float,
+        nargs=3,
+        default=(-0.60, -0.80, 0.00),
+        metavar=("X", "Y", "Z"),
+        help="Minimum xyz workspace for each 15Hz replay pose keyframe.",
+    )
+    parser.add_argument(
+        "--position-workspace-max",
+        type=float,
+        nargs=3,
+        default=(0.60, 0.80, 0.90),
+        metavar=("X", "Y", "Z"),
+        help="Maximum xyz workspace for each 15Hz replay pose keyframe.",
+    )
+    parser.add_argument(
+        "--position-max-xyz-step-m",
+        type=float,
+        default=0.10,
+        help="Maximum translation norm between consecutive safe 15Hz pose keyframes.",
+    )
+    parser.add_argument(
+        "--position-max-rot-step-deg",
+        type=float,
+        default=15.0,
+        help="Maximum shortest-path rotation between consecutive safe 15Hz pose keyframes.",
+    )
+    parser.add_argument(
+        "--position-max-joint-step-rad",
+        type=float,
+        default=float(math.radians(6.0)),
+        help="Maximum per-joint delta between consecutive safe 15Hz qpos keyframes.",
+    )
+    parser.add_argument(
+        "--position-collision-required",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require coupled dual-arm collision IK for each high-rate pose reference. "
+            "Enabled by default; disabling is allowed only for a non-motion legacy/debug dry run."
+        ),
+    )
+    parser.add_argument(
+        "--position-collision-scene-profile",
+        default="dual_arm_hand_proxy_open",
+        help="Dual-arm collision scene used by the high-rate pose-to-qpos planner.",
+    )
+    parser.add_argument(
+        "--position-collision-min-distance-m",
+        type=float,
+        default=0.03,
+        help="Minimum accepted collision distance at each limited high-rate qpos endpoint.",
+    )
+    parser.add_argument(
+        "--position-collision-distance-epsilon-m",
+        type=float,
+        default=1e-4,
+        help="Numerical tolerance applied to the high-rate endpoint collision threshold.",
+    )
+    parser.add_argument(
+        "--position-collision-max-joint-velocity-rad-s",
+        default="0.35,0.35,0.35,0.5,0.5,0.5",
+        help="One or six per-joint safety velocity limits used at the high-rate IK stage.",
+    )
+    parser.add_argument(
+        "--position-collision-max-joint-step-rad",
+        default="",
+        help=(
+            "Optional one or six per-reference joint-step limits at the high-rate IK stage; "
+            "empty uses velocity/reference_hz only."
+        ),
+    )
+    parser.add_argument(
+        "--position-collision-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Attach raw IK qpos/pose arrays and complete planner diagnostics to each command.",
+    )
+    parser.add_argument(
+        "--arm-canfd-follow",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Send RM65 replay CANFD commands with SDK follow=True. Defaults on only for position mode.",
+    )
+    parser.add_argument("--force-tare-sec", type=float, default=3.0, help="Tare duration for impedance replay.")
+    parser.add_argument(
+        "--strict-tool-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require confirmed TCP/payload/impedance profile for impedance replay.",
+    )
     parser.add_argument(
         "--replay-arm-max-angvel",
         default="3,3,3,4,4,4",
@@ -1161,7 +1655,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--send-actions",
         action="store_true",
-        help="Enable robot arm command output at startup. Defaults to disabled.",
+        help=(
+            "Locally arm and enable robot arm command output at startup. Defaults to disabled; "
+            "this process-side flag cannot be supplied through the web API."
+        ),
+    )
+    parser.add_argument(
+        "--arm-web-hardware-output",
+        action="store_true",
+        help=(
+            "Locally authorize this web session to enable hardware output later, while leaving "
+            "send_actions disabled at startup."
+        ),
     )
     parser.add_argument(
         "--connect-hardware",
@@ -1234,7 +1739,12 @@ def main(argv: list[str] | None = None) -> None:
         gripper_speed=float(args.gripper_speed),
         gripper_torque=float(args.gripper_torque),
         gripper_max_action=float(args.gripper_max_action),
-        arm_control_hz=float(args.arm_control_hz),
+        arm_control_mode=str(args.arm_control_mode),
+        arm_control_hz=args.arm_control_hz,
+        position_reference_hz=float(args.position_reference_hz),
+        arm_canfd_follow=args.arm_canfd_follow,
+        force_tare_sec=float(args.force_tare_sec),
+        strict_tool_profile=bool(args.strict_tool_profile),
         replay_arm_max_angvel=_parse_float_csv(
             args.replay_arm_max_angvel,
             default=(3.0, 3.0, 3.0, 4.0, 4.0, 4.0),
@@ -1245,6 +1755,30 @@ def main(argv: list[str] | None = None) -> None:
     execution_settings = ReplayExecutionSettings(
         end_effectors_enabled=bool(args.end_effectors_enabled),
         qpos_init_max_angvel_rad_s=normalize_qpos_init_max_angvel(args.qpos_init_arm_max_angvel),
+        position_workspace_min=tuple(float(value) for value in args.position_workspace_min),
+        position_workspace_max=tuple(float(value) for value in args.position_workspace_max),
+        position_max_xyz_step_m=float(args.position_max_xyz_step_m),
+        position_max_rot_step_deg=float(args.position_max_rot_step_deg),
+        position_max_joint_step_rad=float(args.position_max_joint_step_rad),
+        position_collision_required=bool(args.position_collision_required),
+        position_collision_scene_profile=str(args.position_collision_scene_profile),
+        position_collision_min_distance_m=float(
+            args.position_collision_min_distance_m
+        ),
+        position_collision_distance_epsilon_m=float(
+            args.position_collision_distance_epsilon_m
+        ),
+        position_collision_max_joint_velocity_rad_s=tuple(
+            _parse_one_or_six_float_csv(
+                args.position_collision_max_joint_velocity_rad_s
+            )
+            or ()
+        ),
+        position_collision_max_joint_step_rad=_parse_one_or_six_float_csv(
+            args.position_collision_max_joint_step_rad,
+            optional=True,
+        ),
+        position_collision_debug=bool(args.position_collision_debug),
     )
     run_server(
         dataset_root=args.dataset_root,
@@ -1257,6 +1791,9 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         open_browser=bool(args.open_browser),
         start_playing=bool(args.start_playing),
+        hardware_output_armed=bool(args.arm_web_hardware_output),
+        unsafe_allow_remote_web=bool(args.unsafe_allow_remote_web),
+        allowed_web_hosts=tuple(args.web_allowed_host),
         access_log=bool(args.access_log),
     )
 

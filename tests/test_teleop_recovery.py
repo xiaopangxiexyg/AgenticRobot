@@ -6,12 +6,15 @@ import tempfile
 import time
 import types
 import unittest
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation as R
 
+from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.backends.hands.inspire_tac import InspireTacHandBackend, InspireTacHandBackendConfig
 from teleop_runtime.arm_frames import TOOL_TCP_FRAME
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
@@ -70,6 +73,14 @@ def _has_dual_arm_ik_dependencies() -> bool:
 
 
 DUAL_ARM_IK_AVAILABLE = _has_dual_arm_ik_dependencies()
+
+
+def test_session_config_does_not_duplicate_safety_stale_timeout() -> None:
+    assert "stale_timeout_sec" not in {
+        item.name for item in fields(TeleopSessionConfig)
+    }
+    with pytest.raises(TypeError, match="stale_timeout_sec"):
+        TeleopSessionConfig(stale_timeout_sec=0.1)  # type: ignore[call-arg]
 
 
 def _write_default_initial_alignment_fixture(test_case: unittest.TestCase) -> str:
@@ -2281,6 +2292,47 @@ class TeleopRecoveryTests(unittest.TestCase):
         self.assertIsNone(right_command.stale_target)
         np.testing.assert_allclose(dual.left_qpos, live_left)
         np.testing.assert_allclose(dual.right_qpos, live_right)
+
+    def test_real_runtime_restart_uses_bounded_preview_anchor_for_tiny_feedback_overshoot(self) -> None:
+        class FakeStateBackend:
+            def refresh_state_from_hardware(self):
+                qpos = np.zeros(6, dtype=float)
+                qpos[2] = 2.355008
+                return {"current_qpos": qpos}
+
+        class FakeCommandBackend:
+            def __init__(self):
+                self.reset_qpos = None
+
+            def reset_motion_state(self, qpos):
+                self.reset_qpos = np.asarray(qpos, dtype=float).copy()
+
+        preview = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="192.0.2.1",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+            )
+        )
+        command = FakeCommandBackend()
+        components = SimpleNamespace(
+            active_sides=("left",),
+            left_state_backend=FakeStateBackend(),
+            right_state_backend=None,
+            left_preview_backend=preview,
+            right_preview_backend=None,
+            left_command_backend=command,
+            right_command_backend=None,
+            dual_arm_retargeter=None,
+        )
+
+        synced = _reset_runtime_motion_state_from_real_qpos(components, required=True)
+
+        self.assertEqual(synced, {"left": True})
+        self.assertAlmostEqual(command.reset_qpos[2], 2.355, places=9)
+        self.assertEqual(preview.get_state()["local_qpos_normalization"]["status"], "clipped")
 
     def test_safety_monitor_resets_pose_baseline_after_invalid_channel(self) -> None:
         monitor = SafetyMonitor(

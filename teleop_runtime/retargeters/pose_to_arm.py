@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -12,6 +12,10 @@ from ..hand_tcp_alignment import apply_local_pose_rotation
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
+from ..sources.pose.vive_motion import (
+    TrackerMotionIntentConfig,
+    TrackerMotionIntentStateMachine,
+)
 from ..transforms import as_pose_matrix, rotation_is_orthonormal
 
 
@@ -42,6 +46,10 @@ class PoseToArmRetargeterConfig:
     output_frame_name: str = "arm_base"
     input_local_translation_offset: np.ndarray | Sequence[float] | None = None
     input_local_rotation_offset: np.ndarray | Sequence[float] | None = None
+    tracker_motion_intent_enabled: bool = False
+    tracker_motion_intent_config: TrackerMotionIntentConfig = field(
+        default_factory=TrackerMotionIntentConfig
+    )
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
@@ -103,6 +111,9 @@ class PoseToArmRetargeter(Retargeter):
                 self.config.input_local_rotation_offset,
                 dtype=float,
             ).reshape(3, 3).copy()
+        self._tracker_motion_intent = TrackerMotionIntentStateMachine(
+            self.config.tracker_motion_intent_config
+        )
 
     @property
     def name(self) -> str:
@@ -112,11 +123,13 @@ class PoseToArmRetargeter(Retargeter):
         self._home_human_pose_desk = self.prepare_input_pose_desk(human_pose_desk)
         self._home_robot_pose_desk = as_pose_matrix(robot_pose_desk)
         self._last_target_pose_desk = self._home_robot_pose_desk.copy()
+        self._tracker_motion_intent.reset("home_anchors_set")
 
     def clear_home_anchors(self) -> None:
         self._home_human_pose_desk = None
         self._home_robot_pose_desk = None
         self._last_target_pose_desk = None
+        self._tracker_motion_intent.reset("home_anchors_cleared")
 
     @property
     def last_target_pose_desk(self) -> np.ndarray | None:
@@ -187,6 +200,7 @@ class PoseToArmRetargeter(Retargeter):
             clutch_pressed=clutch_pressed,
         )
         self._last_target_pose_desk = as_pose_matrix(robot_pose_desk)
+        self._tracker_motion_intent.reset("reanchored")
 
     def build_command_from_target_pose_desk(
         self,
@@ -209,6 +223,10 @@ class PoseToArmRetargeter(Retargeter):
             side=self.config.side,
         )
         clutch_pressed = self._resolve_clutch_pressed(observation)
+        tracker_motion_intent = self._resolve_tracker_motion_intent(
+            channel=channel,
+            clutch_pressed=clutch_pressed,
+        )
 
         command.add_command(
             EffectorCommand(
@@ -236,6 +254,7 @@ class PoseToArmRetargeter(Retargeter):
                     "input_channel": self.config.input_channel_name,
                     "tracker_role": self._resolve_tracker_role(channel),
                     "clutch_pressed": clutch_pressed,
+                    "tracker_motion_intent": tracker_motion_intent,
                     "target_pose_operator": None
                     if pose_operator is None
                     else as_pose_matrix(pose_operator),
@@ -253,6 +272,30 @@ class PoseToArmRetargeter(Retargeter):
             )
         )
         return command
+
+    def _resolve_tracker_motion_intent(
+        self,
+        *,
+        channel,
+        clutch_pressed: bool,
+    ) -> dict[str, object]:
+        if not bool(self.config.tracker_motion_intent_enabled):
+            return {
+                "schema": "teleop_runtime.tracker_motion_intent/v1",
+                "state": "DISABLED",
+                "inactive": False,
+                "hold_weight": 0.0,
+                "transition_reason": "disabled",
+            }
+        metadata = dict(channel.metadata or {})
+        motion_window = metadata.get("tracker_motion_window")
+        return self._tracker_motion_intent.update(
+            motion_window=(
+                dict(motion_window) if isinstance(motion_window, dict) else None
+            ),
+            tracker_pose=as_pose_matrix(channel.value),
+            clutch_pressed=bool(clutch_pressed),
+        )
 
     def retarget(
         self, observation: TeleopObservation, calibration: TeleopCalibration | None = None

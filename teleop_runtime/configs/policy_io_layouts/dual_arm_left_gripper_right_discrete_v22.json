@@ -1,0 +1,57 @@
+{
+  "schema": "dexteleop_policy_io_layout_v2.2",
+  "name": "dual_arm_left_continuous_right_discrete_gripper",
+  "end_effectors": {
+    "left": {
+      "side": "left",
+      "adapter": "dmtac_gripper_v1",
+      "target": {
+        "value_type": "continuous",
+        "dim": 1,
+        "names": ["gripper_close"],
+        "source_indices": [0],
+        "legacy_q6_slot_indices": [0],
+        "tokens": [],
+        "units": "normalized_0_0.9",
+        "normalization": {}
+      },
+      "state": null,
+      "state_source_field": "joint_pos",
+      "metadata": {
+        "legacy_q6_command_space": "normalized_0_0.9"
+      }
+    },
+    "right": {
+      "side": "right",
+      "adapter": "two_state_gripper_v1",
+      "target": {
+        "value_type": "discrete",
+        "dim": 1,
+        "names": ["mode"],
+        "source_indices": null,
+        "legacy_q6_slot_indices": [0],
+        "tokens": [
+          {
+            "name": "mode",
+            "categories": [
+              {"id": 0, "label": "open", "backend_value": 0.0, "metadata": {}},
+              {"id": 1, "label": "close", "backend_value": 0.9, "metadata": {}}
+            ],
+            "source_metadata_key": "mode"
+          }
+        ],
+        "units": null,
+        "normalization": {}
+      },
+      "state": null,
+      "state_source_field": "mode",
+      "metadata": {
+        "legacy_q6_command_space": "normalized_0_0.9"
+      }
+    }
+  },
+  "metadata": {
+    "example": true,
+    "description": "Left continuous 1D gripper plus right discrete int64 gripper token."
+  }
+}

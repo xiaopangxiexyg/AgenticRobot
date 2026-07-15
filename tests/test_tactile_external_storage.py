@@ -265,12 +265,7 @@ class TactileExternalStorageTest(unittest.TestCase):
                 np.arange(12, dtype=np.uint8).reshape(3, 4),
             )
 
-    def test_external_writer_defaults_to_lz4_chunked_tactile_streams(self) -> None:
-        try:
-            import lz4.frame  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("lz4 is not installed")
-
+    def test_external_writer_defaults_to_uncompressed_tactile_streams(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(
                 LeRobotV21WriterConfig(
@@ -297,14 +292,13 @@ class TactileExternalStorageTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["format"], "binary_stream_v1")
             stream = manifest["streams"]["M_RAW"]
-            self.assertEqual(stream["compression"], "lz4")
-            self.assertEqual(stream["encoding"], "chunked_lz4")
-            self.assertTrue(stream["path"].endswith(".uint8.bin.lz4"))
+            self.assertEqual(stream["compression"], "none")
+            self.assertEqual(stream["encoding"], "raw_c_order")
+            self.assertTrue(stream["path"].endswith(".uint8.bin"))
             self.assertEqual(stream["frame_count"], 2)
-            self.assertEqual(len(stream["chunks"]), 1)
+            self.assertEqual(stream["chunks"], [])
             raw_total = 2 * 12
-            self.assertEqual(stream["chunks"][0]["raw_bytes"], raw_total)
-            self.assertNotEqual((Path(tmpdir) / stream["path"]).stat().st_size, raw_total)
+            self.assertEqual((Path(tmpdir) / stream["path"]).stat().st_size, raw_total)
 
             store = ExternalTactileStore(dataset_root=Path(tmpdir), manifest_path=manifest_path)
             frame = store.frame(tactile_frame_index=1)

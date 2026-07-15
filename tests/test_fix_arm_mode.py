@@ -153,6 +153,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         )
         self.assertEqual(filtered.metadata["fix_arm_active_side"], "left")
         self.assertEqual(filtered.metadata["fix_arm_mode"], "fixed")
+        self.assertEqual(filtered.metadata["fix_arm_scope"], "arm_and_end_effector")
+        self.assertEqual(filtered.metadata["fix_arm_warning"], "")
+        self.assertEqual(filtered.metadata["fix_arm_effectors"], ["left_arm", "left_hand"])
         np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
         np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 3.0))
         np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 20.0))
@@ -161,6 +164,39 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertEqual(filtered.commands["left_arm"].metadata["fix_arm_side"], "left")
         for effector_command in filtered.commands.values():
             np.testing.assert_equal(np.asarray(effector_command.value).shape, (6,))
+
+    def test_arm_only_fix_emits_a_warning_when_no_end_effector_is_configured(self) -> None:
+        controller = FixArmCommandController(
+            active_sides=("left", "right"),
+            required_effectors_by_side={
+                "left": ("left_arm",),
+                "right": ("right_arm",),
+            },
+            selected_side="left",
+        )
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+
+        transition = controller.freeze_selected(now=1.1)
+        self.assertTrue(transition.ok)
+        self.assertIn("warning", transition.message)
+
+        filtered = controller.filter_command(
+            _command(left_arm=10.0, right_arm=20.0, left_hand=30.0, right_hand=40.0),
+            None,
+            1.2,
+        )
+        self.assertEqual(filtered.metadata["fix_arm_scope"], "arm_only")
+        self.assertIn("end_effector_not_configured", filtered.metadata["fix_arm_warning"])
+        np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
+        np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 30.0))
 
     def test_freeze_does_not_inject_fixed_command_when_pipeline_omits_it_by_default(self) -> None:
         controller = _controller("left")

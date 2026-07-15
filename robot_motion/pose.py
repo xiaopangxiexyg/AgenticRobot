@@ -4,7 +4,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R, Slerp
 
 
-def as_pose_matrix(pose: np.ndarray) -> np.ndarray:
+def as_strict_pose_matrix(pose: np.ndarray) -> np.ndarray:
+    """Return a finite 4x4 pose matrix, rejecting compact pose encodings."""
     matrix = np.asarray(pose, dtype=float)
     if matrix.shape != (4, 4):
         raise ValueError(f"pose must be a 4x4 matrix, got {matrix.shape}")
@@ -13,9 +14,12 @@ def as_pose_matrix(pose: np.ndarray) -> np.ndarray:
     return matrix
 
 
+as_pose_matrix = as_strict_pose_matrix
+
+
 def pose_delta_metrics(reference_pose: np.ndarray, target_pose: np.ndarray) -> tuple[float, float]:
-    reference = as_pose_matrix(reference_pose)
-    target = as_pose_matrix(target_pose)
+    reference = as_strict_pose_matrix(reference_pose)
+    target = as_strict_pose_matrix(target_pose)
     translation_m = float(np.linalg.norm(target[:3, 3] - reference[:3, 3]))
     relative_rot = target[:3, :3] @ reference[:3, :3].T
     rotation_deg = float(np.rad2deg(R.from_matrix(relative_rot).magnitude()))
@@ -31,7 +35,7 @@ def pose6_to_matrix(pose6: list[float] | tuple[float, ...] | np.ndarray) -> np.n
 
 
 def matrix_to_pose6(matrix: np.ndarray) -> list[float]:
-    pose = as_pose_matrix(matrix)
+    pose = as_strict_pose_matrix(matrix)
     rpy = R.from_matrix(pose[:3, :3]).as_euler("xyz", degrees=False)
     return [
         float(pose[0, 3]),
@@ -44,8 +48,8 @@ def matrix_to_pose6(matrix: np.ndarray) -> list[float]:
 
 
 def interpolate_pose(start_pose: np.ndarray, end_pose: np.ndarray, alpha: float) -> np.ndarray:
-    start = as_pose_matrix(start_pose)
-    end = as_pose_matrix(end_pose)
+    start = as_strict_pose_matrix(start_pose)
+    end = as_strict_pose_matrix(end_pose)
     blend = float(np.clip(alpha, 0.0, 1.0))
     if blend <= 0.0:
         return start.copy()
@@ -60,7 +64,7 @@ def interpolate_pose(start_pose: np.ndarray, end_pose: np.ndarray, alpha: float)
 
 
 def matrix_to_rm_quat_pose(matrix: np.ndarray) -> list[float]:
-    pose = as_pose_matrix(matrix)
+    pose = as_strict_pose_matrix(matrix)
     quat_xyzw = R.from_matrix(pose[:3, :3]).as_quat()
     return [
         float(pose[0, 3]),
@@ -80,8 +84,8 @@ def relax_pose_toward_reference(
     max_position_m: float,
     max_orientation_deg: float,
 ) -> np.ndarray:
-    target = as_pose_matrix(target_pose)
-    reference = as_pose_matrix(reference_pose)
+    target = as_strict_pose_matrix(target_pose)
+    reference = as_strict_pose_matrix(reference_pose)
     relaxed = target.copy()
 
     delta_t = reference[:3, 3] - target[:3, 3]

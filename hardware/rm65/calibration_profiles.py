@@ -354,7 +354,7 @@ def default_impedance(mode: str = "pose") -> dict[str, Any]:
         "radio": 0,
         "hard_stop_force_n": 50.0,
         "hard_stop_torque_nm": 10.0,
-        "max_command_joint_step_deg": 20.0,
+        "max_command_joint_step_deg": 40.0,
     }
 
 

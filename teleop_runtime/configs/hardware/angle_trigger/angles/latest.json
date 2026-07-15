@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "left": {
+      "one_deg": 64.35409090909091,
+      "zero_deg": 78.57
+    },
+    "right": {
+      "one_deg": 215.03863636363647,
+      "zero_deg": 196.03636363636372
+    }
+  },
+  "schema_version": "angle_trigger_angle_calibration.v1",
+  "updated_at": "2026-07-12T21:42:52+08:00"
+}

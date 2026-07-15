@@ -6,6 +6,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from robot_motion.runtime.lifecycle import (
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+)
+
 
 class AsyncWriterError(RuntimeError):
     """Raised when the async writer pipeline cannot accept or process jobs."""
@@ -101,14 +107,27 @@ class AsyncWriterPool:
             return
         self._closed = False
         self._threads = []
-        for index in range(int(self.config.worker_count)):
-            thread = threading.Thread(
-                target=self._worker_loop,
-                name=f"{self.name}_{index}",
-                daemon=True,
+        try:
+            for index in range(int(self.config.worker_count)):
+                thread = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"{self.name}_{index}",
+                    daemon=True,
+                )
+                thread.start()
+                self._threads.append(thread)
+        except BaseException as start_error:  # noqa: BLE001 - stop partial worker set.
+            self._started = bool(self._threads)
+            rollback_failures = collect_lifecycle_failures(
+                (("workers", lambda: self.close(wait=False)),)
             )
-            thread.start()
-            self._threads.append(thread)
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    f"{self.name}.start",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
         self._started = True
 
     def _ensure_started(self) -> None:
@@ -173,15 +192,55 @@ class AsyncWriterPool:
         if self._closed and not self._started:
             return
         self._closed = True
+        failures = []
         if wait:
-            self.join()
-        for _ in self._threads:
-            self._queue.put(_SENTINEL)
-        for thread in self._threads:
+            # Drain first, but do not surface handler failures until every worker
+            # has received a stop signal and a bounded join attempt.
+            failures.extend(
+                collect_lifecycle_failures((("queue_drain", self._queue.join),))
+            )
+
+        stop_put_timeout = max(0.1, float(self.config.put_timeout_sec))
+        workers_to_stop = [thread for thread in self._threads if thread.is_alive()]
+        failures.extend(
+            collect_lifecycle_failures(
+                (
+                    (
+                        f"worker[{index}].stop_signal",
+                        lambda timeout=stop_put_timeout: self._queue.put(
+                            _SENTINEL,
+                            timeout=timeout,
+                        ),
+                    )
+                    for index, _thread in enumerate(workers_to_stop)
+                )
+            )
+        )
+
+        def join_worker(thread: threading.Thread) -> None:
             thread.join(timeout=1.0)
-        self._threads = []
-        self._started = False
-        self.raise_if_failed()
+            if thread.is_alive():
+                raise AsyncWriterError(
+                    f"{self.name} worker {thread.name!r} did not stop within 1.000s."
+                )
+
+        failures.extend(
+            collect_lifecycle_failures(
+                (
+                    (
+                        f"worker[{thread.name}].join",
+                        lambda thread=thread: join_worker(thread),
+                    )
+                    for thread in reversed(self._threads)
+                )
+            )
+        )
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
+        self._started = bool(self._threads)
+        failures.extend(
+            collect_lifecycle_failures((("handler_failures", self.raise_if_failed),))
+        )
+        raise_lifecycle_failures(f"{self.name}.close", failures)
 
     def stats(self) -> AsyncWriterStats:
         return AsyncWriterStats(

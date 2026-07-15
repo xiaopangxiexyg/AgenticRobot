@@ -30,7 +30,8 @@
   [teleop_runtime/collection/README.md](./collection/README.md)
 - 独立策略部署 CLI runner：
   `python -m teleop_runtime.deploy`
-  （兼容旧入口 `python -m teleop_runtime.deploy.run_policy`）
+  （同一受支持运行时也提供直接入口
+  `python -m teleop_runtime.deploy.run_policy`；OpenPI launcher 当前依赖其 `main`）
 - 策略部署使用说明：
   [teleop_runtime/deploy/README.md](./deploy/README.md)
 - 部署动作链路现在以 `RobotAction` 为 sim/real 通用语义边界，以
@@ -113,13 +114,8 @@ hand16 中的空槽必须按无效值处理，而不是按 0 处理：
 
 推荐发送端在 [hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py)。它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。
 
-默认 tracker 映射：
-
-- `tracker_1 -> left_wrist`
-- `tracker_2 -> right_wrist`
-
-第三只 `auxiliary` tracker 是可选项。实际遥操和当前标定流程只需要左右两个 wrist tracker；
-virtual desk 扫动可以用 `left_wrist` 或 `right_wrist` 代替 auxiliary。
+sender 只接受两个 GenericTracker，并按设备名字典序自动映射：较小者为
+`left_wrist`，较大者为 `right_wrist`。发现多于两个 tracker 会直接报错。
 
 示例：
 
@@ -127,9 +123,7 @@ virtual desk 扫动可以用 `left_wrist` 或 `right_wrist` 代替 auxiliary。
 python hardware/VIVE/mocap/vive_data_sender.py \
   --host 192.168.20.90 \
   --port 9999 \
-  --hz 60 \
-  --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist
+  --hz 300
 ```
 
 发送协议是结构化 JSON UDP，`teleop_runtime` 也保留了 legacy float 包兼容。仓库里只保留这一个 sender 入口，避免误跑旧的 float/满速 UDP sender。
@@ -555,9 +549,7 @@ VIVE 发送端：
 python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
-  --hz 60 \
-  --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist
+  --hz 300
 ```
 
 SAPIEN 虚拟跑法：
@@ -592,7 +584,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 默认先等待你按 `p` 或回车，再开始 runtime home calibration
 - `arm-mode=real` 下会在开始 home capture 前读取真机当前关节状态，并把它作为本地 preview 的起始姿态；整个入口不会发送任何真机动作指令
 - `--load-initial-alignment` 会在你按下 `p` 时提供机器人侧的 home pose/qpos；如果没有它，而又连了真机，则 `p` 会同时采当前真机 arm home；如果既没有它也没连真机，则 `p` 用当前 preview arm pose 作为 robot home
-- 默认会启用 joint-space 双臂碰撞规避，scene profile 默认 `dual_arm_hand_proxy_open`
+- 默认会启用 joint-space 双臂碰撞规避，scene profile 默认 `dual_arm_hand_proxy_open`；它使用明确指定的 12 对碰撞检测集合，覆盖固定张开手/arm-link3 proxy 与中央/左右 camera pole、table 的关键组合
 - 默认碰撞模式是 `boundary_slide`；如果要在接触阈值附近直接保持最近安全关节位姿，可改用 `--collision-avoidance-mode freeze_on_contact`
 - 如果想直接退回旧的独立双臂链路，可以加 `--no-collision`；旧参数 `--disable-dual-arm-collision-avoidance` 仍兼容
 - 当前预留的 scene profile 顺序是：`dual_arm` -> `dual_arm_hand_proxy_open` -> `dual_arm_hand` -> `dual_arm_cylinder_table`
@@ -604,7 +596,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 手部输入默认是**附加功能**：手部输入异常不会触发 arm teleop 的 `FROZEN`
 - 如果当前机器没有可用渲染设备，可以先用 `--skip-renderer` 验证 teleop 主链是否正常跑通
 - joint-space 双臂碰撞规避依赖 `pinocchio + pink + qpsolvers`
-- RM65 位控 backend 默认启用轻量奇异保护：只在目标关节从正常区进入 SDK 判定的奇异区时保持当前小步；如果当前已经在奇异区，则允许继续小步运动以便操作者退出奇异区
+- RM65 默认 impedance 遥操不再调用 SDK 奇异解检测；其独立的 IK、关节限位、力控与故障保护不变。普通位控遥操仍会在目标从正常区进入 SDK 判定奇异区时保持当前姿态。默认双臂 position replay 则先以原有效关节步幅的 0.2 生成慢速目标，并在同一 12 对碰撞复核通过后才下发；复核失败会 fault/hold，且该 replay 专用规则不影响 deploy。
 - 更详细的控制模式说明见 [teleop_runtime/README_control_modes.md](./README_control_modes.md)
 - 如果发现 `+X/+Y` 同时反了，先回 calibration tool 按 `f`，或者在标定入口直接加 `--virtual-desk-post-yaw-deg 180`
 
@@ -668,8 +660,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --left-hand-ip 192.168.12.210 \
   --right-hand-ip 192.168.11.210 \
   --hand-telemetry-hz 10 \
-  --hand-tactile-regions all \
-  --status-sec 1
+  --hand-tactile-regions all
 ```
 
 `--hand-tactile-regions` 默认就是 `all`，所以上面这一行也可以省略；保留它可以让采集命令更显式。如果只是排查控制链路、需要临时关闭触觉读取：
@@ -677,6 +668,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 ```bash
 --hand-tactile-regions ""
 ```
+
+真实遥操作默认仅在状态变化、故障和生命周期事件时打印终端日志，避免常规状态刷屏掩盖真实问题。若需要周期性状态摘要，显式追加 `--status-sec 1`；若需要连续姿态调试，追加 `--debug-orientation-console`。
 
 如果希望在开始前先验证当前真机起始关节和某份对齐状态是否足够接近：
 
@@ -817,13 +810,13 @@ debug trajectory 不会在正式 dataset 采集中默认重复保存；仅在 `-
 
 - 还没有真实键盘监听，`KeyboardButtonSource` 目前需要你主动 `set_button(...)`
 - `run_vive_rm65_calibration_debug.py` 已可用，但当前还没有把 `W / V / D / target axes` 显式叠加画到 SAPIEN 里
-- 双臂 joint-space 碰撞规避当前默认推荐 `dual_arm_hand_proxy_open`；它用固定张开手的 proxy 几何和固定桌面 box 维持 12DoF arm-only 求解。`dual_arm_hand` 仍保留给完整手模型实验路径，`dual_arm_cylinder_table` 仍是特定场景 profile
+- 双臂 joint-space 碰撞规避当前默认推荐 `dual_arm_hand_proxy_open`；它用固定张开手/arm-link3 proxy、中央与左右 camera pole、固定桌面 box 的 12 对碰撞检测集合维持 12DoF arm-only 求解。`dual_arm_hand` 仍保留给完整手模型实验路径，`dual_arm_cylinder_table` 仍是特定场景 profile
 - 当前 `virtual desk` 标定不恢复物理桌面的绝对世界原点
 - wrist 外参目前是“neutral pose 粗标 + 人工细调”，不是完全自动辨识；当前 coarse 默认 canonical hand frame 为 `[0, 0, 0]`，neutral hold 直接定义 tracker-to-hand 粗标外参
 
 ## 建议的当前工作流
 
-1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py --hz 60`
+1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py --hz 300`
 2. 跑 `run_vive_rm65_calibration_debug.py` 完成 `LINK_CHECK -> virtual desk -> wrist offset -> save profile`
 3. 启动 `run_vive_sapien_virtual.py`，读取 profile，并在当前真机/虚拟起始姿态上做 session `home capture`
 4. 用 `control_mode="absolute"` 做虚拟验收，确认前/左/上和双臂相对关系

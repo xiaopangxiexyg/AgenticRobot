@@ -9,7 +9,7 @@ from cameras.configs import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )
-from sim.mujoco_real2sim.config import default_camera_registry_path
+from sim.mujoco.config import default_camera_registry_path
 from teleop_runtime.cameras.registry import (
     build_camera_registry_snapshot,
     camera_matrix_from_intrinsics,

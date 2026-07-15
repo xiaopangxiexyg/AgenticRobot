@@ -14,8 +14,9 @@ if __package__ in (None, ""):
     REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
+    __package__ = "utils.hand_eye"
 
-from utils.hand_eye.calibration import (
+from .calibration import (
     CalibrationSample,
     load_samples,
     save_result,
@@ -23,7 +24,7 @@ from utils.hand_eye.calibration import (
     sample_plan_summary,
     solve_eye_in_hand,
 )
-from utils.hand_eye.camera import (
+from .camera import (
     DEFAULT_CAMERA_SERIALS,
     RealSenseCamera,
     RealSenseConfig,
@@ -31,9 +32,9 @@ from utils.hand_eye.camera import (
     TargetDetector,
     available_video_profiles,
 )
-from utils.hand_eye.capture import CaptureBurstConfig, capture_burst
-from utils.hand_eye.robot import RM65PoseReader
-from utils.hand_eye.transforms import transform_distance
+from .capture import CaptureBurstConfig, capture_burst
+from .robot import RM65PoseReader
+from .transforms import transform_distance
 
 
 LEFT_ARM_IP = "192.168.101.21"

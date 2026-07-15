@@ -18,7 +18,7 @@ from robot_motion.arm_init.constrained_transition import (
     evaluate_transition_state,
     plan_constrained_qpos_transition,
 )
-from robot_motion.pose import as_pose_matrix
+from robot_motion.pose import as_strict_pose_matrix
 
 from .constants import ARM_DOF, LEFT, RIGHT, SIDES
 from .ik import RM65DualArmCollisionIKBundle, RM65DualArmCollisionIKConfig, build_rm65_dual_arm_collision_ik_solver
@@ -168,12 +168,12 @@ def _embed_dual_arm_qpos(profile: Any, current_full_q: np.ndarray, left_rad: np.
 def _compute_frame_pose(solver: Any, frame_name: str, full_q: np.ndarray) -> np.ndarray:
     method = getattr(solver, "compute_frame_pose")
     try:
-        return as_pose_matrix(np.asarray(method(frame_name, full_q), dtype=float))
+        return as_strict_pose_matrix(np.asarray(method(frame_name, full_q), dtype=float))
     except TypeError:
         set_q = getattr(solver, "set_configuration_q", None)
         if set_q is not None:
             set_q(full_q)
-        return as_pose_matrix(np.asarray(method(frame_name), dtype=float))
+        return as_strict_pose_matrix(np.asarray(method(frame_name), dtype=float))
 
 
 __all__ = [

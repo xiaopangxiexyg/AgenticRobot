@@ -1,3 +1,10 @@
+"""Archived legacy delta-clutch controller.
+
+Kept for existing teleop_runtime delta_clutch compatibility. This module is
+intentionally not migrated to robot_motion; new shared sim/real motion code
+should use the absolute tool-TCP action contracts.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

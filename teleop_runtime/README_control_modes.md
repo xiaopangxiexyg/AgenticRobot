@@ -58,12 +58,12 @@
 
 ### 3.1 VIVE 发送端
 
-[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 默认发送两个 wrist tracker：
+[hardware/VIVE/mocap/vive_data_sender.py](../hardware/VIVE/mocap/vive_data_sender.py) 只接受两个 GenericTracker：
 
-- `tracker_1:left_wrist`
-- `tracker_2:right_wrist`
+- 按设备名字典序较小者发送为 `left_wrist`
+- 按设备名字典序较大者发送为 `right_wrist`
 
-第三只 `tracker_3:auxiliary` 可选；virtual desk 标定可以直接使用左/右 wrist tracker。
+发现多于两个 GenericTracker 时 sender 直接报错；virtual desk 标定可以直接使用左/右 wrist tracker。
 
 每个 tracker 打包内容包括：
 
@@ -369,9 +369,7 @@ conda activate dexteleop310
 python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
-  --hz 60 \
-  --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist
+  --hz 300
 ```
 
 跨机器调试时，把 `--host` 改成运行 `teleop_runtime` 接收端那台机器的 IP。
@@ -394,11 +392,10 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 正常工作时，终端会周期性打印类似：
 
 ```text
-[Calibration] expecting left_wrist_pose<-tracker_1, right_wrist_pose<-tracker_2
+[Calibration] expecting left_wrist_pose/right_wrist_pose from the two lexically sorted trackers
 [Calibration] HOME CAPTURE IS ARMED. Position robot and trackers first, then press 'p' or Enter.
 [Calibration] waiting_for_key tracker_ready={'left_wrist_pose': True, 'right_wrist_pose': True} ready_key='p/Enter'
-[Calibration] observed left_wrist_pose <- tracker_1:left_wrist frame=vive_world
-[Calibration] observed right_wrist_pose <- tracker_2:right_wrist frame=vive_world
+[Calibration] observed left_wrist_pose/right_wrist_pose frame=vive_world
 [Calibration] runtime home captured left_samples=20 right_samples=20
 [VirtualRun] step=123 hz=29.9 state=ARMED channels=['left_clutch_button', 'left_wrist_pose', 'right_clutch_button', 'right_wrist_pose'] left_clutch=False right_clutch=False faults=[] collision=tracking
 ```

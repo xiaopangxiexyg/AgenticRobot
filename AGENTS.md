@@ -1,11 +1,30 @@
-# Connection Codex Agent Rules
+# Project Rules
+
+## Core Rules
+
+* Respect directory ownership:
+
+  * `robot_motion/`: motion-control modules shared by simulation and real robots.
+  * `sim/`: simulation-only modules.
+  * `teleop_runtime/`: real-robot teleoperation, data collection, and deployment modules.
+  * `legacy/`: archived files and documents pending deletion.
+
+* Before writing code, ask for clarification if any requirement is ambiguous or underspecified.
+
+* Assume related modules may be modified or debugged concurrently. Avoid overwriting unrelated changes and keep edits scoped.
+
+* When necessary, add short temporary notes such as `AGENT_TEMP_NOTE:` near modified code to support collaboration. Before finishing, remove obsolete notes and retain only useful permanent comments.
+
+* When the project environment changes, update all relevant metadata and lock files—including pyproject.toml, environment.yml, and uv.lock.
+
+## Connection Codex Agent Rules
 
 These are agent instructions, not a full user manual. Apply them only when the
 Codex session current directory is
 `codex_remote` or a child directory. If they
 are loaded during unrelated local-only work, do not let them steer that task.
 
-## Hard Rules
+### Hard Rules
 
 - Keep Codex local. Treat remote machines only as SSH-reachable execution and
   hardware hosts.
@@ -22,7 +41,7 @@ are loaded during unrelated local-only work, do not let them steer that task.
 - Do not assume `Agent (Full Access)`. Respect the active sandbox and approval
   mode.
 
-## Sync Model
+### Sync Model
 
 - When the user states that realtime sync is active via
   `/home/zc/Release/util_scripts/Connection/realtime_sync_ssh.sh` in no-delete
@@ -40,7 +59,7 @@ are loaded during unrelated local-only work, do not let them steer that task.
 - If sync health matters or stale remote code is suspected, verify explicit
   files/directories with `remote_sync_check.sh`.
 
-## Safety Levels
+### Safety Levels
 
 - If an operation is not listed or cannot be confidently classified, treat it
   as L5 and stop for explicit user direction.
@@ -57,7 +76,7 @@ are loaded during unrelated local-only work, do not let them steer that task.
   servo, gripper motion, force control, reboot, shutdown, firmware flashing,
   CAN bus reset, or unknown robot-control actions; never run automatically.
 
-## Required Wrappers
+### Required Wrappers
 
 - Read-only checks: `remote_whoami.sh`, `remote_env.sh`, `remote_lsusb.sh`,
   `remote_dev_nodes.sh`, `remote_groups.sh`, `remote_dmesg_usb.sh`,
@@ -71,7 +90,7 @@ are loaded during unrelated local-only work, do not let them steer that task.
 - Intentional result retrieval: `remote_pull.sh` or
   `remote_collect_debug_bundle.sh`.
 
-## Real Control
+### Real Control
 
 - Do not execute real motion, homing, enable/disable, replay, trajectory,
   servo, gripper, force-control, emergency-stop, or other L4/L5 actions unless

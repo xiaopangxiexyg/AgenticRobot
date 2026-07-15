@@ -8,10 +8,9 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from .actions import NormalizedAction
-from .observation import DeploymentObservation
-from .replay import load_replay_actions_from_parquet, resolve_replay_parquet_path
-from .schema import (
+from robot_motion.deploy.actions import NormalizedAction
+from robot_motion.deploy.observation import DeploymentObservation
+from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
     ACTION_HAND_SLICES,
@@ -20,6 +19,8 @@ from .schema import (
     STATE_ARM_POSE_SLICES,
     deploy_arm_specs_metadata,
 )
+
+from .replay import load_replay_actions_from_parquet, resolve_replay_parquet_path
 
 _STARTUP_ARM_POSITION_TOLERANCE_M = 0.03
 _STARTUP_ARM_ROTATION_TOLERANCE_DEG = 20.0
@@ -270,12 +271,6 @@ def _startup_action_metadata() -> dict[str, Any]:
             for side, spec in deploy_arm_specs_metadata().items()
         },
         "arm_spec_required": True,
-        "safety_overrides": {
-            "max_arm_xyz_step_m": 0.0,
-            "max_arm_rot_step_deg": 0.0,
-            "max_arm_joint_step_rad": 0.0,
-            "max_hand_step": 0.0,
-        }
     }
 
 

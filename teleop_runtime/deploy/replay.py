@@ -7,11 +7,20 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ..collection.schema_v21 import chunk_id_from_episode_index, episode_id_from_index
-from .actions import NormalizedAction
-from .observation import DeploymentObservation
-from .policy import LoadedPolicy
-from .schema import (
+from dataset_contracts.v22 import (
+    DEXTELEOP_DATASET_SCHEMA_V22,
+    PolicyIOLayout,
+    policy_io_layout_from_metadata,
+)
+from dataset_contracts.pose_frames import PoseFrameContract, PoseFrameContractError
+from robot_motion.deploy.actions import NormalizedAction
+from robot_motion.deploy.observation import DeploymentObservation
+from robot_motion.deploy.pose_adapter import (
+    PoseDeploymentError,
+    convert_normalized_action_chunk_to_relative,
+)
+from robot_motion.deploy.v22 import V22DeploymentAdapter
+from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
     ACTION_HAND_SLICES,
@@ -20,6 +29,14 @@ from .schema import (
     HAND_DOF,
     nan_vector,
 )
+from robot_motion.replay.action_frame import replay_end_effector_targets_at_index
+from robot_motion.replay.trajectory import (
+    ReplayTrajectoryGroup,
+    replay_action_chunk_round_trip_metrics,
+)
+
+from ..collection.schema_v21 import chunk_id_from_episode_index, episode_id_from_index
+from .policy import LoadedPolicy
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -39,6 +56,16 @@ def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
         return {}
     payload = json.loads(info_path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else {}
+
+
+def _discover_dataset_root_for_parquet(path: Path) -> Path | None:
+    """Find an enclosing LeRobot-style root for a directly supplied parquet."""
+
+    resolved = path.expanduser().resolve()
+    for parent in resolved.parents:
+        if (parent / "meta" / "info.json").is_file():
+            return parent
+    return None
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -193,7 +220,16 @@ def resolve_replay_parquet_path(
         path = Path(parquet_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(f"Replay parquet does not exist: {path}")
-        return path, {"parquet_path": str(path), "source": "direct_parquet"}
+        discovered_root = _discover_dataset_root_for_parquet(path)
+        metadata: dict[str, Any] = {
+            "parquet_path": str(path),
+            "source": "direct_parquet",
+        }
+        if discovered_root is not None:
+            metadata["dataset_root"] = str(discovered_root)
+            metadata["dataset_info"] = _load_dataset_info(discovered_root)
+            metadata["source"] = "direct_parquet_with_dataset_meta"
+        return path, metadata
 
     if dataset_root is None or not str(dataset_root):
         raise ValueError("Replay mode requires --debug-replay-dataset or --debug-replay-parquet.")
@@ -366,6 +402,162 @@ def load_replay_actions_from_parquet(
     return np.stack(actions, axis=0).astype(np.float32, copy=False)
 
 
+def v22_replay_rows_to_legacy_actions(
+    rows: Sequence[Mapping[str, Any]],
+    layout: PolicyIOLayout,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Adapt typed v2.2 replay rows through an explicit legacy-q6 bridge.
+
+    This pure helper is shared by parquet replay loading and tests.  It does
+    not issue a command; the returned vectors still pass through the normal
+    deployment safety filter before real dispatch.
+    """
+
+    adapter = V22DeploymentAdapter(layout)
+    actions: list[np.ndarray] = []
+    action_metadata: dict[str, Any] | None = None
+    for row_index, row in enumerate(rows):
+        output = {
+            "action": row.get("action"),
+            "action.discrete": row.get("action.discrete"),
+            "policy_io_layout_hash": row.get("policy_io_layout_hash"),
+            "metadata": {"replay_row_index": int(row_index)},
+        }
+        normalized = adapter.to_legacy_normalized_actions(output, source="dataset_replay_v22")
+        if len(normalized) != 1:
+            raise ValueError("A single v2.2 replay row must produce exactly one action.")
+        actions.append(normalized[0].vector.astype(np.float32, copy=True))
+        if action_metadata is None:
+            action_metadata = dict(normalized[0].metadata)
+    if not actions:
+        raise ValueError("v2.2 replay contains no selected rows.")
+    return np.stack(actions, axis=0).astype(np.float32, copy=False), (action_metadata or {})
+
+
+def load_v22_replay_actions_from_parquet(
+    parquet_path: str | Path,
+    *,
+    layout: PolicyIOLayout,
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Load v2.2 action + int64 token fields from parquet for safe replay."""
+
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    available_columns = set(pq.read_schema(path).names)
+    required = {"action", "policy_io_layout_hash"}
+    if layout.action_discrete_dim:
+        required.add("action.discrete")
+    missing = sorted(required - available_columns)
+    if missing:
+        raise ValueError(
+            f"v2.2 replay parquet {path} is missing required column(s): {', '.join(missing)}."
+        )
+    rows = pq.read_table(path, columns=sorted(required)).to_pylist()
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay frame range is empty: start_index={start}, end_index={end_index}, "
+            f"row_count={len(rows)}."
+        )
+    return v22_replay_rows_to_legacy_actions(rows[start:stop], layout)
+
+
+def _parquet_declares_v22_policy_io(path: Path) -> bool:
+    """Return whether row-level v2.2 identity columns are present."""
+
+    names = set(_require_pyarrow_parquet().read_schema(path).names)
+    return "policy_io_layout_hash" in names and "action" in names
+
+
+def load_replay_frame_times_from_parquet(
+    parquet_path: str | Path,
+    *,
+    start_index: int = 0,
+    end_index: int | None = None,
+    fallback_hz: float,
+) -> tuple[tuple[float, ...], dict[str, Any]]:
+    """Load strictly increasing relative source times, with an explicit fallback.
+
+    Position replay should preserve real dataset jitter when a complete valid
+    timestamp column exists.  Missing, non-finite, duplicate, or backward
+    timestamps fall back for the whole selected range to the nominal action
+    grid; mixing real and synthetic intervals would create a harder-to-audit
+    trajectory.
+    """
+
+    rate = float(fallback_hz)
+    if not np.isfinite(rate) or rate <= 0.0:
+        raise ValueError("fallback_hz must be finite and positive")
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    schema = pq.read_schema(path)
+    available_columns = set(schema.names)
+    timestamp_column = next(
+        (
+            column
+            for column in ("timestamp", "observation.timestamp")
+            if column in available_columns
+        ),
+        None,
+    )
+
+    if timestamp_column is None:
+        row_count = int(pq.read_metadata(path).num_rows)
+        selected_values: list[Any] = []
+        fallback_reason = "timestamp_column_missing"
+    else:
+        rows = pq.read_table(path, columns=[timestamp_column]).to_pylist()
+        row_count = len(rows)
+        selected_values = [row.get(timestamp_column) for row in rows]
+        fallback_reason = "timestamp_values_invalid"
+
+    start = max(0, int(start_index))
+    stop = row_count if end_index is None else min(row_count, int(end_index))
+    if stop <= start:
+        raise ValueError(
+            "Replay frame range is empty for timestamp loading: "
+            f"start_index={start}, end_index={end_index}, row_count={row_count}."
+        )
+    count = stop - start
+    if timestamp_column is not None:
+        raw = np.asarray(
+            [
+                np.nan if _float_or_none(value) is None else float(value)
+                for value in selected_values[start:stop]
+            ],
+            dtype=float,
+        )
+        if np.all(np.isfinite(raw)) and (
+            raw.size <= 1 or np.all(np.diff(raw) > 0.0)
+        ):
+            relative = raw - raw[0]
+            return (
+                tuple(float(value) for value in relative),
+                {
+                    "source_timestamp_mode": "dataset",
+                    "source_timestamp_column": str(timestamp_column),
+                    "source_timestamp_start": float(raw[0]),
+                    "source_timestamp_duration_sec": float(relative[-1]),
+                    "frame_range": [int(start), int(stop)],
+                },
+            )
+
+    fallback = tuple(float(index) / rate for index in range(count))
+    return (
+        fallback,
+        {
+            "source_timestamp_mode": "nominal_fallback",
+            "source_timestamp_column": timestamp_column,
+            "source_timestamp_fallback_reason": fallback_reason,
+            "source_timestamp_fallback_hz": rate,
+            "frame_range": [int(start), int(stop)],
+        },
+    )
+
+
 def load_replay_arm_joint_targets_from_parquet(
     parquet_path: str | Path,
     *,
@@ -458,6 +650,74 @@ def load_replay_arm_joint_targets_from_parquet(
     }
 
 
+def load_replay_hand_joint_targets_from_parquet(
+    parquet_path: str | Path,
+    *,
+    active_sides: Sequence[str],
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Load explicit, fully resolved hand targets recorded for replay.
+
+    Formal collection intentionally stores ``action.replay.*_hand_joint_target``
+    from the backend's last accepted command.  It remains valid across a
+    temporary tracker hold where the high-level 26D action may omit the hand
+    effector and therefore contain NaN hand slots.
+    """
+
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    requested_columns = [
+        f"action.replay.{side}_hand_joint_target"
+        for side in ("left", "right")
+        if side in set(active_sides)
+    ]
+    available_columns = set(pq.read_schema(path).names)
+    columns = [column for column in requested_columns if column in available_columns]
+    if not columns:
+        return {}
+
+    loaded_sides = [
+        side
+        for side in active_sides
+        if f"action.replay.{side}_hand_joint_target" in columns
+    ]
+    rows = pq.read_table(path, columns=columns).to_pylist()
+    if not rows:
+        raise ValueError(f"Replay parquet contains no rows: {path}")
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay frame range is empty: start_index={start}, end_index={end_index}, "
+            f"row_count={len(rows)}."
+        )
+
+    targets_by_side: dict[str, list[np.ndarray]] = {side: [] for side in loaded_sides}
+    invalid_sides: set[str] = set()
+    for row in rows[start:stop]:
+        for side in loaded_sides:
+            if side in invalid_sides:
+                continue
+            key = f"action.replay.{side}_hand_joint_target"
+            try:
+                vector = np.asarray(row.get(key), dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError):
+                invalid_sides.add(side)
+                continue
+            if vector.shape != (HAND_DOF,) or not np.all(np.isfinite(vector)):
+                invalid_sides.add(side)
+                continue
+            targets_by_side[side].append(vector.astype(np.float32, copy=True))
+    for side in invalid_sides:
+        targets_by_side.pop(side, None)
+    return {
+        side: np.stack(values, axis=0).astype(np.float32, copy=False)
+        for side, values in targets_by_side.items()
+        if len(values) == stop - start
+    }
+
+
 def load_replay_arm_observation_qpos_from_parquet(
     parquet_path: str | Path,
     *,
@@ -526,6 +786,216 @@ def load_replay_arm_observation_qpos_from_parquet(
     }
 
 
+def load_replay_arm_qpos_audit_from_parquet(
+    parquet_path: str | Path,
+    *,
+    active_sides: Sequence[str],
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Load the v2.2 independent 12D arm-qpos audit field by logical side."""
+
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    available = set(pq.read_schema(path).names)
+    qpos_key = "observation.arm.qpos"
+    if qpos_key not in available:
+        return {}
+    columns = [qpos_key]
+    valid_key = "observation.arm.qpos_valid"
+    if valid_key in available:
+        columns.append(valid_key)
+    rows = pq.read_table(path, columns=columns).to_pylist()
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay qpos audit frame range is empty: start_index={start}, "
+            f"end_index={end_index}, row_count={len(rows)}."
+        )
+    active = tuple(side for side in ("left", "right") if side in set(active_sides))
+    output: dict[str, list[np.ndarray]] = {side: [] for side in active}
+    side_slices = {"left": slice(0, ARM_JOINT_DOF), "right": slice(ARM_JOINT_DOF, 12)}
+    invalid = nan_vector(ARM_JOINT_DOF)
+    for row in rows[start:stop]:
+        try:
+            qpos = np.asarray(row.get(qpos_key), dtype=np.float32).reshape(-1)
+        except Exception:
+            qpos = np.empty((0,), dtype=np.float32)
+        validity = row.get(valid_key)
+        try:
+            valid = None if validity is None else np.asarray(validity, dtype=bool).reshape(-1)
+        except Exception:
+            valid = np.empty((0,), dtype=bool)
+        for side in active:
+            target_slice = side_slices[side]
+            value = qpos[target_slice] if qpos.shape == (12,) else invalid
+            if valid is not None and (valid.shape != (12,) or not np.all(valid[target_slice])):
+                value = invalid
+            if value.shape != (ARM_JOINT_DOF,) or not np.all(np.isfinite(value)):
+                value = invalid
+            output[side].append(np.asarray(value, dtype=np.float32).copy())
+    return {
+        side: np.stack(values, axis=0).astype(np.float32, copy=False)
+        for side, values in output.items()
+    }
+
+
+def load_replay_arm_actual_tcp_pose_from_parquet(
+    parquet_path: str | Path,
+    *,
+    active_sides: Sequence[str],
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Load actual TCP anchor history for v2.2/v2.3 pose replay checks."""
+
+    path = Path(parquet_path).expanduser().resolve()
+    pq = _require_pyarrow_parquet()
+    requested = {
+        side: f"observation.arm.{side}.actual_tcp_pose"
+        for side in ("left", "right")
+        if side in {str(value).strip().lower() for value in active_sides}
+    }
+    available = set(pq.read_schema(path).names)
+    columns = [column for column in requested.values() if column in available]
+    if not columns:
+        return {}
+    rows = pq.read_table(path, columns=columns).to_pylist()
+    if not rows:
+        raise ValueError(f"Replay parquet contains no rows: {path}")
+    start = max(0, int(start_index))
+    stop = len(rows) if end_index is None else min(len(rows), int(end_index))
+    if stop <= start:
+        raise ValueError(
+            f"Replay actual TCP frame range is empty: start_index={start}, end_index={end_index}, "
+            f"row_count={len(rows)}."
+        )
+    invalid = np.full((7,), np.nan, dtype=np.float32)
+    output: dict[str, list[np.ndarray]] = {
+        side: [] for side, column in requested.items() if column in columns
+    }
+    for row in rows[start:stop]:
+        for side, column in requested.items():
+            if column not in columns:
+                continue
+            try:
+                value = np.asarray(row.get(column), dtype=np.float32).reshape(-1)
+            except Exception:
+                value = invalid
+            if value.shape != (7,) or not np.all(np.isfinite(value)):
+                value = invalid
+            output[side].append(np.asarray(value, dtype=np.float32).copy())
+    return {
+        side: np.stack(values, axis=0).astype(np.float32, copy=False)
+        for side, values in output.items()
+    }
+
+
+def compare_v22_replay_absolute_relative_chunks(
+    parquet_path: str | Path,
+    *,
+    layout: PolicyIOLayout,
+    active_sides: Sequence[str] = ("left", "right"),
+    start_index: int = 0,
+    end_index: int | None = None,
+    chunk_size: int = 32,
+    pose_frame_contract: PoseFrameContract | None = None,
+) -> dict[str, Any]:
+    """Compare absolute and relative round-trip replay poses from one parquet.
+
+    This is a hardware-free diagnostic.  It loads the v2.2 model action and
+    actual-TCP history, uses each chunk's first actual TCP as its fixed anchor,
+    and returns per-chunk SE(3) reconstruction metrics.  It never rewrites the
+    source dataset and does not change deployment's default absolute mode.
+    """
+
+    actions, action_metadata = load_v22_replay_actions_from_parquet(
+        parquet_path,
+        layout=layout,
+        start_index=int(start_index),
+        end_index=end_index,
+    )
+    actual_tcp = load_replay_arm_actual_tcp_pose_from_parquet(
+        parquet_path,
+        active_sides=active_sides,
+        start_index=int(start_index),
+        end_index=end_index,
+    )
+    missing = [side for side in active_sides if str(side).strip().lower() not in actual_tcp]
+    if missing:
+        raise ValueError(
+            "v2.2 relative replay comparison requires actual TCP columns for side(s): "
+            f"{sorted(set(str(side).strip().lower() for side in missing))}."
+        )
+    frame_contract = (
+        PoseFrameContract.legacy_v22_raw(active_sides=active_sides)
+        if pose_frame_contract is None
+        else pose_frame_contract
+    )
+    # Replay actions and measured anchors must enter the relative converter in
+    # one canonical desk frame.  The default legacy v2.2 contract is raw with
+    # identity transforms, so this remains a no-op for existing datasets.
+    for side in active_sides:
+        normalized_side = str(side).strip().lower()
+        pose_slice = ACTION_ARM_POSE_SLICES[normalized_side]
+        try:
+            actions[:, pose_slice] = np.stack(
+                [
+                    frame_contract.storage_pose_vector_to_desk(
+                        row[pose_slice], side=normalized_side
+                    )
+                    for row in actions
+                ],
+                axis=0,
+            )
+            actual_tcp[normalized_side] = np.stack(
+                [
+                    frame_contract.storage_pose_vector_to_desk(
+                        row, side=normalized_side
+                    )
+                    for row in actual_tcp[normalized_side]
+                ],
+                axis=0,
+            )
+        except (PoseFrameContractError, ValueError) as exc:
+            raise ValueError(
+                f"Replay pose frame conversion failed for side {normalized_side!r}: {exc}"
+            ) from exc
+    group = ReplayTrajectoryGroup(
+        key="v22_pose_comparison",
+        label="v22_pose_comparison",
+        source_path=str(Path(parquet_path).expanduser().resolve()),
+        source_episode_index=0,
+        start_index=int(start_index),
+        end_index=int(start_index) + int(actions.shape[0]),
+        frame_count=int(actions.shape[0]),
+        action_hz=0.0,
+        actions=actions,
+        arm_observation_actual_tcp_pose=actual_tcp,
+        metadata={"action_metadata": dict(action_metadata)},
+    )
+    reports: list[dict[str, Any]] = []
+    for chunk_start in range(0, int(actions.shape[0]), max(1, int(chunk_size))):
+        reports.append(
+            replay_action_chunk_round_trip_metrics(
+                group,
+                active_sides,
+                start_index=chunk_start,
+                chunk_size=int(chunk_size),
+            )
+        )
+    return {
+        "source_path": str(Path(parquet_path).expanduser().resolve()),
+        "frame_count": int(actions.shape[0]),
+        "chunk_size": max(1, int(chunk_size)),
+        "active_sides": tuple(str(side).strip().lower() for side in active_sides),
+        "pose_frame_contract": frame_contract.to_dict(),
+        "reports": reports,
+        "action_metadata": dict(action_metadata),
+    }
+
+
 def infer_replay_action_hz(
     *,
     parquet_path: str | Path,
@@ -553,12 +1023,17 @@ def infer_replay_action_hz(
         raise
     schema = pq.read_schema(path)
     available_columns = set(schema.names)
-    timing_columns = [column for column in ("control_hz", "timestamp") if column in available_columns]
+    timing_columns = [
+        column
+        for column in ("control_hz", "timestamp", "observation.timestamp")
+        if column in available_columns
+    ]
     if not timing_columns:
         if estimate is not None:
             return estimate
         raise ValueError(
-            f"Replay parquet {path} does not contain 'control_hz' or 'timestamp', "
+            f"Replay parquet {path} does not contain 'control_hz', 'timestamp', or "
+            "'observation.timestamp', "
             "and no metadata-derived action hz was available."
         )
 
@@ -573,12 +1048,23 @@ def infer_replay_action_hz(
             f"row_count={len(rows)}."
         )
     selected_rows = rows[start:stop]
+    timestamp_column = next(
+        (
+            column
+            for column in ("timestamp", "observation.timestamp")
+            if column in timing_columns
+        ),
+        None,
+    )
     timestamp_estimate = (
-        _estimate_hz_from_timestamps([row.get("timestamp") for row in selected_rows])
-        if "timestamp" in timing_columns
+        _estimate_hz_from_timestamps(
+            [row.get(timestamp_column) for row in selected_rows]
+        )
+        if timestamp_column is not None
         else None
     )
     if timestamp_estimate is not None:
+        timestamp_estimate["timestamp_column"] = str(timestamp_column)
         timestamp_estimate["episode_index"] = int(episode_index)
         timestamp_estimate["frame_range"] = [int(start), int(stop)]
         return timestamp_estimate
@@ -607,6 +1093,9 @@ class DatasetReplayPolicy:
     chunk_size: int = 32
     loop: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    action_metadata: dict[str, Any] = field(default_factory=dict)
+    output_pose_mode: str = "absolute"
+    active_sides: tuple[str, ...] = ("left", "right")
     cursor: int = 0
     completed_passes: int = 0
     finished: bool = False
@@ -622,6 +1111,14 @@ class DatasetReplayPolicy:
         self.actions = actions
         self.source_path = Path(self.source_path).expanduser().resolve()
         self.chunk_size = max(1, int(self.chunk_size))
+        self.output_pose_mode = str(self.output_pose_mode).strip().lower()
+        if self.output_pose_mode not in {"absolute", "relative"}:
+            raise ValueError(
+                "DatasetReplayPolicy output_pose_mode must be 'absolute' or 'relative'."
+            )
+        self.active_sides = tuple(
+            dict.fromkeys(str(side).strip().lower() for side in self.active_sides)
+        )
 
     @property
     def frame_count(self) -> int:
@@ -665,8 +1162,23 @@ class DatasetReplayPolicy:
         return chunk
 
     def predict(self, observation: DeploymentObservation) -> dict[str, Any]:
+        actions = [
+            NormalizedAction(vector=action, metadata=dict(self.action_metadata))
+            for action in self._next_action_chunk()
+        ]
+        if self.output_pose_mode == "relative":
+            try:
+                actions = convert_normalized_action_chunk_to_relative(
+                    actions,
+                    observation,
+                    active_sides=self.active_sides,
+                )
+            except PoseDeploymentError as exc:
+                raise RuntimeError(
+                    f"Dataset replay relative output requires measured actual TCP anchors: {exc}"
+                ) from exc
         return {
-            "action_chunk": [NormalizedAction(vector=action) for action in self._next_action_chunk()],
+            "action_chunk": actions,
             "metadata": {
                 "policy": "dataset_replay",
                 "source_path": str(self.source_path),
@@ -675,8 +1187,41 @@ class DatasetReplayPolicy:
                 "loop": bool(self.loop),
                 "finished": bool(self.finished),
                 "observation_step_index": int(observation.step_index),
+                "output_pose_mode": self.output_pose_mode,
             },
         }
+
+
+def _restrict_replay_end_effector_metadata(
+    metadata: Mapping[str, Any],
+    end_effector_sides: Sequence[str],
+) -> dict[str, Any]:
+    """Bind replay action metadata to the runtime end-effector selection.
+
+    v2.2 rows carry the end-effector sides declared by the dataset layout.  A
+    deployment may intentionally run the same arm-only dataset with
+    ``--end-effector-sides none`` (for example when the legacy hand hardware is
+    absent).  In that case the dataset declaration must not be allowed to
+    manufacture a hand request at the common safety boundary.
+    """
+
+    requested = tuple(dict.fromkeys(str(side).strip().lower() for side in end_effector_sides))
+    invalid = set(requested) - set(ACTION_HAND_SLICES)
+    if invalid:
+        raise ValueError(f"Unsupported replay end-effector side(s): {sorted(invalid)}")
+    restricted = dict(metadata)
+    restricted["end_effector_enabled_sides"] = list(requested)
+    for key in ("hand_action_specs_by_side", "hand_active_mask_by_side"):
+        value = restricted.get(key)
+        if isinstance(value, Mapping):
+            restricted[key] = {
+                side: item
+                for side, item in value.items()
+                if str(side).strip().lower() in set(requested)
+            }
+        elif not requested:
+            restricted[key] = {}
+    return restricted
 
 
 def load_dataset_replay_policy(
@@ -689,18 +1234,102 @@ def load_dataset_replay_policy(
     end_index: int | None = None,
     chunk_size: int = 32,
     loop: bool = False,
+    active_sides: Sequence[str] = ("left", "right"),
+    end_effector_sides: Sequence[str] | None = None,
+    output_pose_mode: str = "absolute",
+    policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None,
 ) -> LoadedPolicy:
     path, metadata = resolve_replay_parquet_path(
         dataset_root=dataset_root,
         parquet_path=parquet_path,
         episode_index=int(episode_index),
     )
-    actions = load_replay_actions_from_parquet(
-        path,
-        action_column=action_column,
-        start_index=int(start_index),
-        end_index=end_index,
+    dataset_info = metadata.get("dataset_info")
+    dataset_info = dataset_info if isinstance(dataset_info, Mapping) else {}
+    explicit_layout = policy_io_layout
+    if isinstance(explicit_layout, Mapping):
+        explicit_layout = PolicyIOLayout.from_dict(explicit_layout)
+    elif explicit_layout is not None and not isinstance(explicit_layout, PolicyIOLayout):
+        raise TypeError("policy_io_layout must be a PolicyIOLayout, mapping, or None.")
+    metadata_is_v22 = (
+        str(dataset_info.get("dexteleop_dataset_schema") or "")
+        == DEXTELEOP_DATASET_SCHEMA_V22
     )
+    row_contract_is_v22 = path.is_file() and _parquet_declares_v22_policy_io(path)
+    is_v22 = metadata_is_v22 or row_contract_is_v22
+    if is_v22:
+        if metadata_is_v22:
+            layout = policy_io_layout_from_metadata(dataset_info, allow_legacy_v21=False)
+            if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
+                raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
+        elif explicit_layout is not None:
+            layout = explicit_layout
+        else:
+            raise ValueError(
+                "Direct parquet declares v2.2 policy I/O but its layout cannot be reconstructed. "
+                "Pass the enclosing --debug-replay-dataset or an explicit policy_io_layout."
+            )
+        actions, v22_action_metadata = load_v22_replay_actions_from_parquet(
+            path,
+            layout=layout,
+            start_index=int(start_index),
+            end_index=end_index,
+        )
+    else:
+        if explicit_layout is not None:
+            raise ValueError(
+                "A v2.2 replay layout was supplied for a non-v2.2 dataset; convert the dataset first."
+            )
+        actions = load_replay_actions_from_parquet(
+            path,
+            action_column=action_column,
+            start_index=int(start_index),
+            end_index=end_index,
+        )
+        v22_action_metadata = {}
+    if end_effector_sides is not None:
+        v22_action_metadata = _restrict_replay_end_effector_metadata(
+            v22_action_metadata,
+            end_effector_sides,
+        )
+    active = tuple(dict.fromkeys(str(side).strip().lower() for side in active_sides))
+    unknown_sides = [side for side in active if side not in ACTION_HAND_SLICES]
+    if unknown_sides:
+        raise ValueError(f"Unsupported dataset replay side(s): {unknown_sides}.")
+    hand_joint_targets = (
+        {}
+        if is_v22
+        else load_replay_hand_joint_targets_from_parquet(
+            path,
+            active_sides=active,
+            start_index=int(start_index),
+            end_index=end_index,
+        )
+    )
+    if active and hand_joint_targets:
+        replay_group = ReplayTrajectoryGroup(
+            key="deploy_debug_replay",
+            label="deploy_debug_replay",
+            source_path=str(path),
+            source_episode_index=int(metadata.get("episode_index", int(episode_index))),
+            start_index=int(start_index),
+            end_index=int(start_index) + int(actions.shape[0]),
+            frame_count=int(actions.shape[0]),
+            action_hz=0.0,
+            actions=actions,
+            hand_joint_targets=hand_joint_targets,
+            metadata={"source_metadata": dict(metadata)},
+        )
+        normalized_actions = np.asarray(actions, dtype=np.float32).copy()
+        for index in range(int(normalized_actions.shape[0])):
+            resolved_hands = replay_end_effector_targets_at_index(
+                replay_group,
+                active,
+                index=index,
+            )
+            for side, target in resolved_hands.items():
+                normalized_actions[index, ACTION_HAND_SLICES[side]] = target
+        actions = normalized_actions
     action_hz_estimate = infer_replay_action_hz(
         parquet_path=path,
         dataset_root=dataset_root,
@@ -715,6 +1344,9 @@ def load_dataset_replay_policy(
         chunk_size=int(chunk_size),
         loop=bool(loop),
         metadata={**dict(metadata), "action_hz_estimate": dict(action_hz_estimate)},
+        action_metadata=v22_action_metadata,
+        output_pose_mode=str(output_pose_mode),
+        active_sides=active,
     )
     return LoadedPolicy(
         policy=policy,
@@ -725,9 +1357,14 @@ def load_dataset_replay_policy(
             "source_path": str(path),
             "frame_count": int(actions.shape[0]),
             "action_column": str(action_column or "action"),
+            "policy_io_layout_hash": (
+                None if not is_v22 else layout.layout_hash
+            ),
+            "explicit_hand_replay_sides": sorted(hand_joint_targets),
             "action_hz": float(action_hz_estimate["hz"]),
             "action_hz_source": str(action_hz_estimate.get("source", "unknown")),
             "action_hz_estimate": dict(action_hz_estimate),
+            "output_pose_mode": str(output_pose_mode).strip().lower(),
             **dict(metadata),
         },
     )

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from teleop_runtime.collection.video_frame import NearestFrameBuffer, VideoFrame
-from dataset_postprocess import (
+from utils.dataset_postprocess import (
     causal_align_dataset,
     clean_stutters,
     delete_episodes,
@@ -22,6 +22,7 @@ from dataset_postprocess import (
     split_episodes,
     trim_nan_tails,
 )
+from utils.dataset_postprocess.io import clone_dataset_tree
 
 
 def _write_jsonl(path, records):
@@ -51,6 +52,51 @@ def test_camera_buffer_latest_before_or_at_does_not_look_ahead() -> None:
 
 def test_parse_episode_selection_ranges() -> None:
     assert parse_episode_selection("1,3,5-7,3") == (1, 3, 5, 6, 7)
+
+
+def test_clone_dataset_tree_copies_mutable_prefixes_and_hardlinks_artifacts(tmp_path) -> None:
+    root = tmp_path / "dataset"
+    out = tmp_path / "dataset_clone"
+    (root / "meta").mkdir(parents=True)
+    (root / "data/chunk-000").mkdir(parents=True)
+    (root / "videos/front/chunk-000").mkdir(parents=True)
+    (root / "meta/info.json").write_text("{}", encoding="utf-8")
+    (root / "data/chunk-000/episode_000000.parquet").write_text("rows", encoding="utf-8")
+    (root / "videos/front/chunk-000/episode_000000.mp4").write_text("video", encoding="utf-8")
+
+    clone_dataset_tree(root, out, copy_prefixes=("meta", "data"))
+
+    source_meta = root / "meta/info.json"
+    clone_meta = out / "meta/info.json"
+    source_data = root / "data/chunk-000/episode_000000.parquet"
+    clone_data = out / "data/chunk-000/episode_000000.parquet"
+    source_video = root / "videos/front/chunk-000/episode_000000.mp4"
+    clone_video = out / "videos/front/chunk-000/episode_000000.mp4"
+
+    assert clone_meta.read_text(encoding="utf-8") == "{}"
+    assert clone_data.read_text(encoding="utf-8") == "rows"
+    assert clone_video.read_text(encoding="utf-8") == "video"
+    assert (source_meta.stat().st_dev, source_meta.stat().st_ino) != (
+        clone_meta.stat().st_dev,
+        clone_meta.stat().st_ino,
+    )
+    assert (source_data.stat().st_dev, source_data.stat().st_ino) != (
+        clone_data.stat().st_dev,
+        clone_data.stat().st_ino,
+    )
+    assert (source_video.stat().st_dev, source_video.stat().st_ino) == (
+        clone_video.stat().st_dev,
+        clone_video.stat().st_ino,
+    )
+
+
+def test_clone_dataset_tree_rejects_output_inside_source(tmp_path) -> None:
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta/info.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be inside source_root"):
+        clone_dataset_tree(root, root / "derived")
 
 
 def test_detect_stutter_segments_splits_on_long_gap() -> None:
@@ -388,7 +434,7 @@ def test_label_force_collisions_updates_episode_and_stats_meta(tmp_path) -> None
     assert updated_stats[0]["force_collision_detected"] is True
     assert updated_stats[1]["force_collision_label"] == "clean"
     info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
-    assert info["postprocess_history"][-1]["tool"] == "dataset_postprocess.label_force_collisions"
+    assert info["postprocess_history"][-1]["tool"] == "utils.dataset_postprocess.label_force_collisions"
 
 
 def test_label_force_collisions_override_all_detected(tmp_path) -> None:
@@ -481,7 +527,7 @@ def test_causal_align_dataset_uses_latest_non_future_refs(tmp_path) -> None:
     assert updated[1]["observation.images.front.age_sec"] == pytest.approx(0.1)
     info = json.loads((out / "meta" / "info.json").read_text(encoding="utf-8"))
     assert info["dataset_name"] == "dataset_causal"
-    assert info["postprocess_history"][-1]["tool"] == "dataset_postprocess.causal_align"
+    assert info["postprocess_history"][-1]["tool"] == "utils.dataset_postprocess.causal_align"
 
 
 def test_trim_nan_tails_copies_dataset_and_updates_meta(tmp_path) -> None:

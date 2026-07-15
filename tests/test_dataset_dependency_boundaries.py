@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+import ast
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+from dataset_contracts import parquet as parquet_contract
+from dataset_contracts.stats import EpisodeStatsAccumulator
+from dataset_contracts.tactile import ChunkedTactileStream
+from dataset_contracts.wrist_depth import DepthRangeMaskConfig, mask_manifest_payload
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _absolute_import_roots(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.split(".", 1)[0])
+    return roots
+
+
+def _python_files(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
+
+
+def _dynamic_imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    importlib_names = {"importlib"}
+    import_module_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib":
+                    importlib_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_module_names.add(alias.asname or alias.name)
+
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = node.func
+        is_import_module = (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and function.value.id in importlib_names
+            and function.attr == "import_module"
+        ) or (
+            isinstance(function, ast.Name)
+            and function.id in import_module_names
+        )
+        is_builtin_import = isinstance(function, ast.Name) and function.id == "__import__"
+        if not (is_import_module or is_builtin_import):
+            continue
+        module = node.args[0]
+        if isinstance(module, ast.Constant) and isinstance(module.value, str):
+            imports.add(module.value)
+    return imports
+
+
+def _imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    modules = set(_dynamic_imports(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules.add(node.module)
+    return modules
+
+
+def _is_declared_diagnostic_bridge(path: Path) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "DIAGNOSTIC_RUNTIME_BRIDGE" for target in node.targets):
+            continue
+        return isinstance(node.value, ast.Constant) and node.value.value is True
+    return False
+
+
+def test_dataset_contracts_has_no_application_or_tooling_dependencies() -> None:
+    forbidden = {
+        "teleop_runtime",
+        "robot_motion",
+        "hardware",
+        "cameras",
+        "sim",
+        "utils",
+        "rm65_inspire_tac",
+    }
+    violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
+        )
+        for path in _python_files(REPO_ROOT / "dataset_contracts")
+        if {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
+    }
+    assert violations == {}
+
+
+def test_offline_postprocess_has_no_static_runtime_dependency() -> None:
+    forbidden = {
+        "teleop_runtime",
+        "robot_motion",
+        "hardware",
+        "cameras",
+        "sim",
+        "rm65_inspire_tac",
+    }
+    violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(_absolute_import_roots(path) & forbidden)
+        for path in _python_files(REPO_ROOT / "utils/dataset_postprocess")
+        if not _is_declared_diagnostic_bridge(path)
+        and _absolute_import_roots(path) & forbidden
+    }
+    assert violations == {}
+
+
+def test_postprocess_runtime_bridge_is_explicit_and_limited_to_camera_smoke_cli() -> None:
+    dynamic_runtime_imports = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            name
+            for name in _dynamic_imports(path)
+            if name.split(".", 1)[0] in {"teleop_runtime", "robot_motion"}
+        )
+        for path in _python_files(REPO_ROOT / "utils/dataset_postprocess")
+        if any(
+            name.split(".", 1)[0] in {"teleop_runtime", "robot_motion"}
+            for name in _dynamic_imports(path)
+        )
+    }
+    expected_path = "utils/dataset_postprocess/wrist_cam_adjust/smoke_wrist_depth_capture.py"
+    assert dynamic_runtime_imports == {
+        expected_path: ["teleop_runtime.sources.camera"],
+    }
+    assert _is_declared_diagnostic_bridge(REPO_ROOT / expected_path)
+
+
+def test_runtime_and_sim_do_not_import_offline_postprocess_implementation() -> None:
+    violations: list[str] = []
+    for package in ("teleop_runtime", "robot_motion", "sim", "rm65_inspire_tac"):
+        for path in _python_files(REPO_ROOT / package):
+            if any(
+                name == "utils.dataset_postprocess"
+                or name.startswith("utils.dataset_postprocess.")
+                for name in _imported_modules(path)
+            ):
+                violations.append(str(path.relative_to(REPO_ROOT)))
+    assert sorted(set(violations)) == []
+
+
+def test_legacy_data_paths_reexport_the_shared_contract_objects() -> None:
+    from teleop_runtime.collection import schema_v21
+    from teleop_runtime.collection.stats import EpisodeStatsAccumulator as RuntimeStats
+    from teleop_runtime.collection.writer_v21 import DepthRangeMaskConfig as WriterDepthConfig
+    from teleop_runtime.replay.media import _ChunkedTactileStream
+    from sim.mujoco.replay.dataset_writer import DepthRangeMaskConfig as SimWriterDepthConfig
+    from utils.dataset_postprocess.wrist_cam_adjust.depth import (
+        DepthRangeMaskConfig as OfflineDepthConfig,
+    )
+
+    assert RuntimeStats is EpisodeStatsAccumulator
+    assert WriterDepthConfig is DepthRangeMaskConfig
+    assert SimWriterDepthConfig is DepthRangeMaskConfig
+    assert OfflineDepthConfig is DepthRangeMaskConfig
+    assert _ChunkedTactileStream is ChunkedTactileStream
+    assert schema_v21.write_rows_to_parquet is parquet_contract.write_rows_to_parquet
+    assert schema_v21._FLOAT32_LIST_COLUMNS is parquet_contract.FLOAT32_LIST_COLUMNS
+    assert schema_v21._STRING_LIST_COLUMNS is parquet_contract.STRING_LIST_COLUMNS
+    assert schema_v21._INT64_LIST_COLUMNS is parquet_contract.INT64_LIST_COLUMNS
+    assert schema_v21._ARM_MODE_FLOAT64_COLUMNS is parquet_contract.ARM_MODE_FLOAT64_COLUMNS
+    assert schema_v21._ARM_MODE_INT64_COLUMNS is parquet_contract.ARM_MODE_INT64_COLUMNS
+    assert schema_v21._ARM_MODE_STRING_COLUMNS is parquet_contract.ARM_MODE_STRING_COLUMNS
+
+
+def test_shared_manifest_does_not_embed_an_offline_implementation_path() -> None:
+    payload = mask_manifest_payload(
+        camera_key="left_wrist",
+        relative_dir="wrist_depth/mask/left_wrist",
+        stream_path="mask.bitpack.bin",
+        frame_count=0,
+        height=2,
+        width=2,
+        records=[],
+        config=DepthRangeMaskConfig(),
+    )
+    note = str(payload["semantics"]["postprocess_note"])
+    assert "utils.dataset_postprocess" not in note
+
+
+def test_scene_layout_legacy_path_reexports_robot_motion_contract() -> None:
+    from robot_motion.scene_layout import rm65_base_y_for_side as canonical
+    from teleop_runtime.scene_layout import rm65_base_y_for_side as legacy
+
+    assert legacy is canonical
+
+
+def test_rm65_support_package_does_not_import_teleop_runtime() -> None:
+    violations = {
+        str(path.relative_to(REPO_ROOT)): sorted(
+            name for name in _imported_modules(path)
+            if name == "teleop_runtime" or name.startswith("teleop_runtime.")
+        )
+        for path in _python_files(REPO_ROOT / "rm65_inspire_tac")
+        if any(
+            name == "teleop_runtime" or name.startswith("teleop_runtime.")
+            for name in _imported_modules(path)
+        )
+    }
+    assert violations == {}
+
+
+def test_data_packages_import_without_loading_runtime_or_hardware() -> None:
+    code = """
+import sys
+import dataset_contracts
+import utils.dataset_postprocess
+
+forbidden = ("teleop_runtime", "robot_motion", "hardware", "rm65_inspire_tac")
+loaded = sorted(
+    name for name in sys.modules
+    if name in forbidden or name.startswith(tuple(prefix + "." for prefix in forbidden))
+)
+assert loaded == [], loaded
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

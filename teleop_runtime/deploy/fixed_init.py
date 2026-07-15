@@ -6,21 +6,21 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ..schemas import EffectorCommand
-from .replay import (
-    infer_replay_action_hz,
-    load_replay_actions_from_parquet,
-    load_replay_arm_joint_targets_from_parquet,
-    resolve_replay_parquet_path,
-)
-from .schema import (
+from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
-    ACTION_DIM,
     ACTION_HAND_SLICES,
     ARM_JOINT_DOF,
     ARM_POSE_DOF,
     HAND_DOF,
     xyzquat_to_pose_matrix,
+)
+from robot_motion.runtime import EffectorCommand
+
+from .replay import (
+    infer_replay_action_hz,
+    load_replay_actions_from_parquet,
+    load_replay_arm_joint_targets_from_parquet,
+    resolve_replay_parquet_path,
 )
 
 
@@ -305,7 +305,7 @@ class DeployFixedInitController:
         plan: DeployFixedInitPlan,
         *,
         arm_max_angvel: Sequence[float],
-        qpos_tolerance: float = 0.01,
+        qpos_tolerance: float = 0.1,
     ) -> None:
         self.plan = plan
         self.arm_max_angvel = tuple(float(value) for value in arm_max_angvel)

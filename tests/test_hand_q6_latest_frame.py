@@ -239,7 +239,19 @@ class HandQ6NormalizationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             serial_obj = _FakeCalibratingSerial(_angles_line(200))
-            with unittest.mock.patch.object(runtime_hand_q6_reader.serial, "Serial", return_value=serial_obj):
+            record_dir = Path(tmp_dir) / "hand_zero_pose_calibrations"
+            with (
+                unittest.mock.patch.object(
+                    runtime_hand_q6_reader.serial,
+                    "Serial",
+                    return_value=serial_obj,
+                ),
+                unittest.mock.patch.object(
+                    runtime_hand_q6_reader,
+                    "_default_zero_pose_record_dir",
+                    return_value=record_dir,
+                ),
+            ):
                 reader = runtime_hand_q6_reader.SingleHandQ6Reader(
                     port="/dev/current-q6",
                     side="right",
@@ -249,8 +261,10 @@ class HandQ6NormalizationTests(unittest.TestCase):
 
             payload = json.loads(path.read_text(encoding="utf-8"))
             current_entry = payload["port_calibrations"]["right"]["/dev/current-q6"]
+            calibration_records = list(record_dir.glob("*.json"))
 
         self.assertTrue(serial_obj.closed)
+        self.assertEqual(len(calibration_records), 1)
         self.assertEqual(reader.calib["deg_at_0"].tolist(), [200.0, 201.0, 202.0, 203.0, 204.0, 205.0])
         self.assertEqual(current_entry["port"], "/dev/current-q6")
         self.assertEqual(current_entry["deg_at_0"], [200.0, 201.0, 202.0, 203.0, 204.0, 205.0])

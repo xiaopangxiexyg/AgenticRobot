@@ -1,0 +1,526 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from robot_motion.position_control import (
+    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_45_150_PROFILE,
+    POSITION_PROFILE,
+    PositionControlRates,
+)
+from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.position_control import (
+    ControlDebugConfig,
+    resolve_control_debug_config,
+    resolve_real_arm_execution_config,
+)
+
+
+def _execution_args(**overrides):
+    values = {
+        "arm_execution_profile": None,
+        "arm_control_mode": "impedance",
+        "hz": 15.0,
+        "position_reference_hz": 75.0,
+        "dual_arm_ik_hz": None,
+        "arm_control_hz": None,
+        "arm_canfd_follow": None,
+        "arm_canfd_follow_stream_hz": None,
+        "position_post_ik_qpos_smoothing_alpha": None,
+        "arm_follow_qpos_alpha": None,
+        "arm_canfd_follow_warning_ratio": None,
+        "arm_canfd_trajectory_mode": None,
+        "arm_canfd_radio": None,
+        "position_reference_max_age_sec": 0.2,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _parse_real_teleop_args(argv: list[str]) -> argparse.Namespace:
+    with patch.object(
+        sys,
+        "argv",
+        ["prog", "--no-device-preflight", *argv],
+    ):
+        return real_teleop.parse_args()
+
+
+def test_default_common_position_profile_contract_has_independent_15_75_150_clocks() -> None:
+    rates = POSITION_PROFILE.rates
+
+    assert rates.sample_hz == 15.0
+    assert rates.reference_hz == 75.0
+    assert rates.ik_hz == 75.0
+    assert rates.command_hz == 150.0
+    assert rates.ordering_warnings == ()
+    assert rates.to_metadata()["independent_clocks"] is True
+
+
+def test_real_teleop_velocity_planner_is_explicit_opt_in_with_point_one_second_ramp() -> None:
+    defaults = _parse_real_teleop_args([])
+    assert defaults.position_command_planner == POSITION_COMMAND_PLANNER_LINEAR
+    assert defaults.position_velocity_ramp_sec == pytest.approx(0.10)
+    assert defaults.position_degraded_speed_scale == pytest.approx(0.50)
+    assert defaults.position_max_acceleration_rad_s2 == pytest.approx(
+        (7.0, 7.0, 9.0, 15.0, 15.0, 20.0)
+    )
+
+    enabled = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position",
+            "--position-command-planner",
+            "acceleration_limited",
+            "--position-velocity-ramp-sec",
+            "0.08",
+            "--position-degraded-speed-scale",
+            "0.2",
+            "--position-max-acceleration-rad-s2",
+            "8,8,10,16,16,21",
+        ]
+    )
+    assert (
+        enabled.position_command_planner
+        == POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED
+    )
+    assert enabled.position_velocity_ramp_sec == pytest.approx(0.08)
+    assert enabled.position_degraded_speed_scale == pytest.approx(0.2)
+    assert enabled.position_max_acceleration_rad_s2 == pytest.approx(
+        (8.0, 8.0, 10.0, 16.0, 16.0, 21.0)
+    )
+
+
+def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            ["--position-command-planner", "acceleration_limited"]
+        )
+
+
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-execution-profile",
+                "position",
+                "--no-arm-canfd-follow",
+                "--position-command-planner",
+                "acceleration_limited",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-execution-profile",
+                "position",
+                "--position-reference-hz",
+                "100",
+                "--arm-control-hz",
+                "50",
+                "--position-command-planner",
+                "acceleration_limited",
+            ]
+        )
+
+
+def test_real_teleop_position_ik_iteration_options_are_exposed_and_position_only() -> None:
+    defaults = _parse_real_teleop_args([])
+    assert defaults.position_ik_solve_max_iterations == 1
+    assert defaults.position_ik_adaptive_iterations is False
+    assert defaults.position_ik_iteration_reserve_ms == pytest.approx(5.0)
+    assert defaults.position_ik_local_step_clip_scale == pytest.approx(1.0)
+
+    tuned = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position",
+            "--position-ik-solve-max-iterations",
+            "4",
+            "--position-ik-adaptive-iterations",
+            "--position-ik-iteration-reserve-ms",
+            "6.5",
+            "--position-ik-local-step-clip-scale",
+            "2.5",
+        ]
+    )
+    assert tuned.position_ik_solve_max_iterations == 4
+    assert tuned.position_ik_adaptive_iterations is True
+    assert tuned.position_ik_iteration_reserve_ms == pytest.approx(6.5)
+    assert tuned.position_ik_local_step_clip_scale == pytest.approx(2.5)
+
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-execution-profile",
+                "impedance",
+                "--ik-solve-max-iterations",
+                "2",
+                "--position-ik-local-step-clip-scale",
+                "2",
+            ]
+        )
+
+
+def test_legacy_common_position_profile_keeps_15_45_150_clocks() -> None:
+    rates = POSITION_45_150_PROFILE.rates
+
+    assert rates.sample_hz == 15.0
+    assert rates.reference_hz == 45.0
+    assert rates.ik_hz == 45.0
+    assert rates.command_hz == 150.0
+    assert rates.ordering_warnings == ()
+    assert rates.to_metadata()["independent_clocks"] is True
+
+
+def test_common_position_rates_reject_non_positive_values_but_report_ordering() -> None:
+    with pytest.raises(ValueError, match="sample_hz"):
+        PositionControlRates(sample_hz=0.0)
+
+    rates = PositionControlRates(
+        sample_hz=30.0,
+        reference_hz=20.0,
+        ik_hz=20.0,
+        command_hz=10.0,
+    )
+    assert rates.ordering_warnings == (
+        "reference_hz_below_sample_hz",
+        "command_hz_below_reference_hz",
+    )
+
+
+def test_shared_impedance_profile_keeps_15hz_outer_and_40hz_backend_by_default() -> None:
+    args = _execution_args(arm_execution_profile="impedance_40hz")
+
+    resolved = resolve_real_arm_execution_config(
+        args,
+        raw_argv=("--arm-execution-profile", "impedance_40hz"),
+    )
+
+    assert resolved.requested_profile == "impedance_40hz"
+    assert resolved.resolved_profile == "impedance_40hz"
+    assert resolved.mode == "impedance"
+    assert resolved.sample_hz == 15.0
+    assert resolved.outer_control_hz == 15.0
+    assert resolved.dual_arm_ik_hz == 15.0
+    assert resolved.arm_control_hz == 40.0
+    assert resolved.arm_canfd_follow is False
+    assert resolved.position_background_streaming_enabled is False
+
+
+def test_legacy_position_profile_selects_mode_and_resolves_15_45_150() -> None:
+    args = _execution_args(arm_execution_profile="position_45_150hz")
+
+    resolved = resolve_real_arm_execution_config(
+        args,
+        raw_argv=("--arm-execution-profile", "position_45_150hz"),
+    )
+
+    assert resolved.requested_profile == "position_45_150hz"
+    assert resolved.resolved_profile == "position_45_150hz"
+    assert resolved.mode == "position"
+    assert resolved.sample_hz == 15.0
+    assert resolved.outer_control_hz == 45.0
+    assert resolved.position_reference_hz == 45.0
+    assert resolved.dual_arm_ik_hz == 45.0
+    assert resolved.arm_control_hz == 150.0
+    assert resolved.position_background_streaming_hz == 150.0
+    assert resolved.arm_canfd_follow is True
+    assert resolved.position_background_streaming_enabled is True
+    assert resolved.arm_canfd_trajectory_mode == 0
+    assert resolved.arm_canfd_radio == 0
+
+
+def test_default_position_profile_selects_mode_and_resolves_15_75_150() -> None:
+    args = _execution_args(arm_execution_profile="position")
+
+    resolved = resolve_real_arm_execution_config(
+        args,
+        raw_argv=("--arm-execution-profile", "position"),
+    )
+
+    assert resolved.requested_profile == "position"
+    assert resolved.resolved_profile == "position"
+    assert resolved.mode == "position"
+    assert resolved.sample_hz == 15.0
+    assert resolved.outer_control_hz == 75.0
+    assert resolved.position_reference_hz == 75.0
+    assert resolved.dual_arm_ik_hz == 75.0
+    assert resolved.arm_control_hz == 150.0
+    assert resolved.position_background_streaming_hz == 150.0
+    assert resolved.arm_canfd_follow is True
+    assert resolved.position_background_streaming_enabled is True
+
+
+def test_unnamed_position_mode_uses_default_15_75_150_profile() -> None:
+    args = _execution_args(arm_control_mode="position")
+
+    resolved = resolve_real_arm_execution_config(args)
+
+    assert resolved.requested_profile is None
+    assert resolved.resolved_profile == "position"
+    assert resolved.sample_hz == 15.0
+    assert resolved.position_reference_hz == 75.0
+    assert resolved.dual_arm_ik_hz == 75.0
+    assert resolved.arm_control_hz == 150.0
+
+
+def test_position_profile_allows_stage_overrides_and_marks_legacy_stream_precedence() -> None:
+    args = _execution_args(
+        arm_execution_profile="position_45_150hz",
+        hz=12.0,
+        position_reference_hz=48.0,
+        dual_arm_ik_hz=48.0,
+        arm_control_hz=160.0,
+        arm_canfd_follow=True,
+        arm_canfd_follow_stream_hz=140.0,
+        arm_follow_qpos_alpha=1.0,
+    )
+    raw_argv = (
+        "--arm-execution-profile",
+        "position_45_150hz",
+        "--hz",
+        "12",
+        "--position-reference-hz",
+        "48",
+        "--dual-arm-ik-hz",
+        "48",
+        "--arm-control-hz",
+        "160",
+        "--arm-canfd-follow",
+        "--arm-canfd-follow-stream-hz",
+        "140",
+        "--arm-follow-qpos-alpha",
+        "1.0",
+    )
+
+    resolved = resolve_real_arm_execution_config(args, raw_argv=raw_argv)
+
+    assert resolved.resolved_profile == "position_custom"
+    assert resolved.sample_hz == 12.0
+    assert resolved.position_reference_hz == 48.0
+    assert resolved.dual_arm_ik_hz == 48.0
+    assert resolved.arm_control_hz == 160.0
+    assert resolved.position_background_streaming_hz == 140.0
+    assert resolved.arm_follow_qpos_alpha == 1.0
+    assert "arm_canfd_follow_stream_hz" in resolved.explicit_overrides
+    assert any(
+        "overrides --arm-control-hz" in warning
+        for warning in resolved.compatibility_warnings
+    )
+
+
+def test_position_profile_ik_rate_follows_custom_reference_when_not_overridden() -> None:
+    args = _execution_args(
+        arm_execution_profile="position_45_150hz",
+        position_reference_hz=50.0,
+    )
+
+    resolved = resolve_real_arm_execution_config(
+        args,
+        raw_argv=(
+            "--arm-execution-profile",
+            "position_45_150hz",
+            "--position-reference-hz",
+            "50",
+        ),
+    )
+
+    assert resolved.position_reference_hz == 50.0
+    assert resolved.outer_control_hz == 50.0
+    assert resolved.dual_arm_ik_hz == 50.0
+    assert resolved.resolved_profile == "position_custom"
+
+
+def test_mismatched_ik_nominal_rate_is_audited_as_not_an_independent_clock() -> None:
+    args = _execution_args(
+        arm_execution_profile="position_45_150hz",
+        dual_arm_ik_hz=30.0,
+    )
+    resolved = resolve_real_arm_execution_config(
+        args,
+        raw_argv=(
+            "--arm-execution-profile",
+            "position_45_150hz",
+            "--dual-arm-ik-hz",
+            "30",
+        ),
+    )
+
+    assert any(
+        "actual IK calls" in warning for warning in resolved.compatibility_warnings
+    )
+    assert (
+        resolved.to_metadata()["rate_semantics"]["dual_arm_ik_hz"]
+        == "solver_nominal_budget_not_independent_scheduler"
+    )
+
+
+def test_named_profile_rejects_explicit_conflicting_mode() -> None:
+    args = _execution_args(
+        arm_execution_profile="position_45_150hz",
+        arm_control_mode="impedance",
+    )
+
+    with pytest.raises(ValueError, match="requires --arm-control-mode position"):
+        resolve_real_arm_execution_config(
+            args,
+            raw_argv=(
+                "--arm-execution-profile",
+                "position_45_150hz",
+                "--arm-control-mode",
+                "impedance",
+            ),
+        )
+
+
+def test_control_debug_contract_is_observational_only() -> None:
+    args = SimpleNamespace(
+        control_debug="full",
+        control_debug_root="teleop_records/custom_control_debug",
+        control_debug_queue_size=256,
+        control_debug_flush_every=12,
+        safe_debug=False,
+        disable_hold=False,
+        strict_degree_limit=False,
+    )
+
+    resolved = resolve_control_debug_config(args)
+
+    assert resolved == ControlDebugConfig(
+        level="full",
+        root="teleop_records/custom_control_debug",
+        queue_size=256,
+        flush_every=12,
+    )
+    assert resolved.enabled is True
+    assert resolved.record_summary is True
+    assert resolved.record_full_trace is True
+    assert resolved.to_metadata()["observational_only"] is True
+    assert args.safe_debug is False
+    assert args.disable_hold is False
+    assert args.strict_degree_limit is False
+
+
+def test_control_debug_runtime_metadata_distinguishes_request_attachment_and_error() -> None:
+    args = SimpleNamespace(
+        control_debug_config=ControlDebugConfig(level="full"),
+        control_debug_runtime_metadata={},
+    )
+
+    requested = real_teleop._merge_control_debug_runtime_metadata(
+        args,
+        session_sidecar_requested=True,
+        session_sidecar_attached=False,
+        session_sidecar_error=None,
+    )
+    attached = real_teleop._merge_control_debug_runtime_metadata(
+        args,
+        session_sidecar_attached=True,
+        session_sidecar_output_dir="teleop_records/control_debug/session",
+        session_sidecar_attached_wall_time=123.0,
+        session_sidecar_attached_monotonic_time=45.0,
+    )
+
+    assert requested["session_sidecar_attached"] is False
+    assert attached["session_sidecar_requested"] is True
+    assert attached["session_sidecar_attached"] is True
+    assert attached["session_sidecar_error"] is None
+    assert attached["session_sidecar_output_dir"].endswith("/session")
+    assert attached["session_sidecar_attached_wall_time"] == 123.0
+    assert attached["session_sidecar_attached_monotonic_time"] == 45.0
+    assert requested is not attached
+    metadata = real_teleop._debug_timing_metadata(args)["control_debug"]
+    assert metadata["session_sidecar_requested"] is True
+    assert metadata["session_sidecar_attached"] is True
+
+
+def test_summary_recorder_embeds_sanitized_execution_context(tmp_path: Path) -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position_45_150hz",
+            "--control-debug",
+            "summary",
+        ]
+    )
+    recorder = real_teleop._new_position_debug_recorder(
+        args,
+        output_dir=tmp_path,
+        thread_name="unit-position-summary",
+        components=None,
+    )
+    recorder.close()
+
+    summary = json.loads((tmp_path / "position_summary.json").read_text())
+    context = summary["context"]
+    assert context["arm_execution"]["resolved_profile"] == "position_45_150hz"
+    assert context["arm_execution"]["rates"]["position_reference_hz"] == 45.0
+    assert context["effective_transport"]["position_background_streaming_hz"] == 150.0
+    assert "left_arm_ip" not in json.dumps(context)
+
+
+def test_real_entry_profile_and_debug_parse_without_overwriting_legacy_raw_defaults() -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position_45_150hz",
+            "--control-debug",
+            "full",
+            "--control-debug-root",
+            "teleop_records/profile_debug",
+            "--control-debug-queue-size",
+            "512",
+            "--control-debug-flush-every",
+            "20",
+        ]
+    )
+
+    assert args.arm_control_mode == "position"
+    assert args.arm_control_hz is None
+    assert args.dual_arm_ik_hz is None
+    assert args.arm_canfd_follow is None
+    assert real_teleop._effective_outer_control_hz(args) == 45.0
+    assert real_teleop._effective_dual_arm_ik_hz(args) == 45.0
+    assert real_teleop._effective_arm_control_hz(args) == 150.0
+    assert real_teleop._effective_arm_canfd_follow(args) is True
+    assert args.control_debug_config.level == "full"
+    assert args.control_debug_config.root == "teleop_records/profile_debug"
+    assert args.safe_debug is False
+    assert args.disable_hold is False
+    assert args.strict_degree_limit is False
+    metadata = real_teleop._debug_timing_metadata(args)
+    assert metadata["control_debug"]["observational_only"] is True
+    assert metadata["control_debug"]["recording_requested"] is True
+
+
+def test_real_entry_legacy_position_overrides_remain_compatible() -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--arm-control-mode",
+            "position",
+            "--arm-control-hz",
+            "80",
+            "--no-arm-canfd-follow",
+        ]
+    )
+
+    assert args.arm_execution_profile is None
+    assert args.arm_control_hz == 80.0
+    assert args.arm_canfd_follow is False
+    assert args.arm_execution_config.resolved_profile == "position_custom"
+    assert real_teleop._effective_arm_control_hz(args) == 80.0
+    assert real_teleop._effective_arm_canfd_follow(args) is False
+    assert (
+        real_teleop._canfd_follow_runtime_config(args)[
+            "position_background_streaming_enabled"
+        ]
+        is False
+    )

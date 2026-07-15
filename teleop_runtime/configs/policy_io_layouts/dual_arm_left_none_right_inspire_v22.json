@@ -1,0 +1,61 @@
+{
+  "schema": "dexteleop_policy_io_layout_v2.2",
+  "name": "dual_arm_left_none_right_inspire",
+  "arm": {
+    "pose_representation": "xyz_quat_xyzw",
+    "controlled_frame_by_side": {
+      "left": "tool_tcp",
+      "right": "tool_tcp"
+    },
+    "reference_frame_by_side": {
+      "left": "left_arm_base",
+      "right": "right_arm_base"
+    }
+  },
+  "end_effectors": {
+    "left": {
+      "side": "left",
+      "adapter": "none_v1",
+      "target": {
+        "value_type": "none",
+        "dim": 0,
+        "names": [],
+        "source_indices": null,
+        "legacy_q6_slot_indices": null,
+        "tokens": [],
+        "units": null,
+        "normalization": {}
+      },
+      "state": null,
+      "state_source_field": "joint_pos",
+      "metadata": {}
+    },
+    "right": {
+      "side": "right",
+      "adapter": "inspire_tac_v1",
+      "target": {
+        "value_type": "continuous",
+        "dim": 6,
+        "names": ["pinky", "ring", "middle", "index", "thumb_yaw", "thumb_flex"],
+        "source_indices": [0, 1, 2, 3, 4, 5],
+        "legacy_q6_slot_indices": [0, 1, 2, 3, 4, 5],
+        "tokens": [],
+        "units": "normalized_0_1",
+        "normalization": {"minimum": 0.0, "maximum": 1.0}
+      },
+      "state": null,
+      "state_source_field": "measured_joint_pos",
+      "metadata": {
+        "collection_action_source": "final_hand_command.q6",
+        "collection_state_source": "measured_joint_pos",
+        "collection_state_timestamp_field": "joint_timestamp",
+        "collection_state_requires_measured_feedback": true,
+        "collection_state_max_age_sec": 0.5
+      }
+    }
+  },
+  "metadata": {
+    "example": true,
+    "description": "Dual-arm v2.2 policy I/O: left arm has no end effector; right Inspire hand has six continuous joints."
+  }
+}

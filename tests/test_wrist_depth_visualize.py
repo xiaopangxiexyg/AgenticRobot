@@ -7,12 +7,12 @@ from pathlib import Path
 
 import numpy as np
 
-from dataset_postprocess.wrist_cam_adjust.depth import (
+from utils.dataset_postprocess.wrist_cam_adjust.depth import (
     DepthRangeMaskConfig,
     mask_manifest_payload,
     pack_binary_mask,
 )
-from dataset_postprocess.wrist_cam_adjust.visualize_depth_mask import (
+from utils.dataset_postprocess.wrist_cam_adjust.visualize_depth_mask import (
     compose_preview_frame,
     find_session_mask_manifests,
     iter_mask_frames,

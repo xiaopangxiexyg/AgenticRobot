@@ -38,6 +38,23 @@ datasets/<dataset_name>/
 
 `chunk-000` 按 `meta/info.json` 中的 `chunk_size` 分组。当前数据通常少于一个 chunk，但 reader 不应假设永远只有 `chunk-000`。
 
+训练用的 wrist final keep-mask 通常是离线后处理派生产物，不要求写回原始
+dataset 目录。默认位置为：
+
+```text
+utils/dataset_postprocess/wrist_cam_adjust/outputs/final_keep_mask/
+  <dataset_name>/
+    episode_000000/
+      <camera_key>/
+        manifest.json
+        final_keep.bitpack.bin
+```
+
+如果需要把 final mask 路径固化进 dataset metadata，可在 `episodes.jsonl` 中添加
+`final_mask_paths`、`wrist_final_mask_paths` 或 `wrist_keep_mask_paths`，结构与
+`video_paths` 相同：`camera_key -> manifest path`。读取端应优先使用显式路径；
+没有显式路径时，可按上面的默认 final mask root 解析。
+
 ## 元信息
 
 `meta/info.json` 是 dataset 级别总览：
@@ -47,6 +64,10 @@ datasets/<dataset_name>/
 - `nominal_fps`: 采集目标频率，当前常见为 `15.0`。
 - `episode_count`, `frame_count`: 当前 dataset 内 episode 和 frame 总数。
 - `features`: 训练常用向量列的形状与 dtype，例如 `action`, `observation.state`, `observation.last_action`。
+- `dexteleop_dataset_schema`: 若为 `dexteleop_dataset_v2.2`，表示下面的 v2.2 policy-I/O
+  contract 生效；目录布局仍是 `lerobot_v2.1_style`，不是上游 LeRobot 格式版本升级。
+- `policy_io_layout`, `policy_io_layout_hash`: v2.2 的唯一维度/语义权威和其 canonical SHA-256
+  标识。dataset、episode metadata、训练 checkpoint 与部署模型服务必须使用同一个 hash。
 - `arm_action_specs_by_side`: 每侧手臂 action 语义，当前为 `xyz_quat`, `dof=7`。
 - `hand_action_specs_by_side`: 每侧手/夹爪 action 语义。训练与部署不应硬编码维度，应读取 `active_dof`, `active_mask`, `slot_map`。
 - `postprocess_history`: 后处理记录，可选。
@@ -63,6 +84,9 @@ datasets/<dataset_name>/
 - `tactile_paths`: 左/右触觉 manifest 相对路径。
 - `wrist_depth_mask_paths`: 腕部相机 depth mask manifest 相对路径。
 - `wrist_depth_raw_paths`: 腕部相机 raw depth manifest 相对路径。
+- `final_mask_paths` / `wrist_final_mask_paths` / `wrist_keep_mask_paths`: 可选，
+  腕部相机 final keep-mask manifest 路径。没有这些字段时，训练接口可从外部
+  final mask root 按 `<dataset>/<episode>/<camera>/manifest.json` 解析。
 - `metadata`, `summary`: 采集配置、频率统计、停止原因、故障状态等辅助信息。
 
 启用 wrist depth mask/raw 采集时，`metadata.wrist_depth_integrity` 和
@@ -104,6 +128,72 @@ hold gap。`summary` 可包含以下暂停元信息：
 - `observation.state`: 训练用拼接状态向量，维度由 `features` 给出。
 - `observation.last_action`: 上一帧 action。
 
+## DexTeleop v2.2 policy-I/O contract
+
+v2.2 保持 LeRobot v2.1 风格的目录、episode metadata、parquet 和外置媒体；只替换模型
+低维输入/输出的定义。启用条件是 `meta/info.json.dexteleop_dataset_schema =
+"dexteleop_dataset_v2.2"`，并且 `policy_io_layout_hash` 与嵌入的 `policy_io_layout` 自洽。
+
+- `action` 是 float32，固定前缀始终为 `left_pose7 + right_pose7`（14 维，`xyz + quat_xyzw`），
+  再按 `left`、`right` 的 layout 顺序拼接**连续型**末端 target。没有配置末端的一侧不占维度。
+- `observation.state` 同样以两个 arm pose 的 14 维前缀开始，再按 layout 拼接连续型末端
+  measured state。默认 state channel 复制 target channel，因此默认 state/action float 维度相同；
+  需要不同 state 维度时必须在 layout 明确声明。
+- 离散末端绝不写进上述 float 向量。`action.discrete`、
+  `observation.state.discrete`、`observation.last_action.discrete` 是独立 fixed-size
+  `int64` token 列；每个 token 的合法 category、label 与可选 backend value 在 layout 中声明。
+  reader/training batch/deployment model input 必须保留 `int64`，禁止转换成 float feature。
+- `observation.arm.qpos` 固定为 `left_qpos6 + right_qpos6`（12 维 float32）且标记为
+  `audit_only`；`observation.arm.qpos_valid` 是对应 bool mask。它不属于默认
+  `observation.state`，dataset interface、训练 batch 与部署 observation 默认不读取它。
+- 组件审计列包括 `action.arm.pose`, `observation.arm.pose`，以及每侧
+  `action.end_effector.<side>.target` / `observation.end_effector.<side>.state` 或相应
+  `_token` 列。它们便于审计和 adapter 调试，不替代根 `action`/`observation.state`。
+
+每侧末端由 `policy_io_layout.end_effectors.<side>` 独立定义，可为 `none`、`continuous`
+或 `discrete`。例如左侧 `none`、右侧 6D Inspire hand，或两侧不同类型的 1D gripper/离散
+gripper 都是合法 layout。`source_indices` 只表示采集时从历史/raw 向量取值；如果需要复用
+当前 q6 deploy/replay 路径，必须另行声明 `legacy_q6_slot_indices`。代码不会从采集 source
+索引推断硬件命令映射。
+
+一个可直接使用的左右不对称样例位于
+`teleop_runtime/configs/policy_io_layouts/dual_arm_left_none_right_inspire_v22.json`；当前双
+DM-Tac 夹爪使用
+`teleop_runtime/configs/policy_io_layouts/dual_arm_bimanual_dmtac_gripper_v22.json`。真机采集
+推荐用 `--policy-io-layout auto`：它只根据已实例化的 backend/retargeter 成对解析 canonical
+layout，并选择语义完全相同的 preset；未知、缺 backend、缺 retargeter 或显式 JSON 不一致时
+fail-closed。`--policy-io-layout <json>` 是显式复现覆盖，同样必须与 runtime 合同一致。未提供
+该参数时保持旧 v2.1 行为。v2.2 采集会在 `meta/info.json` 与 episode metadata 写入
+`policy_io_layout_collection`，包括 `auto_preset`/`auto_generated`/`explicit` 来源和 strict 标记。
+
+严格 v2.2 采集不允许把“上次下发命令”伪装为 state：DM-Tac 必须记录新鲜
+`gripper_measured_scalar`（带 `joint_timestamp`），Inspire 必须记录新鲜
+`measured_joint_pos`。缺失、非有限或超过 layout 声明 freshness 上限的值会拒绝该 row；不会
+回退到 legacy q6 state。DM-Tac 的 action/state 统一为归一化 `0..1`，历史 profile 中的
+`0.9`/`0.95` 上限会在 runtime 中归一为 `1.0`。
+
+旧 fixed-q6
+数据可先用如下 copy-on-write 命令生成新目录，绝不原地改写源 dataset：
+
+另一个 `dual_arm_left_gripper_right_discrete_v22.json` 展示左侧连续 1D gripper、右侧
+离散 `int64` token 的组合；离散 category 的 `backend_value` 仅供显式 legacy-q6 bridge
+使用，模型本身看到的仍是 token id。
+
+```bash
+python -m utils.dataset_postprocess v21-to-v22 \
+  <source_dataset> --output-root <new_v22_dataset> --layout-json <layout.json> --apply
+```
+
+转换 layout 必须明确选择 legacy q6 中哪些 slot 代表真实末端，特别是 1D gripper；转换器不会
+猜测 padding 的语义。
+
+部署时，v2.2 policy/server metadata 必须同时声明 `policy_io_layout_hash`、连续 action
+dim 和离散 action token dim。OpenPI adapter 会把 state token 作为独立 `state_discrete`
+`int64` 请求字段发送，并要求响应的 discrete action field 保持整数。若双臂都启用但只有
+一侧配置末端，真实 deploy CLI 使用 `--end-effector-sides right`（或 `left`）以避免为
+未配置的一侧启动 telemetry/dispatch（并按需配合 `--enable-hands`）；该选项不改变两个固定
+arm pose slot。
+
 常见展开列：
 
 - `action.<side>_arm.pose`: 单侧手臂目标 pose，通常 `[x, y, z, qx, qy, qz, qw]`。
@@ -115,7 +205,7 @@ hold gap。`summary` 可包含以下暂停元信息：
   `Start` 阶段默认仍以 26 维 `action` 中的 7D arm pose 作为下游接口验证输入，不用该字段逐帧下发。
 - `action.replay.<side>_hand_joint_target`: replay/可视化用的手部目标。手部实际维度仍以
   `hand_action_specs_by_side` 为准。
-- 通用 replay 与后续模型部署应优先读取 26 维 `action` 和 action spec，
+- 对旧 v2.1 dataset，通用 replay 与后续模型部署应优先读取 26 维 `action` 和 action spec，
   再经同一套 `RobotAction`/`TeleopCommand` 解析路径下发。首帧 qpos init
   是机械臂定位辅助，不是模型 action schema 的一部分。
 - `action.gripper.<side>.target`: DMTAC gripper 的标量夹爪目标，适合后续按 1 维 gripper 训练。
@@ -129,10 +219,57 @@ hold gap。`summary` 可包含以下暂停元信息：
 - `teleop.pose_quality.*`: 从本帧已有 IK/防碰撞 metadata 派生的 pose 质量指标。
 - `teleop.arm_mode.*`: 从本帧 command/session metadata 派生的左右臂语义状态标签。
 
+## v2.3 causal state snapshot contract (`dexteleop_causal_snapshot_v1`)
+
+从 v2.3 起，落盘 state/action 的时间切点为动作信息被接收并建立的 `T0`，而不是
+异步 sample builder 或 writer 实际运行的时间。手部 telemetry、触觉和 arm feedback
+都先进入有界、不可变历史，再按 `T0` 查询；数组和嵌套字典在发布历史时完成深拷贝。
+
+每个内建快照至少记录：
+
+- `source_timestamp`：设备测量/帧产生时间；
+- `available_timestamp`：完整 payload 在本机完成接收、解析、深拷贝并发布到历史后的时间；
+- `source_clock`、`available_clock`、`snapshot_sequence`：时间域和稳定的选择审计信息。
+
+严格资格为 `source_timestamp <= T0 AND available_timestamp <= T0`。没有满足条件的
+快照必须以缺失/invalid 表示，不得回退到 sample build 时直接读取的可变 backend state。
+手部 telemetry 与 tactile 是独立 stream：一个 row 可以选择不同的历史序号，并分别写入
+`telemetry_snapshot_*` 与 `tactile_snapshot_*` 列。arm 和 wrist-camera actual pose
+使用同一套 arm snapshot 选择结果。
+
+VIVE 已完成的 clock-sync 将 sender monotonic capture time 映射到本机 wall-clock，写入
+`source_timestamp`；本机 UDP 接收/发布时间仍写入 `available_timestamp`，因此“物理上早但
+网络上晚”的包同样不会进入该 T0。未校准旧 sender 保留显式 receiver-wall fallback 标记。
+
 读取时建议只依赖需要的列；调试/采集列可能随版本增加。
 历史 parquet 可能没有 `teleop.pose_quality.*`，兼容读取时不应把缺失解释为坏样本。
 历史 parquet 也可能没有 `teleop.arm_mode.*`；兼容读取时应按可选标签处理，
 不要把缺失解释为 action/state schema 错误。
+
+## v2.3 absolute/relative pose contract (`dexteleop_pose_frame_contract_v1`)
+
+v2.3 的落盘 pose 仍然是绝对位姿；relative 只是训练窗口或部署 policy
+输出的即时表示，不回写 parquet。这样同一份 v2.2/v2.3 数据可以按模型需要选择
+absolute 或 relative，而不会产生两份相互漂移的标签。
+
+- `observation.state` 的 arm pose 永远是 canonical desktop absolute frame (`desk`)。
+- `action` 与 `observation.last_action` 在存储层仍为绝对 pose；`last_action` 的
+  relative 视图使用当前行的 actual TCP，而不是上一行/上一 chunk 的 anchor。
+- relative action chunk 的 anchor 是该 chunk 首行、且 `<=T0` 选出的实际测量
+  `observation.arm.<side>.actual_tcp_pose`；一个 chunk 内所有 action 行共用该 anchor。
+- `meta/info.json`、episode metadata 或 row metadata 必须携带
+  `pose_frame_contract`。其中 `source` 显式声明 `source_id`、`source_family`、
+  `topology`、各 side 的 raw frame 和 raw→desk 变换；`pose_storage_frame` 为
+  `desk_absolute`（v2.3 默认）或强制采集的 `raw_absolute`。
+- v2.2 及更早数据没有该 metadata 时，reader 按
+  `PoseFrameContract.legacy_v22_raw()` 解释，即 raw RM65（按单臂/双臂 topology
+  区分）且默认 raw→desk 为 identity；不会把旧数据误认成已经校准的 desk 数据。
+- 训练/回放 reader 必须先把 storage frame 转换到 desk，再做 relative 解算；
+  仅允许有限、合法的 SE(3) pose，不能用 command target 代替实际 TCP anchor。
+
+这组字段构成 v2.3 的 dataset contract，而不是某个模型的私有约定。转换结果应在
+部署边界重新由固定的 measured TCP anchor 解回绝对 pose，并在 canonical safety/IK
+之前完成。
 
 ## 外置媒体
 
@@ -146,7 +283,7 @@ hold gap。`summary` 可包含以下暂停元信息：
 
 - 路径来自 `episodes.jsonl.tactile_paths`。
 - `manifest.json` 描述 `format`, `frame_count`, `sensor_keys`, 每个 sensor 的 binary stream 路径、dtype、shape。
-- 新采集默认对外置触觉流使用 `lz4` chunk 压缩；也可以用 `--tactile-compression zstd|lz4|none` 覆盖。`none` 会写旧式裸 `.bin`。
+- 新采集默认对外置触觉流不压缩，按 C-order 写入裸 `.bin`；也可以用 `--tactile-compression zstd|lz4|none` 选择无损 chunk 压缩。选择 `none` 时保持旧式裸流格式。
 - 压缩流在每个 stream spec 中记录 `encoding`, `compression`, `chunk_frame_count`, `chunks`。`chunks` 包含 `frame_start`, `frame_count`, `offset`, `compressed_bytes`, `raw_bytes`，用于随机读取单个 chunk。旧裸流可没有这些字段，reader 应按 `raw_c_order`/`none` 兼容。
 - parquet 中 `observation.hand.<side>.tactile_frame_index` 指向 manifest 中的触觉帧。
 - 触觉可能相对视觉/action 有延迟，reader 应使用 manifest 与 parquet 中的 timestamp/索引做一致性检查。
@@ -157,18 +294,37 @@ hold gap。`summary` 可包含以下暂停元信息：
 - `manifest.json` 描述 bitpack stream、图像 shape、每帧时间戳和有效深度比例。
 - `stream.bitpack.bin` 使用 `np.packbits`，语义是指定深度范围内为 1，非法或范围外为 0。
 
+腕部 final keep-mask：
+
+- 推荐由 `utils.dataset_postprocess.wrist_cam_adjust compose-final-mask` 生成。
+- 默认语义是 `final_keep_mask = depth_range_mask_postprocessed OR table_geometry_keep_mask`。
+- final 合成阶段不额外添加 proxy/body mask；如果上游 table keep-mask 已包含 painted
+  body mask，final keep-mask 会按输入保留。
+- `manifest.json` 使用与 wrist depth mask 兼容的 bitpack stream schema；`mask_family`
+  可为 `wrist_final_keep`。
+- `value_1` 表示训练和增强时应保留原始 RGB 的像素；`value_0` 表示可替换背景。
+
 ## 训练读取约定
 
 - `episode_index` 是 episode 身份编号，不是数组下标；删除/抽取后可能不连续。若后处理把一个 episode 切成多个 segment，可重新生成唯一的 `episode_index`，并在 metadata 中保留 `source_episode_index`。
 - `index` 是当前 dataset 的扁平 row id；复制式后处理产物应重建 `index`，保证当前输出 dataset 内唯一且连续。需要追溯原始编号时，应使用派生 metadata 或额外 source 字段，而不是复用 `index`。
-- `features` 和 action spec 是维度权威来源，不要硬编码 `action` 维度。
+- v2.2 的 `policy_io_layout` / `policy_io_layout_hash` 是维度和语义权威来源；旧数据才以
+  `features` 和 action spec 为准。下游不得硬编码 `action=26` 或 `observation.state=38`。
 - 对 DMTAC gripper，新数据应按每侧 1 维 gripper target 训练；历史数据如果仍保留 6 slot hand target，需要通过 `action.gripper.<side>.target`、action spec 或后处理转换到训练所需格式。每侧未使用的 5 个 hand slot 是 padding，不应当作训练 action 维度。
-- replay、部署和模型推理应共享同一个 action contract：arm 使用 7D pose，
+- replay、部署和模型推理应共享同一个 action contract：v2.2 先校验 layout hash，然后 arm 使用 7D pose，
   hand/gripper 使用 `hand_action_specs_by_side` 声明的 active slots。末端类型变化时，
   优先新增或更新 action spec 与后端适配器，不应在 replay、训练 reader 或 deploy
   入口分别硬编码维度。
-- `FAULT/HOLD` 后继续写入的尾段、长时间卡顿分段、以及人工标记的碰撞 episode，应通过 `dataset_postprocess` 生成新的 clean/collision dataset，而不是原地改写原始数据。
+- `FAULT/HOLD` 后继续写入的尾段、长时间卡顿分段、以及人工标记的碰撞 episode，应通过 `utils.dataset_postprocess` 生成新的 clean/collision dataset，而不是原地改写原始数据。
 - 后处理产物应更新 `meta/info.json`, `episodes.jsonl`, `episodes_stats.jsonl`，并保留 `postprocess_history`。
+- 通用 masked image/video 增强应通过 `dataset_interface` 接入下游模型。该层只负责读取
+  RGB 视频、读取 final keep-mask、按 mask 在线增强并返回 NumPy/Tensor 友好数组；
+  不负责生成 mask、不修改 dataset、不定义模型归一化策略。
+- `dataset_interface` 默认把 `mask > 0` 解释为 keep region。DataLoader worker 内应各自持有
+  video reader cache、bitpack mask reader cache 和 background stream cache，避免每帧重新打开
+  mp4 或 mask 文件。
+- `episode_index` 仍按身份编号解析，不应当作连续数组下标；`dataset_interface` 应从
+  `episodes.jsonl` 建索引后解析视频和 mask 路径。
 
 ## Arm Mode 特殊状态标签
 
@@ -176,37 +332,55 @@ hold gap。`summary` 可包含以下暂停元信息：
 “人为固定/保持不动”与“执行 init pose”。它是旁路标签，不参与 action
 拼接，不改变 `action`, `observation.state`, `observation.last_action` 的形状或语义。
 
-完整 payload 位于 `sample_metadata_json.arm_mode`，schema 名为
-`dexteleop_arm_mode_v1`。parquet 中同时展开以下常用列：
+完整 payload 位于 `sample_metadata_json.arm_mode`，当前 schema 名为
+`dexteleop_arm_mode_v2`（读取端仍须兼容 v1）。Parquet 中同时展开以下模型 mode 列：
 
-- `teleop.arm_mode.schema`: 当前为 `dexteleop_arm_mode_v1`。
+- `teleop.arm_mode.schema`: 当前为 `dexteleop_arm_mode_v2`（兼容读取 v1）。
 - `teleop.arm_mode.available`: `0/1`，表示本帧是否有 arm mode metadata。
 - `teleop.arm_mode.<side>.id`: 训练友好的整数枚举。
 - `teleop.arm_mode.<side>.label`: 字符串枚举。
 - `teleop.arm_mode.<side>.is_special`: `0/1`，`fixed_hold` 和 `init_pose` 为特殊状态。
 - `teleop.arm_mode.<side>.source`: 标签来源，例如 `normal`, `fix_arm`, `init_arm`,
   `recording_pause`, `session_state`, `inactive_side`。
-- `teleop.arm_mode.<side>.tags`: 可扩展标签列表。当前可能包含 `fix_arm`, `init_arm`, `hold`。
+- `teleop.arm_mode.<side>.tags`: 可扩展标签列表。当前可能包含 `fix_arm`, `init_arm`。
 - `teleop.arm_mode_json`: 完整 JSON，包含每侧 `mode/id/source/tags/detail`。
+
+另有仅供审计的列：
+
+- `teleop.arm_mode.<side>.scope`: fix 的实际覆盖范围，
+  `arm_and_end_effector` 或 `arm_only`。
+- `teleop.arm_mode.<side>.init_phase`: `not_active`, `init_move`, `init_hold`, `unknown`。
+- `teleop.arm_mode.<side>.init_phase_valid`、目标误差、实际 TCP 线/角速度及 dwell 时间。
+
+上述 `init_phase`/scope 字段不进入 dataset interface、训练 batch、模型 token/embedding、
+loss 或部署 observation。模型对 init 只有 `init_pose` 一个标签。
 
 当前枚举：
 
 - `unknown = 0`: 缺失或无法判断。
 - `teleop = 1`: 正常遥操。
 - `fixed_hold = 2`: fix-arm 固定侧保持上一帧下发目标动作。该标签不是硬件急停。
-- `init_pose = 3`: init-arm 侧正在前往或保持 init pose。
-- `stopped = 4`: hold、非 RUNNING session 或其他停止/暂停路径。
+- `init_pose = 3`: init-arm 侧正在前往或保持 init pose；模型侧不区分移动和静止。
+- `stopped = 4`: 非 RUNNING session 或已写入的停止路径。
 
 判定优先级：
 
-1. 如果本帧处于 recording pause、hold 或非 `RUNNING` session，左右活动臂标为 `stopped`。
+1. 如果本帧处于 recording pause 或非 `RUNNING` session，左右活动臂标为 `stopped`。
 2. 否则该侧处于 init-arm active/recapturing，标为 `init_pose`。
 3. 否则该侧处于 fix-arm fixed/recapturing，标为 `fixed_hold`。
 4. 否则活动侧标为 `teleop`，非活动侧标为 `unknown`。
 
 正式数采中触发 hold 时，当前 episode 保持打开但暂停写样本；同时 fix/init
-特殊状态会停止。再次 hold/re-home 后恢复普通遥操，后续写入帧应从 `teleop`
-重新开始，而不是继续继承 hold 前的 `fixed_hold` 或 `init_pose`。
+特殊状态会停止。`task_hold` 只用于运行时/episode 审计，不生成数据集标签。再次
+hold/re-home 后恢复普通遥操，后续写入帧应从 `teleop` 重新开始，而不是继续继承 hold
+前的 `fixed_hold` 或 `init_pose`。
+
+`init_phase=init_hold` 只在实际、因果有效的 TCP 反馈相对 init target 满足 1.5 mm /
+0.25° 误差、低于静息微动速度阈值并连续 3 s 后写入。缺少真实反馈、target 或时间连续性
+时写 `unknown` 且 `init_phase_valid=0`，绝不由下发 command 推断。
+
+`fix_arm` 必须锁存该侧全部已配置 effector（arm 与 hand/gripper）。若某侧没有配置
+末端执行器，允许 `arm_only`，但完整 JSON 的 `detail.fix_arm_warning` 会明确说明该退化。
 
 兼容旧数据时，如果缺少 `teleop.arm_mode.*`，reader 应允许加载。需要补齐统一字段时，
 推荐策略是：`session_state == RUNNING` 的活动侧按 `teleop` 填充；无法确认活动侧或

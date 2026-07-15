@@ -20,6 +20,15 @@ python -m teleop_runtime.replay \
 http://127.0.0.1:8765/
 ```
 
+服务每次启动都会生成新的 256-bit control token，并将其注入当前页面；页面发出的
+`POST /api/control` 会携带 `X-DexTeleop-Control-Token`。token 同时打印在启动终端，
+供本机调试客户端使用。控制请求还必须满足同源 `Host`/`Origin` 校验和
+`application/json` 类型，单个请求体上限为 64 KiB。
+
+HTTP 服务默认只允许 loopback bind。确需从其他机器访问时，必须显式传
+`--unsafe-allow-remote-web`；通配 bind 还必须至少传一个
+`--web-allowed-host <hostname-or-ip>`。该模式仍是明文 HTTP，不建议跨不可信网络使用。
+
 也可以启动时直接加载数据集：
 
 ```bash
@@ -54,13 +63,39 @@ data/chunk-*/episode_*.parquet
   首帧 QPOS 初始化速度可通过启动参数或 GUI 的 `QPOS Init Vel`
   调整；传 1 个 rad/s 值应用到 6 个关节，也可传 6 个逗号分隔的逐关节 rad/s 值。
 - `Start`: 按帧读取数据集 26 维 `action` 中 active side 的 7D
-  `[x, y, z, qx, qy, qz, qw]` pose，构造成
-  `TeleopCommand/EffectorCommand(cartesian_pose)`，再走 RM65 backend 的
-  IK/限步/下发路径。
+  `[x, y, z, qx, qy, qz, qw]` pose。先对 15 Hz 离散关键帧执行
+  finite/quaternion/workspace/位姿步长安全限制；优先按 parquet 的完整、严格递增真实
+  timestamp 重采样，缺失或非法时整段显式退回 nominal action grid，再生成
+  可配置的pose reference（默认75 Hz；xyz linear + shortest-path quaternion SLERP，不是时序平滑）。
+  默认必须同时激活左右臂，每个 75 Hz tool pose 由共享双臂 collision-aware IK
+  转成 qpos，再执行绝对关节限位、每 reference 步长/速度限制，并对限位后 qpos
+  重新计算碰撞距离。只有通过的 75 Hz qpos 才会交给通用 75→150 qcmd 链路，
+  真机 backend 不再对该链路独立解逐臂 Cartesian IK。
+
+当前安全边界：每个最终限位后的 75 Hz qpos endpoint 会执行双臂碰撞检查；
+但相邻 75 Hz endpoint 之间的 150 Hz 关节插值整段尚未做连续碰撞认证。
+调试 metadata 因此始终明确记录 `endpoint_collision_checked=true`、
+`segment_collision_certified=false`；不能将该链路描述为连续轨迹已认证。
+
+真实输出在创建/reset planner 时只接受本轮成功读取的双臂硬件 qpos：默认测量年龄不超过
+0.25 s、左右测量时间差不超过 0.05 s，并要求 read/measured sequence、timestamp、qpos
+一致。硬件读取失败时不会退回 cached `current_qpos`/`last_target_qpos`。coupled planner
+通过后的 qpos 会标记为 prelimited，backend 若再次单臂改写或触发 singularity hold，replay
+会在同 tick hand 下发前 fault/hold。arm queue 前后及每次 hand I/O 前也会检查两侧 150 Hz
+stream readiness/fault/stale 状态。
+
+仅在默认的 coupled position replay 中，若 RM65 位控 backend 的 SDK 判定某侧目标或当前
+qpos 处于奇异区，执行器会先按原本有效关节步幅的 `0.2` 计算该侧的慢速 qpos；随后对这组
+**实际将发送的双臂慢速 qpos** 再执行同一组 12 对 endpoint 碰撞检查。复核不通过时，
+该 reference 不会下发，replay 进入 fault 并保持；只有复核成功的 command 才携带
+`singularity_replay_slowdown_preapplied` 标记，backend 才接受该慢速目标，避免二次限幅改写
+已检查的双臂组合。此规则不进入 deploy 链路，也不改变 qpos-init 的既有慢速规则。
 
 这一步用于验证后续模型预测的 action 是否能对齐真机下游接口。显式
-`qpos_target` 模式仅作为低层调试路径，需要数据集中存在全帧 finite 的
-`action.replay.<side>_arm_joint_target`。
+`qpos_target` 模式仅作为低层兼容/调试路径：生产默认的
+`position_collision_required=true` 会明确拒绝它。显式设置
+`--no-position-collision-required` 只允许进入不下发动作的旧 qpos/Cartesian
+backend 兼容检查；position 模式一旦启用真机输出仍会 fail-closed 拒绝该配置。
 
 ## 末端 Replay
 
@@ -85,27 +120,86 @@ python -m teleop_runtime.replay \
 ```
 
 `Move Start` 仍然只做机械臂首帧 qpos 初始化，不移动末端。`Start` 阶段
-会从数据集 `action` 中读取 active side 的 hand slot，与 arm pose 一起构造
-同一个 `TeleopCommand`，再由 replay hardware rig 按 `left_arm`,
-`left_hand`, `right_arm`, `right_hand` 分发到对应 backend。
+会从数据集 `action` 中读取 active side 的 hand slot。手/夹爪仍在各自 15 Hz
+source timestamp 离散下发；机械臂独立按 75 Hz reference 下发，因而不会提前
+发送下一帧 hand keyframe，也不会制造中间 hand action。
+
+若临时 tracker hold/FROZEN 帧没有新的 hand command，正式数据集的 26D `action`
+hand slot 可能为 NaN；此时 replay 只在对应
+`action.replay.<side>_hand_joint_target` 存在、整段 shape 正确且全部 finite 时，使用该列
+记录的 backend last-accepted target。主 action 有效时仍优先使用主 action。显式 replay
+列缺失或损坏时 preflight 继续 BLOCK，不会把任意 observation/默认零值当作命令。
+
+Impedance replay 的 TCP preflight 比较 active impedance controller 实际加载的
+`tcp.pose_flange_m_rad`，不能回退为 arm-endpoint 零 TCP；例如 DMTAC profile 的
+`[0, 0, 0.14, 0, 0, 0]` 应与数据集工具 profile 数值一致。
 
 末端维度以 dataset metadata 中的 `hand_action_specs_by_side` 为准。DMTAC
 gripper 当前使用 `dmtac_gripper` spec，将 6-slot 兼容 hand target 映射到
 1 维 gripper target；如果缺少 spec，resolver 会退回 q6 手部默认语义，
 这通常不适合夹爪部署，需要先补齐数据集 metadata 或做后处理转换。
 
-当前通用 replay 动作构造集中在
-`teleop_runtime/replay/action_frame.py`。该文件刻意不依赖真机硬件，只负责
-把 dataset frame 转成 `RobotAction` / `TeleopCommand`；后续大规模整理时，
-它应迁移到 sim/real 共享的 replay/action package，`teleop_runtime` 只保留
-真机 backend、GUI 和安全执行壳。
+当前通用 replay 动作构造、轨迹 contract 与 15→75→150 schedule 已集中在
+`robot_motion/replay` 和 `robot_motion/position_control`。`teleop_runtime/replay`
+只保留真机 backend、GUI、preflight 与安全执行壳；MuJoCo replay 复用同一
+时间戳 resampling/schedule。
 
-右臂示例：
+position 频率和 15 Hz keyframe 安全可在启动时配置：
+
+```text
+--position-reference-hz 75
+--arm-control-hz 150
+--position-workspace-min -0.60 -0.80 0.00
+--position-workspace-max  0.60  0.80 0.90
+--position-max-xyz-step-m 0.10
+--position-max-rot-step-deg 15
+--position-max-joint-step-rad 0.10472
+--position-collision-required
+--position-collision-scene-profile dual_arm_hand_proxy_open
+--position-collision-min-distance-m 0.03
+--position-collision-distance-epsilon-m 0.0001
+--position-collision-max-joint-velocity-rad-s 0.35,0.35,0.35,0.5,0.5,0.5
+--no-position-collision-debug
+```
+
+`--position-collision-max-joint-step-rad` 可选传 1 个或 6 个值；留空时仅使用
+`max_joint_velocity / reference_hz` 生成每个 75 Hz reference 的安全步长上限。
+
+`--position-collision-debug` 会在每个 75 Hz command metadata 中附加 raw IK qpos、
+限位后 qpos、target/realized endpoint pose、碰撞尝试和耗时明细；关闭时仍保留
+status、距离、限位原因、endpoint/segment 认证边界等摘要。controller 同时维护一个
+512 条的有界事件环和 tracking/limited/backoff/hold/drop 计数；`/api/state` 返回 last 与
+计数，完整有界记录可从
+`GET /api/position-collision-debug?limit=100` 读取。只有实际最近一次检查成功且 replay
+当前未 fault 时，status 才会报告 `endpoint_collision_certified=true`。
+
+开启 collision debug 时，每个 ring event 还固定保留三个 transport-health 槽：
+`before_arm_reference`、`after_arm_reference_before_hand` 和
+`immediately_before_end_effector_dispatch`。前两个槽记录每个reference tick的检查；
+第三个槽仅在该 reference 实际调度 hand command 时记录，否则为 `not_applicable`。
+检查失败会先保存阶段、时间和异常再 fail-closed。该 ring/API 是进程内有界调试窗口，
+进程退出后不会作为 sidecar 自动落盘。
+
+这里仍不是跨设备原子事务：左右 RM65 backend 目前是顺序 queue，hand I/O 与 arm
+background worker 也没有共同事务。第二侧 queue 才失败时，第一侧可能短暂入队后再执行
+group hold；最后一次 arm health 检查之后瞬时发生的 SDK fault 也存在不可彻底消除的极小
+竞态。debug transport-health snapshot 只保留已执行 gate 的观察结果；replay ring 当前不保存
+完整 backend receipt，因此不能据此宣称双臂与 hand 同时生效。
+
+impedance 模式保留原 action-rate → 40 Hz backend 路径。
+
+Replay 会在连接/预检前比较 episode metadata 的 `arm_control_mode` 与所选
+`--arm-control-mode`。不一致会直接拒绝。旧 episode 缺少该字段时，真机上下文按
+`impedance` 契约处理，因此不会被默认 position 分支静默接管；无硬件 dry-run 仅给出
+无法验证模式的 warning。
+
+单右臂非运动旧兼容示例（显式关闭双臂 collision planner，不能配合真机输出）：
 
 ```bash
 python -m teleop_runtime.replay \
   --dataset-root /path/to/lerobot_dataset_root \
   --active-sides right \
+  --no-position-collision-required \
   --right-arm-ip "$RIGHT_ARM_IP" \
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
   --host 127.0.0.1 \
@@ -131,7 +225,9 @@ python -m teleop_runtime.replay \
 GUI 中按顺序操作：
 
 1. 确认 `Hardware Replay` 面板里的 active side、IP、TCP profile。
-2. 默认 `Arm Output` 关闭；确认安全后再勾选。
+2. 默认 `Arm Output` 关闭且 Web API 无权自行解锁。需要稍后在 GUI 内开启时，
+   启动进程必须预先显式传 `--arm-web-hardware-output`；`--send-actions` 则同时完成
+   本机授权并在启动时直接打开输出。
 3. 点击 `Preflight`。GUI 会先应用当前表单配置，并在需要时自动 `Connect`。
 4. 确认所有阻断项通过后，点击 `Move Start` 执行 qpos init plan 到轨迹首帧。
 5. 点击 `Start`，按 `action` pose 复现轨迹并验证下游 action 接口。
@@ -155,4 +251,7 @@ GUI 中按顺序操作：
 `Preflight` 本身不执行轨迹运动；它只会连接/读取当前硬件状态并生成阻断项。
 真正的机械臂运动从 `Move Start` 开始，真正的 action replay 从 `Start` 开始。
 
-默认不会向真机发送动作。只有勾选 GUI 的 `Arm Output`，或启动时显式添加 `--send-actions`，才允许 `Move Start` 和 `Start` 下发命令。
+默认不会向真机发送动作。未通过本机进程参数授权时，HTTP 即使持有 control token，
+也不能开启 `send_actions`，不能调用 `Move Start` 或 `Start`。授权方式只有启动时显式
+添加 `--arm-web-hardware-output`（允许 GUI 稍后开启）或 `--send-actions`
+（启动时立即开启）。

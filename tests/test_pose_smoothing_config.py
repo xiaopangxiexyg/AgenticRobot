@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
+import robot_motion.pose_smoothing as robot_pose_smoothing
+import teleop_runtime.configs.pose_smoothing as teleop_pose_smoothing
 from teleop_runtime.configs.pose_smoothing import (
     BimanualPoseSmoother,
     PoseSmoother,
     PoseSmoothingConfig,
     load_default_pose_smoothing_config,
+    load_impedance_pose_smoothing_config,
 )
 
 
@@ -16,6 +19,15 @@ def _pose(x: float = 0.0) -> np.ndarray:
     return pose
 
 
+def test_teleop_pose_smoothing_reexports_robot_motion_classes() -> None:
+    assert PoseSmoothingConfig is robot_pose_smoothing.PoseSmoothingConfig
+    assert PoseSmoother is robot_pose_smoothing.PoseSmoother
+    assert BimanualPoseSmoother is robot_pose_smoothing.BimanualPoseSmoother
+    assert teleop_pose_smoothing.load_pose_smoothing_config is (
+        robot_pose_smoothing.load_pose_smoothing_config
+    )
+
+
 def test_default_pose_smoothing_config_loads_from_configs_dir() -> None:
     config = load_default_pose_smoothing_config()
 
@@ -23,6 +35,18 @@ def test_default_pose_smoothing_config_loads_from_configs_dir() -> None:
     assert config.source_path is not None
     assert config.source_path.endswith("teleop_runtime/configs/pose_smoothing.json")
     assert config.deadband_translation_m > 0.0
+
+
+def test_impedance_pose_smoothing_is_lower_latency_and_position_isolated() -> None:
+    default = load_default_pose_smoothing_config()
+    impedance = load_impedance_pose_smoothing_config()
+
+    assert impedance.enabled is True
+    assert impedance.source_path is not None
+    assert impedance.source_path.endswith("teleop_runtime/configs/impedance_pose_smoothing.json")
+    assert impedance.time_constant_sec < default.time_constant_sec
+    assert impedance.deadband_translation_m > default.deadband_translation_m
+    assert impedance.deadband_rotation_deg > default.deadband_rotation_deg
 
 
 def test_pose_smoother_holds_deadband_then_interpolates() -> None:

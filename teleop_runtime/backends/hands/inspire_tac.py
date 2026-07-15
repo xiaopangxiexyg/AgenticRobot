@@ -139,7 +139,7 @@ class InspireTacHandBackend(EffectorBackend):
     def is_ready(self) -> bool:
         return (not self.config.connect_hardware) or (self.hand is not None)
 
-    def send_command(self, command: EffectorCommand) -> None:
+    def send_command(self, command: EffectorCommand) -> bool:
         if command.effector_name != self.name:
             raise ValueError(
                 f"{self.name} received command for effector '{command.effector_name}'."
@@ -160,13 +160,13 @@ class InspireTacHandBackend(EffectorBackend):
         if self._last_sent_command is not None:
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < self.config.send_threshold:
-                return
+                return True
 
         sent = False
         if self.hand is not None:
             with self._lock:
                 if self.hand is None:
-                    return
+                    return False
                 try:
                     self.hand.set_joint_pos(target.tolist())
                 except Exception as exc:
@@ -176,9 +176,9 @@ class InspireTacHandBackend(EffectorBackend):
                             self.hand.set_joint_pos(target.tolist())
                         except Exception as retry_exc:
                             self._handle_io_error_locked("send_retry_failed", retry_exc)
-                            return
+                            return False
                     else:
-                        return
+                        return False
                 sent = True
         elif self.config.connect_hardware:
             with self._lock:
@@ -191,10 +191,10 @@ class InspireTacHandBackend(EffectorBackend):
                         self.hand.set_joint_pos(target.tolist())
                     except Exception as exc:
                         self._handle_io_error_locked("send_retry_failed", exc)
-                        return
+                        return False
                     sent = True
                 else:
-                    return
+                    return False
         else:
             sent = True
 
@@ -202,6 +202,7 @@ class InspireTacHandBackend(EffectorBackend):
             self._latest_joint_pos = target.copy()
         self._last_sent_command = target.copy()
         self._last_sent_command_timestamp = command_time
+        return bool(sent)
 
     @staticmethod
     def _normalize_joint_pos(joint_pos: object) -> np.ndarray:
@@ -287,31 +288,64 @@ class InspireTacHandBackend(EffectorBackend):
             if remaining > 0:
                 self._stop_event.wait(remaining)
 
-    def get_state(self) -> dict[str, object]:
-        return {
-            "last_sent_command": None
-            if self._last_sent_command is None
-            else self._last_sent_command.copy(),
-            "last_sent_command_timestamp": self._last_sent_command_timestamp,
-            "commanded_joint_pos": None
-            if self._last_sent_command is None
-            else self._last_sent_command.copy(),
-            "joint_pos": None if self._latest_joint_pos is None else self._latest_joint_pos.copy(),
-            "measured_joint_pos": None if self._latest_joint_pos is None else self._latest_joint_pos.copy(),
-            "joint_timestamp": self._latest_joint_timestamp,
-            "tactile": None if self._latest_tactile is None else self._latest_tactile.copy(),
-            "tactile_timestamp": self._latest_tactile_timestamp,
-            "tactile_dict": None
-            if self._latest_tactile_dict is None
-            else {name: value.copy() for name, value in self._latest_tactile_dict.items()},
-            "telemetry_timestamp": self._latest_telemetry_timestamp,
-            "tactile_regions": tuple(self.config.tactile_regions),
-            "telemetry_error": self._telemetry_error,
-            "connect_hardware": bool(self.config.connect_hardware),
-            "is_connected": self.hand is not None,
-            "reconnect_count": int(self._reconnect_count),
-            "max_fingertip_force": int(self.config.max_fingertip_force),
-        }
+    def get_state(
+        self,
+        *,
+        include_tactile_arrays: bool = True,
+        include_tactile_vector: bool = True,
+        copy_tactile_arrays: bool = True,
+    ) -> dict[str, object]:
+        """Return a coherent cached state without triggering hardware I/O.
+
+        ``include_tactile_arrays=False`` is used by the causal history poller
+        for its high-rate light telemetry pass.  The optional copy switch is
+        safe for that internal path because the history immediately deep-copies
+        the returned immutable record before publishing it.
+        """
+        with self._lock:
+            latest_joint = self._latest_joint_pos
+            latest_tactile = self._latest_tactile
+            latest_tactile_dict = self._latest_tactile_dict
+            if include_tactile_arrays:
+                tactile = (
+                    None
+                    if latest_tactile is None
+                    else (latest_tactile.copy() if copy_tactile_arrays else latest_tactile)
+                )
+                tactile_dict = (
+                    None
+                    if latest_tactile_dict is None
+                    else (
+                        {name: value.copy() for name, value in latest_tactile_dict.items()}
+                        if copy_tactile_arrays
+                        else dict(latest_tactile_dict)
+                    )
+                )
+            else:
+                tactile = None
+                tactile_dict = None
+            return {
+                "last_sent_command": None
+                if self._last_sent_command is None
+                else self._last_sent_command.copy(),
+                "last_sent_command_timestamp": self._last_sent_command_timestamp,
+                "commanded_joint_pos": None
+                if self._last_sent_command is None
+                else self._last_sent_command.copy(),
+                "joint_pos": None if latest_joint is None else latest_joint.copy(),
+                "measured_joint_pos": None if latest_joint is None else latest_joint.copy(),
+                "joint_timestamp": self._latest_joint_timestamp,
+                "tactile": tactile if include_tactile_vector else None,
+                "tactile_timestamp": self._latest_tactile_timestamp,
+                "tactile_dict": tactile_dict,
+                "telemetry_timestamp": self._latest_telemetry_timestamp,
+                "tactile_regions": tuple(self.config.tactile_regions),
+                "telemetry_error": self._telemetry_error,
+                "connect_hardware": bool(self.config.connect_hardware),
+                "is_connected": self.hand is not None,
+                "reconnect_count": int(self._reconnect_count),
+                "max_fingertip_force": int(self.config.max_fingertip_force),
+            }
 
     def close(self) -> None:
         if self._stop_event is not None:

@@ -249,6 +249,43 @@ class InitArmModeTests(unittest.TestCase):
         self.assertEqual(controller.active_side, "")
         self.assertIn("stopped", controller.status_message)
 
+    def test_arrival_status_is_display_only_and_requires_measured_stillness(self) -> None:
+        target = np.eye(4)
+        controller = InitArmCommandController(
+            targets_by_side={
+                "left": SimpleNamespace(
+                    side="left",
+                    tcp_pose_base=target,
+                    tcp_pose_desk=target,
+                    solver_pose_desk=target,
+                    arm_qpos=None,
+                    source_path="profile.json",
+                ),
+                "right": SimpleNamespace(
+                    side="right",
+                    tcp_pose_base=target,
+                    tcp_pose_desk=target,
+                    solver_pose_desk=target,
+                    arm_qpos=None,
+                    source_path="profile.json",
+                ),
+            },
+            selected_side="left",
+        )
+        self.assertTrue(controller.start_init(now=0.0).ok)
+
+        controller.observe_actual_feedback(None, timestamp=0.0, valid=False)
+        status = controller.status_payload()
+        self.assertEqual(status["init_arm_arrival_label"], "未到位")
+
+        for timestamp in np.arange(0.0, 3.3, 0.1):
+            controller.observe_actual_feedback(target, timestamp=float(timestamp), valid=True)
+
+        status = controller.status_payload()
+        self.assertEqual(status["init_arm_arrival_label"], "到位稳定")
+        self.assertEqual(status["init_arm_arrival_status"], "stable")
+        self.assertTrue(controller.active)  # Display status must not release or gate init-arm.
+
 
 if __name__ == "__main__":
     unittest.main()

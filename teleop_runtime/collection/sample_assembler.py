@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -8,11 +9,24 @@ from typing import Any, Callable, Mapping
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from robot_motion.deploy.schema import (
+    ACTION_ARM_POSE_SLICES,
+    ACTION_HAND_SLICES,
+    ALL_SIDES,
+    ARM_JOINT_DOF,
+    DEPLOY_ACTION_DIM,
+    DEPLOY_OBSERVATION_STATE_DIM,
+    HAND_DOF,
+    STATE_ARM_POSE_SLICES,
+    STATE_ARM_QPOS_SLICES,
+    STATE_HAND_SLICES,
+)
+
 from ..recording import _to_serializable
 from ..schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from ..session import SessionStepResult
 from .action_record import collection_action_record_metadata
-from .arm_mode_labels import build_arm_mode_metadata
+from .arm_mode_labels import InitArmAuditTracker, build_arm_mode_metadata
 from .build_collect_components import CollectorComponents
 from .video_frame import NearestFrameBuffer, VideoFrame
 
@@ -26,8 +40,11 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
         "hand_action_spec",
         "fix_arm_active",
         "fix_arm_active_side",
+        "fix_arm_effectors",
         "fix_arm_mode",
+        "fix_arm_scope",
         "fix_arm_side",
+        "fix_arm_warning",
         "fix_arm_original_timestamp",
         "invert",
         "init_arm_active",
@@ -47,11 +64,15 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
         "target_pose_desk",
         "target_pose_operator",
         "target_pose_tcp_base",
+        "action_pose_source",
+        "execution_step_metadata",
+        "solver_output_qpos",
         "tcp_frame",
     }
 )
 
 _POSE_QUALITY_SCHEMA = "dexteleop_pose_quality_v1"
+DEFAULT_CAMERA_FRAME_MAX_AGE_SEC = 0.1
 
 
 def _finite_float(value: Any) -> float | None:
@@ -191,6 +212,22 @@ def _camera_debug_snapshot(
             ),
         }
     return debug
+
+
+def _timestamp_delta(sample_timestamp: float, timestamp: Any) -> dict[str, float | None]:
+    event_timestamp = _finite_float(timestamp)
+    if event_timestamp is None:
+        return {
+            "last_command_timestamp": None,
+            "last_command_age_sec_at_sample": None,
+            "sample_to_last_command_dt_sec": None,
+        }
+    age = float(sample_timestamp - event_timestamp)
+    return {
+        "last_command_timestamp": event_timestamp,
+        "last_command_age_sec_at_sample": age,
+        "sample_to_last_command_dt_sec": float(-age),
+    }
 
 
 def _hand_debug_snapshot(
@@ -485,6 +522,82 @@ def _pose_xyz_quat_or_nan(value: Any) -> np.ndarray:
     return np.concatenate((xyz, quat_xyzw), dtype=np.float32)
 
 
+def _pose_matrix_or_none(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        pose = np.asarray(value, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+        return None
+    return pose.copy()
+
+
+def _pose_delta_summary(current_pose: Any, target_pose: Any) -> dict[str, float | None]:
+    current = _pose_matrix_or_none(current_pose)
+    target = _pose_matrix_or_none(target_pose)
+    if current is None or target is None:
+        return {
+            "target_current_translation_m": None,
+            "target_current_rotation_deg": None,
+        }
+    translation = float(np.linalg.norm(target[:3, 3] - current[:3, 3]))
+    try:
+        relative_rot = current[:3, :3].T @ target[:3, :3]
+        rotation_deg = float(np.rad2deg(R.from_matrix(relative_rot).magnitude()))
+    except Exception:
+        rotation_deg = None
+    return {
+        "target_current_translation_m": translation,
+        "target_current_rotation_deg": rotation_deg,
+    }
+
+
+def _action_pose_source_for_command(command: EffectorCommand | None) -> str | None:
+    if command is None:
+        return None
+    metadata_source = command.metadata.get("action_pose_source")
+    if metadata_source:
+        return str(metadata_source)
+    if command.command_type == "cartesian_pose":
+        return "command_cartesian_pose"
+    if command.command_type == "joint_vector":
+        for key in (
+            "target_pose_base",
+            "target_pose_tcp_base",
+            "solver_output_tcp_pose_base",
+            "solver_output_endpoint_pose_base",
+            "source_target_pose_base",
+        ):
+            if _finite_pose_or_none(command.metadata.get(key)) is not None:
+                return key
+    return None
+
+
+def _arm_action_debug_snapshot(
+    *,
+    sample_timestamp: float,
+    arm_states: Mapping[str, Mapping[str, Any] | None],
+    command: TeleopCommand | None,
+) -> dict[str, Any]:
+    debug: dict[str, Any] = {}
+    commands = {} if command is None else command.commands
+    for side, state in arm_states.items():
+        arm_state = state or {}
+        effector_command = commands.get(f"{side}_arm")
+        timing = _timestamp_delta(sample_timestamp, arm_state.get("last_command_timestamp"))
+        debug[str(side)] = {
+            **timing,
+            "pose_source": _action_pose_source_for_command(effector_command),
+            **_pose_delta_summary(
+                arm_state.get("current_tcp_pose"),
+                arm_state.get("last_target_tcp_pose"),
+            ),
+        }
+    return debug
+
+
 def _command_joint_or_nan(command: EffectorCommand | None, *, length: int = 6) -> np.ndarray:
     if command is None or command.command_type != "joint_vector":
         return _nan_vector(length)
@@ -508,14 +621,90 @@ def _command_joint_or_nan(command: EffectorCommand | None, *, length: int = 6) -
     return padded
 
 
-def _command_pose_or_nan(command: EffectorCommand | None) -> np.ndarray:
+def _finite_pose_or_none(value: Any) -> np.ndarray | None:
+    pose = _pose_xyz_quat_or_nan(value)
+    if np.all(np.isfinite(pose)):
+        return pose
+    return None
+
+
+def _command_pose_or_nan(
+    command: EffectorCommand | None,
+    *,
+    arm_state: Mapping[str, Any] | None = None,
+) -> np.ndarray:
     if command is None:
         return _nan_vector(7)
+    for key in ("target_pose_base", "target_pose_tcp_base"):
+        pose = _finite_pose_or_none(command.metadata.get(key))
+        if pose is not None:
+            return pose
     if command.command_type == "cartesian_pose":
         return _pose_xyz_quat_or_nan(command.value)
     if command.command_type == "joint_vector":
-        return _pose_xyz_quat_or_nan(command.metadata.get("source_target_pose_base"))
+        if arm_state:
+            for key in ("last_target_tcp_pose", "last_command_tcp_pose"):
+                pose = _finite_pose_or_none(arm_state.get(key))
+                if pose is not None:
+                    return pose
+        for key in (
+            "target_pose_base",
+            "target_pose_tcp_base",
+            "solver_output_tcp_pose_base",
+            "solver_output_endpoint_pose_base",
+            "source_target_pose_base",
+        ):
+            pose = _finite_pose_or_none(command.metadata.get(key))
+            if pose is not None:
+                return pose
     return _nan_vector(7)
+
+
+def _side_from_arm_command(effector_name: str, command: EffectorCommand) -> str | None:
+    if command.side in {"left", "right"}:
+        return str(command.side)
+    text = str(effector_name or command.effector_name or "")
+    if text.startswith("left_"):
+        return "left"
+    if text.startswith("right_"):
+        return "right"
+    return None
+
+
+def _command_with_action_target_pose(
+    command: TeleopCommand | None,
+    *,
+    arm_states: Mapping[str, Mapping[str, Any] | None],
+    use_backend_target_pose: bool,
+) -> TeleopCommand | None:
+    if command is None:
+        return command
+    adjusted = TeleopCommand(timestamp=command.timestamp, metadata=dict(command.metadata))
+    changed = False
+    for effector_name, effector_command in command.commands.items():
+        out = effector_command.copy()
+        if str(effector_name).endswith("_arm"):
+            side = _side_from_arm_command(effector_name, out)
+            target_pose = _pose_matrix_or_none(out.metadata.get("target_pose_base"))
+            if target_pose is None:
+                target_pose = _pose_matrix_or_none(out.metadata.get("target_pose_tcp_base"))
+            action_pose_source = out.metadata.get("action_pose_source")
+            if target_pose is None and use_backend_target_pose and out.command_type == "joint_vector":
+                arm_state = arm_states.get(side or "") or {}
+                target_pose = _pose_matrix_or_none(arm_state.get("last_target_tcp_pose"))
+                action_pose_source = "backend_last_target_tcp_pose"
+            if target_pose is not None:
+                out.metadata = {
+                    **dict(out.metadata),
+                    "target_pose_base": target_pose.copy(),
+                    "target_pose_tcp_base": target_pose.copy(),
+                    "action_pose_source": str(action_pose_source or "target_pose_metadata"),
+                }
+                if out.command_type == "cartesian_pose":
+                    out.value = target_pose.copy()
+                changed = True
+        adjusted.add_command(out)
+    return adjusted if changed else command
 
 
 def _state_tcp_pose_or_nan(state: Mapping[str, Any] | None) -> np.ndarray:
@@ -526,10 +715,7 @@ def _state_tcp_pose_or_nan(state: Mapping[str, Any] | None) -> np.ndarray:
         return _pose_xyz_quat_or_nan(current_tcp_pose)
     last_command = state.get("last_command")
     if isinstance(last_command, EffectorCommand):
-        if last_command.command_type == "cartesian_pose":
-            return _pose_xyz_quat_or_nan(last_command.value)
-        if last_command.command_type == "joint_vector":
-            return _pose_xyz_quat_or_nan(last_command.metadata.get("source_target_pose_base"))
+        return _command_pose_or_nan(last_command, arm_state=state)
     return _nan_vector(7)
 
 
@@ -582,6 +768,403 @@ ArmStateMetadataProvider = Callable[
     [CollectorComponents, float],
     Mapping[str, Mapping[str, Any]] | None,
 ]
+HandStateProvider = Callable[
+    [CollectorComponents, float],
+    Mapping[str, Mapping[str, Any]] | None,
+]
+PositionReferenceProvider = Callable[[float], Any | None]
+
+
+def _reference_value(reference: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        if isinstance(reference, Mapping) and name in reference:
+            return reference[name]
+        if hasattr(reference, name):
+            return getattr(reference, name)
+    return default
+
+
+def _reference_side_payload(reference: Any, side: str) -> Any:
+    references = _reference_value(
+        reference,
+        "references",
+        "arm_references",
+        "references_by_side",
+        default=None,
+    )
+    if isinstance(references, Mapping):
+        return references.get(str(side))
+    return None
+
+
+def _reference_side_value(reference: Any, side: str, *names: str) -> Any:
+    for name in names:
+        by_side = _reference_value(reference, f"{name}_by_side", default=None)
+        if isinstance(by_side, Mapping) and str(side) in by_side:
+            return by_side[str(side)]
+        value = _reference_value(reference, name, default=None)
+        if isinstance(value, Mapping) and str(side) in value:
+            return value[str(side)]
+        direct = _reference_value(reference, f"{side}_{name}", default=None)
+        if direct is not None:
+            return direct
+    payload = _reference_side_payload(reference, side)
+    if payload is not None:
+        return _reference_value(payload, *names, default=None)
+    return None
+
+
+def _reference_qpos_or_none(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        qpos = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    if qpos.shape != (ARM_JOINT_DOF,) or not np.all(np.isfinite(qpos)):
+        return None
+    return qpos.copy()
+
+
+def _causal_measured_arm_state_eligibility(
+    metadata: Mapping[str, Any],
+    *,
+    sample_timestamp: float,
+) -> tuple[bool, str]:
+    """Validate a measured-state snapshot before replacing commanded state.
+
+    Poller snapshots use the strict contract below. Older custom providers that
+    do not publish contract flags remain compatible, but an explicit failure,
+    invalidity, stale marker, bad sequence, or future measurement always wins
+    over the mere presence of cached qpos.
+    """
+
+    if _reference_qpos_or_none(metadata.get("actual_qpos")) is None:
+        return False, "missing_or_invalid_qpos"
+    strict_contract = "actual_state_valid" in metadata
+    if strict_contract:
+        if metadata.get("actual_state_read_success") is not True:
+            return False, "hardware_read_failed"
+        if metadata.get("actual_state_valid") is not True:
+            return False, "measurement_invalid"
+        if metadata.get("actual_state_stale") is not False:
+            return False, "freshness_unconfirmed_or_stale"
+        sequence = metadata.get("actual_state_sequence")
+        if isinstance(sequence, bool):
+            return False, "invalid_measurement_sequence"
+        try:
+            sequence_int = int(sequence)
+        except (TypeError, ValueError):
+            return False, "missing_measurement_sequence"
+        if sequence_int <= 0 or sequence_int != sequence:
+            return False, "invalid_measurement_sequence"
+    elif metadata.get("actual_state_read_success") is False:
+        return False, "hardware_read_failed"
+    if metadata.get("actual_state_stale") is True:
+        return False, "measurement_stale"
+    measurement_timestamp = _finite_float(metadata.get("actual_state_timestamp"))
+    if measurement_timestamp is None:
+        return False, "missing_measurement_timestamp"
+    if measurement_timestamp > float(sample_timestamp) + 1e-6:
+        return False, "measurement_is_from_future"
+    # Providers that publish the explicit poller contract must satisfy the
+    # availability bound.  Keep older custom providers source-compatible; the
+    # built-in arm poller always emits ``available_timestamp``.
+    if "available_timestamp" in metadata or "actual_state_read_end_time" in metadata:
+        available_timestamp = _finite_float(
+            metadata.get("available_timestamp", metadata.get("actual_state_read_end_time"))
+        )
+        if available_timestamp is None:
+            return False, "missing_snapshot_available_timestamp"
+        if available_timestamp > float(sample_timestamp) + 1e-6:
+            return False, "snapshot_available_after_sample"
+    return True, "accepted"
+
+
+def _reference_pose_matrix_or_none(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value, dtype=float)
+    except Exception:
+        return None
+    if array.shape == (4, 4):
+        return array.copy() if np.all(np.isfinite(array)) else None
+    vector = array.reshape(-1)
+    if vector.shape != (7,) or not np.all(np.isfinite(vector)):
+        return None
+    quaternion = vector[3:7]
+    quaternion_norm = float(np.linalg.norm(quaternion))
+    if quaternion_norm <= 1e-12:
+        return None
+    pose = np.eye(4, dtype=float)
+    pose[:3, :3] = R.from_quat(quaternion / quaternion_norm).as_matrix()
+    pose[:3, 3] = vector[:3]
+    return pose
+
+
+def _reference_reasons(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, Mapping):
+        reasons: list[str] = []
+        for key, item in value.items():
+            for reason in _reference_reasons(item):
+                reasons.append(f"{key}:{reason}")
+        return reasons
+    if isinstance(value, Sequence):
+        return [str(item) for item in value if str(item)]
+    return [str(value)]
+
+
+def _reference_pipeline_version(reference: Any) -> str | None:
+    value = _reference_value(reference, "pipeline_version", "schema_version", default=None)
+    if value is None:
+        frame_metadata = _reference_value(reference, "frame_metadata", "metadata", default=None)
+        if isinstance(frame_metadata, Mapping):
+            value = frame_metadata.get("pipeline_version", frame_metadata.get("schema_version"))
+    return None if value is None else str(value)
+
+
+def _normalize_position_reference(
+    reference: Any,
+    *,
+    sample_timestamp: float,
+    active_sides: Sequence[str],
+    max_age_sec: float | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if reference is None:
+        return None, "no_reference_at_or_before_sample"
+
+    published_timestamp = _finite_float(
+        _reference_value(
+            reference,
+            "published_wall_time",
+            "published_timestamp",
+            "published_time",
+            "reference_time",
+            "timestamp",
+            default=None,
+        )
+    )
+    if published_timestamp is None:
+        return None, "missing_published_timestamp"
+    if published_timestamp > float(sample_timestamp):
+        return None, "future_reference"
+    wall_age_sec = float(sample_timestamp) - float(published_timestamp)
+    selected_age_sec = _finite_float(
+        _reference_value(reference, "selection_age_sec", "age_sec", default=None)
+    )
+    age_sec = wall_age_sec if selected_age_sec is None else max(0.0, selected_age_sec)
+    if max_age_sec is not None and age_sec > float(max_age_sec):
+        return None, "stale_reference"
+
+    valid = bool(_reference_value(reference, "valid", "is_valid", default=True))
+    if not valid:
+        return None, "invalid_reference"
+    epoch = _to_serializable(_reference_value(reference, "epoch", default=None))
+    if epoch is None:
+        return None, "missing_reference_epoch"
+    sequence = _to_serializable(_reference_value(reference, "sequence", default=None))
+    if sequence is None:
+        return None, "missing_reference_sequence"
+
+    q_ref_by_side: dict[str, np.ndarray] = {}
+    q_ik_raw_by_side: dict[str, np.ndarray] = {}
+    pose_ref_by_side: dict[str, np.ndarray] = {}
+    side_valid_by_side: dict[str, bool] = {}
+    side_hold_by_side: dict[str, bool] = {}
+    reasons_by_side: dict[str, list[str]] = {}
+    normalized_active_sides = tuple(str(side) for side in active_sides)
+    for side in ALL_SIDES:
+        payload = _reference_side_payload(reference, side)
+        side_valid = bool(
+            _reference_value(payload, "valid", "is_valid", default=True)
+            if payload is not None
+            else True
+        )
+        side_hold = bool(
+            _reference_value(payload, "hold", "is_hold", default=False)
+            if payload is not None
+            else False
+        )
+        q_ref = _reference_qpos_or_none(
+            _reference_side_value(reference, side, "q_ref", "joint_reference")
+        )
+        q_ik_raw = _reference_qpos_or_none(
+            _reference_side_value(reference, side, "q_ik_raw", "raw_ik_qpos")
+        )
+        pose_ref = _reference_pose_matrix_or_none(
+            _reference_side_value(reference, side, "pose_ref", "action_pose_ref")
+        )
+        reasons = _reference_reasons(
+            _reference_side_value(reference, side, "modification_reasons", "modification_reason")
+        )
+        if q_ref is not None:
+            q_ref_by_side[side] = q_ref
+        if q_ik_raw is not None:
+            q_ik_raw_by_side[side] = q_ik_raw
+        if pose_ref is not None:
+            pose_ref_by_side[side] = pose_ref
+        if payload is not None or q_ref is not None or pose_ref is not None:
+            side_valid_by_side[side] = side_valid
+            side_hold_by_side[side] = side_hold
+            reasons_by_side[side] = reasons
+
+    for side in normalized_active_sides:
+        if side not in q_ref_by_side:
+            return None, f"missing_q_ref:{side}"
+        if side not in pose_ref_by_side:
+            return None, f"missing_pose_ref:{side}"
+        if not side_valid_by_side.get(side, True):
+            return None, f"invalid_side_reference:{side}"
+
+    frame_reasons = _reference_reasons(
+        _reference_value(reference, "modification_reasons", "modification_reason", default=None)
+    )
+    all_reasons = list(frame_reasons)
+    for side in normalized_active_sides:
+        all_reasons.extend(f"{side}:{reason}" for reason in reasons_by_side.get(side, ()))
+
+    source_value = _reference_value(reference, "source", "source_label", default=None)
+    source_timestamp = _finite_float(
+        _reference_value(reference, "source_wall_time", "source_timestamp", "source_time")
+    )
+    generated_timestamp = _finite_float(
+        _reference_value(
+            reference,
+            "generated_wall_time",
+            "generated_timestamp",
+            "generated_time",
+        )
+    )
+    generated_monotonic_timestamp = _finite_float(
+        _reference_value(
+            reference,
+            "generated_monotonic_time",
+            "generated_monotonic_timestamp",
+        )
+    )
+    published_monotonic_timestamp = _finite_float(
+        _reference_value(
+            reference,
+            "published_monotonic_time",
+            "published_monotonic_timestamp",
+        )
+    )
+    return {
+        "epoch": epoch,
+        "sequence": sequence,
+        "source": None if source_value is None else str(source_value),
+        "source_timestamp": source_timestamp,
+        "generated_timestamp": generated_timestamp,
+        "published_timestamp": float(published_timestamp),
+        "generated_monotonic_timestamp": generated_monotonic_timestamp,
+        "published_monotonic_timestamp": published_monotonic_timestamp,
+        "age_sec": float(age_sec),
+        "wall_age_sec": float(wall_age_sec),
+        "age_clock": _reference_value(
+            reference,
+            "selection_age_clock",
+            default="wall",
+        ),
+        "valid": True,
+        "hold": bool(
+            _reference_value(reference, "hold", "is_hold", default=False)
+            or any(side_hold_by_side.get(side, False) for side in normalized_active_sides)
+        ),
+        "modification_reasons": all_reasons,
+        "modification_reasons_by_side": reasons_by_side,
+        "pipeline_version": _reference_pipeline_version(reference),
+        "q_ref_by_side": {
+            side: qpos.copy() for side, qpos in q_ref_by_side.items()
+        },
+        "q_ik_raw_by_side": {
+            side: qpos.copy() for side, qpos in q_ik_raw_by_side.items()
+        },
+        "pose_ref_by_side": {
+            side: pose.copy() for side, pose in pose_ref_by_side.items()
+        },
+        "side_valid_by_side": side_valid_by_side,
+        "side_hold_by_side": side_hold_by_side,
+    }, None
+
+
+def _position_reference_command(
+    command: TeleopCommand | None,
+    reference: Mapping[str, Any],
+    *,
+    active_sides: Sequence[str],
+) -> TeleopCommand:
+    published_timestamp = float(reference["published_timestamp"])
+    out = TeleopCommand(
+        timestamp=published_timestamp,
+        metadata={} if command is None else dict(command.metadata),
+    )
+    if command is not None:
+        for effector_name, effector_command in command.commands.items():
+            if not str(effector_name).endswith("_arm"):
+                out.add_command(effector_command.copy())
+
+    q_ref_by_side = reference.get("q_ref_by_side", {})
+    pose_ref_by_side = reference.get("pose_ref_by_side", {})
+    for side in tuple(str(value) for value in active_sides):
+        q_ref = _reference_qpos_or_none(q_ref_by_side.get(side))
+        pose_ref = _reference_pose_matrix_or_none(pose_ref_by_side.get(side))
+        if q_ref is None or pose_ref is None:
+            continue
+        existing = None if command is None else command.commands.get(f"{side}_arm")
+        metadata = {} if existing is None else dict(existing.metadata)
+        metadata.update(
+            {
+                "target_pose_base": pose_ref.copy(),
+                "target_pose_tcp_base": pose_ref.copy(),
+                "solver_output_qpos": q_ref.copy(),
+                "position_reference_epoch": reference.get("epoch"),
+                "position_reference_sequence": reference.get("sequence"),
+                "position_reference_published_timestamp": published_timestamp,
+                "action_pose_source": "position_reference_frame_fk",
+            }
+        )
+        out.add_command(
+            EffectorCommand(
+                effector_name=f"{side}_arm",
+                side=side,
+                command_type="joint_vector",
+                value=q_ref.copy(),
+                frame_name=(
+                    existing.frame_name
+                    if existing is not None and existing.frame_name is not None
+                    else f"{side}_arm_base"
+                ),
+                metadata=metadata,
+            )
+        )
+    out.metadata.update(
+        {
+            "position_reference_epoch": reference.get("epoch"),
+            "position_reference_sequence": reference.get("sequence"),
+            "position_reference_published_timestamp": published_timestamp,
+        }
+    )
+    return out
+
+
+def _step_with_command(step_result: SessionStepResult, command: TeleopCommand) -> SessionStepResult:
+    return SessionStepResult(
+        timestamp=float(step_result.timestamp),
+        state=step_result.state,
+        control_hz=float(step_result.control_hz),
+        channels=dict(step_result.channels),
+        raw_channels=dict(step_result.raw_channels),
+        observation=step_result.observation,
+        command=command,
+        command_dispatched=bool(step_result.command_dispatched),
+        action_record=None,
+        faults=list(step_result.faults),
+    )
 
 
 @dataclass
@@ -594,11 +1177,17 @@ class CollectorSampleBuilderConfig:
         default_factory=lambda: {"left": "left_hand", "right": "right_hand"}
     )
     camera_buffers: dict[str, NearestFrameBuffer] = field(default_factory=dict)
+    require_camera_frames: bool = True
+    camera_frame_max_age_sec: float | None = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
     episode_index: int = 0
     frame_index_start: int = 0
     sample_index_start: int = 0
     include_debug_metadata: bool = False
+    include_action_debug_metadata: bool = False
     tactile_array_snapshot_policy: str = "on_change"
+    position_reference_max_age_sec: float | None = 0.2
+    position_reference_epoch: Any = None
+    prefer_causal_measured_arm_state: bool = False
 
     def __post_init__(self) -> None:
         self.active_sides = tuple(str(side) for side in self.active_sides)
@@ -611,7 +1200,20 @@ class CollectorSampleBuilderConfig:
         self.camera_buffers = {
             str(camera_key): buffer for camera_key, buffer in dict(self.camera_buffers).items()
         }
+        self.require_camera_frames = bool(self.require_camera_frames)
+        if self.camera_frame_max_age_sec is not None:
+            self.camera_frame_max_age_sec = float(self.camera_frame_max_age_sec)
+            if self.camera_frame_max_age_sec <= 0.0:
+                raise ValueError("camera_frame_max_age_sec must be positive or None.")
         self.include_debug_metadata = bool(self.include_debug_metadata)
+        self.include_action_debug_metadata = bool(self.include_action_debug_metadata)
+        self.prefer_causal_measured_arm_state = bool(
+            self.prefer_causal_measured_arm_state
+        )
+        if self.position_reference_max_age_sec is not None:
+            self.position_reference_max_age_sec = float(self.position_reference_max_age_sec)
+            if self.position_reference_max_age_sec <= 0.0:
+                raise ValueError("position_reference_max_age_sec must be positive or None.")
         policy = str(self.tactile_array_snapshot_policy).strip().lower().replace("-", "_")
         if policy not in {"always", "on_change", "never"}:
             raise ValueError("tactile_array_snapshot_policy must be always, on_change, or never.")
@@ -621,27 +1223,37 @@ class CollectorSampleBuilderConfig:
 class SampleAssembler:
     def __init__(self, config: SampleAssemblerConfig | None = None):
         self.config = config if config is not None else SampleAssemblerConfig()
-        self._last_action = _nan_vector(26)
+        self._last_action = _nan_vector(DEPLOY_ACTION_DIM)
 
     def reset_last_action(self) -> None:
-        self._last_action = _nan_vector(26)
+        self._last_action = _nan_vector(DEPLOY_ACTION_DIM)
 
     def _side_enabled(self, side: str) -> bool:
         return str(side) in self.config.active_sides
 
-    def _build_action_vector(self, command: TeleopCommand | None) -> np.ndarray:
+    def _build_action_vector(
+        self,
+        command: TeleopCommand | None,
+        *,
+        arm_states: Mapping[str, Mapping[str, Any] | None] | None = None,
+        use_backend_target_pose: bool = False,
+    ) -> np.ndarray:
         if command is None:
-            return _nan_vector(26)
+            return _nan_vector(DEPLOY_ACTION_DIM)
         commands = command.commands
-        return np.concatenate(
-            (
-                _command_pose_or_nan(commands.get("left_arm")),
-                _command_pose_or_nan(commands.get("right_arm")),
-                _command_joint_or_nan(commands.get("left_hand")),
-                _command_joint_or_nan(commands.get("right_hand")),
-            ),
-            dtype=np.float32,
-        )
+        states = arm_states or {}
+        action = _nan_vector(DEPLOY_ACTION_DIM)
+        for side in ALL_SIDES:
+            arm_state = states.get(side) if use_backend_target_pose else None
+            action[ACTION_ARM_POSE_SLICES[side]] = _command_pose_or_nan(
+                commands.get(f"{side}_arm"),
+                arm_state=arm_state,
+            )
+            action[ACTION_HAND_SLICES[side]] = _command_joint_or_nan(
+                commands.get(f"{side}_hand"),
+                length=HAND_DOF,
+            )
+        return action.astype(np.float32, copy=False)
 
     def _build_observation_state(
         self,
@@ -649,17 +1261,22 @@ class SampleAssembler:
         arm_states: Mapping[str, Mapping[str, Any] | None],
         hand_states: Mapping[str, Mapping[str, Any] | None],
     ) -> np.ndarray:
-        state_parts: list[np.ndarray] = []
-        for side in ("left", "right"):
+        state = _nan_vector(DEPLOY_OBSERVATION_STATE_DIM)
+        for side in ALL_SIDES:
             if not self._side_enabled(side):
-                state_parts.extend((_nan_vector(6), _nan_vector(7), _nan_vector(6)))
                 continue
             arm_state = arm_states.get(side) or {}
             hand_state = hand_states.get(side) or {}
-            state_parts.append(_vector_or_nan(arm_state.get("current_qpos"), length=6))
-            state_parts.append(_state_tcp_pose_or_nan(arm_state))
-            state_parts.append(_vector_or_nan(hand_state.get("joint_pos"), length=6))
-        return np.concatenate(state_parts, dtype=np.float32)
+            state[STATE_ARM_QPOS_SLICES[side]] = _vector_or_nan(
+                arm_state.get("current_qpos"),
+                length=ARM_JOINT_DOF,
+            )
+            state[STATE_ARM_POSE_SLICES[side]] = _state_tcp_pose_or_nan(arm_state)
+            state[STATE_HAND_SLICES[side]] = _vector_or_nan(
+                hand_state.get("joint_pos"),
+                length=HAND_DOF,
+            )
+        return state.astype(np.float32, copy=False)
 
     def _camera_matches(
         self,
@@ -701,11 +1318,25 @@ class SampleAssembler:
         frame_index: int,
         metadata: Mapping[str, Any] | None = None,
     ) -> CollectorSample:
-        action = self._build_action_vector(step_result.command)
+        action = self._build_action_vector(
+            step_result.command,
+            arm_states=arm_states,
+            use_backend_target_pose=bool(getattr(step_result, "command_dispatched", False)),
+        )
         observation_state = self._build_observation_state(
             arm_states=arm_states,
             hand_states=hand_states,
         )
+        active_arm_state_sources = {
+            str((arm_states.get(side) or {}).get("runtime_arm_state_source", "last_commanded_action"))
+            for side in self.config.active_sides
+        }
+        if active_arm_state_sources == {"causal_measured_hardware"}:
+            arm_state_source = "causal_measured_hardware"
+        elif "causal_measured_hardware" in active_arm_state_sources:
+            arm_state_source = "mixed_causal_measured_and_commanded"
+        else:
+            arm_state_source = "last_commanded_action"
         sample = CollectorSample(
             index=int(index),
             episode_index=int(episode_index),
@@ -716,7 +1347,7 @@ class SampleAssembler:
             action=action,
             observation_state=observation_state,
             observation_last_action=self._last_action.copy(),
-            arm_state_source="last_commanded_action",
+            arm_state_source=arm_state_source,
             active_sides=tuple(self.config.active_sides),
             channels={
                 name: channel.copy()
@@ -752,18 +1383,98 @@ class CollectorSampleBuilder:
         assembler: SampleAssembler | None = None,
         metadata_builder: MetadataBuilder | None = None,
         arm_state_metadata_provider: ArmStateMetadataProvider | None = None,
+        hand_state_provider: HandStateProvider | None = None,
+        position_reference_provider: PositionReferenceProvider | None = None,
+        position_reference_timeline: Any | None = None,
     ):
+        if position_reference_provider is not None and position_reference_timeline is not None:
+            raise ValueError(
+                "Provide either position_reference_provider or position_reference_timeline, not both."
+            )
         self.config = config if config is not None else CollectorSampleBuilderConfig()
         self.assembler = assembler if assembler is not None else SampleAssembler(
             SampleAssemblerConfig(active_sides=self.config.active_sides)
         )
         self.metadata_builder = metadata_builder
         self.arm_state_metadata_provider = arm_state_metadata_provider
+        self.hand_state_provider = hand_state_provider
+        self.position_reference_provider = position_reference_provider
+        self.position_reference_timeline = position_reference_timeline
+        self.last_position_reference_rejection: str | None = None
+        self.last_camera_rejection: str | None = None
+        self.last_camera_frame_age_sec_by_key: dict[str, float | None] = {}
         self.include_debug_metadata = bool(self.config.include_debug_metadata)
+        self.include_action_debug_metadata = bool(self.config.include_action_debug_metadata)
         self._episode_index = int(self.config.episode_index)
         self._frame_index = int(self.config.frame_index_start)
         self._sample_index = int(self.config.sample_index_start)
         self._last_tactile_snapshot_key_by_side: dict[str, tuple[str, Any] | None] = {}
+        self._init_arm_audit_tracker = InitArmAuditTracker()
+
+    @property
+    def position_reference_enabled(self) -> bool:
+        return bool(
+            self.position_reference_provider is not None
+            or self.position_reference_timeline is not None
+        )
+
+    def _lookup_position_reference(self, sample_timestamp: float) -> Any | None:
+        provider = self.position_reference_provider
+        if provider is not None:
+            return provider(float(sample_timestamp))
+
+        timeline = self.position_reference_timeline
+        if timeline is None:
+            return None
+        lookup = getattr(timeline, "latest_at_or_before", None)
+        if not callable(lookup):
+            lookup = getattr(timeline, "get_latest_before_or_at", None)
+        if not callable(lookup):
+            raise TypeError(
+                "position_reference_timeline must provide latest_at_or_before(sample_time, ...)."
+            )
+
+        try:
+            parameters = inspect.signature(lookup).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs: dict[str, Any] = {}
+        if "epoch" in parameters:
+            if self.config.position_reference_epoch is None:
+                raise ValueError(
+                    "position_reference_epoch is required when injecting a ReferenceTimeline "
+                    "directly; use a provider to bind a dynamic episode epoch."
+                )
+            kwargs["epoch"] = self.config.position_reference_epoch
+        if "max_age" in parameters:
+            kwargs["max_age"] = self.config.position_reference_max_age_sec
+        elif "max_age_sec" in parameters:
+            kwargs["max_age_sec"] = self.config.position_reference_max_age_sec
+        return lookup(float(sample_timestamp), **kwargs)
+
+    def _position_reference_for_sample(
+        self,
+        sample_timestamp: float,
+    ) -> dict[str, Any] | None:
+        if not self.position_reference_enabled:
+            self.last_position_reference_rejection = None
+            return None
+        reference = self._lookup_position_reference(float(sample_timestamp))
+        normalized, rejection = _normalize_position_reference(
+            reference,
+            sample_timestamp=float(sample_timestamp),
+            active_sides=self.config.active_sides,
+            max_age_sec=self.config.position_reference_max_age_sec,
+        )
+        if (
+            normalized is not None
+            and self.config.position_reference_epoch is not None
+            and normalized.get("epoch") != self.config.position_reference_epoch
+        ):
+            normalized = None
+            rejection = "reference_epoch_mismatch"
+        self.last_position_reference_rejection = rejection
+        return normalized
 
     @property
     def episode_index(self) -> int:
@@ -781,6 +1492,7 @@ class CollectorSampleBuilder:
         self._episode_index += 1
         self._frame_index = 0
         self._last_tactile_snapshot_key_by_side.clear()
+        self._init_arm_audit_tracker.reset()
         return int(self._episode_index)
 
     def set_episode(self, episode_index: int) -> None:
@@ -788,6 +1500,7 @@ class CollectorSampleBuilder:
         self._frame_index = 0
         self.assembler.reset_last_action()
         self._last_tactile_snapshot_key_by_side.clear()
+        self._init_arm_audit_tracker.reset()
 
     def _snapshot_arm_state_metadata(
         self,
@@ -842,13 +1555,103 @@ class CollectorSampleBuilder:
                     state["current_tcp_pose"] = compute_tcp_pose()
                 except Exception:
                     state["current_tcp_pose"] = None
+                last_target_qpos = state.get("last_target_qpos")
+                if last_target_qpos is not None and state.get("last_target_tcp_pose") is None:
+                    try:
+                        state["last_target_tcp_pose"] = compute_tcp_pose(qpos=last_target_qpos)
+                    except Exception:
+                        state["last_target_tcp_pose"] = None
             extra = actual_metadata.get(side)
+            if self.config.prefer_causal_measured_arm_state and extra is None:
+                # The live backend dictionary is mutable and may have been
+                # refreshed after T0.  Keep only its commanded anchor as a
+                # compatibility fallback; measured fields remain explicitly
+                # absent until the causal poller supplies a valid snapshot.
+                commanded_qpos = _reference_qpos_or_none(state.get("current_qpos"))
+                commanded_tcp_pose = _pose_matrix_or_none(state.get("current_tcp_pose"))
+                if commanded_qpos is not None:
+                    state["commanded_qpos"] = commanded_qpos
+                    state["current_qpos"] = commanded_qpos.copy()
+                else:
+                    state["current_qpos"] = None
+                if commanded_tcp_pose is not None:
+                    state["commanded_tcp_pose"] = commanded_tcp_pose
+                    state["current_tcp_pose"] = commanded_tcp_pose.copy()
+                else:
+                    state["current_tcp_pose"] = None
+                state.update(
+                    {
+                        "actual_qpos": None,
+                        "actual_tcp_pose": None,
+                        "actual_hardware_qpos": None,
+                        "actual_hardware_pose_6d": None,
+                        "wrist_camera_pose_base": None,
+                        "causal_measured_state_eligible": False,
+                        "causal_measured_state_rejection_reason": "no_causal_feedback",
+                        "causal_snapshot_contract": (
+                            "source_timestamp<=T0_and_available_timestamp<=T0"
+                        ),
+                    }
+                )
             if extra:
+                if self.config.prefer_causal_measured_arm_state:
+                    commanded_qpos = _reference_qpos_or_none(state.get("current_qpos"))
+                    commanded_tcp_pose = _pose_matrix_or_none(state.get("current_tcp_pose"))
+                    actual_qpos = _reference_qpos_or_none(extra.get("actual_qpos"))
+                    actual_tcp_pose = _pose_matrix_or_none(extra.get("actual_tcp_pose"))
+                    actual_state_eligible, actual_state_reason = (
+                        _causal_measured_arm_state_eligibility(
+                            extra,
+                            sample_timestamp=sample_timestamp,
+                        )
+                    )
+                    if commanded_qpos is not None:
+                        state["commanded_qpos"] = commanded_qpos
+                    if commanded_tcp_pose is not None:
+                        state["commanded_tcp_pose"] = commanded_tcp_pose
                 state.update(_copy_value(extra))
+                if self.config.prefer_causal_measured_arm_state:
+                    state["causal_measured_state_eligible"] = bool(actual_state_eligible)
+                    state["causal_measured_state_rejection_reason"] = actual_state_reason
+                    if not actual_state_eligible:
+                        # Never serialize rejected cached feedback in fields
+                        # whose schema says "actual/measured".
+                        state["actual_qpos"] = None
+                        state["actual_tcp_pose"] = None
+                        state["actual_hardware_qpos"] = None
+                        state["actual_hardware_pose_6d"] = None
+                        state["wrist_camera_pose_base"] = None
+                if (
+                    self.config.prefer_causal_measured_arm_state
+                    and actual_qpos is not None
+                    and actual_state_eligible
+                ):
+                    state["current_qpos"] = actual_qpos
+                    if actual_tcp_pose is not None:
+                        state["current_tcp_pose"] = actual_tcp_pose
+                    state["runtime_arm_state_source"] = "causal_measured_hardware"
+                else:
+                    state.setdefault("runtime_arm_state_source", "last_commanded_action")
+            else:
+                state.setdefault("runtime_arm_state_source", "last_commanded_action")
             states[side] = state
         return states
 
-    def _snapshot_hand_states(self, components: CollectorComponents) -> dict[str, dict[str, Any]]:
+    def _snapshot_hand_states(
+        self,
+        components: CollectorComponents,
+        *,
+        sample_timestamp: float,
+    ) -> dict[str, dict[str, Any]]:
+        if self.hand_state_provider is not None:
+            provided = self.hand_state_provider(components, float(sample_timestamp))
+            if not isinstance(provided, Mapping):
+                return {}
+            return {
+                str(side): _copy_value(state)
+                for side, state in provided.items()
+                if isinstance(state, Mapping)
+            }
         states: dict[str, dict[str, Any]] = {}
         for side in ("left", "right"):
             backend_name = self.config.hand_backend_names.get(side)
@@ -896,6 +1699,53 @@ class CollectorSampleBuilder:
             frames[str(camera_key)] = buffer.get_latest_before_or_at(timestamp)
         return frames
 
+    def _camera_rejection(
+        self,
+        *,
+        sample_timestamp: float,
+        camera_frames: Mapping[str, VideoFrame | None],
+    ) -> str | None:
+        if not self.config.camera_buffers or not self.config.require_camera_frames:
+            self.last_camera_frame_age_sec_by_key = {}
+            return None
+
+        max_age = self.config.camera_frame_max_age_sec
+        age_by_key: dict[str, float | None] = {}
+        failures: list[str] = []
+        for camera_key in sorted(self.config.camera_buffers):
+            frame = camera_frames.get(camera_key)
+            if frame is None:
+                age_by_key[camera_key] = None
+                failures.append(f"unavailable:{camera_key}")
+                continue
+
+            source_timestamp = _finite_float(frame.source_timestamp)
+            receive_timestamp = _finite_float(frame.receive_timestamp)
+            freshness_timestamp = (
+                receive_timestamp if receive_timestamp is not None else source_timestamp
+            )
+            if source_timestamp is None or freshness_timestamp is None:
+                age_by_key[camera_key] = None
+                failures.append(f"invalid_timestamp:{camera_key}")
+                continue
+
+            source_age_sec = float(sample_timestamp - source_timestamp)
+            freshness_age_sec = float(sample_timestamp - freshness_timestamp)
+            effective_age_sec = max(source_age_sec, freshness_age_sec)
+            age_by_key[camera_key] = effective_age_sec
+            if source_age_sec < 0.0 or freshness_age_sec < 0.0:
+                failures.append(
+                    f"future:{camera_key}:{min(source_age_sec, freshness_age_sec):.6f}"
+                )
+                continue
+            if max_age is not None and effective_age_sec > max_age:
+                failures.append(f"stale:{camera_key}:{effective_age_sec:.6f}")
+
+        self.last_camera_frame_age_sec_by_key = age_by_key
+        if not failures:
+            return None
+        return "camera_frame_" + ",".join(failures)
+
     @staticmethod
     def _default_metadata(
         step_result: SessionStepResult,
@@ -905,8 +1755,28 @@ class CollectorSampleBuilder:
         camera_frames: Mapping[str, VideoFrame | None],
         *,
         include_debug_metadata: bool = False,
+        include_action_debug_metadata: bool = False,
     ) -> dict[str, Any]:
         command = step_result.command
+        canonical_command = _command_with_action_target_pose(
+            command,
+            arm_states=_arm_states,
+            use_backend_target_pose=bool(getattr(step_result, "command_dispatched", False)),
+        )
+        canonical_step_result = step_result
+        if canonical_command is not command:
+            canonical_step_result = SessionStepResult(
+                timestamp=float(step_result.timestamp),
+                state=step_result.state,
+                control_hz=float(step_result.control_hz),
+                channels=dict(step_result.channels),
+                raw_channels=dict(step_result.raw_channels),
+                observation=step_result.observation,
+                command=canonical_command,
+                command_dispatched=bool(step_result.command_dispatched),
+                action_record=None,
+                faults=list(step_result.faults),
+            )
         command_metadata = (
             {}
             if command is None
@@ -942,12 +1812,14 @@ class CollectorSampleBuilder:
             }
             for channel_name, channel in step_result.channels.items()
         }
-        return {
+        metadata = {
             "canonical_action_record": collection_action_record_metadata(
-                step_result,
+                canonical_step_result,
                 include_debug_metadata=include_debug_metadata,
             ),
             "pose_quality": _build_pose_quality_metadata(command),
+            # Compatibility/default payload only.  CollectorSampleBuilder
+            # replaces this with its actual-feedback audit before writing.
             "arm_mode": build_arm_mode_metadata(
                 command=command,
                 session_state=str(step_result.state.value),
@@ -958,68 +1830,137 @@ class CollectorSampleBuilder:
             "channel_metadata": channel_metadata,
             "camera_keys": sorted(str(camera_key) for camera_key in camera_frames),
         }
+        if include_action_debug_metadata:
+            metadata["arm_action_debug_by_side"] = _arm_action_debug_snapshot(
+                sample_timestamp=float(step_result.timestamp),
+                arm_states=_arm_states,
+                command=canonical_command,
+            )
+        return metadata
+
+    def _build_arm_mode_metadata(
+        self,
+        *,
+        command: TeleopCommand | None,
+        session_state: str,
+        active_sides: Sequence[str],
+        arm_states: Mapping[str, Mapping[str, Any] | None],
+        timestamp: float,
+    ) -> dict[str, Any]:
+        return build_arm_mode_metadata(
+            command=command,
+            session_state=session_state,
+            active_sides=active_sides,
+            init_audit_by_side=self._init_arm_audit_tracker.observe(
+                command=command,
+                arm_states=arm_states,
+                timestamp=timestamp,
+            ),
+        )
 
     def __call__(
         self,
         step_result: SessionStepResult,
         components: CollectorComponents,
-    ) -> CollectorSample:
+    ) -> CollectorSample | None:
+        position_reference = self._position_reference_for_sample(
+            float(step_result.timestamp)
+        )
+        if self.position_reference_enabled and position_reference is None:
+            return None
+        effective_step_result = step_result
+        if position_reference is not None:
+            effective_step_result = _step_with_command(
+                step_result,
+                _position_reference_command(
+                    step_result.command,
+                    position_reference,
+                    active_sides=self.config.active_sides,
+                ),
+            )
+
         timing_started = time.perf_counter()
         arm_states = self._snapshot_arm_states(
             components,
-            sample_timestamp=float(step_result.timestamp),
+            sample_timestamp=float(effective_step_result.timestamp),
         )
         arm_snapshot_s = time.perf_counter() - timing_started
         timing_started = time.perf_counter()
-        hand_states = self._snapshot_hand_states(components)
+        hand_states = self._snapshot_hand_states(
+            components,
+            sample_timestamp=float(effective_step_result.timestamp),
+        )
         hand_snapshot_s = time.perf_counter() - timing_started
         timing_started = time.perf_counter()
-        camera_frames = self._snapshot_camera_frames(float(step_result.timestamp))
+        camera_frames = self._snapshot_camera_frames(float(effective_step_result.timestamp))
         camera_snapshot_s = time.perf_counter() - timing_started
+        self.last_camera_rejection = self._camera_rejection(
+            sample_timestamp=float(effective_step_result.timestamp),
+            camera_frames=camera_frames,
+        )
+        if self.last_camera_rejection is not None:
+            return None
         timing_started = time.perf_counter()
         if self.metadata_builder is None:
             metadata = self._default_metadata(
-                step_result,
+                effective_step_result,
                 components,
                 arm_states,
                 hand_states,
                 camera_frames,
                 include_debug_metadata=bool(self.include_debug_metadata),
+                include_action_debug_metadata=bool(self.include_action_debug_metadata),
             )
         else:
             metadata = self.metadata_builder(
-                step_result,
+                effective_step_result,
                 components,
                 arm_states,
                 hand_states,
                 camera_frames,
             )
         metadata = {} if metadata is None else dict(metadata)
-        metadata.setdefault(
-            "arm_mode",
-            build_arm_mode_metadata(
-                command=step_result.command,
-                session_state=str(step_result.state.value),
-                active_sides=tuple(getattr(components, "active_sides", self.config.active_sides)),
-            ),
+        if position_reference is not None:
+            metadata["position_reference"] = _to_serializable(position_reference)
+        # This label is collection-owned.  A custom metadata builder may add
+        # unrelated metadata, but cannot bypass the actual-feedback init audit.
+        metadata["arm_mode"] = self._build_arm_mode_metadata(
+            command=effective_step_result.command,
+            session_state=str(effective_step_result.state.value),
+            active_sides=tuple(getattr(components, "active_sides", self.config.active_sides)),
+            arm_states=arm_states,
+            timestamp=float(effective_step_result.timestamp),
         )
-        metadata["sample_builder_debug"] = {
+        sample_builder_debug = {
             "arm_snapshot_s": float(arm_snapshot_s),
             "hand_snapshot_s": float(hand_snapshot_s),
             "camera_snapshot_s": float(camera_snapshot_s),
             "metadata_build_s": float(time.perf_counter() - timing_started),
             "camera_frames": _camera_debug_snapshot(
-                sample_timestamp=float(step_result.timestamp),
+                sample_timestamp=float(effective_step_result.timestamp),
                 camera_frames=camera_frames,
             ),
             "hand_states": _hand_debug_snapshot(
-                sample_timestamp=float(step_result.timestamp),
+                sample_timestamp=float(effective_step_result.timestamp),
                 hand_states=hand_states,
             ),
         }
+        if self.include_action_debug_metadata:
+            sample_builder_debug["arm_actions"] = _arm_action_debug_snapshot(
+                sample_timestamp=float(effective_step_result.timestamp),
+                arm_states=arm_states,
+                command=_command_with_action_target_pose(
+                    effective_step_result.command,
+                    arm_states=arm_states,
+                    use_backend_target_pose=bool(
+                        getattr(effective_step_result, "command_dispatched", False)
+                    ),
+                ),
+            )
+        metadata["sample_builder_debug"] = sample_builder_debug
         timing_started = time.perf_counter()
         sample = self.assembler.build_sample(
-            step_result=step_result,
+            step_result=effective_step_result,
             arm_states=arm_states,
             hand_states=hand_states,
             camera_frames=camera_frames,

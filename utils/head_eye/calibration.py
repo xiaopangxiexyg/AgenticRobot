@@ -375,10 +375,25 @@ def save_samples(
     return output
 
 
-def load_samples(path: str | Path) -> list[CalibrationSample]:
+def load_samples_with_metadata(
+    path: str | Path,
+) -> tuple[list[CalibrationSample], dict[str, Any]]:
+    """Load calibration samples and their optional session metadata.
+
+    ``load_samples`` remains the compact legacy API.  Keeping this companion
+    reader separate lets offline re-solves retain capture provenance introduced
+    by newer tools without changing existing callers.
+    """
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     items = payload.get("samples", payload if isinstance(payload, list) else [])
-    return [CalibrationSample.from_dict(item) for item in items]
+    metadata = dict(payload.get("metadata") or {}) if isinstance(payload, Mapping) else {}
+    return [CalibrationSample.from_dict(item) for item in items], metadata
+
+
+def load_samples(path: str | Path) -> list[CalibrationSample]:
+    """Load samples using the established list-only API."""
+    samples, _ = load_samples_with_metadata(path)
+    return samples
 
 
 def save_result(

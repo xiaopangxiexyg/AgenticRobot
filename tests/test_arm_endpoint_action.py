@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from unittest import mock
 
 import numpy as np
+
+from robot_motion.runtime import BackendDispatchError
 
 from hardware.rm65.calibration_profiles import is_position_endpoint_profile, load_profile
 from teleop_runtime.arm_frames import (
@@ -19,6 +23,7 @@ from teleop_runtime.backends.arms import (
     RM65ImpedanceArmBackendConfig,
 )
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
+from teleop_runtime.defaults import DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
 from teleop_runtime.retargeters.pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopObservation
 
@@ -26,6 +31,8 @@ from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopOb
 class _SingularityFakeArm:
     def __init__(self):
         self.sent_joint_deg: list[list[float]] = []
+        self.follow_values: list[bool] = []
+        self.movej_options: list[dict[str, int | bool]] = []
         self.thresholds: tuple[float, float, float] | None = None
         self.stop_calls = 0
         self.slow_stop_calls = 0
@@ -42,8 +49,16 @@ class _SingularityFakeArm:
             return -2, 0.42
         return 0, 0.42
 
-    def Movej_CANFD(self, joint_deg, follow=False):
+    def Movej_CANFD(self, joint_deg, follow=False, trajectory_mode=0, radio=0):
         self.sent_joint_deg.append([float(value) for value in joint_deg])
+        self.follow_values.append(bool(follow))
+        self.movej_options.append(
+            {
+                "follow": bool(follow),
+                "trajectory_mode": int(trajectory_mode),
+                "radio": int(radio),
+            }
+        )
         return 0
 
     def Arm_Stop(self):
@@ -53,6 +68,50 @@ class _SingularityFakeArm:
     def Arm_Slow_Stop(self):
         self.slow_stop_calls += 1
         return 0
+
+
+class _PositionTransportFakeArm:
+    def __init__(
+        self,
+        *,
+        movej_results: list[object] | None = None,
+        movej_exception: Exception | None = None,
+        measured_joint_deg: np.ndarray | None = None,
+    ) -> None:
+        self.movej_results = list(movej_results or [0])
+        self.movej_exception = movej_exception
+        self.measured_joint_deg = np.asarray(
+            np.zeros(6) if measured_joint_deg is None else measured_joint_deg,
+            dtype=float,
+        ).reshape(6)
+        self.sent_joint_deg: list[np.ndarray] = []
+        self.slow_stop_calls = 0
+        self.uninit_calls = 0
+        self.socket_close_calls = 0
+
+    def Movej_CANFD(self, joint_deg, follow=False, trajectory_mode=0, radio=0):
+        del follow, trajectory_mode, radio
+        self.sent_joint_deg.append(np.asarray(joint_deg, dtype=float).reshape(6).copy())
+        if self.movej_exception is not None:
+            raise self.movej_exception
+        if not self.movej_results:
+            return 0
+        if len(self.movej_results) == 1:
+            return self.movej_results[0]
+        return self.movej_results.pop(0)
+
+    def Get_Current_Arm_State(self):
+        return 0, self.measured_joint_deg.tolist(), [0.0] * 6, 0, 0
+
+    def Arm_Slow_Stop(self):
+        self.slow_stop_calls += 1
+        return 0
+
+    def RM_API_UnInit(self):
+        self.uninit_calls += 1
+
+    def Arm_Socket_Close(self):
+        self.socket_close_calls += 1
 
 
 class _ToolSyncFakeArm:
@@ -158,6 +217,52 @@ class ArmEndpointActionTest(unittest.TestCase):
 
         self.assertEqual(config.ik_framework, "robot_motion")
 
+    def test_rm65_position_backend_defaults_to_canfd_follow_150hz(self) -> None:
+        config = RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+        )
+
+        self.assertTrue(config.canfd_follow)
+        self.assertEqual(config.background_streaming_hz, DEFAULT_RM65_POSITION_ARM_CONTROL_HZ)
+
+    def test_rm65_position_backend_sends_canfd_follow_from_config(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                max_angvel=(100.0,) * 6,
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.deg2rad(np.asarray([1.0, 2.0, 20.0, 4.0, 5.0, 6.0])),
+            )
+        )
+
+        self.assertEqual(fake_arm.follow_values[-1], True)
+
+        backend.config.canfd_follow = False
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.deg2rad(np.asarray([2.0, 3.0, 21.0, 5.0, 6.0, 7.0])),
+            )
+        )
+
+        self.assertEqual(fake_arm.follow_values[-1], False)
+
     def test_rm65_position_backend_rejects_legacy_ik_framework(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsupported RM65 IK framework"):
             RM65ArmBackendConfig(
@@ -231,6 +336,407 @@ class ArmEndpointActionTest(unittest.TestCase):
 
         self.assertIsNone(backend._stream_target_qpos)
         self.assertIsNone(state["last_target_qpos"])
+
+    def test_rm65_joint_vector_prelimited_solver_qpos_bypasses_backend_step_clip(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                dry_run_fast=False,
+                control_dt=0.025,
+                max_angvel=(0.1,) * 6,
+                initial_qpos=np.zeros(6),
+            )
+        )
+        target = np.asarray([0.2, -0.2, 0.1, -0.1, 0.05, -0.05], dtype=float)
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=target,
+            metadata={
+                "action_pose_source": "limited_solver_output_qpos",
+                "execution_step_metadata": {"enabled": True},
+            },
+        )
+
+        backend.send_command(command)
+
+        np.testing.assert_allclose(backend.get_state()["current_qpos"], target)
+        np.testing.assert_allclose(command.value, target)
+        np.testing.assert_allclose(command.metadata["solver_output_qpos"], target)
+        np.testing.assert_allclose(command.metadata["backend_final_target_qpos"], target)
+        self.assertEqual(command.metadata["action_pose_source"], "non_impedance_final_qpos")
+        try:
+            __import__("pinocchio")
+        except ModuleNotFoundError:
+            self.assertFalse(command.metadata["target_pose_available"])
+            self.assertEqual(command.metadata["target_pose_error_type"], "ModuleNotFoundError")
+            self.assertIn("pinocchio", command.metadata["target_pose_error"])
+        else:
+            self.assertTrue(command.metadata["target_pose_available"])
+            self.assertIn("target_pose_base", command.metadata)
+            self.assertIn("target_pose_tcp_base", command.metadata)
+
+    def test_rm65_background_stream_interpolates_to_15hz_target_without_step_clip(self) -> None:
+        start = np.zeros(6, dtype=float)
+        target = np.asarray([0.2, -0.2, 0.1, -0.1, 0.05, -0.05], dtype=float)
+
+        halfway = RM65ArmBackend._interpolate_stream_qpos(
+            start_qpos=start,
+            target_qpos=target,
+            segment_start_time=10.0,
+            segment_duration_sec=1.0 / 15.0,
+            now=10.0 + 0.5 / 15.0,
+        )
+        done = RM65ArmBackend._interpolate_stream_qpos(
+            start_qpos=start,
+            target_qpos=target,
+            segment_start_time=10.0,
+            segment_duration_sec=1.0 / 15.0,
+            now=10.0 + 1.0 / 15.0,
+        )
+
+        np.testing.assert_allclose(halfway, target * 0.5)
+        np.testing.assert_allclose(done, target)
+
+    def test_rm65_background_stream_records_low_rate_warning(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                background_streaming_enabled=True,
+                background_streaming_hz=120.0,
+                background_streaming_warning_ratio=0.9,
+                initial_qpos=np.zeros(6),
+            )
+        )
+
+        backend._record_background_stream_send(
+            qpos_rad=np.zeros(6),
+            sent_at_perf=100.0,
+            call_ms=0.2,
+            deadline_lag_ms=0.0,
+        )
+        backend._record_background_stream_send(
+            qpos_rad=np.ones(6) * np.deg2rad(1.0),
+            sent_at_perf=100.02,
+            call_ms=0.3,
+            deadline_lag_ms=10.0,
+        )
+
+        stream = backend.get_state()["background_streaming"]
+
+        self.assertEqual(stream["send_count"], 2)
+        self.assertAlmostEqual(stream["actual_hz"], 50.0)
+        self.assertEqual(stream["low_rate_count"], 1)
+        self.assertEqual(stream["deadline_miss_count"], 1)
+        self.assertTrue(stream["warning"]["active"])
+        self.assertIn("below target", stream["warning"]["message"])
+        self.assertAlmostEqual(stream["warning_threshold_hz"], 108.0)
+        self.assertAlmostEqual(stream["last_sent_step_deg"], 1.0)
+
+    def test_rm65_position_movej_canfd_passes_follow_trajectory_options(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                canfd_follow=True,
+                canfd_trajectory_mode=2,
+                canfd_radio=30,
+                initial_qpos=np.zeros(6),
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+
+        backend._send_joint_target(np.zeros(6))
+
+        self.assertEqual(
+            fake_arm.movej_options[-1],
+            {"follow": True, "trajectory_mode": 2, "radio": 30},
+        )
+
+    def test_rm65_position_transport_keeps_command_and_measured_state_separate(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+            )
+        )
+        fake_arm = _PositionTransportFakeArm(measured_joint_deg=np.full(6, 10.0))
+        backend.arm = fake_arm
+        accepted = np.asarray([0.1, -0.1, 0.2, -0.2, 0.15, -0.15], dtype=float)
+
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=accepted,
+            )
+        )
+        backend.refresh_state_from_hardware(hardware_read_retries=0)
+        state = backend.get_state()
+
+        np.testing.assert_allclose(state["last_attempted_qpos"], accepted)
+        np.testing.assert_allclose(state["last_accepted_qpos"], accepted)
+        np.testing.assert_allclose(state["current_qpos"], accepted)
+        np.testing.assert_allclose(state["measured_qpos"], np.deg2rad(np.full(6, 10.0)))
+        np.testing.assert_allclose(state["hardware_qpos"], state["measured_qpos"])
+        self.assertEqual(state["last_attempted_sequence"], 1)
+        self.assertEqual(state["last_accepted_sequence"], 1)
+        self.assertEqual(state["measured_sequence"], 1)
+
+        backend.config.background_streaming_enabled = True
+        next_target = accepted + 0.05
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=next_target,
+            )
+        )
+        np.testing.assert_allclose(backend._stream_segment_start_qpos, accepted)
+        planner_tick = backend._stream_planner.step(
+            monotonic_time=backend._stream_target_monotonic,
+        )
+        self.assertEqual(
+            planner_tick.reference_sequence,
+            backend._stream_target_sequence,
+        )
+        np.testing.assert_allclose(
+            planner_tick.q_cmd_by_side["left"],
+            accepted,
+        )
+
+    def test_rm65_position_transport_nonzero_sdk_result_does_not_advance_accepted_state(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+            )
+        )
+        backend.arm = _PositionTransportFakeArm(movej_results=[7])
+        target = np.asarray([0.1, -0.1, 0.2, -0.2, 0.15, -0.15], dtype=float)
+
+        with self.assertRaises(BackendDispatchError) as caught:
+            backend.send_command(
+                EffectorCommand(
+                    effector_name="left_arm",
+                    side="left",
+                    command_type="joint_vector",
+                    value=target,
+                )
+            )
+        state = backend.get_state()
+
+        self.assertEqual(caught.exception.receipt.result_code, 7)
+        self.assertFalse(caught.exception.receipt.accepted)
+        np.testing.assert_allclose(state["last_attempted_qpos"], target)
+        np.testing.assert_allclose(state["last_accepted_qpos"], np.zeros(6))
+        np.testing.assert_allclose(state["current_qpos"], np.zeros(6))
+        self.assertEqual(state["last_attempted_sequence"], 1)
+        self.assertEqual(state["last_accepted_sequence"], 0)
+        self.assertEqual(state["send_result_code"], 7)
+
+    def test_rm65_position_transport_rejects_nonfinite_and_absolute_limit_targets(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+            )
+        )
+        fake_arm = _PositionTransportFakeArm()
+        backend.arm = fake_arm
+
+        for target in (
+            np.asarray([np.nan, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            np.asarray([0.0, 1.7, 0.0, 0.0, 0.0, 0.0]),
+        ):
+            with self.assertRaisesRegex(ValueError, "non-finite|absolute limits"):
+                backend.send_command(
+                    EffectorCommand(
+                        effector_name="left_arm",
+                        side="left",
+                        command_type="joint_vector",
+                        value=target,
+                    )
+                )
+
+        self.assertEqual(fake_arm.sent_joint_deg, [])
+
+    def test_rm65_background_stream_latches_sdk_exception_without_accepting_target(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+                background_streaming_enabled=True,
+                background_streaming_hz=150.0,
+                background_streaming_target_max_age_sec=1.0,
+            )
+        )
+        backend.arm = _PositionTransportFakeArm(movej_exception=RuntimeError("sdk exploded"))
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.full(6, 0.1),
+            )
+        )
+
+        backend._background_stream_loop()
+        state = backend.get_state()
+        stream = state["background_streaming"]
+
+        self.assertIn("sdk exploded", stream["fault"])
+        self.assertEqual(stream["fault_count"], 1)
+        self.assertEqual(stream["attempted_send_count"], 1)
+        self.assertEqual(stream["accepted_send_count"], 0)
+        self.assertEqual(stream["failed_send_count"], 1)
+        self.assertFalse(stream["target_active"])
+        self.assertFalse(stream["healthy"])
+        np.testing.assert_allclose(state["current_qpos"], np.zeros(6))
+
+    def test_rm65_close_stops_an_arm_that_received_a_motion_command_before_disconnect(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+                background_streaming_enabled=False,
+            )
+        )
+        fake_arm = _PositionTransportFakeArm()
+        backend.arm = fake_arm
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.full(6, 0.01),
+            )
+        )
+
+        backend.close()
+
+        self.assertEqual(fake_arm.slow_stop_calls, 1)
+        self.assertEqual(fake_arm.uninit_calls, 1)
+        self.assertEqual(fake_arm.socket_close_calls, 1)
+
+    def test_rm65_background_stream_expires_stale_target_before_sdk_send(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+                background_streaming_enabled=True,
+                background_streaming_target_max_age_sec=0.1,
+            )
+        )
+        fake_arm = _PositionTransportFakeArm()
+        backend.arm = fake_arm
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.full(6, 0.1),
+            )
+        )
+        with backend._state_lock:
+            backend._stream_target_monotonic = 10.0
+
+        self.assertTrue(backend._expire_stale_stream_target(now_monotonic=10.2))
+        stream = backend.get_state()["background_streaming"]
+
+        self.assertFalse(stream["target_active"])
+        self.assertEqual(stream["stale_count"], 1)
+        self.assertAlmostEqual(stream["last_stale_age_sec"], 0.2)
+        self.assertEqual(fake_arm.sent_joint_deg, [])
+
+    def test_rm65_hold_is_a_hard_boundary_for_background_sends(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+                background_streaming_enabled=True,
+                background_streaming_hz=200.0,
+                background_streaming_target_max_age_sec=1.0,
+            )
+        )
+        fake_arm = _PositionTransportFakeArm()
+        backend.arm = fake_arm
+        backend._stream_thread = threading.Thread(target=backend._background_stream_loop, daemon=True)
+        backend._stream_thread.start()
+        backend.send_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.full(6, 0.1),
+            )
+        )
+        deadline = time.monotonic() + 0.2
+        while not fake_arm.sent_joint_deg and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(fake_arm.sent_joint_deg)
+
+        backend.hold_motion("test")
+        send_count_after_hold = len(fake_arm.sent_joint_deg)
+        time.sleep(0.02)
+
+        self.assertEqual(len(fake_arm.sent_joint_deg), send_count_after_hold)
+        backend.close()
+
+    def test_rm65_close_reports_background_thread_join_timeout(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                background_streaming_enabled=True,
+                background_streaming_shutdown_timeout_sec=0.01,
+            )
+        )
+        release = threading.Event()
+        backend._stream_thread = threading.Thread(target=release.wait, daemon=True)
+        backend._stream_thread.start()
+
+        with self.assertRaisesRegex(RuntimeError, "did not stop"):
+            backend.close()
+        stream = backend.get_state()["background_streaming"]
+        self.assertTrue(stream["join_timed_out"])
+        self.assertIn("shutdown timeout", stream["fault"])
+
+        release.set()
+        backend._stream_thread.join(timeout=0.2)
+        backend.close()
 
     def test_empty_frame_aliases_to_arm_endpoint(self) -> None:
         backend = RM65ArmBackend(
@@ -645,7 +1151,7 @@ class ArmEndpointActionTest(unittest.TestCase):
                 self.assertGreater(fake_arm.sent_joint_deg[-1][2], 1.0)
                 self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], np.rad2deg(np.deg2rad(4.0) - 0.02))
 
-    def test_rm65_backend_still_holds_replay_qpos_trajectory_entering_singularity(self) -> None:
+    def test_rm65_backend_holds_unchecked_replay_qpos_trajectory_entering_singularity(self) -> None:
         backend = RM65ArmBackend(
             RM65ArmBackendConfig(
                 arm_ip="0.0.0.0",
@@ -672,6 +1178,54 @@ class ArmEndpointActionTest(unittest.TestCase):
         self.assertEqual(metadata["singularity_gate_status"], "hold_entry")
         self.assertEqual(metadata["source"], "replay_qpos_trajectory")
         self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 4.0, places=6)
+
+    def test_rm65_backend_accepts_only_prechecked_replay_singularity_slow_target(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
+                singularity_replay_slowdown=0.2,
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+        requested_target = np.asarray(
+            [0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0], dtype=float
+        )
+
+        slow_target, preparation = backend.prepare_replay_singularity_target(
+            requested_target,
+            source="replay_collision_qpos_reference_75hz",
+        )
+
+        self.assertTrue(preparation["applied"])
+        self.assertAlmostEqual(
+            slow_target[2],
+            np.deg2rad(4.0) - 0.02,
+        )
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=slow_target,
+            metadata={
+                "source": "replay_collision_qpos_reference_75hz",
+                "singularity_replay_slowdown_preapplied": True,
+                "singularity_replay_slowdown_collision_rechecked": True,
+                "max_joint_step_rad": preparation["max_joint_step_rad"],
+            },
+        )
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(metadata["singularity_gate_status"], "slow_replay_entering_singularity")
+        self.assertTrue(metadata["singularity_replay_slowdown_preapplied"])
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], np.rad2deg(slow_target[2]))
 
     def test_rm65_backend_uses_robot_action_source_for_qpos_init_slowdown(self) -> None:
         backend = RM65ArmBackend(

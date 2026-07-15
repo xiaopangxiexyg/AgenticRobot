@@ -7,6 +7,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from robot_motion.runtime.lifecycle import run_best_effort_cleanup
+
+from dataset_contracts.tactile import ChunkedTactileStream, tactile_stream_compression
+
 from .dataset import LoadedReplayEpisode
 
 
@@ -58,41 +62,6 @@ def _safe_json_dict(value: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return dict(payload) if isinstance(payload, Mapping) else {}
-
-
-def _tactile_stream_compression(spec: Mapping[str, Any]) -> str:
-    compression = str(spec.get("compression") or "").strip().lower().replace("-", "_")
-    if compression in {"", "raw", "uncompressed"}:
-        encoding = str(spec.get("encoding") or "").strip().lower().replace("-", "_")
-        if encoding.startswith("chunked_"):
-            compression = encoding.removeprefix("chunked_")
-        else:
-            compression = "none"
-    if compression == "raw_c_order":
-        compression = "none"
-    return compression
-
-
-def _decompress_tactile_chunk(payload: bytes, *, compression: str, raw_bytes: int) -> bytes:
-    if compression == "none":
-        return payload
-    if compression == "lz4":
-        try:
-            import lz4.frame
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "Reading lz4-compressed tactile streams requires the lz4 Python package."
-            ) from exc
-        return lz4.frame.decompress(payload)
-    if compression == "zstd":
-        try:
-            import zstandard as zstd
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "Reading zstd-compressed tactile streams requires the zstandard Python package."
-            ) from exc
-        return zstd.ZstdDecompressor().decompress(payload, max_output_size=int(raw_bytes))
-    raise ValueError(f"Unsupported tactile stream compression '{compression}'.")
 
 
 def _encode_jpeg(bgr: np.ndarray, *, quality: int = 86) -> bytes:
@@ -239,78 +208,7 @@ class TactileFrame:
         return bool(self.arrays) or (self.vector is not None and self.vector.size > 0)
 
 
-class _ChunkedTactileStream:
-    def __init__(self, *, dataset_root: Path, spec: Mapping[str, Any]):
-        self.dataset_root = Path(dataset_root)
-        self.spec = dict(spec)
-        path = _resolve_dataset_path(self.dataset_root, self.spec.get("path"))
-        if path is None:
-            raise ValueError("Compressed tactile stream is missing a path.")
-        self.path = path
-        self.shape = tuple(int(dim) for dim in self.spec.get("shape", ()) or ())
-        self.frame_count = int(self.spec.get("frame_count") or 0)
-        self.dtype = np.dtype(str(self.spec.get("dtype") or "float32"))
-        self.compression = _tactile_stream_compression(self.spec)
-        self.chunks = [
-            dict(chunk)
-            for chunk in self.spec.get("chunks", []) or []
-            if isinstance(chunk, Mapping)
-        ]
-        self._cached_chunk_index: int | None = None
-        self._cached_chunk_array: np.ndarray | None = None
-
-    def _chunk_index_for_frame(self, frame_index: int) -> int | None:
-        index = int(frame_index)
-        for chunk_index, chunk in enumerate(self.chunks):
-            start = int(chunk.get("frame_start") or 0)
-            count = int(chunk.get("frame_count") or 0)
-            if start <= index < start + count:
-                return int(chunk_index)
-        return None
-
-    def _load_chunk(self, chunk_index: int) -> np.ndarray:
-        if self._cached_chunk_index == int(chunk_index) and self._cached_chunk_array is not None:
-            return self._cached_chunk_array
-        chunk = self.chunks[int(chunk_index)]
-        offset = int(chunk.get("offset") or 0)
-        compressed_bytes = int(chunk.get("compressed_bytes") or 0)
-        raw_bytes = int(chunk.get("raw_bytes") or 0)
-        frame_count = int(chunk.get("frame_count") or 0)
-        if compressed_bytes <= 0 or raw_bytes <= 0 or frame_count <= 0:
-            raise ValueError(f"Invalid tactile chunk metadata in {self.path}.")
-        with self.path.open("rb") as handle:
-            handle.seek(offset)
-            payload = handle.read(compressed_bytes)
-        if len(payload) != compressed_bytes:
-            raise ValueError(f"Short tactile chunk read from {self.path}.")
-        raw = _decompress_tactile_chunk(
-            payload,
-            compression=self.compression,
-            raw_bytes=raw_bytes,
-        )
-        if len(raw) != raw_bytes:
-            raise ValueError(
-                f"Tactile chunk decompressed to {len(raw)} bytes, expected {raw_bytes}."
-            )
-        array = np.frombuffer(raw, dtype=self.dtype).reshape((frame_count, *self.shape))
-        self._cached_chunk_index = int(chunk_index)
-        self._cached_chunk_array = array
-        return array
-
-    def frame(self, frame_index: int) -> np.ndarray | None:
-        index = int(frame_index)
-        if index < 0 or index >= int(self.frame_count):
-            return None
-        chunk_index = self._chunk_index_for_frame(index)
-        if chunk_index is None:
-            return None
-        chunk = self.chunks[chunk_index]
-        start = int(chunk.get("frame_start") or 0)
-        array = self._load_chunk(chunk_index)
-        offset = index - start
-        if offset < 0 or offset >= int(array.shape[0]):
-            return None
-        return np.asarray(array[offset])
+_ChunkedTactileStream = ChunkedTactileStream
 
 
 class ExternalTactileStore:
@@ -351,7 +249,7 @@ class ExternalTactileStore:
         dtype = np.dtype(str(spec.get("dtype") or "float32"))
         if frame_count <= 0 or not shape:
             return None
-        compression = _tactile_stream_compression(spec)
+        compression = tactile_stream_compression(spec)
         if compression != "none":
             stream = _ChunkedTactileStream(dataset_root=self.dataset_root, spec=spec)
             self._streams[sensor_key] = stream
@@ -412,9 +310,16 @@ class TactileEpisodeReader:
         self._stores: dict[Path, ExternalTactileStore] = {}
 
     def close(self) -> None:
-        for store in self._stores.values():
-            store.close()
-        self._stores.clear()
+        try:
+            run_best_effort_cleanup(
+                f"tactile_episode_reader[{self.side}].close",
+                (
+                    (f"store[{path}]", store.close)
+                    for path, store in reversed(tuple(self._stores.items()))
+                ),
+            )
+        finally:
+            self._stores.clear()
 
     def _store_for_path(self, path: Path) -> ExternalTactileStore:
         resolved = path.resolve()

@@ -22,7 +22,8 @@ def _ensure_repo_root_on_path() -> None:
     """Allow running this portable script directly by file path."""
 
     for parent in Path(__file__).resolve().parents:
-        if (parent / "dataset_postprocess").is_dir() and (parent / "teleop_runtime").is_dir():
+        has_postprocess = (parent / "utils" / "dataset_postprocess").is_dir()
+        if has_postprocess and (parent / "teleop_runtime").is_dir():
             root = str(parent)
             if root not in sys.path:
                 sys.path.insert(0, root)
@@ -38,8 +39,8 @@ except Exception as exc:  # noqa: BLE001
 
 import numpy as np
 
-from dataset_postprocess.wrist_cam_adjust.depth import WRIST_DEPTH_MASK_FORMAT, unpack_binary_mask
-from dataset_postprocess.wrist_cam_adjust.visualize_depth_mask import MaskStream, load_mask_stream
+from dataset_contracts.wrist_depth import WRIST_DEPTH_MASK_FORMAT, unpack_binary_mask
+from utils.dataset_postprocess.wrist_cam_adjust.visualize_depth_mask import MaskStream, load_mask_stream
 
 
 DEFAULT_CAMERA_KEYS = ("left_wrist", "right_wrist")

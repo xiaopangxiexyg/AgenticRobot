@@ -1,0 +1,35 @@
+{
+  "schema": "dexteleop.dataset_organization_manifest.v1",
+  "min_duration_sec": 2.0,
+  "datasets": [
+    {
+      "name": "bimanual-cube-new-failure-case",
+      "output_root": "../../../datasets/sorted_v22/bimanual-cube-new-failure-case",
+      "task": {
+        "id": "bimanual_cube_grasp",
+        "description": "Bimanual cube grasping failure-case demonstrations collected on or after 2026-07-07, with incomplete wrist-depth episodes removed."
+      },
+      "labels": {
+        "task": "cube",
+        "era": "new (2026-07-07 and later)",
+        "quality": "failure_case"
+      },
+      "notes": [
+        "This v2.2 derivative removes every episode with a wrist-depth stream whose frame count does not equal the episode RGB frame count.",
+        "Removed pre-cleanup episode indices are 2, 3, and 6; output episode indices are rebuilt as contiguous 0..3.",
+        "Wrist final keep-masks are generated externally and used only for training-time background augmentation."
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/2026-07-08_vive_rm65_real_teleop",
+          "episode_indices": [8, 10]
+        },
+        {
+          "dataset_root": "../../../datasets/2026-07-08_vive_rm65_real_teleop_part2",
+          "episode_indices": [52, 124]
+        }
+      ]
+    }
+  ]
+}
+

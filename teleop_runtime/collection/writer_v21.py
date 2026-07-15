@@ -10,7 +10,16 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from dataset_postprocess.wrist_cam_adjust.depth import (
+from dataset_contracts.stats import EpisodeStatsAccumulator
+from dataset_contracts.v22 import (
+    DEXTELEOP_DATASET_SCHEMA_V22,
+    LEROBOT_V21_STYLE_FORMAT,
+    DatasetLayoutBindingError,
+    PolicyIOLayout,
+    bind_policy_io_layout,
+    policy_io_layout_from_metadata,
+)
+from dataset_contracts.wrist_depth import (
     DepthRangeMaskConfig,
     depth_range_mask,
     mask_manifest_payload,
@@ -35,7 +44,7 @@ from .schema_v21 import (
     episode_id_from_index,
     write_rows_to_parquet,
 )
-from .stats import EpisodeStatsAccumulator
+from .schema_v22 import collector_sample_to_v22_row
 
 
 ROW_JOB_KIND = "lerobot_v21.row"
@@ -167,7 +176,7 @@ class LeRobotV21WriterConfig:
     write_parquet: bool = True
     write_video: bool = True
     tactile_storage: str = TACTILE_STORAGE_EXTERNAL
-    tactile_compression: str = TACTILE_COMPRESSION_LZ4
+    tactile_compression: str = TACTILE_COMPRESSION_NONE
     allow_missing_video_frames: bool = False
     arm_action_specs: Mapping[str, Any] | None = None
     hand_action_specs: Mapping[str, Any] | None = None
@@ -176,6 +185,9 @@ class LeRobotV21WriterConfig:
     wrist_depth_camera_keys: tuple[str, ...] = ("left_wrist", "right_wrist")
     wrist_depth_min_m: float = 0.05
     wrist_depth_max_m: float = 0.5
+    policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None
+    policy_io_layout_provenance: Mapping[str, Any] | None = None
+    strict_v22_policy_io: bool = False
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
@@ -197,6 +209,19 @@ class LeRobotV21WriterConfig:
         self.tactile_compression = _normalize_tactile_compression(self.tactile_compression)
         self.arm_action_specs = normalize_arm_action_specs(self.arm_action_specs)
         self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
+        self.policy_io_layout_provenance = dict(self.policy_io_layout_provenance or {})
+        self.strict_v22_policy_io = bool(self.strict_v22_policy_io)
+        if self.policy_io_layout is not None:
+            if isinstance(self.policy_io_layout, Mapping):
+                self.policy_io_layout = PolicyIOLayout.from_dict(self.policy_io_layout)
+            elif not isinstance(self.policy_io_layout, PolicyIOLayout):
+                raise TypeError("policy_io_layout must be a PolicyIOLayout, mapping, or None.")
+            if str(self.format_name) != LEROBOT_V21_STYLE_FORMAT:
+                raise ValueError(
+                    "DexTeleop v2.2 policy I/O keeps the LeRobot-v2.1-style storage format."
+                )
+        elif self.strict_v22_policy_io:
+            raise ValueError("strict_v22_policy_io requires policy_io_layout.")
 
 
 @dataclass
@@ -406,6 +431,52 @@ class LeRobotV21Writer:
         with self._lock:
             return int(self._finalized_frame_count)
 
+    @property
+    def policy_io_layout(self) -> PolicyIOLayout | None:
+        layout = self.config.policy_io_layout
+        return layout if isinstance(layout, PolicyIOLayout) else None
+
+    @property
+    def is_v22(self) -> bool:
+        return self.policy_io_layout is not None
+
+    def _existing_info_payload(self) -> dict[str, Any]:
+        if not self.info_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.info_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read existing dataset info at {self.info_path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Existing dataset info at {self.info_path} is not a JSON object.")
+        return payload
+
+    def _validate_existing_policy_io_layout(self) -> None:
+        existing = self._existing_info_payload()
+        if not existing:
+            return
+        existing_schema = existing.get("dexteleop_dataset_schema")
+        layout = self.policy_io_layout
+        has_existing_frames = bool(existing.get("frame_count", 0) or existing.get("episode_count", 0))
+        if layout is None:
+            if existing_schema == DEXTELEOP_DATASET_SCHEMA_V22:
+                raise DatasetLayoutBindingError(
+                    "Refusing to append a v2.1 writer to a v2.2 policy-I/O dataset. "
+                    "Pass the matching policy_io_layout explicitly."
+                )
+            return
+        if has_existing_frames and existing_schema != DEXTELEOP_DATASET_SCHEMA_V22:
+            raise DatasetLayoutBindingError(
+                "Refusing to append a v2.2 writer to a populated pre-v2.2 dataset. "
+                "Use the explicit v2.1-to-v2.2 conversion path instead."
+            )
+        if existing_schema == DEXTELEOP_DATASET_SCHEMA_V22:
+            existing_layout = policy_io_layout_from_metadata(existing, allow_legacy_v21=False)
+            if existing_layout.layout_hash != layout.layout_hash:
+                raise DatasetLayoutBindingError(
+                    "Dataset policy_io_layout_hash differs from the writer configuration."
+                )
+
     def _prepare_dataset_root(self) -> None:
         self.meta_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -413,6 +484,7 @@ class LeRobotV21Writer:
         for path in (self.episodes_path, self.tasks_path, self.episode_stats_path):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(exist_ok=True)
+        self._validate_existing_policy_io_layout()
         self._load_existing_dataset_state()
         self._ensure_task_manifest()
         self._write_info_locked()
@@ -457,9 +529,17 @@ class LeRobotV21Writer:
     def _write_info_locked(self) -> None:
         arm_specs = arm_action_specs_metadata(self.config.arm_action_specs)
         hand_specs = hand_action_specs_metadata(self.config.hand_action_specs)
-        _write_json(
-            self.info_path,
-            {
+        layout = self.policy_io_layout
+        features = (
+            layout.feature_metadata()
+            if layout is not None
+            else {
+                "action": {"shape": [26], "dtype": "float32"},
+                "observation.state": {"shape": [38], "dtype": "float32"},
+                "observation.last_action": {"shape": [26], "dtype": "float32"},
+            }
+        )
+        info: dict[str, Any] = {
                 "format": self.config.format_name,
                 "dataset_name": self.config.dataset_name,
                 "nominal_fps": float(self.config.nominal_fps),
@@ -511,15 +591,37 @@ class LeRobotV21Writer:
                         "mode_ids": dict(ARM_MODE_IDS),
                         "legacy_default_policy": "missing_columns_running_rows_are_teleop_else_unknown",
                         "json_column": "teleop.arm_mode_json",
+                        "model_columns": [
+                            "teleop.arm_mode.<side>.id",
+                            "teleop.arm_mode.<side>.label",
+                        ],
+                        "audit_only_columns": [
+                            "teleop.arm_mode.<side>.scope",
+                            "teleop.arm_mode.<side>.init_phase",
+                            "teleop.arm_mode.<side>.init_phase_valid",
+                            "teleop.arm_mode.<side>.init_target_position_error_m",
+                            "teleop.arm_mode.<side>.init_target_rotation_error_deg",
+                            "teleop.arm_mode.<side>.init_translation_speed_m_s",
+                            "teleop.arm_mode.<side>.init_rotation_speed_deg_s",
+                            "teleop.arm_mode.<side>.init_dwell_sec",
+                        ],
                     }
                 },
-                "features": {
-                    "action": {"shape": [26], "dtype": "float32"},
-                    "observation.state": {"shape": [38], "dtype": "float32"},
-                    "observation.last_action": {"shape": [26], "dtype": "float32"},
-                },
-            },
-        )
+                "features": features,
+        }
+        if layout is not None:
+            info["dexteleop_dataset_schema"] = DEXTELEOP_DATASET_SCHEMA_V22
+            info.update(bind_policy_io_layout(None, layout))
+            info["policy_io_layout_collection"] = {
+                **dict(self.config.policy_io_layout_provenance or {}),
+                "strict": bool(self.config.strict_v22_policy_io),
+            }
+            info["policy_io_layout_binding"] = {
+                "required_for_training_checkpoint": True,
+                "required_for_deploy_runtime": True,
+                "legacy_v21_requires_explicit_conversion": True,
+            }
+        _write_json(self.info_path, info)
 
     def write_calibration_snapshot(self, name: str, payload: Any) -> Path:
         path = self.meta_dir / "calibration" / f"{name}.json"
@@ -567,6 +669,7 @@ class LeRobotV21Writer:
             state = self._episodes[episode_index]
             if metadata:
                 state.metadata.update(_to_serializable(dict(metadata)))
+            self._bind_episode_policy_io_layout(state.metadata)
             state.metadata.setdefault(
                 "arm_action_specs_by_side",
                 arm_action_specs_metadata(self.config.arm_action_specs),
@@ -582,6 +685,7 @@ class LeRobotV21Writer:
             chunk_size=self.config.chunk_size,
         )
         episode_metadata = {} if metadata is None else dict(_to_serializable(dict(metadata)))
+        self._bind_episode_policy_io_layout(episode_metadata)
         episode_metadata.setdefault(
             "arm_action_specs_by_side",
             arm_action_specs_metadata(self.config.arm_action_specs),
@@ -622,6 +726,26 @@ class LeRobotV21Writer:
         self._episodes[episode_index] = state
         self._next_episode_index = max(self._next_episode_index, episode_index + 1)
         return state
+
+    def _bind_episode_policy_io_layout(self, metadata: dict[str, Any]) -> None:
+        layout = self.policy_io_layout
+        if layout is None:
+            return
+        binding = bind_policy_io_layout(None, layout)
+        existing_hash = metadata.get("policy_io_layout_hash")
+        if existing_hash is not None and str(existing_hash) != layout.layout_hash:
+            raise DatasetLayoutBindingError(
+                "Episode metadata policy_io_layout_hash differs from the writer configuration."
+            )
+        metadata.update(binding)
+        if self.config.policy_io_layout_provenance:
+            metadata.setdefault(
+                "policy_io_layout_collection",
+                {
+                    **dict(self.config.policy_io_layout_provenance),
+                    "strict": bool(self.config.strict_v22_policy_io),
+                },
+            )
 
     def _episode_parquet_relative_path(self, episode_index: int) -> str:
         chunk_id = chunk_id_from_episode_index(
@@ -936,12 +1060,23 @@ class LeRobotV21Writer:
                 sample
             )
         wrist_depth_jobs, wrist_depth_expectations, wrist_depth_status = self._plan_wrist_depth_jobs(sample)
-        row, camera_expectations = collector_sample_to_row(
-            sample,
-            camera_video_paths=camera_video_paths,
-            tactile_storage_refs=tactile_refs,
-            inline_tactile=inline_tactile,
-        )
+        layout = self.policy_io_layout
+        if layout is None:
+            row, camera_expectations = collector_sample_to_row(
+                sample,
+                camera_video_paths=camera_video_paths,
+                tactile_storage_refs=tactile_refs,
+                inline_tactile=inline_tactile,
+            )
+        else:
+            row, camera_expectations = collector_sample_to_v22_row(
+                sample,
+                layout=layout,
+                camera_video_paths=camera_video_paths,
+                tactile_storage_refs=tactile_refs,
+                inline_tactile=inline_tactile,
+                strict=bool(self.config.strict_v22_policy_io),
+            )
         if not self.config.write_video:
             camera_expectations = {camera_key: False for camera_key in camera_expectations}
         jobs = [
@@ -1781,6 +1916,11 @@ class LeRobotV21Writer:
                 rows,
                 self.root_dir / parquet_relative_path,
                 compression=self.config.parquet_compression,
+                fixed_size_list_columns=(
+                    None
+                    if self.policy_io_layout is None
+                    else self.policy_io_layout.parquet_fixed_list_columns()
+                ),
             )
 
         assert episode.stats is not None

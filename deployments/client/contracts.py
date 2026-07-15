@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from dataset_contracts.state_input import (
+    STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+    normalize_state_input_mode,
+)
+
 
 DEXTELEOP_DEPLOY_SCHEMA_VERSION = "dexteleop_deploy_v1"
+DEXTELEOP_DEPLOY_SCHEMA_V2 = "dexteleop_deploy_v2"
 DEFAULT_ACTION_KEY = "actions"
 
 
@@ -25,8 +31,15 @@ class DeployPolicyContract:
     deploy_schema_version: str | None = None
     model_id: str | None = None
     checkpoint_step: int | str | None = None
+    state_key: str | None = None
+    state_dim: int | None = None
+    state_input_mode: str | None = None
+    state_discrete_key: str | None = None
+    state_discrete_dim: int | None = None
     action_key: str = DEFAULT_ACTION_KEY
     action_dim: int = 26
+    action_discrete_dim: int | None = None
+    policy_io_layout_hash: str | None = None
     min_action_horizon: int = 1
     active_sides: tuple[str, ...] = ("left", "right")
     require_active_sides_match: bool = True
@@ -39,8 +52,30 @@ class DeployPolicyContract:
         object.__setattr__(self, "protocol_version", _optional_str(self.protocol_version))
         object.__setattr__(self, "deploy_schema_version", _optional_str(self.deploy_schema_version))
         object.__setattr__(self, "model_id", _optional_str(self.model_id))
+        object.__setattr__(self, "state_key", _optional_str(self.state_key))
+        state_input_mode = self.state_input_mode
+        object.__setattr__(
+            self,
+            "state_input_mode",
+            None if state_input_mode is None else normalize_state_input_mode(state_input_mode),
+        )
+        object.__setattr__(self, "state_discrete_key", _optional_str(self.state_discrete_key))
+        for name in ("state_dim", "state_discrete_dim"):
+            value = getattr(self, name)
+            if value is not None:
+                value = int(value)
+                if value < 0:
+                    raise ValueError(f"{name} must be non-negative when declared.")
+            object.__setattr__(self, name, value)
         object.__setattr__(self, "action_key", str(self.action_key or DEFAULT_ACTION_KEY))
         object.__setattr__(self, "action_dim", int(self.action_dim))
+        discrete_dim = self.action_discrete_dim
+        if discrete_dim is not None:
+            discrete_dim = int(discrete_dim)
+            if discrete_dim < 0:
+                raise ValueError("action_discrete_dim must be non-negative when declared.")
+        object.__setattr__(self, "action_discrete_dim", discrete_dim)
+        object.__setattr__(self, "policy_io_layout_hash", _optional_str(self.policy_io_layout_hash))
         object.__setattr__(self, "min_action_horizon", int(self.min_action_horizon))
         object.__setattr__(self, "active_sides", _normalize_sides(self.active_sides))
         object.__setattr__(self, "required_camera_slots", tuple(str(v) for v in self.required_camera_slots))
@@ -110,11 +145,118 @@ def validate_server_metadata(
             f"expected={str(contract.checkpoint_step)!r}, actual={checkpoint_step!r}"
         )
 
+    state_dim = _server_state_dim(payload)
+    if contract.state_dim is not None:
+        if state_dim is None:
+            errors.append("input_state_dim_missing")
+        elif state_dim != contract.state_dim:
+            errors.append(
+                f"input_state_dim_mismatch:expected={contract.state_dim}, actual={state_dim}"
+            )
+    state_discrete_dim = _server_state_discrete_dim(payload)
+    if contract.state_discrete_dim is not None:
+        if state_discrete_dim is None:
+            errors.append("input_state_discrete_dim_missing")
+        elif state_discrete_dim != contract.state_discrete_dim:
+            errors.append(
+                "input_state_discrete_dim_mismatch:"
+                f"expected={contract.state_discrete_dim}, actual={state_discrete_dim}"
+            )
+    state_key = _optional_str(
+        _first_present(payload, ("local_robot.input_state_key", "model.state_key", "state_key"))
+    )
+    if contract.state_key is not None and state_key != contract.state_key:
+        errors.append(
+            f"input_state_key_mismatch:expected={contract.state_key!r}, actual={state_key!r}"
+        )
+    server_state_input_mode = _optional_str(
+        _first_present(
+            payload,
+            (
+                "local_robot.input_state_mode",
+                "dataset_adapter.state_input_mode",
+                "model.state_input_mode",
+                "state_input_mode",
+            ),
+        )
+    )
+    if contract.state_input_mode == STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT:
+        if server_state_input_mode != contract.state_input_mode:
+            errors.append(
+                "input_state_mode_mismatch:"
+                f"expected={contract.state_input_mode!r}, actual={server_state_input_mode!r}"
+            )
+    elif contract.state_input_mode is not None and server_state_input_mode not in (None, contract.state_input_mode):
+        errors.append(
+            "input_state_mode_mismatch:"
+            f"expected={contract.state_input_mode!r}, actual={server_state_input_mode!r}"
+        )
+    state_discrete_key = _optional_str(
+        _first_present(
+            payload,
+            (
+                "local_robot.input_state_discrete_key",
+                "model.state_discrete_key",
+                "state_discrete_key",
+            ),
+        )
+    )
+    if (
+        contract.state_discrete_key is not None
+        and state_discrete_key != contract.state_discrete_key
+    ):
+        errors.append(
+            "input_state_discrete_key_mismatch:"
+            f"expected={contract.state_discrete_key!r}, actual={state_discrete_key!r}"
+        )
+
     action_dim = _server_action_dim(payload)
     if action_dim is None:
         errors.append("output_action_dim_missing")
     elif int(action_dim) != contract.action_dim:
         errors.append(f"output_action_dim_mismatch:expected={contract.action_dim}, actual={int(action_dim)}")
+
+    if contract.action_discrete_dim is not None:
+        server_discrete_dim = _server_action_discrete_dim(payload)
+        if server_discrete_dim is None:
+            errors.append("output_action_discrete_dim_missing")
+        elif int(server_discrete_dim) != int(contract.action_discrete_dim):
+            errors.append(
+                "output_action_discrete_dim_mismatch:"
+                f"expected={int(contract.action_discrete_dim)}, actual={int(server_discrete_dim)}"
+            )
+    else:
+        server_discrete_dim = _server_action_discrete_dim(payload)
+
+    if contract.policy_io_layout_hash is not None:
+        server_layout_hash = _optional_str(
+            _first_present(
+                payload,
+                (
+                    "policy_io_layout_hash",
+                    "dataset_adapter.policy_io_layout_hash",
+                    "model.policy_io_layout_hash",
+                    "deployment.policy_io_layout_hash",
+                ),
+            )
+        )
+        if server_layout_hash != contract.policy_io_layout_hash:
+            errors.append(
+                "policy_io_layout_hash_mismatch:"
+                f"expected={contract.policy_io_layout_hash!r}, actual={server_layout_hash!r}"
+            )
+    else:
+        server_layout_hash = _optional_str(
+            _first_present(
+                payload,
+                (
+                    "policy_io_layout_hash",
+                    "dataset_adapter.policy_io_layout_hash",
+                    "model.policy_io_layout_hash",
+                    "deployment.policy_io_layout_hash",
+                ),
+            )
+        )
 
     horizon = _int_or_none(_nested_get(payload, "model.action_horizon"))
     if horizon is None:
@@ -145,7 +287,14 @@ def validate_server_metadata(
         "deploy_schema_version": _first_present(payload, ("deploy_schema_version", "schema_version")),
         "model_id": server_model_id,
         "checkpoint_step": checkpoint_step,
+        "state_key": state_key,
+        "state_dim": state_dim,
+        "state_input_mode": server_state_input_mode,
+        "state_discrete_key": state_discrete_key,
+        "state_discrete_dim": state_discrete_dim,
         "action_dim": action_dim,
+        "action_discrete_dim": server_discrete_dim,
+        "policy_io_layout_hash": server_layout_hash,
         "action_horizon": horizon,
         "active_sides": list(server_sides),
         "camera_slots": _server_camera_slots(payload),
@@ -227,6 +376,53 @@ def _server_action_dim(metadata: Mapping[str, Any]) -> int | None:
     )
 
 
+def _server_state_dim(metadata: Mapping[str, Any]) -> int | None:
+    return _int_or_none(
+        _first_present(
+            metadata,
+            (
+                "local_robot.input_state_dim",
+                "dataset_adapter.state_dim",
+                "dataset_adapter.model_state_dim",
+                "model.state_dim",
+                "input_state_dim",
+                "state_dim",
+            ),
+        )
+    )
+
+
+def _server_state_discrete_dim(metadata: Mapping[str, Any]) -> int | None:
+    return _int_or_none(
+        _first_present(
+            metadata,
+            (
+                "local_robot.input_state_discrete_dim",
+                "dataset_adapter.state_discrete_dim",
+                "dataset_adapter.model_state_discrete_dim",
+                "model.state_discrete_dim",
+                "input_state_discrete_dim",
+                "state_discrete_dim",
+            ),
+        )
+    )
+
+
+def _server_action_discrete_dim(metadata: Mapping[str, Any]) -> int | None:
+    return _int_or_none(
+        _first_present(
+            metadata,
+            (
+                "local_robot.output_action_discrete_dim",
+                "dataset_adapter.action_discrete_dim",
+                "dataset_adapter.deployment_action_discrete_dim",
+                "model.action_discrete_dim",
+                "action_discrete_dim",
+            ),
+        )
+    )
+
+
 def _server_camera_slots(metadata: Mapping[str, Any]) -> tuple[str, ...]:
     value = _first_present(
         metadata,
@@ -273,4 +469,3 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-

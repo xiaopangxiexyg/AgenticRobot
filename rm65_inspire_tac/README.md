@@ -103,6 +103,14 @@ teleop/rm65_inspire_tac_portable/
 
 适合双臂协同和带碰撞约束的场景。
 
+`dual_arm_hand_proxy_open` 和 `dual_arm_hand_proxy_strict` 共用一份明确指定的 12 对碰撞检测集合：固定张开手/arm-link3 proxy 与对侧 proxy、中央/左右 camera pole 和 table。新增的第 12 对是 `right_arm_link3_proxy_0 <-> right_camera_pole_0`；这两个 profile 的差异只在 URDF 几何（例如 strict table），不在碰撞检测集合。唯一权威定义是 `rm65_inspire_tac.pipeline.DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS`。需要人工复核几何时使用：
+
+```bash
+python hardware/rm65/utils/scripts/rm65_visualize_dual_arm_collision_scene.py \
+  --scene-profile dual_arm_hand_proxy_open \
+  --output-html /tmp/rm65_dual_arm_collision_scene.html
+```
+
 ### 5. `RM65InspireTacController` / `BimanualRM65InspireTacSystem`
 
 这是硬件层封装：

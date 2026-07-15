@@ -50,10 +50,14 @@ from ..schemas import TeleopObservation, latest_channel_timestamp, merge_teleop_
 from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
-from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..sources.pose import (
+    DEFAULT_VIVE_CLOCK_SYNC_PORT,
+    VivePoseSource,
+    ViveTrackerConfig,
+)
 from ..tcp import legacy_tcp_mode_requested
 from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
-from .log_utils import DEFAULT_LOG_HEARTBEAT_SEC, ChangeGate, log_event
+from .log_utils import ChangeGate, log_event
 from robot_motion.rm65 import build_rm65_dual_arm_scene_profile
 from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
 from rm65_inspire_tac.paths import require_asset_path
@@ -352,6 +356,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver")
     parser.add_argument("--port", type=int, default=9999, help="UDP bind port for the VIVE receiver")
+    parser.add_argument(
+        "--vive-clock-sync-port",
+        type=int,
+        default=DEFAULT_VIVE_CLOCK_SYNC_PORT,
+        help=(
+            "Separate VIVE clock-control UDP port for the default new protocol; "
+            "set 0 to select the legacy v1-only receiver."
+        ),
+    )
     parser.add_argument(
         "--active-sides",
         type=_parse_active_sides,
@@ -701,6 +714,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             translation_scale=args.translation_scale,
             input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
+            tracker_motion_intent_enabled=True,
         )
     )
     right_retargeter = PoseToArmRetargeter(
@@ -712,6 +726,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             translation_scale=args.translation_scale,
             input_local_translation_offset=tracker_translation_offset,
             input_local_rotation_offset=tracker_hand_to_rm65_tcp_rotation(),
+            tracker_motion_intent_enabled=True,
         )
     )
     dual_arm_retargeter = None
@@ -824,6 +839,9 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
             tracker_configs=tracker_configs,
             host=args.host,
             port=args.port,
+            clock_sync_port=int(
+                getattr(args, "vive_clock_sync_port", DEFAULT_VIVE_CLOCK_SYNC_PORT)
+            ),
         ),
         keyboard_source,
     ]
@@ -1146,8 +1164,25 @@ def _resolve_robot_home_for_side(
         if qpos is not None:
             qpos_array = np.asarray(qpos, dtype=float).copy()
             preview_backend.set_local_qpos(qpos_array)
+            # A preview backend may normalize a tiny SDK feedback quantization
+            # overshoot at a hard endpoint. Persist that bounded anchor for
+            # this session's home/IK seed rather than the raw observation.
+            preview_state = preview_backend.get_state()
+            anchor_qpos = preview_state.get("current_qpos")
+            if anchor_qpos is None:
+                raise RuntimeError(f"{side}_arm preview did not retain a local qpos anchor.")
+            anchor_qpos = np.asarray(anchor_qpos, dtype=float).reshape(6).copy()
+            normalization = preview_state.get("local_qpos_normalization")
+            if isinstance(normalization, dict) and normalization.get("status") == "clipped":
+                clipped_joints = normalization.get("clipped_joint_indices", [])
+                _log(
+                    "Calibration",
+                    f"{side}_arm hardware qpos had a tiny endpoint quantization overshoot; "
+                    f"preview/home anchor clipped at joint(s) {clipped_joints}. "
+                    "The arm remains at the hard limit; move it away before normal tracking.",
+                )
             _sync_dual_arm_retargeter_from_preview(components)
-            return _preview_tcp_pose_desk(components, side=side), qpos_array, "real_current_state"
+            return _preview_tcp_pose_desk(components, side=side), anchor_qpos, "real_current_state"
 
     qpos = preview_backend.get_state()["current_qpos"]
     return _preview_tcp_pose_desk(components, side=side), qpos, "preview_current_state"
@@ -1897,17 +1932,30 @@ def _wait_for_calibration_start(
         time.sleep(0.02)
 
 
-def _sync_dual_arm_retargeter_from_preview(components: VirtualRunComponents) -> None:
+def _sync_dual_arm_retargeter_from_preview(
+    components: VirtualRunComponents,
+    *,
+    reset_tracking: bool = True,
+) -> None:
     if components.dual_arm_retargeter is None:
         return
     left_qpos = components.left_preview_backend.get_state()["current_qpos"]
     right_qpos = components.right_preview_backend.get_state()["current_qpos"]
     if left_qpos is None or right_qpos is None:
         return
-    components.dual_arm_retargeter.set_current_qpos_pair(
-        left_qpos=left_qpos,
-        right_qpos=right_qpos,
-    )
+    try:
+        components.dual_arm_retargeter.set_current_qpos_pair(
+            left_qpos=left_qpos,
+            right_qpos=right_qpos,
+            reset_tracking=reset_tracking,
+        )
+    except TypeError as exc:
+        if "reset_tracking" not in str(exc):
+            raise
+        components.dual_arm_retargeter.set_current_qpos_pair(
+            left_qpos=left_qpos,
+            right_qpos=right_qpos,
+        )
 
 
 def _preview_tcp_pose_desk(

@@ -4,6 +4,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+from robot_motion.runtime.lifecycle import (
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    run_best_effort_cleanup,
+)
+
 from ..session import SessionStepResult
 from .async_writer import AsyncWriterPool, WriteJob
 from .build_collect_components import CollectorComponents
@@ -49,10 +55,29 @@ class CollectionRuntime:
     def start(self) -> None:
         if self._started:
             return
-        if self.config.auto_start_writer_pool:
-            self.writer_observer.start()
-        if self.config.auto_start_session:
-            self.components.session.start()
+        rollback_steps: list[tuple[str, Callable[[], None]]] = []
+        try:
+            if self.config.auto_start_writer_pool:
+                rollback_steps.append(
+                    (
+                        "writer_observer",
+                        lambda: self.writer_observer.close(flush=False),
+                    )
+                )
+                self.writer_observer.start()
+            if self.config.auto_start_session:
+                rollback_steps.append(("session", self.components.session.close))
+                self.components.session.start()
+        except BaseException as start_error:  # noqa: BLE001 - rollback before propagating.
+            self._started = False
+            rollback_failures = collect_lifecycle_failures(reversed(rollback_steps))
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    f"{self.config.name}.start",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
         self._started = True
 
     def step(
@@ -60,6 +85,21 @@ class CollectionRuntime:
         now: float | None = None,
         phase_recorder: Callable[[str, float], None] | None = None,
     ) -> SessionStepResult:
+        result = self.control_step(now=now, phase_recorder=phase_recorder)
+        self.record_step(result, phase_recorder=phase_recorder)
+        return result
+
+    def control_step(
+        self,
+        now: float | None = None,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> SessionStepResult:
+        """Run one control/reference update without constructing a dataset sample.
+
+        Position control uses this at its reference rate (nominally 75 Hz).  Sampling
+        is intentionally a separate operation so camera/state/action alignment can
+        run on an independent 15 Hz clock instead of relying on a fixed 1:3 ratio.
+        """
         phase_started = time.perf_counter()
 
         def mark_phase(name: str) -> None:
@@ -78,19 +118,36 @@ class CollectionRuntime:
             phase_recorder=phase_recorder,
         )
         mark_phase("runtime.session.run_step")
-        self.writer_observer.handle_step(result, phase_recorder=phase_recorder)
         return result
+
+    def record_step(
+        self,
+        result: SessionStepResult,
+        *,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> Any | None:
+        """Build and enqueue one dataset sample from an already completed step."""
+        return self.writer_observer.handle_step(result, phase_recorder=phase_recorder)
 
     def flush(self) -> None:
         self.writer_observer.flush()
 
     def close(self) -> None:
+        steps: list[tuple[str, Callable[[], None]]] = [
+            ("session", self.components.session.close),
+            (
+                "writer_observer",
+                lambda: self.writer_observer.close(
+                    flush=bool(self.config.flush_on_close)
+                ),
+            ),
+        ]
         try:
-            if self.config.flush_on_close:
-                self.flush()
+            # Startup order is writer -> session, so teardown reverses it.  This
+            # stops hardware first while still guaranteeing the writer receives
+            # its drain/termination attempt if session cleanup fails.
+            run_best_effort_cleanup(f"{self.config.name}.close", steps)
         finally:
-            self.writer_observer.close(flush=False if not self.config.flush_on_close else True)
-            self.components.session.close()
             self._started = False
 
     @property

@@ -2,6 +2,9 @@
 
 本文档是当前仓库内从设备连接、虚拟验证、真机 teleop 验证、带三路相机采集，到 SAPIEN+视频回放的完整流程。
 
+首次创建或更新 Python 环境请先阅读 [`README_ENV.md`](./README_ENV.md)，并运行
+`bash scripts/install_conda_env.sh`；不要按机器历史状态手工拼接依赖。
+
 默认假设在采集电脑上执行，工作目录固定为：
 
 ```bash
@@ -27,7 +30,7 @@ PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
 
 ## 02. Q6 控制双臂 1D 夹爪
 
-Q6 夹爪控制已接入 `teleop_runtime.debug.run_vive_rm65_real_teleop` 和 `teleop_runtime.collection.run_collect`。先保存 Q6 左右手配置，再保存 gripper / DM TAC USB 配置。
+Q6 夹爪控制已接入 `teleop_runtime.debug.run_vive_rm65_real_teleop` 和 `teleop_runtime.collection.run_collect`。真机 GUI 主线会优先静默识别 Q6；未发现 Q6 时会使用已标定的 `hardware.angle_trigger` 左右标量输入。先保存 Q6 左右手配置，再保存 gripper / DM TAC USB 配置。
 
 采集命令中追加：
 
@@ -36,6 +39,8 @@ Q6 夹爪控制已接入 `teleop_runtime.debug.run_vive_rm65_real_teleop` 和 `t
 --dmtac-config latest \
 --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
 ```
+
+如需直接使用 angle trigger（跳过 Q6 识别），追加 `--gripper-angle-trigger`。首次使用或 USB 映射/角度标定失效时，主线会进入 angle trigger 的左右分配与 0/1 标定流程；其配置默认保存于 `teleop_runtime/configs/hardware/angle_trigger`。
 
 如果没有 DM TAC 触觉，只接 1D gripper，追加 `--dmtac-no-tactile`。夹爪默认读取 Q6 `source_dim=2`，把 Q6 的 `0.1..0.9` 映射到夹爪 `0..1.0`；训练使用 `action.gripper.<side>.target` 的 1D 标量，兼容 hand action 只允许写入 slot 0。
 
@@ -133,16 +138,18 @@ teleop_runtime/configs/hardware/rm65_arm_ips/latest.json
 `--no-arm-ip-default-config`；需要显式传 IP 但不更新 latest 时使用
 `--no-arm-ip-save-latest`。
 
-## 2a. 频率语义：数采 15Hz，RM65 控制默认 40Hz
+## 2a. 频率语义：数采 15Hz，RM65 控制/透传独立设置
 
 这里有两层频率，不能混在一起调：
 
 - `--hz`：外层 action / 数据采样频率。采集时决定图像、状态、统一 action 空间等写盘节拍；单臂和双臂默认都是 `15Hz`。
 - `--nominal-fps`：数据集 metadata 的 fps。采集入口不传时默认跟随 `--hz`，所以默认也是 `15Hz`。
 - 部署入口优先用 `--action-hz`；如果没有显式传，也没有从 policy/参考数据集推断到频率，就回退到 `--hz=15`。
-- `--arm-control-hz`：RM65 backend 收到外层 action 后的机械臂控制/streaming 频率，默认 `40Hz`。这和采集/部署 action 频率无关，正常不要为了 15Hz 数采去降低它。
+- `--arm-control-hz`：RM65 backend 收到外层 action 后的机械臂控制/streaming 频率。未显式传入时，impedance 默认 `40Hz`，position 默认 `150Hz`。这和采集/部署 action 频率无关，正常不要为了 `15Hz` 数采去降低它。
+- `--arm-canfd-follow-stream-hz`：RM65 `Movej_CANFD(follow=True)` 关节透传下发频率。position 模式下控制后台 qpos stream，默认跟随 position 控制默认值 `150Hz`；impedance 关节透传下控制 follow stream。设为 `0` 可关闭高频透传；如需回退旧 `120Hz`，显式传 `--arm-canfd-follow-stream-hz 120`。
+- `--arm-canfd-follow-warning-ratio`：实际下发频率低于 `ratio * stream_hz` 时记录 warning。position 模式写入 `background_streaming.warning`，impedance 关节透传写入 `canfd_follow_stream.warning`。
 
-因此默认行为是：数据和 policy action 以 `15Hz` 对齐，RM65 真机执行层仍按 `40Hz` 持续跟随最新 action。
+因此默认行为是：数据和 policy action 以 `15Hz` 对齐，RM65 真机执行层按控制模式独立持续跟随最新 action；需要排查透传延迟时，应同时查看 action/state lag 和后台 stream 的 `actual_hz`。
 
 ```bash
 cd "$REPO"
@@ -259,12 +266,17 @@ conda activate dexteleop310
 python hardware/VIVE/mocap/vive_data_sender.py \
   --host "$VIVE_TARGET_HOST" \
   --port 9999 \
-  --hz 60 \
-  --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist
+  --hz 300
 ```
 
-仓库只保留一个 VIVE sender 入口：`hardware/VIVE/mocap/vive_data_sender.py`。它每帧只取一次 OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时。第三只 `auxiliary` tracker 需要时再显式追加。
+本地默认 sender 是 `hardware/VIVE/mocap/vive_data_sender.py`：它每帧只取一次
+OpenVR pose snapshot，再复用到所有 tracker，并会打印 loop/get_pose/json/send 耗时；
+启动时只接受两个 GenericTracker，并按设备名的字典序自动分配为
+`left_wrist` 和 `right_wrist`；多于两个会直接报错。同时会自动尝试独立的 UDP 校时控制面。
+若对端是 `DexTeleop_StableCollect_0705` 等稳定 receiver，请改用
+`hardware/VIVE/mocap/vive_data_sender_legacy.py`；它强制只发送发布版字段形状的
+v1 pose 流（默认 60 Hz）。
+完整的新旧协议启动方式见 `hardware/VIVE/mocap/CLOCK_SYNC.md`。
 
 如果 sender 和 receiver 在同一台机器上临时自测，可以把 `VIVE_TARGET_HOST` 改成 `127.0.0.1`。
 
@@ -321,7 +333,6 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --hand-telemetry-hz 10 \
   --hand-tactile-regions thumb_1,index_1,middle_1,ring_1,little_1,palm \
   --hz 15 \
-  --status-sec 1 \
   --calibration-timeout 15 \
   --calibration-samples 20 \
   --visualize-tactile \
@@ -370,7 +381,6 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --arm-control-hz 40 \
   --calibration-timeout 15 \
   --calibration-samples 20 \
-  --status-sec 1 \
   --visualize-tactile \
   --vis_cam \
   --storage-queue-size 64
@@ -417,6 +427,54 @@ videos/observation.images.left_wrist/chunk-000/episode_000000.mp4
 videos/observation.images.right_wrist/chunk-000/episode_000000.mp4
 tactile/observation.hand.left.tactile/chunk-000/episode_000000/manifest.json
 tactile/observation.hand.right.tactile/chunk-000/episode_000000/manifest.json
+```
+
+## 7a. 采集后处理入口
+
+后处理统一在 `dexteleop310` 环境下运行：
+
+```bash
+cd "$REPO"
+conda activate dexteleop310
+```
+
+推荐完整路径：
+
+```text
+raw dataset
+  -> trim-nan-tails / clean-stutters / delete-episodes / split-episodes
+  -> label-force-collisions
+  -> causal-align
+  -> wrist table keep-mask
+  -> wrist depth mask postprocess
+  -> final wrist keep-mask = postprocessed depth OR table keep-mask
+  -> dataset_interface training-time masked augmentation
+```
+
+低维策略合同的新数据使用 `dexteleop_dataset_v2.2`，目录仍保持 LeRobot-v2.1-style。
+模型 float state/action 固定以左右 arm pose7（共 14D）开头，末端按左右配置追加；离散末端
+使用独立 int64 token，arm qpos 保留为独立 12D 审计列。旧 26D/38D 数据不被原地重解释，
+可用 `python -m utils.dataset_postprocess v21-to-v22 --help` 先 dry-run 预检，再复制式转换。
+数据集、checkpoint policy artifact 与部署必须使用相同 `policy_io_layout_hash`。
+
+默认 wrist final mask 不使用 proxy：
+
+```text
+final_keep_mask = depth_range_mask_postprocessed OR table_geometry_keep_mask
+final 合成阶段不额外添加 proxy/body mask
+```
+
+默认 table keep-mask 应只包含桌面；如果上游 table keep-mask 已经渲入 painted body mask，
+final keep-mask 会按输入保留这部分像素。
+
+结构类后处理会写新 dataset，并优先 hardlink 视频、触觉、depth 等大文件，避免大批量数据全量复制。
+详细命令见：
+
+```text
+utils/dataset_postprocess/README.md
+utils/dataset_postprocess/wrist_cam_adjust/README.md
+dataset_interface/README.md
+utils/random_background/README.md
 ```
 
 ## 8. 回放采集数据
@@ -482,7 +540,7 @@ Frame 兼容约定：
 
 | 现象 | 优先检查 |
 | --- | --- |
-| 按 `p` 超时 | VIVE sender 是否在发 `tracker_1:left_wrist` 和 `tracker_2:right_wrist`，receiver `--host/--port` 是否匹配 |
+| 按 `p` 超时 | VIVE sender 是否发现并发送两个 GenericTracker，receiver `--host/--port` 是否匹配 |
 | 左右臂/VIVE tracker 输入反了 | tracker 名称、`--left-tracker-name`、`--right-tracker-name`、profile 是否匹配；只需在开始前交换 VIVE tracker 时用 `--swap-operator-sides` |
 | 机械臂方向不对 | 先回到 virtual SAPIEN 验证 profile，不要直接在真机上调 |
 | 相机启动失败 | `realsense.json` 的三路 serial 是否正确，`pyrealsense2` 是否能枚举设备 |

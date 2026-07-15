@@ -5,9 +5,9 @@ from pathlib import Path
 
 import numpy as np
 
-from dataset_postprocess.real_undistort.dataset import inspect_intrinsics, undistort_dataset
-from dataset_postprocess.real_undistort.intrinsics import CameraIntrinsics, build_undistort_maps, require_cv2
-from dataset_postprocess.real_undistort.video import process_video
+from utils.dataset_postprocess.real_undistort.dataset import inspect_intrinsics, undistort_dataset
+from utils.dataset_postprocess.real_undistort.intrinsics import CameraIntrinsics, build_undistort_maps, require_cv2
+from utils.dataset_postprocess.real_undistort.video import process_video
 
 
 def _write_json(path: Path, payload: object) -> None:

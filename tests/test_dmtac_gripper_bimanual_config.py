@@ -203,11 +203,11 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         )
         np.testing.assert_allclose(
             command_for(0.5),
-            np.array([0.475, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([0.45125, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
         )
         np.testing.assert_allclose(
             command_for(0.9),
-            np.array([0.95, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([0.9250625, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
         )
 
     def test_run_collect_builds_dmtac_gripper_retargeter_from_q6(self) -> None:
@@ -250,7 +250,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertFalse(configs["left"].connect_tactile)
         self.assertAlmostEqual(configs["left"].speed, 0.12)
         self.assertAlmostEqual(configs["left"].torque, 0.34)
-        self.assertAlmostEqual(configs["left"].max_action, 0.8)
+        self.assertAlmostEqual(configs["left"].max_action, 1.0)
         self.assertAlmostEqual(configs["left"].command_hz, 12.0)
         self.assertTrue(configs["left"].continuous_grasp)
         self.assertFalse(configs["left"].tactile_parallel_read)
@@ -323,6 +323,59 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(config.tactile_process_queue_size, 2)
         self.assertEqual(config.tactile_max_fps, 30)
         self.assertEqual(config.tactile_fields, ("raw",))
+        self.assertFalse(config.tactile_reset_on_start)
+
+    def test_dmtac_solved_tactile_fields_request_startup_calibration(self) -> None:
+        force_config = DMTacGripperBackendConfig(
+            side="left",
+            connect_hardware=False,
+            connect_tactile=True,
+            tactile_fields=("distributed_force",),
+        )
+        raw_config = DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=False,
+            connect_tactile=True,
+            tactile_fields=("raw", "infer"),
+        )
+
+        self.assertTrue(force_config.tactile_reset_on_start)
+        self.assertFalse(raw_config.tactile_reset_on_start)
+
+    def test_dmtac_start_only_resets_for_solved_tactile_fields(self) -> None:
+        class _FakeDevice:
+            gripper = None
+            tactile = object()
+
+            def __init__(self) -> None:
+                self.reset_calls = 0
+
+            def reset_tactile(self) -> None:
+                self.reset_calls += 1
+
+            def wait_tactile_ready(self, *, timeout_s: float) -> dict[str, bool]:
+                del timeout_s
+                return {"M_TEST": True}
+
+            def close(self) -> None:
+                return None
+
+        for fields, expected_resets in (("raw", 0), ("distributed_force", 1)):
+            device = _FakeDevice()
+            backend = DMTacGripperBackend(
+                DMTacGripperBackendConfig(
+                    side="left",
+                    connect_hardware=False,
+                    connect_tactile=True,
+                    enable_telemetry=False,
+                    tactile_process_read=False,
+                    tactile_fields=(fields,),
+                )
+            )
+            with patch.object(backend, "_create_device", return_value=device):
+                backend.start()
+            self.assertEqual(device.reset_calls, expected_resets)
+            backend.close()
 
     def test_gripper_task_profile_overrides_force_for_selected_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -366,7 +419,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         self.assertAlmostEqual(policy["torque"], 0.17)
         self.assertAlmostEqual(policy["speed"], 0.09)
-        self.assertAlmostEqual(policy["max_action"], 0.55)
+        self.assertAlmostEqual(policy["max_action"], 1.0)
         self.assertEqual(policy["output_dim"], 0)
         self.assertTrue(policy["continuous_grasp"])
 
@@ -409,7 +462,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(args._resolved_gripper_task, "firm_grasp")
         self.assertAlmostEqual(policy["torque"], 0.36)
         self.assertAlmostEqual(policy["speed"], 0.22)
-        self.assertAlmostEqual(policy["max_action"], 0.77)
+        self.assertAlmostEqual(policy["max_action"], 1.0)
 
     def test_real_teleop_gripper_task_profile_supports_left_right_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -799,7 +852,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
                 max_action=0.8,
             )
 
-    def test_dmtac_backend_accepts_095_max_action(self) -> None:
+    def test_dmtac_backend_normalizes_legacy_max_action_to_one(self) -> None:
         config = DMTacGripperBackendConfig(
             side="right",
             connect_hardware=False,
@@ -807,7 +860,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             max_action=0.95,
         )
 
-        self.assertAlmostEqual(config.max_action, 0.95)
+        self.assertAlmostEqual(config.max_action, 1.0)
 
     def test_dmtac_backend_rate_limits_q6_commands_but_not_fixed_commands(self) -> None:
         backend = DMTacGripperBackend(

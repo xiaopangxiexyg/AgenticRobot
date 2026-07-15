@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
@@ -31,16 +32,19 @@ from robot_motion.ik_resolver import IKSafetyResolver
 from robot_motion.joint_limits import (
     JointRateLimiter,
     JointVelocityLimitProfile,
+    limit_joint_step,
     load_joint_velocity_limit_profiles,
 )
 from robot_motion.pinocchio_provider import PinocchioIKProvider
 from robot_motion.pose import matrix_to_pose6, pose6_to_matrix
 from robot_motion.profiles import load_ik_safety_profiles
+from robot_motion.rm65 import RM65_ABSOLUTE_Q_MAX_RAD, RM65_ABSOLUTE_Q_MIN_RAD
 from robot_motion.seed_expansion import load_seed_expansion_profiles
 from robot_motion.types import IKResolveRequest
 
 
 ActionSource = Callable[[int, float, dict[str, object] | None], Iterable[float] | None]
+_IK_HARD_DEADLINE_RETURN_CODE = -101
 
 
 def _require_zero(code: object, label: str) -> None:
@@ -88,6 +92,23 @@ def _current_tool_name(frame_result: object) -> str:
         if value is not None:
             return str(value).strip("\x00")
     return str(frame_result).strip("\x00")
+
+
+class _LockedRobotProxy:
+    def __init__(self, robot: object, lock: threading.RLock):
+        self._robot = robot
+        self._lock = lock
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._robot, name)
+        if not callable(attr):
+            return attr
+
+        def locked_call(*args, **kwargs):
+            with self._lock:
+                return attr(*args, **kwargs)
+
+        return locked_call
 
 
 def _current_tool_pose(frame_result: object) -> list[float] | None:
@@ -288,15 +309,33 @@ class RM65ImpedanceConfig:
     max_linear_offset_m: float = 0.05
     max_angular_offset_rad: float = 0.4
     return_rate_s: float = 0.35
+    canfd_follow: bool = False
+    follow_qpos_alpha: float = 1.0
+    canfd_follow_stream_hz: float = 150.0
+    canfd_follow_warning_ratio: float = 0.9
+    passthrough_position_control: bool = False
     trajectory_mode: int = 0
     radio: int = 0
     hard_stop_force_n: float = 50.0
     hard_stop_torque_nm: float = 10.0
-    max_command_joint_step_deg: float = 20.0
+    max_command_joint_step_deg: float = 40.0
     max_command_joint_velocity_deg_s: float = 120.0
     joint_rate_limiter_enabled: bool = True
     joint_velocity_limits_json: str | None = None
     joint_velocity_limit_profile: str = "rm65"
+    # Force control never turns a delayed 40 Hz tick into a larger catch-up
+    # command.  The measured tick interval remains diagnostic-only.
+    joint_rate_limit_use_nominal_dt: bool = True
+    # A delayed loop must not integrate a larger Cartesian force offset in one
+    # catch-up tick.  Keep observed dt for diagnostics, use control-period dt
+    # for the impedance/admittance state update.
+    admittance_use_nominal_dt: bool = True
+    # Optional force-only interior envelope.  The final SDK transport limit is
+    # still hard and independent of this operating margin.
+    joint_operating_margin_deg: float = 0.0
+    # SDK feedback is degree-valued, so permit only encoder/float quantization
+    # overshoot when it is used as a local state/IK anchor.
+    observed_joint_tolerance_deg: float = 0.01
     pose_command_transport: str = "joint"
     ik_offset_backoff_min_scale: float = 1.0
     ik_reference_backoff_min_scale: float = 0.1
@@ -321,7 +360,23 @@ class RM65ImpedanceConfig:
     ik_resolver_local_step_max_iterations: int | None = None
     ik_resolver_local_step_trigger_ratio: float | None = None
     ik_resolver_local_step_max_position_worsen_m: float | None = None
+    ik_resolver_local_step_max_orientation_worsen_deg: float | None = None
     ik_resolver_local_step_component_progress_max_position_worsen_m: float | None = None
+    ik_resolver_local_step_dynamic_worsen_enabled: bool | None = None
+    # A provider may finish an in-flight SDK call late, but the resolver must
+    # then stop candidate expansion/evaluation and keep the best safe result.
+    ik_hard_deadline_enabled: bool = True
+    # ``None`` means min(profile provider budget, one control period).
+    ik_hard_deadline_ms: float | None = None
+    # Deployment-only dual-rate IK is opt-in.  When enabled, the 40 Hz
+    # impedance thread keeps force/admittance and command output alive while a
+    # separate, Pinocchio-only worker owns one full IK solve every period.
+    # The default remains the legacy single-thread path used by teleoperation.
+    deployment_dual_rate_ik_enabled: bool = False
+    deployment_full_ik_hz: float = 15.0
+    deployment_full_ik_deadline_ms: float = 66.66666666666667
+    deployment_local_ik_deadline_ms: float = 6.0
+    deployment_full_ik_preempts_local: bool = True
     ik_seed_expansion_enabled: bool = True
     ik_seed_expansion_profile: str = "rm65"
     ik_seed_expansion_json: str | None = None
@@ -345,6 +400,12 @@ class RM65ImpedanceConfig:
     @classmethod
     def from_profile(cls, profile: dict[str, object], mode: str = "pose", **overrides) -> "RM65ImpedanceConfig":
         impedance = dict(((profile.get("impedance") or {}).get(mode) or {}))
+        if "follow" in impedance:
+            follow_value = impedance.pop("follow")
+            impedance.setdefault("canfd_follow", follow_value)
+        if "follow" in overrides:
+            follow_value = overrides.pop("follow")
+            overrides.setdefault("canfd_follow", follow_value)
         tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
         payload = profile.get("payload") if isinstance(profile.get("payload"), dict) else {}
         if "tcp_pose_flange_m_rad" not in overrides and tcp.get("pose_flange_m_rad") is not None:
@@ -387,8 +448,24 @@ class RM65ImpedanceConfig:
             raise ValueError("max_linear_return_velocity_m_s must be non-negative")
         if self.max_angular_return_velocity_rad_s is not None and self.max_angular_return_velocity_rad_s < 0.0:
             raise ValueError("max_angular_return_velocity_rad_s must be non-negative")
+        if not 0.0 <= float(self.follow_qpos_alpha) <= 1.0:
+            raise ValueError("follow_qpos_alpha must be in [0, 1]")
+        if not math.isfinite(float(self.canfd_follow_stream_hz)) or float(self.canfd_follow_stream_hz) < 0.0:
+            raise ValueError("canfd_follow_stream_hz must be finite and >= 0")
+        if (
+            not math.isfinite(float(self.canfd_follow_warning_ratio))
+            or not 0.0 < float(self.canfd_follow_warning_ratio) <= 1.0
+        ):
+            raise ValueError("canfd_follow_warning_ratio must be finite and in (0, 1]")
+        self.trajectory_mode = int(self.trajectory_mode)
+        self.radio = int(self.radio)
+        if self.trajectory_mode not in (0, 1, 2):
+            raise ValueError("trajectory_mode must be 0, 1, or 2")
+        if not 0 <= self.radio <= 100:
+            raise ValueError("radio must be in [0, 100]")
         if self.state_read_every < 1:
             raise ValueError("state_read_every must be >= 1")
+        self.passthrough_position_control = bool(self.passthrough_position_control)
         if self.max_command_joint_step_deg <= 0.0:
             raise ValueError("max_command_joint_step_deg must be positive")
         if self.max_command_joint_velocity_deg_s <= 0.0:
@@ -399,6 +476,10 @@ class RM65ImpedanceConfig:
             raise ValueError("joint_rate_limiter_enabled requires pose_command_transport='joint'")
         if self.joint_rate_limiter_enabled and not str(self.joint_velocity_limit_profile).strip():
             raise ValueError("joint_velocity_limit_profile must not be empty when joint_rate_limiter_enabled")
+        if not math.isfinite(float(self.joint_operating_margin_deg)) or float(self.joint_operating_margin_deg) < 0.0:
+            raise ValueError("joint_operating_margin_deg must be finite and non-negative")
+        if not math.isfinite(float(self.observed_joint_tolerance_deg)) or float(self.observed_joint_tolerance_deg) < 0.0:
+            raise ValueError("observed_joint_tolerance_deg must be finite and non-negative")
         if not 0.0 <= self.ik_offset_backoff_min_scale <= 1.0:
             raise ValueError("ik_offset_backoff_min_scale must be in [0, 1]")
         if not 0.0 <= self.ik_reference_backoff_min_scale <= 1.0:
@@ -441,12 +522,41 @@ class RM65ImpedanceConfig:
         ):
             raise ValueError("ik_resolver_local_step_max_position_worsen_m must be non-negative")
         if (
+            self.ik_resolver_local_step_max_orientation_worsen_deg is not None
+            and float(self.ik_resolver_local_step_max_orientation_worsen_deg) < 0.0
+        ):
+            raise ValueError("ik_resolver_local_step_max_orientation_worsen_deg must be non-negative")
+        if (
             self.ik_resolver_local_step_component_progress_max_position_worsen_m is not None
             and float(self.ik_resolver_local_step_component_progress_max_position_worsen_m) < 0.0
         ):
             raise ValueError(
                 "ik_resolver_local_step_component_progress_max_position_worsen_m must be non-negative"
             )
+        if self.ik_hard_deadline_ms is not None and (
+            not math.isfinite(float(self.ik_hard_deadline_ms))
+            or float(self.ik_hard_deadline_ms) <= 0.0
+        ):
+            raise ValueError("ik_hard_deadline_ms must be finite and positive when provided")
+        if bool(self.deployment_dual_rate_ik_enabled):
+            if (
+                not math.isfinite(float(self.deployment_full_ik_hz))
+                or float(self.deployment_full_ik_hz) <= 0.0
+                or float(self.deployment_full_ik_hz) > float(self.control_hz)
+            ):
+                raise ValueError(
+                    "deployment_full_ik_hz must be finite, positive, and not exceed control_hz"
+                )
+            for name, value in (
+                ("deployment_full_ik_deadline_ms", self.deployment_full_ik_deadline_ms),
+                ("deployment_local_ik_deadline_ms", self.deployment_local_ik_deadline_ms),
+            ):
+                if not math.isfinite(float(value)) or float(value) <= 0.0:
+                    raise ValueError(f"{name} must be finite and positive when dual-rate IK is enabled")
+            if float(self.deployment_local_ik_deadline_ms) > 1000.0 / float(self.control_hz):
+                raise ValueError(
+                    "deployment_local_ik_deadline_ms must not exceed one impedance control period"
+                )
         if self.ik_seed_expansion_enabled and not str(self.ik_seed_expansion_profile).strip():
             raise ValueError("ik_seed_expansion_profile must not be empty when ik_seed_expansion_enabled")
         if self.direct_joint_hint_max_linear_offset_m < 0.0:
@@ -581,6 +691,8 @@ class RM65BaseImpedanceController:
         self._admittance: PoseAdmittance | None = None
         self._reference: _ReferenceInterpolator | None = None
         self._joint_hint_reference: _ReferenceInterpolator | None = None
+        self._joint_hint_target: list[float] | None = None
+        self._last_joint_hint_invalidation: dict[str, object] | None = None
         self._previous_command_joint: list[float] | None = None
         self._ik_seed: list[float] | None = None
         self._tool_frame: dict[str, object] | None = None
@@ -606,6 +718,65 @@ class RM65BaseImpedanceController:
         self._joint_position_limits_deg: tuple[list[float], list[float]] | None = None
         self._joint_position_limits_checked = False
         self._joint_position_limits_error = ""
+        self._last_observed_joint_normalization: dict[str, object] = {
+            "status": "unavailable",
+            "tolerance_deg": float(self.config.observed_joint_tolerance_deg),
+        }
+        self._last_raw_observed_joint_deg: list[float] | None = None
+        self._robot_sdk_lock = threading.RLock()
+        self._follow_stream_lock = threading.RLock()
+        self._follow_stream_stop_event = threading.Event()
+        self._follow_stream_update_event = threading.Event()
+        self._follow_stream_thread: threading.Thread | None = None
+        self._follow_stream_target_joint: list[float] | None = None
+        self._follow_stream_segment_start_joint: list[float] | None = None
+        self._follow_stream_segment_start_time: float | None = None
+        self._follow_stream_target_time: float | None = None
+        self._follow_stream_target_sequence = 0
+        self._follow_stream_last_sent_joint: list[float] | None = None
+        self._follow_stream_last_send_time: float | None = None
+        self._follow_stream_last_send_sequence: int | None = None
+        self._follow_stream_last_send_dt_sec: float | None = None
+        self._follow_stream_last_call_ms: float | None = None
+        self._follow_stream_last_deadline_lag_ms: float | None = None
+        self._follow_stream_last_interpolation_alpha: float | None = None
+        self._follow_stream_last_sent_joint_delta_deg: list[float] | None = None
+        self._follow_stream_last_sent_joint_delta_norm_deg: float | None = None
+        self._follow_stream_last_sent_joint_step_deg: float | None = None
+        self._follow_stream_last_sdk_lock_wait_ms: float | None = None
+        self._follow_stream_send_count = 0
+        self._follow_stream_deadline_miss_count = 0
+        self._follow_stream_low_rate_count = 0
+        self._follow_stream_actual_hz: float | None = None
+        self._follow_stream_warning: dict[str, object] | None = None
+        self._follow_stream_last_warning_print_time = 0.0
+        self._follow_stream_fault: str | None = None
+        self._follow_qpos_previous_raw_target_joint: list[float] | None = None
+        self._follow_qpos_smoothed_target_joint: list[float] | None = None
+        self._last_follow_qpos_smoothing_metadata: dict[str, object] | None = None
+        # These members are inactive unless deployment explicitly opts in.
+        # They intentionally live below the generic controller so the legacy
+        # teleoperation path has neither an extra solver nor an extra thread.
+        self._deployment_dual_rate_lock = threading.RLock()
+        self._deployment_dual_rate_stop_event = threading.Event()
+        self._deployment_full_ik_thread: threading.Thread | None = None
+        self._deployment_full_ik_resolver: IKSafetyResolver | None = None
+        self._deployment_full_ik_provider: CompositeKinematicsProvider | None = None
+        self._deployment_local_ik_resolver: IKSafetyResolver | None = None
+        self._deployment_local_ik_provider: CompositeKinematicsProvider | None = None
+        self._deployment_full_ik_snapshot: dict[str, object] | None = None
+        self._deployment_full_ik_result: dict[str, object] | None = None
+        self._deployment_full_ik_busy = False
+        self._deployment_target_generation = 0
+        self._deployment_full_ik_stats: dict[str, object] = {
+            "enabled": False,
+            "scheduled_count": 0,
+            "completed_count": 0,
+            "deadline_miss_count": 0,
+            "stale_result_count": 0,
+            "last_elapsed_ms": None,
+            "last_error": None,
+        }
 
     @classmethod
     def from_profile(cls, profile_name_or_path: str, *, mode: str, arm: str | None = None, **overrides):
@@ -626,6 +797,58 @@ class RM65BaseImpedanceController:
             self.robot = Arm(RM65, self.ip)
         if int(self.robot.Arm_Socket_State()) != 0:
             raise RuntimeError(f"{self.side}: failed to connect ip={self.ip}")
+
+    def _read_state(self) -> dict[str, list[float]]:
+        assert self.robot is not None
+        with self._robot_sdk_lock:
+            state = _read_state(self.robot, self.side)
+        normalized_joint, normalization = self._normalize_observed_joint_deg(
+            state["joint_deg"],
+            label="hardware qpos",
+        )
+        self._last_raw_observed_joint_deg = list(state["joint_deg"])
+        self._last_observed_joint_normalization = dict(normalization)
+        state["joint_deg"] = normalized_joint
+        return state
+
+    def _read_force(self) -> dict[str, list[float]]:
+        assert self.robot is not None
+        with self._robot_sdk_lock:
+            return _read_force(self.robot, self.side)
+
+    def _robot_movej_canfd(
+        self,
+        joint: list[float],
+        *,
+        follow: bool,
+        lock_wait_recorder: Callable[[float], None] | None = None,
+    ) -> object:
+        assert self.robot is not None
+        wait_started = time.perf_counter()
+        with self._robot_sdk_lock:
+            if lock_wait_recorder is not None:
+                lock_wait_recorder((time.perf_counter() - wait_started) * 1000.0)
+            return self.robot.Movej_CANFD(
+                joint,
+                follow=bool(follow),
+                trajectory_mode=self.config.trajectory_mode,
+                radio=self.config.radio,
+            )
+
+    def _robot_movep_canfd(self, pose: list[float], *, follow: bool) -> object:
+        assert self.robot is not None
+        with self._robot_sdk_lock:
+            return self.robot.Movep_CANFD(
+                pose,
+                follow=bool(follow),
+                trajectory_mode=self.config.trajectory_mode,
+                radio=self.config.radio,
+            )
+
+    def _robot_inverse_kinematics(self, seed_joint: list[float], pose: list[float], *, flag: int) -> object:
+        assert self.robot is not None
+        with self._robot_sdk_lock:
+            return self.robot.Algo_Inverse_Kinematics(seed_joint, pose, flag=flag)
 
     def _check_tool(self) -> None:
         assert self.robot is not None
@@ -701,7 +924,8 @@ class RM65BaseImpedanceController:
 
     def _forward_pose(self, joint_deg: Iterable[float]) -> list[float]:
         assert self.robot is not None
-        pose = self.robot.Algo_Forward_Kinematics(list(joint_deg), flag=1)
+        with self._robot_sdk_lock:
+            pose = self.robot.Algo_Forward_Kinematics(list(joint_deg), flag=1)
         return normalize_pose(finite_list(pose[:6], expected_len=6, label="fk_pose"))
 
     def _target_tcp_to_hand_base_transform(self) -> np.ndarray | None:
@@ -752,9 +976,17 @@ class RM65BaseImpedanceController:
             replace_kwargs["local_step_max_position_worsen_m"] = float(
                 self.config.ik_resolver_local_step_max_position_worsen_m
             )
+        if self.config.ik_resolver_local_step_max_orientation_worsen_deg is not None:
+            replace_kwargs["local_step_max_orientation_worsen_deg"] = float(
+                self.config.ik_resolver_local_step_max_orientation_worsen_deg
+            )
         if self.config.ik_resolver_local_step_component_progress_max_position_worsen_m is not None:
             replace_kwargs["local_step_component_progress_max_position_worsen_m"] = float(
                 self.config.ik_resolver_local_step_component_progress_max_position_worsen_m
+            )
+        if self.config.ik_resolver_local_step_dynamic_worsen_enabled is not None:
+            replace_kwargs["local_step_dynamic_worsen_enabled"] = bool(
+                self.config.ik_resolver_local_step_dynamic_worsen_enabled
             )
         if replace_kwargs:
             profile = replace(profile, **replace_kwargs)
@@ -791,7 +1023,7 @@ class RM65BaseImpedanceController:
 
         providers: list[object] = [
             RM65SDKIKProvider(
-                self.robot,
+                _LockedRobotProxy(self.robot, self._robot_sdk_lock),
                 use_quaternion_fallback=bool(self.config.ik_quaternion_fallback),
                 use_all_solutions=bool(self.config.ik_resolver_use_all_sdk_solutions),
                 include_wrist_flip_candidates=True,
@@ -866,6 +1098,8 @@ class RM65BaseImpedanceController:
             "relaxation_fractions": list(profile.relaxation_fractions),
             "reject_singular": bool(profile.reject_singular),
             "provider_time_budget_ms": profile.provider_time_budget_ms,
+            "hard_deadline_enabled": bool(self.config.ik_hard_deadline_enabled),
+            "hard_deadline_configured_ms": self.config.ik_hard_deadline_ms,
             "coarse_tracking_enabled": bool(profile.coarse_tracking_enabled),
             "coarse_tracking_start_fraction": float(profile.coarse_tracking_start_fraction),
             "coarse_tracking_max_tolerance_fraction": float(profile.coarse_tracking_max_tolerance_fraction),
@@ -964,6 +1198,192 @@ class RM65BaseImpedanceController:
         if errors:
             print(f"WARNING: {self.side}: IK resolver provider warnings: {'; '.join(errors)}")
 
+    def _deployment_dual_rate_ik_enabled(self) -> bool:
+        return bool(
+            self.reference_kind == "pose"
+            and self.config.deployment_dual_rate_ik_enabled
+        )
+
+    def _initialize_deployment_dual_rate_ik(self) -> None:
+        """Create deployment-only, SDK-free concurrent IK workers.
+
+        The existing resolver is retained as the full 15 Hz resolver.  Its
+        candidate allowlist is required to contain only Pinocchio, so a worker
+        can never race the 40 Hz hardware thread through an SDK inverse-IK
+        call.  The local resolver is deliberately a different instance: both
+        ``IKSafetyResolver`` and ``CompositeKinematicsProvider`` keep mutable
+        diagnostics/counters and are not safe to share between threads.
+        """
+
+        if not self._deployment_dual_rate_ik_enabled():
+            return
+        if self._ik_resolver is None or self._ik_resolver_provider is None:
+            raise RuntimeError(
+                f"{self.side}: deployment dual-rate IK requires an initialized safety resolver"
+            )
+        allowed = tuple(
+            str(name).strip()
+            for name in self.config.ik_resolver_candidate_provider_names
+            if str(name).strip()
+        )
+        if allowed != ("rm65_pinocchio",):
+            raise RuntimeError(
+                f"{self.side}: deployment dual-rate IK requires "
+                "ik_resolver_candidate_provider_names=['rm65_pinocchio']"
+            )
+        if "rm65_pinocchio" not in list(self._ik_resolver_init_metadata.get("provider_names", [])):
+            raise RuntimeError(
+                f"{self.side}: deployment dual-rate IK requires the Pinocchio provider"
+            )
+        target_to_eef = self._target_tcp_to_hand_base_transform()
+        if target_to_eef is None:
+            raise RuntimeError(
+                f"{self.side}: deployment dual-rate IK requires tcp_pose_flange_m_rad"
+            )
+        try:
+            from rm65_inspire_tac.ik import SingleArmIKSolver
+
+            local_provider = PinocchioIKProvider(
+                solver=SingleArmIKSolver(
+                    eef_name=str(self.config.ik_resolver_pinocchio_eef_name),
+                ),
+                source="rm65_pinocchio",
+                target_to_eef_transform=target_to_eef,
+                qpos_size=6,
+            )
+        except Exception as exc:  # noqa: BLE001 - deployment must fail closed before motion.
+            raise RuntimeError(
+                f"{self.side}: deployment dual-rate IK could not initialize local Pinocchio solver: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self._deployment_full_ik_resolver = self._ik_resolver
+        self._deployment_full_ik_provider = self._ik_resolver_provider
+        self._deployment_local_ik_provider = CompositeKinematicsProvider(
+            providers=(local_provider,),
+            names=("rm65_pinocchio",),
+            primary_index=0,
+        )
+        self._deployment_local_ik_resolver = IKSafetyResolver(
+            profile=self._ik_resolver.profile,
+            provider=self._deployment_local_ik_provider,
+            # Full seed expansion belongs to the 15 Hz worker.  Expanding
+            # seeds at 40 Hz would break the bounded local-work contract.
+            seed_expansion_profile=None,
+        )
+        with self._deployment_dual_rate_lock:
+            self._deployment_full_ik_snapshot = None
+            self._deployment_full_ik_result = None
+            self._deployment_full_ik_busy = False
+            self._deployment_target_generation = 0
+            self._deployment_full_ik_stats = {
+                "enabled": True,
+                "full_ik_hz": float(self.config.deployment_full_ik_hz),
+                "full_ik_deadline_ms": float(self.config.deployment_full_ik_deadline_ms),
+                "local_ik_deadline_ms": float(self.config.deployment_local_ik_deadline_ms),
+                "full_preempts_local": bool(self.config.deployment_full_ik_preempts_local),
+                "scheduled_count": 0,
+                "completed_count": 0,
+                "deadline_miss_count": 0,
+                "stale_result_count": 0,
+                "last_elapsed_ms": None,
+                "last_error": None,
+            }
+
+    def _start_deployment_dual_rate_ik(self) -> None:
+        if not self._deployment_dual_rate_ik_enabled():
+            return
+        if self._deployment_full_ik_resolver is None or self._deployment_local_ik_resolver is None:
+            raise RuntimeError(f"{self.side}: deployment dual-rate IK was not initialized")
+        if self._deployment_full_ik_thread is not None and self._deployment_full_ik_thread.is_alive():
+            return
+        self._deployment_dual_rate_stop_event.clear()
+        self._deployment_full_ik_thread = threading.Thread(
+            target=self._deployment_full_ik_loop,
+            name=f"{self.side}-deployment-full-ik",
+            daemon=True,
+        )
+        self._deployment_full_ik_thread.start()
+
+    def _stop_deployment_dual_rate_ik(self) -> None:
+        thread = self._deployment_full_ik_thread
+        if thread is None:
+            return
+        self._deployment_dual_rate_stop_event.set()
+        thread.join(timeout=max(0.2, float(self.config.deployment_full_ik_deadline_ms) / 1000.0 + 0.1))
+        if thread.is_alive():
+            print(f"WARNING: {self.side}: deployment full IK worker did not stop within its deadline.")
+        self._deployment_full_ik_thread = None
+        with self._deployment_dual_rate_lock:
+            self._deployment_full_ik_busy = False
+
+    def _deployment_full_ik_loop(self) -> None:
+        """Run exactly one expensive, SDK-free full solve per 15 Hz period.
+
+        No backlog is accumulated.  If a solve misses its deadline, the result
+        is discarded and the next period uses the newest 40 Hz snapshot.
+        """
+
+        assert self._deployment_full_ik_resolver is not None
+        period_sec = 1.0 / float(self.config.deployment_full_ik_hz)
+        next_deadline = time.perf_counter()
+        while not self._deployment_dual_rate_stop_event.is_set():
+            wait_sec = next_deadline - time.perf_counter()
+            if wait_sec > 0.0 and self._deployment_dual_rate_stop_event.wait(wait_sec):
+                break
+            now = time.perf_counter()
+            if now - next_deadline > period_sec:
+                # Skip missed periods rather than queue old poses behind a
+                # difficult target; safety always favors the newest snapshot.
+                skipped = int((now - next_deadline) // period_sec)
+                next_deadline += max(1, skipped + 1) * period_sec
+            else:
+                next_deadline += period_sec
+            with self._deployment_dual_rate_lock:
+                snapshot = self._deployment_full_ik_snapshot
+                self._deployment_full_ik_busy = snapshot is not None
+                if snapshot is not None:
+                    self._deployment_full_ik_stats["scheduled_count"] = int(
+                        self._deployment_full_ik_stats["scheduled_count"]
+                    ) + 1
+            if snapshot is None:
+                continue
+            request = snapshot["request"]
+            assert isinstance(request, IKResolveRequest)
+            started_at = time.perf_counter()
+            result = None
+            error = None
+            try:
+                result = self._deployment_full_ik_resolver.resolve(request)
+            except Exception as exc:  # noqa: BLE001 - a worker failure must leave the arm holding safe.
+                error = f"{type(exc).__name__}: {exc}"
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            on_time = elapsed_ms <= float(self.config.deployment_full_ik_deadline_ms)
+            with self._deployment_dual_rate_lock:
+                self._deployment_full_ik_busy = False
+                self._deployment_full_ik_stats["last_elapsed_ms"] = float(elapsed_ms)
+                if error is not None:
+                    self._deployment_full_ik_stats["last_error"] = error
+                if not on_time:
+                    self._deployment_full_ik_stats["deadline_miss_count"] = int(
+                        self._deployment_full_ik_stats["deadline_miss_count"]
+                    ) + 1
+                current_generation = int(self._deployment_target_generation)
+                generation = int(snapshot["generation"])
+                if generation != current_generation:
+                    self._deployment_full_ik_stats["stale_result_count"] = int(
+                        self._deployment_full_ik_stats["stale_result_count"]
+                    ) + 1
+                elif result is not None and on_time and result.accepted and result.qpos is not None:
+                    self._deployment_full_ik_result = {
+                        "generation": generation,
+                        "result": result,
+                        "elapsed_ms": float(elapsed_ms),
+                        "snapshot_sequence": int(snapshot["sequence"]),
+                    }
+                    self._deployment_full_ik_stats["completed_count"] = int(
+                        self._deployment_full_ik_stats["completed_count"]
+                    ) + 1
+
     def _initialize_joint_rate_limiter(self) -> None:
         self._joint_rate_limiter = None
         self._joint_velocity_limit_profile = None
@@ -1007,8 +1427,9 @@ class RM65BaseImpedanceController:
                 if min_getter is None or max_getter is None:
                     continue
                 try:
-                    q_min = _coerce_float_list(min_getter(), expected_len=6)
-                    q_max = _coerce_float_list(max_getter(), expected_len=6)
+                    with self._robot_sdk_lock:
+                        q_min = _coerce_float_list(min_getter(), expected_len=6)
+                        q_max = _coerce_float_list(max_getter(), expected_len=6)
                 except Exception as exc:  # noqa: BLE001 - diagnostic path.
                     self._joint_position_limits_error = f"{type(exc).__name__}: {exc}"
                     continue
@@ -1021,6 +1442,65 @@ class RM65BaseImpedanceController:
             self._joint_position_limits_error = "joint limit getters unavailable"
         return None
 
+    def _effective_joint_position_limits_deg(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the canonical envelope intersected with SDK limits when available."""
+
+        lower = np.rad2deg(np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float))
+        upper = np.rad2deg(np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float))
+        sdk_limits = self._joint_position_limits()
+        if sdk_limits is not None:
+            sdk_lower = np.asarray(sdk_limits[0], dtype=float).reshape(6)
+            sdk_upper = np.asarray(sdk_limits[1], dtype=float).reshape(6)
+            if np.all(np.isfinite(sdk_lower)) and np.all(np.isfinite(sdk_upper)) and np.all(sdk_upper > sdk_lower):
+                lower = np.maximum(lower, sdk_lower)
+                upper = np.minimum(upper, sdk_upper)
+        if np.any(upper <= lower):
+            raise RuntimeError(f"{self.side}: effective RM65 joint limits are invalid.")
+        return lower, upper
+
+    def _normalize_observed_joint_deg(
+        self,
+        joint_deg: Iterable[float],
+        *,
+        label: str,
+    ) -> tuple[list[float], dict[str, object]]:
+        """Clamp only tiny feedback quantization overshoot used as an anchor.
+
+        This function is deliberately separate from command validation.  It
+        applies only to measured/local state used by FK, IK and replay/deploy
+        initialization; all commands still go through the SDK's strict final
+        safety check with no endpoint tolerance.
+        """
+
+        observed = np.asarray(
+            finite_list(joint_deg, expected_len=6, label=label),
+            dtype=float,
+        )
+        lower, upper = self._effective_joint_position_limits_deg()
+        tolerance_deg = float(self.config.observed_joint_tolerance_deg)
+        invalid = np.flatnonzero(
+            (observed < lower - tolerance_deg) | (observed > upper + tolerance_deg)
+        )
+        if invalid.size:
+            index = int(invalid[0])
+            raise ValueError(
+                f"{self.side} {label} joint {index + 1}={observed[index]:.6f}deg exceeds "
+                f"absolute limits [{lower[index]:.6f}, {upper[index]:.6f}]deg by more than "
+                f"observed-state tolerance {tolerance_deg:.4f}deg."
+            )
+        normalized = np.clip(observed, lower, upper)
+        normalized_indices = np.flatnonzero(np.abs(normalized - observed) > 0.0)
+        metadata: dict[str, object] = {
+            "status": "clipped" if normalized_indices.size else "exact",
+            "tolerance_deg": tolerance_deg,
+            "raw_joint_deg": observed.astype(float).tolist(),
+            "normalized_joint_deg": normalized.astype(float).tolist(),
+            "normalized_joint_indices": [int(index) for index in normalized_indices.tolist()],
+            "limit_min_deg": lower.astype(float).tolist(),
+            "limit_max_deg": upper.astype(float).tolist(),
+        }
+        return normalized.astype(float).tolist(), metadata
+
     def _joint_limit_margin_metadata(self, joint_deg: Iterable[float]) -> dict[str, object]:
         joint = finite_list(joint_deg, expected_len=6, label="joint_deg")
         metadata: dict[str, object] = {"available": False}
@@ -1030,7 +1510,8 @@ class RM65BaseImpedanceController:
             checker = getattr(self.robot, "Algo_IKine_Check_Joint_Position_Limit", None)
             if checker is not None:
                 try:
-                    position_limit_code = int(checker(joint))
+                    with self._robot_sdk_lock:
+                        position_limit_code = int(checker(joint))
                 except Exception as exc:  # noqa: BLE001 - diagnostic path.
                     metadata["position_limit_error"] = f"{type(exc).__name__}: {exc}"
         if position_limit_code is not None:
@@ -1061,46 +1542,97 @@ class RM65BaseImpedanceController:
         )
         return metadata
 
-    def _singularity_metadata(self, joint_deg: Iterable[float]) -> dict[str, object]:
-        if self.robot is None:
-            return {"available": False, "label": "unavailable", "error": "robot_unavailable"}
-        joint = finite_list(joint_deg, expected_len=6, label="joint_deg")
-        labels = {
-            0: "normal",
-            -1: "shoulder_singularity",
-            -2: "elbow_singularity",
-            -3: "wrist_singularity",
-        }
-        try:
-            result = self.robot.Algo_Kin_Singularity_Analyse(joint)
-        except Exception as exc:  # noqa: BLE001 - diagnostic path must not mask control.
+    def _joint_operating_margin_metadata(
+        self,
+        *,
+        reference_joint_deg: Iterable[float],
+        output_joint_deg: Iterable[float],
+    ) -> dict[str, object]:
+        """Require strictly improving margin while a force target is near a stop.
+
+        This is an interior operating envelope, not a second transport limit.
+        It never clips a command.  A target already inside the margin may move
+        outward gradually, while a target that enters or moves deeper into the
+        envelope is rejected before the rate limiter can chase it.
+        """
+
+        required_margin_deg = float(self.config.joint_operating_margin_deg)
+        if required_margin_deg <= 0.0:
             return {
-                "available": False,
-                "label": "unavailable",
-                "error": f"{type(exc).__name__}: {exc}",
+                "enabled": False,
+                "status": "disabled",
+                "required_margin_deg": 0.0,
+                "reject": False,
+                "violations": [],
             }
-        if not isinstance(result, tuple) or len(result) < 2:
-            return {
-                "available": False,
-                "label": "unknown",
-                "raw": repr(result),
-            }
-        try:
-            status = int(result[0])
-        except (TypeError, ValueError):
-            status = None
-        try:
-            metric = float(result[1])
-        except (TypeError, ValueError):
-            metric = None
+        reference = np.asarray(
+            finite_list(reference_joint_deg, expected_len=6, label="operating_margin_reference_joint"),
+            dtype=float,
+        )
+        output = np.asarray(
+            finite_list(output_joint_deg, expected_len=6, label="operating_margin_output_joint"),
+            dtype=float,
+        )
+        lower, upper = self._effective_joint_position_limits_deg()
+        reference_margin = np.minimum(reference - lower, upper - reference)
+        output_margin = np.minimum(output - lower, upper - output)
+        tolerance_deg = 1e-7
+        violations: list[dict[str, object]] = []
+        for index in np.flatnonzero(output_margin < required_margin_deg).tolist():
+            before = float(reference_margin[index])
+            after = float(output_margin[index])
+            progress = after - before
+            violations.append(
+                {
+                    "joint": int(index + 1),
+                    "reference_margin_deg": before,
+                    "output_margin_deg": after,
+                    "margin_progress_deg": progress,
+                    "margin_improving": bool(progress > tolerance_deg),
+                }
+            )
+        reject = bool(violations and any(not item["margin_improving"] for item in violations))
         return {
-            "available": True,
-            "status_code": status,
-            "label": labels.get(status, f"unknown_status_{status}"),
-            "is_singular": status not in (0, None),
-            "wrist_center_distance_m": metric,
-            "raw": repr(result),
+            "enabled": True,
+            "status": "rejected" if reject else "recovery_only" if violations else "pass",
+            "required_margin_deg": required_margin_deg,
+            "reference_min_margin_deg": reference_margin.astype(float).tolist(),
+            "output_min_margin_deg": output_margin.astype(float).tolist(),
+            "reject": reject,
+            "violations": violations,
         }
+
+    def _apply_joint_operating_margin_guard(
+        self,
+        *,
+        command_joint: list[float],
+    ) -> None:
+        if self._passthrough_position_control_enabled() or self._previous_command_joint is None:
+            return
+        metadata = self._joint_operating_margin_metadata(
+            reference_joint_deg=self._previous_command_joint,
+            output_joint_deg=command_joint,
+        )
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["joint_operating_margin"] = dict(metadata)
+            ik_metadata = dict(self._latest_wrench_context.get("ik_metadata", {}))
+            ik_metadata["joint_operating_margin"] = dict(metadata)
+            self._latest_wrench_context["ik_metadata"] = ik_metadata
+        if not bool(metadata["reject"]):
+            return
+        violations = list(metadata.get("violations", []))
+        detail = ", ".join(
+            "J{joint}: {before:.3f}->{after:.3f}deg".format(
+                joint=int(item["joint"]),
+                before=float(item["reference_margin_deg"]),
+                after=float(item["output_margin_deg"]),
+            )
+            for item in violations
+        )
+        raise RuntimeError(
+            f"{self.side}: joint operating margin rejected force command "
+            f"required={float(metadata['required_margin_deg']):.3f}deg; {detail}"
+        )
 
     def _attach_ik_timing_metadata(
         self,
@@ -1119,12 +1651,27 @@ class RM65BaseImpedanceController:
             "time_budget_ms",
             provider_metadata.get("provider_time_budget_ms"),
         )
+        hard_deadline_budget_ms = metadata.get("hard_deadline_budget_ms")
+        if hard_deadline_budget_ms is not None:
+            try:
+                hard_deadline_budget_ms = float(hard_deadline_budget_ms)
+            except (TypeError, ValueError):
+                hard_deadline_budget_ms = None
+            if hard_deadline_budget_ms is not None and math.isfinite(hard_deadline_budget_ms):
+                time_budget_ms = (
+                    hard_deadline_budget_ms
+                    if time_budget_ms is None
+                    else min(float(time_budget_ms), hard_deadline_budget_ms)
+                )
+            else:
+                hard_deadline_budget_ms = None
+        hard_deadline_expired = bool(metadata.get("hard_deadline_expired", False))
         time_budget_exceeded = bool(
             ik_debug_profile.get(
                 "time_budget_exceeded",
                 provider_metadata.get("provider_time_budget_exceeded", False),
             )
-        )
+        ) or hard_deadline_expired
         ik_debug_profile.setdefault("frame_total_ms", float(elapsed_ms))
         ik_debug_profile.setdefault("solve_total_ms", float(elapsed_ms))
         if provider_elapsed_ms is not None:
@@ -1133,6 +1680,12 @@ class RM65BaseImpedanceController:
             ik_debug_profile["provider_last_ms"] = provider_last_elapsed_ms
         if time_budget_ms is not None:
             ik_debug_profile.setdefault("time_budget_ms", time_budget_ms)
+        if hard_deadline_budget_ms is not None:
+            ik_debug_profile["hard_deadline_budget_ms"] = hard_deadline_budget_ms
+        if "hard_deadline_enabled" in metadata:
+            ik_debug_profile["hard_deadline_enabled"] = bool(metadata["hard_deadline_enabled"])
+        if "hard_deadline_expired" in metadata:
+            ik_debug_profile["hard_deadline_expired"] = hard_deadline_expired
         ik_debug_profile["time_budget_exceeded"] = bool(time_budget_exceeded)
         metadata.update(
             {
@@ -1150,6 +1703,8 @@ class RM65BaseImpedanceController:
                 "ik_candidate_eval_ms": ik_debug_profile.get("candidate_eval_ms"),
                 "ik_time_budget_ms": time_budget_ms,
                 "ik_time_budget_exceeded": time_budget_exceeded,
+                "ik_hard_deadline_enabled": bool(metadata.get("hard_deadline_enabled", False)),
+                "ik_hard_deadline_expired": hard_deadline_expired,
                 "ik_timing_source": source,
                 "ik_debug_profile": ik_debug_profile,
             }
@@ -1165,6 +1720,7 @@ class RM65BaseImpedanceController:
                 "provider_elapsed_ms": provider_elapsed_ms,
                 "time_budget_ms": time_budget_ms,
                 "time_budget_exceeded": time_budget_exceeded,
+                "hard_deadline_expired": hard_deadline_expired,
             }
         return metadata
 
@@ -1177,7 +1733,7 @@ class RM65BaseImpedanceController:
         interval = 1.0 / self.config.control_hz
         rows = []
         for index in range(samples):
-            rows.append(_read_force(self.robot, self.side)[self.config.force_source])
+            rows.append(self._read_force()[self.config.force_source])
             if index + 1 < samples:
                 time.sleep(interval)
         return mean_wrench(rows)
@@ -1193,28 +1749,6 @@ class RM65BaseImpedanceController:
         preferred_joint: list[float] | None = None,
     ) -> tuple[list[float], list[float]]:
         raise NotImplementedError
-
-    def _singularity_summary(self, joint_deg: Iterable[float]) -> str | None:
-        if self.robot is None:
-            return None
-        try:
-            result = self.robot.Algo_Kin_Singularity_Analyse(list(joint_deg))
-        except Exception as exc:  # noqa: BLE001 - diagnostic path must not mask the IK failure.
-            return f"unavailable ({exc})"
-        if not isinstance(result, tuple) or len(result) < 2:
-            return str(result)
-        status, distance = result[:2]
-        labels = {
-            0: "normal",
-            -1: "shoulder_singularity",
-            -2: "elbow_singularity",
-            -3: "wrist_singularity",
-        }
-        label = labels.get(int(status), f"unknown_status_{int(status)}")
-        try:
-            return f"{label} wrist_center_distance_m={float(distance):.6f}"
-        except (TypeError, ValueError):
-            return f"{label} wrist_center_distance_m={distance}"
 
     def _ik_backoff_scales(self) -> list[float]:
         min_scale = float(self.config.ik_offset_backoff_min_scale)
@@ -1257,15 +1791,13 @@ class RM65BaseImpedanceController:
         return out
 
     def _max_allowed_command_joint_step_deg(self) -> float:
-        dt_for_velocity = self._observed_control_dt_sec()
+        dt_details = self._joint_rate_limit_dt_details()
+        dt_for_velocity = float(dt_details["effective_dt_sec"])
         if self._joint_velocity_limit_profile is not None:
             profile_max_step = self._joint_velocity_limit_profile.max_step_deg(dt_for_velocity)
             if self.config.joint_rate_limiter_enabled:
                 profile_max_abs = float(np.max(profile_max_step)) if profile_max_step.size else 0.0
                 return max(float(self.config.max_command_joint_step_deg), profile_max_abs)
-            dt_for_velocity = self._joint_velocity_limit_profile.effective_dt_sec(dt_for_velocity)
-        else:
-            dt_for_velocity = min(dt_for_velocity, 1.0)
         return min(
             float(self.config.max_command_joint_step_deg),
             float(self.config.max_command_joint_velocity_deg_s) * dt_for_velocity,
@@ -1303,12 +1835,12 @@ class RM65BaseImpedanceController:
         command_pose: list[float],
     ) -> tuple[int, list[float], list[float], str]:
         assert self.robot is not None
-        code, command_joint = self.robot.Algo_Inverse_Kinematics(seed_joint, command_pose, flag=1)
+        code, command_joint = self._robot_inverse_kinematics(seed_joint, command_pose, flag=1)
         used_seed = list(seed_joint)
         method = "euler"
         if int(code) != 0 and self.config.ik_quaternion_fallback:
             quat_pose = _pose6_to_quat_pose(command_pose)
-            quat_code, quat_joint = self.robot.Algo_Inverse_Kinematics(seed_joint, quat_pose, flag=0)
+            quat_code, quat_joint = self._robot_inverse_kinematics(seed_joint, quat_pose, flag=0)
             if int(quat_code) == 0:
                 code = quat_code
                 command_joint = quat_joint
@@ -1316,7 +1848,7 @@ class RM65BaseImpedanceController:
         if int(code) != 0 and self._state is not None:
             current_joint = finite_list(self._state["joint_deg"], expected_len=6, label="current_joint_deg")
             if _joint_delta_deg(used_seed, current_joint) > 1e-6:
-                retry_code, retry_joint = self.robot.Algo_Inverse_Kinematics(current_joint, command_pose, flag=1)
+                retry_code, retry_joint = self._robot_inverse_kinematics(current_joint, command_pose, flag=1)
                 if int(retry_code) == 0:
                     used_seed = current_joint
                     code = retry_code
@@ -1324,7 +1856,7 @@ class RM65BaseImpedanceController:
                     method = "current_seed_euler"
                 elif self.config.ik_quaternion_fallback:
                     quat_pose = _pose6_to_quat_pose(command_pose)
-                    retry_quat_code, retry_quat_joint = self.robot.Algo_Inverse_Kinematics(
+                    retry_quat_code, retry_quat_joint = self._robot_inverse_kinematics(
                         current_joint,
                         quat_pose,
                         flag=0,
@@ -1383,12 +1915,28 @@ class RM65BaseImpedanceController:
         _append_unique_seed(seeds, labels, reference_qpos, "reference_duplicate_guard")
         return tuple(seeds), tuple(labels)
 
+    def _effective_ik_hard_deadline_ms(self) -> float | None:
+        if (
+            not bool(self.config.ik_hard_deadline_enabled)
+            or self._passthrough_position_control_enabled()
+        ):
+            return None
+        candidates = [1000.0 / float(self.config.control_hz)]
+        if self.config.ik_hard_deadline_ms is not None:
+            candidates.append(float(self.config.ik_hard_deadline_ms))
+        if self._ik_resolver is not None:
+            provider_budget = self._ik_resolver.profile.provider_time_budget_ms
+            if provider_budget is not None and float(provider_budget) > 0.0:
+                candidates.append(float(provider_budget))
+        return max(1e-3, min(candidates))
+
     def _command_from_pose_with_resolver(
         self,
         *,
         reference_pose: list[float],
         offset: list[float],
         seed_joint_override: list[float] | None = None,
+        use_joint_velocity_limit: bool = True,
     ) -> tuple[list[float], list[float], list[float], float, list[float], int]:
         if self._ik_resolver is None:
             raise RuntimeError("IK resolver is not initialized")
@@ -1411,6 +1959,37 @@ class RM65BaseImpedanceController:
         )
         reference_pose_matrix = pose6_to_matrix(self._previous_command_pose or reference_pose)
         target_pose_matrix = pose6_to_matrix(command_pose)
+        hard_deadline_ms = self._effective_ik_hard_deadline_ms()
+        resolver_started_at = time.perf_counter()
+        request_metadata: dict[str, object] = {
+            "side": self.side,
+            "controller": type(self).__name__,
+            "tool_name": self.config.tool_name,
+            "ik_resolver_init": dict(self._ik_resolver_init_metadata),
+            **(
+                {
+                    "provider_name_allowlist": list(
+                        self.config.ik_resolver_candidate_provider_names
+                    )
+                }
+                if self.config.ik_resolver_candidate_provider_names
+                else {}
+            ),
+            "pinocchio_max_iterations": int(self.config.ik_resolver_pinocchio_max_iterations),
+            "pinocchio_max_joint_step_rad": float(self.config.ik_resolver_pinocchio_max_joint_step_rad),
+            "pinocchio_damping": float(self.config.ik_resolver_pinocchio_damping),
+            "pinocchio_tolerance": float(self.config.ik_resolver_pinocchio_tolerance),
+        }
+        if hard_deadline_ms is not None:
+            request_metadata.update(
+                {
+                    "hard_deadline_enabled": True,
+                    "hard_deadline_budget_ms": float(hard_deadline_ms),
+                    "hard_deadline_monotonic": float(
+                        resolver_started_at + float(hard_deadline_ms) / 1000.0
+                    ),
+                }
+            )
         request = IKResolveRequest(
             target_pose=target_pose_matrix,
             reference_qpos=reference_qpos,
@@ -1418,29 +1997,15 @@ class RM65BaseImpedanceController:
             seed_qpos=seed_qpos,
             seed_labels=seed_labels,
             previous_safe_qpos=previous_safe_qpos,
-            metadata={
-                "side": self.side,
-                "controller": type(self).__name__,
-                "tool_name": self.config.tool_name,
-                "ik_resolver_init": dict(self._ik_resolver_init_metadata),
-                **(
-                    {
-                        "provider_name_allowlist": list(
-                            self.config.ik_resolver_candidate_provider_names
-                        )
-                    }
-                    if self.config.ik_resolver_candidate_provider_names
-                    else {}
-                ),
-                "pinocchio_max_iterations": int(self.config.ik_resolver_pinocchio_max_iterations),
-                "pinocchio_max_joint_step_rad": float(self.config.ik_resolver_pinocchio_max_joint_step_rad),
-                "pinocchio_damping": float(self.config.ik_resolver_pinocchio_damping),
-                "pinocchio_tolerance": float(self.config.ik_resolver_pinocchio_tolerance),
-            },
+            metadata=request_metadata,
         )
 
-        started_at = time.perf_counter()
-        if bool(self.config.joint_rate_limiter_enabled) and self.config.pose_command_transport == "joint":
+        started_at = resolver_started_at
+        if (
+            bool(use_joint_velocity_limit)
+            and bool(self.config.joint_rate_limiter_enabled)
+            and self.config.pose_command_transport == "joint"
+        ):
             if self._joint_velocity_limit_profile is None:
                 self._initialize_joint_rate_limiter()
             rate_limit_dt_details = self._joint_rate_limit_dt_details()
@@ -1483,6 +2048,34 @@ class RM65BaseImpedanceController:
             elapsed_ms=elapsed_ms,
             provider_metadata=provider_metadata,
         )
+
+        hard_deadline_hold = bool(
+            result.candidate_source == "hard_deadline_hold_reference"
+            and bool(base_metadata.get("hard_deadline_expired", False))
+        )
+        if hard_deadline_hold:
+            # A resolver hold is not an approved move toward a newer qpos hint.
+            # Route it through the controller's existing last-safe hold path so
+            # preferred solver qpos and admittance state remain synchronized.
+            base_metadata.update(
+                {
+                    "status": "hard_deadline",
+                    "accepted": False,
+                    "reason": "ik_hard_deadline",
+                    "result_message": "ik_hard_deadline_hold_last_safe",
+                }
+            )
+            if self._latest_wrench_context is not None:
+                self._latest_wrench_context["ik_method"] = ["hard_deadline_hold"]
+                self._latest_wrench_context["ik_metadata"] = base_metadata
+            return (
+                command_pose,
+                [0.0] * 6,
+                np.rad2deg(reference_qpos).astype(float).tolist(),
+                1.0,
+                list(offset),
+                _IK_HARD_DEADLINE_RETURN_CODE,
+            )
 
         if not result.accepted or result.qpos is None:
             if self._latest_wrench_context is not None:
@@ -1670,17 +2263,42 @@ class RM65BaseImpedanceController:
             return 1.0 / float(self.config.control_hz)
         return float(dt)
 
-    def _joint_rate_limit_dt_details(self) -> dict[str, float]:
+    def _admittance_dt_details(self) -> dict[str, object]:
+        """Return the force-state integration dt without delayed-frame catch-up."""
+
         observed_dt = self._observed_control_dt_sec()
-        max_dt = 1.0
-        effective_dt = min(observed_dt, max_dt)
+        nominal_dt = 1.0 / float(self.config.control_hz)
+        use_nominal = bool(self.config.admittance_use_nominal_dt) and not self._passthrough_position_control_enabled()
+        return {
+            "observed_dt_sec": float(observed_dt),
+            "effective_dt_sec": float(nominal_dt if use_nominal else observed_dt),
+            "nominal_dt_sec": float(nominal_dt),
+            "dt_policy": "nominal_control_period" if use_nominal else "observed_control_period",
+        }
+
+    def _joint_rate_limit_dt_details(self) -> dict[str, object]:
+        observed_dt = self._observed_control_dt_sec()
+        nominal_dt = 1.0 / float(self.config.control_hz)
+        profile_max_dt = 1.0
+        effective_dt = min(observed_dt, profile_max_dt)
         if self._joint_velocity_limit_profile is not None:
-            max_dt = float(self._joint_velocity_limit_profile.max_dt_sec)
+            profile_max_dt = float(self._joint_velocity_limit_profile.max_dt_sec)
             effective_dt = self._joint_velocity_limit_profile.effective_dt_sec(observed_dt)
+        if bool(self.config.joint_rate_limit_use_nominal_dt):
+            effective_dt = min(nominal_dt, profile_max_dt)
         return {
             "observed_dt_sec": float(observed_dt),
             "effective_dt_sec": float(effective_dt),
-            "max_dt_sec": float(max_dt),
+            "max_dt_sec": float(min(nominal_dt, profile_max_dt))
+            if bool(self.config.joint_rate_limit_use_nominal_dt)
+            else float(profile_max_dt),
+            "nominal_dt_sec": float(nominal_dt),
+            "profile_max_dt_sec": float(profile_max_dt),
+            "dt_policy": (
+                "nominal_control_period"
+                if bool(self.config.joint_rate_limit_use_nominal_dt)
+                else "observed_capped_by_profile"
+            ),
         }
 
     def _joint_rate_limit_dt(self) -> float:
@@ -1742,6 +2360,9 @@ class RM65BaseImpedanceController:
             "joint_velocity_limit_observed_dt_sec": float(dt_details["observed_dt_sec"]),
             "joint_velocity_limit_effective_dt_sec": float(dt_sec),
             "joint_velocity_limit_max_dt_sec": float(dt_details["max_dt_sec"]),
+            "joint_velocity_limit_nominal_dt_sec": float(dt_details["nominal_dt_sec"]),
+            "joint_velocity_limit_profile_max_dt_sec": float(dt_details["profile_max_dt_sec"]),
+            "joint_velocity_limit_dt_policy": str(dt_details["dt_policy"]),
             "joint_velocity_limit_requested_delta_deg": requested_delta_deg.tolist(),
             "joint_velocity_limit_requested_max_abs_delta_deg": requested_max,
             "joint_velocity_limit_delta_deg": result.delta_deg.tolist(),
@@ -1771,6 +2392,7 @@ class RM65BaseImpedanceController:
                 "joint_velocity_limit_observed_dt_sec": float(dt_details["observed_dt_sec"]),
                 "joint_velocity_limit_effective_dt_sec": float(dt_sec),
                 "joint_velocity_limit_max_dt_sec": float(dt_details["max_dt_sec"]),
+                "joint_velocity_limit_dt_policy": str(dt_details["dt_policy"]),
                 "joint_velocity_limit_delta_deg": result.delta_deg.tolist(),
                 "joint_velocity_limit_max_step_deg": result.max_step_deg.tolist(),
                 "joint_velocity_limit_ratio": float(result.limit_ratio),
@@ -1798,9 +2420,102 @@ class RM65BaseImpedanceController:
         command_pose: list[float],
         command_joint: list[float],
     ) -> tuple[list[float], list[float]]:
+        self._apply_joint_operating_margin_guard(command_joint=command_joint)
         if self.config.joint_rate_limiter_enabled:
             return self._apply_joint_rate_limiter(command_pose=command_pose, command_joint=command_joint)
         return self._limit_command_joint_step(command_pose=command_pose, command_joint=command_joint)
+
+    def _apply_final_command_step_guard(
+        self,
+        *,
+        command_pose: list[float],
+        command_joint: list[float],
+        command_step: float,
+        allowed_command_step: float,
+    ) -> tuple[list[float], list[float], float, float]:
+        previous_joint = self._previous_command_joint
+        if previous_joint is None or command_step <= allowed_command_step:
+            return command_pose, command_joint, command_step, allowed_command_step
+
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["ik_command_step_candidate_deg"] = [float(command_step)]
+            self._latest_wrench_context["ik_command_step_allowed_deg"] = [float(allowed_command_step)]
+
+        if self.config.joint_rate_limiter_enabled:
+            guarded_pose, guarded_joint = self._apply_joint_rate_limiter(
+                command_pose=command_pose,
+                command_joint=command_joint,
+            )
+            guarded_step = _joint_delta_deg(previous_joint, guarded_joint)
+            guarded_allowed = self._max_allowed_command_joint_step_deg()
+            if guarded_step <= guarded_allowed:
+                return guarded_pose, guarded_joint, guarded_step, guarded_allowed
+            command_pose = guarded_pose
+            command_joint = guarded_joint
+            command_step = guarded_step
+            allowed_command_step = guarded_allowed
+
+        step_profile = JointVelocityLimitProfile(
+            name="final_command_joint_step_guard",
+            max_velocity_deg_s=tuple([float(allowed_command_step)] * 6),
+            max_dt_sec=1.0,
+        )
+        result = limit_joint_step(
+            reference_qpos=_joint_deg_to_rad(previous_joint, label="final_step_guard_previous_joint"),
+            target_qpos=_joint_deg_to_rad(command_joint, label="final_step_guard_target_joint"),
+            profile=step_profile,
+            dt_sec=1.0,
+        )
+        guarded_joint = np.rad2deg(result.qpos).astype(float).tolist()
+        guarded_step = _joint_delta_deg(previous_joint, guarded_joint)
+        report = check_rm65_joint_safety(
+            self.robot,
+            guarded_joint,
+            side=self.side,
+            label=self._step_index + 1,
+            previous_joint_deg=previous_joint,
+            check_position_limit=True,
+            check_self_collision=True,
+            context={
+                "phase": "final_command_joint_step_guard",
+                "requested_pose": list(command_pose),
+                "ik_target_pose": list(command_pose),
+                "ik_target_joint_deg": list(command_joint),
+                "candidate_step_deg": float(command_step),
+                "allowed_step_deg": float(allowed_command_step),
+                "guarded_step_deg": float(guarded_step),
+                "guarded_delta_deg": result.delta_deg.tolist(),
+            },
+        )
+        metadata: dict[str, object] = {
+            "final_command_step_guard_applied": True,
+            "final_command_step_guard_candidate_deg": float(command_step),
+            "final_command_step_guard_allowed_deg": float(allowed_command_step),
+            "final_command_step_guard_output_deg": float(guarded_step),
+            "joint_rate_limited": True,
+            "joint_velocity_limit_target_joint_deg": list(command_joint),
+            "joint_velocity_limit_output_joint_deg": list(guarded_joint),
+            "joint_velocity_limit_requested_max_abs_delta_deg": float(command_step),
+            "joint_velocity_limit_applied_max_abs_delta_deg": float(guarded_step),
+            "joint_velocity_limit_delta_deg": result.delta_deg.tolist(),
+            "joint_velocity_limit_max_step_deg": result.max_step_deg.tolist(),
+            "joint_velocity_limit_ratio": float(result.limit_ratio),
+            "joint_safety": {
+                "ok": bool(report.ok),
+                "position_limit_code": report.position_limit_code,
+                "position_limit_available": bool(report.position_limit_available),
+                "self_collision_code": report.self_collision_code,
+                "self_collision_available": bool(report.self_collision_available),
+                "status_text": report.status_text,
+            },
+        }
+        self._record_joint_rate_limit_metadata(metadata)
+        report.raise_if_unsafe()
+        if self._joint_rate_limiter is not None:
+            self._joint_rate_limiter.reset(
+                _joint_deg_to_rad(guarded_joint, label="final_step_guard_output_joint")
+            )
+        return self._forward_pose(guarded_joint), guarded_joint, guarded_step, allowed_command_step
 
     def _limit_command_joint_step(
         self,
@@ -1954,13 +2669,6 @@ class RM65BaseImpedanceController:
         if self._state is not None:
             lines.append(f"current_joint_deg={_format_vector(self._state['joint_deg'], precision=3)}")
             lines.append(f"current_pose={_format_vector(self._state['pose'], precision=6)}")
-        seed_singularity = self._singularity_summary(seed_joint)
-        if seed_singularity is not None:
-            lines.append(f"seed_singularity={seed_singularity}")
-        if self._state is not None:
-            current_singularity = self._singularity_summary(self._state["joint_deg"])
-            if current_singularity is not None:
-                lines.append(f"current_singularity={current_singularity}")
         if self._model_fk_pose is not None and self._state is not None:
             linear, angular = _pose_delta(self._model_fk_pose, self._state["pose"])
             lines.append(f"model_fk_pose={_format_vector(self._model_fk_pose, precision=6)}")
@@ -2166,6 +2874,8 @@ class RM65BaseImpedanceController:
                 "ik_provider_elapsed_ms",
                 "ik_time_budget_ms",
                 "ik_time_budget_exceeded",
+                "ik_hard_deadline_enabled",
+                "ik_hard_deadline_expired",
                 "ik_timing_source",
                 "provider",
                 "ik_debug_profile",
@@ -2186,6 +2896,11 @@ class RM65BaseImpedanceController:
                 "provider_budget_skipped_names",
                 "provider_global_time_budget_ms",
                 "provider_global_time_budget_scope",
+                "hard_deadline_enabled",
+                "hard_deadline_budget_ms",
+                "hard_deadline_expired",
+                "hard_deadline_phase",
+                "hard_deadline_remaining_ms",
             ):
                 if key in previous_metadata:
                     metadata[key] = previous_metadata[key]
@@ -2199,8 +2914,8 @@ class RM65BaseImpedanceController:
         assert self.robot is not None
         self._check_tool()
         self._activate_debug_arm_endpoint_tcp()
-        self._state = _read_state(self.robot, self.side)
-        self._tare = self._sample_tare()
+        self._state = self._read_state()
+        self._tare = [0.0] * 6 if self._passthrough_position_control_enabled() else self._sample_tare()
         self._processor = WrenchProcessor(
             tare=self._tare,
             lowpass_alpha=self.config.lowpass_alpha,
@@ -2219,12 +2934,18 @@ class RM65BaseImpedanceController:
             kind="joint",
             action_hz=self.config.action_hz,
         )
+        self._joint_hint_target = None
+        self._last_joint_hint_invalidation = None
+        self._follow_qpos_previous_raw_target_joint = None
+        self._follow_qpos_smoothed_target_joint = None
+        self._last_follow_qpos_smoothing_metadata = None
         self._previous_command_joint = list(self._state["joint_deg"])
         self._previous_command_pose = list(self._state["pose"])
         self._ik_seed = list(self._state["joint_deg"])
         self._model_fk_pose = self._forward_pose(self._state["joint_deg"])
         self._initialize_joint_rate_limiter()
         self._initialize_ik_resolver()
+        self._initialize_deployment_dual_rate_ik()
         self._latest_wrench_context = None
         self._post_start_preflight()
         initial_sample_time = time.perf_counter()
@@ -2233,18 +2954,28 @@ class RM65BaseImpedanceController:
         self._previous_measured_sample_time = initial_sample_time
         self._last_step_time = initial_sample_time
         self._started = True
+        self._reset_follow_stream_state(self._previous_command_joint)
+        self._start_follow_stream_if_needed()
+        self._start_deployment_dual_rate_ik()
 
     def reset_motion_state(self, joint_rad: Iterable[float] | None = None) -> None:
+        self._reset_follow_stream_state(None)
         if joint_rad is None:
             if self.robot is None:
                 return
-            state = _read_state(self.robot, self.side)
+            state = self._read_state()
             state["pose"] = normalize_pose(state["pose"])
         else:
             if self.robot is None:
                 raise RuntimeError(f"{self.side}: cannot reset motion state without an RM65 robot")
             joint_values = finite_list(joint_rad, expected_len=6, label="joint_rad")
-            joint_deg = [float(math.degrees(value)) for value in joint_values]
+            raw_joint_deg = [float(math.degrees(value)) for value in joint_values]
+            joint_deg, normalization = self._normalize_observed_joint_deg(
+                raw_joint_deg,
+                label="reset motion state qpos",
+            )
+            self._last_raw_observed_joint_deg = list(raw_joint_deg)
+            self._last_observed_joint_normalization = dict(normalization)
             state = {
                 "joint_deg": joint_deg,
                 "pose": self._forward_pose(joint_deg),
@@ -2265,6 +2996,11 @@ class RM65BaseImpedanceController:
             kind="joint",
             action_hz=self.config.action_hz,
         )
+        self._joint_hint_target = None
+        self._last_joint_hint_invalidation = None
+        self._follow_qpos_previous_raw_target_joint = None
+        self._follow_qpos_smoothed_target_joint = None
+        self._last_follow_qpos_smoothing_metadata = None
         self._previous_command_joint = list(self._state["joint_deg"])
         self._previous_command_pose = list(self._state["pose"])
         self._ik_seed = list(self._state["joint_deg"])
@@ -2282,11 +3018,115 @@ class RM65BaseImpedanceController:
         self._last_step_time = reset_sample_time
         self._current_step_dt = None
         self._step_index = 0
+        self._reset_follow_stream_state(self._previous_command_joint)
+        self._start_follow_stream_if_needed()
 
     def set_target(self, target: Iterable[float], *, duration_sec: float | None = None) -> None:
         self.start()
         assert self._reference is not None
         self._reference.set_target(target, duration_sec)
+
+    def _smooth_follow_qpos_target(self, target: list[float]) -> tuple[list[float], dict[str, object]]:
+        metadata: dict[str, object] = {
+            "enabled": False,
+            "applied": False,
+            "stage": "pre_interpolation_target",
+            "transport": self.config.pose_command_transport,
+            "alpha": float(self.config.follow_qpos_alpha),
+            "final_command_stage": "passthrough",
+            "reason": "prelimited_15hz_solver_qpos_passthrough",
+            "target_rate_limiter_enabled": False,
+            "target_rate_limiter_bypassed": True,
+            "target_rate_limiter_bypass_reason": "prelimited_15hz_solver_qpos",
+        }
+        previous_raw_target = self._follow_qpos_previous_raw_target_joint
+        previous_target = (
+            self._follow_qpos_smoothed_target_joint
+            or self._previous_command_joint
+            or list(target)
+        )
+        previous_target = finite_list(
+            previous_target,
+            expected_len=6,
+            label="previous_follow_qpos_target_joint_deg",
+        )
+        smoothed_target = list(target)
+        self._follow_qpos_previous_raw_target_joint = list(target)
+        self._follow_qpos_smoothed_target_joint = list(smoothed_target)
+        raw_delta = (
+            None
+            if previous_raw_target is None
+            else _joint_deltas_deg(previous_raw_target, target)
+        )
+        metadata.update(
+            {
+                "previous_raw_target_joint_deg": (
+                    None if previous_raw_target is None else list(previous_raw_target)
+                ),
+                "previous_target_joint_deg": list(previous_target),
+                "raw_target_joint_deg": list(target),
+                "output_target_joint_deg": list(smoothed_target),
+                "raw_target_delta_deg": raw_delta,
+                "raw_target_delta_norm_deg": (
+                    None if previous_raw_target is None else _vector_error_norm(previous_raw_target, target)
+                ),
+                "input_delta_deg": _joint_deltas_deg(previous_target, target),
+                "output_delta_deg": _joint_deltas_deg(previous_target, smoothed_target),
+                "input_delta_norm_deg": _vector_error_norm(previous_target, target),
+                "output_delta_norm_deg": _vector_error_norm(previous_target, smoothed_target),
+            }
+        )
+        return smoothed_target, metadata
+
+    def _advance_preferred_joint(
+        self,
+        target_joint_deg: Iterable[float] | None,
+        dt: float,
+    ) -> list[float] | None:
+        self._last_follow_qpos_smoothing_metadata = None
+        if self._joint_hint_reference is None:
+            return None
+        if target_joint_deg is not None:
+            target = finite_list(target_joint_deg, expected_len=6, label="target_joint_deg")
+            target, self._last_follow_qpos_smoothing_metadata = self._smooth_follow_qpos_target(target)
+            if (
+                self._joint_hint_target is None
+                or _joint_delta_deg(self._joint_hint_target, target) > 1e-9
+            ):
+                self._joint_hint_reference.set_target(target)
+                self._joint_hint_target = list(target)
+        elif self._joint_hint_target is None:
+            return None
+        return self._joint_hint_reference.advance(dt)
+
+    def _invalidate_preferred_joint_hint(self, *, reason: str) -> None:
+        """Drop a qpos hint when a newer Cartesian target has no matching qpos.
+
+        The 40 Hz inner loop normally calls :meth:`step` without a new target
+        between 15 Hz outer updates, so ``target_joint_deg is None`` alone is
+        not enough to invalidate the interpolator.  This path is only for a
+        *fresh* Cartesian target whose solver qpos was intentionally removed
+        or was unavailable.  Continuing the old hint here would make its FK
+        override the new Cartesian reference.
+        """
+
+        anchor = self._previous_command_joint
+        if anchor is None and self._state is not None:
+            anchor = list(self._state["joint_deg"])
+        if anchor is not None:
+            self._joint_hint_reference = _ReferenceInterpolator(
+                list(anchor),
+                kind="joint",
+                action_hz=self.config.action_hz,
+            )
+        self._joint_hint_target = None
+        self._follow_qpos_previous_raw_target_joint = None
+        self._follow_qpos_smoothed_target_joint = None
+        self._last_follow_qpos_smoothing_metadata = None
+        self._last_joint_hint_invalidation = {
+            "reason": str(reason),
+            "anchor_joint_deg": None if anchor is None else list(anchor),
+        }
 
     def step(
         self,
@@ -2301,6 +3141,7 @@ class RM65BaseImpedanceController:
         assert self._admittance is not None
         assert self._reference is not None
         assert self._previous_command_joint is not None
+        self._raise_follow_stream_fault_if_any()
         timing_enabled = bool(self.config.debug_timing)
         timing_started_at = time.perf_counter()
         timing_last_at = timing_started_at
@@ -2330,6 +3171,8 @@ class RM65BaseImpedanceController:
                 "step": int(self._step_index),
                 "total_ms": (now_timing - timing_started_at) * 1000.0,
                 "dt_sec": float(self._current_step_dt),
+                "admittance_dt_sec": float(admittance_dt),
+                "admittance_dt_policy": str(admittance_dt_details["dt_policy"]),
                 "state_read_performed": bool(state_read_performed),
                 "pose_command_transport": self.config.pose_command_transport,
                 "phases": timing_phases,
@@ -2339,35 +3182,88 @@ class RM65BaseImpedanceController:
         dt = now - self._last_step_time if self._last_step_time is not None else 1.0 / self.config.control_hz
         self._last_step_time = now
         self._current_step_dt = dt
+        admittance_dt_details = self._admittance_dt_details()
+        admittance_dt = float(admittance_dt_details["effective_dt_sec"])
+        self._last_joint_hint_invalidation = None
         if target is not None:
             self._reference.set_target(target)
-        has_preferred_joint = target_joint_deg is not None
-        if has_preferred_joint and self._joint_hint_reference is not None:
-            self._joint_hint_reference.set_target(target_joint_deg)
+            if self._deployment_dual_rate_ik_enabled():
+                with self._deployment_dual_rate_lock:
+                    self._deployment_target_generation += 1
+            if target_joint_deg is None:
+                self._invalidate_preferred_joint_hint(
+                    reason="fresh_cartesian_target_without_solver_qpos",
+                )
         reference = self._reference.advance(dt)
-        preferred_joint = (
-            None
-            if not has_preferred_joint or self._joint_hint_reference is None
-            else self._joint_hint_reference.advance(dt)
-        )
+        preferred_joint = self._advance_preferred_joint(target_joint_deg, dt)
         mark_timing("reference")
 
-        readings = _read_force(self.robot, self.side)
-        mark_timing("read_force")
-        processed = self._processor.process(readings[self.config.force_source])
-        raw_deadbanded = list(processed["deadbanded"])
-        admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, self.side)
-        return_activity_wrench = admittance_wrench_for_arm(processed["filtered"], self.side)
-        return_force_deadband_n = self.config.effective_return_force_deadband_n
-        return_torque_deadband_nm = self.config.effective_return_torque_deadband_nm
-        update = self._admittance.update(
-            admittance_wrench,
-            dt,
-            return_activity_wrench=return_activity_wrench,
-            return_force_deadband_n=return_force_deadband_n,
-            return_torque_deadband_nm=return_torque_deadband_nm,
-        )
+        passthrough_position_control = self._passthrough_position_control_enabled()
+        if passthrough_position_control:
+            zero_wrench = [0.0] * 6
+            readings = {
+                "raw": list(zero_wrench),
+                "zero": list(zero_wrench),
+                "work": list(zero_wrench),
+                "tool": list(zero_wrench),
+            }
+            processed = {
+                "tare_corrected": list(zero_wrench),
+                "deadbanded": list(zero_wrench),
+                "filtered": list(zero_wrench),
+            }
+            update = {
+                "active_wrench": list(zero_wrench),
+                "return_activity_wrench": list(zero_wrench),
+                "target_offset_unclamped": list(zero_wrench),
+                "target_offset_after_return": list(zero_wrench),
+                "target_offset_after_offset_limit": list(zero_wrench),
+                "target_offset": list(zero_wrench),
+                "offset": list(zero_wrench),
+                "offset_delta_before_velocity_limit": list(zero_wrench),
+                "offset_step_after_velocity_limit": list(zero_wrench),
+                "return_applied_axes": [],
+                "return_paused_axes": [],
+                "linear_return_paused": False,
+                "angular_return_paused": False,
+                "linear_offset_limit_applied": False,
+                "angular_offset_limit_applied": False,
+                "linear_velocity_limit_applied": False,
+                "angular_velocity_limit_applied": False,
+                "angular_axis_velocity_limit_applied": False,
+                "linear_return_velocity_limit_applied": False,
+                "angular_return_velocity_limit_applied": False,
+                "linear_step_velocity_limit_m_s": 0.0,
+                "angular_step_velocity_limit_rad_s": 0.0,
+                "angular_axis_velocity_scales": list(self.config.angular_axis_velocity_scales),
+                "angular_axis_step_velocity_limits_rad_s": [0.0, 0.0, 0.0],
+            }
+            raw_deadbanded = list(zero_wrench)
+            admittance_wrench = list(zero_wrench)
+            return_activity_wrench = list(zero_wrench)
+            return_force_deadband_n = self.config.effective_return_force_deadband_n
+            return_torque_deadband_nm = self.config.effective_return_torque_deadband_nm
+            mark_timing("force_admittance_skipped")
+        else:
+            readings = self._read_force()
+            mark_timing("read_force")
+            processed = self._processor.process(readings[self.config.force_source])
+            raw_deadbanded = list(processed["deadbanded"])
+            admittance_wrench = admittance_wrench_for_arm(raw_deadbanded, self.side)
+            return_activity_wrench = admittance_wrench_for_arm(processed["filtered"], self.side)
+            return_force_deadband_n = self.config.effective_return_force_deadband_n
+            return_torque_deadband_nm = self.config.effective_return_torque_deadband_nm
+            update = self._admittance.update(
+                admittance_wrench,
+                admittance_dt,
+                return_activity_wrench=return_activity_wrench,
+                return_force_deadband_n=return_force_deadband_n,
+                return_torque_deadband_nm=return_torque_deadband_nm,
+            )
+            mark_timing("process_force_admittance")
         self._latest_wrench_context = {
+            "passthrough_position_control": bool(passthrough_position_control),
+            "force_admittance_skipped": bool(passthrough_position_control),
             "tare_corrected": list(processed["tare_corrected"]),
             "active_wrench": list(update["active_wrench"]),
             "deadbanded": list(admittance_wrench),
@@ -2375,6 +3271,10 @@ class RM65BaseImpedanceController:
             "return_activity_wrench": list(return_activity_wrench),
             "return_force_deadband_n": return_force_deadband_n,
             "return_torque_deadband_nm": return_torque_deadband_nm,
+            "admittance_observed_dt_sec": float(admittance_dt_details["observed_dt_sec"]),
+            "admittance_effective_dt_sec": admittance_dt,
+            "admittance_nominal_dt_sec": float(admittance_dt_details["nominal_dt_sec"]),
+            "admittance_dt_policy": str(admittance_dt_details["dt_policy"]),
             "target_offset_unclamped": list(update["target_offset_unclamped"]),
             "target_offset_after_return": list(update["target_offset_after_return"]),
             "target_offset_after_offset_limit": list(update["target_offset_after_offset_limit"]),
@@ -2398,13 +3298,57 @@ class RM65BaseImpedanceController:
             "angular_axis_velocity_scales": list(update["angular_axis_velocity_scales"]),
             "angular_axis_step_velocity_limits_rad_s": list(update["angular_axis_step_velocity_limits_rad_s"]),
             "preferred_joint_deg": [] if preferred_joint is None else list(preferred_joint),
+            "joint_hint_invalidation": (
+                None
+                if self._last_joint_hint_invalidation is None
+                else dict(self._last_joint_hint_invalidation)
+            ),
         }
-        mark_timing("process_force_admittance")
         command_pose, command_joint = self._command_from_reference(
             reference,
             update["offset"],
             preferred_joint=preferred_joint,
         )
+        pre_follow_smoothing_command_pose = list(command_pose)
+        pre_follow_smoothing_command_joint = list(command_joint)
+        follow_qpos_smoothing = dict(
+            self._last_follow_qpos_smoothing_metadata
+            or {
+                "enabled": bool(self.config.canfd_follow),
+                "applied": False,
+                "stage": "pre_interpolation_target",
+                "transport": self.config.pose_command_transport,
+                "alpha": float(self.config.follow_qpos_alpha),
+                "reason": "no_target_joint_hint",
+                "final_command_stage": "passthrough",
+            }
+        )
+        final_command_pose_realized_from_joint = False
+        if (
+            self.config.canfd_follow
+            and self.config.pose_command_transport == "joint"
+            and not passthrough_position_control
+        ):
+            command_pose = self._forward_pose(command_joint)
+            final_command_pose_realized_from_joint = True
+            follow_qpos_smoothing.update(
+                {
+                    "final_command_stage": "passthrough",
+                    "final_command_realized_from_joint": True,
+                    "final_command_joint_deg": list(command_joint),
+                }
+            )
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["follow_qpos_smoothing"] = dict(follow_qpos_smoothing)
+        sync_realized_offset = getattr(self, "_sync_admittance_to_realized_pose_offset", None)
+        if callable(sync_realized_offset) and final_command_pose_realized_from_joint:
+            sync_realized_offset(
+                reference_pose=reference,
+                command_pose=command_pose,
+                requested_offset=update["offset"],
+                update_admittance_state=True,
+                realization_source="final_joint_transport_fk",
+            )
         realized_offset = (
             None
             if self._latest_wrench_context is None
@@ -2417,11 +3361,12 @@ class RM65BaseImpedanceController:
         command_step = _joint_delta_deg(self._previous_command_joint, command_joint)
         allowed_command_step = self._max_allowed_command_joint_step_deg()
         if command_step > allowed_command_step:
-            raise RuntimeError(
-                self._command_step_failure_message(
+            command_pose, command_joint, command_step, allowed_command_step = (
+                self._apply_final_command_step_guard(
                     command_pose=command_pose,
                     command_joint=command_joint,
                     command_step=command_step,
+                    allowed_command_step=allowed_command_step,
                 )
             )
         force_norm = norm(processed["tare_corrected"][:3])
@@ -2446,16 +3391,24 @@ class RM65BaseImpedanceController:
                 )
             ) from exc
         mark_timing("send")
+        canfd_follow_stream = dict(
+            self._latest_wrench_context.get("canfd_follow_stream", {})
+            if self._latest_wrench_context is not None
+            else {}
+        )
+        canfd_follow_stream.update(self._follow_stream_snapshot())
         self._step_index += 1
         state_read_performed = self._step_index % self.config.state_read_every == 0
         state_sample_time: float | None = None
+        state_sample_wall_time: float | None = None
         previous_measured_pose = None if self._previous_measured_pose is None else list(self._previous_measured_pose)
         previous_measured_joint = None if self._previous_measured_joint is None else list(self._previous_measured_joint)
         previous_measured_sample_time = self._previous_measured_sample_time
         if state_read_performed:
             try:
-                self._state = _read_state(self.robot, self.side)
+                self._state = self._read_state()
                 state_sample_time = time.perf_counter()
+                state_sample_wall_time = time.time()
             except Exception as exc:
                 raise RuntimeError(
                     self._hardware_command_failure_message(
@@ -2563,29 +3516,27 @@ class RM65BaseImpedanceController:
             self._previous_measured_sample_time = (
                 state_sample_time if state_sample_time is not None else time.perf_counter()
             )
-        command_singularity = self._singularity_metadata(command_joint)
-        measured_singularity = (
-            {"available": False, "label": "unavailable", "error": "state_unavailable"}
-            if measured_joint is None
-            else self._singularity_metadata(measured_joint)
-        )
-        command_joint_limit_margin = self._joint_limit_margin_metadata(command_joint)
-        measured_joint_limit_margin = (
-            {"available": False, "error": "state_unavailable"}
-            if measured_joint is None
-            else self._joint_limit_margin_metadata(measured_joint)
-        )
-        singularity_metadata = {
-            "command": command_singularity,
-            "measured": measured_singularity,
-        }
+        if passthrough_position_control:
+            command_joint_limit_margin = {
+                "available": False,
+                "reason": "passthrough_position_control",
+            }
+            measured_joint_limit_margin = {
+                "available": False,
+                "reason": "passthrough_position_control",
+            }
+        else:
+            command_joint_limit_margin = self._joint_limit_margin_metadata(command_joint)
+            measured_joint_limit_margin = (
+                {"available": False, "error": "state_unavailable"}
+                if measured_joint is None
+                else self._joint_limit_margin_metadata(measured_joint)
+            )
         joint_limit_margin_metadata = {
             "command": command_joint_limit_margin,
             "measured": measured_joint_limit_margin,
         }
         ik_metadata = dict(self._latest_wrench_context.get("ik_metadata", {}))
-        ik_metadata.setdefault("command_singularity", command_singularity)
-        ik_metadata.setdefault("measured_singularity", measured_singularity)
         ik_metadata.setdefault("command_joint_limit_margin", command_joint_limit_margin)
         ik_metadata.setdefault("measured_joint_limit_margin", measured_joint_limit_margin)
         ik_metadata.setdefault("ik_resolver_init", dict(self._ik_resolver_init_metadata))
@@ -2594,15 +3545,37 @@ class RM65BaseImpedanceController:
         mark_timing("metadata")
         record = {
             "step": self._step_index,
+            "measurement_timestamp": state_sample_wall_time,
+            "measurement_timestamp_monotonic": state_sample_time,
+            "measurement_valid": bool(
+                state_sample_wall_time is not None
+                and measured_pose is not None
+                and measured_joint is not None
+            ),
             "dt_sec": dt,
             "reference": reference,
+            "joint_hint_invalidation": self._latest_wrench_context.get(
+                "joint_hint_invalidation"
+            ),
+            "passthrough_position_control": bool(passthrough_position_control),
+            "force_admittance_skipped": bool(passthrough_position_control),
             "force_source": self.config.force_source,
             "force_readings": {key: list(value) for key, value in readings.items()},
             "selected_force_wrench": list(readings[self.config.force_source]),
             "command_pose": command_pose,
             "command_joint_deg": command_joint,
+            "pre_follow_smoothing_command_pose": pre_follow_smoothing_command_pose,
+            "pre_follow_smoothing_command_joint_deg": pre_follow_smoothing_command_joint,
+            "follow_qpos_smoothing": follow_qpos_smoothing,
+            "canfd_follow_stream": canfd_follow_stream,
             "measured_pose": None if self._state is None else list(self._state["pose"]),
             "measured_joint_deg": measured_joint,
+            "measured_joint_deg_raw": (
+                None
+                if self._last_raw_observed_joint_deg is None
+                else list(self._last_raw_observed_joint_deg)
+            ),
+            "measured_joint_normalization": dict(self._last_observed_joint_normalization),
             "offset": update["offset"],
             "applied_offset": applied_offset,
             "requested_offset_before_command_realization": self._latest_wrench_context.get(
@@ -2610,6 +3583,18 @@ class RM65BaseImpedanceController:
             ),
             "admittance_offset_before_antiwindup": self._latest_wrench_context.get(
                 "admittance_offset_before_antiwindup"
+            ),
+            "final_command_pose_realized_offset": self._latest_wrench_context.get(
+                "final_command_pose_realized_offset"
+            ),
+            "final_command_pose_realization_source": self._latest_wrench_context.get(
+                "final_command_pose_realization_source"
+            ),
+            "admittance_offset_state_update_enabled": self._latest_wrench_context.get(
+                "admittance_offset_state_update_enabled"
+            ),
+            "admittance_offset_antiwindup_would_apply": self._latest_wrench_context.get(
+                "admittance_offset_antiwindup_would_apply"
             ),
             "applied_offset_source": self._latest_wrench_context.get("applied_offset_source"),
             "admittance_offset_antiwindup_applied": self._latest_wrench_context.get(
@@ -2662,6 +3647,16 @@ class RM65BaseImpedanceController:
             "return_activity_wrench": update["return_activity_wrench"],
             "return_force_deadband_n": return_force_deadband_n,
             "return_torque_deadband_nm": return_torque_deadband_nm,
+            "admittance_observed_dt_sec": self._latest_wrench_context.get(
+                "admittance_observed_dt_sec"
+            ),
+            "admittance_effective_dt_sec": self._latest_wrench_context.get(
+                "admittance_effective_dt_sec"
+            ),
+            "admittance_nominal_dt_sec": self._latest_wrench_context.get(
+                "admittance_nominal_dt_sec"
+            ),
+            "admittance_dt_policy": self._latest_wrench_context.get("admittance_dt_policy"),
             "return_paused_axes": update["return_paused_axes"],
             "linear_return_paused": update["linear_return_paused"],
             "angular_return_paused": update["angular_return_paused"],
@@ -2669,7 +3664,27 @@ class RM65BaseImpedanceController:
             "torque_norm_nm": torque_norm,
             "command_joint_step_deg": command_step,
             "allowed_command_joint_step_deg": allowed_command_step,
+            "final_command_step_guard_applied": self._latest_wrench_context.get(
+                "final_command_step_guard_applied",
+                False,
+            ),
+            "final_command_step_guard_candidate_deg": self._latest_wrench_context.get(
+                "final_command_step_guard_candidate_deg"
+            ),
+            "final_command_step_guard_allowed_deg": self._latest_wrench_context.get(
+                "final_command_step_guard_allowed_deg"
+            ),
+            "final_command_step_guard_output_deg": self._latest_wrench_context.get(
+                "final_command_step_guard_output_deg"
+            ),
             "joint_rate_limited": self._latest_wrench_context.get("joint_rate_limited"),
+            "joint_rate_limiter_bypassed": self._latest_wrench_context.get("joint_rate_limiter_bypassed"),
+            "joint_rate_limiter_bypass_reason": self._latest_wrench_context.get(
+                "joint_rate_limiter_bypass_reason"
+            ),
+            "joint_rate_limiter_synced_to_prelimited_target": self._latest_wrench_context.get(
+                "joint_rate_limiter_synced_to_prelimited_target"
+            ),
             "joint_velocity_limit_profile": self._latest_wrench_context.get("joint_velocity_limit_profile"),
             "joint_velocity_limit_dt_sec": self._latest_wrench_context.get("joint_velocity_limit_dt_sec"),
             "joint_velocity_limit_observed_dt_sec": self._latest_wrench_context.get(
@@ -2679,6 +3694,15 @@ class RM65BaseImpedanceController:
                 "joint_velocity_limit_effective_dt_sec"
             ),
             "joint_velocity_limit_max_dt_sec": self._latest_wrench_context.get("joint_velocity_limit_max_dt_sec"),
+            "joint_velocity_limit_nominal_dt_sec": self._latest_wrench_context.get(
+                "joint_velocity_limit_nominal_dt_sec"
+            ),
+            "joint_velocity_limit_profile_max_dt_sec": self._latest_wrench_context.get(
+                "joint_velocity_limit_profile_max_dt_sec"
+            ),
+            "joint_velocity_limit_dt_policy": self._latest_wrench_context.get(
+                "joint_velocity_limit_dt_policy"
+            ),
             "joint_velocity_limit_requested_delta_deg": self._latest_wrench_context.get(
                 "joint_velocity_limit_requested_delta_deg"
             ),
@@ -2793,8 +3817,8 @@ class RM65BaseImpedanceController:
                 else self._latest_wrench_context["ik_resolver_tolerance_fraction"][0]
             ),
             "ik_timing": ik_timing,
-            "singularity": singularity_metadata,
             "joint_limit_margin": joint_limit_margin_metadata,
+            "joint_operating_margin": self._latest_wrench_context.get("joint_operating_margin"),
             "ik_metadata": ik_metadata,
             "pose_tracking_linear_m": pose_delta[0],
             "pose_tracking_angular_rad": pose_delta[1],
@@ -2850,20 +3874,388 @@ class RM65BaseImpedanceController:
             self.stop_motion()
         return records
 
+    def _canfd_follow_stream_enabled(self) -> bool:
+        return bool(
+            self.config.canfd_follow
+            and self.config.pose_command_transport == "joint"
+            and float(self.config.canfd_follow_stream_hz) > 0.0
+        )
+
+    def _passthrough_position_control_enabled(self) -> bool:
+        return bool(
+            self.config.passthrough_position_control
+            and self.config.canfd_follow
+            and self.config.pose_command_transport == "joint"
+        )
+
+    def _follow_stream_period_sec(self) -> float:
+        hz = max(1e-6, float(self.config.canfd_follow_stream_hz))
+        return 1.0 / hz
+
+    def _reset_follow_stream_state(self, joint_deg: Iterable[float] | None = None) -> None:
+        joint = None if joint_deg is None else finite_list(joint_deg, expected_len=6, label="follow_stream_joint")
+        with self._follow_stream_lock:
+            self._follow_stream_target_joint = None
+            self._follow_stream_segment_start_joint = None
+            self._follow_stream_segment_start_time = None
+            self._follow_stream_target_time = None
+            self._follow_stream_last_sent_joint = None if joint is None else list(joint)
+            self._follow_stream_last_send_time = None
+            self._follow_stream_last_send_sequence = None
+            self._follow_stream_last_send_dt_sec = None
+            self._follow_stream_last_call_ms = None
+            self._follow_stream_last_deadline_lag_ms = None
+            self._follow_stream_last_interpolation_alpha = None
+            self._follow_stream_last_sent_joint_delta_deg = None
+            self._follow_stream_last_sent_joint_delta_norm_deg = None
+            self._follow_stream_last_sent_joint_step_deg = None
+            self._follow_stream_last_sdk_lock_wait_ms = None
+            self._follow_stream_send_count = 0
+            self._follow_stream_deadline_miss_count = 0
+            self._follow_stream_low_rate_count = 0
+            self._follow_stream_actual_hz = None
+            self._follow_stream_warning = None
+            self._follow_stream_last_warning_print_time = 0.0
+            self._follow_stream_fault = None
+        self._follow_stream_update_event.set()
+
+    def _start_follow_stream_if_needed(self) -> None:
+        if not self._canfd_follow_stream_enabled():
+            return
+        if self._follow_stream_thread is not None and self._follow_stream_thread.is_alive():
+            return
+        self._follow_stream_stop_event.clear()
+        self._follow_stream_update_event.clear()
+        self._follow_stream_thread = threading.Thread(
+            target=self._follow_stream_loop,
+            name=f"rm65-{self.side}-canfd-follow-stream",
+            daemon=True,
+        )
+        self._follow_stream_thread.start()
+
+    def _stop_follow_stream(self) -> None:
+        self._follow_stream_stop_event.set()
+        self._follow_stream_update_event.set()
+        thread = self._follow_stream_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._follow_stream_thread = None
+        with self._follow_stream_lock:
+            self._follow_stream_target_joint = None
+            self._follow_stream_segment_start_joint = None
+            self._follow_stream_segment_start_time = None
+            self._follow_stream_target_time = None
+
+    def _follow_stream_snapshot(self) -> dict[str, object]:
+        thread = self._follow_stream_thread
+        with self._follow_stream_lock:
+            now = time.perf_counter()
+            target_age = (
+                None
+                if self._follow_stream_target_time is None
+                else float(now - self._follow_stream_target_time)
+            )
+            return {
+                "enabled": self._canfd_follow_stream_enabled(),
+                "hz": float(self.config.canfd_follow_stream_hz),
+                "warning_ratio": float(self.config.canfd_follow_warning_ratio),
+                "warning_threshold_hz": (
+                    float(self.config.canfd_follow_stream_hz)
+                    * float(self.config.canfd_follow_warning_ratio)
+                ),
+                "thread_alive": bool(thread is not None and thread.is_alive()),
+                "target_active": self._follow_stream_target_joint is not None,
+                "target_sequence": int(self._follow_stream_target_sequence),
+                "target_age_sec": target_age,
+                "last_send_sequence": self._follow_stream_last_send_sequence,
+                "send_count": int(self._follow_stream_send_count),
+                "last_send_dt_sec": self._follow_stream_last_send_dt_sec,
+                "actual_hz": self._follow_stream_actual_hz,
+                "last_call_ms": self._follow_stream_last_call_ms,
+                "last_deadline_lag_ms": self._follow_stream_last_deadline_lag_ms,
+                "last_sdk_lock_wait_ms": self._follow_stream_last_sdk_lock_wait_ms,
+                "last_interpolation_alpha": self._follow_stream_last_interpolation_alpha,
+                "last_sent_joint_delta_deg": (
+                    None
+                    if self._follow_stream_last_sent_joint_delta_deg is None
+                    else list(self._follow_stream_last_sent_joint_delta_deg)
+                ),
+                "last_sent_joint_delta_norm_deg": self._follow_stream_last_sent_joint_delta_norm_deg,
+                "last_sent_joint_step_deg": self._follow_stream_last_sent_joint_step_deg,
+                "deadline_miss_count": int(self._follow_stream_deadline_miss_count),
+                "low_rate_count": int(self._follow_stream_low_rate_count),
+                "warning": (
+                    {"active": False}
+                    if self._follow_stream_warning is None
+                    else dict(self._follow_stream_warning)
+                ),
+                "fault": self._follow_stream_fault,
+            }
+
+    def _set_follow_stream_target(self, command_joint: list[float]) -> dict[str, object]:
+        if not self._canfd_follow_stream_enabled():
+            return self._follow_stream_snapshot()
+        self._start_follow_stream_if_needed()
+        joint = finite_list(command_joint, expected_len=6, label="follow_stream_target_joint")
+        now = time.perf_counter()
+        with self._follow_stream_lock:
+            start_joint = (
+                self._follow_stream_last_sent_joint
+                or self._follow_stream_target_joint
+                or self._previous_command_joint
+                or joint
+            )
+            self._follow_stream_target_sequence += 1
+            self._follow_stream_target_joint = list(joint)
+            self._follow_stream_segment_start_joint = list(start_joint)
+            self._follow_stream_segment_start_time = now
+            self._follow_stream_target_time = now
+            target_sequence = int(self._follow_stream_target_sequence)
+        self._follow_stream_update_event.set()
+        snapshot = self._follow_stream_snapshot()
+        snapshot.update(
+            {
+                "target_updated": True,
+                "updated_target_sequence": target_sequence,
+            }
+        )
+        return snapshot
+
+    def _follow_stream_command_at(self, now: float) -> tuple[list[float] | None, int | None, float | None]:
+        with self._follow_stream_lock:
+            target = None if self._follow_stream_target_joint is None else list(self._follow_stream_target_joint)
+            start = (
+                None
+                if self._follow_stream_segment_start_joint is None
+                else list(self._follow_stream_segment_start_joint)
+            )
+            start_time = self._follow_stream_segment_start_time
+            sequence = int(self._follow_stream_target_sequence)
+        if target is None:
+            return None, None, None
+        if start is None or start_time is None:
+            return target, sequence, 1.0
+        duration = self._follow_stream_segment_duration_sec()
+        alpha = float(np.clip((now - float(start_time)) / duration, 0.0, 1.0))
+        return _interpolate_joint(start, target, alpha), sequence, alpha
+
+    def _follow_stream_segment_duration_sec(self) -> float:
+        stream_period = self._follow_stream_period_sec()
+        control_hz = max(float(self.config.control_hz), 1e-9)
+        action_hz = max(float(self.config.action_hz), 1e-9)
+        command_period = 1.0 / min(control_hz, action_hz)
+        return max(stream_period, command_period)
+
+    def _record_follow_stream_send(
+        self,
+        *,
+        joint: list[float],
+        sequence: int,
+        sent_at: float,
+        call_ms: float,
+        deadline_lag_ms: float,
+        sdk_lock_wait_ms: float | None,
+        interpolation_alpha: float | None,
+    ) -> None:
+        warning_to_print: str | None = None
+        with self._follow_stream_lock:
+            previous_send_time = self._follow_stream_last_send_time
+            previous_joint = (
+                None
+                if self._follow_stream_last_sent_joint is None
+                else list(self._follow_stream_last_sent_joint)
+            )
+            joint_delta = None if previous_joint is None else _joint_deltas_deg(previous_joint, joint)
+            send_dt_sec = None if previous_send_time is None else float(sent_at - previous_send_time)
+            actual_hz = (
+                None
+                if send_dt_sec is None or send_dt_sec <= 0.0
+                else 1.0 / send_dt_sec
+            )
+            target_hz = float(self.config.canfd_follow_stream_hz)
+            warning_threshold_hz = target_hz * float(self.config.canfd_follow_warning_ratio)
+            warning: dict[str, object] | None = None
+            if actual_hz is not None and actual_hz < warning_threshold_hz:
+                self._follow_stream_low_rate_count += 1
+                warning = {
+                    "active": True,
+                    "message": (
+                        f"WARNING: {self.side} CANFD follow stream actual send rate "
+                        f"{actual_hz:.1f} Hz below target {target_hz:.1f} Hz "
+                        f"(threshold {warning_threshold_hz:.1f} Hz)."
+                    ),
+                    "target_hz": target_hz,
+                    "threshold_hz": warning_threshold_hz,
+                    "actual_hz": float(actual_hz),
+                    "last_send_dt_sec": float(send_dt_sec),
+                    "low_rate_count": int(self._follow_stream_low_rate_count),
+                }
+                now_for_print = time.perf_counter()
+                if now_for_print - self._follow_stream_last_warning_print_time >= 1.0:
+                    warning_to_print = str(warning["message"])
+                    self._follow_stream_last_warning_print_time = now_for_print
+            else:
+                warning = {
+                    "active": False,
+                    "target_hz": target_hz,
+                    "threshold_hz": warning_threshold_hz,
+                    "actual_hz": None if actual_hz is None else float(actual_hz),
+                    "last_send_dt_sec": None if send_dt_sec is None else float(send_dt_sec),
+                    "low_rate_count": int(self._follow_stream_low_rate_count),
+                }
+            self._follow_stream_last_sent_joint = list(joint)
+            self._follow_stream_last_send_time = float(sent_at)
+            self._follow_stream_last_send_sequence = int(sequence)
+            self._follow_stream_last_send_dt_sec = send_dt_sec
+            self._follow_stream_last_call_ms = float(call_ms)
+            self._follow_stream_last_deadline_lag_ms = float(deadline_lag_ms)
+            self._follow_stream_last_sdk_lock_wait_ms = (
+                None if sdk_lock_wait_ms is None else float(sdk_lock_wait_ms)
+            )
+            self._follow_stream_last_interpolation_alpha = (
+                None if interpolation_alpha is None else float(interpolation_alpha)
+            )
+            self._follow_stream_last_sent_joint_delta_deg = joint_delta
+            self._follow_stream_last_sent_joint_delta_norm_deg = (
+                None if previous_joint is None else _vector_error_norm(previous_joint, joint)
+            )
+            self._follow_stream_last_sent_joint_step_deg = (
+                None if joint_delta is None else max(abs(value) for value in joint_delta)
+            )
+            self._follow_stream_actual_hz = None if actual_hz is None else float(actual_hz)
+            self._follow_stream_warning = warning
+            self._follow_stream_send_count += 1
+            if deadline_lag_ms > self._follow_stream_period_sec() * 1000.0:
+                self._follow_stream_deadline_miss_count += 1
+        if warning_to_print:
+            print(warning_to_print)
+
+    def _set_follow_stream_fault(self, exc: BaseException) -> None:
+        with self._follow_stream_lock:
+            self._follow_stream_fault = f"{type(exc).__name__}: {exc}"
+        self._follow_stream_stop_event.set()
+        self._follow_stream_update_event.set()
+
+    def _raise_follow_stream_fault_if_any(self) -> None:
+        with self._follow_stream_lock:
+            fault = self._follow_stream_fault
+        if fault:
+            raise RuntimeError(f"{self.side}: CANFD follow stream failed: {fault}")
+
+    def _follow_stream_loop(self) -> None:
+        period = self._follow_stream_period_sec()
+        next_deadline = time.perf_counter()
+        while not self._follow_stream_stop_event.is_set():
+            now = time.perf_counter()
+            wait_sec = next_deadline - now
+            if wait_sec > 0.0:
+                self._follow_stream_stop_event.wait(wait_sec)
+                if self._follow_stream_stop_event.is_set():
+                    break
+            scheduled_at = next_deadline
+            now = time.perf_counter()
+            joint, sequence, interpolation_alpha = self._follow_stream_command_at(now)
+            if joint is None or sequence is None:
+                self._follow_stream_update_event.wait(period)
+                self._follow_stream_update_event.clear()
+                next_deadline = time.perf_counter()
+                continue
+            call_started = time.perf_counter()
+            deadline_lag_ms = max(0.0, (call_started - scheduled_at) * 1000.0)
+            sdk_lock_wait_ms: float | None = None
+
+            def record_sdk_lock_wait(value: float) -> None:
+                nonlocal sdk_lock_wait_ms
+                sdk_lock_wait_ms = float(value)
+
+            try:
+                _require_zero(
+                    self._robot_movej_canfd(
+                        joint,
+                        follow=True,
+                        lock_wait_recorder=record_sdk_lock_wait,
+                    ),
+                    f"{self.side} Movej_CANFD follow stream",
+                )
+            except Exception as exc:  # noqa: BLE001 - surface on the 40Hz loop.
+                self._set_follow_stream_fault(exc)
+                break
+            call_finished = time.perf_counter()
+            self._record_follow_stream_send(
+                joint=joint,
+                sequence=sequence,
+                sent_at=call_finished,
+                call_ms=(call_finished - call_started) * 1000.0,
+                deadline_lag_ms=deadline_lag_ms,
+                sdk_lock_wait_ms=sdk_lock_wait_ms,
+                interpolation_alpha=interpolation_alpha,
+            )
+            next_deadline += period
+            now_after_send = time.perf_counter()
+            if next_deadline < now_after_send:
+                next_deadline = now_after_send + period
+
+    def _apply_follow_qpos_smoothing(
+        self,
+        *,
+        command_pose: list[float],
+        command_joint: list[float],
+    ) -> tuple[list[float], list[float], dict[str, object]]:
+        metadata: dict[str, object] = {
+            "enabled": bool(self.config.canfd_follow),
+            "applied": False,
+            "stage": "final_command_passthrough",
+            "transport": self.config.pose_command_transport,
+            "alpha": float(self.config.follow_qpos_alpha),
+            "reason": "smoothing_moved_to_pre_interpolation_target",
+        }
+        if not self.config.canfd_follow or self.config.pose_command_transport != "joint":
+            return command_pose, command_joint, metadata
+        metadata.update(
+            {
+                "final_command_realized_from_joint": True,
+                "final_command_joint_deg": list(command_joint),
+            }
+        )
+        return self._forward_pose(command_joint), command_joint, metadata
+
+    def _record_follow_stream_context(self, metadata: dict[str, object]) -> None:
+        if self._latest_wrench_context is not None:
+            self._latest_wrench_context["canfd_follow_stream"] = dict(metadata)
+
+    def _send_joint_canfd(self, command_joint: list[float]) -> None:
+        if self._canfd_follow_stream_enabled():
+            metadata = self._set_follow_stream_target(command_joint)
+            self._record_follow_stream_context(metadata)
+            return
+        metadata = self._follow_stream_snapshot()
+        metadata["target_updated"] = False
+        self._record_follow_stream_context(metadata)
+        _require_zero(
+            self._robot_movej_canfd(command_joint, follow=bool(self.config.canfd_follow)),
+            f"{self.side} Movej_CANFD",
+        )
+
     def _send(self, command_pose: list[float], command_joint: list[float]) -> None:
         raise NotImplementedError
 
     def stop_motion(self) -> None:
+        self._stop_deployment_dual_rate_ik()
+        self._stop_follow_stream()
         if self.robot is not None:
-            code = self.robot.Arm_Slow_Stop()
+            with self._robot_sdk_lock:
+                code = self.robot.Arm_Slow_Stop()
             if int(code) != 0:
                 print(f"{self.side}: Arm_Slow_Stop -> {code}")
 
     def close(self) -> None:
+        self._stop_deployment_dual_rate_ik()
+        self._stop_follow_stream()
         if self.robot is not None:
             self._restore_debug_tool_frame()
             if self._owns_robot:
-                self.robot.Arm_Socket_Close()
+                with self._robot_sdk_lock:
+                    self.robot.Arm_Socket_Close()
         self._started = False
 
 
@@ -2880,6 +4272,8 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         command_pose: Iterable[float],
         requested_offset: Iterable[float],
         require_active_wrench: bool = True,
+        update_admittance_state: bool = True,
+        realization_source: str = "final_command_pose",
     ) -> list[float]:
         requested = finite_list(requested_offset, expected_len=6, label="requested_offset")
         realized = _pose_offset_from_reference(
@@ -2947,12 +4341,15 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             any(active_axes)
             and not returning_to_neutral
         )
-        antiwindup_applied = bool(
+        antiwindup_would_apply = bool(
             active_for_antiwindup
             and (linear_error > 1e-6 or angular_error > 1e-6)
         )
+        antiwindup_applied = bool(update_admittance_state and antiwindup_would_apply)
         skip_reason = ""
-        if not active_for_antiwindup:
+        if antiwindup_would_apply and not update_admittance_state:
+            skip_reason = "state_update_disabled"
+        elif not active_for_antiwindup:
             skip_reason = (
                 "returning_to_neutral"
                 if returning_to_neutral
@@ -2968,13 +4365,21 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             if previous is not None:
                 self._latest_wrench_context["admittance_offset_before_antiwindup"] = list(previous)
             self._latest_wrench_context["requested_offset_before_command_realization"] = list(requested)
+            self._latest_wrench_context["final_command_pose_realized_offset"] = list(realized)
+            self._latest_wrench_context["final_command_pose_realization_source"] = str(realization_source)
+            self._latest_wrench_context["admittance_offset_state_update_enabled"] = bool(
+                update_admittance_state
+            )
+            self._latest_wrench_context["admittance_offset_antiwindup_would_apply"] = bool(
+                antiwindup_would_apply
+            )
             if antiwindup_applied:
                 self._latest_wrench_context["applied_offset"] = list(realized)
                 self._latest_wrench_context["offset"] = list(realized)
                 self._latest_wrench_context["applied_offset_source"] = (
                     "guarded_final_command_pose" if guarded_axes else "final_command_pose"
                 )
-            else:
+            elif update_admittance_state:
                 self._latest_wrench_context["applied_offset_source"] = (
                     "requested_offset:antiwindup_guarded"
                     if guarded_axes
@@ -3002,7 +4407,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         assert self._state is not None
         assert self._ik_seed is not None
         controller_pose = normalize_pose(self._state["pose"])
-        code, _joint = self.robot.Algo_Inverse_Kinematics(self._ik_seed, controller_pose, flag=1)
+        code, _joint = self._robot_inverse_kinematics(self._ik_seed, controller_pose, flag=1)
         if int(code) != 0:
             self._raise_ik_failure(
                 code=code,
@@ -3054,6 +4459,282 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         )
         return active, metadata
 
+    def _deployment_dual_rate_request(
+        self,
+        *,
+        reference: list[float],
+        offset: list[float],
+        seed_joint_override: list[float] | None,
+        deadline_ms: float,
+        phase: str,
+    ) -> tuple[IKResolveRequest, list[float], list[float]]:
+        """Freeze all mutable controller state before handing work to IK."""
+
+        assert self._ik_seed is not None
+        desired_pose = normalize_pose(apply_pose_offset(reference, offset))
+        reference_joint = (
+            list(seed_joint_override)
+            if seed_joint_override is not None
+            else list(self._previous_command_joint or self._ik_seed)
+        )
+        reference_joint = finite_list(reference_joint, expected_len=6, label="deployment_reference_joint")
+        reference_qpos = _joint_deg_to_rad(reference_joint, label="deployment_reference_joint")
+        seed_qpos, seed_labels = self._resolver_seed_qpos(
+            reference_qpos=reference_qpos,
+            seed_joint_override=seed_joint_override,
+        )
+        previous_safe_qpos = (
+            None
+            if self._previous_command_joint is None
+            else _joint_deg_to_rad(
+                self._previous_command_joint,
+                label="deployment_previous_command_joint",
+            )
+        )
+        started_at = time.perf_counter()
+        hard_deadline = started_at + float(deadline_ms) / 1000.0
+        request = IKResolveRequest(
+            target_pose=pose6_to_matrix(desired_pose),
+            reference_qpos=reference_qpos,
+            reference_pose=pose6_to_matrix(self._previous_command_pose or reference),
+            seed_qpos=tuple(np.asarray(seed, dtype=float).copy() for seed in seed_qpos),
+            seed_labels=tuple(seed_labels),
+            previous_safe_qpos=previous_safe_qpos,
+            metadata={
+                "side": self.side,
+                "controller": type(self).__name__,
+                "tool_name": self.config.tool_name,
+                "deployment_dual_rate_ik": True,
+                "deployment_ik_phase": str(phase),
+                "provider_name_allowlist": ["rm65_pinocchio"],
+                "hard_deadline_enabled": True,
+                "hard_deadline_budget_ms": float(deadline_ms),
+                "hard_deadline_monotonic": float(hard_deadline),
+                "provider_deadline_monotonic": float(hard_deadline),
+                # Override the teleop profile's 35 ms provider budget.  The
+                # deployment worker owns a full 15 Hz period, while the local
+                # path receives its own much smaller request budget below.
+                "provider_time_budget_ms": float(deadline_ms),
+                "provider_global_time_budget_ms": float(deadline_ms),
+                "provider_remaining_time_budget_ms": float(deadline_ms),
+                "provider_global_time_budget_scope": f"deployment_{phase}",
+                "pinocchio_max_iterations": int(self.config.ik_resolver_pinocchio_max_iterations),
+                "pinocchio_max_joint_step_rad": float(self.config.ik_resolver_pinocchio_max_joint_step_rad),
+                "pinocchio_damping": float(self.config.ik_resolver_pinocchio_damping),
+                "pinocchio_tolerance": float(self.config.ik_resolver_pinocchio_tolerance),
+            },
+        )
+        return request, desired_pose, reference_joint
+
+    def _deployment_dual_rate_stats_snapshot(self) -> dict[str, object]:
+        with self._deployment_dual_rate_lock:
+            return {
+                **dict(self._deployment_full_ik_stats),
+                "worker_busy": bool(self._deployment_full_ik_busy),
+                "target_generation": int(self._deployment_target_generation),
+                "latest_snapshot_sequence": (
+                    None
+                    if self._deployment_full_ik_snapshot is None
+                    else int(self._deployment_full_ik_snapshot["sequence"])
+                ),
+                "latest_full_result_generation": (
+                    None
+                    if self._deployment_full_ik_result is None
+                    else int(self._deployment_full_ik_result["generation"])
+                ),
+            }
+
+    def _deployment_dual_rate_record(
+        self,
+        *,
+        status: str,
+        method: str,
+        elapsed_ms: float,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        if self._latest_wrench_context is None:
+            return
+        payload = {
+            "status": str(status),
+            "method": str(method),
+            "source": "deployment_dual_rate_ik",
+            "deployment_dual_rate": self._deployment_dual_rate_stats_snapshot(),
+            **dict(metadata or {}),
+        }
+        self._latest_wrench_context["ik_method"] = [str(method)]
+        self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata(
+            payload,
+            source="deployment_dual_rate_ik",
+            elapsed_ms=float(elapsed_ms),
+        )
+
+    def _deployment_dual_rate_hold(
+        self,
+        *,
+        reference: list[float],
+        offset: list[float],
+        reason: str,
+        full_result: object | None = None,
+    ) -> tuple[list[float], list[float]]:
+        command_pose = list(self._previous_command_pose or reference)
+        command_joint = list(self._previous_command_joint or self._ik_seed or [0.0] * 6)
+        if full_result is not None and getattr(full_result, "qpos", None) is not None:
+            command_joint = np.rad2deg(
+                np.asarray(getattr(full_result, "qpos"), dtype=float).reshape(6)
+            ).astype(float).tolist()
+            try:
+                command_pose = normalize_pose(matrix_to_pose6(getattr(full_result, "effective_target_pose")))
+            except Exception:
+                command_pose = list(self._previous_command_pose or reference)
+        try:
+            command_pose, command_joint = self._apply_joint_step_policy(
+                command_pose=command_pose,
+                command_joint=command_joint,
+            )
+        except RuntimeError:
+            # The previous command is already a safe transport command.  A
+            # new result that fails the final 40 Hz guard must not replace it.
+            command_pose = list(self._previous_command_pose or reference)
+            command_joint = list(self._previous_command_joint or self._ik_seed or [0.0] * 6)
+        self._sync_admittance_to_realized_pose_offset(
+            reference_pose=reference,
+            command_pose=command_pose,
+            requested_offset=offset,
+        )
+        self._ik_seed = list(command_joint)
+        self._deployment_dual_rate_record(
+            status="hold",
+            method="deployment_dual_rate_hold_last_safe",
+            elapsed_ms=0.0,
+            metadata={"hold_reason": str(reason)},
+        )
+        return command_pose, command_joint
+
+    def _deployment_dual_rate_command_from_reference(
+        self,
+        *,
+        reference: list[float],
+        offset: list[float],
+        preferred_joint: list[float] | None,
+    ) -> tuple[list[float], list[float]]:
+        """Combine a periodic full solve with bounded, local 40 Hz IK.
+
+        A full request is merely published here; the 15 Hz worker owns the
+        expensive solve.  If that worker is busy, the force thread still reads
+        force, updates admittance, and sends a previous safe joint command at
+        40 Hz.  It deliberately does not start competing candidate searches.
+        """
+
+        if self._deployment_local_ik_resolver is None:
+            raise RuntimeError(f"{self.side}: deployment local IK resolver is unavailable")
+        full_request, desired_pose, _ = self._deployment_dual_rate_request(
+            reference=reference,
+            offset=offset,
+            seed_joint_override=preferred_joint,
+            deadline_ms=float(self.config.deployment_full_ik_deadline_ms),
+            phase="full",
+        )
+        with self._deployment_dual_rate_lock:
+            generation = int(self._deployment_target_generation)
+            previous_snapshot = self._deployment_full_ik_snapshot
+            sequence = 1 if previous_snapshot is None else int(previous_snapshot["sequence"]) + 1
+            self._deployment_full_ik_snapshot = {
+                "request": full_request,
+                "generation": generation,
+                "sequence": sequence,
+            }
+            worker_busy = bool(self._deployment_full_ik_busy)
+            cached_full = self._deployment_full_ik_result
+        fresh_full = (
+            cached_full is not None
+            and int(cached_full["generation"]) == generation
+            and getattr(cached_full.get("result"), "qpos", None) is not None
+        )
+        full_result = None if not fresh_full else cached_full["result"]
+        if bool(self.config.deployment_full_ik_preempts_local) and worker_busy:
+            return self._deployment_dual_rate_hold(
+                reference=reference,
+                offset=offset,
+                reason="full_ik_worker_in_flight",
+                full_result=full_result,
+            )
+
+        local_seed = (
+            None
+            if full_result is None
+            else np.rad2deg(np.asarray(full_result.qpos, dtype=float).reshape(6)).astype(float).tolist()
+        )
+        local_request, _, reference_joint = self._deployment_dual_rate_request(
+            reference=reference,
+            offset=offset,
+            seed_joint_override=local_seed or preferred_joint,
+            deadline_ms=float(self.config.deployment_local_ik_deadline_ms),
+            phase="local",
+        )
+        started_at = time.perf_counter()
+        result = self._deployment_local_ik_resolver.resolve_step(
+            local_request,
+            joint_velocity_profile=self._joint_velocity_limit_profile,
+            dt_sec=float(self._joint_rate_limit_dt_details()["effective_dt_sec"]),
+            local_provider_names=("rm65_pinocchio",),
+            local_options={
+                "pinocchio_damping": float(self.config.ik_resolver_pinocchio_damping),
+                "pinocchio_tolerance": float(self.config.ik_resolver_pinocchio_tolerance),
+            },
+            allow_full_solve=False,
+        )
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        hard_hold = str(result.candidate_source) == "hard_deadline_hold_reference"
+        if not result.accepted or result.qpos is None or hard_hold:
+            return self._deployment_dual_rate_hold(
+                reference=reference,
+                offset=offset,
+                reason="local_ik_no_safe_candidate",
+                full_result=full_result,
+            )
+        command_joint = np.rad2deg(np.asarray(result.qpos, dtype=float).reshape(6)).astype(float).tolist()
+        command_pose = normalize_pose(matrix_to_pose6(result.effective_target_pose))
+        try:
+            command_joint = self._validate_ik_solution(
+                command_joint=command_joint,
+                reference_joint=reference_joint,
+                target_pose=desired_pose,
+                method="deployment_dual_rate_local_ik",
+            )
+            command_pose, command_joint = self._apply_joint_step_policy(
+                command_pose=command_pose,
+                command_joint=command_joint,
+            )
+        except RuntimeError:
+            return self._deployment_dual_rate_hold(
+                reference=reference,
+                offset=offset,
+                reason="local_ik_final_safety_guard",
+                full_result=full_result,
+            )
+        self._sync_admittance_to_realized_pose_offset(
+            reference_pose=reference,
+            command_pose=command_pose,
+            requested_offset=offset,
+        )
+        self._ik_seed = list(command_joint)
+        provider_metadata = (
+            {} if self._deployment_local_ik_provider is None else dict(self._deployment_local_ik_provider.last_metadata)
+        )
+        self._deployment_dual_rate_record(
+            status="pass",
+            method="deployment_dual_rate_local_ik",
+            elapsed_ms=elapsed_ms,
+            metadata={
+                **dict(result.metadata),
+                "candidate_source": result.candidate_source,
+                "accepted": bool(result.accepted),
+                "requested_target_pose": list(desired_pose),
+                "provider": provider_metadata,
+            },
+        )
+        return command_pose, command_joint
+
     def _command_from_reference(
         self,
         reference: list[float],
@@ -3075,12 +4756,52 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
             and angular_offset_rad <= float(self.config.direct_joint_hint_max_angular_offset_rad)
         )
+        if self._passthrough_position_control_enabled() and preferred is not None:
+            command_pose = normalize_pose(reference)
+            command_joint = list(preferred)
+            applied_offset = [0.0] * 6
+            if self._latest_wrench_context is not None:
+                self._latest_wrench_context["applied_offset"] = list(applied_offset)
+                self._latest_wrench_context["requested_offset_before_command_realization"] = list(offset_values)
+                self._latest_wrench_context["applied_offset_source"] = "passthrough_position_joint_hint"
+                self._latest_wrench_context["admittance_offset_antiwindup_applied"] = False
+                self._latest_wrench_context["admittance_offset_antiwindup_skip_reason"] = (
+                    "passthrough_position_control"
+                )
+                self._latest_wrench_context["ik_method"] = ["passthrough_position_joint_hint"]
+                self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata({
+                    "status": "pass",
+                    "method": "passthrough_position_joint_hint",
+                    "source": "retargeter_solver_output_qpos",
+                    "safety_check_skipped": True,
+                    "safety_check_skip_reason": "passthrough_position_control",
+                    "fk_skipped": True,
+                    "fk_skip_reason": "passthrough_position_control",
+                    "seed_joint_deg": list(preferred),
+                }, source="retargeter_solver_output_qpos", elapsed_ms=0.0)
+            self._ik_seed = list(command_joint)
+            return command_pose, command_joint
+        if self._passthrough_position_control_enabled():
+            raise RuntimeError(
+                f"{self.side}: passthrough position control requires 15Hz solver_output_qpos; "
+                "refusing to fall back to SDK IK."
+            )
+        if self._deployment_dual_rate_ik_enabled():
+            return self._deployment_dual_rate_command_from_reference(
+                reference=reference,
+                offset=offset_values,
+                preferred_joint=preferred,
+            )
         direct_joint_hint = bool(
             preferred is not None
             and (offset_within_direct_hint or force_guard_active)
         )
-        if direct_joint_hint:
-            command_pose = normalize_pose(reference)
+        if preferred is not None:
+            reference_from_preferred_joint = self._forward_pose(preferred)
+        else:
+            reference_from_preferred_joint = None
+        if direct_joint_hint and reference_from_preferred_joint is not None:
+            command_pose = normalize_pose(reference_from_preferred_joint)
             command_joint = list(preferred)
             applied_offset = [0.0] * 6
             if (
@@ -3124,6 +4845,9 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     ),
                 }, source="retargeter_solver_output_qpos", elapsed_ms=0.0)
             try:
+                # The outer retargeter is rate-bounded, but a stale or
+                # anomalous qpos can still arrive near a physical stop. Keep
+                # the 40 Hz command policy as the final impedance guard.
                 command_pose, command_joint = self._apply_joint_step_policy(
                     command_pose=command_pose,
                     command_joint=command_joint,
@@ -3139,6 +4863,102 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     self._ik_seed = list(held[1])
                     return held
                 raise
+            self._ik_seed = list(command_joint)
+            return command_pose, command_joint
+
+        if preferred is not None and reference_from_preferred_joint is not None:
+            try:
+                if self._ik_resolver is not None:
+                    command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
+                        self._command_from_pose_with_resolver(
+                            reference_pose=reference_from_preferred_joint,
+                            offset=offset,
+                            seed_joint_override=preferred,
+                            use_joint_velocity_limit=True,
+                        )
+                    )
+                else:
+                    command_pose, command_joint, seed_joint, backoff_scale, applied_offset, code = (
+                        self._command_from_pose_with_ik_backoff(
+                            reference_pose=reference_from_preferred_joint,
+                            offset=offset,
+                            seed_joint_override=preferred,
+                        )
+                    )
+                if self._latest_wrench_context is not None:
+                    self._latest_wrench_context["applied_offset"] = list(applied_offset)
+                    self._latest_wrench_context["applied_offset_source"] = (
+                        "solver_qpos_reference_with_impedance_offset"
+                    )
+            except RuntimeError as exc:
+                held = self._hold_last_safe_command_after_ik_failure(
+                    reason="joint_hint_offset_ik_exception",
+                    message=str(exc),
+                    target_pose=reference_from_preferred_joint,
+                    seed_joint=preferred,
+                )
+                if held is not None:
+                    self._ik_seed = list(held[1])
+                    return held
+                raise
+            if int(code) != 0:
+                hard_deadline = int(code) == _IK_HARD_DEADLINE_RETURN_CODE
+                message = (
+                    f"{self.side}: IK hard deadline reached before a safe candidate was ready."
+                    if hard_deadline
+                    else self._ik_failure_message(
+                        code=code,
+                        seed_joint=seed_joint,
+                        target_pose=command_pose,
+                        reference=reference_from_preferred_joint,
+                        offset=offset,
+                    )
+                )
+                held = self._hold_last_safe_command_after_ik_failure(
+                    reason="ik_hard_deadline" if hard_deadline else "joint_hint_offset_ik_return_code",
+                    message=message,
+                    target_pose=command_pose,
+                    seed_joint=seed_joint,
+                    code=code,
+                )
+                if held is not None:
+                    self._ik_seed = list(held[1])
+                    return held
+                if hard_deadline:
+                    raise RuntimeError(message)
+                self._raise_ik_failure(
+                    code=code,
+                    seed_joint=seed_joint,
+                    target_pose=command_pose,
+                    reference=reference_from_preferred_joint,
+                    offset=offset,
+                )
+            command_joint = finite_list(command_joint[:6], expected_len=6, label="ik_joint_deg")
+            try:
+                # A solver result produced from a qpos hint plus an impedance
+                # offset is still a force-control command.  It must take the
+                # same interior-margin and 40 Hz final-step path as direct
+                # hints; otherwise a delayed frame can bypass both guards.
+                command_pose, command_joint = self._apply_joint_step_policy(
+                    command_pose=command_pose,
+                    command_joint=command_joint,
+                )
+            except RuntimeError as exc:
+                held = self._hold_last_safe_command_after_ik_failure(
+                    reason="joint_hint_offset_step_policy",
+                    message=str(exc),
+                    target_pose=command_pose,
+                    seed_joint=preferred,
+                )
+                if held is not None:
+                    self._ik_seed = list(held[1])
+                    return held
+                raise
+            self._sync_admittance_to_realized_pose_offset(
+                reference_pose=reference_from_preferred_joint,
+                command_pose=command_pose,
+                requested_offset=applied_offset,
+            )
             self._ik_seed = list(command_joint)
             return command_pose, command_joint
 
@@ -3170,15 +4990,24 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             raise
         if int(code) != 0:
             source = "generic_ik_resolver" if self._ik_resolver is not None else "rm_sdk_legacy"
-            message = self._ik_failure_message(
-                code=code,
-                seed_joint=seed_joint,
-                target_pose=command_pose,
-                reference=reference,
-                offset=offset,
+            hard_deadline = int(code) == _IK_HARD_DEADLINE_RETURN_CODE
+            message = (
+                f"{self.side}: IK hard deadline reached before a safe candidate was ready."
+                if hard_deadline
+                else self._ik_failure_message(
+                    code=code,
+                    seed_joint=seed_joint,
+                    target_pose=command_pose,
+                    reference=reference,
+                    offset=offset,
+                )
             )
             held = self._hold_last_safe_command_after_ik_failure(
-                reason="generic_resolver_return_code" if source == "generic_ik_resolver" else "ik_return_code",
+                reason=(
+                    "ik_hard_deadline"
+                    if hard_deadline
+                    else "generic_resolver_return_code" if source == "generic_ik_resolver" else "ik_return_code"
+                ),
                 message=message,
                 target_pose=command_pose,
                 seed_joint=seed_joint,
@@ -3187,6 +5016,8 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             if held is not None:
                 self._ik_seed = list(held[1])
                 return held
+            if hard_deadline:
+                raise RuntimeError(message)
             self._raise_ik_failure(
                 code=code,
                 seed_joint=seed_joint,
@@ -3223,24 +5054,11 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         assert self.robot is not None
         if self.config.pose_command_transport == "pose":
             _require_zero(
-                self.robot.Movep_CANFD(
-                    command_pose,
-                    follow=False,
-                    trajectory_mode=self.config.trajectory_mode,
-                    radio=self.config.radio,
-                ),
+                self._robot_movep_canfd(command_pose, follow=bool(self.config.canfd_follow)),
                 f"{self.side} Movep_CANFD",
             )
             return
-        _require_zero(
-            self.robot.Movej_CANFD(
-                command_joint,
-                follow=False,
-                trajectory_mode=self.config.trajectory_mode,
-                radio=self.config.radio,
-            ),
-            f"{self.side} Movej_CANFD",
-        )
+        self._send_joint_canfd(command_joint)
 
 
 class RM65JointImpedanceController(RM65BaseImpedanceController):
@@ -3282,12 +5100,4 @@ class RM65JointImpedanceController(RM65BaseImpedanceController):
     def _send(self, command_pose: list[float], command_joint: list[float]) -> None:
         del command_pose
         assert self.robot is not None
-        _require_zero(
-            self.robot.Movej_CANFD(
-                command_joint,
-                follow=False,
-                trajectory_mode=self.config.trajectory_mode,
-                radio=self.config.radio,
-            ),
-            f"{self.side} Movej_CANFD",
-        )
+        self._send_joint_canfd(command_joint)

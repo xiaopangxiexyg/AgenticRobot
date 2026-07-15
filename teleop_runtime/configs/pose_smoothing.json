@@ -1,7 +1,7 @@
 {
   "schema_version": "teleop_runtime.pose_smoothing.v1",
   "enabled": true,
-  "time_constant_sec": 0.1,
+  "time_constant_sec": 0.025,
   "nominal_dt_sec": 0.0666666667,
   "min_dt_sec": 0.0,
   "max_dt_sec": 0.12,

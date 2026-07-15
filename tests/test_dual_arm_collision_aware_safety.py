@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from robot_motion.joint_limits import JointVelocityLimitProfile
 from robot_motion.profiles import IKSafetyProfile
@@ -11,7 +12,9 @@ import teleop_runtime.retargeters.dual_arm_collision_aware as dual_module
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
+    DualArmTargetContext,
 )
+from teleop_runtime.schemas import EffectorCommand
 
 
 class _FakeModel:
@@ -33,6 +36,7 @@ class _FakeDualArmSolver:
         self.robot = _FakeRobot(lower=lower_array, upper=upper_array)
         self.last_solve_profile = {}
         self.last_collision_distance_profile = {}
+        self.min_collision_distance = 0.25
 
     @property
     def current_q(self) -> np.ndarray:
@@ -59,7 +63,8 @@ class _FakeDualArmSolver:
         return pose
 
     def compute_min_collision_distance(self, q: np.ndarray | None = None) -> float:
-        return 0.25
+        del q
+        return float(self.min_collision_distance)
 
 
 def _rm65_posture_metadata(*, local_escape_enabled: bool = True) -> dict[str, object]:
@@ -158,6 +163,17 @@ def _scene_profile() -> SimpleNamespace:
     )
 
 
+def _target_pose(*, x_m: float = 0.0, rotation_deg: float = 0.0) -> np.ndarray:
+    angle_rad = np.deg2rad(rotation_deg)
+    pose = np.eye(4, dtype=float)
+    pose[:2, :2] = (
+        (np.cos(angle_rad), -np.sin(angle_rad)),
+        (np.sin(angle_rad), np.cos(angle_rad)),
+    )
+    pose[0, 3] = float(x_m)
+    return pose
+
+
 def _retargeter(
     solver: _FakeDualArmSolver,
     *,
@@ -165,6 +181,7 @@ def _retargeter(
     rm65_local_escape: bool = True,
     component_progress: bool = False,
     loose_dynamic_worsening: bool = False,
+    joint_operating_margin_deg: float = 0.0,
 ) -> DualArmCollisionAwareRetargeter:
     return DualArmCollisionAwareRetargeter(
         DualArmCollisionAwareRetargeterConfig(
@@ -177,6 +194,8 @@ def _retargeter(
                 loose_dynamic_worsening=loose_dynamic_worsening,
             ),
             joint_velocity_profile=_velocity(),
+            joint_operating_margin_deg=joint_operating_margin_deg,
+            inactive_side_hold_execution_release_enabled=True,
         ),
         ik_solver=solver,
     )
@@ -194,6 +213,37 @@ def test_dual_arm_reset_target_pose_smoothing_clears_target_history() -> None:
     retargeter.reset_target_pose_smoothing()
 
     assert retargeter._last_target_poses == {"left": None, "right": None}
+
+
+def test_dual_arm_target_activity_prefers_tracker_motion_state_machine() -> None:
+    retargeter = _retargeter(_FakeDualArmSolver())
+    targets = retargeter.current_world_targets()
+    left_command = EffectorCommand(
+        effector_name="left_arm",
+        side="left",
+        command_type="cartesian_pose",
+        value=np.eye(4, dtype=float),
+        frame_name="arm_base",
+        metadata={
+            "tracker_motion_intent": {
+                "state": "INACTIVE",
+                "inactive": True,
+                "hold_weight": 1.0,
+                "transition_reason": "enter_dwell_complete",
+                "motion_window": {"quality_valid": True},
+            }
+        },
+    )
+
+    activity = retargeter._target_activity_metadata(
+        targets,
+        cartesian_commands={"left": left_command, "right": None},
+    )
+
+    assert activity["left"]["source"] == "tracker_motion_state_machine"
+    assert activity["left"]["state"] == "INACTIVE"
+    assert activity["left"]["hold_weight"] == 1.0
+    assert activity["right"]["source"] == "target_delta_legacy"
 
 
 def test_dual_arm_collision_retargeter_defaults_to_robot_motion_builder(monkeypatch) -> None:
@@ -261,6 +311,42 @@ def test_dual_arm_candidate_layer_generates_joint_limit_escape_for_left_arm() ->
     assert metadata["selected_source"] == "joint_limit_escape"
 
 
+def test_dual_arm_operating_margin_rejects_outward_tracking_and_selects_escape() -> None:
+    lower = np.full(12, -1.0, dtype=float)
+    upper = np.full(12, 1.0, dtype=float)
+    solver = _FakeDualArmSolver(lower=lower, upper=upper)
+    retargeter = _retargeter(solver, joint_operating_margin_deg=3.0)
+    reference = np.zeros(12, dtype=float)
+    reference[0] = 0.99
+    raw = reference.copy()
+    raw[0] = 1.0
+    solver.set_configuration_q(reference)
+    retargeter.set_execution_dt_sec(1.0 / 15.0)
+    targets = retargeter.current_world_targets()
+    targets["left"] = targets["left"].copy()
+    # The raw tracking solution improves Cartesian error by moving J1 outward,
+    # but would consume the last operating margin and must be rejected.
+    targets["left"][0, 3] = -1.5
+
+    qpos, name, _score, _min_distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=raw,
+        reference_full_q=reference,
+        current_targets=targets,
+        profile=None,
+    )
+
+    assert name == "joint_limit_escape_left_j1_neg"
+    assert qpos[0] < reference[0]
+    assert metadata["selected_source"] == "joint_limit_escape"
+    assert any(
+        item["reject_reason"] == "joint_operating_margin"
+        for item in metadata["last_rejections"]
+    )
+    operating_margin = metadata["selected_metadata"]["joint_operating_margin"]
+    assert operating_margin["status"] == "recovery_only"
+    assert operating_margin["violations"][0]["moving_inward"] is True
+
+
 def test_dual_arm_candidate_layer_returns_base_candidate_without_auxiliary_expansion() -> None:
     solver = _FakeDualArmSolver()
     retargeter = _retargeter(solver, rm65_posture=True)
@@ -287,6 +373,112 @@ def test_dual_arm_candidate_layer_returns_base_candidate_without_auxiliary_expan
     assert [stage["stage"] for stage in metadata["candidate_eval_stages"]] == ["base_primary"]
 
 
+def test_dual_arm_candidate_deadline_holds_without_fallback_or_auxiliary_expansion(monkeypatch) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.solve_time_budget_ms = 10.0
+    reference = np.zeros(12, dtype=float)
+    raw = np.deg2rad(np.arange(1.0, 13.0, dtype=float))
+    solver.set_configuration_q(reference)
+    targets = retargeter.current_world_targets()
+    evaluation_calls: list[str] = []
+    candidate_generation_calls: list[dict[str, object]] = []
+    clock = {"value": 0.0}
+    original_candidates = retargeter._dual_arm_tracking_candidates
+
+    def fake_candidates(**kwargs):
+        candidate_generation_calls.append(dict(kwargs))
+        return original_candidates(**kwargs)
+
+    def reject_candidate(*, candidate, **_kwargs):
+        evaluation_calls.append(candidate.name)
+        clock["value"] += 0.002
+        return False, candidate.qpos.copy(), {"score": 1e18, "reject_reason": "test_reject"}
+
+    monkeypatch.setattr(dual_module.time, "perf_counter", lambda: clock["value"])
+    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", fake_candidates)
+    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", reject_candidate)
+
+    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=raw,
+        reference_full_q=reference,
+        current_targets=targets,
+        profile={"solve_total_ms": 0.0},
+    )
+
+    assert name == "local_step_hold"
+    assert np.allclose(qpos, reference)
+    assert len(evaluation_calls) == 3
+    assert len(candidate_generation_calls) == 1
+    assert metadata["reason"] == "branch_budget_exhausted_no_safe_candidate"
+    assert metadata["candidate_eval_mode"] == "deadline_hold"
+    assert metadata["candidate_eval_stop_reason"] == "branch_budget_exhausted_before_candidate"
+    assert [stage["stage"] for stage in metadata["candidate_eval_stages"]] == ["base_primary"]
+
+
+def test_dual_arm_candidate_deadline_accounts_for_pre_selection_frame_time(monkeypatch) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.solve_time_budget_ms = 10.0
+    reference = np.zeros(12, dtype=float)
+    solver.set_configuration_q(reference)
+    targets = retargeter.current_world_targets()
+    evaluation_calls: list[str] = []
+
+    def fail_if_evaluated(*, candidate, **_kwargs):
+        evaluation_calls.append(candidate.name)
+        raise AssertionError("candidate evaluation must not start after the frame budget is exhausted")
+
+    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", fail_if_evaluated)
+
+    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=np.deg2rad(np.arange(1.0, 13.0, dtype=float)),
+        reference_full_q=reference,
+        current_targets=targets,
+        profile=None,
+        elapsed_before_selection_ms=10.0,
+    )
+
+    assert name == "local_step_hold"
+    assert np.allclose(qpos, reference)
+    assert evaluation_calls == []
+    assert metadata["candidate_eval_stop_reason"] == "branch_budget_exhausted_before_candidates"
+    assert metadata["candidate_eval_pre_selection_elapsed_ms"] == 10.0
+
+
+def test_dual_arm_candidate_deadline_selects_best_already_safe_candidate(monkeypatch) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.solve_time_budget_ms = 10.0
+    reference = np.zeros(12, dtype=float)
+    raw = np.deg2rad(np.arange(1.0, 13.0, dtype=float))
+    solver.set_configuration_q(reference)
+    targets = retargeter.current_world_targets()
+    evaluation_calls: list[str] = []
+    clock = {"value": 0.0}
+
+    def accept_candidate(*, candidate, **_kwargs):
+        evaluation_calls.append(candidate.name)
+        clock["value"] += 0.002
+        return True, candidate.qpos.copy(), {"score": float(10 - len(evaluation_calls))}
+
+    monkeypatch.setattr(dual_module.time, "perf_counter", lambda: clock["value"])
+    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", accept_candidate)
+
+    _qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=raw,
+        reference_full_q=reference,
+        current_targets=targets,
+        profile={"solve_total_ms": 0.0},
+    )
+
+    assert len(evaluation_calls) == 3
+    assert name == evaluation_calls[1]
+    assert metadata["candidate_eval_mode"] == "deadline_partial"
+    assert metadata["candidate_eval_stopped_early"] is True
+    assert metadata["collision_safe_count"] == 2
+
+
 def test_dual_arm_candidate_layer_holds_on_hard_branch_jump() -> None:
     solver = _FakeDualArmSolver()
     retargeter = _retargeter(solver)
@@ -306,6 +498,43 @@ def test_dual_arm_candidate_layer_holds_on_hard_branch_jump() -> None:
     assert np.allclose(qpos, reference)
     assert metadata["reason"] == "no_progress_candidate"
     assert metadata["last_rejections"][-1]["reject_reason"] == "hard_branch_jump:left"
+
+
+def test_dual_arm_position_passthrough_skips_local_step_hold_and_keeps_final_step_limit() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            local_step_candidate_selection_enabled=False,
+            inactive_side_hold_enabled=False,
+            inactive_side_hold_execution_cap_enabled=False,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    raw = reference.copy()
+    raw[0] = np.deg2rad(100.0)
+    targets = retargeter.current_world_targets()
+
+    qpos, name, _score, _min_distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=raw,
+        reference_full_q=reference,
+        current_targets=targets,
+        profile=None,
+    )
+    limited_qpos, step_metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=qpos,
+    )
+
+    assert name == "original"
+    assert metadata["enabled"] is False
+    assert metadata["reason"] == "local_step_candidate_selection_disabled"
+    assert np.isclose(limited_qpos[0], np.deg2rad(10.0 / 15.0))
+    assert step_metadata["step_limited"] is True
 
 
 def test_dual_arm_component_progress_accepts_bounded_fine_tracking_step() -> None:
@@ -428,6 +657,526 @@ def test_dual_arm_inactive_execution_step_cap_limits_stationary_side() -> None:
     assert cap["applied"] is True
     assert np.isclose(cap["sides"]["right"]["requested_max_abs_delta_deg"], 3.0)
     assert np.isclose(cap["sides"]["right"]["capped_max_abs_delta_deg"], 0.5)
+
+
+def test_tracker_confirmed_inactive_side_freezes_below_static_error_thresholds() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[:6] = np.deg2rad([0.4, -0.3, 0.2, -0.1, 0.4, -0.2])
+    candidate[6:] = np.deg2rad([-0.4, 0.3, -0.2, 0.1, -0.4, 0.2])
+    target_activity = {
+        "enabled": True,
+        "left": {
+            "source": "tracker_motion_state_machine",
+            "state": "INACTIVE",
+            "inactive": True,
+            "hold_weight": 1.0,
+        },
+        "right": {
+            "source": "tracker_motion_state_machine",
+            "state": "INACTIVE",
+            "inactive": True,
+            "hold_weight": 1.0,
+        },
+    }
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        target_activity=target_activity,
+        current_targets={
+            "left": _target_pose(x_m=0.029, rotation_deg=4.9),
+            "right": _target_pose(x_m=0.029, rotation_deg=4.9),
+        },
+    )
+
+    np.testing.assert_allclose(qpos, reference, atol=1e-12)
+    cap = metadata["inactive_side_hold_execution_cap"]
+    assert cap["applied"] is True
+    for side in ("left", "right"):
+        assert cap["sides"][side]["tracker_inactive_freeze"] is True
+        assert cap["sides"][side]["effective_cap_deg"] == 0.0
+        assert cap["sides"][side]["capped_max_abs_delta_deg"] == 0.0
+        release = cap["sides"][side]["tracker_inactive_execution_release"]
+        assert release["available"] is True
+        assert release["velocity_release_scale"] == 0.0
+
+
+def test_tracker_inactive_execution_release_linearly_adds_pose_error_weights() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[6] = np.deg2rad(0.4)
+    target_activity = {
+        "enabled": True,
+        "left": {"inactive": False, "hold_weight": 0.0},
+        "right": {
+            "source": "tracker_motion_state_machine",
+            "state": "INACTIVE",
+            "inactive": True,
+            "hold_weight": 1.0,
+        },
+    }
+    solver.set_configuration_q(reference)
+    retargeter.set_execution_dt_sec(1.0)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        target_activity=target_activity,
+        current_targets={
+            "left": _target_pose(),
+            "right": _target_pose(x_m=0.0475, rotation_deg=11.25),
+        },
+    )
+
+    # (4.75 - 3.0) / (10.0 - 3.0) == 0.25 and
+    # (11.25 - 5.0) / (30.0 - 5.0) == 0.25, hence 50% release.
+    assert np.isclose(qpos[6], np.deg2rad(0.2))
+    release = metadata["inactive_side_hold_execution_cap"]["sides"]["right"][
+        "tracker_inactive_execution_release"
+    ]
+    assert release["reference_qpos_source"] == "execution_reference_qcmd_or_qref"
+    assert np.isclose(release["translation_weight"], 0.25)
+    assert np.isclose(release["rotation_weight"], 0.25)
+    assert np.isclose(release["velocity_release_scale"], 0.5)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        target_activity=target_activity,
+        current_targets={
+            "left": _target_pose(),
+            "right": _target_pose(x_m=0.065, rotation_deg=17.5),
+        },
+    )
+
+    # Both normalized weights are 0.5, so their equal-weight sum releases the
+    # inactive cap completely and preserves the normal execution-step limit.
+    assert np.isclose(qpos[6], np.deg2rad(0.4))
+    release = metadata["inactive_side_hold_execution_cap"]["sides"]["right"][
+        "tracker_inactive_execution_release"
+    ]
+    assert np.isclose(release["translation_weight"], 0.5)
+    assert np.isclose(release["rotation_weight"], 0.5)
+    assert np.isclose(release["velocity_release_scale"], 1.0)
+    assert metadata["inactive_side_hold_execution_cap"]["sides"]["right"]["applied"] is False
+
+
+def test_tracker_inactive_execution_release_is_opt_in_for_position_only() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.inactive_side_hold_execution_release_enabled = False
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[6] = np.deg2rad(0.4)
+    target_activity = {
+        "enabled": True,
+        "left": {"inactive": False, "hold_weight": 0.0},
+        "right": {
+            "source": "tracker_motion_state_machine",
+            "state": "INACTIVE",
+            "inactive": True,
+            "hold_weight": 1.0,
+        },
+    }
+    retargeter.set_execution_dt_sec(1.0)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        target_activity=target_activity,
+        current_targets={"left": _target_pose(), "right": _target_pose(x_m=0.10)},
+    )
+
+    # Generic callers (including force-control callers) retain the historical
+    # confirmed-inactive freeze unless a position entrypoint opts in.
+    assert np.isclose(qpos[6], 0.0)
+    side = metadata["inactive_side_hold_execution_cap"]["sides"]["right"]
+    assert side["tracker_inactive_execution_release_enabled"] is False
+    assert side["tracker_inactive_execution_release"] is None
+    assert side["tracker_inactive_freeze"] is True
+
+
+def test_build_command_passes_targets_to_inactive_execution_release() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    candidate = np.zeros(12, dtype=float)
+    candidate[6] = np.deg2rad(5.0)
+    solver.solve = lambda *, targets: candidate.copy()  # type: ignore[attr-defined]
+    inactive_right = EffectorCommand(
+        effector_name="right_arm",
+        side="right",
+        command_type="cartesian_pose",
+        value=_target_pose(x_m=0.10),
+        frame_name="arm_base",
+        metadata={
+            "tracker_motion_intent": {
+                "state": "INACTIVE",
+                "inactive": True,
+                "hold_weight": 1.0,
+            }
+        },
+    )
+    context = DualArmTargetContext(
+        timestamp=0.0,
+        left_target=_target_pose(),
+        right_target=_target_pose(x_m=0.10),
+        left_world_to_base=None,
+        right_world_to_base=None,
+        left_cartesian=None,
+        right_cartesian=inactive_right,
+        left_input_skipped=None,
+        right_input_skipped=None,
+    )
+
+    command = retargeter.build_command_for_context(context)
+
+    right = command.commands["right_arm"].metadata
+    release = right["execution_step_metadata"]["inactive_side_hold_execution_cap"]["sides"][
+        "right"
+    ]["tracker_inactive_execution_release"]
+    assert release["available"] is True
+    assert "unavailable_reason" not in release
+    assert release["velocity_release_scale"] == 1.0
+
+
+def test_dual_arm_velocity_profile_and_explicit_execution_step_use_strictest_limit() -> None:
+    solver = _FakeDualArmSolver()
+    explicit_step = np.deg2rad(np.full(6, 0.25, dtype=float))
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="fast_profile",
+                max_velocity_deg_s=(1000.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+            left_execution_max_joint_step_rad=explicit_step,
+            right_execution_max_joint_step_rad=explicit_step,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[0] = np.deg2rad(3.0)
+    candidate[6] = -np.deg2rad(4.0)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+    )
+
+    assert np.isclose(qpos[0], np.deg2rad(0.25))
+    assert np.isclose(qpos[6], -np.deg2rad(0.25))
+    assert metadata["step_limited"] is True
+    assert metadata["execution_step_source"] == "joint_velocity_profile+explicit_execution_max_joint_step"
+    assert np.allclose(metadata["left_max_step_deg"], np.full(6, 0.25))
+    assert np.allclose(metadata["right_max_step_deg"], np.full(6, 0.25))
+
+
+def test_candidate_local_clip_scale_does_not_raise_final_execution_step() -> None:
+    solver = _FakeDualArmSolver()
+    explicit_step = np.deg2rad(np.full(6, 0.25, dtype=float))
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="fast_profile",
+                max_velocity_deg_s=(1000.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+            left_execution_max_joint_step_rad=explicit_step,
+            right_execution_max_joint_step_rad=explicit_step,
+            local_step_candidate_clip_scale=2.0,
+        ),
+        ik_solver=solver,
+    )
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[0] = np.deg2rad(3.0)
+
+    local_qpos, local_metadata = retargeter._limit_full_joint_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        step_scale=1.0,
+    )
+    final_qpos, final_metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=local_qpos,
+    )
+
+    assert np.isclose(local_qpos[0], np.deg2rad(0.5))
+    assert local_metadata["candidate_local_step_clip_scale"] == pytest.approx(2.0)
+    assert np.isclose(final_qpos[0], np.deg2rad(0.25))
+    assert final_metadata["step_limited"] is True
+
+
+def test_dual_arm_runtime_execution_step_update_limits_velocity_profile() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=JointVelocityLimitProfile(
+                name="fast_profile",
+                max_velocity_deg_s=(1000.0,) * 6,
+                max_dt_sec=1.0,
+            ),
+        ),
+        ik_solver=solver,
+    )
+    runtime_step = np.deg2rad(np.full(6, 0.2, dtype=float))
+    retargeter.set_execution_max_joint_step(
+        left_step_rad=runtime_step,
+        right_step_rad=runtime_step,
+    )
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[0] = np.deg2rad(3.0)
+    candidate[6] = -np.deg2rad(4.0)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+    )
+
+    assert np.isclose(qpos[0], np.deg2rad(0.2))
+    assert np.isclose(qpos[6], -np.deg2rad(0.2))
+    assert metadata["step_limited"] is True
+    assert metadata["execution_step_source"] == "joint_velocity_profile+explicit_execution_max_joint_step"
+    assert np.allclose(metadata["left_max_step_deg"], np.full(6, 0.2))
+    assert np.allclose(metadata["right_max_step_deg"], np.full(6, 0.2))
+
+
+def test_dual_arm_output_qpos_smoothing_runs_before_action_fk() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.5,
+        ),
+        ik_solver=solver,
+    )
+    raw_left = np.deg2rad(np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    raw_right = np.deg2rad(np.array([-8.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    raw_full = retargeter._embed_arm_qpos(
+        current_full_q=solver.current_q,
+        left_qpos=raw_left,
+        right_qpos=raw_right,
+    )
+
+    first_full, first_left, first_right, first_metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=raw_full,
+        left_qpos=raw_left,
+        right_qpos=raw_right,
+    )
+    second_full, second_left, second_right, second_metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=np.zeros_like(raw_full),
+        left_qpos=np.zeros(6, dtype=float),
+        right_qpos=np.zeros(6, dtype=float),
+    )
+
+    np.testing.assert_allclose(first_left, raw_left)
+    np.testing.assert_allclose(first_right, raw_right)
+    assert first_metadata["initialized"] is True
+    assert first_metadata["applied"] is False
+    np.testing.assert_allclose(first_full, raw_full)
+    np.testing.assert_allclose(second_left[0], np.deg2rad(5.0))
+    np.testing.assert_allclose(second_right[0], -np.deg2rad(4.0))
+    assert second_metadata["applied"] is True
+    assert second_metadata["stage"] == "post_ik_pre_action_fk"
+    assert second_metadata["downstream_command_stage"] == "interpolation_only"
+    assert np.isclose(second_metadata["left"]["output_target_joint_deg"][0], 5.0)
+    assert np.isclose(second_metadata["right"]["output_target_joint_deg"][0], -4.0)
+
+
+def test_dual_arm_output_qpos_smoothing_adapts_to_valid_tracker_speed() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.18,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.7,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    activity = {
+        "left": {
+            "evidence": {
+                "quality_valid": True,
+                "linear_speed_p90_m_s": 0.30,
+                "angular_speed_p90_rad_s": 0.2,
+            }
+        }
+    }
+
+    alpha, metadata = retargeter._effective_output_qpos_smoothing_alpha(activity)
+
+    assert 0.18 < alpha <= 0.7
+    assert metadata["reason"] == "tracker_speed"
+    assert metadata["requested_alpha"] == 0.7
+    assert metadata["transition"] == "attack"
+    assert metadata["valid_sides"] == ["left"]
+
+
+def test_dual_arm_output_qpos_smoothing_uses_motion_window_validity() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.18,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.7,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+
+    alpha, metadata = retargeter._effective_output_qpos_smoothing_alpha(
+        {
+            "right": {
+                "evidence": {
+                    "linear_speed_p90_m_s": 0.30,
+                    "angular_speed_p90_rad_s": 0.2,
+                },
+                "motion_window": {"quality_valid": True},
+            }
+        }
+    )
+
+    assert 0.18 < alpha <= 0.7
+    assert metadata["reason"] == "tracker_speed"
+    assert metadata["requested_alpha"] == 0.7
+    assert metadata["valid_sides"] == ["right"]
+
+
+def test_dual_arm_output_qpos_smoothing_ignores_invalid_tracker_speed() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.18,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.7,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+
+    alpha, metadata = retargeter._effective_output_qpos_smoothing_alpha(
+        {"left": {"evidence": {"quality_valid": False, "linear_speed_p90_m_s": 1.0}}}
+    )
+
+    assert alpha == 0.18
+    assert metadata["reason"] == "invalid_or_missing_speed"
+
+
+def test_dual_arm_current_qpos_sync_can_preserve_output_qpos_smoothing_state() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.5,
+        ),
+        ik_solver=solver,
+    )
+    raw_left = np.deg2rad(np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    raw_right = np.deg2rad(np.array([-8.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    raw_full = retargeter._embed_arm_qpos(
+        current_full_q=solver.current_q,
+        left_qpos=raw_left,
+        right_qpos=raw_right,
+    )
+
+    retargeter._smooth_output_qpos_before_action(
+        active_q=raw_full,
+        left_qpos=raw_left,
+        right_qpos=raw_right,
+    )
+    retargeter.set_current_qpos_pair(
+        left_qpos=raw_left,
+        right_qpos=raw_right,
+        reset_tracking=False,
+    )
+    _, preserved_left, preserved_right, preserved_metadata = (
+        retargeter._smooth_output_qpos_before_action(
+            active_q=np.zeros_like(raw_full),
+            left_qpos=np.zeros(6, dtype=float),
+            right_qpos=np.zeros(6, dtype=float),
+        )
+    )
+
+    assert preserved_metadata["initialized"] is False
+    assert preserved_metadata["applied"] is True
+    np.testing.assert_allclose(preserved_left[0], np.deg2rad(5.0))
+    np.testing.assert_allclose(preserved_right[0], -np.deg2rad(4.0))
+
+    retargeter.set_current_qpos_pair(
+        left_qpos=raw_left,
+        right_qpos=raw_right,
+        reset_tracking=True,
+    )
+    _, reset_left, reset_right, reset_metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=np.zeros_like(raw_full),
+        left_qpos=np.zeros(6, dtype=float),
+        right_qpos=np.zeros(6, dtype=float),
+    )
+
+    assert reset_metadata["initialized"] is True
+    assert reset_metadata["applied"] is False
+    np.testing.assert_allclose(reset_left, np.zeros(6, dtype=float))
+    np.testing.assert_allclose(reset_right, np.zeros(6, dtype=float))
+
+
+def test_dual_arm_explicit_execution_step_is_fallback_without_velocity_profile() -> None:
+    solver = _FakeDualArmSolver()
+    explicit_step = np.deg2rad(np.full(6, 0.25, dtype=float))
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=15.0,
+            enforce_realistic_joint_step=True,
+            ik_safety_profile=_profile(),
+            left_execution_max_joint_step_rad=explicit_step,
+            right_execution_max_joint_step_rad=explicit_step,
+        ),
+        ik_solver=solver,
+    )
+    retargeter.joint_velocity_profile = None
+    retargeter.config.joint_velocity_profile = None
+    retargeter._full_execution_joint_step = retargeter._make_full_execution_joint_step(
+        solver.current_q
+    )
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[0] = np.deg2rad(3.0)
+    candidate[6] = -np.deg2rad(4.0)
+
+    qpos, metadata = retargeter._limit_to_execution_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+    )
+
+    assert np.isclose(qpos[0], np.deg2rad(0.25))
+    assert np.isclose(qpos[6], -np.deg2rad(0.25))
+    assert metadata["step_limited"] is True
+    assert metadata["execution_step_source"] == "explicit_execution_max_joint_step"
 
 
 def test_dual_arm_activity_hold_allows_unmoved_side_to_reduce_existing_error() -> None:
@@ -560,3 +1309,27 @@ def test_dual_arm_jump_gate_warns_but_does_not_hold_for_wrist_jump() -> None:
     assert gate["hold"] is False
     assert gate["status"] == "warning"
     assert gate["reason"] == "small_pose_large_q_jump_warning_only:left"
+
+
+def test_final_qpos_pair_collision_check_is_read_only_and_fail_closed() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    initial_q = solver.current_q.copy()
+
+    safe = retargeter.check_qpos_pair_collision(
+        left_qpos=np.zeros(6),
+        right_qpos=np.zeros(6),
+    )
+    assert safe.safe
+    assert safe.collision_pair_count == len(retargeter.profile.collision_pairs)
+    assert safe.min_distance_m == 0.25
+    np.testing.assert_allclose(solver.current_q, initial_q)
+
+    solver.min_collision_distance = -0.01
+    unsafe = retargeter.check_qpos_pair_collision(
+        left_qpos=np.zeros(6),
+        right_qpos=np.zeros(6),
+    )
+    assert not unsafe.safe
+    assert unsafe.reason == "collision_margin_low"
+    np.testing.assert_allclose(solver.current_q, initial_q)

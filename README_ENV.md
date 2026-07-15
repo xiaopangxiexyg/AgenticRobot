@@ -1,101 +1,226 @@
-# DexTeleop 真机与 real2sim 环境安装指南
+# DexTeleop 环境与复现指南
 
-本文用于安装 `teleop_runtime` 真机采集、遥操作、部署和 real2sim 检查环境。默认真机环境名为
-`dexteleop310`。除特别说明外，所有命令都在仓库根目录执行。
+本文是环境安装、更新和验收的唯一入口。项目主环境统一使用 Python 3.10 conda 环境
+`dexteleop310`；`core`、`test`、`dataset`、`sim`、`openpi`、`hardware` 是同一个环境内的
+依赖分组，不是六个 conda 环境。
 
-## 1. 创建环境
+## 1. 环境边界与唯一来源
+
+| 环境 | 用途 | 是否属于主环境 |
+| --- | --- | --- |
+| `dexteleop310` / Python 3.10 | 项目代码、测试、数据集、MuJoCo/SAPIEN、OpenPI client、真机硬件 | 是 |
+| `isaacgym38` / Python 3.8 | Isaac Gym Preview 4 real2sim 检查 | 否，因上游 Python 限制独立 |
+| OpenPI server / GPU | 模型加载和 JAX/CUDA 推理服务 | 否，使用 OpenPI 自己的 `uv` 环境 |
+
+项目环境的机器可读来源如下：
+
+- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和六个 PyPI extras；
+- [`environment.yml`](./environment.yml)：conda 基础层，包括 Python、NumPy、SciPy 和 Pinocchio；
+- [`uv.lock`](./uv.lock)：六个 extras 的 PyPI 版本与 hash 锁定结果；
+- [`scripts/install_conda_env.sh`](./scripts/install_conda_env.sh)：创建、更新和验收完整环境的入口。
+
+Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的可移植范围；它们的边界和安装方式
+在本文后面或对应模块文档中单独说明。
+
+## 2. 创建、更新与重建主环境
+
+前置条件：
+
+- Linux，且 `conda` 已安装并可执行；
+- 完整真机环境需要 DM-Tac SDK，默认路径为
+  `assets/DM_Tac_SDK_Publish_1.2.10`；没有 SDK 时可使用 `--skip-vendor-sdk`；
+- 以下命令从仓库根目录执行。
+
+首次创建完整环境：
 
 ```bash
-conda create -n dexteleop310 python=3.10 -y
+cd /home/zc/HandMotion/Developing/DexTeleop
+export REPO="$PWD"
+bash scripts/install_conda_env.sh
 conda activate dexteleop310
-
-cd <DexTeleop仓库根目录>
-export REPO="$(pwd)"
-export PYTHONPATH="$REPO:${PYTHONPATH:-}"
-export DEXTELEOP_CONSTRAINTS="$REPO/.cache/dexteleop_constraints.txt"
 ```
 
+如果 SDK 位于仓库外：
+
+```bash
+DEXTELEOP_DMTAC_SDK_ROOT=/path/to/DM_Tac_SDK_Publish_1.2.10 \
+  bash scripts/install_conda_env.sh
+```
+
+没有 DM-Tac SDK 时，只安装软件、仿真和测试栈：
+
+```bash
+bash scripts/install_conda_env.sh --skip-vendor-sdk
+```
+
+环境规格发生增删或版本变更时，先修改 `pyproject.toml` / `environment.yml`，再重新生成锁文件并更新
+环境：
 
 ```bash
 conda activate dexteleop310
-conda config --env --set channel_priority strict
-conda install -c conda-forge -y \
-  "numpy=1.26.4" \
-  "scipy=1.13.1" \
-  "pinocchio=3.7.0"
-
-mkdir -p "$REPO/.cache"
-cat > "$DEXTELEOP_CONSTRAINTS" <<'EOF'
-numpy==1.26.4
-scipy==1.13.1
-EOF
+uv lock --python 3.10
+bash scripts/install_conda_env.sh --update
 ```
 
-不要安装 pip 包 `pin`。本项目使用 conda-forge 的 `pinocchio`。
-
-## 2. 安装基础依赖
+`--update` 会按新的 `environment.yml` 更新并清理 conda 包，再按新的 `uv.lock` 安装 PyPI 包；它不会
+自动卸载环境中曾经手工安装、但已不在锁文件中的 PyPI 包。若需要彻底清除这类残留，建议删除并重建环境：
 
 ```bash
-python -m pip install --no-cache-dir \
-  -c "$DEXTELEOP_CONSTRAINTS" \
-  "sapien==3.0.3" \
-  "transforms3d==0.4.1" \
-  "pymodbus==2.5.3" \
-  opencv-python \
-  pyserial \
-  pyarrow \
-  Pillow \
-  pyrealsense2 \
-  pandas \
-  pytest \
-  pyarrow \
-  scipy \
-  pyyaml \
-  websockets \
-  msgpack
-python -m pip install --no-cache-dir \
-  -c "$DEXTELEOP_CONSTRAINTS" \
-  "qpsolvers==4.11.0" \
-  osqp \
-  loop-rate-limiters \
-  typing-extensions
+conda deactivate
+conda env remove --name dexteleop310
+bash scripts/install_conda_env.sh
+```
 
-python -m pip install --no-cache-dir \
-  -c "$DEXTELEOP_CONSTRAINTS" \
-  --no-deps \
-  "pin-pink==4.2.0"
+已有同名环境不会被覆盖；也可以通过 `--env-name NAME`、`--sdk-root PATH` 覆盖默认环境名或 SDK 路径。
+安装脚本会依次完成：
 
+1. 创建 Python 3.10、NumPy、SciPy、conda-forge Pinocchio 基础环境；
+2. 使用 `uv.lock` 的 hash 锁定结果安装全部六个 PyPI 依赖分组；
+3. 以 editable 方式安装本仓库；
+4. 以 `--no-deps` 安装 `pin-pink==4.2.0`，避免错误拉取 pip 包 `pin`；
+5. 以 editable 方式安装本地 `dmrobotics==1.2.10` SDK（除非使用 `--skip-vendor-sdk`）；
+6. 执行核心、仿真、数据集和硬件模块导入检查。
+
+## 3. 依赖分组与特殊包
+
+| 分组 | 内容 | 主环境中是否安装 |
+| --- | --- | --- |
+| `core` | NumPy、SciPy、Pink/QP 求解和控制循环工具（`pin-pink` 由脚本特殊安装） | 是 |
+| `test` | pytest | 是 |
+| `dataset` | Pandas、PyArrow、Pillow | 是 |
+| `sim` | MuJoCo、Gymnasium、SAPIEN | 是 |
+| `openpi` | DexTeleop OpenPI websocket/msgpack client | 是 |
+| `hardware` | RealSense、串口、Modbus、USB、DM-Tac SDK 运行库 | 是 |
+
+extras 也可以在已有 Python 3.10 环境中按需安装，例如：
+
+```bash
+python -m pip install -e '.[core,test]'
+python -m pip install -e '.[core,dataset]'
+```
+
+按需安装只适合临时减少 PyPI 依赖；它不会安装 conda-only 的 `pinocchio`、特殊处理的 `pin-pink` 或
+本地厂商 SDK。正式复现和真机部署应使用本章的安装脚本，确保所有组件进入同一个 `dexteleop310`。
+
+不要安装 pip 包 `pin`。`pip check` 可能报告 `pin-pink requires pin`，这是 `pin-pink` 上游 metadata
+与 conda-forge Pinocchio 命名不一致造成的已知例外；安装脚本已经刻意使用 `--no-deps`。
+
+这里的 `openpi` 分组只指 DexTeleop 的 OpenPI client；真正加载模型的 OpenPI server 仍按其 GPU/JAX
+版本在独立的 OpenPI `uv` 环境运行。详细的 server/client 启动流程见
+[`deployments/openpi/README.md`](./deployments/openpi/README.md)。
+
+## 4. 主环境验证
+
+激活环境后，从仓库根目录执行基本 smoke test：
+
+```bash
 conda activate dexteleop310
-cd "$REPO"
+cd /home/zc/HandMotion/Developing/DexTeleop
 
-export DMTAC_SDK_ROOT="$REPO/assets/DM_Tac_SDK_Publish_1.2.10"
-cd "$DMTAC_SDK_ROOT"
-python -m pip install -e .
+PYTHONNOUSERSITE=1 python - <<'PY'
+import importlib.metadata as metadata
+import importlib.util
+import sys
 
-cd "$REPO/hardware/DMTAC_gripper"
-python -m pip install --no-cache-dir \
-  -c "$DEXTELEOP_CONSTRAINTS" \
-  -r requirements.txt
+assert sys.version_info[:2] == (3, 10), sys.version
+for name in ("numpy", "scipy", "pinocchio", "pink", "qpsolvers", "mujoco", "gymnasium", "pyarrow"):
+    assert importlib.util.find_spec(name) is not None, name
+
+for distribution in ("dexteleop", "pin-pink", "mujoco", "pyarrow"):
+    print(distribution, metadata.version(distribution))
+print("DexTeleop environment imports ok")
+PY
 ```
 
-`pip check` 可能提示 `pin-pink requires pin`，这是预期的 metadata 提示。不要为了消除它安装 pip 包 `pin`。
-
-VIVE 发送端才需要：
+检查关键包没有从 `~/.local` user-site 加载：
 
 ```bash
-python -m pip install --no-cache-dir \
-  -c "$DEXTELEOP_CONSTRAINTS" \
-  triad-openvr
+PYTHONNOUSERSITE=1 python - <<'PY'
+import importlib.util
+
+for name in ("numpy", "pandas", "pyarrow", "pinocchio", "hppfcl", "pytest"):
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        raise RuntimeError(f"missing package: {name}")
+    print(name, spec.origin)
+PY
 ```
 
-
-运行遥操作时，DMTAC gripper 默认只连接夹爪，不读取触觉相机。需要触觉数据或触觉可视化时再显式加：
+项目测试统一关闭 user-site 和外部 pytest 插件：
 
 ```bash
---dmtac-with-tactile
+# 修改后最快的默认回归层：纯进程内单元测试。
+PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -m pytest -m 'unit and not optional' -q
+
+# 不含可选软件栈的完整回归。
+PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -m pytest -m 'not optional' -q
+
+# 完整环境中的全部测试。
+PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -m pytest -q
 ```
 
-## 3. 安装 Isaac Gym 环境
+测试按 `unit`、`contract`、`integration`、`optional` 和 `hardware` marker 分层；mocked 硬件行为仍
+属于 `unit`/`integration`，`hardware` 仅留给未来必须连接真实设备的测试。`pyarrow` 是正式 parquet
+数据写盘和 integration 测试的依赖，完整环境会安装它。
+
+基础数值栈和双臂 IK：
+
+```bash
+PYTHONNOUSERSITE=1 python - <<'PY'
+import importlib.metadata as metadata
+import numpy as np
+import scipy
+import pinocchio as pin
+import qpsolvers
+import pink
+
+assert np.__version__ == "1.26.4", np.__version__
+assert scipy.__version__ == "1.13.1", scipy.__version__
+assert "osqp" in qpsolvers.available_solvers, qpsolvers.available_solvers
+try:
+    metadata.version("pin")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise RuntimeError("Remove pip package 'pin'. Use conda-forge pinocchio only.")
+
+print("numpy", np.__version__)
+print("scipy", scipy.__version__)
+print("pinocchio", pin.__version__)
+print("pink/qpsolvers", "ok")
+PY
+```
+
+项目和硬件 backend smoke test：
+
+```bash
+PYTHONNOUSERSITE=1 python - <<'PY'
+from hardware.rm65.robotic_arm_package.robotic_arm import RM65, dllPath
+from teleop_runtime.backends.arms import RM65ArmBackend, RM65ImpedanceArmBackend
+from teleop_runtime.backends.grippers import DMTacGripperBackend
+from teleop_runtime.backends.hands import InspireTacHandBackend
+
+print("RM65 SDK", RM65, dllPath)
+print("teleop_runtime imports ok")
+PY
+```
+
+DM-Tac 和 RealSense 只做导入/帮助检查，不会连接设备：
+
+```bash
+PYTHONNOUSERSITE=1 python - <<'PY'
+import pyrealsense2 as rs
+print("pyrealsense2", getattr(rs, "__version__", "unknown"))
+PY
+
+cd /home/zc/HandMotion/Developing/DexTeleop/hardware/DMTAC_gripper
+python run_gripper.py --help
+```
+
+## 5. 安装 Isaac Gym 环境
 
 Isaac Gym Preview 4 用于后续 real2sim 和相机位姿检查。不要安装到 `dexteleop310`：包内
 `setup.py` 声明只支持 Python `>=3.6,<3.9`，而 `dexteleop310` 是 Python 3.10。建议单独创建
@@ -196,7 +321,7 @@ conda activate rlgpu
 后续 real2sim 相机检查优先使用这里生成的双臂 URDF：
 
 ```bash
-export DEXTELEOP_REAL2SIM_URDF="$REPO/assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf"
+export DEXTELEOP_REAL2SIM_URDF="/home/zc/HandMotion/Developing/DexTeleop/assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf"
 ```
 
 该 URDF 是自包含相对 mesh 路径，已包含：
@@ -206,27 +331,21 @@ export DEXTELEOP_REAL2SIM_URDF="$REPO/assets/rm65_inspire_gripper_v1/rm65_dual_a
 - 左右 `arm_link6` 末端挂载的法兰、D405、`left_camera_rgb` / `right_camera_rgb`
 - 左右 gripper 几何
 
-## 4. 安装 MuJoCo 环境
+## 6. MuJoCo / SAPIEN 验证
 
-MuJoCo 用于更轻量的相机、几何和坐标系检查。官方 Python binding 发布为 `mujoco` 包，包内已经包含
-MuJoCo library，不需要单独下载 MuJoCo 二进制。它可以直接安装到 `dexteleop310`，方便复用项目代码和
-URDF 资产。
+MuJoCo 和 SAPIEN 已由完整主环境安装。官方 Python binding 包内已经包含 MuJoCo library，不需要另行
+下载 MuJoCo 二进制，也不要在主环境中再执行一套不受项目元数据约束的 `pip install`。
 
 ```bash
 conda activate dexteleop310
-cd "$REPO"
-
-python -m pip install --no-cache-dir \
-  -c "$DEXTELEOP_CONSTRAINTS" \
-  mujoco
-```
-
-验证 MuJoCo Python package：
-
-```bash
 python - <<'PY'
+import gymnasium
 import mujoco
+import sapien
+
+print("gymnasium", gymnasium.__version__)
 print("mujoco", mujoco.__version__)
+print("sapien", sapien.__version__)
 PY
 ```
 
@@ -236,10 +355,31 @@ PY
 python -m mujoco.viewer
 ```
 
+### 6.1 MuJoCo Gymnasium API
+
+`sim.mujoco.tasks.cube_lift.CubeLiftEnv` 使用 MuJoCo 作为物理后端、使用
+Gymnasium 的标准 `reset/step` API 和 `Box` spaces。它目前不依赖 PyTorch、Stable-Baselines3
+或任何训练框架；MuJoCo 和 Gymnasium 已随完整主环境安装，训练框架仍保持在环境之外。
+
+```bash
+cd /home/zc/HandMotion/Developing/DexTeleop
+PYTHONPATH=. python - <<'PY'
+import gymnasium
+import mujoco
+
+print("gymnasium", gymnasium.__version__)
+print("mujoco", mujoco.__version__)
+PY
+```
+
+后续确实要在本机运行 PPO/SAC 等训练时，再根据该机器的 CUDA/PyTorch 版本单独选择训练框架；
+不要无条件把 `torch` 或 `stable-baselines3` 加入 DexTeleop 主环境。训练框架不是
+`CubeLiftEnv` 的运行时依赖。
+
 后续 real2sim 相机检查仍然优先使用同一个双臂 URDF：
 
 ```bash
-export DEXTELEOP_REAL2SIM_URDF="$REPO/assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf"
+export DEXTELEOP_REAL2SIM_URDF="/home/zc/HandMotion/Developing/DexTeleop/assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf"
 ```
 
 先做最小加载检查：
@@ -265,103 +405,10 @@ PY
 如果该 URDF 不能被 MuJoCo 直接编译，下一步应保留 URDF 作为真实装配基准，再生成一个 MJCF wrapper 或转换后的
 MJCF 用于 MuJoCo 检查，避免为了仿真破坏原始坐标定义。
 
-参考：[MuJoCo 官方 Python 文档](https://mujoco.readthedocs.io/en/stable/python.html)推荐通过
-`pip install mujoco` 安装，并说明 package 内置 MuJoCo library。
+参考：[MuJoCo 官方 Python 文档](https://mujoco.readthedocs.io/en/stable/python.html)。本项目已在
+`pyproject.toml` 的 `sim` 分组中固定 MuJoCo 版本。
 
-## 5. 验证安装
-
-基础数值栈：
-
-```bash
-python - <<'PY'
-import importlib.metadata as metadata
-import numpy as np
-import scipy
-import pinocchio as pin
-
-assert np.__version__ == "1.26.4", np.__version__
-assert scipy.__version__ == "1.13.1", scipy.__version__
-try:
-    metadata.version("pin")
-except metadata.PackageNotFoundError:
-    pass
-else:
-    raise RuntimeError("Remove pip package 'pin'. Use conda-forge pinocchio only.")
-
-print("numpy", np.__version__)
-print("scipy", scipy.__version__)
-print("pinocchio", pin.__version__)
-PY
-```
-
-项目和硬件 backend：
-
-```bash
-python - <<'PY'
-from hardware.rm65.robotic_arm_package.robotic_arm import RM65, dllPath
-from teleop_runtime.backends.arms import RM65ArmBackend, RM65ImpedanceArmBackend
-from teleop_runtime.backends.grippers import DMTacGripperBackend
-from teleop_runtime.backends.hands import InspireTacHandBackend
-
-print("RM65 SDK", RM65, dllPath)
-print("teleop_runtime imports ok")
-PY
-```
-
-双臂防碰撞 IK：
-
-```bash
-python - <<'PY'
-import pink
-import qpsolvers
-from teleop_runtime.retargeters.dual_arm_collision_aware import (
-    DualArmCollisionAwareRetargeter,
-    DualArmCollisionAwareRetargeterConfig,
-)
-
-assert "osqp" in qpsolvers.available_solvers, qpsolvers.available_solvers
-retargeter = DualArmCollisionAwareRetargeter(
-    DualArmCollisionAwareRetargeterConfig(scene_profile="dual_arm_hand_proxy_open")
-)
-print("dual-arm IK ok", retargeter.profile.name, len(retargeter.profile.collision_pairs))
-PY
-```
-
-DM-Tac 夹爪：
-
-```bash
-cd "$REPO/hardware/DMTAC_gripper"
-python run_gripper.py --help
-```
-
-RealSense：
-
-```bash
-python - <<'PY'
-import pyrealsense2 as rs
-print("pyrealsense2", getattr(rs, "__version__", "unknown"))
-PY
-```
-
-Isaac Gym real2sim 环境：
-
-```bash
-conda activate isaacgym38
-cd "$ISAACGYM_ROOT/python/examples"
-python joint_monkey.py
-```
-
-MuJoCo real2sim 环境：
-
-```bash
-conda activate dexteleop310
-python - <<'PY'
-import mujoco
-print("mujoco", mujoco.__version__)
-PY
-```
-
-## 6. 设备权限
+## 7. 设备权限
 
 运行 GUI 遥操作前先检查 USB、相机、串口和配置：
 
@@ -389,45 +436,17 @@ sudo -E "$CONDA_PREFIX/bin/python" \
 
 长期建议安装 udev rules，或把当前用户加入 `dialout`、`video` 后重新登录并重新插拔设备。
 
-## 7. 常用运行方式
+## 8. 运行文档索引
 
-双臂 RM65 + VIVE + DMTAC gripper：
+本文只负责环境，不重复维护真机命令和设备配置。环境准备完成后，按用途阅读：
 
-```bash
-export LEFT_ARM_IP=192.168.101.21
-export RIGHT_ARM_IP=192.168.1.20
+- [根目录运行流程](./README.md)：VIVE、SAPIEN、真机 teleop、数据采集和回放；
+- [`teleop_runtime/README.md`](./teleop_runtime/README.md)：teleop runtime、标定和 dry-run；
+- [`hardware/DMTAC_gripper/README.md`](./hardware/DMTAC_gripper/README.md)：DM-Tac USB 配置、触觉和夹爪调试；
+- [`sim/mujoco/README.md`](./sim/mujoco/README.md)：MuJoCo real2sim、任务和数据回放；
+- [`deployments/openpi/README.md`](./deployments/openpi/README.md)：OpenPI server/client、预检和部署。
 
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  --active-sides both \
-  --left-arm-ip "$LEFT_ARM_IP" \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json \
-  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
-  --load-profile teleop_records/calibration_profiles/20260627_190203_vive_rm65_virtual_desk.json \
-  --gui \
-  --hand-backend dmtac-gripper \
-  --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
-```
-
-如果要同时读取 DM-Tac 触觉：
-
-```bash
-  --dmtac-with-tactile
-```
-
-只做无相机调试：
-
-```bash
-  --no-camera
-```
-
-跳过 GUI 设备预检：
-
-```bash
-  --no-device-preflight
-```
-
-## 8. 故障速查
+## 9. 故障速查
 
 - `ModuleNotFoundError: pinocchio`：确认已用 conda 安装 `pinocchio=3.7.0`。
 - `cmeel-boost requires numpy>=2`：环境被 pip `pin` 污染，建议重建环境。
@@ -436,7 +455,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 - Isaac Gym import 失败：确认在 `isaacgym38` 或 `rlgpu` 环境中，且 Python 版本是 3.6/3.7/3.8。
 - Isaac Gym viewer 黑屏或无法创建设备：先检查 `nvidia-smi`，再尝试设置 `VK_ICD_FILENAMES=<path-to-nvidia_icd.json>`。
 - Isaac Gym 报 `libpython3.x` 或 `libstdc++`：优先设置 `LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"`，再重新运行 smoke test。
-- MuJoCo import 失败：确认在 `dexteleop310` 环境中，并重新执行 `python -m pip install mujoco`。
+- MuJoCo import 失败：确认已激活 `dexteleop310`，然后重新执行 `bash scripts/install_conda_env.sh --update`。
 - MuJoCo viewer 无法打开：先确认当前会话有桌面显示权限；远程或无显示环境下优先做 import 和模型加载检查。
 - MuJoCo 直接加载 URDF 失败：保留 URDF 作为装配真值，单独生成 MJCF 检查文件，不要在 URDF 里混入 MuJoCo 专用 workaround。
 - 串口不可读写：先运行 `configure_devices --fix-permissions`。

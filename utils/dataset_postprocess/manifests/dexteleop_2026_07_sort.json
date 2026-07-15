@@ -1,0 +1,142 @@
+{
+  "schema": "dexteleop.dataset_organization_manifest.v1",
+  "min_duration_sec": 2.0,
+  "datasets": [
+    {
+      "name": "bimanual-cube-old-success",
+      "output_root": "../../../datasets/sorted/cube/old/success",
+      "task": {
+        "id": "bimanual_cube_grasp",
+        "description": "Bimanual cube grasping demonstrations collected before 2026-07-07."
+      },
+      "labels": {
+        "task": "cube",
+        "era": "old (2026-07-06 and earlier)",
+        "quality": "success"
+      },
+      "notes": [
+        "旧数据的 front 主视角角度不正确；不应把该视角与新数据的 front 视角混为同一相机外参。",
+        "旧数据可能存在 depth 或触觉流缺失、格式不一致或语义不完整。构建仅验证元数据声明的 artifact 存在，不将其自动修复为新格式。",
+        "训练或评估若依赖 front、depth 或 tactile，须依据任务需求进一步逐 episode 审核。"
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/2026-07-05_vive_rm65_real_teleop_old_cube",
+          "episode_indices": "all"
+        }
+      ]
+    },
+    {
+      "name": "bimanual-cube-old-failure-case",
+      "output_root": "../../../datasets/sorted/cube/old/failure_case",
+      "task": {
+        "id": "bimanual_cube_grasp",
+        "description": "Bimanual cube grasping failure and collision cases collected before 2026-07-07."
+      },
+      "labels": {
+        "task": "cube",
+        "era": "old (2026-07-06 and earlier)",
+        "quality": "failure_case"
+      },
+      "notes": [
+        "全部 episode 均为用户标注的碰撞/失败案例，不得与 success 数据混用。",
+        "原始文件的 hand_action_specs 误标为 InspireTac；实际为 DM-Tac 采集。所有机器人手部六维向量已按旧 slot 1 到规范 slot 0 的规则迁移，完整映射记录在 provenance 与迁移元数据中。",
+        "旧数据的 front 主视角角度不正确；depth 或触觉流也可能存在格式或完整性问题。"
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/2026-07-05_vive_rm65_real_teleop_old_cube_collision",
+          "episode_indices": "all",
+          "transforms": [
+            "dmtac_slot1_to_slot0"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "bimanual-soft-object-old-success",
+      "output_root": "../../../datasets/sorted/soft_object/old/success",
+      "task": {
+        "id": "bimanual_soft_object_grasp",
+        "description": "Bimanual soft-object grasping demonstrations collected before 2026-07-07."
+      },
+      "labels": {
+        "task": "soft_object",
+        "era": "old (2026-07-06 and earlier)",
+        "quality": "success"
+      },
+      "notes": [
+        "这是唯一的双软物体抓取来源；其余本批非空数据均归为方块任务。",
+        "旧数据的 front 主视角角度不正确；不应把该视角与新数据的 front 视角混为同一相机外参。",
+        "旧数据可能存在 depth 或触觉流缺失、格式不一致或语义不完整。构建仅验证元数据声明的 artifact 存在，不将其自动修复为新格式。"
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/2026-07-06_vive_rm65_real_teleop_old_soft_object",
+          "episode_indices": "all"
+        }
+      ]
+    },
+    {
+      "name": "bimanual-cube-new-success",
+      "output_root": "../../../datasets/sorted/cube/new/success",
+      "task": {
+        "id": "bimanual_cube_grasp",
+        "description": "Bimanual cube grasping demonstrations collected on or after 2026-07-07."
+      },
+      "labels": {
+        "task": "cube",
+        "era": "new (2026-07-07 and later)",
+        "quality": "success"
+      },
+      "notes": [
+        "已排除用户标注为 failure_case 的 episode；对应失败样本另存于 ../failure_case。",
+        "来源按采集日期和原始 episode_index 的稳定顺序合并；输出编号重新连续编号。"
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/2026-07-08_vive_rm65_real_teleop",
+          "episode_indices": "all",
+          "exclude_episode_indices": [6, 8, 10, 16, 57, 101]
+        },
+        {
+          "dataset_root": "../../../datasets/2026-07-08_vive_rm65_real_teleop_part2",
+          "episode_indices": "all",
+          "exclude_episode_indices": [52, 124, 159]
+        },
+        {
+          "dataset_root": "../../../datasets/2026-07-09_vive_rm65_real_teleop_cube",
+          "episode_indices": "all"
+        }
+      ]
+    },
+    {
+      "name": "bimanual-cube-new-failure-case",
+      "output_root": "../../../datasets/sorted/cube/new/failure_case",
+      "task": {
+        "id": "bimanual_cube_grasp",
+        "description": "Bimanual cube grasping failure cases collected on or after 2026-07-07."
+      },
+      "labels": {
+        "task": "cube",
+        "era": "new (2026-07-07 and later)",
+        "quality": "failure_case"
+      },
+      "notes": [
+        "全部 episode 均为用户显式标注的失败、碰撞或任务未完成案例，不得与 success 数据混用。",
+        "所列编号是原始 meta/episodes.jsonl 中的 episode_index，不是目录排序后的第 N 个文件。"
+      ],
+      "sources": [
+        {
+          "dataset_root": "../../../datasets/2026-07-08_vive_rm65_real_teleop",
+          "episode_indices": [6, 8, 10, 16, 57, 101]
+        },
+        {
+          "dataset_root": "../../../datasets/2026-07-08_vive_rm65_real_teleop_part2",
+          "episode_indices": [52, 124, 159]
+        }
+      ]
+    }
+  ]
+}
+

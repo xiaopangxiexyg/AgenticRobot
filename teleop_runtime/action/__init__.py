@@ -1,3 +1,9 @@
+"""Legacy teleop action namespace.
+
+Common action contracts live in robot_motion.action. This package keeps
+teleop-specific adapters/replay helpers plus compatibility exports.
+"""
+
 from .adapters import (
     TeleopCommandActionAdapterConfig,
     matrix_to_xyzquat,
@@ -8,6 +14,8 @@ from .codec import (
     EE_POSE_HAND16_VECTOR_DIM,
     QPOS_VECTOR_DIM,
     QPOS_HAND16_VECTOR_DIM,
+    ROBOT_ACTION_VECTOR_HAND16_LAYOUT_VERSION,
+    ROBOT_ACTION_VECTOR_LAYOUT_VERSION,
     ActionVectorEncoding,
     decode_robot_action,
     encode_robot_action,
@@ -44,6 +52,7 @@ from .schema import (
     INSPIRE_HAND_DOF,
     ActionExecutionResult,
     ActionRecord,
+    EndEffectorTarget,
     RobotAction,
     default_arm_controlled_frame,
     default_arm_frame,
@@ -74,6 +83,7 @@ __all__ = [
     "BIMANUAL_QPOS_V1",
     "CallableActionSource",
     "EE_POSE_VECTOR_DIM",
+    "EndEffectorTarget",
     "EE_POSE_HAND16_VECTOR_DIM",
     "HAND16_SLOT_DOF",
     "DEFAULT_HAND_SLOT_SEMANTICS",
@@ -82,6 +92,8 @@ __all__ = [
     "NullCommandDispatcher",
     "QPOS_VECTOR_DIM",
     "QPOS_HAND16_VECTOR_DIM",
+    "ROBOT_ACTION_VECTOR_HAND16_LAYOUT_VERSION",
+    "ROBOT_ACTION_VECTOR_LAYOUT_VERSION",
     "RigCommandDispatcher",
     "RobotAction",
     "RobotActionResolver",

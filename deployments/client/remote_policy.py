@@ -33,16 +33,35 @@ ObservationAdapter = Callable[[Any], dict[str, Any]]
 class RemotePolicyConfig:
     action_key: str = DEFAULT_ACTION_KEY
     action_dim: int = 26
+    action_discrete_key: str | None = None
+    action_discrete_dim: int = 0
     contract: DeployPolicyContract = field(default_factory=DeployPolicyContract)
     source: str = "remote_model_policy"
 
     def __post_init__(self) -> None:
         action_key = str(self.action_key or DEFAULT_ACTION_KEY)
         action_dim = int(self.action_dim)
+        action_discrete_dim = int(self.action_discrete_dim)
+        if action_discrete_dim < 0:
+            raise ValueError("action_discrete_dim must be non-negative.")
+        action_discrete_key = None if self.action_discrete_key is None else str(self.action_discrete_key).strip()
+        if action_discrete_dim and not action_discrete_key:
+            raise ValueError("action_discrete_key is required when action_discrete_dim is non-zero.")
+        expected_discrete_dim = (
+            action_discrete_dim
+            if action_discrete_dim > 0 or self.contract.action_discrete_dim is not None
+            else None
+        )
         object.__setattr__(self, "action_key", action_key)
         object.__setattr__(self, "action_dim", action_dim)
+        object.__setattr__(self, "action_discrete_dim", action_discrete_dim)
+        object.__setattr__(self, "action_discrete_key", action_discrete_key or None)
         object.__setattr__(self, "source", str(self.source or "remote_model_policy"))
-        if self.contract.action_key != action_key or self.contract.action_dim != action_dim:
+        if (
+            self.contract.action_key != action_key
+            or self.contract.action_dim != action_dim
+            or self.contract.action_discrete_dim != expected_discrete_dim
+        ):
             object.__setattr__(
                 self,
                 "contract",
@@ -51,8 +70,14 @@ class RemotePolicyConfig:
                     deploy_schema_version=self.contract.deploy_schema_version,
                     model_id=self.contract.model_id,
                     checkpoint_step=self.contract.checkpoint_step,
+                    state_key=self.contract.state_key,
+                    state_dim=self.contract.state_dim,
+                    state_discrete_key=self.contract.state_discrete_key,
+                    state_discrete_dim=self.contract.state_discrete_dim,
                     action_key=action_key,
                     action_dim=action_dim,
+                    action_discrete_dim=expected_discrete_dim,
+                    policy_io_layout_hash=self.contract.policy_io_layout_hash,
                     min_action_horizon=self.contract.min_action_horizon,
                     active_sides=self.contract.active_sides,
                     require_active_sides_match=self.contract.require_active_sides_match,
@@ -110,14 +135,42 @@ class RemoteModelPolicy:
             raise ValueError(
                 f"Remote action dim mismatch: expected {self.config.action_dim}, got {actions.shape[1]}."
             )
+        discrete_actions = None
+        if self.config.action_discrete_dim:
+            assert self.config.action_discrete_key is not None
+            if self.config.action_discrete_key not in response:
+                raise ValueError(
+                    "Remote response missing discrete action key "
+                    f"{self.config.action_discrete_key!r}; "
+                    f"available keys={sorted(str(key) for key in response)}."
+                )
+            discrete_actions = np.asarray(response[self.config.action_discrete_key])
+            if discrete_actions.ndim == 1:
+                discrete_actions = discrete_actions.reshape(1, -1)
+            if discrete_actions.ndim != 2:
+                raise ValueError(
+                    "Remote discrete actions must be 2D [horizon, token_dim], "
+                    f"got shape {discrete_actions.shape}."
+                )
+            if discrete_actions.shape != (
+                actions.shape[0],
+                int(self.config.action_discrete_dim),
+            ):
+                raise ValueError(
+                    "Remote discrete action shape mismatch: expected "
+                    f"({actions.shape[0]}, {int(self.config.action_discrete_dim)}), "
+                    f"got {discrete_actions.shape}."
+                )
         return UnifiedActionChunk(
             actions=actions,
+            discrete_actions=discrete_actions,
             metadata=_action_metadata(
                 source=self.config.source,
                 response=response,
                 server_metadata=self.server_metadata,
                 validation=self.validation,
                 action_key=self.config.action_key,
+                action_discrete_key=self.config.action_discrete_key,
             ),
         )
 
@@ -132,6 +185,7 @@ def _action_metadata(
     server_metadata: Mapping[str, Any],
     validation: MetadataValidationResult,
     action_key: str,
+    action_discrete_key: str | None,
 ) -> dict[str, Any]:
     timing = {}
     for key in ("server_timing", "policy_timing"):
@@ -142,6 +196,7 @@ def _action_metadata(
         "source": str(source),
         "remote_policy": {
             "action_key": str(action_key),
+            "action_discrete_key": action_discrete_key,
             "server": dict(server_metadata),
             "server_summary": dict(validation.server_summary),
             "validation_warnings": list(validation.warnings),
@@ -149,4 +204,3 @@ def _action_metadata(
             **timing,
         },
     }
-

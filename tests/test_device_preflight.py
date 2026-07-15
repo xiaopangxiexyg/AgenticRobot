@@ -673,9 +673,12 @@ class DevicePreflightTests(unittest.TestCase):
         with patch.object(sys, "argv", argv):
             args = real_teleop.parse_args()
 
-        self.assertAlmostEqual(args.minimum_control_hz, 13.5)
+        # Impedance outer control runs independently from the 15 Hz sample
+        # cadence, so the automatic watchdog threshold reaches its 15 Hz cap.
+        self.assertAlmostEqual(args.minimum_control_hz, 15.0)
         self.assertTrue(args.minimum_control_hz_auto)
-        self.assertAlmostEqual(args.arm_step_dt_max_scale, 50.0 / 15.0 * 1.1)
+        # The computed 50/30 margin is below the configured safety floor.
+        self.assertAlmostEqual(args.arm_step_dt_max_scale, 3.0)
         self.assertTrue(args.arm_step_dt_max_scale_auto)
         self.assertAlmostEqual(args.dual_arm_temp_max_xyz_step_m, 0.03)
         self.assertAlmostEqual(args.dual_arm_temp_max_rot_step_deg, 8.0)
@@ -743,7 +746,8 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertEqual(args.right_hand_port, "/dev/q6-right")
         self.assertIsNone(args.dmtac_tactile)
         self.assertEqual(len(seen_options), 1)
-        self.assertTrue(seen_options[0].require_q6)
+        self.assertEqual(args.gripper_input_source, "angle_trigger")
+        self.assertFalse(seen_options[0].require_q6)
         self.assertTrue(seen_options[0].require_dmtac_gripper)
         self.assertFalse(seen_options[0].require_dmtac_tactile)
         self.assertTrue(seen_options[0].probe_all_serial)

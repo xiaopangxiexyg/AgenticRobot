@@ -131,7 +131,11 @@ class RM65SDKIKProvider:
             and len(candidates) < max_count
             and not _deadline_exceeded(deadline)
         ):
-            self._append_wrist_flip_candidates(candidates, max_count=max_count)
+            self._append_wrist_flip_candidates(
+                candidates,
+                max_count=max_count,
+                deadline=deadline,
+            )
 
         return candidates[:max_count]
 
@@ -251,7 +255,13 @@ class RM65SDKIKProvider:
                 ),
             )
 
-    def _append_wrist_flip_candidates(self, candidates: list[IKCandidate], *, max_count: int) -> None:
+    def _append_wrist_flip_candidates(
+        self,
+        candidates: list[IKCandidate],
+        *,
+        max_count: int,
+        deadline: float | None,
+    ) -> None:
         try:
             from rm65_inspire_tac.ik_tuning import generate_rm65_wrist_flip_candidates
         except Exception:  # noqa: BLE001 - optional branch expansion.
@@ -259,7 +269,7 @@ class RM65SDKIKProvider:
 
         base_candidates = list(candidates)
         for base in base_candidates:
-            if len(candidates) >= max_count:
+            if len(candidates) >= max_count or _deadline_exceeded(deadline):
                 return
             try:
                 alternatives = generate_rm65_wrist_flip_candidates(
@@ -270,7 +280,7 @@ class RM65SDKIKProvider:
             except Exception:  # noqa: BLE001 - optional branch expansion.
                 continue
             for alt_index, qpos in enumerate(alternatives):
-                if len(candidates) >= max_count:
+                if len(candidates) >= max_count or _deadline_exceeded(deadline):
                     return
                 if np.allclose(qpos, base.qpos, atol=1e-8):
                     continue

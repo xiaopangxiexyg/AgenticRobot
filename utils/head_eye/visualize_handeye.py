@@ -13,10 +13,11 @@ if __package__ in (None, ""):
     REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
+    __package__ = "utils.head_eye"
 
-from utils.handeye.calibration import load_result
-from utils.handeye.camera import RealSenseCamera, RealSenseConfig
-from utils.handeye.dual_arm import (
+from .calibration import load_result
+from .camera import RealSenseCamera, RealSenseConfig
+from .dual_arm import (
     DEFAULT_DUAL_ARM_URDF,
     derive_camera_to_arm_base,
     load_dual_arm_base_transforms,

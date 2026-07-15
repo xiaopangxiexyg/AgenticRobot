@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from robot_motion.pose import pose_delta_metrics
 
 from ...diagnostics import FaultEvent
 from ...schemas import EffectorCommand, TeleopCommand
@@ -21,6 +22,15 @@ INIT_ARM_FAULT_CODES = frozenset(
         "rotation_jump",
     }
 )
+
+# Display-only arrival criteria.  They intentionally match the collection
+# audit contract but never gate init-arm motion or home recapture.
+INIT_ARM_ARRIVAL_POSITION_TOLERANCE_M = 0.0015
+INIT_ARM_ARRIVAL_ROTATION_TOLERANCE_DEG = 0.25
+INIT_ARM_ARRIVAL_STILL_TRANSLATION_SPEED_M_S = 0.015
+INIT_ARM_ARRIVAL_STILL_ROTATION_SPEED_DEG_S = 2.5
+INIT_ARM_ARRIVAL_DWELL_SEC = 3.0
+INIT_ARM_ARRIVAL_MAX_SAMPLE_GAP_SEC = 0.5
 
 
 def normalize_init_arm_side(side: str) -> str:
@@ -116,6 +126,20 @@ class _RecalibrationState:
     timeout_sec: float = 0.0
     min_samples: int = 1
     samples: list[np.ndarray] = field(default_factory=list)
+
+
+@dataclass
+class _ArrivalState:
+    last_actual_pose_base: np.ndarray | None = None
+    last_timestamp: float | None = None
+    stable_since: float | None = None
+    status: str = "inactive"
+    reason: str = ""
+    position_error_m: float | None = None
+    rotation_error_deg: float | None = None
+    translation_speed_m_s: float | None = None
+    rotation_speed_deg_s: float | None = None
+    dwell_sec: float = 0.0
 
 
 def _parse_raw_side_target(
@@ -366,6 +390,7 @@ class InitArmCommandController:
         self._mode = "live"
         self._active_side = ""
         self._recalibration = _RecalibrationState()
+        self._arrival = _ArrivalState()
         self._status_message = "init-arm ready"
         self._use_dual_target_override = bool(use_dual_target_override)
 
@@ -452,6 +477,7 @@ class InitArmCommandController:
         self._active_side = side
         self._mode = "moving"
         self._recalibration = _RecalibrationState()
+        self._arrival = _ArrivalState(status="not_reached", reason="waiting_for_actual_feedback")
         self._status_message = f"{side} moving to init pose"
         return InitArmTransition(ok=True, message=self._status_message, side=side, mode=self._mode)
 
@@ -492,6 +518,7 @@ class InitArmCommandController:
         self._mode = "live"
         self._active_side = ""
         self._recalibration = _RecalibrationState()
+        self._arrival = _ArrivalState()
         self._status_message = message or f"{side} home recaptured; init-arm released"
         return InitArmTransition(ok=True, message=self._status_message, side=side, mode=self._mode)
 
@@ -502,6 +529,7 @@ class InitArmCommandController:
         self._mode = "live"
         self._active_side = ""
         self._recalibration = _RecalibrationState()
+        self._arrival = _ArrivalState()
         if was_active:
             suffix = f": {reason}" if reason else ""
             self._status_message = f"{side} init-arm stopped{suffix}"
@@ -526,6 +554,101 @@ class InitArmCommandController:
         if not self.active:
             return None
         return self.targets_by_side.get(self._active_side)
+
+    def observe_actual_feedback(
+        self,
+        actual_tcp_pose_base: Any | None,
+        *,
+        timestamp: float,
+        valid: bool,
+        invalid_reason: str = "",
+    ) -> None:
+        """Update display-only init arrival status from measured TCP feedback.
+
+        This method has no control authority: it never alters the active init
+        target, home recapture, or state transition.  It only exposes whether
+        the active arm is actually at rest at its configured init pose.
+        """
+
+        target = self.active_target()
+        if target is None:
+            self._arrival = _ArrivalState()
+            return
+        if not valid:
+            self._arrival = _ArrivalState(
+                status="not_reached",
+                reason=str(invalid_reason or "actual_feedback_unavailable"),
+            )
+            return
+        try:
+            actual = as_pose_matrix(actual_tcp_pose_base)
+            current_time = float(timestamp)
+        except (TypeError, ValueError):
+            self._arrival = _ArrivalState(
+                status="not_reached",
+                reason="invalid_actual_feedback",
+            )
+            return
+        if not np.all(np.isfinite(actual)) or not np.isfinite(current_time):
+            self._arrival = _ArrivalState(
+                status="not_reached",
+                reason="invalid_actual_feedback",
+            )
+            return
+
+        previous = self._arrival
+        position_error_m, rotation_error_deg = pose_delta_metrics(
+            actual,
+            target.tcp_pose_base,
+        )
+        translation_speed_m_s: float | None = None
+        rotation_speed_deg_s: float | None = None
+        continuity_valid = False
+        if previous.last_actual_pose_base is not None and previous.last_timestamp is not None:
+            dt_sec = current_time - float(previous.last_timestamp)
+            if 0.0 < dt_sec <= INIT_ARM_ARRIVAL_MAX_SAMPLE_GAP_SEC:
+                moved_m, moved_deg = pose_delta_metrics(previous.last_actual_pose_base, actual)
+                translation_speed_m_s = float(moved_m / dt_sec)
+                rotation_speed_deg_s = float(moved_deg / dt_sec)
+                continuity_valid = True
+
+        within_target = bool(
+            position_error_m <= INIT_ARM_ARRIVAL_POSITION_TOLERANCE_M
+            and rotation_error_deg <= INIT_ARM_ARRIVAL_ROTATION_TOLERANCE_DEG
+        )
+        still = bool(
+            continuity_valid
+            and translation_speed_m_s is not None
+            and rotation_speed_deg_s is not None
+            and translation_speed_m_s <= INIT_ARM_ARRIVAL_STILL_TRANSLATION_SPEED_M_S
+            and rotation_speed_deg_s <= INIT_ARM_ARRIVAL_STILL_ROTATION_SPEED_DEG_S
+        )
+        stable_since = previous.stable_since if within_target and still else None
+        if within_target and still and stable_since is None:
+            stable_since = current_time
+        dwell_sec = 0.0 if stable_since is None else max(0.0, current_time - stable_since)
+        if within_target and still and dwell_sec >= INIT_ARM_ARRIVAL_DWELL_SEC:
+            status, reason = "stable", "target_reached_and_still"
+        elif not continuity_valid:
+            status, reason = "not_reached", "waiting_for_continuous_actual_feedback"
+        elif not within_target:
+            status, reason = "not_reached", "target_error_above_tolerance"
+        elif not still:
+            status, reason = "not_reached", "actual_speed_above_stillness_threshold"
+        else:
+            status, reason = "not_reached", "stability_dwell_in_progress"
+        self._arrival = _ArrivalState(
+            last_actual_pose_base=actual.copy(),
+            last_timestamp=current_time,
+            stable_since=stable_since,
+            status=status,
+            reason=reason,
+            position_error_m=float(position_error_m),
+            rotation_error_deg=float(rotation_error_deg),
+            translation_speed_m_s=translation_speed_m_s,
+            rotation_speed_deg_s=rotation_speed_deg_s,
+            dwell_sec=float(dwell_sec),
+        )
 
     def filter_dual_arm_targets(
         self,
@@ -576,6 +699,7 @@ class InitArmCommandController:
 
     def status_payload(self) -> dict[str, object]:
         active_side = self._active_side if self.active else ""
+        arrival = self._arrival
         return {
             "init_arm_available": True,
             "init_arm_selected_side": self._selected_side,
@@ -586,6 +710,18 @@ class InitArmCommandController:
             "init_arm_sample_count": self.sample_count if self.recapturing else None,
             "init_arm_min_samples": self.min_samples if self.recapturing else None,
             "init_arm_profile_path": next(iter(self.targets_by_side.values())).source_path,
+            "init_arm_arrival_status": arrival.status if active_side else "inactive",
+            "init_arm_arrival_label": (
+                "到位稳定"
+                if active_side and arrival.status == "stable"
+                else "未到位"
+                if active_side
+                else ""
+            ),
+            "init_arm_arrival_reason": arrival.reason if active_side else "",
+            "init_arm_target_position_error_m": arrival.position_error_m if active_side else None,
+            "init_arm_target_rotation_error_deg": arrival.rotation_error_deg if active_side else None,
+            "init_arm_stability_dwell_sec": arrival.dwell_sec if active_side else None,
         }
 
     def _filter_arm_command(

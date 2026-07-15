@@ -543,8 +543,8 @@ collector 不为旧 state/action 维度做额外兼容语义。
 - `--external-tactile`
   `--tactile-storage external` 的快捷写法。
 - `--tactile-compression zstd|lz4|none`
-  外置触觉 stream 的无损压缩方式。默认 `lz4`，在 writer 后台线程按 chunk 压缩；
-  `none` 写旧式裸 `.bin`，用于兼容旧工具或做低层调试。
+  外置触觉 stream 的无损压缩方式。默认 `none`，按 C-order 写裸 `.bin`；传入
+  `lz4` 或 `zstd` 时由 writer 后台线程按 chunk 压缩。
 - `--calibration-timeout`
   runtime home capture 超时时间。
 - `--calibration-samples`
@@ -596,9 +596,9 @@ dataset_root/
 - `videos/observation.images.<camera_key>/...` 是每路 RGB 的 mp4。
 - `tactile/observation.hand.<side>.tactile/...` 只在 `--tactile-storage external`
   且该侧有触觉帧时写出。`manifest.json` 记录 sensor key、shape、dtype、frame
-  对齐关系。默认压缩时每个 stream spec 还包含 `encoding=chunked_lz4`、`compression`
-  和 `chunks` 索引；`--tactile-compression none` 时 `.float32.bin`/`.uint8.bin`
-  是按 frame 顺序追加的原始数组。
+  对齐关系。选择 `lz4`/`zstd` 时每个 stream spec 还包含对应的 chunk encoding、
+  `compression` 和 `chunks` 索引；默认 `--tactile-compression none` 时
+  `.float32.bin`/`.uint8.bin` 是按 frame 顺序追加的原始数组。
 
 ## 10. SAPIEN 数据集回放
 

@@ -5,10 +5,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from ..schemas import EffectorCommand, TeleopCommand
-from .arm_spec import ArmActionSpec, arm_action_specs_metadata
-from .hand_spec import HandActionSpec, hand_action_specs_metadata
-from .schema import (
+from robot_motion.action import (
+    ArmActionSpec,
     BIMANUAL_EE_POSE_HAND16_V1,
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_MIXED_HAND16_V1,
@@ -16,12 +14,16 @@ from .schema import (
     BIMANUAL_QPOS_HAND16_V1,
     BIMANUAL_QPOS_V1,
     HAND16_SLOT_DOF,
+    HandActionSpec,
     INSPIRE_HAND_DOF,
     RobotAction,
-    effector_name,
+    arm_action_specs_metadata,
     default_arm_frame,
+    effector_name,
+    hand_action_specs_metadata,
     split_effector_name,
 )
+from robot_motion.runtime import EffectorCommand, TeleopCommand
 
 
 def matrix_to_xyzquat(value: Any) -> np.ndarray:
@@ -65,7 +67,13 @@ def matrix_to_xyzquat(value: Any) -> np.ndarray:
 @dataclass(frozen=True)
 class TeleopCommandActionAdapterConfig:
     arm_joint_policy: str = "source_pose_when_available"
-    pose_metadata_keys: tuple[str, ...] = ("source_target_pose_base", "target_pose_base")
+    pose_metadata_keys: tuple[str, ...] = (
+        "target_pose_base",
+        "target_pose_tcp_base",
+        "solver_output_tcp_pose_base",
+        "solver_output_endpoint_pose_base",
+        "source_target_pose_base",
+    )
     hand_slot_dof: int = INSPIRE_HAND_DOF
     hand_pad_value: float = float("nan")
     arm_specs: Mapping[str, ArmActionSpec | Mapping[str, Any]] | None = None

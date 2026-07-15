@@ -68,3 +68,39 @@ Use `--orientation-mode history` to show sampled historical axes.
 
 Reading parquet files requires `pyarrow`; reading `frames.jsonl` only needs
 Python and NumPy.
+
+## Pose action alignment
+
+Visualize one dataset episode with two synchronized 3D panels:
+
+- left panel: `action_t` vs `observation.state_t`
+- right panel: `action_t` vs `observation.state_{t+1}`
+
+```bash
+/home/zc/anaconda3/envs/dexteleop310/bin/python \
+  utils/portable_vis/eef_vis/visualize_pose_action_alignment.py \
+  datasets/2026-07-06_vive_rm65_real_teleop \
+  --episode 10
+```
+
+By default it writes:
+
+```text
+<dataset>/visualizations/pose_action_alignment_episode_000010.html
+```
+
+Use `--no-open` when running on a headless machine, and `--output` to choose a
+specific HTML path:
+
+```bash
+/home/zc/anaconda3/envs/dexteleop310/bin/python \
+  utils/portable_vis/eef_vis/visualize_pose_action_alignment.py \
+  datasets/2026-07-06_vive_rm65_real_teleop/data/chunk-000/episode_000010.parquet \
+  --output /tmp/pose_action_alignment_ep10.html \
+  --no-open
+```
+
+The page draws action as dashed/ring markers, state or next-state as solid
+markers, and residual segments between them. The timeline slider is shared by
+both panels so the same `action_t` can be compared against `state_t` and
+`state_{t+1}` at once.

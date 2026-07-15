@@ -14,6 +14,14 @@ from .canonical_action import (
     CanonicalDeployActionResult,
 )
 from .observation import DeploymentObservation, build_deployment_observation
+from robot_motion.deploy.pose_adapter import (
+    PoseDeploymentError,
+    convert_last_action_to_policy_mode,
+    convert_normalized_action_chunk_to_absolute,
+    convert_normalized_action_chunk_to_relative,
+    measured_tcp_anchors_by_side,
+    prepare_observation_for_policy_pose_mode,
+)
 from .policy import HoldPolicy, LoadedPolicy, load_policy
 
 __all__ = [
@@ -28,7 +36,13 @@ __all__ = [
     "HoldPolicy",
     "LoadedPolicy",
     "NormalizedAction",
+    "PoseDeploymentError",
     "build_deployment_observation",
     "load_policy",
     "normalize_policy_output",
+    "convert_last_action_to_policy_mode",
+    "convert_normalized_action_chunk_to_absolute",
+    "convert_normalized_action_chunk_to_relative",
+    "measured_tcp_anchors_by_side",
+    "prepare_observation_for_policy_pose_mode",
 ]

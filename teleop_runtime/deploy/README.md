@@ -2,60 +2,153 @@
 
 `teleop_runtime.deploy` 是独立于采集主循环和左臂实验模式的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手、DMTac 1D gripper 和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`，且默认要求先用数据集帧 qpos 初始化。
 
-当前推荐入口是 `python -m teleop_runtime.deploy`。兼容入口
-`python -m teleop_runtime.deploy.run_policy` 仍然保留。
+当前推荐的 shell 入口是 `python -m teleop_runtime.deploy`。它的薄包装
+`teleop_runtime.deploy.cli.main` 会委托给同一份 `run_policy.main` 运行时；
+`python -m teleop_runtime.deploy.run_policy` 和 `run_policy.main(...)` 不是“已不用”的
+遗留实现，而是当前仍受支持的直接/程序化入口。
+
+## 入口支持、责任与兼容期
+
+| 入口 | 当前状态 | 责任边界 | 替代/迁移关系 |
+| --- | --- | --- | --- |
+| `python -m teleop_runtime.deploy` / `teleop_runtime.deploy.cli.main` | 推荐的 shell CLI | `teleop_runtime.deploy` 真机部署运行时 | 调用同一 `run_policy.main`，不另建控制环。 |
+| `python -m teleop_runtime.deploy.run_policy` / `run_policy.main` | **受支持**的直接与程序化入口 | `teleop_runtime.deploy` 真机部署运行时 | OpenPI real launcher 当前直接依赖；未来若收敛调用面，应迁向上述 canonical CLI wrapper 或其稳定 API。 |
+| `python -m deployments.openpi.client.real` | **受支持**的 OpenPI 专用薄入口 | `deployments.openpi.client` 负责 OpenPI 参数/transport；`teleop_runtime.deploy` 负责真机 I/O 和 dispatch | 直接组装 OpenPI policy 后交给 `run_policy.main`，不实现第二套控制循环。 |
+
+本仓库目前没有 `CODEOWNERS` 或个人维护人清单；上表的模块责任边界就是当前可审计的
+owner 记录。`run_policy` 没有已宣布的结束日期，兼容期持续到所有直接调用方完成迁移、
+替代 API/入口与迁移文档发布，并经过明确的弃用期为止。在此之前不得删除、降级或仅按
+“兼容遗留”处理该入口。任何封存变更必须同时更新 OpenPI launcher、CLI/导入契约测试和本节。
 
 ## 当前执行链路
 
 deploy 主线已经收敛到 canonical action path：
 
 ```text
-policy output
+policy output (15 Hz)
   -> NormalizedAction
-  -> filter_normalized
-  -> RobotAction
-  -> RobotActionResolver
-  -> TeleopCommand
-  -> launcher/backend dispatch
+  -> filter_normalized（15 Hz keyframe safety，仅一次）
+  -> position: causal timestamp pose resampling（75 Hz）
+  -> coupled dual-arm collision IK + joint/step limits + endpoint recheck（75 Hz qpos）
+  -> RobotAction / RobotActionResolver / joint TeleopCommand
+  -> real launcher dispatch
+  -> common qpos interpolation / RM65 position backend qcmd stream（150 Hz 默认）
 ```
 
 代码边界：
 
-- `teleop_runtime/action/vector_pipeline.py`: dense action vector 到 `RobotAction` 的通用适配层；后续目标是迁到 `robot_motion/action`。
-- `teleop_runtime/deploy/canonical_action.py`: policy action 过滤、canonical `RobotAction` 构造和 `TeleopCommand` 解析；保持硬件无关，后续目标是迁到 `robot_motion/deploy`。
+- `robot_motion/action`: dense action vector 到 `RobotAction` 的 sim/real 通用适配层。
+- `robot_motion/deploy`: policy action 过滤、canonical `RobotAction` 构造和 `TeleopCommand` 解析；`teleop_runtime.deploy` 中同名模块仅为兼容 re-export。
+- `robot_motion/position_control/resampling.py`: sim/real 通用真实时间戳 pose/qpos 重采样。
+- `robot_motion/rm65/position_collision.py`: sim/real 通用双臂 75 Hz pose→qpos、绝对/
+  reference 步长限位，以及限位后 endpoint collision recheck；不含时序平滑。
+- `robot_motion/position_control/interpolation.py`: sim/real 共用 75 Hz qpos→150 Hz qcmd
+  planner；sim/real 只在最后 qcmd sink 分叉。
+- `teleop_runtime/position_control/deploy_executor.py`: real-only 在线因果 75 Hz worker、暂停/故障 hold 与 backend dispatch 边界。
 - `teleop_runtime/deploy/dispatch.py`: 当前真机 launcher 的 `TeleopCommand` 到 arm/hand backend 分发；这是 real-specific 代码，不应迁到 `robot_motion`，sim launcher 应实现自己的 dispatcher。
 - `teleop_runtime/deploy/actions.py`: 仍保留旧 `ActionSafetyFilter.filter()` direct-command path 作为 legacy 封存入口；新代码应使用 `filter_normalized()`。
 
 因此模型部署、dataset replay debug 和未来 sim deploy 都应以 `RobotAction` 作为语义边界，
 以 `TeleopCommand` 作为下发边界，不再让 policy adapter 直接生成 backend command。
 
-后续迁移到 `robot_motion` 时，建议只搬硬件无关部分：
+当前目录边界为：
 
-- 搬迁：`RobotAction` schema/spec、vector -> `RobotAction` 适配、canonical deploy preparation、value-level safety filter、`RobotActionResolver`。
-- 不搬迁：CLI 参数、键盘控制、相机/触觉采集、真机 backend 构造、`dispatch.py`、fixed-init 的真机执行细节。
-- 迁移后：`teleop_runtime.deploy.run_policy` 和未来 `sim` deploy runner 都调用同一套 `robot_motion` deploy preparation，再分别 dispatch 到真机或仿真 backend。
+- `robot_motion`：`RobotAction` schema/spec、vector adapter、canonical deploy preparation、value-level safety、时间戳 motion resampling。
+- `teleop_runtime`：CLI、键盘、相机/触觉、真机 backend、在线因果 worker、`dispatch.py`、fixed-init 真机执行。
+- `sim`：MuJoCo/Sapien 等仿真专属 scene/controller/dispatcher；复用 `robot_motion` 的 action/resampling/schedule。
 
 部署频率兼容旧接口：
 
-- 默认仍可用 `--hz` 指定控制/发送频率。
+- `--arm-execution-profile impedance_40hz|position` 复用真机遥操作已有的
+  `RealArmExecutionConfig` profile resolver，避免 deployment 与 teleop 各维护一套默认值；
+  历史命令可显式选择兼容profile `position_45_150hz`；`--arm-control-mode`和下面的逐阶段
+  频率仍可显式覆盖。`deployments` 下所有真机命令应
+  明确写 profile 或 mode，不依赖入口默认值。
+- `--hz` 指定 policy/action keyframe 频率；position分支另用通用参数
+  `--position-reference-hz`（默认75）和`--arm-control-hz`（默认150），算法不按45/75分支。
+- `--position-collision-scene-profile`、`--position-collision-min-distance-m` 和
+  `--position-collision-distance-epsilon-m` 配置 75 Hz endpoint checker；真实 position
+  输出不能使用 `--no-position-collision-check`，该开关只保留给非运动 legacy dry-run。
+- 75 Hz joint safety step 使用 `--arm-max-angvel / --position-reference-hz`，并与
+  `--max-arm-joint-step-rad` 取更严格者；限位后必须重新做 collision distance check。
 - 如果提供 `--debug-replay-dataset` / `--debug-replay-parquet`，且没有显式传 `--action-hz`，部署器会优先从数据集实际记录的 action 行间 `timestamp` / episode stats / `control_hz` 推断真实 action 执行频率，并按该频率发送 action。
 - 也可以用 `--action-hz-dataset` 单独指定一个参考数据集来推断发送频率，而不进入 replay 模式。
-- `--policy-hz` 可以省略；省略时，普通部署保持历史默认 `10Hz`，而 replay / 参考数据集频率模式会默认跟随推断出的 action 频率。
+- `--policy-hz` 可以省略；省略时按现有 resolver 选择 policy/action 频率。
+- position 在线插值严格因果，显式落后一个 action period；零延迟没有未来右括号时只能 hold。xyz 线性、quaternion 最短弧 SLERP、qpos 线性，不增加 low-pass/EMA。
+- position 真机输出默认强制双臂模式：15 Hz target pose 先按时间插值为 75 Hz pose，
+  再由共享 coupled planner 做双臂 collision-aware IK；绝对关节限位和每 75 Hz
+  reference 步长限位之后会重新计算所选 scene profile 的碰撞距离。通过后的 qpos 才会
+  进入公共 75→150 qcmd planner，real backend 不再各自执行单臂 Cartesian IK。
+- 每次新 position stream（包括 clear/resume 后）只允许用本次 observation 中左右臂都
+  `hardware_read_success=true`、时间戳足够新鲜且双臂时间差受限的
+  `hardware_qpos/measured_qpos` 重置 coupled planner。真机下发不会回退到
+  `current_qpos`、last command 或 state vector 缓存；仅显式 non-motion dry-run 可用
+  observation state vector，并在 debug 中标记 `authoritative=false` 和 fallback reason。
+  当前 executor 默认 freshness 上限为 0.25 s、双臂 measurement timestamp skew 上限为
+  0.05 s，并会在 worker 真正调用 planner reset 时再次检查 age，而不只在 submit 时检查。
+- collision planner 的 75 Hz qpos 会标记为已做联合限位，RM65 backend 不再重复做独立
+  单臂 step clip。每次 arm queue 后仍会核对结构化 backend receipt：任一侧 reject、
+  singularity hold、target 改写或 background stream 不健康都会在 hand 入队前 fail-stop。
+  由于 RM65 backend 当前没有公开的无副作用 singularity preview/双臂原子 queue API，
+  两侧 SDK queue 仍是顺序边界；若第二侧才拒绝，第一侧可能已短暂入队，随后立即 group
+  hold。这一 partial coupled boundary 会进入 debug receipt，不能宣称原子提交。
+- 当前认证范围是“所选 scene profile 的 75 Hz 最终 qpos endpoint”。相邻 endpoint 之间
+  的 150 Hz 关节插值整段没有连续碰撞认证；`dual_arm_hand_proxy_open` 也是固定张开手/
+  link proxy，不代表任意自定义工具外形已被完整建模。metadata/debug 会始终记录
+  `endpoint_collision_checked` 与 `segment_collision_certified=false`。
+- 单臂 position 真机输出暂时 fail-closed：当前没有未激活机械臂的权威 qpos/TCP 状态源，
+  因此不能用默认姿态猜测被动臂。单臂 dry-run 会保留，但不宣称双臂碰撞认证。
+- 同一 policy action 内的手/夹爪仍保持安全后的 15 Hz 离散值、不做插值，但与 arm
+  keyframe 一起进入因果队列，在对应的延迟后 75 Hz reference tick 做逻辑调度，避免手部
+  领先机械臂一个 action period。实际 hand I/O 由独立有界 worker 执行，不阻塞 75 Hz arm
+  reference；executor 对每个未合并 keyframe 至多调用一次 backend callback（backend 内部仍
+  可能按其恢复策略重试）。调度落后时只保留最新到期离散值，不补发 burst；callback
+  起止时间、backend receipt、合并/跳过和 fault/hold 都进入 deploy debug event。
+  这是 fail-stop，不是跨设备原子提交：若 hand 故障发生时一个 arm callback 已越过最终
+  gate 并进入 backend，该 callback 最多仍会完成一次，随后才 hold；debug 会把它标为
+  `accepted_before_async_abort`。所有真实 backend callback 必须配置有限 I/O timeout，
+  `shutdown_timeout_sec` 只约束 worker join，不能取消已经阻塞在 SDK 内部的调用。
+  hand worker 在每次真实 hand callback 前还会重新检查全部 arm backend 的 readiness、
+  emergency/send 状态与 background stream fault/thread/target health；发现故障会抛出并
+  触发 executor fault/hold。该检查缩小了 arm target 入队后后台故障造成的 hand 尾发窗口，
+  但健康快照与实际 hand I/O 之间仍不是跨设备事务，无法消除最后一个检查后发生故障的竞态。
+- impedance 分支保持现有 action-rate -> 40 Hz backend，不进入 position executor。
+- `--debug --debug-dir <dir>` 的 JSONL 会把 15 Hz `action_step` 明确记录为
+  `position_async_queue`（只表示入队），并另写 `position_executor_*` 异步事件：source
+  index、75 Hz parent/alpha/arm command、hand logical tick、callback 实际起止/queue lag、
+  backend receipt、coalesce/skip、partial failure、fault 与 hold；不会把入队误报成已下发。
+  collision summary 始终包含 status、distance、限位原因、endpoint/segment 边界；debug
+  开启时另含 raw IK qpos、最终 qpos、target/realized world pose、每次 distance attempt
+  和 solve/budget 时间。collision reset event 另含双臂 hardware read/measured sequence、
+  measurement age/pair skew/authoritative source；arm dispatch event 含 requested/final qpos、
+  rewrite、singularity gate、transport receipt 和 background health。
 - RM65 策略执行的关节速度/步长默认对齐
   `run_vive_rm65_real_teleop`：`--arm-max-angvel` 默认为
   `0.7,0.7,0.9,1.5,1.5,2.0`，`--arm-step-dt-scaling` 默认开启，
-  `--arm-step-dt-max-scale` 未显式指定时按
-  `max(3.0, 1.1 * --arm-control-hz / effective_action_hz)` 自动计算。
+  `--arm-step-dt-max-scale` 未显式指定时，position 按
+  `max(3.0, 1.1 * --arm-control-hz / --position-reference-hz)` 自动计算；
+  impedance 仍按其实际 command-input rate 计算。
   joint-vector action 的 `--max-arm-joint-step-rad` 默认是 `6deg`。
-  policy action 的 IK 目标步长按 action 间隔计算，RM65 background stream
-  仍按 `--arm-control-hz` 细分发送。
+  position policy 的 IK 目标步长按 75 Hz reference 间隔计算，RM65 background stream
+  再按 `--arm-control-hz` 细分发送。
 
 ## Action / Observation Layout
 
-部署器兼容 `teleop_runtime.collection` 的数据布局：
+部署器有两个加法式合同代际，旧代际不被重解释：
 
-- `action`: 26 维 `[left_arm_pose7, right_arm_pose7, left_hand_q6, right_hand_q6]`
-- `observation.state`: 38 维 `[left_qpos6, left_pose7, left_hand6, right_qpos6, right_pose7, right_hand6]`
+- `legacy_v1`：`action` 为 26 维
+  `[left_arm_pose7, right_arm_pose7, left_hand_q6, right_hand_q6]`；
+  `observation.state` 为 38 维
+  `[left_qpos6, left_pose7, left_hand6, right_qpos6, right_pose7, right_hand6]`。
+- `dexteleop_dataset_v2.2`：float action/state 都固定以
+  `[left_pose7, right_pose7]` 开头，再按 `PolicyIOLayout` 分侧追加连续末端值；离散末端值放在
+  独立 int64 token 字段。`observation.arm.qpos` 是独立 12D 记录/审计与初始化字段，不进入
+  默认模型 `observation.state`。
+- 左右末端布局可以不同，也可以缺省一侧。运行时可用
+  `--left-hand-backend` / `--right-hand-backend` 覆盖全局 `--hand-backend`。
+- v2.2 部署用 `--policy-artifact-json` 在创建 backend 前绑定 layout hash、输入/输出 float/token
+  维度及运行时末端能力。带显式 `legacy_q6_slot_indices` 的 layout 走现有 q6 安全链；缺少该
+  映射的 `v22_native` 当前 fail-closed，直到对应 native safety/dispatch adapter 被配置。
 - arm pose 是 base frame 下的 `[x, y, z, qx, qy, qz, qw]`，控制对象是
   `tool_tcp`，也就是当前臂/末端 profile 绑定的软件 TCP。
 - RM65 真机执行会把 `tool_tcp` 目标转换到 SDK/IK 所需的 hand_base 或 arm_link6
@@ -78,7 +171,9 @@ policy output
 - hand-only shape `(12,)`，顺序 `left,right`
 - dict: `{"action": ...}` 或 `{"action_chunk": ...}`
 - dict: `{"left_arm_pose": pose7, "right_arm_pose": pose7, "left_hand": q6, "right_hand": q6}`
-- dict: `{"left_arm_qpos": q6, "right_arm_qpos": q6}` 可直接下发 joint target
+- dict: `{"left_arm_qpos": q6, "right_arm_qpos": q6}` 仍可用于 legacy/dry-run 或
+  impedance/初始化等显式低层路径；collision-required 的 position 真机 policy 主链目前只
+  接受双臂 target pose，避免绕过 75 Hz coupled IK 的状态提交。
 
 注意：`DEPLOY_SCHEMA.md` 中的完整 canonical JSON 是目标契约，不是当前
 `normalize_policy_output()` 可直接接收的返回格式。policy wrapper 如果内部使用该结构，
@@ -112,8 +207,9 @@ python -m teleop_runtime.deploy \
 - 再按 `A`，才开始 policy inference / action execution。
 
 `--policy-qpos-init-source auto` 和 replay 一致，优先使用记录的
-`action.replay.<side>_arm_joint_target`，缺失时依次回退到
-`observation.arms.<side>.current_qpos`、`observation.arms.<side>.actual_qpos`。
+`action.replay.<side>_arm_joint_target`；v2.2 随后使用独立的
+`observation.arm.qpos` 审计列，旧数据再依次回退到
+`observation.arm.<side>.current_qpos`、`observation.arm.<side>.actual_qpos`。
 初始化轨迹规划同样复用 replay qpos init 的慢速、双臂碰撞检查和奇异位形保护。
 需要临时调整首帧 QPOS 初始化速度时，使用 `--policy-qpos-init-arm-max-angvel`；
 可传 1 个 rad/s 值应用到 6 个关节，也可传 6 个逗号分隔的逐关节 rad/s 值。
@@ -175,7 +271,8 @@ python -m teleop_runtime.deploy \
 - `timed out while moving to dataset frame`：轨迹已经开始执行，但实际 qpos 未在
   `--policy-qpos-init-timeout-s` 内进入 `--policy-qpos-init-qpos-tolerance`。
   日志会给出最大关节误差。先确认机械臂是否仍在运动、是否被限速/保护挡住；必要时增大
-  timeout，或在确认可接受的前提下放宽 qpos tolerance。
+  timeout，或在确认可接受的前提下放宽 qpos tolerance。当前 policy/replay qpos init
+  完成阈值默认为 `0.1rad`；显式传入的 CLI/profile 值仍优先。
 - `targets={'left': 'observation_current_qpos', ...}` 表示该帧没有可用的
   `action.replay.<side>_arm_joint_target`，`--policy-qpos-init-source auto` 回退到了记录的
   observation qpos。若必须使用 replay qpos，改用
@@ -212,18 +309,11 @@ python -m teleop_runtime.deploy \
 
 ## 单臂真实下发
 
-```bash
-python -m teleop_runtime.deploy \
-  --policy /abs/path/my_policy.py:Policy \
-  --policy-kwargs-json '{"checkpoint": "/abs/path/model.pt"}' \
-  --active-sides right \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --right-tool-profile position_endpoint \
-  --policy-qpos-init-dataset /abs/path/to/dataset \
-  --policy-qpos-init-episode 20 \
-  --policy-qpos-init-frame 123 \
-  --send-actions
-```
+当前 collision-required position 主链会拒绝单臂 `--send-actions`，因为 runtime 没有
+被动臂权威 qpos/TCP，不能在完整双臂模型中严谨认证。若现场实际只有一台机械臂，需要先
+增加与物理场景匹配的单臂 collision scene/状态 contract；不要用默认双臂姿态绕过。
+既有 impedance 40 Hz 单臂链路不经过本 position planner，仍按其已确认的 tool/payload/
+force profile 与独立安全流程使用。
 
 ## 双臂 + 双手
 
@@ -295,6 +385,12 @@ debug replay 在 `--action-queue-policy auto` 下会自动 append 预取的 acti
 chunk，避免按 `--min-action-queue` 补队列时跳过轨迹尾部；普通模型 policy 仍默认
 replace pending queue。
 
+`--debug-replay-dataset` 会在创建真机 backend 前比较 episode metadata 的
+`arm_control_mode` 与所选 execution profile/mode；不一致直接拒绝。旧 episode 缺少该字段
+且启用 `--send-actions` 时按 `impedance` 契约处理，避免未知旧数据误走 position；纯 dry-run
+只输出 warning。该约束只作用于真正消费 dataset action 的 debug replay，不作用于仅用于
+qpos 初始化或 action-rate 推断的数据集。
+
 ```bash
 python -m teleop_runtime.deploy \
   --debug-replay-dataset /abs/path/to/dataset \
@@ -326,8 +422,8 @@ python -m teleop_runtime.deploy \
 ## 安全边界
 
 - arm cartesian pose 会按 `--arm-workspace-min/--arm-workspace-max` 裁剪位置。
-- arm pose 每 tick 默认限速：`--max-arm-xyz-step-m 0.03`、`--max-arm-rot-step-deg 8`。
-- arm joint target 每 tick 默认限速：`--max-arm-joint-step-rad 0.08`。
+- arm pose 每个 action keyframe 默认限速：`--max-arm-xyz-step-m 0.10`、`--max-arm-rot-step-deg 15`。
+- arm joint target 每个 action keyframe 默认限速：`--max-arm-joint-step-rad 0.10472`（约 `6deg`）。
 - hand q6 当前只会 clip 到 `[0, 1]`；`--max-hand-step` 是保留参数，hand rate-limit 暂未启用。
 - `--require-ready-observation` 会在 active state 或图像缺失时跳过策略和下发。
 - `--inspire-hand-max-force` 默认继承 `teleop_runtime` 的 `800`。

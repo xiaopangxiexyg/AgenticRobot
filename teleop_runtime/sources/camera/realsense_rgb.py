@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from robot_motion.runtime.lifecycle import LifecycleFailure, raise_lifecycle_failures
+
 from ...interfaces import ObservationSource
 from ...recording import _to_serializable
 from ...registry import register_source
@@ -768,6 +770,7 @@ class RealSenseRGBSource(ObservationSource):
 
     def close(self) -> None:
         self._running = False
+        failures: list[LifecycleFailure] = []
         with self._pipeline_lock:
             pipeline = self._pipeline
             self._pipeline = None
@@ -780,6 +783,24 @@ class RealSenseRGBSource(ObservationSource):
                 with self._lock:
                     self._last_runtime_error = f"pipeline_stop_failed:{type(exc).__name__}:{exc}"
                     self._last_error = self._last_runtime_error
+                failures.append(LifecycleFailure(label="pipeline.stop", error=exc))
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+            worker = self._thread
+            try:
+                worker.join(timeout=1.0)
+            except BaseException as exc:  # noqa: BLE001 - report after pipeline cleanup.
+                failures.append(
+                    LifecycleFailure(label=f"worker[{worker.name}].join", error=exc)
+                )
+            if worker.is_alive():
+                failures.append(
+                    LifecycleFailure(
+                        label=f"worker[{worker.name}].join_timeout",
+                        error=RuntimeError(
+                            f"{self.name} worker did not stop within 1.000s"
+                        ),
+                    )
+                )
+            else:
+                self._thread = None
+        raise_lifecycle_failures(f"{self.name}.close", failures)

@@ -7,10 +7,21 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.v22 import (
+    DEXTELEOP_DATASET_SCHEMA_V22,
+    policy_io_layout_from_metadata,
+)
+from robot_motion.deploy.schema import ACTION_DIM, ARM_JOINT_DOF
+from robot_motion.replay.trajectory import (
+    QPOS_INIT_AUTO,
+    ReplayTrajectoryGroup,
+    normalize_qpos_init_source,
+    select_replay_qpos_init_targets,
+)
 from robot_motion.rm65.arm_init.qpos_init import DEFAULT_QPOS_TARGET_PATH
 from robot_motion.rm65.arm_init.schema import load_qpos_target
+from robot_motion.runtime import EffectorCommand
 
-from ..schemas import EffectorCommand
 from ..replay.arm_init.qpos_execute import (
     DEFAULT_QPOS_INIT_BRANCH_SEARCH,
     DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES,
@@ -26,19 +37,14 @@ from ..replay.arm_init.qpos_execute import (
     build_rm65_qpos_init_plan,
     normalize_qpos_init_max_angvel,
 )
-from ..replay.trajectory import (
-    QPOS_INIT_AUTO,
-    normalize_qpos_init_source,
-    select_replay_qpos_init_targets,
-)
 from .replay import (
     load_replay_actions_from_parquet,
     load_replay_arm_joint_targets_from_parquet,
     load_replay_arm_observation_qpos_from_parquet,
+    load_replay_arm_qpos_audit_from_parquet,
+    load_v22_replay_actions_from_parquet,
     resolve_replay_parquet_path,
 )
-from .schema import ACTION_DIM, ARM_JOINT_DOF
-from ..replay.trajectory import ReplayTrajectoryGroup
 
 
 # Migration note:
@@ -61,7 +67,9 @@ class DeployPolicyQposInitPlan:
 
 @dataclass(frozen=True)
 class DeployPolicyQposInitSettings:
-    qpos_reached_tolerance_rad: float = 0.01
+    # A 0.01 rad completion gate is too strict for the compliant impedance
+    # backend.  Keep the same completion contract across deploy/replay paths.
+    qpos_reached_tolerance_rad: float = 0.1
     move_to_start_timeout_s: float = 30.0
     qpos_init_dt_sec: float = 0.05
     qpos_init_joint_velocity_profile: str = "rm65_init_slow"
@@ -88,6 +96,50 @@ class PolicyQposInitStepResult:
     message: str = ""
 
 
+def _load_policy_qpos_init_actions(
+    source_path: Path,
+    *,
+    resolved_metadata: Mapping[str, Any],
+    action_column: str,
+    frame_index: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Load one display/hold action without assuming a legacy 26D source row.
+
+    Qpos target selection below uses only audited joint-state columns.  The
+    action retained on the init plan is nevertheless consumed by status/debug
+    paths, so it must always be a canonical 26D deployment action.  v2.2
+    datasets store a compact layout-bound action (16D for dual DMTAC), which
+    must take the same explicit bridge used by dataset replay.
+    """
+
+    dataset_info = resolved_metadata.get("dataset_info")
+    if (
+        isinstance(dataset_info, Mapping)
+        and str(dataset_info.get("dexteleop_dataset_schema") or "")
+        == DEXTELEOP_DATASET_SCHEMA_V22
+    ):
+        layout = policy_io_layout_from_metadata(dataset_info, allow_legacy_v21=False)
+        actions, action_metadata = load_v22_replay_actions_from_parquet(
+            source_path,
+            layout=layout,
+            start_index=frame_index,
+            end_index=frame_index + 1,
+        )
+        return actions, {
+            "action_encoding": "v22_layout_to_legacy_q6_bridge",
+            "policy_io_layout_hash": layout.layout_hash,
+            "action_metadata": dict(action_metadata),
+        }
+
+    actions = load_replay_actions_from_parquet(
+        source_path,
+        action_column=action_column,
+        start_index=frame_index,
+        end_index=frame_index + 1,
+    )
+    return actions, {"action_encoding": "legacy_26d"}
+
+
 def load_deploy_policy_qpos_init_plan(
     *,
     dataset_root: str | Path | None,
@@ -111,11 +163,11 @@ def load_deploy_policy_qpos_init_plan(
     frame = int(frame_index)
     if frame < 0:
         raise ValueError("--policy-qpos-init-frame must be >= 0.")
-    actions = load_replay_actions_from_parquet(
+    actions, action_metadata = _load_policy_qpos_init_actions(
         source_path,
+        resolved_metadata=resolved_metadata,
         action_column=str(action_column or "action"),
-        start_index=frame,
-        end_index=frame + 1,
+        frame_index=frame,
     )
     action = np.asarray(actions[0], dtype=np.float32).reshape(ACTION_DIM)
     group = ReplayTrajectoryGroup(
@@ -149,6 +201,12 @@ def load_deploy_policy_qpos_init_plan(
             start_index=frame,
             end_index=frame + 1,
         ),
+        arm_observation_qpos_audit=load_replay_arm_qpos_audit_from_parquet(
+            source_path,
+            active_sides=active,
+            start_index=frame,
+            end_index=frame + 1,
+        ),
         metadata={"source_metadata": dict(resolved_metadata)},
     )
     targets, sources = select_replay_qpos_init_targets(
@@ -175,6 +233,7 @@ def load_deploy_policy_qpos_init_plan(
         target_sources_by_side={str(side): str(sources.get(side, "")) for side in active},
         metadata={
             "action_column": str(action_column or "action"),
+            **action_metadata,
             "qpos_init_source": normalize_qpos_init_source(qpos_init_source),
             "source_metadata": dict(resolved_metadata),
         },

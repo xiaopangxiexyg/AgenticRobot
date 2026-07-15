@@ -17,10 +17,13 @@ from .observers import (
 from .preview_rate import PreviewRateLimiter
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .sample_assembler import (
+    ArmStateMetadataProvider,
     CameraFrameMatch,
     CollectorSample,
     CollectorSampleBuilder,
     CollectorSampleBuilderConfig,
+    HandStateProvider,
+    PositionReferenceProvider,
     SampleAssembler,
     SampleAssemblerConfig,
 )
@@ -47,6 +50,7 @@ __all__ = [
     "AsyncWriterConfig",
     "AsyncWriterPool",
     "AsyncWriterStats",
+    "ArmStateMetadataProvider",
     "CameraFrameMatch",
     "CollectionRuntime",
     "CollectionRuntimeConfig",
@@ -65,10 +69,12 @@ __all__ = [
     "FINALIZE_EPISODE_JOB_KIND",
     "LeRobotV21Writer",
     "LeRobotV21WriterConfig",
+    "HandStateProvider",
     "LatencyItem",
     "NearestFrameBuffer",
     "PhaseTimer",
     "PreviewRateLimiter",
+    "PositionReferenceProvider",
     "ROW_JOB_KIND",
     "SampleAssembler",
     "SampleAssemblerConfig",

@@ -1,0 +1,18 @@
+name: dexteleop310
+channels:
+  - conda-forge
+  - nodefaults
+
+# This is the conda base for the complete project environment.  The installer
+# uses uv.lock for the six PyPI dependency groups, then adds pin-pink with
+# --no-deps and installs the local DM-Tac SDK. Those special steps are kept
+# out of this pip section because their package metadata is not suitable for
+# the conda-forge Pinocchio stack.
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26.4
+  - scipy=1.13.1
+  - pinocchio=3.7.0
+  - pip:
+      - "uv==0.9.3"

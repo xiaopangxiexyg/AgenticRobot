@@ -15,7 +15,7 @@ np = pytest.importorskip("numpy")
 
 viewer = importlib.import_module("utils.portable_vis.wrist_mask_view.wrist_rgb_mask_viewer")
 
-from dataset_postprocess.wrist_cam_adjust.depth import (  # noqa: E402
+from utils.dataset_postprocess.wrist_cam_adjust.depth import (  # noqa: E402
     DepthRangeMaskConfig,
     mask_manifest_payload,
     pack_binary_mask,

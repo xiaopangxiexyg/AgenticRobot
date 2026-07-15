@@ -6,8 +6,10 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from robot_motion.runtime.lifecycle import run_best_effort_cleanup
+
 from .dataset import LoadedReplayEpisode, ReplayDatasetIndex
-from .executor import ReplayExecutionController, ReplayExecutionSettings
+from .executor import ReplayExecutionController, ReplayExecutionSettings, _bool_value
 from .hardware import ReplayHardwareConfig
 from .media import (
     CameraVideoTrack,
@@ -56,17 +58,35 @@ class ReplayGuiSession:
             self.load_dataset(dataset_root)
 
     def close(self) -> None:
+        run_best_effort_cleanup(
+            "replay_gui_session.close",
+            (
+                ("media", self._close_media),
+                ("executor", self.executor.close),
+            ),
+        )
+
+    def _close_media(self) -> None:
         with self._lock:
             self._close_media_locked()
-        self.executor.close()
+
+    def position_collision_debug_snapshot(self, *, limit: int = 100) -> dict[str, Any]:
+        return self.executor.position_collision_debug_snapshot(limit=limit)
 
     def _close_media_locked(self) -> None:
-        for track in self._camera_tracks.values():
-            track.close()
-        for reader in self._tactile_readers.values():
-            reader.close()
-        self._camera_tracks.clear()
-        self._tactile_readers.clear()
+        steps = [
+            (f"tactile_reader[{side}]", reader.close)
+            for side, reader in reversed(tuple(self._tactile_readers.items()))
+        ]
+        steps.extend(
+            (f"camera_track[{camera_key}]", track.close)
+            for camera_key, track in reversed(tuple(self._camera_tracks.items()))
+        )
+        try:
+            run_best_effort_cleanup("replay_gui_session.media.close", steps)
+        finally:
+            self._camera_tracks.clear()
+            self._tactile_readers.clear()
 
     def _log_locked(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -86,8 +106,16 @@ class ReplayGuiSession:
             "leftToolProfile",
             "right_tool_profile",
             "rightToolProfile",
+            "arm_control_mode",
+            "armControlMode",
             "arm_control_hz",
             "armControlHz",
+            "arm_canfd_follow",
+            "armCanfdFollow",
+            "force_tare_sec",
+            "forceTareSec",
+            "strict_tool_profile",
+            "strictToolProfile",
             "connect_hardware",
             "connectHardware",
             "end_effectors_enabled",
@@ -137,11 +165,25 @@ class ReplayGuiSession:
         first_message = str(blocked[0].get("message") or "") if blocked else ""
         return f"hardware preflight failed blocked={len(blocked)} [{names}] {first_message}".strip()
 
-    def _configure_connect_for_preflight(self, payload: Mapping[str, Any]) -> None:
+    def _configure_connect_for_preflight(
+        self,
+        payload: Mapping[str, Any],
+        episode: LoadedReplayEpisode,
+    ) -> None:
         if self._payload_has_hardware_config(payload):
             self.executor.configure_from_payload(payload)
             with self._lock:
                 self._log_locked("hardware replay configured for preflight")
+        mode_validator = getattr(
+            self.executor,
+            "validate_episode_arm_control_mode",
+            None,
+        )
+        if callable(mode_validator):
+            mode_contract = mode_validator(episode)
+            if mode_contract.get("warning"):
+                with self._lock:
+                    self._log_locked(str(mode_contract["warning"]))
         status = self.executor.status()
         if not bool(status.get("connected")):
             connect_status = self.executor.connect()
@@ -259,12 +301,25 @@ class ReplayGuiSession:
                 self._log_locked("hardware replay configured")
             return self.state()
         if action == "set_send_actions":
-            enabled = bool(payload.get("enabled") if "enabled" in payload else payload.get("send_actions"))
+            enabled = _bool_value(
+                payload.get("enabled") if "enabled" in payload else payload.get("send_actions"),
+                name="send_actions",
+            )
             self.executor.set_send_actions(enabled)
             with self._lock:
                 self._log_locked(f"arm output {'enabled' if enabled else 'disabled'}")
             return self.state()
         if action == "connect_hardware":
+            with self._lock:
+                episode = self.episode
+            if episode is not None:
+                mode_validator = getattr(
+                    self.executor,
+                    "validate_episode_arm_control_mode",
+                    None,
+                )
+                if callable(mode_validator):
+                    mode_validator(episode)
             status = self.executor.connect()
             with self._lock:
                 self._log_locked(status.get("last_message") or "hardware connected")
@@ -275,7 +330,7 @@ class ReplayGuiSession:
             if episode is None:
                 raise RuntimeError("Select an episode before hardware replay preflight.")
             try:
-                self._configure_connect_for_preflight(payload)
+                self._configure_connect_for_preflight(payload, episode)
                 status = self.executor.preflight(episode)
             except Exception as exc:
                 with self._lock:

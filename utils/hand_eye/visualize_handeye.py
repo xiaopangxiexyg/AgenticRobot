@@ -12,10 +12,11 @@ if __package__ in (None, ""):
     REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
+    __package__ = "utils.hand_eye"
 
-from utils.hand_eye.calibration import load_result
-from utils.hand_eye.camera import RealSenseCamera, RealSenseConfig
-from utils.hand_eye.robot import RM65PoseReader
+from .calibration import load_result
+from .camera import RealSenseCamera, RealSenseConfig
+from .robot import RM65PoseReader
 
 
 LEFT_ARM_IP = "192.168.101.21"

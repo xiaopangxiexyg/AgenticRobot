@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-from teleop_runtime.collection.arm_mode_labels import build_arm_mode_metadata
+from teleop_runtime.collection.arm_mode_labels import (
+    InitArmAuditTracker,
+    build_arm_mode_metadata,
+    flatten_arm_mode_columns,
+)
 from teleop_runtime.collection.sample_assembler import CollectorSample
-from teleop_runtime.collection.schema_v21 import collector_sample_to_row
+from teleop_runtime.collection.schema_v21 import (
+    collector_sample_to_row,
+    write_rows_to_parquet,
+)
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 
 
@@ -26,6 +35,12 @@ def _command() -> TeleopCommand:
     command.add_command(_arm_command("left"))
     command.add_command(_arm_command("right"))
     return command
+
+
+def _pose(x: float = 0.0) -> np.ndarray:
+    pose = np.eye(4)
+    pose[0, 3] = x
+    return pose
 
 
 class ArmModeLabelTests(unittest.TestCase):
@@ -59,6 +74,142 @@ class ArmModeLabelTests(unittest.TestCase):
         self.assertEqual(payload["sides"]["left"]["mode"], "teleop")
         self.assertEqual(payload["sides"]["right"]["mode"], "init_pose")
         self.assertEqual(payload["sides"]["right"]["source"], "init_arm")
+
+    def test_init_audit_uses_actual_feedback_but_model_mode_stays_single_label(self) -> None:
+        command = _command()
+        target = _pose()
+        command.commands["right_arm"].metadata.update(
+            {
+                "init_arm_active": True,
+                "init_arm_side": "right",
+                "init_arm_mode": "moving",
+                "init_arm_target_pose_base": target,
+            }
+        )
+        tracker = InitArmAuditTracker()
+        arm_states = {"right": {"actual_tcp_pose": target}}
+
+        first = tracker.observe(command=command, arm_states=arm_states, timestamp=0.0)
+        self.assertEqual(first["right"]["init_phase"], "init_move")
+        self.assertTrue(first["right"]["init_phase_valid"])
+
+        audit = first
+        for timestamp in np.arange(0.1, 3.3, 0.1):
+            audit = tracker.observe(
+                command=command,
+                arm_states=arm_states,
+                timestamp=float(timestamp),
+            )
+
+        payload = build_arm_mode_metadata(
+            command=command,
+            session_state="RUNNING",
+            active_sides=("left", "right"),
+            init_audit_by_side=audit,
+        )
+        columns = flatten_arm_mode_columns(payload)
+        self.assertEqual(payload["sides"]["right"]["mode"], "init_pose")
+        self.assertEqual(payload["sides"]["right"]["audit"]["init_phase"], "init_hold")
+        self.assertEqual(columns["teleop.arm_mode.right.label"], "init_pose")
+        self.assertEqual(columns["teleop.arm_mode.right.init_phase"], "init_hold")
+
+    def test_init_audit_never_guesses_hold_without_actual_feedback(self) -> None:
+        command = _command()
+        command.commands["right_arm"].metadata.update(
+            {
+                "init_arm_active": True,
+                "init_arm_side": "right",
+                "init_arm_target_pose_base": _pose(),
+            }
+        )
+        audit = InitArmAuditTracker().observe(
+            command=command,
+            arm_states={"right": {}},
+            timestamp=1.0,
+        )
+        self.assertEqual(audit["right"]["init_phase"], "unknown")
+        self.assertFalse(audit["right"]["init_phase_valid"])
+
+    def test_init_audit_requires_low_actual_speed_before_hold(self) -> None:
+        command = _command()
+        target = _pose()
+        command.commands["right_arm"].metadata.update(
+            {
+                "init_arm_active": True,
+                "init_arm_side": "right",
+                "init_arm_target_pose_base": target,
+            }
+        )
+        tracker = InitArmAuditTracker()
+        tracker.observe(
+            command=command,
+            arm_states={"right": {"actual_tcp_pose": _pose(0.0014)}},
+            timestamp=0.0,
+        )
+        audit = tracker.observe(
+            command=command,
+            arm_states={"right": {"actual_tcp_pose": target}},
+            timestamp=0.01,
+        )
+
+        self.assertEqual(audit["right"]["init_phase"], "init_move")
+        self.assertEqual(audit["right"]["reason"], "actual_speed_above_stillness_threshold")
+
+    def test_init_audit_target_change_resets_dwell(self) -> None:
+        command = _command()
+        initial_target = _pose()
+        changed_target = _pose(0.001)
+        command.commands["right_arm"].metadata.update(
+            {
+                "init_arm_active": True,
+                "init_arm_side": "right",
+                "init_arm_target_pose_base": initial_target,
+            }
+        )
+        tracker = InitArmAuditTracker()
+        arm_states = {"right": {"actual_tcp_pose": initial_target}}
+        tracker.observe(command=command, arm_states=arm_states, timestamp=0.0)
+        tracker.observe(command=command, arm_states=arm_states, timestamp=0.1)
+        before_change = tracker.observe(command=command, arm_states=arm_states, timestamp=0.4)
+
+        command.commands["right_arm"].metadata["init_arm_target_pose_base"] = changed_target
+        changed = tracker.observe(
+            command=command,
+            arm_states={"right": {"actual_tcp_pose": initial_target}},
+            timestamp=0.5,
+        )
+
+        self.assertEqual(before_change["right"]["init_phase"], "init_move")
+        self.assertGreater(before_change["right"]["dwell_sec"], 0.0)
+        self.assertEqual(changed["right"]["init_phase"], "init_move")
+        self.assertEqual(changed["right"]["reason"], "init_target_changed")
+        self.assertEqual(changed["right"]["dwell_sec"], 0.0)
+
+    def test_init_audit_time_gap_or_reversal_resets_dwell(self) -> None:
+        command = _command()
+        target = _pose()
+        command.commands["right_arm"].metadata.update(
+            {
+                "init_arm_active": True,
+                "init_arm_side": "right",
+                "init_arm_target_pose_base": target,
+            }
+        )
+        tracker = InitArmAuditTracker()
+        arm_states = {"right": {"actual_tcp_pose": target}}
+        tracker.observe(command=command, arm_states=arm_states, timestamp=0.0)
+        tracker.observe(command=command, arm_states=arm_states, timestamp=0.1)
+
+        after_gap = tracker.observe(command=command, arm_states=arm_states, timestamp=1.0)
+        after_reversal = tracker.observe(command=command, arm_states=arm_states, timestamp=0.9)
+
+        for audit in (after_gap, after_reversal):
+            self.assertEqual(audit["right"]["init_phase"], "init_move")
+            self.assertEqual(
+                audit["right"]["reason"],
+                "waiting_for_continuous_actual_feedback",
+            )
+            self.assertEqual(audit["right"]["dwell_sec"], 0.0)
 
     def test_hold_or_non_running_state_overrides_special_labels(self) -> None:
         command = _command()
@@ -106,7 +257,9 @@ class ArmModeLabelTests(unittest.TestCase):
         self.assertEqual(row["teleop.arm_mode.right.id"], 1)
         self.assertFalse(row["teleop.arm_mode.left.is_special"])
         decoded = json.loads(row["teleop.arm_mode_json"])
-        self.assertEqual(decoded["schema"], "dexteleop_arm_mode_v1")
+        self.assertEqual(decoded["schema"], "dexteleop_arm_mode_v2")
+        self.assertEqual(row["teleop.arm_mode.left.init_phase"], "not_active")
+        self.assertEqual(row["teleop.arm_mode.left.init_phase_valid"], 0)
 
     def test_schema_keeps_missing_legacy_arm_mode_compatible(self) -> None:
         sample = CollectorSample(
@@ -129,6 +282,122 @@ class ArmModeLabelTests(unittest.TestCase):
         self.assertEqual(row["teleop.arm_mode.available"], 0)
         self.assertEqual(row["teleop.arm_mode.left.label"], "unknown")
         self.assertEqual(row["teleop.arm_mode.right.label"], "unknown")
+
+    def test_parquet_uses_stable_vector_and_empty_tag_types(self) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ModuleNotFoundError:
+            self.skipTest("pyarrow is not installed")
+
+        rows = []
+        for index in range(2):
+            row = {
+                "action": [float(index)] * 26,
+                "observation.state": [float(index)] * 38,
+                "observation.last_action": [float(index)] * 26,
+                "action.replay.left_arm_joint_target": [float(index)] * 6,
+                "observation.arm.left.actual_qpos": [float(index)] * 6,
+                "fault_codes": [],
+                "teleop.arm_mode.schema": "dexteleop_arm_mode_v2",
+                "teleop.arm_mode.available": 1,
+                "teleop.arm_mode.left.id": 1,
+                "teleop.arm_mode.left.label": "teleop",
+                "teleop.arm_mode.left.is_special": 0,
+                "teleop.arm_mode.left.source": "normal",
+                "teleop.arm_mode.left.tags": [],
+                "teleop.arm_mode.left.scope": "",
+                "teleop.arm_mode.left.init_phase": "not_active",
+                "teleop.arm_mode.left.init_phase_valid": 0,
+                "teleop.arm_mode.left.init_target_position_error_m": None,
+                "teleop.arm_mode.left.init_target_rotation_error_deg": None,
+                "teleop.arm_mode.left.init_translation_speed_m_s": None,
+                "teleop.arm_mode.left.init_rotation_speed_deg_s": None,
+                "teleop.arm_mode.left.init_dwell_sec": 0.0,
+                "teleop.arm_mode.right.id": 1,
+                "teleop.arm_mode.right.label": "teleop",
+                "teleop.arm_mode.right.is_special": 0,
+                "teleop.arm_mode.right.source": "normal",
+                "teleop.arm_mode.right.tags": [],
+                "teleop.arm_mode.right.scope": "",
+                "teleop.arm_mode.right.init_phase": "not_active",
+                "teleop.arm_mode.right.init_phase_valid": 0,
+                "teleop.arm_mode.right.init_target_position_error_m": None,
+                "teleop.arm_mode.right.init_target_rotation_error_deg": None,
+                "teleop.arm_mode.right.init_translation_speed_m_s": None,
+                "teleop.arm_mode.right.init_rotation_speed_deg_s": None,
+                "teleop.arm_mode.right.init_dwell_sec": 0.0,
+                "teleop.arm_mode_json": "{}",
+                "observation.hand.left.tactile_process_cpu_affinity": [],
+            }
+            if index == 1:
+                row["teleop.channels.late.valid"] = True
+            rows.append(row)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "episode.parquet"
+            write_rows_to_parquet(rows, path)
+            table = pq.read_table(path)
+
+        self.assertEqual(table.schema.field("action").type, pa.list_(pa.float32()))
+        self.assertEqual(
+            table.schema.field("observation.state").type,
+            pa.list_(pa.float32()),
+        )
+        self.assertEqual(
+            table.schema.field("observation.last_action").type,
+            pa.list_(pa.float32()),
+        )
+        self.assertEqual(
+            table.schema.field("action.replay.left_arm_joint_target").type,
+            pa.list_(pa.float32()),
+        )
+        self.assertEqual(
+            table.schema.field("observation.arm.left.actual_qpos").type,
+            pa.list_(pa.float32()),
+        )
+        self.assertEqual(
+            table.schema.field("fault_codes").type,
+            pa.list_(pa.string()),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.left.id").type,
+            pa.int64(),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.left.label").type,
+            pa.string(),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.left.tags").type,
+            pa.list_(pa.string()),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.right.tags").type,
+            pa.list_(pa.string()),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.left.init_phase").type,
+            pa.string(),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.left.init_phase_valid").type,
+            pa.int64(),
+        )
+        self.assertEqual(
+            table.schema.field("teleop.arm_mode.left.init_dwell_sec").type,
+            pa.float64(),
+        )
+        self.assertEqual(
+            table.schema.field(
+                "observation.hand.left.tactile_process_cpu_affinity"
+            ).type,
+            pa.list_(pa.int64()),
+        )
+        self.assertEqual(
+            table.column("teleop.channels.late.valid").to_pylist(),
+            [None, True],
+        )
 
 
 if __name__ == "__main__":

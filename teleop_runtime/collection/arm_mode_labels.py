@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Mapping
+
+import numpy as np
+
+from robot_motion.pose import pose_delta_metrics
 
 from ..schemas import TeleopCommand
 
-ARM_MODE_SCHEMA = "dexteleop_arm_mode_v1"
+ARM_MODE_SCHEMA = "dexteleop_arm_mode_v2"
+INIT_AUDIT_SCHEMA = "dexteleop_init_audit_v1"
+
+# Match the existing hand-eye auto-record stillness detector.  The velocity
+# limits are the corresponding 1.5 mm / 0.25 deg micro-motion allowance over
+# a 100 ms audit interval; they annotate collection data only and never alter
+# the init controller.
+INIT_TARGET_POSITION_TOLERANCE_M = 0.0015
+INIT_TARGET_ROTATION_TOLERANCE_DEG = 0.25
+INIT_STILL_TRANSLATION_SPEED_M_S = 0.015
+INIT_STILL_ROTATION_SPEED_DEG_S = 2.5
+INIT_STILL_DWELL_SEC = 3.0
+INIT_AUDIT_MAX_SAMPLE_GAP_SEC = 0.5
 
 ARM_MODE_IDS: dict[str, int] = {
     "unknown": 0,
@@ -27,6 +44,24 @@ def _boolish(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _pose_or_none(value: Any) -> np.ndarray | None:
+    try:
+        pose = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+        return None
+    return pose.copy()
 
 
 def _metadata_values(command: TeleopCommand | None, key: str) -> list[Any]:
@@ -66,12 +101,228 @@ def _active_sides(command: TeleopCommand | None, *, active_key: str, side_key: s
     return sides
 
 
+def _init_sides(command: TeleopCommand | None) -> set[str]:
+    sides = _active_sides(command, active_key="init_arm_active", side_key="init_arm_side")
+    side = _normalize_side(_first_metadata(command, "init_arm_active_side"))
+    if side:
+        sides.add(side)
+    return sides
+
+
+def _fix_sides(command: TeleopCommand | None) -> set[str]:
+    sides = _active_sides(command, active_key="fix_arm_active", side_key="fix_arm_side")
+    side = _normalize_side(_first_metadata(command, "fix_arm_active_side"))
+    if side:
+        sides.add(side)
+    return sides
+
+
+def _default_init_audit(*, phase: str = "not_active", valid: bool = False, reason: str = "") -> dict[str, Any]:
+    return {
+        "schema": INIT_AUDIT_SCHEMA,
+        "init_phase": phase,
+        "init_phase_valid": bool(valid),
+        "reason": str(reason),
+        "target_position_error_m": None,
+        "target_rotation_error_deg": None,
+        "translation_speed_m_s": None,
+        "rotation_speed_deg_s": None,
+        "dwell_sec": 0.0,
+    }
+
+
+def _normalized_init_audit(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return _default_init_audit()
+    phase = str(value.get("init_phase", "unknown") or "unknown")
+    if phase not in {"not_active", "init_move", "init_hold", "unknown"}:
+        phase = "unknown"
+    normalized = _default_init_audit(
+        phase=phase,
+        valid=bool(value.get("init_phase_valid", False)),
+        reason=str(value.get("reason", "") or ""),
+    )
+    normalized["schema"] = str(value.get("schema") or INIT_AUDIT_SCHEMA)
+    for field_name in (
+        "target_position_error_m",
+        "target_rotation_error_deg",
+        "translation_speed_m_s",
+        "rotation_speed_deg_s",
+        "dwell_sec",
+    ):
+        normalized[field_name] = _finite_float(value.get(field_name))
+    if normalized["dwell_sec"] is None:
+        normalized["dwell_sec"] = 0.0
+    return normalized
+
+
+@dataclass
+class _InitAuditSideState:
+    last_pose: np.ndarray | None = None
+    last_timestamp: float | None = None
+    last_target: np.ndarray | None = None
+    stable_since: float | None = None
+
+
+class InitArmAuditTracker:
+    """Derive audit-only init phases from actual TCP feedback.
+
+    The tracker deliberately has no control authority.  It is held by the
+    collection sample builder so phase history never appears in policy inputs
+    or deployment observations.
+    """
+
+    def __init__(self) -> None:
+        self._state_by_side = {side: _InitAuditSideState() for side in ("left", "right")}
+
+    def reset(self) -> None:
+        self._state_by_side = {side: _InitAuditSideState() for side in ("left", "right")}
+
+    def observe(
+        self,
+        *,
+        command: TeleopCommand | None,
+        arm_states: Mapping[str, Mapping[str, Any] | None],
+        timestamp: float,
+    ) -> dict[str, dict[str, Any]]:
+        sample_timestamp = _finite_float(timestamp)
+        init_sides = _init_sides(command)
+        audits: dict[str, dict[str, Any]] = {}
+        for side in ("left", "right"):
+            if side not in init_sides:
+                self._state_by_side[side] = _InitAuditSideState()
+                audits[side] = _default_init_audit()
+                continue
+            audits[side] = self._observe_side(
+                side=side,
+                command=command,
+                arm_state=arm_states.get(side),
+                timestamp=sample_timestamp,
+            )
+        return audits
+
+    def _observe_side(
+        self,
+        *,
+        side: str,
+        command: TeleopCommand | None,
+        arm_state: Mapping[str, Any] | None,
+        timestamp: float | None,
+    ) -> dict[str, Any]:
+        state = self._state_by_side[side]
+        target = _init_target_pose(command, side)
+        actual = _actual_tcp_pose(arm_state)
+        if timestamp is None:
+            self._state_by_side[side] = _InitAuditSideState()
+            return _default_init_audit(phase="unknown", reason="invalid_sample_timestamp")
+        if target is None:
+            self._state_by_side[side] = _InitAuditSideState()
+            return _default_init_audit(phase="unknown", reason="missing_init_target")
+        if actual is None:
+            self._state_by_side[side] = _InitAuditSideState()
+            return _default_init_audit(phase="unknown", reason="missing_or_invalid_actual_tcp_feedback")
+
+        target_position_error_m, target_rotation_error_deg = pose_delta_metrics(actual, target)
+        target_changed = (
+            state.last_target is not None
+            and any(value > 1e-9 for value in pose_delta_metrics(state.last_target, target))
+        )
+        dt_sec: float | None = None
+        translation_speed_m_s: float | None = None
+        rotation_speed_deg_s: float | None = None
+        continuity_valid = False
+        if state.last_pose is not None and state.last_timestamp is not None:
+            dt_sec = float(timestamp - state.last_timestamp)
+            if 0.0 < dt_sec <= INIT_AUDIT_MAX_SAMPLE_GAP_SEC:
+                moved_m, moved_deg = pose_delta_metrics(state.last_pose, actual)
+                translation_speed_m_s = moved_m / dt_sec
+                rotation_speed_deg_s = moved_deg / dt_sec
+                continuity_valid = True
+
+        within_target = (
+            target_position_error_m <= INIT_TARGET_POSITION_TOLERANCE_M
+            and target_rotation_error_deg <= INIT_TARGET_ROTATION_TOLERANCE_DEG
+        )
+        below_speed_limit = bool(
+            continuity_valid
+            and translation_speed_m_s is not None
+            and rotation_speed_deg_s is not None
+            and translation_speed_m_s <= INIT_STILL_TRANSLATION_SPEED_M_S
+            and rotation_speed_deg_s <= INIT_STILL_ROTATION_SPEED_DEG_S
+        )
+        eligible_for_dwell = bool(within_target and below_speed_limit and not target_changed)
+        if not eligible_for_dwell:
+            state.stable_since = None
+        elif state.stable_since is None:
+            state.stable_since = float(timestamp)
+
+        dwell_sec = (
+            max(0.0, float(timestamp - state.stable_since))
+            if state.stable_since is not None
+            else 0.0
+        )
+        if eligible_for_dwell and dwell_sec >= INIT_STILL_DWELL_SEC:
+            phase = "init_hold"
+            reason = "target_reached_and_still"
+        elif not continuity_valid:
+            phase = "init_move"
+            reason = "waiting_for_continuous_actual_feedback"
+        elif not within_target:
+            phase = "init_move"
+            reason = "target_error_above_tolerance"
+        elif not below_speed_limit:
+            phase = "init_move"
+            reason = "actual_speed_above_stillness_threshold"
+        elif target_changed:
+            phase = "init_move"
+            reason = "init_target_changed"
+        else:
+            phase = "init_move"
+            reason = "dwell_in_progress"
+
+        state.last_pose = actual.copy()
+        state.last_timestamp = float(timestamp)
+        state.last_target = target.copy()
+        return {
+            "schema": INIT_AUDIT_SCHEMA,
+            "init_phase": phase,
+            "init_phase_valid": True,
+            "reason": reason,
+            "target_position_error_m": float(target_position_error_m),
+            "target_rotation_error_deg": float(target_rotation_error_deg),
+            "translation_speed_m_s": translation_speed_m_s,
+            "rotation_speed_deg_s": rotation_speed_deg_s,
+            "dwell_sec": float(dwell_sec),
+        }
+
+
+def _init_target_pose(command: TeleopCommand | None, side: str) -> np.ndarray | None:
+    if command is None:
+        return None
+    arm_command = command.commands.get(f"{side}_arm")
+    if arm_command is None:
+        return None
+    metadata = arm_command.metadata or {}
+    return _pose_or_none(metadata.get("init_arm_target_pose_base"))
+
+
+def _actual_tcp_pose(arm_state: Mapping[str, Any] | None) -> np.ndarray | None:
+    if not isinstance(arm_state, Mapping):
+        return None
+    if arm_state.get("causal_measured_state_eligible") is False:
+        return None
+    if arm_state.get("actual_state_valid") is False or _boolish(arm_state.get("actual_state_stale")):
+        return None
+    return _pose_or_none(arm_state.get("actual_tcp_pose"))
+
+
 def _side_payload(
     *,
     mode: str,
     source: str,
     tags: Sequence[str] = (),
     detail: Mapping[str, Any] | None = None,
+    audit: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     label = str(mode or "unknown")
     if label not in ARM_MODE_IDS:
@@ -87,6 +338,7 @@ def _side_payload(
         "is_special": bool(label in {"fixed_hold", "init_pose"}),
         "tags": tag_list,
         "detail": dict(detail or {}),
+        "audit": _normalized_init_audit(audit),
     }
 
 
@@ -96,8 +348,14 @@ def build_arm_mode_metadata(
     session_state: str,
     active_sides: Sequence[str] = ("left", "right"),
     recording_paused: bool = False,
+    init_audit_by_side: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build per-side semantic labels without changing action/state vectors."""
+    """Build model mode labels plus non-model audit metadata.
+
+    `init_audit_by_side` is emitted by :class:`InitArmAuditTracker`.  Its
+    fields remain Parquet/JSON audit data and never change action or state
+    vectors.
+    """
 
     normalized_active_sides = {
         side for side in (_normalize_side(side) for side in active_sides) if side
@@ -105,22 +363,9 @@ def build_arm_mode_metadata(
     state_text = str(session_state or "").strip()
     state_upper = state_text.upper()
     stopped_by_session = bool(recording_paused or state_upper not in {"RUNNING"})
-    init_sides = _active_sides(
-        command,
-        active_key="init_arm_active",
-        side_key="init_arm_side",
-    )
-    init_side = _normalize_side(_first_metadata(command, "init_arm_active_side"))
-    if init_side:
-        init_sides.add(init_side)
-    fix_sides = _active_sides(
-        command,
-        active_key="fix_arm_active",
-        side_key="fix_arm_side",
-    )
-    fix_side = _normalize_side(_first_metadata(command, "fix_arm_active_side"))
-    if fix_side:
-        fix_sides.add(fix_side)
+    init_sides = _init_sides(command)
+    fix_sides = _fix_sides(command)
+    audit_by_side = init_audit_by_side if isinstance(init_audit_by_side, Mapping) else {}
 
     sides: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
@@ -130,12 +375,12 @@ def build_arm_mode_metadata(
             "session_state": state_text,
             "recording_paused": bool(recording_paused),
         }
+        init_audit = audit_by_side.get(side)
         if stopped_by_session:
             source = "recording_pause" if recording_paused else "session_state"
             sides[side] = _side_payload(
                 mode="stopped" if enabled else "unknown",
                 source=source,
-                tags=("hold",) if recording_paused else (),
                 detail=detail,
             )
         elif side in init_sides:
@@ -144,13 +389,22 @@ def build_arm_mode_metadata(
                 source="init_arm",
                 tags=("init_arm",),
                 detail={**detail, "init_arm_mode": _first_metadata(command, "init_arm_mode")},
+                audit=init_audit or _default_init_audit(phase="unknown", reason="audit_not_collected"),
             )
         elif side in fix_sides:
+            scope = str(_first_metadata(command, "fix_arm_scope") or "arm_and_end_effector")
+            warning = str(_first_metadata(command, "fix_arm_warning") or "")
             sides[side] = _side_payload(
                 mode="fixed_hold",
                 source="fix_arm",
                 tags=("fix_arm",),
-                detail={**detail, "fix_arm_mode": _first_metadata(command, "fix_arm_mode")},
+                detail={
+                    **detail,
+                    "fix_arm_mode": _first_metadata(command, "fix_arm_mode"),
+                    "effector_scope": scope,
+                    "fix_arm_warning": warning,
+                    "fix_arm_effectors": _first_metadata(command, "fix_arm_effectors"),
+                },
             )
         elif enabled:
             sides[side] = _side_payload(mode="teleop", source="normal", detail=detail)
@@ -194,6 +448,7 @@ def normalize_arm_mode_metadata(value: Any) -> dict[str, Any]:
                         source=str(raw_side.get("source", "")),
                         tags=tags,
                         detail=raw_side.get("detail", {}) if isinstance(raw_side.get("detail"), Mapping) else {},
+                        audit=raw_side.get("audit"),
                     )
                 else:
                     sides[side] = _side_payload(mode="unknown", source="missing_side")
@@ -229,6 +484,9 @@ def flatten_arm_mode_columns(payload: Any) -> dict[str, Any]:
         mode = str(side_payload.get("mode") or side_payload.get("label") or "unknown")
         if mode not in ARM_MODE_IDS:
             mode = "unknown"
+        audit = _normalized_init_audit(side_payload.get("audit"))
+        detail = side_payload.get("detail", {})
+        detail = detail if isinstance(detail, Mapping) else {}
         columns[f"teleop.arm_mode.{side}.id"] = int(ARM_MODE_IDS[mode])
         columns[f"teleop.arm_mode.{side}.label"] = mode
         columns[f"teleop.arm_mode.{side}.is_special"] = int(
@@ -239,4 +497,22 @@ def flatten_arm_mode_columns(payload: Any) -> dict[str, Any]:
         columns[f"teleop.arm_mode.{side}.tags"] = [
             str(tag) for tag in tags
         ] if isinstance(tags, Sequence) and not isinstance(tags, (str, bytes)) else []
+        columns[f"teleop.arm_mode.{side}.scope"] = str(detail.get("effector_scope", "") or "")
+        columns[f"teleop.arm_mode.{side}.init_phase"] = str(audit["init_phase"])
+        columns[f"teleop.arm_mode.{side}.init_phase_valid"] = int(
+            bool(audit["init_phase_valid"])
+        )
+        columns[f"teleop.arm_mode.{side}.init_target_position_error_m"] = audit[
+            "target_position_error_m"
+        ]
+        columns[f"teleop.arm_mode.{side}.init_target_rotation_error_deg"] = audit[
+            "target_rotation_error_deg"
+        ]
+        columns[f"teleop.arm_mode.{side}.init_translation_speed_m_s"] = audit[
+            "translation_speed_m_s"
+        ]
+        columns[f"teleop.arm_mode.{side}.init_rotation_speed_deg_s"] = audit[
+            "rotation_speed_deg_s"
+        ]
+        columns[f"teleop.arm_mode.{side}.init_dwell_sec"] = audit["dwell_sec"]
     return columns

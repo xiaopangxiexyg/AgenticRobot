@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from robot_motion.pose import as_pose_matrix
+from robot_motion.pose import as_strict_pose_matrix
 
 from .qpos_transition import validate_qpos_mapping
 
@@ -515,9 +515,9 @@ def _append_endpoint_excursion_events(
     slow = max(0.0, hard - float(cfg.endpoint_slow_margin_m))
     distances: dict[str, dict[str, float]] = {}
     for side in pose_by_side:
-        pose = as_pose_matrix(np.asarray(pose_by_side[side], dtype=float))
-        start_pose = as_pose_matrix(np.asarray(start_pose_by_side[side], dtype=float))
-        target_pose = as_pose_matrix(np.asarray(target_pose_by_side[side], dtype=float))
+        pose = as_strict_pose_matrix(np.asarray(pose_by_side[side], dtype=float))
+        start_pose = as_strict_pose_matrix(np.asarray(start_pose_by_side[side], dtype=float))
+        target_pose = as_strict_pose_matrix(np.asarray(target_pose_by_side[side], dtype=float))
         measurements = {
             "start": float(np.linalg.norm(pose[:3, 3] - start_pose[:3, 3])),
             "target": float(np.linalg.norm(pose[:3, 3] - target_pose[:3, 3])),
@@ -626,7 +626,7 @@ def _append_upper_bound_signal_events(events: list[ArmTransitionRiskEvent], *, v
 
 def _fk_by_side(model: ArmTransitionModel, qpos_by_side: Mapping[str, Any]) -> Mapping[str, np.ndarray]:
     result = model.fk_by_side(validate_qpos_mapping(qpos_by_side))
-    return {str(side): as_pose_matrix(np.asarray(result[side], dtype=float)) for side in result}
+    return {str(side): as_strict_pose_matrix(np.asarray(result[side], dtype=float)) for side in result}
 
 
 def _require_same_shapes(a: Mapping[str, np.ndarray], b: Mapping[str, np.ndarray]) -> None:

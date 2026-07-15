@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from teleop_runtime.scene_layout import (
+from robot_motion.scene_layout import (
     rm65_base_y_for_side,
     rm65_base_yaw_for_side,
     rm65_viewer_camera_pose,
@@ -99,9 +99,9 @@ class SapienArmHandRenderer:
         if show_desk_plane:
             desk_builder = self.scene.create_actor_builder()
             desk_builder.add_box_visual(
-                pose=sapien.Pose(p=[0.0, 0.0, -0.005]),
-                half_size=[0.45, 0.65, 0.005],
-                material=sapien.render.RenderMaterial(base_color=[0.82, 0.82, 0.84, 1.0]),
+                pose=sapien.Pose(p=[-0.412, 0.0, -0.005]),
+                half_size=[0.412, 0.65, 0.005],
+                material=sapien.render.RenderMaterial(base_color=[0.02, 0.02, 0.02, 1.0]),
                 name="desk_plane",
             )
             self.desk_plane = desk_builder.build_kinematic(name="desk_plane")

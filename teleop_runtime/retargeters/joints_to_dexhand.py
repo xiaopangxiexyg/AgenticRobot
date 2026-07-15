@@ -5,8 +5,12 @@ from typing import Sequence
 
 import numpy as np
 
+from robot_motion.action.hand_mapping import (
+    DEFAULT_INSPIRE_HAND_JOINT_ORDER,
+    map_q6_to_dexhand_target,
+)
+
 from ..calibration import TeleopCalibration
-from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from ..schemas import EffectorCommand, TeleopCommand, TeleopObservation
@@ -59,24 +63,28 @@ class JointsToDexHandRetargeter(Retargeter):
             command.metadata["skipped"] = self.config.input_channel_name
             return command
 
-        source = np.asarray(channel.value, dtype=np.float32)
-        if source.shape != (6,):
+        source_q6 = np.asarray(channel.value, dtype=np.float32)
+        if source_q6.shape != (6,):
             raise ValueError(
-                f"{self.name} expects q6 input with shape (6,), got {source.shape}."
+                f"{self.name} expects q6 input with shape (6,), got {source_q6.shape}."
             )
 
-        source = np.clip(source, 0.0, 1.0)
-        source = source[self._joint_order]
-
-        target = 1.0 - source if self.config.invert else source.copy()
-        target = target * self._gain + self._bias
-        target = np.clip(target, self.config.output_min, self.config.output_max)
+        mapped = map_q6_to_dexhand_target(
+            source_q6,
+            joint_order=self._joint_order,
+            invert=self.config.invert,
+            gain=self._gain,
+            bias=self._bias,
+            output_min=self.config.output_min,
+            output_max=self.config.output_max,
+        )
 
         if self._filtered_cmd is None or self.config.alpha >= 1.0:
-            self._filtered_cmd = target
+            self._filtered_cmd = mapped.target_q6
         else:
             self._filtered_cmd = (
-                self.config.alpha * target + (1.0 - self.config.alpha) * self._filtered_cmd
+                self.config.alpha * mapped.target_q6
+                + (1.0 - self.config.alpha) * self._filtered_cmd
             )
 
         command.add_command(
@@ -93,7 +101,7 @@ class JointsToDexHandRetargeter(Retargeter):
                     "gain": self._gain.copy(),
                     "bias": self._bias.copy(),
                     "alpha": self.config.alpha,
-                    "source_q6": source.copy(),
+                    "source_q6": mapped.source_q6.copy(),
                 },
             )
         )

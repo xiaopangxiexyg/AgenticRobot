@@ -87,13 +87,12 @@ conda activate dexteleop310
 python hardware/VIVE/mocap/vive_data_sender.py \
   --host 127.0.0.1 \
   --port 9999 \
-  --hz 60 \
-  --tracker tracker_1:left_wrist \
-  --tracker tracker_2:right_wrist
+  --hz 300
 ```
 
-第三只 `tracker_3:auxiliary` 可选。没有 auxiliary 时，calibration debug 会用左或右
-wrist tracker 完成 virtual desk 扫动。
+sender 会自动把设备名较小的 tracker 分配为 `left_wrist`，较大的分配为
+`right_wrist`；发现多于两个 tracker 时直接报错。没有 auxiliary 时，calibration debug
+会用左或右 wrist tracker 完成 virtual desk 扫动。
 
 ```bash
 python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \

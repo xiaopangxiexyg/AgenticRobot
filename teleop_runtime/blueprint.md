@@ -982,7 +982,6 @@ class TeleopSessionConfig:
     teleop_profile: str              # mapping + safety + clutch policy
     tcp_mode: str                    # "rm_eef" / "hand_base"
     scale: float
-    stale_timeout_sec: float
     record_enabled: bool
     allow_hardware_after_debug_pass: bool
 ```
@@ -1016,15 +1015,10 @@ session.run()
 class TeleopSafetyConfig:
     max_translation_jump_m: float
     max_rotation_jump_deg: float
-    max_target_speed_mps: float
-    max_target_angular_speed_dps: float
     stale_timeout_sec: float
     invalid_frame_limit: int
-    ik_failure_limit: int
     freeze_on_fault: bool
-    freeze_scope: str                # "whole_rig"
     minimum_control_hz: float        # 15
-    target_control_hz: float         # 30
 ```
 
 并建议为可扩展性补一层 profile：

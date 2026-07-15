@@ -12,6 +12,7 @@ from teleop_runtime.action import (
     BIMANUAL_MIXED_V1,
     BIMANUAL_QPOS_V1,
     EE_POSE_HAND16_VECTOR_DIM,
+    EndEffectorTarget,
     QPOS_HAND16_VECTOR_DIM,
     decode_robot_action,
     encode_robot_action,
@@ -31,6 +32,44 @@ from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObserva
 
 
 class TeleopActionContractTest(unittest.TestCase):
+    def test_native_v22_discrete_end_effector_target_remains_int64_to_command(self) -> None:
+        action = RobotAction(
+            action_space="dexteleop_policy_io_v2.2",
+            arm_pose_by_side={
+                "left": np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            },
+            end_effector_targets_by_side={
+                "right": EndEffectorTarget(
+                    value_type="discrete",
+                    values=[1],
+                    adapter="two_state_gripper_v1",
+                    names=("mode",),
+                )
+            },
+        )
+
+        command = RobotActionResolver().resolve(action)
+
+        self.assertEqual(action.active_effectors, ("left_arm", "right_hand"))
+        target = command.commands["right_hand"]
+        self.assertEqual(target.command_type, "end_effector_discrete")
+        self.assertEqual(target.value.dtype, np.int64)
+        self.assertEqual(target.metadata["end_effector_adapter"], "two_state_gripper_v1")
+
+    def test_native_v22_target_rejects_legacy_target_for_same_side(self) -> None:
+        with self.assertRaises(ValueError):
+            RobotAction(
+                action_space="dexteleop_policy_io_v2.2",
+                hand_qpos_by_side={"right": np.zeros((6,), dtype=np.float32)},
+                end_effector_targets_by_side={
+                    "right": EndEffectorTarget(
+                        value_type="continuous",
+                        values=[0.5],
+                        adapter="dmtac_gripper_v1",
+                    )
+                },
+            )
+
     def test_bimanual_ee_pose_derives_mask_and_frames(self) -> None:
         action = RobotAction.bimanual_ee_pose(
             left_arm=np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
@@ -143,7 +182,31 @@ class TeleopActionContractTest(unittest.TestCase):
         self.assertEqual(left.metadata["arm_controlled_frame"], ARM_ENDPOINT_FRAME)
         self.assertEqual(left.metadata["arm_action_spec"]["controlled_frame"], ARM_ENDPOINT_FRAME)
 
-    def test_teleop_joint_command_prefers_source_pose_metadata_by_default(self) -> None:
+    def test_teleop_joint_command_prefers_backend_target_pose_metadata_by_default(self) -> None:
+        source_pose = np.array([0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        target_pose = np.array([0.5, 0.6, 0.7, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        command = TeleopCommand(timestamp=8.0)
+        command.add_command(
+            EffectorCommand(
+                effector_name="right_arm",
+                side="right",
+                command_type="joint_vector",
+                value=np.arange(6, dtype=np.float32),
+                frame_name=None,
+                metadata={
+                    "target_pose_base": xyzquat_to_matrix(target_pose),
+                    "source_target_pose_base": xyzquat_to_matrix(source_pose),
+                },
+            )
+        )
+
+        action = robot_action_from_teleop_command(command)
+
+        self.assertEqual(action.action_space, BIMANUAL_EE_POSE_V1)
+        np.testing.assert_allclose(action.arm_pose_by_side["right"], target_pose, atol=1e-6)
+        self.assertNotIn("right", action.arm_qpos_by_side)
+
+    def test_teleop_joint_command_falls_back_to_source_pose_when_target_missing(self) -> None:
         source_pose = np.array([0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         command = TeleopCommand(timestamp=8.0)
         command.add_command(
@@ -161,7 +224,6 @@ class TeleopActionContractTest(unittest.TestCase):
 
         self.assertEqual(action.action_space, BIMANUAL_EE_POSE_V1)
         np.testing.assert_allclose(action.arm_pose_by_side["right"], source_pose, atol=1e-6)
-        self.assertNotIn("right", action.arm_qpos_by_side)
 
     def test_teleop_joint_command_can_be_kept_as_qpos_action(self) -> None:
         command = TeleopCommand(timestamp=9.0)

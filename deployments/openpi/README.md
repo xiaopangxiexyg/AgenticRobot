@@ -1,542 +1,268 @@
-# DexTeleop OpenPI Deployment
+# OpenPI wrist-only 部署
 
-This directory contains the OpenPI deployment integration.
+本目录连接 OpenPI 推理服务与 DexTeleop 真机部署运行时。OpenPI 仅负责模型加载和 websocket 推理；相机、机械臂、夹爪、初始化、限幅和力控均由 DexTeleop 负责。
 
-- `src/`: symlink to the OpenPI source tree. It owns model loading and serving.
-- `client/`: DexTeleop-side OpenPI adapters and launchers.
-- `../client/`: model-agnostic client contracts, remote-policy glue, and unified action chunks.
+当前经过闭环 server/client 握手验证的模型是：
 
-The supported LAN topology is:
+| 项目 | 值 |
+| --- | --- |
+| server model id | `0712-wrist-cube` |
+| checkpoint | `checkpoints/0712-wrist-cube/0712-wrist-cube-wrist-only/92599` |
+| artifact | checkpoint 下的 `policy_artifact.json` |
+| 图像 | `left_wrist`、`right_wrist`（RGB） |
+| state / action | 16D / 16D，连续 DMTAC gripper 标量 |
+| server schema | `dexteleop_deploy_v2` |
 
-```text
-GPU / model server machine
-  OpenPI server, checkpoint, websocket port
+`92599` 是当前保存的训练 checkpoint，并不表示 150k 训练已完成或已通过任务成功率评估。部署前应先完成无硬件预检和 dry-run。
 
-Robot / client machine
-  DexTeleop real observation, cameras, robot backends, safety checks, dispatch
+## 1. 不可变契约
+
+`policy_artifact.json` 是 checkpoint 的唯一 I/O 权威。客户端传入 `--policy-artifact-json` 后会强制校验：
+
+- server model id 和 checkpoint step；
+- v2 schema、16D state/action、layout hash；
+- 左右 wrist 的逻辑相机键、OpenPI 输入键和 server slots；
+- DMTAC 的连续 gripper 映射。
+
+不要手动将 wrist 图像伪装成 `front`，也不要用位置顺序猜测相机。`0712-wrist-cube` 的 registry key 必须与 artifact 内的 `model_id` 完全相同；否则 websocket 握手会 fail-closed。
+
+服务端 registry 位于 `~/zc/openpi/configs/dexteleop_policy_registry.json`，必须包含：
+
+```json
+"0712-wrist-cube": {
+  "config": "0712-wrist-cube",
+  "checkpoint_dir": "checkpoints/0712-wrist-cube/0712-wrist-cube-wrist-only/92599",
+  "deploy_schema_version": "dexteleop_deploy_v2",
+  "action_key": "actions",
+  "action_discrete_key": "actions_discrete",
+  "action_dim": 16,
+  "action_discrete_dim": 0,
+  "state_dim": 16,
+  "state_discrete_dim": 0,
+  "action_horizon": 50,
+  "active_sides": ["left", "right"],
+  "camera_slots": ["left_wrist_0_rgb", "right_wrist_0_rgb"]
+}
 ```
 
-The real runtime does not import OpenPI. The OpenPI client converts model output
-to the unified dense deployment action space, then `teleop_runtime` consumes it
-like any other policy output.
+## 2. 两套环境
 
-## 1. Network Assumptions
+不要混用环境：
 
-Both machines must be on the same LAN or otherwise routable:
+| 机器/职责 | 根目录 | 环境 |
+| --- | --- | --- |
+| OpenPI server / GPU | `/home/user/zc/openpi` | `uv` / `.venv` |
+| DexTeleop client / 硬件 | `/home/user/zc/DexTeleop` | `/home/user/miniconda3/envs/dexteleop310/bin/python` |
 
-- server can bind and listen on `PORT`, usually `8078`
-- client can reach `SERVER_IP:PORT`
-- robot arm / hand / camera devices are connected to, or reachable from, the client machine
-- only model inference runs on the server machine
-
-On the server machine, find the LAN IP:
+以下变量应在 **DexTeleop client 机器**上设置；若 server 与 client 是同一台机器，`SERVER_IP=127.0.0.1` 仅适用于本机检查，局域网部署应使用可路由 IP。
 
 ```bash
-hostname -I
-ip -4 addr
-```
+export DEXTELEOP_ROOT=/home/user/zc/DexTeleop
+export OPENPI_ROOT=/home/user/zc/openpi
+export DEXTELEOP_PYTHON=/home/user/miniconda3/envs/dexteleop310/bin/python
 
-Use the address that the client can reach, for example:
-
-```bash
-export SERVER_IP=192.168.20.74
+export SERVER_IP=127.0.0.1
 export OPENPI_PORT=8078
-export OPENPI_MODEL=dual_rm65_dmgripper_latest
-```
+export OPENPI_MODEL=0712-wrist-cube
+export OPENPI_ARTIFACT=$OPENPI_ROOT/checkpoints/0712-wrist-cube/0712-wrist-cube-wrist-only/92599/policy_artifact.json
 
-If a firewall is enabled on the server, allow the port, for example:
-
-```bash
-sudo ufw allow 8078/tcp
-```
-
-## 2. Server Machine
-
-Start from the OpenPI tree exposed through `deployments/openpi/src`:
-
-```bash
-cd /home/zc/HandMotion/Developing/DexTeleop/deployments/openpi/src
-```
-
-Check the registered model:
-
-```bash
-sed -n '1,200p' configs/dexteleop_policy_registry.json
-```
-
-Start the server for LAN access. The important part is `--host 0.0.0.0`; this
-binds the websocket server to all network interfaces rather than localhost.
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.70 uv run scripts/serve_dexteleop_policy.py \
-  --model "$OPENPI_MODEL" \
-  --host 0.0.0.0 \
-  --port "$OPENPI_PORT"
-```
-
-To override the registry checkpoint at launch time:
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.70 uv run scripts/serve_dexteleop_policy.py \
-  --model "$OPENPI_MODEL" \
-  --checkpoint-dir /abs/path/to/checkpoint/100000 \
-  --host 0.0.0.0 \
-  --port "$OPENPI_PORT"
-```
-
-The server exposes both websocket inference and simple HTTP checks:
-
-```bash
-curl http://127.0.0.1:8078/healthz
-curl http://127.0.0.1:8078/metadata
-```
-
-The metadata should include at least:
-
-- `protocol_version=openpi.local_policy.websocket.v1`
-- `deploy_schema_version=dexteleop_deploy_v1`
-- `model_id`
-- `deployment.checkpoint_dir`
-- `deployment.checkpoint_step`
-- `model.action_horizon`
-- `local_robot.output_action_dim`
-- `local_robot.active_sides`
-- `dataset_adapter.camera_slots`
-- `dataset_adapter.hand_layout`
-
-## 3. Client Machine: Connectivity Checks
-
-Start from DexTeleop:
-
-```bash
-export SERVER_IP=192.168.20.74
-export OPENPI_PORT=8078
-export OPENPI_MODEL=dual_rm65_dmgripper_latest
-```
-
-Check basic network reachability:
-
-```bash
-ping "$SERVER_IP"
-curl "http://$SERVER_IP:$OPENPI_PORT/healthz"
-curl "http://$SERVER_IP:$OPENPI_PORT/metadata"
-```
-
-Check the OpenPI client entry:
-
-```bash
-PYTHONPATH=. uv run python -m deployments.openpi.client.real --help
-```
-
-Check websocket metadata and contract validation without running robot control:
-
-```bash
-PYTHONPATH=. uv run python -c 'import os; from deployments.openpi.client.policy import create_policy; p=create_policy(host=os.environ["SERVER_IP"], port=int(os.environ["OPENPI_PORT"]), expected_model_id=os.environ["OPENPI_MODEL"]); print(p.name); print(p.metadata["validation"])'
-```
-
-This command connects to the server, reads metadata, validates the protocol and
-unified action-space dimensions, then exits. It does not read cameras or move
-hardware.
-
-## 4. Client Dry-Run With Real Observation
-
-Dry-run performs local observation collection, server inference, action
-normalization, safety filtering, and queue handling. It does not send robot
-commands because `--send-actions` is omitted.
-
-For a single local RealSense config:
-
-```bash
-PYTHONPATH=. uv run python -m deployments.openpi.client.real \
-  --host "$SERVER_IP" \
-  --port "$OPENPI_PORT" \
-  --model "$OPENPI_MODEL" \
-  --active-sides both \
-  --enable-hands \
-  --hand-backend dmtac-gripper \
-  --dmtac-config latest \
-  --camera-mode single \
-  --camera-config cameras/configs/rm65/devices/realsense_front.json \
-  --require-camera-frame \
-  --require-ready-observation \
-  --action-queue-policy replace \
-  --min-action-queue 0 \
-  --init-source none \
-  --auto-start \
-  --max-steps 100
-```
-
-For multi-camera deployment, change only the camera mode/config:
-
-```bash
---camera-mode multi \
---camera-config cameras/configs/rm65/devices/realsense.json
-```
-
-The OpenPI client expects a `front` image by default. If the local camera config
-uses a different key, either rename it to `front` in the camera config or use
-the direct policy-spec form with an explicit `image_key_map`.
-`--camera-mode single` expects the camera config JSON to contain exactly one
-entry, so use `realsense_front.json` for front-only runs.
-
-## 5. Client Real Execution
-
-Only add `--send-actions` after metadata check and dry-run look correct. Real
-arm execution requires a recorded dataset-frame qpos init by default. To
-intentionally start from the current qpos without dataset init, add
-`--start-init_qpos` as an explicit safety override.
-
-Example dual-arm + DMTAC gripper deployment:
-
-```bash
 export LEFT_ARM_IP=192.168.101.21
 export RIGHT_ARM_IP=192.168.1.20
 
-PYTHONPATH=. uv run python -m deployments.openpi.client.real \
-  --host "$SERVER_IP" \
-  --port "$OPENPI_PORT" \
-  --model "$OPENPI_MODEL" \
+```
+
+## 3. 启动 OpenPI server
+
+在 GPU/server 机器执行。`PYTHONPATH` 必须指向 DexTeleop，因为 OpenPI 的训练配置会加载共享的数据集接口。
+
+```bash
+cd /home/user/zc/openpi
+export PYTHONPATH=/home/user/zc/DexTeleop
+export JAX_PLATFORMS=cuda
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+
+uv run scripts/serve_dexteleop_policy.py \
+  --model 0712-wrist-cube \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+server 应保持在该终端运行。另开一个终端确认 health 和 metadata：
+
+```bash
+curl --fail --silent http://127.0.0.1:8078/healthz
+curl --fail --silent http://127.0.0.1:8078/metadata
+```
+
+metadata 至少应显示：
+
+```text
+model_id=0712-wrist-cube
+deployment.checkpoint_step=92599
+deploy_schema_version=dexteleop_deploy_v2
+local_robot.output_action_dim=16
+dataset_adapter.camera_slots=[left_wrist_0_rgb,right_wrist_0_rgb]
+```
+
+## 4. 无硬件 websocket 预检
+
+此命令只连接 server、读取 metadata 并验证 artifact；不打开相机、不连接机械臂或夹爪、不发送动作。
+
+```bash
+cd "$DEXTELEOP_ROOT"
+"$DEXTELEOP_PYTHON" -c '
+from deployments.client import load_policy_artifact
+from deployments.openpi.client.policy import create_policy
+import os
+
+artifact = load_policy_artifact(os.environ["OPENPI_ARTIFACT"])
+policy = create_policy(
+    host=os.environ["SERVER_IP"],
+    port=int(os.environ["OPENPI_PORT"]),
+    policy_artifact=artifact,
+)
+print(policy.name)
+print(policy.metadata["validation"])
+'
+```
+
+任何 model id、step、16D action、layout hash 或 camera slot 不匹配都必须先修复；不要用关闭校验的方式绕过。
+
+## 5. qpos-init 与 v2.2 数据集
+
+`--policy-qpos-init-dataset` 用于把机械臂安全移动到数据集的指定帧 qpos，随后才允许策略启动。v2.2 数据集的 `action` 是 16D；运行时现在会根据数据集 `meta/info.json` 内的 `policy_io_layout` 显式桥接成内部 canonical 26D debug/hold action，而不是把 16D 当成旧 action 解析。
+
+实际 qpos 目标不从模型 action 猜测，`--policy-qpos-init-source auto` 按以下优先级选择该帧有限且完整的 6D joint target：
+
+1. `replay_qpos`
+2. `observation.arm.qpos`
+3. `observation.*.current_qpos`
+4. `observation.*.actual_qpos`
+
+对 `bimanual-cube-new-success` 的 episode 0/frame 0，当前会选择 `observation_arm_qpos`，左右臂各为 6D。读取/规划失败时策略保持被阻塞，不能自动退化为任意当前姿态。
+
+可在没有硬件的情况下验证 qpos-init 数据读取：
+
+```bash
+cd "$DEXTELEOP_ROOT"
+"$DEXTELEOP_PYTHON" -c '
+from teleop_runtime.deploy.policy_qpos_init import load_deploy_policy_qpos_init_plan
+plan = load_deploy_policy_qpos_init_plan(
+    dataset_root="/home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success",
+    parquet_path=None,
+    episode_index=0,
+    frame_index=0,
+    action_column="action",
+    active_sides=("left", "right"),
+    qpos_init_source="auto",
+)
+print(plan.metadata["action_encoding"], plan.target_sources_by_side)
+'
+```
+
+预期包含 `v22_layout_to_legacy_q6_bridge` 和两个 qpos source；若不是，停止并检查数据集 metadata、episode 和 layout hash。
+
+## 6. 相机/推理 dry-run（不发送硬件动作）
+
+以下命令会打开两个 wrist 相机、读取真实观测、请求推理、执行动作归一化和安全过滤，但**不**加 `--send-actions`，因此不会向机械臂或夹爪发送命令。先检查两路图像、server validation、动作限幅和 fault 日志。
+
+```bash
+cd "$DEXTELEOP_ROOT"
+"$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
+  --host "$SERVER_IP" --port "$OPENPI_PORT" \
+  --policy-artifact-json "$OPENPI_ARTIFACT" \
   --active-sides both \
-  --enable-hands \
-  --hand-backend dmtac-gripper \
-  --dmtac-config latest \
+  --arm-execution-profile impedance_40hz \
+  --enable-hands --hand-backend dmtac-gripper --dmtac-config latest \
   --camera-mode multi \
   --camera-config cameras/configs/rm65/devices/realsense.json \
-  --require-camera-frame \
-  --require-ready-observation \
-  --action-queue-policy replace \
-  --min-action-queue 0 \
+  --require-camera-frame --require-ready-observation \
+  --action-queue-policy replace --min-action-queue 0 \
   --init-source current \
-  --wait-for-ready-confirm \
-  --policy-qpos-init-dataset /home/user/zc/DexTeleop/datasets/2026-07-05_vive_rm65_real_teleop \
-  --policy-qpos-init-episode 20 \
-  --policy-qpos-init-frame 1 \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success \
+  --policy-qpos-init-episode 0 --policy-qpos-init-frame 0 \
   --policy-qpos-init-source auto \
-  --policy-qpos-init-arm-max-angvel 0.25,0.25,0.25,0.35,0.35,0.35 \
-  --arm-workspace-min -0.80 -0.80 0.00 \
-  --arm-workspace-max 0.80 0.80 0.90 \
-  --left-arm-ip "$LEFT_ARM_IP" \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --send-actions
+  --max-steps 100 --debug
 ```
 
-To choose a different recorded start frame, change the normal DexTeleop deploy
-qpos-init flags:
+`multi` 配置可以含 front 相机；artifact 会只选择 `left_wrist` 和 `right_wrist`。缺少任一 artifact-required view 会 fail-closed。
+
+## 7. 真机阻抗/力控执行（L5）
+
+下面命令会连接真实 RM65、使能阻抗/力控后端、执行 dataset-frame qpos 初始化，并在启动许可后向双臂和 DMTAC 夹爪发送策略动作。只应在以下条件全部满足且操作者现场确认后执行：
+
+- 人员远离工作空间，急停可用；
+- 两臂 IP、tool frame、碰撞场景和 DMTAC assignment 已确认；
+- 两路 wrist 相机在 dry-run 中已验证；
+- server metadata 与 artifact 已通过第 4 节预检；
+- dataset frame 0 是可安全到达的起始姿态；
+- 已了解 `g` 会开始 qpos-init/策略流程，`A` 只会在 ready 后放行策略。
 
 ```bash
-  --policy-qpos-init-dataset /abs/path/to/dataset \
-  --policy-qpos-init-episode 20 \
-  --policy-qpos-init-frame 123 \
-  --policy-qpos-init-source auto \
-  --policy-qpos-init-arm-max-angvel 0.25 \
-  --init-source current \
-  --wait-for-ready-confirm
-```
-
-Then press `g` to move to the selected qpos frame; after startup init reaches
-ready, press `A` to release policy inference/action execution.
-
-Runtime keys are the normal `teleop_runtime.deploy` keys: `g` starts/resumes,
-`A` confirms ready, `h` pauses and clears the action queue, and `q` exits.
-See `teleop_runtime/deploy/README.md` for the full state/keyboard reference.
-
-For Inspire hand deployment, provide hand IPs as well:
-
-```bash
-export LEFT_HAND_IP=192.168.12.210
-export RIGHT_HAND_IP=192.168.11.210
-
-PYTHONPATH=. uv run python -m deployments.openpi.client.real \
-  --host "$SERVER_IP" \
-  --port "$OPENPI_PORT" \
-  --model "$OPENPI_MODEL" \
+cd "$DEXTELEOP_ROOT"
+"$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
+  --host "$SERVER_IP" --port "$OPENPI_PORT" \
+  --policy-artifact-json "$OPENPI_ARTIFACT" \
   --active-sides both \
-  --enable-hands \
-  --hand-backend inspire \
-  --camera-mode single \
-  --camera-config cameras/configs/rm65/devices/realsense_front.json \
-  --require-camera-frame \
-  --require-ready-observation \
-  --init-source current \
-  --wait-for-ready-confirm \
-  --policy-qpos-init-dataset /home/user/zc/DexTeleop/datasets/2026-07-05_vive_rm65_real_teleop \
-  --policy-qpos-init-episode 20 \
-  --policy-qpos-init-frame 1 \
+  --arm-execution-profile impedance_40hz \
+  --enable-hands --hand-backend dmtac-gripper --dmtac-config latest \
+  --camera-mode multi \
+  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --require-camera-frame --require-ready-observation \
+  --action-queue-policy replace --min-action-queue 0 \
+  --init-source current --wait-for-ready-confirm \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success \
+  --policy-qpos-init-episode 0 --policy-qpos-init-frame 0 \
   --policy-qpos-init-source auto \
-  --policy-qpos-init-arm-max-angvel 0.25,0.25,0.25,0.35,0.35,0.35 \
-  --left-arm-ip "$LEFT_ARM_IP" \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --left-hand-ip "$LEFT_HAND_IP" \
-  --right-hand-ip "$RIGHT_HAND_IP" \
-  --inspire-tac-max-fingertip-force 800 \
-  --send-actions
+  --left-arm-ip "$LEFT_ARM_IP" --right-arm-ip "$RIGHT_ARM_IP" \
+  --send-actions --debug
 ```
 
-The safety-critical runtime flags are on the client side. The server only
-produces action chunks.
+`impedance_40hz` 选择经过测试的阻抗分支：policy 15 Hz（默认时）、臂后端 40 Hz、无 CANFD follow。OpenPI 部署会额外显式启用以下双速率 IK；这是部署专用覆盖，**不改变遥操**：
 
-`--policy-qpos-init-arm-max-angvel` is optional. It sets the first-frame QPOS
-initialization velocity limit in rad/s; pass one value for all six joints or six
-comma-separated values for per-joint limits.
+| 周期 | 工作 | 预算/优先级 |
+| --- | --- | --- |
+| 15 Hz | 独立的完整 Pinocchio IK（每臂一个 worker） | 66.7 ms；只使用 `rm65_pinocchio`，不会并发调用 RM65 SDK IK。超时结果丢弃，不积压旧 pose。 |
+| 40 Hz | 力读取、导纳更新、限幅和安全 joint 输出 | 完整 IK 运行时只复用上一条安全命令；否则最多进行 6 ms 的本地 IK。 |
 
-Real execution start sequence for the examples above:
+因此 40 Hz 不是“重复执行完整 IK”。完整求解在运行时优先，40 Hz 力控循环仍持续运行；若 pose 落入难解空间，输出保持最后安全关节命令，而不会让陈旧求解阻塞或追赶。不要改为位置分支，也不要添加 `--start-init_qpos`，除非已明确审查其安全影响。
 
-1. Start the command and wait until `faults=none` and every required camera has
-   nonzero frames.
-2. Press `g` to start dataset-frame qpos init.
-3. Wait for `policy_qpos_init=released`, then for `init=done:current` and
-   `ready=wait:A`.
-4. Press `A` to release policy inference and action execution.
-
-If `--auto-start` is added, step 2 happens automatically, but `A` is still
-required when `--wait-for-ready-confirm` is used. For unattended dry-run only,
-use `--auto-start --no-wait-for-ready-confirm`. For real execution without a
-dataset-frame qpos init, add `--start-init_qpos` only after manually confirming
-the current qpos is a safe policy start state.
-
-## 6. Front-Only DMTAC Checkpoint
-
-The front-camera-only DMTAC gripper model is registered as
-`dual_rm65_dmgripper_front`. Its default checkpoint is:
+手动启动（不带 `--auto-start`）时，启动日志必须先显示：
 
 ```text
-/home/zc/HandMotion/openpi/checkpoints/dual_rm65_dmgripper_front/dual_rm65_dmgripper_front_lora_b2_lr5e-5_100k_20260708/120000
+[Deploy] impedance prepared without periodic output; press g/H/A to enable it, or use --auto-start.
 ```
 
-The checkpoint directory currently contains `40000`, `80000`, `120000`, and
-`160000`. To use a different step, change both `CKPT_DIR` on the server and
-`--checkpoint-step` on the client.
+这一步只完成力传感器/安全参考预热，**不会**启动 40 Hz 周期输出、执行 IK 或发送保持命令。按 `g` 才开启阻抗输出并开始 qpos-init；qpos-init 和 startup-init 完成后，按 `A` 才会请求 OpenPI 策略动作。若尚未按 `g` 就看到 `IK hold_last_safe`，说明远端仍在运行修复前代码，不能继续真机流程。
 
-On the OpenPI server machine:
+## 8. 失败定位
 
-```bash
-cd /home/zc/HandMotion/Developing/DexTeleop/deployments/openpi/src
+| 现象 | 含义与处理 |
+| --- | --- |
+| `must have shape (26,), got (16,)` | 使用了旧 qpos-init 代码；同步 `teleop_runtime/deploy/policy_qpos_init.py` 后重新运行第 5 节只读检查。 |
+| `model_id_mismatch` 或 `checkpoint_step_mismatch` | server registry key/step 与 artifact 不一致；修正 registry，不要伪造客户端参数。 |
+| `camera_slots` 或 required image key 不匹配 | 相机配置缺少 wrist logical key，或试图用 front 替代 wrist；修正配置。 |
+| qpos-init 缺少 target | 指定帧没有有效 qpos audit；换经过审查的 episode/frame，或修复数据集。 |
+| `DMTAC ... config is missing` | `latest` assignment、USB 映射或 side 配置不完整；先解决硬件配置，不要允许缺失后继续执行。 |
+| `deployment_dual_rate_ik.deadline_miss_count` 增长（已按 `g` 后，`--debug` record） | 15 Hz 完整 IK 没能在 66.7 ms 内完成。该次结果已丢弃，40 Hz 仍保持力/导纳和最后安全 joint command。不要按 `A` 放行策略，不要增大 deadline 来掩盖问题；检查 tool/TCP、当前 qpos/反馈、力传感器偏置、Pinocchio 迭代耗时和策略 pose 是否进入难解空间。 |
+| `deployment_dual_rate_hold_last_safe`（已按 `g` 后，`--debug` record） | 本地 6 ms IK 没有安全候选，或完整 worker 正在运行；这是受控保持而非新的策略动作。连续出现时不要按 `A`，先按上一行检查完整 IK deadline 和姿态可达性。 |
+| `impedance IK hold_last_safe ... hard deadline`（已按 `g` 后） | 这属于旧的单线程阻抗路径，或说明部署双速率覆盖没有生效。停止真机流程，确认运行的是同步后的 `teleop_runtime/deploy/run_policy.py`，并检查 debug config 中 `deployment_dual_rate_ik_enabled=true`。 |
+| server 无法起动 CUDA | 确认在 OpenPI uv 环境启动，且设置了 `JAX_PLATFORMS=cuda`。 |
 
-export OPENPI_PORT=8078
-export OPENPI_MODEL=dual_rm65_dmgripper_front
-export CKPT_STEP=120000
-export CKPT_DIR=/home/zc/HandMotion/openpi/checkpoints/dual_rm65_dmgripper_front/dual_rm65_dmgripper_front_lora_b2_lr5e-5_100k_20260708/$CKPT_STEP
-
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.70 uv run scripts/serve_dexteleop_policy.py \
-  --model "$OPENPI_MODEL" \
-  --checkpoint-dir "$CKPT_DIR" \
-  --host 0.0.0.0 \
-  --port "$OPENPI_PORT"
-```
-
-Verify the server metadata:
-
-```bash
-curl http://127.0.0.1:8078/metadata
-```
-
-Confirm `model_id=dual_rm65_dmgripper_front`,
-`deployment.config_name=dual_rm65_dmgripper_front`,
-`deployment.checkpoint_step=120000`, and
-`dataset_adapter.camera_slots=["base_0_rgb"]`.
-
-On the DexTeleop client machine:
-
-```bash
-cd /home/zc/HandMotion/Developing/DexTeleop
-
-export SERVER_IP=<server_lan_ip>
-export OPENPI_PORT=8078
-export OPENPI_MODEL=dual_rm65_dmgripper_front
-export CKPT_STEP=120000
-
-echo "SERVER_IP=$SERVER_IP OPENPI_PORT=$OPENPI_PORT OPENPI_MODEL=$OPENPI_MODEL CKPT_STEP=$CKPT_STEP"
-```
-
-Check connectivity and contract validation:
-
-```bash
-curl "http://$SERVER_IP:$OPENPI_PORT/healthz"
-curl "http://$SERVER_IP:$OPENPI_PORT/metadata"
-
-PYTHONPATH=. uv run python -c 'import os; from deployments.openpi.client.policy import create_policy; p=create_policy(host=os.environ["SERVER_IP"], port=int(os.environ["OPENPI_PORT"]), expected_model_id=os.environ["OPENPI_MODEL"], expected_checkpoint_step=os.environ["CKPT_STEP"], required_camera_slots=("base_0_rgb",), required_image_keys=("front",)); print(p.name); print(p.metadata["validation"])'
-```
-
-Front-only dry-run:
-
-```bash
-PYTHONPATH=. uv run python -m deployments.openpi.client.real \
-  --host "$SERVER_IP" \
-  --port "$OPENPI_PORT" \
-  --model "$OPENPI_MODEL" \
-  --checkpoint-step "$CKPT_STEP" \
-  --active-sides both \
-  --enable-hands \
-  --hand-backend dmtac-gripper \
-  --dmtac-config latest \
-  --camera-mode single \
-  --camera-key front \
-  --camera-config cameras/configs/rm65/devices/realsense_front.json \
-  --required-camera-slot base_0_rgb \
-  --required-image-key front \
-  --require-camera-frame \
-  --require-ready-observation \
-  --debug \
-  --action-queue-policy replace \
-  --min-action-queue 0 \
-  --init-source none \
-  --auto-start \
-  --max-steps 100
-```
-
-Front-only real execution:
-
-```bash
-export LEFT_ARM_IP=192.168.101.21
-export RIGHT_ARM_IP=192.168.1.20
-
-PYTHONPATH=. uv run python -m deployments.openpi.client.real \
-  --host "$SERVER_IP" \
-  --port "$OPENPI_PORT" \
-  --model "$OPENPI_MODEL" \
-  --checkpoint-step "$CKPT_STEP" \
-  --active-sides both \
-  --enable-hands \
-  --hand-backend dmtac-gripper \
-  --dmtac-config latest \
-  --camera-mode single \
-  --camera-key front \
-  --camera-config cameras/configs/rm65/devices/realsense_front.json \
-  --required-camera-slot base_0_rgb \
-  --required-image-key front \
-  --require-camera-frame \
-  --require-ready-observation \
-  --debug \
-  --action-queue-policy replace \
-  --min-action-queue 0 \
-  --init-source current \
-  --wait-for-ready-confirm \
-  --policy-qpos-init-dataset /home/zc/HandMotion/Developing/DexTeleop/datasets/2026-07-06_vive_rm65_real_teleop \
-  --policy-qpos-init-episode 20 \
-  --policy-qpos-init-frame 1 \
-  --policy-qpos-init-source auto \
-  --policy-qpos-init-arm-max-angvel 0.25,0.25,0.25,0.35,0.35,0.35 \
-  --arm-workspace-min -0.80 -0.80 0.00 \
-  --arm-workspace-max 0.80 0.80 0.90 \
-  --left-arm-ip "$LEFT_ARM_IP" \
-  --right-arm-ip "$RIGHT_ARM_IP" \
-  --send-actions
-```
-
-Start sequence is unchanged: press `g` for dataset-frame qpos init, wait for
-`policy_qpos_init=released` and `ready=wait:A`, then press `A` to release policy
-inference/action execution.
-
-With `--debug`, the client writes JSONL logs to:
+## 9. 代码边界
 
 ```text
-/home/zc/HandMotion/Developing/DexTeleop/teleop_records/deployment_debug/
+OpenPI server
+  scripts/serve_dexteleop_policy.py
+  configs/dexteleop_policy_registry.json
+
+DexTeleop OpenPI client
+  deployments/openpi/client/real.py       thin CLI + artifact forwarding
+  deployments/openpi/client/policy.py     websocket contract + v2.2 adapter
+
+Shared real deployment runtime
+  teleop_runtime/deploy/run_policy.py
+  teleop_runtime/deploy/policy_qpos_init.py
 ```
 
-Each run records `startup`, `policy_chunk`, and `action_step` events. For action
-amplitude checks, compare `raw_action`, `filtered_action`, `command`,
-`raw_to_filtered_pose_delta`, `filtered_to_command_pose_delta`, backend
-`effective_max_joint_step_rad`, command
-`commands.*_arm.metadata.max_joint_step_rad`, and
-`post_arm_state_by_side.*.last_target_qpos`.
-Use `--debug-dir /abs/path` to override the output directory.
-
-Deploy arm execution defaults are aligned with
-`run_vive_rm65_real_teleop`: `--arm-max-angvel` defaults to
-`0.7,0.7,0.9,1.5,1.5,2.0`, arm step-dt scaling is enabled, and joint-vector
-action safety defaults to `6deg` per step. The policy action IK target uses the
-effective action interval, while the RM65 background stream still sends at
-`--arm-control-hz`.
-
-## 7. Action Chunk Execution Control
-
-OpenPI returns an action chunk shaped `[horizon, action_dim]`. The real runtime
-normalizes that chunk into a FIFO queue of single-step actions, then each deploy
-loop pops at most one action and sends it through the canonical
-`RobotAction -> TeleopCommand -> backend` path.
-
-Use these flags to control the timing:
-
-- `--action-hz`: action execution/control frequency. One queued action is popped
-  and dispatched per deploy loop. This is the most direct way to control how fast
-  a returned chunk is consumed.
-- `--policy-hz`: policy inference frequency. If omitted, it follows
-  `--action-hz`.
-- `--min-action-queue`: low-water mark for requesting the next policy chunk.
-  Default `0` means infer again only when the queue is empty.
-- `--action-queue-policy replace|append|auto`: how a newly predicted chunk is
-  inserted. For normal OpenPI deployment, `auto` resolves to `replace`; debug
-  replay uses `append`.
-
-For strict chunk-by-chunk execution, keep:
-
-```bash
---action-queue-policy replace \
---min-action-queue 0
-```
-
-With this setting, the runtime normally consumes the whole current chunk before
-requesting another one. Set `--action-hz` to the dataset/control rate you want
-to reproduce. Use `--min-action-queue > 0` only when intentionally prefetching
-the next chunk before the current queue is empty.
-
-## 8. Direct Policy-Spec Form
-
-The OpenPI launcher is a convenience wrapper. It expands to the normal
-`teleop_runtime` policy loader:
-
-```bash
-PYTHONPATH=. uv run python -m teleop_runtime.deploy \
-  --policy deployments.openpi.client.policy:create_policy \
-  --policy-kwargs-json '{"host":"192.168.20.74","port":8078,"expected_model_id":"dual_rm65_dmgripper_latest"}' \
-  --active-sides both \
-  --enable-hands \
-  --hand-backend dmtac-gripper \
-  --dmtac-config latest \
-  --camera-mode single \
-  --camera-config cameras/configs/rm65/devices/realsense_front.json \
-  --require-camera-frame \
-  --require-ready-observation
-```
-
-Prefer `python -m deployments.openpi.client.real` for normal use because it
-keeps OpenPI-specific arguments separate from real-runtime arguments.
-
-## 9. Troubleshooting
-
-If `curl http://$SERVER_IP:$OPENPI_PORT/healthz` fails:
-
-- confirm the server was started with `--host 0.0.0.0`
-- confirm `SERVER_IP` is the server LAN IP, not `127.0.0.1`
-- confirm firewall rules allow `OPENPI_PORT`
-- confirm both machines are on the same reachable network
-
-If `/metadata` works but the client rejects the server:
-
-- check `expected_model_id`
-- check `local_robot.output_action_dim`
-- check `local_robot.active_sides`
-- check `dataset_adapter.camera_slots`
-- check `dataset_adapter.hand_layout`
-
-If dry-run connects but policy inference fails:
-
-- confirm the client has a valid local camera frame
-- confirm the camera key expected by the OpenPI adapter is present, usually `front`
-- confirm the model was trained for the same unified action space
-
-If real execution refuses to start:
-
-- `--send-actions` requires arm IPs for all active sides
-- real arm execution requires `--policy-qpos-init-dataset` /
-  `--policy-qpos-init-parquet`, unless explicitly overridden with `--start-init_qpos`
-- `qpos init planning failed before execution` means no command was sent; choose
-  a safer `--policy-qpos-init-frame`, move to a safer pre-start qpos, or after
-  checking clearance try `--policy-qpos-init-collision-scene-profile dual_arm_hand_proxy_open`
-- `timed out while moving to dataset frame` means qpos init began but did not
-  reach `--policy-qpos-init-qpos-tolerance` before `--policy-qpos-init-timeout-s`;
-  check the reported max joint error, then increase timeout or adjust tolerance
-  only after confirming the arm state is safe
-- Inspire hands require hand IPs when `--send-actions` and `--enable-hands` are used
-- DMTAC gripper deployment needs a valid `--dmtac-config`
-- keep dry-run working before enabling `--send-actions`
+OpenPI 不应导入或控制真机 SDK；真机动作只能通过 `teleop_runtime` 的初始化、限幅、状态检查和 dispatch 路径执行。

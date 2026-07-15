@@ -38,11 +38,25 @@ datasets
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+test-results/
+playwright-report/
 .agents
 .realtime_sync_ssh.exclude
 logs/
 
 camera_process/wrist_cam_adjust/outputs/
+utils/dataset_postprocess/wrist_cam_adjust/outputs/
+sim/outputs/
+utils/random_background/generated/
+utils/random_background/samples/
+utils/random_background/real_images/
+codex_remote/
+legacy/
 
 datasets_debug
 teleop_records/*

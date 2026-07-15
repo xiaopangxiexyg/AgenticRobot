@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
 
+from robot_motion.runtime.lifecycle import run_best_effort_cleanup
+
 import numpy as np
 
 from project_paths import teleop_records_root
@@ -121,11 +123,15 @@ class SessionRecorder:
         )
 
     def close(self) -> None:
-        for handle in self._handles.values():
-            handle.flush()
-            handle.close()
-        self._handles.clear()
-        self._pending_flush_counts.clear()
+        steps = []
+        for stream_name, handle in reversed(tuple(self._handles.items())):
+            steps.append((f"stream[{stream_name}].flush", handle.flush))
+            steps.append((f"stream[{stream_name}].close", handle.close))
+        try:
+            run_best_effort_cleanup("session_recorder.close", steps)
+        finally:
+            self._handles.clear()
+            self._pending_flush_counts.clear()
 
     def __enter__(self) -> "SessionRecorder":
         return self

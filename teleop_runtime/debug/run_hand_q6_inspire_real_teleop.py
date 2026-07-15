@@ -400,7 +400,6 @@ def _build_components(args: argparse.Namespace) -> HandOnlyComponents:
             required_channels=(),
             invalid_frame_limit=3,
             minimum_control_hz=float(args.minimum_control_hz),
-            target_control_hz=float(args.hz),
         ),
     )
 

@@ -5,9 +5,9 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from robot_motion.action import ActionVectorEncoding, RobotAction
+
 from ..arm_frames import ARM_ENDPOINT_FRAME, ARM_ENDPOINT_SEMANTICS
-from .codec import ActionVectorEncoding
-from .schema import RobotAction
 from .synthetic import SyntheticReplayFrame
 
 

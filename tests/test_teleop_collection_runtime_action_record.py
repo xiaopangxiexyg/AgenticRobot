@@ -141,6 +141,33 @@ class CollectionRuntimeActionRecordTest(unittest.TestCase):
         runtime.step(now=2.0)
         self.assertIsNone(runtime.last_sample)
 
+    def test_control_step_does_not_build_sample_until_record_step(self) -> None:
+        writer_pool = _FakeWriterPool()
+        calls = {"sample_builder": 0}
+
+        def sample_builder(result, components):
+            calls["sample_builder"] += 1
+            return {"index": 1, "action": result.action_record.action}
+
+        runtime = CollectionRuntime(
+            components=CollectorComponents(session=_FakeSession()),
+            sample_builder=sample_builder,
+            write_planner=lambda sample, components: (),
+            writer_pool=writer_pool,
+        )
+
+        result = runtime.control_step(now=1.0)
+
+        self.assertEqual(calls["sample_builder"], 0)
+        self.assertIsNone(result.action_record)
+        self.assertIsNone(runtime.last_sample)
+
+        sample = runtime.record_step(result)
+
+        self.assertEqual(calls["sample_builder"], 1)
+        self.assertIsNotNone(result.action_record)
+        self.assertIs(sample, runtime.last_sample)
+
 
 if __name__ == "__main__":
     unittest.main()

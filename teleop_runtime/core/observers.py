@@ -4,6 +4,13 @@ import queue
 import threading
 from typing import Any, Protocol
 
+from robot_motion.runtime.lifecycle import (
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+    run_best_effort_cleanup,
+)
+
 
 class RuntimeObserver(Protocol):
     def start(self) -> None:
@@ -32,20 +39,38 @@ class CompositeRuntimeObserver:
         self.observers = list(observers)
 
     def start(self) -> None:
-        for observer in self.observers:
-            start = getattr(observer, "start", None)
-            if callable(start):
-                start()
+        rollback_steps = []
+        try:
+            for index, observer in enumerate(self.observers):
+                start = getattr(observer, "start", None)
+                close = getattr(observer, "close", None)
+                if callable(start):
+                    if callable(close):
+                        rollback_steps.append((f"observer[{index}]", close))
+                    start()
+        except BaseException as start_error:  # noqa: BLE001 - rollback before propagating.
+            rollback_failures = collect_lifecycle_failures(reversed(rollback_steps))
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    "composite_runtime_observer.start",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
 
     def on_step(self, result: Any) -> None:
         for observer in self.observers:
             observer.on_step(result)
 
     def close(self) -> None:
-        for observer in reversed(self.observers):
-            close = getattr(observer, "close", None)
-            if callable(close):
-                close()
+        run_best_effort_cleanup(
+            "composite_runtime_observer.close",
+            (
+                (f"observer[{index}]", close)
+                for index, observer in reversed(tuple(enumerate(self.observers)))
+                if callable(close := getattr(observer, "close", None))
+            ),
+        )
 
 
 _SENTINEL = object()
@@ -88,15 +113,34 @@ class DropOldestAsyncObserver:
         if self._started:
             return
         start = getattr(self.observer, "start", None)
-        if callable(start):
-            start()
-        self._closed = False
-        self._thread = threading.Thread(
-            target=self._worker_loop,
-            name=self.name,
-            daemon=True,
-        )
-        self._thread.start()
+        close = getattr(self.observer, "close", None)
+        observer_started = False
+        try:
+            if callable(start):
+                start()
+                observer_started = True
+            self._closed = False
+            self._thread = threading.Thread(
+                target=self._worker_loop,
+                name=self.name,
+                daemon=True,
+            )
+            self._thread.start()
+        except BaseException as start_error:  # noqa: BLE001 - rollback observer startup.
+            rollback_failures = collect_lifecycle_failures(
+                (("observer", close),)
+                if observer_started and callable(close)
+                else ()
+            )
+            self._thread = None
+            self._started = False
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    f"{self.name}.start",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
         self._started = True
 
     def _worker_loop(self) -> None:
@@ -138,6 +182,7 @@ class DropOldestAsyncObserver:
         if self._closed:
             return
         self._closed = True
+        failures = []
         if self._started:
             try:
                 self._queue.put_nowait(_SENTINEL)
@@ -152,7 +197,24 @@ class DropOldestAsyncObserver:
                 except queue.Full:
                     pass
             if self._thread is not None:
-                self._thread.join(timeout=2.0)
+                worker = self._thread
+
+                def join_worker() -> None:
+                    worker.join(timeout=2.0)
+                    if worker.is_alive():
+                        raise RuntimeError(
+                            f"{self.name} worker did not stop within 2.000s."
+                        )
+
+                failures.extend(
+                    collect_lifecycle_failures((("worker.join", join_worker),))
+                )
         close = getattr(self.observer, "close", None)
         if callable(close):
-            close()
+            failures.extend(
+                collect_lifecycle_failures((("observer", close),))
+            )
+        failures.extend(
+            collect_lifecycle_failures((("worker_failures", self.raise_if_failed),))
+        )
+        raise_lifecycle_failures(f"{self.name}.close", failures)

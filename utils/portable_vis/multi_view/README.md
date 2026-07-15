@@ -58,6 +58,23 @@ python utils/portable_vis/multi_view/multi_view_video_player.py /path/to/session
   --at 12.5
 ```
 
+Export a real/sim same-time comparison video from two dataset roots:
+
+```bash
+python utils/portable_vis/multi_view/real_sim_video_compare.py \
+  --real-dataset datasets/2026-07-09_vive_rm65_real_teleop_sample_ep000000 \
+  --sim-dataset sim/outputs/0709_v3_dual_replay_camera_depth_mp4_fovy_no_debug_visual_dataset \
+  --episode 0 \
+  --cameras front,left_wrist,right_wrist \
+  --output sim/outputs/0709_v3_real_sim_compare.mp4
+```
+
+The comparison exporter reads `meta/episodes.jsonl` from both roots, resolves
+same-name `video_paths`, and writes one MP4 where each camera is one row and
+the columns are `real` and `sim`. Frames are sampled by relative episode time;
+use `--real-offset` or `--sim-offset` when one side needs a fixed time shift.
+`--cell-size WIDTHxHEIGHT` controls the size of each real/sim tile.
+
 ## Useful Options
 
 ```bash

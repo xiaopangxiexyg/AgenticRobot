@@ -120,7 +120,7 @@ ssh dex-remote 'cd ~/DexTeleop && source ~/anaconda3/etc/profile.d/conda.sh && c
 
 ```bash
 ./remote_python.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- teleop_runtime/replay/arm_init/dry_run.py
-./remote_module.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- sim.mujoco_real2sim.replay.runner
+./remote_module.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- sim.mujoco.replay.runner
 ./remote_pytest.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- tests/test_xxx.py -q
 ```
 
@@ -1150,7 +1150,7 @@ remote_rsync_project.sh --delete
   --env dexteleop310 \
   --allow-control-risk \
   --require-safety-ok /tmp/codex_remote_safety_ok \
-  -- sim.mujoco_real2sim.replay.runner --dry-run
+  -- sim.mujoco.replay.runner --dry-run
 ```
 
 ### VSCode Codex 插件使用

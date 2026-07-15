@@ -28,7 +28,11 @@ from ..arm_frames import TOOL_TCP_FRAME
 from ..hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from ..retargeters import PoseToArmRetargeter, PoseToArmRetargeterConfig
 from ..schemas import TeleopObservation, latest_channel_timestamp, merge_teleop_commands
-from ..sources.pose import VivePoseSource, ViveTrackerConfig
+from ..sources.pose import (
+    DEFAULT_VIVE_CLOCK_SYNC_PORT,
+    VivePoseSource,
+    ViveTrackerConfig,
+)
 from ..tcp import legacy_tcp_mode_requested
 from ..tracker_hand import (
     TRACKER_OFFSET_CALIBRATION_VERSION,
@@ -212,6 +216,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="UDP bind host for the VIVE receiver")
     parser.add_argument("--port", type=int, default=9999, help="UDP bind port for the VIVE receiver")
+    parser.add_argument(
+        "--vive-clock-sync-port",
+        type=int,
+        default=DEFAULT_VIVE_CLOCK_SYNC_PORT,
+        help=(
+            "Separate VIVE clock-control UDP port for the default new protocol; "
+            "set 0 to select the legacy v1-only receiver."
+        ),
+    )
     parser.add_argument(
         "--tcp-mode",
         type=str,
@@ -540,6 +553,9 @@ def build_components(args: argparse.Namespace) -> CalibrationDebugComponents:
         tracker_configs=tracker_configs,
         host=args.host,
         port=args.port,
+        clock_sync_port=int(
+            getattr(args, "vive_clock_sync_port", DEFAULT_VIVE_CLOCK_SYNC_PORT)
+        ),
     )
     arm_urdf_path = require_asset_path("rm65_arm.urdf")
     left_backend = RM65ArmBackend(

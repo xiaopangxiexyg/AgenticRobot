@@ -1,7 +1,0 @@
-numpy
-pillow
-trimesh
-
-# Optional: only needed for set_texture_coords / PyVista rendering.
-pyvista
-vtk

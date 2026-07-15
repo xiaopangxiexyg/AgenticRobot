@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from dataset_postprocess.DM_force_calculate.processor import (
+from utils.dataset_postprocess.DM_force_calculate.processor import (
     FORCE_SHAPE,
     ForceProcessConfig,
     RAW_SHAPE,
@@ -105,7 +105,7 @@ class DMForceCalculateTest(unittest.TestCase):
             )
             raw.tofile(source)
             task = discover_raw_tactile_tasks
-            from dataset_postprocess.DM_force_calculate.processor import RawTactileStreamTask
+            from utils.dataset_postprocess.DM_force_calculate.processor import RawTactileStreamTask
 
             stream_task = RawTactileStreamTask(
                 dataset_root=root,
@@ -229,7 +229,7 @@ class DMForceCalculateTest(unittest.TestCase):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 np.zeros((2, 480, 640), dtype=np.uint8).tofile(source)
                 np.zeros((2, *FORCE_SHAPE), dtype=np.float32).tofile(output)
-                from dataset_postprocess.DM_force_calculate.processor import RawTactileStreamTask
+                from utils.dataset_postprocess.DM_force_calculate.processor import RawTactileStreamTask
 
                 task = RawTactileStreamTask(
                     dataset_root=root,

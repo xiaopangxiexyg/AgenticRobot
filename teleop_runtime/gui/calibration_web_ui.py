@@ -5,7 +5,9 @@ import json
 import math
 import os
 import queue
+import re
 import threading
+from collections.abc import Mapping
 from urllib.parse import parse_qs, urlparse
 import webbrowser
 from dataclasses import dataclass, field
@@ -328,6 +330,32 @@ button.stop-ready {
   background: #e4f5ef;
   border-color: #69b99f;
   color: #075238;
+}
+.runtime-home-diagnostic {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #f5f8fb;
+}
+.runtime-home-diagnostic.capturing {
+  background: #e8f5f3;
+  border-color: #74cba9;
+  color: #064d33;
+}
+.runtime-home-diagnostic.error {
+  background: #ffe9e9;
+  border-color: #e38c8c;
+  color: #832020;
+}
+.runtime-home-diagnostic-title {
+  font-size: 15px;
+  font-weight: 900;
+}
+.runtime-home-diagnostic-detail {
+  margin-top: 7px;
+  font-size: 13px;
+  line-height: 1.5;
 }
 .capture-mode-label {
   font-size: 22px;
@@ -703,6 +731,10 @@ button.stop-ready {
         <div id="captureModeDetail" class="capture-mode-detail">__INITIAL_CAPTURE_DETAIL__</div>
         <div class="capture-progress"><div id="captureProgressBar" style="width: __INITIAL_CAPTURE_PROGRESS__%;"></div></div>
       </div>
+      <div id="runtimeHomeDiagnostic" class="runtime-home-diagnostic __INITIAL_RUNTIME_HOME_DIAGNOSTIC_LEVEL__" __INITIAL_RUNTIME_HOME_DIAGNOSTIC_HIDDEN__>
+        <div id="runtimeHomeDiagnosticTitle" class="runtime-home-diagnostic-title">__INITIAL_RUNTIME_HOME_DIAGNOSTIC_TITLE__</div>
+        <div id="runtimeHomeDiagnosticDetail" class="runtime-home-diagnostic-detail mono">__INITIAL_RUNTIME_HOME_DIAGNOSTIC_DETAIL__</div>
+      </div>
       <div id="episodeBanner" class="episode-banner unavailable">
         <div class="episode-banner-title">
           <span id="episodeBannerState" class="episode-banner-state">数采未启用</span>
@@ -801,6 +833,19 @@ button.stop-ready {
         <button class="secondary" data-event="movement_multiple_reset">重置</button>
       </div>
       <div id="movementMultipleStatus" class="numeric-value mono">movement_multiple=1.000</div>
+      <div id="gripperForceSection" hidden>
+        <div class="control-title">左右夹爪力度（仅非数采）</div>
+        <div class="form-grid">
+          <label>左夹爪力度
+            <input id="leftGripperForceInput" type="number" min="0" max="1" step="0.01" value="0.20">
+          </label>
+          <label>右夹爪力度
+            <input id="rightGripperForceInput" type="number" min="0" max="1" step="0.01" value="0.20">
+          </label>
+        </div>
+        <button id="gripperForceApplyButton" class="secondary">应用左右力度</button>
+        <div id="gripperForceStatus" class="numeric-value mono">仅在非数采阶段可设置；开始数采前会恢复任务配置。</div>
+      </div>
       <div class="control-title">流程</div>
       <div class="button-grid">
         <button class="danger" data-event="q">退出 / 停臂</button>
@@ -841,6 +886,9 @@ button.stop-ready {
           <button id="initArmToggleButton" data-event="init_arm_toggle">左臂归位</button>
         </div>
         <div id="initArmStatus" class="numeric-value mono">-</div>
+      </div>
+      <div id="footPadSpecialArmHint" class="gripper-status mono" hidden>
+        Foot-pad 模式：踏板 1/2 固定左/右臂；踏板 3/4 归位左/右臂。再次踩同一踏板重采该侧 Home。
       </div>
       <div class="control-title">数采</div>
       <div class="form-grid">
@@ -1003,6 +1051,27 @@ button.stop-ready {
     }
     if (state.capture_valid != null) return state.capture_valid ? "有效" : "缺失";
     return "-";
+  }
+
+  function renderRuntimeHomeDiagnosticLegacy(state) {
+    var panel = byId("runtimeHomeDiagnostic");
+    var title = byId("runtimeHomeDiagnosticTitle");
+    var detail = byId("runtimeHomeDiagnosticDetail");
+    if (!panel) return;
+    var diagnostic = state.runtime_home_diagnostic || {};
+    var visible = Boolean(diagnostic.visible);
+    panel.hidden = !visible;
+    if (!visible) {
+      panel.className = "runtime-home-diagnostic";
+      if (title) title.textContent = "";
+      if (detail) detail.textContent = "";
+      return;
+    }
+    var level = String(diagnostic.level || "capturing");
+    if (level !== "capturing" && level !== "error") level = "capturing";
+    panel.className = "runtime-home-diagnostic " + level;
+    if (title) title.textContent = diagnostic.title || "Runtime Home 状态";
+    if (detail) detail.textContent = diagnostic.detail || "-";
   }
 
   function legacyNumberText(value, digits) {
@@ -1374,6 +1443,7 @@ button.stop-ready {
     setText("captureValid", captureValidText(state));
     setText("captureStatus", state.teleop_running ? "遥操中" : labelPhase(state.capture_phase || "idle"));
     renderCaptureMode(state);
+    renderRuntimeHomeDiagnosticLegacy(state);
     renderButtons(state);
     renderRawPosesLegacy(state);
     renderPoseQualityLegacy(state);
@@ -1580,6 +1650,11 @@ const viveCalibrationLoadButtonEl = document.getElementById("viveCalibrationLoad
 const viveCalibrationStatusEl = document.getElementById("viveCalibrationStatus");
 const movementMultipleInputEl = document.getElementById("movementMultipleInput");
 const movementMultipleStatusEl = document.getElementById("movementMultipleStatus");
+const gripperForceSectionEl = document.getElementById("gripperForceSection");
+const leftGripperForceInputEl = document.getElementById("leftGripperForceInput");
+const rightGripperForceInputEl = document.getElementById("rightGripperForceInput");
+const gripperForceApplyButtonEl = document.getElementById("gripperForceApplyButton");
+const gripperForceStatusEl = document.getElementById("gripperForceStatus");
 const fixArmSectionEl = document.getElementById("fixArmSection");
 const fixArmSideSelectEl = document.getElementById("fixArmSideSelect");
 const fixArmToggleButtonEl = document.getElementById("fixArmToggleButton");
@@ -1588,6 +1663,7 @@ const initArmSectionEl = document.getElementById("initArmSection");
 const initArmSideSelectEl = document.getElementById("initArmSideSelect");
 const initArmToggleButtonEl = document.getElementById("initArmToggleButton");
 const initArmStatusEl = document.getElementById("initArmStatus");
+const footPadSpecialArmHintEl = document.getElementById("footPadSpecialArmHint");
 const leftRawCardEl = document.getElementById("leftRawCard");
 const rightRawCardEl = document.getElementById("rightRawCard");
 const leftRawPoseEl = document.getElementById("leftRawPose");
@@ -1598,6 +1674,9 @@ const captureModeEl = document.getElementById("captureMode");
 const captureModeLabelEl = document.getElementById("captureModeLabel");
 const captureModeDetailEl = document.getElementById("captureModeDetail");
 const captureProgressBarEl = document.getElementById("captureProgressBar");
+const runtimeHomeDiagnosticEl = document.getElementById("runtimeHomeDiagnostic");
+const runtimeHomeDiagnosticTitleEl = document.getElementById("runtimeHomeDiagnosticTitle");
+const runtimeHomeDiagnosticDetailEl = document.getElementById("runtimeHomeDiagnosticDetail");
 const ikWarningBannerEl = document.getElementById("ikWarningBanner");
 const ikWarningTextEl = document.getElementById("ikWarningText");
 const poseQualityCardEl = document.getElementById("poseQualityCard");
@@ -1906,6 +1985,31 @@ async function sendMovementMultipleSet() {
   }
 }
 
+function gripperForceValue(input, side) {
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${sideLabel(side)}夹爪力度必须在 0 到 1 之间`);
+  }
+  return value;
+}
+
+async function sendGripperForceSet() {
+  if (!gripperForceApplyButtonEl || gripperForceApplyButtonEl.disabled) return;
+  const payload = {
+    left: leftGripperForceInputEl && !leftGripperForceInputEl.disabled
+      ? gripperForceValue(leftGripperForceInputEl, "left")
+      : null,
+    right: rightGripperForceInputEl && !rightGripperForceInputEl.disabled
+      ? gripperForceValue(rightGripperForceInputEl, "right")
+      : null,
+  };
+  try {
+    await sendEvent("gripper_force_set:" + JSON.stringify(payload));
+  } catch (error) {
+    sendStatusEl.textContent = String(error);
+  }
+}
+
 buttons.forEach((button) => {
   button.addEventListener("click", async () => {
     if (button.disabled) return;
@@ -1959,6 +2063,29 @@ if (movementMultipleInputEl) {
   });
 }
 
+if (gripperForceApplyButtonEl) {
+  gripperForceApplyButtonEl.addEventListener("click", async () => {
+    try {
+      await sendGripperForceSet();
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+  });
+}
+
+for (const input of [leftGripperForceInputEl, rightGripperForceInputEl]) {
+  if (!input) continue;
+  input.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    try {
+      await sendGripperForceSet();
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+  });
+}
+
 if (datasetChooseRootButtonEl) {
   datasetChooseRootButtonEl.addEventListener("click", async () => {
     await chooseDatasetDirectory();
@@ -1981,7 +2108,7 @@ if (taskTypeSelectEl) {
 }
 
 if (taskSelectEl) {
-  taskSelectEl.addEventListener("change", () => {
+  taskSelectEl.addEventListener("change", async () => {
     const selectedKey = taskSelectEl.value;
     const stateRegistry = window.__latestTaskRegistry || [];
     const item = stateRegistry.find((entry) => (
@@ -1995,6 +2122,11 @@ if (taskSelectEl) {
     }
     if (taskEnglishNameInputEl) taskEnglishNameInputEl.value = item.english_name || item.key || "";
     if (taskChineseNameInputEl) taskChineseNameInputEl.value = item.chinese_name || "";
+    try {
+      await sendEvent("task_select", collectEpisodeStartPayload());
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
   });
 }
 
@@ -2080,6 +2212,7 @@ function updateButtons(state) {
   }
   const captureButton = Array.from(buttons).find((button) => button.dataset.event === "c");
   if (captureButton) {
+    captureButton.hidden = String(state.special_arm_control_mode || "manual") === "foot-pad";
     if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
@@ -2097,8 +2230,11 @@ function updateButtons(state) {
 }
 
 function updateShortcutHints(state) {
+  const footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
   if (shortcutCLabelEl) {
-    if (state.fix_arm_available && state.teleop_running) {
+    if (footPadMode && state.fix_arm_available) {
+      shortcutCLabelEl.textContent = "踏板 1/2：固定 / 重采左右臂 Home";
+    } else if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
       shortcutCLabelEl.textContent = state.fix_arm_recalibrating
@@ -2113,7 +2249,9 @@ function updateShortcutHints(state) {
     }
   }
   if (shortcutGLabelEl) {
-    if (state.init_arm_available && state.teleop_running) {
+    if (footPadMode && state.init_arm_available) {
+      shortcutGLabelEl.textContent = "踏板 3/4：归位 / 重采左右臂 Home";
+    } else if (state.init_arm_available && state.teleop_running) {
       const side = state.init_arm_active_side || state.init_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
       shortcutGLabelEl.textContent = state.init_arm_recalibrating
@@ -2142,9 +2280,47 @@ function renderMovementMultiple(state) {
   movementMultipleStatusEl.textContent = `movement_multiple=${Number.isFinite(value) ? value.toFixed(3) : "-"}`;
 }
 
+function renderGripperForce(state) {
+  const available = Boolean(state.gripper_control_available);
+  if (gripperForceSectionEl) gripperForceSectionEl.hidden = !available;
+  if (!available) return;
+
+  const canSet = activeControls.has("gripper_force_set");
+  const gripperStatus = state.gripper_status || {};
+  const inputs = {
+    left: leftGripperForceInputEl,
+    right: rightGripperForceInputEl,
+  };
+  let configuredCount = 0;
+  for (const side of ["left", "right"]) {
+    const input = inputs[side];
+    if (!input) continue;
+    const item = gripperStatus[side] || {};
+    const configured = Boolean(item.configured);
+    if (configured) configuredCount += 1;
+    input.disabled = !canSet || !configured;
+    const torque = Number(item.torque);
+    if (configured && document.activeElement !== input && Number.isFinite(torque)) {
+      input.value = torque.toFixed(3);
+    }
+  }
+  if (gripperForceApplyButtonEl) {
+    gripperForceApplyButtonEl.disabled = !canSet || configuredCount === 0;
+  }
+  if (gripperForceStatusEl) {
+    gripperForceStatusEl.textContent = !canSet
+      ? "数采录制、倒计时或保存中已锁定；当前 episode 按任务配置运行。"
+      : configuredCount === 0
+        ? "未检测到可设置的 DM-Tac 夹爪。"
+        : "范围 0–1；应用后立即更新已连接夹爪，开始数采前会恢复任务配置。";
+  }
+}
+
 function renderFixArm(state) {
   const available = Boolean(state.fix_arm_available);
   if (fixArmSectionEl) fixArmSectionEl.hidden = !available;
+  const footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
+  if (footPadSpecialArmHintEl) footPadSpecialArmHintEl.hidden = !footPadMode;
   if (!available) return;
   const selected = state.fix_arm_selected_side || "left";
   const fixed = state.fix_arm_fixed_side || "";
@@ -2152,12 +2328,16 @@ function renderFixArm(state) {
   const side = fixed || selected;
   const label = side === "right" ? "右臂" : "左臂";
   if (fixArmSideSelectEl) {
+    if (fixArmSideSelectEl.parentElement && fixArmSideSelectEl.parentElement.parentElement) {
+      fixArmSideSelectEl.parentElement.parentElement.hidden = footPadMode;
+    }
     fixArmSideSelectEl.disabled = !activeControls.has("fix_arm_select") || Boolean(fixed);
     if (document.activeElement !== fixArmSideSelectEl) {
       fixArmSideSelectEl.value = selected;
     }
   }
   if (fixArmToggleButtonEl) {
+    if (fixArmToggleButtonEl.parentElement) fixArmToggleButtonEl.parentElement.hidden = footPadMode;
     fixArmToggleButtonEl.disabled = !activeControls.has("fix_arm_toggle");
     fixArmToggleButtonEl.textContent = recalibrating
       ? `重采 ${label} Home...`
@@ -2183,6 +2363,7 @@ function renderFixArm(state) {
 function renderInitArm(state) {
   const available = Boolean(state.init_arm_available);
   if (initArmSectionEl) initArmSectionEl.hidden = !available;
+  const footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
   if (!available) return;
   const selected = state.init_arm_selected_side || "left";
   const activeSide = state.init_arm_active_side || "";
@@ -2190,12 +2371,16 @@ function renderInitArm(state) {
   const side = activeSide || selected;
   const label = side === "right" ? "右臂" : "左臂";
   if (initArmSideSelectEl) {
+    if (initArmSideSelectEl.parentElement && initArmSideSelectEl.parentElement.parentElement) {
+      initArmSideSelectEl.parentElement.parentElement.hidden = footPadMode;
+    }
     initArmSideSelectEl.disabled = !activeControls.has("init_arm_select") || Boolean(activeSide);
     if (document.activeElement !== initArmSideSelectEl) {
       initArmSideSelectEl.value = selected;
     }
   }
   if (initArmToggleButtonEl) {
+    if (initArmToggleButtonEl.parentElement) initArmToggleButtonEl.parentElement.hidden = footPadMode;
     initArmToggleButtonEl.disabled = !activeControls.has("init_arm_toggle");
     initArmToggleButtonEl.textContent = recalibrating
       ? `重采 ${label} Home...`
@@ -2213,6 +2398,9 @@ function renderInitArm(state) {
     lines.push(`${label}: 归位中`);
   } else {
     lines.push(`${label}: 待归位`);
+  }
+  if (activeSide && state.init_arm_arrival_label) {
+    lines.push(`实际反馈: ${String(state.init_arm_arrival_label)}`);
   }
   if (state.init_arm_status) lines.push(String(state.init_arm_status));
   initArmStatusEl.textContent = lines.join("\\n");
@@ -2319,6 +2507,27 @@ function renderCaptureMode(state) {
   captureModeLabelEl.textContent = labelFor(phaseLabels, phase);
   captureModeDetailEl.textContent = detail;
   captureProgressBarEl.style.width = `${clampPercent(progress)}%`;
+}
+
+function renderRuntimeHomeDiagnostic(state) {
+  if (!runtimeHomeDiagnosticEl) return;
+  const diagnostic = state.runtime_home_diagnostic || {};
+  const visible = Boolean(diagnostic.visible);
+  runtimeHomeDiagnosticEl.hidden = !visible;
+  if (!visible) {
+    runtimeHomeDiagnosticEl.className = "runtime-home-diagnostic";
+    if (runtimeHomeDiagnosticTitleEl) runtimeHomeDiagnosticTitleEl.textContent = "";
+    if (runtimeHomeDiagnosticDetailEl) runtimeHomeDiagnosticDetailEl.textContent = "";
+    return;
+  }
+  const level = diagnostic.level === "error" ? "error" : "capturing";
+  runtimeHomeDiagnosticEl.className = `runtime-home-diagnostic ${level}`;
+  if (runtimeHomeDiagnosticTitleEl) {
+    runtimeHomeDiagnosticTitleEl.textContent = diagnostic.title || "Runtime Home 状态";
+  }
+  if (runtimeHomeDiagnosticDetailEl) {
+    runtimeHomeDiagnosticDetailEl.textContent = diagnostic.detail || "-";
+  }
 }
 
 function formatPills(state) {
@@ -2663,8 +2872,9 @@ function renderGripper(state) {
       ? item.tactile_devices.join(", ")
       : "-";
     const command = item.q6_command || {};
+    const inputName = item.input_source === "angle_trigger" ? "angle trigger" : "Q6";
     const q6Status = item.q6_control_available
-      ? `${item.q6_valid ? "有效" : "无效"} age=${formatAge(item.q6_age_sec)} src dim${item.q6_source_dim == null ? "-" : item.q6_source_dim}=${formatScalar(item.q6_source_value)} target=${formatScalar(item.q6_target_preview)}`
+      ? `${item.q6_valid ? "有效" : "无效"} age=${formatAge(item.q6_age_sec)} src ${item.q6_source_dim == null ? "scalar" : `dim${item.q6_source_dim}`}=${formatScalar(item.q6_source_value)} target=${formatScalar(item.q6_target_preview)}`
       : "未配置";
     const commandStatus = labelGripperCommandStatus(command.status);
     const commandTarget = command.target != null ? command.target : item.q6_filtered_target;
@@ -2676,9 +2886,9 @@ function renderGripper(state) {
     ].join(" ");
     const lines = [
       `gripper port: ${item.port || "-"}`,
-      `q6: ${q6Status}`,
-      `q6[0..5]: ${formatQ6Values(item.q6_values)}`,
-      `q6 serial: ${q6SerialText}`,
+      `${inputName}: ${q6Status}`,
+      `${inputName} values: ${formatQ6Values(item.q6_values)}`,
+      `${inputName} input: ${q6SerialText}`,
       `cmd: ${commandStatus} sent=${command.sent ? "yes" : "no"} target=${formatScalar(commandTarget)}`,
       `target/measured: ${formatScalar(item.commanded)} / ${formatScalar(item.measured)}`,
       `state: ${formatScalar(item.state)}  max: ${formatScalar(item.max_action)}`,
@@ -2686,7 +2896,7 @@ function renderGripper(state) {
       `tactile: ${tactileDevices}`,
       `tactile status: ${formatTactileStatus(item)}`,
     ];
-    if (item.q6_read_error) lines.push(`q6 error: ${item.q6_read_error}`);
+    if (item.q6_read_error) lines.push(`${inputName} error: ${item.q6_read_error}`);
     if (command.error) lines.push(`cmd error: ${command.error}`);
     if (item.telemetry_error) lines.push(`telemetry error: ${item.telemetry_error}`);
     cards.push(`
@@ -2882,7 +3092,7 @@ function renderTaskForm(state, recording) {
   }
   const registry = Array.isArray(state.task_registry) ? state.task_registry : [];
   if (taskSelectEl) {
-    taskSelectEl.disabled = locked;
+    taskSelectEl.disabled = locked || !activeControls.has("task_select");
     const current = state.collection_task_key || state.collection_task_id || state.gripper_task || "";
     const existing = Array.from(taskSelectEl.options).map((option) => option.value).join("\\n");
     const filteredRegistry = registry.filter((item) => normalizeTaskType(item.task_type) === selectedType);
@@ -3177,10 +3387,12 @@ async function refresh() {
     captureValidEl.textContent = formatValid(state);
     captureStatusEl.innerHTML = formatCaptureStatus(state);
     renderCaptureMode(state);
+    renderRuntimeHomeDiagnostic(state);
     updateButtons(state);
     updateShortcutHints(state);
     renderViveCalibrationProfile(state);
     renderMovementMultiple(state);
+    renderGripperForce(state);
     renderFixArm(state);
     renderInitArm(state);
     renderRawPoses(state);
@@ -3309,6 +3521,27 @@ _FALLBACK_SCRIPT = r"""
     }
     if (state.capture_valid != null) return state.capture_valid ? "有效" : "缺失";
     return "-";
+  }
+
+  function renderRuntimeHomeDiagnosticFallback(state) {
+    var panel = byId("runtimeHomeDiagnostic");
+    var title = byId("runtimeHomeDiagnosticTitle");
+    var detail = byId("runtimeHomeDiagnosticDetail");
+    if (!panel) return;
+    var diagnostic = state.runtime_home_diagnostic || {};
+    var visible = Boolean(diagnostic.visible);
+    panel.hidden = !visible;
+    if (!visible) {
+      panel.className = "runtime-home-diagnostic";
+      if (title) title.textContent = "";
+      if (detail) detail.textContent = "";
+      return;
+    }
+    var level = String(diagnostic.level || "capturing");
+    if (level !== "capturing" && level !== "error") level = "capturing";
+    panel.className = "runtime-home-diagnostic " + level;
+    if (title) title.textContent = diagnostic.title || "Runtime Home 状态";
+    if (detail) detail.textContent = diagnostic.detail || "-";
   }
 
   function numberText(value, digits) {
@@ -3756,6 +3989,7 @@ _FALLBACK_SCRIPT = r"""
     setText("captureValid", captureValidText(state));
     setText("captureStatus", state.teleop_running ? "遥操中" : labelPhase(state.capture_phase || "idle"));
     renderCaptureMode(state);
+    renderRuntimeHomeDiagnosticFallback(state);
     renderButtons(state);
     renderRawPoses(state);
     renderPoseQualityFallback(state);
@@ -3982,6 +4216,35 @@ def _json_response_payload(value: Any) -> bytes:
     return json.dumps(safe_value, ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
+def _encode_http_event_payload(payload: Mapping[str, Any]) -> str:
+    """Normalize events received from the browser before queueing them.
+
+    Task selection sends its task metadata as sibling JSON fields.  The
+    runtime event consumer expects that metadata in the event suffix, just as
+    it does for episode start, so preserve the same wire format for both
+    browser events.
+    """
+    event = str(payload.get("event", "")).strip()
+    if event in {"episode_start", "task_select"}:
+        details = {
+            key: str(payload.get(key, "") or "").strip()
+            for key in (
+                "dataset_base_root",
+                "task_type",
+                "task_key",
+                "task_english_name",
+                "task_chinese_name",
+                "round_trip_phase",
+            )
+        }
+        event = event + ":" + json.dumps(
+            details,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return event
+
+
 def _choose_directory_payload(initial_dir: str = "") -> dict[str, Any]:
     initial_text = os.path.expandvars(str(initial_dir or "")).strip()
     initial_path = Path(initial_text).expanduser() if initial_text else Path.home()
@@ -4051,6 +4314,114 @@ def _label_frame_viz(value: Any) -> str:
     labels = {"calibrated": "校准后", "raw": "原始", "both": "全部"}
     text = str(value or "")
     return labels.get(text, text or "-")
+
+
+_RUNTIME_HOME_LIMIT_FAILURE_RE = re.compile(
+    r"\b(?P<arm>left_arm|right_arm)\s+local\s+qpos\s+joint\s+"
+    r"(?P<joint>\d+)\s*=\s*(?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+))rad\s+"
+    r"exceeds\s+absolute\s+limits\s+\[\s*"
+    r"(?P<lower>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*"
+    r"(?P<upper>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*\]rad",
+    re.IGNORECASE,
+)
+
+
+def _runtime_home_diagnostic_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Derive a display-only runtime-home status from the already published state."""
+
+    hidden = {"visible": False, "level": "", "title": "", "detail": ""}
+    control_hint = str(snapshot.get("control_hint") or "").strip()
+    if "runtime home 标定失败" in control_hint:
+        failure_line = next(
+            (line.strip() for line in control_hint.splitlines() if line.strip()),
+            control_hint,
+        )
+        limit_match = _RUNTIME_HOME_LIMIT_FAILURE_RE.search(control_hint)
+        if limit_match is not None:
+            groups = limit_match.groupdict()
+            arm_label = "左臂" if groups["arm"] == "left_arm" else "右臂"
+            return {
+                "visible": True,
+                "level": "error",
+                "title": f"Runtime Home 标定失败：{arm_label}关节 {groups['joint']} 到达绝对限位",
+                "detail": "\n".join(
+                    (
+                        f"当前位置：{groups['value']} rad",
+                        f"允许范围：[{groups['lower']}, {groups['upper']}] rad",
+                        "本次 Runtime Home 未完成，界面保持在重新标定等待状态。",
+                        "请按现场安全流程检查关节姿态/限位后，点击“开始遥操”重新采集 Runtime Home。",
+                        f"后端错误：{failure_line}",
+                    )
+                ),
+            }
+        return {
+            "visible": True,
+            "level": "error",
+            "title": "Runtime Home 标定失败",
+            "detail": "\n".join(
+                (
+                    failure_line or "后端未提供失败详情。",
+                    "本次 Runtime Home 未完成，界面保持在重新标定等待状态。",
+                    "请检查 VIVE tracker、机械臂状态和限位后，重新发起标定。",
+                )
+            ),
+        }
+
+    if (
+        str(snapshot.get("capture_stage") or "") != "runtime_home"
+        or str(snapshot.get("capture_phase") or "") != "capturing"
+    ):
+        return hidden
+
+    min_samples = int(snapshot.get("capture_min_samples") or 0)
+    left_samples = snapshot.get("capture_left_samples")
+    right_samples = snapshot.get("capture_right_samples")
+    samples = snapshot.get("capture_samples")
+    progress_parts: list[str] = []
+    if left_samples is not None:
+        progress_parts.append(f"左臂 {int(left_samples or 0)}/{min_samples}")
+    if right_samples is not None:
+        progress_parts.append(f"右臂 {int(right_samples or 0)}/{min_samples}")
+    if not progress_parts and samples is not None:
+        progress_parts.append(f"{int(samples or 0)}/{min_samples}")
+    validity_parts: list[str] = []
+    if snapshot.get("capture_left_valid") is not None:
+        validity_parts.append(
+            f"左臂 {'有效' if bool(snapshot.get('capture_left_valid')) else '等待有效 tracker'}"
+        )
+    if snapshot.get("capture_right_valid") is not None:
+        validity_parts.append(
+            f"右臂 {'有效' if bool(snapshot.get('capture_right_valid')) else '等待有效 tracker'}"
+        )
+    if not validity_parts and snapshot.get("capture_valid") is not None:
+        validity_parts.append(
+            "tracker 有效" if bool(snapshot.get("capture_valid")) else "等待有效 tracker"
+        )
+    elapsed = snapshot.get("capture_elapsed_sec")
+    timeout = snapshot.get("capture_duration_sec")
+    timing = ""
+    if elapsed is not None and timeout is not None:
+        try:
+            timing = f"采样时间：{float(elapsed):.1f}/{float(timeout):.1f}s"
+        except (TypeError, ValueError):
+            timing = ""
+    detail_parts = [
+        f"样本进度：{'；'.join(progress_parts) if progress_parts else '正在等待第一帧'}",
+    ]
+    if validity_parts:
+        detail_parts.append(f"输入状态：{'；'.join(validity_parts)}")
+    if timing:
+        detail_parts.append(timing)
+    if bool(snapshot.get("capture_waiting_for_samples")):
+        detail_parts.append("正在等待新的有效 VIVE tracker 样本；无效帧不会计入进度。")
+    else:
+        detail_parts.append("请保持当前 VIVE 与机械臂 Home 姿态稳定，直到左右样本均采满。")
+    return {
+        "visible": True,
+        "level": "capturing",
+        "title": "Runtime Home 正在采样",
+        "detail": "\n".join(detail_parts),
+    }
 
 
 def _initial_capture_phase(snapshot: dict[str, Any]) -> str:
@@ -4179,6 +4550,13 @@ def _render_initial_html(snapshot: dict[str, Any]) -> str:
     right_raw_status, right_raw_pose = _initial_raw_pose_text(raw_poses.get("right") if isinstance(raw_poses, dict) else None)
     yaw = snapshot.get("virtual_desk_post_yaw_deg")
     yaw_text = "-" if yaw is None else f"{yaw} deg"
+    runtime_home_diagnostic = snapshot.get("runtime_home_diagnostic")
+    if not isinstance(runtime_home_diagnostic, dict):
+        runtime_home_diagnostic = _runtime_home_diagnostic_payload(snapshot)
+    diagnostic_visible = bool(runtime_home_diagnostic.get("visible"))
+    diagnostic_level = str(runtime_home_diagnostic.get("level") or "")
+    if diagnostic_level not in {"capturing", "error"}:
+        diagnostic_level = ""
     replacements = {
         "__INITIAL_STAGE__": _label_stage(snapshot.get("stage")),
         "__INITIAL_SELECTED_SIDE__": _label_side(snapshot.get("selected_side")),
@@ -4193,6 +4571,10 @@ def _render_initial_html(snapshot: dict[str, Any]) -> str:
         "__INITIAL_CAPTURE_SAMPLES__": _initial_capture_samples(snapshot),
         "__INITIAL_CAPTURE_VALID__": _initial_capture_valid(snapshot),
         "__INITIAL_CAPTURE_STATUS__": "遥操中" if bool(snapshot.get("teleop_running")) else _label_phase(phase),
+        "__INITIAL_RUNTIME_HOME_DIAGNOSTIC_LEVEL__": diagnostic_level,
+        "__INITIAL_RUNTIME_HOME_DIAGNOSTIC_HIDDEN__": "" if diagnostic_visible else "hidden",
+        "__INITIAL_RUNTIME_HOME_DIAGNOSTIC_TITLE__": str(runtime_home_diagnostic.get("title") or ""),
+        "__INITIAL_RUNTIME_HOME_DIAGNOSTIC_DETAIL__": str(runtime_home_diagnostic.get("detail") or ""),
         "__INITIAL_LEFT_RAW_STATUS__": left_raw_status,
         "__INITIAL_LEFT_RAW_POSE__": left_raw_pose,
         "__INITIAL_RIGHT_RAW_STATUS__": right_raw_status,
@@ -4284,6 +4666,7 @@ class CalibrationWebUiState:
     fix_arm_status: str = ""
     fix_arm_sample_count: int | None = None
     fix_arm_min_samples: int | None = None
+    special_arm_control_mode: str = "manual"
     init_arm_available: bool = False
     init_arm_selected_side: str = ""
     init_arm_active_side: str = ""
@@ -4293,6 +4676,12 @@ class CalibrationWebUiState:
     init_arm_sample_count: int | None = None
     init_arm_min_samples: int | None = None
     init_arm_profile_path: str = ""
+    init_arm_arrival_status: str = "inactive"
+    init_arm_arrival_label: str = ""
+    init_arm_arrival_reason: str = ""
+    init_arm_target_position_error_m: float | None = None
+    init_arm_target_rotation_error_deg: float | None = None
+    init_arm_stability_dwell_sec: float | None = None
     pose_snapshot_available: bool = False
     pose_snapshot_dir: str = ""
     pose_snapshot_count: int = 0
@@ -4409,24 +4798,7 @@ class CalibrationWebUi:
                 raw = self.rfile.read(length) if length > 0 else b"{}"
                 try:
                     payload = json.loads(raw.decode("utf-8"))
-                    event = str(payload.get("event", "")).strip()
-                    if event == "episode_start":
-                        details = {
-                            key: str(payload.get(key, "") or "").strip()
-                            for key in (
-                                "dataset_base_root",
-                                "task_type",
-                                "task_key",
-                                "task_english_name",
-                                "task_chinese_name",
-                                "round_trip_phase",
-                            )
-                        }
-                        event = "episode_start:" + json.dumps(
-                            details,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
+                    event = _encode_http_event_payload(payload)
                 except Exception:
                     self._send(400, "text/plain; charset=utf-8", b"invalid json")
                     return
@@ -4464,7 +4836,9 @@ class CalibrationWebUi:
         event_control = event_name.split(":", 1)[0]
         if ":" in event_name and event_control not in {
             "movement_multiple_set",
+            "gripper_force_set",
             "episode_start",
+            "task_select",
             "fix_arm_select",
             "init_arm_select",
         }:
@@ -4521,7 +4895,7 @@ class CalibrationWebUi:
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
-            return {
+            snapshot = {
                 "stage": self._state.stage,
                 "selected_side": self._state.selected_side,
                 "frame_viz_mode": self._state.frame_viz_mode,
@@ -4599,6 +4973,7 @@ class CalibrationWebUi:
                 "fix_arm_status": self._state.fix_arm_status,
                 "fix_arm_sample_count": self._state.fix_arm_sample_count,
                 "fix_arm_min_samples": self._state.fix_arm_min_samples,
+                "special_arm_control_mode": self._state.special_arm_control_mode,
                 "init_arm_available": self._state.init_arm_available,
                 "init_arm_selected_side": self._state.init_arm_selected_side,
                 "init_arm_active_side": self._state.init_arm_active_side,
@@ -4608,6 +4983,12 @@ class CalibrationWebUi:
                 "init_arm_sample_count": self._state.init_arm_sample_count,
                 "init_arm_min_samples": self._state.init_arm_min_samples,
                 "init_arm_profile_path": self._state.init_arm_profile_path,
+                "init_arm_arrival_status": self._state.init_arm_arrival_status,
+                "init_arm_arrival_label": self._state.init_arm_arrival_label,
+                "init_arm_arrival_reason": self._state.init_arm_arrival_reason,
+                "init_arm_target_position_error_m": self._state.init_arm_target_position_error_m,
+                "init_arm_target_rotation_error_deg": self._state.init_arm_target_rotation_error_deg,
+                "init_arm_stability_dwell_sec": self._state.init_arm_stability_dwell_sec,
                 "pose_snapshot_available": self._state.pose_snapshot_available,
                 "pose_snapshot_dir": self._state.pose_snapshot_dir,
                 "pose_snapshot_count": self._state.pose_snapshot_count,
@@ -4635,6 +5016,8 @@ class CalibrationWebUi:
                 "shutdown_message": self._state.shutdown_message,
                 "messages": list(self._state.messages),
             }
+        snapshot["runtime_home_diagnostic"] = _runtime_home_diagnostic_payload(snapshot)
+        return snapshot
 
 
 class WebUiKeyInput:
