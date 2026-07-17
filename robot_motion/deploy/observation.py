@@ -272,13 +272,18 @@ def build_tactile_vectors(
     return tactile, tactile_by_side, tactile_valid_by_side
 
 
-def latest_camera_frames(
+def _latest_camera_frames_with_availability(
     camera_sources: Mapping[str, Any],
     *,
     cutoff_timestamp: float | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, float | None]]:
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, float | None],
+    dict[str, float | None],
+]:
     images: dict[str, np.ndarray] = {}
     timestamps: dict[str, float | None] = {}
+    available_timestamps: dict[str, float | None] = {}
     for camera_key, camera_source in sorted(camera_sources.items()):
         key = str(camera_key)
         frame = None
@@ -291,20 +296,39 @@ def latest_camera_frames(
                 if callable(lookup):
                     causal_lookup_attempted = True
                     frame = lookup(float(cutoff_timestamp))
-        if frame is None and not causal_lookup_attempted:
+        if cutoff_timestamp is None and frame is None and not causal_lookup_attempted:
             frame = camera_source.get_latest_frame()
         if frame is None:
             timestamps[key] = None
+            available_timestamps[key] = None
             continue
         try:
             source_timestamp = float(frame.source_timestamp)
+            available_timestamp = float(frame.available_timestamp)
         except (TypeError, ValueError):
             source_timestamp = float("nan")
-        if not np.isfinite(source_timestamp):
+            available_timestamp = float("nan")
+        if not np.isfinite(source_timestamp) or not np.isfinite(available_timestamp):
             timestamps[key] = None
+            available_timestamps[key] = None
             continue
         images[key] = np.asarray(frame.image).copy()
         timestamps[key] = source_timestamp
+        available_timestamps[key] = available_timestamp
+    return images, timestamps, available_timestamps
+
+
+def latest_camera_frames(
+    camera_sources: Mapping[str, Any],
+    *,
+    cutoff_timestamp: float | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, float | None]]:
+    """Compatibility view; causal availability is retained by the observation builder."""
+
+    images, timestamps, _available_timestamps = _latest_camera_frames_with_availability(
+        camera_sources,
+        cutoff_timestamp=cutoff_timestamp,
+    )
     return images, timestamps
 
 
@@ -412,11 +436,14 @@ def build_deployment_observation(
         end_effector_sides=effective_end_effector_sides,
         hand_states=hand_states,
     )
-    images, image_timestamps = latest_camera_frames(
-        camera_sources or {}, cutoff_timestamp=now
+    images, image_timestamps, image_available_timestamps = (
+        _latest_camera_frames_with_availability(
+            camera_sources or {}, cutoff_timestamp=now
+        )
     )
     for camera_key in (camera_sources or {}):
         image_timestamps.setdefault(str(camera_key), None)
+        image_available_timestamps.setdefault(str(camera_key), None)
     if camera_frame_max_age_sec is not None:
         camera_frame_max_age_sec = float(camera_frame_max_age_sec)
         if camera_frame_max_age_sec <= 0.0:
@@ -470,6 +497,23 @@ def build_deployment_observation(
     observation_metadata.setdefault("end_effector_enabled_sides", list(effective_end_effector_sides))
     observation_metadata.setdefault("camera_frame_max_age_sec", camera_frame_max_age_sec)
     observation_metadata.setdefault("camera_frame_age_sec_by_key", dict(image_ages_sec))
+    observation_metadata.setdefault(
+        "camera_frame_source_timestamp_by_key", dict(image_timestamps)
+    )
+    observation_metadata.setdefault(
+        "camera_frame_available_timestamp_by_key", dict(image_available_timestamps)
+    )
+    observation_metadata.setdefault(
+        "camera_frame_available_age_sec_by_key",
+        {
+            key: None if value is None else float(now - float(value))
+            for key, value in image_available_timestamps.items()
+        },
+    )
+    observation_metadata.setdefault(
+        "camera_causal_snapshot_contract",
+        "source_timestamp<=T0_and_available_timestamp<=T0",
+    )
     return DeploymentObservation(
         timestamp=now,
         step_index=int(step_index),

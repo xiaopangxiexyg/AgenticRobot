@@ -15,11 +15,19 @@ from teleop_runtime.schemas import TeleopObservation
 from teleop_runtime.session import SessionStepResult
 
 
-def _frame(timestamp: float, *, frame_index: int = 0) -> VideoFrame:
+def _frame(
+    timestamp: float,
+    *,
+    frame_index: int = 0,
+    available_timestamp: float | None = None,
+) -> VideoFrame:
+    if available_timestamp is None:
+        available_timestamp = float(timestamp)
     return VideoFrame(
         image=np.full((2, 2, 3), frame_index, dtype=np.uint8),
         source_timestamp=float(timestamp),
         receive_timestamp=float(timestamp),
+        available_timestamp=available_timestamp,
         frame_index=int(frame_index),
     )
 
@@ -77,12 +85,31 @@ def test_collection_rejects_missing_required_camera_frame() -> None:
     assert builder.sample_index == 0
 
 
+def test_collection_camera_lookup_requires_source_and_availability_before_t0() -> None:
+    buffer = NearestFrameBuffer(keep_last=3)
+    buffer.push(_frame(9.90, frame_index=1, available_timestamp=9.95))
+    buffer.push(_frame(9.99, frame_index=2, available_timestamp=10.01))
+
+    selected = buffer.get_latest_before_or_at(10.0)
+
+    assert selected is not None
+    assert selected.frame_index == 1
+    assert selected.source_timestamp <= 10.0
+    assert selected.available_timestamp <= 10.0
+
+
 class _CameraSource:
     def __init__(self, frame: VideoFrame | None):
         self.frame = frame
+        self._buffer = NearestFrameBuffer()
+        if frame is not None:
+            self._buffer.push(frame)
 
     def get_latest_frame(self) -> VideoFrame | None:
         return self.frame
+
+    def frame_buffer(self) -> NearestFrameBuffer:
+        return self._buffer
 
 
 def test_deployment_observation_marks_frame_over_100ms_stale() -> None:
@@ -100,6 +127,12 @@ def test_deployment_observation_marks_frame_over_100ms_stale() -> None:
     )
 
     assert observation.image_ages_sec["front"] == pytest.approx(0.2)
+    assert observation.metadata["camera_frame_available_timestamp_by_key"]["front"] == (
+        pytest.approx(9.8)
+    )
+    assert observation.metadata["camera_causal_snapshot_contract"] == (
+        "source_timestamp<=T0_and_available_timestamp<=T0"
+    )
     assert any(fault.startswith("camera_frame_stale:front:") for fault in observation.faults)
     assert observation.metadata["camera_frame_max_age_sec"] == 0.1
 

@@ -17,6 +17,7 @@ from .observation import DeploymentObservation, build_deployment_observation
 from robot_motion.deploy.pose_adapter import (
     PoseDeploymentError,
     convert_last_action_to_policy_mode,
+    convert_policy_absolute_vector_to_runtime_raw,
     convert_normalized_action_chunk_to_absolute,
     convert_normalized_action_chunk_to_relative,
     measured_tcp_anchors_by_side,
@@ -41,6 +42,7 @@ __all__ = [
     "load_policy",
     "normalize_policy_output",
     "convert_last_action_to_policy_mode",
+    "convert_policy_absolute_vector_to_runtime_raw",
     "convert_normalized_action_chunk_to_absolute",
     "convert_normalized_action_chunk_to_relative",
     "measured_tcp_anchors_by_side",

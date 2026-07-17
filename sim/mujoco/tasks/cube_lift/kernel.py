@@ -8,9 +8,11 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ...collision_safety import project_grippers_then_arms
 from ...scene import MujocoScene
 from .config import CubeLiftTaskConfig
 from .env import DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH
+from .grasp_latch import ContactGraspLatch
 
 
 InfoMode = Literal["compact", "terminal"]
@@ -99,6 +101,17 @@ class CubeLiftKernel:
         self._cube_body_id = self.scene.body_id(self.config.object_body_name)
         self._table_body_id = self.scene.body_id(self.config.table_body_name)
         self._grasp_body_id = self.scene.body_id(self.config.right_grasp_body_name)
+        self._grasp_latch = ContactGraspLatch(
+            self.scene,
+            object_body_name=self.config.object_body_name,
+            object_freejoint_name=self.config.object_freejoint_name,
+            grasp_body_name=self.config.right_grasp_body_name,
+            left_finger_body_name=self.config.grasp_latch_left_finger_body_name,
+            right_finger_body_name=self.config.grasp_latch_right_finger_body_name,
+            acquire_close=self.config.grasp_latch_acquire_close,
+            release_close=self.config.grasp_latch_release_close,
+            acquire_distance_m=self.config.grasp_latch_acquire_distance_m,
+        )
 
         self._left_home = np.asarray(self.config.left_home_qpos, dtype=np.float64)
         self._right_home = np.asarray(self.config.right_home_qpos, dtype=np.float64)
@@ -127,6 +140,11 @@ class CubeLiftKernel:
         self.last_physics_ticks = 0
         self.last_command_ticks = 0
         self._settled_snapshot: dict[str, np.ndarray | float] | None = None
+        self._collision_projector = self.scene.collision_projector()
+        self._accepted_controlled_qpos = self.scene.kinematic_controlled_qpos()
+        self._last_safety_result = None
+        self._last_active_collision_check = None
+        self._grasp_latch.reset()
 
     def _arm_indices(self, side: str) -> tuple[np.ndarray, np.ndarray]:
         joints = self.scene.arm_specs[side].joint_names
@@ -151,6 +169,9 @@ class CubeLiftKernel:
         self._episode_steps = 0
         self._success_hold_ticks = 0
         self._termination_reason = None
+        self._last_safety_result = None
+        self._last_active_collision_check = None
+        self._grasp_latch.reset()
 
         if self.use_settled_snapshot and self._settled_snapshot is not None:
             self._restore_settled_snapshot()
@@ -162,6 +183,26 @@ class CubeLiftKernel:
             self.data.qvel[self._cube_dof_addr : self._cube_dof_addr + 6] = self._zero_cube_qvel
             self._physics_tick = 0
             self._next_command_time = 1.0 / self.config.command_hz
+            self._accepted_controlled_qpos = self.scene.kinematic_target_vector(
+                self.scene.kinematic_controlled_qpos(),
+                {
+                    self.config.fixed_side: self._left_home,
+                    self.config.controlled_side: self._right_home,
+                },
+                gripper_close_by_name={
+                    name: float(close)
+                    for name, close in zip(self._gripper_names, self._gripper_close)
+                },
+            )
+            if self._collision_projector is not None:
+                initial_check = self._collision_projector.check_qpos(
+                    self.data, self._accepted_controlled_qpos
+                )
+                if not initial_check.safe:
+                    raise RuntimeError(
+                        "CubeLift fast reset target is collision-unsafe: "
+                        f"{initial_check.to_dict()}"
+                    )
             self.last_physics_ticks, self.last_command_ticks = self._advance_ticks(
                 self.config.settle_physics_ticks,
                 check_success=False,
@@ -186,7 +227,8 @@ class CubeLiftKernel:
             raise ValueError("CubeLift action must be a finite 7-D vector.")
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError("CubeLift action values must lie in [-1, 1].")
-        self._last_action[:] = values
+        previous_right_target = self._right_target.copy()
+        previous_right_close = float(self._gripper_close[1])
         np.clip(
             self._right_target + values[:6] * self._right_delta,
             self._right_lower,
@@ -196,13 +238,81 @@ class CubeLiftKernel:
         self._gripper_close[1] = np.clip(
             self._gripper_close[1] + float(values[6]) * self.config.right_gripper_delta,
             0.0,
+            self.config.right_gripper_max_close,
+        )
+        qpos_by_side = {
+            self.config.fixed_side: self._left_home,
+            self.config.controlled_side: self._right_target,
+        }
+        gripper_close_by_name = {
+            name: float(close)
+            for name, close in zip(self._gripper_names, self._gripper_close)
+        }
+        requested = self.scene.kinematic_target_vector(
+            self._accepted_controlled_qpos,
+            qpos_by_side,
+            gripper_close_by_name=gripper_close_by_name,
+        )
+        clearance_violation = False
+        if np.array_equal(requested, self._accepted_controlled_qpos):
+            self._last_safety_result = None
+        elif self._collision_projector is None:
+            self._accepted_controlled_qpos = requested
+            self._last_safety_result = None
+        else:
+            self._last_safety_result = project_grippers_then_arms(
+                self.scene,
+                self._collision_projector,
+                self.data,
+                start_qpos=self._accepted_controlled_qpos,
+                qpos_by_side=qpos_by_side,
+                gripper_close_by_name=gripper_close_by_name,
+            )
+            if self._last_safety_result.status == "invalid_safe_state":
+                # A kinematically prescribed state can land just inside the
+                # clearance envelope after the intervening dynamics/contact
+                # solve even though the preceding target was projected. Treat
+                # this as a fail-safe terminal transition so a vector worker
+                # auto-resets instead of killing the complete PPO run. Hard
+                # penetration remains a separate termination checked every
+                # physics tick.
+                clearance_violation = True
+            else:
+                self._accepted_controlled_qpos = (
+                    self._last_safety_result.accepted_qpos.copy()
+                )
+        self._right_target[:] = self.scene.arm_qpos_from_kinematic_vector(
+            self._accepted_controlled_qpos, self.config.controlled_side
+        )
+        self._gripper_close[:] = [
+            self.scene.gripper_close_from_kinematic_vector(
+                self._accepted_controlled_qpos, name
+            )
+            for name in self._gripper_names
+        ]
+        self._last_action[:6] = np.clip(
+            (self._right_target - previous_right_target) / self._right_delta,
+            -1.0,
+            1.0,
+        )
+        self._last_action[6] = np.clip(
+            (self._gripper_close[1] - previous_right_close)
+            / self.config.right_gripper_delta,
+            -1.0,
             1.0,
         )
         self._episode_steps += 1
-        self._termination_reason = None
+        self._termination_reason = (
+            "robot_environment_clearance_violation"
+            if clearance_violation
+            else None
+        )
         physics_ticks = 0
         command_ticks = 0
-        while self.physics_time + 1e-12 < self._next_policy_time:
+        while (
+            not clearance_violation
+            and self.physics_time + 1e-12 < self._next_policy_time
+        ):
             due = self.physics_time + 1e-12 >= self._next_command_time
             if due:
                 command_ticks += 1
@@ -247,23 +357,24 @@ class CubeLiftKernel:
         )
 
     def _write_direct_state(self) -> None:
-        self.data.qpos[self._left_qpos_idx] = self._left_home
-        self.data.qpos[self._right_qpos_idx] = self._right_target
-        for index, opened, span, close in zip(
-            self._gripper_qpos_idx,
-            self._gripper_open,
-            self._gripper_span,
-            self._gripper_close,
-        ):
-            self.data.qpos[index] = opened + close * span
+        self.data.qpos[self.scene.kinematic_qpos_indices] = self._accepted_controlled_qpos
         self.data.qvel[self._controlled_dof_idx] = 0.0
 
     def _step_physics(self) -> None:
         self._write_direct_state()
         # mj_step performs the pre-integration forward pipeline.  One post-step
-        # forward keeps body poses and contacts current for this task's checks.
+        # rewrite keeps the robot truly prescribed: contact forces computed by
+        # mj_step still advance the free cube, while robot joints are not
+        # allowed to drift away from the collision-approved target.
         self.mujoco.mj_step(self.model, self.data)
+        self._write_direct_state()
         self.mujoco.mj_forward(self.model, self.data)
+        self._grasp_latch.update(self._gripper_close[1])
+        self._last_active_collision_check = (
+            None
+            if self._collision_projector is None
+            else self._collision_projector.oracle.check_contacts(self.data)
+        )
         self._physics_tick += 1
 
     def _advance_ticks(self, ticks: int, *, check_success: bool) -> tuple[int, int]:
@@ -312,6 +423,12 @@ class CubeLiftKernel:
         if not self._critical_state_is_finite():
             self._termination_reason = "non_finite_simulation_state"
             return True
+        if (
+            self._last_active_collision_check is not None
+            and not self._last_active_collision_check.safe
+        ):
+            self._termination_reason = "robot_environment_penetration"
+            return True
         cube_position = self.data.qpos[self._cube_qpos_addr : self._cube_qpos_addr + 3]
         if np.any(cube_position < self._bounds_lower) or np.any(cube_position > self._bounds_upper):
             self._termination_reason = "cube_out_of_bounds"
@@ -358,6 +475,8 @@ class CubeLiftKernel:
             "command_ticks": self.last_command_ticks,
             "success_hold_physics_ticks": self._success_hold_ticks,
             "termination_reason": self._termination_reason,
+            "grasp_latched": self._grasp_latch.active,
+            "grasp_latch_acquisition_count": self._grasp_latch.acquisition_count,
             "execution_mode": self.config.execution_mode,
             "robot_dynamics": self.config.robot_dynamics,
             "runtime": "cube_lift_fast_kernel_v1",
@@ -366,6 +485,20 @@ class CubeLiftKernel:
             ),
             "model_cache_hit": (
                 None if self.model_artifact is None else self.model_artifact.cache_hit
+            ),
+            "safety_modified": bool(
+                self._last_safety_result is not None
+                and self._last_safety_result.modified
+            ),
+            "safety_projection_alpha": float(
+                1.0
+                if self._last_safety_result is None
+                else self._last_safety_result.projection_alpha
+            ),
+            "safety_minimum_distance_m": float(
+                float("inf")
+                if self._last_safety_result is None
+                else self._last_safety_result.check.minimum_distance_m
             ),
         }
         if self.info_mode == "compact" or not terminal:
@@ -378,6 +511,16 @@ class CubeLiftKernel:
             "cube_quaternion_wxyz": cube[3:].astype(float).tolist(),
             "cube_z_m": float(cube[2]),
             "table_contact": self._cube_touches_table(),
+            "safety": (
+                None
+                if self._last_safety_result is None
+                else self._last_safety_result.to_dict()
+            ),
+            "active_collision": (
+                None
+                if self._last_active_collision_check is None
+                else self._last_active_collision_check.to_dict()
+            ),
         }
 
     def _capture_settled_snapshot(self) -> None:
@@ -397,6 +540,7 @@ class CubeLiftKernel:
         for name in ("qpos", "qvel", "act", "ctrl", "qacc_warmstart"):
             getattr(self.data, name)[:] = self._settled_snapshot[name]
         self.mujoco.mj_forward(self.model, self.data)
+        self._accepted_controlled_qpos = self.scene.kinematic_controlled_qpos()
         self._physics_tick = self.config.settle_physics_ticks
         self._next_command_time = (
             np.floor(self.physics_time * self.config.command_hz + 1e-12) + 1.0

@@ -1,0 +1,68 @@
+{
+  "schema": "dexteleop_policy_io_layout_v2.2",
+  "name": "dual_umi_dmtac_gripper_v23",
+  "arm": {
+    "pose_representation": "xyz_quat_xyzw",
+    "controlled_frame_by_side": {
+      "left": "tool_tcp",
+      "right": "tool_tcp"
+    },
+    "reference_frame_by_side": {
+      "left": "desk",
+      "right": "desk"
+    }
+  },
+  "end_effectors": {
+    "left": {
+      "side": "left",
+      "adapter": "dmtac_gripper_v1",
+      "target": {
+        "value_type": "continuous",
+        "dim": 1,
+        "names": ["gripper_close"],
+        "source_indices": [0],
+        "legacy_q6_slot_indices": [0],
+        "tokens": [],
+        "units": "normalized_0_1",
+        "normalization": {"minimum": 0.0, "maximum": 1.0}
+      },
+      "state": null,
+      "state_source_field": "gripper_measured_scalar",
+      "metadata": {
+        "collection_action_source": "angle_trigger_final_command",
+        "collection_state_source": "gripper_measured_scalar",
+        "collection_state_timestamp_field": "joint_timestamp",
+        "collection_state_requires_measured_feedback": true,
+        "collection_state_max_age_sec": 0.5
+      }
+    },
+    "right": {
+      "side": "right",
+      "adapter": "dmtac_gripper_v1",
+      "target": {
+        "value_type": "continuous",
+        "dim": 1,
+        "names": ["gripper_close"],
+        "source_indices": [0],
+        "legacy_q6_slot_indices": [0],
+        "tokens": [],
+        "units": "normalized_0_1",
+        "normalization": {"minimum": 0.0, "maximum": 1.0}
+      },
+      "state": null,
+      "state_source_field": "gripper_measured_scalar",
+      "metadata": {
+        "collection_action_source": "angle_trigger_final_command",
+        "collection_state_source": "gripper_measured_scalar",
+        "collection_state_timestamp_field": "joint_timestamp",
+        "collection_state_requires_measured_feedback": true,
+        "collection_state_max_age_sec": 0.5
+      }
+    }
+  },
+  "metadata": {
+    "description": "Arm-free dual-wrist UMI v2.3 layout; legacy arm pose slots carry measured tool TCP poses in desk.",
+    "embodiment": "umi_dual_wrist",
+    "embodiment_has_arm": false
+  }
+}

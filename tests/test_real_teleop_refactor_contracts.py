@@ -12,13 +12,17 @@ import numpy as np
 import pytest
 
 from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
+from teleop_runtime.gui import collection_tasks as gui_collection_tasks
 from teleop_runtime.gui import status_payloads
 from teleop_runtime.real_teleop import (
     action_debug_payload,
     cli_value_parsers,
     components,
     dataset_finalize,
+    dataset_layout,
     debug_payload_primitives,
+    debug_ik_payload,
+    debug_timing_payload,
 )
 
 
@@ -27,16 +31,17 @@ ENTRYPOINT = ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py"
 EXTRACTED_ROOT = ROOT / "teleop_runtime/real_teleop"
 
 # Temporary staged-refactor measurements.  Update these values deliberately at
-# the start/end of every extraction batch; do not silently let the baseline drift.
-BASELINE_ENTRYPOINT_LINES = 15_300
-BASELINE_EXTRACTED_MODULE_COUNT = 22
-BASELINE_EXTRACTED_LINES = 4_228
+# the start/end of every extraction or in-place slimming batch; do not silently
+# let the baseline drift.
+BASELINE_ENTRYPOINT_LINES = 14_536
+BASELINE_EXTRACTED_MODULE_COUNT = 25
+BASELINE_EXTRACTED_LINES = 5_648
 BASELINE_GUI_CONTROL_LINES = 2_297
-BASELINE_DIRECT_REAL_TELEOP_IMPORTS = 23
+BASELINE_DIRECT_REAL_TELEOP_IMPORTS = 26
 BASELINE_BRIDGE_MARKERS = 17
 
 
-def test_real_teleop_batch_two_measurements_are_frozen() -> None:
+def test_real_teleop_light_dedup_measurements_are_frozen() -> None:
     entrypoint_lines = len(ENTRYPOINT.read_text(encoding="utf-8").splitlines())
     module_paths = sorted(EXTRACTED_ROOT.glob("*.py"))
     extracted_lines = sum(
@@ -59,6 +64,22 @@ def test_real_teleop_batch_two_measurements_are_frozen() -> None:
     assert len(
         re.findall(r"^# (?:MIGRATION|GUI batch|Compatibility bridge)", source, flags=re.MULTILINE)
     ) == BASELINE_BRIDGE_MARKERS
+
+
+def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
+    debug_source = ENTRYPOINT.read_text(encoding="utf-8")
+    collection_runtime_source = (
+        ROOT / "teleop_runtime/collection/runtime.py"
+    ).read_text(encoding="utf-8")
+    writer_runtime_source = (
+        ROOT / "teleop_runtime/collection/writer_runtime.py"
+    ).read_text(encoding="utf-8")
+
+    assert "from ..collection.writer_runtime import CollectionWriterRuntime" in debug_source
+    assert "self.writer_runtime = CollectionWriterRuntime(" in debug_source
+    assert "self.writer_runtime = CollectionWriterRuntime(" in collection_runtime_source
+    assert "run_vive_rm65_real_teleop" not in writer_runtime_source
+    assert "teleop_runtime.debug" not in writer_runtime_source
 
 
 def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
@@ -110,6 +131,8 @@ def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_impo
         ROOT / "teleop_runtime/real_teleop/components.py",
         ROOT / "teleop_runtime/real_teleop/dataset_finalize.py",
         ROOT / "teleop_runtime/real_teleop/debug_payload_primitives.py",
+        ROOT / "teleop_runtime/real_teleop/debug_ik_payload.py",
+        ROOT / "teleop_runtime/real_teleop/debug_timing_payload.py",
     ):
         source = path.read_text(encoding="utf-8")
         assert "run_vive_rm65_real_teleop" not in source
@@ -174,6 +197,94 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
         assert getattr(legacy_entrypoint, name) is getattr(debug_payload_primitives, name)
 
 
+def test_dataset_layout_module_preserves_legacy_adapters_and_import_boundary() -> None:
+    for legacy_name, module_name in (
+        ("_expand_cli_path", "expand_cli_path"),
+        ("_sanitize_dataset_name_for_path", "sanitize_dataset_name_for_path"),
+        ("_default_task_id_from_name", "default_task_id_from_name"),
+    ):
+        assert getattr(legacy_entrypoint, legacy_name) is getattr(dataset_layout, module_name)
+
+    assert list(inspect.signature(legacy_entrypoint._load_task_registry).parameters) == ["args"]
+    assert list(inspect.signature(legacy_entrypoint._task_definition_for_key).parameters) == [
+        "args",
+        "key",
+    ]
+    assert list(inspect.signature(legacy_entrypoint._collection_task_ui_state).parameters) == ["args"]
+
+    assert dataset_layout.expand_cli_path("~/dexteleop").name == "dexteleop"
+    assert dataset_layout.sanitize_dataset_name_for_path("Pick  chips") == "Pick_chips"
+    assert dataset_layout.default_task_id_from_name("Pick  chips") == "pick_chips"
+    layout_args = SimpleNamespace(
+        dataset_root="/tmp/dexteleop-layout-contract",
+        dataset_name="",
+        task_config="",
+        collection_task_key="",
+        collection_task_id="",
+        gripper_task="",
+        collection_task_type="",
+        collection_task_name="",
+        collection_task_name_zh="",
+        collection_task_description="",
+    )
+    layout = dataset_layout.resolve_formal_dataset_layout(layout_args, date_prefix="2026-07-15")
+    assert isinstance(layout, dataset_layout.FormalDatasetLayout)
+    assert layout.dataset_dir_name == "2026-07-15_vive_rm65_real_teleop"
+    assert layout.dataset_root == Path("/tmp/dexteleop-layout-contract") / layout.dataset_dir_name
+    assert gui_collection_tasks.FormalDatasetLayout is dataset_layout.FormalDatasetLayout
+    assert gui_collection_tasks.resolve_formal_dataset_layout is dataset_layout.resolve_formal_dataset_layout
+    assert gui_collection_tasks.toggle_round_trip_phase is dataset_layout.toggle_round_trip_phase
+    for path in (
+        ROOT / "teleop_runtime/real_teleop/dataset_layout.py",
+        ROOT / "teleop_runtime/gui/collection_tasks.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "run_vive_rm65_real_teleop" not in source
+        assert "teleop_runtime.debug" not in source
+
+
+def test_debug_ik_payload_module_preserves_legacy_identity_and_import_boundary() -> None:
+    for name in (
+        "_ik_profile_compact_debug",
+        "_execution_step_compact_debug",
+        "_candidate_selection_compact_debug",
+        "_command_metadata_compact_debug",
+        "_teleop_command_metadata_compact_debug",
+        "_command_compact_debug_payload",
+        "_impedance_record_compact_debug",
+        "_backend_ik_metadata_compact_debug",
+        "_backend_compact_debug_payload",
+        "_observation_pose_compact_debug",
+        "_command_debug_payload",
+        "_teleop_command_metadata_debug",
+        "_impedance_record_debug",
+        "_backend_debug_payload",
+        "_observation_pose_debug",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(debug_ik_payload, name)
+    for name in (
+        "_IK_PROFILE_COMPACT_KEYS",
+        "_IMPEDANCE_RECORD_BASE_KEYS",
+        "_IMPEDANCE_RECORD_BACKEND_TARGET_KEYS",
+        "_IMPEDANCE_RECORD_FORCE_KEYS",
+        "_IMPEDANCE_RECORD_TARGET_OFFSET_KEYS",
+        "_IMPEDANCE_RECORD_REALIZATION_KEYS",
+        "_IMPEDANCE_RECORD_REALIZATION_TAIL_KEYS",
+        "_IMPEDANCE_RECORD_RETURN_LIMIT_KEYS",
+        "_IMPEDANCE_RECORD_JOINT_LIMIT_PROFILE_KEYS",
+        "_IMPEDANCE_RECORD_COMMON_TAIL_KEYS",
+        "_IMPEDANCE_RECORD_POSE_TRACKING_KEYS",
+        "_IMPEDANCE_RECORD_COMPACT_KEYS",
+        "_IMPEDANCE_RECORD_DEBUG_KEYS",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(debug_ik_payload, name)
+    source = (ROOT / "teleop_runtime/real_teleop/debug_ik_payload.py").read_text(
+        encoding="utf-8"
+    )
+    assert "run_vive_rm65_real_teleop" not in source
+    assert "teleop_runtime.debug" not in source
+
+
 def test_batch_two_cli_parsers_and_debug_primitives_are_pure() -> None:
     assert cli_value_parsers._non_negative_float("0.5") == 0.5
     assert cli_value_parsers._canfd_trajectory_mode("2") == 2
@@ -230,6 +341,101 @@ def test_batch_two_ik_payloads_match_for_metadata_snapshots() -> None:
     assert payload["ik_warning"]["active"] is True
     assert payload["ik_warning"]["codes"] == ["failed", "hold_entry", "hold_last_safe"]
     assert status_payloads._build_ik_timing_payload(active_command=None)["available"] is False
+
+
+def test_batch_three_debug_timing_payloads_preserve_snapshot_outputs() -> None:
+    for name in (
+        "_fault_signature",
+        "_phase_timings_log_payload",
+        "_latency_items_log_payload",
+        "_latency_log_payload",
+        "_faults_log_payload",
+        "_channels_log_payload",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(debug_timing_payload, name)
+
+    fault = SimpleNamespace(
+        code="hold_last_safe",
+        channel_name="left_arm",
+        component="ik",
+        severity=SimpleNamespace(value="error"),
+        message="test fault",
+        timestamp=9.0,
+        metadata={"score": np.asarray([1.0, 2.0])},
+    )
+    channel = SimpleNamespace(
+        valid=True,
+        critical=True,
+        capability="pose",
+        side="left",
+        frame_name="desk",
+        source_name="vive",
+        timestamp=9.5,
+        metadata={"seq": 7, "sender_timestamp": 9.25, "ignored": "x"},
+    )
+    result = SimpleNamespace(faults=(fault,), channels={"left_wrist_pose": channel})
+    assert debug_timing_payload._fault_signature(result.faults) == ("hold_last_safe:left_arm",)
+    assert debug_timing_payload._faults_log_payload(result) == legacy_entrypoint._faults_log_payload(result)
+    assert debug_timing_payload._channels_log_payload(result, now=10.0) == legacy_entrypoint._channels_log_payload(
+        result,
+        now=10.0,
+    )
+    assert debug_timing_payload._phase_timings_log_payload(
+        [("slow", 0.02), ("fast", 0.001)]
+    )["top"][0]["name"] == "slow"
+    assert debug_timing_payload._latency_log_payload(None, now=10.0) == {
+        "reference_time": 10.0,
+        "step_age_ms": None,
+        "observation_age_ms": None,
+        "command_age_ms": None,
+        "channel_age": [],
+        "receiver_age": [],
+        "sender_age": [],
+    }
+
+
+def test_in_place_impedance_debug_catalogs_preserve_order_and_special_handling() -> None:
+    compact_keys = legacy_entrypoint._IMPEDANCE_RECORD_COMPACT_KEYS
+    debug_keys = legacy_entrypoint._IMPEDANCE_RECORD_DEBUG_KEYS
+
+    assert len(compact_keys) == 130
+    assert len(debug_keys) == 123
+    assert compact_keys[:11] == debug_keys[:11]
+    assert compact_keys[11:24] == (
+        "backend_target_sequence",
+        "backend_target_timestamp",
+        "backend_target_present",
+        "backend_target_joint_hint_present",
+        "backend_target_dispatched_this_step",
+        "backend_last_dispatched_target_sequence",
+        "backend_target_snapshot_wall_time",
+        "backend_controller_step_start_wall_time",
+        "backend_controller_step_end_wall_time",
+        "backend_controller_step_wall_duration_sec",
+        "backend_target_age_sec_at_snapshot",
+        "backend_target_age_sec_at_step_start",
+        "backend_target_age_sec_at_step_end",
+    )
+    assert debug_keys[11:20] == compact_keys[24:33]
+    assert "ik_metadata" not in compact_keys
+    assert debug_keys[-3:] == (
+        "ik_metadata",
+        "pose_tracking_linear_m",
+        "pose_tracking_angular_rad",
+    )
+
+    record = {
+        key: key
+        for key in set(compact_keys) | set(debug_keys) | {"ik_metadata"}
+    }
+    record["ik_metadata"] = {"status": "ok"}
+    compact = legacy_entrypoint._impedance_record_compact_debug(record)
+    debug = legacy_entrypoint._impedance_record_debug(record)
+
+    assert tuple(compact) == compact_keys + ("ik_metadata",)
+    assert compact["ik_metadata"] == {"status": "ok"}
+    assert tuple(debug) == debug_keys
+    assert debug["ik_metadata"] is record["ik_metadata"]
 
 
 def test_batch_one_action_debug_keeps_backend_read_in_legacy_seam() -> None:

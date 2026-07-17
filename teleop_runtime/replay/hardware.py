@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from hardware.rm65.calibration_profiles import ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD
-from rm65_inspire_tac.paths import require_asset_path
+from robot_motion.rm65.assets import require_asset_path
 from robot_motion.action import RobotAction, RobotActionResolver
 from robot_motion.deploy.schema import ARM_JOINT_DOF
 from robot_motion.runtime import EffectorCommand, TeleopCommand, run_best_effort_cleanup

@@ -366,8 +366,10 @@ def _gripper_animation_callback(
     def _on_step(elapsed_s: float) -> None:
         alpha = 0.5 - 0.5 * math.cos(2.0 * math.pi * float(elapsed_s) / period)
         close = lower + alpha * (upper - lower)
-        for name in gripper_names:
-            scene.set_gripper_close(name, close)
+        scene.apply_safe_kinematic_target(
+            {},
+            gripper_close_by_name={name: close for name in gripper_names},
+        )
 
     return _on_step
 
@@ -408,8 +410,14 @@ def run(args: argparse.Namespace) -> None:
 
     extra: dict[str, object] = {"control": args.control, "mode": args.mode}
     if args.control == "qpos":
-        qpos_result = QposController(scene).apply(_qpos_targets(args, scene))
+        qpos_controller = QposController(scene)
+        qpos_result = qpos_controller.apply(_qpos_targets(args, scene))
         extra["qpos_result"] = qpos_result
+        extra["qpos_safety"] = (
+            None
+            if qpos_controller.last_safety_result is None
+            else qpos_controller.last_safety_result.to_dict()
+        )
     elif args.control == "pose-ik":
         explicit_initial_qpos: dict[str, np.ndarray] = {}
         if args.left_qpos is not None:
@@ -421,7 +429,12 @@ def run(args: argparse.Namespace) -> None:
             assert right_initial is not None
             explicit_initial_qpos["right"] = right_initial
         if explicit_initial_qpos:
-            scene.set_qpos_by_side(explicit_initial_qpos)
+            initial_safety = scene.apply_safe_kinematic_target(explicit_initial_qpos)
+            if initial_safety is not None and initial_safety.modified:
+                raise SystemExit(
+                    "Explicit planner reset qpos is collision-unsafe: "
+                    f"{initial_safety.to_dict()}"
+                )
             extra["planner_reset_qpos_by_side"] = {
                 side: values.tolist() for side, values in explicit_initial_qpos.items()
             }
@@ -465,7 +478,13 @@ def run(args: argparse.Namespace) -> None:
 
     gripper_targets = _parse_gripper_close_items(args.gripper_close, scene)
     if gripper_targets:
-        extra["gripper_result"] = GripperController(scene).apply(gripper_targets)
+        gripper_controller = GripperController(scene)
+        extra["gripper_result"] = gripper_controller.apply(gripper_targets)
+        extra["gripper_safety"] = (
+            None
+            if gripper_controller.last_safety_result is None
+            else gripper_controller.last_safety_result.to_dict()
+        )
 
     if args.print_camera_poses:
         print(json.dumps(scene.camera_metadata(), indent=2, ensure_ascii=False))

@@ -4,8 +4,9 @@
 
 - **MuJoCo is the canonical task-physics backend** for real2sim, task scenes,
   contact, system identification, policy rollout, and later sim2real checks.
-- **SAPIEN remains a teleop/debug preview** in `teleop_runtime`; it is useful
-  for tracker mapping and operator visualization, but it is not the canonical
+- **SAPIEN remains a teleop/debug preview**; its RM65 renderer lives in
+  `sim/rm65`, while entrypoints remain in `teleop_runtime`. It is useful for
+  tracker mapping and operator visualization, but it is not the canonical
   task-physics source of truth.
 - MuJoCo `replay/` keeps an explicit kinematic diagnostic profile. It may set
   qpos directly for camera/geometry checks and must not be reported as a
@@ -133,6 +134,12 @@ and loading a versioned MJB artifact from `.cache/mujoco/`. Override the cache
 with `SIM_MUJOCO_CACHE_DIR` or the `model_cache_dir` constructor argument. MJB
 files are reproducible caches and must not be committed.
 
+Reference and fast environments share the same collision policy: prescribed
+targets are swept and projected before application, gripper/object and
+object/table contacts remain legal, and robot/environment penetration beyond
+the hard threshold terminates the episode. Compact info exposes projection
+rate, projection alpha, minimum safety distance and hard-penetration status.
+
 Run the debug-machine benchmark without rendering or realtime sleeps:
 
 ```bash
@@ -140,6 +147,10 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 python -m sim.mujoco.benchmarks.benchmark_cube_lift \
   --runtime both --vector-envs 1,4,8,16 --steps 500 --warmup-steps 50
 ```
+
+Add `--random-actions --random-action-scale 1.0` to include collision-oracle
+and projection cost; the default zero-action benchmark measures the physics
+and multiprocessing floor.
 
 The vector executor transfers actions, observations, rewards, done flags and
 terminal observations through fixed shared-memory arrays. Pipes carry only

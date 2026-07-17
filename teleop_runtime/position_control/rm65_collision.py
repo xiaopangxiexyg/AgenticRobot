@@ -9,6 +9,7 @@ from robot_motion.pose import pose6_to_matrix
 from robot_motion.rm65.position_collision import (
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
+    RM65PositionPlannerProtocol,
 )
 
 
@@ -69,8 +70,13 @@ def build_position_collision_planner_from_started_backends(
     collision_distance_epsilon_m: float,
     max_joint_velocity_rad_s: Sequence[float],
     max_joint_step_rad: float | Sequence[float] | None = None,
+    damping: float = 0.01,
+    solve_max_iterations: int = 1,
+    solve_min_iterations: int = 1,
+    solve_adaptive_iterations_enabled: bool = False,
+    solve_iteration_reserve_ms: float = 5.0,
     debug_profile: bool = False,
-) -> RM65PositionCollisionPlanner:
+) -> RM65PositionPlannerProtocol:
     """Build the common pose-to-qpos planner at the real-runtime boundary."""
 
     max_step: tuple[float, ...] | None
@@ -95,6 +101,13 @@ def build_position_collision_planner_from_started_backends(
                 name="max_joint_velocity_rad_s",
             ),
             max_joint_step_rad=max_step,
+            damping=float(damping),
+            solve_max_iterations=int(solve_max_iterations),
+            solve_min_iterations=int(solve_min_iterations),
+            solve_adaptive_iterations_enabled=bool(
+                solve_adaptive_iterations_enabled
+            ),
+            solve_iteration_reserve_ms=float(solve_iteration_reserve_ms),
             debug_profile=bool(debug_profile),
         ),
         endpoint_to_tool_by_side=endpoint_to_tool_transforms_from_started_backends(

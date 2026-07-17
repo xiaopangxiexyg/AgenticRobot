@@ -263,7 +263,7 @@ class RM65SDKIKProvider:
         deadline: float | None,
     ) -> None:
         try:
-            from rm65_inspire_tac.ik_tuning import generate_rm65_wrist_flip_candidates
+            from robot_motion.rm65.ik_tuning import generate_rm65_wrist_flip_candidates
         except Exception:  # noqa: BLE001 - optional branch expansion.
             return
 

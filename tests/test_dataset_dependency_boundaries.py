@@ -149,7 +149,7 @@ def test_postprocess_runtime_bridge_is_explicit_and_limited_to_camera_smoke_cli(
 
 def test_runtime_and_sim_do_not_import_offline_postprocess_implementation() -> None:
     violations: list[str] = []
-    for package in ("teleop_runtime", "robot_motion", "sim", "rm65_inspire_tac"):
+    for package in ("teleop_runtime", "robot_motion", "sim"):
         for path in _python_files(REPO_ROOT / package):
             if any(
                 name == "utils.dataset_postprocess"
@@ -206,19 +206,8 @@ def test_scene_layout_legacy_path_reexports_robot_motion_contract() -> None:
     assert legacy is canonical
 
 
-def test_rm65_support_package_does_not_import_teleop_runtime() -> None:
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            name for name in _imported_modules(path)
-            if name == "teleop_runtime" or name.startswith("teleop_runtime.")
-        )
-        for path in _python_files(REPO_ROOT / "rm65_inspire_tac")
-        if any(
-            name == "teleop_runtime" or name.startswith("teleop_runtime.")
-            for name in _imported_modules(path)
-        )
-    }
-    assert violations == {}
+def test_rm65_support_package_is_archived() -> None:
+    assert _python_files(REPO_ROOT / "rm65_inspire_tac") == []
 
 
 def test_data_packages_import_without_loading_runtime_or_hardware() -> None:

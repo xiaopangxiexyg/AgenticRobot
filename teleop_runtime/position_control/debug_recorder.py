@@ -44,6 +44,7 @@ class PositionDebugRecorderConfig:
     max_samples_per_metric: int = 100_000
     flush_every_events: int = 128
     summary_checkpoint_every_events: int = 2_048
+    runtime_summary_checkpoints: bool = False
     thread_name: str = "position-debug-recorder"
     context: Mapping[str, Any] = field(default_factory=dict)
 
@@ -70,6 +71,11 @@ class PositionDebugRecorderConfig:
         if not thread_name:
             raise ValueError("thread_name must not be empty.")
         object.__setattr__(self, "thread_name", thread_name)
+        object.__setattr__(
+            self,
+            "runtime_summary_checkpoints",
+            bool(self.runtime_summary_checkpoints),
+        )
         if not isinstance(self.context, Mapping):
             raise TypeError("context must be a mapping")
         object.__setattr__(self, "context", copy.deepcopy(dict(self.context)))
@@ -267,6 +273,9 @@ class PositionDebugRecorder:
                 "summary_checkpoint_every_events": int(
                     self.config.summary_checkpoint_every_events
                 ),
+                "runtime_summary_checkpoints": bool(
+                    self.config.runtime_summary_checkpoints
+                ),
             }
         summary = {
             "schema_version": POSITION_AUDIT_SCHEMA_VERSION,
@@ -322,7 +331,8 @@ class PositionDebugRecorder:
                     self._process_event(item)
                     self._processed_count += 1
                     if (
-                        self._processed_count
+                        self.config.runtime_summary_checkpoints
+                        and self._processed_count
                         % int(self.config.summary_checkpoint_every_events)
                         == 0
                     ):

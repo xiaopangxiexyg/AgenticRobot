@@ -12,6 +12,12 @@ from dataset_contracts.v22 import (
 )
 from dataset_contracts.v23 import V23DatasetContract, resolve_v23_dataset_contract
 from dataset_contracts.pose_frames import PoseFrameContract
+from dataset_contracts.pose_chunk import PoseActionChunkContract
+
+from .pose_chunk import (
+    PoseActionChunkLocation,
+    pose_action_chunk_start_indices,
+)
 
 
 MODALITY_VALIDITY_SCHEMA_VERSION = "dexteleop.modality_validity.v1"
@@ -236,6 +242,43 @@ class DexTeleopDatasetIndex:
             return self._episodes[int(episode_index)]
         except KeyError as exc:
             raise KeyError(f"episode_index {episode_index} not found in {self.episodes_path}") from exc
+
+    def pose_action_chunk_locations(
+        self,
+        chunk_contract: PoseActionChunkContract,
+        *,
+        episode_indices: tuple[int, ...] | list[int] | None = None,
+    ) -> tuple[PoseActionChunkLocation, ...]:
+        """Enumerate legal per-episode training starts from metadata only.
+
+        A missing/zero ``frame_count`` is rejected rather than guessed because
+        guessing could construct a chunk that crosses the real episode tail.
+        """
+
+        selected = self.episode_indices if episode_indices is None else tuple(
+            int(value) for value in episode_indices
+        )
+        locations: list[PoseActionChunkLocation] = []
+        for episode_index in selected:
+            episode = self.episode(episode_index)
+            if episode.frame_count <= 0:
+                raise ValueError(
+                    f"episode {episode_index} has no positive frame_count in metadata."
+                )
+            for start_index in pose_action_chunk_start_indices(
+                episode.frame_count, chunk_contract
+            ):
+                locations.append(
+                    PoseActionChunkLocation(
+                        episode_index=episode_index,
+                        start_index=start_index,
+                        valid_action_count=min(
+                            chunk_contract.action_horizon,
+                            episode.frame_count - start_index,
+                        ),
+                    )
+                )
+        return tuple(locations)
 
     @property
     def training_camera_keys(self) -> tuple[str, ...]:

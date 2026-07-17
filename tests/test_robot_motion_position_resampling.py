@@ -140,6 +140,38 @@ def test_causal_resampling_interpolates_only_when_both_brackets_were_available()
         resampler.sample_at(2.1, emitted_timestamp=2.0)
 
 
+def test_causal_resampling_uses_future_logical_target_already_available_from_chunk() -> None:
+    resampler = CausalMotionResampler()
+    resampler.push(
+        TimestampedMotionTarget(
+            timestamp=10.0,
+            source_index=0,
+            qpos_by_side={"right": _qpos(0.0)},
+            available_timestamp=10.0,
+        )
+    )
+    resampler.push(
+        TimestampedMotionTarget(
+            timestamp=11.0,
+            source_index=1,
+            qpos_by_side={"right": _qpos(1.0)},
+            # The complete action chunk was decoded at t=10.
+            available_timestamp=10.0,
+        )
+    )
+
+    reference = resampler.sample_at(10.5, emitted_timestamp=10.5)
+
+    np.testing.assert_allclose(reference.qpos_by_side["right"], _qpos(0.5))
+    assert reference.metadata["resampling_mode"] == (
+        "causal_available_lookahead_interpolation"
+    )
+    assert reference.metadata["lookahead_used"] is True
+    assert reference.metadata["lookahead_available_at_emit"] is True
+    assert reference.metadata["output_lag_sec"] == pytest.approx(0.0)
+    assert reference.metadata["right_source_available_timestamp"] == pytest.approx(10.0)
+
+
 def test_uniform_grid_endpoint_rule_and_motion_target_immutability() -> None:
     unaligned = build_uniform_time_grid(0.0, 0.1, hz=45.0, include_final=True)
     assert unaligned[-2] == pytest.approx(4.0 / 45.0)
@@ -171,4 +203,3 @@ def test_uniform_grid_endpoint_rule_and_motion_target_immutability() -> None:
     np.testing.assert_allclose(target.qpos_by_side["right"], _qpos(3.0))
     with pytest.raises(ValueError):
         target.qpos_by_side["right"][0] = 4.0
-

@@ -687,8 +687,17 @@ class RealSenseRGBSource(ObservationSource):
                     color_frame_number = int(color_frame.get_frame_number())
                 except Exception:  # noqa: BLE001
                     color_frame_number = None
+                # RealSense numpy views may alias SDK-owned frame memory.  One
+                # explicit copy per new camera frame creates the immutable
+                # history snapshot; sample-rate lookups never recopy it.
+                image_snapshot = np.array(image, copy=True, order="C")
+                image_snapshot.setflags(write=False)
+                depth_snapshot = None
+                if depth_image is not None:
+                    depth_snapshot = np.array(depth_image, copy=True, order="C")
+                    depth_snapshot.setflags(write=False)
                 frame = VideoFrame(
-                    image=np.ascontiguousarray(image),
+                    image=image_snapshot,
                     source_timestamp=received_at,
                     receive_timestamp=received_at,
                     frame_index=frame_index,
@@ -704,16 +713,16 @@ class RealSenseRGBSource(ObservationSource):
                         "sensor_timestamp_ms": sensor_timestamp_ms,
                         "color_frame_number": color_frame_number,
                     },
-                    depth_image=None if depth_image is None else np.ascontiguousarray(depth_image),
+                    depth_image=depth_snapshot,
                     depth_metadata=depth_metadata,
                 )
+                frame = self._frame_buffer.publish(frame)
                 with self._lock:
                     self._latest_frame = frame
                     self._last_error = None
                     self._last_runtime_error = None
                     self._last_frame_receive_timestamp = received_at
                     self._consecutive_timeout_count = 0
-                self._frame_buffer.push(frame)
             except RuntimeError as exc:
                 if not self._running:
                     break
@@ -739,6 +748,7 @@ class RealSenseRGBSource(ObservationSource):
             image=np.asarray(frame.image).copy(),
             source_timestamp=float(frame.source_timestamp),
             receive_timestamp=frame.receive_timestamp,
+            available_timestamp=frame.available_timestamp,
             frame_index=frame.frame_index,
             metadata=dict(frame.metadata),
             depth_image=None if frame.depth_image is None else np.asarray(frame.depth_image).copy(),

@@ -6,11 +6,13 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from robot_motion.tests.tracker_replay import (
     OfflineTrackerReplayFrame,
     OfflineTrackerReplayReport,
     SideReplayError,
+    _observation_from_row,
     report_exceeds_thresholds,
     summarize_offline_tracker_frames,
 )
@@ -51,6 +53,45 @@ def _frame(index: int) -> OfflineTrackerReplayFrame:
             )
         },
     )
+
+
+def test_tracker_replay_binds_historical_desk_pose_to_vive_retarget_frame() -> None:
+    row = {
+        "timestamp": 1.0,
+        "teleop.action_source.left_wrist_pose_desk": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+        "teleop.action_source.left_wrist_pose_desk_frame": "vive_retarget_frame",
+    }
+
+    observation = _observation_from_row(row, ("left",))
+
+    assert observation.channels["left_wrist_pose"].frame_name == "vive_retarget_frame"
+
+
+def test_tracker_replay_rejects_canonical_desk_label_on_historical_pose_column() -> None:
+    row = {
+        "timestamp": 1.0,
+        "teleop.action_source.left_wrist_pose_desk": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+        "teleop.action_source.left_wrist_pose_desk_frame": "canonical_desk",
+    }
+
+    with pytest.raises(ValueError, match="expected 'vive_retarget_frame'"):
+        _observation_from_row(row, ("left",))
 
 
 def test_offline_tracker_summary_separates_source_and_ik_errors() -> None:

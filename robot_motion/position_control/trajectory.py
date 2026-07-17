@@ -19,6 +19,7 @@ POSITION_COMMAND_PLANNER_CHOICES = (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
 )
 DEFAULT_POSITION_VELOCITY_RAMP_SEC = 0.10
+DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC = 0.03
 DEFAULT_POSITION_DEGRADED_SPEED_SCALE = 0.50
 
 
@@ -236,6 +237,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
         limits: JointTrajectoryLimits,
         *,
         velocity_ramp_sec: float = DEFAULT_POSITION_VELOCITY_RAMP_SEC,
+        target_velocity_filter_tau_sec: float = 0.0,
         reference_period_sec: float | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ):
@@ -244,6 +246,11 @@ class AccelerationLimitedJointTrajectoryPlanner:
         ramp = float(velocity_ramp_sec)
         if not math.isfinite(ramp) or ramp <= 0.0:
             raise ValueError("velocity_ramp_sec must be finite and positive.")
+        filter_tau = float(target_velocity_filter_tau_sec)
+        if not math.isfinite(filter_tau) or filter_tau < 0.0:
+            raise ValueError(
+                "target_velocity_filter_tau_sec must be finite and non-negative."
+            )
         if not callable(monotonic_clock):
             raise TypeError("monotonic_clock must be callable.")
         if reference_period_sec is None:
@@ -257,6 +264,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
                 raise ValueError("reference_period_sec must be finite and positive, or None.")
         self.limits = limits
         self.velocity_ramp_sec = ramp
+        self.target_velocity_filter_tau_sec = filter_tau
         self.reference_period_sec = normalized_reference_period
         self._clock = monotonic_clock
         self._lock = threading.RLock()
@@ -269,6 +277,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
         self._braking_guard_q: np.ndarray | None = None
         self._braking_guard_direction: np.ndarray | None = None
         self._target_qd_raw: np.ndarray | None = None
+        self._target_qd_unfiltered: np.ndarray | None = None
         self._target_qd_reference: np.ndarray | None = None
         self._target_qd_desired: np.ndarray | None = None
         self._target_qd_desired_raw: np.ndarray | None = None
@@ -276,6 +285,9 @@ class AccelerationLimitedJointTrajectoryPlanner:
         self._target_braking_offset: np.ndarray | None = None
         self._target_reference_lead_reserve: np.ndarray | None = None
         self._target_reference_period_sec = 0.0
+        self._target_velocity_filter_alpha = 1.0
+        self._target_velocity_filter_applied = False
+        self._target_velocity_filter_dt_sec: float | None = None
         self._target_sequence: int | None = None
         self._target_published_monotonic: float | None = None
         self._last_safe_target_q: np.ndarray | None = None
@@ -313,6 +325,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
             self._braking_guard_q = qpos.copy()
             self._braking_guard_direction = np.zeros_like(qpos, dtype=np.int8)
             self._target_qd_raw = None
+            self._target_qd_unfiltered = None
             self._target_qd_reference = None
             self._target_qd_desired = None
             self._target_qd_desired_raw = None
@@ -320,6 +333,9 @@ class AccelerationLimitedJointTrajectoryPlanner:
             self._target_braking_offset = None
             self._target_reference_lead_reserve = None
             self._target_reference_period_sec = 0.0
+            self._target_velocity_filter_alpha = 1.0
+            self._target_velocity_filter_applied = False
+            self._target_velocity_filter_dt_sec = None
             self._target_sequence = None
             self._target_published_monotonic = None
             self._last_safe_target_q = None
@@ -483,11 +499,42 @@ class AccelerationLimitedJointTrajectoryPlanner:
                 dtype=float,
             )
             scaled_velocity = max_velocity * scale
-            target_qd_reference = np.clip(
+            target_qd_unfiltered = np.clip(
                 target_qd_raw,
                 -scaled_velocity,
                 scaled_velocity,
             )
+            previous_target_qd_reference = (
+                None
+                if anchor_resynced or self._target_qd_reference is None
+                else np.clip(
+                    self._target_qd_reference,
+                    -scaled_velocity,
+                    scaled_velocity,
+                )
+            )
+            filter_dt = self._last_observed_reference_dt_sec
+            filter_applied = bool(
+                self.target_velocity_filter_tau_sec > 0.0
+                and previous_target_qd_reference is not None
+                and filter_dt is not None
+                and filter_dt > 0.0
+            )
+            filter_alpha = 1.0
+            if filter_applied:
+                filter_alpha = 1.0 - math.exp(
+                    -float(filter_dt) / self.target_velocity_filter_tau_sec
+                )
+                target_qd_reference = previous_target_qd_reference + filter_alpha * (
+                    target_qd_unfiltered - previous_target_qd_reference
+                )
+                target_qd_reference = np.clip(
+                    target_qd_reference,
+                    -scaled_velocity,
+                    scaled_velocity,
+                )
+            else:
+                target_qd_reference = target_qd_unfiltered.copy()
             reference_period = self.reference_period_sec
             if reference_period is None:
                 observed_period = self._last_observed_reference_dt_sec
@@ -522,6 +569,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
             self._braking_guard_direction = guard_direction.astype(np.int8, copy=False)
             self._target_q = target.copy()
             self._target_qd_raw = target_qd_raw
+            self._target_qd_unfiltered = target_qd_unfiltered
             self._target_qd_reference = target_qd_reference
             self._target_qd_desired = target_qd_desired
             self._target_qd_desired_raw = target_qd_desired_raw
@@ -529,6 +577,11 @@ class AccelerationLimitedJointTrajectoryPlanner:
             self._target_braking_offset = braking_offset
             self._target_reference_lead_reserve = reference_lead_reserve
             self._target_reference_period_sec = float(reference_period)
+            self._target_velocity_filter_alpha = float(filter_alpha)
+            self._target_velocity_filter_applied = filter_applied
+            self._target_velocity_filter_dt_sec = (
+                None if filter_dt is None else float(filter_dt)
+            )
             self._target_sequence = normalized_sequence
             self._target_published_monotonic = published
             self._last_safe_target_q = target.copy()
@@ -572,6 +625,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
             self._braking_guard_q = self._q.copy()
             self._braking_guard_direction = np.zeros_like(self._q, dtype=np.int8)
             self._target_qd_raw = np.zeros_like(self._q)
+            self._target_qd_unfiltered = np.zeros_like(self._q)
             self._target_qd_reference = np.zeros_like(self._q)
             self._target_qd_desired = np.zeros_like(self._q)
             self._target_qd_desired_raw = np.zeros_like(self._q)
@@ -583,6 +637,9 @@ class AccelerationLimitedJointTrajectoryPlanner:
                 if self.reference_period_sec is not None
                 else self._last_observed_reference_dt_sec or 0.0
             )
+            self._target_velocity_filter_alpha = 1.0
+            self._target_velocity_filter_applied = False
+            self._target_velocity_filter_dt_sec = None
             self._target_sequence = normalized_sequence
             self._target_published_monotonic = now
             self._qd = np.zeros_like(self._q)
@@ -609,6 +666,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
             assert self._braking_guard_q is not None
             assert self._braking_guard_direction is not None
             assert self._target_qd_raw is not None
+            assert self._target_qd_unfiltered is not None
             assert self._target_qd_reference is not None
             assert self._target_qd_desired is not None
             assert self._target_qd_desired_raw is not None
@@ -813,6 +871,24 @@ class AccelerationLimitedJointTrajectoryPlanner:
                 safety_envelope_limited=envelope_limited,
                 metadata={
                     "trajectory_target_velocity_raw_rad_s": self._target_qd_raw.tolist(),
+                    "trajectory_target_velocity_unfiltered_rad_s": (
+                        self._target_qd_unfiltered.tolist()
+                    ),
+                    "trajectory_target_velocity_filtered_rad_s": (
+                        self._target_qd_reference.tolist()
+                    ),
+                    "trajectory_target_velocity_filter_tau_sec": float(
+                        self.target_velocity_filter_tau_sec
+                    ),
+                    "trajectory_target_velocity_filter_alpha": float(
+                        self._target_velocity_filter_alpha
+                    ),
+                    "trajectory_target_velocity_filter_applied": bool(
+                        self._target_velocity_filter_applied
+                    ),
+                    "trajectory_target_velocity_filter_dt_sec": (
+                        self._target_velocity_filter_dt_sec
+                    ),
                     "trajectory_desired_velocity_raw_rad_s": raw_desired.tolist(),
                     "trajectory_velocity_ramp_sec": float(self.velocity_ramp_sec),
                     "trajectory_max_velocity_rad_s": max_velocity.tolist(),
@@ -949,12 +1025,31 @@ class AccelerationLimitedJointTrajectoryPlanner:
                 "target_qd_raw_rad_s": (
                     None if self._target_qd_raw is None else self._target_qd_raw.tolist()
                 ),
+                "target_qd_unfiltered_rad_s": (
+                    None
+                    if self._target_qd_unfiltered is None
+                    else self._target_qd_unfiltered.tolist()
+                ),
+                "target_qd_filtered_rad_s": (
+                    None
+                    if self._target_qd_reference is None
+                    else self._target_qd_reference.tolist()
+                ),
                 "target_sequence": self._target_sequence,
                 "speed_scale": float(self._speed_scale),
                 "mode": self._mode,
                 "reason": self._reason,
                 "quick_stop": bool(self._quick_stop),
                 "velocity_ramp_sec": float(self.velocity_ramp_sec),
+                "target_velocity_filter_tau_sec": float(
+                    self.target_velocity_filter_tau_sec
+                ),
+                "target_velocity_filter_alpha": float(
+                    self._target_velocity_filter_alpha
+                ),
+                "target_velocity_filter_applied": bool(
+                    self._target_velocity_filter_applied
+                ),
                 "reference_period_sec": self.reference_period_sec,
                 "last_observed_reference_dt_sec": self._last_observed_reference_dt_sec,
                 "max_velocity_rad_s": self.limits.max_velocity_rad_s.tolist(),
@@ -1001,6 +1096,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
 __all__ = [
     "AccelerationLimitedJointTrajectoryPlanner",
     "DEFAULT_POSITION_DEGRADED_SPEED_SCALE",
+    "DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC",
     "DEFAULT_POSITION_VELOCITY_RAMP_SEC",
     "JointTrajectoryLimits",
     "JointTrajectoryProposal",

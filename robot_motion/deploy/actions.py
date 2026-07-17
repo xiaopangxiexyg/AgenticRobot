@@ -495,6 +495,13 @@ class ActionChunkBuffer:
             return self._queue.popleft()
         return default
 
+    def peek(self, default: NormalizedAction | None = None) -> NormalizedAction | None:
+        """Return the next queued action without changing queue ownership."""
+
+        if self._queue:
+            return self._queue[0]
+        return default
+
 
 @dataclass(frozen=True)
 class ActionSafetyFilterConfig:

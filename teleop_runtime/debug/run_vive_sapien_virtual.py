@@ -59,14 +59,14 @@ from ..tcp import legacy_tcp_mode_requested
 from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
 from .log_utils import ChangeGate, log_event
 from robot_motion.rm65 import build_rm65_dual_arm_scene_profile
-from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
-from rm65_inspire_tac.paths import require_asset_path
-from rm65_inspire_tac.pipeline import (
+from robot_motion.rm65.ik_tuning import load_ik_tuning_config
+from robot_motion.rm65.assets import require_asset_path
+from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     DualArmSceneProfile,
 )
-from rm65_inspire_tac.rendering import DebugBoxOverlay, DebugBoxTemplate, SapienArmHandRenderer
+from sim.rm65.sapien_renderer import DebugBoxOverlay, DebugBoxTemplate, SapienArmHandRenderer
 
 
 _TRACKER_BEFORE_CORRECTION_MARKER_SIZE_M = (0.018, 0.018, 0.018)
@@ -373,9 +373,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--control-mode",
-        choices=["absolute", "delta_clutch"],
+        choices=["absolute"],
         default="absolute",
-        help="Virtual retargeting mode. Use delta_clutch with --keyboard-clutch for relative control.",
+        help="Virtual retargeting mode. The active runtime uses absolute pose mapping.",
     )
     parser.add_argument(
         "--tcp-mode",
@@ -522,7 +522,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start runtime home calibration immediately without waiting for a key press.",
     )
-    parser.add_argument("--keyboard-clutch", action="store_true", help="Enable terminal clutch toggles: z/x/b/r, q to quit")
+    parser.add_argument(
+        "--keyboard-clutch",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--no-record", action="store_true", help="Disable JSONL recording for this session")
     parser.add_argument(
         "--no-episode-recording",
@@ -563,7 +567,7 @@ def parse_args() -> argparse.Namespace:
         "--ik-tuning-json",
         type=str,
         default="",
-        help="Optional RM65 IK tuning JSON. Defaults to teleop_runtime/configs/rm65_ik_tuning.json.",
+        help="Optional RM65 IK tuning JSON. Defaults to robot_motion/configs/rm65_ik_tuning.json.",
     )
     parser.add_argument(
         "--recovery-healthy-frames",
@@ -658,7 +662,7 @@ def build_components(args: argparse.Namespace) -> VirtualRunComponents:
         }
     )
     keyboard_source = KeyboardButtonSource(name="terminal_clutch")
-    default_clutch_pressed = args.control_mode == "delta_clutch" and not args.keyboard_clutch
+    default_clutch_pressed = False
     keyboard_source.set_button(
         "left_clutch_button",
         default_clutch_pressed,
@@ -2326,22 +2330,11 @@ def _start_recovery_plan(
     control_mode: str,
     ramp_sec: float,
 ) -> tuple[RecoveryPlan | None, object | None, bool]:
+    if control_mode != "absolute":
+        raise ValueError("delta_clutch has been hard-archived; recovery only supports 'absolute'.")
     calibration = components.session.calibration
     assert calibration is not None
     _sync_dual_arm_retargeter_from_preview(components)
-
-    if control_mode == "delta_clutch":
-        for side in components.active_sides:
-            _side_retargeter(components, side).reanchor_to_current_input(
-                observation,
-                calibration,
-                robot_pose_desk=_preview_tcp_pose_desk(
-                    components,
-                    side=side,
-                ),
-            )
-        _sync_dual_arm_retargeter_from_preview(components)
-        return None, components.session.build_command(observation), True
 
     if arm_mode == "virtual":
         return None, components.session.build_command(observation), True
@@ -2590,8 +2583,6 @@ def main() -> None:
                 "Keys",
                 "p/Enter=start calibration, t=start episode, s=stop episode, z=left clutch, x=right clutch, b=both clutch, r=release, q=quit",
             )
-        elif args.control_mode == "delta_clutch":
-            _log("Info", "delta_clutch is running with both clutch buttons held true by default.")
         if episode_recorder.config.enabled:
             auto_start_note = " auto_start=on" if args.record_auto_start else " auto_start=off"
             _log(

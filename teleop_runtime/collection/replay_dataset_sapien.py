@@ -9,9 +9,9 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from rm65_inspire_tac.paths import require_asset_path
-from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
-from rm65_inspire_tac.rendering import SapienArmHandRenderer
+from robot_motion.rm65.assets import require_asset_path
+from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+from sim.rm65.sapien_renderer import SapienArmHandRenderer
 
 from ..configs import ANNOTATED_DUAL_RM65_BASE_DISTANCE_M
 from ..hand_render import (

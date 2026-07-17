@@ -17,7 +17,7 @@ from robot_motion.frames import TOOL_TCP_FRAME
 from robot_motion.pose_smoothing import build_bimanual_pose_smoother
 from robot_motion.runtime import EffectorCommand, ObservationChannel, TeleopCommand, TeleopObservation
 from robot_motion.transforms import as_pose_matrix, rotation_angle_rad
-from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
 
 from teleop_runtime.calibration import TeleopCalibration
 from teleop_runtime.configs import load_default_pose_smoothing_config
@@ -30,6 +30,7 @@ from teleop_runtime.retargeters.dual_arm_collision_aware import (
 
 SIDES = ("left", "right")
 DEFAULT_ARM_MAX_ANGVEL_RAD_S = (0.35, 0.35, 0.35, 0.5, 0.5, 0.5)
+VIVE_RETARGET_FRAME_NAME = "vive_retarget_frame"
 
 
 @dataclass(frozen=True)
@@ -532,6 +533,14 @@ def _observation_from_row(row: Mapping[str, Any], active_sides: Sequence[str]) -
     channels: dict[str, ObservationChannel] = {}
     channel_metadata = _json_mapping(row.get("channels_json"))
     for side in active_sides:
+        pose_frame = row.get(
+            f"teleop.action_source.{side}_wrist_pose_desk_frame"
+        )
+        if pose_frame is not None and str(pose_frame) != VIVE_RETARGET_FRAME_NAME:
+            raise ValueError(
+                f"teleop.action_source.{side}_wrist_pose_desk declares unsupported "
+                f"frame {pose_frame!r}; expected {VIVE_RETARGET_FRAME_NAME!r}."
+            )
         pose = _pose_from_row(row, f"teleop.action_source.{side}_wrist_pose_desk")
         valid = pose is not None and bool(
             _nested_get(channel_metadata, f"{side}_wrist_pose", "valid", default=True)
@@ -541,7 +550,7 @@ def _observation_from_row(row: Mapping[str, Any], active_sides: Sequence[str]) -
             capability="pose6d",
             side=side,
             value=np.eye(4, dtype=float) if pose is None else pose,
-            frame_name="desk",
+            frame_name=VIVE_RETARGET_FRAME_NAME,
             timestamp=_float_or_none(
                 _nested_get(channel_metadata, f"{side}_wrist_pose", "timestamp")
             )
@@ -674,11 +683,7 @@ def _side_errors(
 
 
 def _current_qpos_by_side(retargeter: DualArmCollisionAwareRetargeter) -> dict[str, np.ndarray]:
-    left, right = retargeter._split_solution(retargeter.ik_solver.current_q)  # noqa: SLF001
-    return {
-        "left": np.asarray(left, dtype=float).reshape(6).copy(),
-        "right": np.asarray(right, dtype=float).reshape(6).copy(),
-    }
+    return retargeter.current_qpos_by_side()
 
 
 def _seed_retargeter_from_row(

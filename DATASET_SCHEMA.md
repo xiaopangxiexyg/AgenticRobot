@@ -214,7 +214,12 @@ arm pose slot。
   是无效 padding，可能为 `NaN`，不应仅因此判定整帧 action 损坏。
 - `observation.arm.<side>.*`: 当前/实际关节、TCP、硬件回读和时序信息。
 - `observation.hand.<side>.*`: 手/夹爪 telemetry、触觉索引、触觉采样状态。
-- `observation.images.<camera_key>.*`: 视频帧索引、源时间戳、接收时间戳和视频路径。
+- `observation.images.<camera_key>.*`: 视频帧索引、源时间戳、接收时间戳、
+  本机历史可用时间戳和视频路径。
+- `teleop.action_source.<side>_wrist_pose_desk`: 历史命名的 Vive 遥操目标 pose；它实际位于
+  `vive_retarget_frame`，不是 v2.3 canonical desk。新数据必须同时写入
+  `teleop.action_source.<side>_wrist_pose_desk_frame="vive_retarget_frame"`；旧数据缺少该
+  frame 列时只能按这一历史语义兼容，不能推断为 canonical desk。
 - `teleop.channels.*`: 操作端输入通道时间戳和有效性。
 - `teleop.pose_quality.*`: 从本帧已有 IK/防碰撞 metadata 派生的 pose 质量指标。
 - `teleop.arm_mode.*`: 从本帧 command/session metadata 派生的左右臂语义状态标签。
@@ -252,14 +257,18 @@ v2.3 的落盘 pose 仍然是绝对位姿；relative 只是训练窗口或部署
 输出的即时表示，不回写 parquet。这样同一份 v2.2/v2.3 数据可以按模型需要选择
 absolute 或 relative，而不会产生两份相互漂移的标签。
 
-- `observation.state` 的 arm pose 永远是 canonical desktop absolute frame (`desk`)。
+- reader 提供给模型的 `observation.state` arm pose 永远是 canonical desktop absolute
+  frame (`desk`)；若 dataset 标记为 `raw_absolute`，这是读取时转换后的视图，不代表
+  parquet 原值已经位于 desk。
 - `action` 与 `observation.last_action` 在存储层仍为绝对 pose；`last_action` 的
   relative 视图使用当前行的 actual TCP，而不是上一行/上一 chunk 的 anchor。
 - relative action chunk 的 anchor 是该 chunk 首行、且 `<=T0` 选出的实际测量
   `observation.arm.<side>.actual_tcp_pose`；一个 chunk 内所有 action 行共用该 anchor。
 - `meta/info.json`、episode metadata 或 row metadata 必须携带
   `pose_frame_contract`。其中 `source` 显式声明 `source_id`、`source_family`、
-  `topology`、各 side 的 raw frame 和 raw→desk 变换；`pose_storage_frame` 为
+  `topology`、各 side 的 raw frame 和 raw→canonical-desk 变换；不同 side 可以来自
+  不同机器人 base frame，并分别覆盖共享默认变换。该 contract 在整个 dataset 内不可变；
+  `pose_storage_frame` 为
   `desk_absolute`（v2.3 默认）或强制采集的 `raw_absolute`。
 - v2.2 及更早数据没有该 metadata 时，reader 按
   `PoseFrameContract.legacy_v22_raw()` 解释，即 raw RM65（按单臂/双臂 topology
@@ -267,9 +276,65 @@ absolute 或 relative，而不会产生两份相互漂移的标签。
 - 训练/回放 reader 必须先把 storage frame 转换到 desk，再做 relative 解算；
   仅允许有限、合法的 SE(3) pose，不能用 command target 代替实际 TCP anchor。
 
+这里的 canonical `desk` 与 Vive 遥操标定历史上称为 `desk` 的中间坐标系不是同一概念。
+后者统一称为 `vive_retarget_frame`，旧配置键 `desk_frame`、`T_O_D`、`T_D_B` 仅作为兼容
+别名；对应的新名称为 `vive_retarget_frame`、`T_O_VR`、`T_VR_B`，不得直接拿它充当
+dataset raw→desk contract。
+
+`observation.arm.<side>.actual_hardware_pose_6d` 是 RM65 SDK 原样反馈的 controller-base
+`[x,y,z,rx,ry,rz]`（m/rad）审计值，使用控制器当前 TCP；它不参与 raw/desk 存储转换，
+也不能作为 relative anchor。`actual_tcp_pose` 才是项目按 measured qpos、配置的运动学与
+TCP 定义计算并按 pose contract 变换的标准 pose，因此两者允许存在差异。
+
+当前 collection writer 的 v2.3 接入位于 row 构造完成、异步写任务提交之前，只处理该 row
+的深拷贝，不修改 `CollectorSample`、`TeleopCommand` 或 backend state。配置
+`raw_absolute` 时 pose 数值不变；配置 `desk_absolute` 时转换以下标准 arm pose 副本：
+
+- `action`、`action.arm.pose`；
+- `observation.state`、`observation.arm.pose`、`observation.last_action`；
+- `observation.<side>_arm.pose`；
+- `observation.arm.<side>.current_tcp_pose/commanded_tcp_pose/actual_tcp_pose`。
+
+明确声明 base/controller frame 的审计字段不转换，包括
+`actual_hardware_pose_6d` 和 `observation.wrist_camera.<side>.pose_base`。每行额外记录
+`dexteleop.pose_storage_frame` 与 `dexteleop.pose_source_id`；dataset `info.json` 和 episode
+metadata 中重复的 `pose_frame_contract` 必须完全一致，否则 writer/loader 拒绝继续。
+
+v2.3 writer 在 pose 转换前还会逐侧验证 measured TCP：反馈必须成功且有效、未过期、
+sequence 合法，并同时满足 arm snapshot 的
+`source_timestamp <= T0` 与 `available_timestamp <= T0`。任一条件不满足时该 row
+fail-closed，不允许用 commanded/cached pose 补写。启用 `pose_frame_contract` 时也不允许
+通过 CLI 关闭 actual arm feedback。对当前 `rm65_*` source profile 还强制要求 TCP 来源为
+`hardware_qpos_fk` 且保存有限的 measured hardware qpos；未来 sim/其他硬件 source 可声明
+自己的 measured pose source，但同样不得使用 commanded pose。writer 同时核对每侧
+`observation.<side>_arm.pose` 与该 measured `actual_tcp_pose` 一致，防止训练 state 悄然退回
+commanded pose。
+
 这组字段构成 v2.3 的 dataset contract，而不是某个模型的私有约定。转换结果应在
 部署边界重新由固定的 measured TCP anchor 解回绝对 pose，并在 canonical safety/IK
 之前完成。
+
+### v2.3 training action-chunk view
+
+固定 horizon 模型使用 `dexteleop_pose_action_chunk_v1` 显式声明训练视图。一个样本只包含
+chunk 起点的一帧 observation，以及从该帧开始、长度为 `action_horizon` 的 action target：
+
+- `observation.state` 始终是起点帧的 canonical desk absolute state；
+- relative action 的整个真实前缀共用起点帧 measured `actual_tcp_pose`；
+- `observation.last_action` 使用起点帧当前 measured TCP 作为 anchor；
+- window 不能跨 episode；默认 `tail_policy=drop`，只暴露完整窗口；模型可在自己的
+  `PoseActionChunkContract` 中显式选择 `pad_last`，使每个真实帧都可成为起点；
+- `pad_last` 在 raw/desk 和 absolute/relative 转换全部完成后重复最后一个有效 action，
+  并输出连续尾部 mask `action_is_pad`；不虚构 observation、state 或 TCP anchor；
+- normalization statistics 和 action loss 必须排除 `action_is_pad=true` 的位置。
+
+`dataset_interface.pose_chunk` 提供确定性的 episode/start→sample 转换和合法 start 索引；
+随机采样、batch 组织及具体 learner 仍由模型训练实现负责。chunk contract 的 canonical hash
+必须随 v2.3 policy artifact 保存，部署据其 `action_pose_mode` 绑定 absolute/relative 解码。
+artifact 还必须用 `pose_training_data_contract` 区分 `native_v23_dataset` 与
+`v22_raw_identity_compatibility`：后者只是把旧 raw state 数值按 identity compatibility 暴露给
+模型，不能在部署时改用新的非 identity canonical-desk 变换；具体启动约束见
+`DEPLOY_SCHEMA.md`。
 
 ## 外置媒体
 

@@ -73,7 +73,7 @@ def _gripper_mapping(values: Mapping[str, float] | None) -> Mapping[str, float]:
 
 @dataclass(frozen=True)
 class DirectQposCommand:
-    """One atomic 150 Hz joint-position command for the MuJoCo debug bridge."""
+    """One atomic command-rate joint-position command for the MuJoCo debug bridge."""
 
     sequence: int
     qpos_by_side: Mapping[str, Sequence[float]]
@@ -108,6 +108,11 @@ class DirectQposDebugTick:
     scheduled_command_time_sec: float | None
     active_command_sequence: int
     command_applied: bool
+    safety_status: str = "unavailable"
+    target_modified: bool = False
+    projection_alpha: float = 1.0
+    minimum_distance_m: float = float("inf")
+    collision_pair: tuple[str | None, str | None] = (None, None)
 
 
 class DirectQposDebugController:
@@ -117,7 +122,8 @@ class DirectQposDebugController:
     The controller never performs pose IK or qpos interpolation: callers must
     provide the canonical, fully formed high-rate command produced upstream.
     ``command_due`` uses timestamp deadlines rather than an integer clock-ratio
-    assumption, so 150 Hz commands schedule correctly against 1000 Hz physics.
+    assumption, so configured command rates (including 120 or 150 Hz) schedule
+    correctly against 1000 Hz physics.
     """
 
     def __init__(
@@ -127,6 +133,7 @@ class DirectQposDebugController:
         *,
         active_sides: Sequence[str] | None = None,
         zero_controlled_qvel: bool = True,
+        record_ticks: bool = True,
     ) -> None:
         if not isinstance(timing, TimingSpec):
             raise TypeError("timing must be a SimulationContract TimingSpec.")
@@ -149,9 +156,14 @@ class DirectQposDebugController:
             raise KeyError(f"scene is missing active arm side(s): {missing_sides}")
         self.active_sides = sides
         self.zero_controlled_qvel = bool(zero_controlled_qvel)
+        self.record_ticks = bool(record_ticks)
         self._physics_tick = 0
         self._next_command_time_sec = 0.0
         self._held_command: DirectQposCommand | None = None
+        self._accepted_controlled_qpos: np.ndarray | None = None
+        self._last_requested_controlled_qpos: np.ndarray | None = None
+        self._last_safety_result = None
+        self._last_active_collision_check = None
         self._ticks: list[DirectQposDebugTick] = []
 
     @property
@@ -174,6 +186,30 @@ class DirectQposDebugController:
         return tuple(self._ticks)
 
     @property
+    def last_safety_result(self):
+        return self._last_safety_result
+
+    def accepted_arm_qpos(self, side: str) -> np.ndarray:
+        if self._accepted_controlled_qpos is None:
+            return self.scene.get_arm_qpos(side)
+        return self.scene.arm_qpos_from_kinematic_vector(
+            self._accepted_controlled_qpos, side
+        )
+
+    def accepted_gripper_close(self, name: str) -> float:
+        if self._accepted_controlled_qpos is None:
+            return float(self.scene.get_gripper_close(name))
+        return float(
+            self.scene.gripper_close_from_kinematic_vector(
+                self._accepted_controlled_qpos, name
+            )
+        )
+
+    @property
+    def last_active_collision_check(self):
+        return self._last_active_collision_check
+
+    @property
     def command_due(self) -> bool:
         return self.physics_time_sec + 1e-12 >= self._next_command_time_sec
 
@@ -182,9 +218,34 @@ class DirectQposDebugController:
         self._physics_tick = 0
         # ``initial_command`` is already the command at t=0.  The first call
         # to step_physics therefore holds it and asks for a new command only at
-        # the following 150 Hz deadline.
+        # the following configured command-rate deadline.
         self._next_command_time_sec = 1.0 / self.timing.command_hz
         self._held_command = initial_command
+        if hasattr(self.scene, "kinematic_controlled_qpos"):
+            current = self.scene.kinematic_controlled_qpos()
+            target = self.scene.kinematic_target_vector(
+                current,
+                initial_command.qpos_by_side,
+                gripper_close_by_name=initial_command.gripper_close_by_name,
+            )
+            projector = self.scene.collision_projector()
+            if projector is not None:
+                check = projector.check_qpos(self.scene.data, target)
+                if not check.safe:
+                    raise RuntimeError(
+                        "Initial direct-qpos command is collision-unsafe: "
+                        f"{check.to_dict()}"
+                    )
+            self._accepted_controlled_qpos = target
+            self._last_requested_controlled_qpos = target.copy()
+        else:
+            # Small protocol fakes and legacy collision-disabled callers retain
+            # the original prescribed-motion surface. Real MujocoScene objects
+            # always take the validated path above.
+            self._accepted_controlled_qpos = None
+            self._last_requested_controlled_qpos = None
+        self._last_safety_result = None
+        self._last_active_collision_check = None
         self._ticks.clear()
 
     def step_physics(
@@ -193,9 +254,9 @@ class DirectQposDebugController:
     ) -> DirectQposDebugTick:
         """Apply one prescribed robot state and advance exactly one physics tick.
 
-        A command is required on the first physics tick at or after every 150 Hz
-        deadline.  Passing one earlier is rejected so callers cannot silently
-        alter the intended command clock.
+        A command is required on the first physics tick at or after every
+        configured command-rate deadline. Passing one earlier is rejected so
+        callers cannot silently alter the intended command clock.
         """
 
         due = self.command_due
@@ -219,6 +280,42 @@ class DirectQposDebugController:
             command_applied = False
 
         assert self._held_command is not None
+        legacy_scene = self._accepted_controlled_qpos is None
+        if command_applied and not legacy_scene:
+            assert self._accepted_controlled_qpos is not None
+            requested = self.scene.kinematic_target_vector(
+                self._accepted_controlled_qpos,
+                self._held_command.qpos_by_side,
+                gripper_close_by_name=self._held_command.gripper_close_by_name,
+            )
+            target_changed = bool(
+                self._last_requested_controlled_qpos is None
+                or not np.array_equal(requested, self._last_requested_controlled_qpos)
+            )
+            self._last_requested_controlled_qpos = requested.copy()
+            projector = self.scene.collision_projector()
+            if projector is None:
+                self._accepted_controlled_qpos = requested
+                self._last_safety_result = None
+            elif target_changed:
+                from ..collision_safety import project_grippers_then_arms
+
+                self._last_safety_result = project_grippers_then_arms(
+                    self.scene,
+                    projector,
+                    self.scene.data,
+                    start_qpos=self._accepted_controlled_qpos,
+                    qpos_by_side=self._held_command.qpos_by_side,
+                    gripper_close_by_name=self._held_command.gripper_close_by_name,
+                )
+                if self._last_safety_result.status == "invalid_safe_state":
+                    raise RuntimeError(
+                        "Direct-qpos controller lost its collision-safe state: "
+                        f"{self._last_safety_result.to_dict()}"
+                    )
+                self._accepted_controlled_qpos = self._last_safety_result.accepted_qpos.copy()
+
+        safety_result = self._last_safety_result
         tick = DirectQposDebugTick(
             physics_tick=self._physics_tick,
             physics_time_sec=self.physics_time_sec,
@@ -226,13 +323,45 @@ class DirectQposDebugController:
             scheduled_command_time_sec=scheduled_time,
             active_command_sequence=self._held_command.sequence,
             command_applied=command_applied,
+            safety_status=("unavailable" if safety_result is None else safety_result.status),
+            target_modified=(False if safety_result is None else safety_result.modified),
+            projection_alpha=(1.0 if safety_result is None else safety_result.projection_alpha),
+            minimum_distance_m=(
+                float("inf") if safety_result is None else safety_result.check.minimum_distance_m
+            ),
+            collision_pair=(
+                (None, None)
+                if safety_result is None
+                else (safety_result.check.body1_name, safety_result.check.body2_name)
+            ),
         )
-        self.scene.step_kinematic_direct_qpos_debug(
-            self._held_command.qpos_by_side,
-            gripper_close_by_name=self._held_command.gripper_close_by_name,
-            zero_controlled_qvel=self.zero_controlled_qvel,
-        )
-        self._ticks.append(tick)
+        if legacy_scene:
+            self.scene.step_kinematic_direct_qpos_debug(
+                self._held_command.qpos_by_side,
+                gripper_close_by_name=self._held_command.gripper_close_by_name,
+                zero_controlled_qvel=self.zero_controlled_qvel,
+            )
+        else:
+            assert self._accepted_controlled_qpos is not None
+            self.scene.write_kinematic_controlled_qpos(
+                self._accepted_controlled_qpos,
+                zero_controlled_qvel=self.zero_controlled_qvel,
+            )
+            self.scene.forward()
+            self.scene.mujoco.mj_step(self.scene.model, self.scene.data)
+            self.scene.write_kinematic_controlled_qpos(
+                self._accepted_controlled_qpos,
+                zero_controlled_qvel=self.zero_controlled_qvel,
+            )
+            self.scene.forward()
+            projector = self.scene.collision_projector()
+            self._last_active_collision_check = (
+                None
+                if projector is None
+                else projector.oracle.check_contacts(self.scene.data)
+            )
+        if self.record_ticks:
+            self._ticks.append(tick)
         self._physics_tick += 1
         return tick
 

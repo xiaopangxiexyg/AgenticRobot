@@ -60,6 +60,7 @@ class RM65DualArmCollisionIKConfig:
     scene_profile: str = DEFAULT_COLLISION_SCENE
     solver: str | None = None
     solver_frequency: float = DEFAULT_DUAL_ARM_SOLVER_FREQUENCY_HZ
+    damping: float = 0.01
     posture_cost: float = DEFAULT_DUAL_ARM_POSTURE_COST
     collision_min_distance_m: float = DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M
     collision_distance_epsilon_m: float = DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
@@ -72,6 +73,8 @@ class RM65DualArmCollisionIKConfig:
     def __post_init__(self) -> None:
         if float(self.solver_frequency) <= 0.0:
             raise ValueError("solver_frequency must be positive.")
+        if not np.isfinite(float(self.damping)) or float(self.damping) <= 0.0:
+            raise ValueError("damping must be finite and positive.")
         if float(self.posture_cost) < 0.0:
             raise ValueError("posture_cost must be >= 0.")
         if float(self.collision_min_distance_m) < 0.0:
@@ -80,6 +83,7 @@ class RM65DualArmCollisionIKConfig:
             raise ValueError("collision_distance_epsilon_m must be >= 0.")
         object.__setattr__(self, "scene_profile", str(self.scene_profile or DEFAULT_COLLISION_SCENE))
         object.__setattr__(self, "solver_frequency", float(self.solver_frequency))
+        object.__setattr__(self, "damping", float(self.damping))
         object.__setattr__(self, "posture_cost", float(self.posture_cost))
         object.__setattr__(self, "collision_min_distance_m", float(self.collision_min_distance_m))
         object.__setattr__(self, "collision_distance_epsilon_m", float(self.collision_distance_epsilon_m))
@@ -142,11 +146,11 @@ def rm65_single_arm_candidate_frames(frame: str | None = None) -> tuple[str, ...
 def build_rm65_single_arm_ik_solver(config: RM65SingleArmIKConfig):
     """Build a SingleArmIKSolver from shared RM65 defaults.
 
-    ``rm65_inspire_tac`` and Pinocchio are imported lazily so this module remains
-    importable in lightweight test environments.
+    The optional Pinocchio implementation is imported lazily so this module
+    remains importable in lightweight test environments.
     """
 
-    from rm65_inspire_tac.ik import SingleArmIKSolver
+    from .single_arm_ik import SingleArmIKSolver
 
     last_error: Exception | None = None
     for frame_name in rm65_single_arm_candidate_frames(config.controlled_frame):
@@ -219,11 +223,11 @@ def build_rm65_dual_arm_collision_ik_solver(
     resolved_config = config if config is not None else RM65DualArmCollisionIKConfig()
     scene_profile = build_rm65_dual_arm_scene_profile(resolved_config.scene_profile)
     try:
-        from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
-        from rm65_inspire_tac.multitask_ik import MultiTaskIKSolver
+        from .dual_arm_ik import MultiTaskIKSolver
+        from .ik_tuning import load_ik_tuning_config
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "RM65 dual-arm collision IK requires pinocchio, pink, qpsolvers, and rm65_inspire_tac."
+            "RM65 dual-arm collision IK requires pinocchio, pink, and qpsolvers."
         ) from exc
 
     ik_tuning = (
@@ -239,9 +243,9 @@ def build_rm65_dual_arm_collision_ik_solver(
         robot_collision_pair_names=list(scene_profile.collision_pairs),
         solver=resolved_config.solver,
         frequency=float(resolved_config.solver_frequency),
+        damping=float(resolved_config.damping),
         debug_viz=bool(resolved_config.debug_viz),
         debug_profile=bool(resolved_config.debug_profile),
-        sleep=False,
         collision_barrier_gain=float(resolved_config.collision_barrier_gain),
         collision_safe_displacement_gain=float(resolved_config.collision_safe_displacement_gain),
         collision_min_distance_m=float(resolved_config.collision_min_distance_m),
@@ -266,7 +270,7 @@ def build_rm65_dual_arm_collision_ik_solver(
 
 
 def rm65_dual_arm_default_initial_qpos_by_side() -> dict[str, np.ndarray]:
-    from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+    from .defaults import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
 
     return {
         "left": np.asarray(DEFAULT_LEFT_ARM_QPOS, dtype=float).reshape(6).copy(),

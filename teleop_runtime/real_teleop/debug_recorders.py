@@ -98,6 +98,7 @@ class DebugTimingLogRecorder:
         root_dir: Path | str | None = None,
         max_queue_size: int = 512,
         heartbeat_sec: float = 1.0,
+        sample_hz: float = 0.0,
     ) -> None:
         self.root_dir = Path(root_dir) if root_dir is not None else DEFAULT_DEBUG_TIMING_LOG_ROOT
         self.path: Path | None = None
@@ -105,12 +106,14 @@ class DebugTimingLogRecorder:
         self._writer_thread: threading.Thread | None = None
         self._max_queue_size = max(16, int(max_queue_size))
         self.heartbeat_sec = max(0.05, float(heartbeat_sec))
+        self.sample_hz = max(0.0, float(sample_hz))
         self.frame_count = 0
         self.dropped_frame_count = 0
         self.dropped_event_count = 0
         self._last_logged_at = 0.0
         self._last_state: str | None = None
         self._last_fault_signature: tuple[str, ...] | None = None
+        self._last_sampled_at = 0.0
 
     @property
     def active(self) -> bool:
@@ -135,6 +138,7 @@ class DebugTimingLogRecorder:
         self._last_logged_at = 0.0
         self._last_state = None
         self._last_fault_signature = None
+        self._last_sampled_at = 0.0
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
             args=(log_queue, log_file, self.path),
@@ -142,7 +146,15 @@ class DebugTimingLogRecorder:
             name="debug_timing_log_writer",
         )
         self._writer_thread.start()
-        self.write_event("start", {"path": str(self.path), "heartbeat_sec": self.heartbeat_sec}, now=now)
+        self.write_event(
+            "start",
+            {
+                "path": str(self.path),
+                "heartbeat_sec": self.heartbeat_sec,
+                "sample_hz": self.sample_hz,
+            },
+            now=now,
+        )
         return self.path
 
     def _writer_loop(
@@ -210,6 +222,18 @@ class DebugTimingLogRecorder:
             reasons.append("heartbeat")
         if not reasons:
             return None
+        transition_reason = any(
+            reason in {"state_change", "fault_change", "fault_clear"}
+            for reason in reasons
+        )
+        if not transition_reason and self.sample_hz > 0.0:
+            sample_period_sec = 1.0 / self.sample_hz
+            if (
+                self._last_sampled_at > 0.0
+                and float(now) - self._last_sampled_at < sample_period_sec
+            ):
+                return None
+        self._last_sampled_at = float(now)
         self._last_logged_at = float(now)
         self._last_state = current_state
         self._last_fault_signature = fault_signature
@@ -305,6 +329,7 @@ class ActionDebugLogRecorder:
         root_dir: Path | str | None = None,
         max_queue_size: int = 2048,
         flush_every: int = 1,
+        sample_hz: float = 0.0,
     ) -> None:
         self.root_dir = Path(root_dir) if root_dir is not None else DEFAULT_ACTION_DEBUG_LOG_ROOT
         self.path: Path | None = None
@@ -312,9 +337,11 @@ class ActionDebugLogRecorder:
         self._writer_thread: threading.Thread | None = None
         self._max_queue_size = max(16, int(max_queue_size))
         self.flush_every = max(1, int(flush_every))
+        self.sample_hz = max(0.0, float(sample_hz))
         self.frame_count = 0
         self.dropped_frame_count = 0
         self.dropped_event_count = 0
+        self._last_sampled_at = 0.0
 
     @property
     def active(self) -> bool:
@@ -336,6 +363,7 @@ class ActionDebugLogRecorder:
         self.frame_count = 0
         self.dropped_frame_count = 0
         self.dropped_event_count = 0
+        self._last_sampled_at = 0.0
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
             args=(log_queue, log_file, self.path),
@@ -349,10 +377,29 @@ class ActionDebugLogRecorder:
                 "path": str(self.path),
                 "flush_every": int(self.flush_every),
                 "max_queue_size": int(self._max_queue_size),
+                "sample_hz": self.sample_hz,
             },
             now=now,
         )
         return self.path
+
+    def should_record_frame(self, *, now: float) -> bool:
+        """Gate payload construction as well as background JSON/file work."""
+
+        if self._queue is None:
+            return False
+        timestamp = float(now)
+        if self.sample_hz <= 0.0:
+            self._last_sampled_at = timestamp
+            return True
+        sample_period_sec = 1.0 / self.sample_hz
+        if (
+            self._last_sampled_at > 0.0
+            and timestamp - self._last_sampled_at < sample_period_sec
+        ):
+            return False
+        self._last_sampled_at = timestamp
+        return True
 
     def _writer_loop(
         self,

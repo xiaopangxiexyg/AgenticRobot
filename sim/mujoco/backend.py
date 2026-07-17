@@ -88,6 +88,7 @@ class MuJoCoArmBackend(EffectorBackend):
         self._last_command: EffectorCommand | None = None
         self._last_target_qpos: np.ndarray | None = None
         self._last_command_timestamp: float | None = None
+        self._last_safety_result = None
         self._endpoint_to_tool: np.ndarray | None = None
         self._tool_tcp_pose_flange_m_rad: np.ndarray | None = None
         if config.side not in self.scene.arm_specs:
@@ -112,7 +113,17 @@ class MuJoCoArmBackend(EffectorBackend):
 
     def start(self) -> None:
         if self.config.initial_qpos is not None:
-            self.scene.set_arm_qpos(self.config.side, self.config.initial_qpos)
+            self._apply_joint_target(self.config.initial_qpos)
+
+    def _apply_joint_target(self, target: Sequence[float] | np.ndarray) -> None:
+        values = np.asarray(target, dtype=float).reshape(6)
+        if hasattr(self.scene, "apply_safe_kinematic_target"):
+            self._last_safety_result = self.scene.apply_safe_kinematic_target(
+                {self.config.side: values}
+            )
+        else:
+            self.scene.set_arm_qpos(self.config.side, values)
+            self._last_safety_result = None
 
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
@@ -125,7 +136,7 @@ class MuJoCoArmBackend(EffectorBackend):
                 target > np.asarray(RM65_ABSOLUTE_Q_MAX_RAD)
             ):
                 raise ValueError(f"{self.name} joint_vector exceeds canonical RM65 joint limits.")
-            self.scene.set_arm_qpos(self.config.side, target)
+            self._apply_joint_target(target)
         elif command.command_type == "cartesian_pose":
             raise ValueError(
                 f"{self.name} is a joint-vector sink and cannot solve cartesian_pose per arm. "
@@ -136,7 +147,7 @@ class MuJoCoArmBackend(EffectorBackend):
             raise ValueError(f"{self.name} does not support command_type={command.command_type!r}.")
 
         self._last_command = command.copy()
-        self._last_target_qpos = target.copy()
+        self._last_target_qpos = self.scene.get_arm_qpos(self.config.side).copy()
         self._last_command_timestamp = time.time()
 
     def hold_motion(self, reason: str = "manual hold") -> None:
@@ -145,7 +156,7 @@ class MuJoCoArmBackend(EffectorBackend):
 
     def reset_motion_state(self, qpos: Sequence[float] | np.ndarray | None = None) -> None:
         if qpos is not None:
-            self.scene.set_arm_qpos(self.config.side, np.asarray(qpos, dtype=float).reshape(6))
+            self._apply_joint_target(qpos)
         self._last_command = None
         self._last_target_qpos = None
         self._last_command_timestamp = None
@@ -214,6 +225,11 @@ class MuJoCoArmBackend(EffectorBackend):
             "last_target_qpos": None if self._last_target_qpos is None else self._last_target_qpos.copy(),
             "last_command": None if self._last_command is None else self._last_command.copy(),
             "last_command_timestamp": self._last_command_timestamp,
+            "last_collision_safety": (
+                None
+                if self._last_safety_result is None
+                else self._last_safety_result.to_dict()
+            ),
             "backend": "mujoco_joint_sink",
             "controlled_body": self.scene.arm_specs[self.config.side].controlled_body,
             "tool_profile": None if self.config.tool_profile is None else str(self.config.tool_profile),
@@ -231,6 +247,7 @@ class MuJoCoGripperBackend(EffectorBackend):
         self._last_target_close: float | None = None
         self._last_target_qpos: np.ndarray | None = None
         self._last_command_timestamp: float | None = None
+        self._last_safety_result = None
 
     @property
     def name(self) -> str:
@@ -242,25 +259,36 @@ class MuJoCoGripperBackend(EffectorBackend):
 
     def start(self) -> None:
         if self.config.initial_close is not None:
-            self.scene.set_gripper_close(self.gripper_name, float(self.config.initial_close))
+            self._last_safety_result = self.scene.apply_safe_kinematic_target(
+                {},
+                gripper_close_by_name={
+                    self.gripper_name: float(self.config.initial_close)
+                },
+            )
 
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
             raise ValueError(f"{self.name} received command for {command.effector_name!r}.")
         if command.command_type == "gripper_scalar":
             close = self._extract_close_scalar(command.value)
-            self.scene.set_gripper_close(self.gripper_name, close)
+            self._last_safety_result = self.scene.apply_safe_kinematic_target(
+                {}, gripper_close_by_name={self.gripper_name: close}
+            )
             target_qpos = self.scene.get_gripper_qpos(self.gripper_name)
         elif command.command_type == "joint_vector":
             values = np.asarray(command.value, dtype=float).reshape(-1)
             spec = self.scene.gripper_specs[self.gripper_name]
             if values.shape == (len(spec.joint_names),):
-                self.scene.set_gripper_qpos(self.gripper_name, values)
+                close = spec.close_from_qpos(values)
+                self._last_safety_result = self.scene.apply_safe_kinematic_target(
+                    {}, gripper_close_by_name={self.gripper_name: close}
+                )
                 target_qpos = self.scene.get_gripper_qpos(self.gripper_name)
-                close = self.scene.get_gripper_close(self.gripper_name)
             else:
                 close = self._extract_close_scalar(values)
-                self.scene.set_gripper_close(self.gripper_name, close)
+                self._last_safety_result = self.scene.apply_safe_kinematic_target(
+                    {}, gripper_close_by_name={self.gripper_name: close}
+                )
                 target_qpos = self.scene.get_gripper_qpos(self.gripper_name)
         else:
             raise ValueError(
@@ -295,9 +323,12 @@ class MuJoCoGripperBackend(EffectorBackend):
         if qpos is not None:
             values = np.asarray(qpos, dtype=float).reshape(-1)
             if values.shape == (1,):
-                self.scene.set_gripper_close(self.gripper_name, float(values[0]))
+                close = float(values[0])
             else:
-                self.scene.set_gripper_qpos(self.gripper_name, values)
+                close = self.scene.gripper_specs[self.gripper_name].close_from_qpos(values)
+            self._last_safety_result = self.scene.apply_safe_kinematic_target(
+                {}, gripper_close_by_name={self.gripper_name: close}
+            )
         self._last_command = None
         self._last_target_close = None
         self._last_target_qpos = None
@@ -312,5 +343,10 @@ class MuJoCoGripperBackend(EffectorBackend):
             "last_target_qpos": None if self._last_target_qpos is None else self._last_target_qpos.copy(),
             "last_command": None if self._last_command is None else self._last_command.copy(),
             "last_command_timestamp": self._last_command_timestamp,
+            "last_collision_safety": (
+                None
+                if self._last_safety_result is None
+                else self._last_safety_result.to_dict()
+            ),
             "backend": "mujoco_gripper",
         }

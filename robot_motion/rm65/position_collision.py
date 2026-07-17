@@ -8,13 +8,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from xml.etree import ElementTree as ET
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from robot_motion.pose import pose6_to_matrix
+from robot_motion.pose import pose6_to_matrix, pose_delta_metrics
 from robot_motion.position_control.interpolation import DEFAULT_POSITION_REFERENCE_HZ
 from robot_motion.safety_constraints import constrain_joint_vector
 from robot_motion.transforms import invert_pose, validate_pose_matrix
@@ -155,6 +155,13 @@ class RM65PositionCollisionPlannerConfig:
     joint_upper_rad: tuple[float, ...] | Sequence[float] = RM65_ABSOLUTE_Q_MAX_RAD
     collision_backoff_scales: tuple[float, ...] | Sequence[float] = (0.5, 0.25, 0.1)
     solve_time_budget_ms: float | None = None
+    damping: float = 0.01
+    solve_max_iterations: int = 1
+    solve_min_iterations: int = 1
+    solve_adaptive_iterations_enabled: bool = False
+    solve_iteration_reserve_ms: float = 5.0
+    solve_translation_tolerance_m: float = 2e-3
+    solve_orientation_tolerance_deg: float = 0.5
     debug_profile: bool = False
     ik_tuning: Any | None = field(default=None, repr=False)
 
@@ -206,6 +213,30 @@ class RM65PositionCollisionPlannerConfig:
         budget = float(budget)
         if not math.isfinite(budget) or budget < 0.0:
             raise ValueError("solve_time_budget_ms must be finite and >= 0.")
+        damping = _finite_positive(self.damping, name="damping")
+        if (
+            isinstance(self.solve_max_iterations, bool)
+            or int(self.solve_max_iterations) != self.solve_max_iterations
+            or int(self.solve_max_iterations) <= 0
+        ):
+            raise ValueError("solve_max_iterations must be a positive integer.")
+        if (
+            isinstance(self.solve_min_iterations, bool)
+            or int(self.solve_min_iterations) != self.solve_min_iterations
+            or int(self.solve_min_iterations) <= 0
+        ):
+            raise ValueError("solve_min_iterations must be a positive integer.")
+        if int(self.solve_min_iterations) > int(self.solve_max_iterations):
+            raise ValueError("solve_min_iterations must be <= solve_max_iterations.")
+        reserve_ms = float(self.solve_iteration_reserve_ms)
+        if not math.isfinite(reserve_ms) or reserve_ms < 0.0:
+            raise ValueError("solve_iteration_reserve_ms must be finite and >= 0.")
+        translation_tolerance_m = float(self.solve_translation_tolerance_m)
+        orientation_tolerance_deg = float(self.solve_orientation_tolerance_deg)
+        if not math.isfinite(translation_tolerance_m) or translation_tolerance_m < 0.0:
+            raise ValueError("solve_translation_tolerance_m must be finite and >= 0.")
+        if not math.isfinite(orientation_tolerance_deg) or orientation_tolerance_deg < 0.0:
+            raise ValueError("solve_orientation_tolerance_deg must be finite and >= 0.")
 
         object.__setattr__(self, "reference_hz", reference_hz)
         object.__setattr__(self, "scene_profile", scene_profile)
@@ -234,6 +265,25 @@ class RM65PositionCollisionPlannerConfig:
         object.__setattr__(self, "joint_upper_rad", tuple(float(value) for value in upper))
         object.__setattr__(self, "collision_backoff_scales", tuple(scales))
         object.__setattr__(self, "solve_time_budget_ms", budget)
+        object.__setattr__(self, "damping", damping)
+        object.__setattr__(self, "solve_max_iterations", int(self.solve_max_iterations))
+        object.__setattr__(self, "solve_min_iterations", int(self.solve_min_iterations))
+        object.__setattr__(
+            self,
+            "solve_adaptive_iterations_enabled",
+            bool(self.solve_adaptive_iterations_enabled),
+        )
+        object.__setattr__(self, "solve_iteration_reserve_ms", reserve_ms)
+        object.__setattr__(
+            self,
+            "solve_translation_tolerance_m",
+            translation_tolerance_m,
+        )
+        object.__setattr__(
+            self,
+            "solve_orientation_tolerance_deg",
+            orientation_tolerance_deg,
+        )
         object.__setattr__(self, "debug_profile", bool(self.debug_profile))
 
     @property
@@ -351,6 +401,34 @@ class RM65QposCollisionValidationResult:
             else float(self.collision_distance_m),
         )
         object.__setattr__(self, "metadata", _freeze_value(dict(self.metadata)))
+
+
+class RM65PositionPlannerProtocol(Protocol):
+    """Device-neutral boundary consumed by real, replay, and sim runtimes.
+
+    Implementations own coupled pose-to-qref planning state, hard joint
+    constraints, endpoint collision certification, and last-safe recovery.
+    They must not own transport threads, vendor SDK calls, or device lifecycle.
+    """
+
+    @property
+    def collision_pair_count(self) -> int:
+        ...
+
+    def reset(self, current_qpos_by_side: Mapping[str, Any]) -> Mapping[str, Any]:
+        ...
+
+    def plan_pose_reference(
+        self,
+        target_pose_by_side: Mapping[str, Any],
+        *,
+        target_reference_frame: Literal["arm_base", "world", "scene_world"] = "arm_base",
+        target_controlled_frame: str = TOOL_TCP_FRAME,
+        source_timestamp: float | None = None,
+        source: str = "position_reference",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> RM65PositionCollisionPlanResult:
+        ...
 
 
 def _parse_numeric_tuple(text: str | None, *, count: int, label: str) -> tuple[float, ...]:
@@ -478,6 +556,7 @@ class RM65PositionCollisionPlanner:
                     scene_profile=self.config.scene_profile,
                     solver=self.config.solver,
                     solver_frequency=float(self.config.reference_hz),
+                    damping=float(self.config.damping),
                     posture_cost=float(self.config.posture_cost),
                     collision_min_distance_m=float(self.config.collision_min_distance_m),
                     collision_distance_epsilon_m=float(
@@ -617,6 +696,9 @@ class RM65PositionCollisionPlanner:
             raw_full_q: np.ndarray | None = None
             collision_attempts: list[dict[str, Any]] = []
             solve_ms = 0.0
+            solve_iterations = 0
+            solve_stop_reason: str | None = None
+            solve_pose_error: dict[str, dict[str, float]] = {}
             try:
                 if source_timestamp is not None and not math.isfinite(float(source_timestamp)):
                     raise _PlanningFailure(
@@ -683,14 +765,74 @@ class RM65PositionCollisionPlanner:
                     self._pose_to_xyzquat(target_endpoint_world[LEFT]),
                     self._pose_to_xyzquat(target_endpoint_world[RIGHT]),
                 ]
-                solve_started = time.perf_counter()
-                raw_full_q = np.asarray(
-                    self.solver.solve(targets=solver_targets),
-                    dtype=float,
-                ).reshape(-1)
-                solve_ms = (time.perf_counter() - solve_started) * 1000.0
+                previous_solve_ms: float | None = None
+                iteration_budget_ms = (
+                    max(
+                        0.0,
+                        float(self.config.solve_time_budget_ms or 0.0)
+                        - float(self.config.solve_iteration_reserve_ms),
+                    )
+                    if self.config.solve_adaptive_iterations_enabled
+                    and float(self.config.solve_time_budget_ms or 0.0) > 0.0
+                    else None
+                )
+                for iteration in range(1, int(self.config.solve_max_iterations) + 1):
+                    if (
+                        iteration > int(self.config.solve_min_iterations)
+                        and iteration_budget_ms is not None
+                    ):
+                        elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
+                        estimated_next_ms = max(0.05, float(previous_solve_ms or 0.0))
+                        if elapsed_ms + estimated_next_ms > iteration_budget_ms:
+                            solve_stop_reason = "iteration_budget_estimate"
+                            break
+                    iteration_started = time.perf_counter()
+                    raw_full_q = np.asarray(
+                        self.solver.solve(targets=solver_targets),
+                        dtype=float,
+                    ).reshape(-1)
+                    iteration_ms = (time.perf_counter() - iteration_started) * 1000.0
+                    solve_ms += iteration_ms
+                    previous_solve_ms = max(0.05, iteration_ms)
+                    solve_iterations = iteration
+                    if (
+                        raw_full_q.shape != reference_full_q.shape
+                        or not np.all(np.isfinite(raw_full_q))
+                    ):
+                        break
+                    solve_pose_error = {}
+                    within_tolerance = True
+                    for side in SIDES:
+                        realized_pose = self._compute_frame_pose(
+                            frame_name_by_side[side],
+                            raw_full_q,
+                        )
+                        translation_m, rotation_deg = pose_delta_metrics(
+                            realized_pose,
+                            target_endpoint_world[side],
+                        )
+                        solve_pose_error[side] = {
+                            "translation_m": float(translation_m),
+                            "rotation_deg": float(rotation_deg),
+                        }
+                        within_tolerance = bool(
+                            within_tolerance
+                            and translation_m
+                            <= float(self.config.solve_translation_tolerance_m)
+                            and rotation_deg
+                            <= float(self.config.solve_orientation_tolerance_deg)
+                        )
+                    if (
+                        iteration >= int(self.config.solve_min_iterations)
+                        and within_tolerance
+                    ):
+                        solve_stop_reason = "pose_tolerance"
+                        break
+                if solve_stop_reason is None:
+                    solve_stop_reason = "max_iterations"
                 if (
-                    raw_full_q.shape != reference_full_q.shape
+                    raw_full_q is None
+                    or raw_full_q.shape != reference_full_q.shape
                     or not np.all(np.isfinite(raw_full_q))
                 ):
                     raise _PlanningFailure(
@@ -835,6 +977,9 @@ class RM65PositionCollisionPlanner:
                         collision_distance_m=accepted_distance,
                         collision_backoff_scale=accepted_scale,
                         failure=None,
+                        solve_iterations=solve_iterations,
+                        solve_stop_reason=solve_stop_reason,
+                        solve_pose_error=solve_pose_error,
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 - all planning failures fail closed to hold.
@@ -857,6 +1002,9 @@ class RM65PositionCollisionPlanner:
                     solve_ms=solve_ms,
                     collision_attempts=collision_attempts,
                     source_metadata=source_metadata,
+                    solve_iterations=solve_iterations,
+                    solve_stop_reason=solve_stop_reason,
+                    solve_pose_error=solve_pose_error,
                 )
 
     def plan_pose_reference(
@@ -977,6 +1125,9 @@ class RM65PositionCollisionPlanner:
         solve_ms: float,
         collision_attempts: list[dict[str, Any]],
         source_metadata: Mapping[str, Any],
+        solve_iterations: int,
+        solve_stop_reason: str | None,
+        solve_pose_error: Mapping[str, Mapping[str, float]],
     ) -> RM65PositionCollisionPlanResult:
         assert self._last_safe_full_q is not None
         hold_q = self._last_safe_full_q.copy()
@@ -1025,6 +1176,9 @@ class RM65PositionCollisionPlanner:
                     "error_type": type(error).__name__,
                     "error": str(error),
                 },
+                solve_iterations=solve_iterations,
+                solve_stop_reason=solve_stop_reason,
+                solve_pose_error=solve_pose_error,
             ),
         )
 
@@ -1041,6 +1195,9 @@ class RM65PositionCollisionPlanner:
         collision_distance_m: float | None,
         collision_backoff_scale: float,
         failure: Mapping[str, Any] | None,
+        solve_iterations: int,
+        solve_stop_reason: str | None,
+        solve_pose_error: Mapping[str, Mapping[str, float]],
     ) -> dict[str, Any]:
         budget_ms = float(self.config.solve_time_budget_ms or 0.0)
         output_endpoint_safe = bool(
@@ -1099,6 +1256,25 @@ class RM65PositionCollisionPlanner:
             "passive_sides": list(passive_sides),
             "passive_side_policy": "freeze_at_last_safe_qpos_in_full_collision_model",
             "solve_ms": float(solve_ms),
+            "ik_solve_iterations": int(solve_iterations),
+            "ik_solve_iteration_min": int(self.config.solve_min_iterations),
+            "ik_solve_iteration_max": int(self.config.solve_max_iterations),
+            "ik_solve_iteration_mode": (
+                "adaptive_budget"
+                if self.config.solve_adaptive_iterations_enabled
+                else "fixed_max"
+            ),
+            "ik_solve_iteration_stop_reason": solve_stop_reason,
+            "ik_solve_pose_error": {
+                str(side): {
+                    str(name): float(value) for name, value in dict(metrics).items()
+                }
+                for side, metrics in dict(solve_pose_error).items()
+            },
+            "ik_damping": float(self.config.damping),
+            "ik_solve_iteration_reserve_ms": float(
+                self.config.solve_iteration_reserve_ms
+            ),
             "frame_total_ms": float(elapsed_ms),
             "solve_time_budget_ms": budget_ms,
             "solve_time_budget_exceeded": bool(budget_ms > 0.0 and elapsed_ms > budget_ms),
@@ -1249,5 +1425,6 @@ __all__ = [
     "RM65PositionCollisionPlanResult",
     "RM65PositionCollisionPlanner",
     "RM65PositionCollisionPlannerConfig",
+    "RM65PositionPlannerProtocol",
     "load_world_from_arm_base_transforms",
 ]

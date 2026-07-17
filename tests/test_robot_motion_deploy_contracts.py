@@ -6,16 +6,19 @@ import inspect
 
 import numpy as np
 
+import deployments.client.policy as common_policy
 import robot_motion.deploy.actions as robot_actions
 import robot_motion.deploy.canonical_action as robot_canonical
 import robot_motion.deploy.dispatcher as robot_dispatcher
 import robot_motion.deploy.observation as robot_observation
+import robot_motion.deploy.pose_adapter as robot_pose_adapter
 import robot_motion.deploy.runtime as robot_runtime
 import robot_motion.deploy.schema as robot_schema
 import teleop_runtime.deploy.actions as legacy_actions
 import teleop_runtime.deploy.canonical_action as legacy_canonical
 import teleop_runtime.deploy.observation as legacy_observation
 import teleop_runtime.deploy.schema as legacy_schema
+import teleop_runtime.deploy.policy as legacy_policy
 from robot_motion.action import EE_POSE_VECTOR_DIM
 
 
@@ -192,6 +195,15 @@ def test_robot_motion_deploy_pipeline_modules_do_not_import_teleop_runtime() -> 
         assert "import teleop_runtime" not in source
 
 
+def test_policy_loader_is_shared_with_legacy_teleop_import() -> None:
+    assert legacy_policy.LoadedPolicy is common_policy.LoadedPolicy
+    assert legacy_policy.HoldPolicy is common_policy.HoldPolicy
+    assert legacy_policy.load_policy is common_policy.load_policy
+    loaded = common_policy.load_policy("hold")
+    assert isinstance(loaded.policy, common_policy.HoldPolicy)
+    assert loaded.name == "hold"
+
+
 def test_teleop_deploy_defaults_use_robot_motion_common_pipeline() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     run_policy_source = (repo_root / "teleop_runtime/deploy/run_policy.py").read_text(
@@ -200,6 +212,16 @@ def test_teleop_deploy_defaults_use_robot_motion_common_pipeline() -> None:
     assert "from robot_motion.deploy.actions import" in run_policy_source
     assert "from robot_motion.deploy.canonical_action import" in run_policy_source
     assert "from robot_motion.deploy.observation import" in run_policy_source
+    assert "from robot_motion.deploy.runtime import (" in run_policy_source
+    assert "    PolicyDeployRuntime," in run_policy_source
+    assert "    resolve_policy_action_pose_mode_from_artifact," in run_policy_source
+    assert "from deployments.client.policy import load_policy" in run_policy_source
+    assert "policy_deploy_runtime.predict_and_queue(" in run_policy_source
+    assert "policy_deploy_runtime.prepare_next_action(" in run_policy_source
+    assert "ActionChunkBuffer" not in run_policy_source
+    assert "policy.begin_prediction_transaction" not in run_policy_source
+    assert "policy.rollback_prediction_transaction" not in run_policy_source
+    assert "def _policy_should_run" not in run_policy_source
     assert "from robot_motion.deploy.schema import" in run_policy_source
     assert "from robot_motion.replay.trajectory import QPOS_INIT_SOURCES" in run_policy_source
     assert "from .actions import" not in run_policy_source
@@ -215,6 +237,56 @@ def test_teleop_deploy_defaults_use_robot_motion_common_pipeline() -> None:
     assert "from robot_motion.runtime import TeleopCommand" in dispatch_source
     assert "from ..action import" not in dispatch_source
     assert "from ..schemas import" not in dispatch_source
+
+
+def test_policy_deploy_runtime_reuses_v23_relative_decode_boundary() -> None:
+    pose = np.eye(4, dtype=float)
+    pose[:3, 3] = [0.10, 0.20, 0.30]
+    observation = robot_observation.build_deployment_observation(
+        active_sides=("right",),
+        arms_enabled=True,
+        hands_enabled=False,
+        step_index=0,
+        arm_states={
+            "right": {
+                "current_qpos": np.zeros(6, dtype=np.float32),
+                "current_tcp_pose": pose,
+                "actual_tcp_pose": pose,
+            }
+        },
+        hand_states={},
+        timestamp=12.5,
+    )
+    absolute = robot_schema.nan_vector(robot_schema.DEPLOY_ACTION_DIM)
+    absolute[robot_schema.ACTION_ARM_POSE_SLICES["right"]] = np.asarray(
+        [0.18, 0.24, 0.36, 0.0, 0.0, 0.0, 1.0],
+        dtype=np.float32,
+    )
+    relative = robot_pose_adapter.convert_normalized_action_chunk_to_relative(
+        [robot_actions.NormalizedAction(vector=absolute)],
+        observation,
+        active_sides=("right",),
+    )[0]
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=False,
+            policy_action_pose_mode="relative",
+        )
+    )
+
+    policy_observation = runtime.prepare_policy_observation(observation)
+    decoded = runtime.normalize_and_decode(relative.vector, observation)
+
+    assert policy_observation.metadata["policy_pose_action_mode"] == "relative"
+    assert len(decoded) == 1
+    np.testing.assert_allclose(
+        decoded[0].vector[robot_schema.ACTION_ARM_POSE_SLICES["right"]],
+        absolute[robot_schema.ACTION_ARM_POSE_SLICES["right"]],
+        atol=1e-6,
+    )
+    assert decoded[0].metadata["pose_anchor_policy"] == "current_actual_tcp_fixed_for_chunk"
 
 
 class _FakeDeploymentObservationSource:
@@ -252,6 +324,195 @@ class _FakePolicy:
     def predict(self, observation):
         self.observations.append(observation)
         return self.action.copy()
+
+
+class _TransactionalPolicy:
+    name = "transactional_policy"
+
+    def __init__(self, output=None, error: BaseException | None = None) -> None:
+        self.output = output
+        self.error = error
+        self.events: list[str] = []
+
+    def begin_prediction_transaction(self):
+        self.events.append("begin")
+        return len(self.events)
+
+    def predict(self, observation):
+        del observation
+        self.events.append("predict")
+        if self.error is not None:
+            raise self.error
+        if isinstance(self.output, np.ndarray):
+            return self.output.copy()
+        return self.output
+
+    def commit_prediction_transaction(self, checkpoint):
+        del checkpoint
+        self.events.append("commit")
+
+    def rollback_prediction_transaction(self, checkpoint):
+        del checkpoint
+        self.events.append("rollback")
+
+
+class _FakeActionPreparer:
+    def prepare(self, action, observation, *, policy_name=""):
+        return {
+            "action": action,
+            "observation": observation,
+            "policy_name": policy_name,
+        }
+
+
+def _right_arm_policy_observation():
+    source = _FakeDeploymentObservationSource()
+    return source.get_observation(now=10.0)
+
+
+def _right_arm_policy_action() -> np.ndarray:
+    action = robot_schema.nan_vector(robot_schema.DEPLOY_ACTION_DIM)
+    action[robot_schema.ACTION_ARM_POSE_SLICES["right"]] = np.asarray(
+        [0.12, 0.22, 0.32, 0.0, 0.0, 0.0, 1.0],
+        dtype=np.float32,
+    )
+    return action
+
+
+def test_policy_deploy_runtime_owns_schedule_transaction_and_chunk_queue() -> None:
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+    policy = _TransactionalPolicy(_right_arm_policy_action())
+    observation = _right_arm_policy_observation()
+
+    assert robot_runtime.resolve_action_queue_policy(
+        action_queue_policy="auto",
+        debug_replay=False,
+    ) == "replace"
+    assert runtime.should_predict(now=10.0, policy_interval_s=0.1)
+
+    result = runtime.predict_and_queue(
+        policy,
+        observation,
+        now=10.0,
+        queue_policy="replace",
+    )
+
+    assert result.accepted is True
+    assert result.queue_len_before == 0
+    assert result.queue_len_after == 1
+    assert result.error is None
+    assert policy.events == ["begin", "predict", "commit"]
+    assert runtime.should_predict(now=10.05, policy_interval_s=0.1) is False
+    action_step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+    assert action_step.raw_action is not None
+    assert action_step.raw_lookahead_action is None
+    assert action_step.prepared_action["policy_name"] == policy.name
+    assert action_step.queue_len_before == 1
+    assert action_step.queue_len_after == 0
+    assert runtime.action_queue_length() == 0
+
+
+def test_policy_deploy_runtime_exposes_only_same_chunk_successor_as_lookahead() -> None:
+    observation = _right_arm_policy_observation()
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+    first = _right_arm_policy_action()
+    second = np.asarray(first, dtype=np.float32).copy()
+    second[7] += 0.01
+    policy = _TransactionalPolicy(np.stack((first, second), axis=0))
+
+    prediction = runtime.predict_and_queue(policy, observation, now=10.0)
+    assert prediction.accepted is True
+    assert prediction.queue_len_after == 2
+
+    first_step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+    assert first_step.raw_action is not None
+    assert first_step.raw_lookahead_action is not None
+    assert first_step.raw_action.metadata["deploy_action_chunk_index"] == 0
+    assert first_step.raw_lookahead_action.metadata["deploy_action_chunk_index"] == 1
+    assert (
+        first_step.raw_action.metadata["deploy_action_chunk_id"]
+        == first_step.raw_lookahead_action.metadata["deploy_action_chunk_id"]
+    )
+
+    second_step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+    assert second_step.raw_action is not None
+    assert second_step.raw_lookahead_action is None
+
+
+def test_policy_deploy_runtime_rolls_back_empty_and_recovery_discarded_chunks() -> None:
+    observation = _right_arm_policy_observation()
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+
+    empty_policy = _TransactionalPolicy(None)
+    empty = runtime.predict_and_queue(empty_policy, observation, now=1.0)
+    assert empty.empty is True
+    assert empty.faults == ("policy_empty_action",)
+    assert empty_policy.events == ["begin", "predict", "rollback"]
+
+    discarded_policy = _TransactionalPolicy(_right_arm_policy_action())
+    discarded = runtime.predict_and_queue(
+        discarded_policy,
+        observation,
+        now=2.0,
+        discard_policy_output=True,
+    )
+    assert discarded.discarded_by_gate is True
+    assert discarded.accepted is False
+    assert discarded_policy.events == ["begin", "predict", "rollback"]
+    assert runtime.action_queue_length() == 0
+    assert runtime.should_predict(now=2.05, policy_interval_s=0.1) is False
+
+
+def test_policy_deploy_runtime_clears_queue_and_rolls_back_on_prediction_error() -> None:
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+        )
+    )
+    policy = _TransactionalPolicy(error=RuntimeError("predict failed"))
+    result = runtime.predict_and_queue(
+        policy,
+        _right_arm_policy_observation(),
+        now=3.0,
+    )
+
+    assert isinstance(result.error, RuntimeError)
+    assert result.rollback_error is None
+    assert result.faults == ()
+    assert policy.events == ["begin", "predict", "rollback"]
+    assert runtime.action_queue_length() == 0
 
 
 def test_deploy_runtime_steps_source_policy_canonical_pipeline_dispatcher() -> None:

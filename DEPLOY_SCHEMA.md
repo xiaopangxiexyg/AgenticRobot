@@ -55,12 +55,20 @@ v2.3 默认兼容 v2.2 的 tensor layout，但显式增加 pose representation �
   不得回退到 `current/target/last_command`。
 - v2.2 replay bridge 可以把存储的 absolute action 在每次 chunk prediction 时即时转换为
   relative，再走同一部署解算器；这用于不改写旧数据的兼容和端到端一致性测试。
-- 若 observation 带 `pose_frame_contract`，runtime 先按 source raw/desk 声明将实际 TCP
-  转到 desk；没有 metadata 的旧 RM65 runtime 暂按 identity compatibility profile，
-  但新 session 应显式发布 source/topology/变换配置。
+- structured v2.3 session 在后端创建前冻结 `runtime_pose_frame_contract`。模型 observation
+  中的 arm state/actual TCP 从当前机器 raw 转到 desk；原始 execution observation 保持 raw，
+  不被模型视图修改。没有显式配置时使用带审计标签的 identity compatibility profile；
+  正式非 identity 部署应通过 `--runtime-pose-frame-contract` 显式发布 source/topology/变换。
+- Vive 遥操历史中间坐标系统一称为 `vive_retarget_frame`（旧键 `desk_frame/T_O_D/T_D_B`
+  仅兼容读取），它不是本节的 canonical dataset `desk`，不能跳过 source raw→desk
+  contract 直接绑定。
+- RM65 `hardware_pose_6d` 是控制器 SDK 的 base-frame `[xyz,rpy]` 审计反馈，不是 canonical
+  pose，也不是 relative anchor；部署 anchor 仍只接受 contract 转换后的 measured
+  `actual_tcp_pose`。
 
-因此模型输出的 pose 表示是可替换的接口层选项，硬件执行层永远只接收 canonical desk
-absolute target。
+absolute v2.3 输出先做 desk→当前机器 raw；relative 输出由于共同 world-frame 左变换会抵消，
+可以用同一 T0 measured raw TCP 直接解成 raw absolute。两条路径在 canonical safety/IK
+之前汇合，硬件执行层永远只接收当前机器的 runtime raw absolute target。
 
 ## Session Contract
 
@@ -136,6 +144,89 @@ runtime 的 `policy_io_layout_hash` 必须完全一致。
 时，启动必须配置完整的同名逻辑视角；`required=false` 允许无图像运行，但仍固定已提供图像的键和格式。
 旧 artifact 没有 `camera_input` 时保持 v1/早期 v2 的默认 OpenPI front 路径，以便旧 checkpoint 直接部署；
 迁移后的视觉 checkpoint 应补写此字段，而不要依赖自由 metadata。
+
+#### v2.3 action chunk 契约
+
+relative/absolute pose 模型应在 artifact 顶层写入 `pose_action_chunk_contract`、
+`pose_training_data_contract` 和匹配的 `pose_action_chunk_contract_hash`，并用
+`pose_frame_contract_hashes` 记录一个或多个训练数据源的完整 pose-frame contract hash，
+而不是只在自由 `metadata.pose_representation` 中记录：
+
+```json
+{
+  "schema": "dexteleop_pose_action_chunk_v1",
+  "action_horizon": 32,
+  "action_pose_mode": "relative",
+  "last_action_pose_mode": "relative",
+  "absolute_pose_frame": "canonical_desk",
+  "observation_state_pose_frame": "canonical_desk",
+  "tail_policy": "drop",
+  "padding_mask_key": "action_is_pad",
+  "padding_value_policy": "repeat_last_converted_action",
+  "relative_action_anchor": "chunk_start_actual_tcp",
+  "relative_last_action_anchor": "current_actual_tcp",
+  "normalization_excludes_padding": true
+}
+```
+
+`pose_training_data_contract` 必须显式区分两条不能混用的部署路径：
+
+1. 原生 v2.3 数据训练：
+
+   ```json
+   {
+     "schema": "dexteleop_pose_training_data_v1",
+     "origin": "native_v23_dataset",
+     "source_dataset_schema": "dexteleop_dataset_v2.3",
+     "model_state_pose_frame": "desk",
+     "runtime_pose_binding": "explicit_runtime_raw_to_canonical_desk",
+     "expected_runtime_source_id": null,
+     "relative_action_world_transform_invariant": true
+   }
+   ```
+
+   部署必须显式传入当前机器的 `--runtime-pose-frame-contract`。即使当前机器数值上
+   raw=desk，也必须传入显式 identity contract，不能依赖 legacy fallback。
+
+2. v2.2 raw 经默认 identity compatibility 构建 relative action：
+
+   ```json
+   {
+     "schema": "dexteleop_pose_training_data_v1",
+     "origin": "v22_raw_identity_compatibility",
+     "source_dataset_schema": "dexteleop_dataset_v2.2",
+     "model_state_pose_frame": "desk",
+     "runtime_pose_binding": "same_source_identity_raw_to_desk",
+     "expected_runtime_source_id": "rm65_real_dual_arm_v1",
+     "relative_action_world_transform_invariant": true
+   }
+   ```
+
+   这里的 `desk` 是 identity compatibility 的模型接口名称；训练 state 数值仍是左右臂各自
+   RM65 base 下的旧 raw pose。runtime 只允许相同 `source_id` 且每侧 raw→desk 都为 identity；
+   误传 table-center 等非 identity contract 会在创建硬件 backend 前失败。relative action
+   本身对共同 world transform 不敏感，但 absolute state 的输入分布敏感，因此不能把这类
+   checkpoint 当成原生 v2.3 canonical-desk checkpoint。
+
+构造 artifact 时应使用 typed factory，避免手写字符串：
+
+```python
+from dataset_contracts import PoseTrainingDataContract
+
+v22_compat = PoseTrainingDataContract.v22_raw_identity(
+    active_sides=("left", "right"),
+)
+native_v23 = PoseTrainingDataContract.native_v23()
+```
+
+该字段只允许用于 `dataset_schema=dexteleop_dataset_v2.3`。部署启动时，若 CLI 未显式指定
+`--policy-action-pose-mode`，runtime 采用 contract 的 `action_pose_mode`；若 CLI 显式值、
+structured contract 和旧 `metadata.pose_representation.action` 互相冲突，则启动失败。
+当前 runtime 使用同一个 pose mode 同时转换 action 与 `last_action`，因此 artifact 若声明两者
+模式不同也会 fail-closed；在部署链路增加双模式输入前，不会静默按其中一个执行。
+`drop` 是默认训练 tail policy；需要保留不完整 episode 尾部的模型可在 artifact 中显式写
+`tail_policy="pad_last"`。`action_horizon` 与 tail policy 用于 checkpoint/训练审计；部署仍以
+服务端实际返回 chunk 进行队列处理，不会在真机侧复现训练 padding。
 
 ### Resolved v2 Session
 

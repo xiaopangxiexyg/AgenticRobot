@@ -100,7 +100,7 @@ def test_cube_lift_env_has_gymnasium_reset_step_contract() -> None:
     assert observation.dtype == np.float32
     assert env.observation_space.contains(observation)
     assert info["execution_mode"] == "kinematic_direct_qpos_debug"
-    assert info["grasp_mode"] == "physics_contact"
+    assert info["grasp_mode"] == "contact_latch_debug"
     assert info["contacts"]["table_contact"]
 
     next_observation, reward, terminated, truncated, step_info = env.step(

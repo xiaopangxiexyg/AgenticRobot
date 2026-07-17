@@ -17,6 +17,7 @@ def _planner(
     max_velocity: float = 1.0,
     max_acceleration: float = 10.0,
     max_step: float | None = None,
+    target_velocity_filter_tau_sec: float = 0.0,
 ) -> AccelerationLimitedJointTrajectoryPlanner:
     limits = JointTrajectoryLimits(
         max_velocity_rad_s=np.full(2, max_velocity),
@@ -28,6 +29,7 @@ def _planner(
     planner = AccelerationLimitedJointTrajectoryPlanner(
         limits,
         velocity_ramp_sec=0.1,
+        target_velocity_filter_tau_sec=target_velocity_filter_tau_sec,
     )
     planner.reset(np.zeros(2), monotonic_time=0.0)
     return planner
@@ -90,6 +92,52 @@ def test_target_preemption_inherits_velocity_instead_of_resetting_it() -> None:
     second = planner.propose(monotonic_time=0.02)
     assert second.qd_command_rad_s[0] == pytest.approx(0.2)
     assert second.q_command[0] > first.q_command[0]
+
+
+def test_target_velocity_low_pass_uses_reference_dt_and_reports_both_values() -> None:
+    planner = _planner(target_velocity_filter_tau_sec=0.03)
+    _accept(planner, (0.0, 0.0), sequence=1, now=0.0)
+    _accept(planner, (0.01, 0.0), sequence=2, now=0.01)
+
+    proposal = planner.propose(monotonic_time=0.01)
+    expected_alpha = 1.0 - np.exp(-0.01 / 0.03)
+    assert proposal.qd_reference_rad_s[0] == pytest.approx(expected_alpha)
+    assert proposal.metadata["trajectory_target_velocity_unfiltered_rad_s"][
+        0
+    ] == pytest.approx(1.0)
+    assert proposal.metadata["trajectory_target_velocity_filtered_rad_s"][
+        0
+    ] == pytest.approx(expected_alpha)
+    assert proposal.metadata[
+        "trajectory_target_velocity_filter_alpha"
+    ] == pytest.approx(expected_alpha)
+    assert proposal.metadata[
+        "trajectory_target_velocity_filter_dt_sec"
+    ] == pytest.approx(0.01)
+    assert proposal.metadata["trajectory_target_velocity_filter_applied"] is True
+
+
+def test_zero_target_velocity_filter_tau_is_an_exact_bypass() -> None:
+    planner = _planner(target_velocity_filter_tau_sec=0.0)
+    _accept(planner, (0.0, 0.0), sequence=1, now=0.0)
+    _accept(planner, (0.01, 0.0), sequence=2, now=0.01)
+
+    proposal = planner.propose(monotonic_time=0.01)
+    assert proposal.qd_reference_rad_s[0] == pytest.approx(1.0)
+    assert proposal.metadata["trajectory_target_velocity_filter_applied"] is False
+
+
+@pytest.mark.parametrize("value", [-0.01, float("nan"), float("inf")])
+def test_target_velocity_filter_tau_rejects_invalid_values(value: float) -> None:
+    limits = JointTrajectoryLimits(
+        max_velocity_rad_s=np.ones(2),
+        max_acceleration_rad_s2=np.ones(2),
+    )
+    with pytest.raises(ValueError, match="target_velocity_filter_tau_sec"):
+        AccelerationLimitedJointTrajectoryPlanner(
+            limits,
+            target_velocity_filter_tau_sec=value,
+        )
 
 
 def test_reversal_brakes_before_reversing_and_stays_in_safe_endpoint_envelope() -> None:

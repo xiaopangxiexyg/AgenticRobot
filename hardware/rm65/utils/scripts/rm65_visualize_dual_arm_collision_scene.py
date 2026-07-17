@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rm65_inspire_tac.pipeline import (  # noqa: E402
+from robot_motion.rm65 import (  # noqa: E402
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     build_dual_arm_scene_profile,

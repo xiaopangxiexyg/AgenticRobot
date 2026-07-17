@@ -21,14 +21,14 @@ from ...arm_frames import (
     TOOL_TCP_FRAME,
     canonical_arm_controlled_frame,
 )
-from rm65_inspire_tac.ik_tuning import (
+from robot_motion.rm65.ik_tuning import (
     RM65IKTuningConfig,
     hard_branch_jump_exceeds,
     joint_jump_exceeds,
     load_ik_tuning_config,
     pose_delta_metrics,
 )
-from rm65_inspire_tac.paths import require_asset_path
+from robot_motion.rm65.assets import require_asset_path
 from robot_motion.rm65 import (
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
@@ -51,9 +51,15 @@ from robot_motion.position_control.interpolation import (
     interpolate_joint_command_segment,
     reference_age_and_stale,
 )
+from robot_motion.position_control.execution_policy import (
+    PositionTrajectoryPolicy as _PositionTrajectoryPolicy,
+    classify_position_trajectory_policy as _position_trajectory_policy,
+    final_follow_qpos_target as _final_follow_qpos_target,
+)
 from robot_motion.position_control.trajectory import (
     AccelerationLimitedJointTrajectoryPlanner,
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
+    DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
     JointTrajectoryLimits,
     JointTrajectoryProposal,
@@ -107,145 +113,8 @@ _RM65_LOCAL_QPOS_OBSERVATION_TOLERANCE_RAD = float(np.deg2rad(0.01))
 _BACKGROUND_AUDIT_STATS_MAX_SAMPLES = 20_000
 _BACKGROUND_AUDIT_SNAPSHOT_CACHE_SEC = 1.0
 _BACKGROUND_WORKER_TERMINAL_STAGE = "rm65_background_stream_worker_terminal"
-_POSITION_TRAJECTORY_HARD_STOP_COLLISION_STATUSES = frozenset(
-    {"hold_last_safe", "jump_gate_hold", "unsafe_candidate", "failed"}
-)
-_POSITION_TRAJECTORY_HARD_STOP_JUMP_STATUSES = frozenset(
-    {"hold_entered", "holding"}
-)
-_POSITION_TRAJECTORY_DEGRADED_JUMP_STATUSES = frozenset(
-    {"warning", "recovering", "released"}
-)
-_POSITION_TRAJECTORY_NORMAL_SINGULARITY_STATUSES = frozenset(
-    {"pass", "disabled", "not_checked"}
-)
-@dataclass(frozen=True)
-class _PositionTrajectoryPolicy:
-    mode: str
-    speed_scale: float
-    quick_stop: bool
-    reasons: tuple[str, ...]
-
-    @property
-    def reason(self) -> str:
-        return ",".join(self.reasons) if self.reasons else "normal"
-
-
 def _metadata_mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
-
-
-def _final_follow_qpos_target(
-    planned_qpos: np.ndarray,
-    accepted_qpos: np.ndarray | None,
-    *,
-    alpha: float,
-    bypass: bool,
-) -> tuple[np.ndarray, bool]:
-    """Apply the final transport EMA around the last SDK-accepted qpos."""
-
-    planned = np.asarray(planned_qpos, dtype=float).reshape(6)
-    if bypass or float(alpha) >= 1.0 or accepted_qpos is None:
-        return planned.copy(), False
-    accepted = np.asarray(accepted_qpos, dtype=float).reshape(6)
-    output = accepted + float(alpha) * (planned - accepted)
-    return output, not np.allclose(output, planned, rtol=0.0, atol=1e-12)
-
-
-def _position_trajectory_policy(
-    command_metadata: Mapping[str, object],
-    singularity_metadata: Mapping[str, object],
-    *,
-    degraded_speed_scale: float,
-) -> _PositionTrajectoryPolicy:
-    """Classify an already validated teleop qref for the optional planner.
-
-    Collision/no-valid-IK holds are fail-closed software quick stops.  A
-    singularity-entry target is already replaced by the current accepted qpos
-    in ``_apply_singularity_protection``; it therefore decelerates at the
-    degraded speed instead of introducing another instantaneous stop. Other
-    warnings whose qpos is still finite and safety-approved retain the target
-    but lower desired speed. A finite IK pose residual is deliberately not a
-    speed-degradation reason: it means the accepted safe qref has not matched
-    the Cartesian request, and slowing its position convergence makes that
-    residual worse. Transport faults never reach this classifier; they remain
-    fault-latched by the background worker.
-    """
-
-    hard_stop_reasons: list[str] = []
-    degraded_reasons: list[str] = []
-
-    collision_status = str(command_metadata.get("collision_avoidance_status") or "").strip()
-    if collision_status in _POSITION_TRAJECTORY_HARD_STOP_COLLISION_STATUSES:
-        hard_stop_reasons.append(f"collision:{collision_status}")
-    elif collision_status == "boundary_active":
-        degraded_reasons.append("collision:boundary_active")
-    elif collision_status and collision_status != "tracking":
-        degraded_reasons.append(f"collision:{collision_status}")
-    fallback_reason = str(
-        command_metadata.get("collision_avoidance_fallback_reason") or ""
-    ).strip()
-    if fallback_reason and not hard_stop_reasons:
-        degraded_reasons.append(f"collision_fallback:{fallback_reason}")
-
-    jump_status = str(command_metadata.get("ik_jump_gate_status") or "").strip()
-    if jump_status in _POSITION_TRAJECTORY_HARD_STOP_JUMP_STATUSES:
-        hard_stop_reasons.append(f"ik_jump:{jump_status}")
-    elif jump_status in _POSITION_TRAJECTORY_DEGRADED_JUMP_STATUSES:
-        degraded_reasons.append(f"ik_jump:{jump_status}")
-
-    singularity_status = str(
-        singularity_metadata.get("singularity_gate_status") or ""
-    ).strip()
-    if (
-        singularity_status
-        and singularity_status not in _POSITION_TRAJECTORY_NORMAL_SINGULARITY_STATUSES
-    ):
-        degraded_reasons.append(f"singularity:{singularity_status}")
-
-    execution_step = _metadata_mapping(command_metadata.get("execution_step_metadata"))
-    if bool(execution_step.get("step_limited", False)):
-        degraded_reasons.append("execution_step_limited")
-    if bool(command_metadata.get("ik_time_budget_exceeded", False)):
-        degraded_reasons.append("ik_time_budget_exceeded")
-
-    pose_error = _metadata_mapping(command_metadata.get("ik_solve_pose_error"))
-    if pose_error:
-        try:
-            translation_m = float(pose_error.get("translation_m", 0.0) or 0.0)
-            rotation_deg = float(pose_error.get("rotation_deg", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            hard_stop_reasons.append("ik_pose_error_invalid")
-        else:
-            if not math.isfinite(translation_m) or not math.isfinite(rotation_deg):
-                hard_stop_reasons.append("ik_pose_error_nonfinite")
-            # Finite pose error remains available in command/debug metadata.
-            # The qref has already passed collision, joint-limit and IK safety
-            # gates, so it must retain normal speed to converge position-first.
-
-    def unique(values: Sequence[str]) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(str(value) for value in values if str(value)))
-
-    if hard_stop_reasons:
-        return _PositionTrajectoryPolicy(
-            mode="quick_stop",
-            speed_scale=0.0,
-            quick_stop=True,
-            reasons=unique(hard_stop_reasons),
-        )
-    if degraded_reasons:
-        return _PositionTrajectoryPolicy(
-            mode="degraded",
-            speed_scale=float(degraded_speed_scale),
-            quick_stop=False,
-            reasons=unique(degraded_reasons),
-        )
-    return _PositionTrajectoryPolicy(
-        mode="tracking",
-        speed_scale=1.0,
-        quick_stop=False,
-        reasons=(),
-    )
 
 
 def normalize_rm65_ik_framework(value: object) -> str:
@@ -494,6 +363,9 @@ class RM65ArmBackendConfig:
     background_streaming_shutdown_timeout_sec: float = 1.0
     position_command_planner: str = POSITION_COMMAND_PLANNER_LINEAR
     position_velocity_ramp_sec: float = DEFAULT_POSITION_VELOCITY_RAMP_SEC
+    position_target_velocity_filter_tau_sec: float = (
+        DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC
+    )
     position_max_acceleration_rad_s2: tuple[float, ...] | None = None
     # Optional position-only envelope applied to every high-rate planner
     # proposal.  It is intentionally independent of max_angvel so a peak-step
@@ -515,6 +387,14 @@ class RM65ArmBackendConfig:
     tool_profile: str | None = None
     tcp_pose_flange_m_rad: tuple[float, ...] | None = None
     singularity_protection_enabled: bool = True
+    # Position-teleop-only opt-in. A singular target is allowed only when the
+    # upstream candidate selector explicitly reports that no fully
+    # non-wrist-singular feasible branch existed.
+    allow_position_wrist_singularity_fallback: bool = False
+    # Position-teleop-only opt-in.  The backend still requires an upstream
+    # candidate-selection certificate that no fully non-singular feasible
+    # candidate was found.  Shoulder singularity is never included.
+    allow_position_elbow_singularity_fallback: bool = False
     configure_singularity_thresholds: bool = True
     singularity_elbow_threshold_deg: float = 3.0
     singularity_wrist_threshold_deg: float = 3.0
@@ -588,6 +468,14 @@ class RM65ArmBackendConfig:
             self.position_velocity_ramp_sec
         ) <= 0.0:
             raise ValueError("position_velocity_ramp_sec must be finite and positive.")
+        target_velocity_filter_tau = float(
+            self.position_target_velocity_filter_tau_sec
+        )
+        if not math.isfinite(target_velocity_filter_tau) or target_velocity_filter_tau < 0.0:
+            raise ValueError(
+                "position_target_velocity_filter_tau_sec must be finite and non-negative."
+            )
+        self.position_target_velocity_filter_tau_sec = target_velocity_filter_tau
         if self.position_max_acceleration_rad_s2 is not None:
             max_acceleration = np.asarray(
                 self.position_max_acceleration_rad_s2,
@@ -789,6 +677,9 @@ class RM65ArmBackend(EffectorBackend):
                     max_command_step_rad=self._base_max_joint_step,
                 ),
                 velocity_ramp_sec=float(config.position_velocity_ramp_sec),
+                target_velocity_filter_tau_sec=float(
+                    config.position_target_velocity_filter_tau_sec
+                ),
                 reference_period_sec=self._base_control_dt,
             )
             self._stream_planner.reset(
@@ -1495,6 +1386,56 @@ class RM65ArmBackend(EffectorBackend):
                     f"{self.name} {stop_label} failed with return code {stop_text}"
                 )
 
+    def disengage_position_command_stream(
+        self,
+        reason: str = "manual interaction",
+    ) -> None:
+        """Stop once, then withdraw this backend from position interaction.
+
+        ``hold_motion`` intentionally keeps sending the frozen qpos while a
+        short safety hold may auto-recover.  The operator Hold screen has a
+        different contract: the arm may be moved manually or by another mode.
+        In that state a persistent 120 Hz qpos target would fight the other
+        interaction, so invalidate it at a hard send boundary after issuing a
+        one-shot SDK stop.
+        """
+
+        normalized_reason = str(reason).strip() or "manual interaction"
+        with self._send_lock:
+            with self._state_lock:
+                self._clear_stream_target_locked()
+                self._last_target_qpos = None
+                self._last_target_pose = None
+                arm = self.arm
+            if arm is None:
+                with self._state_lock:
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = "position_stream_disengaged_no_arm"
+                return
+            stop_method = getattr(arm, "Arm_Slow_Stop", None)
+            stop_label = "Arm_Slow_Stop"
+            if not callable(stop_method):
+                stop_method = getattr(arm, "Arm_Stop", None)
+                stop_label = "Arm_Stop"
+            if not callable(stop_method):
+                raise RuntimeError(
+                    f"{self.name} RM65 SDK exposes no stop method while disengaging "
+                    "the position command stream"
+                )
+            stop_result = stop_method()
+            stop_code, stop_text = _parse_rm65_result(stop_result)
+            with self._state_lock:
+                self._last_send_result_code = stop_code
+                self._last_send_result_text = (
+                    f"position_stream_disengaged:{normalized_reason}:"
+                    f"{stop_label}:{stop_text}"
+                )
+            if stop_code != 0:
+                raise RuntimeError(
+                    f"{self.name} {stop_label} failed while disengaging the position "
+                    f"command stream with return code {stop_text}"
+                )
+
     def reset_motion_state(self, qpos: Sequence[float] | np.ndarray | None = None) -> None:
         reset_qpos = (
             None
@@ -1728,6 +1669,10 @@ class RM65ArmBackend(EffectorBackend):
         source: str,
         max_joint_step: Sequence[float] | np.ndarray | None = None,
         replay_slowdown_preapplied: bool = False,
+        allow_position_wrist_fallback: bool = False,
+        position_wrist_fallback_metadata: Mapping[str, object] | None = None,
+        allow_position_elbow_fallback: bool = False,
+        position_singularity_fallback_metadata: Mapping[str, object] | None = None,
     ) -> np.ndarray:
         target = np.asarray(qpos_target, dtype=float).reshape(6)
         reference = np.asarray(reference_qpos, dtype=float).reshape(6)
@@ -1774,6 +1719,23 @@ class RM65ArmBackend(EffectorBackend):
         current_singular = current_code not in (0, None)
         entering_singularity = bool(target_singular and current_code == 0)
         gate_status = "hold_entry" if entering_singularity else "pass"
+        allow_wrist_fallback = bool(
+            entering_singularity
+            and self.config.allow_position_wrist_singularity_fallback
+            and allow_position_wrist_fallback
+            and target_status.get("label") == "wrist_singularity"
+        )
+        allow_elbow_fallback = bool(
+            entering_singularity
+            and self.config.allow_position_elbow_singularity_fallback
+            and allow_position_elbow_fallback
+            and target_status.get("label") == "elbow_singularity"
+        )
+        allow_position_fallback = bool(allow_wrist_fallback or allow_elbow_fallback)
+        if allow_wrist_fallback:
+            gate_status = "allow_position_wrist_singular"
+        elif allow_elbow_fallback:
+            gate_status = "allow_position_elbow_singular"
         slow_singularity_mode: str | None = None
         if (
             qpos_init_slow_source
@@ -1817,7 +1779,24 @@ class RM65ArmBackend(EffectorBackend):
             "configured_elbow_threshold_deg": float(self.config.singularity_elbow_threshold_deg),
             "configured_wrist_threshold_deg": float(self.config.singularity_wrist_threshold_deg),
             "configured_shoulder_threshold_m": float(self.config.singularity_shoulder_threshold_m),
+            "position_wrist_singularity_fallback_requested": bool(
+                allow_position_wrist_fallback
+            ),
+            "position_wrist_singularity_fallback_allowed": bool(allow_wrist_fallback),
+            "position_elbow_singularity_fallback_requested": bool(
+                allow_position_elbow_fallback
+            ),
+            "position_elbow_singularity_fallback_allowed": bool(allow_elbow_fallback),
+            "position_singularity_fallback_allowed": bool(allow_position_fallback),
         }
+        if position_wrist_fallback_metadata is not None:
+            metadata["position_wrist_singularity_fallback"] = dict(
+                position_wrist_fallback_metadata
+            )
+        if position_singularity_fallback_metadata is not None:
+            metadata["position_singularity_fallback"] = dict(
+                position_singularity_fallback_metadata
+            )
         if slow_singularity:
             slowdown = (
                 float(self.config.singularity_qpos_init_slowdown)
@@ -1851,7 +1830,7 @@ class RM65ArmBackend(EffectorBackend):
         if "wrist_center_distance_m" in current_status:
             metadata["current_wrist_center_distance_m"] = current_status["wrist_center_distance_m"]
         self._record_singularity_metadata(metadata)
-        if entering_singularity and not slow_singularity:
+        if entering_singularity and not slow_singularity and not allow_position_fallback:
             self._emit_singularity_warning(metadata)
             return reference.copy()
         return target
@@ -1986,12 +1965,46 @@ class RM65ArmBackend(EffectorBackend):
             qpos_target,
             label="pre-singularity target",
         )
+        command_metadata = command.metadata if isinstance(command.metadata, Mapping) else {}
+        candidate_selection = _metadata_mapping(command_metadata.get("ik_candidate_selection"))
+        wrist_preference = _metadata_mapping(
+            candidate_selection.get("wrist_singularity_preference")
+        )
+        selected_wrist = _metadata_mapping(wrist_preference.get("selected"))
+        selected_wrist_sides = _metadata_mapping(selected_wrist.get("sides"))
+        selected_side_wrist = _metadata_mapping(selected_wrist_sides.get(self.config.side))
+        allow_position_wrist_fallback = bool(
+            wrist_preference.get("enabled", False)
+            and wrist_preference.get("fallback_to_singular", False)
+            and selected_side_wrist.get("is_wrist_singular", False)
+        )
+        position_singularity_preference = _metadata_mapping(
+            candidate_selection.get("position_singularity_preference")
+        )
+        selected_position_singularity = _metadata_mapping(
+            position_singularity_preference.get("selected")
+        )
+        selected_position_sides = _metadata_mapping(
+            selected_position_singularity.get("sides")
+        )
+        selected_position_side = _metadata_mapping(
+            selected_position_sides.get(self.config.side)
+        )
+        allow_position_elbow_fallback = bool(
+            position_singularity_preference.get("enabled", False)
+            and position_singularity_preference.get("fallback_to_singular", False)
+            and selected_position_side.get("is_elbow_singular", False)
+        )
         qpos_target = self._apply_singularity_protection(
             qpos_target,
             reference_qpos=reference_qpos,
             source=command_source,
             max_joint_step=max_joint_step,
             replay_slowdown_preapplied=replay_slowdown_preapplied,
+            allow_position_wrist_fallback=allow_position_wrist_fallback,
+            position_wrist_fallback_metadata=wrist_preference,
+            allow_position_elbow_fallback=allow_position_elbow_fallback,
+            position_singularity_fallback_metadata=position_singularity_preference,
         )
         qpos_target = self._validate_final_joint_target(qpos_target, label="final target")
         self._stamp_final_action_target(command, qpos_target, source=command_source)

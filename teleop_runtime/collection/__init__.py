@@ -16,6 +16,7 @@ from .observers import (
 )
 from .preview_rate import PreviewRateLimiter
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
+from .writer_runtime import CollectionWriterRuntime
 from .sample_assembler import (
     ArmStateMetadataProvider,
     CameraFrameMatch,
@@ -58,6 +59,7 @@ __all__ = [
     "CollectionTopology",
     "CollectionWriterObserver",
     "CollectionWriterObserverConfig",
+    "CollectionWriterRuntime",
     "CollectorSample",
     "CollectorSampleBuilder",
     "CollectorSampleBuilderConfig",

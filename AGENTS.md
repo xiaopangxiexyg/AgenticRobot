@@ -1,105 +1,70 @@
-# Project Rules
+# DexTeleop Project Rules
 
-## Core Rules
+DexTeleop contains shared robot motion, real-robot teleoperation, data
+collection, policy deployment, simulation, and dataset contracts. Keep the
+directory boundaries stable and do not add a new production entrypoint without
+checking the existing README and architecture plan.
 
-* Respect directory ownership:
+## Canonical entrypoints
 
-  * `robot_motion/`: motion-control modules shared by simulation and real robots.
-  * `sim/`: simulation-only modules.
-  * `teleop_runtime/`: real-robot teleoperation, data collection, and deployment modules.
-  * `legacy/`: archived files and documents pending deletion.
+- GUI human teleop and formal collection:
+  `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui`
+- Headless/compatibility collection:
+  `python -m teleop_runtime.collection`
+- Policy deployment:
+  `python -m teleop_runtime.deploy`
 
-* Before writing code, ask for clarification if any requirement is ambiguous or underspecified.
+`teleop_runtime.collection` is headless/compatibility only. `teleop_runtime/core/kernel.py`
+is experimental.
 
-* Assume related modules may be modified or debugged concurrently. Avoid overwriting unrelated changes and keep edits scoped.
+## Directory ownership
 
-* When necessary, add short temporary notes such as `AGENT_TEMP_NOTE:` near modified code to support collaboration. Before finishing, remove obsolete notes and retain only useful permanent comments.
+- `robot_motion/`: shared motion semantics, Rig, Safety, Planner, position
+  control, and runtime contracts; no vendor-device initialization or training.
+- `hardware/`: vendor SDKs and device backends; no dataset schema or learner.
+- `sim/`: simulation-only backends, tasks, and adapters; may use `robot_motion`,
+  but must not depend on `teleop_runtime` or real hardware.
+- `teleop_runtime/`: real////-robot teleop, GUI/headless orchestration, collection,
+  and policy deployment frontends.
+- `deployments/`: model client, protocol, and artifact integration.
+- `dataset_contracts/` and `dataset_interface/`: pure data contracts and
+  trajectory/window/batch adapters; no hardware or training implementation.
+- `model/`: future policy/learner/DAgger/RL package, not a current runtime entrypoint.
+- `legacy/`: confirmed-archived code/docs only; production code must not import it.
+- `tests/` and `todos/`: verification and planning; neither is runtime code.
 
-* When the project environment changes, update all relevant metadata and lock files—including pyproject.toml, environment.yml, and uv.lock.
+Shared code should depend toward `robot_motion` and pure data contracts. `sim`
+must not reverse-depend on `teleop_runtime`.
 
-## Connection Codex Agent Rules
+## Safety and change protocol
 
-These are agent instructions, not a full user manual. Apply them only when the
-Codex session current directory is
-`codex_remote` or a child directory. If they
-are loaded during unrelated local-only work, do not let them steer that task.
+- Prefer read-only, dry-run, mock, contract, and `--help` checks.
+- Do not start real devices or execute motion, homing, replay, servo,
+  force-control, reboot, or other device-state changes without explicit scope
+  and the relevant safety check.
+- Remote hardware work must use the wrappers and rules in `codex_remote/`.
+- Inspect status/diff first, preserve concurrent work, keep edits scoped, and
+  do not reset or overwrite unrelated changes.
+- Ask for clarification when an unresolved choice affects safety, public
+  control/data semantics, ownership, or destructive behavior; otherwise state
+  assumptions and proceed.
+- Use `AGENT_TEMP_NOTE:` only for active collaboration and remove obsolete notes.
 
-### Hard Rules
+## Verification and environment metadata
 
-- Keep Codex local. Treat remote machines only as SSH-reachable execution and
-  hardware hosts.
-- Use the wrappers in this directory for remote work. Do not handwrite SSH
-  commands for remote writes, process control, hardware access, robot control,
-  USB reset, reboot/shutdown, or motion.
-- Do not modify wrapper behavior, shared safety logic, or safety policy
-  documents by default.
-- Only modify wrappers or safety policy when the user explicitly asks to modify
-  this wrapper set. Before doing so, read `README.md`, state the intended safety
-  impact, keep the edit narrowly scoped, and run relevant verification.
-- Do not store passwords, tokens, private keys, host secrets, or credentials in
-  this directory.
-- Do not assume `Agent (Full Access)`. Respect the active sandbox and approval
-  mode.
+Run the smallest relevant tests and report them. Use `git diff --check`; add
+targeted tests, `py_compile`, and entrypoint `--help` checks as appropriate.
+Hardware tests and remote runs require explicit scope.
 
-### Sync Model
+Only dependency, Python-version, package-discovery, or installation changes
+require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,
+`scripts/install_conda_env.sh`, or `README_ENV.md` as applicable. Source-only
+and documentation changes do not require lock updates. Never hand-edit
+`uv.lock`; regenerate it after dependency changes.
 
-- When the user states that realtime sync is active via
-  `/home/zc/Release/util_scripts/Connection/realtime_sync_ssh.sh` in no-delete
-  mode, treat the local directory as the only code editing surface.
-- Edit source code locally only. Do not edit remote source files with SSH, sed,
-  vim, Python snippets, or ad hoc shell commands.
-- Do not run `remote_rsync_project.sh` for routine edits while realtime sync is
-  active, unless the user explicitly requests a one-shot sync.
-- Run tests and runtime commands on the remote host when they need remote
-  hardware, drivers, devices, GPUs, robot networks, or the remote Python
-  environment.
-- Remote runtime outputs are not assumed to sync back. Inspect them with
-  `remote_view.sh` or `remote_tail_log.sh`, or pull them intentionally with
-  `remote_pull.sh` or `remote_collect_debug_bundle.sh`.
-- If sync health matters or stale remote code is suspected, verify explicit
-  files/directories with `remote_sync_check.sh`.
+## Legacy policy
 
-### Safety Levels
-
-- If an operation is not listed or cannot be confidently classified, treat it
-  as L5 and stop for explicit user direction.
-- L0/L1: local or remote read-only diagnostics; may run when relevant.
-- L2: non-motion writes such as pulling remote results, debug bundles, camera
-  snapshots, or explicit one-shot sync; first state target and write scope.
-- L3: remote process execution/control such as Python, modules, pytest, preview
-  services, or controlled sessions; first state target process and stop/timeout
-  expectations.
-- L4: device or host state changes without planned motion, including USB reset,
-  udev reload, enable/disable, controlled kill, or stop/zero-velocity commands;
-  never run automatically.
-- L5: real motion or system-level action, including homing, trajectory/replay,
-  servo, gripper motion, force control, reboot, shutdown, firmware flashing,
-  CAN bus reset, or unknown robot-control actions; never run automatically.
-
-### Required Wrappers
-
-- Read-only checks: `remote_whoami.sh`, `remote_env.sh`, `remote_lsusb.sh`,
-  `remote_dev_nodes.sh`, `remote_groups.sh`, `remote_dmesg_usb.sh`,
-  `remote_camera_list.sh`, `remote_arm_ping.sh`, `remote_arm_port_check.sh`,
-  `remote_ps.sh`, `remote_view.sh`, `remote_tail_log.sh`,
-  `remote_sync_check.sh`.
-- Remote Python/test execution: `remote_python.sh`, `remote_module.sh`,
-  `remote_pytest.sh`. Do not bypass their control-risk checks.
-- Arm dry-run work: `remote_arm_dry_run.sh`. Do not pass flags that disable
-  dry-run behavior.
-- Intentional result retrieval: `remote_pull.sh` or
-  `remote_collect_debug_bundle.sh`.
-
-### Real Control
-
-- Do not execute real motion, homing, enable/disable, replay, trajectory,
-  servo, gripper, force-control, emergency-stop, or other L4/L5 actions unless
-  the user explicitly requests that specific action in the current turn.
-- Before any L4/L5 or control-risk command, require a fresh
-  `remote_safety_check.sh` with relevant `--arm-ip`, `--arm-port`, and/or
-  `--require-device` checks.
-- Do not add `--allow-control-risk` just to make a generic Python command run.
-  If a command is blocked by control-risk checks, stop and explain what was
-  blocked.
-- If the user explicitly confirms a control-risk command, require
-  `--require-safety-ok TOKEN_PATH` and keep `--safety-max-age` short.
+Move code to `legacy/` only after confirming there are no production, import,
+test, or documentation callers, a replacement exists, and a migration note
+records the reason, replacement, and deletion condition. Keep required
+compatibility shims in their active import paths.

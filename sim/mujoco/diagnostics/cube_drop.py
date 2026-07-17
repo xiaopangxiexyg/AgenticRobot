@@ -128,6 +128,21 @@ def build_isolated_drop_scene(
         raise ValueError("Generated MJCF has no worldbody.")
 
     table = copy.deepcopy(_direct_body(worldbody, str(table_body_name)))
+    # Semantic frames such as table_center_frame are useful in the complete
+    # scene but are geometry-free and do not belong in the rigid-body drop
+    # oracle. Preserve nested table geometry while pruning empty descendants.
+    def prune_empty_descendants(body: ET.Element) -> bool:
+        for child in list(body.findall("./body")):
+            if not prune_empty_descendants(child):
+                body.remove(child)
+        return bool(
+            body.findall("./geom")
+            or body.findall("./site")
+            or body.findall("./camera")
+            or body.findall("./body")
+        )
+
+    prune_empty_descendants(table)
     dropped_object = copy.deepcopy(_direct_body(worldbody, object_spec.name))
     for body in list(worldbody.findall("./body")):
         worldbody.remove(body)

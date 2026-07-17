@@ -282,6 +282,28 @@ def test_summary_mode_writes_stats_without_high_rate_sidecars(tmp_path: Path) ->
     assert not (tmp_path / POSITION_REFERENCE_SIDECAR_NAME).exists()
 
 
+def test_runtime_summary_checkpoint_is_disabled_until_recorder_close(
+    tmp_path: Path,
+) -> None:
+    recorder = PositionDebugRecorder(
+        PositionDebugRecorderConfig(
+            output_dir=tmp_path,
+            mode="summary",
+            summary_checkpoint_every_events=1,
+        )
+    )
+    assert recorder.record(_command_event())
+    recorder._queue.join()
+
+    assert not (tmp_path / POSITION_SUMMARY_NAME).exists()
+    assert recorder.snapshot()["runtime_summary_checkpoints"] is False
+
+    recorder.close()
+    summary = json.loads((tmp_path / POSITION_SUMMARY_NAME).read_text(encoding="utf-8"))
+    assert summary["processed_count"] == 1
+    assert summary["runtime_summary_checkpoints"] is False
+
+
 def test_summary_reports_aggregate_and_per_side_actual_rates_and_counters(
     tmp_path: Path,
 ) -> None:

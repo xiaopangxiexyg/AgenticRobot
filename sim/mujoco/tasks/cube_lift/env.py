@@ -1,4 +1,4 @@
-"""A minimal state-privileged, pure-contact Cube-Lift Gymnasium environment."""
+"""A minimal state-privileged Cube-Lift Gymnasium debug environment."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from sim.mujoco.scene import MujocoScene
 
 from .config import CubeLiftTaskConfig
 from .contacts import CubeLiftContactSummary, summarize_cube_contacts
+from .grasp_latch import ContactGraspLatch
 from .reward import cube_out_of_bounds, lift_progress, reward_for_step
 from .scheduler import CubeLiftPolicyScheduler, PolicyAdvance
 from .spec import CubeLiftActionSpec, CubeLiftObservationSpec, require_gymnasium
@@ -33,10 +34,11 @@ except ModuleNotFoundError:
 class CubeLiftEnv(_EnvBase):
     """Right-arm joint-delta task: lift the center-table cube above a threshold.
 
-    The robot is held through ``kinematic_direct_qpos_debug``. Only the cube is
-    a dynamically evolved rigid body, so this environment is useful for RL API,
-    reset, observation, clock and contact-pipeline development—not sim2real or
-    physical-grasp claims.
+    The robot is held through ``kinematic_direct_qpos_debug``. The temporary
+    task uses bilateral contact to acquire a debug grasp latch, after which the
+    cube follows the grasp frame until the gripper opens. This environment is
+    useful for RL API, reset, observation, clock and contact-pipeline
+    development—not sim2real or physical-grasp claims.
     """
 
     metadata = {"render_modes": [], "render_fps": 15}
@@ -70,6 +72,17 @@ class CubeLiftEnv(_EnvBase):
             self.controller,
             policy_hz=self.config.policy_hz,
         )
+        self._grasp_latch = ContactGraspLatch(
+            self.scene,
+            object_body_name=self.config.object_body_name,
+            object_freejoint_name=self.config.object_freejoint_name,
+            grasp_body_name=self.config.right_grasp_body_name,
+            left_finger_body_name=self.config.grasp_latch_left_finger_body_name,
+            right_finger_body_name=self.config.grasp_latch_right_finger_body_name,
+            acquire_close=self.config.grasp_latch_acquire_close,
+            release_close=self.config.grasp_latch_release_close,
+            acquire_distance_m=self.config.grasp_latch_acquire_distance_m,
+        )
 
         self._rng = np.random.default_rng()
         self._needs_reset = True
@@ -80,6 +93,7 @@ class CubeLiftEnv(_EnvBase):
         self._right_target_qpos = np.asarray(self.config.right_home_qpos, dtype=float)
         self._gripper_close_by_name = dict(self.config.initial_gripper_close_by_name)
         self._last_action = np.zeros(self.action_spec.dim, dtype=np.float32)
+        self._grasp_latch.reset()
         self._resting_center_z_m = float("nan")
         self._last_advance: PolicyAdvance | None = None
 
@@ -105,6 +119,7 @@ class CubeLiftEnv(_EnvBase):
         self._right_target_qpos = np.asarray(self.config.right_home_qpos, dtype=float)
         self._gripper_close_by_name = dict(self.config.initial_gripper_close_by_name)
         self._last_action = np.zeros(self.action_spec.dim, dtype=np.float32)
+        self._grasp_latch.reset()
 
         self.scene.set_freejoint_state(
             self.config.object_freejoint_name,
@@ -134,10 +149,15 @@ class CubeLiftEnv(_EnvBase):
         if self._needs_reset:
             raise RuntimeError("CubeLiftEnv.reset() must be called before step().")
         values = self.action_spec.coerce(action)
-        self._last_action = values
+        previous_right_target = self._right_target_qpos.copy()
+        previous_right_close = float(
+            self._gripper_close_by_name[self.config.right_gripper_name]
+        )
         self._right_target_qpos = np.clip(
             self._right_target_qpos
-            + values[:6] * np.asarray(self.config.right_joint_delta_rad, dtype=np.float32),
+            + values[:6].astype(np.float64) * np.asarray(
+                self.config.right_joint_delta_rad, dtype=np.float64
+            ),
             np.asarray(self.config.right_qpos_lower, dtype=float),
             np.asarray(self.config.right_qpos_upper, dtype=float),
         )
@@ -146,7 +166,7 @@ class CubeLiftEnv(_EnvBase):
                 self._gripper_close_by_name[self.config.right_gripper_name]
                 + values[6] * self.config.right_gripper_delta,
                 0.0,
-                1.0,
+                self.config.right_gripper_max_close,
             )
         )
         self._episode_steps += 1
@@ -154,6 +174,29 @@ class CubeLiftEnv(_EnvBase):
         self._last_advance = self.scheduler.advance_one_policy_step(
             command_supplier=lambda: self._new_command(source="cube_lift_policy"),
             after_tick=self._check_physics_termination,
+        )
+        # Invalid requested deltas must not accumulate behind the safety
+        # boundary. The next policy action starts from the accepted target.
+        self._right_target_qpos = self.controller.accepted_arm_qpos(
+            self.config.controlled_side
+        )
+        self._gripper_close_by_name[self.config.right_gripper_name] = (
+            self.controller.accepted_gripper_close(self.config.right_gripper_name)
+        )
+        self._last_action[:6] = np.clip(
+            (self._right_target_qpos - previous_right_target)
+            / np.asarray(self.config.right_joint_delta_rad, dtype=float),
+            -1.0,
+            1.0,
+        )
+        self._last_action[6] = np.clip(
+            (
+                self._gripper_close_by_name[self.config.right_gripper_name]
+                - previous_right_close
+            )
+            / self.config.right_gripper_delta,
+            -1.0,
+            1.0,
         )
 
         terminated = self._termination_reason is not None
@@ -229,6 +272,8 @@ class CubeLiftEnv(_EnvBase):
             self.config.object_body_name,
             self.config.table_body_name,
             self.config.right_grasp_body_name,
+            self.config.grasp_latch_left_finger_body_name,
+            self.config.grasp_latch_right_finger_body_name,
         ):
             if not self.scene.has_body(body_name):
                 raise ValueError(f"CubeLift scene is missing required body {body_name!r}.")
@@ -265,6 +310,9 @@ class CubeLiftEnv(_EnvBase):
         if not self.scene.state_is_finite():
             self._termination_reason = "non_finite_simulation_state"
             return True
+        self._grasp_latch.update(
+            self.scene.get_gripper_close(self.config.right_gripper_name)
+        )
         cube_position = self._cube_qpos()[:3]
         if cube_out_of_bounds(
             cube_position,
@@ -272,6 +320,10 @@ class CubeLiftEnv(_EnvBase):
             upper_m=self.config.out_of_bounds_xyz_upper_m,
         ):
             self._termination_reason = "cube_out_of_bounds"
+            return True
+        active_collision = self.controller.last_active_collision_check
+        if active_collision is not None and not active_collision.safe:
+            self._termination_reason = "robot_environment_penetration"
             return True
         contacts = self._contact_summary()
         above_target = float(cube_position[2]) >= (
@@ -321,6 +373,8 @@ class CubeLiftEnv(_EnvBase):
             "cube_z_m": float(cube_qpos[2]),
             "termination_reason": self._termination_reason,
             "success_hold_physics_ticks": self._success_hold_ticks,
+            "grasp_latched": self._grasp_latch.active,
+            "grasp_latch_acquisition_count": self._grasp_latch.acquisition_count,
             "controller_sequence": None if last_tick is None else last_tick.active_command_sequence,
             "controller_physics_tick": None if last_tick is None else last_tick.physics_tick,
             "scheduler": None
@@ -332,6 +386,16 @@ class CubeLiftEnv(_EnvBase):
                 "final_physics_time_sec": self._last_advance.final_physics_time_sec,
             },
             "contacts": contacts.to_info(),
+            "safety": (
+                None
+                if self.controller.last_safety_result is None
+                else self.controller.last_safety_result.to_dict()
+            ),
+            "active_collision": (
+                None
+                if self.controller.last_active_collision_check is None
+                else self.controller.last_active_collision_check.to_dict()
+            ),
         }
 
 

@@ -25,6 +25,31 @@ python -m sim.mujoco.run_control \
   --mjcf-out /tmp/rm65_bimanual_physics_v1.xml
 ```
 
+## Real-aligned VIVE position-teleop debug
+
+The shared position path can be exercised without a real RM65 through the
+dedicated debug composition root below. It receives VIVE poses, runs the same
+collision-aware target-to-qref solver at 60 Hz, plans accepted qref to qcmd at
+120 Hz, and holds the accepted command through the 1000 Hz MuJoCo bridge. The
+tracker source contract remains 15 Hz. Tool profiles are mandatory so the
+solver cannot silently substitute a flange/identity TCP.
+
+```bash
+PYTHONPATH=. python -m teleop_runtime.debug.run_vive_mujoco_teleop \
+  --left-tool-profile position_endpoint \
+  --right-tool-profile position_endpoint
+```
+
+Keep both trackers steady at the desired runtime home and press Enter. Add
+`--auto-home` for a non-interactive run. To compare the retained 1.0/1.0 and
+1.0/0.2 IK objectives, use the default command above and then add
+`--position-ik-orientation-cost 0.2`.
+
+This entry is intentionally arms-only and headless. MuJoCo owns task physics;
+SAPIEN may later subscribe as a renderer, but it is not an execution backend.
+The bridge remains `kinematic_direct_qpos_debug`, so it does not validate a
+physical RM65 servo, force control, or actuator dynamics.
+
 ## v3 RM65 CAD Colors
 
 The v3 RM65 arm visual meshes are multi-material OBJ assets: their CAD colors
@@ -79,6 +104,14 @@ bridge for building the first cube task before real 150 Hz actuator data is
 available. It consumes an already-planned, complete dual-arm qpos command at
 150 Hz, maps normalized gripper close values to finger qpos, and re-applies
 the held command at every 1000 Hz physics tick.
+
+Physical scene profiles now pass every new prescribed target through the
+shared collision-safety layer before it is written. The layer checks forbidden
+robot/environment, non-gripper/object and self-collision pairs on a scratch
+`MjData`, sweeps the joint-space segment, and projects an RL target back to the
+last safe point. A hard penetration detected after `mj_step` is reported as an
+environment failure. Collision-disabled kinematic replay remains raw and is
+explicitly labelled as unavailable for collision validation.
 
 It deliberately does not perform pose IK, qpos interpolation, PD control,
 torque control, or target tracking. Use the existing `robot_motion` canonical

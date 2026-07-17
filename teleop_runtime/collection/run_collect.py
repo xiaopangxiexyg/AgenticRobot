@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.pose_frames import load_pose_frame_contract
 from robot_motion.runtime.lifecycle import (
     LifecycleStartupError,
     collect_lifecycle_failures,
@@ -28,7 +29,7 @@ from cameras.configs import (
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )
 from project_paths import calibration_profiles_dir, default_dataset_root
-from rm65_inspire_tac.paths import require_asset_path
+from robot_motion.rm65.assets import require_asset_path
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.grippers import (
@@ -1437,9 +1438,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--control-mode",
-        choices=["absolute", "delta_clutch"],
+        choices=["absolute"],
         default="absolute",
-        help="Arm retargeting mode.",
+        help="Arm retargeting mode. The active collection runtime uses absolute pose mapping.",
     )
     parser.add_argument("--translation-scale", type=float, default=1.0, help="Desk-frame translation scale.")
     add_vive_tracker_height_correction_args(parser)
@@ -1651,6 +1652,17 @@ def parse_args() -> argparse.Namespace:
             "Optional DexTeleop v2.2 policy-I/O layout JSON, or literal 'auto' to resolve a "
             "strict layout from the instantiated backend/retargeter pairs. When supplied, "
             "collection keeps LeRobot-v2.1-style storage but writes typed v2.2 fields."
+        ),
+    )
+    parser.add_argument(
+        "--pose-frame-contract",
+        type=load_pose_frame_contract,
+        default=None,
+        metavar="JSON",
+        help=(
+            "Optional explicit v2.3 pose-frame contract JSON. Requires "
+            "--policy-io-layout auto or a layout JSON. raw_absolute preserves pose values; "
+            "desk_absolute converts only the detached writer row."
         ),
     )
     parser.add_argument(
@@ -2005,6 +2017,22 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args(_normalize_qpos_option_argv(sys.argv[1:]))
     if args.nominal_fps is None:
         args.nominal_fps = float(args.hz)
+    if args.pose_frame_contract is not None and not str(args.policy_io_layout).strip():
+        parser.error(
+            "--pose-frame-contract requires --policy-io-layout auto or an explicit layout JSON."
+        )
+    if args.pose_frame_contract is not None:
+        if not bool(args.record_actual_wrist_camera_pose):
+            parser.error(
+                "--pose-frame-contract requires measured arm feedback; remove "
+                "--no-record-actual-wrist-camera-pose."
+            )
+        contract_sides = tuple(args.pose_frame_contract.source.active_sides)
+        if contract_sides != tuple(args.active_sides):
+            parser.error(
+                "--pose-frame-contract active_sides disagree with collection --active-sides: "
+                f"{contract_sides!r} != {tuple(args.active_sides)!r}."
+            )
     for side in ("left", "right"):
         qpos_rad = getattr(args, f"return_{side}_qpos", None)
         qpos_deg = getattr(args, f"return_{side}_qpos_deg", None)
@@ -2101,6 +2129,22 @@ class CollectApp:
     arm_state_poller: ArmHardwareStatePoller | None
     hand_state_poller: HandStateHistoryPoller | None
     position_reference_publisher: PositionReferencePublisher
+
+
+def _dispatch_runtime_command(app: CollectApp, command: TeleopCommand) -> Any:
+    """Use the shared headless runtime dispatch seam with legacy fake fallback."""
+
+    runtime_dispatch = getattr(getattr(app, "runtime", None), "dispatch_command", None)
+    if callable(runtime_dispatch):
+        return runtime_dispatch(command)
+    session = app.components.session
+    dispatch = getattr(session, "dispatch_command", None)
+    if callable(dispatch):
+        return dispatch(command)
+    rig = getattr(session, "rig", None)
+    if rig is None:
+        raise RuntimeError("Collection app has no rig for command dispatch.")
+    return rig.send_commands(command)
 
 
 @dataclass
@@ -3546,6 +3590,8 @@ def _start_recovery_plan(
     control_mode: str,
     ramp_sec: float,
 ) -> tuple[RecoveryPlan | None, TeleopCommand | None, bool]:
+    if control_mode != "absolute":
+        raise ValueError("delta_clutch has been hard-archived; recovery only supports 'absolute'.")
     _seed_dual_arm_retargeter_from_backends(app)
     fixed_arm_retargeters = getattr(app, "fixed_arm_retargeters", {}) or {}
     jitter_arm_retargeters = getattr(app, "jitter_arm_retargeters", {}) or {}
@@ -3554,16 +3600,6 @@ def _start_recovery_plan(
         for side in app.active_sides
         if side not in fixed_arm_retargeters and side not in jitter_arm_retargeters
     )
-
-    if control_mode == "delta_clutch":
-        for side in moving_sides:
-            app.pose_retargeters[side].reanchor_to_current_input(
-                observation,
-                app.calibration,
-                robot_pose_desk=_backend_tcp_pose_desk(app, side=side),
-            )
-        _seed_dual_arm_retargeter_from_backends(app)
-        return None, app.components.session.build_command(observation), True
 
     if app.dual_arm_retargeter is not None:
         context = app.dual_arm_retargeter.build_target_context(
@@ -3727,7 +3763,7 @@ def _drive_recovery_step(
     if active_command is not None:
         if app.components.session.rig is None:
             raise RuntimeError("Recovery requires an active rig.")
-        app.components.session.rig.send_commands(active_command)
+        _dispatch_runtime_command(app, active_command)
 
     if recovery_done:
         app.components.session.finish_recovery("recovery completed")
@@ -4045,23 +4081,15 @@ def _sync_teleop_home_after_return(app: CollectApp, *, now: float) -> None:
             continue
         try:
             robot_pose_desk = _backend_tcp_pose_desk(app, side=side)
-            control_mode = str(getattr(retargeter.config, "control_mode", ""))
-            if control_mode == "absolute":
-                channel = observation.get_channel(retargeter.config.input_channel_name)
-                if channel is None or not channel.valid:
-                    raise RuntimeError(
-                        f"missing valid '{retargeter.config.input_channel_name}' channel"
-                    )
-                retargeter.set_home_anchors(
-                    human_pose_desk=_channel_pose_in_desk(channel, app.calibration),
-                    robot_pose_desk=robot_pose_desk,
+            channel = observation.get_channel(retargeter.config.input_channel_name)
+            if channel is None or not channel.valid:
+                raise RuntimeError(
+                    f"missing valid '{retargeter.config.input_channel_name}' channel"
                 )
-            else:
-                retargeter.reanchor_to_current_input(
-                    observation,
-                    app.calibration,
-                    robot_pose_desk=robot_pose_desk,
-                )
+            retargeter.set_home_anchors(
+                human_pose_desk=_channel_pose_in_desk(channel, app.calibration),
+                robot_pose_desk=robot_pose_desk,
+            )
         except Exception as exc:
             _log("ReturnHome", f"{side} teleop resync skipped: {exc}")
     for side in app.fixed_arm_retargeters:
@@ -4142,7 +4170,7 @@ def _advance_return_home(
     hand_command = _build_runtime_hand_command_from_sources(app, now=now)
     if hand_command is not None:
         command = merge_teleop_commands((command, hand_command))
-    app.components.session.rig.send_commands(command)
+    _dispatch_runtime_command(app, command)
 
     errors: dict[str, float] = {}
     for side, target in plan.target_qpos_by_side.items():
@@ -4972,7 +5000,7 @@ def _advance_unrecorded_replay_run(
         )
         if command.commands:
             _assert_replay_qpos_init_within_180_deg(app, run.startup_target_qpos_by_side)
-            app.components.session.rig.send_commands(command)
+            _dispatch_runtime_command(app, command)
         if _qpos_targets_reached(app, run.startup_target_qpos_by_side):
             _restore_replay_arm_speed_override(app, run.original_max_angvel_by_side)
             app.control_state.active_unrecorded_replay_run = None
@@ -5059,7 +5087,7 @@ def _advance_unrecorded_replay_run(
         },
     )
     if command.commands:
-        app.components.session.rig.send_commands(command)
+        _dispatch_runtime_command(app, command)
     run.last_action = deployment_action.vector.astype(np.float32, copy=True)
     return False
 
@@ -5143,7 +5171,7 @@ def _advance_replay_episode(
         },
     )
     if command.commands:
-        app.components.session.rig.send_commands(command)
+        _dispatch_runtime_command(app, command)
     run.last_action = deployment_action.vector.astype(np.float32, copy=True)
     control_hz = (
         float(args.hz)
@@ -5285,7 +5313,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     )
     vive_source = None if replay_groups else _build_vive_source(args, active_sides)
     keyboard_source = KeyboardButtonSource(name="collection_clutch")
-    default_clutch_pressed = args.control_mode == "delta_clutch"
+    default_clutch_pressed = False
     for side in ("left", "right"):
         keyboard_source.set_button(
             CollectionTopology.for_active_sides((side,)).clutch_button_channel(side),
@@ -5506,6 +5534,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
             policy_io_layout=policy_io_resolution.layout,
             policy_io_layout_provenance=policy_io_resolution.provenance,
             strict_v22_policy_io=bool(policy_io_resolution.layout is not None),
+            pose_frame_contract=args.pose_frame_contract,
         )
     )
     control_state = CollectControlState(

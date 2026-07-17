@@ -15,6 +15,11 @@
 
 export LEFT_ARM_IP="${LEFT_ARM_IP:-192.168.101.21}"
 export RIGHT_ARM_IP="${RIGHT_ARM_IP:-192.168.1.20}"
+# 防止 --dataset-root "$DATASET_BASE" 被展开为空字符串；可在source前覆盖到独立数据盘。
+export DATASET_BASE="${DATASET_BASE:-datasets}"
+# 触觉读取子进程CPU亲和性可在source本文件之前覆盖；默认值保持原4核行为。
+# 例如只使用2核：export DMTAC_TACTILE_WORKER_CPUS=12,13
+export DMTAC_TACTILE_WORKER_CPUS="${DMTAC_TACTILE_WORKER_CPUS:-12,13,14,15}"
 
 COMMON_REAL_TELEOP_ARGS=(
   --active-sides both
@@ -23,10 +28,29 @@ COMMON_REAL_TELEOP_ARGS=(
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json
   --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json
   --gui
-  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json
   --hand-backend dmtac-gripper
   --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
   --q6-hold-recalibration-gesture
+  --no-episode-recording
+  --arm-io-threads 4
+)
+
+# 双臂最小设备遥操：保留当前 DMTAC_M 工具/TCP、碰撞场景及最新控制参数，
+# 只是不连接相机、Q6、DMTAC 夹爪/触觉，也不启动正式数据采集。
+# 与最新位控参数组组合使用；不要再展开 DATASET_COMMON_ARGS、DMTAC_CAPTURE_*
+# 或 DMTAC_A/B_ARGS。
+NO_GRIPPER_COMMON_ARGS=(
+  --active-sides both
+  --right-arm-ip "$RIGHT_ARM_IP"
+  --left-arm-ip "$LEFT_ARM_IP"
+  --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json
+  --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json
+  --gui
+  --hand-backend none
+  --no-q6-default-config
+  --no-dmtac-default-config
+  --no-camera
+  --no-collection
   --no-episode-recording
   --arm-io-threads 4
 )
@@ -36,7 +60,6 @@ RIGHT_ONLY_COMMON_ARGS=(
   --right-arm-ip "$RIGHT_ARM_IP"
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json
   --gui
-  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json
   --hand-backend dmtac-gripper
   --q6-hold-recalibration-gesture
   --no-episode-recording
@@ -49,7 +72,7 @@ DMTAC_CAPTURE_COMMON_ARGS=(
   --dmtac-tactile-compute-profile requested
   --dmtac-tactile-read-hz 15
   --dmtac-tactile-process-read
-  --dmtac-tactile-worker-cpus 12,13,14,15
+  --dmtac-tactile-worker-cpus "$DMTAC_TACTILE_WORKER_CPUS"
   --dmtac-tactile-worker-nice 15
   --dmtac-tactile-worker-queue-size 4
   --dmtac-tactile-parallel-read
@@ -66,6 +89,16 @@ DMTAC_B_ARGS=(
   --dmtac-tactile-no-global-read-lock
 )
 
+# CPU亲和性profile放在DMTAC_CAPTURE_*和DMTAC_A/B_ARGS之后展开，利用argparse
+# 的最后值覆盖规则。2核profile释放逻辑CPU14-15给其他进程/系统任务。
+DMTAC_TACTILE_WORKER_2CPU_ARGS=(
+  --dmtac-tactile-worker-cpus 12,13
+)
+
+DMTAC_TACTILE_WORKER_4CPU_ARGS=(
+  --dmtac-tactile-worker-cpus 12,13,14,15
+)
+
 # 使用全串行方案时，以此数组替换 DMTAC_CAPTURE_COMMON_ARGS；避免 parallel/sequential 同传。
 DMTAC_CAPTURE_SEQUENTIAL_ARGS=(
   --dmtac-with-tactile
@@ -73,7 +106,7 @@ DMTAC_CAPTURE_SEQUENTIAL_ARGS=(
   --dmtac-tactile-compute-profile requested
   --dmtac-tactile-read-hz 15
   --dmtac-tactile-process-read
-  --dmtac-tactile-worker-cpus 12,13,14,15
+  --dmtac-tactile-worker-cpus "$DMTAC_TACTILE_WORKER_CPUS"
   --dmtac-tactile-worker-nice 15
   --dmtac-tactile-worker-queue-size 4
   --dmtac-tactile-sequential-read
@@ -110,8 +143,8 @@ POSITION_CONTROL_ARGS=(
   --position-reference-max-age-sec 0.2
   --arm-control-hz 120
   --arm-canfd-follow
-  --position-post-ik-qpos-smoothing-alpha 0.18
-  --position-post-ik-qpos-smoothing-fast-alpha 0.7
+  --position-post-ik-qpos-smoothing-alpha 0.14
+  --position-post-ik-qpos-smoothing-fast-alpha 0.45
   --position-post-ik-qpos-smoothing-adaptive
   --arm-follow-qpos-alpha 0.9
   --arm-canfd-trajectory-mode 0
@@ -128,6 +161,7 @@ POSITION_CONTROL_ARGS=(
 # 并通过position error反馈继续收敛到静止qref，避免“目标停止后停在远处”。
 POSITION_ACCELERATION_LIMITED_ARGS=(
   --position-command-planner acceleration_limited
+  --position-target-velocity-filter-tau-sec 0.03
   --arm-max-angvel 0.7,0.7,0.9,1.5,1.5,2.0
   --position-max-acceleration-rad-s2 7,7,9,15,15,20
   --position-velocity-ramp-sec 0.10
@@ -136,33 +170,109 @@ POSITION_ACCELERATION_LIMITED_ARGS=(
 
 # 全流程 8× 位置跟踪上界测试（仅 position mode）。
 # 固定 IK 为 rm65_ik_tuning.json 的 orientation_priority，即位置/旋转=1.0/1.0；
-# 维持当前的一次 IK solve，避免与“放宽限速”这个变量混在一起。
+# 位控使用至少/至多2次 IK solve，并采用 Pink damping=0.03。
 #
-# 重要前置条件：先人工确认 robot_motion/configs/joint_velocity_limits.json 的
-# profiles.rm65.max_velocity_deg_s 已临时设为
-# [321, 321, 413, 688, 688, 917]。该 profile 仍是 qref final step cap 的一部分；
-# 未满足此前置条件时，下面的 --arm-max-angvel 无法使 qref 真正达到 8×。
-# 这是共享 profile，只能在专门的受控真机试验窗口临时修改，试验后恢复。
+# qref final cap 使用独立 position-only profile；共享 rm65 profile 保持不变。
+# 2x/4x/8x profile 都仍与 --arm-max-angvel 逐关节取最小值。
 #
 # 四个放宽点：candidate-local clip、final qref step、120Hz planner V、120Hz planner A。
 # 另在120Hz planner增加独立0.675°单次proposal envelope；它不降低持续V上限。
 # 该envelope位于0.9 final EMA之前，因此正常跟踪时实际qcmd单步最大约0.6075°。
 # 保留 0.10s horizon、0.9 final EMA、碰撞/关节/endpoint braking safety envelope；
-# 不传 force/impedance 参数，position-only 参数在 force mode 会被入口拒绝。
+# 不传 force/impedance 参数；目标速度低通仅由 acceleration-limited 位控 planner 消费，
+# force/impedance 链路不会读取或应用该滤波。
 POSITION_ACCELERATION_LIMITED_8X_1X1_ARGS=(
   --position-command-planner acceleration_limited
-  --ik-tuning-json teleop_runtime/configs/rm65_ik_tuning.json
-  --position-ik-solve-max-iterations 1
+  --position-target-velocity-filter-tau-sec 0.03
+  --ik-tuning-json robot_motion/configs/rm65_ik_tuning.json
+  --position-ik-solve-min-iterations 2
+  --position-ik-solve-max-iterations 2
+  --position-ik-damping 0.03
   --position-ik-local-step-clip-scale 8
+  --position-joint-velocity-limit-profile rm65_position_8x
   --arm-max-angvel 5.6,5.6,7.2,12,12,16.0
   --position-max-acceleration-rad-s2 56,56,72,120,120,160
   --position-max-command-step-deg 0.675
   --position-velocity-ramp-sec 0.10
-  --position-post-ik-qpos-smoothing-alpha 0.17
-  --position-post-ik-qpos-smoothing-fast-alpha 0.50
+  --position-post-ik-qpos-smoothing-alpha 0.14
+  --position-post-ik-qpos-smoothing-fast-alpha 0.45
   --position-post-ik-qpos-smoothing-adaptive
   --arm-follow-qpos-alpha 0.9
   --position-degraded-speed-scale 0.50
+)
+
+# 最新离线 A/B 推荐的 position-only 组合。共享 IK JSON 不变，因此力控仍使用其原始设置：
+# - position/orientation = 1.0/0.5；
+# - 每帧固定至少/至多2次局部solve；时间预算只约束未来把max提高到2以上后的附加迭代；
+# - INACTIVE进入速度/窗口跨度阈值收紧为默认值的0.5倍；dwell与退出阈值不变。
+POSITION_ACCELERATION_LIMITED_8X_1X05_ADAPT2_TIGHT05_ARGS=(
+  --position-command-planner acceleration_limited
+  --position-target-velocity-filter-tau-sec 0.03
+  --ik-tuning-json robot_motion/configs/rm65_ik_tuning.json
+  --position-ik-orientation-weight 0.5
+  --position-ik-solve-min-iterations 2
+  --position-ik-solve-max-iterations 2
+  --position-ik-damping 0.03
+  --position-ik-adaptive-iterations
+  --position-ik-iteration-reserve-ms 5
+  --position-inactive-enter-threshold-scale 0.5
+  --position-ik-local-step-clip-scale 8
+  --position-joint-velocity-limit-profile rm65_position_2x
+  --arm-max-angvel 5.6,5.6,7.2,12,12,16.0
+  --position-max-acceleration-rad-s2 56,56,72,120,120,160
+  --position-max-command-step-deg 0.675
+  --position-velocity-ramp-sec 0.10
+  --position-post-ik-qpos-smoothing-alpha 0.14
+  --position-post-ik-qpos-smoothing-fast-alpha 0.45
+  --position-post-ik-qpos-smoothing-adaptive
+  --arm-follow-qpos-alpha 0.9
+  --position-degraded-speed-scale 0.50
+)
+
+# 位控正式数采的进程隔离数据面。远端 Ryzen 9 9950X 的逻辑 CPU 0-15
+# 分别对应16个物理核心；推荐最终命令用 taskset -c 0-7 约束遥操主进程，
+# 数采子进程固定8-11，现有DMTAC读取子进程固定12-15，避免三者共享物理核心。
+# auto 在位控也会解析为process；这里显式写出便于运行记录与回退。
+# writer-workers/storage-queue属于旧thread路径，process模式不依赖它们。
+POSITION_COLLECTION_PROCESS_ARGS=(
+  --collection-worker-mode process
+  --collection-process-queue-size 4
+  --collection-process-shared-slots 4
+  --collection-process-extra-array-mb 8
+  --collection-worker-cpus 8,9,10,11
+  --collection-worker-nice 5
+)
+
+# 在完整现有1.0/0.5位控配置之后展开：保持min=2，允许在帧预算内最多4次。
+POSITION_IK_1X05_MAX4_ARGS=(
+  --position-ik-orientation-weight 0.5
+  --position-ik-solve-min-iterations 2
+  --position-ik-solve-max-iterations 4
+  --position-ik-damping 0.03
+  --position-ik-adaptive-iterations
+  --position-ik-iteration-reserve-ms 5
+)
+
+# 与上组仅旋转权重不同，用于严格A/B；位置权重仍固定1.0。
+POSITION_IK_1X035_MAX4_ARGS=(
+  --position-ik-orientation-weight 0.35
+  --position-ik-solve-min-iterations 2
+  --position-ik-solve-max-iterations 4
+  --position-ik-damping 0.03
+  --position-ik-adaptive-iterations
+  --position-ik-iteration-reserve-ms 5
+)
+
+# 只替换 60 Hz qref final execution-step profile 的逐级 A/B；其余参数保持不变。
+# 下一次真机从2x开始，确认后再用4x；当前离线数据不支持直接使用8x。
+POSITION_QREF_FINAL_CAP_2X_ARGS=(
+  --position-joint-velocity-limit-profile rm65_position_2x
+)
+POSITION_QREF_FINAL_CAP_4X_ARGS=(
+  --position-joint-velocity-limit-profile rm65_position_4x
+)
+POSITION_QREF_FINAL_CAP_8X_ARGS=(
+  --position-joint-velocity-limit-profile rm65_position_8x
 )
 
 # 历史15→45→150数据或显式对照实验使用；不再是默认位控分支。
@@ -216,6 +326,60 @@ CONTROL_DEBUG_FULL_ARGS=(
   --debug-timing-report-interval-sec 1.0
 )
 
+# 正式数采性能A/B。四档必须一次只运行一档，且按1→4逐级增加诊断负载。
+# 新参数均保留历史默认行为；只有下面显式profile会关闭episode重复sidecar或进行抽样。
+POSITION_COLLECTION_AB1_NO_DEBUG_ARGS=(
+  --no-debug-disk-write
+)
+
+POSITION_COLLECTION_AB2_SUMMARY_ARGS=(
+  --control-debug summary
+  --control-debug-root teleop_records/control_debug
+  --control-debug-queue-size 8192
+  --control-debug-flush-every 30
+  --no-control-debug-episode-sidecar
+  --no-debug-action
+  --no-debug-timing-auto-log
+)
+
+POSITION_COLLECTION_AB3_SESSION_FULL_ARGS=(
+  --control-debug full
+  --control-debug-root teleop_records/control_debug
+  --control-debug-queue-size 8192
+  --control-debug-flush-every 30
+  --no-control-debug-episode-sidecar
+  --no-debug-action
+  --no-debug-timing-auto-log
+)
+
+# 推荐的可长期复测诊断档：保留完整session qref/qcmd审计；action按正式数据频率15 Hz，
+# timing最多5 Hz且只把40 ms以上帧视为slow。状态/故障变化不受5 Hz限制。
+POSITION_COLLECTION_AB4_SAMPLED_FULL_ARGS=(
+  --control-debug full
+  --control-debug-root teleop_records/control_debug
+  --control-debug-queue-size 8192
+  --control-debug-flush-every 30
+  --no-control-debug-episode-sidecar
+  --debug-action
+  --debug-action-log-root teleop_records/action_debug
+  --debug-action-flush-every 30
+  --debug-action-queue-size 8192
+  --debug-action-sample-hz 15
+  --debug-timing-log
+  --debug-timing-log-sample-hz 5
+  --debug-timing-console
+  --debug-timing-ik
+  --debug-timing-threshold-sec 0.040
+  --debug-timing-report-interval-sec 1.0
+)
+
+# 一次性关闭所有 standalone debug 写盘。它覆盖 CONTROL_DEBUG_*、debug action/
+# timing/IK sidecar、legacy session JSONL、fix-arm pose snapshot 和 debug trajectory；
+# 不影响正式 LeRobot dataset。可将该数组放在命令参数的最后，便于临时关闭写盘。
+NO_DEBUG_DISK_WRITE_ARGS=(
+  --no-debug-disk-write
+)
+
 LEGACY_SESSION_DEBUG_ARGS=(
   --record
   --session-record-root teleop_records/debug_sessions
@@ -261,4 +425,4 @@ DMTAC_DISTRIBUTED_FORCE_ARGS=(
 
 DMTAC_FLAT_VECTOR_ARGS=(--dmtac-tactile-flat-vector)
 
-echo "DMTAC 参数已加载；尚未执行任何遥操作命令。"
+echo "遥操作参数已加载（含 DMTAC 与无夹爪版本）；尚未执行任何遥操作命令。"

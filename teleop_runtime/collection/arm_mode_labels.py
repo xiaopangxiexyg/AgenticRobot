@@ -427,6 +427,66 @@ def build_arm_mode_metadata(
     }
 
 
+def build_operator_annotation_arm_mode_metadata(
+    *,
+    labels_by_side: Mapping[str, str],
+    source_by_side: Mapping[str, str] | None = None,
+    changed_at_by_side: Mapping[str, float] | None = None,
+    sequence: int = 0,
+) -> dict[str, Any]:
+    """Build existing arm-mode columns for an arm-free annotation source.
+
+    The wire values remain compatible with v2.3 readers, while the JSON detail
+    makes it explicit that no arm controller or arrival audit was involved.
+    """
+
+    sources = {} if source_by_side is None else dict(source_by_side)
+    changed = {} if changed_at_by_side is None else dict(changed_at_by_side)
+    sides: dict[str, dict[str, Any]] = {}
+    for side in ("left", "right"):
+        mode = str(labels_by_side.get(side, "teleop"))
+        if mode not in ARM_MODE_IDS:
+            raise ValueError(f"unsupported operator arm-mode annotation {mode!r}")
+        tags = ()
+        if mode == "fixed_hold":
+            tags = ("fix_arm",)
+        elif mode == "init_pose":
+            tags = ("init_arm",)
+        sides[side] = _side_payload(
+            mode=mode,
+            source="umi_operator_annotation",
+            tags=tags,
+            detail={
+                "active_side": True,
+                "annotation_only": True,
+                "control_effect": False,
+                "embodiment_has_arm": False,
+                "input_source": str(sources.get(side, "default")),
+                "effector_scope": "tool_tcp_and_gripper",
+                "changed_at": _finite_float(changed.get(side)),
+                "event_sequence": int(sequence),
+            },
+            audit=_default_init_audit(
+                phase="not_active",
+                valid=False,
+                reason="annotation_only_no_arm",
+            ),
+        )
+    active_special_tasks = sorted(
+        {
+            tag
+            for side_payload in sides.values()
+            for tag in side_payload.get("tags", ())
+        }
+    )
+    return {
+        "schema": ARM_MODE_SCHEMA,
+        "available": True,
+        "sides": sides,
+        "active_special_tasks": active_special_tasks,
+    }
+
+
 def normalize_arm_mode_metadata(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         raw_sides = value.get("sides")

@@ -11,6 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from .pose_chunk import POSE_ACTION_CHUNK_METADATA_KEY, PoseActionChunkContract
+from .pose_training import (
+    POSE_TRAINING_DATA_METADATA_KEY,
+    PoseTrainingDataContract,
+)
 from .v22 import (
     DEXTELEOP_DATASET_SCHEMA_V22,
     DatasetLayoutBindingError,
@@ -45,6 +50,14 @@ def _mapping(value: Any, *, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise DatasetLayoutBindingError(f"{name} must be a mapping.")
     return value
+
+
+def _is_canonical_sha256(value: str) -> bool:
+    prefix = "sha256:"
+    if not value.startswith(prefix):
+        return False
+    digest = value[len(prefix) :]
+    return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
 
 
 @dataclass(frozen=True)
@@ -235,6 +248,9 @@ class PolicyArtifactContract:
     dataset_schema: str = DEXTELEOP_DATASET_SCHEMA_V22
     deploy_schema_version: str = DEPLOY_SCHEMA_V2
     camera_input: PolicyCameraInputContract | Mapping[str, Any] | None = None
+    pose_action_chunk: PoseActionChunkContract | Mapping[str, Any] | None = None
+    pose_training_data: PoseTrainingDataContract | Mapping[str, Any] | None = None
+    pose_frame_contract_hashes: tuple[str, ...] = ()
     state_augmentation: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -264,6 +280,56 @@ class PolicyArtifactContract:
             raise TypeError(
                 "camera_input must be a PolicyCameraInputContract, mapping, or None."
             )
+        pose_action_chunk = self.pose_action_chunk
+        if isinstance(pose_action_chunk, Mapping):
+            pose_action_chunk = PoseActionChunkContract.from_dict(pose_action_chunk)
+        elif pose_action_chunk is not None and not isinstance(
+            pose_action_chunk, PoseActionChunkContract
+        ):
+            raise TypeError(
+                "pose_action_chunk must be a PoseActionChunkContract, mapping, or None."
+            )
+        pose_training_data = self.pose_training_data
+        if isinstance(pose_training_data, Mapping):
+            pose_training_data = PoseTrainingDataContract.from_dict(
+                pose_training_data
+            )
+        elif pose_training_data is not None and not isinstance(
+            pose_training_data, PoseTrainingDataContract
+        ):
+            raise TypeError(
+                "pose_training_data must be a PoseTrainingDataContract, mapping, or None."
+            )
+        if pose_action_chunk is not None and dataset_schema != DEXTELEOP_DATASET_SCHEMA_V23:
+            raise DatasetLayoutBindingError(
+                "A pose action chunk contract requires dexteleop_dataset_v2.3 semantics."
+            )
+        if pose_training_data is not None and pose_action_chunk is None:
+            raise DatasetLayoutBindingError(
+                "pose_training_data_contract requires a pose_action_chunk_contract."
+            )
+        if pose_action_chunk is not None and pose_training_data is None:
+            raise DatasetLayoutBindingError(
+                "A v2.3 pose action chunk artifact must explicitly distinguish native v2.3 "
+                "training from v2.2 raw identity compatibility with "
+                "pose_training_data_contract."
+            )
+        pose_frame_hashes = tuple(
+            dict.fromkeys(str(value).strip() for value in self.pose_frame_contract_hashes)
+        )
+        if any(not _is_canonical_sha256(value) for value in pose_frame_hashes):
+            raise DatasetLayoutBindingError(
+                "pose_frame_contract_hashes must contain canonical sha256 hashes."
+            )
+        if pose_frame_hashes and dataset_schema != DEXTELEOP_DATASET_SCHEMA_V23:
+            raise DatasetLayoutBindingError(
+                "pose_frame_contract_hashes require dexteleop_dataset_v2.3 semantics."
+            )
+        if pose_action_chunk is not None and not pose_frame_hashes:
+            raise DatasetLayoutBindingError(
+                "A v2.3 pose action chunk artifact must bind at least one "
+                "pose_frame_contract_hash."
+            )
         for name in ("state_key", "state_discrete_key", "action_key", "action_discrete_key"):
             value = str(getattr(self, name)).strip()
             if not value:
@@ -280,6 +346,9 @@ class PolicyArtifactContract:
         object.__setattr__(self, "dataset_schema", dataset_schema)
         object.__setattr__(self, "deploy_schema_version", DEPLOY_SCHEMA_V2)
         object.__setattr__(self, "camera_input", camera_input)
+        object.__setattr__(self, "pose_action_chunk", pose_action_chunk)
+        object.__setattr__(self, "pose_training_data", pose_training_data)
+        object.__setattr__(self, "pose_frame_contract_hashes", pose_frame_hashes)
         object.__setattr__(self, "state_augmentation", dict(self.state_augmentation))
         object.__setattr__(self, "metadata", dict(self.metadata))
 
@@ -316,7 +385,7 @@ class PolicyArtifactContract:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema": POLICY_ARTIFACT_SCHEMA_V1,
             "dataset_schema": self.dataset_schema,
             "deploy_schema_version": DEPLOY_SCHEMA_V2,
@@ -332,6 +401,13 @@ class PolicyArtifactContract:
             "outputs": {field.key: field.to_dict() for field in self.outputs},
             "metadata": dict(self.metadata),
         }
+        if self.pose_action_chunk is not None:
+            payload[POSE_ACTION_CHUNK_METADATA_KEY] = self.pose_action_chunk.to_dict()
+            payload["pose_action_chunk_contract_hash"] = self.pose_action_chunk.contract_hash
+            assert self.pose_training_data is not None
+            payload[POSE_TRAINING_DATA_METADATA_KEY] = self.pose_training_data.to_dict()
+            payload["pose_frame_contract_hashes"] = list(self.pose_frame_contract_hashes)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "PolicyArtifactContract":
@@ -390,6 +466,40 @@ class PolicyArtifactContract:
         source_datasets = payload.get("source_datasets", ())
         if not isinstance(source_datasets, Sequence) or isinstance(source_datasets, (str, bytes)):
             raise DatasetLayoutBindingError("source_datasets must be a sequence.")
+        raw_pose_action_chunk = payload.get(POSE_ACTION_CHUNK_METADATA_KEY)
+        pose_action_chunk = (
+            None
+            if raw_pose_action_chunk is None
+            else PoseActionChunkContract.from_dict(
+                _mapping(raw_pose_action_chunk, name=POSE_ACTION_CHUNK_METADATA_KEY)
+            )
+        )
+        raw_pose_training_data = payload.get(POSE_TRAINING_DATA_METADATA_KEY)
+        pose_training_data = (
+            None
+            if raw_pose_training_data is None
+            else PoseTrainingDataContract.from_dict(
+                _mapping(
+                    raw_pose_training_data,
+                    name=POSE_TRAINING_DATA_METADATA_KEY,
+                )
+            )
+        )
+        declared_pose_chunk_hash = payload.get("pose_action_chunk_contract_hash")
+        if pose_action_chunk is None:
+            if declared_pose_chunk_hash is not None:
+                raise DatasetLayoutBindingError(
+                    "Policy artifact declares a pose action chunk hash without its contract."
+                )
+        elif str(declared_pose_chunk_hash or "") != pose_action_chunk.contract_hash:
+            raise DatasetLayoutBindingError(
+                "Policy artifact pose_action_chunk_contract_hash does not match its contract."
+            )
+        raw_pose_frame_hashes = payload.get("pose_frame_contract_hashes", ())
+        if not isinstance(raw_pose_frame_hashes, Sequence) or isinstance(
+            raw_pose_frame_hashes, (str, bytes)
+        ):
+            raise DatasetLayoutBindingError("pose_frame_contract_hashes must be a sequence.")
         return cls(
             policy_io_layout=layout,
             model_id=payload.get("model_id"),
@@ -409,6 +519,11 @@ class PolicyArtifactContract:
                 else PolicyCameraInputContract.from_dict(
                     _mapping(payload.get("camera_input"), name="policy camera_input")
                 )
+            ),
+            pose_action_chunk=pose_action_chunk,
+            pose_training_data=pose_training_data,
+            pose_frame_contract_hashes=tuple(
+                str(value) for value in raw_pose_frame_hashes
             ),
             state_augmentation=dict(_mapping(payload.get("state_augmentation", {}), name="state_augmentation")),
             metadata=dict(_mapping(payload.get("metadata", {}), name="policy artifact metadata")),

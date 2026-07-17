@@ -68,11 +68,19 @@ def debug_timing_modules(args: argparse.Namespace) -> DebugTimingModules:
     timing_rm65 = bool(getattr(args, "debug_timing_rm65", False))
     timing_ik = bool(getattr(args, "debug_timing_ik", False))
     auto_log = bool(getattr(args, "debug_timing_auto_log", True))
+    disk_write_disabled = bool(getattr(args, "no_debug_disk_write", False))
     auto_light_log = auto_log and (timing_rm65 or timing_ik)
     return DebugTimingModules(
         legacy_all=legacy_all,
         console=legacy_all or bool(getattr(args, "debug_timing_console", False)),
-        light_log=legacy_all or bool(getattr(args, "debug_timing_log", False)) or auto_light_log,
+        light_log=(
+            not disk_write_disabled
+            and (
+                legacy_all
+                or bool(getattr(args, "debug_timing_log", False))
+                or auto_light_log
+            )
+        ),
         rm65_backend=legacy_all or timing_rm65,
         ik_profile=legacy_all
         or timing_ik
@@ -93,9 +101,18 @@ def debug_timing_metadata(args: argparse.Namespace) -> dict[str, object]:
         "rm65_backend_debug_timing": bool(modules.rm65_backend),
         "debug_timing_ik_profile": bool(modules.ik_profile),
         "debug_timing_watchdog": bool(modules.watchdog),
+        "debug_disk_write_disabled": bool(
+            getattr(args, "no_debug_disk_write", False)
+        ),
         "debug_timing_threshold_sec": float(getattr(args, "debug_timing_threshold_sec", 0.025)),
         "debug_timing_report_interval_sec": float(
             getattr(args, "debug_timing_report_interval_sec", 1.0)
+        ),
+        "debug_timing_log_sample_hz": float(
+            getattr(args, "debug_timing_log_sample_hz", 0.0)
+        ),
+        "debug_action_sample_hz": float(
+            getattr(args, "debug_action_sample_hz", 0.0)
         ),
         "control_debug": (
             {

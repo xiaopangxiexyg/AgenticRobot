@@ -21,7 +21,7 @@ _HTML_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VIVE -> RM65 标定</title>
+<title>__PAGE_TITLE__</title>
 <style>
 :root {
   color-scheme: light;
@@ -712,7 +712,7 @@ button.stop-ready {
 </head>
 <body>
 <header>
-  <h1>VIVE -> RM65 标定</h1>
+  <h1>__PAGE_TITLE__</h1>
 </header>
 <main>
   <section class="panel">
@@ -4558,6 +4558,11 @@ def _render_initial_html(snapshot: dict[str, Any]) -> str:
     if diagnostic_level not in {"capturing", "error"}:
         diagnostic_level = ""
     replacements = {
+        "__PAGE_TITLE__": (
+            "DexTeleop UMI 数采"
+            if str(snapshot.get("ui_mode")) == "umi_collection"
+            else "VIVE -> RM65 标定"
+        ),
         "__INITIAL_STAGE__": _label_stage(snapshot.get("stage")),
         "__INITIAL_SELECTED_SIDE__": _label_side(snapshot.get("selected_side")),
         "__INITIAL_FRAME_VIZ_MODE__": _label_frame_viz(snapshot.get("frame_viz_mode")),

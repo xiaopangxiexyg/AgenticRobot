@@ -23,7 +23,7 @@
 - `InspireTacHandBackend`
 - `DMTacGripperBackend`
 - `BimanualRig`
-- 独立数据采集 CLI runner：
+- headless/兼容数据采集 CLI runner（正式 GUI 数采主线不再从这里扩展第二套控制实现）：
   `python -m teleop_runtime.collection`
   （兼容旧入口 `python -m teleop_runtime.collection.run_collect`）
 - 数据采集使用说明：
@@ -51,7 +51,9 @@
 
 1. 先用 `connect_hardware=False` 做 dry-run
 2. 先完成启动标定和虚拟验收，再接真硬件
-3. 真机遥操作优先走 `teleop_runtime.debug.run_vive_rm65_real_teleop`
+3. 真机遥操作和正式 GUI 数采走
+   `teleop_runtime.debug.run_vive_rm65_real_teleop --gui`；
+   `teleop_runtime.collection` 仅作为 headless/兼容入口保留
 
 ## 目录
 
@@ -316,7 +318,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 
 保存内容包括：
 
-- 当前 `virtual desk` 写回后的 `T_W_O / T_O_D`
+- 当前 `vive_retarget_frame` 写回后的 `T_W_O / T_O_VR`（旧键 `T_O_D` 兼容保留）
 - `virtual_desk_post_yaw_deg`
 - 左右 wrist tracker 的 `coarse_offset / fine_tune_rpy_deg / final_offset`
 - 不包含 session `home capture`
@@ -368,7 +370,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 - 已有可用 calibration profile 后的快速虚拟跑法
 - 每次启动都重新做 session `home anchor`
-- 简单验证 `absolute / delta_clutch`
+- 简单验证 `absolute`
 - 非完整标定场景下的 home-only 调试
 
 它仍然有价值，但它不替代完整标定流程。
@@ -397,26 +399,26 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 
 这超出了当前 calibration app 的范围。需要重新确认：
 
-- `arms[*].T_D_B`
+- `arms[*].T_VR_B`（旧键 `T_D_B`）
 - workspace box
-- 双臂基距和 desk 定义
+- 双臂基距和 `vive_retarget_frame` 定义
 
 ## 当前代码里标定字段的实际含义
 
 `TeleopCalibration` 当前最关键的字段：
 
 - `T_W_O`
-- `T_O_D`
+- `T_O_VR`（旧键 `T_O_D`）
 - `tracker_offsets[*]`
-- `arms[*].T_D_B`
+- `arms[*].T_VR_B`（旧键 `T_D_B`）
 
 对于当前 virtual-desk 标定，保存时采用的是：
 
 - `T_W_O = I`
-- `T_O_D = T_W_V`
+- `T_O_VR = T_W_V`
 
-也就是把 `virtual desk` 直接写入 `world -> desk` 链路里。  
-这让现有 retargeter 不需要改接口，就能直接把 `vive_world` 映射到当前 session 的 `virtual desk`。
+也就是把 virtual-desk 标定结果写入 `world -> vive_retarget_frame` 链路。这个历史
+retarget frame 与 v2.3 dataset contract 的 canonical `desk` 无关。
 
 如果在验证阶段额外做了 `XY` 符号翻转：
 
@@ -717,20 +719,7 @@ thumb_1, thumb_2, thumb_3, thumb_4,
 palm
 ```
 
-如果你想用终端键盘做 delta clutch：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --control-mode delta_clutch \
-  --keyboard-clutch
-```
-
-键位：
-
-- `z`: 左臂 clutch 开关
-- `x`: 右臂 clutch 开关
-- `c`: 左右同时切换
-- `r`: 全部释放
+`delta_clutch` 已硬封存，active 入口不再接受该参数；历史行为仅保留在版本历史中。
 - `t`: 开始一个 episode 轨迹录制
 - `s`: 结束当前 episode 轨迹录制
 - `q`: 退出
@@ -759,9 +748,9 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 `PoseToArmRetargeter` 当前支持：
 
 - `absolute`
-- `delta_clutch`
+- `delta_clutch`（已硬封存，仅作历史说明）
 
-默认是 `delta_clutch`。注意当前实现里，第一次进入 `delta_clutch` 模式时必须先按下 clutch 建立 anchor，否则 retargeter 会返回空命令，这是刻意的安全行为，用来避免启动瞬间跳变。
+默认是 `absolute`。当前 active runtime 不再接受 `delta_clutch`。
 
 ## 录制与安全
 

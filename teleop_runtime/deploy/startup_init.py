@@ -8,6 +8,11 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from dataset_contracts.pose_frames import PoseFrameContractError
+from dataset_contracts.v23 import (
+    DEXTELEOP_DATASET_SCHEMA_V23,
+    resolve_v23_dataset_contract,
+)
 from robot_motion.deploy.actions import NormalizedAction
 from robot_motion.deploy.observation import DeploymentObservation
 from robot_motion.deploy.schema import (
@@ -90,10 +95,33 @@ def _load_dataset_init_action(args: Any) -> tuple[np.ndarray, str]:
         start_index=frame_index,
         end_index=frame_index + 1,
     )
+    dataset_info = metadata.get("dataset_info")
+    absolute_frame = "runtime_raw"
+    if (
+        isinstance(dataset_info, dict)
+        and str(dataset_info.get("dexteleop_dataset_schema") or "")
+        == DEXTELEOP_DATASET_SCHEMA_V23
+    ):
+        resolved = resolve_v23_dataset_contract(dataset_info)
+        for side in resolved.pose_frames.source.active_sides:
+            pose_slice = ACTION_ARM_POSE_SLICES[side]
+            try:
+                actions[0, pose_slice] = (
+                    resolved.pose_frames.storage_pose_vector_to_canonical_desk(
+                        actions[0, pose_slice], side=side
+                    )
+                )
+            except (PoseFrameContractError, ValueError) as exc:
+                raise ValueError(
+                    f"v2.3 startup init action for {side!r} cannot be converted "
+                    f"to canonical desk: {exc}"
+                ) from exc
+        absolute_frame = "canonical_desk"
     source = (
         f"dataset:{Path(path)}"
         f":episode={metadata.get('episode_index', getattr(args, 'init_episode', 0))}"
         f":frame={frame_index}"
+        f":policy_absolute_frame={absolute_frame}"
     )
     return actions[0].astype(np.float32, copy=True), source
 

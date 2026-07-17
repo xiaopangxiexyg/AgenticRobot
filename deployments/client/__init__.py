@@ -17,6 +17,7 @@ from .remote_policy import (
     RemotePolicyConfig,
     RemoteTransport,
 )
+from .policy import HoldPolicy, LoadedPolicy, load_policy
 from .runtime import (
     ActionPreparer,
     ClientRuntimeStepResult,
@@ -41,9 +42,12 @@ __all__ = [
     "RemoteModelPolicy",
     "RemotePolicyConfig",
     "RemoteTransport",
+    "HoldPolicy",
+    "LoadedPolicy",
     "ServerMetadataError",
     "UnifiedActionChunk",
     "validate_server_metadata",
     "deploy_contract_from_policy_artifact",
     "load_policy_artifact",
+    "load_policy",
 ]

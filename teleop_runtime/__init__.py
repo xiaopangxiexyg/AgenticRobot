@@ -13,10 +13,10 @@ from .backends import (
 from .calibration import (
     ArmCalibration,
     DeskFrameConfig,
+    ViveRetargetFrameConfig,
     HandCalibration,
     TeleopCalibration,
 )
-from .clutch import ClutchAnchor, ClutchState, DeltaClutchController
 from .diagnostics import (
     FaultEvent,
     FaultSeverity,
@@ -82,10 +82,8 @@ from .configs import (
 __all__ = [
     "ANNOTATED_DUAL_RM65_BASE_DISTANCE_M",
     "ArmCalibration",
-    "ClutchAnchor",
-    "ClutchState",
-    "DeltaClutchController",
     "DeskFrameConfig",
+    "ViveRetargetFrameConfig",
     "DMTacGripperBackend",
     "DMTacGripperBackendConfig",
     "DualArmCollisionAwareRetargeter",

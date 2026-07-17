@@ -255,24 +255,15 @@ class TeleopRecoveryTests(unittest.TestCase):
         target = retargeter._apply_absolute_mapping(human_home)
         np.testing.assert_allclose(target, robot_home, atol=1e-9)
 
-    def test_delta_clutch_reference_keeps_tracker_orientation_at_home(self) -> None:
-        retargeter = PoseToArmRetargeter(
-            PoseToArmRetargeterConfig(
-                side="left",
-                input_channel_name="left_wrist_pose",
-                control_mode="delta_clutch",
+    def test_delta_clutch_is_hard_archived(self) -> None:
+        with pytest.raises(ValueError, match="hard-archived"):
+            PoseToArmRetargeter(
+                PoseToArmRetargeterConfig(
+                    side="left",
+                    input_channel_name="left_wrist_pose",
+                    control_mode="delta_clutch",
+                )
             )
-        )
-        human_home = _pose(tx=0.12, yaw_deg=35.0)
-        robot_home = _pose(tx=-0.28, yaw_deg=-70.0)
-        retargeter.set_home_anchors(
-            human_pose_desk=human_home,
-            robot_pose_desk=robot_home,
-        )
-
-        reference = retargeter._apply_clutch_reference_mapping(human_home)
-        np.testing.assert_allclose(reference[:3, 3], robot_home[:3, 3], atol=1e-9)
-        np.testing.assert_allclose(reference[:3, :3], human_home[:3, :3], atol=1e-9)
 
     def test_inspire_hand_backend_clips_read_joint_pos_to_unit_range(self) -> None:
         class FakeHand:
@@ -435,7 +426,7 @@ class TeleopRecoveryTests(unittest.TestCase):
             atol=1e-6,
         )
 
-    def test_collect_recovery_driver_sends_delta_command_and_finishes(self) -> None:
+    def test_collect_recovery_driver_rejects_archived_delta_mode(self) -> None:
         sent_commands = []
 
         class FakeRig:
@@ -487,26 +478,14 @@ class TeleopRecoveryTests(unittest.TestCase):
         )
         args = SimpleNamespace(control_mode="delta_clutch", recovery_ramp_sec=1.0)
 
-        with patch(
-            "teleop_runtime.collection.run_collect._backend_tcp_pose_desk",
-            return_value=identity_pose(),
-        ), patch(
-            "teleop_runtime.collection.run_collect._seed_dual_arm_retargeter_from_backends",
-            return_value=None,
-        ):
-            next_plan = _drive_recovery_step(
+        with pytest.raises(ValueError, match="hard-archived"):
+            _drive_recovery_step(
                 app,
                 args,
                 result,
                 None,
                 now=1.0,
             )
-
-        self.assertIsNone(next_plan)
-        self.assertEqual(session.finished, ["recovery completed"])
-        self.assertEqual(len(sent_commands), 1)
-        self.assertIn("left_arm", sent_commands[0].commands)
-        self.assertEqual(len(pose_retargeter.reanchors), 1)
 
     def test_collect_recovery_driver_advances_absolute_ramp_and_finishes(self) -> None:
         sent_commands = []

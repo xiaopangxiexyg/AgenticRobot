@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from rm65_inspire_tac.ik_tuning import hard_branch_jump_exceeds
+from robot_motion.rm65.ik_tuning import hard_branch_jump_exceeds
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 
 

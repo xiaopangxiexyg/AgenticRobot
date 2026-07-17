@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from project_paths import teleop_records_root
-from rm65_inspire_tac.ik_tuning import weighted_joint_distance_score
+from robot_motion.rm65.ik_tuning import weighted_joint_distance_score
 
 from .recording import _to_serializable
 

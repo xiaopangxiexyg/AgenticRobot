@@ -91,3 +91,59 @@ def test_extracted_timing_recorder_selects_state_change_and_heartbeat(tmp_path) 
         )
     finally:
         recorder.stop(reason="test", now=2.0)
+
+
+def test_action_debug_sampling_gates_before_payload_construction(tmp_path) -> None:
+    recorder = ActionDebugLogRecorder(root_dir=tmp_path, sample_hz=10.0)
+    recorder.start(now=1.0)
+    try:
+        assert recorder.should_record_frame(now=1.0) is True
+        assert recorder.should_record_frame(now=1.05) is False
+        assert recorder.should_record_frame(now=1.10) is True
+    finally:
+        recorder.stop(reason="test", now=1.2)
+
+
+def test_timing_sampling_preserves_state_and_fault_transitions(tmp_path) -> None:
+    recorder = DebugTimingLogRecorder(
+        root_dir=tmp_path,
+        heartbeat_sec=1.0,
+        sample_hz=5.0,
+    )
+    recorder.start(now=1.0)
+    try:
+        state = SimpleNamespace(value="RUNNING")
+        assert recorder.select_frame_reason(
+            now=1.0,
+            elapsed_sec=0.1,
+            phases=(),
+            state=state,
+            fault_codes=(),
+            threshold_sec=0.04,
+        ) == "slow+state_change"
+        assert recorder.select_frame_reason(
+            now=1.05,
+            elapsed_sec=0.1,
+            phases=(),
+            state=state,
+            fault_codes=(),
+            threshold_sec=0.04,
+        ) is None
+        assert recorder.select_frame_reason(
+            now=1.21,
+            elapsed_sec=0.1,
+            phases=(),
+            state=state,
+            fault_codes=(),
+            threshold_sec=0.04,
+        ) == "slow"
+        assert recorder.select_frame_reason(
+            now=1.22,
+            elapsed_sec=0.1,
+            phases=(),
+            state=state,
+            fault_codes=("fault",),
+            threshold_sec=0.04,
+        ) == "slow+fault_change"
+    finally:
+        recorder.stop(reason="test", now=1.3)

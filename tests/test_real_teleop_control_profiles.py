@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from robot_motion.rm65.ik_tuning import load_ik_tuning_config
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_LINEAR,
@@ -99,6 +100,47 @@ def test_real_teleop_velocity_planner_is_explicit_opt_in_with_point_one_second_r
     )
 
 
+def test_formal_collection_process_is_position_auto_only_with_thread_rollback() -> None:
+    impedance = _parse_real_teleop_args([])
+    assert impedance.collection_worker_mode == "auto"
+    assert impedance.collection_worker_mode_resolved == "thread"
+
+    position = _parse_real_teleop_args(
+        ["--arm-execution-profile", "position"]
+    )
+    assert position.collection_worker_mode_resolved == "process"
+    assert position.collection_process_queue_size == 4
+    assert position.collection_process_shared_slots == 4
+    assert position.collection_process_extra_array_mb == 8
+    assert position.collection_worker_nice == 5
+
+    rollback = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position",
+            "--collection-worker-mode",
+            "thread",
+        ]
+    )
+    assert rollback.collection_worker_mode_resolved == "thread"
+
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(["--collection-worker-mode", "process"])
+
+
+def test_dmtac_tactile_worker_cpu_affinity_accepts_two_core_profile() -> None:
+    args = _parse_real_teleop_args(
+        ["--dmtac-tactile-worker-cpus", "12,13"]
+    )
+
+    assert args.dmtac_tactile_worker_cpus == (12, 13)
+
+
+def test_dataset_root_rejects_explicit_empty_string() -> None:
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(["--dataset-root", ""])
+
+
 def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:
     with pytest.raises(SystemExit):
         _parse_real_teleop_args(
@@ -133,28 +175,56 @@ def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() 
 
 def test_real_teleop_position_ik_iteration_options_are_exposed_and_position_only() -> None:
     defaults = _parse_real_teleop_args([])
-    assert defaults.position_ik_solve_max_iterations == 1
+    assert defaults.position_ik_orientation_weight is None
+    assert defaults.position_ik_solve_max_iterations == 2
+    assert defaults.position_ik_solve_min_iterations == 2
+    assert defaults.position_ik_damping == pytest.approx(0.03)
     assert defaults.position_ik_adaptive_iterations is False
     assert defaults.position_ik_iteration_reserve_ms == pytest.approx(5.0)
     assert defaults.position_ik_local_step_clip_scale == pytest.approx(1.0)
+    assert defaults.position_joint_velocity_limit_profile == "rm65"
+    assert defaults.position_inactive_enter_threshold_scale == pytest.approx(1.0)
 
     tuned = _parse_real_teleop_args(
         [
             "--arm-execution-profile",
             "position",
+            "--position-ik-orientation-weight",
+            "0.5",
             "--position-ik-solve-max-iterations",
             "4",
+            "--position-ik-solve-min-iterations",
+            "3",
+            "--position-ik-damping",
+            "0.04",
             "--position-ik-adaptive-iterations",
             "--position-ik-iteration-reserve-ms",
             "6.5",
             "--position-ik-local-step-clip-scale",
             "2.5",
+            "--position-inactive-enter-threshold-scale",
+            "0.5",
+            "--position-joint-velocity-limit-profile",
+            "rm65_position_2x",
         ]
     )
+    assert tuned.position_ik_orientation_weight == pytest.approx(0.5)
     assert tuned.position_ik_solve_max_iterations == 4
+    assert tuned.position_ik_solve_min_iterations == 3
+    assert tuned.position_ik_damping == pytest.approx(0.04)
     assert tuned.position_ik_adaptive_iterations is True
     assert tuned.position_ik_iteration_reserve_ms == pytest.approx(6.5)
     assert tuned.position_ik_local_step_clip_scale == pytest.approx(2.5)
+    assert tuned.position_inactive_enter_threshold_scale == pytest.approx(0.5)
+    assert tuned.position_joint_velocity_limit_profile == "rm65_position_2x"
+    metadata = real_teleop._position_ik_iteration_metadata(tuned)
+    assert metadata["position_ik_orientation_weight"] == pytest.approx(0.5)
+    assert metadata["position_ik_solve_max_iterations"] == 4
+    assert metadata["position_ik_solve_min_iterations"] == 3
+    assert metadata["position_ik_damping"] == pytest.approx(0.04)
+    assert metadata["position_ik_adaptive_iterations"] is True
+    assert metadata["position_inactive_enter_threshold_scale"] == pytest.approx(0.5)
+    assert metadata["position_joint_velocity_limit_profile"] == "rm65_position_2x"
 
     with pytest.raises(SystemExit):
         _parse_real_teleop_args(
@@ -165,6 +235,112 @@ def test_real_teleop_position_ik_iteration_options_are_exposed_and_position_only
                 "2",
                 "--position-ik-local-step-clip-scale",
                 "2",
+                "--position-inactive-enter-threshold-scale",
+                "0.5",
+                "--position-joint-velocity-limit-profile",
+                "rm65_position_2x",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-execution-profile",
+                "impedance",
+                "--position-ik-orientation-weight",
+                "0.5",
+            ]
+        )
+
+
+def test_position_runtime_ik_weight_and_inactive_tightening_are_scoped() -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position",
+            "--position-ik-orientation-weight",
+            "0.5",
+            "--position-inactive-enter-threshold-scale",
+            "0.5",
+        ]
+    )
+    tuning = real_teleop._position_ik_tuning_for_args(
+        args,
+        load_ik_tuning_config(),
+        arm_control_mode="position",
+    )
+    objective = tuning.objective_weights()
+    assert objective.single_arm_position_weight == pytest.approx(1.0)
+    assert objective.single_arm_orientation_weight == pytest.approx(0.5)
+    assert objective.dual_arm_position_cost == pytest.approx(1.0)
+    assert objective.dual_arm_orientation_cost == pytest.approx(0.5)
+
+    intent = real_teleop._position_tracker_motion_intent_config(
+        args,
+        arm_control_mode="position",
+    )
+    assert intent.enter_linear_speed_m_s == pytest.approx(0.015)
+    assert intent.enter_angular_speed_rad_s == pytest.approx(0.09)
+    assert intent.enter_translation_span_m == pytest.approx(0.00125)
+    assert intent.enter_rotation_span_rad == pytest.approx(0.0125)
+    assert intent.enter_dwell_sec == pytest.approx(0.30)
+    assert intent.exit_linear_speed_m_s == pytest.approx(0.060)
+
+    base_tuning = load_ik_tuning_config()
+    assert real_teleop._position_ik_tuning_for_args(
+        args,
+        base_tuning,
+        arm_control_mode="impedance",
+    ) is base_tuning
+    impedance_intent = real_teleop._position_tracker_motion_intent_config(
+        args,
+        arm_control_mode="impedance",
+    )
+    assert impedance_intent.enter_linear_speed_m_s == pytest.approx(0.030)
+    assert impedance_intent.enter_translation_span_m == pytest.approx(0.0025)
+
+
+def test_position_elbow_singularity_preference_has_atomic_rollback_switch() -> None:
+    enabled = _parse_real_teleop_args(
+        ["--arm-execution-profile", "position"]
+    )
+    assert enabled.position_prefer_non_elbow_singular_branch is True
+    enabled_metadata = real_teleop._position_ik_iteration_metadata(enabled)
+    assert enabled_metadata["position_prefer_non_elbow_singular_branch"] is True
+
+    rollback = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position",
+            "--no-position-prefer-non-elbow-singular-branch",
+        ]
+    )
+    assert rollback.position_prefer_non_elbow_singular_branch is False
+    rollback_metadata = real_teleop._position_ik_iteration_metadata(rollback)
+    assert rollback_metadata["position_prefer_non_elbow_singular_branch"] is False
+
+
+@pytest.mark.parametrize("value", ["0", "-0.5", "1.01", "nan"])
+def test_position_inactive_tightening_rejects_invalid_scale(value: str) -> None:
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-execution-profile",
+                "position",
+                "--position-inactive-enter-threshold-scale",
+                value,
+            ]
+        )
+
+
+@pytest.mark.parametrize("value", ["0", "-0.5", "nan", "inf"])
+def test_position_ik_orientation_weight_rejects_invalid_value(value: str) -> None:
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--arm-execution-profile",
+                "position",
+                "--position-ik-orientation-weight",
+                value,
             ]
         )
 
@@ -499,6 +675,40 @@ def test_real_entry_profile_and_debug_parse_without_overwriting_legacy_raw_defau
     metadata = real_teleop._debug_timing_metadata(args)
     assert metadata["control_debug"]["observational_only"] is True
     assert metadata["control_debug"]["recording_requested"] is True
+
+
+def test_no_debug_disk_write_overrides_all_standalone_debug_writers() -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--no-debug-disk-write",
+            "--control-debug",
+            "full",
+            "--debug-action",
+            "--debug-timing",
+            "--record",
+            "--debug-trajectory-recording",
+            "--episode-root",
+            "teleop_records/debug_episodes",
+        ]
+    )
+
+    assert args.no_debug_disk_write is True
+    assert args.control_debug_config.level == "off"
+    assert args.debug_action is False
+    assert args.debug_timing_log is False
+    assert args.debug_timing_auto_log is False
+    assert args.no_record is True
+    assert args.no_episode_recording is True
+    assert args.debug_trajectory_recording is False
+    modules = real_teleop._debug_timing_modules(args)
+    assert modules.console is True
+    assert modules.light_log is False
+    assert modules.rm65_backend is True
+    assert modules.ik_profile is True
+    assert modules.watchdog is True
+    metadata = real_teleop._debug_timing_metadata(args)
+    assert metadata["debug_disk_write_disabled"] is True
+    assert metadata["control_debug"]["recording_requested"] is False
 
 
 def test_real_entry_legacy_position_overrides_remain_compatible() -> None:

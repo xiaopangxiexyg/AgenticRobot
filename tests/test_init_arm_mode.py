@@ -46,32 +46,38 @@ class _FakeCalibration:
         return SimpleNamespace(T_D_B=np.eye(4))
 
 
-class _FakeIkSolver:
-    def __init__(self) -> None:
-        self.current_q = np.zeros(12)
-
-    def compute_frame_pose(self, frame_name: str, qpos):
-        qpos = np.asarray(qpos, dtype=float).reshape(-1)
-        pose = np.eye(4)
-        pose[0, 3] = float(qpos[0] if frame_name == "left_tcp" else qpos[6])
-        return pose
-
-
 class _FakeDualArmRetargeter:
     def __init__(self) -> None:
-        self.ik_solver = _FakeIkSolver()
-        self.profile = SimpleNamespace(left_frame_name="left_tcp", right_frame_name="right_tcp")
-        self._tool_tcp_from_solver = {"left": np.eye(4), "right": np.eye(4)}
+        self._current = {
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        }
 
-    def _split_solution(self, qpos):
-        qpos = np.asarray(qpos, dtype=float).reshape(12)
-        return qpos[0:6].copy(), qpos[6:12].copy()
+    def current_qpos_by_side(self):
+        return {side: qpos.copy() for side, qpos in self._current.items()}
 
-    def _embed_arm_qpos(self, *, current_full_q, left_qpos, right_qpos):
-        qpos = np.asarray(current_full_q, dtype=float).reshape(12).copy()
-        qpos[0:6] = np.asarray(left_qpos, dtype=float).reshape(6)
-        qpos[6:12] = np.asarray(right_qpos, dtype=float).reshape(6)
-        return qpos
+    @staticmethod
+    def solver_world_targets_for_qpos_pair(*, left_qpos, right_qpos):
+        targets = {}
+        for side, qpos in (("left", left_qpos), ("right", right_qpos)):
+            pose = np.eye(4)
+            pose[0, 3] = float(np.asarray(qpos, dtype=float).reshape(6)[0])
+            targets[side] = pose
+        return targets
+
+    @staticmethod
+    def tool_tcp_world_targets_for_qpos_pair(*, left_qpos, right_qpos):
+        return _FakeDualArmRetargeter.solver_world_targets_for_qpos_pair(
+            left_qpos=left_qpos,
+            right_qpos=right_qpos,
+        )
+
+    @staticmethod
+    def solver_world_target_from_tool_tcp_world_target(
+        *, side, tool_tcp_world_target
+    ):
+        assert side in {"left", "right"}
+        return np.asarray(tool_tcp_world_target, dtype=float).reshape(4, 4).copy()
 
 
 class InitArmModeTests(unittest.TestCase):

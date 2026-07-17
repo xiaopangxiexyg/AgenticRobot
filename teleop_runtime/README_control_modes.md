@@ -1,9 +1,9 @@
 # VIVE 到 RM65 的相对控制与绝对控制说明
 
-本文档只说明当前仓库里**已经落地、能对上代码实现**的 arm teleop 控制模式，也就是：
+本文档说明当前仓库里已经落地的 arm teleop 控制模式。当前 active 主路径是 `absolute`；`delta_clutch` 章节仅保留历史说明，已经硬封存：
 
 - `absolute`：绝对控制
-- `delta_clutch`：相对控制 / 带 clutch 的增量控制
+- `delta_clutch`：已硬封存的历史相对控制实现
 
 这里讨论的是 `VIVE -> PoseToArmRetargeter -> RM65` 这条链路，**不包含** `q6 -> hand/gripper` 手部链路。
 当前真正可运行的调试入口是：
@@ -20,7 +20,7 @@
 | 模式 | 核心行为 | 是否需要 clutch | 更适合什么场景 |
 | --- | --- | --- | --- |
 | `absolute` | VIVE 位姿直接映射为机器人目标位姿 | 否 | 坐标系调试、标定检查、快速验证 |
-| `delta_clutch` | 先记住一个锚点，再用“人手相对锚点的位移”去推动机器人 | 是，或默认常按住 | 真正遥操作、更安全的重抓取、避免大跳变 |
+| `delta_clutch`（legacy） | 先记住一个锚点，再用“人手相对锚点的位移”去推动机器人 | 是，或默认常按住 | 复现旧遥操作、有限工作空间下的 re-grasp |
 
 更具体地说：
 
@@ -40,7 +40,7 @@
 3. [teleop_runtime/session.py](./session.py)  
    聚合 source，生成 observation，调用 retargeter。
 4. [teleop_runtime/retargeters/pose_to_arm.py](./retargeters/pose_to_arm.py)  
-   在这里分流到 `absolute` 或 `delta_clutch`。
+   当前 active runtime 固定走 `absolute`。
 5. [teleop_runtime/backends/arms/rm65.py](./backends/arms/rm65.py)  
    把笛卡尔目标位姿转成关节目标；真机模式下调用 `Movej_CANFD`。
 6. [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)  
@@ -54,7 +54,7 @@
 
 ## 3. 共享的数据流和坐标变换
 
-不管是 `absolute` 还是 `delta_clutch`，前半段流程完全一样。
+当前 active runtime 的前半段流程统一走 `absolute`；旧 delta 行为仅保留为历史说明。
 
 ### 3.1 VIVE 发送端
 
@@ -82,23 +82,24 @@
 - `value=4x4 pose matrix`
 - `metadata.tracker_role`
 
-### 3.3 `PoseToArmRetargeter` 先统一到 desk frame
+### 3.3 `PoseToArmRetargeter` 先统一到 Vive retarget frame
 
 [teleop_runtime/retargeters/pose_to_arm.py](./retargeters/pose_to_arm.py) 不会直接拿 `vive_world` 去控机器人，而是先走标定对象 [teleop_runtime/calibration.py](./calibration.py)：
 
 - `world_to_operator`
-- `operator_to_desk`
-- `desk_to_base`
+- `operator_to_vive_retarget`（旧名 `operator_to_desk`）
+- `vive_retarget_to_base`（旧名 `desk_to_base`）
 
 当前公式是：
 
 ```text
 pose_operator = inv(T_W_O) @ pose_world @ T_tracker_offset
-pose_desk     = inv(T_O_D) @ pose_operator
-pose_base     = inv(T_D_B) @ pose_desk
+pose_vr       = inv(T_O_VR) @ pose_operator
+pose_base     = inv(T_VR_B) @ pose_vr
 ```
 
-也就是说，控制模式的分歧发生在 `pose_desk` 这一层。
+这里的 `vive_retarget_frame` 是 Vive 标定/重定向的历史中间坐标系，不是 v2.3 dataset
+contract 的 canonical `desk`。`T_O_D/T_D_B` 仍作为旧配置别名读取。
 
 ### 3.4 当前虚拟跑法默认标定
 
@@ -109,22 +110,22 @@ pose_base     = inv(T_D_B) @ pose_desk
 这个默认标定的关键点是：
 
 - `T_W_O = I`
-- `T_O_D = I`
+- `T_O_VR = I`（旧名 `T_O_D`）
 - 左右臂底座距离默认 `0.525 m`
-- 左臂底座在 desk 下约为 `y = +0.2625 m`，偏航 `-90°`
-- 右臂底座在 desk 下约为 `y = -0.2625 m`，偏航 `+90°`
+- 左臂底座在 vive retarget frame 下约为 `y = +0.2625 m`，偏航 `-90°`
+- 右臂底座在 vive retarget frame 下约为 `y = -0.2625 m`，偏航 `+90°`
 
 因此在默认虚拟跑法里，preset 本身仍然是：
 
 - `T_W_O = I`
-- `T_O_D = I`
+- `T_O_VR = I`（旧名 `T_O_D`）
 
 但脚本启动后会先进入等待状态，等你按 `p` 或回车后，再做一次 **runtime home calibration**：
 
 - 等待 `left_wrist_pose` 和 `right_wrist_pose`
 - 对每侧收集若干帧稳定样本
 - 记录“人手 home pose”和“机器人当前 home TCP pose”
-- 之后无论 `absolute` 还是 `delta_clutch`，都先以这个启动 home 作为对齐锚点
+- 之后 `absolute` 会以这个启动 home 作为对齐锚点
 
 这意味着：
 
@@ -215,10 +216,10 @@ target_rotation    = home_robot.rotation * inv(home_human.rotation) * current_hu
 
 `absolute` 模式下，预期看到的行为是：
 
-- VIVE tracker 在 `desk` 中向前/左/上移动时，机器人 TCP 也按同一全局方向移动
+- VIVE tracker 在 `vive_retarget_frame` 中向前/左/上移动时，机器人 TCP 也按同一全局方向移动
 - VIVE tracker 当前姿态变化，会直接映射成末端姿态变化
 - 不需要 clutch，就会持续响应输入
-- 如果 `T_W_O / T_O_D / T_D_B` 不准，机械臂目标会明显偏、歪，或者一开始就在不合理位置
+- 如果 `T_W_O / T_O_VR / T_VR_B` 不准，机械臂目标会明显偏、歪，或者一开始就在不合理位置
 - 如果输入 tracker 瞬时跳变，目标也会跟着跳，只是后端 IK 和关节步长限制会把执行动作稍微抹平
 
 ### 4.5 适用场景
@@ -232,30 +233,27 @@ target_rotation    = home_robot.rotation * inv(home_human.rotation) * current_hu
 
 它不一定适合作为第一选择的真机精细遥操作模式，因为对标定质量非常敏感。
 
-## 5. 相对控制 `delta_clutch` 的当前实现
+## 5. Legacy 相对控制 `delta_clutch` 的兼容实现
 
-### 5.1 代码入口
+### 5.1 历史代码入口
 
-相对控制由两部分组成：
-
-- [teleop_runtime/retargeters/pose_to_arm.py](./retargeters/pose_to_arm.py)
-- [teleop_runtime/clutch.py](./clutch.py)
-
-`PoseToArmRetargeter` 先决定当前 clutch 是否按下，再把数据交给 `DeltaClutchController.update(...)`。
+历史版本曾由 `PoseToArmRetargeter` 和 `DeltaClutchController` 共同实现；相关 active
+分支和 `teleop_runtime/clutch.py` 已经移除。下面内容仅用于理解旧记录或旧版本，当前
+入口不会再构造 clutch retargeting。
 
 ### 5.2 当前 clutch 的定义
 
-默认会读取这些按钮 channel：
+历史版本读取过这些按钮 channel：
 
 - `left_clutch_button`
 - `right_clutch_button`
 - 兼容通用名 `clutch_button`
 
-在当前现成入口 [run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 里，这些按钮来自：
+历史入口中的这些按钮来自：
 
 - [teleop_runtime/sources/misc/keyboard.py](./sources/misc/keyboard.py)
 
-如果启用 `--keyboard-clutch`，终端键位是：
+历史 `--keyboard-clutch` 的终端键位是：
 
 - `z`：切换左手 clutch
 - `x`：切换右手 clutch
@@ -336,7 +334,7 @@ target.rotation = current_human.rotation
 
 ### 5.6 当前实现的一个重要细节
 
-当前 `delta_clutch` 的 orientation 处理是：
+历史 `delta_clutch` 的 orientation 处理是：
 
 - **按住时**：姿态跟当前 tracker
 - **松开时**：姿态停在上一帧目标
@@ -407,30 +405,10 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 机械臂不动
 - 终端只打印到单侧 `observed ...`
 
-### 6.4 启动相对控制
+### 6.4 历史相对控制
 
-带键盘 clutch 的推荐方式：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --control-mode delta_clutch \
-  --keyboard-clutch
-```
-
-启动后先按一次对应侧的 clutch 建 anchor，再开始移动。
-
-如果你只是想快速看连续效果，也可以不加 `--keyboard-clutch`：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --control-mode delta_clutch
-```
-
-这时脚本会把左右 clutch 默认设成 `True`，表现会更接近“持续开启的相对控制”。
+`delta_clutch` 已从 active 入口硬封存。这里保留历史语义说明，不能再通过当前
+`run_vive_*` 入口启动；需要复现旧行为时应使用对应历史版本或版本控制中的旧代码。
 
 ### 6.5 常用附加参数
 
@@ -479,11 +457,11 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 
 ### 9.1 这是 arm 模式，不是 hand 模式
 
-当前 `absolute / delta_clutch` 只实现于：
+当前 active runtime 只实现：
 
-- [teleop_runtime/retargeters/pose_to_arm.py](./retargeters/pose_to_arm.py)
+- [teleop_runtime/retargeters/pose_to_arm.py](./retargeters/pose_to_arm.py) 的 `absolute` 路径
 
-不影响 `JointsToDexHandRetargeter` 那条手部链路。
+不影响 `JointsToDexHandRetargeter` 那条手部链路；`delta_clutch` 不是当前 active capability。
 
 ### 9.2 现成入口的边界
 
@@ -502,14 +480,14 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 
 它适合调试，不代表真实工位下已经完成 runtime calibration。
 
-### 9.4 `delta_clutch` 当前对姿态不是纯增量
+### 9.4 历史 `delta_clutch` 对姿态不是纯增量
 
-再次强调，当前实现不是“整个位姿都做相对增量”，而是：
+历史实现不是“整个位姿都做相对增量”，而是：
 
 - 平移：相对 anchor 增量
 - 姿态：按住 clutch 时直接跟当前 tracker
 
-如果后续你想要“平移和姿态都做增量”或者“姿态只保留 yaw”，需要继续改 [pose_to_arm.py](./retargeters/pose_to_arm.py) 里的策略。
+当前 active runtime 不再提供该策略；如需恢复，应基于历史版本单独迁移。
 
 ## 10. 建议的实际调试顺序
 
@@ -518,11 +496,10 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py`，确认 VIVE tracker 本身正常输出
 2. 再跑 `run_vive_sapien_virtual.py --control-mode absolute`
 3. 确认左右 tracker 映射、坐标方向、TCP frame 都合理
-4. 再切到 `--control-mode delta_clutch --keyboard-clutch`
-5. 确认 clutch anchor、释放、重抓取符合预期
-6. 最后用 `run_vive_rm65_real_teleop.py` 做真机短测或 GUI 采集
+4. 保持 `absolute`，确认 home anchor、tracker 映射和 TCP frame 稳定
+5. 最后用 `run_vive_rm65_real_teleop.py` 做真机短测或 GUI 采集
 
 如果你只是想判断“模式是不是工作了”，最直观的判断标准是：
 
 - `absolute`：不按任何键，机械臂持续跟 tracker 走
-- `delta_clutch`：只有按住 clutch 时机械臂才继续响应；松开后停住
+- `delta_clutch`：历史行为，当前 active runtime 不再支持

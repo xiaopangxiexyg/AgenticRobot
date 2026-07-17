@@ -125,19 +125,37 @@ def _validate_modalities(
 
 @dataclass(frozen=True)
 class TimestampedMotionTarget:
-    """A timestamped pose and/or qpos keyframe from an action/reference stream."""
+    """A timestamped pose and/or qpos keyframe from an action/reference stream.
+
+    ``timestamp`` is the target's logical motion time. ``available_timestamp``
+    records when the producer made that target available to the consumer. They
+    are normally equal, but predicted action chunks legitimately make a future
+    logical target available now. Keeping both clocks prevents a causal
+    resampler from confusing known lookahead with unavailable future input.
+    """
 
     timestamp: float
     source_index: int
     pose_by_side: Mapping[str, np.ndarray | Sequence[float]] = field(default_factory=dict)
     qpos_by_side: Mapping[str, np.ndarray | Sequence[float]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    available_timestamp: float | None = None
 
     def __post_init__(self) -> None:
         pose_by_side = _normalize_pose_mapping(self.pose_by_side, name="pose_by_side")
         qpos_by_side = _normalize_qpos_mapping(self.qpos_by_side, name="qpos_by_side")
         _validate_modalities(pose_by_side, qpos_by_side, name="motion target")
-        object.__setattr__(self, "timestamp", _finite_time(self.timestamp, name="timestamp"))
+        timestamp = _finite_time(self.timestamp, name="timestamp")
+        available_timestamp = (
+            timestamp
+            if self.available_timestamp is None
+            else _finite_time(
+                self.available_timestamp,
+                name="available_timestamp",
+            )
+        )
+        object.__setattr__(self, "timestamp", timestamp)
+        object.__setattr__(self, "available_timestamp", available_timestamp)
         object.__setattr__(
             self,
             "source_index",
@@ -389,7 +407,11 @@ def _resample_at(
     interpolated = left.source_index != right.source_index
     if causal:
         if interpolated:
-            mode = "causal_delayed_interpolation"
+            mode = (
+                "causal_available_lookahead_interpolation"
+                if emitted - query <= _TIME_EPSILON_SEC
+                else "causal_delayed_interpolation"
+            )
         elif fallback_reason is not None:
             mode = "causal_hold"
         else:
@@ -401,8 +423,11 @@ def _resample_at(
         "causal": bool(causal),
         "lookahead_used": bool(interpolated and right.timestamp > query),
         "lookahead_available_at_emit": bool(
-            not causal or right.timestamp <= emitted + _TIME_EPSILON_SEC
+            not causal
+            or float(right.available_timestamp) <= emitted + _TIME_EPSILON_SEC
         ),
+        "left_source_available_timestamp": float(left.available_timestamp),
+        "right_source_available_timestamp": float(right.available_timestamp),
         "query_timestamp": query,
         "emitted_timestamp": emitted if causal else None,
         "output_lag_sec": emitted - query if causal else None,
@@ -463,12 +488,12 @@ def resample_motion_targets(
 class CausalMotionResampler:
     """Online resampler which never reads a target unavailable at emission.
 
-    Calling ``sample_at(now, emitted_timestamp=now)`` has no source-time
-    lookahead and therefore holds the latest input. To obtain linear/SLERP
-    interpolation online, call with a delayed query timestamp. Interpolation is
-    allowed only when both brackets were pushed and have timestamps no later
-    than ``emitted_timestamp``; the resulting delay/lookahead is explicit in
-    result metadata.
+    Calling ``sample_at(now, emitted_timestamp=now)`` normally has no
+    source-time lookahead and therefore holds the latest input. A producer may
+    also push a future logical target whose ``available_timestamp`` is already
+    no later than ``now`` (for example an action chunk). Such a target is valid
+    causal lookahead and permits zero-lag linear/SLERP interpolation. Otherwise
+    callers can still obtain interpolation by querying a delayed timestamp.
     """
 
     def __init__(self, *, max_samples: int = 256) -> None:
@@ -522,7 +547,8 @@ class CausalMotionResampler:
             eligible = tuple(
                 sample
                 for sample in self._samples
-                if sample.timestamp <= emitted + _TIME_EPSILON_SEC
+                if float(sample.available_timestamp)
+                <= emitted + _TIME_EPSILON_SEC
             )
             if not eligible:
                 raise RuntimeError("no causal motion target is available at emitted_timestamp")

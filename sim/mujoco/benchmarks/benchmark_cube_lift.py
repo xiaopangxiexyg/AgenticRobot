@@ -58,6 +58,8 @@ def _measure(
     steps: int,
     warmup_steps: int,
     seed: int,
+    random_actions: bool,
+    random_action_scale: float,
 ) -> dict[str, Any]:
     start = time.perf_counter()
     env = factory()
@@ -65,7 +67,12 @@ def _measure(
     env.reset(seed=seed)
     reset_done = time.perf_counter()
     action = np.zeros(7, dtype=np.float32)
+    rng = np.random.default_rng(seed)
     for _ in range(warmup_steps):
+        if random_actions:
+            action = rng.uniform(
+                -random_action_scale, random_action_scale, 7
+            ).astype(np.float32)
         _obs, _reward, terminated, truncated, _info = env.step(action)
         if terminated or truncated:
             env.reset()
@@ -74,6 +81,10 @@ def _measure(
     physics_ticks = 0
     resets = 0
     for _ in range(steps):
+        if random_actions:
+            action = rng.uniform(
+                -random_action_scale, random_action_scale, 7
+            ).astype(np.float32)
         _obs, _reward, terminated, truncated, info = env.step(action)
         scheduler = info.get("scheduler") if isinstance(info, dict) else None
         if scheduler is not None:
@@ -95,6 +106,8 @@ def _measure(
         "measured_policy_steps": steps,
         "measured_physics_steps": physics_ticks,
         "automatic_resets": resets,
+        "action_mode": "random" if random_actions else "zero",
+        "random_action_scale": random_action_scale if random_actions else None,
         "elapsed_seconds": elapsed,
         "policy_steps_per_second": steps / elapsed,
         "physics_steps_per_second": physics_ticks / elapsed,
@@ -132,6 +145,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--random-actions", action="store_true")
+    parser.add_argument("--random-action-scale", type=float, default=1.0)
     parser.add_argument(
         "--runtime",
         choices=("reference", "fast", "both", "vector"),
@@ -152,6 +167,8 @@ def _measure_vector(
     steps: int,
     warmup_steps: int,
     seed: int,
+    random_actions: bool,
+    random_action_scale: float,
 ) -> dict[str, Any]:
     from ..runtime import CubeLiftVectorExecutor
 
@@ -163,11 +180,20 @@ def _measure_vector(
     process_ids = [os.getpid(), *executor.worker_pids]
     memory = _linux_memory_kib(process_ids)
     actions = np.zeros((num_envs, 7), dtype=np.float32)
+    rng = np.random.default_rng(seed)
     for _ in range(warmup_steps):
+        if random_actions:
+            actions[:] = rng.uniform(
+                -random_action_scale, random_action_scale, actions.shape
+            )
         executor.step(actions)
     measured_start = time.perf_counter()
     physics_ticks = 0
     for _ in range(steps):
+        if random_actions:
+            actions[:] = rng.uniform(
+                -random_action_scale, random_action_scale, actions.shape
+            )
         executor.step(actions)
         physics_ticks += int(np.sum(executor.last_physics_ticks))
     measured_end = time.perf_counter()
@@ -186,6 +212,8 @@ def _measure_vector(
         "measured_policy_transitions": transitions,
         "measured_physics_steps": physics_ticks,
         "elapsed_seconds": elapsed,
+        "action_mode": "random" if random_actions else "zero",
+        "random_action_scale": random_action_scale if random_actions else None,
         "policy_transitions_per_second": transitions / elapsed,
         "physics_steps_per_second": physics_ticks / elapsed,
         "shared_memory_bytes": shared_memory_bytes,
@@ -204,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if args.steps <= 0 or args.warmup_steps < 0:
         raise ValueError("steps must be positive and warmup-steps must be non-negative.")
+    if not 0.0 < float(args.random_action_scale) <= 1.0:
+        raise ValueError("random-action-scale must be in (0, 1].")
     factories: list[tuple[str, Callable[[], Any]]] = []
     if args.runtime in {"reference", "both"}:
         factories.append(("reference", CubeLiftEnv))
@@ -226,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
                 steps=args.steps,
                 warmup_steps=args.warmup_steps,
                 seed=args.seed,
+                random_actions=bool(args.random_actions),
+                random_action_scale=float(args.random_action_scale),
             )
             for name, factory in factories
         ]
@@ -235,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
                 steps=args.steps,
                 warmup_steps=args.warmup_steps,
                 seed=args.seed,
+                random_actions=bool(args.random_actions),
+                random_action_scale=float(args.random_action_scale),
             )
             for count in vector_counts
         ],

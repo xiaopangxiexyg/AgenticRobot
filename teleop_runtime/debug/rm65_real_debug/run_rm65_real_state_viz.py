@@ -38,9 +38,9 @@ from ...initial_alignment import AlignmentSideState, TeleopInitialAlignment
 from ...tcp import legacy_tcp_mode_requested
 from ...transforms import identity_pose
 from ..log_utils import ChangeGate, log_event, log_stage
-from rm65_inspire_tac.paths import require_asset_path
-from rm65_inspire_tac.rendering import SapienArmHandRenderer
-from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+from robot_motion.rm65.assets import require_asset_path
+from sim.rm65.sapien_renderer import SapienArmHandRenderer
+from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
 
 DEFAULT_INITIAL_ALIGNMENT_STATES_DIR = initial_alignment_states_dir()
 

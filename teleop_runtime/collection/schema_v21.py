@@ -29,6 +29,7 @@ from .sample_assembler import CollectorSample
 
 ACTION_DIM = 26
 OBSERVATION_STATE_DIM = 38
+VIVE_RETARGET_FRAME_NAME = "vive_retarget_frame"
 
 
 def _vector_list(value: Any, *, length: int | None = None) -> list[float] | None:
@@ -536,6 +537,9 @@ def collector_sample_to_row(
         row[f"observation.arm.{side}.actual_tcp_pose"] = _pose_matrix_to_xyzquat_list(
             arm_state.get("actual_tcp_pose")
         )
+        row[f"observation.arm.{side}.actual_tcp_pose_source"] = arm_state.get(
+            "actual_tcp_pose_source"
+        )
         row[f"observation.arm.{side}.actual_hardware_qpos"] = _vector_list(
             arm_state.get("actual_hardware_qpos"),
             length=6,
@@ -691,6 +695,12 @@ def collector_sample_to_row(
         ) or _mapping_pose_metadata(
             arm_command_metadata,
             "target_pose_desk",
+        )
+        # Historical ``desk`` here is the Vive retargeting intermediate, not
+        # the v2.3 canonical dataset desk frame.  Keep the pose column for
+        # compatibility but make its frame explicit on every new row.
+        row[f"teleop.action_source.{side}_wrist_pose_desk_frame"] = (
+            VIVE_RETARGET_FRAME_NAME
         )
         row[f"teleop.action_source.{side}_wrist_pose_base"] = _command_pose_metadata(
             arm_command,
@@ -910,6 +920,9 @@ def collector_sample_to_row(
         camera_expectations[camera_key] = frame is not None
         row[f"{prefix}.source_timestamp"] = match.selected_timestamp
         row[f"{prefix}.receive_timestamp"] = None if frame is None else frame.receive_timestamp
+        row[f"{prefix}.available_timestamp"] = (
+            None if frame is None else frame.available_timestamp
+        )
         row[f"{prefix}.age_sec"] = match.age_sec
         row[f"{prefix}.source_frame_index"] = None if frame is None else frame.frame_index
         row[f"{prefix}.video_frame_index"] = None

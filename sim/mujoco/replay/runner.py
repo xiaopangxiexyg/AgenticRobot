@@ -838,8 +838,10 @@ def run(args: argparse.Namespace) -> None:
         inactive_sides=inactive_sides,
         qpos_source=args.qpos_source,
     )
-    controller = QposController(scene)
-    gripper_controller = GripperController(scene)
+    # Dataset replay must remain faithful to recorded qpos. Collision checks
+    # are audit-only here; projecting would silently alter the source data.
+    controller = QposController(scene, collision_mode="audit")
+    gripper_controller = GripperController(scene, collision_mode="audit")
     gripper_side_by_name = _resolve_gripper_side_by_name(
         args=args,
         scene=scene,
@@ -1283,6 +1285,11 @@ def run(args: argparse.Namespace) -> None:
                     "command_hz": control_hz,
                     "gripper_replay_side_by_name": gripper_side_by_name,
                     "gripper_source": args.gripper_source,
+                    "collision_validation": (
+                        "audit_only"
+                        if scene.collision_safety_available
+                        else "unavailable_collision_disabled"
+                    ),
                 }
             )
         if recorder is not None:
@@ -1305,6 +1312,11 @@ def run(args: argparse.Namespace) -> None:
         "qpos_by_side": scene.arm_qpos_by_side(),
         "gripper_close_by_name": scene.gripper_close_by_name(),
         "gripper_qpos_by_name": scene.gripper_qpos_by_name(),
+        "collision_validation": (
+            "audit_only"
+            if scene.collision_safety_available
+            else "unavailable_collision_disabled"
+        ),
         "controlled_body_pose_world_xyz_quat_xyzw": {
             side: pose_to_xyz_quat_xyzw(scene.body_pose(spec.controlled_body))
             for side, spec in sorted(scene.arm_specs.items())

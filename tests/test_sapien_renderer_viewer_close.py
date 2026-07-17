@@ -5,7 +5,7 @@ import io
 import types
 import unittest
 
-from rm65_inspire_tac.rendering import SapienArmHandRenderer
+from sim.rm65.sapien_renderer import SapienArmHandRenderer
 
 
 class _FakeScene:

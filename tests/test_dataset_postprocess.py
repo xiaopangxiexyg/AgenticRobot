@@ -42,8 +42,8 @@ def _write_parquet(path, rows):
 
 def test_camera_buffer_latest_before_or_at_does_not_look_ahead() -> None:
     buffer = NearestFrameBuffer(keep_last=4)
-    buffer.push(VideoFrame(image="old", source_timestamp=1.0))
-    buffer.push(VideoFrame(image="future", source_timestamp=1.2))
+    buffer.push(VideoFrame(image="old", source_timestamp=1.0, available_timestamp=1.0))
+    buffer.push(VideoFrame(image="future", source_timestamp=1.2, available_timestamp=1.2))
 
     assert buffer.get_latest_before_or_at(1.1).image == "old"
     assert buffer.get_latest_before_or_at(0.9) is None

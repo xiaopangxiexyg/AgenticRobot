@@ -34,9 +34,9 @@ from ..schemas import TeleopCommand
 from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.hand import HandQ6Source
 from .log_utils import ChangeGate, log_event, log_stage
-from rm65_inspire_tac.paths import require_asset_path
-from rm65_inspire_tac.pipeline import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
-from rm65_inspire_tac.rendering import SapienArmHandRenderer
+from robot_motion.rm65.assets import require_asset_path
+from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+from sim.rm65.sapien_renderer import SapienArmHandRenderer
 
 
 def _positive_float(text: str) -> float:

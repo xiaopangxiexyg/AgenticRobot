@@ -10,7 +10,7 @@ from robot_motion.pose import pose_delta_metrics
 
 from ...diagnostics import FaultEvent
 from ...schemas import EffectorCommand, TeleopCommand
-from ...transforms import as_pose_matrix, invert_pose
+from ...transforms import as_pose_matrix
 
 INIT_ARM_FAULT_CODES = frozenset(
     {
@@ -231,59 +231,14 @@ def _calibration_base_to_desk(calibration: Any, pose_base: np.ndarray, side: str
     return as_pose_matrix(transform) @ as_pose_matrix(pose_base)
 
 
-def _tool_tcp_from_solver(dual_arm_retargeter: Any, side: str) -> np.ndarray | None:
-    raw = getattr(dual_arm_retargeter, "_tool_tcp_from_solver", None)
-    if isinstance(raw, Mapping) and raw.get(side) is not None:
-        return as_pose_matrix(raw[side])
-    return None
-
-
-def _split_current_qpos(dual_arm_retargeter: Any) -> tuple[np.ndarray, np.ndarray]:
-    current_q = np.asarray(dual_arm_retargeter.ik_solver.current_q, dtype=float).reshape(-1)
-    splitter = getattr(dual_arm_retargeter, "_split_solution", None)
-    if callable(splitter):
-        left, right = splitter(current_q)
-        return np.asarray(left, dtype=float).reshape(6), np.asarray(right, dtype=float).reshape(6)
-    if current_q.shape[0] == 12:
-        return current_q[0:6].copy(), current_q[6:12].copy()
-    if current_q.shape[0] == 14:
-        return current_q[1:7].copy(), current_q[8:14].copy()
-    if current_q.shape[0] >= 24:
-        return current_q[0:6].copy(), current_q[18:24].copy()
-    raise ValueError(f"cannot split dual-arm solver qpos shape {current_q.shape}.")
-
-
-def _embed_qpos(
-    dual_arm_retargeter: Any,
-    *,
-    left_qpos: np.ndarray,
-    right_qpos: np.ndarray,
-) -> np.ndarray:
-    current_q = np.asarray(dual_arm_retargeter.ik_solver.current_q, dtype=float).reshape(-1)
-    embedder = getattr(dual_arm_retargeter, "_embed_arm_qpos", None)
-    if callable(embedder):
-        return np.asarray(
-            embedder(
-                current_full_q=current_q,
-                left_qpos=np.asarray(left_qpos, dtype=float).reshape(6),
-                right_qpos=np.asarray(right_qpos, dtype=float).reshape(6),
-            ),
-            dtype=float,
+def _dual_kinematics_method(dual_arm_retargeter: Any, name: str):
+    method = getattr(dual_arm_retargeter, name, None)
+    if not callable(method):
+        raise TypeError(
+            "dual-arm retargeter does not implement the shared kinematics "
+            f"interface method {name}()."
         )
-    full_q = current_q.copy()
-    if full_q.shape[0] == 12:
-        full_q[0:6] = left_qpos
-        full_q[6:12] = right_qpos
-        return full_q
-    if full_q.shape[0] == 14:
-        full_q[1:7] = left_qpos
-        full_q[8:14] = right_qpos
-        return full_q
-    if full_q.shape[0] >= 24:
-        full_q[0:6] = left_qpos
-        full_q[18:24] = right_qpos
-        return full_q
-    raise ValueError(f"cannot embed dual-arm qpos into solver qpos shape {full_q.shape}.")
+    return method
 
 
 def load_init_arm_targets(
@@ -295,8 +250,43 @@ def load_init_arm_targets(
     raw_targets = _raw_targets_from_profile(path)
     current_left_qpos: np.ndarray | None = None
     current_right_qpos: np.ndarray | None = None
+    solver_targets_for_profile: dict[str, np.ndarray] | None = None
+    tcp_targets_for_profile: dict[str, np.ndarray] | None = None
     if dual_arm_retargeter is not None:
-        current_left_qpos, current_right_qpos = _split_current_qpos(dual_arm_retargeter)
+        current = _dual_kinematics_method(
+            dual_arm_retargeter,
+            "current_qpos_by_side",
+        )()
+        if not isinstance(current, Mapping):
+            raise TypeError("current_qpos_by_side() must return a mapping.")
+        current_left_qpos = _finite_vector(
+            current.get("left"), length=6, label="current left qpos"
+        )
+        current_right_qpos = _finite_vector(
+            current.get("right"), length=6, label="current right qpos"
+        )
+
+        if any(target.arm_qpos is not None for target in raw_targets.values()):
+            left_profile_qpos = raw_targets["left"].arm_qpos
+            right_profile_qpos = raw_targets["right"].arm_qpos
+            if left_profile_qpos is None:
+                left_profile_qpos = current_left_qpos
+            if right_profile_qpos is None:
+                right_profile_qpos = current_right_qpos
+            if left_profile_qpos is None or right_profile_qpos is None:
+                raise ValueError("cannot resolve complete bimanual qpos for init-arm FK.")
+            pair_kwargs = {
+                "left_qpos": np.asarray(left_profile_qpos, dtype=float).reshape(6),
+                "right_qpos": np.asarray(right_profile_qpos, dtype=float).reshape(6),
+            }
+            solver_targets_for_profile = _dual_kinematics_method(
+                dual_arm_retargeter,
+                "solver_world_targets_for_qpos_pair",
+            )(**pair_kwargs)
+            tcp_targets_for_profile = _dual_kinematics_method(
+                dual_arm_retargeter,
+                "tool_tcp_world_targets_for_qpos_pair",
+            )(**pair_kwargs)
 
     resolved: dict[str, InitArmResolvedTarget] = {}
     for side in ("left", "right"):
@@ -313,35 +303,10 @@ def load_init_arm_targets(
                         "but dual-arm FK is unavailable. Add tcp_pose_base/tcp_pose_desk."
                     )
             else:
-                left_qpos = raw_targets["left"].arm_qpos
-                right_qpos = raw_targets["right"].arm_qpos
-                if left_qpos is None:
-                    if current_left_qpos is None:
-                        raise ValueError("cannot resolve left fallback qpos for init-arm FK.")
-                    left_qpos = current_left_qpos
-                if right_qpos is None:
-                    if current_right_qpos is None:
-                        raise ValueError("cannot resolve right fallback qpos for init-arm FK.")
-                    right_qpos = current_right_qpos
-                full_q = _embed_qpos(
-                    dual_arm_retargeter,
-                    left_qpos=np.asarray(left_qpos, dtype=float).reshape(6),
-                    right_qpos=np.asarray(right_qpos, dtype=float).reshape(6),
-                )
-                frame_name = (
-                    getattr(dual_arm_retargeter.profile, "left_frame_name")
-                    if side == "left"
-                    else getattr(dual_arm_retargeter.profile, "right_frame_name")
-                )
-                solver_pose_desk = as_pose_matrix(
-                    dual_arm_retargeter.ik_solver.compute_frame_pose(frame_name, full_q)
-                )
-                tool_tcp = _tool_tcp_from_solver(dual_arm_retargeter, side)
-                tcp_pose_desk = (
-                    solver_pose_desk.copy()
-                    if tool_tcp is None
-                    else solver_pose_desk @ tool_tcp
-                )
+                if solver_targets_for_profile is None or tcp_targets_for_profile is None:
+                    raise RuntimeError("shared dual-arm FK results were not prepared.")
+                solver_pose_desk = as_pose_matrix(solver_targets_for_profile[side])
+                tcp_pose_desk = as_pose_matrix(tcp_targets_for_profile[side])
                 tcp_pose_base = _calibration_desk_to_base(calibration, tcp_pose_desk, side)
 
         if tcp_pose_base is None and tcp_pose_desk is not None:
@@ -349,11 +314,14 @@ def load_init_arm_targets(
         if tcp_pose_desk is None and tcp_pose_base is not None:
             tcp_pose_desk = _calibration_base_to_desk(calibration, tcp_pose_base, side)
         if solver_pose_desk is None and tcp_pose_desk is not None and dual_arm_retargeter is not None:
-            tool_tcp = _tool_tcp_from_solver(dual_arm_retargeter, side)
-            solver_pose_desk = (
-                tcp_pose_desk.copy()
-                if tool_tcp is None
-                else tcp_pose_desk @ invert_pose(tool_tcp)
+            solver_pose_desk = as_pose_matrix(
+                _dual_kinematics_method(
+                    dual_arm_retargeter,
+                    "solver_world_target_from_tool_tcp_world_target",
+                )(
+                    side=side,
+                    tool_tcp_world_target=tcp_pose_desk,
+                )
             )
         if tcp_pose_base is None:
             raise ValueError(f"init-arm profile side {side!r} could not be resolved to tcp_pose_base.")

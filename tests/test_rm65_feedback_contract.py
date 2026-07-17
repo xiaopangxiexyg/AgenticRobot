@@ -347,6 +347,47 @@ class _FailedRefreshBackend:
         return pose
 
 
+class _DivergentCommandAndMeasuredBackend:
+    def __init__(self) -> None:
+        self.hardware_qpos = np.asarray([0.2, 0.3, 0.4, 0.0, 0.0, 0.0])
+        self.command_pose = np.eye(4, dtype=float)
+        self.command_pose[:3, 3] = [9.0, 8.0, 7.0]
+
+    def refresh_state_from_hardware(self):
+        return {
+            "hardware_qpos": self.hardware_qpos.copy(),
+            "current_tcp_pose": self.command_pose.copy(),
+            "hardware_measurement_timestamp": 99.0,
+            "hardware_measurement_sequence": 4,
+            "hardware_measurement_valid": True,
+            "hardware_read_success": True,
+            "hardware_result_code": 0,
+            "hardware_result_text": "ok",
+        }
+
+    def compute_tcp_pose(self, *, qpos=None):
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = np.asarray(qpos, dtype=float)[:3]
+        return pose
+
+
+def test_poller_actual_tcp_pose_uses_hardware_qpos_fk_not_command_pose() -> None:
+    backend = _DivergentCommandAndMeasuredBackend()
+    poller = ArmHardwareStatePoller(
+        backends_by_side={"left": backend},
+        config=ArmHardwareStatePollerConfig(stale_after_sec=0.2),
+    )
+
+    poller._poll_once("left", backend)
+    snapshot = poller.latest_at_or_before(100.0)["left"]
+    expected = backend.compute_tcp_pose(qpos=backend.hardware_qpos)
+
+    np.testing.assert_allclose(snapshot["actual_tcp_pose"], expected)
+    np.testing.assert_allclose(snapshot["wrist_camera_pose_base"], expected)
+    assert not np.allclose(snapshot["actual_tcp_pose"], backend.command_pose)
+    assert snapshot["actual_tcp_pose_source"] == "hardware_qpos_fk"
+
+
 def test_poller_does_not_retimestamp_cached_qpos_after_failed_read() -> None:
     backend = _FailedRefreshBackend()
     poller = ArmHardwareStatePoller(

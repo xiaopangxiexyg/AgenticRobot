@@ -258,7 +258,7 @@ def _compute_arm_points(joint_deg: list[float] | None, tcp_pose_flange: list[flo
         return {"error": "no robot joint state available"}
     try:
         import numpy as np
-        from rm65_inspire_tac.ik import SingleArmIKSolver
+        from robot_motion.rm65.single_arm_ik import SingleArmIKSolver
     except Exception as exc:
         return {"error": f"Pinocchio/IK import failed: {exc}"}
     try:

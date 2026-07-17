@@ -13,6 +13,7 @@ from .interpolation import (
 DEFAULT_POSITION_SAMPLE_HZ = 15.0
 POSITION_PROFILE_NAME = "position"
 POSITION_45_150_PROFILE_NAME = "position_45_150hz"
+POSITION_15_60_120_PROFILE_NAME = "position_15_60_120hz"
 
 
 def _finite_positive(value: float, *, name: str) -> float:
@@ -140,6 +141,18 @@ POSITION_PROFILE = PositionControlProfile(
     rates=PositionControlRates(),
 )
 
+# Deployment-compatible profile matching the accepted position-teleop clock
+# contract while keeping the historical shared default available unchanged.
+POSITION_15_60_120_PROFILE = PositionControlProfile(
+    name=POSITION_15_60_120_PROFILE_NAME,
+    rates=PositionControlRates(
+        sample_hz=15.0,
+        reference_hz=60.0,
+        ik_hz=60.0,
+        command_hz=120.0,
+    ),
+)
+
 # Explicit compatibility profile for historical commands and datasets.  The
 # default position-control profile is 15 -> 75 -> 150 Hz, but selecting this
 # legacy name must continue to mean 15 -> 45 -> 150 Hz rather than silently
@@ -157,6 +170,8 @@ __all__ = [
     "DEFAULT_POSITION_PROFILE",
     "POSITION_45_150_PROFILE",
     "POSITION_45_150_PROFILE_NAME",
+    "POSITION_15_60_120_PROFILE",
+    "POSITION_15_60_120_PROFILE_NAME",
     "POSITION_PROFILE",
     "POSITION_PROFILE_NAME",
     "PositionControlProfile",

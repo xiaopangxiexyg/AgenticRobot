@@ -29,6 +29,8 @@ from .contracts import (
     PositionSideReference,
 )
 from .config import (
+    POSITION_15_60_120_PROFILE,
+    POSITION_15_60_120_PROFILE_NAME,
     DEFAULT_POSITION_PROFILE,
     DEFAULT_POSITION_SAMPLE_HZ,
     POSITION_45_150_PROFILE,
@@ -46,6 +48,11 @@ from .interpolation import (
     JointCommandInterpolator,
     interpolate_joint_command_segment,
     reference_age_and_stale,
+)
+from .execution_policy import (
+    PositionTrajectoryPolicy,
+    classify_position_trajectory_policy,
+    final_follow_qpos_target,
 )
 from .resampling import (
     CausalMotionResampler,
@@ -67,6 +74,7 @@ from .timeline import OutOfOrderReferenceError, ReferenceTimeline
 from .trajectory import (
     AccelerationLimitedJointTrajectoryPlanner,
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
+    DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
     DEFAULT_POSITION_VELOCITY_RAMP_SEC,
     JointTrajectoryLimits,
     JointTrajectoryProposal,
@@ -85,6 +93,7 @@ __all__ = [
     "DEFAULT_POSITION_REFERENCE_HZ",
     "DEFAULT_POSITION_SAMPLE_HZ",
     "DEFAULT_POSITION_SEGMENT_DURATION_SEC",
+    "DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC",
     "DEFAULT_POSITION_VELOCITY_RAMP_SEC",
     "DEFAULT_REFERENCE_STALE_AFTER_SEC",
     "JointCommandInterpolator",
@@ -98,6 +107,8 @@ __all__ = [
     "POSITION_COMMAND_PLANNER_LINEAR",
     "POSITION_45_150_PROFILE",
     "POSITION_45_150_PROFILE_NAME",
+    "POSITION_15_60_120_PROFILE",
+    "POSITION_15_60_120_PROFILE_NAME",
     "POSITION_PROFILE",
     "POSITION_PROFILE_NAME",
     "POSITION_TRANSPORT_TARGET_SEQUENCE_KEY",
@@ -122,10 +133,13 @@ __all__ = [
     "PositionReferenceSideAudit",
     "PositionSideReference",
     "PositionTimingAuditEvent",
+    "PositionTrajectoryPolicy",
     "ReferenceTimeline",
     "ResampledMotionReference",
     "TimestampedMotionTarget",
     "build_uniform_time_grid",
+    "classify_position_trajectory_policy",
+    "final_follow_qpos_target",
     "interpolate_pose_shortest_path",
     "interpolate_joint_command_segment",
     "interpolate_qpos_by_side",

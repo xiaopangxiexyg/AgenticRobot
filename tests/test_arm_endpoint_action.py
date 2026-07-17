@@ -70,6 +70,22 @@ class _SingularityFakeArm:
         return 0
 
 
+class _WristSingularityFakeArm(_SingularityFakeArm):
+    def Algo_Kin_Singularity_Analyse(self, joint_deg):
+        joint = np.asarray(joint_deg, dtype=float).reshape(6)
+        if abs(float(joint[4])) < 3.0:
+            return -3, 0.42
+        return 0, 0.42
+
+
+class _ShoulderSingularityFakeArm(_SingularityFakeArm):
+    def Algo_Kin_Singularity_Analyse(self, joint_deg):
+        joint = np.asarray(joint_deg, dtype=float).reshape(6)
+        if abs(float(joint[2])) < 3.0:
+            return -1, 0.01
+        return 0, 0.42
+
+
 class _PositionTransportFakeArm:
     def __init__(
         self,
@@ -1112,6 +1128,184 @@ class ArmEndpointActionTest(unittest.TestCase):
 
         self.assertEqual(fake_arm.thresholds, (3.0, 3.0, 0.05))
         self.assertEqual(backend.get_state()["singularity_metadata"]["singularity_gate_status"], "hold_entry")
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 4.0, places=6)
+
+    def test_position_backend_allows_explicit_no_clean_wrist_branch_fallback(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, 0.0, 0.0, np.deg2rad(4.0), 0.0),
+                allow_position_wrist_singularity_fallback=True,
+            )
+        )
+        fake_arm = _WristSingularityFakeArm()
+        backend.arm = fake_arm
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.asarray([0.0, 0.0, 0.0, 0.0, np.deg2rad(1.0), 0.0]),
+            metadata={
+                "ik_candidate_selection": {
+                    "wrist_singularity_preference": {
+                        "enabled": True,
+                        "fallback_to_singular": True,
+                        "selected": {
+                            "sides": {
+                                "left": {"is_wrist_singular": True},
+                                "right": {"is_wrist_singular": False},
+                            }
+                        },
+                    }
+                }
+            },
+        )
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(
+            metadata["singularity_gate_status"],
+            "allow_position_wrist_singular",
+        )
+        self.assertTrue(metadata["position_wrist_singularity_fallback_allowed"])
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][4], 1.0, places=6)
+
+        rollback_backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, 0.0, 0.0, np.deg2rad(4.0), 0.0),
+                allow_position_wrist_singularity_fallback=False,
+            )
+        )
+        rollback_arm = _WristSingularityFakeArm()
+        rollback_backend.arm = rollback_arm
+        rollback_backend.send_command(command)
+        self.assertEqual(
+            rollback_backend.get_state()["singularity_metadata"]["singularity_gate_status"],
+            "hold_entry",
+        )
+        self.assertAlmostEqual(rollback_arm.sent_joint_deg[-1][4], 4.0, places=6)
+
+    def test_position_backend_allows_explicit_no_clean_elbow_branch_fallback(self) -> None:
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.asarray([0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0]),
+            metadata={
+                "ik_candidate_selection": {
+                    "position_singularity_preference": {
+                        "enabled": True,
+                        "fallback_to_singular": True,
+                        "fully_non_singular_count": 0,
+                        "selected": {
+                            "sides": {
+                                "left": {"is_elbow_singular": True},
+                                "right": {"is_elbow_singular": False},
+                            }
+                        },
+                    }
+                }
+            },
+        )
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_elbow_singularity_fallback=True,
+            )
+        )
+        fake_arm = _SingularityFakeArm()
+        backend.arm = fake_arm
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(
+            metadata["singularity_gate_status"],
+            "allow_position_elbow_singular",
+        )
+        self.assertTrue(metadata["position_elbow_singularity_fallback_allowed"])
+        self.assertTrue(metadata["position_singularity_fallback_allowed"])
+        self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 1.0, places=6)
+
+        rollback_backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_elbow_singularity_fallback=False,
+            )
+        )
+        rollback_arm = _SingularityFakeArm()
+        rollback_backend.arm = rollback_arm
+        rollback_backend.send_command(command)
+        self.assertEqual(
+            rollback_backend.get_state()["singularity_metadata"]["singularity_gate_status"],
+            "hold_entry",
+        )
+        self.assertAlmostEqual(rollback_arm.sent_joint_deg[-1][2], 4.0, places=6)
+
+    def test_position_singularity_fallback_never_allows_shoulder_singularity(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_wrist_singularity_fallback=True,
+                allow_position_elbow_singularity_fallback=True,
+            )
+        )
+        fake_arm = _ShoulderSingularityFakeArm()
+        backend.arm = fake_arm
+        command = EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.asarray([0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0]),
+            metadata={
+                "ik_candidate_selection": {
+                    "position_singularity_preference": {
+                        "enabled": True,
+                        "fallback_to_singular": True,
+                        "selected": {
+                            "sides": {
+                                "left": {
+                                    "is_elbow_singular": True,
+                                    "is_wrist_singular": True,
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+        )
+
+        backend.send_command(command)
+
+        metadata = backend.get_state()["singularity_metadata"]
+        self.assertEqual(metadata["target_singularity_label"], "shoulder_singularity")
+        self.assertEqual(metadata["singularity_gate_status"], "hold_entry")
+        self.assertFalse(metadata["position_singularity_fallback_allowed"])
         self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 4.0, places=6)
 
     def test_rm65_backend_slows_qpos_init_when_command_enters_singularity(self) -> None:

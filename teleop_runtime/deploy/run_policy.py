@@ -17,7 +17,7 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,23 +25,25 @@ import numpy as np
 
 from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from dataset_contracts.policy_artifact import policy_artifact_from_metadata
+from dataset_contracts.pose_frames import load_pose_frame_contract
 from dataset_contracts.v22 import DEXTELEOP_DATASET_SCHEMA_V22, policy_io_layout_from_metadata
+from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from deployments.client import load_policy_artifact
 from project_paths import repo_path
-from rm65_inspire_tac.paths import require_asset_path
+from robot_motion.rm65.assets import require_asset_path
 from robot_motion.action import HandActionSpec, hand_action_specs_metadata
 from robot_motion.deploy.actions import (
-    ActionChunkBuffer,
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
     NormalizedAction,
-    normalize_policy_output,
 )
 from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
 from robot_motion.deploy.observation import build_deployment_observation
-from robot_motion.deploy.pose_adapter import (
-    convert_normalized_action_chunk_to_absolute,
-    prepare_observation_for_policy_pose_mode,
+from robot_motion.deploy.pose_adapter import convert_policy_absolute_vector_to_runtime_raw
+from robot_motion.deploy.runtime import (
+    PolicyDeployRuntime,
+    PolicyDeployRuntimeConfig,
+    resolve_action_queue_policy,
 )
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
@@ -55,6 +57,7 @@ from robot_motion.deploy.session_contract import (
     POLICY_CONTRACT_V22_NATIVE,
     RuntimeEndEffectorCapability,
     resolve_deploy_session_contract,
+    resolve_policy_action_pose_mode_from_artifact,
 )
 from robot_motion.replay.trajectory import QPOS_INIT_SOURCES
 from robot_motion.rm65 import (
@@ -63,6 +66,17 @@ from robot_motion.rm65 import (
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
+    RM65_POSITION_TRACKING_FOLLOW_ALPHA,
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+    RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
+    RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
+)
+from robot_motion.position_control import (
+    DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
+    DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
+    DEFAULT_POSITION_VELOCITY_RAMP_SEC,
+    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_CHOICES,
 )
 from robot_motion.runtime import TeleopCommand
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
@@ -108,6 +122,7 @@ from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
 from ..position_control import (
     ARM_EXECUTION_PROFILE_CHOICES,
+    POSITION_15_60_120HZ_PROFILE_NAME,
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
     PositionDeployExecutorFault,
@@ -129,7 +144,7 @@ from .dispatch import (
     require_arm_backends_ready_for_position_dispatch,
 )
 from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
-from .policy import load_policy
+from deployments.client.policy import load_policy
 from .policy_qpos_init import (
     DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
@@ -881,6 +896,9 @@ class ArmStateReader:
             state = dict(backend.get_state())
             if refresh_error is not None:
                 state["state_error"] = refresh_error
+            state["actual_tcp_pose"] = None
+            state["actual_tcp_pose_source"] = None
+            state["actual_tcp_pose_timestamp"] = None
             if self.compute_tcp_pose:
                 try:
                     hardware_qpos = state.get("hardware_qpos")
@@ -888,8 +906,50 @@ class ArmStateReader:
                     if not callable(compute_pose):
                         raise AttributeError("backend has no compute_tcp_pose")
                     if hardware_qpos is not None:
-                        state["current_tcp_pose"] = compute_pose(qpos=hardware_qpos)
+                        measured_pose = compute_pose(qpos=hardware_qpos)
+                        state["current_tcp_pose"] = measured_pose
                         state["tcp_pose_source"] = "hardware_qpos_fk"
+                        try:
+                            hardware_qpos_vector = np.asarray(
+                                hardware_qpos, dtype=float
+                            ).reshape(-1)
+                            measurement_timestamp = float(
+                                state.get("hardware_measurement_timestamp")
+                            )
+                            measurement_sequence = state.get(
+                                "hardware_measurement_sequence"
+                            )
+                            measurement_valid = state.get(
+                                "hardware_measurement_valid"
+                            )
+                            read_success = state.get("hardware_read_success")
+                            sequence_valid = (
+                                measurement_sequence is None
+                                or int(measurement_sequence) > 0
+                            )
+                            actual_valid = bool(
+                                hardware_qpos_vector.shape == (6,)
+                                and np.all(np.isfinite(hardware_qpos_vector))
+                                and np.isfinite(measurement_timestamp)
+                                and isinstance(measurement_valid, (bool, np.bool_))
+                                and bool(measurement_valid)
+                                and not (
+                                    isinstance(read_success, (bool, np.bool_))
+                                    and not bool(read_success)
+                                )
+                                and sequence_valid
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            actual_valid = False
+                            measurement_timestamp = None
+                        if actual_valid:
+                            state["actual_tcp_pose"] = np.asarray(
+                                measured_pose, dtype=float
+                            ).copy()
+                            state["actual_tcp_pose_source"] = "hardware_qpos_fk"
+                            state["actual_tcp_pose_timestamp"] = float(
+                                measurement_timestamp
+                            )
                     else:
                         state["current_tcp_pose"] = compute_pose()
                         state["tcp_pose_source"] = "current_qpos_fk"
@@ -1375,6 +1435,19 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--runtime-pose-frame-contract",
+        type=load_pose_frame_contract,
+        default=None,
+        metavar="JSON",
+        help=(
+            "Current robot runtime raw_absolute->canonical-desk pose contract. "
+            "Native-v2.3-trained pose policies require this explicitly. Policies "
+            "declared as v2.2 raw identity compatibility may only use the matching "
+            "same-source identity binding; omitting it selects that audited identity "
+            "profile."
+        ),
+    )
+    parser.add_argument(
         "--debug-replay-output-pose-mode",
         choices=("absolute", "relative"),
         default="absolute",
@@ -1406,8 +1479,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Canonical real-arm profile shared with the existing teleop runtime: "
-            "impedance_40hz or position. position_45_150hz remains an "
-            "explicit legacy profile; per-stage rate flags remain supported as overrides."
+            "position deploy defaults to position_15_60_120hz. position and "
+            "position_45_150hz remain explicit compatibility profiles; per-stage "
+            "rate flags remain supported as overrides."
         ),
     )
     parser.add_argument(
@@ -1424,8 +1498,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_float,
         default=None,
         help=(
-            "RM65 backend control/streaming rate after each action update. Defaults to 150Hz "
-            "for --arm-control-mode position and 40Hz for impedance."
+            "RM65 backend control/streaming rate after each action update. Position deploy "
+            "defaults to 120Hz; explicit compatibility profile 'position' uses 150Hz."
         ),
     )
     parser.add_argument(
@@ -1434,7 +1508,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
         help=(
             "Position-mode pose-reference/IK rate between the policy action rate and "
-            "the RM65 command stream. Defaults to 75Hz; impedance mode ignores it."
+            "the RM65 command stream. Position deploy defaults to 60Hz; impedance mode ignores it."
+        ),
+    )
+    parser.add_argument(
+        "--position-chunk-lookahead",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the already-predicted next action inside one policy chunk for "
+            "zero-period causal 15->reference interpolation (default: enabled). "
+            "Disable to restore the compatibility one-action-period delayed path."
         ),
     )
     parser.add_argument(
@@ -1473,6 +1557,44 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "Enable collision-solver timing profiling. Full q/pose/distance diagnostics "
             "are written by the existing --debug logger independently."
         ),
+    )
+    parser.add_argument(
+        "--position-ik-solve-max-iterations",
+        type=_positive_int,
+        default=2,
+        help=(
+            "Position-only coupled IK iteration upper bound (default 2). "
+            "The impedance path does not consume this option."
+        ),
+    )
+    parser.add_argument(
+        "--position-ik-solve-min-iterations",
+        type=_positive_int,
+        default=2,
+        help=(
+            "Position-only coupled IK hard minimum iterations (default 2)."
+        ),
+    )
+    parser.add_argument(
+        "--position-ik-damping",
+        type=_positive_float,
+        default=0.03,
+        help="Position-only Pink QP damping (default 0.03).",
+    )
+    parser.add_argument(
+        "--position-ik-adaptive-iterations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "After the minimum iterations, continue only while the shared "
+            "planner's frame budget has room."
+        ),
+    )
+    parser.add_argument(
+        "--position-ik-iteration-reserve-ms",
+        type=_non_negative_float,
+        default=5.0,
+        help="Time reserved after optional IK iterations for limits/collision selection.",
     )
     parser.add_argument(
         "--arm-canfd-follow",
@@ -1808,6 +1930,54 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--position-qref-max-angvel",
+        type=_parse_arm_max_angvel,
+        default=None,
+        help=(
+            "Position-only 60 Hz accepted-qref velocity cap in rad/s. "
+            "Omit to reuse --arm-max-angvel. This is independent from the "
+            "120 Hz qcmd planner envelope."
+        ),
+    )
+    parser.add_argument(
+        "--position-command-planner",
+        choices=POSITION_COMMAND_PLANNER_CHOICES,
+        default=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        help="Position-only high-rate qcmd planner.",
+    )
+    parser.add_argument(
+        "--position-velocity-ramp-sec",
+        type=_positive_float,
+        default=DEFAULT_POSITION_VELOCITY_RAMP_SEC,
+    )
+    parser.add_argument(
+        "--position-target-velocity-filter-tau-sec",
+        type=_non_negative_float,
+        default=DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
+        help="Position-only target qd low-pass time constant; default 0.03 s.",
+    )
+    parser.add_argument(
+        "--position-max-acceleration-rad-s2",
+        type=_parse_arm_max_angvel,
+        default=RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+    )
+    parser.add_argument(
+        "--position-max-command-step-deg",
+        type=_positive_float,
+        default=RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
+    )
+    parser.add_argument(
+        "--position-degraded-speed-scale",
+        type=_unit_interval_float,
+        default=DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
+    )
+    parser.add_argument(
+        "--arm-follow-qpos-alpha",
+        type=_unit_interval_float,
+        default=None,
+        help="Position-only final qref-follow alpha applied by the 120 Hz backend.",
+    )
+    parser.add_argument(
         "--arm-step-dt-scaling",
         dest="arm_step_dt_scaling",
         action="store_true",
@@ -2070,15 +2240,45 @@ def validate_args(
 ) -> tuple[str, ...]:
     active_sides = _parse_active_sides(args.active_sides)
     args.active_sides = active_sides
+    raw_tokens = tuple(str(value) for value in raw_argv)
+    requested_profile = getattr(args, "arm_execution_profile", None)
+    position_requested = bool(
+        requested_profile != "impedance_40hz"
+        and str(getattr(args, "arm_control_mode", "")).strip()
+        == RM65_ARM_CONTROL_MODE_POSITION
+    )
+    if (
+        requested_profile in (None, "")
+        and position_requested
+    ):
+        # Deployment defaults to the clock contract already validated by the
+        # current position teleop. Explicit rate flags remain profile
+        # overrides through resolve_real_arm_execution_config().
+        args.arm_execution_profile = POSITION_15_60_120HZ_PROFILE_NAME
+    current_position_profile = bool(
+        args.arm_execution_profile == POSITION_15_60_120HZ_PROFILE_NAME
+    )
+    if current_position_profile and not any(
+        token == "--arm-max-angvel" or token.startswith("--arm-max-angvel=")
+        for token in raw_tokens
+    ):
+        args.arm_max_angvel = RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
+    if current_position_profile and not any(
+        token == "--arm-follow-qpos-alpha"
+        or token.startswith("--arm-follow-qpos-alpha=")
+        for token in raw_tokens
+    ):
+        args.arm_follow_qpos_alpha = RM65_POSITION_TRACKING_FOLLOW_ALPHA
     execution_config = resolve_real_arm_execution_config(
         args,
-        raw_argv=tuple(str(value) for value in raw_argv),
+        raw_argv=raw_tokens,
     )
     setattr(args, "_real_arm_execution_config", execution_config)
     args.arm_control_mode = execution_config.mode
     args.arm_canfd_follow = execution_config.arm_canfd_follow
     args.arm_control_hz = execution_config.arm_control_hz
     args.position_reference_hz = execution_config.position_reference_hz
+    args.arm_follow_qpos_alpha = execution_config.arm_follow_qpos_alpha
     if (
         args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION
         and float(args.arm_control_hz) < float(args.position_reference_hz)
@@ -2097,6 +2297,13 @@ def validate_args(
         raise ValueError(
             "--position-collision-distance-epsilon-m must not exceed "
             "--position-collision-min-distance-m."
+        )
+    if int(args.position_ik_solve_min_iterations) > int(
+        args.position_ik_solve_max_iterations
+    ):
+        raise ValueError(
+            "--position-ik-solve-min-iterations must be <= "
+            "--position-ik-solve-max-iterations."
         )
     args.arm_workspace_min = _parse_vector3(args.arm_workspace_min)
     args.arm_workspace_max = _parse_vector3(args.arm_workspace_max)
@@ -2168,7 +2375,8 @@ def validate_args(
     ):
         raise ValueError(
             "Real arm policy execution requires an explicit execution branch: "
-            "pass --arm-execution-profile impedance_40hz|position "
+            "pass --arm-execution-profile "
+            "impedance_40hz|position_15_60_120hz|position "
             "or --arm-control-mode impedance|position."
         )
     if (
@@ -2451,7 +2659,7 @@ def _dispatch_position_discrete_command_checked(
     *,
     hand_backends: Mapping[str, EffectorBackend],
 ) -> Mapping[str, Any]:
-    """Dispatch one delayed hand keyframe and preserve backend receipts.
+    """Dispatch one reference-clock-aligned hand keyframe and preserve receipts.
 
     Hand backends historically used both exceptions and return values to
     report I/O failures.  Position deploy needs an explicit result so the
@@ -2667,6 +2875,22 @@ def build_arm_backends(
                 actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
                 background_streaming_enabled=bool(arm_ip) and bool(arm_canfd_follow),
                 background_streaming_hz=float(control_hz),
+                position_command_planner=str(args.position_command_planner),
+                position_velocity_ramp_sec=float(args.position_velocity_ramp_sec),
+                position_target_velocity_filter_tau_sec=float(
+                    args.position_target_velocity_filter_tau_sec
+                ),
+                position_max_acceleration_rad_s2=tuple(
+                    float(value)
+                    for value in args.position_max_acceleration_rad_s2
+                ),
+                position_max_command_step_deg=float(
+                    args.position_max_command_step_deg
+                ),
+                position_degraded_speed_scale=float(
+                    args.position_degraded_speed_scale
+                ),
+                arm_follow_qpos_alpha=float(args.arm_follow_qpos_alpha),
                 canfd_follow=bool(arm_canfd_follow),
                 canfd_trajectory_mode=int(getattr(args, "arm_canfd_trajectory_mode", 0)),
                 canfd_radio=int(getattr(args, "arm_canfd_radio", 0)),
@@ -2910,30 +3134,14 @@ def print_controls(
     print("=" * 60 + "\n")
 
 
-def _policy_should_run(
-    *,
-    now: float,
-    last_policy_at: float | None,
-    policy_interval_s: float,
-    chunk_buffer: ActionChunkBuffer,
-    min_action_queue: int,
-) -> bool:
-    if len(chunk_buffer) > int(min_action_queue):
-        return False
-    if last_policy_at is None:
-        return True
-    return now - float(last_policy_at) >= float(policy_interval_s)
-
-
 def _resolve_action_queue_policy(args: argparse.Namespace, *, debug_replay: bool) -> str:
-    if bool(getattr(args, "append_action_chunks", False)):
-        return "append"
-    policy = str(getattr(args, "action_queue_policy", "auto") or "auto").strip().lower()
-    if policy == "auto":
-        return "append" if bool(debug_replay) else "replace"
-    if policy not in {"replace", "append"}:
-        raise ValueError(f"Unsupported action queue policy: {policy!r}.")
-    return policy
+    """Compatibility wrapper for the shared queue-policy resolver."""
+
+    return resolve_action_queue_policy(
+        action_queue_policy=getattr(args, "action_queue_policy", "auto"),
+        append_action_chunks=bool(getattr(args, "append_action_chunks", False)),
+        debug_replay=bool(debug_replay),
+    )
 
 
 def _send_legacy_deployment_action_commands(
@@ -3049,37 +3257,18 @@ def _bind_policy_pose_mode_from_artifact(
     *,
     raw_argv: list[str],
 ) -> None:
-    """Bind an optional v2.3 artifact pose declaration to the runtime CLI."""
+    """Compatibility wrapper around the shared artifact binding contract."""
 
-    if policy_artifact is None:
-        return
-    metadata = getattr(policy_artifact, "metadata", {})
-    if not isinstance(metadata, Mapping):
-        return
-    representation = metadata.get("pose_representation")
-    if not isinstance(representation, Mapping):
-        return
-    declared = representation.get("action", representation.get("action_pose_mode"))
-    if declared is None:
-        return
-    declared_mode = str(declared).strip().lower()
-    if declared_mode not in {"absolute", "relative"}:
-        raise ValueError(
-            "policy artifact pose_representation.action must be 'absolute' or 'relative', "
-            f"got {declared!r}."
-        )
     explicit = any(
         token == "--policy-action-pose-mode"
         or token.startswith("--policy-action-pose-mode=")
         for token in raw_argv
     )
-    if not explicit:
-        args.policy_action_pose_mode = declared_mode
-    elif str(args.policy_action_pose_mode) != declared_mode:
-        raise ValueError(
-            "CLI policy action pose mode disagrees with policy artifact: "
-            f"{args.policy_action_pose_mode!r} != {declared_mode!r}"
-        )
+    args.policy_action_pose_mode = resolve_policy_action_pose_mode_from_artifact(
+        policy_artifact,
+        configured_mode=str(args.policy_action_pose_mode),
+        explicit=explicit,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3163,7 +3352,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             isinstance(dataset_info, Mapping)
             and str(dataset_info.get("dexteleop_dataset_schema") or "")
-            == DEXTELEOP_DATASET_SCHEMA_V22
+            in {DEXTELEOP_DATASET_SCHEMA_V22, DEXTELEOP_DATASET_SCHEMA_V23}
         ):
             deploy_layout = policy_io_layout_from_metadata(
                 dataset_info,
@@ -3184,9 +3373,20 @@ def main(argv: list[str] | None = None) -> int:
         model_metadata=getattr(policy, "metadata", {}),
         policy_artifact=policy_artifact,
         policy_io_layout=deploy_layout,
+        runtime_pose_frame_contract=args.runtime_pose_frame_contract,
         runtime_end_effectors=runtime_capabilities,
         hardware_output=bool(args.send_actions),
         allow_missing_end_effectors=bool(args.allow_missing_v22_end_effectors),
+    )
+    policy_deploy_runtime = PolicyDeployRuntime(
+        PolicyDeployRuntimeConfig(
+            active_sides=active_sides,
+            arms_enabled=bool(args.arms_enabled),
+            hands_enabled=hands_enabled,
+            policy_action_pose_mode=str(args.policy_action_pose_mode),
+            policy_absolute_frame=str(deploy_session_contract.policy_absolute_frame),
+            runtime_pose_frame_contract=deploy_session_contract.runtime_pose_frame_contract,
+        )
     )
     policy.metadata["resolved_deploy_session_contract"] = deploy_session_contract.to_dict()
     if deploy_session_contract.policy_contract_mode == POLICY_CONTRACT_V22_NATIVE:
@@ -3197,6 +3397,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     action_queue_policy = _resolve_action_queue_policy(args, debug_replay=debug_replay)
     startup_init_action, startup_init_source = resolve_startup_init_action(args, policy)
+    if startup_init_action is not None:
+        startup_absolute_frame = deploy_session_contract.policy_absolute_frame
+        if "policy_absolute_frame=runtime_raw" in startup_init_source:
+            startup_absolute_frame = "runtime_raw"
+        elif "policy_absolute_frame=canonical_desk" in startup_init_source:
+            startup_absolute_frame = "canonical_desk"
+        startup_init_action = convert_policy_absolute_vector_to_runtime_raw(
+            startup_init_action,
+            active_sides=active_sides,
+            policy_absolute_frame=startup_absolute_frame,
+            runtime_pose_frame_contract=(
+                deploy_session_contract.runtime_pose_frame_contract
+            ),
+        )
     fixed_init_plan = load_deploy_fixed_init_plan(
         dataset_root=args.deploy_fixed_init_dataset,
         parquet_path=args.deploy_fixed_init_parquet,
@@ -3292,7 +3506,6 @@ def main(argv: list[str] | None = None) -> int:
         arms_enabled=bool(args.arms_enabled),
         hands_enabled=bool(hands_enabled),
     )
-    chunk_buffer = ActionChunkBuffer()
     ik_action_gate = IKActionChunkGate(stable_frames_required=int(args.ik_recovery_stable_frames))
     startup_initializer = StartupInitializer(
         duration_s=float(args.init_time_s),
@@ -3349,7 +3562,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     ready_confirmed = not wait_for_ready_confirm
     last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
-    last_policy_at: float | None = None
     step_index = 0
     loop_rate = LoopRate()
     last_status_at = 0.0
@@ -3414,7 +3626,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def dispatch_position_discrete(command: TeleopCommand) -> Mapping[str, Any]:
             # Recheck after the arm target was queued and immediately before
-            # any delayed hand packet.  This catches a background stream fault
+            # any scheduled hand packet.  This catches a background stream fault
             # that appeared in the arm->hand worker gap and makes the executor
             # latch/hold instead of tail-sending the hand keyframe.
             require_arm_backends_ready_for_position_dispatch(
@@ -3440,6 +3652,7 @@ def main(argv: list[str] | None = None) -> int:
                 allow_non_authoritative_collision_reset_in_dry_run=not bool(
                     send_actions
                 ),
+                chunk_lookahead_enabled=bool(args.position_chunk_lookahead),
             ),
             canonical_pipeline=arm_only_pipeline,
             dispatch_callback=(dispatch_position_reference if send_actions else None),
@@ -3469,12 +3682,30 @@ def main(argv: list[str] | None = None) -> int:
                             args.position_collision_distance_epsilon_m
                         ),
                         max_joint_velocity_rad_s=tuple(
-                            float(value) for value in args.arm_max_angvel
+                            float(value)
+                            for value in (
+                                args.arm_max_angvel
+                                if args.position_qref_max_angvel is None
+                                else args.position_qref_max_angvel
+                            )
                         ),
                         max_joint_step_rad=(
                             None
                             if float(args.max_arm_joint_step_rad) <= 0.0
                             else float(args.max_arm_joint_step_rad)
+                        ),
+                        damping=float(args.position_ik_damping),
+                        solve_max_iterations=int(
+                            args.position_ik_solve_max_iterations
+                        ),
+                        solve_min_iterations=int(
+                            args.position_ik_solve_min_iterations
+                        ),
+                        solve_adaptive_iterations_enabled=bool(
+                            args.position_ik_adaptive_iterations
+                        ),
+                        solve_iteration_reserve_ms=float(
+                            args.position_ik_iteration_reserve_ms
                         ),
                         debug_profile=bool(args.position_collision_debug_profile),
                     )
@@ -3497,6 +3728,8 @@ def main(argv: list[str] | None = None) -> int:
         observation: Any,
         *,
         policy_name: str,
+        lookahead_canonical_action: Any | None = None,
+        lookahead_observation: Any | None = None,
     ) -> _PreparedActionExecution:
         command = getattr(canonical_action, "command", None)
         if command is None or not command.commands:
@@ -3522,6 +3755,12 @@ def main(argv: list[str] | None = None) -> int:
 
         arm_command = command_effector_kind_subset(command, kind="arm")
         hand_command = command_effector_kind_subset(command, kind="hand")
+        lookahead_hand_command = None
+        if lookahead_canonical_action is not None:
+            lookahead_hand_command = command_effector_kind_subset(
+                getattr(lookahead_canonical_action, "command", None),
+                kind="hand",
+            )
         if arm_command is not None:
             try:
                 source_index = position_deploy_executor.submit(
@@ -3529,6 +3768,13 @@ def main(argv: list[str] | None = None) -> int:
                     observation,
                     policy_name=str(policy_name),
                     discrete_command=hand_command,
+                    lookahead_filtered=(
+                        None
+                        if lookahead_canonical_action is None
+                        else lookahead_canonical_action.filtered
+                    ),
+                    lookahead_observation=lookahead_observation,
+                    lookahead_discrete_command=lookahead_hand_command,
                 )
             except PositionDeployExecutorFault:
                 fault_stage = str(
@@ -3557,7 +3803,7 @@ def main(argv: list[str] | None = None) -> int:
         elif send_actions and hand_command is not None:
             # A hand-only command has no arm keyframe whose causal reference
             # clock could carry it. Mixed arm+hand actions are queued together
-            # above so both become effective on the same delayed reference tick.
+            # above so both become effective on the same logical reference tick.
             try:
                 require_arm_backends_ready_for_position_dispatch(
                     arm_backends,
@@ -3822,7 +4068,7 @@ def main(argv: list[str] | None = None) -> int:
                     print("[Deploy] r ignored: no manually re-armable safety fault is latched.")
                 elif rearm_requested:
                     policy_active = False
-                    chunk_buffer.clear()
+                    policy_deploy_runtime.clear_action_queue()
                 elif key == "g":
                     if position_safety_fault_latched:
                         policy_active = False
@@ -3835,9 +4081,9 @@ def main(argv: list[str] | None = None) -> int:
                         position_deploy_executor.clear()
                         last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
                     policy.reset()
-                    chunk_buffer.clear()
+                    policy_deploy_runtime.clear_action_queue()
                     startup_initializer.reset()
-                    last_policy_at = None
+                    policy_deploy_runtime.reset_prediction_schedule()
                     ready_confirmed = not wait_for_ready_confirm
                     if fixed_init_controller is not None and fixed_init_controller.blocks_policy:
                         print("[Deploy] ignore g: complete fixed-init H -> H before starting policy.")
@@ -3867,14 +4113,14 @@ def main(argv: list[str] | None = None) -> int:
                             print("[Deploy] ready confirm ignored: startup init is not complete yet.")
                         else:
                             ready_confirmed = True
-                            chunk_buffer.clear()
-                            last_policy_at = None
+                            policy_deploy_runtime.clear_action_queue()
+                            policy_deploy_runtime.reset_prediction_schedule()
                             print("[Deploy] ready confirmed; policy inference/execution may start.")
                 elif key == "h":
                     if position_deploy_executor is not None:
                         position_deploy_executor.clear()
                         last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
-                    chunk_buffer.clear()
+                    policy_deploy_runtime.clear_action_queue()
                     ready_confirmed = not wait_for_ready_confirm
                     if policy_active:
                         policy_active = False
@@ -3906,9 +4152,9 @@ def main(argv: list[str] | None = None) -> int:
                 arm_states = arm_reader.snapshot(loop_started_at)
                 ik_gate_event = ik_action_gate.update(arm_states)
                 if ik_action_gate.blocks_action_output:
-                    chunk_buffer.clear()
+                    policy_deploy_runtime.clear_action_queue()
                 if ik_gate_event:
-                    last_policy_at = None
+                    policy_deploy_runtime.reset_prediction_schedule()
                     print(f"[Deploy] {ik_gate_event}; action queue cleared")
                 hand_states = hand_state_snapshot(
                     hand_backends,
@@ -3936,6 +4182,12 @@ def main(argv: list[str] | None = None) -> int:
                         "causal_snapshot_cutoff_timestamp": float(loop_started_at),
                         "policy_active": policy_active,
                         "send_actions": send_actions,
+                        "policy_absolute_frame": deploy_session_contract.policy_absolute_frame,
+                        "runtime_pose_frame_contract_hash": (
+                            None
+                            if deploy_session_contract.runtime_pose_frame_contract is None
+                            else deploy_session_contract.runtime_pose_frame_contract.contract_hash
+                        ),
                         "hand_action_specs_by_side": hand_action_specs,
                         "hand_active_mask_by_side": {
                             side: list(spec.get("active_mask", ()))
@@ -3946,7 +4198,7 @@ def main(argv: list[str] | None = None) -> int:
                 faults = list(observation.faults)
                 if position_safety_fault_latched:
                     policy_active = False
-                    chunk_buffer.clear()
+                    policy_deploy_runtime.clear_action_queue()
                     faults.append("position_safety_fault_manual_rearm_required")
                     if rearm_requested and position_deploy_executor is not None:
                         try:
@@ -3960,7 +4212,7 @@ def main(argv: list[str] | None = None) -> int:
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
                             policy.reset()
                             startup_initializer.reset()
-                            last_policy_at = None
+                            policy_deploy_runtime.reset_prediction_schedule()
                             ready_confirmed = not wait_for_ready_confirm
                             faults.append("position_safety_rearmed_press_g_to_resume")
                             print("[Deploy] safety fault re-armed; press g to begin a fresh policy stream.")
@@ -3984,9 +4236,9 @@ def main(argv: list[str] | None = None) -> int:
                         print(fixed_result.message)
                     if fixed_result.completed:
                         policy.reset()
-                        chunk_buffer.clear()
+                        policy_deploy_runtime.clear_action_queue()
                         startup_initializer.reset()
-                        last_policy_at = None
+                        policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         if bool(args.auto_start):
                             policy_active = True
@@ -4009,9 +4261,9 @@ def main(argv: list[str] | None = None) -> int:
                         print(policy_qpos_result.message)
                     if policy_qpos_result.completed:
                         policy.reset()
-                        chunk_buffer.clear()
+                        policy_deploy_runtime.clear_action_queue()
                         startup_initializer.reset()
-                        last_policy_at = None
+                        policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         policy_active = True
                         policy_qpos_completed_this_step = True
@@ -4074,8 +4326,8 @@ def main(argv: list[str] | None = None) -> int:
                                                 "[StartupInit] replay startup target consumed; "
                                                 f"skipped {skipped} replay frame(s)."
                                             )
-                                    chunk_buffer.clear()
-                                    last_policy_at = None
+                                    policy_deploy_runtime.clear_action_queue()
+                                    policy_deploy_runtime.reset_prediction_schedule()
                                     if wait_for_ready_confirm and not ready_confirmed:
                                         print(
                                             "[StartupInit] ready; press A to start policy inference/execution."
@@ -4083,95 +4335,80 @@ def main(argv: list[str] | None = None) -> int:
                         can_run_policy = False
                     if can_run_policy and wait_for_ready_confirm and not ready_confirmed:
                         can_run_policy = False
-                    if can_run_policy and _policy_should_run(
+                    if can_run_policy and policy_deploy_runtime.should_predict(
                         now=loop_started_at,
-                        last_policy_at=last_policy_at,
                         policy_interval_s=1.0 / float(effective_policy_hz),
-                        chunk_buffer=chunk_buffer,
                         min_action_queue=int(args.min_action_queue),
                     ):
-                        queue_len_before_update = len(chunk_buffer)
-                        try:
-                            policy_observation = prepare_observation_for_policy_pose_mode(
-                                observation,
-                                target_mode=str(args.policy_action_pose_mode),
-                                active_sides=active_sides,
+                        prediction = policy_deploy_runtime.predict_and_queue(
+                            policy,
+                            observation,
+                            now=loop_started_at,
+                            queue_policy=action_queue_policy,
+                            discard_policy_output=ik_action_gate.discards_policy_output,
+                        )
+                        queue_len_before_update = prediction.queue_len_before
+                        if prediction.accepted:
+                            ik_action_gate.mark_policy_output_accepted()
+                            debug_logger.log_policy_chunk(
+                                timestamp=loop_started_at,
+                                step_index=step_index,
+                                policy_name=policy.name,
+                                policy_output=prediction.policy_output,
+                                actions=list(prediction.actions),
+                                accepted=True,
+                                discarded_by_ik=False,
+                                queue_policy=action_queue_policy,
+                                queue_len_before=queue_len_before_update,
+                                queue_len_after=prediction.queue_len_after,
+                                faults=faults,
+                                ik_recovery_statuses=ik_action_gate.last_statuses,
+                                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
                             )
-                            policy_output = policy.predict(policy_observation)
-                            actions = normalize_policy_output(
-                                policy_output,
-                                observation,
-                                active_sides=active_sides,
-                                arms_enabled=bool(args.arms_enabled),
-                                hands_enabled=hands_enabled,
+                        elif prediction.discarded_by_gate:
+                            print("[Deploy] IK recovery active; discarded predicted action chunk.")
+                            debug_logger.log_policy_chunk(
+                                timestamp=loop_started_at,
+                                step_index=step_index,
+                                policy_name=policy.name,
+                                policy_output=prediction.policy_output,
+                                actions=list(prediction.actions),
+                                accepted=False,
+                                discarded_by_ik=True,
+                                queue_policy=action_queue_policy,
+                                queue_len_before=queue_len_before_update,
+                                queue_len_after=prediction.queue_len_after,
+                                faults=faults,
+                                ik_recovery_statuses=ik_action_gate.last_statuses,
+                                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
                             )
-                            actions = convert_normalized_action_chunk_to_absolute(
-                                actions,
-                                observation,
-                                source_mode=str(args.policy_action_pose_mode),
-                                active_sides=active_sides,
+                        elif prediction.error is None:
+                            faults.extend(prediction.faults)
+                            debug_logger.log_policy_chunk(
+                                timestamp=loop_started_at,
+                                step_index=step_index,
+                                policy_name=policy.name,
+                                policy_output=prediction.policy_output,
+                                actions=[],
+                                accepted=False,
+                                discarded_by_ik=False,
+                                queue_policy=action_queue_policy,
+                                queue_len_before=queue_len_before_update,
+                                queue_len_after=prediction.queue_len_after,
+                                faults=faults,
+                                ik_recovery_statuses=ik_action_gate.last_statuses,
+                                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
                             )
-                            if actions:
-                                last_policy_at = loop_started_at
-                                if ik_action_gate.discards_policy_output:
-                                    chunk_buffer.clear()
-                                    print("[Deploy] IK recovery active; discarded predicted action chunk.")
-                                    debug_logger.log_policy_chunk(
-                                        timestamp=loop_started_at,
-                                        step_index=step_index,
-                                        policy_name=policy.name,
-                                        policy_output=policy_output,
-                                        actions=actions,
-                                        accepted=False,
-                                        discarded_by_ik=True,
-                                        queue_policy=action_queue_policy,
-                                        queue_len_before=queue_len_before_update,
-                                        queue_len_after=len(chunk_buffer),
-                                        faults=faults,
-                                        ik_recovery_statuses=ik_action_gate.last_statuses,
-                                        ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
-                                    )
-                                else:
-                                    if action_queue_policy == "append":
-                                        chunk_buffer.append(actions)
-                                    else:
-                                        chunk_buffer.replace(actions)
-                                    ik_action_gate.mark_policy_output_accepted()
-                                    debug_logger.log_policy_chunk(
-                                        timestamp=loop_started_at,
-                                        step_index=step_index,
-                                        policy_name=policy.name,
-                                        policy_output=policy_output,
-                                        actions=actions,
-                                        accepted=True,
-                                        discarded_by_ik=False,
-                                        queue_policy=action_queue_policy,
-                                        queue_len_before=queue_len_before_update,
-                                        queue_len_after=len(chunk_buffer),
-                                        faults=faults,
-                                        ik_recovery_statuses=ik_action_gate.last_statuses,
-                                        ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
-                                    )
-                            else:
-                                faults.append("policy_empty_action")
-                                debug_logger.log_policy_chunk(
-                                    timestamp=loop_started_at,
-                                    step_index=step_index,
-                                    policy_name=policy.name,
-                                    policy_output=policy_output,
-                                    actions=[],
-                                    accepted=False,
-                                    discarded_by_ik=False,
-                                    queue_policy=action_queue_policy,
-                                    queue_len_before=queue_len_before_update,
-                                    queue_len_after=len(chunk_buffer),
-                                    faults=faults,
-                                    ik_recovery_statuses=ik_action_gate.last_statuses,
-                                    ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
+                        else:
+                            faults.extend(prediction.faults)
+                            if prediction.rollback_error is not None:
+                                rollback_error = prediction.rollback_error
+                                print(
+                                    "[Deploy] policy prediction rollback error: "
+                                    f"{type(rollback_error).__name__}: {rollback_error}"
                                 )
-                        except Exception as exc:  # noqa: BLE001
+                            exc = prediction.error
                             print(f"[Deploy] policy error: {type(exc).__name__}: {exc}")
-                            chunk_buffer.clear()
                             faults.append(f"policy_error:{type(exc).__name__}")
                             debug_logger.log_policy_error(
                                 timestamp=loop_started_at,
@@ -4186,24 +4423,50 @@ def main(argv: list[str] | None = None) -> int:
                                     position_deploy_executor.clear()
                                     last_action = observation.hold_action()
 
-                    queue_len_before_pop = len(chunk_buffer)
-                    raw_action = (
-                        # An empty policy queue is intentionally a no-op.  The
-                        # impedance backend already keeps its last safe
-                        # command; synthesising the current measured TCP here
-                        # would re-anchor the Cartesian reference on every
-                        # control-loop gap.
-                        chunk_buffer.pop()
-                        if can_run_policy and not ik_action_gate.blocks_action_output
-                        else None
+                    # An empty policy queue is intentionally a no-op.  The
+                    # impedance backend already keeps its last safe command;
+                    # synthesising the current measured TCP here would
+                    # re-anchor the Cartesian reference on every gap.
+                    action_step = policy_deploy_runtime.prepare_next_action(
+                        observation,
+                        preparer=canonical_action_pipeline,
+                        policy_name=policy.name,
+                        allow_output=(
+                            can_run_policy and not ik_action_gate.blocks_action_output
+                        ),
                     )
-                    queue_len_after_pop = len(chunk_buffer)
+                    queue_len_before_pop = action_step.queue_len_before
+                    raw_action = action_step.raw_action
+                    raw_lookahead_action = action_step.raw_lookahead_action
+                    queue_len_after_pop = action_step.queue_len_after
                     if raw_action is not None:
-                        canonical_action = canonical_action_pipeline.prepare(
-                            raw_action,
-                            observation,
-                            policy_name=policy.name,
-                        )
+                        canonical_action = action_step.prepared_action
+                        lookahead_canonical_action = None
+                        lookahead_observation = None
+                        if (
+                            position_deploy_executor is not None
+                            and bool(args.position_chunk_lookahead)
+                            and raw_lookahead_action is not None
+                            and not canonical_action.faults
+                        ):
+                            # The current safe action is the correct 15 Hz
+                            # reference for filtering the next action in the
+                            # same already-decoded chunk.  This is validation,
+                            # not an extra temporal smoothing stage.
+                            lookahead_observation = replace(
+                                observation,
+                                last_action=canonical_action.action.vector.astype(
+                                    np.float32,
+                                    copy=True,
+                                ),
+                            )
+                            prepared_lookahead = canonical_action_pipeline.prepare(
+                                raw_lookahead_action,
+                                lookahead_observation,
+                                policy_name=policy.name,
+                            )
+                            if not prepared_lookahead.faults:
+                                lookahead_canonical_action = prepared_lookahead
                         faults.extend(canonical_action.faults)
                         latch_canonical_safety_fault(
                             canonical_action,
@@ -4227,6 +4490,10 @@ def main(argv: list[str] | None = None) -> int:
                                     canonical_action,
                                     observation,
                                     policy_name=policy.name,
+                                    lookahead_canonical_action=(
+                                        lookahead_canonical_action
+                                    ),
+                                    lookahead_observation=lookahead_observation,
                                 )
                                 if execution.accepted:
                                     position_action_submitted_this_loop = (
@@ -4376,7 +4643,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"step={step_index} hz={control_hz:.2f} "
                         f"policy={'active' if policy_active else 'paused'} "
                         f"send={'on' if send_actions else 'dry-run'} "
-                        f"queue={len(chunk_buffer)} "
+                        f"queue={policy_deploy_runtime.action_queue_length()} "
                         f"state_valid={int(np.sum(observation.state_valid))}/{observation.state_valid.size} "
                         f"{camera_status_text(camera_sources, camera_previewer)}"
                         f"{suffix}"

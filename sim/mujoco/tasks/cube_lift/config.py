@@ -84,7 +84,7 @@ class CubeLiftTaskConfig:
     base_contract_sha256: str
     execution_mode: str = DIRECT_QPOS_DEBUG_EXECUTION_MODE
     robot_dynamics: str = "not_simulated"
-    grasp_mode: str = "physics_contact"
+    grasp_mode: str = "contact_latch_debug"
     controlled_side: str = "right"
     fixed_side: str = "left"
     left_home_qpos: tuple[float, ...] = (0.0,) * 6
@@ -93,12 +93,18 @@ class CubeLiftTaskConfig:
     right_qpos_upper: tuple[float, ...] = (0.0,) * 6
     right_joint_delta_rad: tuple[float, ...] = (0.0,) * 6
     right_gripper_delta: float = 0.2
+    right_gripper_max_close: float = 0.8
     left_gripper_name: str = "left_gripper"
     right_gripper_name: str = "right_gripper"
     initial_gripper_close_by_name: Mapping[str, float] = field(default_factory=dict)
     object_body_name: str = "debug_cube"
     object_freejoint_name: str = "debug_cube_freejoint"
     right_grasp_body_name: str = "right_gripper_grasp_center_frame"
+    grasp_latch_left_finger_body_name: str = "right_gripper_left_finger"
+    grasp_latch_right_finger_body_name: str = "right_gripper_right_finger"
+    grasp_latch_acquire_close: float = 0.45
+    grasp_latch_release_close: float = 0.20
+    grasp_latch_acquire_distance_m: float = 0.06
     object_size_m: tuple[float, ...] = (0.03, 0.03, 0.03)
     cube_center_xy_m: tuple[float, ...] = (-0.412, 0.0)
     table_body_name: str = "table"
@@ -131,8 +137,8 @@ class CubeLiftTaskConfig:
             raise ValueError("CubeLift v0 only supports kinematic_direct_qpos_debug.")
         if self.robot_dynamics != "not_simulated":
             raise ValueError("CubeLift v0 must declare robot_dynamics=not_simulated.")
-        if self.grasp_mode != "physics_contact":
-            raise ValueError("CubeLift v0 only permits grasp_mode=physics_contact.")
+        if self.grasp_mode != "contact_latch_debug":
+            raise ValueError("CubeLift v0 only permits grasp_mode=contact_latch_debug.")
         if (self.controlled_side, self.fixed_side) != ("right", "left"):
             raise ValueError("CubeLift v0 controls right and holds left.")
         base_contract_path = str(self.base_contract_path).strip()
@@ -182,6 +188,7 @@ class CubeLiftTaskConfig:
             "command_hz",
             "physics_hz",
             "lift_delta_m",
+            "grasp_latch_acquire_distance_m",
         )
         scalar_values = {name: float(getattr(self, name)) for name in scalar_names}
         if not all(math.isfinite(value) and value > 0.0 for value in scalar_values.values()):
@@ -192,6 +199,17 @@ class CubeLiftTaskConfig:
             raise ValueError("settle_physics_ticks must be >= 0 and max_episode_steps > 0.")
         if self.success_hold_physics_ticks <= 0:
             raise ValueError("success_hold_physics_ticks must be positive.")
+        unit_values = {
+            "right_gripper_max_close": float(self.right_gripper_max_close),
+            "grasp_latch_acquire_close": float(self.grasp_latch_acquire_close),
+            "grasp_latch_release_close": float(self.grasp_latch_release_close),
+        }
+        if any(not 0.0 <= value <= 1.0 for value in unit_values.values()):
+            raise ValueError(f"CubeLift latch close values must be in [0, 1]: {unit_values}.")
+        if unit_values["grasp_latch_release_close"] >= unit_values["grasp_latch_acquire_close"]:
+            raise ValueError("grasp latch release close must be below acquire close.")
+        if unit_values["grasp_latch_acquire_close"] > unit_values["right_gripper_max_close"]:
+            raise ValueError("grasp latch acquire close cannot exceed gripper max close.")
 
         grippers = _unit_interval_mapping(
             self.initial_gripper_close_by_name,
@@ -208,6 +226,8 @@ class CubeLiftTaskConfig:
             "object_body_name",
             "object_freejoint_name",
             "right_grasp_body_name",
+            "grasp_latch_left_finger_body_name",
+            "grasp_latch_right_finger_body_name",
             "table_body_name",
         ):
             if not str(getattr(self, field_name)).strip():
@@ -229,6 +249,8 @@ class CubeLiftTaskConfig:
         object.__setattr__(self, "out_of_bounds_xyz_upper_m", upper_xyz)
         object.__setattr__(self, "initial_gripper_close_by_name", grippers)
         for field_name, value in scalar_values.items():
+            object.__setattr__(self, field_name, value)
+        for field_name, value in unit_values.items():
             object.__setattr__(self, field_name, value)
         object.__setattr__(self, "settle_physics_ticks", int(self.settle_physics_ticks))
         object.__setattr__(self, "max_episode_steps", int(self.max_episode_steps))
@@ -282,7 +304,7 @@ class CubeLiftTaskConfig:
             "grasp_mode": self.grasp_mode,
             "observation_mode": "state_privileged",
             "action_layout": "right_qpos_delta6_right_gripper_delta1.v0",
-            "observation_layout": "right_qpos6_right_close1_cube_pose7_cube_velocity6_cube_to_grasp3_last_action7_progress1.v0",
+            "observation_layout": "right_qpos6_right_close1_cube_pose7_cube_velocity6_cube_to_grasp3_last_applied_action7_progress1.v0",
         }
 
     @classmethod
@@ -297,7 +319,7 @@ class CubeLiftTaskConfig:
             base_contract_sha256=str(payload["base_contract_sha256"]),
             execution_mode=str(payload.get("execution_mode", DIRECT_QPOS_DEBUG_EXECUTION_MODE)),
             robot_dynamics=str(payload.get("robot_dynamics", "not_simulated")),
-            grasp_mode=str(payload.get("grasp_mode", "physics_contact")),
+            grasp_mode=str(payload.get("grasp_mode", "contact_latch_debug")),
             controlled_side=str(payload.get("controlled_side", "right")),
             fixed_side=str(payload.get("fixed_side", "left")),
             left_home_qpos=tuple(payload["left_home_qpos"]),
@@ -306,6 +328,7 @@ class CubeLiftTaskConfig:
             right_qpos_upper=tuple(payload["right_qpos_upper"]),
             right_joint_delta_rad=tuple(payload["right_joint_delta_rad"]),
             right_gripper_delta=float(payload.get("right_gripper_delta", 0.2)),
+            right_gripper_max_close=float(payload.get("right_gripper_max_close", 0.8)),
             left_gripper_name=str(payload.get("left_gripper_name", "left_gripper")),
             right_gripper_name=str(payload.get("right_gripper_name", "right_gripper")),
             initial_gripper_close_by_name=dict(payload["initial_gripper_close_by_name"]),
@@ -313,6 +336,17 @@ class CubeLiftTaskConfig:
             object_freejoint_name=str(payload.get("object_freejoint_name", "debug_cube_freejoint")),
             right_grasp_body_name=str(
                 payload.get("right_grasp_body_name", "right_gripper_grasp_center_frame")
+            ),
+            grasp_latch_left_finger_body_name=str(
+                payload.get("grasp_latch_left_finger_body_name", "right_gripper_left_finger")
+            ),
+            grasp_latch_right_finger_body_name=str(
+                payload.get("grasp_latch_right_finger_body_name", "right_gripper_right_finger")
+            ),
+            grasp_latch_acquire_close=float(payload.get("grasp_latch_acquire_close", 0.45)),
+            grasp_latch_release_close=float(payload.get("grasp_latch_release_close", 0.20)),
+            grasp_latch_acquire_distance_m=float(
+                payload.get("grasp_latch_acquire_distance_m", 0.06)
             ),
             object_size_m=tuple(payload["object_size_m"]),
             cube_center_xy_m=tuple(payload["cube_center_xy_m"]),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rm65_inspire_tac.pipeline import (
+from robot_motion.rm65 import (
     DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
     DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES,
     build_dual_arm_scene_profile,

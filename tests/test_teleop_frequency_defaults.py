@@ -9,6 +9,8 @@ from unittest.mock import call, patch
 import numpy as np
 import pytest
 
+from dataset_contracts.pose_frames import PoseFrameContract
+from robot_motion.rm65 import RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
 from teleop_runtime.collection import run_collect
 from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
 from teleop_runtime.backends.arms import (
@@ -140,6 +142,22 @@ def test_real_teleop_position_command_step_envelope_cli() -> None:
     )
 
     assert args.position_max_command_step_deg == pytest.approx(0.675)
+    assert args.position_target_velocity_filter_tau_sec == pytest.approx(0.03)
+
+
+def test_real_teleop_position_target_velocity_filter_can_be_bypassed() -> None:
+    args = _parse_real_teleop_args(
+        [
+            "--arm-execution-profile",
+            "position",
+            "--position-command-planner",
+            "acceleration_limited",
+            "--position-target-velocity-filter-tau-sec",
+            "0",
+        ]
+    )
+
+    assert args.position_target_velocity_filter_tau_sec == pytest.approx(0.0)
 
 
 def test_real_teleop_position_command_step_envelope_rejects_impedance() -> None:
@@ -175,6 +193,85 @@ def test_lerobot_writer_default_nominal_fps_is_15hz(tmp_path) -> None:
     config = LeRobotV21WriterConfig(root_dir=tmp_path)
 
     assert config.nominal_fps == DEFAULT_TELEOP_SAMPLE_HZ
+
+
+def test_collection_pose_contract_is_explicit_opt_in_and_loaded_before_runtime(tmp_path) -> None:
+    contract = PoseFrameContract.legacy_v22_raw(active_sides=("left", "right"))
+    path = tmp_path / "pose_contract.json"
+    path.write_text(
+        json.dumps({"pose_frame_contract": contract.to_dict()}),
+        encoding="utf-8",
+    )
+    args = _parse_collect_args(
+        [
+            "--active-sides",
+            "both",
+            "--no-camera",
+            "--no-video",
+            "--policy-io-layout",
+            "auto",
+            "--pose-frame-contract",
+            str(path),
+        ]
+    )
+    assert args.pose_frame_contract.to_dict() == contract.to_dict()
+    real_args = _parse_real_teleop_args(
+        [
+            "--policy-io-layout",
+            "auto",
+            "--pose-frame-contract",
+            str(path),
+        ]
+    )
+    assert real_args.pose_frame_contract.to_dict() == contract.to_dict()
+
+
+def test_collection_pose_contract_requires_typed_layout(tmp_path) -> None:
+    contract = PoseFrameContract.legacy_v22_raw(active_sides=("left", "right"))
+    path = tmp_path / "pose_contract.json"
+    path.write_text(json.dumps(contract.to_dict()), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        _parse_collect_args(
+            [
+                "--active-sides",
+                "both",
+                "--no-camera",
+                "--no-video",
+                "--pose-frame-contract",
+                str(path),
+            ]
+        )
+
+
+def test_v23_collection_contract_cannot_disable_measured_arm_feedback(tmp_path) -> None:
+    contract = PoseFrameContract.legacy_v22_raw(active_sides=("left", "right"))
+    path = tmp_path / "pose_contract.json"
+    path.write_text(json.dumps(contract.to_dict()), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        _parse_collect_args(
+            [
+                "--active-sides",
+                "both",
+                "--no-camera",
+                "--no-video",
+                "--policy-io-layout",
+                "auto",
+                "--pose-frame-contract",
+                str(path),
+                "--no-record-actual-wrist-camera-pose",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(
+            [
+                "--policy-io-layout",
+                "auto",
+                "--pose-frame-contract",
+                str(path),
+                "--no-record-actual-wrist-camera-pose",
+            ]
+        )
 
 
 def test_collect_actual_wrist_camera_pose_recording_defaults_on() -> None:
@@ -314,6 +411,11 @@ def test_real_teleop_debug_action_options_parse() -> None:
             "3",
             "--debug-action-queue-size",
             "64",
+            "--debug-action-sample-hz",
+            "15",
+            "--debug-timing-log-sample-hz",
+            "5",
+            "--no-control-debug-episode-sidecar",
         ]
     )
 
@@ -321,6 +423,15 @@ def test_real_teleop_debug_action_options_parse() -> None:
     assert args.debug_action_log_root == "teleop_records/custom_action_debug"
     assert args.debug_action_flush_every == 3
     assert args.debug_action_queue_size == 64
+    assert args.debug_action_sample_hz == 15.0
+    assert args.debug_timing_log_sample_hz == 5.0
+    assert args.control_debug_episode_sidecar is False
+
+
+def test_real_teleop_debug_action_can_be_explicitly_disabled() -> None:
+    args = _parse_real_teleop_args(["--debug-action", "--no-debug-action"])
+
+    assert args.debug_action is False
 
 
 def test_real_teleop_arm_singularity_protection_can_be_disabled() -> None:
@@ -467,7 +578,9 @@ def test_real_teleop_canfd_follow_defaults_to_backend_or_profile() -> None:
     assert args.arm_canfd_follow is None
     assert args.arm_control_hz is None
     assert args.arm_follow_qpos_alpha is None
-    assert args.position_post_ik_qpos_smoothing_alpha is None
+    assert args.position_post_ik_qpos_smoothing_alpha == pytest.approx(0.14)
+    assert args.position_post_ik_qpos_smoothing_fast_alpha == pytest.approx(0.45)
+    assert args.position_post_ik_qpos_smoothing_adaptive is True
     assert args.arm_canfd_follow_stream_hz is None
     assert args.arm_canfd_follow_warning_ratio is None
     assert args.arm_canfd_trajectory_mode is None
@@ -835,9 +948,41 @@ def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
 
     assert active_sides == ("left", "right")
     assert args.hz == DEFAULT_TELEOP_SAMPLE_HZ
-    assert args.arm_control_hz == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert args.position_reference_hz == 60.0
+    assert args.arm_control_hz == 120.0
+    assert args.position_chunk_lookahead is True
+    assert args.position_ik_solve_min_iterations == 2
+    assert args.position_ik_solve_max_iterations == 2
+    assert args.position_ik_damping == pytest.approx(0.03)
+    assert args.position_ik_adaptive_iterations is False
+    assert args.position_ik_iteration_reserve_ms == pytest.approx(5.0)
     assert hz == DEFAULT_TELEOP_SAMPLE_HZ
     assert info["source"] == "cli.hz"
+
+
+def test_deploy_position_chunk_lookahead_has_explicit_rollback_switch() -> None:
+    args = _parse_deploy_args(
+        ["--active-sides", "both", "--no-position-chunk-lookahead"]
+    )
+    run_policy.validate_args(args)
+
+    assert args.position_chunk_lookahead is False
+
+
+def test_deploy_position_ik_iteration_range_is_validated() -> None:
+    args = _parse_deploy_args(
+        [
+            "--active-sides",
+            "both",
+            "--position-ik-solve-min-iterations",
+            "3",
+            "--position-ik-solve-max-iterations",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="solve-min-iterations"):
+        run_policy.validate_args(args)
 
 
 def test_deploy_default_fallback_action_hz_is_15hz_for_single_arm() -> None:
@@ -847,7 +992,8 @@ def test_deploy_default_fallback_action_hz_is_15hz_for_single_arm() -> None:
 
     assert active_sides == ("right",)
     assert args.hz == DEFAULT_TELEOP_SAMPLE_HZ
-    assert args.arm_control_hz == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert args.position_reference_hz == 60.0
+    assert args.arm_control_hz == 120.0
     assert hz == DEFAULT_TELEOP_SAMPLE_HZ
     assert info["source"] == "cli.hz"
 
@@ -859,8 +1005,8 @@ def test_deploy_dry_run_arm_backend_uses_position_control_default() -> None:
     backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
 
     assert args.arm_control_mode == "position"
-    assert backends["right"].config.control_dt == 1.0 / DEFAULT_TELEOP_POSITION_REFERENCE_HZ
-    assert backends["right"].config.background_streaming_hz == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert backends["right"].config.control_dt == 1.0 / 60.0
+    assert backends["right"].config.background_streaming_hz == 120.0
     assert backends["right"].config.canfd_follow is True
 
 
@@ -980,7 +1126,7 @@ def test_deploy_position_can_disable_canfd_follow() -> None:
 
     backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
 
-    assert args.arm_control_hz == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+    assert args.arm_control_hz == 120.0
     assert args.arm_canfd_follow is False
     assert backends["right"].config.canfd_follow is False
     assert backends["right"].config.background_streaming_enabled is False
@@ -992,7 +1138,7 @@ def test_deploy_arm_limits_match_real_teleop_defaults() -> None:
 
     backends = run_policy.build_arm_backends(args, active_sides, control_hz=args.arm_control_hz)
 
-    assert args.arm_max_angvel == (0.7, 0.7, 0.9, 1.5, 1.5, 2.0)
+    assert args.arm_max_angvel == RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
     assert args.arm_step_dt_scaling is True
     assert args.arm_step_dt_alpha == 0.25
     assert args.arm_step_dt_stall_reset_sec == 0.25
@@ -1000,14 +1146,21 @@ def test_deploy_arm_limits_match_real_teleop_defaults() -> None:
         args.arm_step_dt_max_scale,
         max(
             run_policy.DEPLOY_ARM_STEP_DT_MAX_SCALE,
-            DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
-            / DEFAULT_TELEOP_POSITION_REFERENCE_HZ
+            120.0
+            / 60.0
             * 1.1,
         ),
     )
     assert args.arm_step_dt_max_scale_auto is True
     assert np.isclose(args.max_arm_joint_step_rad, np.deg2rad(6.0))
-    assert backends["right"].config.max_angvel == (0.7, 0.7, 0.9, 1.5, 1.5, 2.0)
+    assert (
+        backends["right"].config.max_angvel
+        == RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
+    )
+    assert backends["right"].config.position_command_planner == "acceleration_limited"
+    assert backends["right"].config.position_target_velocity_filter_tau_sec == 0.03
+    assert backends["right"].config.position_max_command_step_deg == 0.675
+    assert backends["right"].config.arm_follow_qpos_alpha == 0.9
     assert backends["right"].config.use_actual_send_dt_scaling is True
     assert backends["right"].config.actual_send_dt_max_scale == args.arm_step_dt_max_scale
 
@@ -1073,12 +1226,12 @@ def test_deploy_policy_arm_command_limit_uses_action_dt() -> None:
         action_hz=15.0,
     )
 
-    expected = np.asarray((0.7, 0.7, 0.9, 1.5, 1.5, 2.0), dtype=float) / 15.0
+    expected = np.asarray(RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S) / 15.0
     actual = command.commands["right_arm"].metadata["max_joint_step_rad"]
     assert np.allclose(actual, expected)
     assert command.commands["right_arm"].metadata["deploy_action_step_dt_sec"] == 1.0 / 15.0
     assert command.commands["right_arm"].metadata["deploy_backend_control_dt_sec"] == (
-        1.0 / DEFAULT_TELEOP_POSITION_REFERENCE_HZ
+        1.0 / 60.0
     )
 
 

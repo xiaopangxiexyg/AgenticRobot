@@ -36,6 +36,10 @@ from robot_motion.position_control import (
     ResampledMotionReference,
     TimestampedMotionTarget,
 )
+from robot_motion.rm65 import (
+    RM65PositionCollisionPlanResult,
+    RM65PositionPlannerProtocol,
+)
 from robot_motion.runtime import TeleopCommand
 from robot_motion.safety_constraints import (
     constrain_joint_vector,
@@ -61,10 +65,11 @@ class PositionDeployExecutorFault(RuntimeError):
 class PositionDeployExecutorConfig:
     """Rates and safety timing for real-only online position deployment.
 
-    ``stale_after_sec`` is measured from the last accepted input keyframe.  It
-    must exceed one sample period because the online interpolator deliberately
-    runs one complete sample period behind the keyframe stream.  Collision
-    reset freshness uses monotonic hardware measurement timestamps.  The
+    ``stale_after_sec`` is measured from the last accepted input keyframe and
+    must exceed one sample period.  The compatibility path deliberately runs
+    one sample behind; chunk-lookahead mode instead uses an already-available
+    same-chunk successor at the current logical time. Collision reset
+    freshness uses monotonic hardware measurement timestamps. The
     non-authoritative fallback is dry-run only and is ignored whenever a real
     dispatch callback exists.
     """
@@ -82,6 +87,10 @@ class PositionDeployExecutorConfig:
     collision_reset_pair_max_skew_sec: float = 0.05
     safety_rearm_measurement_max_age_sec: float = 0.1
     allow_non_authoritative_collision_reset_in_dry_run: bool = False
+    # Opt-in deployment mode: a same-chunk successor is already known when the
+    # current sample-rate action is consumed, so references query the current logical
+    # time instead of adding the legacy one-sample causal delay.
+    chunk_lookahead_enabled: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -130,6 +139,11 @@ class PositionDeployExecutorConfig:
         object.__setattr__(self, "collision_required", bool(self.collision_required))
         object.__setattr__(
             self,
+            "chunk_lookahead_enabled",
+            bool(self.chunk_lookahead_enabled),
+        )
+        object.__setattr__(
+            self,
             "allow_non_authoritative_collision_reset_in_dry_run",
             bool(self.allow_non_authoritative_collision_reset_in_dry_run),
         )
@@ -160,6 +174,16 @@ class _Submission:
     anchor_qpos_by_side: Mapping[str, np.ndarray] | None = None
     collision_reset_qpos_by_side: Mapping[str, np.ndarray] | None = None
     collision_reset_metadata: Mapping[str, Any] | None = None
+    logical_timestamp: float | None = None
+    current_already_staged: bool = False
+    lookahead_source_index: int | None = None
+    lookahead_timestamp: float | None = None
+    lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
+    lookahead_qpos_by_side: Mapping[str, np.ndarray] | None = None
+    lookahead_filtered: FilteredNormalizedAction | None = None
+    lookahead_observation: DeploymentObservation | None = None
+    lookahead_policy_name: str | None = None
+    lookahead_discrete_command: TeleopCommand | None = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +268,23 @@ def _copy_teleop_command(command: TeleopCommand) -> TeleopCommand:
     )
 
 
+def _target_maps_equal(
+    left: Mapping[str, np.ndarray],
+    right: Mapping[str, np.ndarray],
+) -> bool:
+    if set(left) != set(right):
+        return False
+    return all(
+        np.allclose(
+            np.asarray(left[side], dtype=float),
+            np.asarray(right[side], dtype=float),
+            rtol=0.0,
+            atol=1e-7,
+        )
+        for side in left
+    )
+
+
 def _slim_observation(observation: DeploymentObservation) -> DeploymentObservation:
     """Retain canonical-resolution state without pinning camera frames in the FIFO."""
 
@@ -281,7 +322,7 @@ class PositionDeployExecutor:
         dispatch_callback: Callable[[TeleopCommand], object] | None = None,
         discrete_dispatch_callback: Callable[[TeleopCommand], object] | None = None,
         hold_callback: Callable[[], None] | None = None,
-        collision_planner_factory: Callable[[], Any] | None = None,
+        collision_planner_factory: Callable[[], RM65PositionPlannerProtocol] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -332,7 +373,7 @@ class PositionDeployExecutor:
         self.discrete_dispatch_callback = discrete_dispatch_callback
         self.hold_callback = hold_callback
         self._collision_planner_factory = collision_planner_factory
-        self._collision_planner: Any | None = None
+        self._collision_planner: RM65PositionPlannerProtocol | None = None
         self._collision_planner_initialized = False
         self._clock = clock
         self._wall_clock = wall_clock
@@ -368,6 +409,14 @@ class PositionDeployExecutor:
         self._last_submitted_timestamp: float | None = None
         self._last_source_timestamp: float | None = None
         self._next_tick_timestamp: float | None = None
+        self._staged_lookahead_source_index: int | None = None
+        self._staged_lookahead_timestamp: float | None = None
+        self._staged_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
+        self._staged_lookahead_qpos_by_side: Mapping[str, np.ndarray] | None = None
+        self._staged_lookahead_discrete_command: TeleopCommand | None = None
+        self._terminal_pose_by_side: Mapping[str, np.ndarray] | None = None
+        self._terminal_qpos_by_side: Mapping[str, np.ndarray] | None = None
+        self._terminal_timestamp: float | None = None
         self._last_discrete_source_index = -1
         self._fault: BaseException | None = None
         self._fault_stage: str | None = None
@@ -485,6 +534,9 @@ class PositionDeployExecutor:
         policy_name: str,
         timestamp_monotonic: float | None = None,
         discrete_command: TeleopCommand | None = None,
+        lookahead_filtered: FilteredNormalizedAction | None = None,
+        lookahead_observation: DeploymentObservation | None = None,
+        lookahead_discrete_command: TeleopCommand | None = None,
     ) -> int:
         """Enqueue one safe keyframe without applying its safety filter again.
 
@@ -498,6 +550,20 @@ class PositionDeployExecutor:
             raise TypeError("filtered must be a FilteredNormalizedAction")
         if not isinstance(observation, DeploymentObservation):
             raise TypeError("observation must be a DeploymentObservation")
+        if lookahead_filtered is not None and not self.config.chunk_lookahead_enabled:
+            raise ValueError(
+                "lookahead_filtered requires chunk_lookahead_enabled=True"
+            )
+        if lookahead_filtered is not None and not isinstance(
+            lookahead_filtered,
+            FilteredNormalizedAction,
+        ):
+            raise TypeError("lookahead_filtered must be a FilteredNormalizedAction or None")
+        if lookahead_observation is not None and not isinstance(
+            lookahead_observation,
+            DeploymentObservation,
+        ):
+            raise TypeError("lookahead_observation must be a DeploymentObservation or None")
         if filtered.faults:
             self.latch_safety_fault(
                 filtered.faults,
@@ -508,12 +574,26 @@ class PositionDeployExecutor:
                 "cannot submit a keyframe with safety faults: "
                 + ", ".join(str(fault) for fault in filtered.faults)
             )
-        if discrete_command is not None:
-            if not isinstance(discrete_command, TeleopCommand):
-                raise TypeError("discrete_command must be a TeleopCommand or None")
+        if lookahead_filtered is not None and lookahead_filtered.faults:
+            raise PositionDeployExecutorFault(
+                "cannot stage a lookahead keyframe with safety faults: "
+                + ", ".join(str(fault) for fault in lookahead_filtered.faults)
+            )
+        if lookahead_discrete_command is not None and lookahead_filtered is None:
+            raise ValueError(
+                "lookahead_discrete_command requires lookahead_filtered"
+            )
+        for command_name, candidate_command in (
+            ("discrete_command", discrete_command),
+            ("lookahead_discrete_command", lookahead_discrete_command),
+        ):
+            if candidate_command is None:
+                continue
+            if not isinstance(candidate_command, TeleopCommand):
+                raise TypeError(f"{command_name} must be a TeleopCommand or None")
             non_hand_effectors = [
                 str(name)
-                for name in discrete_command.commands
+                for name in candidate_command.commands
                 if not str(name).endswith("_hand")
             ]
             if non_hand_effectors:
@@ -522,7 +602,7 @@ class PositionDeployExecutor:
                     + ", ".join(non_hand_effectors)
                 )
             if (
-                discrete_command.commands
+                candidate_command.commands
                 and self.dispatch_callback is not None
                 and self.discrete_dispatch_callback is None
             ):
@@ -535,6 +615,21 @@ class PositionDeployExecutor:
         )
 
         pose_by_side, qpos_by_side = self._target_maps(filtered, observation)
+        resolved_lookahead_observation = (
+            observation
+            if lookahead_observation is None
+            else lookahead_observation
+        )
+        lookahead_pose_by_side: Mapping[str, np.ndarray] = {}
+        lookahead_qpos_by_side: Mapping[str, np.ndarray] = {}
+        if lookahead_filtered is not None:
+            (
+                lookahead_pose_by_side,
+                lookahead_qpos_by_side,
+            ) = self._target_maps(
+                lookahead_filtered,
+                resolved_lookahead_observation,
+            )
         try:
             self._validate_observation_reference_domain(
                 observation,
@@ -549,7 +644,22 @@ class PositionDeployExecutor:
                 stage="reference_anchor_safety",
             )
             raise
+        if lookahead_filtered is not None:
+            self._validate_observation_reference_domain(
+                resolved_lookahead_observation,
+                pose_sides=tuple(lookahead_pose_by_side),
+                qpos_sides=tuple(lookahead_qpos_by_side),
+                require_fresh_measurement=False,
+            )
         signature = (tuple(sorted(pose_by_side)), tuple(sorted(qpos_by_side)))
+        lookahead_signature = (
+            tuple(sorted(lookahead_pose_by_side)),
+            tuple(sorted(lookahead_qpos_by_side)),
+        )
+        if lookahead_filtered is not None and lookahead_signature != signature:
+            raise ValueError(
+                "current and lookahead pose/qpos side modalities must match"
+            )
         if self.config.collision_required:
             if qpos_by_side:
                 raise ValueError(
@@ -559,6 +669,13 @@ class PositionDeployExecutor:
             if set(pose_by_side) != {"left", "right"}:
                 raise ValueError(
                     "collision-required online deploy needs left+right target poses at each keyframe"
+                )
+            if lookahead_filtered is not None and set(lookahead_pose_by_side) != {
+                "left",
+                "right",
+            }:
+                raise ValueError(
+                    "collision-required lookahead needs left+right target poses"
                 )
 
         with self._lock:
@@ -584,17 +701,66 @@ class PositionDeployExecutor:
             collision_reset_qpos: Mapping[str, np.ndarray] | None = None
             collision_reset_metadata: Mapping[str, Any] | None = None
             next_source_index = self._next_source_index
-            if first:
-                anchor_index = next_source_index
-                source_index = next_source_index + 1
-                next_source_index += 2
-                anchor_timestamp = timestamp - self.config.sample_period_sec
-                anchor_pose, anchor_qpos = self._anchor_maps(
-                    observation,
-                    pose_sides=tuple(pose_by_side),
-                    qpos_sides=tuple(qpos_by_side),
+            logical_timestamp = timestamp
+            current_already_staged = False
+            staged_discrete_was_present = False
+            effective_discrete_command = discrete_command
+            if self.config.chunk_lookahead_enabled:
+                staged_matches = bool(
+                    self._staged_lookahead_source_index is not None
+                    and self._staged_lookahead_timestamp is not None
+                    and self._staged_lookahead_pose_by_side is not None
+                    and self._staged_lookahead_qpos_by_side is not None
+                    and _target_maps_equal(
+                        pose_by_side,
+                        self._staged_lookahead_pose_by_side,
+                    )
+                    and _target_maps_equal(
+                        qpos_by_side,
+                        self._staged_lookahead_qpos_by_side,
+                    )
                 )
-                if self.config.collision_required:
+                if staged_matches:
+                    source_index = int(self._staged_lookahead_source_index)
+                    logical_timestamp = float(self._staged_lookahead_timestamp)
+                    current_already_staged = True
+                    staged_discrete_was_present = bool(
+                        self._staged_lookahead_discrete_command is not None
+                        and self._staged_lookahead_discrete_command.commands
+                    )
+                    if (
+                        effective_discrete_command is None
+                        and self._staged_lookahead_discrete_command is not None
+                    ):
+                        # Re-submitting a staged arm endpoint must not erase the
+                        # hand value that was staged beside it.  The discrete
+                        # scheduler still keys on source_index, so it can run
+                        # at most once.
+                        effective_discrete_command = _copy_teleop_command(
+                            self._staged_lookahead_discrete_command
+                        )
+                else:
+                    source_index = next_source_index
+                    next_source_index += 1
+                    if not first and self._terminal_timestamp is not None:
+                        # No same-chunk right endpoint was available.  Insert a
+                        # hold anchor at the arrival cut, then interpolate the
+                        # new chunk's first action over one accepted 15 Hz wait.
+                        anchor_index = source_index
+                        source_index = next_source_index
+                        next_source_index += 1
+                        anchor_timestamp = max(
+                            timestamp,
+                            float(self._terminal_timestamp)
+                            + self.config.reference_period_sec,
+                        )
+                        anchor_pose = self._terminal_pose_by_side
+                        anchor_qpos = self._terminal_qpos_by_side
+                        logical_timestamp = (
+                            anchor_timestamp + self.config.sample_period_sec
+                        )
+
+                if first and self.config.collision_required:
                     (
                         collision_reset_qpos,
                         collision_reset_metadata,
@@ -603,8 +769,36 @@ class PositionDeployExecutor:
                         now_monotonic=timestamp,
                     )
             else:
-                source_index = next_source_index
+                if first:
+                    anchor_index = next_source_index
+                    source_index = next_source_index + 1
+                    next_source_index += 2
+                    anchor_timestamp = timestamp - self.config.sample_period_sec
+                    anchor_pose, anchor_qpos = self._anchor_maps(
+                        observation,
+                        pose_sides=tuple(pose_by_side),
+                        qpos_sides=tuple(qpos_by_side),
+                    )
+                    if self.config.collision_required:
+                        (
+                            collision_reset_qpos,
+                            collision_reset_metadata,
+                        ) = self._collision_reset_qpos(
+                            observation,
+                            now_monotonic=timestamp,
+                        )
+                else:
+                    source_index = next_source_index
+                    next_source_index += 1
+
+            lookahead_source_index: int | None = None
+            lookahead_timestamp: float | None = None
+            if lookahead_filtered is not None:
+                lookahead_source_index = next_source_index
                 next_source_index += 1
+                lookahead_timestamp = (
+                    float(logical_timestamp) + self.config.sample_period_sec
+                )
 
             submission = _Submission(
                 generation=self._generation,
@@ -617,8 +811,8 @@ class PositionDeployExecutor:
                 policy_name=str(policy_name),
                 discrete_command=(
                     None
-                    if discrete_command is None
-                    else _copy_teleop_command(discrete_command)
+                    if effective_discrete_command is None
+                    else _copy_teleop_command(effective_discrete_command)
                 ),
                 anchor_source_index=anchor_index,
                 anchor_timestamp=anchor_timestamp,
@@ -626,6 +820,38 @@ class PositionDeployExecutor:
                 anchor_qpos_by_side=anchor_qpos,
                 collision_reset_qpos_by_side=collision_reset_qpos,
                 collision_reset_metadata=collision_reset_metadata,
+                logical_timestamp=float(logical_timestamp),
+                current_already_staged=bool(current_already_staged),
+                lookahead_source_index=lookahead_source_index,
+                lookahead_timestamp=lookahead_timestamp,
+                lookahead_pose_by_side=(
+                    None
+                    if lookahead_filtered is None
+                    else dict(lookahead_pose_by_side)
+                ),
+                lookahead_qpos_by_side=(
+                    None
+                    if lookahead_filtered is None
+                    else dict(lookahead_qpos_by_side)
+                ),
+                lookahead_filtered=(
+                    None
+                    if lookahead_filtered is None
+                    else _copy_filtered_action(lookahead_filtered)
+                ),
+                lookahead_observation=(
+                    None
+                    if lookahead_filtered is None
+                    else _slim_observation(resolved_lookahead_observation)
+                ),
+                lookahead_policy_name=(
+                    None if lookahead_filtered is None else str(policy_name)
+                ),
+                lookahead_discrete_command=(
+                    None
+                    if lookahead_discrete_command is None
+                    else _copy_teleop_command(lookahead_discrete_command)
+                ),
             )
             try:
                 self._queue.put_nowait(submission)
@@ -639,8 +865,50 @@ class PositionDeployExecutor:
             self._submission_stream_initialized = True
             self._stream_signature = signature
             self._last_submitted_timestamp = timestamp
+            if self.config.chunk_lookahead_enabled:
+                self._staged_lookahead_source_index = lookahead_source_index
+                self._staged_lookahead_timestamp = lookahead_timestamp
+                self._staged_lookahead_pose_by_side = (
+                    None
+                    if lookahead_filtered is None
+                    else dict(lookahead_pose_by_side)
+                )
+                self._staged_lookahead_qpos_by_side = (
+                    None
+                    if lookahead_filtered is None
+                    else dict(lookahead_qpos_by_side)
+                )
+                self._staged_lookahead_discrete_command = (
+                    None
+                    if lookahead_discrete_command is None
+                    else _copy_teleop_command(lookahead_discrete_command)
+                )
+                self._terminal_pose_by_side = (
+                    dict(lookahead_pose_by_side)
+                    if lookahead_filtered is not None
+                    else dict(pose_by_side)
+                )
+                self._terminal_qpos_by_side = (
+                    dict(lookahead_qpos_by_side)
+                    if lookahead_filtered is not None
+                    else dict(qpos_by_side)
+                )
+                self._terminal_timestamp = (
+                    float(lookahead_timestamp)
+                    if lookahead_timestamp is not None
+                    else float(logical_timestamp)
+                )
             self._submitted_count += 1
-            if discrete_command is not None and discrete_command.commands:
+            if (
+                effective_discrete_command is not None
+                and effective_discrete_command.commands
+                and not staged_discrete_was_present
+            ):
+                self._discrete_submitted_count += 1
+            if (
+                lookahead_discrete_command is not None
+                and lookahead_discrete_command.commands
+            ):
                 self._discrete_submitted_count += 1
             self._append_debug_event_locked(
                 "keyframe_submitted",
@@ -649,8 +917,13 @@ class PositionDeployExecutor:
                     "source_timestamp_monotonic": float(timestamp),
                     "generation": int(self._generation),
                     "has_discrete_command": bool(
-                        discrete_command is not None and discrete_command.commands
+                        effective_discrete_command is not None
+                        and effective_discrete_command.commands
                     ),
+                    "lookahead_source_index": lookahead_source_index,
+                    "lookahead_timestamp_monotonic": lookahead_timestamp,
+                    "same_chunk_lookahead": bool(lookahead_filtered is not None),
+                    "current_already_staged": bool(current_already_staged),
                     "queue_depth": int(self._queue.qsize()),
                 },
             )
@@ -985,7 +1258,12 @@ class PositionDeployExecutor:
                 "sample_hz": float(self.config.sample_hz),
                 "reference_hz": float(self.config.reference_hz),
                 "command_hz": float(self.config.command_hz),
-                "causal_delay_periods": 1,
+                "causal_delay_periods": (
+                    0 if self.config.chunk_lookahead_enabled else 1
+                ),
+                "chunk_lookahead_enabled": bool(
+                    self.config.chunk_lookahead_enabled
+                ),
                 "no_temporal_smoothing": True,
                 "endpoint_collision_certified": bool(
                     self._last_collision_metadata is not None
@@ -1782,8 +2060,17 @@ class PositionDeployExecutor:
                 filtered=submission.filtered,
                 observation=submission.observation,
                 policy_name=submission.policy_name,
-                source_timestamp=submission.timestamp,
+                source_timestamp=(
+                    submission.timestamp
+                    if submission.logical_timestamp is None
+                    else float(submission.logical_timestamp)
+                ),
                 discrete_command=submission.discrete_command,
+            )
+            logical_timestamp = (
+                submission.timestamp
+                if submission.logical_timestamp is None
+                else float(submission.logical_timestamp)
             )
             if submission.anchor_source_index is not None:
                 assert submission.anchor_timestamp is not None
@@ -1794,6 +2081,11 @@ class PositionDeployExecutor:
                             source_index=submission.anchor_source_index,
                             pose_by_side=dict(submission.anchor_pose_by_side or {}),
                             metadata={"stage": "current_observation_anchor"},
+                            available_timestamp=(
+                                submission.timestamp
+                                if self.config.chunk_lookahead_enabled
+                                else None
+                            ),
                         )
                     )
                 if submission.qpos_by_side:
@@ -1803,6 +2095,11 @@ class PositionDeployExecutor:
                             source_index=submission.anchor_source_index,
                             qpos_by_side=dict(submission.anchor_qpos_by_side or {}),
                             metadata={"stage": "current_observation_anchor"},
+                            available_timestamp=(
+                                submission.timestamp
+                                if self.config.chunk_lookahead_enabled
+                                else None
+                            ),
                         )
                     )
                 self._store_template_locked(
@@ -1814,33 +2111,93 @@ class PositionDeployExecutor:
                     ),
                 )
 
-            if submission.pose_by_side:
+            if submission.pose_by_side and not submission.current_already_staged:
                 self._pose_resampler.push(
                     TimestampedMotionTarget(
-                        timestamp=submission.timestamp,
+                        timestamp=logical_timestamp,
                         source_index=submission.source_index,
                         pose_by_side=submission.pose_by_side,
                         metadata={
                             "stage": f"safe_{_rate_label(self.config.sample_hz)}hz_keyframe"
                         },
+                        available_timestamp=(
+                            submission.timestamp
+                            if self.config.chunk_lookahead_enabled
+                            else None
+                        ),
                     )
                 )
-            if submission.qpos_by_side:
+            if submission.qpos_by_side and not submission.current_already_staged:
                 self._qpos_resampler.push(
                     TimestampedMotionTarget(
-                        timestamp=submission.timestamp,
+                        timestamp=logical_timestamp,
                         source_index=submission.source_index,
                         qpos_by_side=submission.qpos_by_side,
                         metadata={
                             "stage": f"safe_{_rate_label(self.config.sample_hz)}hz_keyframe"
                         },
+                        available_timestamp=(
+                            submission.timestamp
+                            if self.config.chunk_lookahead_enabled
+                            else None
+                        ),
                     )
                 )
             self._store_template_locked(submission.source_index, template)
+            if submission.lookahead_source_index is not None:
+                if (
+                    submission.lookahead_timestamp is None
+                    or submission.lookahead_filtered is None
+                    or submission.lookahead_observation is None
+                ):
+                    raise RuntimeError("incomplete chunk lookahead submission")
+                if submission.lookahead_pose_by_side:
+                    self._pose_resampler.push(
+                        TimestampedMotionTarget(
+                            timestamp=float(submission.lookahead_timestamp),
+                            source_index=int(submission.lookahead_source_index),
+                            pose_by_side=dict(submission.lookahead_pose_by_side),
+                            metadata={
+                                "stage": (
+                                    f"safe_{_rate_label(self.config.sample_hz)}hz_"
+                                    "chunk_lookahead"
+                                )
+                            },
+                            available_timestamp=submission.timestamp,
+                        )
+                    )
+                if submission.lookahead_qpos_by_side:
+                    self._qpos_resampler.push(
+                        TimestampedMotionTarget(
+                            timestamp=float(submission.lookahead_timestamp),
+                            source_index=int(submission.lookahead_source_index),
+                            qpos_by_side=dict(submission.lookahead_qpos_by_side),
+                            metadata={
+                                "stage": (
+                                    f"safe_{_rate_label(self.config.sample_hz)}hz_"
+                                    "chunk_lookahead"
+                                )
+                            },
+                            available_timestamp=submission.timestamp,
+                        )
+                    )
+                self._store_template_locked(
+                    int(submission.lookahead_source_index),
+                    _ReferenceTemplate(
+                        filtered=submission.lookahead_filtered,
+                        observation=submission.lookahead_observation,
+                        policy_name=str(
+                            submission.lookahead_policy_name
+                            or submission.policy_name
+                        ),
+                        source_timestamp=float(submission.lookahead_timestamp),
+                        discrete_command=submission.lookahead_discrete_command,
+                    ),
+                )
             self._last_source_timestamp = submission.timestamp
             self._active = True
             if self._next_tick_timestamp is None:
-                self._next_tick_timestamp = max(submission.timestamp, self._clock())
+                self._next_tick_timestamp = max(logical_timestamp, self._clock())
 
     def _collision_reset_metadata_at_apply(
         self,
@@ -1892,7 +2249,11 @@ class PositionDeployExecutor:
         with self._dispatch_lock:
             actual_emit = _finite_time(self._clock(), name="clock")
             wall_emit = _finite_time(self._wall_clock(), name="wall_clock")
-            query = actual_emit - self.config.sample_period_sec
+            query = (
+                actual_emit
+                if self.config.chunk_lookahead_enabled
+                else actual_emit - self.config.sample_period_sec
+            )
             with self._lock:
                 if (
                     not self._active
@@ -2378,14 +2739,14 @@ class PositionDeployExecutor:
             f"->causal_{_rate_label(self.config.reference_hz)}"
             f"->{_rate_label(self.config.command_hz)}"
         )
-        default_chain = (
-            f"safe_{_rate_label(_DEFAULT_SAMPLE_HZ)}"
-            f"->causal_{_rate_label(_DEFAULT_REFERENCE_HZ)}"
-            f"->{_rate_label(_DEFAULT_COMMAND_HZ)}"
-        )
         return {
             "position_execution_contract": chain,
-            "position_default_profile_contract": default_chain,
+            # Keep the historical metadata key for consumers, but report the
+            # actually configured chain instead of the module's compatibility
+            # defaults.  Profile identity is owned by the caller/config
+            # resolver; the executor only knows effective rates.
+            "position_default_profile_contract": chain,
+            "position_configured_profile_contract": chain,
             "position_execution_chain": chain,
             "position_pipeline_stage_order": (
                 f"safe_{_rate_label(self.config.sample_hz)}hz_keyframe",
@@ -2402,7 +2763,12 @@ class PositionDeployExecutor:
             "position_reference_emitted_monotonic_time": float(actual_emit),
             "position_reference_query_monotonic_time": float(query),
             "position_causal_output_lag_sec": float(actual_emit - query),
-            "position_causal_delay_periods": 1,
+            "position_causal_delay_periods": (
+                0 if self.config.chunk_lookahead_enabled else 1
+            ),
+            "position_chunk_lookahead_enabled": bool(
+                self.config.chunk_lookahead_enabled
+            ),
             "position_parent_source_indices": list(parent_indices),
             "position_parent_source_indices_by_modality": parent_by_modality,
             "position_parent_source_timestamps_by_modality": source_timestamps_by_modality,
@@ -2421,7 +2787,9 @@ class PositionDeployExecutor:
             "position_lookahead_available_at_emit": bool(
                 all(bool(ref.metadata.get("lookahead_available_at_emit")) for ref in references)
             ),
-            "position_safety_applied_at": "15hz_keyframe_only",
+            "position_safety_applied_at": (
+                f"{_rate_label(self.config.sample_hz)}hz_keyframe_only"
+            ),
             "position_safety_reapplied_at_reference": False,
             "position_endpoint_collision_checked": False,
             "position_segment_collision_checked": False,
@@ -2430,7 +2798,10 @@ class PositionDeployExecutor:
             "temporal_operation": "timestamp_interpolation_only",
         }
 
-    def _collision_result_metadata(self, result: Any) -> dict[str, Any]:
+    def _collision_result_metadata(
+        self,
+        result: RM65PositionCollisionPlanResult,
+    ) -> dict[str, Any]:
         planner_metadata = dict(getattr(result, "metadata", {}) or {})
         hold = bool(getattr(result, "hold", False))
         endpoint_checked = bool(planner_metadata.get("endpoint_collision_checked", False))
@@ -2504,7 +2875,7 @@ class PositionDeployExecutor:
 
     def _record_collision_result_locked(
         self,
-        result: Any,
+        result: RM65PositionCollisionPlanResult,
         metadata: Mapping[str, Any],
     ) -> None:
         status = str(getattr(result, "status", "unknown"))
@@ -2680,7 +3051,9 @@ class PositionDeployExecutor:
             "position_discrete_coalesced": bool(skipped_before_this),
             "position_discrete_skipped_before_this": int(skipped_before_this),
             "position_arm_hand_phase": (
-                "same_logical_reference_tick_after_one_action_period_causal_delay"
+                "same_logical_reference_tick_with_chunk_lookahead"
+                if self.config.chunk_lookahead_enabled
+                else "same_logical_reference_tick_after_one_action_period_causal_delay"
             ),
         }
         command.timestamp = float(wall_emit)
@@ -2854,6 +3227,14 @@ class PositionDeployExecutor:
         self._last_submitted_timestamp = None
         self._last_source_timestamp = None
         self._next_tick_timestamp = None
+        self._staged_lookahead_source_index = None
+        self._staged_lookahead_timestamp = None
+        self._staged_lookahead_pose_by_side = None
+        self._staged_lookahead_qpos_by_side = None
+        self._staged_lookahead_discrete_command = None
+        self._terminal_pose_by_side = None
+        self._terminal_qpos_by_side = None
+        self._terminal_timestamp = None
         self._last_discrete_source_index = -1
         self._pose_resampler.clear()
         self._qpos_resampler.clear()

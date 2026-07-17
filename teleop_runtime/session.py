@@ -663,6 +663,26 @@ class TeleopSession:
         command.metadata.setdefault("tcp_mode", self.config.tcp_mode)
         return command
 
+    def dispatch_command(
+        self,
+        command: TeleopCommand,
+        *,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> Any:
+        """Dispatch an already-validated command through the session's rig.
+
+        Normal teleop steps, recovery helpers, and headless compatibility
+        actions use this seam.  It intentionally does not perform another
+        safety pass or state transition: callers that construct an external
+        command remain responsible for their existing guard/state semantics.
+        Keeping the transport call here prevents frontends from growing
+        independent direct-rig dispatch paths.
+        """
+
+        if self.rig is None:
+            raise RuntimeError("TeleopSession has no rig for command dispatch.")
+        return self.rig.send_commands(command, phase_recorder=phase_recorder)
+
     def run_step(
         self,
         now: float | None = None,
@@ -886,7 +906,7 @@ class TeleopSession:
             TeleopRunState.ARMED,
             TeleopRunState.RUNNING,
         }:
-            self.rig.send_commands(command, phase_recorder=phase_recorder)
+            self.dispatch_command(command, phase_recorder=phase_recorder)
             command_dispatched = True
             self._last_safe_command = self._copy_command(command)
             mark_phase("session.rig.send_commands")

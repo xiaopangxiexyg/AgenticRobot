@@ -10,7 +10,25 @@
 - 确认双臂 arm / 双手 q6 / InspireTac telemetry 都正常后，再接 RealSense RGB
 - 单臂模式或不含手模式不是单独一套实现，而是复用同一套双臂 schema，未启用部分留空
 
-当前推荐入口是：
+这里是 headless/兼容采集 frontend，不是当前正式 GUI 数采主入口。正式真机
+teleop/数采主线是：
+
+```bash
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
+```
+
+正式GUI位控数采默认将 `--collection-worker-mode auto` 解析为 `process`：硬件状态和
+相机因果选择仍在frontend的低优先级snapshot线程，sample/action metadata组装、schema、
+视频/触觉、统计和最终写盘在spawn子进程。相机数组通过预分配共享内存槽传递，不经
+`multiprocessing.Queue`复制大数组。位控进程模式下，嵌套在hand state中的原始触觉
+ndarray也使用同一共享内存槽；`--collection-process-extra-array-mb`控制每槽为这些
+非相机数组预留的容量，默认8 MiB。队列/共享槽过载会显式暂停episode，不能阻塞位控。
+
+`--collection-worker-mode thread` 保留原实现作为回退。force/impedance的 `auto` 始终
+解析为 `thread`，因此该变更不改变力控数采链路。这里的headless兼容入口也仍使用原有
+共享writer runtime；不要从 `legacy/` 导入进程实现。
+
+当前仍可使用本包的 headless 入口：
 
 - `python -m teleop_runtime.collection`
 
@@ -19,7 +37,9 @@
 - `python -m teleop_runtime.collection.run_collect`
 - [run_collect.py](run_collect.py)
 
-第一阶段重构后，包级入口只是一层薄 CLI，真实行为仍由原 collector 承接；后续会继续把
+包级入口只是一层 headless CLI，真实行为仍由兼容 collector 承接；后续只收敛共享
+`TeleopSession`/writer/runtime 边界，不再在这里新增独立的正式控制语义。第一阶段重构后，
+真实行为仍由原 collector 承接；后续会继续把
 `run_collect.py` 中的 mode、home calibration、replay、writer 和 debug 逻辑拆到独立模块。
 第二阶段开始把循环耗时与 `--debug-frozen` 相关的纯诊断工具移到
 `teleop_runtime.collection.diagnostics`，并把状态文本快照移到
@@ -464,10 +484,45 @@ qpos 数据要求：
 其中：
 
 - arm pose 使用 `xyz + xyzw quaternion`
-- arm action 的 pose frame 是 robot base frame
+- 未提供 v2.3 pose contract 时，arm action 的 pose frame 是历史 robot base frame
 - 未启用 side 的槽位按空值写出
 
-### 7.2.1 hand16 空槽语义
+### 7.2.1 v2.3 pose contract 显式启用
+
+GUI 正式数采和 headless/兼容数采都接受：
+
+```bash
+--policy-io-layout auto \
+--pose-frame-contract /abs/path/to/pose_frame_contract.json
+```
+
+该选项默认关闭，不改变现有控制或 v2.2 落盘。contract 在进程创建硬件前完成加载，
+且 `active_sides` 必须与本次采集一致。启用后 writer 将同一 contract 固定写入
+`meta/info.json` 和 episode metadata：
+
+- `pose_storage_frame=raw_absolute`：pose 数值保持当前左右 robot-base raw 值，只增加
+  v2.3 schema/source/frame 标签；
+- `pose_storage_frame=desk_absolute`：只在 row 构造后的深拷贝上执行各 side
+  raw→canonical-desk，不修改 `TeleopCommand`、backend state 或位控 target。
+
+历史 Vive `desk/T_D_B` 不等于 canonical dataset desk，不能直接作为这里的 contract。
+真实 raw→desk 外参尚未确认时，应先使用显式 `raw_absolute` contract。
+
+当前 RM65 v3 双臂桌面中心的显式 collection contract 为：
+
+```bash
+--policy-io-layout auto \
+--pose-frame-contract \
+  robot_motion/configs/pose_frames/rm65_dual_arm_table_center_v1_collection_desk_absolute.json
+```
+
+它将 canonical dataset `desk` 绑定到 URDF `table_center_frame`，即桌面表面中心
+`world xyz=(-0.412, 0, 0.010)`，朝向与 URDF 根坐标系一致。左右 RM65 base 的
+`-90/+90 deg` 安装旋转包含在 per-side raw→desk 外参中。该 profile 当前来源是
+annotated station URDF，metadata 明确标记为 `hardware_measurement_status=not_measured`；
+真实安装外参完成测量前不得把它描述为 measured calibration。
+
+### 7.2.2 hand16 空槽语义
 
 后续接入夹爪或高自由度灵巧手时，主 action contract 会使用固定 hand slot，
 例如 `left_hand_q16/right_hand_q16`。这类固定冗余槽只统一数据接口长度，不表示

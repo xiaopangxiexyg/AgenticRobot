@@ -12,7 +12,15 @@ from .pipeline import MaskedFramePipeline
 from .pose_action import (
     PosePolicyViewError,
     PosePolicyWindow,
+    pose_policy_window_from_dataset_metadata,
     pose_policy_window_from_rows,
+)
+from .pose_chunk import (
+    PoseActionChunkLocation,
+    PoseActionChunkSample,
+    pose_action_chunk_from_dataset_metadata,
+    pose_action_chunk_from_episode_rows,
+    pose_action_chunk_start_indices,
 )
 from .policy_io import (
     PolicyIOBatch,
@@ -41,6 +49,8 @@ __all__ = [
     "MissingViewConfig",
     "PosePolicyViewError",
     "PosePolicyWindow",
+    "PoseActionChunkLocation",
+    "PoseActionChunkSample",
     "MODALITY_VALIDITY_SCHEMA_VERSION",
     "InvalidTrainingDataError",
     "PolicyIOFrame",
@@ -53,7 +63,11 @@ __all__ = [
     "VideoConfig",
     "policy_io_batch_from_rows",
     "policy_io_frame_from_row",
+    "pose_policy_window_from_dataset_metadata",
     "pose_policy_window_from_rows",
+    "pose_action_chunk_from_dataset_metadata",
+    "pose_action_chunk_from_episode_rows",
+    "pose_action_chunk_start_indices",
     "augment_normalized_state",
     "augment_normalized_state_torch",
 ]

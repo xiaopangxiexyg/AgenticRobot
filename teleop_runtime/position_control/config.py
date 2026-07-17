@@ -6,10 +6,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from robot_motion.position_control import (
+    POSITION_15_60_120_PROFILE,
     POSITION_45_150_PROFILE,
     POSITION_PROFILE,
     PositionControlRates,
 )
+from robot_motion.rm65 import RM65_POSITION_TRACKING_FOLLOW_ALPHA
 
 from ..defaults import (
     DEFAULT_RM65_ARM_CONTROL_HZ,
@@ -21,14 +23,17 @@ from ..defaults import (
 
 IMPEDANCE_40HZ_PROFILE_NAME = "impedance_40hz"
 POSITION_45_150HZ_PROFILE_NAME = POSITION_45_150_PROFILE.name
+POSITION_15_60_120HZ_PROFILE_NAME = POSITION_15_60_120_PROFILE.name
 POSITION_PROFILE_NAME = POSITION_PROFILE.name
 POSITION_PROFILES_BY_NAME = {
     POSITION_PROFILE_NAME: POSITION_PROFILE,
+    POSITION_15_60_120HZ_PROFILE_NAME: POSITION_15_60_120_PROFILE,
     POSITION_45_150HZ_PROFILE_NAME: POSITION_45_150_PROFILE,
 }
 ARM_EXECUTION_PROFILE_CHOICES = (
     IMPEDANCE_40HZ_PROFILE_NAME,
     POSITION_PROFILE_NAME,
+    POSITION_15_60_120HZ_PROFILE_NAME,
     POSITION_45_150HZ_PROFILE_NAME,
 )
 
@@ -423,7 +428,7 @@ def resolve_real_arm_execution_config(
         )
 
     raw_follow = getattr(args, "arm_canfd_follow", None)
-    if follow_explicit and raw_follow is not None:
+    if raw_follow is not None:
         arm_canfd_follow = bool(raw_follow)
     elif requested_position_profile is not None:
         arm_canfd_follow = True
@@ -466,7 +471,7 @@ def resolve_real_arm_execution_config(
     arm_follow_qpos_alpha = (
         (
             float(raw_alpha)
-            if alpha_explicit and raw_alpha is not None
+            if raw_alpha is not None
             else 0.1
         )
         if mode == "position" and position_background_streaming_enabled
@@ -492,6 +497,11 @@ def resolve_real_arm_execution_config(
     )
 
     expected_position_profile = requested_position_profile or POSITION_PROFILE
+    expected_position_follow_alpha = (
+        RM65_POSITION_TRACKING_FOLLOW_ALPHA
+        if expected_position_profile.name == POSITION_15_60_120HZ_PROFILE_NAME
+        else 0.1
+    )
     expected = (
         {
             "sample_hz": DEFAULT_TELEOP_SAMPLE_HZ,
@@ -517,7 +527,7 @@ def resolve_real_arm_execution_config(
             "position_background_streaming_enabled": True,
             "position_background_streaming_hz": expected_position_profile.rates.command_hz,
             "position_post_ik_qpos_smoothing_alpha": 0.9,
-            "arm_follow_qpos_alpha": 0.1,
+            "arm_follow_qpos_alpha": expected_position_follow_alpha,
             "arm_canfd_trajectory_mode": 0,
             "arm_canfd_radio": 0,
         }
@@ -644,6 +654,7 @@ __all__ = [
     "DEFAULT_CONTROL_DEBUG_QUEUE_SIZE",
     "DEFAULT_CONTROL_DEBUG_ROOT",
     "IMPEDANCE_40HZ_PROFILE_NAME",
+    "POSITION_15_60_120HZ_PROFILE_NAME",
     "POSITION_45_150HZ_PROFILE_NAME",
     "POSITION_PROFILE_NAME",
     "ControlDebugConfig",

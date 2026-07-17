@@ -1,0 +1,183 @@
+{
+  "format": "lerobot_v2.1_style",
+  "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+  "nominal_fps": 15.0,
+  "chunk_size": 1000,
+  "episode_count": 2,
+  "frame_count": 297,
+  "write_parquet": true,
+  "write_video": true,
+  "tactile_storage": "external",
+  "tactile_compression": "none",
+  "tactile_stream_format": "binary_stream_v1",
+  "wrist_depth_mask": true,
+  "wrist_depth_raw": false,
+  "wrist_depth_camera_keys": [
+    "left_wrist",
+    "right_wrist"
+  ],
+  "wrist_depth_stream_format": "binary_stream_v1",
+  "wrist_depth_mask_config": {
+    "depth_min_m": 0.05,
+    "depth_max_m": 0.5
+  },
+  "task_id": "dmtac_position_process_1x05_min2_max4_15_60_120hz",
+  "task_description": "dmtac_position_process_1x05_min2_max4_15_60_120hz",
+  "arm_action_specs_by_side": {
+    "left": {
+      "side": "left",
+      "controlled_frame": "tool_tcp",
+      "reference_frame": "left_arm_base",
+      "representation": "xyz_quat",
+      "dof": 7,
+      "semantics": "Arm pose actions control the active tool TCP. The TCP is loaded from the arm/tool calibration profile at execution time; RM65 backends convert this software TCP target to the internal IK/control frame.",
+      "metadata": {}
+    },
+    "right": {
+      "side": "right",
+      "controlled_frame": "tool_tcp",
+      "reference_frame": "right_arm_base",
+      "representation": "xyz_quat",
+      "dof": 7,
+      "semantics": "Arm pose actions control the active tool TCP. The TCP is loaded from the arm/tool calibration profile at execution time; RM65 backends convert this software TCP target to the internal IK/control frame.",
+      "metadata": {}
+    }
+  },
+  "arm_controlled_frame_by_side": {
+    "left": "tool_tcp",
+    "right": "tool_tcp"
+  },
+  "arm_reference_frame_by_side": {
+    "left": "left_arm_base",
+    "right": "right_arm_base"
+  },
+  "arm_spec_required": true,
+  "hand_action_specs_by_side": {
+    "left": {
+      "side": "left",
+      "hand_model": "dmtac_gripper",
+      "slot_count": 6,
+      "active_dof": 1,
+      "active_mask": [
+        true,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "joint_names": [
+        "gripper_close"
+      ],
+      "command_space": "normalized_0_0.9",
+      "slot_map": {
+        "gripper_close": 0
+      },
+      "invalid_slot_value": "zero_padding",
+      "semantics": "DM-Tac gripper uses the fixed 6-wide hand slot for compatibility; only slot 0 / gripper_close is a real actuator target and the other slots are padding.",
+      "metadata": {
+        "gripper_slot": 0,
+        "gripper_action_dim": 1
+      }
+    },
+    "right": {
+      "side": "right",
+      "hand_model": "dmtac_gripper",
+      "slot_count": 6,
+      "active_dof": 1,
+      "active_mask": [
+        true,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "joint_names": [
+        "gripper_close"
+      ],
+      "command_space": "normalized_0_0.9",
+      "slot_map": {
+        "gripper_close": 0
+      },
+      "invalid_slot_value": "zero_padding",
+      "semantics": "DM-Tac gripper uses the fixed 6-wide hand slot for compatibility; only slot 0 / gripper_close is a real actuator target and the other slots are padding.",
+      "metadata": {
+        "gripper_slot": 0,
+        "gripper_action_dim": 1
+      }
+    }
+  },
+  "hand_active_mask_by_side": {
+    "left": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "right": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hand_spec_required": true,
+  "label_specs": {
+    "teleop.arm_mode": {
+      "schema": "dexteleop_arm_mode_v2",
+      "columns_optional": true,
+      "sides": [
+        "left",
+        "right"
+      ],
+      "mode_ids": {
+        "unknown": 0,
+        "teleop": 1,
+        "fixed_hold": 2,
+        "init_pose": 3,
+        "stopped": 4
+      },
+      "legacy_default_policy": "missing_columns_running_rows_are_teleop_else_unknown",
+      "json_column": "teleop.arm_mode_json",
+      "model_columns": [
+        "teleop.arm_mode.<side>.id",
+        "teleop.arm_mode.<side>.label"
+      ],
+      "audit_only_columns": [
+        "teleop.arm_mode.<side>.scope",
+        "teleop.arm_mode.<side>.init_phase",
+        "teleop.arm_mode.<side>.init_phase_valid",
+        "teleop.arm_mode.<side>.init_target_position_error_m",
+        "teleop.arm_mode.<side>.init_target_rotation_error_deg",
+        "teleop.arm_mode.<side>.init_translation_speed_m_s",
+        "teleop.arm_mode.<side>.init_rotation_speed_deg_s",
+        "teleop.arm_mode.<side>.init_dwell_sec"
+      ]
+    }
+  },
+  "features": {
+    "action": {
+      "shape": [
+        26
+      ],
+      "dtype": "float32"
+    },
+    "observation.state": {
+      "shape": [
+        38
+      ],
+      "dtype": "float32"
+    },
+    "observation.last_action": {
+      "shape": [
+        26
+      ],
+      "dtype": "float32"
+    }
+  }
+}

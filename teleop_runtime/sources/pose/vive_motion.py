@@ -215,6 +215,7 @@ class TrackerMotionIntentStateMachine:
         self._exit_since: float | None = None
         self._last_sample_time: float | None = None
         self._last_quality_valid_time: float | None = None
+        self._quiet_anchor_pose: np.ndarray | None = None
         self._inactive_anchor_pose: np.ndarray | None = None
         self._transition_reason = str(reason)
         self._evidence: dict[str, Any] = {}
@@ -275,26 +276,59 @@ class TrackerMotionIntentStateMachine:
             "rotation_span_rad": rotation_span,
         }
 
+        quiet_anchor_translation = 0.0
+        quiet_anchor_rotation = 0.0
+        if self._quiet_anchor_pose is not None:
+            quiet_anchor_translation = float(
+                np.linalg.norm(pose[:3, 3] - self._quiet_anchor_pose[:3, 3])
+            )
+            quiet_anchor_rotation = _rotation_angle_rad(
+                self._quiet_anchor_pose[:3, :3], pose[:3, :3]
+            )
+        quiet_anchor_stable = bool(
+            quiet_anchor_translation <= self.config.enter_translation_span_m
+            and quiet_anchor_rotation <= self.config.enter_rotation_span_rad
+        )
+        self._evidence.update(
+            {
+                "quiet_anchor_translation_m": quiet_anchor_translation,
+                "quiet_anchor_rotation_rad": quiet_anchor_rotation,
+                "quiet_anchor_stable": quiet_anchor_stable,
+            }
+        )
+
         if self._state == "UNKNOWN":
             self._state = "QUIETING" if quiet_evidence else "ACTIVE"
             self._quiet_since = sample_time if quiet_evidence else None
+            self._quiet_anchor_pose = pose.copy() if quiet_evidence else None
             self._transition_reason = "quiet_evidence" if quiet_evidence else "motion_evidence"
         elif self._state == "ACTIVE":
             if quiet_evidence:
                 self._state = "QUIETING"
                 self._quiet_since = sample_time
+                self._quiet_anchor_pose = pose.copy()
                 self._transition_reason = "quiet_evidence"
         elif self._state == "QUIETING":
             if not quiet_evidence:
                 self._state = "ACTIVE"
                 self._quiet_since = None
+                self._quiet_anchor_pose = None
                 self._transition_reason = "quiet_evidence_lost"
+            elif not quiet_anchor_stable:
+                # A sliding short window can look quiet during deliberate slow
+                # motion.  Require the full quiet dwell to remain spatially
+                # bounded before declaring the tracker inactive.
+                self._state = "ACTIVE"
+                self._quiet_since = None
+                self._quiet_anchor_pose = None
+                self._transition_reason = "quiet_dwell_motion"
             elif (
                 self._quiet_since is not None
                 and sample_time - self._quiet_since + 1e-9 >= self.config.enter_dwell_sec
             ):
                 self._state = "INACTIVE"
                 self._inactive_anchor_pose = pose.copy()
+                self._quiet_anchor_pose = None
                 self._exit_since = None
                 self._transition_reason = "enter_dwell_complete"
         else:
@@ -313,11 +347,8 @@ class TrackerMotionIntentStateMachine:
                 or angular_speed >= self.config.exit_angular_speed_rad_s
             )
             anchor_exit_evidence = bool(
-                not quiet_evidence
-                and (
-                    anchor_translation >= self.config.exit_translation_m
-                    or anchor_rotation >= self.config.exit_rotation_rad
-                )
+                anchor_translation >= self.config.exit_translation_m
+                or anchor_rotation >= self.config.exit_rotation_rad
             )
             exit_evidence = speed_exit_evidence or anchor_exit_evidence
             self._evidence.update(
@@ -337,17 +368,12 @@ class TrackerMotionIntentStateMachine:
                 ):
                     self._state = "ACTIVE"
                     self._quiet_since = None
+                    self._quiet_anchor_pose = None
                     self._exit_since = None
                     self._inactive_anchor_pose = None
                     self._transition_reason = "exit_evidence_debounced"
             else:
                 self._exit_since = None
-                # Slowly accumulated SteamVR drift is not operator intent.  A
-                # locally quiet window follows that drift, while deliberate
-                # movement first violates a span/velocity enter threshold and
-                # leaves this anchor fixed for the exit test above.
-                if quiet_evidence:
-                    self._inactive_anchor_pose = pose.copy()
 
         return self._metadata(metrics)
 

@@ -120,6 +120,7 @@ required = (
     "qpsolvers",
     "mujoco",
     "gymnasium",
+    "torch",
     "pyarrow",
     "websockets",
     "msgpack",
@@ -133,6 +134,8 @@ if missing:
 
 print("DexTeleop full environment imports ok")
 print("python", sys.version.split()[0])
+import torch
+print("torch", torch.__version__, "wheel CUDA", torch.version.cuda, "CUDA available", torch.cuda.is_available())
 PY
 
 if ((SKIP_VENDOR_SDK == 0)); then

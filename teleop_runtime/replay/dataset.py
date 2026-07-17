@@ -521,6 +521,46 @@ class ReplayDatasetIndex:
             frame_times_sec=frame_times,
         )
 
+    def load_pose_policy_window(
+        self,
+        token: Any,
+        *,
+        start_index: int = 0,
+        end_index: int | None = None,
+        active_sides: Sequence[str] | None = None,
+        action_pose_mode: str = "absolute",
+        last_action_pose_mode: str | None = None,
+    ) -> Any:
+        """Load a detached canonical desk/relative policy view.
+
+        Normal replay row loading remains byte-for-byte storage-facing.  This
+        explicit method is the v2.3 model boundary and never mutates the rows
+        retained by :meth:`load_episode`.
+        """
+
+        from dataset_interface.pose_action import (  # noqa: PLC0415
+            pose_policy_window_from_dataset_metadata,
+        )
+
+        loaded = self.load_episode(token)
+        start = max(0, int(start_index))
+        stop = loaded.frame_count if end_index is None else min(
+            loaded.frame_count, int(end_index)
+        )
+        if stop <= start:
+            raise ValueError(
+                f"Pose policy window is empty: start_index={start}, end_index={end_index}, "
+                f"frame_count={loaded.frame_count}."
+            )
+        return pose_policy_window_from_dataset_metadata(
+            loaded.rows[start:stop],
+            self.info,
+            episode_metadata=loaded.summary.metadata,
+            active_sides=active_sides,
+            action_pose_mode=action_pose_mode,
+            last_action_pose_mode=last_action_pose_mode,
+        )
+
     def _read_parquet_rows(self, path: Path) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
         pq = _require_parquet()
         schema = pq.read_schema(path)

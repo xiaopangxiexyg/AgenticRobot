@@ -28,8 +28,8 @@
   - `rm_eef`：用于单独控制机械臂和坐标调试
   - `hand_base`：用于更精细的末端控制
 - arm 默认要求完整 `6DoF`
-- 控制模式同时支持 `absolute` 和 `delta_clutch`
-- 默认控制模式：`delta_clutch`
+- 控制模式主路径：`absolute`；`delta_clutch` 已硬封存
+- 默认控制模式：`absolute`
 - 每次启动都必须重新做 runtime calibration
 - 机械臂 home 由人工移动到位后采集，程序不自动规划 home
 - 异常后的默认行为：优先冻结到最后一个已确认安全的位置
@@ -473,8 +473,8 @@ $$T_B^{E_{target}} = (T_D^B)^{-1} \cdot T_D^{E_{target}}$$
 
 当前项目的明确默认值：
 
-- 默认控制模式：`delta_clutch`
-- 必须支持的控制模式：`absolute`
+- 默认控制模式：`absolute`
+- `delta_clutch` 已硬封存
 - 默认姿态策略：完整 `6DoF`
 - 默认精细控制 TCP：`hand_base`
 - 默认调试 / 纯 arm 控制 TCP：`rm_eef`
@@ -697,13 +697,13 @@ class TeleopCalibration:
 
 - `absolute_1x`
 - `delta_clutch`
-- `delta_clutch_scaled`
+- `delta_clutch_scaled`（历史实现）
 
 当前明确要求：
 
 - 第一版必须支持完整 `6DoF`
-- 默认 `delta_clutch`
-- 必须保留 `absolute`
+- 默认 `absolute`
+- `delta_clutch` / `delta_clutch_scaled` 已硬封存，不属于 active runtime
 - 第一版不需要以 `yaw_only` / `position_only` 作为主路径
 
 还必须内置输入合法性检查：
@@ -878,7 +878,7 @@ class TeleopCalibration:
 - `teleop_runtime/calibration.py`
 - `teleop_runtime/session.py`
 - `teleop_runtime/transforms.py`
-- `teleop_runtime/clutch.py`
+- 历史版本中的 `teleop_runtime/clutch.py`（已从 active runtime 移除）
 - `teleop_runtime/safety.py`
 - `teleop_runtime/diagnostics.py`
 - `teleop_runtime/recording.py`

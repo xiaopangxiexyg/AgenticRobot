@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -130,7 +131,48 @@ def test_deferred_finalize_starts_only_after_explicit_post_control_launch(tmp_pa
     assert summary["finalize_queued_at"] == task.queued_at
     assert summary["finalize_started_at"] == task.started_at
     assert summary["position_audit_finalize"] == {"closed": True, "elapsed_ms": 1.0}
+    assert summary["collection_integrity_valid"] is True
+    assert summary["collection_integrity_reasons"] == []
     assert set(summary["finalize_prewrite_timing_ms"]) == {
         "position_audit_close",
         "writer_flush",
     }
+
+
+def test_finalize_summary_persists_collection_integrity_failure(tmp_path: Path) -> None:
+    recorder = _new_recorder(tmp_path, [])
+    recorder._mark_collection_integrity_issue("collection_snapshot_thread_busy")
+    recorder._mark_collection_integrity_issue("collection_snapshot_thread_busy")
+
+    summary = recorder._finalize_summary(
+        reason="manual_key_stop",
+        step_index=42,
+        last_state="RUNNING",
+        frame_count=7,
+        queued_at=time.time(),
+        frequency_status={"sample_hz": 15.0},
+        pause_summary={},
+    )
+
+    assert summary["collection_integrity_valid"] is False
+    assert summary["collection_integrity_reasons"] == [
+        "collection_snapshot_thread_busy"
+    ]
+
+
+def test_thread_writer_contract_failure_becomes_pauseable_integrity_reason() -> None:
+    recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
+        real_teleop.RealTeleopDatasetRecorder
+    )
+    recorder.collection_worker_mode = "thread"
+    recorder._sample_overload_reason = None
+    recorder._collection_integrity_reasons = []
+    future: Future[object] = Future()
+    future.set_exception(RuntimeError("invalid v2.3 measured TCP"))
+    recorder._sample_future = future
+
+    reason = recorder.poll_collection_overload()
+
+    assert reason.startswith("collection_writer_error:RuntimeError:")
+    assert recorder._sample_future is None
+    assert recorder._collection_integrity_reasons == [reason]

@@ -18,6 +18,7 @@ from teleop_runtime import (
     DMTacGripperBackendConfig,
     build_annotated_dual_rm65_calibration,
     build_bimanual_session,
+    TeleopSessionConfig,
 )
 from teleop_runtime.action import robot_action_from_teleop_command
 from teleop_runtime.backends.grippers import DMTacGripperBackend
@@ -69,6 +70,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         session = build_bimanual_session(
             calibration=build_annotated_dual_rm65_calibration(),
+            session_config=TeleopSessionConfig(record_enabled=False),
             left_hand_serial_port="/dev/null",
             right_hand_serial_port="/dev/null",
             left_hand_backend_config=left_config,
@@ -97,6 +99,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
                 retargeter.config
                 for retargeter in build_bimanual_session(
                     calibration=build_annotated_dual_rm65_calibration(),
+                    session_config=TeleopSessionConfig(record_enabled=False),
                     left_hand_serial_port="/dev/null",
                     left_hand_backend_config=DMTacGripperBackendConfig(
                         side="left",

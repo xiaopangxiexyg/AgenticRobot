@@ -259,6 +259,33 @@ artifact = PolicyArtifactContract(
 兼容的模型/server 必须只归一化前 `D` 个 base-state 元素，并保持后 `D` 个 mask 元素为 0/1。旧
 artifact 使用 `raw_state_v1`，部署和模型输入仍是原来的 `D` 维。
 
+## v2.3 pose action chunk
+
+`PoseActionChunkContract` 和 `pose_action_chunk_from_episode_rows(...)` 将同一份绝对 pose
+episode 映射成 absolute 或 relative 固定 horizon 训练样本。adapter 返回起点 observation、
+action chunk、`action_is_pad` 和 measured TCP anchor；`actions_for_normalization()` 只返回
+mask 为 false 的真实 action。`DexTeleopDatasetIndex.pose_action_chunk_locations(...)` 按每个
+episode 的 `frame_count` 枚举合法起点，因此不会跨 episode。
+
+默认 `tail_policy="drop"`，只生成完整 chunk。模型可显式选择 `tail_policy="pad_last"`，
+在 pose 转换后重复最后一个有效 action。reader 不会自行从 episode 长度猜测或切换策略。
+
+checkpoint artifact 不能只因为 model-facing 接口是 v2.3 就把训练来源统一写成“v2.3”。
+从旧 v2.2 raw 通过默认 identity compatibility 构造 relative action 时，应显式使用：
+
+```python
+from dataset_contracts import PoseTrainingDataContract
+
+pose_training_data = PoseTrainingDataContract.v22_raw_identity(
+    active_sides=("left", "right"),
+)
+```
+
+只有训练 rows 自身带完整 v2.3 pose-frame contract、且 reader 确实生成 canonical-desk state
+时，才使用 `PoseTrainingDataContract.native_v23()`。两者都放入
+`PolicyArtifactContract.pose_training_data`；部署据此分别限制 identity compatibility runtime
+或要求显式 canonical-desk runtime contract，避免旧 raw state checkpoint 被误当作原生 v2.3。
+
 ## 训练数据有效性
 
 `meta/modality_validity.json` 是可选文件。文件不存在时，兼容历史数据集：所有 episode 和

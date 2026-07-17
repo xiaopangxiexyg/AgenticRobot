@@ -7,6 +7,11 @@ import pytest
 
 from robot_motion.joint_limits import JointVelocityLimitProfile
 from robot_motion.profiles import IKSafetyProfile
+from robot_motion.rm65 import (
+    BimanualIKResult,
+    BimanualPoseTarget,
+    BimanualPoseTargetSource,
+)
 from robot_motion.types import PoseTolerance
 import teleop_runtime.retargeters.dual_arm_collision_aware as dual_module
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
@@ -215,6 +220,43 @@ def test_dual_arm_reset_target_pose_smoothing_clears_target_history() -> None:
     assert retargeter._last_target_poses == {"left": None, "right": None}
 
 
+def test_dual_arm_solve_min_iterations_precedes_tolerance_and_budget_exit() -> None:
+    solver = _FakeDualArmSolver()
+    solve_calls = 0
+
+    def solve(*, targets):
+        nonlocal solve_calls
+        del targets
+        solve_calls += 1
+        return solver.current_q
+
+    solver.solve = solve  # type: ignore[attr-defined]
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_max_iterations=3,
+            solve_min_iterations=2,
+            solve_adaptive_iterations_enabled=True,
+            solve_time_budget_ms=0.01,
+            solve_iteration_reserve_ms=0.0,
+            solve_translation_tolerance_m=100.0,
+            solve_orientation_tolerance_deg=360.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+
+    _, iterations, _ = retargeter._solve_toward_targets(
+        left_target=np.eye(4, dtype=float),
+        right_target=np.eye(4, dtype=float),
+    )
+
+    assert solve_calls == 2
+    assert iterations == 2
+    assert retargeter._last_solve_iteration_stop_reason == "pose_tolerance"
+
+
 def test_dual_arm_target_activity_prefers_tracker_motion_state_machine() -> None:
     retargeter = _retargeter(_FakeDualArmSolver())
     targets = retargeter.current_world_targets()
@@ -244,6 +286,268 @@ def test_dual_arm_target_activity_prefers_tracker_motion_state_machine() -> None
     assert activity["left"]["state"] == "INACTIVE"
     assert activity["left"]["hold_weight"] == 1.0
     assert activity["right"]["source"] == "target_delta_legacy"
+
+
+def test_dual_arm_public_kinematics_interface_is_read_only() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    solver.set_configuration_q(np.linspace(-0.3, 0.3, 12))
+    initial_full_q = solver.current_q.copy()
+
+    current = retargeter.current_qpos_by_side()
+    np.testing.assert_allclose(current["left"], initial_full_q[:6])
+    np.testing.assert_allclose(current["right"], initial_full_q[6:12])
+    current["left"][:] = 99.0
+    np.testing.assert_allclose(solver.current_q, initial_full_q)
+
+    left = np.linspace(0.1, 0.6, 6)
+    right = np.linspace(-0.1, -0.6, 6)
+    embedded = retargeter.solver_q_from_qpos_by_side(
+        {"left": left, "right": right}
+    )
+    np.testing.assert_allclose(embedded[:6], left)
+    np.testing.assert_allclose(embedded[6:12], right)
+
+    solver_targets = retargeter.solver_world_targets_for_qpos_pair(
+        left_qpos=left,
+        right_qpos=right,
+    )
+    tcp_targets = retargeter.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=left,
+        right_qpos=right,
+    )
+    np.testing.assert_allclose(solver_targets["left"][0, 3], -left[0])
+    np.testing.assert_allclose(solver_targets["right"][0, 3], right[0])
+    np.testing.assert_allclose(tcp_targets["left"], solver_targets["left"])
+    np.testing.assert_allclose(tcp_targets["right"], solver_targets["right"])
+    np.testing.assert_allclose(solver.current_q, initial_full_q)
+
+
+def test_bimanual_pose_target_owns_detached_pure_data() -> None:
+    left_target = _target_pose(x_m=0.10)
+    source_value = _target_pose(x_m=0.05)
+    tracker_intent = {"state": "ACTIVE", "inactive": False}
+    target = BimanualPoseTarget(
+        timestamp=1.25,
+        target_pose_by_side={"left": left_target, "right": _target_pose()},
+        active_sides=("left",),
+        source_by_side={
+            "left": BimanualPoseTargetSource(
+                command_type="cartesian_pose",
+                value=source_value,
+                frame_name="arm_base",
+                metadata={"tracker_motion_intent": tracker_intent},
+            ),
+            "right": None,
+        },
+    )
+
+    left_target[0, 3] = 99.0
+    source_value[0, 3] = 99.0
+    tracker_intent["state"] = "INACTIVE"
+
+    assert target.target_pose_by_side["left"][0, 3] == pytest.approx(0.10)
+    assert target.source_by_side["left"] is not None
+    assert target.source_by_side["left"].value[0, 3] == pytest.approx(0.05)
+    assert (
+        target.source_by_side["left"].metadata["tracker_motion_intent"]["state"]
+        == "ACTIVE"
+    )
+
+
+def test_pure_bimanual_solve_returns_atomic_result_and_facade_round_trips() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    candidate = np.zeros(12, dtype=float)
+    candidate[0] = 0.04
+    candidate[6] = -0.06
+    solver.solve = lambda *, targets: candidate.copy()  # type: ignore[attr-defined]
+    target = BimanualPoseTarget(
+        timestamp=2.0,
+        target_pose_by_side={
+            "left": _target_pose(x_m=0.10),
+            "right": _target_pose(x_m=-0.10),
+        },
+        active_sides=("left", "right"),
+        source_by_side={
+            side: BimanualPoseTargetSource(
+                command_type="cartesian_pose",
+                value=_target_pose(),
+                frame_name="arm_base",
+                metadata={
+                    "tracker_motion_intent": {
+                        "state": "ACTIVE",
+                        "inactive": False,
+                        "hold_weight": 0.0,
+                    }
+                },
+            )
+            for side in ("left", "right")
+        },
+    )
+
+    result = retargeter.solve_target_pair(target)
+
+    assert isinstance(result, BimanualIKResult)
+    assert tuple(result.side_results) == ("left", "right")
+    assert result.status in {"tracking", "boundary_active"}
+    assert result.metadata["target_activity"]["left"]["source"] == (
+        "tracker_motion_state_machine"
+    )
+    np.testing.assert_allclose(
+        result.qpos_by_side()["left"],
+        result.side_results["left"].metadata["solver_output_qpos"],
+    )
+    np.testing.assert_allclose(
+        result.qpos_by_side()["right"],
+        result.side_results["right"].metadata["solver_output_qpos"],
+    )
+
+    command = retargeter._command_from_bimanual_result(result)
+    assert command.timestamp == 2.0
+    assert command.metadata == result.metadata
+    for side in ("left", "right"):
+        effector = command.commands[f"{side}_arm"]
+        side_result = result.side_results[side]
+        assert effector.command_type == side_result.command_type
+        assert effector.frame_name == side_result.command_frame_name
+        np.testing.assert_allclose(effector.value, side_result.command_value)
+
+
+def test_bimanual_contract_facade_has_explicit_compatibility_rollback() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            enforce_realistic_joint_step=False,
+            bimanual_result_contract_enabled=False,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=solver,
+    )
+    context = DualArmTargetContext(
+        timestamp=3.0,
+        left_target=_target_pose(),
+        right_target=_target_pose(),
+        left_world_to_base=None,
+        right_world_to_base=None,
+        left_cartesian=None,
+        right_cartesian=None,
+        left_input_skipped=None,
+        right_input_skipped=None,
+    )
+
+    command = retargeter.build_command_for_context(context)
+
+    assert command.timestamp == 3.0
+    assert tuple(command.commands) == ("left_arm", "right_arm")
+    assert command.metadata["collision_avoidance_status"] in {
+        "tracking",
+        "boundary_active",
+        "hold_last_safe",
+    }
+
+
+def test_bimanual_contract_facade_can_be_enabled_explicitly() -> None:
+    retargeter = _retargeter(_FakeDualArmSolver())
+    retargeter.config.bimanual_result_contract_enabled = True
+    results: list[BimanualIKResult] = []
+    original_convert = retargeter._command_from_bimanual_result
+
+    def recording_convert(result: BimanualIKResult):
+        results.append(result)
+        return original_convert(result)
+
+    retargeter._command_from_bimanual_result = recording_convert  # type: ignore[method-assign]
+    context = DualArmTargetContext(
+        timestamp=4.0,
+        left_target=_target_pose(),
+        right_target=_target_pose(),
+        left_world_to_base=None,
+        right_world_to_base=None,
+        left_cartesian=None,
+        right_cartesian=None,
+        left_input_skipped=None,
+        right_input_skipped=None,
+    )
+
+    command = retargeter.build_command_for_context(context)
+
+    assert len(results) == 1
+    assert isinstance(results[0], BimanualIKResult)
+    assert command.timestamp == 4.0
+    assert tuple(command.commands) == ("left_arm", "right_arm")
+
+
+@pytest.mark.parametrize("output_command_type", ["joint_vector", "cartesian_pose"])
+def test_native_and_compat_bimanual_outputs_are_field_equivalent(
+    output_command_type: str,
+) -> None:
+    compat = _retargeter(_FakeDualArmSolver())
+    native = _retargeter(_FakeDualArmSolver())
+    compat.config.output_command_type = output_command_type
+    native.config.output_command_type = output_command_type
+    compat.config.bimanual_result_contract_enabled = False
+    native.config.bimanual_result_contract_enabled = True
+    source = EffectorCommand(
+        effector_name="left_arm",
+        side="left",
+        command_type="cartesian_pose",
+        value=_target_pose(),
+        frame_name="arm_base",
+        metadata={
+            "tracker_motion_intent": {
+                "state": "ACTIVE",
+                "inactive": False,
+                "hold_weight": 0.0,
+            }
+        },
+    )
+    context = DualArmTargetContext(
+        timestamp=5.0,
+        left_target=_target_pose(),
+        right_target=_target_pose(),
+        left_world_to_base=None,
+        right_world_to_base=None,
+        left_cartesian=source,
+        right_cartesian=None,
+        left_input_skipped=None,
+        right_input_skipped="inactive",
+    )
+
+    compat_command = compat.build_command_for_context(context)
+    native_command = native.build_command_for_context(context)
+
+    def assert_equivalent(left, right, *, key: str | None = None) -> None:
+        if key == "ik_frame_total_ms":
+            assert isinstance(left, float)
+            assert isinstance(right, float)
+            return
+        if isinstance(left, dict):
+            assert isinstance(right, dict)
+            assert set(left) == set(right)
+            for child_key in left:
+                assert_equivalent(left[child_key], right[child_key], key=child_key)
+            return
+        if isinstance(left, np.ndarray):
+            np.testing.assert_allclose(left, right)
+            return
+        if isinstance(left, float):
+            assert float(right) == pytest.approx(left)
+            return
+        assert right == left
+
+    assert tuple(compat_command.commands) == tuple(native_command.commands)
+    assert_equivalent(compat_command.metadata, native_command.metadata)
+    for effector_name in compat_command.commands:
+        left = compat_command.commands[effector_name]
+        right = native_command.commands[effector_name]
+        assert left.effector_name == right.effector_name
+        assert left.side == right.side
+        assert left.command_type == right.command_type
+        assert left.frame_name == right.frame_name
+        np.testing.assert_allclose(left.value, right.value)
+        assert_equivalent(left.metadata, right.metadata)
 
 
 def test_dual_arm_collision_retargeter_defaults_to_robot_motion_builder(monkeypatch) -> None:
@@ -371,6 +675,234 @@ def test_dual_arm_candidate_layer_returns_base_candidate_without_auxiliary_expan
     assert metadata["candidate_eval_mode"] == "base_only"
     assert metadata["limit_escape"]["status"] == "deferred"
     assert [stage["stage"] for stage in metadata["candidate_eval_stages"]] == ["base_primary"]
+
+
+def test_position_candidate_layer_prefers_feasible_non_wrist_singular_branch(
+    monkeypatch,
+) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_wrist_singular_branch = True
+    retargeter.config.wrist_singularity_threshold_deg = 3.0
+    reference = np.zeros(12, dtype=float)
+    singular = reference.copy()
+    singular[4] = np.deg2rad(1.0)
+    singular[10] = np.deg2rad(5.0)
+    non_singular = reference.copy()
+    non_singular[4] = np.deg2rad(5.0)
+    non_singular[10] = np.deg2rad(5.0)
+    candidates = [
+        dual_module._DualArmCandidate(
+            name="singular_low_score",
+            qpos=singular,
+            source="multitask",
+            method="singular_low_score",
+        ),
+        dual_module._DualArmCandidate(
+            name="non_singular_high_score",
+            qpos=non_singular,
+            source="multitask",
+            method="non_singular_high_score",
+        ),
+    ]
+
+    monkeypatch.setattr(
+        retargeter,
+        "_dual_arm_tracking_candidates",
+        lambda **_kwargs: (candidates, {"enabled": False, "status": "deferred"}),
+    )
+
+    def evaluate(*, candidate, **_kwargs):
+        return (
+            True,
+            candidate.qpos.copy(),
+            {"score": 1.0 if candidate.name.startswith("singular") else 100.0},
+        )
+
+    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", evaluate)
+    monkeypatch.setattr(retargeter, "_profiled_min_collision_distance", lambda *_a, **_k: 1.0)
+
+    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=singular,
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+        profile=None,
+    )
+
+    assert name == "non_singular_high_score"
+    assert np.allclose(qpos, non_singular)
+    preference = metadata["wrist_singularity_preference"]
+    assert preference["fully_non_singular_count"] == 1
+    assert preference["fallback_to_singular"] is False
+    assert preference["selected"]["singular_side_count"] == 0
+
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    rollback_qpos, rollback_name, *_ = retargeter._select_safe_tracking_candidate(
+        raw_full_q=singular,
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+        profile=None,
+    )
+    assert rollback_name == "singular_low_score"
+    assert np.allclose(rollback_qpos, singular)
+
+
+def test_position_candidate_layer_accepts_singular_when_no_clean_branch(
+    monkeypatch,
+) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_wrist_singular_branch = True
+    reference = np.zeros(12, dtype=float)
+    lower_score = reference.copy()
+    lower_score[4] = np.deg2rad(1.0)
+    lower_score[10] = np.deg2rad(5.0)
+    higher_score = lower_score.copy()
+    higher_score[4] = np.deg2rad(2.0)
+    candidates = [
+        dual_module._DualArmCandidate("singular_best", lower_score, "multitask", "best"),
+        dual_module._DualArmCandidate("singular_other", higher_score, "multitask", "other"),
+    ]
+    monkeypatch.setattr(
+        retargeter,
+        "_dual_arm_tracking_candidates",
+        lambda **_kwargs: (candidates, {"enabled": False, "status": "deferred"}),
+    )
+    monkeypatch.setattr(
+        retargeter,
+        "_evaluate_dual_arm_step_candidate",
+        lambda *, candidate, **_kwargs: (
+            True,
+            candidate.qpos.copy(),
+            {"score": 1.0 if candidate.name == "singular_best" else 2.0},
+        ),
+    )
+    monkeypatch.setattr(retargeter, "_profiled_min_collision_distance", lambda *_a, **_k: 1.0)
+
+    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=lower_score,
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+        profile=None,
+    )
+
+    assert name == "singular_best"
+    assert np.allclose(qpos, lower_score)
+    preference = metadata["wrist_singularity_preference"]
+    assert preference["fully_non_singular_count"] == 0
+    assert preference["fallback_to_singular"] is True
+    assert preference["selected"]["sides"]["left"]["is_wrist_singular"] is True
+
+
+def test_position_candidate_layer_expands_auxiliary_for_elbow_singularity(
+    monkeypatch,
+) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver, rm65_posture=True)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(6.0)
+    reference[8] = np.deg2rad(6.0)
+    elbow_singular = reference.copy()
+    elbow_singular[2] = np.deg2rad(1.0)
+    elbow_clean = reference.copy()
+    elbow_clean[2] = np.deg2rad(7.0)
+    base = dual_module._DualArmCandidate(
+        "original", elbow_singular, "multitask", "original"
+    )
+    auxiliary = dual_module._DualArmCandidate(
+        "posture_escape_left_j3",
+        elbow_clean,
+        "posture_escape",
+        "posture_escape_left_j3",
+    )
+
+    def candidates(**kwargs):
+        if kwargs.get("include_posture_escape", False):
+            return [auxiliary], {
+                "posture_escape": {"enabled": True, "status": "active"}
+            }
+        return [base], {"enabled": False, "status": "deferred"}
+
+    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", candidates)
+    monkeypatch.setattr(
+        retargeter,
+        "_evaluate_dual_arm_step_candidate",
+        lambda *, candidate, **_kwargs: (
+            True,
+            candidate.qpos.copy(),
+            {"score": 1.0 if candidate.name == "original" else 100.0},
+        ),
+    )
+    monkeypatch.setattr(retargeter, "_profiled_min_collision_distance", lambda *_a, **_k: 1.0)
+
+    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=elbow_singular,
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+        profile=None,
+    )
+
+    assert name == "posture_escape_left_j3"
+    assert np.allclose(qpos, elbow_clean)
+    assert metadata["candidate_eval_mode"] == "base_then_auxiliary_singularity_search"
+    assert metadata["expanded_for_elbow_singularity"] is True
+    preference = metadata["position_singularity_preference"]
+    assert preference["fully_non_singular_count"] == 1
+    assert preference["fallback_to_singular"] is False
+    assert preference["selected"]["any_elbow_singular"] is False
+
+
+def test_position_candidate_layer_marks_elbow_fallback_when_no_clean_candidate(
+    monkeypatch,
+) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver, rm65_posture=True)
+    retargeter.config.prefer_non_elbow_singular_branch = True
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    reference = np.zeros(12, dtype=float)
+    reference[2] = np.deg2rad(6.0)
+    reference[8] = np.deg2rad(6.0)
+    singular = reference.copy()
+    singular[2] = np.deg2rad(1.0)
+    candidate = dual_module._DualArmCandidate(
+        "original", singular, "multitask", "original"
+    )
+
+    monkeypatch.setattr(
+        retargeter,
+        "_dual_arm_tracking_candidates",
+        lambda **_kwargs: ([candidate], {"enabled": False, "status": "deferred"}),
+    )
+    monkeypatch.setattr(
+        retargeter,
+        "_evaluate_dual_arm_step_candidate",
+        lambda *, candidate, **_kwargs: (
+            True,
+            candidate.qpos.copy(),
+            {"score": 1.0},
+        ),
+    )
+    monkeypatch.setattr(retargeter, "_profiled_min_collision_distance", lambda *_a, **_k: 1.0)
+
+    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
+        raw_full_q=singular,
+        reference_full_q=reference,
+        current_targets=retargeter.current_world_targets(),
+        profile=None,
+    )
+
+    assert name == "original"
+    assert np.allclose(qpos, singular)
+    preference = metadata["position_singularity_preference"]
+    assert preference["fully_non_singular_count"] == 0
+    assert preference["fallback_to_singular"] is True
+    assert preference["selected"]["sides"]["left"]["is_elbow_singular"] is True
+
+    retargeter.config.prefer_non_elbow_singular_branch = False
+    rollback = retargeter._position_singularity_metadata(singular)
+    assert rollback["any_elbow_singular"] is False
 
 
 def test_dual_arm_candidate_deadline_holds_without_fallback_or_auxiliary_expansion(monkeypatch) -> None:
@@ -766,6 +1298,44 @@ def test_tracker_inactive_execution_release_linearly_adds_pose_error_weights() -
     assert metadata["inactive_side_hold_execution_cap"]["sides"]["right"]["applied"] is False
 
 
+def test_candidate_local_step_uses_tracker_inactive_execution_release() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    reference = np.zeros(12, dtype=float)
+    candidate = reference.copy()
+    candidate[6] = np.deg2rad(0.4)
+    target_activity = {
+        "enabled": True,
+        "left": {"inactive": False, "hold_weight": 0.0},
+        "right": {
+            "source": "tracker_motion_state_machine",
+            "state": "INACTIVE",
+            "inactive": True,
+            "hold_weight": 1.0,
+        },
+    }
+    solver.set_configuration_q(reference)
+    retargeter.set_execution_dt_sec(1.0)
+
+    qpos, metadata = retargeter._limit_full_joint_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        step_scale=1.0,
+        target_activity=target_activity,
+        current_targets={
+            "left": _target_pose(),
+            "right": _target_pose(x_m=0.0475, rotation_deg=11.25),
+        },
+    )
+
+    assert np.isclose(qpos[6], np.deg2rad(0.2))
+    release = metadata["inactive_side_hold_execution_cap"]["sides"]["right"][
+        "tracker_inactive_execution_release"
+    ]
+    assert release["available"] is True
+    assert np.isclose(release["velocity_release_scale"], 0.5)
+
+
 def test_tracker_inactive_execution_release_is_opt_in_for_position_only() -> None:
     solver = _FakeDualArmSolver()
     retargeter = _retargeter(solver)
@@ -836,6 +1406,7 @@ def test_build_command_passes_targets_to_inactive_execution_release() -> None:
     command = retargeter.build_command_for_context(context)
 
     right = command.commands["right_arm"].metadata
+    assert np.max(np.abs(command.commands["right_arm"].value)) > 0.0
     release = right["execution_step_metadata"]["inactive_side_hold_execution_cap"]["sides"][
         "right"
     ]["tracker_inactive_execution_release"]
@@ -1026,11 +1597,13 @@ def test_dual_arm_output_qpos_smoothing_adapts_to_valid_tracker_speed() -> None:
 
     alpha, metadata = retargeter._effective_output_qpos_smoothing_alpha(activity)
 
-    assert 0.18 < alpha <= 0.7
-    assert metadata["reason"] == "tracker_speed"
-    assert metadata["requested_alpha"] == 0.7
-    assert metadata["transition"] == "attack"
-    assert metadata["valid_sides"] == ["left"]
+    assert 0.18 < alpha["left"] <= 0.7
+    assert alpha["right"] == pytest.approx(0.18)
+    assert metadata["selection"] == "per_side_tracker_speed"
+    assert metadata["left"]["reason"] == "tracker_speed"
+    assert metadata["left"]["requested_alpha"] == 0.7
+    assert metadata["left"]["transition"] == "attack"
+    assert metadata["right"]["reason"] == "invalid_or_missing_speed"
 
 
 def test_dual_arm_output_qpos_smoothing_uses_motion_window_validity() -> None:
@@ -1058,10 +1631,10 @@ def test_dual_arm_output_qpos_smoothing_uses_motion_window_validity() -> None:
         }
     )
 
-    assert 0.18 < alpha <= 0.7
-    assert metadata["reason"] == "tracker_speed"
-    assert metadata["requested_alpha"] == 0.7
-    assert metadata["valid_sides"] == ["right"]
+    assert alpha["left"] == pytest.approx(0.18)
+    assert 0.18 < alpha["right"] <= 0.7
+    assert metadata["right"]["reason"] == "tracker_speed"
+    assert metadata["right"]["requested_alpha"] == 0.7
 
 
 def test_dual_arm_output_qpos_smoothing_ignores_invalid_tracker_speed() -> None:
@@ -1081,8 +1654,42 @@ def test_dual_arm_output_qpos_smoothing_ignores_invalid_tracker_speed() -> None:
         {"left": {"evidence": {"quality_valid": False, "linear_speed_p90_m_s": 1.0}}}
     )
 
-    assert alpha == 0.18
-    assert metadata["reason"] == "invalid_or_missing_speed"
+    assert alpha == {"left": pytest.approx(0.18), "right": pytest.approx(0.18)}
+    assert metadata["left"]["reason"] == "invalid_or_missing_speed"
+
+
+def test_dual_arm_output_qpos_smoothing_applies_distinct_side_alphas() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+            output_qpos_smoothing_alpha=0.14,
+            output_qpos_smoothing_adaptive_enabled=True,
+            output_qpos_smoothing_fast_alpha=0.45,
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    retargeter._last_output_qpos_smoothing_full_q = np.zeros(12, dtype=float)
+    activity = {
+        "left": {
+            "evidence": {
+                "quality_valid": True,
+                "linear_speed_p90_m_s": 0.30,
+                "angular_speed_p90_rad_s": 0.2,
+            }
+        },
+        "right": {"evidence": {"quality_valid": False}},
+    }
+    _, left, right, metadata = retargeter._smooth_output_qpos_before_action(
+        active_q=np.ones(12, dtype=float),
+        left_qpos=np.ones(6, dtype=float),
+        right_qpos=np.ones(6, dtype=float),
+        target_activity=activity,
+    )
+
+    assert metadata["left"]["alpha"] > metadata["right"]["alpha"]
+    assert np.all(left > right)
 
 
 def test_dual_arm_current_qpos_sync_can_preserve_output_qpos_smoothing_state() -> None:

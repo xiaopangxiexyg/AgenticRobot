@@ -7,6 +7,7 @@ import numpy as np
 from teleop_runtime.collection.build_collect_components import CollectorComponents
 from teleop_runtime.collection.async_writer import WriteJob
 from teleop_runtime.collection.runtime import CollectionRuntime
+from teleop_runtime.collection.writer_runtime import CollectionWriterRuntime
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.session import SessionStepResult
@@ -80,6 +81,9 @@ class CollectionRuntimeActionRecordTest(unittest.TestCase):
             write_planner=lambda sample, components: (),
             writer_pool=_FakeWriterPool(),
         )
+
+        self.assertIsInstance(runtime.writer_runtime, CollectionWriterRuntime)
+        self.assertIs(runtime.writer_observer, runtime.writer_runtime.writer_observer)
 
         result = runtime.step(now=1.0)
 

@@ -4,6 +4,13 @@
 > 非目标：本计划不迁移 VIVE/OpenVR、tracker UDP、会话/校准、RM65 SDK/CANFD、MuJoCo scene，也不改变现有传输协议和传输时序。  
 > 原则：先建立兼容 facade 和行为基线，再迁移调用方；不在迁移过程中并行维护两套“看起来都正确”的 IK。
 
+当前进度（2026-07-15）：RM65 scene profile、默认姿态、资源定位、纯
+IK tuning、单臂 IK 和双臂 Pink IK 已迁入 robot_motion/rm65。旧
+rm65_inspire_tac 对应模块仅保留薄兼容 shim；VIVE、真机执行、15 Hz
+action、force/position transport 和底层通信未修改。下一阶段仍是把
+teleop_runtime/retargeters/dual_arm_collision_aware.py 中的 planner policy
+逐步收敛到共享 facade，而不是再次复制 solver。
+
 ## 1. 总体判断
 
 这项工作不是把一份 IK 文件从 teleop_runtime 移到 robot_motion，而是把当前分散在三处的职责重新收敛：

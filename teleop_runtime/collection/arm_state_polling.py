@@ -253,14 +253,22 @@ class ArmHardwareStatePoller:
         )
         hardware_qpos = cached_hardware_qpos if actual_valid else None
         qpos = hardware_qpos
-        tcp_pose = _pose_or_none(state.get("current_tcp_pose")) if actual_valid else None
-        if tcp_pose is None and qpos is not None:
+        tcp_pose = None
+        tcp_pose_source = None
+        if qpos is not None:
+            # ``current_tcp_pose`` is not a measured-state contract.  The RM65
+            # position backend deliberately derives it from the last accepted
+            # command/local interpolation anchor, while ``hardware_qpos`` is
+            # the actual SDK feedback.  Always compute the measured TCP from
+            # the validated hardware qpos and fail closed if FK is unavailable.
             compute_tcp_pose = getattr(backend, "compute_tcp_pose", None)
             if callable(compute_tcp_pose):
                 try:
                     tcp_pose = _pose_or_none(compute_tcp_pose(qpos=qpos))
                 except Exception:
                     tcp_pose = None
+                if tcp_pose is not None:
+                    tcp_pose_source = "hardware_qpos_fk"
 
         pose_timestamp = hardware_refresh_time if actual_valid else None
         hardware_pose_6d = (
@@ -295,6 +303,7 @@ class ArmHardwareStatePoller:
             "actual_hardware_qpos": hardware_qpos,
             "actual_qpos": qpos,
             "actual_tcp_pose": tcp_pose,
+            "actual_tcp_pose_source": tcp_pose_source,
             "actual_hardware_pose_6d": hardware_pose_6d,
             "wrist_camera_pose_base": tcp_pose,
             "wrist_camera_pose_timestamp": pose_timestamp,

@@ -199,16 +199,25 @@ def _camera_debug_snapshot(
         receive_timestamp = (
             None if frame.receive_timestamp is None else float(frame.receive_timestamp)
         )
+        available_timestamp = (
+            None if frame.available_timestamp is None else float(frame.available_timestamp)
+        )
         debug[name] = {
             "missing": False,
             "frame_index": frame.frame_index,
             "source_timestamp": source_timestamp,
             "receive_timestamp": receive_timestamp,
+            "available_timestamp": available_timestamp,
             "source_age_sec": float(sample_timestamp - source_timestamp),
             "receive_age_sec": (
                 None
                 if receive_timestamp is None
                 else float(sample_timestamp - receive_timestamp)
+            ),
+            "available_age_sec": (
+                None
+                if available_timestamp is None
+                else float(sample_timestamp - available_timestamp)
             ),
         }
     return debug
@@ -746,6 +755,33 @@ class CollectorSample:
     faults: list[dict[str, Any]] = field(default_factory=list)
     camera_frames: dict[str, CameraFrameMatch] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CollectorSampleSnapshot:
+    """Causal live-state snapshot consumed by detached sample assembly.
+
+    Hardware and camera-buffer reads stay in the frontend process.  Everything
+    after this boundary is pure data work and may safely run in a spawned
+    collection process without inheriting vendor handles or runtime locks.
+    """
+
+    step_result: SessionStepResult
+    arm_states: dict[str, dict[str, Any]]
+    hand_states: dict[str, dict[str, Any]]
+    camera_frames: dict[str, VideoFrame | None]
+    position_reference: dict[str, Any] | None
+    active_sides: tuple[str, ...]
+    component_metadata: dict[str, Any]
+    snapshot_timings_s: dict[str, float]
+    include_debug_metadata: bool = False
+    include_action_debug_metadata: bool = False
+
+
+@dataclass(frozen=True)
+class _SnapshotComponentView:
+    active_sides: tuple[str, ...]
+    metadata: dict[str, Any]
 
 
 @dataclass
@@ -1384,6 +1420,7 @@ class CollectorSampleBuilder:
         metadata_builder: MetadataBuilder | None = None,
         arm_state_metadata_provider: ArmStateMetadataProvider | None = None,
         hand_state_provider: HandStateProvider | None = None,
+        hand_state_provider_returns_isolated: bool = False,
         position_reference_provider: PositionReferenceProvider | None = None,
         position_reference_timeline: Any | None = None,
     ):
@@ -1398,6 +1435,9 @@ class CollectorSampleBuilder:
         self.metadata_builder = metadata_builder
         self.arm_state_metadata_provider = arm_state_metadata_provider
         self.hand_state_provider = hand_state_provider
+        self.hand_state_provider_returns_isolated = bool(
+            hand_state_provider_returns_isolated
+        )
         self.position_reference_provider = position_reference_provider
         self.position_reference_timeline = position_reference_timeline
         self.last_position_reference_rejection: str | None = None
@@ -1720,22 +1760,19 @@ class CollectorSampleBuilder:
                 continue
 
             source_timestamp = _finite_float(frame.source_timestamp)
-            receive_timestamp = _finite_float(frame.receive_timestamp)
-            freshness_timestamp = (
-                receive_timestamp if receive_timestamp is not None else source_timestamp
-            )
-            if source_timestamp is None or freshness_timestamp is None:
+            available_timestamp = _finite_float(frame.available_timestamp)
+            if source_timestamp is None or available_timestamp is None:
                 age_by_key[camera_key] = None
                 failures.append(f"invalid_timestamp:{camera_key}")
                 continue
 
             source_age_sec = float(sample_timestamp - source_timestamp)
-            freshness_age_sec = float(sample_timestamp - freshness_timestamp)
-            effective_age_sec = max(source_age_sec, freshness_age_sec)
+            available_age_sec = float(sample_timestamp - available_timestamp)
+            effective_age_sec = max(source_age_sec, available_age_sec)
             age_by_key[camera_key] = effective_age_sec
-            if source_age_sec < 0.0 or freshness_age_sec < 0.0:
+            if source_age_sec < 0.0 or available_age_sec < 0.0:
                 failures.append(
-                    f"future:{camera_key}:{min(source_age_sec, freshness_age_sec):.6f}"
+                    f"future:{camera_key}:{min(source_age_sec, available_age_sec):.6f}"
                 )
                 continue
             if max_age is not None and effective_age_sec > max_age:
@@ -1858,11 +1895,49 @@ class CollectorSampleBuilder:
             ),
         )
 
-    def __call__(
+    @staticmethod
+    def _freeze_step_result(step_result: SessionStepResult) -> SessionStepResult:
+        command = step_result.command
+        frozen_command = None
+        if command is not None:
+            frozen_effectors: dict[str, EffectorCommand] = {}
+            for name, effector in command.commands.items():
+                frozen_effector = effector.copy()
+                frozen_effector.metadata = _copy_value(dict(effector.metadata))
+                frozen_effectors[str(name)] = frozen_effector
+            frozen_command = TeleopCommand(
+                commands=frozen_effectors,
+                timestamp=command.timestamp,
+                metadata=_copy_value(dict(command.metadata)),
+            )
+        return SessionStepResult(
+            timestamp=float(step_result.timestamp),
+            state=step_result.state,
+            control_hz=float(step_result.control_hz),
+            channels={
+                str(name): channel.copy()
+                for name, channel in step_result.channels.items()
+            },
+            raw_channels={},
+            observation=None,
+            command=frozen_command,
+            command_dispatched=bool(step_result.command_dispatched),
+            action_record=None,
+            faults=list(step_result.faults),
+            motion_hold_mode=str(step_result.motion_hold_mode),
+            motion_hold_reason=str(step_result.motion_hold_reason),
+            tracker_loss_duration_sec=float(step_result.tracker_loss_duration_sec),
+            tracker_loss_channels=tuple(step_result.tracker_loss_channels),
+            home_recalibration_required=bool(step_result.home_recalibration_required),
+        )
+
+    def snapshot_inputs(
         self,
         step_result: SessionStepResult,
         components: CollectorComponents,
-    ) -> CollectorSample | None:
+    ) -> CollectorSampleSnapshot | None:
+        """Freeze only causal live inputs; do no schema or row construction."""
+
         position_reference = self._position_reference_for_sample(
             float(step_result.timestamp)
         )
@@ -1900,67 +1975,125 @@ class CollectorSampleBuilder:
         )
         if self.last_camera_rejection is not None:
             return None
+        return CollectorSampleSnapshot(
+            step_result=self._freeze_step_result(effective_step_result),
+            arm_states={
+                str(side): _copy_value(state)
+                for side, state in arm_states.items()
+            },
+            hand_states=(
+                {
+                    str(side): state
+                    for side, state in hand_states.items()
+                }
+                if self.hand_state_provider_returns_isolated
+                else {
+                    str(side): _copy_value(state)
+                    for side, state in hand_states.items()
+                }
+            ),
+            camera_frames=dict(camera_frames),
+            position_reference=(
+                None
+                if position_reference is None
+                else dict(_to_serializable(position_reference))
+            ),
+            active_sides=tuple(
+                getattr(components, "active_sides", self.config.active_sides)
+            ),
+            component_metadata=dict(_to_serializable(components.metadata)),
+            snapshot_timings_s={
+                "arm_snapshot_s": float(arm_snapshot_s),
+                "hand_snapshot_s": float(hand_snapshot_s),
+                "camera_snapshot_s": float(camera_snapshot_s),
+            },
+            include_debug_metadata=bool(self.include_debug_metadata),
+            include_action_debug_metadata=bool(
+                self.include_action_debug_metadata
+            ),
+        )
+
+    def build_from_snapshot(
+        self,
+        snapshot: CollectorSampleSnapshot,
+        *,
+        components: CollectorComponents | None = None,
+    ) -> CollectorSample:
+        """Perform pure sample assembly from an already frozen snapshot."""
+
+        if self.metadata_builder is not None and components is None:
+            raise RuntimeError(
+                "Detached sample assembly does not support a live custom metadata_builder."
+            )
+        effective_components: Any = components
+        if effective_components is None:
+            effective_components = _SnapshotComponentView(
+                active_sides=tuple(snapshot.active_sides),
+                metadata=dict(snapshot.component_metadata),
+            )
+        step_result = snapshot.step_result
+        arm_states = snapshot.arm_states
+        hand_states = snapshot.hand_states
+        camera_frames = snapshot.camera_frames
         timing_started = time.perf_counter()
         if self.metadata_builder is None:
             metadata = self._default_metadata(
-                effective_step_result,
-                components,
+                step_result,
+                effective_components,
                 arm_states,
                 hand_states,
                 camera_frames,
-                include_debug_metadata=bool(self.include_debug_metadata),
-                include_action_debug_metadata=bool(self.include_action_debug_metadata),
+                include_debug_metadata=bool(snapshot.include_debug_metadata),
+                include_action_debug_metadata=bool(
+                    snapshot.include_action_debug_metadata
+                ),
             )
         else:
             metadata = self.metadata_builder(
-                effective_step_result,
-                components,
+                step_result,
+                effective_components,
                 arm_states,
                 hand_states,
                 camera_frames,
             )
         metadata = {} if metadata is None else dict(metadata)
-        if position_reference is not None:
-            metadata["position_reference"] = _to_serializable(position_reference)
-        # This label is collection-owned.  A custom metadata builder may add
-        # unrelated metadata, but cannot bypass the actual-feedback init audit.
+        if snapshot.position_reference is not None:
+            metadata["position_reference"] = _to_serializable(
+                snapshot.position_reference
+            )
         metadata["arm_mode"] = self._build_arm_mode_metadata(
-            command=effective_step_result.command,
-            session_state=str(effective_step_result.state.value),
-            active_sides=tuple(getattr(components, "active_sides", self.config.active_sides)),
+            command=step_result.command,
+            session_state=str(step_result.state.value),
+            active_sides=tuple(snapshot.active_sides),
             arm_states=arm_states,
-            timestamp=float(effective_step_result.timestamp),
+            timestamp=float(step_result.timestamp),
         )
         sample_builder_debug = {
-            "arm_snapshot_s": float(arm_snapshot_s),
-            "hand_snapshot_s": float(hand_snapshot_s),
-            "camera_snapshot_s": float(camera_snapshot_s),
+            **dict(snapshot.snapshot_timings_s),
             "metadata_build_s": float(time.perf_counter() - timing_started),
             "camera_frames": _camera_debug_snapshot(
-                sample_timestamp=float(effective_step_result.timestamp),
+                sample_timestamp=float(step_result.timestamp),
                 camera_frames=camera_frames,
             ),
             "hand_states": _hand_debug_snapshot(
-                sample_timestamp=float(effective_step_result.timestamp),
+                sample_timestamp=float(step_result.timestamp),
                 hand_states=hand_states,
             ),
         }
-        if self.include_action_debug_metadata:
+        if snapshot.include_action_debug_metadata:
             sample_builder_debug["arm_actions"] = _arm_action_debug_snapshot(
-                sample_timestamp=float(effective_step_result.timestamp),
+                sample_timestamp=float(step_result.timestamp),
                 arm_states=arm_states,
                 command=_command_with_action_target_pose(
-                    effective_step_result.command,
+                    step_result.command,
                     arm_states=arm_states,
-                    use_backend_target_pose=bool(
-                        getattr(effective_step_result, "command_dispatched", False)
-                    ),
+                    use_backend_target_pose=bool(step_result.command_dispatched),
                 ),
             )
         metadata["sample_builder_debug"] = sample_builder_debug
         timing_started = time.perf_counter()
         sample = self.assembler.build_sample(
-            step_result=effective_step_result,
+            step_result=step_result,
             arm_states=arm_states,
             hand_states=hand_states,
             camera_frames=camera_frames,
@@ -1969,9 +2102,19 @@ class CollectorSampleBuilder:
             frame_index=self._frame_index,
             metadata=metadata,
         )
-        sample.metadata.setdefault("sample_builder_debug", {})["build_sample_s"] = float(
-            time.perf_counter() - timing_started
-        )
+        sample.metadata.setdefault("sample_builder_debug", {})[
+            "build_sample_s"
+        ] = float(time.perf_counter() - timing_started)
         self._sample_index += 1
         self._frame_index += 1
         return sample
+
+    def __call__(
+        self,
+        step_result: SessionStepResult,
+        components: CollectorComponents,
+    ) -> CollectorSample | None:
+        snapshot = self.snapshot_inputs(step_result, components)
+        if snapshot is None:
+            return None
+        return self.build_from_snapshot(snapshot, components=components)

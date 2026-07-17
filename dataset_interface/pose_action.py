@@ -13,7 +13,12 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from dataset_contracts.pose_frames import PoseFrameContract, PoseFrameContractError
+from dataset_contracts.pose_frames import (
+    POSE_FRAME_CONTRACT_METADATA_KEY,
+    PoseFrameContract,
+    PoseFrameContractError,
+)
+from dataset_contracts.v23 import resolve_v23_dataset_contract
 from dataset_contracts.v22 import DatasetLayoutBindingError, PolicyIOLayout
 from robot_motion.relative_action import (
     ACTION_POSE_MODE_ABSOLUTE,
@@ -257,9 +262,55 @@ def pose_policy_window_from_rows(
     )
 
 
+def pose_policy_window_from_dataset_metadata(
+    rows: Sequence[Mapping[str, Any]],
+    dataset_metadata: Mapping[str, Any],
+    *,
+    episode_metadata: Mapping[str, Any] | None = None,
+    active_sides: Sequence[str] | None = None,
+    action_pose_mode: str = ACTION_POSE_MODE_ABSOLUTE,
+    last_action_pose_mode: str | None = None,
+) -> PosePolicyWindow:
+    """Resolve a dataset contract and return its canonical model-facing view.
+
+    Episode metadata may repeat the dataset-wide pose contract for audit, but
+    it is not allowed to override it.
+    """
+
+    resolved = resolve_v23_dataset_contract(
+        dataset_metadata,
+        active_sides=active_sides,
+    )
+    episode = {} if episode_metadata is None else dict(episode_metadata)
+    episode_contract_payload = episode.get(POSE_FRAME_CONTRACT_METADATA_KEY)
+    if episode_contract_payload is not None:
+        if not isinstance(episode_contract_payload, Mapping):
+            raise PosePolicyViewError("episode pose_frame_contract must be a mapping.")
+        try:
+            episode_contract = PoseFrameContract.from_dict(episode_contract_payload)
+        except PoseFrameContractError as exc:
+            raise PosePolicyViewError(f"episode pose_frame_contract is invalid: {exc}") from exc
+        if episode_contract.to_dict() != resolved.pose_frames.to_dict():
+            raise PosePolicyViewError(
+                "episode pose_frame_contract differs from the dataset-wide contract."
+            )
+    sides = active_sides
+    if sides is None:
+        sides = resolved.pose_frames.source.active_sides
+    return pose_policy_window_from_rows(
+        rows,
+        resolved.policy_io_layout,
+        pose_frame_contract=resolved.pose_frames,
+        active_sides=sides,
+        action_pose_mode=action_pose_mode,
+        last_action_pose_mode=last_action_pose_mode,
+    )
+
+
 __all__ = [
     "ANCHOR_COLUMN_TEMPLATE",
     "PosePolicyViewError",
     "PosePolicyWindow",
+    "pose_policy_window_from_dataset_metadata",
     "pose_policy_window_from_rows",
 ]

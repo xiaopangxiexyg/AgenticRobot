@@ -43,6 +43,18 @@ def _local_step_clip_scale_arg(text: str) -> float:
         raise argparse.ArgumentTypeError("local-step clip scale must be finite and >= 1")
     return value
 
+def _positive_unit_scale_arg(text: str) -> float:
+    value = float(text)
+    if not np.isfinite(value) or not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError("scale must be finite and in (0, 1]")
+    return value
+
+def _positive_finite_float_arg(text: str) -> float:
+    value = float(text)
+    if not np.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("value must be positive and finite")
+    return value
+
 def _positive_int(text: str) -> int:
     value = int(text)
     if value <= 0:
@@ -82,9 +94,10 @@ __all__ = [
     "_canfd_radio",
     "_movement_multiple_arg",
     "_local_step_clip_scale_arg",
+    "_positive_unit_scale_arg",
+    "_positive_finite_float_arg",
     "_positive_int",
     "_dmtac_worker_cpu_affinity",
     "_dmtac_worker_nice",
     "_parse_dmtac_tactile_fields",
 ]
-

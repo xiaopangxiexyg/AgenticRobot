@@ -13,6 +13,10 @@ from dataset_contracts.v22 import (
     policy_io_layout_from_metadata,
 )
 from dataset_contracts.pose_frames import PoseFrameContract, PoseFrameContractError
+from dataset_contracts.v23 import (
+    DEXTELEOP_DATASET_SCHEMA_V23,
+    resolve_v23_dataset_contract,
+)
 from robot_motion.deploy.actions import NormalizedAction
 from robot_motion.deploy.observation import DeploymentObservation
 from robot_motion.deploy.pose_adapter import (
@@ -1086,6 +1090,13 @@ def infer_replay_action_hz(
     )
 
 
+@dataclass(frozen=True)
+class _DatasetReplayPredictionCheckpoint:
+    cursor: int
+    completed_passes: int
+    finished: bool
+
+
 @dataclass
 class DatasetReplayPolicy:
     actions: np.ndarray
@@ -1144,6 +1155,32 @@ class DatasetReplayPolicy:
         if self.cursor >= self.frame_count:
             self.finished = not self.loop
         return int(skipped)
+
+    def begin_prediction_transaction(self) -> _DatasetReplayPredictionCheckpoint:
+        """Checkpoint every field mutated while selecting the next chunk."""
+
+        return _DatasetReplayPredictionCheckpoint(
+            cursor=int(self.cursor),
+            completed_passes=int(self.completed_passes),
+            finished=bool(self.finished),
+        )
+
+    def commit_prediction_transaction(
+        self,
+        checkpoint: _DatasetReplayPredictionCheckpoint,
+    ) -> None:
+        if not isinstance(checkpoint, _DatasetReplayPredictionCheckpoint):
+            raise TypeError("Invalid dataset replay prediction checkpoint.")
+
+    def rollback_prediction_transaction(
+        self,
+        checkpoint: _DatasetReplayPredictionCheckpoint,
+    ) -> None:
+        if not isinstance(checkpoint, _DatasetReplayPredictionCheckpoint):
+            raise TypeError("Invalid dataset replay prediction checkpoint.")
+        self.cursor = int(checkpoint.cursor)
+        self.completed_passes = int(checkpoint.completed_passes)
+        self.finished = bool(checkpoint.finished)
 
     def _next_action_chunk(self) -> np.ndarray:
         if self.cursor >= self.frame_count:
@@ -1251,14 +1288,21 @@ def load_dataset_replay_policy(
         explicit_layout = PolicyIOLayout.from_dict(explicit_layout)
     elif explicit_layout is not None and not isinstance(explicit_layout, PolicyIOLayout):
         raise TypeError("policy_io_layout must be a PolicyIOLayout, mapping, or None.")
-    metadata_is_v22 = (
-        str(dataset_info.get("dexteleop_dataset_schema") or "")
-        == DEXTELEOP_DATASET_SCHEMA_V22
-    )
+    dataset_schema = str(dataset_info.get("dexteleop_dataset_schema") or "")
+    metadata_is_v22 = dataset_schema == DEXTELEOP_DATASET_SCHEMA_V22
+    metadata_is_v23 = dataset_schema == DEXTELEOP_DATASET_SCHEMA_V23
+    metadata_is_typed = metadata_is_v22 or metadata_is_v23
     row_contract_is_v22 = path.is_file() and _parquet_declares_v22_policy_io(path)
-    is_v22 = metadata_is_v22 or row_contract_is_v22
-    if is_v22:
-        if metadata_is_v22:
+    is_typed = metadata_is_typed or row_contract_is_v22
+    resolved_pose_contract: PoseFrameContract | None = None
+    if is_typed:
+        if metadata_is_v23:
+            v23_contract = resolve_v23_dataset_contract(dataset_info)
+            layout = v23_contract.policy_io_layout
+            resolved_pose_contract = v23_contract.pose_frames
+            if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
+                raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
+        elif metadata_is_v22:
             layout = policy_io_layout_from_metadata(dataset_info, allow_legacy_v21=False)
             if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
                 raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
@@ -1275,6 +1319,32 @@ def load_dataset_replay_policy(
             start_index=int(start_index),
             end_index=end_index,
         )
+        if resolved_pose_contract is not None:
+            for side in resolved_pose_contract.source.active_sides:
+                pose_slice = ACTION_ARM_POSE_SLICES[side]
+                try:
+                    actions[:, pose_slice] = np.stack(
+                        [
+                            resolved_pose_contract.storage_pose_vector_to_canonical_desk(
+                                row[pose_slice], side=side
+                            )
+                            for row in actions
+                        ],
+                        axis=0,
+                    )
+                except (PoseFrameContractError, ValueError) as exc:
+                    raise ValueError(
+                        f"v2.3 replay action for {side!r} cannot be converted to "
+                        f"canonical desk: {exc}"
+                    ) from exc
+            v22_action_metadata.update(
+                {
+                    "pose_frame_contract": resolved_pose_contract.to_dict(),
+                    "pose_storage_frame": resolved_pose_contract.pose_storage_frame,
+                    "pose_source_id": resolved_pose_contract.source_id,
+                    "pose_action_absolute_frame": "canonical_desk",
+                }
+            )
     else:
         if explicit_layout is not None:
             raise ValueError(
@@ -1298,7 +1368,7 @@ def load_dataset_replay_policy(
         raise ValueError(f"Unsupported dataset replay side(s): {unknown_sides}.")
     hand_joint_targets = (
         {}
-        if is_v22
+        if is_typed
         else load_replay_hand_joint_targets_from_parquet(
             path,
             active_sides=active,
@@ -1358,13 +1428,16 @@ def load_dataset_replay_policy(
             "frame_count": int(actions.shape[0]),
             "action_column": str(action_column or "action"),
             "policy_io_layout_hash": (
-                None if not is_v22 else layout.layout_hash
+                None if not is_typed else layout.layout_hash
             ),
             "explicit_hand_replay_sides": sorted(hand_joint_targets),
             "action_hz": float(action_hz_estimate["hz"]),
             "action_hz_source": str(action_hz_estimate.get("source", "unknown")),
             "action_hz_estimate": dict(action_hz_estimate),
             "output_pose_mode": str(output_pose_mode).strip().lower(),
+            "policy_absolute_frame": (
+                "canonical_desk" if metadata_is_v23 else "runtime_raw"
+            ),
             **dict(metadata),
         },
     )

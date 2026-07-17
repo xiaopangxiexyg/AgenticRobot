@@ -10,7 +10,18 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from dataset_contracts.pose_frames import (
+    POSE_FRAME_CONTRACT_METADATA_KEY,
+    PoseFrameContract,
+    PoseFrameContractError,
+)
 from dataset_contracts.stats import EpisodeStatsAccumulator
+from dataset_contracts.v23 import (
+    DEXTELEOP_DATASET_SCHEMA_V23,
+    V23_POSE_ACTION_MODE_METADATA_KEY,
+    V23_POSE_STORAGE_FRAME_METADATA_KEY,
+    V23_RELATIVE_ACTION_SUPPORTED_METADATA_KEY,
+)
 from dataset_contracts.v22 import (
     DEXTELEOP_DATASET_SCHEMA_V22,
     LEROBOT_V21_STYLE_FORMAT,
@@ -45,6 +56,11 @@ from .schema_v21 import (
     write_rows_to_parquet,
 )
 from .schema_v22 import collector_sample_to_v22_row
+from .pose_storage import (
+    bind_collection_row_pose_storage,
+    validate_v23_collection_row_actual_tcp,
+)
+from .row_encoder import CollectionRowEncoder
 
 
 ROW_JOB_KIND = "lerobot_v21.row"
@@ -188,6 +204,9 @@ class LeRobotV21WriterConfig:
     policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None
     policy_io_layout_provenance: Mapping[str, Any] | None = None
     strict_v22_policy_io: bool = False
+    pose_frame_contract: PoseFrameContract | Mapping[str, Any] | None = None
+    row_encoder: CollectionRowEncoder | None = None
+    dataset_metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.root_dir = Path(self.root_dir)
@@ -211,6 +230,7 @@ class LeRobotV21WriterConfig:
         self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
         self.policy_io_layout_provenance = dict(self.policy_io_layout_provenance or {})
         self.strict_v22_policy_io = bool(self.strict_v22_policy_io)
+        self.dataset_metadata = dict(self.dataset_metadata or {})
         if self.policy_io_layout is not None:
             if isinstance(self.policy_io_layout, Mapping):
                 self.policy_io_layout = PolicyIOLayout.from_dict(self.policy_io_layout)
@@ -222,6 +242,19 @@ class LeRobotV21WriterConfig:
                 )
         elif self.strict_v22_policy_io:
             raise ValueError("strict_v22_policy_io requires policy_io_layout.")
+        if self.pose_frame_contract is not None:
+            if isinstance(self.pose_frame_contract, Mapping):
+                self.pose_frame_contract = PoseFrameContract.from_dict(
+                    self.pose_frame_contract
+                )
+            elif not isinstance(self.pose_frame_contract, PoseFrameContract):
+                raise TypeError(
+                    "pose_frame_contract must be a PoseFrameContract, mapping, or None."
+                )
+            if self.policy_io_layout is None:
+                raise ValueError(
+                    "v2.3 pose_frame_contract requires the v2.2-compatible policy_io_layout."
+                )
 
 
 @dataclass
@@ -440,6 +473,11 @@ class LeRobotV21Writer:
     def is_v22(self) -> bool:
         return self.policy_io_layout is not None
 
+    @property
+    def pose_frame_contract(self) -> PoseFrameContract | None:
+        contract = self.config.pose_frame_contract
+        return contract if isinstance(contract, PoseFrameContract) else None
+
     def _existing_info_payload(self) -> dict[str, Any]:
         if not self.info_path.exists():
             return {}
@@ -459,23 +497,75 @@ class LeRobotV21Writer:
         layout = self.policy_io_layout
         has_existing_frames = bool(existing.get("frame_count", 0) or existing.get("episode_count", 0))
         if layout is None:
-            if existing_schema == DEXTELEOP_DATASET_SCHEMA_V22:
+            if existing_schema in {
+                DEXTELEOP_DATASET_SCHEMA_V22,
+                DEXTELEOP_DATASET_SCHEMA_V23,
+            }:
                 raise DatasetLayoutBindingError(
-                    "Refusing to append a v2.1 writer to a v2.2 policy-I/O dataset. "
+                    "Refusing to append a v2.1 writer to a v2.2/v2.3 policy-I/O dataset. "
                     "Pass the matching policy_io_layout explicitly."
                 )
             return
-        if has_existing_frames and existing_schema != DEXTELEOP_DATASET_SCHEMA_V22:
+        accepted_schemas = {DEXTELEOP_DATASET_SCHEMA_V22}
+        if self.pose_frame_contract is not None:
+            accepted_schemas.add(DEXTELEOP_DATASET_SCHEMA_V23)
+        if has_existing_frames and existing_schema not in accepted_schemas:
             raise DatasetLayoutBindingError(
-                "Refusing to append a v2.2 writer to a populated pre-v2.2 dataset. "
-                "Use the explicit v2.1-to-v2.2 conversion path instead."
+                "Refusing to append with a dataset contract that differs from the populated "
+                "dataset schema. Use an explicit conversion path instead."
             )
-        if existing_schema == DEXTELEOP_DATASET_SCHEMA_V22:
+        if existing_schema in {
+            DEXTELEOP_DATASET_SCHEMA_V22,
+            DEXTELEOP_DATASET_SCHEMA_V23,
+        }:
             existing_layout = policy_io_layout_from_metadata(existing, allow_legacy_v21=False)
             if existing_layout.layout_hash != layout.layout_hash:
                 raise DatasetLayoutBindingError(
                     "Dataset policy_io_layout_hash differs from the writer configuration."
                 )
+        self._validate_existing_pose_frame_contract(existing)
+        self._validate_existing_dataset_metadata(existing)
+
+    def _validate_existing_dataset_metadata(self, existing: Mapping[str, Any]) -> None:
+        if not self.config.dataset_metadata:
+            return
+        populated = bool(existing.get("frame_count", 0) or existing.get("episode_count", 0))
+        for key, expected in self.config.dataset_metadata.items():
+            if key not in existing:
+                if populated:
+                    raise ValueError(
+                        f"Refusing to append without immutable dataset metadata {key!r}."
+                    )
+                continue
+            if existing[key] != _to_serializable(expected):
+                raise ValueError(
+                    f"Existing dataset metadata {key!r} differs from writer configuration."
+                )
+
+    def _validate_existing_pose_frame_contract(self, existing: Mapping[str, Any]) -> None:
+        configured = self.pose_frame_contract
+        existing_payload = existing.get(POSE_FRAME_CONTRACT_METADATA_KEY)
+        if configured is None:
+            if existing_payload is not None:
+                raise PoseFrameContractError(
+                    "Refusing to append without the existing dataset pose_frame_contract."
+                )
+            return
+        if existing_payload is None:
+            if bool(existing.get("frame_count", 0) or existing.get("episode_count", 0)):
+                raise PoseFrameContractError(
+                    "Refusing to append a v2.3 pose contract to a populated dataset without one."
+                )
+            return
+        if not isinstance(existing_payload, Mapping):
+            raise PoseFrameContractError(
+                "Existing dataset pose_frame_contract must be a mapping."
+            )
+        existing_contract = PoseFrameContract.from_dict(existing_payload)
+        if existing_contract.to_dict() != configured.to_dict():
+            raise PoseFrameContractError(
+                "Existing dataset pose_frame_contract differs from the writer configuration."
+            )
 
     def _prepare_dataset_root(self) -> None:
         self.meta_dir.mkdir(parents=True, exist_ok=True)
@@ -610,7 +700,11 @@ class LeRobotV21Writer:
                 "features": features,
         }
         if layout is not None:
-            info["dexteleop_dataset_schema"] = DEXTELEOP_DATASET_SCHEMA_V22
+            info["dexteleop_dataset_schema"] = (
+                DEXTELEOP_DATASET_SCHEMA_V23
+                if self.pose_frame_contract is not None
+                else DEXTELEOP_DATASET_SCHEMA_V22
+            )
             info.update(bind_policy_io_layout(None, layout))
             info["policy_io_layout_collection"] = {
                 **dict(self.config.policy_io_layout_provenance or {}),
@@ -621,7 +715,27 @@ class LeRobotV21Writer:
                 "required_for_deploy_runtime": True,
                 "legacy_v21_requires_explicit_conversion": True,
             }
+        if self.pose_frame_contract is not None:
+            info.update(self._pose_frame_metadata_patch())
+        for key, value in self.config.dataset_metadata.items():
+            if key in info and info[key] != value:
+                raise ValueError(
+                    f"dataset_metadata cannot override writer-owned field {key!r}"
+                )
+            info[key] = _to_serializable(value)
         _write_json(self.info_path, info)
+
+    def _pose_frame_metadata_patch(self) -> dict[str, Any]:
+        contract = self.pose_frame_contract
+        if contract is None:
+            return {}
+        return {
+            "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+            POSE_FRAME_CONTRACT_METADATA_KEY: contract.to_dict(),
+            V23_POSE_STORAGE_FRAME_METADATA_KEY: contract.pose_storage_frame,
+            V23_RELATIVE_ACTION_SUPPORTED_METADATA_KEY: True,
+            V23_POSE_ACTION_MODE_METADATA_KEY: "absolute",
+        }
 
     def write_calibration_snapshot(self, name: str, payload: Any) -> Path:
         path = self.meta_dir / "calibration" / f"{name}.json"
@@ -670,6 +784,7 @@ class LeRobotV21Writer:
             if metadata:
                 state.metadata.update(_to_serializable(dict(metadata)))
             self._bind_episode_policy_io_layout(state.metadata)
+            self._bind_episode_pose_frame_contract(state.metadata)
             state.metadata.setdefault(
                 "arm_action_specs_by_side",
                 arm_action_specs_metadata(self.config.arm_action_specs),
@@ -686,6 +801,7 @@ class LeRobotV21Writer:
         )
         episode_metadata = {} if metadata is None else dict(_to_serializable(dict(metadata)))
         self._bind_episode_policy_io_layout(episode_metadata)
+        self._bind_episode_pose_frame_contract(episode_metadata)
         episode_metadata.setdefault(
             "arm_action_specs_by_side",
             arm_action_specs_metadata(self.config.arm_action_specs),
@@ -746,6 +862,22 @@ class LeRobotV21Writer:
                     "strict": bool(self.config.strict_v22_policy_io),
                 },
             )
+
+    def _bind_episode_pose_frame_contract(self, metadata: dict[str, Any]) -> None:
+        contract = self.pose_frame_contract
+        if contract is None:
+            return
+        existing = metadata.get(POSE_FRAME_CONTRACT_METADATA_KEY)
+        if existing is not None:
+            if not isinstance(existing, Mapping):
+                raise PoseFrameContractError(
+                    "Episode pose_frame_contract must be a mapping."
+                )
+            if PoseFrameContract.from_dict(existing).to_dict() != contract.to_dict():
+                raise PoseFrameContractError(
+                    "Episode pose_frame_contract differs from the dataset contract."
+                )
+        metadata.update(self._pose_frame_metadata_patch())
 
     def _episode_parquet_relative_path(self, episode_index: int) -> str:
         chunk_id = chunk_id_from_episode_index(
@@ -1029,6 +1161,7 @@ class LeRobotV21Writer:
                         "depth_metadata": depth_metadata,
                         "source_timestamp": match.selected_timestamp,
                         "receive_timestamp": frame.receive_timestamp,
+                        "available_timestamp": frame.available_timestamp,
                         "source_frame_index": frame.frame_index,
                     },
                     critical=False,
@@ -1061,7 +1194,15 @@ class LeRobotV21Writer:
             )
         wrist_depth_jobs, wrist_depth_expectations, wrist_depth_status = self._plan_wrist_depth_jobs(sample)
         layout = self.policy_io_layout
-        if layout is None:
+        if self.config.row_encoder is not None:
+            row, camera_expectations = self.config.row_encoder.encode_row(
+                sample,
+                layout=layout,
+                camera_video_paths=camera_video_paths,
+                tactile_storage_refs=tactile_refs,
+                inline_tactile=inline_tactile,
+            )
+        elif layout is None:
             row, camera_expectations = collector_sample_to_row(
                 sample,
                 camera_video_paths=camera_video_paths,
@@ -1076,6 +1217,15 @@ class LeRobotV21Writer:
                 tactile_storage_refs=tactile_refs,
                 inline_tactile=inline_tactile,
                 strict=bool(self.config.strict_v22_policy_io),
+            )
+        if self.pose_frame_contract is not None:
+            validate_v23_collection_row_actual_tcp(
+                row,
+                contract=self.pose_frame_contract,
+            )
+            row = bind_collection_row_pose_storage(
+                row,
+                contract=self.pose_frame_contract,
             )
         if not self.config.write_video:
             camera_expectations = {camera_key: False for camera_key in camera_expectations}
@@ -1638,6 +1788,7 @@ class LeRobotV21Writer:
             "depth_frame_index": depth_frame_index,
             "source_timestamp": payload.get("source_timestamp"),
             "receive_timestamp": payload.get("receive_timestamp"),
+            "available_timestamp": payload.get("available_timestamp"),
             "source_frame_index": payload.get("source_frame_index"),
             "depth_camera_timestamp_sec": depth_metadata.get("camera_timestamp_sec"),
             "depth_sensor_timestamp_ms": depth_metadata.get("sensor_timestamp_ms"),
@@ -1689,6 +1840,7 @@ class LeRobotV21Writer:
         row[f"{prefix}_frame_index"] = int(depth_frame_index)
         row[f"{prefix}_source_timestamp"] = record.get("source_timestamp")
         row[f"{prefix}_receive_timestamp"] = record.get("receive_timestamp")
+        row[f"{prefix}_available_timestamp"] = record.get("available_timestamp")
         row[f"{prefix}_source_frame_index"] = record.get("source_frame_index")
         row[f"{prefix}_depth_camera_timestamp_sec"] = record.get("depth_camera_timestamp_sec")
         row[f"{prefix}_depth_sensor_timestamp_ms"] = record.get("depth_sensor_timestamp_ms")

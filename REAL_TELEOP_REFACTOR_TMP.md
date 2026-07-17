@@ -4,7 +4,7 @@
 
 ## 为什么现在需要更新计划
 
-在 GUI coordinator 文件迁移前，`teleop_runtime/debug/run_vive_rm65_real_teleop.py` 为 **18,836 行**；原记录中的“17,144 行”已经失真。GUI coordinator 迁移后入口为 **16,694 行**；完成 1A/1B 后曾为 **15,834 行**，本批纯模块迁移后当前入口为 **15,300 行**。当前新增/扩展的迁出文件包括 `teleop_runtime/gui/real_teleop_control.py`（2,297 行）、`teleop_runtime/gui/status_payloads.py`（871 行）和 `teleop_runtime/real_teleop/action_debug_payload.py`（556 行），以及 `components.py`（57 行）、`cli_value_parsers.py`（90 行）、`dataset_finalize.py`（60 行）和 `debug_payload_primitives.py`（176 行）。`teleop_runtime/real_teleop/` 目前为 22 个模块、4,228 行；入口仍保留 CLI 组装、硬件组装、运行时控制、数采副作用和清理逻辑。
+在 GUI coordinator 文件迁移前，`teleop_runtime/debug/run_vive_rm65_real_teleop.py` 为 **18,836 行**；原记录中的“17,144 行”已经失真。GUI coordinator 迁移后入口为 **16,694 行**；完成 1A/1B 后曾为 **15,834 行**，前一批纯模块迁移后为 **15,300 行**，timing payload 迁移后为 **15,213 行**，共享 writer lifecycle 接线后为 **15,217 行**，兼容 writer observer seam 后为 **15,230 行**，原地轻量去重后为 **15,172 行**，dataset/task layout adapter 迁移后为 **15,145 行**，dataset 实现本体迁移后为 **15,162 行**，本批低风险 debug serializer 的迁移快照为 **14,431 行**。验证期间工作区另有 position-IK/TrackerMotionIntent 相关并发改动，当前入口实测为 **14,536 行**；该增量不属于本批迁移。当前新增/扩展的迁出文件包括 `teleop_runtime/gui/real_teleop_control.py`（2,297 行）、`teleop_runtime/gui/status_payloads.py`（871 行）和 `teleop_runtime/real_teleop/action_debug_payload.py`（556 行），以及 `components.py`（57 行）、`cli_value_parsers.py`（90 行）、`dataset_finalize.py`（60 行）、`dataset_layout.py`（420 行）、`debug_payload_primitives.py`（176 行）、`debug_timing_payload.py`（179 行）和 `debug_ik_payload.py`（815 行）。`teleop_runtime/real_teleop/` 目前为 25 个模块、5,648 行；入口仍保留 CLI 组装、硬件组装、运行时控制、数采副作用和清理逻辑。
 
 这不是简单的“大文件格式化”问题。入口同时承载以下不同风险等级的职责：
 
@@ -35,6 +35,8 @@
 | `teleop_runtime/gui/real_teleop_control.py` | `RealTeleopControlInput` 文件本体 | 由旧入口绑定显式 support；暂时仍拥有 GUI 副作用协调 |
 | `teleop_runtime/gui/status_payloads.py` | 1A 只读状态/GUI payload 投影 | 只接收 mapping/snapshot；不刷新 source/backend |
 | `teleop_runtime/real_teleop/action_debug_payload.py` | 1B action-debug 序列化与聚合 | backend `get_state()` reader 仍归旧入口 |
+| `teleop_runtime/real_teleop/debug_timing_payload.py` | 已读取 snapshot 的 timing/fault/channel payload | 不读取 backend、camera 或 source |
+| `teleop_runtime/real_teleop/debug_ik_payload.py` | IK/backend/impedance/observation 纯 debug serializer | 不读取 backend、camera 或 source；入口保留 frame coordinator |
 
 入口中的兼容桥仍然是有意保留的：测试、外部脚本和并行修改者目前大量从
 `teleop_runtime.debug.run_vive_rm65_real_teleop` 导入旧名字。迁移完成前，旧名字只能 alias 或使用参数转发 wrapper，不能悄悄改变签名或默认值。
@@ -45,13 +47,14 @@
 
 | 区域 | 当前范围 | 风险判断 |
 | --- | ---: | --- |
-| CLI、硬件/任务 profile 合并 | `parse_args()` 起始约 1,527 行 | 纯 value parser 已迁出；Namespace 合并和默认值仍留在入口 |
-| VIVE calibration、相机 source helper | 约 3,700–5,250 | capture 有 GUI/设备时序，不应与纯几何函数一起整体搬动 |
-| episode layout、action debug reader、dataset recorder | 约 5,400–6,730 | writer、poller、pause/resume 共享生命周期；finalize task 仅迁出状态类 |
-| `_build_components()` | 约 6,731–8,050 | 打开/启动硬件、创建 source/backend、失败回滚；高风险 |
-| arm/gripper runtime、剩余状态和 command debug | 约 8,051–11,500 | 混合只读状态与命令发送，必须继续按副作用分层 |
-| GUI/status/action-debug 兼容导入 | 约 11,518–11,610 | 旧入口保留名字、reader seam 和 support bridge |
-| startup self-check、alignment、`main()` | 约 11,611–15,300 | 启动顺序、控制循环和 reverse cleanup；最后拆 |
+| CLI、硬件/任务 profile 合并 | `parse_args()` 起始约 1,662 行 | 纯 value parser 已迁出；Namespace 合并和默认值仍留在入口 |
+| VIVE calibration、相机 source helper | 约 3,945–5,349 | capture 有 GUI/设备时序，不应与纯几何函数一起整体搬动 |
+| episode layout、action debug reader、dataset recorder | 约 5,364–6,727 | writer、poller、pause/resume 共享生命周期；finalize task 仅迁出状态类 |
+| `_build_components()` | 约 6,738–8,052 | 打开/启动硬件、创建 source/backend、失败回滚；高风险 |
+| arm/gripper runtime、剩余状态和 command debug reader | 约 8,055–10,238 | 混合只读状态与命令发送，必须继续按副作用分层 |
+| IK/backend/impedance 纯 debug serializer 与 frame coordinator | `debug_ik_payload.py` 815 行；入口约 10,239–10,515 | serializer 只接收已读取 mapping/对象；入口保留 command/backend/timing frame 组装 |
+| GUI/status/action-debug 兼容导入 | 约 11,329–11,464 | 旧入口保留名字、reader seam 和 support bridge |
+| startup self-check、alignment、`main()` | 约 10,532–14,536 | 启动顺序、控制循环和 reverse cleanup；最后拆 |
 
 ## 不可破坏的安全和生命周期不变量
 
@@ -112,6 +115,86 @@
 - `teleop_runtime/real_teleop/dataset_finalize.py` 承载 `RealDatasetFinalizeTask` 的锁保护生命周期字段和状态方法；writer、线程创建、目录 finalize 和 recorder owner 保留在入口。
 - 本批旧入口从 **15,834** 行降至 **15,300** 行，减少 **534** 行；extracted workspace 为 22 个模块、4,228 行。旧入口到 `real_teleop` 的直接 import site 为 23，compatibility marker 为 17。
 - 所有新模块均不反向导入 `run_vive_rm65_real_teleop`，import-only/`--help` 不启动设备或线程；`RealDatasetFinalizeTask` 和 `RealTeleopComponents` 的旧路径 introspection 由 bridge 显式保留。
+
+#### Debug timing payload 迁移（本批，2026-07-15）
+
+- `teleop_runtime/real_teleop/debug_timing_payload.py` 承载 `_fault_signature`、phase/latency/fault/channel snapshot payload；输入均为已读取对象，不读取 backend、相机或 source。
+- `_camera_status_log_payload`、`_backend_timing_log_payload` 和 `_build_debug_timing_log_frame` 仍保留在旧入口，因为它们分别连接 camera status、backend compact helper 和总 debug frame coordinator。
+- 新模块对 `_float_or_none`、`_compact_debug_value` 使用动态 support binding；旧入口 monkeypatch 点和 action-debug 的 support 链继续有效。
+- 旧入口从 **15,300** 行降至 **15,213** 行，减少 **87** 行；extracted workspace 为 23 个模块、4,407 行，直接 import site 为 24，compatibility marker 为 17。
+
+#### Shared writer lifecycle boundary（本批，2026-07-15）
+
+- 新增 `teleop_runtime.collection.writer_runtime.CollectionWriterRuntime`，统一封装
+  `CollectionWriterObserver` 的 sample/job/flush/close 生命周期。
+- GUI `RealTeleopDatasetRecorder` 和 headless `CollectionRuntime` 共用该 writer runtime；
+  episode、pause/resume、异步 sample、finalize、GUI 状态和 headless replay 仍由各自 frontend
+  持有，避免把控制副作用混入共享 writer 层。
+- 旧的 `writer_observer` 属性保留为兼容 alias；没有改变 writer queue/backpressure、T0
+  timestamp、ActionRecord 生成或任何真机 dispatch 参数。
+- 这不是完整 `DatasetRecorder` 文件迁移；下一步仍需先冻结 recorder lifecycle contract，
+  再决定是否把 `RealTeleopDatasetRecorder` 本体迁到 `teleop_runtime.real_teleop`。
+- 本批入口行数为 **15,230**，extracted workspace 仍为 23 个模块、4,407 行；新增共享模块
+  位于 `teleop_runtime.collection`，不计入 real_teleop extracted workspace。
+
+#### 原地轻量去重（本批，2026-07-15）
+
+- `_impedance_record_compact_debug()` 和 `_impedance_record_debug()` 原先各自维护一份大字段目录，合计 253 个目录条目，其中 116 个字段在两份目录中重复出现。此次只把无副作用的字段目录拆成有序 tuple 片段，再按两个旧函数各自原来的顺序拼接。
+- compact/full 两套目录中有意保留不同的 backend target、joint-rate limiter 和 `ik_metadata` 位置；compact 的 `ik_metadata` 仍由原来的专用压缩分支追加，未改变输出顺序、字段缺失规则或值压缩上限。
+- 两个函数的签名、`Mapping` 边界、循环和 debug payload 读取逻辑均未改动；未触碰 CLI、主循环、recorder、夹爪或任何硬件控制路径。
+- 入口从 **15,230** 行降至 **15,172** 行，减少 **58** 行；`teleop_runtime/real_teleop/` 仍为 23 个模块、4,407 行，未新增依赖边界。
+- 新增 contract 覆盖两套目录的长度、关键分叉顺序和 `ik_metadata` 特殊处理，并用完整 synthetic record 验证输出 key order。
+
+#### CLI/config helper 原位重排（本批，2026-07-15）
+
+- 将 `control_profile` compatibility bridge 及 `_impedance_mode_arg()`、工具 profile/TCP、初始对齐摘要、dataset layout 和 round-trip UI helper 整段从旧位置（约 5,218–5,359）原样挪到 `parse_args()` 之前（当前约 1,528–1,669）。
+- 函数体、签名、旧导入名和 bridge 文本没有改写；这里只改变同一 Python 模块内的定义位置，使后续 parser/config 模块可以连续截取。
+- 保留旧 camera source 与 GUI status bridge 的相邻边界；未跨越 `globals()` support binding、recorder、component factory 或 `main()` 启动清理逻辑。
+- 入口仍为 **15,172** 行，extracted workspace 仍为 23 个模块、4,407 行；这是纯布局变更，不计作行数瘦身。
+- AST 顶层定义唯一性、`parse_args()` 前置位置、静态编译、`--help`、contract 和全量回归均通过。
+
+#### Dataset/task layout adapter 文件迁移（本批，2026-07-15）
+
+- 将 `_expand_cli_path`、任务注册表查询、正式 dataset layout、round-trip phase 和 collection task UI state 的实现迁到 `teleop_runtime/real_teleop/dataset_layout.py`。
+- 入口保留原有 `_...` 名称：无日期的路径/registry/UI helper 使用同一函数对象 alias；需要日期的四个 layout wrapper 继续在旧入口读取 `datetime` 后把 `date_prefix` 显式传入，保留现有 `patch.object(legacy_entrypoint, "datetime", ...)` seam。
+- 新模块只委托 `teleop_runtime/gui/collection_tasks.py`，不导入旧入口，不打开设备、不创建线程、不访问 backend/source。旧入口仍保留 `gui_collection_tasks` 全局名，因为 GUI coordinator 的白名单 support contract 仍直接使用该命名空间。
+- 入口从 **15,172** 行降至 **15,145** 行，减少 **27** 行；`teleop_runtime/real_teleop/` 变为 24 个模块、4,510 行；直接 import site 为 25，compatibility marker 为 17。
+- 新增 contract 检查旧入口 alias 身份、路径/任务 ID 输出及新模块无反向入口依赖；GUI collection visualization 回归保持通过。
+
+#### Dataset/task layout 实现本体归属迁移（本批，2026-07-15）
+
+- 将原 `teleop_runtime/gui/collection_tasks.py` 中的 `FormalDatasetLayout`、任务 registry 解析、general/round-trip layout 计算、namespace 更新和 UI state 生成全部迁入 `teleop_runtime/real_teleop/dataset_layout.py`；该文件现在承接真实实现，不再只是 adapter。
+- `teleop_runtime/gui/collection_tasks.py` 缩为 62 行兼容导出，保留旧模块路径、常量、dataclass 和公开函数身份；GUI coordinator 不需要改调用面，也没有第二份布局实现。
+- 新实现支持原有 `expand_path` 注入；旧入口的 `_load_task_registry`、`_task_definition_for_key`、`_collection_task_ui_state` 保留原参数签名，`_resolve_formal_dataset_layout` 继续返回旧 tuple，日期仍由入口显式注入。
+- 入口因保留 tuple/signature compatibility wrapper 为 **15,162** 行；`teleop_runtime/real_teleop/` 为 24 个模块、4,827 行；直接 import site 25，compatibility marker 17。
+- 这次只改变实现所有权和 import 方向：新模块不导入 GUI 或旧入口；不打开设备、不创建线程、不访问 backend/source。
+
+#### 低风险 IK/backend/impedance debug serializer 迁移（本批，2026-07-15）
+
+- 将入口中连续的纯 payload 区域原样迁到
+  `teleop_runtime/real_teleop/debug_ik_payload.py`：IK profile、execution step、candidate
+  selection、command metadata、backend/impedance snapshot 和 observation pose 的 compact/full
+  serializer，以及它们使用的有序字段目录。
+- 迁移只改变文件归属，没有重写函数体、签名、字段顺序或缺失值规则。入口通过显式 alias
+  保留全部旧名字和常量身份；`_command_for_side`、`_build_ik_debug_log_frame`、camera/backend
+  timing reader 及总 frame builder 仍留在入口，继续承接运行时读取和日志帧组装。
+- 新模块只接收已捕获的 mapping、`TeleopCommand` 或 observation 对象，并调用
+  `debug_payload_primitives`；不读取硬件/backend/source，不发布 GUI 状态，不创建线程，也不
+  触碰 command filter、Hold、校准、episode 或夹爪门控。
+- 入口从 **15,162** 行降至 **14,431** 行，减少 **731** 行；新模块为 815 行，
+  `teleop_runtime/real_teleop/` 变为 25 个模块、5,648 行；直接 import site 为 26，
+  compatibility marker 仍为 17。
+- 新增 contract 检查入口与新模块的函数/常量 identity、无反向入口依赖，并复用现有
+  impedance catalog synthetic record 验证 compact/full 输出 key order。该批不执行真实设备或运动。
+
+#### Shared dispatch seam（本批，2026-07-15）
+
+- `TeleopSession.dispatch_command()` 现在是 `TeleopSession -> Rig` 的显式最终 dispatch
+  seam；普通 `run_step()`、GUI recovery 和 headless external command 都通过它进入。
+- headless 旧 fake session 仍由窄 fallback 支持，真实 `CollectApp` 不再在 replay、return-home
+  或 recovery helper 中直接访问 `rig.send_commands`。
+- 该 seam 不重复执行 safety/fault/hold，也不自动改变 state；调用方现有的 guard、recovery
+  和 replay safety 顺序保持不变。
 
 ### 第 1 批：纯只读 payload 和配置投影
 
@@ -217,12 +300,31 @@ git diff --check
 
 ### 本次审查验证（2026-07-15）
 
-- 本批契约与纯模块回归：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_real_teleop_refactor_contracts.py`：**9 passed**。
-- real-teleop broad 回归：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_real_teleop*.py tests/test_dmtac_gripper_bimanual_config.py`：**222 passed**。
-- 新增 contract 覆盖：components/parser/finalize/debug primitive 的旧符号身份、IK warning/timing snapshot 等价性、无反向入口依赖、finalize task 状态生命周期和纯 parser 边界。
+- 本批契约与纯模块回归：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_real_teleop_refactor_contracts.py`：**13 passed**。
+- real-teleop broad 回归：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_real_teleop*.py tests/test_dmtac_gripper_bimanual_config.py`：**226 passed**。
+- 新增 contract 覆盖：components/parser/finalize/debug primitive/debug timing payload/dataset layout 的旧符号身份、snapshot 等价性、无反向入口依赖、finalize task 状态生命周期、纯 parser 边界，以及阻抗 debug 两套字段目录的完整顺序和 `ik_metadata` 特殊处理。
 - 入口及 `teleop_runtime.real_teleop/*.py` 静态编译通过。
 - `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --help` 通过。
 - `git diff --check` 通过。
+- 未启动真实相机、串口、机械臂、夹爪、脚踏或网络控制；未执行 motion/servo/force-control。
+
+#### Dataset/task layout adapter verification（2026-07-15）
+
+- GUI collection visualization：**103 passed**。
+- 契约额外验证 `gui.collection_tasks` 与 `real_teleop.dataset_layout` 的 dataclass/函数身份、旧入口 helper 签名和无反向入口依赖。
+- 排除已知无关的 `tests/test_mujoco_temp_pipeline.py` 后工作区全量回归：**1531 passed, 47 skipped**。
+- 未排除的全量回归：**1534 passed, 47 skipped, 1 failed**；唯一失败为
+  `tests/test_mujoco_temp_pipeline.py::test_temp_policy_checkpoint_round_trip`，是当前 PyTorch
+  `torch.load(weights_only=True)` 对 `torch.torch_version.TorchVersion` 未 allowlist 的环境/既有
+  checkpoint 兼容问题，与本次 teleop dataset layout 迁移无调用路径关系，未在本批顺手修改。
+
+#### Shared writer lifecycle boundary verification（2026-07-15）
+
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_teleop_collection_runtime_action_record.py tests/test_real_teleop_refactor_contracts.py tests/test_collection_storage_queue.py tests/test_lifecycle_cleanup.py`：**29 passed**。
+- 合并执行真实 teleop、collection、deploy、recovery、queue 和 lifecycle 回归：**351 passed, 2 skipped**。
+- GUI、headless、deploy 三个 `--help` import/argument checks 均通过。
+- `teleop_runtime/collection/writer_runtime.py`、`collection/runtime.py` 和 GUI entrypoint 静态编译通过；`git diff --check` 通过。
+- 当前工作区全量回归：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q`：**1530 passed, 47 skipped**。
 - 未启动真实相机、串口、机械臂、夹爪、脚踏或网络控制；未执行 motion/servo/force-control。
 
 ## 暂不拆分或暂不改动的内容

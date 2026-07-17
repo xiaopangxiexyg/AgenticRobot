@@ -1,8 +1,8 @@
 # DexTeleop 环境与复现指南
 
 本文是环境安装、更新和验收的唯一入口。项目主环境统一使用 Python 3.10 conda 环境
-`dexteleop310`；`core`、`test`、`dataset`、`sim`、`openpi`、`hardware` 是同一个环境内的
-依赖分组，不是六个 conda 环境。
+`dexteleop310`；`core`、`test`、`dataset`、`sim`、`model`、`openpi`、`hardware` 是同一个环境内的
+依赖分组，不是七个 conda 环境。
 
 ## 1. 环境边界与唯一来源
 
@@ -14,9 +14,9 @@
 
 项目环境的机器可读来源如下：
 
-- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和六个 PyPI extras；
+- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和七个 PyPI extras；
 - [`environment.yml`](./environment.yml)：conda 基础层，包括 Python、NumPy、SciPy 和 Pinocchio；
-- [`uv.lock`](./uv.lock)：六个 extras 的 PyPI 版本与 hash 锁定结果；
+- [`uv.lock`](./uv.lock)：七个 extras 的 PyPI 版本、来源与 hash 锁定结果；
 - [`scripts/install_conda_env.sh`](./scripts/install_conda_env.sh)：创建、更新和验收完整环境的入口。
 
 Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的可移植范围；它们的边界和安装方式
@@ -75,7 +75,7 @@ bash scripts/install_conda_env.sh
 安装脚本会依次完成：
 
 1. 创建 Python 3.10、NumPy、SciPy、conda-forge Pinocchio 基础环境；
-2. 使用 `uv.lock` 的 hash 锁定结果安装全部六个 PyPI 依赖分组；
+2. 使用 `uv.lock` 的 hash 锁定结果安装全部七个 PyPI 依赖分组；
 3. 以 editable 方式安装本仓库；
 4. 以 `--no-deps` 安装 `pin-pink==4.2.0`，避免错误拉取 pip 包 `pin`；
 5. 以 editable 方式安装本地 `dmrobotics==1.2.10` SDK（除非使用 `--skip-vendor-sdk`）；
@@ -89,6 +89,7 @@ bash scripts/install_conda_env.sh
 | `test` | pytest | 是 |
 | `dataset` | Pandas、PyArrow、Pillow | 是 |
 | `sim` | MuJoCo、Gymnasium、SAPIEN | 是 |
+| `model` | PyTorch 2.10、临时 PPO 训练与 checkpoint 推理 | 是 |
 | `openpi` | DexTeleop OpenPI websocket/msgpack client | 是 |
 | `hardware` | RealSense、串口、Modbus、USB、DM-Tac SDK 运行库 | 是 |
 
@@ -123,10 +124,10 @@ import importlib.util
 import sys
 
 assert sys.version_info[:2] == (3, 10), sys.version
-for name in ("numpy", "scipy", "pinocchio", "pink", "qpsolvers", "mujoco", "gymnasium", "pyarrow"):
+for name in ("numpy", "scipy", "pinocchio", "pink", "qpsolvers", "mujoco", "gymnasium", "torch", "pyarrow"):
     assert importlib.util.find_spec(name) is not None, name
 
-for distribution in ("dexteleop", "pin-pink", "mujoco", "pyarrow"):
+for distribution in ("dexteleop", "pin-pink", "mujoco", "torch", "pyarrow"):
     print(distribution, metadata.version(distribution))
 print("DexTeleop environment imports ok")
 PY
@@ -358,23 +359,31 @@ python -m mujoco.viewer
 ### 6.1 MuJoCo Gymnasium API
 
 `sim.mujoco.tasks.cube_lift.CubeLiftEnv` 使用 MuJoCo 作为物理后端、使用
-Gymnasium 的标准 `reset/step` API 和 `Box` spaces。它目前不依赖 PyTorch、Stable-Baselines3
-或任何训练框架；MuJoCo 和 Gymnasium 已随完整主环境安装，训练框架仍保持在环境之外。
+Gymnasium 的标准 `reset/step` API 和 `Box` spaces。环境实现本身不导入训练框架；为运行
+`sim.mujoco_temp_pipeline` 的临时 PPO，主环境的 `model` extra 固定安装官方 PyTorch 2.10
+CUDA 12.6 wheel。未安装 NVIDIA driver 的 debug 机器会自动使用 CPU。
 
 ```bash
 cd /home/zc/HandMotion/Developing/DexTeleop
 PYTHONPATH=. python - <<'PY'
 import gymnasium
 import mujoco
+import torch
 
 print("gymnasium", gymnasium.__version__)
 print("mujoco", mujoco.__version__)
+print("torch", torch.__version__)
+print("torch wheel CUDA", torch.version.cuda)
+print("CUDA available", torch.cuda.is_available())
 PY
 ```
 
-后续确实要在本机运行 PPO/SAC 等训练时，再根据该机器的 CUDA/PyTorch 版本单独选择训练框架；
-不要无条件把 `torch` 或 `stable-baselines3` 加入 DexTeleop 主环境。训练框架不是
-`CubeLiftEnv` 的运行时依赖。
+项目通过官方 direct wheel URL 固定 `torch==2.10.0+cu126` 的 CPython 3.10 Linux x86_64
+构建；不安装 Stable-Baselines3。直接 URL 使 `uv export` 后的 hash requirements 在新机器上
+不依赖额外 index 参数。CUDA 12.x minor compatibility 要求 Linux driver 至少为
+525.60.13；最终采样服务器仍需执行 `nvidia-smi` 和上面的 CUDA smoke。PyTorch wheel 自带所需
+CUDA runtime，通常不需要在 conda 环境重复安装完整 CUDA Toolkit。训练框架不是
+`CubeLiftEnv` 自身的运行时依赖。
 
 后续 real2sim 相机检查仍然优先使用同一个双臂 URDF：
 

@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pytest
 
 from dataset_contracts.pose_frames import PoseFrameContract, PoseSourceProfile
 from dataset_contracts.v22 import EndEffectorSpec, PolicyIOLayout
-from dataset_interface.pose_action import pose_policy_window_from_rows
+from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
+from dataset_interface.pose_action import (
+    PosePolicyViewError,
+    pose_policy_window_from_dataset_metadata,
+    pose_policy_window_from_rows,
+)
 from robot_motion.relative_action import (
     ACTION_POSE_MODE_ABSOLUTE,
     ACTION_POSE_MODE_RELATIVE,
     absolute_pose,
     xyzquat_to_pose_matrix,
 )
+from teleop_runtime.replay.dataset import ReplayDatasetIndex
 
 
 def _pose(x: float, y: float = 0.0) -> list[float]:
@@ -114,3 +123,81 @@ def test_absolute_pose_window_is_a_desk_view_without_relative_conversion() -> No
     )
     np.testing.assert_allclose(window.action[0, :3], [1.2, 0.0, 0.3], atol=1e-6)
     np.testing.assert_allclose(window.action[0, 7:10], [0.4, -0.5, 0.3], atol=1e-6)
+
+
+def test_dataset_metadata_resolves_contract_without_mutating_storage_rows() -> None:
+    layout = _layout()
+    contract = _contract()
+    metadata = {
+        "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+        **layout.binding_metadata(),
+        "pose_frame_contract": contract.to_dict(),
+        "pose_storage_frame": contract.pose_storage_frame,
+    }
+    rows = [_row(0), _row(1)]
+    source_action = list(rows[0]["action"])
+    window = pose_policy_window_from_dataset_metadata(rows, metadata)
+    np.testing.assert_allclose(window.action[0, :3], [1.2, 0.0, 0.3], atol=1e-6)
+    assert rows[0]["action"] == source_action
+
+
+def test_episode_contract_cannot_override_dataset_contract() -> None:
+    layout = _layout()
+    contract = _contract()
+    metadata = {
+        "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+        **layout.binding_metadata(),
+        "pose_frame_contract": contract.to_dict(),
+        "pose_storage_frame": contract.pose_storage_frame,
+    }
+    conflicting_source = PoseSourceProfile(
+        source_id="other_source",
+        source_family="test",
+        source_description="conflict",
+        topology="dual_arm",
+    )
+    conflicting = PoseFrameContract.v23_forced_raw(conflicting_source)
+    with pytest.raises(PosePolicyViewError, match="differs"):
+        pose_policy_window_from_dataset_metadata(
+            [_row(0)],
+            metadata,
+            episode_metadata={"pose_frame_contract": conflicting.to_dict()},
+        )
+
+
+def test_replay_index_explicit_pose_window_keeps_loaded_storage_rows_raw(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    layout = _layout()
+    contract = _contract()
+    info = {
+        "chunk_size": 1000,
+        "nominal_fps": 10.0,
+        "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+        **layout.binding_metadata(),
+        "pose_frame_contract": contract.to_dict(),
+        "pose_storage_frame": contract.pose_storage_frame,
+    }
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    rows = [_row(0), _row(1)]
+    parquet_path = tmp_path / "data" / "chunk-000" / "episode_000000.parquet"
+    parquet_path.parent.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(rows), parquet_path)
+    episode_record = {
+        "episode_index": 0,
+        "episode_id": "episode_000000",
+        "frame_count": 2,
+        "parquet_path": "data/chunk-000/episode_000000.parquet",
+        "metadata": {"pose_frame_contract": contract.to_dict()},
+    }
+    (meta_dir / "episodes.jsonl").write_text(
+        json.dumps(episode_record) + "\n", encoding="utf-8"
+    )
+
+    index = ReplayDatasetIndex(tmp_path)
+    loaded = index.load_episode(0)
+    window = index.load_pose_policy_window(0)
+    assert loaded.rows[0]["action"][0] == pytest.approx(0.2)
+    assert window.action[0, 0] == pytest.approx(1.2)

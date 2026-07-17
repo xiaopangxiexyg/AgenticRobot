@@ -333,6 +333,198 @@ def test_pose_segment_emits_reference_points_without_rerunning_safety() -> None:
         executor.close()
 
 
+def test_same_chunk_lookahead_interpolates_without_one_action_period_delay() -> None:
+    commands: list[TeleopCommand] = []
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            chunk_lookahead_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=commands.append,
+    )
+    current = _filtered_pose("left", _pose(0.16))
+    lookahead = _filtered_pose("left", _pose(0.20))
+    executor.start()
+    try:
+        current_index = executor.submit(
+            current,
+            _observation(),
+            "chunk_policy",
+            lookahead_filtered=lookahead,
+            lookahead_observation=_observation(),
+        )
+        _wait_until(lambda: len(commands) >= 3)
+
+        x_values = [
+            float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+            for command in commands[:3]
+        ]
+        assert x_values[0] == pytest.approx(0.16, abs=2e-3)
+        assert x_values == sorted(x_values)
+        assert x_values[-1] > x_values[0]
+        metadata = commands[1].metadata
+        assert metadata["position_causal_delay_periods"] == 0
+        assert metadata["position_chunk_lookahead_enabled"] is True
+        assert metadata["position_causal_output_lag_sec"] == pytest.approx(0.0)
+        assert metadata["position_safety_applied_at"] == "15hz_keyframe_only"
+        assert metadata["position_default_profile_contract"] == (
+            "safe_15->causal_60->120"
+        )
+        assert metadata["position_configured_profile_contract"] == (
+            "safe_15->causal_60->120"
+        )
+        assert metadata["position_parent_source_indices"] == [
+            current_index,
+            current_index + 1,
+        ]
+
+        # When the staged successor becomes current it reuses the existing
+        # endpoint instead of adding a duplicate timestamp.  With no further
+        # same-chunk successor, the endpoint is held at the chunk tail.
+        staged_index = executor.submit(
+            lookahead,
+            _observation(),
+            "chunk_policy",
+        )
+        assert staged_index == current_index + 1
+        _wait_until(
+            lambda: any(
+                abs(
+                    float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+                    - 0.20
+                )
+                < 2e-3
+                for command in commands
+            )
+        )
+        assert executor.snapshot()["causal_delay_periods"] == 0
+    finally:
+        executor.close()
+
+
+def test_chunk_lookahead_discrete_command_is_dispatched_once_per_source() -> None:
+    hand_commands: list[TeleopCommand] = []
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            chunk_lookahead_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda _command: None,
+        discrete_dispatch_callback=hand_commands.append,
+    )
+    current = _filtered_pose("left", _pose(0.16))
+    lookahead = _filtered_pose("left", _pose(0.20))
+    executor.start()
+    try:
+        current_index = executor.submit(
+            current,
+            _observation(),
+            "chunk_policy",
+            discrete_command=_hand_command("left", 0.2),
+            lookahead_filtered=lookahead,
+            lookahead_observation=_observation(),
+            lookahead_discrete_command=_hand_command("left", 0.4),
+        )
+        staged_index = executor.submit(
+            lookahead,
+            _observation(),
+            "chunk_policy",
+            # The runtime supplies the same canonical hand action again when
+            # the staged endpoint becomes current.
+            discrete_command=_hand_command("left", 0.4),
+        )
+        assert staged_index == current_index + 1
+        _wait_until(lambda: len(hand_commands) >= 2)
+        time.sleep(0.04)
+
+        assert len(hand_commands) == 2
+        assert [
+            command.metadata["position_discrete_source_index"]
+            for command in hand_commands
+        ] == [current_index, staged_index]
+        assert [
+            float(command.commands["left_hand"].value[0])
+            for command in hand_commands
+        ] == pytest.approx([0.2, 0.4])
+        assert all(
+            command.metadata["position_arm_hand_phase"]
+            == "same_logical_reference_tick_with_chunk_lookahead"
+            for command in hand_commands
+        )
+        assert executor.snapshot()["discrete_submitted_count"] == 2
+    finally:
+        executor.close()
+
+
+def test_cross_chunk_first_action_uses_one_period_boundary_transition() -> None:
+    commands: list[TeleopCommand] = []
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            chunk_lookahead_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=commands.append,
+    )
+    current = _filtered_pose("left", _pose(0.16))
+    tail = _filtered_pose("left", _pose(0.20))
+    next_chunk_first = _filtered_pose("left", _pose(0.30))
+    executor.start()
+    try:
+        executor.submit(
+            current,
+            _observation(),
+            "chunk_policy",
+            lookahead_filtered=tail,
+            lookahead_observation=_observation(),
+        )
+        executor.submit(tail, _observation(), "chunk_policy")
+        _wait_until(
+            lambda: any(
+                abs(
+                    float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+                    - 0.20
+                )
+                < 2e-3
+                for command in commands
+            )
+        )
+
+        before_new_chunk = len(commands)
+        executor.submit(next_chunk_first, _observation(), "chunk_policy")
+        _wait_until(lambda: len(commands) >= before_new_chunk + 3)
+        boundary_values = [
+            float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+            for command in commands[before_new_chunk : before_new_chunk + 3]
+        ]
+        assert boundary_values == sorted(boundary_values)
+        assert boundary_values[0] == pytest.approx(0.20, abs=2e-3)
+        assert boundary_values[-1] < 0.30 - 1e-3
+        _wait_until(
+            lambda: any(
+                abs(
+                    float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+                    - 0.30
+                )
+                < 2e-3
+                for command in commands
+            )
+        )
+    finally:
+        executor.close()
+
+
 def test_mixed_pose_and_qpos_sides_share_one_causal_reference_clock() -> None:
     pipeline = _pipeline(("left", "right"))
     commands = []

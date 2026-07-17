@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from rm65_inspire_tac.pipeline import (
+from robot_motion.rm65 import (
     DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
     DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES,
 )

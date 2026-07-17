@@ -1,0 +1,52 @@
+{
+  "dataset_root": "../../../datasets/umi_dual_wrist",
+  "calibration_result": "../../../teleop_records/umi_calibration/latest.json",
+  "policy_io_layout": "../policy_io_layouts/dual_umi_dmtac_v23.json",
+  "task_id": "umi_collection",
+  "task_description": "Dual-wrist UMI collection with DMTac grippers",
+  "vive_host": "0.0.0.0",
+  "vive_port": 9999,
+  "vive_clock_sync_port": 10001,
+  "angle_trigger_rate_hz": 30.0,
+  "allow_identity_tcp_placeholder": true,
+  "calibration_validity_sec": 3600.0,
+  "tactile_required": true,
+  "tactile_compression": "none",
+  "send_gripper_commands": true,
+  "dmtac_assignment": "latest",
+  "foot_pad_enabled": false,
+  "gui_host": "127.0.0.1",
+  "gui_port": 0,
+  "open_browser": true,
+  "timing": {
+    "control_hz": 30.0,
+    "sample_hz": 15.0,
+    "vive_max_age_sec": 0.1,
+    "camera_max_age_sec": 0.1,
+    "angle_trigger_max_age_sec": 0.2,
+    "gripper_max_age_sec": 0.5,
+    "tactile_max_age_sec": 0.5
+  },
+  "sides": {
+    "left": {
+      "tracker_name": "tracker_1",
+      "tracker_role": "left_wrist",
+      "tracker_channel": "left_wrist_pose",
+      "camera_serial": "261122273924",
+      "gripper_port": "",
+      "tactile_ids": [],
+      "T_tcp_to_tracker": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+      "tcp_extrinsic_status": "identity_placeholder_unmeasured"
+    },
+    "right": {
+      "tracker_name": "tracker_2",
+      "tracker_role": "right_wrist",
+      "tracker_channel": "right_wrist_pose",
+      "camera_serial": "260522278055",
+      "gripper_port": "",
+      "tactile_ids": [],
+      "T_tcp_to_tracker": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+      "tcp_extrinsic_status": "identity_placeholder_unmeasured"
+    }
+  }
+}

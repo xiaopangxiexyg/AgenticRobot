@@ -11,9 +11,11 @@ from robot_motion.runtime.lifecycle import (
 )
 
 from ..session import SessionStepResult
+from ..schemas import TeleopCommand
 from .async_writer import AsyncWriterPool, WriteJob
 from .build_collect_components import CollectorComponents
-from .observers import CollectionWriterObserver, CollectionWriterObserverConfig
+from .observers import CollectionWriterObserverConfig
+from .writer_runtime import CollectionWriterRuntime
 
 SampleBuilder = Callable[[SessionStepResult, CollectorComponents], Any | None]
 WritePlanner = Callable[[Any, CollectorComponents], Iterable[WriteJob]]
@@ -43,13 +45,16 @@ class CollectionRuntime:
         self.write_planner = write_planner
         self.writer_pool = writer_pool
         self.config = config if config is not None else CollectionRuntimeConfig()
-        self.writer_observer = CollectionWriterObserver(
+        self.writer_runtime = CollectionWriterRuntime(
             components=self.components,
             sample_builder=self.sample_builder,
             write_planner=self.write_planner,
             writer_pool=self.writer_pool,
             config=writer_observer_config,
         )
+        # Compatibility aliases for status/debug consumers.  New code should
+        # use ``writer_runtime`` for the shared writer lifecycle.
+        self.writer_observer = self.writer_runtime.writer_observer
         self._started = False
 
     def start(self) -> None:
@@ -60,11 +65,11 @@ class CollectionRuntime:
             if self.config.auto_start_writer_pool:
                 rollback_steps.append(
                     (
-                        "writer_observer",
-                        lambda: self.writer_observer.close(flush=False),
+                        "writer_runtime",
+                        lambda: self.writer_runtime.close(flush=False),
                     )
                 )
-                self.writer_observer.start()
+                self.writer_runtime.start()
             if self.config.auto_start_session:
                 rollback_steps.append(("session", self.components.session.close))
                 self.components.session.start()
@@ -127,17 +132,35 @@ class CollectionRuntime:
         phase_recorder: Callable[[str, float], None] | None = None,
     ) -> Any | None:
         """Build and enqueue one dataset sample from an already completed step."""
-        return self.writer_observer.handle_step(result, phase_recorder=phase_recorder)
+        return self.writer_runtime.handle_step(result, phase_recorder=phase_recorder)
+
+    def dispatch_command(
+        self,
+        command: TeleopCommand,
+        *,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> Any:
+        """Forward an external headless command through the session seam."""
+
+        dispatch = getattr(self.components.session, "dispatch_command", None)
+        if callable(dispatch):
+            return dispatch(command, phase_recorder=phase_recorder)
+        # Fake/legacy session objects used by compatibility callers may not
+        # have the new seam yet.  Keep this fallback narrow and temporary.
+        rig = getattr(self.components.session, "rig", None)
+        if rig is None:
+            raise RuntimeError("CollectionRuntime has no rig for command dispatch.")
+        return rig.send_commands(command, phase_recorder=phase_recorder)
 
     def flush(self) -> None:
-        self.writer_observer.flush()
+        self.writer_runtime.flush()
 
     def close(self) -> None:
         steps: list[tuple[str, Callable[[], None]]] = [
             ("session", self.components.session.close),
             (
                 "writer_observer",
-                lambda: self.writer_observer.close(
+                lambda: self.writer_runtime.close(
                     flush=bool(self.config.flush_on_close)
                 ),
             ),
@@ -152,11 +175,11 @@ class CollectionRuntime:
 
     @property
     def submitted_samples(self) -> int:
-        return self.writer_observer.submitted_samples
+        return self.writer_runtime.submitted_samples
 
     @property
     def last_sample(self) -> Any | None:
-        return self.writer_observer.last_sample
+        return self.writer_runtime.last_sample
 
     def __enter__(self) -> "CollectionRuntime":
         self.start()

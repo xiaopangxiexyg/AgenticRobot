@@ -94,6 +94,10 @@ class _FakeRefreshArmBackend:
             "hardware_result_text": "ok",
         }
 
+    def compute_tcp_pose(self, *, qpos=None) -> np.ndarray:
+        del qpos
+        return self.tcp_pose.copy()
+
 
 class TeleopCollectionActionRecordTest(unittest.TestCase):
     def test_collection_action_record_metadata_uses_canonical_pose_action(self) -> None:
@@ -267,6 +271,7 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
                 frame_name="left_arm_base",
                 metadata={
                     "source_target_pose_base": xyzquat_to_matrix(source_pose),
+                    "source_target_pose_desk": xyzquat_to_matrix(source_pose),
                     "target_pose_base": xyzquat_to_matrix(target_pose),
                     "target_pose_tcp_base": xyzquat_to_matrix(target_pose),
                     "solver_output_qpos": solver_qpos,
@@ -314,6 +319,15 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
             row["teleop.action_source.left_wrist_pose_base"],
             source_pose,
             atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            row["teleop.action_source.left_wrist_pose_desk"],
+            source_pose,
+            atol=1e-6,
+        )
+        self.assertEqual(
+            row["teleop.action_source.left_wrist_pose_desk_frame"],
+            "vive_retarget_frame",
         )
         canonical = sample.metadata["canonical_action_record"]["action"]
         np.testing.assert_allclose(

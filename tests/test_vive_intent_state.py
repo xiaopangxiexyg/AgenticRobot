@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from teleop_runtime.sources.pose.vive_motion import (
+    TrackerMotionIntentConfig,
     TrackerMotionIntentStateMachine,
     summarize_tracker_motion_window,
 )
@@ -96,6 +97,26 @@ def test_motion_intent_enters_inactive_only_after_time_dwell() -> None:
     assert after_dwell["hold_weight"] == 1.0
 
 
+def test_tightened_motion_intent_requires_all_quiet_evidence_below_scaled_thresholds() -> None:
+    config = TrackerMotionIntentConfig(
+        enter_linear_speed_m_s=0.015,
+        enter_angular_speed_rad_s=0.09,
+        enter_translation_span_m=0.00125,
+        enter_rotation_span_rad=0.0125,
+    )
+    state_machine = TrackerMotionIntentStateMachine(config)
+    metrics = _quiet_metrics(1.0)
+    metrics["linear_speed_p90_m_s"] = 0.020
+
+    first = state_machine.update(motion_window=metrics, tracker_pose=_pose())
+    metrics = dict(metrics, newest_history_time=1.4)
+    later = state_machine.update(motion_window=metrics, tracker_pose=_pose())
+
+    assert first["state"] == "ACTIVE"
+    assert later["state"] == "ACTIVE"
+    assert later["evidence"]["quiet"] is False
+
+
 def test_motion_intent_exit_inherits_anchor_and_requires_debounce() -> None:
     state_machine = TrackerMotionIntentStateMachine()
     state_machine.update(motion_window=_quiet_metrics(1.0), tracker_pose=_pose())
@@ -118,19 +139,45 @@ def test_motion_intent_exit_inherits_anchor_and_requires_debounce() -> None:
     assert debounced_exit["hold_weight"] == 0.0
 
 
-def test_motion_intent_tracks_quiet_drift_without_leaving_inactive() -> None:
+def test_motion_intent_does_not_enter_inactive_during_slow_monotonic_motion() -> None:
+    state_machine = TrackerMotionIntentStateMachine()
+    state_machine.update(motion_window=_quiet_metrics(1.0), tracker_pose=_pose())
+    state_machine.update(
+        motion_window=_quiet_metrics(1.15),
+        tracker_pose=_pose(x=0.0015),
+    )
+
+    result = state_machine.update(
+        motion_window=_quiet_metrics(1.3),
+        tracker_pose=_pose(x=0.0030),
+    )
+
+    assert result["state"] == "ACTIVE"
+    assert result["hold_weight"] == 0.0
+    assert result["transition_reason"] == "quiet_dwell_motion"
+    assert result["evidence"]["quiet"] is True
+    assert result["evidence"]["quiet_anchor_translation_m"] > 0.0025
+
+
+def test_motion_intent_accumulates_slow_motion_from_fixed_inactive_anchor() -> None:
     state_machine = TrackerMotionIntentStateMachine()
     state_machine.update(motion_window=_quiet_metrics(1.0), tracker_pose=_pose())
     state_machine.update(motion_window=_quiet_metrics(1.3), tracker_pose=_pose())
 
-    for index in range(1, 101):
-        result = state_machine.update(
-            motion_window=_quiet_metrics(1.3 + index * 0.02),
-            tracker_pose=_pose(x=index * 0.0001),
-        )
+    first_exit = state_machine.update(
+        motion_window=_quiet_metrics(2.10),
+        tracker_pose=_pose(x=0.0041),
+    )
+    result = state_machine.update(
+        motion_window=_quiet_metrics(2.15),
+        tracker_pose=_pose(x=0.0043),
+    )
 
-    assert result["state"] == "INACTIVE"
-    assert result["hold_weight"] == 1.0
+    assert first_exit["state"] == "INACTIVE"
+    assert first_exit["evidence"]["quiet"] is True
+    assert first_exit["evidence"]["anchor_exit"] is True
+    assert result["state"] == "ACTIVE"
+    assert result["hold_weight"] == 0.0
 
 
 def test_motion_intent_tolerates_short_quality_dropout() -> None:

@@ -82,7 +82,7 @@ def test_rm65_single_arm_frame_candidates_are_shared() -> None:
 
 
 def test_build_rm65_single_arm_ik_solver_tries_shared_fallback_frames(monkeypatch) -> None:
-    import rm65_inspire_tac.ik as single_ik_module
+    import robot_motion.rm65.single_arm_ik as single_ik_module
 
     _FakeSingleArmSolver.calls.clear()
     tuning = object()
@@ -153,6 +153,7 @@ def test_rm65_dual_arm_collision_ik_config_matches_real_defaults() -> None:
 
     assert config.scene_profile == DEFAULT_COLLISION_SCENE
     assert config.solver_frequency == 30.0
+    assert config.damping == 0.01
     assert config.posture_cost == 1e-1
     assert config.collision_min_distance_m == 0.03
     assert config.collision_distance_epsilon_m == 1e-4
@@ -161,7 +162,7 @@ def test_rm65_dual_arm_collision_ik_config_matches_real_defaults() -> None:
 
 
 def test_build_rm65_dual_arm_collision_ik_solver_adds_shared_tasks(monkeypatch) -> None:
-    import rm65_inspire_tac.multitask_ik as multitask_module
+    import robot_motion.rm65.dual_arm_ik as multitask_module
     import robot_motion.rm65.ik as rm65_ik_module
 
     scene = SimpleNamespace(
@@ -180,6 +181,7 @@ def test_build_rm65_dual_arm_collision_ik_solver_adds_shared_tasks(monkeypatch) 
         RM65DualArmCollisionIKConfig(
             ik_tuning=_IkTuning(),
             solver_frequency=42.0,
+            damping=0.03,
             debug_profile=True,
         )
     )
@@ -191,7 +193,8 @@ def test_build_rm65_dual_arm_collision_ik_solver_adds_shared_tasks(monkeypatch) 
     assert call["robot_package_dirs"] == ["assets"]
     assert call["robot_collision_pair_names"] == [("left_hand_proxy_0", "right_hand_proxy_0")]
     assert call["frequency"] == 42.0
-    assert call["sleep"] is False
+    assert call["damping"] == 0.03
+    assert "sleep" not in call
     assert call["debug_profile"] is True
     assert [task[0] for task in bundle.solver.tasks] == ["frame", "frame", "posture"]
     assert bundle.solver.tasks[0][2]["position_cost"] == 11.0

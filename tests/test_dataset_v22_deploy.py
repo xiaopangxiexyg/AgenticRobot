@@ -10,6 +10,8 @@ from dataset_contracts import (
     PolicyArtifactContract,
     PolicyCameraInput,
     PolicyCameraInputContract,
+    PoseFrameContract,
+    PoseSourceProfile,
 )
 from dataset_contracts.v22 import (
     DatasetLayoutBindingError,
@@ -48,6 +50,7 @@ from robot_motion.deploy.schema import (
     STATE_HAND_SLICES,
 )
 from robot_motion.relative_action import compare_pose_chunks
+from robot_motion.runtime_gate import IKActionChunkGate
 from robot_motion.replay.trajectory import (
     QPOS_INIT_OBSERVATION_ARM_QPOS,
     ReplayTrajectoryGroup,
@@ -61,6 +64,7 @@ from teleop_runtime.deploy.replay import (
     resolve_replay_parquet_path,
     v22_replay_rows_to_legacy_actions,
 )
+from teleop_runtime.deploy.policy import LoadedPolicy
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.collection import run_collect
 
@@ -300,6 +304,68 @@ def test_v22_replay_adapter_preserves_side_specific_end_effector_metadata(tmp_pa
     assert predicted["action_chunk"][0].metadata["end_effector_enabled_sides"] == ["right"]
 
 
+def test_replay_prediction_transaction_rolls_back_chunk_discarded_by_ik_recovery(
+    tmp_path,
+) -> None:
+    actions = np.zeros((8, ACTION_DIM), dtype=np.float32)
+    replay = DatasetReplayPolicy(
+        actions=actions,
+        source_path=tmp_path / "episode.parquet",
+        chunk_size=4,
+    )
+    policy = LoadedPolicy(policy=replay, name="dataset_replay:test")
+    gate = IKActionChunkGate(stable_frames_required=1)
+
+    assert gate.update(
+        {"right": {"ik_metadata": {"status": "smoothing_required"}}}
+    ) == "ik_recovery_started"
+    checkpoint = policy.begin_prediction_transaction()
+    predicted = policy.predict(_observation())
+    assert len(predicted["action_chunk"]) == 4
+    assert replay.cursor == 4
+    assert gate.discards_policy_output
+    policy.rollback_prediction_transaction(checkpoint)
+    assert replay.cursor == 0
+    assert replay.completed_passes == 0
+    assert replay.finished is False
+
+    assert gate.update(
+        {"right": {"ik_metadata": {"status": "pass"}}}
+    ) == "ik_recovery_stable_waiting_fresh_policy"
+    checkpoint = policy.begin_prediction_transaction()
+    predicted = policy.predict(_observation())
+    assert len(predicted["action_chunk"]) == 4
+    policy.commit_prediction_transaction(checkpoint)
+    gate.mark_policy_output_accepted()
+    assert replay.cursor == 4
+    assert not gate.blocks_action_output
+
+
+def test_looping_replay_prediction_rollback_restores_pass_and_finished_state(
+    tmp_path,
+) -> None:
+    replay = DatasetReplayPolicy(
+        actions=np.zeros((3, ACTION_DIM), dtype=np.float32),
+        source_path=tmp_path / "episode.parquet",
+        chunk_size=2,
+        loop=True,
+        cursor=3,
+        completed_passes=5,
+        finished=True,
+    )
+
+    checkpoint = replay.begin_prediction_transaction()
+    replay.predict(_observation())
+    assert replay.cursor == 2
+    assert replay.completed_passes == 6
+    assert replay.finished is False
+
+    replay.rollback_prediction_transaction(checkpoint)
+    assert replay.cursor == 3
+    assert replay.completed_passes == 5
+    assert replay.finished is True
+
+
 def test_v22_replay_binds_metadata_to_runtime_arm_only_selection(monkeypatch) -> None:
     layout = _right_discrete_layout()
     actions = np.zeros((1, ACTION_DIM), dtype=np.float32)
@@ -349,6 +415,147 @@ def test_v22_replay_binds_metadata_to_runtime_arm_only_selection(monkeypatch) ->
     )
     filtered = safety.filter_normalized(predicted["action_chunk"][0], _observation(), policy_name="replay")
     assert filtered.faults == []
+
+
+def _v23_replay_dataset_info(*, storage_frame: str) -> tuple[dict[str, object], PolicyIOLayout]:
+    layout = _right_discrete_layout()
+    source = PoseSourceProfile(
+        source_id="rm65_real_dual_arm_test_v1",
+        source_family="real_robot",
+        source_description="test fixture",
+        topology="dual_arm",
+        raw_absolute_frame_by_side={
+            "left": "left_rm65_base",
+            "right": "right_rm65_base",
+        },
+    )
+    contract = (
+        PoseFrameContract.v23_forced_raw(source)
+        if storage_frame == "raw_absolute"
+        else PoseFrameContract.v23_default_desk(source)
+    )
+    return (
+        {
+            "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+            **layout.binding_metadata(),
+            "pose_frame_contract": contract.to_dict(),
+            "pose_storage_frame": contract.pose_storage_frame,
+        },
+        layout,
+    )
+
+
+def test_v23_raw_replay_uses_typed_layout_and_preserves_pose_contract(monkeypatch) -> None:
+    dataset_info, layout = _v23_replay_dataset_info(storage_frame="raw_absolute")
+    actions = np.zeros((1, ACTION_DIM), dtype=np.float32)
+    actions[0, ACTION_ARM_POSE_SLICES["left"]] = _pose(-0.1)
+    actions[0, ACTION_ARM_POSE_SLICES["right"]] = _pose(0.1)
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.resolve_replay_parquet_path",
+        lambda **_: (Path("/tmp/v23_raw.parquet"), {"dataset_info": dataset_info}),
+    )
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.load_v22_replay_actions_from_parquet",
+        lambda *_, **__: (actions, {}),
+    )
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.infer_replay_action_hz",
+        lambda **_: {"hz": 15.0, "source": "test"},
+    )
+
+    loaded = load_dataset_replay_policy(
+        dataset_root=None,
+        parquet_path="/tmp/v23_raw.parquet",
+        episode_index=0,
+        policy_io_layout=layout,
+        end_effector_sides=(),
+    )
+    predicted = loaded.policy.predict(_observation())
+    action_metadata = predicted["action_chunk"][0].metadata
+    assert loaded.metadata["policy_io_layout_hash"] == layout.layout_hash
+    assert action_metadata["pose_storage_frame"] == "raw_absolute"
+    assert action_metadata["pose_source_id"] == "rm65_real_dual_arm_test_v1"
+
+
+def test_v23_raw_replay_converts_each_side_to_canonical_desk(monkeypatch) -> None:
+    layout = _right_discrete_layout()
+    left_transform = np.eye(4)
+    left_transform[0, 3] = 1.0
+    right_transform = np.eye(4)
+    right_transform[1, 3] = -0.5
+    source = PoseSourceProfile(
+        source_id="rm65_real_dual_arm_nonidentity_test_v1",
+        source_family="real_robot",
+        source_description="test fixture",
+        topology="dual_arm",
+        raw_to_desk_transform_by_side={
+            "left": left_transform,
+            "right": right_transform,
+        },
+    )
+    contract = PoseFrameContract.v23_forced_raw(source)
+    dataset_info = {
+        "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+        **layout.binding_metadata(),
+        "pose_frame_contract": contract.to_dict(),
+        "pose_storage_frame": contract.pose_storage_frame,
+    }
+    actions = np.zeros((1, ACTION_DIM), dtype=np.float32)
+    actions[0, ACTION_ARM_POSE_SLICES["left"]] = _pose(-0.1)
+    actions[0, ACTION_ARM_POSE_SLICES["right"]] = _pose(0.1)
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.resolve_replay_parquet_path",
+        lambda **_: (Path("/tmp/v23_raw_nonidentity.parquet"), {"dataset_info": dataset_info}),
+    )
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.load_v22_replay_actions_from_parquet",
+        lambda *_, **__: (actions, {}),
+    )
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.infer_replay_action_hz",
+        lambda **_: {"hz": 15.0, "source": "test"},
+    )
+    loaded = load_dataset_replay_policy(
+        dataset_root=None,
+        parquet_path="/tmp/v23_raw_nonidentity.parquet",
+        episode_index=0,
+        policy_io_layout=layout,
+    )
+    predicted = loaded.policy.predict(_observation())["action_chunk"][0].vector
+    np.testing.assert_allclose(
+        predicted[ACTION_ARM_POSE_SLICES["left"]][:3], [0.9, 0.0, 0.2], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        predicted[ACTION_ARM_POSE_SLICES["right"]][:3], [0.1, -0.5, 0.2], atol=1e-6
+    )
+
+
+def test_v23_desk_deploy_replay_emits_canonical_desk_policy_actions(monkeypatch) -> None:
+    dataset_info, layout = _v23_replay_dataset_info(storage_frame="desk_absolute")
+    actions = np.zeros((1, ACTION_DIM), dtype=np.float32)
+    actions[0, ACTION_ARM_POSE_SLICES["left"]] = _pose(-0.1)
+    actions[0, ACTION_ARM_POSE_SLICES["right"]] = _pose(0.1)
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.resolve_replay_parquet_path",
+        lambda **_: (Path("/tmp/v23_desk.parquet"), {"dataset_info": dataset_info}),
+    )
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.load_v22_replay_actions_from_parquet",
+        lambda *_, **__: (actions, {}),
+    )
+    monkeypatch.setattr(
+        "teleop_runtime.deploy.replay.infer_replay_action_hz",
+        lambda **_: {"hz": 15.0, "source": "test"},
+    )
+    loaded = load_dataset_replay_policy(
+        dataset_root=None,
+        parquet_path="/tmp/v23_desk.parquet",
+        episode_index=0,
+        policy_io_layout=layout,
+    )
+    assert loaded.metadata["policy_absolute_frame"] == "canonical_desk"
+    predicted = loaded.policy.predict(_observation())["action_chunk"][0]
+    assert predicted.metadata["pose_action_absolute_frame"] == "canonical_desk"
 
 
 def test_policy_artifact_accepts_v23_dataset_schema_with_pose_metadata() -> None:

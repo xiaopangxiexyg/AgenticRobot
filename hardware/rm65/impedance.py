@@ -1037,7 +1037,7 @@ class RM65BaseImpedanceController:
                 errors.append("rm65_pinocchio_skipped:tcp_pose_flange_m_rad_unavailable")
             else:
                 try:
-                    from rm65_inspire_tac.ik import SingleArmIKSolver
+                    from robot_motion.rm65.single_arm_ik import SingleArmIKSolver
 
                     providers.append(
                         PinocchioIKProvider(
@@ -1241,7 +1241,7 @@ class RM65BaseImpedanceController:
                 f"{self.side}: deployment dual-rate IK requires tcp_pose_flange_m_rad"
             )
         try:
-            from rm65_inspire_tac.ik import SingleArmIKSolver
+            from robot_motion.rm65.single_arm_ik import SingleArmIKSolver
 
             local_provider = PinocchioIKProvider(
                 solver=SingleArmIKSolver(

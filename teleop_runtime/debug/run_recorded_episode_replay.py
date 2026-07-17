@@ -17,9 +17,9 @@ from ..hand_render import (
 )
 from ..schemas import EffectorCommand
 from .log_utils import ChangeGate, log_event
-from rm65_inspire_tac.ik_tuning import load_ik_tuning_config
-from rm65_inspire_tac.paths import require_asset_path
-from rm65_inspire_tac.rendering import SapienArmHandRenderer
+from robot_motion.rm65.ik_tuning import load_ik_tuning_config
+from robot_motion.rm65.assets import require_asset_path
+from sim.rm65.sapien_renderer import SapienArmHandRenderer
 
 
 def _positive_float(text: str) -> float:

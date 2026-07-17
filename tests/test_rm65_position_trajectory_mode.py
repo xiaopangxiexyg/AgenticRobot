@@ -112,6 +112,35 @@ def test_rm65_position_planner_default_remains_linear() -> None:
     assert config.position_command_planner == POSITION_COMMAND_PLANNER_LINEAR
 
 
+def test_acceleration_planner_defaults_to_30ms_target_velocity_filter() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        )
+    )
+
+    assert backend._stream_planner.target_velocity_filter_tau_sec == pytest.approx(0.03)
+
+
+def test_acceleration_planner_target_velocity_filter_can_be_bypassed() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            position_target_velocity_filter_tau_sec=0.0,
+        )
+    )
+
+    assert backend._stream_planner.target_velocity_filter_tau_sec == pytest.approx(0.0)
+
+
 def test_final_follow_qpos_alpha_filters_from_last_accepted_command() -> None:
     output, applied = _final_follow_qpos_target(
         np.ones(6),
@@ -371,6 +400,22 @@ def test_position_trajectory_policy_distinguishes_stop_degrade_and_normal() -> N
     assert singularity.mode == "degraded"
     assert singularity.speed_scale == pytest.approx(0.1)
 
+    accepted_wrist_fallback = _position_trajectory_policy(
+        {"collision_avoidance_status": "tracking"},
+        {"singularity_gate_status": "allow_position_wrist_singular"},
+        degraded_speed_scale=0.1,
+    )
+    assert accepted_wrist_fallback.mode == "tracking"
+    assert accepted_wrist_fallback.speed_scale == 1.0
+
+    accepted_elbow_fallback = _position_trajectory_policy(
+        {"collision_avoidance_status": "tracking"},
+        {"singularity_gate_status": "allow_position_elbow_singular"},
+        degraded_speed_scale=0.1,
+    )
+    assert accepted_elbow_fallback.mode == "tracking"
+    assert accepted_elbow_fallback.speed_scale == 1.0
+
     normal = _position_trajectory_policy(
         {"collision_avoidance_status": "tracking"},
         {"singularity_gate_status": "pass"},
@@ -542,5 +587,33 @@ def test_successful_stream_continues_fixed_qpos_ticks_after_manual_hold() -> Non
         atol=1e-10,
     )
     assert arm.slow_stop_calls == 0
+
+    backend.close()
+
+
+def test_disengage_position_stream_stops_once_and_withdraws_hold_target() -> None:
+    backend, arm = _backend()
+    backend._stream_thread = threading.Thread(
+        target=backend._background_stream_loop,
+        daemon=True,
+    )
+    backend._stream_thread.start()
+    backend.send_command(_command(0.05))
+    deadline = time.monotonic() + 0.3
+    while len(arm.sent_joint_deg) < 4 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert len(arm.sent_joint_deg) >= 4
+
+    backend.hold_motion("operator hold")
+    backend.disengage_position_command_stream("operator manual interaction")
+    send_count_after_disengage = len(arm.sent_joint_deg)
+    time.sleep(0.03)
+
+    stream = backend.get_state()["background_streaming"]
+    assert stream["target_active"] is False
+    assert stream["quick_stop_active"] is False
+    assert stream["continuous_hold"] is False
+    assert len(arm.sent_joint_deg) == send_count_after_disengage
+    assert arm.slow_stop_calls == 1
 
     backend.close()

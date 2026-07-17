@@ -1,0 +1,34 @@
+{
+  "schema": "dexteleop.umi_hand_eye.config.v1",
+  "validity_seconds": 3600.0,
+  "vive_host": "0.0.0.0",
+  "vive_port": 9999,
+  "vive_clock_sync_port": 10001,
+  "camera_resolution": [640, 480],
+  "camera_fps": 15,
+  "sides": {
+    "left": {
+      "camera_serial": "261122273924",
+      "tracker_name": "tracker_1",
+      "tracker_role": "left_wrist",
+      "channel_name": "left_wrist_pose"
+    },
+    "right": {
+      "camera_serial": "260522278055",
+      "tracker_name": "tracker_2",
+      "tracker_role": "right_wrist",
+      "channel_name": "right_wrist_pose"
+    }
+  },
+  "target": {
+    "target_type": "charuco",
+    "dictionary": "DICT_6X6_100",
+    "marker_length_m": 0.1,
+    "marker_id": null,
+    "charuco_squares_x": 5,
+    "charuco_squares_y": 7,
+    "charuco_square_length_m": 0.035,
+    "charuco_marker_length_m": 0.026,
+    "min_charuco_corners": 12
+  }
+}

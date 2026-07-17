@@ -1,0 +1,38 @@
+{
+  "schema": "dexteleop_pose_frame_contract_v1",
+  "pose_storage_frame": "raw_absolute",
+  "canonical_absolute_frame": "desk",
+  "source": {
+    "schema": "dexteleop_pose_source_contract_v1",
+    "source_id": "rm65_real_dual_arm_v1",
+    "source_family": "real_robot",
+    "source_description": "Dual RM65 real-hardware runtime; identity raw-to-canonical-desk compatibility profile.",
+    "topology": "dual_arm",
+    "active_sides": [
+      "left",
+      "right"
+    ],
+    "raw_absolute_frame_by_side": {
+      "left": "left_rm65_base",
+      "right": "right_rm65_base"
+    },
+    "raw_to_canonical_desk_transform": [
+      [1.0, 0.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0, 0.0],
+      [0.0, 0.0, 1.0, 0.0],
+      [0.0, 0.0, 0.0, 1.0]
+    ],
+    "raw_to_canonical_desk_transform_by_side": {},
+    "canonical_desk_frame": "desk",
+    "profile_version": "1",
+    "metadata": {
+      "compatibility_profile": true,
+      "runtime_use": true,
+      "calibration_status": "identity_default_not_measured"
+    }
+  },
+  "metadata": {
+    "runtime_binding": true,
+    "storage_field_name_reused_for_runtime_raw_input": true
+  }
+}

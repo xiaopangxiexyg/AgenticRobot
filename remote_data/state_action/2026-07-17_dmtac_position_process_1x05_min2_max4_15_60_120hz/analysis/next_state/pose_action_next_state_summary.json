@@ -1,0 +1,1387 @@
+{
+  "schema": "dexteleop_pose_action_next_state_summary_v1",
+  "dataset_root": "/home/zc/HandMotion/Developing/DexTeleop/remote_data/state_action/2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+  "dataset_count": 1,
+  "datasets": [
+    {
+      "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+      "dataset_dir_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+      "dataset_label": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+      "dataset_root": "/home/zc/HandMotion/Developing/DexTeleop/remote_data/state_action/2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+      "info_frame_count": 297,
+      "info_episode_count": 2,
+      "scanned_episode_count": 2,
+      "scanned_row_count": 297,
+      "thresholds": {
+        "translation_m": 0.01,
+        "rotation_deg": 5.0
+      },
+      "features": {
+        "action": {
+          "shape": [
+            26
+          ],
+          "dtype": "float32"
+        },
+        "observation.state": {
+          "shape": [
+            38
+          ],
+          "dtype": "float32"
+        },
+        "observation.last_action": {
+          "shape": [
+            26
+          ],
+          "dtype": "float32"
+        }
+      },
+      "arm_action_specs_by_side": {
+        "left": {
+          "side": "left",
+          "controlled_frame": "tool_tcp",
+          "reference_frame": "left_arm_base",
+          "representation": "xyz_quat",
+          "dof": 7,
+          "semantics": "Arm pose actions control the active tool TCP. The TCP is loaded from the arm/tool calibration profile at execution time; RM65 backends convert this software TCP target to the internal IK/control frame.",
+          "metadata": {}
+        },
+        "right": {
+          "side": "right",
+          "controlled_frame": "tool_tcp",
+          "reference_frame": "right_arm_base",
+          "representation": "xyz_quat",
+          "dof": 7,
+          "semantics": "Arm pose actions control the active tool TCP. The TCP is loaded from the arm/tool calibration profile at execution time; RM65 backends convert this software TCP target to the internal IK/control frame.",
+          "metadata": {}
+        }
+      },
+      "relations": {
+        "same_state": {
+          "left": {
+            "pair_count": 297,
+            "skipped_missing": 0,
+            "skipped_nonfinite": 0,
+            "translation_error_m": {
+              "count": 297,
+              "mean": 0.020348933968698257,
+              "std": 0.012857933635017705,
+              "min": 0.000602018617828093,
+              "p50": 0.017367079676353973,
+              "p90": 0.041130061745282456,
+              "p95": 0.04863368917945606,
+              "p99": 0.05371324087153924,
+              "max": 0.06550610791556534
+            },
+            "rotation_error_deg": {
+              "count": 297,
+              "mean": 3.4162509699641728,
+              "std": 2.1735149687908013,
+              "min": 0.02324726680638712,
+              "p50": 2.932239801724248,
+              "p90": 6.546141330002297,
+              "p95": 7.344359247199769,
+              "p99": 9.672329514297047,
+              "max": 11.874189673422599
+            },
+            "abs_xyz_error_m": {
+              "x": {
+                "count": 297,
+                "mean": 0.007483937454888886,
+                "std": 0.007512687072677076,
+                "min": 6.0580670833587646e-05,
+                "p50": 0.005234681069850922,
+                "p90": 0.016428285837173467,
+                "p95": 0.022309232503175732,
+                "p99": 0.03583973448723559,
+                "max": 0.0405880231410265
+              },
+              "y": {
+                "count": 297,
+                "mean": 0.0077976399800592806,
+                "std": 0.005575982828184195,
+                "min": 7.814168930053711e-05,
+                "p50": 0.007257401943206787,
+                "p90": 0.014764428138732912,
+                "p95": 0.017895090579986568,
+                "p99": 0.023357405662536627,
+                "max": 0.025124579668045044
+              },
+              "z": {
+                "count": 297,
+                "mean": 0.013821793074158305,
+                "std": 0.013565362015096723,
+                "min": 1.6242265701293945e-05,
+                "p50": 0.010388046503067017,
+                "p90": 0.03471438884735108,
+                "p95": 0.04659660756587982,
+                "p99": 0.05088247120380411,
+                "max": 0.06205713748931885
+              }
+            },
+            "dt_sec": {
+              "count": 297,
+              "mean": 0.0,
+              "std": 0.0,
+              "min": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "max": 0.0
+            },
+            "translation_gt_threshold_fraction": 0.7878787878787878,
+            "rotation_gt_threshold_fraction": 0.22895622895622897
+          },
+          "right": {
+            "pair_count": 297,
+            "skipped_missing": 0,
+            "skipped_nonfinite": 0,
+            "translation_error_m": {
+              "count": 297,
+              "mean": 0.022441510411181795,
+              "std": 0.014815672836787528,
+              "min": 0.001076474434243021,
+              "p50": 0.02028470635479037,
+              "p90": 0.044880016746141706,
+              "p95": 0.05149739264242233,
+              "p99": 0.06174375088905375,
+              "max": 0.06855825884799273
+            },
+            "rotation_error_deg": {
+              "count": 297,
+              "mean": 3.2360618953318583,
+              "std": 2.3768006037494764,
+              "min": 0.05707016277373933,
+              "p50": 2.5366493670448462,
+              "p90": 6.59684444300372,
+              "p95": 8.528121084507685,
+              "p99": 9.987155086782701,
+              "max": 12.52096894002911
+            },
+            "abs_xyz_error_m": {
+              "x": {
+                "count": 297,
+                "mean": 0.008739536212001119,
+                "std": 0.01098498260619965,
+                "min": 6.315484642982483e-05,
+                "p50": 0.004699820652604103,
+                "p90": 0.024256766214966793,
+                "p95": 0.034565229256986636,
+                "p99": 0.04605362758040433,
+                "max": 0.06137705221772194
+              },
+              "y": {
+                "count": 297,
+                "mean": 0.008671092565613563,
+                "std": 0.006314261514630081,
+                "min": 0.00020259618759155273,
+                "p50": 0.008180677890777588,
+                "p90": 0.01636788845062256,
+                "p95": 0.02009063959121704,
+                "p99": 0.02727191448211673,
+                "max": 0.034077584743499756
+              },
+              "z": {
+                "count": 297,
+                "mean": 0.01449441387998536,
+                "std": 0.0141749933545532,
+                "min": 5.3942203521728516e-06,
+                "p50": 0.009926706552505493,
+                "p90": 0.037477144598960885,
+                "p95": 0.043971621990203845,
+                "p99": 0.05851925253868109,
+                "max": 0.06798067688941956
+              }
+            },
+            "dt_sec": {
+              "count": 297,
+              "mean": 0.0,
+              "std": 0.0,
+              "min": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "max": 0.0
+            },
+            "translation_gt_threshold_fraction": 0.797979797979798,
+            "rotation_gt_threshold_fraction": 0.20202020202020202
+          }
+        },
+        "next_state": {
+          "left": {
+            "pair_count": 295,
+            "skipped_missing": 0,
+            "skipped_nonfinite": 0,
+            "translation_error_m": {
+              "count": 295,
+              "mean": 0.009742848254653897,
+              "std": 0.0071905000701918366,
+              "min": 0.00022905605435134598,
+              "p50": 0.007959201587265268,
+              "p90": 0.02055827289290081,
+              "p95": 0.024175578592213066,
+              "p99": 0.03133849873315857,
+              "max": 0.039137572608864635
+            },
+            "rotation_error_deg": {
+              "count": 295,
+              "mean": 1.689206133510249,
+              "std": 1.1983921583933177,
+              "min": 0.04383291437717202,
+              "p50": 1.3784978710313858,
+              "p90": 3.5071981754511237,
+              "p95": 4.075526002291988,
+              "p99": 5.358184310853139,
+              "max": 5.833021935935651
+            },
+            "abs_xyz_error_m": {
+              "x": {
+                "count": 295,
+                "mean": 0.003249451587611999,
+                "std": 0.0035464472577701185,
+                "min": 6.444752216339111e-06,
+                "p50": 0.0020247139036655426,
+                "p90": 0.007869848050177103,
+                "p95": 0.00998758226633072,
+                "p99": 0.016338160410523415,
+                "max": 0.021951857954263687
+              },
+              "y": {
+                "count": 295,
+                "mean": 0.002850145404621706,
+                "std": 0.002848059886607873,
+                "min": 6.556510925292969e-06,
+                "p50": 0.0018048286437988281,
+                "p90": 0.006474244594573976,
+                "p95": 0.008260488510131838,
+                "p99": 0.01169829249382019,
+                "max": 0.016180694103240967
+              },
+              "z": {
+                "count": 295,
+                "mean": 0.007285055215075865,
+                "std": 0.007360934462985444,
+                "min": 5.5946409702301025e-05,
+                "p50": 0.0049960315227508545,
+                "p90": 0.01887808442115785,
+                "p95": 0.022918665409088136,
+                "p99": 0.030246983617544177,
+                "max": 0.03792358934879303
+              }
+            },
+            "dt_sec": {
+              "count": 295,
+              "mean": 0.06663529266745358,
+              "std": 0.00551203185671892,
+              "min": 0.05016446113586426,
+              "p50": 0.06689119338989258,
+              "p90": 0.07347288131713868,
+              "p95": 0.07649598121643067,
+              "p99": 0.07948930263519287,
+              "max": 0.08362960815429688
+            },
+            "translation_gt_threshold_fraction": 0.3694915254237288,
+            "rotation_gt_threshold_fraction": 0.020338983050847456
+          },
+          "right": {
+            "pair_count": 295,
+            "skipped_missing": 0,
+            "skipped_nonfinite": 0,
+            "translation_error_m": {
+              "count": 295,
+              "mean": 0.010599351075432861,
+              "std": 0.007544371927005303,
+              "min": 0.00045901134359828193,
+              "p50": 0.008698957737915835,
+              "p90": 0.021771268281908392,
+              "p95": 0.026436032862072734,
+              "p99": 0.030930873822355463,
+              "max": 0.03738418702907307
+            },
+            "rotation_error_deg": {
+              "count": 295,
+              "mean": 1.6365840471591606,
+              "std": 1.270350706341303,
+              "min": 0.07192471511957226,
+              "p50": 1.3025571723348126,
+              "p90": 3.3816838050827767,
+              "p95": 4.4312693276685495,
+              "p99": 5.946111925259202,
+              "max": 6.718515545679159
+            },
+            "abs_xyz_error_m": {
+              "x": {
+                "count": 295,
+                "mean": 0.003867099496636587,
+                "std": 0.0048127319153840244,
+                "min": 2.146512269973755e-05,
+                "p50": 0.002087380737066269,
+                "p90": 0.010085417330265056,
+                "p95": 0.012556223571300507,
+                "p99": 0.023970219269394875,
+                "max": 0.02869485318660736
+              },
+              "y": {
+                "count": 295,
+                "mean": 0.0034733850066944703,
+                "std": 0.003246456031789405,
+                "min": 2.3365020751953125e-05,
+                "p50": 0.002583622932434082,
+                "p90": 0.007530915737152101,
+                "p95": 0.010467487573623658,
+                "p99": 0.015307290554046634,
+                "max": 0.01796281337738037
+              },
+              "z": {
+                "count": 295,
+                "mean": 0.0074174989583128586,
+                "std": 0.0073159943288235545,
+                "min": 7.3015689849853516e-06,
+                "p50": 0.005406439304351807,
+                "p90": 0.018513023853302005,
+                "p95": 0.02244730964303018,
+                "p99": 0.030172400772571564,
+                "max": 0.03722870349884033
+              }
+            },
+            "dt_sec": {
+              "count": 295,
+              "mean": 0.06663529266745358,
+              "std": 0.00551203185671892,
+              "min": 0.05016446113586426,
+              "p50": 0.06689119338989258,
+              "p90": 0.07347288131713868,
+              "p95": 0.07649598121643067,
+              "p99": 0.07948930263519287,
+              "max": 0.08362960815429688
+            },
+            "translation_gt_threshold_fraction": 0.4440677966101695,
+            "rotation_gt_threshold_fraction": 0.030508474576271188
+          }
+        },
+        "last_action": {
+          "left": {
+            "pair_count": 295,
+            "skipped_missing": 0,
+            "skipped_nonfinite": 0,
+            "translation_error_m": {
+              "count": 295,
+              "mean": 0.0,
+              "std": 0.0,
+              "min": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "max": 0.0
+            },
+            "rotation_error_deg": {
+              "count": 295,
+              "mean": 6.506347159947751e-07,
+              "std": 9.228668635500496e-07,
+              "min": 0.0,
+              "p50": 0.0,
+              "p90": 1.7075472925031877e-06,
+              "p95": 2.4148365394514667e-06,
+              "p99": 2.4148365394514667e-06,
+              "max": 2.9575586669421963e-06
+            },
+            "abs_xyz_error_m": {
+              "x": {
+                "count": 295,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0
+              },
+              "y": {
+                "count": 295,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0
+              },
+              "z": {
+                "count": 295,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0
+              }
+            },
+            "dt_sec": {
+              "count": 0,
+              "mean": null,
+              "std": null,
+              "min": null,
+              "p50": null,
+              "p90": null,
+              "p95": null,
+              "p99": null,
+              "max": null
+            },
+            "translation_gt_threshold_fraction": 0.0,
+            "rotation_gt_threshold_fraction": 0.0
+          },
+          "right": {
+            "pair_count": 295,
+            "skipped_missing": 0,
+            "skipped_nonfinite": 0,
+            "translation_error_m": {
+              "count": 295,
+              "mean": 0.0,
+              "std": 0.0,
+              "min": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "max": 0.0
+            },
+            "rotation_error_deg": {
+              "count": 295,
+              "mean": 6.714847858386408e-07,
+              "std": 9.91089091830346e-07,
+              "min": 0.0,
+              "p50": 0.0,
+              "p90": 2.4148365394514667e-06,
+              "p95": 2.4148365394514667e-06,
+              "p99": 2.447399867100912e-06,
+              "max": 2.9575586669421963e-06
+            },
+            "abs_xyz_error_m": {
+              "x": {
+                "count": 295,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0
+              },
+              "y": {
+                "count": 295,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0
+              },
+              "z": {
+                "count": 295,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0
+              }
+            },
+            "dt_sec": {
+              "count": 0,
+              "mean": null,
+              "std": null,
+              "min": null,
+              "p50": null,
+              "p90": null,
+              "p95": null,
+              "p99": null,
+              "max": null
+            },
+            "translation_gt_threshold_fraction": 0.0,
+            "rotation_gt_threshold_fraction": 0.0
+          }
+        }
+      },
+      "best_pose_relation_by_translation_mean": {
+        "left": {
+          "relation": "next_state",
+          "translation_mean_m": 0.009742848254653897
+        },
+        "right": {
+          "relation": "next_state",
+          "translation_mean_m": 0.010599351075432861
+        }
+      },
+      "episodes": [
+        {
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "row_count": 49,
+          "pair_counts": {
+            "same_state": {
+              "left": 49,
+              "right": 49
+            },
+            "next_state": {
+              "left": 48,
+              "right": 48
+            },
+            "last_action": {
+              "left": 48,
+              "right": 48
+            }
+          }
+        },
+        {
+          "episode_index": 1,
+          "episode_id": "episode_000001",
+          "parquet_path": "data/chunk-000/episode_000001.parquet",
+          "row_count": 248,
+          "pair_counts": {
+            "same_state": {
+              "left": 248,
+              "right": 248
+            },
+            "next_state": {
+              "left": 247,
+              "right": 247
+            },
+            "last_action": {
+              "left": 247,
+              "right": 247
+            }
+          }
+        }
+      ],
+      "outliers": [
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 9,
+          "index": 9,
+          "timestamp": 1784264587.7371767,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.020286800407475533,
+          "rotation_deg": 3.1223641144460306
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 9,
+          "index": 9,
+          "timestamp": 1784264587.7371767,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.011527299982054186,
+          "rotation_deg": 1.8646038527913589
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 9,
+          "index": 9,
+          "timestamp": 1784264587.7371767,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.018743832081591107,
+          "rotation_deg": 1.649626313957484
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 10,
+          "index": 10,
+          "timestamp": 1784264587.7987144,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.01394404592802704,
+          "rotation_deg": 2.239419313745571
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 10,
+          "index": 10,
+          "timestamp": 1784264587.7987144,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.010260744468265814,
+          "rotation_deg": 0.9043178599942658
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 11,
+          "index": 11,
+          "timestamp": 1784264587.8743682,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.03705313289120419,
+          "rotation_deg": 5.3512738939093625
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 11,
+          "index": 11,
+          "timestamp": 1784264587.8743682,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.013561092186923572,
+          "rotation_deg": 1.9668712528102217
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 11,
+          "index": 11,
+          "timestamp": 1784264587.8743682,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.032439498713947544,
+          "rotation_deg": 4.510703068800579
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 11,
+          "index": 11,
+          "timestamp": 1784264587.8743682,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.01911168505154063,
+          "rotation_deg": 2.943038460703184
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 12,
+          "index": 12,
+          "timestamp": 1784264587.9334056,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.022451397298941914,
+          "rotation_deg": 3.236278975306119
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 12,
+          "index": 12,
+          "timestamp": 1784264587.9334056,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.02759763018095452,
+          "rotation_deg": 3.6436666165196927
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 13,
+          "index": 13,
+          "timestamp": 1784264588.0128706,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.016852889588974605,
+          "rotation_deg": 2.932239801724248
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 13,
+          "index": 13,
+          "timestamp": 1784264588.0128706,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.01135391914898963,
+          "rotation_deg": 1.2202487870836487
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 14,
+          "index": 14,
+          "timestamp": 1784264588.0812416,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.023561197972644842,
+          "rotation_deg": 3.5640101663540595
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 14,
+          "index": 14,
+          "timestamp": 1784264588.0812416,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.012826224113640393,
+          "rotation_deg": 0.8940396892811108
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 15,
+          "index": 15,
+          "timestamp": 1784264588.148128,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.01746935382861483,
+          "rotation_deg": 2.54197109701906
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 15,
+          "index": 15,
+          "timestamp": 1784264588.148128,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.01055980575939144,
+          "rotation_deg": 0.9805996109908128
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 16,
+          "index": 16,
+          "timestamp": 1784264588.2150118,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.01236444084895245,
+          "rotation_deg": 0.8526972095440455
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 17,
+          "index": 17,
+          "timestamp": 1784264588.2818947,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.01137066755373358,
+          "rotation_deg": 0.9125741886661767
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 18,
+          "index": 18,
+          "timestamp": 1784264588.3321192,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.012552493987587215,
+          "rotation_deg": 0.8576171114207977
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 19,
+          "index": 19,
+          "timestamp": 1784264588.401161,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.011795457161572822,
+          "rotation_deg": 0.7461480519586519
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 20,
+          "index": 20,
+          "timestamp": 1784264588.4682846,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.014575575987223314,
+          "rotation_deg": 1.2465123169856607
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 21,
+          "index": 21,
+          "timestamp": 1784264588.5351622,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.0182510856800011,
+          "rotation_deg": 2.540760400320094
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 21,
+          "index": 21,
+          "timestamp": 1784264588.5351622,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.0122609053294076,
+          "rotation_deg": 1.6541777528907622
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 21,
+          "index": 21,
+          "timestamp": 1784264588.5351622,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.023987649318317712,
+          "rotation_deg": 2.5001924821015886
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 21,
+          "index": 21,
+          "timestamp": 1784264588.5351622,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.016635900276582603,
+          "rotation_deg": 1.951598641250724
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 22,
+          "index": 22,
+          "timestamp": 1784264588.6020772,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.022212978730474918,
+          "rotation_deg": 2.9842839177701452
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 22,
+          "index": 22,
+          "timestamp": 1784264588.6020772,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.010292287310986416,
+          "rotation_deg": 1.4193103696869478
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 22,
+          "index": 22,
+          "timestamp": 1784264588.6020772,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.03277427301047352,
+          "rotation_deg": 3.310446711501303
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 22,
+          "index": 22,
+          "timestamp": 1784264588.6020772,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.016906544582759104,
+          "rotation_deg": 1.9239168373365778
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 23,
+          "index": 23,
+          "timestamp": 1784264588.6689668,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.03755642415741486,
+          "rotation_deg": 4.7906835169572535
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 23,
+          "index": 23,
+          "timestamp": 1784264588.6689668,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.01446068505689566,
+          "rotation_deg": 1.932298658252205
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 23,
+          "index": 23,
+          "timestamp": 1784264588.6689668,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.05225824010828259,
+          "rotation_deg": 5.38568288153001
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 23,
+          "index": 23,
+          "timestamp": 1784264588.6689668,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.028446872140683074,
+          "rotation_deg": 3.061240169069166
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 24,
+          "index": 24,
+          "timestamp": 1784264588.735855,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.0512226135390453,
+          "rotation_deg": 6.445484152328337
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 24,
+          "index": 24,
+          "timestamp": 1784264588.735855,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.022858491644599743,
+          "rotation_deg": 2.8962246038684487
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 24,
+          "index": 24,
+          "timestamp": 1784264588.735855,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.05130718077595727,
+          "rotation_deg": 5.280445308206201
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 24,
+          "index": 24,
+          "timestamp": 1784264588.735855,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.013055661852604527,
+          "rotation_deg": 1.2259462570576285
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 25,
+          "index": 25,
+          "timestamp": 1784264588.8027403,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.03503323072507248,
+          "rotation_deg": 4.5188291313091655
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 25,
+          "index": 25,
+          "timestamp": 1784264588.8027403,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.03136631736034035,
+          "rotation_deg": 2.962102196653988
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 25,
+          "index": 25,
+          "timestamp": 1784264588.8027403,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.012649836621843083,
+          "rotation_deg": 1.141177747075134
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 26,
+          "index": 26,
+          "timestamp": 1784264588.8696222,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.027609911868361103,
+          "rotation_deg": 3.757414880644543
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 26,
+          "index": 26,
+          "timestamp": 1784264588.8696222,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.013463348140077408,
+          "rotation_deg": 0.8902048278548248
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 26,
+          "index": 26,
+          "timestamp": 1784264588.8696222,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.029785729114895673,
+          "rotation_deg": 3.1756715035013974
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 26,
+          "index": 26,
+          "timestamp": 1784264588.8696222,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.013449366345977709,
+          "rotation_deg": 1.151113458097064
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 27,
+          "index": 27,
+          "timestamp": 1784264588.9365065,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.02925985805793922,
+          "rotation_deg": 4.043306727059071
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 27,
+          "index": 27,
+          "timestamp": 1784264588.9365065,
+          "relation": "next_state",
+          "side": "left",
+          "translation_m": 0.012787590202161872,
+          "rotation_deg": 0.7860300160711904
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 27,
+          "index": 27,
+          "timestamp": 1784264588.9365065,
+          "relation": "same_state",
+          "side": "right",
+          "translation_m": 0.029578764762193486,
+          "rotation_deg": 3.6194005166607273
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 27,
+          "index": 27,
+          "timestamp": 1784264588.9365065,
+          "relation": "next_state",
+          "side": "right",
+          "translation_m": 0.012440348077512443,
+          "rotation_deg": 1.3210544105031827
+        },
+        {
+          "dataset_name": "2026-07-17_dmtac_position_process_1x05_min2_max4_15_60_120hz",
+          "episode_index": 0,
+          "episode_id": "episode_000000",
+          "parquet_path": "data/chunk-000/episode_000000.parquet",
+          "frame_index": 28,
+          "index": 28,
+          "timestamp": 1784264589.003413,
+          "relation": "same_state",
+          "side": "left",
+          "translation_m": 0.024497620351993987,
+          "rotation_deg": 3.302996556036604
+        }
+      ],
+      "errors": []
+    }
+  ],
+  "overall": {
+    "scanned_episode_count": 2,
+    "scanned_row_count": 297,
+    "dataset_count": 1,
+    "relations": {
+      "same_state": {
+        "left": {
+          "pair_count": 297,
+          "translation_error_m": {
+            "count": 297,
+            "mean": 0.020348933968698257,
+            "std": 0.0,
+            "min": 0.020348933968698257,
+            "p50": 0.020348933968698257,
+            "p90": 0.020348933968698257,
+            "p95": 0.020348933968698257,
+            "p99": 0.020348933968698257,
+            "max": 0.020348933968698257
+          },
+          "rotation_error_deg": {
+            "count": 297,
+            "mean": 3.4162509699641737,
+            "std": 8.881784197001252e-16,
+            "min": 3.4162509699641728,
+            "p50": 3.4162509699641728,
+            "p90": 3.4162509699641728,
+            "p95": 3.4162509699641728,
+            "p99": 3.4162509699641728,
+            "max": 3.4162509699641728
+          }
+        },
+        "right": {
+          "pair_count": 297,
+          "translation_error_m": {
+            "count": 297,
+            "mean": 0.022441510411181795,
+            "std": 0.0,
+            "min": 0.022441510411181795,
+            "p50": 0.022441510411181795,
+            "p90": 0.022441510411181795,
+            "p95": 0.022441510411181795,
+            "p99": 0.022441510411181795,
+            "max": 0.022441510411181795
+          },
+          "rotation_error_deg": {
+            "count": 297,
+            "mean": 3.2360618953318587,
+            "std": 4.440892098500626e-16,
+            "min": 3.2360618953318583,
+            "p50": 3.2360618953318583,
+            "p90": 3.2360618953318583,
+            "p95": 3.2360618953318583,
+            "p99": 3.2360618953318583,
+            "max": 3.2360618953318583
+          }
+        }
+      },
+      "next_state": {
+        "left": {
+          "pair_count": 295,
+          "translation_error_m": {
+            "count": 295,
+            "mean": 0.009742848254653895,
+            "std": 1.734723475976807e-18,
+            "min": 0.009742848254653897,
+            "p50": 0.009742848254653897,
+            "p90": 0.009742848254653897,
+            "p95": 0.009742848254653897,
+            "p99": 0.009742848254653897,
+            "max": 0.009742848254653897
+          },
+          "rotation_error_deg": {
+            "count": 295,
+            "mean": 1.6892061335102488,
+            "std": 2.220446049250313e-16,
+            "min": 1.689206133510249,
+            "p50": 1.689206133510249,
+            "p90": 1.689206133510249,
+            "p95": 1.689206133510249,
+            "p99": 1.689206133510249,
+            "max": 1.689206133510249
+          }
+        },
+        "right": {
+          "pair_count": 295,
+          "translation_error_m": {
+            "count": 295,
+            "mean": 0.010599351075432861,
+            "std": 0.0,
+            "min": 0.010599351075432861,
+            "p50": 0.010599351075432861,
+            "p90": 0.010599351075432861,
+            "p95": 0.010599351075432861,
+            "p99": 0.010599351075432861,
+            "max": 0.010599351075432861
+          },
+          "rotation_error_deg": {
+            "count": 295,
+            "mean": 1.6365840471591608,
+            "std": 2.220446049250313e-16,
+            "min": 1.6365840471591606,
+            "p50": 1.6365840471591606,
+            "p90": 1.6365840471591606,
+            "p95": 1.6365840471591606,
+            "p99": 1.6365840471591606,
+            "max": 1.6365840471591606
+          }
+        }
+      },
+      "last_action": {
+        "left": {
+          "pair_count": 295,
+          "translation_error_m": {
+            "count": 295,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "rotation_error_deg": {
+            "count": 295,
+            "mean": 6.506347159947751e-07,
+            "std": 0.0,
+            "min": 6.506347159947751e-07,
+            "p50": 6.506347159947751e-07,
+            "p90": 6.506347159947751e-07,
+            "p95": 6.506347159947751e-07,
+            "p99": 6.506347159947751e-07,
+            "max": 6.506347159947751e-07
+          }
+        },
+        "right": {
+          "pair_count": 295,
+          "translation_error_m": {
+            "count": 295,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "rotation_error_deg": {
+            "count": 295,
+            "mean": 6.71484785838641e-07,
+            "std": 2.117582368135751e-22,
+            "min": 6.714847858386408e-07,
+            "p50": 6.714847858386408e-07,
+            "p90": 6.714847858386408e-07,
+            "p95": 6.714847858386408e-07,
+            "p99": 6.714847858386408e-07,
+            "max": 6.714847858386408e-07
+          }
+        }
+      }
+    }
+  }
+}

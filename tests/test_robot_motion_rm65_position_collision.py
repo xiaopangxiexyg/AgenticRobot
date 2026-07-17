@@ -143,6 +143,41 @@ def test_collision_epsilon_cannot_remove_the_configured_minimum_margin() -> None
         )
 
 
+def test_iterative_solve_policy_runs_shared_minimum_and_reports_pose_error() -> None:
+    solver = _FakeDualSolver()
+    planner = _planner(
+        solver,
+        config=RM65PositionCollisionPlannerConfig(
+            reference_hz=60.0,
+            max_joint_velocity_rad_s=(6.0,) * 6,
+            damping=0.03,
+            solve_min_iterations=2,
+            solve_max_iterations=2,
+        ),
+    )
+    planner.reset({"left": np.zeros(6), "right": np.zeros(6)})
+
+    result = planner.plan_pose_reference(
+        {"left": _target(), "right": _target()}
+    )
+
+    assert len(solver.solve_targets) == 2
+    assert result.metadata["ik_solve_iterations"] == 2
+    assert result.metadata["ik_solve_iteration_min"] == 2
+    assert result.metadata["ik_solve_iteration_max"] == 2
+    assert result.metadata["ik_solve_iteration_stop_reason"] == "pose_tolerance"
+    assert result.metadata["ik_damping"] == pytest.approx(0.03)
+    assert result.metadata["ik_solve_pose_error"]["left"]["translation_m"] == 0.0
+
+
+def test_iterative_solve_policy_rejects_invalid_iteration_range() -> None:
+    with pytest.raises(ValueError, match="solve_min_iterations"):
+        RM65PositionCollisionPlannerConfig(
+            solve_min_iterations=3,
+            solve_max_iterations=2,
+        )
+
+
 def test_reset_requires_complete_dual_qpos_and_fail_closes_unavailable_distance() -> None:
     solver = _FakeDualSolver()
     planner = _planner(solver)

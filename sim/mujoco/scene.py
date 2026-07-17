@@ -190,6 +190,12 @@ class MujocoScene:
         self._body_ids = self._build_body_ids()
         self._geom_ids = self._build_geom_ids()
         self._camera_ids = self._build_camera_ids()
+        self._kinematic_qpos_indices = self._build_kinematic_qpos_indices()
+        self._kinematic_qpos_offset = {
+            int(address): offset
+            for offset, address in enumerate(self._kinematic_qpos_indices)
+        }
+        self._collision_projector = None
         self.forward()
 
     @classmethod
@@ -359,6 +365,20 @@ class MujocoScene:
                 out[str(name)] = int(self.model.jnt_qposadr[joint_index])
         return out
 
+    def _build_kinematic_qpos_indices(self) -> np.ndarray:
+        addresses: list[int] = []
+        for side in sorted(self.arm_specs):
+            addresses.extend(
+                self.joint_qpos_addr(name) for name in self.arm_specs[side].joint_names
+            )
+        for name in sorted(self.gripper_specs):
+            addresses.extend(
+                self.joint_qpos_addr(joint) for joint in self.gripper_specs[name].joint_names
+            )
+        if len(addresses) != len(set(addresses)):
+            raise RuntimeError("Kinematic control layout contains duplicate qpos addresses.")
+        return np.asarray(addresses, dtype=np.int32)
+
     def _build_joint_ids(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for joint_index in range(self.model.njnt):
@@ -521,6 +541,7 @@ class MujocoScene:
         )
 
     def set_arm_qpos(self, side: str, qpos: Sequence[float]) -> None:
+        """Teleport one arm for reset/FK/faithful replay; no safety projection."""
         spec = self.arm_specs[side]
         values = np.asarray(qpos, dtype=float).reshape(6)
         for joint_name, value in zip(spec.joint_names, values):
@@ -528,12 +549,172 @@ class MujocoScene:
         self.forward()
 
     def set_qpos_by_side(self, qpos_by_side: Mapping[str, Sequence[float]]) -> None:
+        """Teleport arms for reset/FK/faithful replay; no safety projection."""
         for side, qpos in qpos_by_side.items():
             spec = self.arm_specs[side]
             values = np.asarray(qpos, dtype=float).reshape(6)
             for joint_name, value in zip(spec.joint_names, values):
                 self.data.qpos[self.joint_qpos_addr(joint_name)] = float(value)
         self.forward()
+
+    @property
+    def collision_safety_available(self) -> bool:
+        return bool(self.scene_spec is not None and self.scene_spec.collision.enabled)
+
+    def kinematic_controlled_qpos(self) -> np.ndarray:
+        return self.data.qpos[self._kinematic_qpos_indices].copy()
+
+    @property
+    def kinematic_qpos_indices(self) -> np.ndarray:
+        view = self._kinematic_qpos_indices.view()
+        view.setflags(write=False)
+        return view
+
+    def arm_qpos_from_kinematic_vector(
+        self, controlled_qpos: Sequence[float], side: str
+    ) -> np.ndarray:
+        values = np.asarray(controlled_qpos, dtype=float).reshape(-1)
+        if values.shape != (self._kinematic_qpos_indices.size,):
+            raise ValueError("controlled_qpos does not match scene control layout.")
+        return np.asarray(
+            [
+                values[self._kinematic_qpos_offset[self.joint_qpos_addr(joint)]]
+                for joint in self.arm_specs[str(side)].joint_names
+            ],
+            dtype=float,
+        )
+
+    def gripper_close_from_kinematic_vector(
+        self, controlled_qpos: Sequence[float], name: str
+    ) -> float:
+        values = np.asarray(controlled_qpos, dtype=float).reshape(-1)
+        if values.shape != (self._kinematic_qpos_indices.size,):
+            raise ValueError("controlled_qpos does not match scene control layout.")
+        spec = self.gripper_specs[self._resolve_gripper_name(name)]
+        qpos = np.asarray(
+            [
+                values[self._kinematic_qpos_offset[self.joint_qpos_addr(joint)]]
+                for joint in spec.joint_names
+            ],
+            dtype=float,
+        )
+        return spec.close_from_qpos(qpos)
+
+    def kinematic_target_vector(
+        self,
+        base_qpos: Sequence[float],
+        qpos_by_side: Mapping[str, Sequence[float]],
+        *,
+        gripper_close_by_name: Mapping[str, float] | None = None,
+    ) -> np.ndarray:
+        target = np.asarray(base_qpos, dtype=float).reshape(-1).copy()
+        if target.shape != (self._kinematic_qpos_indices.size,):
+            raise ValueError("base_qpos does not match the scene kinematic control layout.")
+        for side, qpos in qpos_by_side.items():
+            spec = self.arm_specs[str(side)]
+            values = np.asarray(qpos, dtype=float).reshape(6)
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{side} qpos must be finite.")
+            for joint_name, value in zip(spec.joint_names, values):
+                address = self.joint_qpos_addr(joint_name)
+                target[self._kinematic_qpos_offset[address]] = value
+        for name, close in (gripper_close_by_name or {}).items():
+            spec = self.gripper_specs[self._resolve_gripper_name(name)]
+            normalized_close = float(close)
+            if not np.isfinite(normalized_close) or not 0.0 <= normalized_close <= 1.0:
+                raise ValueError(f"gripper close for {spec.name!r} must be finite and in [0, 1].")
+            for joint_name, value in zip(spec.joint_names, spec.qpos_from_close(normalized_close)):
+                address = self.joint_qpos_addr(joint_name)
+                target[self._kinematic_qpos_offset[address]] = value
+        return target
+
+    def collision_projector(self):
+        if not self.collision_safety_available:
+            return None
+        if self._collision_projector is None:
+            from .collision_safety import (
+                CollisionSafetyPolicy,
+                KinematicCollisionProjector,
+            )
+
+            collision = self.scene_spec.collision
+
+            self._collision_projector = KinematicCollisionProjector(
+                self.mujoco,
+                self.model,
+                self._kinematic_qpos_indices,
+                CollisionSafetyPolicy(
+                    minimum_clearance_m=collision.safety_minimum_clearance_m,
+                    hard_penetration_m=collision.safety_hard_penetration_m,
+                    sweep_max_joint_step_rad=collision.safety_sweep_max_joint_step_rad,
+                    projection_iterations=collision.safety_projection_iterations,
+                ),
+            )
+        return self._collision_projector
+
+    def write_kinematic_controlled_qpos(
+        self,
+        controlled_qpos: Sequence[float],
+        *,
+        zero_controlled_qvel: bool = True,
+    ) -> None:
+        """Raw accepted-state write used only after collision validation."""
+
+        values = np.asarray(controlled_qpos, dtype=float).reshape(-1)
+        if values.shape != (self._kinematic_qpos_indices.size,):
+            raise ValueError("controlled_qpos does not match scene control layout.")
+        self.data.qpos[self._kinematic_qpos_indices] = values
+        if zero_controlled_qvel:
+            dof_addresses: list[int] = []
+            for side in sorted(self.arm_specs):
+                dof_addresses.extend(
+                    self.joint_dof_addr(name) for name in self.arm_specs[side].joint_names
+                )
+            for name in sorted(self.gripper_specs):
+                dof_addresses.extend(
+                    self.joint_dof_addr(joint)
+                    for joint in self.gripper_specs[name].joint_names
+                )
+            self.data.qvel[np.asarray(dof_addresses, dtype=np.int32)] = 0.0
+
+    def apply_safe_kinematic_target(
+        self,
+        qpos_by_side: Mapping[str, Sequence[float]],
+        *,
+        gripper_close_by_name: Mapping[str, float] | None = None,
+        project_invalid: bool = False,
+    ):
+        """Apply a collision-projected kinematic command without stepping time."""
+
+        start = self.kinematic_controlled_qpos()
+        requested = self.kinematic_target_vector(
+            start,
+            qpos_by_side,
+            gripper_close_by_name=gripper_close_by_name,
+        )
+        projector = self.collision_projector()
+        if projector is None:
+            result = None
+            accepted = requested
+        else:
+            result = projector.project(
+                self.data,
+                start_qpos=start,
+                requested_qpos=requested,
+            )
+            if result.status == "invalid_safe_state":
+                raise RuntimeError(
+                    "Cannot apply command from a collision-unsafe state: "
+                    f"{result.to_dict()}"
+                )
+            accepted = (
+                result.accepted_qpos
+                if project_invalid or not result.modified
+                else start
+            )
+        self.write_kinematic_controlled_qpos(accepted)
+        self.forward()
+        return result
 
     def step_kinematic_direct_qpos_debug(
         self,
@@ -546,36 +727,27 @@ class MujocoScene:
 
         This is intentionally a debug-only bridge for task-pipeline work before
         an actuator model has been identified.  It re-applies arm and gripper
-        qpos before each ``mj_step`` so gravity cannot collapse the uncontrolled
-        robot.  It does *not* model a real position servo, target tracking, or
-        physically valid robot/object contact forces.
+        qpos before and after each ``mj_step`` so gravity/contact integration
+        cannot move the prescribed robot away from its target. The free object
+        still receives the contact dynamics computed during ``mj_step``. It
+        does *not* model a real position servo or target tracking.
         """
 
-        controlled_dof_addrs: list[int] = []
-        for side, qpos in qpos_by_side.items():
-            spec = self.arm_specs[side]
-            values = np.asarray(qpos, dtype=float).reshape(6)
-            if not np.all(np.isfinite(values)):
-                raise ValueError(f"{side} qpos must be finite.")
-            for joint_name, value in zip(spec.joint_names, values):
-                self.data.qpos[self.joint_qpos_addr(joint_name)] = float(value)
-                controlled_dof_addrs.append(self.joint_dof_addr(joint_name))
-
-        for name, close in (gripper_close_by_name or {}).items():
-            spec = self.gripper_specs[self._resolve_gripper_name(name)]
-            normalized_close = float(close)
-            if not np.isfinite(normalized_close) or not 0.0 <= normalized_close <= 1.0:
-                raise ValueError(f"gripper close for {spec.name!r} must be finite and in [0, 1].")
-            values = spec.qpos_from_close(normalized_close)
-            for joint_name, value in zip(spec.joint_names, values):
-                self.data.qpos[self.joint_qpos_addr(joint_name)] = float(value)
-                controlled_dof_addrs.append(self.joint_dof_addr(joint_name))
-
-        if zero_controlled_qvel:
-            for dof_addr in controlled_dof_addrs:
-                self.data.qvel[dof_addr] = 0.0
+        target = self.kinematic_target_vector(
+            self.kinematic_controlled_qpos(),
+            qpos_by_side,
+            gripper_close_by_name=gripper_close_by_name,
+        )
+        self.write_kinematic_controlled_qpos(
+            target,
+            zero_controlled_qvel=zero_controlled_qvel,
+        )
         self.forward()
         self.mujoco.mj_step(self.model, self.data)
+        self.write_kinematic_controlled_qpos(
+            target,
+            zero_controlled_qvel=zero_controlled_qvel,
+        )
         self.forward()
 
     def arm_qpos_by_side(self) -> dict[str, list[float]]:
@@ -607,6 +779,7 @@ class MujocoScene:
         )
 
     def set_gripper_qpos(self, name: str | None, qpos: Sequence[float]) -> None:
+        """Teleport gripper joints for reset/replay; no safety projection."""
         spec = self.gripper_specs[self._resolve_gripper_name(name)]
         values = np.asarray(qpos, dtype=float).reshape(len(spec.joint_names))
         for joint_name, value in zip(spec.joint_names, values):
@@ -618,6 +791,7 @@ class MujocoScene:
         return spec.close_from_qpos(self.get_gripper_qpos(spec.name))
 
     def set_gripper_close(self, name: str | None, close: float) -> None:
+        """Teleport gripper close state for reset/replay; no safety projection."""
         spec = self.gripper_specs[self._resolve_gripper_name(name)]
         self.set_gripper_qpos(spec.name, spec.qpos_from_close(close))
 

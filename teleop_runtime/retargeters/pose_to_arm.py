@@ -7,7 +7,6 @@ import numpy as np
 
 from ..arm_frames import TOOL_TCP_FRAME, TOOL_TCP_SEMANTICS
 from ..calibration import TeleopCalibration
-from ..clutch import DeltaClutchController
 from ..hand_tcp_alignment import apply_local_pose_rotation
 from ..interfaces import Retargeter
 from ..registry import register_retargeter
@@ -17,6 +16,9 @@ from ..sources.pose.vive_motion import (
     TrackerMotionIntentStateMachine,
 )
 from ..transforms import as_pose_matrix, rotation_is_orthonormal
+
+
+DEFAULT_RETARGET_CONTROL_MODE = "absolute"
 
 
 def _rotation_about_z(yaw_rad: float) -> np.ndarray:
@@ -38,8 +40,7 @@ class PoseToArmRetargeterConfig:
     input_channel_name: str
     effector_name: str | None = None
     tracker_role: str | None = None
-    clutch_channel_names: tuple[str, ...] = ()
-    control_mode: str = "delta_clutch"
+    control_mode: str = DEFAULT_RETARGET_CONTROL_MODE
     orientation_mode: str = "full"
     translation_scale: float = 1.0
     workspace_clip: bool = True
@@ -54,8 +55,11 @@ class PoseToArmRetargeterConfig:
     def __post_init__(self) -> None:
         if self.effector_name is None:
             self.effector_name = f"{self.side}_arm"
-        if not self.clutch_channel_names:
-            self.clutch_channel_names = (f"{self.side}_clutch_button", "clutch_button")
+        if self.control_mode != DEFAULT_RETARGET_CONTROL_MODE:
+            raise ValueError(
+                "delta_clutch has been hard-archived; PoseToArmRetargeter only supports "
+                f"{DEFAULT_RETARGET_CONTROL_MODE!r}."
+            )
         if self.input_local_translation_offset is not None:
             translation = np.asarray(
                 self.input_local_translation_offset,
@@ -79,13 +83,9 @@ class PoseToArmRetargeter(Retargeter):
         self,
         config: PoseToArmRetargeterConfig,
         *,
-        clutch_controller: DeltaClutchController | None = None,
         fixed_orientation_desk: np.ndarray | None = None,
     ):
         self.config = config
-        self.clutch_controller = (
-            clutch_controller if clutch_controller is not None else DeltaClutchController()
-        )
         self.fixed_orientation_desk = None
         if fixed_orientation_desk is not None:
             orientation = np.asarray(fixed_orientation_desk, dtype=float)
@@ -168,39 +168,11 @@ class PoseToArmRetargeter(Retargeter):
             )
         return {
             "channel": channel,
-            "clutch_pressed": self._resolve_clutch_pressed(observation),
+            "clutch_pressed": False,
             "pose_operator": pose_operator,
             "target_pose_desk": target_pose_desk,
             "tracker_role": self._resolve_tracker_role(channel),
         }
-
-    def reanchor_to_current_input(
-        self,
-        observation: TeleopObservation,
-        calibration: TeleopCalibration,
-        *,
-        robot_pose_desk: np.ndarray,
-    ) -> None:
-        channel = observation.get_channel(self.config.input_channel_name)
-        if channel is None or not channel.valid:
-            raise RuntimeError(
-                f"{self.name} cannot reanchor without a valid '{self.config.input_channel_name}' channel."
-            )
-        pose_desk, _ = self._resolve_pose_desk_and_operator(
-            channel=channel,
-            calibration=calibration,
-        )
-        human_reference = self._apply_clutch_reference_mapping(pose_desk)
-        clutch_pressed = self._resolve_clutch_pressed(observation)
-        self.clutch_controller.reanchor(
-            self.config.side,
-            human_pose_reference=human_reference,
-            robot_pose_target=robot_pose_desk,
-            timestamp=float(channel.timestamp),
-            clutch_pressed=clutch_pressed,
-        )
-        self._last_target_pose_desk = as_pose_matrix(robot_pose_desk)
-        self._tracker_motion_intent.reset("reanchored")
 
     def build_command_from_target_pose_desk(
         self,
@@ -222,10 +194,8 @@ class PoseToArmRetargeter(Retargeter):
             target_pose_tcp_desk,
             side=self.config.side,
         )
-        clutch_pressed = self._resolve_clutch_pressed(observation)
         tracker_motion_intent = self._resolve_tracker_motion_intent(
             channel=channel,
-            clutch_pressed=clutch_pressed,
         )
 
         command.add_command(
@@ -253,7 +223,7 @@ class PoseToArmRetargeter(Retargeter):
                     "orientation_mode": self.config.orientation_mode,
                     "input_channel": self.config.input_channel_name,
                     "tracker_role": self._resolve_tracker_role(channel),
-                    "clutch_pressed": clutch_pressed,
+                    "clutch_pressed": False,
                     "tracker_motion_intent": tracker_motion_intent,
                     "target_pose_operator": None
                     if pose_operator is None
@@ -277,7 +247,6 @@ class PoseToArmRetargeter(Retargeter):
         self,
         *,
         channel,
-        clutch_pressed: bool,
     ) -> dict[str, object]:
         if not bool(self.config.tracker_motion_intent_enabled):
             return {
@@ -294,7 +263,7 @@ class PoseToArmRetargeter(Retargeter):
                 dict(motion_window) if isinstance(motion_window, dict) else None
             ),
             tracker_pose=as_pose_matrix(channel.value),
-            clutch_pressed=bool(clutch_pressed),
+            clutch_pressed=False,
         )
 
     def retarget(
@@ -313,34 +282,7 @@ class PoseToArmRetargeter(Retargeter):
             calibration=calibration,
         )
 
-        clutch_pressed = self._resolve_clutch_pressed(observation)
-        if self.config.control_mode == "absolute":
-            target_pose_desk = self._apply_absolute_mapping(pose_desk)
-        elif self.config.control_mode in {"delta_clutch", "delta_clutch_scaled"}:
-            if self._last_target_pose_desk is None and not clutch_pressed:
-                command.metadata.update(
-                    {
-                        "skipped": "waiting_for_clutch_anchor",
-                        "input_channel": self.config.input_channel_name,
-                    }
-                )
-                return command
-            robot_anchor = (
-                self._last_target_pose_desk.copy()
-                if self._last_target_pose_desk is not None
-                else self._apply_clutch_reference_mapping(pose_desk)
-            )
-            human_reference = self._apply_clutch_reference_mapping(pose_desk)
-            target_pose_desk = self.clutch_controller.update(
-                side=self.config.side,
-                clutch_pressed=clutch_pressed,
-                human_pose_reference=human_reference,
-                robot_pose_target=robot_anchor,
-                timestamp=float(channel.timestamp),
-                scale=self.config.translation_scale,
-            )
-        else:
-            raise ValueError(f"Unsupported control_mode: {self.config.control_mode}")
+        target_pose_desk = self._apply_absolute_mapping(pose_desk)
 
         target_pose_desk = self._apply_orientation_policy(target_pose_desk)
         if self.config.workspace_clip:
@@ -354,14 +296,6 @@ class PoseToArmRetargeter(Retargeter):
             calibration=calibration,
             pose_operator=pose_operator,
         )
-
-    def _resolve_clutch_pressed(self, observation: TeleopObservation) -> bool:
-        for channel_name in self.config.clutch_channel_names:
-            channel = observation.get_channel(channel_name)
-            if channel is None:
-                continue
-            return bool(channel.value)
-        return False
 
     def _resolve_tracker_role(self, channel) -> str | None:
         if self.config.tracker_role is not None:
@@ -432,7 +366,7 @@ class PoseToArmRetargeter(Retargeter):
             return as_pose_matrix(pose)
         return apply_local_pose_rotation(pose, self._input_local_rotation_offset)
 
-    def _apply_clutch_reference_mapping(self, pose_desk: np.ndarray) -> np.ndarray:
+    def _apply_home_relative_translation(self, pose_desk: np.ndarray) -> np.ndarray:
         current_human_pose = as_pose_matrix(pose_desk)
         target = current_human_pose.copy()
         translation_scale = float(self.config.translation_scale)
@@ -448,7 +382,7 @@ class PoseToArmRetargeter(Retargeter):
 
     def _apply_absolute_mapping(self, pose_desk: np.ndarray) -> np.ndarray:
         current_human_pose = as_pose_matrix(pose_desk)
-        target = self._apply_clutch_reference_mapping(current_human_pose)
+        target = self._apply_home_relative_translation(current_human_pose)
         if self._home_human_pose_desk is None or self._home_robot_pose_desk is None:
             return target
 

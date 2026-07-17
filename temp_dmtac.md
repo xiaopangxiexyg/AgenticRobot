@@ -34,7 +34,6 @@ COMMON_REAL_TELEOP_ARGS=(
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json
   --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json
   --gui
-  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json
   --hand-backend dmtac-gripper
   --gripper-task-profile teleop_runtime/configs/gripper_task_profile.example.json
   --q6-hold-recalibration-gesture
@@ -159,45 +158,6 @@ POSITION_CONTROL_ARGS=(
   --arm-canfd-follow
   --position-post-ik-qpos-smoothing-alpha 0.9
   --arm-follow-qpos-alpha 0.1
-  --arm-canfd-trajectory-mode 0
-  --arm-canfd-radio 0
-)
-```
-
-### 分支 2B：当前60 Hz reference/IK → 120 Hz qcmd，8×跟踪 + 0.675° step guard
-
-这是当前真机平滑性复测使用的 position-only overlay。独立 step guard 直接接到
-120 Hz acceleration-limited planner，不通过降低 `--arm-max-angvel` 获得，因此不会同时
-压低持续跟踪速度。它位于 final alpha=0.9 之前，正常跟踪时实际 qcmd 单步最大约为
-`0.675° × 0.9 = 0.6075°`。
-
-运行前仍需确认 `robot_motion/configs/joint_velocity_limits.json` 中
-`profiles.rm65.max_velocity_deg_s` 已在受控测试窗口临时设置为
-`[321,321,413,688,688,917]`，否则 qref final step 仍不是完整8×。
-
-```bash
-POSITION_60_120_8X_STEP_GUARD_ARGS=(
-  --arm-execution-profile position
-  --arm-control-mode position
-  --hz 15
-  --position-reference-hz 60
-  --dual-arm-ik-hz 60
-  --position-reference-max-age-sec 0.2
-  --arm-control-hz 120
-  --arm-canfd-follow
-  --position-command-planner acceleration_limited
-  --ik-tuning-json teleop_runtime/configs/rm65_ik_tuning.json
-  --position-ik-solve-max-iterations 1
-  --position-ik-local-step-clip-scale 8
-  --arm-max-angvel 5.6,5.6,7.2,12,12,16.0
-  --position-max-acceleration-rad-s2 56,56,72,120,120,160
-  --position-max-command-step-deg 0.675
-  --position-velocity-ramp-sec 0.10
-  --position-post-ik-qpos-smoothing-alpha 0.17
-  --position-post-ik-qpos-smoothing-fast-alpha 0.50
-  --position-post-ik-qpos-smoothing-adaptive
-  --arm-follow-qpos-alpha 0.9
-  --position-degraded-speed-scale 0.50
   --arm-canfd-trajectory-mode 0
   --arm-canfd-radio 0
 )
@@ -349,18 +309,6 @@ taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   "${CONTROL_DEBUG_FULL_ARGS[@]}"
 ```
 
-### 当前平滑复测：方案 A + position 60→120 Hz + 8× + 0.675° guard
-
-```bash
-taskset -c 0-11 python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  "${COMMON_REAL_TELEOP_ARGS[@]}" \
-  "${DMTAC_CAPTURE_COMMON_ARGS[@]}" \
-  "${DMTAC_A_ARGS[@]}" \
-  "${DATASET_COMMON_ARGS[@]}" \
-  "${POSITION_60_120_8X_STEP_GUARD_ARGS[@]}" \
-  "${CONTROL_DEBUG_FULL_ARGS[@]}"
-```
-
 ### 方案 B + position 75→150 Hz + summary contract
 
 ```bash
@@ -383,7 +331,6 @@ RIGHT_ONLY_COMMON_ARGS=(
   --right-arm-ip "$RIGHT_ARM_IP"
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json
   --gui
-  --load-profile teleop_records/calibration_profiles/20260702_152040_vive_rm65_real_teleop.json
   --hand-backend dmtac-gripper
   --q6-hold-recalibration-gesture
   --no-episode-recording
@@ -403,7 +350,6 @@ CANFD 曲线拟合：               --arm-canfd-trajectory-mode 1 --arm-canfd-ra
 CANFD controller 滤波：        --arm-canfd-trajectory-mode 2 --arm-canfd-radio 100
 修改IK后/轨迹前 qpos EMA：     --position-post-ik-qpos-smoothing-alpha 0.8
 修改最终高频发送 qpos EMA：    --arm-follow-qpos-alpha 0.8
-独立限制position planner单步： --position-max-command-step-deg 0.675
 恢复旧 position safety/filter：--safe-debug
 在 safe-debug 下关闭 hold：     --safe-debug --disable-hold
 严格五分之一关节限速：         --strict-degree-limit
