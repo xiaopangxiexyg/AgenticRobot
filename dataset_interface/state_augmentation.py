@@ -141,6 +141,24 @@ def _as_batch(state_norm: Any, *, state_dim: int) -> tuple[np.ndarray, bool]:
     return state, squeeze
 
 
+def _as_mask_batch(initial_mask: Any, *, state: np.ndarray) -> np.ndarray:
+    """Validate and batch-align a mask produced by an earlier augmentation stage."""
+
+    mask = np.asarray(initial_mask, dtype=np.float32)
+    if mask.ndim == 1 and state.shape[0] == 1 and mask.shape == state.shape[1:]:
+        mask = mask.reshape(1, -1)
+    if mask.shape != state.shape:
+        raise ValueError(
+            "initial state augmentation mask must have the same shape as the normalized state, "
+            f"got {mask.shape} for state {state.shape}."
+        )
+    if not np.all(np.isfinite(mask)):
+        raise ValueError("initial state augmentation mask must be finite.")
+    if np.any((mask != 0.0) & (mask != 1.0)):
+        raise ValueError("initial state augmentation mask must contain only 0 or 1.")
+    return mask
+
+
 def _require_torch() -> Any:
     try:
         import torch
@@ -169,6 +187,26 @@ def _as_torch_batch(state_norm: Any, *, state_dim: int) -> tuple[Any, bool]:
     return state, squeeze
 
 
+def _as_torch_mask_batch(initial_mask: Any, *, state: Any) -> Any:
+    torch = _require_torch()
+    if isinstance(initial_mask, torch.Tensor):
+        mask = initial_mask.to(device=state.device, dtype=state.dtype)
+    else:
+        mask = torch.as_tensor(initial_mask, device=state.device, dtype=state.dtype)
+    if mask.ndim == 1 and state.shape[0] == 1 and tuple(mask.shape) == tuple(state.shape[1:]):
+        mask = mask.unsqueeze(0)
+    if tuple(mask.shape) != tuple(state.shape):
+        raise ValueError(
+            "initial state augmentation mask must have the same shape as the normalized state, "
+            f"got {tuple(mask.shape)} for state {tuple(state.shape)}."
+        )
+    if not bool(torch.isfinite(mask).all()):
+        raise ValueError("initial state augmentation mask must be finite.")
+    if bool(((mask != 0.0) & (mask != 1.0)).any()):
+        raise ValueError("initial state augmentation mask must contain only 0 or 1.")
+    return mask
+
+
 def _side_component_slices(layout: PolicyIOLayout) -> dict[str, tuple[slice, ...]]:
     result: dict[str, list[slice]] = {side: [] for side in SIDES}
     for component in layout.components("state", "continuous"):
@@ -184,6 +222,7 @@ def augment_normalized_state(
     layout: PolicyIOLayout,
     config: StateAugmentationConfig | None = None,
     rng: np.random.Generator | None = None,
+    initial_mask: Any | None = None,
 ) -> StateAugmentationResult:
     """Vectorize normalized-state augmentation over one training batch.
 
@@ -193,7 +232,11 @@ def augment_normalized_state(
 
     resolved = StateAugmentationConfig() if config is None else config
     state, squeeze = _as_batch(state_norm, state_dim=layout.state_dim)
-    mask = np.ones_like(state, dtype=np.float32)
+    mask = (
+        np.ones_like(state, dtype=np.float32)
+        if initial_mask is None
+        else _as_mask_batch(initial_mask, state=state).copy()
+    )
     noise = np.zeros_like(state, dtype=np.float32)
     if resolved.enabled:
         random = np.random.default_rng() if rng is None else rng
@@ -225,6 +268,7 @@ def augment_normalized_state_torch(
     layout: PolicyIOLayout,
     config: StateAugmentationConfig | None = None,
     generator: Any | None = None,
+    initial_mask: Any | None = None,
 ) -> TorchStateAugmentationResult:
     """GPU/CPU Torch equivalent of :func:`augment_normalized_state`.
 
@@ -236,7 +280,11 @@ def augment_normalized_state_torch(
     torch = _require_torch()
     resolved = StateAugmentationConfig() if config is None else config
     state, squeeze = _as_torch_batch(state_norm, state_dim=layout.state_dim)
-    mask = torch.ones_like(state)
+    mask = (
+        torch.ones_like(state)
+        if initial_mask is None
+        else _as_torch_mask_batch(initial_mask, state=state).clone()
+    )
     noise = torch.zeros_like(state)
     if resolved.enabled:
         if resolved.noise_std > 0.0:
@@ -302,27 +350,52 @@ class NormalizedStateInputAdapter:
         state_norm: Any,
         *,
         rng: np.random.Generator | None = None,
+        initial_mask: Any | None = None,
     ) -> StateAugmentationResult:
         return augment_normalized_state(
             state_norm,
             layout=self.layout,
             config=self.config,
             rng=rng,
+            initial_mask=initial_mask,
         )
 
-    def model_input(self, state_norm: Any, *, rng: np.random.Generator | None = None) -> np.ndarray:
-        return self.apply(state_norm, rng=rng).model_input(self.state_input_mode)
+    def model_input(
+        self,
+        state_norm: Any,
+        *,
+        rng: np.random.Generator | None = None,
+        initial_mask: Any | None = None,
+    ) -> np.ndarray:
+        return self.apply(state_norm, rng=rng, initial_mask=initial_mask).model_input(self.state_input_mode)
 
-    def apply_torch(self, state_norm: Any, *, generator: Any | None = None) -> TorchStateAugmentationResult:
+    def apply_torch(
+        self,
+        state_norm: Any,
+        *,
+        generator: Any | None = None,
+        initial_mask: Any | None = None,
+    ) -> TorchStateAugmentationResult:
         return augment_normalized_state_torch(
             state_norm,
             layout=self.layout,
             config=self.config,
             generator=generator,
+            initial_mask=initial_mask,
         )
 
-    def torch_model_input(self, state_norm: Any, *, generator: Any | None = None) -> Any:
-        return self.apply_torch(state_norm, generator=generator).model_input(self.state_input_mode)
+    def torch_model_input(
+        self,
+        state_norm: Any,
+        *,
+        generator: Any | None = None,
+        initial_mask: Any | None = None,
+    ) -> Any:
+        return self.apply_torch(
+            state_norm,
+            generator=generator,
+            initial_mask=initial_mask,
+        ).model_input(self.state_input_mode)
 
 
 __all__ = [

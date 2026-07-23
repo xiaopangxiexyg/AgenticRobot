@@ -9,7 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from robot_motion.replay.control_schedule import DEFAULT_REPLAY_REFERENCE_HZ
+from robot_motion.replay.control_schedule import (
+    DEFAULT_POSITION_QPOS_CONTROL_HZ,
+    DEFAULT_REPLAY_REFERENCE_HZ,
+)
 from sim.mujoco.controllers import QposController
 from sim.mujoco.replay.dataset import (
     fallback_hz,
@@ -33,7 +36,9 @@ from sim.mujoco.scene import MujocoScene
 from sim.mujoco.urdf import discover_camera_mounts, parse_urdf
 
 
-URDF = Path("assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf")
+URDF = Path(
+    "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+)
 DATASET = Path("datasets/2026-07-03_vive_rm65_real_teleop")
 
 
@@ -106,7 +111,7 @@ def test_close_viewer_waits_for_handle_to_stop() -> None:
     assert handle.polls >= 2
 
 
-def test_replay_runner_defaults_to_dataset_action_rate_and_shared_position_rates() -> None:
+def test_debug_qpos_runner_is_explicit_and_uses_shared_position_rates() -> None:
     parser = build_arg_parser()
     args = parser.parse_args(
         [
@@ -119,9 +124,11 @@ def test_replay_runner_defaults_to_dataset_action_rate_and_shared_position_rates
         ]
     )
 
+    assert "DEBUG ONLY" in parser.description
+    assert "python -m sim.mujoco.replay" in parser.description
     assert args.action_hz == 0.0
     assert args.reference_hz == pytest.approx(DEFAULT_REPLAY_REFERENCE_HZ)
-    assert args.control_hz == pytest.approx(150.0)
+    assert args.control_hz == pytest.approx(DEFAULT_POSITION_QPOS_CONTROL_HZ)
     assert args.dt == 0.0
 
     alias_args = parser.parse_args(

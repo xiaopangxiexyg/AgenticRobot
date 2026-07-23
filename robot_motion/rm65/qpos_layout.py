@@ -5,7 +5,12 @@ from typing import Any
 
 import numpy as np
 
-from .constants import ARM_DOF, SIDES
+from .constants import (
+    ARM_DOF,
+    RM65_ABSOLUTE_Q_MAX_RAD,
+    RM65_ABSOLUTE_Q_MIN_RAD,
+    SIDES,
+)
 
 
 def normalize_side(side: str) -> str:
@@ -50,3 +55,22 @@ def validate_qpos_by_side(qpos_by_side: Mapping[str, Any]) -> dict[str, np.ndarr
             raise ValueError(f"duplicate RM65 side {side!r}.")
         out[side] = as_rm65_qpos(values, label=f"{side}.qpos")
     return out
+
+
+def validate_qpos_within_absolute_limits(
+    qpos_by_side: Mapping[str, Any],
+    *,
+    label: str = "qpos_by_side",
+) -> dict[str, np.ndarray]:
+    qpos = validate_qpos_by_side(qpos_by_side)
+    lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
+    upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+    for side, values in qpos.items():
+        invalid = np.flatnonzero((values < lower) | (values > upper))
+        if invalid.size:
+            joint_index = int(invalid[0])
+            raise ValueError(
+                f"{label}.{side}.joint{joint_index + 1}={values[joint_index]:.9f} rad "
+                f"is outside [{lower[joint_index]:.9f}, {upper[joint_index]:.9f}] rad."
+            )
+    return qpos

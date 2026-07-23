@@ -15,8 +15,9 @@ Recovery is deliberately fail-closed:
 * a detached guardian restores the journal if the parent dies unexpectedly;
 * a later invocation restores every unfinished journal before it may capture.
 
-The raw UDP payload is always retained as base64.  JSON payloads are also
-decoded and common joint fields are promoted for convenient offline use.
+The default ``full`` format retains every raw UDP payload as base64.  The
+``compact`` format keeps fixed promoted joint fields and retains raw JSON only
+for the first valid schema sample or an error/unexpected datagram.
 """
 
 from __future__ import annotations
@@ -366,21 +367,32 @@ def _find_nested_mapping(value: Any, key: str) -> Mapping[str, Any] | None:
     return None
 
 
-def decode_udp_payload(payload: bytes) -> dict[str, Any]:
-    """Preserve raw bytes and opportunistically normalize JSON joint fields."""
+def decode_udp_payload(
+    payload: bytes,
+    *,
+    compact: bool = False,
+    retain_raw: bool = False,
+) -> dict[str, Any]:
+    """Decode feedback while allowing compact rows to omit redundant payloads."""
 
     result: dict[str, Any] = {
         "payload_size": len(payload),
-        "payload_base64": base64.b64encode(payload).decode("ascii"),
         "payload_format": "binary",
     }
     try:
         text = payload.rstrip(b"\x00\r\n").decode("utf-8")
         decoded = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
+        # Undecodable packets are diagnostic errors, so compact mode retains
+        # their bytes as well.
+        result["payload_base64"] = base64.b64encode(payload).decode("ascii")
         return result
     result["payload_format"] = "json"
-    result["payload_json"] = _json_safe(decoded)
+    if not compact or retain_raw:
+        result["payload_base64"] = base64.b64encode(payload).decode("ascii")
+        result["payload_json"] = _json_safe(decoded)
+        if compact:
+            result["schema_sample"] = True
     joint = _find_nested_mapping(decoded, "joint_status")
     if joint is None and isinstance(decoded, Mapping):
         joint = decoded
@@ -464,9 +476,18 @@ class UdpTraceWriter:
 
 
 class UdpReceiver:
-    def __init__(self, spec: ArmSpec, writer: UdpTraceWriter):
+    def __init__(
+        self,
+        spec: ArmSpec,
+        writer: UdpTraceWriter,
+        *,
+        trace_format: str = "full",
+    ):
         self.spec = spec
         self.writer = writer
+        self.trace_format = str(trace_format).strip().lower()
+        if self.trace_format not in {"full", "compact"}:
+            raise ValueError(f"Unsupported UDP trace format: {trace_format!r}")
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
         self.socket.bind((spec.local_ip, int(spec.push_port)))
@@ -480,6 +501,7 @@ class UdpReceiver:
         self.json_payload_count = 0
         self.joint_position_count = 0
         self.joint_speed_count = 0
+        self.schema_sample_recorded = False
         self.error: BaseException | None = None
 
     def start(self) -> None:
@@ -507,6 +529,12 @@ class UdpReceiver:
                 receive_monotonic_ns = time.monotonic_ns()
                 if str(source[0]) != self.spec.arm_ip:
                     self.unexpected_source_count += 1
+                    unexpected_payload = decode_udp_payload(
+                        payload,
+                        compact=self.trace_format == "compact",
+                        retain_raw=True,
+                    )
+                    unexpected_payload.pop("schema_sample", None)
                     self.writer.enqueue(
                         {
                             "schema": TRACE_SCHEMA,
@@ -517,34 +545,48 @@ class UdpReceiver:
                             "source_port": int(source[1]),
                             "receive_wall_time_ns": int(receive_wall_ns),
                             "receive_monotonic_time_ns": int(receive_monotonic_ns),
-                            **decode_udp_payload(payload),
+                            **unexpected_payload,
                         }
                     )
                     continue
                 self.sequence += 1
-                decoded = decode_udp_payload(payload)
+                retain_schema_sample = bool(
+                    self.trace_format == "compact"
+                    and not self.schema_sample_recorded
+                )
+                decoded = decode_udp_payload(
+                    payload,
+                    compact=self.trace_format == "compact",
+                    retain_raw=retain_schema_sample,
+                )
                 if decoded.get("payload_format") == "json":
                     self.json_payload_count += 1
+                    if retain_schema_sample:
+                        self.schema_sample_recorded = True
                 if "joint_position_deg" in decoded:
                     self.joint_position_count += 1
                 if "joint_speed_deg_s" in decoded:
                     self.joint_speed_count += 1
-                self.writer.enqueue(
-                    {
-                        "schema": TRACE_SCHEMA,
-                        "event": "feedback",
-                        "side": self.spec.side,
-                        "arm_ip": self.spec.arm_ip,
-                        "source_ip": str(source[0]),
-                        "source_port": int(source[1]),
-                        "local_ip": self.spec.local_ip,
-                        "local_port": int(self.spec.push_port),
-                        "sequence": int(self.sequence),
-                        "receive_wall_time_ns": int(receive_wall_ns),
-                        "receive_monotonic_time_ns": int(receive_monotonic_ns),
-                        **decoded,
-                    }
-                )
+                feedback_row = {
+                    "schema": TRACE_SCHEMA,
+                    "event": "feedback",
+                    "side": self.spec.side,
+                    "sequence": int(self.sequence),
+                    "receive_wall_time_ns": int(receive_wall_ns),
+                    "receive_monotonic_time_ns": int(receive_monotonic_ns),
+                    **decoded,
+                }
+                if self.trace_format == "full":
+                    feedback_row.update(
+                        {
+                            "arm_ip": self.spec.arm_ip,
+                            "source_ip": str(source[0]),
+                            "source_port": int(source[1]),
+                            "local_ip": self.spec.local_ip,
+                            "local_port": int(self.spec.push_port),
+                        }
+                    )
+                self.writer.enqueue(feedback_row)
         except BaseException as exc:  # noqa: BLE001 - propagated by close().
             self.error = exc
 
@@ -691,7 +733,13 @@ def capture(args: argparse.Namespace) -> int:
         receivers: list[UdpReceiver] = []
         try:
             for spec in specs:
-                receivers.append(UdpReceiver(spec, writer))
+                receivers.append(
+                    UdpReceiver(
+                        spec,
+                        writer,
+                        trace_format=str(args.trace_format),
+                    )
+                )
             _prepare_journal(
                 journal_path,
                 specs=specs,
@@ -749,6 +797,16 @@ def capture(args: argparse.Namespace) -> int:
                     "monotonic_time_ns": time.monotonic_ns(),
                     "cycle_ms": args.cycle_ms,
                     "duration_sec": args.duration_sec,
+                    "trace_format": str(args.trace_format),
+                    "arms": [
+                        {
+                            "side": spec.side,
+                            "arm_ip": spec.arm_ip,
+                            "local_ip": spec.local_ip,
+                            "push_port": int(spec.push_port),
+                        }
+                        for spec in specs
+                    ],
                     "journal_path": str(journal_path.resolve()),
                     "original_config_by_side": original_by_side,
                     "temporary_config_by_side": target_by_side,
@@ -804,6 +862,9 @@ def capture(args: argparse.Namespace) -> int:
                                 "json_payload": receiver.json_payload_count,
                                 "joint_position": receiver.joint_position_count,
                                 "joint_speed": receiver.joint_speed_count,
+                                "schema_sample_recorded": (
+                                    receiver.schema_sample_recorded
+                                ),
                             }
                             for receiver in receivers
                         },
@@ -942,6 +1003,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("teleop_records/actuator_feedback"),
     )
     capture_parser.add_argument("--queue-size", type=int, default=65536)
+    capture_parser.add_argument(
+        "--format",
+        dest="trace_format",
+        choices=("full", "compact"),
+        default="full",
+        help=(
+            "full retains every raw payload; compact retains promoted joint fields and only "
+            "one raw schema sample per arm plus error packets."
+        ),
+    )
     capture_parser.add_argument(
         "--apply",
         action="store_true",

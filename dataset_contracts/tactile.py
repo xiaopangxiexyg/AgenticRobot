@@ -23,6 +23,8 @@ def tactile_stream_compression(spec: Mapping[str, Any]) -> str:
         encoding = str(spec.get("encoding") or "").strip().lower().replace("-", "_")
         if encoding.startswith("chunked_"):
             compression = encoding.removeprefix("chunked_")
+            if compression == "delta_zstd":
+                compression = "zstd"
         else:
             compression = "none"
     if compression == "raw_c_order":
@@ -65,6 +67,9 @@ class ChunkedTactileStream:
         self.shape = tuple(int(dim) for dim in self.spec.get("shape", ()) or ())
         self.frame_count = int(self.spec.get("frame_count") or 0)
         self.dtype = np.dtype(str(self.spec.get("dtype") or "float32"))
+        self.storage_dtype = np.dtype(
+            str(self.spec.get("storage_dtype") or self.spec.get("dtype") or "float32")
+        )
         self.compression = tactile_stream_compression(self.spec)
         self.chunks = [
             dict(chunk)
@@ -103,7 +108,43 @@ class ChunkedTactileStream:
             raise ValueError(
                 f"Tactile chunk decompressed to {len(raw)} bytes, expected {raw_bytes}."
             )
-        array = np.frombuffer(raw, dtype=self.dtype).reshape((frame_count, *self.shape))
+        array = np.frombuffer(raw, dtype=self.storage_dtype).reshape((frame_count, *self.shape))
+        encoding = str(self.spec.get("encoding") or "").strip().lower().replace("-", "_")
+        if encoding == "chunked_delta_zstd":
+            predictor = str(chunk.get("predictor") or self.spec.get("predictor") or "")
+            if predictor != "delta_mod_uint8_bias_128":
+                raise ValueError(f"Unsupported tactile delta predictor '{predictor}'.")
+            if self.storage_dtype != np.dtype(np.uint8):
+                raise ValueError("delta_mod_uint8_bias_128 requires uint8 storage.")
+            restored = np.empty_like(array)
+            restored[0] = array[0]
+            for index in range(1, frame_count):
+                restored[index] = (
+                    restored[index - 1].astype(np.int16)
+                    + array[index].astype(np.int16)
+                    - 128
+                ).astype(np.uint8)
+            array = restored
+        quantization = chunk.get("quantization")
+        if isinstance(quantization, Mapping):
+            scheme = str(quantization.get("scheme") or "")
+            if scheme != "symmetric_per_last_axis_int16":
+                raise ValueError(f"Unsupported tactile quantization scheme '{scheme}'.")
+            scales = np.asarray(quantization.get("scales") or (), dtype=np.float32)
+            if self.storage_dtype != np.dtype(np.int16):
+                raise ValueError("symmetric_per_last_axis_int16 requires int16 storage.")
+            if not self.shape or scales.shape != (self.shape[-1],):
+                raise ValueError(
+                    f"Invalid tactile quantization scales {scales.shape}; expected {(self.shape[-1],)}."
+                )
+            array = array.astype(np.float32) * scales.reshape(
+                (1,) * (array.ndim - 1) + (self.shape[-1],)
+            )
+        elif self.storage_dtype != self.dtype:
+            raise ValueError(
+                f"Tactile storage dtype {self.storage_dtype} differs from logical dtype "
+                f"{self.dtype} without a quantization contract."
+            )
         self._cached_chunk_index = int(chunk_index)
         self._cached_chunk_array = array
         return array

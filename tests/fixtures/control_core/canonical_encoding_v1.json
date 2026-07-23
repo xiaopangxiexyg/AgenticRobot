@@ -1,0 +1,17 @@
+{
+  "schema": "dexteleop_canonical_encoding_v1",
+  "cases": {
+    "mapping_and_float32": {
+      "domain": "fixture.mapping",
+      "sha256": "f99d7a84463418f7a2a64c78ebc52f2005a7a3d6ab4cecf30c1eb69354261847"
+    },
+    "float_edges": {
+      "domain": "fixture.float",
+      "sha256": "8f23eedb45a4447fa2fb18759d03bc79b349dd0c01865befc0dded0a4b48616a"
+    },
+    "typed_sequence": {
+      "domain": "fixture.typed",
+      "sha256": "d2dc70f4cd4b17e458825e3223e74351fddffdace802dbd72f6961f33113ef72"
+    }
+  }
+}

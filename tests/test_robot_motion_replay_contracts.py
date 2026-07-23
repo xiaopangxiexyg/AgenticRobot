@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 
@@ -207,6 +208,72 @@ def test_legacy_replay_trajectory_file_keeps_only_dataset_loading_and_wrappers()
     assert "class ReplayTrajectoryPool" not in source
     assert "def parse_replay_group_spec" not in source
     assert "def replay_action_poses_at_index" not in source
+
+
+def test_teleop_replay_group_loads_compact_actions_through_dataset_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = np.zeros((2, ACTION_DIM), dtype=np.float32)
+    resolved_metadata = {
+        "episode_index": 0,
+        "dataset_info": {"dexteleop_dataset_schema": "dexteleop_dataset_v2.3"},
+    }
+    contract_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        legacy_trajectory,
+        "resolve_replay_parquet_path",
+        lambda **_: (Path("/tmp/typed_episode.parquet"), resolved_metadata),
+    )
+
+    def _load_contract(*args: object, **kwargs: object):
+        contract_calls.append(dict(kwargs))
+        return canonical.copy(), {"policy_io_layout_hash": "sha256:test"}, None, True
+
+    monkeypatch.setattr(
+        legacy_trajectory,
+        "load_contract_replay_actions_from_parquet",
+        _load_contract,
+    )
+    monkeypatch.setattr(
+        legacy_trajectory,
+        "infer_replay_action_hz",
+        lambda **_: {"hz": 15.0, "source": "test"},
+    )
+    monkeypatch.setattr(
+        legacy_trajectory,
+        "load_replay_frame_times_from_parquet",
+        lambda *_, **__: ((0.0, 1.0 / 15.0), {"source_timestamp_mode": "test"}),
+    )
+    monkeypatch.setattr(
+        legacy_trajectory,
+        "load_replay_arm_joint_targets_from_parquet",
+        lambda *_, **__: {},
+    )
+    monkeypatch.setattr(
+        legacy_trajectory,
+        "load_replay_arm_observation_qpos_from_parquet",
+        lambda *_, **__: {},
+    )
+
+    group = legacy_trajectory.build_replay_group_for_episode(
+        Namespace(
+            replay_dataset="/tmp/dataset",
+            replay_parquet="",
+            replay_action_column="action",
+            active_sides=("left", "right"),
+        ),
+        episode_index=0,
+        group_spec=robot_trajectory.ReplayGroupSpec(
+            key="a", start_index=0, end_index=-1, episode_range="all"
+        ),
+        balanced_episode_count=1,
+    )
+
+    assert group.actions.shape == (2, ACTION_DIM)
+    assert group.metadata["typed_action_contract"] is True
+    assert group.metadata["action_metadata"]["policy_io_layout_hash"] == "sha256:test"
+    assert contract_calls[0]["resolved_metadata"] is resolved_metadata
 
 
 def test_teleop_replay_execution_defaults_use_robot_motion_common_contracts() -> None:

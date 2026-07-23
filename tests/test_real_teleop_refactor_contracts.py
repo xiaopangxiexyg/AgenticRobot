@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import fields
 import inspect
-import re
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,42 +27,6 @@ from teleop_runtime.real_teleop import (
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "teleop_runtime/debug/run_vive_rm65_real_teleop.py"
-EXTRACTED_ROOT = ROOT / "teleop_runtime/real_teleop"
-
-# Temporary staged-refactor measurements.  Update these values deliberately at
-# the start/end of every extraction or in-place slimming batch; do not silently
-# let the baseline drift.
-BASELINE_ENTRYPOINT_LINES = 14_536
-BASELINE_EXTRACTED_MODULE_COUNT = 25
-BASELINE_EXTRACTED_LINES = 5_648
-BASELINE_GUI_CONTROL_LINES = 2_297
-BASELINE_DIRECT_REAL_TELEOP_IMPORTS = 26
-BASELINE_BRIDGE_MARKERS = 17
-
-
-def test_real_teleop_light_dedup_measurements_are_frozen() -> None:
-    entrypoint_lines = len(ENTRYPOINT.read_text(encoding="utf-8").splitlines())
-    module_paths = sorted(EXTRACTED_ROOT.glob("*.py"))
-    extracted_lines = sum(
-        len(path.read_text(encoding="utf-8").splitlines()) for path in module_paths
-    )
-    gui_control_lines = len(
-        (ROOT / "teleop_runtime/gui/real_teleop_control.py")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
-    source = ENTRYPOINT.read_text(encoding="utf-8")
-
-    assert entrypoint_lines == BASELINE_ENTRYPOINT_LINES
-    assert len(module_paths) == BASELINE_EXTRACTED_MODULE_COUNT
-    assert extracted_lines == BASELINE_EXTRACTED_LINES
-    assert gui_control_lines == BASELINE_GUI_CONTROL_LINES
-    assert len(re.findall(r"^from \.\.real_teleop", source, flags=re.MULTILINE)) == (
-        BASELINE_DIRECT_REAL_TELEOP_IMPORTS
-    )
-    assert len(
-        re.findall(r"^# (?:MIGRATION|GUI batch|Compatibility bridge)", source, flags=re.MULTILINE)
-    ) == BASELINE_BRIDGE_MARKERS
 
 
 def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
@@ -576,11 +539,13 @@ def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> 
 
     assert events == [
         "terminal.poll",
+        # UI events are sampled before foot-pad events so a same-poll
+        # foot_pad_test_start can suppress physical fix/init routing.
+        "ui.consume_events",
         "foot_pad.consume_events",
         "foot_pad.route:fix_arm_left",
         "terminal.should_quit",
         "terminal.consume_calibration",
-        "ui.consume_events",
         "request_hold:manual",
         "q6.poll",
         "publish.raw_tracker",

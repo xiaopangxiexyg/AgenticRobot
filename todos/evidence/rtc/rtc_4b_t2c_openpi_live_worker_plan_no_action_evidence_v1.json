@@ -1,0 +1,233 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t2c_openpi_live_worker_plan_no_action_2026_07_22",
+  "scope": "remote_existing_openpi_synthetic_observation_bounded_worker_unique_timed_plan_no_action",
+  "captured_at": "2026-07-22T23:20:18+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "production_source_changed_by_t2c": true,
+    "remote_openpi_source_changed_by_t2c": false,
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "remote_host_alias": "dex-remote",
+    "openpi_project": "/home/user/zc/openpi",
+    "openpi_commit": "650c5b0283a49c42784fb5055a0507da2c6d347d",
+    "openpi_environment": "/home/user/zc/openpi/.venv",
+    "dexteleop_project": "/home/user/zc/DexTeleop",
+    "server_bind": "127.0.0.1:8078",
+    "gpu_model_loaded": true,
+    "synthetic_observation_used": true,
+    "real_observation_used": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "dispatch_attempted": false,
+    "production_entrypoint_started": false,
+    "control_station_started": false
+  },
+  "representative_loaded_instance": {
+    "evidence_only_not_enable_allowlist": true,
+    "model_id": "0712-wrist-cube",
+    "checkpoint_step": 92599,
+    "action_horizon": 50,
+    "state_dim": 16,
+    "action_dim": 16,
+    "required_synthetic_image_keys": [
+      "left_wrist",
+      "right_wrist"
+    ],
+    "continuation_mode_claimed": "none",
+    "requires_model_side_rtc_adapter": false
+  },
+  "probe_boundary": {
+    "client_location": "remote_/tmp_only",
+    "client_source_promoted_to_production": false,
+    "frontend": "robot_motion.deploy.rtc_runtime.RtcPolicyShadowFrontend",
+    "worker": "robot_motion.deploy.policy_worker.BoundedPolicyInferenceWorker",
+    "plan_owner": "single_control_thread_async_producer_snapshot",
+    "position_lookahead_used": false,
+    "formal_emission_allowed": false,
+    "legacy_queue_used": false,
+    "target_backend_initialized": false,
+    "forbidden_modules_imported": [],
+    "planner_called": false,
+    "safety_called": false,
+    "executor_called": false,
+    "robot_or_camera_module_initialized": false
+  },
+  "request_result_sequence": {
+    "request_ids": [
+      "rtc-request:rtc-4b-t2c-live-synthetic:0",
+      "rtc-request:rtc-4b-t2c-live-synthetic:1"
+    ],
+    "request_ids_unique": true,
+    "worker_session_id": "rtc-worker-session:rtc-4b-t2c-live-synthetic:0",
+    "first_forecast_delay_steps": 2,
+    "second_forecast_delay_steps": 16,
+    "result_count": 2,
+    "ready_result_count": 2,
+    "accepted_result_count": 1,
+    "rejected_result_count": 1,
+    "first_result": {
+      "inference_duration_sec": 9.850662081036717,
+      "status": "ready",
+      "admission_accepted": false,
+      "admission_reasons": [
+        "request_deadline_expired"
+      ],
+      "admitted_keyframe_count": 0,
+      "result_hash": "7294f7c122a2f3039ba70e7851406b932967ecb1a003b46df8b5e130144cca20",
+      "merge_receipt_hash": "70d6bbfc92b5c59b88069f08e18cc79257fe5fd53ca9bb3f485f113dbdc64c51"
+    },
+    "second_result": {
+      "inference_duration_sec": 0.6871011519688182,
+      "status": "ready",
+      "admission_accepted": true,
+      "admission_reasons": [],
+      "source_chunk_size": 50,
+      "admitted_keyframe_count": 44,
+      "discarded_obsolete_count": 6,
+      "result_hash": "944189665a304cabb4f8febf6d2a48e75a72d631296362cb72c0ebae58180baf",
+      "merge_receipt_hash": "8178dc0a7df64b1cfbb209895bcd71ada4cd6a5ae556b140923e28689de1d4a3"
+    }
+  },
+  "timed_plan_before_close": {
+    "generation": 322,
+    "keyframe_count": 44,
+    "semantic_content_hash": "7074888a76243a7d9486e6918f8c872b907664fa194b9ec42714221f453729cb",
+    "first_target_effective_at": 351031.4975998313,
+    "last_target_effective_at": 351032.93093316467,
+    "producer_plan_committed_through": null,
+    "formal_emission_count": 0,
+    "legacy_queue_pop_count": 0
+  },
+  "control_loop": {
+    "decision_hz": 30.0,
+    "control_budget_sec": 0.03333333333333333,
+    "tick_count": 320,
+    "control_duration_max_sec": 0.013812576013151556,
+    "wall_tick_duration_max_sec": 0.013844476023223251,
+    "inference_active_tick_count": 318,
+    "inference_active_tick_max_sec": 0.006973295996431261,
+    "budget_exceeded_count": 0,
+    "blocking_tick_over_50ms_count": 0
+  },
+  "lifecycle_and_transport": {
+    "worker_stop_status": "stopped",
+    "worker_thread_exited": true,
+    "transport_close_status": "closed",
+    "transport_phase_order": [
+      "connect",
+      "metadata",
+      "inference",
+      "inference",
+      "close"
+    ],
+    "all_transport_phase_receipts_completed": true,
+    "post_close_lifecycle_state": "TRANSITIONING",
+    "post_close_plan_generation": 0,
+    "post_close_plan_keyframe_count": 0,
+    "server_metadata_hash": "60fe3aac978331c2e2c058cac4089c6fe66f6d9ddbf2743adedc58cad14f979a"
+  },
+  "identity_bindings": {
+    "artifact_hash": "7296af228a4475138c22af42674df82bd8b4cf5a5dc6f77ec279ad479382ff4a",
+    "frame_contract_hash": "356e75ec496b1bfe38949ad84df449f95e625b7d9026ee0c08862cce239bfa30",
+    "normalization_hash": "89d482c673c9b30cc6c1496653c4a8d65d368c28ea20d60d50debf540cbbf1ed",
+    "normalization_hash_scope": "synthetic_probe_binding_not_norm_stats_attestation",
+    "deadline_spec_hash": "c642d9b74d493a8072b131626f7041208ba32c5233b833f749a5e550cc2f30a9"
+  },
+  "adapter_fix": {
+    "problem": "immutable nested mappingproxy reached msgpack transport",
+    "resolution": "deep_thaw only at prepared-input external transport boundary",
+    "prepared_fact_remains_immutable": true,
+    "semantic_hash_contract_changed": false,
+    "wire_fields_changed": false,
+    "model_or_checkpoint_branch_added": false,
+    "sync_queue_v1_changed": false
+  },
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_openpi_rtc_final_chunk_adapter.py",
+      "location": "local",
+      "result": "32 passed"
+    },
+    {
+      "command": "remote_pytest tests/test_openpi_rtc_final_chunk_adapter.py -q",
+      "location": "remote",
+      "result": "32 passed"
+    },
+    {
+      "command": "python -m pytest -q <full RTC focused set>",
+      "location": "local",
+      "result": "172 passed"
+    },
+    {
+      "command": "python -m pytest -q <OpenPI/default-deploy/position/MuJoCo compatibility set>",
+      "location": "local",
+      "result": "160 passed, 1 skipped"
+    },
+    {
+      "command": "python -m py_compile <T2c scoped Python files>",
+      "location": "local",
+      "result": "passed"
+    },
+    {
+      "command": "python -m teleop_runtime.deploy --help",
+      "location": "local",
+      "result": "passed; rtc-profile default remains off"
+    }
+  ],
+  "cleanup": {
+    "exact_resolved_server_pids": [
+      603245,
+      603242
+    ],
+    "cleanup_signal": "SIGTERM",
+    "only_exact_run_pids_signalled": true,
+    "post_cleanup_port": 8078,
+    "post_cleanup_connect_ex": 111,
+    "post_cleanup_port_closed": true,
+    "remote_tmp_probe_left_for_audit": "/tmp/dexteleop_rtc_t2c_probe_20260722"
+  },
+  "scoped_source_sha256": {
+    "deployments/openpi/client/rtc.py": "c87fa86a4acc72ab2c1ce71548a787ca18542f83a7e1f0a91bd6b86a111e7c14",
+    "deployments/openpi/client/transport.py": "c567a05223114b93f7024aa752c6627d16b3c9bf2d50e6bb2f94c464cf9e8d32",
+    "deployments/client/rtc_executor.py": "f6c876c249f90dbdc2159bb2d40abd13cf3e9f0780ca29d5e85fb5de9c6eb47d",
+    "robot_motion/deploy/rtc_runtime.py": "05f97182f01cb03f0e02900792cebb360e17872e0c784dcf264c11bde02c6fc1",
+    "robot_motion/deploy/policy_worker.py": "52faa19b35484988c4d24984c23af60daa4374e8a6b7676b516fa2b998f2a1aa",
+    "robot_motion/deploy/chunk_plan.py": "64e5b705509e3645367bfb253bdc400ed4aec0b49aef8e5e4dd849a3ac54eb0a",
+    "tests/test_openpi_rtc_final_chunk_adapter.py": "c53a09f6fa518ac2fdf3d27fecf7e2615c466b06258a1e9af5010442cf4332f2",
+    "remote_tmp_live_worker_plan_probe.py": "6e4c3e369f8887f639d7ae8f870ee43608ba37e9d79b92a201c63e0d1b38c107",
+    "remote_openpi/scripts/serve_dexteleop_policy.py": "341d716a20b654d9e1539482e6722d261465eabb77a45913145ea0e14534fa44",
+    "remote_openpi/src/openpi/policies/dexteleop_v22_policy.py": "6a8c78a1798901168c0e0835ee88ddb3e2bcf997c4b92eaef3c53d46891414eb",
+    "remote_openpi/configs/dexteleop_policy_registry.json": "f1f82756b2bcc4fe4b6b1ea7a002617085dc15f9e827e3132531f23407af37b1",
+    "remote_openpi/checkpoint/policy_artifact.json": "ade133634ea77c645f9e3ecbb98113c2ac3c73512b65e1e5ef9b43238acfcb54"
+  },
+  "claims": [
+    "a live existing OpenPI final-chunk call runs behind the shared bounded worker without blocking the 30 Hz control-side loop",
+    "the cold ready result is rejected only by request TTL and cannot mutate the plan",
+    "a fresh warm request/result identity is admitted exactly once into the unique timed plan",
+    "obsolete source rows are discarded before admission while the remaining future rows preserve one plan identity",
+    "no formal emission, legacy queue pop, safety, position reference, dispatch or target initialization occurs",
+    "worker stop, transport close and producer plan invalidation remain distinct and all complete",
+    "the adapter fix is model-agnostic and changes neither OpenPI wire fields nor sync_queue_v1 behavior"
+  ],
+  "non_claims": [
+    "no real observation path was exercised",
+    "no action safety, reference, IK, command or dispatch path was exercised",
+    "no prefix-conditioned continuation capability is claimed",
+    "no true real-time or production p99 guarantee is claimed",
+    "no production RTC enablement or motion authority is claimed",
+    "the representative model and checkpoint are not a compatibility allowlist"
+  ],
+  "next_gate": {
+    "id": "rtc_4b_t3_real_observation_no_action_shadow",
+    "goal": "bind a separately authorized real observation source while retaining no-action shadow and the same model-neutral worker/plan contracts",
+    "requires_camera_scope": true,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false,
+    "requires_position_change": false,
+    "alternative_independent_gate": "rtc_4b_b2_capability_driven_prefix_continuation"
+  }
+}

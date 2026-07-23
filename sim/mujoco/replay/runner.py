@@ -57,7 +57,12 @@ def _json_default(value: object) -> object:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Replay DexTeleop dataset QPOS in MuJoCo.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "DEBUG ONLY: kinematically replay recorded dataset qpos in MuJoCo. "
+            "Use `python -m sim.mujoco.replay` for the canonical Cartesian-action mainline."
+        )
+    )
     parser.add_argument("--dataset-root", required=True, type=Path, help="LeRobot-style dataset root.")
     parser.add_argument(
         "--episode",
@@ -698,6 +703,8 @@ def _write_replay_metadata(
     inactive_sources: dict[str, str],
 ) -> None:
     metadata = {
+        "replay_role": "debug_qpos_kinematic",
+        "canonical_action_mainline": False,
         "dataset_root": args.dataset_root,
         "episode": args.episode,
         "episode_id": episode_id,
@@ -953,6 +960,8 @@ def run(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "dataset_root": str(episode.dataset_root),
+                "replay_role": "debug_qpos_kinematic",
+                "canonical_action_mainline": False,
                 "episode_id": episode.episode_id,
                 "parquet_path": str(episode.parquet_path),
                 "total_rows": len(rows),
@@ -1298,6 +1307,8 @@ def run(args: argparse.Namespace) -> None:
             renderer.close()
 
     final = {
+        "replay_role": "debug_qpos_kinematic",
+        "canonical_action_mainline": False,
         "processed_frames": processed,
         "processed_control_ticks": processed,
         "processed_reference_frames": planned_reference_frames,

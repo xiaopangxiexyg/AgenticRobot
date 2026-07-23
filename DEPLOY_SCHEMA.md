@@ -1,90 +1,113 @@
 # DexTeleop Deploy Schema
 
-本文档定义模型部署时 policy 与 DexTeleop runtime 之间的接口契约。它不是
-dataset 存储格式；离线数据格式见 `DATASET_SCHEMA.md`。部署 schema 关注每次
-在线推理 step 的输入、输出，以及如何兼容单臂/双臂、不同末端、可选相机、可选触觉和历史窗口。
+本文档是 policy 与 DexTeleop deployment runtime 之间的规范契约。它定义模型输入、模型输出、
+artifact/session identity 和兼容边界；不定义 dataset 磁盘格式，也不授予硬件 dispatch 权限。
+离线数据以 [`DATASET_SCHEMA.md`](DATASET_SCHEMA.md) 为准，RTC 实施过程以
+[`todos/dexteleop_rtc_landing_plan.md`](todos/dexteleop_rtc_landing_plan.md) 为准。
 
-当前建议版本为 `dexteleop_deploy_v2`。未携带 v2.2 layout/artifact 信号的旧模型继续按
-`dexteleop_deploy_v1` 解释；不得仅根据向量宽度把旧模型自动重解释为 v2。
+规范文字使用以下含义：`MUST`/“必须”是启动或推理时的硬约束，`MUST NOT`/“不得”表示
+fail-closed 条件，`SHOULD`/“应”是兼容性建议，`MAY`/“可”表示可选能力。JSON/Python 示例
+只用于说明结构；实际对象必须通过 typed contract 校验。
 
-版本关系：
+## 1. 版本、权威来源与边界
 
-| Deploy schema | 数据/模型合同 | 低维 state/action | 状态 |
-| --- | --- | --- | --- |
-| `dexteleop_deploy_v1` | legacy/unversioned | 固定 38D state、26D action、q6 hand slots | 完整兼容保留 |
-| `dexteleop_deploy_v2` | `dexteleop_dataset_v2.2` + `PolicyIOLayout` | 双臂 pose14 固定前缀 + 分侧配置化末端；离散值为独立 int64 token | 新模型推荐 |
+### 1.1 版本关系
 
-`dexteleop_deploy_v2` 不改变 LeRobot-v2.1-style 的数据目录组织；它改变的是模型和部署
-低维张量的语义绑定。
+这些版本位于不同层次，不能互相替代：
 
-## 设计边界
+| 层次 | 标识/对象 | 作用 |
+| --- | --- | --- |
+| Deploy schema | `dexteleop_deploy_v1` / `dexteleop_deploy_v2` | runtime 与 policy 的总接口 |
+| Policy artifact | `dexteleop_policy_artifact_v1` | checkpoint/server sidecar 序列化格式 |
+| Dataset schema | `dexteleop_dataset_v2.2` / `dexteleop_dataset_v2.3` | 训练数据与 pose provenance |
+| Tensor layout | `PolicyIOLayout` | state/action channel、维度、token vocabulary 的唯一语义来源 |
+| RTC protocol | `dexteleop_rtc_protocol_v2` | 可选异步推理扩展，不改变基础 state/action 语义 |
 
-部署链路应分成三层：
+`dexteleop_deploy_v2` 当前覆盖 v2.2 与 v2.3 dataset semantics；v2.3 是 pose/action-chunk
+扩展，不是新的 deploy schema version。未携带 v2 artifact/layout 信号的旧模型继续按显式
+`dexteleop_deploy_v1` 处理；不得仅根据向量宽度把旧模型重解释为 v2。
 
-- Runtime input: 从真机、仿真或 replay 中采集当前观测，构造 policy 输入。
-- Policy output: 模型输出动作，动作语义由 action specs 解释。
-- Runtime execution: 将动作解析为 `RobotAction`，再解析为 `TeleopCommand`，最后由具体 backend 执行。
+| Deploy mode | 输入/输出核心 | 当前边界 |
+| --- | --- | --- |
+| `legacy_v1` | 固定 38D state、26D action、q6 hand slots | 保持同步兼容 |
+| `v22_q6_bridge` | 双臂 pose14 + typed end-effector，经显式 q6 slot projection | 继续走 legacy safety/dispatch |
+| `v22_native` | 双臂 pose14 + typed `EndEffectorTarget` | contract 已定义；未配置 native safety/backend 时必须拒绝 |
 
-部署 schema 只定义前两层的输入/输出契约。IK、限步、防碰撞、硬件下发和 emergency hold 属于 runtime execution，不应由模型输出绕过。
+### 1.2 权威来源顺序
 
-核心原则：
+```text
+PolicyArtifactContract
+  -> PolicyIOLayout / keys / dimensions / pose / camera identity
+Server metadata
+  -> 对 artifact 与协议的运行时 attestation；不得覆盖 artifact
+ResolvedDeploySessionContract
+  -> artifact 与本次 runtime end-effector/frame capability 的不可变合并
+DeployStepInput
+  -> T0 之前冻结的 causal observation cut
+Policy output
+  -> 必须匹配 artifact/layout，先解码再进入 runtime
+RobotAction / safety / dispatcher
+  -> 最终执行边界，模型不得绕过
+```
 
-- v1 中 `active_sides` 是单臂/双臂兼容的主开关。v2 的模型合同固定保留左右 arm pose7；
-  当前 v2 runtime session 因此要求 `active_sides=["left", "right"]`，末端则可以按侧缺省。
-- v2 的唯一模型张量语义来源是 `PolicyIOLayout`；`arm_action_specs_by_side`、
-  `hand_action_specs_by_side` 继续用于 v1/q6 执行兼容，不得覆盖 v2 layout。
-- 缺失模态通过 `available`, `valid`, `mask`, `faults` 表达，不通过换 schema 表达。
-- 模型输出 arm 7D pose 和配置化末端 target；低层 arm qpos 只作为独立审计、初始化、
-  调试或特殊控制输入，不进入 v2 默认模型 state/action。
-- 所有在线视觉/触觉/arm state 输入必须来自不可变历史，并满足
-  `source_timestamp <= T0 AND available_timestamp <= T0`；不允许在推理时直接读取
-  可能已经更新的 mutable backend state。这里的 `T0` 是本次动作/控制信息建立的切点，
-  不是 observation 组装结束时间。
+部署输入、输出和 runtime execution 分为三层：
 
-## v2.3 Absolute/Relative Arm Pose
+1. Runtime input：real、sim 或 replay 提供当前 observation；三者共享本契约，差异只在 source/adapter。
+2. Policy output：模型返回 typed action chunk，由 artifact/layout 解释。
+3. Runtime execution：canonical action 经过 safety、IK/reference 和 dispatcher；这些不属于模型 output schema。
 
-v2.3 默认兼容 v2.2 的 tensor layout，但显式增加 pose representation 选择：
+`metadata`、`state_dict`、自由 JSON 扩展只能提供诊断信息，不能覆盖 typed artifact、session、layout、
+pose-frame 或 modality contract。
 
-- state pose 始终是 desk absolute pose；部署 observation 中的
-  `arm_states.<side>.actual_tcp_pose` 必须是当前 `T0` 之前最新的实际测量 TCP。
-- policy action 的 `absolute`（默认）或 `relative` 由 session/CLI 明确声明，不能按
-  向量宽度猜测。relative chunk 的 anchor 是 chunk 开始时的 measured TCP，chunk 内固定；
-  `last_action` 如送入 relative policy，则使用当前 observation 的 measured TCP。
-- relative policy 输出在 canonical safety、IK 和任何硬件 dispatch 之前由 runtime 解算成
-  absolute pose。解算只接受 `actual_tcp_pose`，缺失、无效或不可转换时 fail-closed，
-  不得回退到 `current/target/last_command`。
-- v2.2 replay bridge 可以把存储的 absolute action 在每次 chunk prediction 时即时转换为
-  relative，再走同一部署解算器；这用于不改写旧数据的兼容和端到端一致性测试。
-- structured v2.3 session 在后端创建前冻结 `runtime_pose_frame_contract`。模型 observation
-  中的 arm state/actual TCP 从当前机器 raw 转到 desk；原始 execution observation 保持 raw，
-  不被模型视图修改。没有显式配置时使用带审计标签的 identity compatibility profile；
-  正式非 identity 部署应通过 `--runtime-pose-frame-contract` 显式发布 source/topology/变换。
-- Vive 遥操历史中间坐标系统一称为 `vive_retarget_frame`（旧键 `desk_frame/T_O_D/T_D_B`
-  仅兼容读取），它不是本节的 canonical dataset `desk`，不能跳过 source raw→desk
-  contract 直接绑定。
-- RM65 `hardware_pose_6d` 是控制器 SDK 的 base-frame `[xyz,rpy]` 审计反馈，不是 canonical
-  pose，也不是 relative anchor；部署 anchor 仍只接受 contract 转换后的 measured
-  `actual_tcp_pose`。
+## 2. 共同不变量
 
-absolute v2.3 输出先做 desk→当前机器 raw；relative 输出由于共同 world-frame 左变换会抵消，
-可以用同一 T0 measured raw TCP 直接解成 raw absolute。两条路径在 canonical safety/IK
-之前汇合，硬件执行层永远只接收当前机器的 runtime raw absolute target。
+- v2 模型张量的唯一语义来源是 `PolicyIOLayout`；`arm_action_specs_by_side` 与
+  `hand_action_specs_by_side` 仅用于 legacy v1/q6 execution compatibility。
+- v2 固定保留 `left_pose7 + right_pose7`。当前 v2 session 要求 `active_sides=("left", "right")`；
+  末端可以按侧为 `none` 或显式配置。
+- v2 连续值使用 `float32`，离散 target/state 使用独立的 `int64` 矩阵；不得拼接、cast、静默丢弃 token。
+- 缺失模态使用 `available`、`valid`、`mask` 和 `faults` 表示，不通过改变 schema 或改变 tensor 顺序表示。
+- 模型输出 arm pose 和配置化 end-effector target；低层 arm qpos 只用于审计、初始化、debug 或特殊 controller，
+  不进入 v2 默认 model state/action。
+- `source_timestamp <= T0` 且 `available_timestamp <= T0`。模型 view 必须由不可变历史构造，不能在推理时读取
+  可能已更新的 mutable backend state；`T0` 是 observation/action cut，不是组装完成时间。
+- 任何 artifact、server metadata、frame、layout、normalization、horizon 或 dtype 不一致都必须在 safety/dispatch
+  之前 fail-closed。
+- safety、IK、position reference、hardware SDK 和 emergency hold 不得由 policy output 绕过。
 
-## Session Contract
+## 3. Policy artifact contract
 
-每个部署 session 在启动时必须固定一个不可变能力声明。v2 使用两层来源：
+实现来源：[`dataset_contracts/policy_artifact.py`](dataset_contracts/policy_artifact.py)。
+`PolicyArtifactContract` 是 checkpoint/server sidecar；artifact 必须能被 typed factory 或
+`PolicyArtifactContract.from_dict()` 解析。
 
-1. `PolicyArtifactContract`：checkpoint/server sidecar，内嵌唯一 `PolicyIOLayout`，声明模型
-   输入/输出键、float/token 维度、模型标识、layout hash，以及（视觉模型必须声明的）相机输入契约。
-2. `ResolvedDeploySessionContract`：启动时临时生成，将 artifact/layout 与本次 runtime
-   左右末端 backend 能力合并；它不是另一份持久化张量配置。
+### 3.1 字段与派生规则
 
-真实 backend 必须在 session 解析成功后创建。dataset、checkpoint/server、显式 layout 与
-runtime 的 `policy_io_layout_hash` 必须完全一致。
+| 字段 | 必须性 | 语义 |
+| --- | --- | --- |
+| `schema` | 必须 | `dexteleop_policy_artifact_v1` |
+| `dataset_schema` | 必须 | `dexteleop_dataset_v2.2` 或 `dexteleop_dataset_v2.3` |
+| `deploy_schema_version` | 必须 | `dexteleop_deploy_v2` |
+| `model_id` / `checkpoint_step` | 通用 v2 可选；OpenPI raw-RTC 及声明 endpoint identity 的 RTC profile 必须 | 已加载实例身份 |
+| `source_datasets` | 可选 | 训练数据 provenance |
+| `policy_io_layout` | 必须 | 嵌入的 `PolicyIOLayout` |
+| `policy_io_layout_hash` | 必须 | 必须等于 layout canonical hash |
+| `state_key` / `state_discrete_key` | 必须 | 输入字段名；当前默认 `state` / `state_discrete` |
+| `action_key` / `action_discrete_key` | 必须 | 输出字段名；当前默认 `actions` / `actions_discrete` |
+| `state_input_mode` | 必须 | `raw_state_v1` 或 `masked_normalized_concat_v1` |
+| `state_augmentation` | 必须为 mapping | 训练期增强审计，不改变 dataset schema |
+| `camera_input` | 视觉 artifact 必须；state-only 可为 `null` | 逻辑相机到 model/server 字段的有序映射 |
+| `pose_action_chunk_contract` | v2.3 pose artifact 必须 | absolute/relative、anchor、tail、horizon |
+| `pose_action_chunk_contract_hash` | 有 pose contract 时必须 | action-chunk contract 的 canonical hash |
+| `pose_training_data_contract` | 有 pose contract 时必须 | native v2.3 或 v2.2 raw-identity provenance |
+| `pose_frame_contract_hashes` | 有 pose contract 时至少一个 | 训练/运行 pose-frame identity |
+| `metadata` | 可选 | 非权威扩展，不能覆盖上述字段 |
 
-### v2 Policy Artifact
+`inputs` 和 `outputs` 在 artifact JSON 中可以出现，但它们是由 layout、keys 和
+`state_input_mode` 派生的 generated fields，不能单独修改维度或 dtype。float/token horizon、
+dimension、layout hash 任一不一致都必须拒绝；即使 token dimension 为 0，也保留稳定的 int64 字段。
 
-默认字段结构：
+### 3.2 最小 artifact 形状
 
 ```json
 {
@@ -96,61 +119,42 @@ runtime 的 `policy_io_layout_hash` 必须完全一致。
   "source_datasets": ["org/task-v22"],
   "policy_io_layout": "<canonical PolicyIOLayout object>",
   "policy_io_layout_hash": "sha256:<canonical-layout-hash>",
-  "camera_input": {
-    "inputs": [
-      {
-        "source_key": "front",
-        "model_input_key": "observation.images.base_0_rgb",
-        "server_camera_slot": "base_0_rgb"
-      }
-    ],
-    "required": true,
-    "color_space": "rgb",
-    "layout": "HWC",
-    "dtype": "uint8"
-  },
   "state_input_mode": "raw_state_v1",
   "state_augmentation": {},
-  "inputs": {
-    "state": {"key": "state", "dim": 15, "dtype": "float32"},
-    "state_discrete": {"key": "state_discrete", "dim": 1, "dtype": "int64"}
-  },
-  "outputs": {
-    "actions": {"key": "actions", "dim": 15, "dtype": "float32"},
-    "actions_discrete": {"key": "actions_discrete", "dim": 1, "dtype": "int64"}
-  }
+  "camera_input": "<PolicyCameraInputContract or null>",
+  "inputs": "<generated from layout and keys>",
+  "outputs": "<generated from layout and keys>",
+  "metadata": {}
 }
 ```
 
-默认 `state_input_mode="raw_state_v1"` 时，float state 维度只能由内嵌 layout 的 `state_dim`
-派生，sidecar 不能独立修改。启用训练期 state dropout 的模型必须显式声明
-`"masked_normalized_concat_v1"`：float 输入维度固定为 `2 * layout.state_dim`，前半是
-归一化后的连续 state，后半是相同长度的 0/1 availability mask。`state_augmentation` 记录训练
-配置以供审计；它不修改磁盘 dataset schema。即使某一 token 维度为 0，对应字段仍可保留为稳定的
-零宽 int64 合同。
+当 `state_input_mode="masked_normalized_concat_v1"` 时，模型 float state 维度为
+`2 * layout.state_dim`：前半为归一化连续 state，后半为同长度的 availability mask。模型/server
+只能归一化前半，不能对 mask 做均值方差归一化。server metadata 必须声明相同
+`input_state_mode` 与 `input_state_dim`。
 
-#### 相机输入契约
+### 3.3 Camera input contract
 
-`camera_input` 是新视觉模型的唯一相机语义来源，`inputs` 的顺序也是模型输入顺序。每一项必须同时
-绑定：
+每个 `camera_input.inputs` 项必须绑定：
 
-- `source_key`：DexTeleop 逻辑相机键，例如 `front`、`left_wrist` 或 `right_wrist`；`front`
-  对应头部/主视角，不是要求物理设备的名称也叫 front。
-- `model_input_key`：送到该模型服务器的精确图像字段名。
-- `server_camera_slot`：服务端 metadata 必须声明的能力槽，用于启动期握手。
+| 字段 | 含义 |
+| --- | --- |
+| `source_key` | DexTeleop 逻辑键，如 `front`、`left_wrist`、`right_wrist` |
+| `model_input_key` | 送入模型的精确图像字段名 |
+| `server_camera_slot` | server metadata 声明的能力槽 |
 
-因此，左腕单视角模型可以把 `left_wrist` 映射到模型的 `observation.images.base_0_rgb`；部署不会再
-把同一帧错误地标为 `front`，也不会把配置文件中未选中的头部或另一腕相机送入模型。`required=true`
-时，启动必须配置完整的同名逻辑视角；`required=false` 允许无图像运行，但仍固定已提供图像的键和格式。
-旧 artifact 没有 `camera_input` 时保持 v1/早期 v2 的默认 OpenPI front 路径，以便旧 checkpoint 直接部署；
-迁移后的视觉 checkpoint 应补写此字段，而不要依赖自由 metadata。
+`inputs` 顺序就是模型输入顺序。`required=true` 时，启动必须提供完整同名逻辑视角；
+`required=false` 允许无图像运行，但仍必须保留已提供图像的键、格式和 availability。旧 artifact 没有
+`camera_input` 时可走 legacy compatibility；OpenPI raw-RTC adapter 则要求显式 camera contract，
+state-only 模型使用 `required=false` 和空输入列表表示。artifact 还必须固定
+`color_space="rgb"`、`layout="HWC"`、`dtype="uint8"`；NCHW/float 转换属于 model adapter。
 
-#### v2.3 action chunk 契约
+### 3.4 v2.3 pose/action-chunk contract
 
-relative/absolute pose 模型应在 artifact 顶层写入 `pose_action_chunk_contract`、
-`pose_training_data_contract` 和匹配的 `pose_action_chunk_contract_hash`，并用
-`pose_frame_contract_hashes` 记录一个或多个训练数据源的完整 pose-frame contract hash，
-而不是只在自由 `metadata.pose_representation` 中记录：
+`pose_action_chunk_contract` 只允许出现在 `dataset_schema=dexteleop_dataset_v2.3` 的 artifact 中，
+并且必须同时提供 `pose_training_data_contract` 与至少一个 `pose_frame_contract_hashes`。
+serialized artifact 使用字段名 `pose_action_chunk_contract`、`pose_training_data_contract`、
+`pose_action_chunk_contract_hash` 和 `pose_frame_contract_hashes`；hash 必须分别匹配 typed contract 的 canonical hash。
 
 ```json
 {
@@ -169,66 +173,40 @@ relative/absolute pose 模型应在 artifact 顶层写入 `pose_action_chunk_con
 }
 ```
 
-`pose_training_data_contract` 必须显式区分两条不能混用的部署路径：
+规则：
 
-1. 原生 v2.3 数据训练：
+- `action_pose_mode` 与 `last_action_pose_mode` 当前必须相同；CLI、structured contract 与旧
+  `metadata.pose_representation.action` 冲突时启动失败。
+- state pose 是 canonical desk absolute pose；runtime observation 的 `actual_tcp_pose` 必须是 T0 之前最新测量值。
+- absolute canonical-desk action 在 runtime 中先转换为当前机器 raw；relative action 因共同 world-frame 左变换可直接使用
+  同一 T0 measured raw TCP 解码为 raw absolute；两条路径在 canonical safety/IK 前汇合。
+- relative chunk 使用 chunk-start measured TCP 作为固定 anchor；relative action 在 safety/IK/dispatch 前解为
+  runtime raw absolute pose，不得回退到 current/target/last command。
+- v2.2 replay bridge 可以在每次 chunk prediction 时将存储的 absolute action 转为 relative，再走同一 runtime 解算器；
+  该过程不得改写旧数据。
+- 原生 v2.3 training 使用显式 runtime raw→canonical-desk frame contract。
+- v2.2 raw identity compatibility 必须声明 `expected_runtime_source_id`，且 runtime raw→desk 对每侧均为 identity；
+  不得把非 identity frame 当作该模型的兼容绑定。
+- 原生 v2.3 的 `runtime_pose_binding` 必须是显式 runtime-raw→canonical-desk；v2.2 兼容路径必须是
+  same-source identity raw→desk，并核对 `expected_runtime_source_id`。两者都必须保留
+  `pose_action_chunk_contract_hash`，不能只放在自由 metadata 中。
+- `tail_policy` 和 `action_horizon` 用于 training/checkpoint 审计；deploy 以 server 实际 chunk 为准，不在真机侧复现训练 padding。
+- Vive 中间 frame 统一称为 `vive_retarget_frame`，不能直接当作 canonical dataset `desk`；RM65 `hardware_pose_6d` 是
+  SDK base-frame audit，不是 canonical pose 或 relative anchor。
 
-   ```json
-   {
-     "schema": "dexteleop_pose_training_data_v1",
-     "origin": "native_v23_dataset",
-     "source_dataset_schema": "dexteleop_dataset_v2.3",
-     "model_state_pose_frame": "desk",
-     "runtime_pose_binding": "explicit_runtime_raw_to_canonical_desk",
-     "expected_runtime_source_id": null,
-     "relative_action_world_transform_invariant": true
-   }
-   ```
-
-   部署必须显式传入当前机器的 `--runtime-pose-frame-contract`。即使当前机器数值上
-   raw=desk，也必须传入显式 identity contract，不能依赖 legacy fallback。
-
-2. v2.2 raw 经默认 identity compatibility 构建 relative action：
-
-   ```json
-   {
-     "schema": "dexteleop_pose_training_data_v1",
-     "origin": "v22_raw_identity_compatibility",
-     "source_dataset_schema": "dexteleop_dataset_v2.2",
-     "model_state_pose_frame": "desk",
-     "runtime_pose_binding": "same_source_identity_raw_to_desk",
-     "expected_runtime_source_id": "rm65_real_dual_arm_v1",
-     "relative_action_world_transform_invariant": true
-   }
-   ```
-
-   这里的 `desk` 是 identity compatibility 的模型接口名称；训练 state 数值仍是左右臂各自
-   RM65 base 下的旧 raw pose。runtime 只允许相同 `source_id` 且每侧 raw→desk 都为 identity；
-   误传 table-center 等非 identity contract 会在创建硬件 backend 前失败。relative action
-   本身对共同 world transform 不敏感，但 absolute state 的输入分布敏感，因此不能把这类
-   checkpoint 当成原生 v2.3 canonical-desk checkpoint。
-
-构造 artifact 时应使用 typed factory，避免手写字符串：
+构造 provenance 应使用 typed factory，例如：
 
 ```python
 from dataset_contracts import PoseTrainingDataContract
 
-v22_compat = PoseTrainingDataContract.v22_raw_identity(
-    active_sides=("left", "right"),
-)
+v22_compat = PoseTrainingDataContract.v22_raw_identity(active_sides=("left", "right"))
 native_v23 = PoseTrainingDataContract.native_v23()
 ```
 
-该字段只允许用于 `dataset_schema=dexteleop_dataset_v2.3`。部署启动时，若 CLI 未显式指定
-`--policy-action-pose-mode`，runtime 采用 contract 的 `action_pose_mode`；若 CLI 显式值、
-structured contract 和旧 `metadata.pose_representation.action` 互相冲突，则启动失败。
-当前 runtime 使用同一个 pose mode 同时转换 action 与 `last_action`，因此 artifact 若声明两者
-模式不同也会 fail-closed；在部署链路增加双模式输入前，不会静默按其中一个执行。
-`drop` 是默认训练 tail policy；需要保留不完整 episode 尾部的模型可在 artifact 中显式写
-`tail_policy="pad_last"`。`action_horizon` 与 tail policy 用于 checkpoint/训练审计；部署仍以
-服务端实际返回 chunk 进行队列处理，不会在真机侧复现训练 padding。
+## 4. Resolved deploy session
 
-### Resolved v2 Session
+实现来源：[`robot_motion/deploy/session_contract.py`](robot_motion/deploy/session_contract.py)。
+session 是启动前解析出的不可变合并结果，不是第二份 artifact。
 
 ```json
 {
@@ -240,96 +218,68 @@ structured contract 和旧 `metadata.pose_representation.action` 互相冲突，
   "state_dim": 15,
   "state_discrete_dim": 1,
   "state_input_mode": "raw_state_v1",
-  "policy_io_layout_hash": "sha256:<canonical-layout-hash>",
+  "policy_absolute_frame": "canonical_desk",
+  "runtime_pose_frame_contract_hash": "sha256:<frame-contract-hash>",
+  "policy_io_layout_hash": "sha256:<matching-layout-hash>",
   "end_effector_sides": ["left", "right"],
-  "runtime_end_effectors": {
-    "left": {"adapter": "dmtac_gripper_v1", "backend": "dmtac-gripper", "enabled": true},
-    "right": {"adapter": "two_state_gripper_v1", "backend": "dmtac-gripper", "enabled": true}
-  },
+  "runtime_end_effectors": {},
   "q6_bridge_compatible": true,
   "hardware_output": false,
-  "warnings": []
+  "warnings": [],
+  "metadata": {}
 }
 ```
 
 `policy_contract_mode` 只能是：
 
-- `legacy_v1`：旧 26D/38D 路径，不强制 layout hash。
-- `v22_q6_bridge`：每个已配置 action channel 都显式声明
-  `legacy_q6_slot_indices`，转换后继续走既有 26D safety/dispatch 链。
-- `v22_native`：不投影到 q6，末端以 typed `EndEffectorTarget` 经
-  `RobotAction -> TeleopCommand` 传递。类型载体已经实现；当前真机 `run_policy` 尚无完整
-  native safety/backend adapter，因此该模式 fail-closed，不会直接下发硬件。
+- `legacy_v1`：旧 26D/38D 路径，不要求 v2 layout hash。
+- `v22_q6_bridge`：所有已配置 action channel 必须声明 `legacy_q6_slot_indices`，然后进入现有
+  26D safety/dispatch 链。
+- `v22_native`：不投影到 q6，使用 typed `EndEffectorTarget`。如果 native safety/backend adapter 未配置，
+  必须 fail-closed，不得直接构造 backend command。
 
-### Legacy v1 Session
+`v22_native + hardware_output=true` 还要求每个启用侧的
+`RuntimeEndEffectorCapability.safety` 与 layout action channel 精确绑定：
 
-以下原有字段继续用于 v1：
-
-```json
-{
-  "schema_version": "dexteleop_deploy_v1",
-  "robot": "dual_rm65",
-  "active_sides": ["left", "right"],
-  "enabled_effectors": ["left_arm", "left_hand", "right_arm", "right_hand"],
-  "control_hz": 15.0,
-  "policy_hz": 15.0,
-  "arm_action_specs_by_side": {
-    "left": {
-      "side": "left",
-      "controlled_frame": "tool_tcp",
-      "reference_frame": "left_arm_base",
-      "representation": "xyz_quat",
-      "dof": 7
-    }
-  },
-  "hand_action_specs_by_side": {
-    "left": {
-      "side": "left",
-      "hand_model": "dmtac_gripper",
-      "slot_count": 6,
-      "active_dof": 1,
-      "active_mask": [true, false, false, false, false, false],
-      "joint_names": ["gripper_close"],
-      "command_space": "normalized_0_0.9",
-      "slot_map": {"gripper_close": 0}
-    }
-  },
-  "camera_contract": {
-    "selected_keys": ["front", "left_wrist", "right_wrist"],
-    "required": false,
-    "color_space": "rgb",
-    "layout": "HWC",
-    "dtype": "uint8"
-  },
-  "tactile_contract": {
-    "enabled": true,
-    "required_by_side": {"left": false, "right": false},
-    "representation": "backend_native_vector_or_dict"
-  },
-  "history_contract": {
-    "enabled": true,
-    "observation_horizon": 1,
-    "action_horizon": 1,
-    "pad_policy": "repeat_latest_with_valid_mask"
-  }
-}
+```text
+adapter + value_type + ordered names + units
+continuous -> lower/upper + optional max_step/max_rate_per_sec/bounded rate interval
+discrete   -> per-component token allowlist + optional transition allowlist
 ```
 
-说明：
+safety token不得超出layout vocabulary；continuous layout未声明units时不得进入真实native输出。模型artifact只声明
+action channel，不能提供或覆盖runtime safety数值。
 
-- `enabled_effectors` 使用 `<side>_arm` / `<side>_hand` 命名。只启用右臂时可为 `["right_arm"]` 或 `["right_arm", "right_hand"]`。
-- session metadata 中的 `camera_contract.selected_keys` 是运行时诊断记录；对 v2.2 visual policy，实际
-  选择、模型字段映射和 server slot 必须来自 artifact 的 `camera_input`，不能由该 metadata 覆盖。
-- `required=false` 表示缺相机时仍可推理，但 input 中必须给出 availability/fault。
-- `hand_action_specs_by_side` 对 DMTAC gripper、Inspire hand 和未来末端采用同一套 active slot 语义。
+`policy_absolute_frame` 只能是 `runtime_raw` 或 `canonical_desk`；它描述模型 absolute pose 的解释，不能替代
+`runtime_pose_frame_contract`。legacy v1 session 继续保留 `active_sides`、`enabled_effectors`、`control_hz`/
+`policy_hz`、分侧 `arm_action_specs_by_side`/`hand_action_specs_by_side`、`camera_contract`、`tactile_contract`
+和 `history_contract`。这些字段用于旧执行兼容与诊断；v2 visual policy 的 camera mapping 仍以 artifact 为准。
 
-## Step Input
+v2 runtime 必须在创建真实 backend 前完成 artifact、server metadata、layout、frame、end-effector capability
+和 requested mode 的一致性检查。启用 layout 中不存在的末端是错误；真实输出缺少 layout 中需要的末端也是错误，
+除非显式使用 dry-run 或 `allow_missing_v22_end_effectors` 兼容选项并记录 warning。
 
-每次 policy 推理接收一个 `DeployStepInput`。容器中的图像、触觉、任务和 fault 字段可由
-模型家族 adapter 改名；低维字段的键、dtype、维度和 layout hash 必须与 policy artifact
-一致。当前 OpenPI adapter 默认使用 `state` / `state_discrete`。
+## 5. Server metadata handshake
 
-推荐顶层结构：
+server metadata 是 loaded endpoint 对 artifact 的运行时 attestation。客户端应核对至少以下字段：
+
+| metadata 事实 | 必须与谁一致 |
+| --- | --- |
+| protocol/deploy schema | client contract / artifact |
+| model id、checkpoint step | artifact（若 artifact 声明） |
+| state key、state dim、state input mode、state token key/dim | artifact/layout |
+| action key、action dim、action token key/dim | artifact/layout |
+| `policy_io_layout_hash` | artifact layout hash |
+| `action_horizon` | 当前 server 实际返回 chunk |
+| camera slots | artifact `camera_input.server_camera_slots` |
+
+任何 missing、drift、dtype/shape mismatch 或 horizon 不一致，都必须在 action 进入 safety 前拒绝。
+server metadata 是证明，不是新的张量配置；自由 metadata 不能覆盖 artifact。
+
+## 6. Deploy step input
+
+每次 policy 推理使用一个逻辑 `DeployStepInput`。实际模型字段可以由 model-family adapter 映射，但
+低维 key、dtype、dimension、layout hash 和 causal semantics 必须保持一致。
 
 ```json
 {
@@ -338,643 +288,368 @@ structured contract 和旧 `metadata.pose_representation.action` 互相冲突，
   "monotonic_time": 12345.678,
   "step_index": 42,
   "active_sides": ["left", "right"],
-  "enabled_effectors": ["left_arm", "left_hand", "right_arm", "right_hand"],
-  "task": {
-    "task_id": 0,
-    "instruction": "pick up the object"
-  },
+  "enabled_effectors": ["left_arm", "right_arm"],
+  "task": {"task_id": 0, "instruction": "pick up the object"},
   "observation": {},
   "history": {},
   "metadata": {}
 }
 ```
 
-v2 实际送入模型的低维字段等价于：
+组装完成的 `observation` 至少暴露 `state`、`state_discrete`、`policy_io_layout_hash`、`images`、
+`tactile_by_side`、`last_action`、`last_action_discrete`、`last_action_valid` 和 `faults`；字段名可由
+artifact 的 key contract 映射，但不得改变其语义。
 
-```json
-{
-  "state": "<float32[state_dim]>",
-  "state_discrete": "<int64[state_discrete_dim]>",
-  "policy_io_layout_hash": "sha256:<canonical-layout-hash>"
-}
-```
+### 6.1 Causal observation cut
 
-当 artifact 的 `state_input_mode` 为 `masked_normalized_concat_v1` 时，`state` 长度是
-`2 * layout.state_dim`；部署 adapter 对原始 base state 自动追加全 1 mask。模型/server 必须只
-归一化前半 state，不能对 mask 再做均值方差归一化。server metadata 必须声明相同
-`input_state_mode` 和 `input_state_dim`，否则启动握手失败。
+每个模态应保留 `snapshot_sequence`、`source_timestamp`、`available_timestamp`、`source_clock`、
+`available_clock` 和 `causal_snapshot_contract`。手部 telemetry、tactile、camera 各自记录自己的 sequence/time。
+T0 前没有合格快照时，必须给出 `available=false`/fault，不得使用推理循环中刚读到的未来值。
 
-离散 token 不得拼接或转换进 float state。部署 observation 不读取 init/fix 审计列，也不
-读取 `task_hold`；这些字段不属于模型合同。
-
-### Observation
-
-`observation` 是当前帧的在线观测包。
-
-在线观测的 `metadata`/`state_dict` 应保留每个模态的 causal selection 审计字段：
-`snapshot_sequence`、`source_timestamp`、`available_timestamp`、`source_clock`、
-`available_clock` 和 `causal_snapshot_contract`。手部 telemetry 与 tactile 分别记录
-自己的 snapshot sequence/时间；如果任一 stream 在 T0 前没有合格快照，应报告
-`available=false`/fault，而不是使用推理循环中刚读取的最新值。VIVE 校时后的
-`source_timestamp` 在本机 wall-clock 域，`available_timestamp` 仍表示本机接收发布完成时刻。
-
-```json
-{
-  "state": "<float32[state_dim]>",
-  "state_discrete": "<int64[state_discrete_dim]>",
-  "policy_io_layout_hash": "sha256:<canonical-layout-hash>",
-  "state_dict": {
-    "left_arm.pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-    "right_arm.pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-    "right_end_effector.state_token": [0]
-  },
-  "images": {
-    "front": {
-      "data": "<HWC uint8 RGB tensor>",
-      "available": true,
-      "timestamp": 1783420000.100,
-      "age_sec": 0.023,
-      "shape": [480, 640, 3],
-      "color_space": "rgb"
-    }
-  },
-  "tactile_by_side": {
-    "left": {
-      "available": true,
-      "timestamp": 1783420000.110,
-      "age_sec": 0.013,
-      "data": "<backend-native tactile vector or dict>",
-      "shape": [64]
-    }
-  },
-  "last_action": "<float32[action_dim]>",
-  "last_action_discrete": "<int64[action_discrete_dim]>",
-  "last_action_valid": true,
-  "faults": []
-}
-```
-
-`state_dict` 是可选诊断视图，不是第二份模型张量权威。arm qpos 如需在线审计应放在独立
-runtime metadata/diagnostic 字段；不得重新拼入 v2 `state`。
-
-### v2 Typed Low-Dimensional Layout
-
-连续向量始终先放固定双臂 pose：
+### 6.2 Typed low-dimensional state
 
 ```text
 state(float32)  = [left_pose7, right_pose7, left_eef_state_cont?, right_eef_state_cont?]
 action(float32) = [left_pose7, right_pose7, left_eef_target_cont?, right_eef_target_cont?]
-
 state_discrete(int64)  = [left_eef_state_tokens?, right_eef_state_tokens?]
 action_discrete(int64) = [left_eef_target_tokens?, right_eef_target_tokens?]
 ```
 
-- `layout.state_dim = 14 + 左右连续末端 state 维度之和`。它始终表示 dataset 的 base state；
-  masked artifact 的模型输入维度为其两倍，而不是改变该 layout。
-- `action_dim = 14 + 左右连续末端 action 维度之和`。
-- state/action 末端维度默认一致，但 layout 可以显式声明不同维度。
-- 左右末端可为 `none`、`continuous` 或 `discrete`，也可以使用不同 adapter。
-- token 顺序、类别 id、名称和可选 backend value 均由 layout 声明；未声明类别必须拒绝。
-- `observation.arm.qpos` 是独立 12D float32 审计/回放初始化字段，顺序为
-  `[left_qpos6, right_qpos6]`；它不属于上述默认 model state。
+- `layout.state_dim = 14 + 左右连续末端 state 维度之和`。
+- `layout.action_dim = 14 + 左右连续末端 target 维度之和`。
+- state/action end-effector dimensions 可以不同，但必须由 layout 显式声明。
+- `observation.arm.qpos` 可作为 `[left_qpos6, right_qpos6]` 的 12D audit/init 字段；不属于默认 v2 model state。
+- `state_dict` 是诊断视图，不是第二份模型 tensor 权威。
+- 当前 OpenPI 默认低维键为 `state` / `state_discrete`；其他框架必须由 artifact 显式声明键名。
+- legacy v1 的 `state_valid` 与 38D `state` 等长；未启用或不可用的 segment 可用 `NaN` 表示，且必须将
+  对应 mask 置为 `false`。adapter 可以在模型侧将 NaN 替换为 0，但不得丢掉 validity 信息。
 
-例如左侧无末端、右侧 Inspire 6D 时，float state/action 默认为 20D；左侧连续 1D、
-右侧离散 1 token 时，float state/action 为 15D，token state/action 为 1D。
+当使用 `masked_normalized_concat_v1` 时，model `state` 长度为 `2 * layout.state_dim`，mask 规则见 3.2。
+部署 observation 不读取 init/fix audit columns，也不读取 `task_hold`。
 
-### Legacy v1 Vector Layout
+### 6.3 Images
 
-```text
-state dim = 38
-state = [
-  left_arm_qpos6, left_arm_pose7, left_hand6,
-  right_arm_qpos6, right_arm_pose7, right_hand6
-]
-
-action dim = 26
-action = [
-  left_arm_pose7,
-  right_arm_pose7,
-  left_hand6,
-  right_hand6
-]
-```
-
-v1 的 `state_valid` 与 `state` 等长。未启用或不可用的 segment 填 `NaN`，对应
-`state_valid=false`。模型输入适配器可把 NaN 替换为 0，但必须保留 mask。
-
-### Images
-
-`images` 是按 camera key 命名的字典。部署时可选择任意子集：
-
-- `front`
-- `left_wrist`
-- `right_wrist`
-- 其他在 camera registry 中声明的 key
-
-每个 image entry 必须带：
-
-- `available`: 当前帧是否可用。
-- `timestamp`: 原始相机帧时间戳，可为 `null`。
-- `age_sec`: `step.timestamp - image.timestamp`，不可用时可为 `null`。
-- `data`: 图像 tensor。推荐 RGB, HWC, uint8；若模型需要 NCHW/float，应在 model adapter 中转换。
-
-当相机缺失：
-
-- 若 session `camera_contract.required=false`，保留 key，设 `available=false`，`data=null` 或填充占位 tensor，并在 `faults` 中记录。
-- 若 `required=true`，runtime 应阻止推理或进入 hold，而不是让 policy 猜。
-
-### Tactile
-
-`tactile_by_side` 按 side 提供。不同末端可以有不同 representation：
-
-- Inspire hand 可使用扁平 tactile vector。
-- DMTAC gripper 可使用 per-sensor dict 或后处理后的 force/dist vector。
-- 没有触觉的末端应保留 `available=false`，不要伪造有效触觉。
-
-推荐字段：
+`images` 按 logical camera key 命名。每项至少包含：
 
 ```json
 {
-  "right": {
-    "available": true,
-    "backend": "dmtac_gripper",
-    "representation": "distributed_force",
-    "data": {"inner": [0.0], "outer": [0.0]},
-    "timestamp": 1783420000.110,
-    "age_sec": 0.013,
-    "sensor_keys": ["inner", "outer"]
-  }
+  "available": true,
+  "timestamp": 1783420000.100,
+  "age_sec": 0.023,
+  "data": "<HWC uint8 RGB tensor>",
+  "color_space": "rgb"
 }
 ```
 
-训练/部署 reader 不应要求所有任务都有触觉。触觉缺失时应依赖 `available=false` 和 mask，而不是改变 observation schema。
+`required=false` 时保留 key 并置 `available=false`/fault；`required=true` 时缺失应阻止推理或进入 hold。
+模型需要 NCHW/float 等转换时，由 model adapter 完成，不能改变 artifact 中的 logical-key 顺序。
+artifact 选择的视角数与 server camera slots 必须在打开相机前核对；required visual artifact 不得以 `camera-mode=none`
+或不足视角启动。旧 artifact 没有 `camera_input` 时才保留 legacy permissive fallback。
 
-### History
+### 6.4 Tactile
 
-`history` 是可选字段，用于需要历史窗口的 policy。它不替代当前帧 observation。
+目前 tactile 是 runtime modality/availability contract，不是一个全局固定的 artifact tensor schema。不同末端可使用
+backend-native vector 或 dict；缺失时保留 side 并置 `available=false`，不得把 stale data 伪装成有效数据。
+如果未来模型直接消费 typed tactile channels，应先增加 artifact-level contract，再宣称跨框架一致。
 
-推荐结构：
+### 6.5 History and last action
 
-```json
-{
-  "observations": {
-    "state": [[0.0]],
-    "state_valid": [[true]],
-    "timestamps": [1783420000.023]
-  },
-  "actions": {
-    "action": [[0.0]],
-    "timestamps": [1783420000.010],
-    "valid": [true]
-  },
-  "images": {
-    "front": {
-      "data": ["<image t-1>", "<image t>"],
-      "timestamps": [1783419999.900, 1783420000.100],
-      "available": [true, true]
-    }
-  },
-  "tactile_by_side": {
-    "left": {
-      "data": ["<tactile t-1>", "<tactile t>"],
-      "timestamps": [1783419999.910, 1783420000.110],
-      "available": [false, true]
-    }
-  }
-}
-```
+history 是可选的 model-adapter contract，不替代当前 observation。每个 stream 必须带 timestamps 与
+available/valid mask；不足 horizon 时可 repeat-last 或 zero-pad，但必须标记 padding。`last_action` 必须来自
+已经 safety-filter 接受或实际 dispatch 的 action，而不是未过滤 raw output。relative policy 的 last-action frame/mode
+必须与 `pose_action_chunk_contract` 一致。
 
-History 规则：
+## 7. Policy output
 
-- 每个 history stream 必须有 `timestamps` 和 `available`/`valid`。
-- 不足 horizon 时可重复最新帧或 zero-pad，但必须用 mask 表示 padding。
-- action history 使用已经实际下发或被 safety filter 接受后的 action，而不是未过滤 raw policy output。
-
-### Metadata
-
-`metadata` 必须包含本次 step 解释动作所需的 specs：
-
-```json
-{
-  "arm_action_specs_by_side": {},
-  "arm_controlled_frame_by_side": {},
-  "arm_reference_frame_by_side": {},
-  "hand_action_specs_by_side": {},
-  "hand_active_mask_by_side": {},
-  "modality_available": {
-    "images": {"front": true},
-    "tactile": {"left": false, "right": true}
-  },
-  "runtime": {
-    "source": "real|sim|replay",
-    "dry_run": false
-  }
-}
-```
-
-## Policy Output
-
-v2 policy 输出两个独立矩阵，horizon 必须一致：
+### 7.1 v2 typed output
 
 ```json
 {
   "actions": "<float32[horizon, action_dim]>",
   "actions_discrete": "<int64[horizon, action_discrete_dim]>",
-  "policy_io_layout_hash": "sha256:<canonical-layout-hash>",
+  "policy_io_layout_hash": "sha256:<matching-layout-hash>",
   "metadata": {}
 }
 ```
 
-也接受兼容键 `action` / `action.discrete`，但 policy artifact 中声明的正式 server 键是握手
-权威。float/token horizon、维度、token 类别和 hash 任一不匹配都必须在进入 safety gate 前
-拒绝。
+`actions` 与 `actions_discrete` horizon 必须一致；continuous 值必须 finite；token 必须是精确 int64 且属于 layout
+声明的 vocabulary。兼容键 `action` / `action.discrete` 只有在 server/artifact 显式声明时才可使用。
 
-v2 action 解析有两条显式路径：
+v2 output 的两条执行路径：
 
 ```text
 v22_q6_bridge:
-typed output -> explicit legacy_q6_slot_indices projection -> NormalizedAction(26D)
+typed output -> explicit legacy_q6_slot_indices -> NormalizedAction(26D)
              -> existing safety -> RobotAction -> TeleopCommand -> dispatcher
 
 v22_native:
 typed output -> RobotAction(typed EndEffectorTarget) -> TeleopCommand(typed target)
-             -> native safety/backend adapter（当前 run_policy 未完成，fail-closed）
+             -> native safety/backend adapter
 ```
 
-离散 target 在整个 typed 路径中保持 int64；不得为了调用旧 backend 而静默转换成连续值。
-只有 layout 中离散 category 显式提供可用 backend value 且声明 q6 slot 时，bridge 才可执行。
+离散 target 在 typed path 中保持 int64；只有 layout category、backend value 和 q6 slot 都显式声明时，q6 bridge 才可执行。
 
-### Legacy v1 Policy Output
+### 7.2 Legacy v1 output
 
-v1 policy 输出 `DeployActionOutput`，runtime 会将它归一化为 `RobotAction`，再由
-`RobotActionResolver` 转成 `TeleopCommand`。当前代码支持后文 short forms；完整
-canonical JSON 是建议接口，policy adapter 仍需显式转换到现有
-`NormalizedAction`/`RobotAction`。
+v1 固定布局：
 
-当前 `normalize_policy_output()` 不直接接收下面完整 canonical JSON dict。
-policy wrapper 若内部使用该结构，必须在返回给 runtime 前转换成后文
-Accepted Short Forms、`NormalizedAction`，或直接走 `RobotAction` 兼容路径。
+```text
+state = [left_arm_qpos6, left_arm_pose7, left_hand6,
+         right_arm_qpos6, right_arm_pose7, right_hand6]  # 38D
+action = [left_arm_pose7, right_arm_pose7, left_hand6, right_hand6]  # 26D
+```
 
-Legacy canonical output target contract:
+完整 v1 canonical action chunk 的语义是：
 
 ```json
 {
   "schema_version": "dexteleop_deploy_v1",
-  "action_space": "bimanual_ee_pose_v1",
-  "timestamp": 1783420000.123,
   "horizon": 1,
   "actions": [
     {
-      "active_effectors": ["left_arm", "left_hand", "right_arm", "right_hand"],
+      "active_effectors": ["right_arm"],
       "arm_pose_by_side": {
-        "left": [0.30, 0.10, 0.25, 0.0, 0.0, 0.0, 1.0],
         "right": [0.30, -0.10, 0.25, 0.0, 0.0, 0.0, 1.0]
       },
-      "hand_qpos_by_side": {
-        "left": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "right": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
-      },
-      "metadata": {
-        "confidence": 0.92
-      }
+      "hand_qpos_by_side": {},
+      "metadata": {}
     }
   ],
-  "metadata": {
-    "policy_name": "my_policy",
-    "raw_output_shape": [26]
-  }
+  "metadata": {"policy_name": "my_policy"}
 }
 ```
 
-Field semantics:
+当前 legacy runtime 还接受以下显式兼容 short forms：
 
-- `actions` may contain a chunk. Runtime may execute only the first item or buffer the chunk.
-- `arm_pose_by_side.<side>` is 7D `[x, y, z, qx, qy, qz, qw]` in `arm_action_specs_by_side.<side>.reference_frame`, controlling the frame declared by `controlled_frame`.
-- `hand_qpos_by_side.<side>` uses the fixed slot width declared by `HandActionSpec.slot_count`. For current DMTAC gripper datasets this is 6 slots with only active slot 0.
-- Inactive hand slots are padding. For q6 DMTAC data they should be finite padding such as `0.0`; for larger generic slots `NaN` padding is allowed only when specs explicitly support it.
-- `arm_qpos_by_side` is allowed only for low-level debug or special controllers. Preferred model output is arm pose.
+- `np.ndarray(shape=(26,))`：full action vector；
+- `np.ndarray(shape=(T, 26))`：legacy action chunk；
+- active-side compact arm pose `(7,)` 或双臂 `(14,)`；
+- `{right_arm_pose, right_hand}` 等带 side 的 mapping；
+- 单臂时 `{arm, hand}` aliases。
 
-### Accepted v1 Short Forms
+这些 short forms 只属于 legacy v1 或显式 q6 bridge；新 checkpoint 应保留 canonical specs/metadata。完整 canonical JSON
+在进入 runtime 前必须转换为 `NormalizedAction` 或 typed `RobotAction`。
 
-Legacy runtime also accepts these policy outputs and normalizes them：
+### 7.3 Chunk horizon and execution prefix
 
-1. Full action vector:
+artifact/training horizon、server-return horizon 与 runtime execution horizon 不是同一字段。runtime 可配置
+`action_chunk_execution_steps=X`：`None` 保持完整 chunk，`X>0` 只 admission 前 X 个 action。该限制只改变调度 admission，
+不得改变 pose representation、relative anchor、safety 或 history semantics；real 与 MuJoCo deploy 应保持同一语义。
 
-```python
-np.ndarray(shape=(26,), dtype=np.float32)
-```
+## 8. Runtime normalization and fault handling
 
-2. Action chunk:
-
-```python
-np.ndarray(shape=(T, 26), dtype=np.float32)
-```
-
-3. Active-side compact arm pose:
-
-```python
-# active_sides=("right",)
-np.ndarray(shape=(7,), dtype=np.float32)
-
-# active_sides=("left", "right")
-np.ndarray(shape=(14,), dtype=np.float32)
-```
-
-4. Mapping with explicit components:
-
-```json
-{
-  "right_arm_pose": [0.30, -0.10, 0.25, 0.0, 0.0, 0.0, 1.0],
-  "right_hand": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
-  "metadata": {
-    "policy": "example"
-  }
-}
-```
-
-5. Single-arm aliases when only one side is active:
-
-```json
-{
-  "arm": [0.30, -0.10, 0.25, 0.0, 0.0, 0.0, 1.0],
-  "hand": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
-}
-```
-
-这些 short forms 仅属于 v1 或显式 q6 bridge。saved checkpoints 和 production
-policy wrappers 应保留 canonical specs/metadata；在 canonical JSON parser 落地前，
-wrapper 返回 runtime 前仍需转换成当前 accepted form。
-
-## Runtime Normalization
-
-v1 和 q6 bridge 使用以下序列：
+### 8.1 Normalization boundary
 
 ```text
 policy output
-  -> NormalizedAction
-  -> RobotAction
+  -> typed/model-space validation
+  -> pose/codec decode to canonical absolute action
+  -> NormalizedAction (v1/q6 bridge) or typed RobotAction (v2 native)
+  -> canonical safety / IK / reference
   -> TeleopCommand
-  -> backend-specific send_command
+  -> backend dispatcher
 ```
 
-`NormalizedAction.vector` 在此路径使用 legacy 26D action layout。
-`RobotAction` is the semantic boundary. `TeleopCommand` is the dispatch boundary.
-
-v2 native 不以 26D `NormalizedAction.vector` 为语义来源；它使用 layout-bound typed
-`RobotAction.end_effector_targets_by_side`。在 native safety/dispatch adapter 完成前，不能
-通过让 policy adapter 直接构造 backend command 来绕过这一边界。
-
-Rules:
-
-- v2 必须给出完整双臂 pose14；任一侧缺失或非有限都是整条 action fault，不允许只下发另一侧。
-- v2 layout 中已配置的连续末端值必须有限；离散 token 必须是精确整数且属于声明 vocabulary。
-- v1 中 missing inactive side output 可以忽略或保持；missing active effector 只有在 policy
-  显式 hold 或 safety fallback 时才可退化为 hold。
-- v1 policy output 中 active arm pose/qpos 或 active hand slot 非有限时，不得向其余有效
-  effector 部分下发。
-- Runtime safety filters 可以裁剪 workspace、限制 pose/qpos 步长、拒绝动作或 hold。q6
-  bridge 继续使用现有 hand q6 `[0, 1]` clip；这些修改必须进入 action metadata。
-
-## Single-Arm Compatibility
-
-### Legacy v1
-
-For `active_sides=["right"]`:
-
-- Input may contain only right-side valid state, images and tactile.
-- `state` and `last_action` may still use full 38D/26D layouts with left side as invalid/NaN.
-- Target canonical output may contain only `right_arm` / `right_hand`; current direct runtime returns should use compact `(7,)` or mapping aliases `arm` and `hand`, unless a policy adapter converts canonical JSON first.
-- Runtime must not require left-side qpos, left images or left tactile.
-
-For `active_sides=["left", "right"]`:
-
-- Outputs should specify side names or use full 26D layout.
-- Compact `(14,)` arm pose means ordered sides `left`, then `right`.
-- Hand compact output follows ordered sides `left`, then `right`.
-
-### v2 Fixed Arm Core
-
-当前 v2 `PolicyIOLayout` 固定包含 `left_pose7 + right_pose7`，因此 model-facing session
-要求左右 arm 都存在。它不使用“删除未激活 arm slot”的方式表达单臂任务。
-
-- 某侧可以没有末端：例如左侧 `none`、右侧 6D hand。
-- 某侧 arm 若在真实 runtime 中不可用，v2 session 应在创建 backend 前失败，而不是用 NaN、
-  默认姿态或上一条命令伪造模型输入。
-- 若未来需要真正的单臂 v2 模型，应定义新的显式 layout/schema 版本；不得复用当前 v2.2
-  hash 后改变双臂 pose14 核心。
-
-## End-Effector Compatibility
-
-### v2 Per-Side End-Effector Spec
-
-每侧 `EndEffectorSpec` 独立声明：
-
-- `side`、`adapter`、`state_source_field`；
-- `target` 与 `state` 各自的 `value_type`、`dim`、名称、单位和 normalization metadata；
-- 离散 channel 的 token vocabulary 与稳定 int64 category id；
-- 仅用于旧执行路径的可选 `legacy_q6_slot_indices`。
-
-左右配置可以不同，例如：
-
-```json
-{
-  "left": {
-    "side": "left",
-    "adapter": "none_v1",
-    "target": {"value_type": "none", "dim": 0},
-    "state": {"value_type": "none", "dim": 0}
-  },
-  "right": {
-    "side": "right",
-    "adapter": "inspire_tac_v1",
-    "target": {"value_type": "continuous", "dim": 6},
-    "state": {"value_type": "continuous", "dim": 6}
-  }
-}
-```
-
-真实输出时，layout 中存在的末端必须有同侧 runtime capability 且 adapter 一致；runtime
-额外启用 layout 中不存在的末端同样是错误。dry-run 可以缺 backend，但必须给出 warning。
-
-### Legacy v1 Hand Slot Spec
-
-v1 end-effector 共用 hand action spec schema：
-
-```json
-{
-  "side": "right",
-  "hand_model": "dmtac_gripper",
-  "slot_count": 6,
-  "active_dof": 1,
-  "active_mask": [true, false, false, false, false, false],
-  "joint_names": ["gripper_close"],
-  "command_space": "normalized_0_0.9",
-  "slot_map": {"gripper_close": 0},
-  "invalid_slot_value": "zero_padding"
-}
-```
-
-Compatibility rules:
-
-- Policy should output full slot vector by side unless the wrapper explicitly supports active-dof output.
-- Runtime converts full slot vector to backend command by selecting active slots.
-- DMTAC gripper backend receives 1D active value after resolver mapping, even if policy emitted a 6-slot vector.
-- v1 future hands can use different `slot_count`, `active_mask`, `joint_names` and
-  `command_space`；v2 新末端必须通过新的 canonical layout/hash 绑定。
-- Tactile availability is independent from hand command availability.
-
-## Modality Compatibility
-
-### No Camera
-
-If camera input is disabled:
-
-- `images={}` or all configured entries have `available=false`.
-- `metadata.modality_available.images` records false values.
-- Policy must be trained/adapted for no-image operation, or runtime should use hold/fallback.
-
-### Camera Selection
-
-If only a subset of cameras is selected:
-
-- Keep original DexTeleop logical keys (`front`/`left_wrist`/`right_wrist`).
-- Use artifact `camera_input.inputs` to record the ordered logical key → model field → server slot mapping.
-- `--policy-artifact-json` makes `run_policy` open only those logical cameras. A single-camera serial source
-  is automatically assigned to the artifact's sole logical key; an explicitly conflicting `--camera-key` fails
-  before opening the device.
-- An artifact that requires two or more views rejects `--camera-mode single`; a required visual artifact rejects
-  `--camera-mode none`. Legacy artifacts without `camera_input` keep the old permissive behavior.
-
-### No Tactile
-
-If tactile is disabled or unavailable:
-
-- `tactile_by_side.<side>.available=false`.
-- `tactile_valid_by_side.<side>=false` in current implementation.
-- Do not fill random or stale tactile as valid data.
-
-### Historical Context
-
-If the model needs history:
-
-- Runtime should provide `history` with masks and timestamps.
-- The current frame must still be present outside history.
-- If history is shorter than expected after startup/reset, masks must mark padded entries invalid.
-
-## Faults And Fallback
-
-`faults` is part of the input because policy and runtime may make different decisions based on degraded sensors.
-
-Common observation faults:
-
-- `<side>_arm_qpos_unavailable`
-- `<side>_arm_pose_unavailable`
-- `<side>_hand_state_unavailable`
-- `camera_frame_unavailable:<camera_keys>`
-- `<side>_hand_telemetry:<reason>`
-
-Recommended behavior:
-
-- Hard hardware faults should stop dispatch or enter hold before policy output is sent.
-- Soft modality faults may still run policy if the session contract marks that modality optional.
-- Every fallback action should be logged with `fallback_reason` and whether it was dispatched.
-
-## Minimal Examples
-
-### v2: Left No End Effector, Right Discrete Gripper
-
-Layout-derived model fields：
-
-```json
-{
-  "state": "<float32[14] = left_pose7 + right_pose7>",
-  "state_discrete": "<int64[1] = right_gripper_state_token>",
-  "actions": "<float32[T,14] = left_pose7 + right_pose7>",
-  "actions_discrete": "<int64[T,1] = right_gripper_target_token>",
-  "policy_io_layout_hash": "sha256:<matching-layout-hash>"
-}
-```
-
-左侧不会生成 hand command。右侧 token 只有在 category 和 adapter 校验通过后，才进入
-显式 q6 bridge 或 native typed target。
-
-### v2: Left 1D Gripper, Right 6D Inspire
-
-默认 state/action 末端维度一致时：
+RTC逐项执行的顺序固定为：
 
 ```text
-state/action float dim = 14 + 1 + 6 = 21
-state/action token dim = 0
+timed-plan due-pop
+  -> PolicyActionEmission
+  -> proposal/source admission
+  -> canonical safety (safe | modified | fault)
+  -> resolver/reference/backend
+  -> downstream receipt
 ```
 
-采集、训练、checkpoint/server、replay 与部署必须使用同一 layout hash。仅 backend 配置
-一致而 hash 不一致仍必须拒绝。
+Emission记录pre-safety intent，不以safety或backend receipt为前置条件；只有RTC-3d future preview/lookahead需要在正式
+emission前取得独立preview acceptance。
 
-### Legacy v1: Right Arm Only, No Camera, No Tactile
+`RobotAction` 是 action semantic boundary，`TeleopCommand` 是 dispatch boundary。model adapter 不得 merge/pop plan、调用
+safety/reference/SDK 或取得 dispatch authority。
 
-Input:
+额外执行规则：v2 缺少任一 pose7、出现非有限值或 layout 中声明的末端缺失时，整条 candidate/chunk 拒绝；v1
+只有 inactive side 可以省略，active effector 缺失只能显式 hold/fallback。q6 bridge 仍使用既有 slot projection 与
+范围裁剪，裁剪/拒绝结果必须进入 action metadata；不得由 adapter 直接发送 backend command。
 
-```json
-{
-  "schema_version": "dexteleop_deploy_v1",
-  "step_index": 1,
-  "active_sides": ["right"],
-  "enabled_effectors": ["right_arm"],
-  "observation": {
-    "state": "<38D float32, right valid, left NaN>",
-    "state_valid": "<38D bool>",
-    "images": {},
-    "tactile_by_side": {},
-    "last_action": "<26D float32>"
-  },
-  "metadata": {
-    "arm_action_specs_by_side": {
-      "right": {"controlled_frame": "tool_tcp", "representation": "xyz_quat", "dof": 7}
-    }
-  }
-}
+### 8.2 Fail-closed matrix
+
+| fault | 处理 |
+| --- | --- |
+| artifact/schema/layout/hash mismatch | 启动前拒绝 |
+| server metadata mismatch/drift | 不接收 result；重新 handshake 或退出 |
+| required camera/telemetry/tactile snapshot 缺失 | 阻止本次推理或进入 hold |
+| optional modality 缺失 | 保留 key，置 availability/mask/fault |
+| output shape/dtype/token/finite 校验失败 | 丢弃整个 chunk，不部分下发 |
+| pose/frame/anchor 无效 | 在 safety/dispatch 前拒绝 |
+| safety/IK/reference fault | hold/取消后续动作，记录 fault |
+| worker/transport late result | 按 request/epoch/session identity 拒绝，不能静默 fallback 同步推理 |
+
+每次 fallback 必须记录 `fallback_reason`、是否进入 safety、是否 dispatch；fault 与 hold 的最终 owner 属于 runtime，
+不是模型。
+
+## 9. Optional RTC extension
+
+RTC 是 `dexteleop_deploy_v2` 的可选推理扩展，默认关闭，不新增 state/action tensor 语义。
+
+### 9.1 raw-RTC
+
+```text
+existing observation -> final action chunk
+model/server unchanged
+client worker -> timed plan -> admission/TTL/epoch -> PolicyActionEmission
+continuation=none
 ```
 
-Output:
+raw-RTC 的模型不消费 future action prefix；request 不得携带 prefix/mask/conditioning receipt，且必须声明
+`continuation=none`。OpenPI 当前 final-chunk 接入属于 raw-RTC。raw-RTC adapter 只负责 input preparation、
+blocking model call、response validation 和 model-space decode，不能拥有 worker、plan、safety、reference 或 dispatch authority。
 
-```json
-{
-  "arm": [0.30, -0.10, 0.25, 0.0, 0.0, 0.0, 1.0]
-}
+RTC 的 `observation_cut_id` 是 versioned causal identity，不是大体积 sensor payload 的内容哈希。v2 identity 必须绑定
+runtime session、control domain、producer/epoch、policy node、单调 request sequence、observation contract、timestamp 和
+step index；control thread 不得为此扫描 camera/tactile bytes。冻结的 actor view 随 work item 进入 worker，worker 再对实际
+model adapter 输出计算 `model_input_hash`；response 必须回显该 hash。两者职责不可混用：
+
+```text
+observation_cut_id = request/epoch/anchor/plan 的因果身份
+model_input_hash   = 本次实际送入模型内容的精确证明
 ```
 
-Runtime normalizes this to `right_arm` cartesian pose.
+absolute raw-RTC 的 decoder 必须在 `PolicyChunkResult` 前产生 typed canonical action，并用同一 receipt 绑定
+`observation_cut_id`、codec/frame/layout/normalization、conversion contract、source chunk hash、canonical chunk hash
+和连续 source index。identity conversion 也必须显式留据；typed 与 legacy result 不得混装。OpenPI typed output
+必须由显式 `typed_canonical_v1` 配置启用，默认 legacy codec/result 保持不变。
 
-### Legacy v1: Dual Arm With DMTAC Grippers
+relative raw-RTC 必须在 client request 构造时冻结
+`PolicyActionRepresentationContext`。该 versioned context 绑定 source pose mode、observation
+cut/contract/timestamp/step、active arm group、每侧 reference/controlled frame、SE(3) 约定，以及每侧同一
+observation cut 的 measured actual-TCP anchor；整个 chunk 只能使用这组 anchor：
 
-Output:
-
-```json
-{
-  "left_arm_pose": [0.30, 0.10, 0.25, 0.0, 0.0, 0.0, 1.0],
-  "right_arm_pose": [0.30, -0.10, 0.25, 0.0, 0.0, 0.0, 1.0],
-  "left_hand": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0],
-  "right_hand": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
-}
+```text
+T_absolute[side, i] = T_request_anchor[side] @ T_relative[side, i]
 ```
 
-Runtime uses `hand_action_specs_by_side` to send only active gripper values to each backend.
+不得在 completion、merge 或 emission 时重新采样/重锚定。SE(3) 变换只作用于 arm pose，typed gripper/hand
+continuous target 与 discrete token 保持原 component identity。context hash 进入 request hash，relative request 缺失
+context、cut/time/frame/arm coverage 不一致或 receipt anchor identity 不匹配时，必须在模型调用或 plan admission 前
+fail closed。该 context 是 client/runtime 内部因果事实，不加入 raw-RTC model/server payload；模型仍只接收既有
+observation 并返回 final chunk。absolute frontend 可携带显式 `anchor_policy=none_v1` context；没有 context 的既有
+absolute request/hash继续按 v1 compatibility 解释。
 
-## Relation To Dataset Schema
+### 9.2 model-RTC
 
-`DATASET_SCHEMA.md` remains the source of truth for offline sample columns and media storage.
-部署与数据集共享同一模型语义，但容器不同：
+model-RTC 才允许模型实际消费 versioned future-action prefix/mask，并返回可验证的
+`RtcConditioningReceiptV2`，证明实际使用的 prefix、mask、delay、implementation parameters 和 execution horizon。
+`continuation != none` 必须走 `async_timed_plan`；当前 typed prefix 不支持离散 token continuation 时必须拒绝。
+model-RTC 的 receipt/identity promotion 不得回写 raw-RTC 的 legacy model/server 调用。
 
-- Dataset rows are persisted samples.
-- Deploy step inputs are online observations with availability masks.
-- Dataset `action` is the training target.
-- Deploy output is the model prediction that must be normalized to `RobotAction`.
-- v2 dataset 的 `PolicyIOLayout` 是张量语义权威；deploy artifact 内嵌同一 layout 并验证 hash。
-- `observation.arm.qpos` 可以被 replay/qpos-init 读取，但 dataset interface、训练 batch 和默认
-  deployment model observation 不读取它。
-- v1 的 26D/38D 仍保持原定义；旧数据/模型只有经过显式、可审计的 adapter 或复制式转换
-  才能进入 v2，不允许原地修改或按维度猜测。
+### 9.3 通用 adapter boundary
 
-任何改变 action/state/token 语义的修改必须同时更新 dataset layout、policy artifact、server
-metadata、replay 和本文档；在线 fault、模态 availability、session preflight 与输出归一化只在
-`DEPLOY_SCHEMA.md` 描述。
+adapter 必须从已加载模型实例导出 capability、request spec、artifact/layout/frame/normalization/horizon identity，
+不得按 model name、checkpoint name、config name 或固定维度猜测。通用入口是结构化
+`RtcModelRuntimeAdapter`/`SimpleRtcModelRuntimeAdapter`；具体 worker/session/transport lifecycle 见
+[`deployments/client/README.md`](deployments/client/README.md) 和
+[`todos/dexteleop_rtc_landing_plan.md`](todos/dexteleop_rtc_landing_plan.md)。
+
+RTC capability/negotiation 至少绑定：`capability_id`/`provider_id`/`artifact_hash`/`protocol_version`、scheduler modes、
+continuation mode、implementation id/`implementation_parameters_hash`、model action space 与 float/token dims、支持的 pose modes
+和 component scope、`action_codec_hash`/`frame_contract_hash`/`layout_hash`/`normalization_hash`、prediction/execution
+horizon 范围、`prefix_requirement`，以及 prefix-mask/conditioning-receipt 能力。客户端与 server 必须逐项核对并保留 typed rejection；
+capability drift、hash drift 或 horizon 不满足时不得降级成另一种 model/RTC 语义。
+
+RTC profile MUST remain default-off；`--rtc-profile off` 时 server metadata、legacy `Policy.infer()`、sampler、websocket
+payload、sync queue 顺序和 existing action-chunk behavior 不得改变。OpenPI raw-RTC 的 launcher/profile 细节见
+[`deployments/openpi/client/README.md`](deployments/openpi/client/README.md)。
+
+### 9.3.1 Live observation/transport no-action shadow
+
+`--rtc-real-shadow` 是 raw-RTC 的显式部署开关，语义是：
+
+```text
+real arm/hand/camera observation
+  -> existing model/server transport
+  -> RTC worker/timed-plan/admission/safety shadow
+  -> no actuator dispatch
+```
+
+它不是数据集 replay；数据集/合成 observation 只能验证离线 codec、adapter 和 plan，不覆盖真实设备采样、相机时序或
+网络延迟。该开关必须与 `raw_rtc_final_chunk_15_30_60_120_v1`、`send_actions=false` 一起使用；没有显式开关时，raw-RTC
+不接受 live arm/hand endpoints。
+
+live shadow 下 backend MUST expose measured observation while `observation_only=true`：RM65 不得配置奇异点阈值、同步工具
+帧、启动 force/CANFD 输出或发送/停止 motion；DMTAC/hand 不得清 fault、写 speed/torque、open/reset 或发送 command。该
+模式只产生 `rtc_real_shadow_ready` 类验证证据，不授予 motion authorization；teleop、replay、sync dry-run 和 model-RTC
+均不继承此开关。
+
+若开启 `--debug`，raw-RTC 还会记录 model-neutral 的 `rtc_transport_exchange` 事件，包含 observation cut、输入/输出
+identity hash、chunk horizon 以及 inference/result latency；该事件只用于观测，不能替代 plan admission、safety、dispatch
+或 worker-drain evidence。
+
+`--rtc-request-validity-steps`和`--rtc-worker-stop-timeout-sec`只在显式RTC profile下有效，分别绑定request/plan TTL和
+frontend close的bounded worker wait；默认值`10`/`0`保持既有fail-closed与non-waiting语义。模型包、checkpoint名称或
+server latency不得隐式改写这两个值，非RTC caller设置override必须拒绝。
+
+### 9.4 vla-scratch migration boundary
+
+外部 `vla-scratch` 仓库保持不修改。DexTeleop 侧只提供 artifact-bound processed-sample binding 和
+`infer(dict) -> final chunk` adapter；server/client 通过 transport 进程边界互通，不要求共享 virtual environment。
+输入顺序、state/action dimension、horizon、frame/layout/normalization identity 必须来自外部 artifact；不得把 LIBERO 默认
+7D action 或 dataset 推导值猜成 DexTeleop canonical action。无 server attestation 时只允许 scoped no-action verification。
+详细接入见 [`deployments/vla_scratch/README.md`](deployments/vla_scratch/README.md)。
+
+## 10. Compatibility matrix
+
+| 维度 | legacy v1 | v2 |
+| --- | --- | --- |
+| active sides | 单臂或双臂 | layout 固定双臂 pose core；session 当前要求两侧 |
+| arm state | 38D 中含 qpos + pose | pose14；qpos 仅 audit/init |
+| arm action | 26D pose + q6 slots | typed continuous/token channels |
+| hand | side-specific q6 slot spec | per-side `EndEffectorSpec`，可 none/continuous/discrete |
+| camera | legacy camera contract / permissive fallback | artifact `camera_input` 为 authority |
+| tactile | runtime-native availability | 仍是 runtime modality，未来 typed channel 需新 contract |
+| output | short forms permitted | layout-bound matrices only，除非显式 bridge |
+| single arm | compact aliases或 full vector + invalid side | 新增单臂 v2 必须有新 layout/schema，不能删除 pose14 slot |
+
+### End-effector rules
+
+v2 每侧 `EndEffectorSpec` 至少声明 `side`、`adapter`、state/target `value_type`、dimension、names/units/normalization，
+以及离散 vocabulary；legacy q6 projection 使用可选 `legacy_q6_slot_indices`。layout 中存在的末端必须有同侧 runtime capability
+且 adapter 一致；runtime 额外启用 layout 中不存在的末端也是错误。dry-run 可以缺 backend，但必须 warning。
+
+v1 hand spec 使用 `slot_count`、`active_dof`、`active_mask`、`joint_names`、`command_space`、`slot_map` 和可选
+`invalid_slot_value`。DMTAC 当前常见为 6-slot vector、active slot 0；inactive slot 使用声明的有限 padding，runtime
+只向 backend 发送 active value。tactile availability（当前实现可同时记录 `tactile_valid_by_side`）与 hand command
+availability 独立。
+
+### Single-arm rules
+
+legacy `active_sides=["right"]` 可只提供 right state/image/tactile，left side 在 full vector 中以 invalid/NaN 表示，或返回
+compact `(7,)` / `{arm, hand}`。v2 当前固定双臂 pose core；真实 runtime 缺少一侧必须失败，不能用 NaN、默认姿态或上一条命令伪造。
+
+## 11. Minimal conformance checklist
+
+一个新模型/框架接入至少必须证明：
+
+1. artifact、dataset/deploy schema、layout hash 可解析且一致；
+2. input/output keys、float/token dims、dtype、horizon 与 server metadata 一致；
+3. camera logical key、model input key、server slot 顺序一致；
+4. state_input_mode、normalization、mask 规则明确；
+5. v2.3 pose mode、anchor、frame contract、training provenance 可重建；
+6. observation 在 T0 前冻结，所有 modality 有 timestamp/availability/mask；
+7. output 经过 finite、shape、token vocabulary、layout/hash validation；
+8. adapter 只返回 decoded candidate/result，不拥有 safety、plan、pop、dispatch；
+9. runtime fault、hold、late result 和 fallback 可观测且 fail-closed；
+10. legacy sync path、sim/replay compatibility 和 default-off behavior 未改变；
+11. 如启用 raw-RTC，明确 `continuation=none`；如启用 model-RTC，提供可验证 conditioning receipt；
+12. 至少有 fake/local deterministic test，真实 observation/hardware/action send 另行授权。
+
+## 12. Relation to dataset schema
+
+`DATASET_SCHEMA.md` 是 offline sample columns、media storage 和 dataset provenance 的权威；本文件是 online deployment
+observation、artifact、session、policy output 和 runtime compatibility 的权威。
+
+- Dataset rows 是持久化样本，deploy step 是带 availability/causal metadata 的在线 observation。
+- Dataset `action` 是 training target，deploy output 是 prediction，必须在 runtime 中归一化为 `RobotAction` 或 typed target。
+- v2 dataset 的 `PolicyIOLayout` 必须嵌入 artifact 并核对 hash；v1 26D/38D 只有经过显式、可审计 adapter 才能进入 v2。
+- `observation.arm.qpos` 可以由 replay/qpos-init 读取，但不进入默认 v2 model observation。
+- 改变 state/action/token/pose/frame 语义时，必须同步更新 dataset layout、artifact、server metadata、adapter 和本文档；
+  runtime availability、fault、session preflight 与 output normalization 只在部署契约层维护。

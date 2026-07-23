@@ -125,6 +125,18 @@ def test_absolute_pose_window_is_a_desk_view_without_relative_conversion() -> No
     np.testing.assert_allclose(window.action[0, 7:10], [0.4, -0.5, 0.3], atol=1e-6)
 
 
+def test_pose_window_rejects_rows_across_pause_resume_continuity_segments() -> None:
+    rows = [_row(0), _row(1)]
+    rows[0]["collection.continuity_segment_index"] = 0
+    rows[1]["collection.continuity_segment_index"] = 1
+    with pytest.raises(PosePolicyViewError, match="pause/resume continuity segment"):
+        pose_policy_window_from_rows(
+            rows,
+            _layout(),
+            pose_frame_contract=_contract(),
+        )
+
+
 def test_dataset_metadata_resolves_contract_without_mutating_storage_rows() -> None:
     layout = _layout()
     contract = _contract()

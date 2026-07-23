@@ -8,6 +8,12 @@ import pytest
 
 
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
+ACTUATED_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v1.json"
+)
+FULLY_ACTUATED_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v2.json"
+)
 
 
 def test_fast_kernel_matches_reference_action_trace(tmp_path: Path) -> None:
@@ -87,6 +93,255 @@ def test_model_artifact_cache_hits_and_recovers_from_corruption(tmp_path: Path) 
     _third_scene, third = cache.load_scene(contract)
     assert not third.cache_hit
     assert third.mjb_path.stat().st_size > len(b"corrupt")
+
+
+def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None:
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.artifacts import ModelArtifactCache
+    from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
+
+    direct = CubeLiftTaskConfig.load(TASK_CONFIG)
+    actuated = CubeLiftTaskConfig.load(ACTUATED_TASK_CONFIG)
+    cache = ModelArtifactCache(tmp_path / "cache")
+    direct_scene, direct_artifact = cache.load_scene(direct.base_contract())
+    actuated_scene, actuated_artifact = cache.load_scene(
+        actuated.base_contract(),
+        position_actuation_profile=actuated.position_actuation_profile(),
+    )
+
+    assert direct_artifact.key != actuated_artifact.key
+    assert direct_scene.model.nu == 0
+    assert actuated_scene.model.nu == 12
+    assert actuated_scene.model.opt.integrator == mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    manifest = json.loads(actuated_artifact.manifest_path.read_text(encoding="utf-8"))
+    assert (
+        manifest["fingerprint"]["position_actuation_profile"]["name"]
+        == actuated.position_actuation_profile_name
+    )
+
+
+def test_model_artifact_cache_separates_fully_actuated_gripper_profile(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("mujoco")
+    from sim.mujoco.artifacts import ModelArtifactCache
+    from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
+
+    arm_only = CubeLiftTaskConfig.load(ACTUATED_TASK_CONFIG)
+    fully_actuated = CubeLiftTaskConfig.load(FULLY_ACTUATED_TASK_CONFIG)
+    cache = ModelArtifactCache(tmp_path / "cache")
+    arm_scene, arm_artifact = cache.load_scene(
+        arm_only.base_contract(),
+        position_actuation_profile=arm_only.position_actuation_profile(),
+    )
+    full_scene, full_artifact = cache.load_scene(
+        fully_actuated.base_contract(),
+        position_actuation_profile=fully_actuated.position_actuation_profile(),
+        gripper_actuation_profile=fully_actuated.gripper_actuation_profile(),
+    )
+
+    assert arm_artifact.key != full_artifact.key
+    assert arm_scene.model.nu == 12
+    assert full_scene.model.nu == 16
+    manifest = json.loads(full_artifact.manifest_path.read_text(encoding="utf-8"))
+    assert (
+        manifest["fingerprint"]["gripper_actuation_profile"]["name"]
+        == fully_actuated.gripper_actuation_profile_name
+    )
+
+
+def test_actuated_cube_lift_uses_measured_arm_state_and_shared_viewer_kernel(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("mujoco")
+    pytest.importorskip("gymnasium")
+    from sim.mujoco.tasks.cube_lift import CubeLiftEnv
+
+    env = CubeLiftEnv(ACTUATED_TASK_CONFIG)
+    try:
+        initial, reset_info = env.reset(seed=4)
+        assert reset_info["execution_mode"] == "actuated_position_servo"
+        assert reset_info["robot_dynamics"] == "mujoco_position_actuator"
+        assert reset_info["gripper_dynamics"] == "prescribed_qpos_debug"
+        assert reset_info["arm_tracking_error_rad_max"] < 0.01
+        assert env.scene.model.nu == 12
+
+        action = np.zeros(7, dtype=np.float32)
+        action[0] = 0.5
+        first = env.step(action)[0]
+        for _ in range(6):
+            final, _reward, terminated, truncated, info = env.step(
+                np.zeros(7, dtype=np.float32)
+            )
+            assert not terminated and not truncated
+        # Physical tracking is delayed: the first step has moved only part of
+        # the 0.04 rad target, and subsequent 1000 Hz dynamics converge.
+        first_delta = float(first[0] - initial[0])
+        final_delta = float(final[0] - initial[0])
+        assert 0.0 < first_delta < 0.04
+        assert final_delta > first_delta
+        assert final_delta == pytest.approx(0.04, abs=0.005)
+        assert info["arm_tracking_error_rad_max"] < 0.01
+    finally:
+        env.close()
+
+
+def test_pose_planner_recovers_only_small_mujoco_joint_limit_residual() -> None:
+    pytest.importorskip("mujoco")
+    pytest.importorskip("gymnasium")
+    from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
+    from sim.mujoco.tasks.cube_lift.pose_action import (
+        SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD,
+    )
+
+    env = FastCubeLiftEnv(
+        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
+        use_settled_snapshot=False,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=11)
+        controller = env.kernel._pose_action_controller
+        assert controller is not None
+        if controller._ik is None:
+            pytest.skip("canonical RM65 planner is unavailable in this environment")
+        upper = controller._ik.planner._joint_upper_by_side["right"]
+        joint_index = 5
+        residual = 0.5 * SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD
+        env.kernel.data.qpos[env.kernel._right_qpos_idx[joint_index]] = (
+            upper[joint_index] + residual
+        )
+        env.kernel.mujoco.mj_forward(env.kernel.model, env.kernel.data)
+
+        status = controller.sync_planner_from_scene()
+
+        assert status.safe is True
+        assert status.recovered is True
+        assert status.violating_side == "right"
+        assert status.violating_joint_index == joint_index
+        assert status.max_violation_rad == pytest.approx(residual, abs=1e-10)
+        # Recovery only sanitizes the planner snapshot; it does not teleport or
+        # rewrite the MuJoCo state.
+        assert env.kernel.scene.get_arm_qpos("right")[joint_index] == pytest.approx(
+            upper[joint_index] + residual,
+            abs=1e-10,
+        )
+    finally:
+        env.close()
+
+
+def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mujoco")
+    pytest.importorskip("gymnasium")
+    from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
+    from sim.mujoco.tasks.cube_lift.pose_action import CubeLiftPosePlannerSyncStatus
+
+    env = FastCubeLiftEnv(
+        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
+        use_settled_snapshot=False,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=12)
+        controller = env.kernel._pose_action_controller
+        assert controller is not None
+        hard_status = CubeLiftPosePlannerSyncStatus(
+            safe=False,
+            recovered=False,
+            max_violation_rad=2e-3,
+            violating_side="right",
+            violating_joint_index=5,
+        )
+
+        def hard_sync():
+            controller._last_planner_sync = hard_status
+            return hard_status
+
+        monkeypatch.setattr(controller, "sync_planner_from_scene", hard_sync)
+
+        _observation, _reward, terminated, truncated, info = env.step(
+            np.zeros(7, dtype=np.float32)
+        )
+
+        assert terminated is True
+        assert truncated is False
+        assert info["termination_reason"] == "sim_joint_position_limit_violation"
+        assert info["pose_ik_limit_violation_rad"] == pytest.approx(2e-3)
+    finally:
+        env.close()
+
+
+def test_pose_planner_uses_mujoco_collision_clearance() -> None:
+    """The sim IK anchor must use the sim policy's clearance, not real defaults."""
+
+    pytest.importorskip("mujoco")
+    pytest.importorskip("gymnasium")
+    from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
+        use_settled_snapshot=False,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=13)
+        controller = env.kernel._pose_action_controller
+        assert controller is not None
+        expected = env.kernel.scene.scene_spec.collision.safety_minimum_clearance_m
+        assert expected == pytest.approx(0.002)
+        assert controller.planner_collision_min_distance_m == pytest.approx(expected)
+        if controller._ik is not None:
+            assert controller._ik.planner.config.collision_min_distance_m == pytest.approx(
+                expected
+            )
+    finally:
+        env.close()
+
+
+def test_default_cube_lift_uses_measured_identified_gripper_state() -> None:
+    pytest.importorskip("mujoco")
+    pytest.importorskip("gymnasium")
+    from sim.mujoco.tasks.cube_lift import CubeLiftEnv
+
+    env = CubeLiftEnv()
+    try:
+        initial, reset_info = env.reset(seed=5)
+        assert env.config.name == "rm65_right_cube_lift_rl_normal_v1"
+        assert env.config.policy_class == "normal"
+        assert initial.shape == (15,)
+        assert reset_info["grasp_latched"] is False
+        assert "training_reward_state" not in reset_info
+        assert reset_info["gripper_dynamics"] == "mujoco_identified_position_actuator"
+        assert reset_info["gripper_actuation_profile_name"] == (
+            "dmtac_bimanual_position_20260722.v1"
+        )
+        assert env.scene.model.nu == 16
+
+        close = np.zeros(7, dtype=np.float32)
+        close[6] = 1.0
+        first, _reward, terminated, truncated, first_info = env.step(close)
+        assert not terminated and not truncated
+        assert first_info["right_gripper_target_close"] == pytest.approx(0.2)
+        # Transport delay plus the physical finger servo keeps the first
+        # 66.7 ms policy observation effectively measured-open.
+        assert first[6] < 1e-3
+        assert first_info["right_gripper_measured_close"] < 1e-3
+
+        for _ in range(3):
+            _observation, _reward, terminated, truncated, _info = env.step(close)
+            assert not terminated and not truncated
+        for _ in range(8):
+            final, _reward, terminated, truncated, info = env.step(
+                np.zeros(7, dtype=np.float32)
+            )
+            assert not terminated and not truncated
+        assert final[6] == pytest.approx(0.8, abs=0.01)
+        assert info["right_gripper_measured_close"] == pytest.approx(0.8, abs=0.01)
+        assert info["right_gripper_tracking_error"] == pytest.approx(0.0, abs=0.01)
+    finally:
+        env.close()
 
 
 def test_vector_executor_is_deterministic_and_preserves_terminal_observation(

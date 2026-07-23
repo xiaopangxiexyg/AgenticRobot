@@ -59,6 +59,30 @@ def test_pose_keyframe_guard_applies_only_explicit_workspace_and_step_limits() -
     )
 
 
+def test_pose_keyframe_guard_can_explicitly_disable_workspace_without_disabling_step() -> None:
+    reference = np.asarray([1.0, 0.0, 0.30, 0.0, 0.0, 0.0, 1.0])
+    target = np.asarray([1.3, 0.0, 0.30, 0.0, 0.0, 0.0, 1.0])
+    config = PositionKeyframeSafetyConfig(
+        workspace_enabled=False,
+        max_translation_step_m=0.1,
+    )
+
+    result = limit_pose_keyframes(
+        {"right": target},
+        reference_by_side={"right": reference},
+        config=config,
+    )
+
+    np.testing.assert_allclose(
+        result.values_by_side["right"][:3],
+        [1.1, 0.0, 0.30],
+        atol=1e-12,
+    )
+    assert result.reasons_by_side["right"] == ("translation_step_limit",)
+    assert result.metadata_by_side["right"]["workspace_enabled"] is False
+    assert result.metadata_by_side["right"]["target_workspace_distance_m"] is None
+
+
 def test_joint_keyframe_guard_clips_absolute_and_delta_limits() -> None:
     config = PositionKeyframeSafetyConfig(
         max_joint_step_rad=0.2,

@@ -37,6 +37,7 @@ from robot_motion.joint_limits import (
 )
 from robot_motion.pinocchio_provider import PinocchioIKProvider
 from robot_motion.pose import matrix_to_pose6, pose6_to_matrix
+from robot_motion.position_control import DEFAULT_POSITION_COMMAND_HZ
 from robot_motion.profiles import load_ik_safety_profiles
 from robot_motion.rm65 import RM65_ABSOLUTE_Q_MAX_RAD, RM65_ABSOLUTE_Q_MIN_RAD
 from robot_motion.seed_expansion import load_seed_expansion_profiles
@@ -311,13 +312,15 @@ class RM65ImpedanceConfig:
     return_rate_s: float = 0.35
     canfd_follow: bool = False
     follow_qpos_alpha: float = 1.0
-    canfd_follow_stream_hz: float = 150.0
+    canfd_follow_stream_hz: float = DEFAULT_POSITION_COMMAND_HZ
     canfd_follow_warning_ratio: float = 0.9
     passthrough_position_control: bool = False
     trajectory_mode: int = 0
     radio: int = 0
     hard_stop_force_n: float = 50.0
     hard_stop_torque_nm: float = 10.0
+    # Absolute final per-tick cap. Joint-specific velocity limits may impose a
+    # smaller bound, but no configured profile may enlarge this hard ceiling.
     max_command_joint_step_deg: float = 40.0
     max_command_joint_velocity_deg_s: float = 120.0
     joint_rate_limiter_enabled: bool = True
@@ -512,6 +515,19 @@ class RM65ImpedanceConfig:
             for name in list(self.ik_resolver_candidate_provider_names or [])
             if str(name).strip()
         ]
+        if (
+            bool(self.ik_resolver_enabled)
+            and bool(self.ik_hard_deadline_enabled)
+            and (
+                not self.ik_resolver_candidate_provider_names
+                or "rm65_sdk" in self.ik_resolver_candidate_provider_names
+            )
+        ):
+            raise ValueError(
+                "ik_hard_deadline_enabled requires non-blocking candidate providers; "
+                "rm65_sdk cannot guarantee the control-period deadline. Disable the hard "
+                "deadline explicitly for SDK-only diagnostics."
+            )
         if self.ik_resolver_local_step_max_iterations is not None and int(self.ik_resolver_local_step_max_iterations) < 1:
             raise ValueError("ik_resolver_local_step_max_iterations must be >= 1")
         if self.ik_resolver_local_step_trigger_ratio is not None and float(self.ik_resolver_local_step_trigger_ratio) < 1.0:
@@ -693,6 +709,11 @@ class RM65BaseImpedanceController:
         self._joint_hint_reference: _ReferenceInterpolator | None = None
         self._joint_hint_target: list[float] | None = None
         self._last_joint_hint_invalidation: dict[str, object] | None = None
+        # Exact-qpos transit is a short-lived control lease used by the real
+        # teleop Init-arm workflow.  It keeps the impedance worker/socket and
+        # force monitoring alive, but gives the collision-planned joint hint
+        # authority over the admittance offset until the workflow enters Hold.
+        self._exact_qpos_transit_operation_id: str | None = None
         self._previous_command_joint: list[float] | None = None
         self._ik_seed: list[float] | None = None
         self._tool_frame: dict[str, object] | None = None
@@ -1797,7 +1818,7 @@ class RM65BaseImpedanceController:
             profile_max_step = self._joint_velocity_limit_profile.max_step_deg(dt_for_velocity)
             if self.config.joint_rate_limiter_enabled:
                 profile_max_abs = float(np.max(profile_max_step)) if profile_max_step.size else 0.0
-                return max(float(self.config.max_command_joint_step_deg), profile_max_abs)
+                return min(float(self.config.max_command_joint_step_deg), profile_max_abs)
         return min(
             float(self.config.max_command_joint_step_deg),
             float(self.config.max_command_joint_velocity_deg_s) * dt_for_velocity,
@@ -3021,6 +3042,52 @@ class RM65BaseImpedanceController:
         self._reset_follow_stream_state(self._previous_command_joint)
         self._start_follow_stream_if_needed()
 
+    @property
+    def exact_qpos_transit_active(self) -> bool:
+        return bool(self._exact_qpos_transit_operation_id)
+
+    @property
+    def exact_qpos_transit_operation_id(self) -> str:
+        return str(self._exact_qpos_transit_operation_id or "")
+
+    def begin_exact_qpos_transit(self, operation_id: str) -> None:
+        """Temporarily suspend compliance while retaining force hard-stops."""
+
+        normalized = str(operation_id or "").strip()
+        if not normalized:
+            raise ValueError("exact qpos transit requires a non-empty operation_id")
+        if not self._started:
+            raise RuntimeError(f"{self.side}: impedance controller is not started")
+        if self.config.pose_command_transport != "joint":
+            raise RuntimeError(
+                f"{self.side}: exact qpos transit requires joint command transport"
+            )
+        active = self._exact_qpos_transit_operation_id
+        if active is not None and active != normalized:
+            raise RuntimeError(
+                f"{self.side}: exact qpos transit {active!r} is already active"
+            )
+        self._exact_qpos_transit_operation_id = normalized
+        if self._admittance is not None:
+            self._admittance.reset()
+
+    def end_exact_qpos_transit(self, operation_id: str | None = None) -> bool:
+        """Release one exact-qpos lease and clear its accumulated compliance."""
+
+        active = self._exact_qpos_transit_operation_id
+        if active is None:
+            return False
+        expected = str(operation_id or "").strip()
+        if expected and expected != active:
+            raise RuntimeError(
+                f"{self.side}: refusing to release exact qpos transit {active!r} "
+                f"with mismatched operation_id {expected!r}"
+            )
+        self._exact_qpos_transit_operation_id = None
+        if self._admittance is not None:
+            self._admittance.reset()
+        return True
+
     def set_target(self, target: Iterable[float], *, duration_sec: float | None = None) -> None:
         self.start()
         assert self._reference is not None
@@ -3545,6 +3612,8 @@ class RM65BaseImpedanceController:
         mark_timing("metadata")
         record = {
             "step": self._step_index,
+            "exact_qpos_transit_active": self.exact_qpos_transit_active,
+            "exact_qpos_transit_operation_id": self.exact_qpos_transit_operation_id,
             "measurement_timestamp": state_sample_wall_time,
             "measurement_timestamp_monotonic": state_sample_time,
             "measurement_valid": bool(
@@ -3939,12 +4008,23 @@ class RM65BaseImpedanceController:
         thread = self._follow_stream_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
+        if thread is not None and thread.is_alive():
+            message = (
+                f"{self.side}: CANFD follow stream worker did not stop within 1.000s"
+            )
+            with self._follow_stream_lock:
+                self._follow_stream_fault = message
+            raise RuntimeError(message)
         self._follow_stream_thread = None
         with self._follow_stream_lock:
             self._follow_stream_target_joint = None
             self._follow_stream_segment_start_joint = None
             self._follow_stream_segment_start_time = None
             self._follow_stream_target_time = None
+
+    def follow_stream_worker_alive(self) -> bool:
+        thread = self._follow_stream_thread
+        return bool(thread is not None and thread.is_alive())
 
     def _follow_stream_snapshot(self) -> dict[str, object]:
         thread = self._follow_stream_thread
@@ -4240,6 +4320,7 @@ class RM65BaseImpedanceController:
         raise NotImplementedError
 
     def stop_motion(self) -> None:
+        self.end_exact_qpos_transit()
         self._stop_deployment_dual_rate_ik()
         self._stop_follow_stream()
         if self.robot is not None:
@@ -4249,6 +4330,7 @@ class RM65BaseImpedanceController:
                 print(f"{self.side}: Arm_Slow_Stop -> {code}")
 
     def close(self) -> None:
+        self.end_exact_qpos_transit()
         self._stop_deployment_dual_rate_ik()
         self._stop_follow_stream()
         if self.robot is not None:
@@ -4751,6 +4833,11 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
         offset_values = finite_list(offset, expected_len=6, label="pose_offset")
         linear_offset_m = norm(offset_values[:3])
         angular_offset_rad = norm(offset_values[3:])
+        exact_qpos_transit = self.exact_qpos_transit_active
+        if exact_qpos_transit and preferred is None:
+            raise RuntimeError(
+                f"{self.side}: exact qpos transit requires a fresh solver_output_qpos"
+            )
         force_guard_active, force_guard_metadata = self._direct_joint_hint_force_guard_state()
         offset_within_direct_hint = bool(
             linear_offset_m <= float(self.config.direct_joint_hint_max_linear_offset_m)
@@ -4786,7 +4873,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 f"{self.side}: passthrough position control requires 15Hz solver_output_qpos; "
                 "refusing to fall back to SDK IK."
             )
-        if self._deployment_dual_rate_ik_enabled():
+        if self._deployment_dual_rate_ik_enabled() and not exact_qpos_transit:
             return self._deployment_dual_rate_command_from_reference(
                 reference=reference,
                 offset=offset_values,
@@ -4794,7 +4881,7 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             )
         direct_joint_hint = bool(
             preferred is not None
-            and (offset_within_direct_hint or force_guard_active)
+            and (exact_qpos_transit or offset_within_direct_hint or force_guard_active)
         )
         if preferred is not None:
             reference_from_preferred_joint = self._forward_pose(preferred)
@@ -4804,10 +4891,12 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
             command_pose = normalize_pose(reference_from_preferred_joint)
             command_joint = list(preferred)
             applied_offset = [0.0] * 6
-            if (
-                force_guard_active
-                and bool(self.config.direct_joint_hint_force_guard_reset_admittance)
-                and self._admittance is not None
+            if self._admittance is not None and (
+                exact_qpos_transit
+                or (
+                    force_guard_active
+                    and bool(self.config.direct_joint_hint_force_guard_reset_admittance)
+                )
             ):
                 self._admittance.reset()
             if self._latest_wrench_context is not None:
@@ -4816,7 +4905,10 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                 self._latest_wrench_context["applied_offset_source"] = "direct_joint_hint"
                 self._latest_wrench_context["admittance_offset_antiwindup_applied"] = False
                 self._latest_wrench_context["admittance_offset_antiwindup_skip_reason"] = "direct_joint_hint"
-                if force_guard_active and bool(self.config.direct_joint_hint_force_guard_reset_admittance):
+                if exact_qpos_transit or (
+                    force_guard_active
+                    and bool(self.config.direct_joint_hint_force_guard_reset_admittance)
+                ):
                     self._latest_wrench_context["offset"] = list(applied_offset)
                 self._latest_wrench_context["ik_method"] = ["dual_arm_joint_hint"]
                 self._latest_wrench_context["ik_metadata"] = self._attach_ik_timing_metadata({
@@ -4824,8 +4916,16 @@ class RM65PoseImpedanceController(RM65BaseImpedanceController):
                     "method": "dual_arm_joint_hint",
                     "source": "retargeter_solver_output_qpos",
                     "direct_joint_hint_reason": (
-                        "force_guard" if force_guard_active and not offset_within_direct_hint else "offset_threshold"
+                        "exact_qpos_transit"
+                        if exact_qpos_transit
+                        else (
+                            "force_guard"
+                            if force_guard_active and not offset_within_direct_hint
+                            else "offset_threshold"
+                        )
                     ),
+                    "exact_qpos_transit_active": bool(exact_qpos_transit),
+                    "exact_qpos_transit_operation_id": self.exact_qpos_transit_operation_id,
                     "seed_joint_deg": list(preferred),
                     "direct_joint_hint_linear_offset_m": float(linear_offset_m),
                     "direct_joint_hint_angular_offset_rad": float(angular_offset_rad),

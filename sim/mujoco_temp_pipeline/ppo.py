@@ -11,6 +11,14 @@ from torch import nn
 
 from sim.mujoco.runtime import CubeLiftVectorExecutor
 from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+from sim.mujoco.learning import encode_model_input
+from sim.mujoco.tasks.cube_lift.learning import (
+    build_action_binding,
+    build_model_input_binding,
+    build_observation_contract,
+    project_flat_observation,
+)
+from sim.mujoco.tasks.cube_lift.reward_adapter import CubeLiftRewardState
 
 from .config import PPOConfig, RewardShapingConfig
 from .normalization import RunningMeanStd
@@ -34,15 +42,22 @@ class RolloutBatch:
     episodes: tuple[dict[str, Any], ...]
     safety_projection_rate: float
     safety_rejection_rate: float
+    safety_recovery_rate: float
     safety_projection_alpha_mean: float
     safety_minimum_distance_m: float | None
     hard_penetration_count: int
     clearance_violation_count: int
+    arm_tracking_error_rad_mean: float
+    arm_tracking_error_rad_max: float
+    gripper_tracking_error_mean: float
+    gripper_tracking_error_max: float
+    wrist_rgb_mean: float | None
+    wrist_rgb_std: float | None
+    wrist_rgb_health_rate: float | None
     reward_term_means: dict[str, float]
 
 
 class PPOSmokeTrainer:
-    observation_dim = 31
     action_dim = 7
 
     def __init__(
@@ -52,11 +67,13 @@ class PPOSmokeTrainer:
         *,
         task_config_path: str,
         model_cache_dir: str | None = None,
+        require_wrist_rgb_health: bool = False,
     ) -> None:
         self.config = ppo_config
         self.reward_config = reward_config
         self.task_config_path = str(task_config_path)
         self.task_config = CubeLiftTaskConfig.load(task_config_path)
+        self.observation_dim = self.task_config.observation_dim
         self.device = resolve_device(ppo_config.device)
         np.random.seed(ppo_config.seed)
         torch.manual_seed(ppo_config.seed)
@@ -67,6 +84,9 @@ class PPOSmokeTrainer:
             self.observation_dim,
             self.action_dim,
             ppo_config.hidden_dim,
+            proprio_dim=self.task_config.proprio_observation_dim,
+            image_shape=self.task_config.wrist_rgb_shape,
+            image_pool_size=self.task_config.wrist_rgb_spatial_pool_size,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(),
@@ -82,16 +102,69 @@ class PPOSmokeTrainer:
             master_seed=ppo_config.seed,
             start_method=ppo_config.start_method,
         )
-        self.observation, _infos = self.env.reset()
+        self.observation, reset_infos = self.env.reset()
+        self.learning_observation_contract = build_observation_contract(self.task_config)
+        self.learning_model_input_binding = build_model_input_binding(
+            self.task_config,
+            self.learning_observation_contract,
+        )
+        self.learning_action_binding = build_action_binding(self.task_config)
+        expected_input_dim = self.learning_model_input_binding.expected_flat_dim(
+            self.learning_observation_contract
+        )
+        if expected_input_dim != self.observation_dim:
+            self.env.close()
+            raise RuntimeError(
+                "CubeLift learning binding dimension does not match policy input: "
+                f"binding={expected_input_dim}, policy={self.observation_dim}."
+            )
+        encoded_reset = encode_model_input(
+            project_flat_observation(self.task_config, self.observation),
+            self.learning_observation_contract,
+            self.learning_model_input_binding,
+        )
+        if not np.array_equal(encoded_reset.flat, self.observation):
+            self.env.close()
+            raise RuntimeError(
+                "CubeLift learning binding changed the reset observation; "
+                "refuse to start PPO with sim/real input drift."
+            )
+        if require_wrist_rgb_health and self.task_config.wrist_rgb_enabled:
+            unhealthy = [
+                {
+                    "env_id": index,
+                    "mean": info.get("wrist_rgb_mean"),
+                    "std": info.get("wrist_rgb_std"),
+                    "nonzero_fraction": info.get("wrist_rgb_nonzero_fraction"),
+                }
+                for index, info in enumerate(reset_infos)
+                if not bool(info.get("wrist_rgb_health_ok", False))
+            ]
+            if unhealthy:
+                self.env.close()
+                raise RuntimeError(
+                    "Wrist RGB health check failed at reset; inspect camera pose/"
+                    f"lighting before training: {unhealthy}"
+                )
+        self._reward_observation = np.stack(
+            [self._training_reward_state(info) for info in reset_infos]
+        )
         self.observation_normalizer.update(self.observation)
         self.global_step = 0
         self.update_index = 0
         self._episode_raw_return = np.zeros(ppo_config.num_envs, dtype=np.float64)
         self._episode_shaped_return = np.zeros(ppo_config.num_envs, dtype=np.float64)
         self._episode_length = np.zeros(ppo_config.num_envs, dtype=np.int32)
-        self._episode_resting_cube_z = self.observation[:, 9].astype(
-            np.float32, copy=True
-        )
+        self._episode_resting_cube_z = CubeLiftRewardState.from_flat(
+            self._reward_observation
+        ).cube_z.astype(np.float32, copy=True)
+
+    @staticmethod
+    def _training_reward_state(info: dict[str, Any]) -> np.ndarray:
+        state = np.asarray(info["training_reward_state"], dtype=np.float32).reshape(-1)
+        if state.shape != (31,) or not np.all(np.isfinite(state)):
+            raise RuntimeError("CubeLift training_reward_state must be finite and 31-D.")
+        return state
 
     def close(self) -> None:
         self.env.close()
@@ -112,11 +185,20 @@ class PPOSmokeTrainer:
         successful = 0
         safety_modified_count = 0
         safety_rejected_count = 0
+        safety_recovery_count = 0
         safety_alpha_sum = 0.0
         safety_sample_count = 0
         safety_minimum_distance = float("inf")
         hard_penetration_count = 0
         clearance_violation_count = 0
+        arm_tracking_error_sum = 0.0
+        arm_tracking_error_max = 0.0
+        gripper_tracking_error_sum = 0.0
+        gripper_tracking_error_max = 0.0
+        wrist_rgb_mean_sum = 0.0
+        wrist_rgb_std_sum = 0.0
+        wrist_rgb_health_count = 0
+        wrist_rgb_sample_count = 0
         reward_term_sums: dict[str, float] = {}
         reward_term_samples = 0
 
@@ -139,9 +221,30 @@ class PPOSmokeTrainer:
                 bool(info.get("safety_modified", False)) for info in infos
             )
             safety_rejected_count += int(np.count_nonzero(safety_alpha <= 1e-8))
+            safety_recovery_count += sum(
+                bool(info.get("safety_recovery", False)) for info in infos
+            )
             safety_alpha_sum += float(np.sum(safety_alpha))
             safety_sample_count += cfg.num_envs
             for info in infos:
+                tracking_mean = float(info.get("arm_tracking_error_rad_mean", 0.0))
+                tracking_max = float(info.get("arm_tracking_error_rad_max", 0.0))
+                arm_tracking_error_sum += tracking_mean
+                arm_tracking_error_max = max(arm_tracking_error_max, tracking_max)
+                gripper_error = abs(
+                    float(info.get("right_gripper_tracking_error", 0.0))
+                )
+                gripper_tracking_error_sum += gripper_error
+                gripper_tracking_error_max = max(
+                    gripper_tracking_error_max, gripper_error
+                )
+                if self.task_config.wrist_rgb_enabled:
+                    wrist_rgb_mean_sum += float(info.get("wrist_rgb_mean", 0.0))
+                    wrist_rgb_std_sum += float(info.get("wrist_rgb_std", 0.0))
+                    wrist_rgb_health_count += int(
+                        bool(info.get("wrist_rgb_health_ok", False))
+                    )
+                    wrist_rgb_sample_count += 1
                 distance = float(info.get("safety_minimum_distance_m", float("inf")))
                 if np.isfinite(distance):
                     safety_minimum_distance = min(safety_minimum_distance, distance)
@@ -150,14 +253,19 @@ class PPOSmokeTrainer:
                 )
                 clearance_violation_count += int(
                     info.get("termination_reason")
-                    == "robot_environment_clearance_violation"
+                    in {
+                        "robot_environment_clearance_violation",
+                        "sim_collision_margin_violation",
+                    }
                 )
 
-            transition_next = next_observation.copy()
+            transition_reward_next = np.stack(
+                [self._training_reward_state(info) for info in infos]
+            )
             for env_id, info in enumerate(infos):
-                if done[env_id] and "final_observation" in info:
-                    transition_next[env_id] = np.asarray(
-                        info["final_observation"], dtype=np.float32
+                if done[env_id] and "final_info" in info:
+                    transition_reward_next[env_id] = self._training_reward_state(
+                        info["final_info"]
                     )
             succeeded = np.asarray(
                 [
@@ -171,8 +279,8 @@ class PPOSmokeTrainer:
                 dtype=np.float32,
             )
             shaped_reward, terms = shape_rewards(
-                self.observation,
-                transition_next,
+                self._reward_observation,
+                transition_reward_next,
                 raw_reward,
                 self.reward_config,
                 safety_projection_alpha=safety_alpha,
@@ -221,9 +329,19 @@ class PPOSmokeTrainer:
                 self._episode_shaped_return[env_id] = 0.0
                 self._episode_length[env_id] = 0
 
-            self._episode_resting_cube_z[done] = next_observation[done, 9]
+            next_reward_observation = transition_reward_next.copy()
+            for env_id in np.flatnonzero(done):
+                reset_info = infos[env_id].get("reset_info")
+                if reset_info is not None:
+                    next_reward_observation[env_id] = self._training_reward_state(
+                        reset_info
+                    )
+            self._episode_resting_cube_z[done] = CubeLiftRewardState.from_flat(
+                next_reward_observation[done]
+            ).cube_z
 
             self.observation = next_observation
+            self._reward_observation = next_reward_observation
             self.observation_normalizer.update(next_observation)
             self.global_step += cfg.num_envs
 
@@ -274,12 +392,36 @@ class PPOSmokeTrainer:
             episodes=tuple(episode_records),
             safety_projection_rate=safety_modified_count / max(safety_sample_count, 1),
             safety_rejection_rate=safety_rejected_count / max(safety_sample_count, 1),
+            safety_recovery_rate=safety_recovery_count / max(safety_sample_count, 1),
             safety_projection_alpha_mean=safety_alpha_sum / max(safety_sample_count, 1),
             safety_minimum_distance_m=(
                 None if not np.isfinite(safety_minimum_distance) else safety_minimum_distance
             ),
             hard_penetration_count=hard_penetration_count,
             clearance_violation_count=clearance_violation_count,
+            arm_tracking_error_rad_mean=(
+                arm_tracking_error_sum / max(safety_sample_count, 1)
+            ),
+            arm_tracking_error_rad_max=arm_tracking_error_max,
+            gripper_tracking_error_mean=(
+                gripper_tracking_error_sum / max(safety_sample_count, 1)
+            ),
+            gripper_tracking_error_max=gripper_tracking_error_max,
+            wrist_rgb_mean=(
+                None
+                if wrist_rgb_sample_count == 0
+                else wrist_rgb_mean_sum / wrist_rgb_sample_count
+            ),
+            wrist_rgb_std=(
+                None
+                if wrist_rgb_sample_count == 0
+                else wrist_rgb_std_sum / wrist_rgb_sample_count
+            ),
+            wrist_rgb_health_rate=(
+                None
+                if wrist_rgb_sample_count == 0
+                else wrist_rgb_health_count / wrist_rgb_sample_count
+            ),
             reward_term_means={
                 f"reward_{name}_mean": total / max(reward_term_samples, 1)
                 for name, total in reward_term_sums.items()

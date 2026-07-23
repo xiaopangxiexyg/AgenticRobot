@@ -5,6 +5,7 @@ from pathlib import Path
 import inspect
 
 import numpy as np
+import pytest
 
 import deployments.client.policy as common_policy
 import robot_motion.deploy.actions as robot_actions
@@ -92,6 +93,18 @@ def test_legacy_deploy_actions_reexport_robot_motion_objects() -> None:
     )
 
 
+def test_action_chunk_execution_steps_reject_fractional_direct_api_values() -> None:
+    from robot_motion.deploy import normalize_action_chunk_execution_steps
+
+    assert normalize_action_chunk_execution_steps(None) is None
+    assert normalize_action_chunk_execution_steps(2) == 2
+    assert normalize_action_chunk_execution_steps(2.0) == 2
+    with pytest.raises(ValueError, match="positive integer"):
+        normalize_action_chunk_execution_steps(2.5)
+    with pytest.raises(ValueError, match="positive integer"):
+        normalize_action_chunk_execution_steps("2.5")
+
+
 def test_deploy_schema_pose_and_vector_reference_samples() -> None:
     pose = np.eye(4, dtype=float)
     pose[:3, 3] = [0.1, 0.2, 0.3]
@@ -158,6 +171,29 @@ def test_deployment_observation_and_action_normalization_reference_sample() -> N
         [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0],
     )
     assert "arm_action_specs_by_side" in normalized[0].metadata
+
+
+def test_deployment_observation_rejects_stale_hand_measurement_timestamp() -> None:
+    hand_state = {
+        "joint_pos": np.zeros(6, dtype=np.float32),
+        "joint_timestamp": 9.6,
+        # A newer worker-loop timestamp must not refresh position feedback.
+        "telemetry_timestamp": 9.99,
+    }
+
+    observation = robot_observation.build_deployment_observation(
+        active_sides=("right",),
+        arms_enabled=False,
+        hands_enabled=True,
+        step_index=0,
+        arm_states={},
+        hand_states={"right": hand_state},
+        timestamp=10.0,
+        hand_state_max_age_sec=0.2,
+    )
+
+    assert "right_hand_state_stale:0.400000" in observation.faults
+    assert np.isclose(observation.metadata["hand_state_age_sec_by_side"]["right"], 0.4)
 
 
 def test_deploy_schema_active_sides_and_serialization_reference_samples() -> None:
@@ -463,6 +499,59 @@ def test_policy_deploy_runtime_exposes_only_same_chunk_successor_as_lookahead() 
     assert second_step.raw_lookahead_action is None
 
 
+def test_policy_deploy_runtime_executes_only_configured_chunk_prefix() -> None:
+    observation = _right_arm_policy_observation()
+    runtime = robot_runtime.PolicyDeployRuntime(
+        robot_runtime.PolicyDeployRuntimeConfig(
+            active_sides=("right",),
+            arms_enabled=True,
+            hands_enabled=True,
+            action_chunk_execution_steps=2,
+        )
+    )
+    first = _right_arm_policy_action()
+    second = np.asarray(first, dtype=np.float32).copy()
+    second[7] += 0.01
+    third = np.asarray(second, dtype=np.float32).copy()
+    third[7] += 0.01
+    policy = _TransactionalPolicy(np.stack((first, second, third), axis=0))
+
+    prediction = runtime.predict_and_queue(policy, observation, now=10.0)
+
+    assert prediction.accepted is True
+    assert prediction.source_chunk_size == 3
+    assert prediction.executed_chunk_size == 2
+    assert prediction.action_chunk_execution_steps == 2
+    assert prediction.queue_len_after == 2
+    assert all(
+        action.metadata["deploy_action_chunk_source_size"] == 3
+        for action in prediction.actions
+    )
+    assert all(
+        action.metadata["deploy_action_chunk_execution_steps"] == 2
+        for action in prediction.actions
+    )
+
+    first_step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+    second_step = runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    )
+    assert first_step.raw_action is not None
+    assert second_step.raw_action is not None
+    assert runtime.action_queue_length() == 0
+    assert runtime.prepare_next_action(
+        observation,
+        preparer=_FakeActionPreparer(),
+        policy_name=policy.name,
+    ).raw_action is None
+
+
 def test_policy_deploy_runtime_rolls_back_empty_and_recovery_discarded_chunks() -> None:
     observation = _right_arm_policy_observation()
     runtime = robot_runtime.PolicyDeployRuntime(
@@ -614,3 +703,29 @@ def test_deploy_runtime_dry_step_prepares_without_dispatch_when_send_disabled() 
     assert result.sent is False
     assert result.command is not None
     assert dispatcher.commands == []
+
+
+def test_common_deploy_runtime_consumes_chunk_prefix_before_next_prediction() -> None:
+    source = _FakeDeploymentObservationSource()
+    first = _right_arm_policy_action()
+    second = np.asarray(first, dtype=np.float32).copy()
+    second[7] += 0.01
+    third = np.asarray(second, dtype=np.float32).copy()
+    third[7] += 0.01
+    policy = _FakePolicy(np.stack((first, second, third), axis=0))
+    runtime = robot_runtime.DeployRuntime(
+        source=source,
+        policy=policy,
+        preparer=_FakeActionPreparer(),
+        dispatcher=robot_dispatcher.DryRunCommandDispatcher(),
+        action_chunk_execution_steps=2,
+    )
+
+    first_step = runtime.step(now=1.0)
+    second_step = runtime.step(now=1.0 + 1.0 / 15.0)
+
+    assert isinstance(first_step.raw_action, robot_actions.NormalizedAction)
+    assert isinstance(second_step.raw_action, robot_actions.NormalizedAction)
+    assert runtime.action_queue_length() == 0
+    assert len(policy.observations) == 1
+    assert first_step.metadata["action_chunk_execution_steps"] == 2

@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - depends on runtime env
 
 @dataclass
 class TactileDenoiseConfig:
-    enabled: bool = True
+    enabled: bool = False
     mode: str = "delta"
     baseline_frames: int = 20
     deadband_abs: float = 5e-5

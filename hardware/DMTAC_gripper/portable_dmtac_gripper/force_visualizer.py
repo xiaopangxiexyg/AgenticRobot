@@ -38,7 +38,7 @@ class ForceVizConfig:
     colorbar_width: int = 42
     show_stats: bool = True
     show_mode_label: bool = True
-    mode: str = "delta"
+    mode: str = "absolute"
     baseline_frames: int = 8
 
 
@@ -484,7 +484,7 @@ def run_live_distributed_force_xy(
     from .device import DMTacGripperDevice
 
     tactile_config.fields = ("distributed_force",)
-    if viz_config is not None:
+    if viz_config is not None and str(viz_config.mode).strip().lower() != "absolute":
         tactile_config.denoise_distributed_force = True
         tactile_config.denoise_config = TactileDenoiseConfig(
             enabled=True,

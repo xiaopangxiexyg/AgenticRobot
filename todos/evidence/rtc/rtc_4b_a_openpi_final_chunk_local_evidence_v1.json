@@ -1,0 +1,176 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_a_openpi_final_chunk_offline_2026_07_22",
+  "scope": "non_formal_offline_fake_transport_only",
+  "captured_at": "2026-07-22T01:21:00+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "head_observed_unchanged_during_batch": true,
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "python": "3.10.20",
+    "test_interpreter": "/home/zc/anaconda3/envs/dexteleop310/bin/python",
+    "real_model_loaded": false,
+    "hardware_accessed": false,
+    "simulation_started": false,
+    "network_transport_started": false,
+    "production_entrypoint_called": false
+  },
+  "rtc_4b_a_boundary": {
+    "protocol_version": "dexteleop_rtc_protocol_v2",
+    "scheduler_mode": "async_timed_plan",
+    "continuation_mode": "none",
+    "concrete_adapter": "deployments/openpi/client/rtc.py",
+    "generic_protocol": "robot_motion/deploy/rtc_protocol.py",
+    "generic_client": "deployments/client/rtc.py",
+    "artifact_contract": "PolicyArtifactContract",
+    "remote_policy_contract": "RemoteModelPolicy",
+    "canonical_decoder": "V22DeploymentAdapter.to_legacy_normalized_actions",
+    "fake_transport_location": "tests/test_openpi_rtc_final_chunk_adapter.py",
+    "production_frontend_integration": false,
+    "real_server_integration": false,
+    "worker_or_plan_authority": false,
+    "safety_or_dispatch_authority": false,
+    "position_lookahead_changed": false,
+    "sync_queue_v1_changed": false
+  },
+  "model_and_embodiment_independence": {
+    "generic_protocol_imports_openpi": false,
+    "generic_protocol_imports_teleop_runtime": false,
+    "generic_protocol_imports_sim_or_hardware": false,
+    "openpi_is_first_replaceable_adapter_not_protocol_authority": true,
+    "request_plan_emission_semantics_owned_outside_adapter": true,
+    "other_local_or_remote_models_replace_backend_and_codec_only": true
+  },
+  "capability_and_exchange_bindings": [
+    "full policy artifact hash",
+    "full validated server metadata hash",
+    "model id and checkpoint step",
+    "explicit camera input contract",
+    "exact declared prediction horizon",
+    "exact prepared OpenPI input hash",
+    "model action space and continuous/discrete dimensions",
+    "absolute action pose mode and component scope",
+    "action codec, frame contract, layout and normalization hashes",
+    "continuous float output matrix",
+    "independent exact-int64 discrete output matrix"
+  ],
+  "discrete_output_gate": {
+    "final_chunk_continuation_none_supported": true,
+    "tokens_cast_to_float": false,
+    "tokens_silently_dropped": false,
+    "typed_discrete_conditioning_prefix_available": false,
+    "discrete_continuation_fail_closed": true,
+    "rejection_reason": "discrete_conditioning_prefix_unsupported_v2"
+  },
+  "fake_policy_robustness": {
+    "continuous_round_trip": true,
+    "discrete_round_trip": true,
+    "horizon_sweep_steps": [
+      2,
+      4,
+      8
+    ],
+    "synthetic_inference_and_receive_timing_sec": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        0.2,
+        0.21
+      ],
+      [
+        0.75,
+        0.9
+      ]
+    ],
+    "metadata_drift_rejected_before_inference": true,
+    "short_chunk_rejected": true,
+    "nonfinite_output_rejected": true,
+    "fraction_bool_or_invalid_discrete_output_rejected": true,
+    "missing_discrete_output_rejected": true,
+    "prepared_input_hash_mismatch_rejected_before_transport": true,
+    "transport_fault_has_no_fallback_result": true,
+    "clock_regression_rejected": true,
+    "prepared_input_and_result_detached_from_mutable_fake_arrays": true,
+    "repeat_exchange_hash_replayable": true,
+    "canonical_arm_slot_order_preserved": true,
+    "reset_forwarding_without_capability_drift": true
+  },
+  "scoped_source_sha256": {
+    "robot_motion/deploy/rtc_protocol.py": "1160600bb39d468b62a4637a86054cd3a63933d49ddbc712ca96c9d5a7e7d835",
+    "deployments/client/rtc.py": "58842a45a1c1bb6434bed0c0cdabd2f8efb111193060e3617f3adb1fdb8c1927",
+    "deployments/client/action.py": "a7947cb0fe14e85eec91fd678ed75ab3c520a56ee4119cf109495f2fa9deff68",
+    "deployments/openpi/client/rtc.py": "33021bd1367f16b8004121fe6a45594d67946ec36f0d50c2600485bdcc83aa5b",
+    "deployments/openpi/client/__init__.py": "39bc5e5ed7ec70751d7aadae4d65b66aa4a270cc19bb3e90810b498282b77220",
+    "tests/test_rtc_model_agnostic_protocol.py": "7a9cc69df14704a48855cbfb590e7ca6d6d3700f0f5df5ce5130de4be8e27c3b",
+    "tests/test_openpi_rtc_final_chunk_adapter.py": "5a8ad2780f318e99547a5f53cef9018ab16ffb54b6ddce381f00d39f85be56c5"
+  },
+  "documentation_sha256": {
+    "todos/dexteleop_rtc_landing_plan.md": "8a419ac780d969b9ec55ada36e203700730dd517c8baa0220282255a5b30e1b0",
+    "todos/dexteleop_rtc_visual_guide.md": "90bf4771e8caeee228b57594adc88ec1fa1a65ca0b6a991938d9e58cb795cf59",
+    "todos/dexteleop_architecture_planning.md": "ae0d8764b142b943fb47a52930f4df1fce842fc9965c184f52a593276345b6c8",
+    "todos/dexteleop_architecture_visual_guide.md": "20ddf9b30e7e72fa9bd12c669cab427c33f3c0a0497e582c6062a9632166c213",
+    "deployments/client/README.md": "f986e6ec61f1efb447cd394a2dbb68c05fda956134011101682a84a21851d68e",
+    "deployments/openpi/README.md": "2c727bf32ef6710cc92c7b6e9625dc590c0022741ba786306ef73b006d12efa8",
+    "deployments/openpi/client/README.md": "bc45da99ece0c0604e04ee75115255f6cc5673c1ce5d770de4f89dc49fc9eb6d",
+    "teleop_runtime/deploy/README.md": "3e6dc59dad422020f4e9828762d76031bfe81056847787c5790b479b96499591"
+  },
+  "out_of_scope_capture_sha256": {
+    "teleop_runtime/deploy/replay.py": "984ab78db8717f42e9d0c843c282bf73546ac24e71ec2eb77ced3e5f1008bb1a",
+    "teleop_runtime/position_control/deploy_executor.py": "69eb32a1b16644d296a50ef9918cef7c981a530248ee16ce2488abb7e5af0c26",
+    "sim/mujoco/deploy/rtc_policy.py": "b2f5e9a8e1d836cd5db87f1903c75f3bc7fbbe5672318c10acd4cf08819df7f8",
+    "teleop_runtime/deploy/rtc_frontend.py": "fba0d70c7b01ca96032fdc6605542711107a2121b591c89c6514640954358847",
+    "teleop_runtime/deploy/run_policy.py": "f52a842a4fb00a73ab2015a2745f19f0a8645c294a2f3e711b14605d3d264c35"
+  },
+  "verification": [
+    {
+      "command": "/home/zc/anaconda3/envs/dexteleop310/bin/python -m pytest -q tests/test_openpi_rtc_final_chunk_adapter.py",
+      "result": "28 passed in 0.42s"
+    },
+    {
+      "command": "/home/zc/anaconda3/envs/dexteleop310/bin/python -m pytest -q tests/test_rtc_model_agnostic_protocol.py",
+      "result": "42 passed in 0.35s"
+    },
+    {
+      "command": "/home/zc/anaconda3/envs/dexteleop310/bin/python -m pytest -q tests/test_openpi_rtc_final_chunk_adapter.py tests/test_rtc_model_agnostic_protocol.py tests/test_policy_chunk_plan.py tests/test_deploy_rtc_producer_state.py tests/test_deploy_rtc_policy_worker.py tests/test_deploy_rtc_prediction_admission.py tests/test_deploy_rtc_frontend_shadow.py tests/test_mujoco_rtc_virtual_policy.py",
+      "result": "130 passed in 2.21s"
+    },
+    {
+      "command": "/home/zc/anaconda3/envs/dexteleop310/bin/python -m pytest -q tests/test_robot_motion_deploy_contracts.py tests/test_deploy_canonical_action.py tests/test_deploy_action_emission.py tests/test_openpi_common_deploy.py tests/test_openpi05_deployment.py tests/test_deploy_policy_qpos_init.py tests/test_position_deploy_executor.py tests/test_mujoco_deploy_runtime.py tests/test_mujoco_async_topology.py",
+      "result": "152 passed, 1 skipped in 3.55s"
+    },
+    {
+      "command": "python -m py_compile <rtc_4b_a_scoped_python_paths>",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check plus trailing-whitespace scan <rtc_4b_a_scoped_paths>",
+      "result": "passed"
+    }
+  ],
+  "claims": [
+    "the generic RTC v2 protocol and client can preserve continuous and independent discrete final-chunk outputs without binding to a model family, transport, simulation or hardware",
+    "the existing artifact-bound OpenPI final-chunk path can round-trip through the generic RTC envelope and explicit V22 codec using only an offline fake transport",
+    "artifact, server metadata, input, representation, horizon and output drift fail closed at the adapter boundary",
+    "the adapter advertises continuation=none only and cannot be negotiated as flow, trained-prefix or native continuation",
+    "the adapter returns PolicyChunkResult facts without acquiring worker, plan-admission, safety, reference or dispatch authority",
+    "the existing RTC and synchronous deployment compatibility fixtures remain green",
+    "the captured replay, position executor, RTC-3c frontend, synchronous deploy entrypoint and deterministic sim runner hashes are unchanged from the RTC-4a evidence"
+  ],
+  "non_claims": [
+    "not proof that OpenPI or any other concrete model supports true prefix-conditioned RTC",
+    "not a real checkpoint inference or policy quality result",
+    "not a real websocket, deadline, reconnect or half-open transport result",
+    "not integration into the RTC-3c frontend or production worker",
+    "not real observation or no-action shadow readiness",
+    "not typed preview or RTC position-lookahead readiness",
+    "not discrete continuation readiness before a typed discrete prefix/mask/receipt exists",
+    "not simulation or hardware evidence",
+    "not motion authorization",
+    "not full-suite green evidence"
+  ]
+}

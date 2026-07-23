@@ -12,6 +12,10 @@ from dataset_contracts.layout import camera_video_channel
 from dataset_contracts.v22 import ARM_ACTION_DIM, PolicyIOLayout
 
 from ..arm_mode_labels import flatten_arm_mode_columns
+from ..schema_v21 import (
+    bind_hand_runtime_diagnostic_fields,
+    bind_hand_state_snapshot_fields,
+)
 from .types import UmiSample
 
 
@@ -43,6 +47,18 @@ def _camera_fields(
         row[f"{prefix}.source_timestamp"] = getattr(match, "selected_timestamp", None)
         row[f"{prefix}.receive_timestamp"] = getattr(frame, "receive_timestamp", None)
         row[f"{prefix}.available_timestamp"] = getattr(frame, "available_timestamp", None)
+        metadata = getattr(frame, "metadata", {}) if frame is not None else {}
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        row[f"{prefix}.source_clock"] = (
+            None if frame is None else metadata.get("source_clock", "receiver_wall_time")
+        )
+        row[f"{prefix}.available_clock"] = (
+            None if frame is None else metadata.get("available_clock", "local_wall_time")
+        )
+        row[f"{prefix}.camera_timestamp_sec"] = metadata.get("camera_timestamp_sec")
+        row[f"{prefix}.timestamp_domain"] = metadata.get("timestamp_domain")
+        row[f"{prefix}.sensor_timestamp_ms"] = metadata.get("sensor_timestamp_ms")
+        row[f"{prefix}.sensor_frame_number"] = metadata.get("color_frame_number")
         row[f"{prefix}.age_sec"] = getattr(match, "age_sec", None)
         row[f"{prefix}.source_frame_index"] = getattr(frame, "frame_index", None)
         row[f"{prefix}.video_frame_index"] = None
@@ -52,7 +68,7 @@ def _camera_fields(
 
 
 class UmiV23RowEncoder:
-    """Pack two measured TCP poses and two scalar grippers into 16D vectors."""
+    """Pack current observations with next-observation arm pose actions."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -77,8 +93,20 @@ class UmiV23RowEncoder:
             raise ValueError(
                 f"UMI layout must define 16D action/state, got {layout.action_dim}/{layout.state_dim}"
             )
+        if sample.arm_action_poses is None:
+            raise ValueError(
+                "UMI arm action requires the next accepted observation; "
+                "the recorder must align samples before row encoding"
+            )
         raw_poses = {
             side: np.asarray(sample.poses[side].raw_tcp_pose7, dtype=np.float32)
+            for side in ("left", "right")
+        }
+        action_poses = {
+            side: np.asarray(
+                sample.arm_action_poses[side].raw_tcp_pose7,
+                dtype=np.float32,
+            )
             for side in ("left", "right")
         }
         command_values = {
@@ -91,7 +119,7 @@ class UmiV23RowEncoder:
             measured_values[side] = [float(measured)]
 
         action = layout.pack_action(
-            arm_pose_by_side=raw_poses,
+            arm_pose_by_side=action_poses,
             end_effector_by_side=command_values,
             strict=True,
         ).continuous
@@ -102,10 +130,15 @@ class UmiV23RowEncoder:
         ).continuous
         if not np.all(np.isfinite(action)) or not np.all(np.isfinite(state)):
             raise ValueError("UMI model vectors must be finite")
+        causal_initial_action = layout.pack_action(
+            arm_pose_by_side=raw_poses,
+            end_effector_by_side=command_values,
+            strict=True,
+        ).continuous
         with self._lock:
             last_action = self._last_action_by_episode.get(int(sample.episode_index))
             if last_action is None:
-                last_action = action.copy()
+                last_action = causal_initial_action
             self._last_action_by_episode[int(sample.episode_index)] = action.copy()
 
         label_payload = sample.operator_labels.arm_mode_compatibility_payload()
@@ -118,8 +151,13 @@ class UmiV23RowEncoder:
             "policy_io_layout_hash": layout.layout_hash,
             "action": action.tolist(),
             "action.arm.pose": action[:ARM_ACTION_DIM].tolist(),
-            "action.left_arm.pose": raw_poses["left"].tolist(),
-            "action.right_arm.pose": raw_poses["right"].tolist(),
+            "action.left_arm.pose": action_poses["left"].tolist(),
+            "action.right_arm.pose": action_poses["right"].tolist(),
+            "action.arm.temporal_alignment": "next_accepted_observation",
+            "action.arm.source_frame_index": int(
+                sample.arm_action_source_frame_index
+            ),
+            "action.arm.source_timestamp": float(sample.arm_action_source_timestamp),
             "observation.state": state.tolist(),
             "observation.arm.pose": state[:ARM_ACTION_DIM].tolist(),
             "observation.arm.qpos": [float("nan")] * 12,
@@ -176,6 +214,8 @@ class UmiV23RowEncoder:
                 hand["gripper_measured_scalar"]
             )
             row[f"observation.hand.{side}.joint_timestamp"] = hand.get("joint_timestamp")
+            bind_hand_state_snapshot_fields(row, side=side, hand_state=hand)
+            bind_hand_runtime_diagnostic_fields(row, side=side, hand_state=hand)
             tactile_ref = (
                 tactile_storage_refs.get(side)
                 if tactile_storage_refs is not None

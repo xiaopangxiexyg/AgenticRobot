@@ -87,20 +87,20 @@ conda run --no-capture-output --name "$ENV_NAME" uv lock --check
 conda run --no-capture-output --name "$ENV_NAME" \
   uv export --frozen --all-extras --format requirements.txt --no-emit-project \
   >"$PIP_LOCK_REQUIREMENTS"
-conda run --no-capture-output --name "$ENV_NAME" \
+PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
   python -m pip install --no-cache-dir --require-hashes --requirement "$PIP_LOCK_REQUIREMENTS"
 
 echo "[dexteleop-env] Installing the repository in editable mode"
-conda run --no-capture-output --name "$ENV_NAME" \
+PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
   python -m pip install --no-cache-dir --no-deps --editable "$REPO_ROOT"
 
 echo "[dexteleop-env] Installing pin-pink without its obsolete pip 'pin' dependency"
-conda run --no-capture-output --name "$ENV_NAME" \
+PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
   python -m pip install --no-cache-dir --no-deps "pin-pink==4.2.0"
 
 if ((SKIP_VENDOR_SDK == 0)); then
   echo "[dexteleop-env] Installing local DM-Tac SDK from $SDK_ROOT"
-  conda run --no-capture-output --name "$ENV_NAME" \
+  PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \
     python -m pip install --no-cache-dir --no-deps --editable "$SDK_ROOT"
 fi
 
@@ -122,8 +122,10 @@ required = (
     "gymnasium",
     "torch",
     "pyarrow",
+    "zstandard",
     "websockets",
     "msgpack",
+    "zmq",
     "serial",
     "cv2",
     "pyrealsense2",

@@ -6,6 +6,12 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from hardware.realsense.color import (
+    color_format_value as _color_format_value,
+    color_image_to_bgr as _color_image_to_bgr,
+    normalize_color_format as _normalize_color_format,
+)
+
 from .transforms import make_transform
 
 
@@ -57,6 +63,9 @@ class RealSenseConfig:
     camera_index: int | None = None
     resolution: tuple[int, int] = (1280, 720)
     fps: int = 15
+    # RealSense color sensors expose YUYV natively. CameraFrame.color_bgr
+    # remains BGR after read(), regardless of this transport format.
+    color_format: str = "yuyv"
     enable_depth: bool = True
     color_auto_exposure: bool | None = False
     color_exposure_us: float | None = 8000.0
@@ -68,6 +77,28 @@ class RealSenseConfig:
     depth_laser_power: float | None = 0.0
     auto_select_supported_profile: bool = True
     restore_settings_on_stop: bool = True
+    startup_warmup_frames: int = 0
+    startup_wait_timeout_ms: int = 1000
+    startup_hardware_reset_on_failure: bool = False
+    startup_hardware_reset_retry_attempts: int = 1
+    startup_hardware_reset_sleep_sec: float = 2.0
+    startup_hardware_reset_reconnect_timeout_sec: float = 6.0
+    startup_hardware_reset_reconnect_poll_sec: float = 0.25
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "color_format", _normalize_color_format(self.color_format))
+        if int(self.startup_warmup_frames) < 0:
+            raise ValueError("startup_warmup_frames must be >= 0")
+        if int(self.startup_wait_timeout_ms) <= 0:
+            raise ValueError("startup_wait_timeout_ms must be positive")
+        if int(self.startup_hardware_reset_retry_attempts) < 0:
+            raise ValueError("startup_hardware_reset_retry_attempts must be >= 0")
+        if float(self.startup_hardware_reset_sleep_sec) < 0.0:
+            raise ValueError("startup_hardware_reset_sleep_sec must be >= 0")
+        if float(self.startup_hardware_reset_reconnect_timeout_sec) < 0.0:
+            raise ValueError("startup_hardware_reset_reconnect_timeout_sec must be >= 0")
+        if float(self.startup_hardware_reset_reconnect_poll_sec) <= 0.0:
+            raise ValueError("startup_hardware_reset_reconnect_poll_sec must be positive")
 
 
 @dataclass(frozen=True)
@@ -89,6 +120,7 @@ class RealSenseCamera:
         self.depth_scale_m: float | None = None
         self.settings_report: dict[str, Any] = {}
         self._settings_snapshot: list[_SensorOptionSnapshot] = []
+        self._active_color_format = self.config.color_format
 
     @staticmethod
     def list_devices() -> list[RealSenseDevice]:
@@ -115,15 +147,54 @@ class RealSenseCamera:
             serial = _serial_from_index(self.config.camera_index)
         self.serial = serial
 
+        attempts = 1
+        if self.config.startup_hardware_reset_on_failure:
+            attempts += int(self.config.startup_hardware_reset_retry_attempts)
+        last_error: Exception | None = None
+        recovery_count = 0
+        for attempt_index in range(attempts):
+            try:
+                self._start_once(serial)
+                self._warmup()
+                self.settings_report["startup.warmup_frames"] = int(
+                    self.config.startup_warmup_frames
+                )
+                self.settings_report["startup.hardware_reset_recovery_count"] = recovery_count
+                return self
+            except Exception as exc:
+                last_error = exc
+                self.stop()
+                should_retry = (
+                    attempt_index + 1 < attempts
+                    and serial is not None
+                    and _is_startup_connection_error(str(exc))
+                )
+                if not should_retry:
+                    raise
+                if not self._hardware_reset_device(str(serial)):
+                    raise RuntimeError(
+                        "RealSense startup recovery failed: unable to reset and reconnect "
+                        f"serial {serial!r} after: {exc}"
+                    ) from exc
+                recovery_count += 1
+        if last_error is not None:  # pragma: no cover - loop always returns or raises
+            raise last_error
+        raise RuntimeError("RealSense startup failed without an exception")  # pragma: no cover
+
+    def _start_once(self, serial: str | None) -> None:
+        if self._pipeline is not None:
+            raise RuntimeError("RealSense pipeline is already running")
+
         rs = self._rs
         pipeline = rs.pipeline()
         config = rs.config()
+        color_format = _color_format_value(rs, self.config.color_format)
         if serial:
             config.enable_device(str(serial))
         width, height = self.config.resolution
         if self.config.enable_depth:
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, int(self.config.fps))
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, int(self.config.fps))
+        config.enable_stream(rs.stream.color, width, height, color_format, int(self.config.fps))
         try:
             profile = pipeline.start(config)
             selected_profiles = {
@@ -131,23 +202,35 @@ class RealSenseCamera:
                     width,
                     height,
                     int(self.config.fps),
+                    color_format=self.config.color_format,
                     enable_depth=self.config.enable_depth,
                 ),
                 "fallback_used": False,
             }
         except Exception as exc:
+            _stop_pipeline_quietly(pipeline)
             if not self.config.auto_select_supported_profile:
                 raise RuntimeError(self._profile_error_message(exc, serial)) from exc
-            fallback_config, selected_profiles = self._fallback_stream_config(serial)
+            fallback_config, selected_profiles, active_color_format = self._fallback_stream_config(
+                serial
+            )
+            pipeline = rs.pipeline()
             try:
                 profile = pipeline.start(fallback_config)
             except Exception as fallback_exc:
+                _stop_pipeline_quietly(pipeline)
                 raise RuntimeError(self._profile_error_message(fallback_exc, serial)) from fallback_exc
         self._pipeline = pipeline
         self._profile = profile
+        self._active_color_format = (
+            self.config.color_format
+            if not selected_profiles.get("fallback_used")
+            else active_color_format
+        )
         self._align = rs.align(rs.stream.color) if self.config.enable_depth else None
         self.settings_report = self._apply_device_settings(profile)
         self.settings_report.update(selected_profiles)
+        self.settings_report["color.format"] = self._active_color_format
         if self.serial is None:
             try:
                 device = profile.get_device()
@@ -159,18 +242,81 @@ class RealSenseCamera:
                 self.depth_scale_m = float(profile.get_device().first_depth_sensor().get_depth_scale())
             except Exception:
                 self.depth_scale_m = None
-        return self
 
-    def _fallback_stream_config(self, serial: str | None):
+    def _warmup(self) -> None:
+        warmup_frames = int(self.config.startup_warmup_frames)
+        if warmup_frames <= 0:
+            return
+        if self._pipeline is None:
+            raise RuntimeError("RealSense pipeline is not running during startup warmup")
+        timeout_ms = int(self.config.startup_wait_timeout_ms)
+        success_count = 0
+        last_error: Exception | None = None
+        for _ in range(warmup_frames):
+            try:
+                self._pipeline.wait_for_frames(timeout_ms)
+                success_count += 1
+            except Exception as exc:
+                last_error = exc
+        if success_count <= 0:
+            detail = "no frame returned"
+            if last_error is not None:
+                detail = f"{type(last_error).__name__}: {last_error}"
+            raise RuntimeError(
+                "RealSense startup warmup received no frames: "
+                f"serial={self.serial!r}, frames={warmup_frames}, "
+                f"timeout_ms={timeout_ms}, last_error={detail}"
+            ) from last_error
+
+    def _hardware_reset_device(self, serial: str) -> bool:
+        try:
+            device = _device_from_serial(self._rs, serial)
+            device.hardware_reset()
+            reset_sleep_sec = float(self.config.startup_hardware_reset_sleep_sec)
+            if reset_sleep_sec > 0.0:
+                time.sleep(reset_sleep_sec)
+            return self._wait_for_device_reconnect(serial)
+        except Exception:
+            return False
+
+    def _wait_for_device_reconnect(self, serial: str) -> bool:
+        timeout_sec = float(self.config.startup_hardware_reset_reconnect_timeout_sec)
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            try:
+                _device_from_serial(self._rs, serial)
+                return True
+            except (RuntimeError, ValueError):
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(float(self.config.startup_hardware_reset_reconnect_poll_sec))
+
+    def _fallback_stream_config(
+        self,
+        serial: str | None,
+    ) -> tuple[Any, dict[str, Any], str]:
         rs = self._rs
         width, height = self.config.resolution
         fps = int(self.config.fps)
         device = _device_from_serial(rs, serial)
+        preferred_color_formats = [
+            getattr(rs.format, name)
+            for name in (
+                self.config.color_format,
+                "yuyv",
+                "bgr8",
+                "rgb8",
+                "rgba8",
+                "bgra8",
+                "y8",
+            )
+            if getattr(rs.format, name, None) is not None
+        ]
         color_profile = _select_video_profile(
             rs,
             device,
             stream=rs.stream.color,
-            preferred_formats=[rs.format.bgr8],
+            preferred_formats=preferred_color_formats,
             requested_width=width,
             requested_height=height,
             requested_fps=fps,
@@ -193,6 +339,7 @@ class RealSenseCamera:
                 width,
                 height,
                 fps,
+                color_format=self.config.color_format,
                 enable_depth=self.config.enable_depth,
             ),
             "fallback_used": True,
@@ -218,13 +365,15 @@ class RealSenseCamera:
                 depth_profile.fps,
             )
             report["fallback_depth_profile"] = depth_profile.describe()
-        return config, report
+        return config, report, color_profile.format_name
 
     def _profile_error_message(self, exc: object, serial: str | None) -> str:
         width, height = self.config.resolution
         lines = [
             "RealSense could not start the requested stream profile.",
-            f"requested camera={serial or 'auto'} color={width}x{height}@{int(self.config.fps)} bgr8 depth={bool(self.config.enable_depth)}",
+            f"requested camera={serial or 'auto'} "
+            f"color={width}x{height}@{int(self.config.fps)} "
+            f"{self.config.color_format} depth={bool(self.config.enable_depth)}",
             f"error: {exc}",
         ]
         try:
@@ -238,7 +387,10 @@ class RealSenseCamera:
                 lines.append(f"  - {item.describe()}")
             if len(profiles) > 80:
                 lines.append(f"  ... {len(profiles) - 80} more")
-        lines.append("Try --resolution 640 480 --fps 30, or run --list-cameras --show-profiles.")
+        lines.append(
+            "Try --resolution 640 480 --fps 30, or set color_format='yuyv' "
+            "and run --list-cameras --show-profiles."
+        )
         return "\n".join(lines)
 
     def read(self, *, timeout_ms: int = 5000) -> CameraFrame:
@@ -256,7 +408,10 @@ class RealSenseCamera:
             [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
-        color_image = np.asanyarray(color_frame.get_data())
+        color_image = _color_image_to_bgr(
+            np.asanyarray(color_frame.get_data()),
+            self._active_color_format,
+        )
         depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
         timestamp_ms = float(color_frame.get_timestamp() or 0.0)
         timestamp_sec = timestamp_ms / 1000.0 if timestamp_ms > 0.0 else time.time()
@@ -288,6 +443,7 @@ class RealSenseCamera:
                 self._pipeline = None
                 self._align = None
                 self._profile = None
+                self._active_color_format = self.config.color_format
 
     def __enter__(self) -> "RealSenseCamera":
         return self.start()
@@ -429,6 +585,10 @@ class TargetConfig:
     charuco_marker_length_m: float = 0.026
     min_charuco_corners: int = 12
     axis_length_m: float = 0.05
+    # A ChArUco board is also an ArUco marker board. When interpolation of
+    # inner corners is weak, retain the same fixed board frame by estimating
+    # its pose from the detected board markers.
+    allow_aruco_board_fallback: bool = True
 
 
 @dataclass
@@ -454,6 +614,23 @@ class TargetDetector:
         self._parameters = _detector_parameters(self._aruco)
         self._detector = _make_aruco_detector(self._aruco, self._dictionary, self._parameters)
         self._charuco_board = self._make_charuco_board() if config.target_type == "charuco" else None
+        self._last_status = "target: not detected"
+        self._last_charuco_corner_count = 0
+        self._last_charuco_failure: str | None = None
+        self._last_charuco_corners: np.ndarray | None = None
+        self._last_charuco_ids: np.ndarray | None = None
+        self._last_target_mode = config.target_type
+        self._aruco_board = (
+            self._make_aruco_board()
+            if config.target_type == "charuco" and config.allow_aruco_board_fallback
+            else None
+        )
+
+    @property
+    def last_status(self) -> str:
+        """Human-readable diagnostic for the most recently processed frame."""
+
+        return self._last_status
 
     def detect(
         self,
@@ -467,11 +644,18 @@ class TargetDetector:
         aruco = self._aruco
         image = np.asarray(color_bgr).copy()
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        self._last_charuco_corner_count = 0
+        self._last_charuco_failure = None
+        self._last_charuco_corners = None
+        self._last_charuco_ids = None
+        self._last_target_mode = self.config.target_type
         corners, ids, _ = self._detect_markers(gray)
         if ids is None or len(corners) == 0:
+            self._last_status = "target: not detected (markers=0)"
             if draw:
-                _put_status(cv2, image, "target: not detected", ok=False)
+                _put_status(cv2, image, self._last_status, ok=False)
             return None, image
+        marker_count = len(corners)
         if draw:
             aruco.drawDetectedMarkers(image, corners, ids)
         if self.config.target_type == "charuco":
@@ -482,6 +666,25 @@ class TargetDetector:
                 intrinsics_matrix,
                 distortion_coeffs,
             )
+            if detection is None and self._aruco_board is not None:
+                detection = self._detect_aruco_board(
+                    corners,
+                    ids,
+                    intrinsics_matrix,
+                    distortion_coeffs,
+                    image_shape=gray.shape[:2],
+                )
+                if detection is not None:
+                    self._last_target_mode = "aruco-board"
+            if draw and self._last_charuco_corners is not None and self._last_charuco_ids is not None:
+                try:
+                    aruco.drawDetectedCornersCharuco(
+                        image,
+                        self._last_charuco_corners,
+                        self._last_charuco_ids,
+                    )
+                except (AttributeError, cv2.error):
+                    pass
         else:
             detection = self._detect_aruco(
                 corners,
@@ -490,14 +693,43 @@ class TargetDetector:
                 distortion_coeffs,
                 image_shape=gray.shape[:2],
             )
-        if detection is not None and draw:
-            self._draw_axes(image, intrinsics_matrix, distortion_coeffs, detection)
+        if detection is not None:
             reproj = detection.reprojection_rmse_px
             suffix = "" if reproj is None else f", reproj={reproj:.2f}px"
-            _put_status(cv2, image, f"target: ok corners={detection.corner_count}{suffix}", ok=True)
-        elif draw:
-            reason = "need one marker" if self.config.target_type == "aruco" else "need more charuco corners"
-            _put_status(cv2, image, f"target: {reason}", ok=False)
+            if self.config.target_type == "charuco":
+                max_corners = max(
+                    0,
+                    (int(self.config.charuco_squares_x) - 1)
+                    * (int(self.config.charuco_squares_y) - 1),
+                )
+                if self._last_target_mode == "aruco-board":
+                    self._last_status = (
+                        f"target: ok aruco-board markers={len(detection.marker_ids)} "
+                        f"charuco={self._last_charuco_corner_count}/"
+                        f"{int(self.config.min_charuco_corners)} "
+                        f"(board_max={max_corners}){suffix}"
+                    )
+                else:
+                    self._last_status = (
+                        f"target: ok markers={marker_count} "
+                        f"charuco={detection.corner_count}/{max_corners}{suffix}"
+                    )
+            else:
+                self._last_status = f"target: ok corners={detection.corner_count}{suffix}"
+            if draw:
+                self._draw_axes(image, intrinsics_matrix, distortion_coeffs, detection)
+                _put_status(cv2, image, self._last_status, ok=True)
+        else:
+            if self.config.target_type == "aruco":
+                self._last_status = f"target: need one marker (markers={marker_count})"
+            else:
+                reason = self._last_charuco_failure or (
+                    f"charuco corners={self._last_charuco_corner_count}/"
+                    f"{int(self.config.min_charuco_corners)}"
+                )
+                self._last_status = f"target: {reason} markers={marker_count}"
+            if draw:
+                _put_status(cv2, image, self._last_status, ok=False)
         return detection, image
 
     def _detect_markers(self, gray: np.ndarray):
@@ -562,6 +794,128 @@ class TargetDetector:
             image_points=image_points,
         )
 
+    def _make_aruco_board(self):
+        if self._charuco_board is None or not hasattr(self._aruco, "Board"):
+            return None
+        try:
+            return self._aruco.Board(
+                self._charuco_board.getObjPoints(),
+                self._dictionary,
+                self._charuco_board.getIds(),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _detect_aruco_board(
+        self,
+        corners: Sequence[np.ndarray],
+        ids: np.ndarray,
+        intrinsics_matrix: np.ndarray,
+        distortion_coeffs: np.ndarray,
+        image_shape: tuple[int, int],
+    ) -> TargetDetection | None:
+        """Estimate the fixed ChArUco board frame from its ArUco markers."""
+
+        if self._aruco_board is None:
+            return None
+        cv2 = self._cv2
+        aruco = self._aruco
+        board_ids = [
+            int(value) for value in np.asarray(self._charuco_board.getIds()).reshape(-1)
+        ]
+        board_id_to_index = {
+            marker_id: index for index, marker_id in enumerate(board_ids)
+        }
+        detected_ids = [int(value) for value in np.asarray(ids).reshape(-1)]
+        valid_pairs = [
+            (index, marker_id, board_id_to_index[marker_id])
+            for index, marker_id in enumerate(detected_ids)
+            if marker_id in board_id_to_index
+        ]
+        if not valid_pairs:
+            return None
+
+        selected_corners = [
+            np.asarray(corners[index], dtype=np.float32)
+            for index, _, _ in valid_pairs
+        ]
+        selected_ids = np.asarray(
+            [marker_id for _, marker_id, _ in valid_pairs],
+            dtype=np.int32,
+        ).reshape(-1, 1)
+        board_obj_points = self._charuco_board.getObjPoints()
+        object_points = np.concatenate(
+            [
+                np.asarray(board_obj_points[board_index], dtype=np.float64)
+                for _, _, board_index in valid_pairs
+            ],
+            axis=0,
+        ).reshape(-1, 3)
+        image_points = np.concatenate(
+            [corner.reshape(4, 2) for corner in selected_corners],
+            axis=0,
+        ).reshape(-1, 2)
+        try:
+            if hasattr(aruco, "estimatePoseBoard"):
+                try:
+                    retval, rvec, tvec = aruco.estimatePoseBoard(
+                        selected_corners,
+                        selected_ids,
+                        self._aruco_board,
+                        intrinsics_matrix,
+                        distortion_coeffs,
+                        None,
+                        None,
+                    )
+                except TypeError:
+                    rvec = np.zeros((3, 1), dtype=np.float64)
+                    tvec = np.zeros((3, 1), dtype=np.float64)
+                    retval, rvec, tvec = aruco.estimatePoseBoard(
+                        selected_corners,
+                        selected_ids,
+                        self._aruco_board,
+                        intrinsics_matrix,
+                        distortion_coeffs,
+                        rvec,
+                        tvec,
+                    )
+            else:
+                retval, rvec, tvec = cv2.solvePnP(
+                    object_points,
+                    image_points,
+                    intrinsics_matrix,
+                    distortion_coeffs,
+                )
+        except cv2.error:
+            return None
+        if not bool(retval):
+            return None
+
+        rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
+        tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
+        rotation, _ = cv2.Rodrigues(rvec)
+        rmse = _board_reprojection_rmse(
+            cv2,
+            object_points,
+            image_points,
+            rvec,
+            tvec,
+            intrinsics_matrix,
+            distortion_coeffs,
+        )
+        return TargetDetection(
+            T_target_to_camera=make_transform(rotation, tvec),
+            rvec=rvec,
+            tvec=tvec,
+            corner_count=int(image_points.shape[0]),
+            marker_ids=[marker_id for _, marker_id, _ in valid_pairs],
+            reprojection_rmse_px=rmse,
+            target_center_px=_mean_image_point(image_points),
+            image_size_px=(int(image_shape[1]), int(image_shape[0])),
+            object_points=object_points,
+            image_points=image_points,
+        )
+
     def _detect_charuco(
         self,
         gray: np.ndarray,
@@ -571,56 +925,110 @@ class TargetDetector:
         distortion_coeffs: np.ndarray,
     ) -> TargetDetection | None:
         if self._charuco_board is None:
+            self._last_charuco_failure = "charuco board unavailable"
             return None
         aruco = self._aruco
         cv2 = self._cv2
         try:
-            count, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
-                corners,
-                ids,
-                gray,
-                self._charuco_board,
-                cameraMatrix=intrinsics_matrix,
-                distCoeffs=distortion_coeffs,
+            if hasattr(aruco, "interpolateCornersCharuco"):
+                try:
+                    count, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+                        corners,
+                        ids,
+                        gray,
+                        self._charuco_board,
+                        cameraMatrix=intrinsics_matrix,
+                        distCoeffs=distortion_coeffs,
+                    )
+                except TypeError:
+                    count, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+                        corners,
+                        ids,
+                        gray,
+                        self._charuco_board,
+                        intrinsics_matrix,
+                        distortion_coeffs,
+                    )
+            elif hasattr(aruco, "CharucoDetector"):
+                charuco_detector = aruco.CharucoDetector(self._charuco_board)
+                charuco_corners, charuco_ids, _, _ = charuco_detector.detectBoard(
+                    gray,
+                    None,
+                    None,
+                    corners,
+                    ids,
+                )
+                count = 0 if charuco_ids is None else len(charuco_ids)
+            else:
+                self._last_charuco_failure = "charuco interpolation API unavailable"
+                return None
+        except cv2.error as exc:
+            self._last_charuco_failure = (
+                f"charuco interpolation failed ({type(exc).__name__})"
             )
-        except TypeError:
-            count, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
-                corners,
-                ids,
-                gray,
-                self._charuco_board,
-                intrinsics_matrix,
-                distortion_coeffs,
-            )
+            return None
+        try:
+            count_int = int(count)
+        except (TypeError, ValueError):
+            count_int = 0
+        self._last_charuco_corner_count = count_int
+        self._last_charuco_corners = charuco_corners
+        self._last_charuco_ids = charuco_ids
         if (
             charuco_ids is None
             or charuco_corners is None
-            or int(count) < int(self.config.min_charuco_corners)
+            or count_int < int(self.config.min_charuco_corners)
         ):
+            self._last_charuco_failure = (
+                f"charuco corners={count_int}/{int(self.config.min_charuco_corners)}"
+            )
             return None
         try:
-            ok, rvec, tvec = aruco.estimatePoseCharucoBoard(
-                charuco_corners,
-                charuco_ids,
-                self._charuco_board,
-                intrinsics_matrix,
-                distortion_coeffs,
-                None,
-                None,
+            if hasattr(aruco, "estimatePoseCharucoBoard"):
+                try:
+                    ok, rvec, tvec = aruco.estimatePoseCharucoBoard(
+                        charuco_corners,
+                        charuco_ids,
+                        self._charuco_board,
+                        intrinsics_matrix,
+                        distortion_coeffs,
+                        None,
+                        None,
+                    )
+                except TypeError:
+                    rvec = np.zeros((3, 1), dtype=np.float64)
+                    tvec = np.zeros((3, 1), dtype=np.float64)
+                    ok = aruco.estimatePoseCharucoBoard(
+                        charuco_corners,
+                        charuco_ids,
+                        self._charuco_board,
+                        intrinsics_matrix,
+                        distortion_coeffs,
+                        rvec,
+                        tvec,
+                    )
+            else:
+                object_points = _charuco_object_points(self._charuco_board, charuco_ids)
+                if object_points is None:
+                    self._last_charuco_failure = "charuco object points unavailable"
+                    return None
+                ok, rvec, tvec = cv2.solvePnP(
+                    np.asarray(object_points, dtype=np.float64).reshape(-1, 3),
+                    np.asarray(charuco_corners, dtype=np.float64).reshape(-1, 2),
+                    intrinsics_matrix,
+                    distortion_coeffs,
+                )
+        except cv2.error as exc:
+            self._last_charuco_failure = (
+                f"charuco corners={count_int}/{int(self.config.min_charuco_corners)}, "
+                f"pose failed ({type(exc).__name__})"
             )
-        except TypeError:
-            rvec = np.zeros((3, 1), dtype=np.float64)
-            tvec = np.zeros((3, 1), dtype=np.float64)
-            ok = aruco.estimatePoseCharucoBoard(
-                charuco_corners,
-                charuco_ids,
-                self._charuco_board,
-                intrinsics_matrix,
-                distortion_coeffs,
-                rvec,
-                tvec,
-            )
+            return None
         if not ok:
+            self._last_charuco_failure = (
+                f"charuco corners={count_int}/{int(self.config.min_charuco_corners)}, "
+                "pose failed"
+            )
             return None
         rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
         tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
@@ -641,7 +1049,7 @@ class TargetDetector:
             T_target_to_camera=make_transform(rotation, tvec),
             rvec=rvec,
             tvec=tvec,
-            corner_count=int(count),
+            corner_count=count_int,
             marker_ids=[int(value) for value in np.asarray(ids).reshape(-1)],
             reprojection_rmse_px=rmse,
             target_center_px=_mean_image_point(image_points),
@@ -750,6 +1158,39 @@ def _device_from_serial(rs: Any, serial: str | None):
     return devices[0]
 
 
+def _stop_pipeline_quietly(pipeline: Any | None) -> None:
+    if pipeline is None:
+        return
+    try:
+        pipeline.stop()
+    except Exception:
+        pass
+
+
+def _is_startup_connection_error(message: str) -> bool:
+    lowered = str(message).lower()
+    if "couldn't resolve requests" in lowered or "could not resolve requests" in lowered:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "startup warmup received no frames",
+            "frame didn't arrive",
+            "frame did not arrive",
+            "device or resource busy",
+            "no device connected",
+            "failed to set power state",
+            "failed to open",
+            "device disconnected",
+            "uvc",
+            "usb",
+            "backend",
+            "ioctl",
+            "resource busy",
+        )
+    )
+
+
 def _select_video_profile(
     rs: Any,
     device: Any,
@@ -772,13 +1213,24 @@ def _select_video_profile(
 
     requested_area = int(requested_width) * int(requested_height)
 
-    def score(item: VideoStreamProfileInfo) -> tuple[int, int, int, int, int]:
+    format_rank = {
+        _format_name(rs, value): index for index, value in enumerate(preferred_formats)
+    }
+
+    def score(item: VideoStreamProfileInfo) -> tuple[int, int, int, int, int, int]:
         exact_resolution = 0 if (item.width, item.height) == (requested_width, requested_height) else 1
         fps_penalty = abs(item.fps - int(requested_fps))
         area_penalty = abs(item.width * item.height - requested_area)
         width_penalty = abs(item.width - int(requested_width))
         height_penalty = abs(item.height - int(requested_height))
-        return exact_resolution, fps_penalty, area_penalty, width_penalty, height_penalty
+        return (
+            exact_resolution,
+            fps_penalty,
+            area_penalty,
+            width_penalty,
+            height_penalty,
+            format_rank.get(item.format_name, len(format_rank)),
+        )
 
     return min(candidates, key=score)
 
@@ -807,14 +1259,21 @@ def _stream_name(rs: Any, stream: Any) -> str:
 
 
 def _format_name(rs: Any, fmt: Any) -> str:
-    for name in ("bgr8", "rgb8", "z16", "y8", "yuyv", "rgba8", "bgra8"):
+    for name in ("bgr8", "rgb8", "z16", "y8", "yuyv", "uyvy", "rgba8", "bgra8"):
         if getattr(rs.format, name, None) == fmt:
             return name
     return str(fmt).split(".")[-1]
 
 
-def _requested_profile_text(width: int, height: int, fps: int, *, enable_depth: bool) -> str:
-    streams = [f"color {int(width)}x{int(height)}@{int(fps)} bgr8"]
+def _requested_profile_text(
+    width: int,
+    height: int,
+    fps: int,
+    *,
+    color_format: str = "yuyv",
+    enable_depth: bool,
+) -> str:
+    streams = [f"color {int(width)}x{int(height)}@{int(fps)} {color_format}"]
     if enable_depth:
         streams.append(f"depth {int(width)}x{int(height)}@{int(fps)} z16")
     return ", ".join(streams)
@@ -1003,6 +1462,28 @@ def _charuco_reprojection_rmse(
         distortion_coeffs,
     )
     diff = projected.reshape(-1, 2) - image_points
+    return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
+
+
+def _board_reprojection_rmse(
+    cv2: Any,
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    intrinsics_matrix: np.ndarray,
+    distortion_coeffs: np.ndarray,
+) -> float:
+    projected, _ = cv2.projectPoints(
+        np.asarray(object_points, dtype=np.float64).reshape(-1, 3),
+        rvec.reshape(3, 1),
+        tvec.reshape(3, 1),
+        intrinsics_matrix,
+        distortion_coeffs,
+    )
+    diff = projected.reshape(-1, 2) - np.asarray(
+        image_points, dtype=np.float64
+    ).reshape(-1, 2)
     return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
 
 

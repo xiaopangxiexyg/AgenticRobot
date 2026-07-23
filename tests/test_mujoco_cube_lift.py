@@ -8,6 +8,7 @@ import pytest
 from sim.mujoco.diagnostics.cube_lift import build_arg_parser
 from sim.mujoco.scene import MujocoScene
 from sim.mujoco.tasks.cube_lift import (
+    CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION,
     CubeLiftActionSpec,
     CubeLiftEnv,
     CubeLiftObservationSpec,
@@ -43,8 +44,8 @@ def test_cube_lift_config_freezes_center_cube_and_task_local_layouts() -> None:
 
     assert config.action_dim == 7
     assert config.observation_dim == 31
-    assert config.cube_center_xy_m == pytest.approx((-0.412, 0.0))
-    assert config.cube_spawn_qpos[:3] == pytest.approx((-0.412, 0.0, 0.026))
+    assert config.cube_center_xy_m == pytest.approx((-0.472, 0.0))
+    assert config.cube_spawn_qpos[:3] == pytest.approx((-0.472, 0.0, 0.026))
     assert cube.size_m == pytest.approx((0.03, 0.03, 0.03))
     assert cube.rgba == pytest.approx((0.85, 0.18, 0.12, 1.0))
     assert config.to_metadata()["observation_mode"] == "state_privileged"
@@ -59,6 +60,15 @@ def test_cube_lift_specs_reject_invalid_action_and_observation() -> None:
         action_spec.coerce(np.full(7, 1.01, dtype=np.float32))
     with pytest.raises(RuntimeError, match="observation"):
         observation_spec.coerce(np.zeros(30, dtype=np.float32))
+
+
+def test_physical_cube_lift_uses_tcp_pose_action_contract() -> None:
+    config = CubeLiftTaskConfig.load(
+        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v1.json"
+    )
+    assert config.uses_pose_action is True
+    assert config.action_layout == CUBE_LIFT_POSE_ACTION_LAYOUT_VERSION
+    assert CubeLiftActionSpec(layout_version=config.action_layout).dim == 7
 
 
 def test_scene_freejoint_helper_resets_center_cube_and_reports_table_contact() -> None:
@@ -79,7 +89,7 @@ def test_scene_freejoint_helper_resets_center_cube_and_reports_table_contact() -
     scene.forward()
 
     cube_qpos = scene.freejoint_qpos(config.object_freejoint_name)
-    assert cube_qpos[0:2] == pytest.approx((-0.412, 0.0), abs=1e-6)
+    assert cube_qpos[0:2] == pytest.approx((-0.472, 0.0), abs=1e-6)
     assert cube_qpos[2] == pytest.approx(0.025, abs=0.004)
     assert any(
         {contact.body1_name, contact.body2_name}

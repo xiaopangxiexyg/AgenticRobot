@@ -24,7 +24,88 @@
 - 左右 wrist 的逻辑相机键、OpenPI 输入键和 server slots；
 - DMTAC 的连续 gripper 映射。
 
+### v2.2 raw 数据训练出的 relative 模型
+
+从 v2.2 数据按 chunk 起始 `actual_tcp_pose` 在线转换 relative action 后训练的模型，
+对外使用 v2.3 model-facing action 语义，但其 absolute state 数值分布仍属于 v2.2
+双臂 raw base。此类 checkpoint 的 artifact 必须同时声明：
+
+```json
+"pose_training_data_contract": {
+  "schema": "dexteleop_pose_training_data_v1",
+  "origin": "v22_raw_identity_compatibility",
+  "source_dataset_schema": "dexteleop_dataset_v2.2",
+  "model_state_pose_frame": "canonical_desk",
+  "runtime_pose_binding": "same_source_identity_raw_to_desk",
+  "expected_runtime_source_id": "rm65_real_dual_arm_v1",
+  "relative_action_world_transform_invariant": true
+}
+```
+
+同时，`pose_action_chunk_contract.action_pose_mode` 和
+`last_action_pose_mode` 必须都是 `relative`，其 pose-frame hash 必须绑定同一
+`rm65_real_dual_arm_v1` identity contract。部署器会据此自动完成：
+
+```text
+runtime measured TCP/raw state
+  -> identity raw-to-canonical-desk model state
+  -> relative policy chunk
+  -> current control-cut measured TCP anchor
+  -> runtime absolute action
+  -> safety / IK / backend
+```
+
+这不是 native v2.3 canonical-desk 模型。不得为它传入 RM65 workspace-near-boundary
+non-identity runtime profile；错误绑定会在 backend 创建前 fail-closed。
+
+服务、相机或机械臂启动前，先执行只读 contract 检查：
+
+```bash
+cd "$DEXTELEOP_ROOT"
+"$DEXTELEOP_PYTHON" -m deployments.openpi.client.real \
+  --policy-artifact-json "$OPENPI_ARTIFACT" \
+  --contract-check-only
+```
+
+该命令不连接 websocket、不打开相机或手部设备，也不创建机械臂 backend。通过时
+JSON 应包含 `ok=true`、`action_pose_mode=relative`、
+`pose_training_origin=v22_raw_identity_compatibility` 和
+`runtime_pose_frame_contract_source=v22_identity_compatibility`。缺少 provenance、
+pose hash 不匹配或误用 native-v2.3 语义都会直接失败；DexTeleop 不根据 checkpoint
+路径或数据集名称猜测并补写这些字段。
+
 不要手动将 wrist 图像伪装成 `front`，也不要用位置顺序猜测相机。`0712-wrist-cube` 的 registry key 必须与 artifact 内的 `model_id` 完全相同；否则 websocket 握手会 fail-closed。
+
+### RTC-4b-A OpenPI raw-RTC final-chunk 边界
+
+这里的 raw-RTC 指 OpenPI 仍执行既有 `observation -> final action chunk` 推理，模型和 server 不接收未来动作；
+RTC 只负责客户端 worker、timed plan、admission、TTL、epoch 和 emission。model-RTC（模型消费未来
+prefix/mask 并返回 conditioning receipt）是独立的后续分支，本节不实现也不暗示该能力。
+
+`deployments.openpi.client.rtc`已经可以把现有artifact约束的OpenPI final chunk接到通用RTC v2
+capability/envelope/decoder seam，但当前只声明：
+
+```text
+scheduler = async_timed_plan
+continuation = none
+transport verification = offline fake transport + shared frontend fixture
+production caller = explicit default-off raw profile only; send_actions=false
+```
+
+该适配器强制绑定完整artifact、完整server metadata、显式camera contract、exact action horizon、prepared
+OpenPI input hash、layout/codec/frame/normalization hash，以及相互独立的continuous float与int64 discrete action
+矩阵。absolute artifact默认继续使用既有`legacy_normalized_v1`结果；relative artifact必须声明structured
+pose chunk、匹配的pose-frame hash并使用`typed_canonical_v1`，由原request observation cut的fixed measured-TCP
+anchor在plan前解为canonical absolute action。artifact/server horizon不一致、relative legacy result、metadata drift、
+短chunk、NaN、非法token、input hash mismatch和时钟回退都会fail closed。该context不进入OpenPI payload，模型和
+server接口不变。带discrete输出的model-RTC continuation仍需独立typed prefix/mask/receipt gate。
+
+这不是 model-RTC，也不授予相机、机械臂或生产 motion authority。现有 OpenPI launcher 仅在显式
+`--rtc-profile raw_rtc_final_chunk_15_30_60_120_v1` 时创建 raw-RTC adapter；默认仍是同步路径，且首轮
+profile 强制 `send_actions=false`。其作用是先用
+可替换的model adapter证明artifact→payload→final output→absolute/relative canonical decode的离线完整性；换用其他本地模型或
+模型服务时，通用RTC request/response/plan/emission语义保持不变，只替换具体backend与codec。鲁棒fixture见
+`tests/test_openpi_rtc_final_chunk_adapter.py`。
 
 服务端 registry 位于 `~/zc/openpi/configs/dexteleop_policy_registry.json`，必须包含：
 
@@ -186,6 +267,17 @@ cd "$DEXTELEOP_ROOT"
 ```
 
 `multi` 配置可以含 front 相机；artifact 会只选择 `left_wrist` 和 `right_wrist`。缺少任一 artifact-required view 会 fail-closed。
+
+如需让 OpenPI 的每个 action chunk 只执行前 `X` 步，再继续下一个 chunk，在上述
+real 命令中加入：
+
+```bash
+--action-chunk-execution-steps X --action-queue-policy replace --min-action-queue 0
+```
+
+不传 `--action-chunk-execution-steps` 时仍执行完整返回 chunk。该开关只截断 chunk
+边界，不改变 pose/relative action、anchor、safety 或 position 控制语义；当前阶段也
+不额外启动推理线程。
 
 ## 7. 真机阻抗/力控执行（L5）
 

@@ -26,12 +26,26 @@ class CameraRegistryTest(unittest.TestCase):
         front_frames = registry["cameras"]["front"]["extrinsics"]["frames"]
         self.assertIn("head_camera_frame", front_frames)
         placements = front_frames["head_camera_frame"]["placements"]
+        expected_dual_arm_urdf = (
+            "assets/rm65_inspire_gripper_v3/"
+            "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+        )
         self.assertEqual(placements[0]["frame"], "head_camera_frame")
-        self.assertIn("rm65_dual_arm_gripper_v1_head_camera.urdf", placements[0]["urdf"])
+        self.assertEqual(
+            [placement["urdf"] for placement in placements],
+            [expected_dual_arm_urdf],
+        )
 
         left_frames = registry["cameras"]["left_wrist"]["extrinsics"]["frames"]
         self.assertIn("left_camera_rgb", left_frames)
-        self.assertGreaterEqual(len(left_frames["left_camera_rgb"]["placements"]), 2)
+        left_wrist_placements = left_frames["left_camera_rgb"]["placements"]
+        self.assertEqual(len(left_wrist_placements), 1)
+        self.assertEqual(left_wrist_placements[0]["urdf"], expected_dual_arm_urdf)
+
+        right_frames = registry["cameras"]["right_wrist"]["extrinsics"]["frames"]
+        right_wrist_placements = right_frames["right_camera_rgb"]["placements"]
+        self.assertEqual(len(right_wrist_placements), 1)
+        self.assertEqual(right_wrist_placements[0]["urdf"], expected_dual_arm_urdf)
 
     def test_canonical_cameras_configs_exist_and_legacy_mirrors_match(self) -> None:
         legacy_device_config = Path("teleop_runtime/configs/devices/realsense.json")

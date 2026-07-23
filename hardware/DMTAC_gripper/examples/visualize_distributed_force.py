@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--temporal_alpha", type=float, default=0.35)
     parser.add_argument("--spatial_blur_ksize", type=int, default=5)
     parser.add_argument("--arrow_pool", type=int, default=16)
-    parser.add_argument("--viz_mode", default="delta", choices=["delta", "absolute", "frame_delta"])
+    parser.add_argument("--viz_mode", default="absolute", choices=["delta", "absolute", "frame_delta"])
     parser.add_argument("--baseline_frames", type=int, default=8)
     parser.add_argument("--fixed_ref", type=float, default=None)
     parser.add_argument("--norm_percentile", type=float, default=99.0)

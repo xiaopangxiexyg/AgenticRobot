@@ -44,6 +44,13 @@ from teleop_runtime.position_control.deploy_executor import (
     PositionDeployExecutorFault,
     PositionDeployQueueFullError,
 )
+from teleop_runtime.position_control.reference_observation import (
+    LegacyPositionReferenceObservationBatch,
+    LegacyPositionReferenceObserverRuntime,
+    LegacyPositionReferenceResolutionFailureObservation,
+    LegacyPositionReferenceResolutionObservation,
+    LegacyPositionReferenceSegmentTerminalObservation,
+)
 from teleop_runtime.position_control.rm65_collision import (
     endpoint_to_tool_transforms_from_started_backends,
 )
@@ -333,6 +340,174 @@ def test_pose_segment_emits_reference_points_without_rerunning_safety() -> None:
         executor.close()
 
 
+def test_position_reference_observer_is_passive_and_uses_actual_parent_pair() -> None:
+    commands: list[TeleopCommand] = []
+    observed = []
+    observer = LegacyPositionReferenceObserverRuntime(
+        worker_instance_id="position-worker:test",
+        executor_instance_id="position-executor:test",
+        sink=observed.append,
+        queue_capacity=64,
+    )
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=commands.append,
+        reference_observer=observer,
+    )
+    executor.start()
+    try:
+        source_index = executor.submit(
+            _filtered_pose("left", _pose(0.16)),
+            _observation(),
+            "unit_policy",
+        )
+        _wait_until(lambda: len(commands) >= 4)
+        observer.flush()
+
+        pose_batches = [
+            batch
+            for batch in observed
+            if isinstance(batch, LegacyPositionReferenceObservationBatch)
+            and batch.frame_observation.modality == "pose"
+        ]
+        pose_resolutions = [
+            item
+            for item in observed
+            if isinstance(item, LegacyPositionReferenceResolutionObservation)
+            and item.modality == "pose"
+        ]
+        segments = [
+            batch.segment_observation
+            for batch in pose_batches
+            if batch.segment_observation is not None
+        ]
+        assert len(segments) == 1
+        segment = segments[0]
+        assert segment is not None
+        assert tuple(
+            item.source_index for item in segment.endpoint_observations
+        ) == (source_index - 1, source_index)
+        assert tuple(
+            item.source_stage for item in segment.endpoint_observations
+        ) == ("current_observation_anchor", "safe_15hz_keyframe")
+        assert all(
+            not batch.frame_observation.anchor_commit_eligible
+            for batch in pose_batches
+        )
+        assert pose_resolutions
+        assert all(
+            item.execution_context_enforcement
+            == "executor_local_generation_only"
+            for item in pose_resolutions
+        )
+        assert all(not item.backend_accepted for item in pose_resolutions)
+        assert {
+            item.source_frame_observation_id for item in pose_resolutions
+        }.issubset(
+            {
+                batch.frame_observation.frame_observation_id
+                for batch in pose_batches
+            }
+        )
+        assert executor.snapshot()["reference_observer_error_count"] == 0
+
+        expected_points = int(
+            round(executor.config.reference_hz / executor.config.sample_hz)
+        )
+        x_values = [
+            float(command.commands["left_arm"].metadata["target_xyzquat"][0])
+            for command in commands[:expected_points]
+        ]
+        assert x_values == sorted(x_values)
+        assert commands[1].metadata["position_parent_source_indices"] == [
+            source_index - 1,
+            source_index,
+        ]
+        executor.clear()
+        observer.flush()
+        terminals = [
+            item
+            for item in observed
+            if isinstance(
+                item,
+                LegacyPositionReferenceSegmentTerminalObservation,
+            )
+        ]
+        assert terminals
+        assert all(item.terminal_status == "canceled" for item in terminals)
+        assert all(not item.backend_stop_acknowledged for item in terminals)
+    finally:
+        executor.close()
+        observer.close()
+
+
+def test_position_reference_observer_failure_does_not_fault_or_block_dispatch() -> None:
+    class _FailingObserver:
+        @staticmethod
+        def submit_nowait(_derivation) -> bool:
+            raise RuntimeError("observer-only failure")
+
+    commands: list[TeleopCommand] = []
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=commands.append,
+        reference_observer=_FailingObserver(),
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_pose("left", _pose(0.16)),
+            _observation(),
+            "unit_policy",
+        )
+        _wait_until(lambda: len(commands) >= 2)
+        snapshot = executor.snapshot()
+        assert not snapshot["fault_latched"]
+        assert snapshot["dispatch_count"] >= 2
+        assert snapshot["reference_observer_error_count"] >= 2
+        assert "observer-only failure" in snapshot["last_reference_observer_error"]
+    finally:
+        executor.close()
+
+
+def test_position_resolution_observer_failure_is_isolated_from_dispatch() -> None:
+    class _ResolutionFailingObserver:
+        @staticmethod
+        def submit_nowait(_derivation) -> bool:
+            return True
+
+        @staticmethod
+        def submit_resolution_nowait(_derivation) -> bool:
+            raise RuntimeError("resolution-observer-only failure")
+
+    commands: list[TeleopCommand] = []
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=commands.append,
+        reference_observer=_ResolutionFailingObserver(),
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_pose("left", _pose(0.16)),
+            _observation(),
+            "unit_policy",
+        )
+        _wait_until(lambda: len(commands) >= 2)
+        snapshot = executor.snapshot()
+        assert not snapshot["fault_latched"]
+        assert snapshot["dispatch_count"] >= 2
+        assert snapshot["reference_observer_error_count"] >= 2
+        assert "resolution-observer-only failure" in (
+            snapshot["last_reference_observer_error"]
+        )
+    finally:
+        executor.close()
+
+
 def test_same_chunk_lookahead_interpolates_without_one_action_period_delay() -> None:
     commands: list[TeleopCommand] = []
     executor = PositionDeployExecutor(
@@ -381,6 +556,20 @@ def test_same_chunk_lookahead_interpolates_without_one_action_period_delay() -> 
             current_index,
             current_index + 1,
         ]
+        pose_speed = metadata["pose_action_interval_velocity"]
+        assert pose_speed["selection"] in {
+            "current_to_next",
+            "bracketing_current_to_next",
+        }
+        assert pose_speed["start_source_index"] == current_index
+        assert pose_speed["end_source_index"] == current_index + 1
+        assert pose_speed["source_rate_hz"] == pytest.approx(15.0)
+        assert pose_speed["by_side"]["left"][
+            "linear_speed_p90_m_s"
+        ] == pytest.approx(0.6, rel=1e-5)
+        assert metadata["position_pose_speed_source"] == (
+            "adjacent_pose_action_interval"
+        )
 
         # When the staged successor becomes current it reuses the existing
         # endpoint instead of adding a duplicate timestamp.  With no further
@@ -571,6 +760,13 @@ def test_mixed_pose_and_qpos_sides_share_one_causal_reference_clock() -> None:
 def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
     planner = _FakePositionCollisionPlanner()
     commands: list[TeleopCommand] = []
+    observed = []
+    observer = LegacyPositionReferenceObserverRuntime(
+        worker_instance_id="position-worker:collision-test",
+        executor_instance_id="position-executor:collision-test",
+        sink=observed.append,
+        queue_capacity=64,
+    )
     pipeline = _pipeline(("left", "right"))
 
     def fail_if_safety_repeats(*_args, **_kwargs):
@@ -589,6 +785,7 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
             command,
         ),
         collision_planner_factory=lambda: planner,
+        reference_observer=observer,
     )
     executor.start()
     try:
@@ -598,6 +795,7 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
             "collision_policy",
         )
         _wait_until(lambda: len(commands) >= 2)
+        observer.flush()
 
         assert len(planner.reset_calls) == 1
         assert set(planner.reset_calls[0]) == {"left", "right"}
@@ -624,6 +822,24 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
         assert snapshot["endpoint_collision_certified"] is True
         assert snapshot["last_collision_reset"]["authoritative"] is True
         assert snapshot["last_reference"]["position_arm_backend_dispatch_verified"] is True
+        collision_resolutions = [
+            item
+            for item in observed
+            if isinstance(item, LegacyPositionReferenceResolutionObservation)
+        ]
+        assert collision_resolutions
+        assert all(
+            item.planner_evidence_status
+            == "legacy_collision_planner_accepted"
+            for item in collision_resolutions
+        )
+        assert all(item.planner_input_hash for item in collision_resolutions)
+        assert all(item.planner_output_hash for item in collision_resolutions)
+        assert all(
+            item.measured_state_evidence_status
+            == "legacy_planner_state_not_typed"
+            for item in collision_resolutions
+        )
 
         executor.clear()
         executor.submit(
@@ -635,6 +851,7 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
         assert executor.snapshot()["collision_reset_count"] == 2
     finally:
         executor.close()
+        observer.close()
 
 
 def test_collision_hold_fault_latches_before_arm_or_hand_dispatch() -> None:
@@ -642,6 +859,13 @@ def test_collision_hold_fault_latches_before_arm_or_hand_dispatch() -> None:
     arm_commands: list[TeleopCommand] = []
     hand_commands: list[TeleopCommand] = []
     hold_called = threading.Event()
+    observed = []
+    observer = LegacyPositionReferenceObserverRuntime(
+        worker_instance_id="position-worker:fault-test",
+        executor_instance_id="position-executor:fault-test",
+        sink=observed.append,
+        queue_capacity=64,
+    )
     executor = PositionDeployExecutor(
         config=PositionDeployExecutorConfig(
             stale_after_sec=0.5,
@@ -653,6 +877,7 @@ def test_collision_hold_fault_latches_before_arm_or_hand_dispatch() -> None:
         discrete_dispatch_callback=hand_commands.append,
         hold_callback=hold_called.set,
         collision_planner_factory=lambda: planner,
+        reference_observer=observer,
     )
     executor.start()
     try:
@@ -663,8 +888,32 @@ def test_collision_hold_fault_latches_before_arm_or_hand_dispatch() -> None:
             discrete_command=_hand_command("left", 0.4),
         )
         _wait_until(lambda: executor.snapshot()["fault_latched"])
+        observer.flush()
         assert hold_called.wait(timeout=0.5)
         assert arm_commands == []
+        terminals = [
+            item
+            for item in observed
+            if isinstance(
+                item,
+                LegacyPositionReferenceSegmentTerminalObservation,
+            )
+        ]
+        assert terminals
+        assert all(item.terminal_status == "faulted" for item in terminals)
+        failures = [
+            item
+            for item in observed
+            if isinstance(
+                item,
+                LegacyPositionReferenceResolutionFailureObservation,
+            )
+        ]
+        assert failures
+        assert all(item.failure_stage == "planner" for item in failures)
+        assert all(item.non_authoritative for item in failures)
+        assert all(not item.anchor_commit_eligible for item in failures)
+        assert all(item.admission_receipt_id is None for item in failures)
         assert hand_commands == []
         snapshot = executor.snapshot()
         assert snapshot["collision_hold_count"] == 1
@@ -672,6 +921,7 @@ def test_collision_hold_fault_latches_before_arm_or_hand_dispatch() -> None:
         assert snapshot["last_collision"]["position_endpoint_collision_passed"] is False
     finally:
         executor.close()
+        observer.close()
 
 
 def test_collision_required_faults_if_endpoint_check_was_not_executed() -> None:

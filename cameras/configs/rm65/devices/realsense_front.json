@@ -4,6 +4,7 @@
     "width": 640,
     "height": 480,
     "fps": 15,
+    "color_format": "yuyv",
     "metadata": {
       "mount": "single_front"
     }

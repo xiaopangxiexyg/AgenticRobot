@@ -17,7 +17,10 @@ Clock messages are never sent to that port and the v1 pose JSON is not
 extended.  The repository now has two sender entry points:
 
 - `vive_data_sender.py` is the **new local default**. It starts the separate
-  control client in `optional` mode automatically.
+  control client in `optional` mode automatically. The sender-side subset of
+  this protocol is embedded in that file, so copying only
+  `vive_data_sender.py` to the VIVE host retains clock synchronization;
+  `clock_sync.py` remains the shared receiver/test protocol implementation.
 - `vive_data_sender_legacy.py` is the **stable v1 entry point**. It forces
   clock control off, even if a clock-sync argument is supplied accidentally.
 

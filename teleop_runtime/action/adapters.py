@@ -16,6 +16,7 @@ from robot_motion.action import (
     HAND16_SLOT_DOF,
     HandActionSpec,
     INSPIRE_HAND_DOF,
+    EndEffectorTarget,
     RobotAction,
     arm_action_specs_metadata,
     default_arm_frame,
@@ -23,6 +24,7 @@ from robot_motion.action import (
     hand_action_specs_metadata,
     split_effector_name,
 )
+from robot_motion.action.schema import hand_dof_for_action_space
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 
 
@@ -78,6 +80,8 @@ class TeleopCommandActionAdapterConfig:
     hand_pad_value: float = float("nan")
     arm_specs: Mapping[str, ArmActionSpec | Mapping[str, Any]] | None = None
     hand_specs: Mapping[str, HandActionSpec | Mapping[str, Any]] | None = None
+    native_end_effector_action_space: str = "dexteleop_policy_io_v2.2"
+    output_action_space: str | None = None
     source: str = "teleop"
     include_command_metadata: bool = True
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -116,6 +120,18 @@ class TeleopCommandActionAdapterConfig:
             hand_specs[resolved.side] = resolved
         object.__setattr__(self, "hand_specs", hand_specs)
         object.__setattr__(self, "source", str(self.source))
+        native_action_space = str(self.native_end_effector_action_space).strip()
+        if not native_action_space:
+            raise ValueError("native_end_effector_action_space must be non-empty.")
+        object.__setattr__(self, "native_end_effector_action_space", native_action_space)
+        output_action_space = (
+            None
+            if self.output_action_space is None
+            else str(self.output_action_space).strip()
+        )
+        if self.output_action_space is not None and not output_action_space:
+            raise ValueError("output_action_space must be non-empty when provided.")
+        object.__setattr__(self, "output_action_space", output_action_space)
         object.__setattr__(self, "metadata", dict(self.metadata))
 
 
@@ -140,7 +156,14 @@ def _action_space_for(
     arm_pose_by_side: Mapping[str, np.ndarray],
     arm_qpos_by_side: Mapping[str, np.ndarray],
     hand_slot_dof: int,
+    native_end_effector_targets_by_side: Mapping[str, EndEffectorTarget],
+    native_end_effector_action_space: str,
+    output_action_space: str | None,
 ) -> str:
+    if output_action_space is not None:
+        return str(output_action_space)
+    if native_end_effector_targets_by_side:
+        return str(native_end_effector_action_space)
     has_pose = bool(arm_pose_by_side)
     has_qpos = bool(arm_qpos_by_side)
     if int(hand_slot_dof) == HAND16_SLOT_DOF:
@@ -264,6 +287,7 @@ def robot_action_from_teleop_command(
     arm_pose_by_side: dict[str, np.ndarray] = {}
     arm_qpos_by_side: dict[str, np.ndarray] = {}
     hand_qpos_by_side: dict[str, np.ndarray] = {}
+    end_effector_targets_by_side: dict[str, EndEffectorTarget] = {}
     arm_specs_by_side: dict[str, ArmActionSpec] = {}
     hand_specs_by_side: dict[str, HandActionSpec] = {}
     controlled_frame_by_effector: dict[str, str] = {}
@@ -294,20 +318,102 @@ def robot_action_from_teleop_command(
                     f"Unsupported arm command_type '{effector_command.command_type}' for {effector}."
                 )
         elif kind == "hand":
-            if effector_command.command_type != "joint_vector":
+            if effector_command.command_type in {
+                "end_effector_continuous",
+                "end_effector_discrete",
+            }:
+                if side in hand_qpos_by_side:
+                    raise ValueError(
+                        f"Cannot mix native and joint-vector hand targets for {side}."
+                    )
+                adapter = str(
+                    effector_command.metadata.get("end_effector_adapter") or ""
+                ).strip()
+                if not adapter:
+                    raise ValueError(
+                        f"{effector} native target requires end_effector_adapter metadata."
+                    )
+                names = tuple(
+                    str(value)
+                    for value in effector_command.metadata.get(
+                        "end_effector_target_names", ()
+                    )
+                )
+                end_effector_targets_by_side[side] = EndEffectorTarget(
+                    value_type=(
+                        "continuous"
+                        if effector_command.command_type == "end_effector_continuous"
+                        else "discrete"
+                    ),
+                    values=effector_command.value,
+                    adapter=adapter,
+                    names=names,
+                )
+            elif effector_command.command_type != "joint_vector":
                 raise ValueError(
                     f"Unsupported hand command_type '{effector_command.command_type}' for {effector}."
                 )
-            hand_qpos_by_side[side], hand_specs_by_side[side] = _hand_vector(
-                effector_command.value,
-                side=side,
-                cfg=cfg,
-                command_metadata=effector_command.metadata,
-            )
+            else:
+                if side in end_effector_targets_by_side:
+                    raise ValueError(
+                        f"Cannot mix native and joint-vector hand targets for {side}."
+                    )
+                hand_qpos_by_side[side], hand_specs_by_side[side] = _hand_vector(
+                    effector_command.value,
+                    side=side,
+                    cfg=cfg,
+                    command_metadata=effector_command.metadata,
+                )
         active_effectors.append(effector)
 
     if not active_effectors:
         return None
+
+    if cfg.output_action_space is not None:
+        expected_hand_dof = hand_dof_for_action_space(cfg.output_action_space)
+        if hand_qpos_by_side and expected_hand_dof != cfg.hand_slot_dof:
+            raise ValueError(
+                "output_action_space hand-slot width does not match "
+                f"hand_slot_dof: {expected_hand_dof}!={cfg.hand_slot_dof}."
+            )
+        if end_effector_targets_by_side and (
+            cfg.output_action_space != cfg.native_end_effector_action_space
+        ):
+            raise ValueError(
+                "Native end-effector targets require output_action_space to match "
+                "native_end_effector_action_space."
+            )
+        pose_spaces = {
+            BIMANUAL_EE_POSE_V1,
+            BIMANUAL_EE_POSE_HAND16_V1,
+            BIMANUAL_MIXED_V1,
+            BIMANUAL_MIXED_HAND16_V1,
+        }
+        qpos_spaces = {
+            BIMANUAL_QPOS_V1,
+            BIMANUAL_QPOS_HAND16_V1,
+            BIMANUAL_MIXED_V1,
+            BIMANUAL_MIXED_HAND16_V1,
+        }
+        known_arm_spaces = pose_spaces | qpos_spaces
+        if (
+            arm_pose_by_side
+            and cfg.output_action_space in known_arm_spaces
+            and cfg.output_action_space not in pose_spaces
+        ):
+            raise ValueError(
+                "Arm pose commands are incompatible with output_action_space "
+                f"{cfg.output_action_space!r}."
+            )
+        if (
+            arm_qpos_by_side
+            and cfg.output_action_space in known_arm_spaces
+            and cfg.output_action_space not in qpos_spaces
+        ):
+            raise ValueError(
+                "Arm qpos commands are incompatible with output_action_space "
+                f"{cfg.output_action_space!r}."
+            )
 
     metadata: dict[str, Any] = dict(cfg.metadata)
     if arm_specs_by_side:
@@ -343,11 +449,15 @@ def robot_action_from_teleop_command(
             arm_pose_by_side=arm_pose_by_side,
             arm_qpos_by_side=arm_qpos_by_side,
             hand_slot_dof=cfg.hand_slot_dof,
+            native_end_effector_targets_by_side=end_effector_targets_by_side,
+            native_end_effector_action_space=cfg.native_end_effector_action_space,
+            output_action_space=cfg.output_action_space,
         ),
         timestamp=command.timestamp,
         arm_pose_by_side=arm_pose_by_side,
         arm_qpos_by_side=arm_qpos_by_side,
         hand_qpos_by_side=hand_qpos_by_side,
+        end_effector_targets_by_side=end_effector_targets_by_side,
         active_effectors=tuple(dict.fromkeys(active_effectors)),
         controlled_frame_by_effector=controlled_frame_by_effector,
         source=cfg.source,

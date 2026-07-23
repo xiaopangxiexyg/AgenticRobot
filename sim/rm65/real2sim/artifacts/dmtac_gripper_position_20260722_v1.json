@@ -1,0 +1,139 @@
+{
+  "schema": "dexteleop.sim.rm65.dmtac_gripper_position_fit.v1",
+  "model_type": "delayed_asymmetric_acceleration_rate_limited_position_v1",
+  "scope": "free_motion_normalized_position_only",
+  "profile_name": "dmtac_bimanual_position_20260722.v1",
+  "source_suite": {
+    "suite_id": "dmtac_bimanual_position_20260722_184856_698964",
+    "remote_locator": "/home/user/zc/DexTeleop/logs/gripper_position_suite/dmtac_bimanual_position_20260722_184856_698964",
+    "fit_artifact_sha256": "bfbc8a079ae8eda0062b233575d9c96ecbe1772554d3dc24ec3183cdd84f2b38",
+    "fit_payload_sha256": "f112b4b06ba892848b23ec36eaaa1f4fcd8e8680794e8fd80b261de9d8fc2d43",
+    "suite_plan_sha256": "17e420a0f295c46c1584f8a6c8ecea79e4cbd724506460e980e4c1ba37dc3de1",
+    "fit_trace_sha256_by_side": {
+      "left": "66b3112b6100d7da2078571067a49c5fd9c0e137ff9d49693a756e1f5e9a4e52",
+      "right": "3d28a4190a5c9f9ab262e9cfd4cec206fc3d3eb5c67e9fb39a8de4eca16190b1"
+    }
+  },
+  "runtime_gate": {
+    "command_hz": 20.0,
+    "send_threshold": 0.002
+  },
+  "source_conditions_observed": {
+    "speed_setting": [1.0],
+    "force_setting": [0.2],
+    "continuous_grasp": [true],
+    "command_mode": ["runtime-equivalent"],
+    "host_position_hold": ["one-shot_per_target"]
+  },
+  "fit_by_side": {
+    "left": {
+      "close": {
+        "delay_sec": 0.0592514185,
+        "max_rate_per_sec": 1.4928638795218356,
+        "acceleration_per_sec2": 13.77982793408203,
+        "segment_count": 23,
+        "source_segment_count": 24,
+        "segment_rmse_median": 0.007681810766522238,
+        "segment_rmse_max": 0.016580112075005916,
+        "sample_abs_error_p95": 0.016513098879342377,
+        "rejected_robust_outlier_count": 1,
+        "status": "identified"
+      },
+      "open": {
+        "delay_sec": 0.046897892,
+        "max_rate_per_sec": 1.5024826742991289,
+        "acceleration_per_sec2": 13.13390231323242,
+        "segment_count": 20,
+        "source_segment_count": 21,
+        "segment_rmse_median": 0.006937166373821253,
+        "segment_rmse_max": 0.013845358447808636,
+        "sample_abs_error_p95": 0.015294612711702169,
+        "rejected_robust_outlier_count": 1,
+        "status": "identified"
+      }
+    },
+    "right": {
+      "close": {
+        "delay_sec": 0.0640776765,
+        "max_rate_per_sec": 1.3773242281700613,
+        "acceleration_per_sec2": 13.749156738281249,
+        "segment_count": 24,
+        "source_segment_count": 24,
+        "segment_rmse_median": 0.012657505466875215,
+        "segment_rmse_max": 0.028088072709192197,
+        "sample_abs_error_p95": 0.03448630961612187,
+        "rejected_robust_outlier_count": 0,
+        "status": "identified"
+      },
+      "open": {
+        "delay_sec": 0.05326578850000002,
+        "max_rate_per_sec": 1.3864800875513763,
+        "acceleration_per_sec2": 12.7875,
+        "segment_count": 22,
+        "source_segment_count": 22,
+        "segment_rmse_median": 0.009700883124140317,
+        "segment_rmse_max": 0.01910662586149234,
+        "sample_abs_error_p95": 0.025321490421199577,
+        "rejected_robust_outlier_count": 0,
+        "status": "identified"
+      }
+    }
+  },
+  "validation": {
+    "status": "passed_for_free_motion_step_response",
+    "groups": {
+      "left.close": {
+        "segment_count": 12,
+        "segment_rmse_median": 0.01441127024427032,
+        "segment_rmse_max": 0.031206326352743702
+      },
+      "left.open": {
+        "segment_count": 10,
+        "segment_rmse_median": 0.011010018933049117,
+        "segment_rmse_max": 0.024408781140731715
+      },
+      "right.close": {
+        "segment_count": 12,
+        "segment_rmse_median": 0.01894132318691623,
+        "segment_rmse_max": 0.02392936063749319
+      },
+      "right.open": {
+        "segment_count": 10,
+        "segment_rmse_median": 0.014660221240691069,
+        "segment_rmse_max": 0.030336727873646795
+      }
+    }
+  },
+  "fast_preemption_diagnostic": {
+    "status": "evaluated_not_identified",
+    "dwell_sec": 0.5,
+    "segment_count_by_side": {"left": 18, "right": 18},
+    "endpoint_model_rmse_by_side": {
+      "left": 0.06447208488230163,
+      "right": 0.055290475266742294
+    },
+    "endpoint_model_median_abs_error_by_side": {
+      "left": 0.009152259485311592,
+      "right": 0.006278869534269649
+    },
+    "endpoint_model_max_abs_error_by_side": {
+      "left": 0.13569021449274699,
+      "right": 0.12289044183011943
+    },
+    "note": "Endpoint-only 1 kHz replay aligned to nominal 0.5 s dwell; long preempted strokes expose the zero-initial-rate fit limitation."
+  },
+  "fidelity_claims": {
+    "free_motion_step_position_response": "identified",
+    "fast_preemption_and_nonzero_initial_velocity": "provisional",
+    "contact_force_newtons": "unavailable",
+    "contact_stall_compliance": "unmodeled",
+    "friction_and_slip": "unmodeled"
+  },
+  "limitations": [
+    "The fit covers normalized free-motion position at speed=1.0, force=0.2, continuous grasp, and the 20 Hz/0.002 software gate only.",
+    "Two left fit segments were removed as robust RMSE outliers; small motions below 0.02 are deadband evidence and are not part of the continuous-motion fit.",
+    "Fast reversals are diagnostic only because the primary step model assumes zero initial velocity.",
+    "No external force gauge was used; contact, force, compliance, friction, slip, and load dependence are not identified."
+  ],
+  "payload_sha256": "3cbb510090d008d1c58ffc5c5e721ad3a2e3b45cda1285dcacb29ef121860691"
+}

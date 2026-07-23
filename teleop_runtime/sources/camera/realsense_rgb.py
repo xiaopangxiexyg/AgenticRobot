@@ -9,6 +9,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from hardware.realsense.color import (
+    color_format_value as _color_format_value,
+    color_image_to_bgr as _color_image_to_bgr,
+    normalize_color_format as _normalize_color_format,
+)
+
 from robot_motion.runtime.lifecycle import LifecycleFailure, raise_lifecycle_failures
 
 from ...interfaces import ObservationSource
@@ -34,6 +40,8 @@ class RealSenseRGBCameraConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
+    # Native transport format. Public frames keep the configured RGB/BGR space.
+    color_format: str = "yuyv"
     camera_key: str = "front"
     name: str | None = None
     keep_last: int = 2
@@ -41,7 +49,11 @@ class RealSenseRGBCameraConfig:
     wait_timeout_ms: int = 1000
     stale_after_sec: float = 2.0
     restart_on_stale_timeout: bool = True
+    restart_on_runtime_error: bool = True
     restart_after_timeouts: int = 3
+    restart_on_black_frames: bool = True
+    restart_after_black_frames: int = 5
+    black_frame_max_value: int = 1
     restart_cooldown_sec: float = 0.5
     startup_reset: bool = True
     startup_reset_sleep_sec: float = 0.2
@@ -70,6 +82,7 @@ class RealSenseRGBCameraConfig:
             raise ValueError("RealSense RGB resolution must be positive.")
         if int(self.fps) <= 0:
             raise ValueError("RealSense RGB fps must be positive.")
+        self.color_format = _normalize_color_format(self.color_format)
         if int(self.keep_last) <= 0:
             raise ValueError("keep_last must be positive.")
         if int(self.wait_timeout_ms) <= 0:
@@ -78,6 +91,10 @@ class RealSenseRGBCameraConfig:
             raise ValueError("stale_after_sec must be positive.")
         if int(self.restart_after_timeouts) <= 0:
             raise ValueError("restart_after_timeouts must be positive.")
+        if int(self.restart_after_black_frames) <= 0:
+            raise ValueError("restart_after_black_frames must be positive.")
+        if not 0 <= int(self.black_frame_max_value) <= 255:
+            raise ValueError("black_frame_max_value must be in [0, 255].")
         if float(self.restart_cooldown_sec) < 0.0:
             raise ValueError("restart_cooldown_sec must be >= 0.")
         if float(self.startup_reset_sleep_sec) < 0.0:
@@ -111,6 +128,7 @@ class RealSenseRGBCameraConfig:
                 "width": int(self.width),
                 "height": int(self.height),
                 "fps": int(self.fps),
+                "color_format": self.color_format,
                 "camera_key": self.camera_key,
                 "name": self.name,
                 "keep_last": int(self.keep_last),
@@ -118,7 +136,11 @@ class RealSenseRGBCameraConfig:
                 "wait_timeout_ms": int(self.wait_timeout_ms),
                 "stale_after_sec": float(self.stale_after_sec),
                 "restart_on_stale_timeout": bool(self.restart_on_stale_timeout),
+                "restart_on_runtime_error": bool(self.restart_on_runtime_error),
                 "restart_after_timeouts": int(self.restart_after_timeouts),
+                "restart_on_black_frames": bool(self.restart_on_black_frames),
+                "restart_after_black_frames": int(self.restart_after_black_frames),
+                "black_frame_max_value": int(self.black_frame_max_value),
                 "restart_cooldown_sec": float(self.restart_cooldown_sec),
                 "startup_reset": bool(self.startup_reset),
                 "startup_reset_sleep_sec": float(self.startup_reset_sleep_sec),
@@ -174,6 +196,7 @@ class RealSenseRGBSource(ObservationSource):
         self._pipeline_lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._running = False
+        self._shutdown_event = threading.Event()
         self._lock = threading.RLock()
         self._latest_frame: VideoFrame | None = None
         self._frame_counter = 0
@@ -183,11 +206,17 @@ class RealSenseRGBSource(ObservationSource):
         self._last_frame_receive_timestamp: float | None = None
         self._timeout_count = 0
         self._consecutive_timeout_count = 0
+        self._black_frame_count = 0
+        self._consecutive_black_frame_count = 0
+        self._last_sampled_max_value: int | None = None
         self._restart_count = 0
+        self._restart_attempt_count = 0
+        self._restart_failure_count = 0
         self._last_restart_timestamp: float | None = None
         self._device_info: dict[str, Any] = {}
         self._depth_align = None
         self._depth_scale_m_per_unit: float | None = None
+        self._active_color_format = self.config.color_format
 
     @property
     def name(self) -> str:
@@ -206,6 +235,7 @@ class RealSenseRGBSource(ObservationSource):
     def start(self) -> None:
         if self._running:
             return
+        self._shutdown_event.clear()
         rs = _load_pyrealsense2()
         with self._lock:
             self._last_error = None
@@ -230,7 +260,12 @@ class RealSenseRGBSource(ObservationSource):
             self._frame_counter = 0
             self._latest_frame = None
             self._timeout_count = 0
+            self._black_frame_count = 0
+            self._consecutive_black_frame_count = 0
+            self._last_sampled_max_value = None
             self._restart_count = 0
+            self._restart_attempt_count = 0
+            self._restart_failure_count = 0
             self._last_restart_timestamp = None
         self._frame_buffer.clear()
         self._thread = threading.Thread(
@@ -247,6 +282,8 @@ class RealSenseRGBSource(ObservationSource):
             attempts += int(self.config.startup_hardware_reset_retry_attempts)
         last_error: RuntimeError | None = None
         for attempt_index in range(attempts):
+            if self._shutdown_event.is_set():
+                raise RuntimeError("startup_cancelled:shutdown_requested")
             try:
                 return self._start_pipeline_once(rs)
             except RuntimeError as exc:
@@ -274,11 +311,12 @@ class RealSenseRGBSource(ObservationSource):
         pipeline = rs.pipeline()
         stream_config = rs.config()
         stream_config.enable_device(self.config.serial)
+        color_format = _color_format_value(rs, self.config.color_format)
         stream_config.enable_stream(
             rs.stream.color,
             int(self.config.width),
             int(self.config.height),
-            rs.format.bgr8,
+            color_format,
             int(self.config.fps),
         )
         if bool(self.config.enable_depth):
@@ -305,6 +343,7 @@ class RealSenseRGBSource(ObservationSource):
                 "If this is a D405 wrist camera with depth enabled, color and depth may need "
                 "matching resolutions, for example color=480x270@15 and depth=480x270@15."
             ) from exc
+        self._active_color_format = self.config.color_format
         try:
             self._configure_sensor_options(profile)
             self._configure_depth_state(rs, profile)
@@ -317,7 +356,7 @@ class RealSenseRGBSource(ObservationSource):
     def _requested_stream_profile_text(self) -> str:
         color = (
             f"color={int(self.config.width)}x{int(self.config.height)}"
-            f"@{int(self.config.fps)} bgr8"
+            f"@{int(self.config.fps)} {self.config.color_format}"
         )
         if not bool(self.config.enable_depth):
             return color
@@ -345,12 +384,20 @@ class RealSenseRGBSource(ObservationSource):
         failure_count = 0
         last_error: str | None = None
         for _ in range(warmup_frames):
+            if self._shutdown_event.is_set():
+                raise RuntimeError("startup_cancelled:shutdown_requested")
             try:
                 pipeline.wait_for_frames(timeout_ms=timeout_ms)
                 success_count += 1
             except Exception as exc:  # noqa: BLE001
                 failure_count += 1
                 last_error = f"{type(exc).__name__}: {exc}"
+                if (
+                    success_count <= 0
+                    and failure_count
+                    >= min(warmup_frames, int(self.config.restart_after_timeouts))
+                ):
+                    break
         if success_count <= 0 and failure_count > 0:
             raise RuntimeError(
                 "startup_warmup_failed:"
@@ -375,8 +422,8 @@ class RealSenseRGBSource(ObservationSource):
                 return False
             target_device.hardware_reset()
             reset_sleep_sec = float(self.config.startup_hardware_reset_sleep_sec)
-            if reset_sleep_sec > 0.0:
-                time.sleep(reset_sleep_sec)
+            if reset_sleep_sec > 0.0 and self._shutdown_event.wait(reset_sleep_sec):
+                return False
             reconnected = self._wait_for_device_reconnect(rs)
             if not reconnected:
                 with self._lock:
@@ -409,9 +456,12 @@ class RealSenseRGBSource(ObservationSource):
         while True:
             if self._find_device_by_serial(rs) is not None:
                 return True
-            if time.time() >= deadline:
+            if time.time() >= deadline or self._shutdown_event.is_set():
                 return False
-            time.sleep(float(self.config.startup_hardware_reset_reconnect_poll_sec))
+            if self._shutdown_event.wait(
+                float(self.config.startup_hardware_reset_reconnect_poll_sec)
+            ):
+                return False
 
     @staticmethod
     def _is_startup_connection_error(message: str) -> bool:
@@ -477,10 +527,15 @@ class RealSenseRGBSource(ObservationSource):
             "height": int(intr.height),
             "fps": int(self.config.fps),
             "color_space": self.config.color_space,
+            "color_format": self.config.color_format,
             "wait_timeout_ms": int(self.config.wait_timeout_ms),
             "stale_after_sec": float(self.config.stale_after_sec),
             "restart_on_stale_timeout": bool(self.config.restart_on_stale_timeout),
+            "restart_on_runtime_error": bool(self.config.restart_on_runtime_error),
             "restart_after_timeouts": int(self.config.restart_after_timeouts),
+            "restart_on_black_frames": bool(self.config.restart_on_black_frames),
+            "restart_after_black_frames": int(self.config.restart_after_black_frames),
+            "black_frame_max_value": int(self.config.black_frame_max_value),
             "restart_cooldown_sec": float(self.config.restart_cooldown_sec),
             "startup_reset": bool(self.config.startup_reset),
             "startup_reset_sleep_sec": float(self.config.startup_reset_sleep_sec),
@@ -544,6 +599,30 @@ class RealSenseRGBSource(ObservationSource):
         lowered = str(message).lower()
         return "frame didn't arrive" in lowered or "frame did not arrive" in lowered
 
+    @staticmethod
+    def _is_recoverable_runtime_error(message: str) -> bool:
+        """Return whether rebuilding the SDK pipeline can recover this error."""
+
+        lowered = str(message).lower()
+        return any(
+            token in lowered
+            for token in (
+                "device disconnected",
+                "device has been disconnected",
+                "no device connected",
+                "device or resource busy",
+                "failed to resolve request",
+                "backend",
+                "uvc",
+                "usb",
+                "pipeline",
+                "wait_for_frames cannot be called before start",
+                "stop() cannot be called before start",
+                "i/o error",
+                "io error",
+            )
+        )
+
     def _set_transient_or_stale_timeout_error(self, message: str) -> bool:
         now = time.time()
         stale_after_sec = float(self.config.stale_after_sec)
@@ -570,12 +649,13 @@ class RealSenseRGBSource(ObservationSource):
             )
         return should_restart
 
-    def _restart_pipeline_after_stale_timeout(self, message: str) -> None:
+    def _restart_pipeline(self, message: str, *, reason: str) -> None:
         if not self._running:
             return
         rs = _load_pyrealsense2()
         with self._lock:
-            self._last_error = f"restarting_after_frame_timeout: {message}"
+            self._restart_attempt_count += 1
+            self._last_error = f"restarting_after_{reason}: {message}"
             self._last_runtime_error = str(message)
         with self._pipeline_lock:
             old_pipeline = self._pipeline
@@ -591,14 +671,17 @@ class RealSenseRGBSource(ObservationSource):
                 with self._lock:
                     self._last_runtime_error = f"pipeline_stop_failed:{type(exc).__name__}:{exc}"
         cooldown_sec = float(self.config.restart_cooldown_sec)
-        if cooldown_sec > 0.0:
-            time.sleep(cooldown_sec)
+        if cooldown_sec > 0.0 and self._shutdown_event.wait(cooldown_sec):
+            return
         if not self._running:
             return
         try:
             pipeline, profile = self._start_pipeline(rs)
         except Exception as exc:  # noqa: BLE001
+            if self._shutdown_event.is_set() or not self._running:
+                return
             with self._lock:
+                self._restart_failure_count += 1
                 self._last_error = f"pipeline_restart_failed:{type(exc).__name__}:{exc}"
                 self._last_runtime_error = self._last_error
             return
@@ -618,8 +701,49 @@ class RealSenseRGBSource(ObservationSource):
             self._last_runtime_error = None
             self._last_frame_receive_timestamp = None
             self._consecutive_timeout_count = 0
+            self._consecutive_black_frame_count = 0
+            self._last_sampled_max_value = None
             self._restart_count += 1
             self._last_restart_timestamp = time.time()
+
+    def _restart_pipeline_after_stale_timeout(self, message: str) -> None:
+        # Compatibility seam for callers/tests that exercised the previous
+        # timeout-only recovery method directly.
+        self._restart_pipeline(message, reason="frame_timeout")
+
+    def _is_near_zero_frame(self, image: np.ndarray) -> tuple[bool, int]:
+        """Detect an uninitialised all-zero payload using at most ~1K pixels."""
+
+        array = np.asarray(image)
+        if array.size == 0:
+            return True, 0
+        row_step = max(1, int(array.shape[0]) // 32)
+        col_step = max(1, int(array.shape[1]) // 32)
+        sample = array[::row_step, ::col_step]
+        sampled_max = int(np.max(sample))
+        return sampled_max <= int(self.config.black_frame_max_value), sampled_max
+
+    def _handle_black_frame(self, image: np.ndarray) -> bool:
+        is_black, sampled_max = self._is_near_zero_frame(image)
+        with self._lock:
+            self._last_sampled_max_value = sampled_max
+            if not is_black:
+                self._consecutive_black_frame_count = 0
+                return False
+            self._black_frame_count += 1
+            self._consecutive_black_frame_count += 1
+            streak = int(self._consecutive_black_frame_count)
+            self._last_error = (
+                "near_zero_color_frame:"
+                f"sampled_max={sampled_max}:streak={streak}/"
+                f"{int(self.config.restart_after_black_frames)}"
+            )
+        if (
+            bool(self.config.restart_on_black_frames)
+            and streak >= int(self.config.restart_after_black_frames)
+        ):
+            self._restart_pipeline(self._last_error or "near_zero_color_frame", reason="black_frame")
+        return True
 
     def _capture_loop(self) -> None:
         rs = _load_pyrealsense2()
@@ -628,7 +752,7 @@ class RealSenseRGBSource(ObservationSource):
                 with self._pipeline_lock:
                     pipeline = self._pipeline
                 if pipeline is None:
-                    self._restart_pipeline_after_stale_timeout("pipeline_missing")
+                    self._restart_pipeline("pipeline_missing", reason="pipeline_missing")
                     continue
                 frames = pipeline.wait_for_frames(timeout_ms=int(self.config.wait_timeout_ms))
                 if bool(self.config.enable_depth) and self._depth_align is not None:
@@ -642,9 +766,14 @@ class RealSenseRGBSource(ObservationSource):
                 received_at = time.time()
                 frame_index = int(self._frame_counter)
                 self._frame_counter += 1
-                image = np.asanyarray(color_frame.get_data()).copy()
+                image = _color_image_to_bgr(
+                    np.asanyarray(color_frame.get_data()),
+                    self._active_color_format,
+                )
+                if self._handle_black_frame(image):
+                    continue
                 if self.config.color_space == "rgb":
-                    image = image[..., ::-1]
+                    image = np.ascontiguousarray(image[..., ::-1])
                 depth_image = None
                 depth_metadata: dict[str, Any] = {}
                 if depth_frame is not None:
@@ -708,6 +837,9 @@ class RealSenseRGBSource(ObservationSource):
                         "height": int(self.config.height),
                         "fps": int(self.config.fps),
                         "color_space": self.config.color_space,
+                        "color_format": self.config.color_format,
+                        "source_clock": "receiver_wall_time",
+                        "available_clock": "local_wall_time",
                         "camera_timestamp_sec": frame_timestamp_sec,
                         "timestamp_domain": timestamp_domain,
                         "sensor_timestamp_ms": sensor_timestamp_ms,
@@ -734,10 +866,17 @@ class RealSenseRGBSource(ObservationSource):
                     with self._lock:
                         self._last_runtime_error = message
                         self._last_error = message
+                    if bool(self.config.restart_on_runtime_error) and self._is_recoverable_runtime_error(message):
+                        self._restart_pipeline(message, reason="runtime_error")
             except Exception as exc:  # noqa: BLE001
+                message = f"{type(exc).__name__}: {exc}"
                 with self._lock:
-                    self._last_runtime_error = f"{type(exc).__name__}: {exc}"
-                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    self._last_runtime_error = message
+                    self._last_error = message
+                if bool(self.config.restart_on_runtime_error) and self._is_recoverable_runtime_error(message):
+                    self._restart_pipeline(message, reason="runtime_error")
+                elif self._running:
+                    time.sleep(min(0.1, max(0.01, float(self.config.restart_cooldown_sec))))
 
     def get_latest_frame(self) -> VideoFrame | None:
         with self._lock:
@@ -767,7 +906,14 @@ class RealSenseRGBSource(ObservationSource):
             info["frame_count"] = int(self._frame_counter)
             info["timeout_count"] = int(self._timeout_count)
             info["consecutive_timeout_count"] = int(self._consecutive_timeout_count)
+            info["black_frame_count"] = int(self._black_frame_count)
+            info["consecutive_black_frame_count"] = int(
+                self._consecutive_black_frame_count
+            )
+            info["last_sampled_max_value"] = self._last_sampled_max_value
             info["restart_count"] = int(self._restart_count)
+            info["restart_attempt_count"] = int(self._restart_attempt_count)
+            info["restart_failure_count"] = int(self._restart_failure_count)
             info["last_restart_timestamp"] = self._last_restart_timestamp
             info["last_frame_receive_timestamp"] = self._last_frame_receive_timestamp
             info["last_frame_age_sec"] = (
@@ -776,16 +922,19 @@ class RealSenseRGBSource(ObservationSource):
                 else float(now - float(self._last_frame_receive_timestamp))
             )
             info["stale_after_sec"] = float(self.config.stale_after_sec)
+            info["running"] = bool(self._running)
         return info
 
     def close(self) -> None:
         self._running = False
+        self._shutdown_event.set()
         failures: list[LifecycleFailure] = []
         with self._pipeline_lock:
             pipeline = self._pipeline
             self._pipeline = None
             self._profile = None
             self._depth_align = None
+        self._active_color_format = self.config.color_format
         if pipeline is not None:
             try:
                 pipeline.stop()
@@ -797,7 +946,11 @@ class RealSenseRGBSource(ObservationSource):
         if self._thread is not None:
             worker = self._thread
             try:
-                worker.join(timeout=1.0)
+                join_timeout_sec = max(
+                    1.5,
+                    float(self.config.wait_timeout_ms) / 1000.0 + 0.5,
+                )
+                worker.join(timeout=join_timeout_sec)
             except BaseException as exc:  # noqa: BLE001 - report after pipeline cleanup.
                 failures.append(
                     LifecycleFailure(label=f"worker[{worker.name}].join", error=exc)
@@ -807,7 +960,8 @@ class RealSenseRGBSource(ObservationSource):
                     LifecycleFailure(
                         label=f"worker[{worker.name}].join_timeout",
                         error=RuntimeError(
-                            f"{self.name} worker did not stop within 1.000s"
+                            f"{self.name} worker did not stop within "
+                            f"{join_timeout_sec:.3f}s"
                         ),
                     )
                 )

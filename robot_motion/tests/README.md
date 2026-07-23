@@ -37,8 +37,11 @@ This launches a passive MuJoCo viewer and replays the qpos produced by the
 offline tracker-to-shared-IK path. By default it uses:
 
 ```text
-assets/rm65_inspire_tac/rm65_dual_arm_hand_proxy_open.urdf
+assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf
 ```
+
+The viewer uses V3 for visualization while the default collision-aware replay
+profile remains the separate TAC open-hand proxy scene.
 
 Useful options:
 

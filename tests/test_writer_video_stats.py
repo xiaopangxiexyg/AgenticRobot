@@ -122,6 +122,38 @@ class WriterVideoStatsTest(unittest.TestCase):
             self.assertFalse(quality["force_collision_detected"])
             self.assertEqual(quality["force_collision_label"], "clean")
 
+    def test_opt_in_finalize_artifact_report_binds_written_video_frames(self) -> None:
+        pytest.importorskip("cv2")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_parquet=False,
+                    write_video=True,
+                    video_codec="mp4v",
+                )
+            )
+            writer.start_episode(episode_index=0)
+            for job in writer.plan_sample_jobs(_camera_sample()):
+                writer.handle_job(job)
+
+            report = writer.finalize_episode_with_artifact_report(0)
+
+            self.assertEqual(report.episode_index, 0)
+            self.assertEqual(len(report.video_artifacts), 1)
+            artifact = report.video_artifacts[0]
+            self.assertEqual(artifact.camera_key, "front")
+            self.assertEqual(artifact.encoding, "mp4/mp4v")
+            self.assertEqual(artifact.compression, "none")
+            self.assertEqual(
+                artifact.video_frame_index_by_sample_frame_index,
+                ((0, 0),),
+            )
+            path = Path(tmpdir) / artifact.artifact_relative_path
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.stat().st_size, artifact.artifact_byte_count)
+            self.assertEqual(len(artifact.artifact_sha256), 64)
+
     def test_finalize_records_trajectory_force_collision_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(

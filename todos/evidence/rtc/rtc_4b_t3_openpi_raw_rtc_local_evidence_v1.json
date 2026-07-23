@@ -1,0 +1,107 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t3_openpi_raw_rtc_local_2026_07_23",
+  "scope": "openpi_raw_rtc_caller_local_fake_frontend_no_action",
+  "captured_at": "2026-07-23T13:53:42+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_repository_suite_rerun": false
+  },
+  "raw_rtc_profile": {
+    "profile_id": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "continuation_mode": "none",
+    "model_server_interface_changed": false,
+    "default_sync_path_changed": false,
+    "position_lookahead_enabled": false,
+    "send_actions": false,
+    "normalization_identity_required": true,
+    "frame_identity_required": true,
+    "model_adapter_factory_required": true,
+    "second_model_client_or_server_session": false,
+    "shared_frontend_builder": "deployments.client.build_rtc_model_shadow_frontend"
+  },
+  "boundary": {
+    "hardware_accessed": false,
+    "real_observation_used": false,
+    "external_network_accessed": false,
+    "real_model_loaded": false,
+    "action_send_enabled": false,
+    "dispatch_attempted": false,
+    "teleop_or_replay_path_changed": false,
+    "position_executor_path_changed": false,
+    "sync_queue_v1_changed": false,
+    "model_rtc_prefix_or_receipt_used": false,
+    "control_station_dependency_added": false,
+    "forbidden_upper_or_target_imports": []
+  },
+  "verified_behavior": {
+    "raw_adapter_reuses_existing_openpi_transport": true,
+    "raw_adapter_reuses_existing_remote_policy_client": true,
+    "capability_negotiated_before_worker_creation": true,
+    "artifact_normalization_frame_identity_is_explicit": true,
+    "missing_factory_or_identity_fails_closed": true,
+    "shared_worker_timed_plan_and_formal_emission_used": true,
+    "lookahead_remains_disabled_only_in_raw_profile": true,
+    "legacy_sync_queue_pop_count_in_raw_frontend_fixture": 0,
+    "unique_formal_emission_per_test_keyframe": true
+  },
+  "verification": [
+    {
+      "command": "NO_PROXY=127.0.0.1,localhost PYTHONPATH=. /home/zc/anaconda3/envs/dexteleop310/bin/python -m pytest -q tests/test_deploy_rtc_frontend_shadow.py tests/test_rtc_generic_deploy_runtime.py tests/test_openpi_rtc_final_chunk_adapter.py tests/test_openpi_common_deploy.py",
+      "result": "82 passed in 2.72s"
+    },
+    {
+      "command": "NO_PROXY=127.0.0.1,localhost PYTHONPATH=. /home/zc/anaconda3/envs/dexteleop310/bin/python -m pytest -q <RTC/OpenPI compatibility set>",
+      "result": "213 passed, 1 skipped in 4.13s"
+    },
+    {
+      "command": "python -m py_compile <raw-RTC deployment sources and tests>",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "python -m deployments.openpi.client.real --help; python -m teleop_runtime.deploy.run_policy --help",
+      "result": "raw profile and explicit identity flags are exposed; default remains off"
+    }
+  ],
+  "scoped_source_sha256": {
+    "robot_motion/deploy/async_producer.py": "2a50089741fc3a2001e2acc8e95c6237fd73a7c87d05291d6f66d517a89adde1",
+    "deployments/client/remote_policy.py": "fe0f41ceb98f12cafa19e4b1a966ce1180a63a404c3caacfe86dd51d0c662083",
+    "deployments/client/rtc_frontend.py": "091241067d5f1b76df1e755a21d35aa3fd93e564fe54c5f5380c8d947ecb26b5",
+    "deployments/openpi/client/rtc.py": "95f287e36ffb451b9ece300a69777c566e5715923519c826bdb507478f208b70",
+    "deployments/openpi/client/policy.py": "0e1d14cb177dd588491d480149b1c7050ebbf49042c6b3c07d6822d08789b282",
+    "deployments/openpi/client/real.py": "1f29b40b9083ec22581873264a9a525dbadbb5dcf014198b0dda6d4882f3ae49",
+    "teleop_runtime/deploy/run_policy.py": "935ef1822571b9dbf29d8502f3ca7df195be9e43e2d3291f8c6f413ecc44d07f",
+    "tests/test_openpi_rtc_final_chunk_adapter.py": "b1234445d3728e36645b366a508c27b9aa5de74971940f69e87a5c44e208948a",
+    "tests/test_openpi_common_deploy.py": "206c79af09781bb40ecf16fdbf81fa50fd004e3657f84f1fd19237b398acfb79",
+    "tests/test_rtc_generic_deploy_runtime.py": "0987c83ba71d681df96f05d2653f49c0b8d59ba5ad19bc7d3084a54d52b0ab8a",
+    "tests/test_deploy_rtc_frontend_shadow.py": "d73b3aa42835f41e463ea86b934c5da85e3fc768908fc0e8636b5eaebc63ba69"
+  },
+  "claims": [
+    "OpenPI can be connected to raw-RTC without changing its final-chunk model/server protocol",
+    "the launcher uses an explicit adapter factory and the generic shared worker/timed-plan frontend",
+    "the existing OpenPI transport and RemoteModelPolicy are reused instead of creating a second client or server session",
+    "artifact, normalization and frame identities are explicit facts and missing bindings fail closed",
+    "the raw profile preserves default synchronous deployment and does not grant dispatch authority"
+  ],
+  "non_claims": [
+    "no real observation or camera path was exercised",
+    "no real OpenPI model/server or GPU was used in this local evidence",
+    "no action send, hardware motion or production motion authority is claimed",
+    "no model-RTC prefix/mask/conditioning receipt/identity promotion capability is claimed",
+    "no teleop or replay path migration is claimed",
+    "this is not full repository green evidence"
+  ],
+  "next_gate": {
+    "id": "rtc_6_openpi_real_observation_no_action_shadow",
+    "requires_separate_observation_scope": true,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false,
+    "requires_position_change": false,
+    "model_rtc_gate": "rtc_4b_b2_prefix_receipt_identity_promotion"
+  }
+}

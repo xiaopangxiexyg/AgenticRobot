@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import bisect
+import queue
 import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from robot_motion.runtime.lifecycle import run_best_effort_cleanup
+from robot_motion.replay.proposal_source import ReplaySourceFrameEmission
+from teleop_runtime.action.replay_shadow_frontend import (
+    ReplayGuiShadowBinding,
+    ReplayGuiShadowConsumer,
+    ReplayGuiShadowProfile,
+)
 
 from .dataset import LoadedReplayEpisode, ReplayDatasetIndex
+from .emission_fanout import ReplaySourceFrameEmissionFanout
 from .executor import ReplayExecutionController, ReplayExecutionSettings, _bool_value
 from .hardware import ReplayHardwareConfig
+from .source_binding import ReplayGuiSourceBinding
 from .media import (
     CameraVideoTrack,
     TactileEpisodeReader,
@@ -33,6 +42,9 @@ class ReplayGuiSession:
         execution_settings: ReplayExecutionSettings | None = None,
         send_actions: bool = False,
         end_effectors_enabled: bool = False,
+        action_observer_queue: queue.Queue[ReplaySourceFrameEmission] | None = None,
+        replay_action_shadow: bool = False,
+        replay_action_shadow_profile: ReplayGuiShadowProfile | None = None,
     ):
         self._lock = threading.RLock()
         self.dataset_root: Path | None = None
@@ -46,11 +58,32 @@ class ReplayGuiSession:
         self._camera_tracks: dict[str, CameraVideoTrack] = {}
         self._tactile_readers: dict[str, TactileEpisodeReader] = {}
         self._messages: list[str] = []
+        self.replay_action_shadow = (
+            ReplayGuiShadowConsumer(
+                profile=(replay_action_shadow_profile or ReplayGuiShadowProfile())
+            )
+            if replay_action_shadow
+            else None
+        )
+        self.replay_action_fanout: ReplaySourceFrameEmissionFanout | None = None
+        if self.replay_action_shadow is not None and action_observer_queue is not None:
+            self.replay_action_fanout = ReplaySourceFrameEmissionFanout(
+                {
+                    "gui_shadow": self.replay_action_shadow.emission_queue,
+                    "external_passive_observer": action_observer_queue,
+                }
+            )
+            observer_queue = self.replay_action_fanout
+        elif self.replay_action_shadow is not None:
+            observer_queue = self.replay_action_shadow.emission_queue
+        else:
+            observer_queue = action_observer_queue
         self.executor = ReplayExecutionController(
             hardware_config=hardware_config,
             settings=execution_settings
             if execution_settings is not None
             else ReplayExecutionSettings(end_effectors_enabled=bool(end_effectors_enabled)),
+            action_observer_queue=observer_queue,
         )
         if send_actions:
             self.executor.set_send_actions(True)
@@ -63,8 +96,58 @@ class ReplayGuiSession:
             (
                 ("media", self._close_media),
                 ("executor", self.executor.close),
+                ("replay_action_shadow", self._close_replay_action_shadow),
             ),
         )
+
+    def _close_replay_action_shadow(self) -> None:
+        if self.replay_action_shadow is not None:
+            self.replay_action_shadow.close()
+
+    def _clear_replay_shadow_binding(self, *, reason: str) -> None:
+        shadow = self.replay_action_shadow
+        if shadow is None:
+            return
+        try:
+            shadow.clear_binding(reason=reason)
+        except Exception as exc:  # passive diagnostics never block GUI lifecycle
+            with self._lock:
+                self._log_locked(
+                    f"replay action shadow clear failed: {type(exc).__name__}: {exc}"
+                )
+
+    def _bind_replay_shadow(
+        self,
+        episode: LoadedReplayEpisode,
+        execution_status: Mapping[str, Any],
+    ) -> None:
+        shadow = self.replay_action_shadow
+        if shadow is None:
+            return
+        preflight = execution_status.get("preflight")
+        if not isinstance(preflight, Mapping) or not bool(preflight.get("ok")):
+            self._clear_replay_shadow_binding(reason="preflight_not_ready")
+            return
+        source_binding = self.executor.checked_source_binding()
+        if source_binding.source_episode_id != episode.summary.episode_id:
+            raise RuntimeError("Replay source binding belongs to another GUI episode.")
+        binding = ReplayGuiShadowBinding(
+            source_path=source_binding.expected_source_path,
+            episode_id=source_binding.source_episode_id,
+            action_field=str(source_binding.source_contract.action_field),
+            source_hz=source_binding.source_hz,
+            dataset_metadata=source_binding.metadata_copy(),
+        )
+        shadow.bind(binding)
+        with self._lock:
+            self._log_locked(
+                "replay action passive shadow bound; legacy replay remains execution owner"
+            )
+
+    def checked_replay_source_binding(self) -> ReplayGuiSourceBinding:
+        """Expose lower-owned typed evidence without exposing the replay group."""
+
+        return self.executor.checked_source_binding()
 
     def _close_media(self) -> None:
         with self._lock:
@@ -134,6 +217,24 @@ class ReplayGuiSession:
             "leftGripperPort",
             "right_gripper_port",
             "rightGripperPort",
+            "gripper_id_by_side",
+            "gripperIdBySide",
+            "gripper_baudrate_by_side",
+            "gripperBaudrateBySide",
+            "gripper_timeout_by_side",
+            "gripperTimeoutBySide",
+            "left_gripper_id",
+            "leftGripperId",
+            "right_gripper_id",
+            "rightGripperId",
+            "left_gripper_baudrate",
+            "leftGripperBaudrate",
+            "right_gripper_baudrate",
+            "rightGripperBaudrate",
+            "left_gripper_timeout",
+            "leftGripperTimeout",
+            "right_gripper_timeout",
+            "rightGripperTimeout",
         }
         return any(key in payload for key in keys)
 
@@ -197,6 +298,7 @@ class ReplayGuiSession:
             raise RuntimeError(f"Abort or wait for hardware replay before {action}; current state is {state!r}.")
 
     def load_dataset(self, dataset_root: str | Path, *, episode: str | int | None = None) -> dict[str, Any]:
+        self._clear_replay_shadow_binding(reason="dataset_reloaded")
         with self._lock:
             self._require_hardware_not_busy_locked("loading a dataset")
             self._close_media_locked()
@@ -221,6 +323,7 @@ class ReplayGuiSession:
         if self.index is None:
             raise RuntimeError("Load a replay dataset before selecting an episode.")
         self._require_hardware_not_busy_locked("selecting an episode")
+        self._clear_replay_shadow_binding(reason="episode_changed")
         self._close_media_locked()
         self.episode = self.index.load_episode(episode)
         self.frame_index = 0
@@ -296,6 +399,7 @@ class ReplayGuiSession:
         if action == "speed":
             return self.set_speed(float(payload.get("speed") or 1.0))
         if action == "configure_hardware":
+            self._clear_replay_shadow_binding(reason="hardware_configuration_changed")
             status = self.executor.configure_from_payload(payload)
             with self._lock:
                 self._log_locked("hardware replay configured")
@@ -338,6 +442,15 @@ class ReplayGuiSession:
                 raise
             with self._lock:
                 self._log_locked(self._preflight_log_message(status))
+            try:
+                self._bind_replay_shadow(episode, status)
+            except Exception as exc:  # passive shadow cannot fail legacy preflight
+                self._clear_replay_shadow_binding(reason="binding_failed")
+                with self._lock:
+                    self._log_locked(
+                        "replay action shadow binding failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             return self.state()
         if action == "move_to_start":
             self.executor.move_to_start()
@@ -451,6 +564,16 @@ class ReplayGuiSession:
                 "tactile_sides": tactile_sides,
                 "row": self._row_summary_locked(),
                 "execution": self.executor.status(),
+                "replay_action_shadow": (
+                    {"enabled": False, "authoritative": False}
+                    if self.replay_action_shadow is None
+                    else self.replay_action_shadow.status()
+                ),
+                "replay_action_fanout": (
+                    {"enabled": False, "authoritative": False}
+                    if self.replay_action_fanout is None
+                    else self.replay_action_fanout.status()
+                ),
                 "messages": list(self._messages),
             }
 

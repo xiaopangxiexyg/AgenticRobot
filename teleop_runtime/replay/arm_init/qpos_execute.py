@@ -24,12 +24,19 @@ from robot_motion.rm65.constrained_transition import (
     RM65ConstrainedTransitionConfig,
     RM65ConstrainedTransitionPlan,
     RM65DualArmCollisionIKTransitionModel,
+    RM65SamplingTransitionConfig,
     plan_dual_arm_constrained_qpos_transition,
+    plan_dual_arm_sampling_qpos_transition,
 )
+from robot_motion.rm65.constants import RM65_ABSOLUTE_Q_MAX_RAD, RM65_ABSOLUTE_Q_MIN_RAD
 from robot_motion.rm65.arm_init.qpos_init import DEFAULT_QPOS_TARGET_PATH
 from robot_motion.rm65.arm_init.schema import load_qpos_target
 from robot_motion.rm65.ik import RM65DualArmCollisionIKConfig
-from robot_motion.rm65.qpos_layout import normalize_sides, validate_qpos_by_side
+from robot_motion.rm65.qpos_layout import (
+    normalize_sides,
+    validate_qpos_by_side,
+    validate_qpos_within_absolute_limits,
+)
 
 from .safety import (
     RM65EmergencyStopResult,
@@ -51,6 +58,10 @@ DEFAULT_SINGLE_ARM_MAX_QPOS_DELTA_DEG = 120.0
 DEFAULT_QPOS_INIT_BRANCH_SEARCH = True
 DEFAULT_QPOS_INIT_BRANCH_SEARCH_MAX_BRANCHES = 8
 CUSTOM_QPOS_INIT_VELOCITY_PROFILE_NAME = "custom_qpos_init_max_angvel"
+# Included in every returned plan so a long-running GUI process can expose
+# which qpos-init safety policy was actually imported.  This is diagnostic
+# metadata only; it does not alter planning or execution.
+QPOS_INIT_PLANNER_CAPABILITY = "rm65_qpos_init_joint_hold_release_v2"
 RM65_ARM_JOINT_DOF = 6
 DOCUMENTATION_IP_NETWORKS = tuple(
     ipaddress.ip_network(value)
@@ -299,6 +310,7 @@ def build_rm65_qpos_init_plan(
     branch_neutral_qpos_by_side: Mapping[str, Any] | None = None,
     collision_model: Any | None = None,
     qpos_init_max_angvel_rad_s: Any = None,
+    sampling_search_config: RM65SamplingTransitionConfig | None = None,
 ) -> Any:
     sides = normalize_sides(tuple(active_sides))
     velocity_profile = qpos_init_velocity_profile_from_max_angvel(qpos_init_max_angvel_rad_s)
@@ -309,8 +321,16 @@ def build_rm65_qpos_init_plan(
         max_steps_per_side=int(max_steps_per_side),
     )
     profile_name = velocity_profile.name if velocity_profile is not None else str(joint_velocity_profile)
-    start = {side: validate_qpos_by_side(start_qpos_by_side)[side] for side in sides}
-    target = {side: validate_qpos_by_side(target_qpos_by_side)[side] for side in sides}
+    validated_start = validate_qpos_within_absolute_limits(
+        start_qpos_by_side,
+        label="start_qpos_by_side",
+    )
+    validated_target = validate_qpos_within_absolute_limits(
+        target_qpos_by_side,
+        label="target_qpos_by_side",
+    )
+    start = {side: validated_start[side] for side in sides}
+    target = {side: validated_target[side] for side in sides}
     if _should_use_dual_arm_collision_qpos_init(collision_check=collision_check, sides=sides):
         model = collision_model
         if model is None:
@@ -336,6 +356,7 @@ def build_rm65_qpos_init_plan(
         plan.metadata.update(
             {
                 "planner": "plan_dual_arm_constrained_qpos_transition",
+                "planner_capability": QPOS_INIT_PLANNER_CAPABILITY,
                 "qpos_init_collision_check": "enabled",
                 "collision_scene_profile": str(collision_scene_profile),
                 "joint_velocity_profile": profile_name,
@@ -365,9 +386,33 @@ def build_rm65_qpos_init_plan(
                 branch_search_max_branches=int(branch_search_max_branches),
             )
             if branch_plan.completed:
+                branch_plan.metadata["planner_capability"] = QPOS_INIT_PLANNER_CAPABILITY
                 return branch_plan
-            plan.metadata["branch_search_attempts"] = branch_plan.metadata.get("branch_search_attempts", [])
-            plan.metadata["branch_search_status"] = "failed"
+            branch_attempts = branch_plan.metadata.get("branch_search_attempts", [])
+            _set_collision_model_reference_qpos(model, start)
+            sampling_plan = plan_dual_arm_sampling_qpos_transition(
+                start_qpos_by_side=start,
+                target_qpos_by_side=target,
+                model=model,
+                config=transition_config,
+                search_config=sampling_search_config,
+            )
+            sampling_plan.metadata.update(
+                {
+                    "planner_capability": QPOS_INIT_PLANNER_CAPABILITY,
+                    "qpos_init_collision_check": "enabled",
+                    "collision_scene_profile": str(collision_scene_profile),
+                    "joint_velocity_profile": profile_name,
+                    "branch_search_status": "failed",
+                    "branch_search_attempts": branch_attempts,
+                    "direct_plan_summary": plan.summary(),
+                }
+            )
+            if velocity_profile is not None:
+                sampling_plan.metadata["qpos_init_max_angvel_rad_s"] = list(
+                    normalize_qpos_init_max_angvel(qpos_init_max_angvel_rad_s) or ()
+                )
+            return sampling_plan
         return plan
 
     if len(sides) == 1:
@@ -385,6 +430,7 @@ def build_rm65_qpos_init_plan(
     )
     plan.metadata.update(
         {
+            "planner_capability": QPOS_INIT_PLANNER_CAPABILITY,
             "qpos_init_collision_check": "disabled"
             if not bool(collision_check)
             else "skipped_requires_both_sides",
@@ -505,9 +551,17 @@ def _build_constrained_qpos_init_config(
         collision_hold_distance_m=float(collision_hold_distance_m),
         collision_stop_distance_m=float(collision_stop_distance_m),
         max_joint_abs_deg=float(max_joint_abs_deg),
+        joint_lower_rad=tuple(float(value) for value in RM65_ABSOLUTE_Q_MIN_RAD),
+        joint_upper_rad=tuple(float(value) for value in RM65_ABSOLUTE_Q_MAX_RAD),
         joint_slow_margin_deg=float(joint_slow_margin_deg),
         joint_hold_margin_deg=float(joint_hold_margin_deg),
+        # A measured start can legitimately sit inside the soft hold margin.
+        # Permit only held joints that stay exactly static or strictly increase
+        # distance from that limit toward a target outside the margin. Hard
+        # limits and every non-joint HOLD/STOP event still fail closed.
+        allow_joint_limit_escape=True,
         require_kinematic_model=True,
+        require_collision_check=True,
     )
 
 
@@ -837,6 +891,12 @@ def _format_incomplete_qpos_init_plan_error(plan: Any) -> str:
             "qpos init refused before execution: no collision-safe interpolation step was found. "
             "Use a safer intermediate qpos or a more conservative recovery path."
         )
+    elif status == "search_exhausted":
+        prefix = (
+            "qpos init bounded heuristic and sampling searches were exhausted before execution. "
+            "This is not proof that no collision-safe path exists; inspect the rejected-edge diagnostics "
+            "or provide a verified intermediate qpos."
+        )
     else:
         prefix = "qpos init plan is not executable."
     events = _plan_blocking_events(plan, status=status)
@@ -850,6 +910,17 @@ def _format_incomplete_qpos_init_plan_error(plan: Any) -> str:
 
 def _plan_blocking_events(plan: Any, *, status: str) -> list[Mapping[str, Any]]:
     assessments: list[Any] = []
+    metadata = getattr(plan, "metadata", {}) or {}
+    diagnostic_assessments: list[Mapping[str, Any]] = []
+    for rejection in metadata.get("blocked_candidate_rejections", ()):
+        if isinstance(rejection, Mapping) and isinstance(rejection.get("assessment"), Mapping):
+            diagnostic_assessments.append(rejection["assessment"])
+    last_edge = metadata.get("last_rejected_edge")
+    if isinstance(last_edge, Mapping) and isinstance(last_edge.get("assessment"), Mapping):
+        diagnostic_assessments.append(last_edge["assessment"])
+    rejected_sample = metadata.get("rejected_execution_sample")
+    if isinstance(rejected_sample, Mapping) and isinstance(rejected_sample.get("assessment"), Mapping):
+        diagnostic_assessments.append(rejected_sample["assessment"])
     if status == "blocked_start":
         assessments.append(getattr(plan, "initial_assessment", None))
     elif status == "blocked_target":
@@ -865,6 +936,10 @@ def _plan_blocking_events(plan: Any, *, status: str) -> list[Mapping[str, Any]]:
         if assessment is not None and assessment not in assessments
     )
     events: list[Mapping[str, Any]] = []
+    for assessment in reversed(diagnostic_assessments):
+        for event in assessment.get("events", []):
+            if isinstance(event, Mapping):
+                events.append(event)
     for assessment in assessments:
         payload = assessment.to_dict() if hasattr(assessment, "to_dict") else {}
         for event in payload.get("events", []):

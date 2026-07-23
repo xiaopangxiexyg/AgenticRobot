@@ -1,0 +1,4 @@
+# The UInput event node is created by the kernel as root:input 0660 on Ubuntu.
+# Match only DexTeleop's virtual F13-F16 keyboard so an unprivileged teleop
+# process can consume it without opening every input device to all users.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="DexTeleop foot pads", MODE:="0666"

@@ -122,6 +122,21 @@ main {
   margin-bottom: 8px;
 }
 .pill strong { color: var(--text); font-weight: 600; }
+.pill.ok {
+  background: #e8f5f3;
+  border-color: rgba(20, 122, 116, 0.42);
+  color: #075238;
+}
+.pill.warn {
+  background: #fff6d8;
+  border-color: #d8b34b;
+  color: #72520a;
+}
+.pill.error {
+  background: #ffe9e9;
+  border-color: #e38c8c;
+  color: #832020;
+}
 .stage {
   font-size: 20px;
   font-weight: 800;
@@ -253,6 +268,22 @@ button.stop-ready {
 .round-trip-status {
   margin-top: 8px;
   min-height: 18px;
+}
+.plus-curation-section {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(20, 122, 116, 0.28);
+  border-radius: 8px;
+  background: #f4fbfa;
+}
+.plus-curation-phase-title {
+  margin: 8px 0 6px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+}
+.plus-curation-section .button-grid {
+  grid-template-columns: 1fr;
 }
 .section { margin-top: 14px; }
 .hint {
@@ -609,6 +640,18 @@ button.stop-ready {
   border-radius: 8px;
   padding: 10px 12px;
 }
+.ik-warning-banner.calibration-warning.warning {
+  background: #fff3d6;
+  border-color: #e0b35b;
+  color: #76510a;
+}
+.ik-warning-banner.calibration-warning.critical,
+.ik-warning-banner.calibration-warning.expired {
+  background: #ffe9e9;
+  border-color: #d96b6b;
+  color: #8f1717;
+  box-shadow: 0 0 0 3px rgba(191, 46, 46, 0.14);
+}
 .ik-warning-title {
   font-size: 13px;
   font-weight: 900;
@@ -669,6 +712,40 @@ button.stop-ready {
   margin-top: 10px;
   color: var(--muted);
   font-size: 12px;
+}
+.foot-pad-test-banner {
+  margin: 12px 0 14px;
+  padding: 14px 16px;
+  border: 2px solid #d88916;
+  border-radius: 10px;
+  background: #fff3d6;
+  color: #6d4300;
+  box-shadow: 0 0 0 3px rgba(216, 137, 22, 0.12);
+}
+.foot-pad-test-banner.active {
+  border-color: #bf2e2e;
+  background: #ffe9e9;
+  color: #7c1717;
+  box-shadow: 0 0 0 4px rgba(191, 46, 46, 0.14);
+}
+.foot-pad-test-banner.unavailable {
+  border-color: #d88916;
+  background: #fff3d6;
+  color: #6d4300;
+  box-shadow: 0 0 0 3px rgba(216, 137, 22, 0.12);
+}
+.foot-pad-test-title {
+  font-size: 16px;
+  font-weight: 950;
+}
+.foot-pad-test-detail {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.foot-pad-test-last {
+  margin-top: 8px;
+  font-weight: 850;
 }
 .shutdown-overlay {
   position: fixed;
@@ -744,6 +821,11 @@ button.stop-ready {
         <div id="episodeBannerMeta" class="episode-banner-meta"></div>
       </div>
       <div id="scriptHealth" class="script-health">网页脚本尚未接管实时刷新；如果这里长期存在，请打开终端输出的 state_url/debug_url 检查后端状态，或硬刷新当前页面。</div>
+      <div id="footPadTestBanner" class="foot-pad-test-banner" hidden>
+        <div id="footPadTestTitle" class="foot-pad-test-title">脚踏映射检查</div>
+        <div id="footPadTestDetail" class="foot-pad-test-detail">-</div>
+        <div id="footPadTestLast" class="foot-pad-test-last mono">最近检测：-</div>
+      </div>
       <div id="ikWarningBanner" class="ik-warning-banner" hidden>
         <div class="ik-warning-title">IK WARNING</div>
         <div id="ikWarningText" class="ik-warning-text mono">-</div>
@@ -778,6 +860,18 @@ button.stop-ready {
       <div id="tactileCameraStatusSection" class="section">
         <div class="label">视触觉相机</div>
         <div id="tactileCameraCards" class="device-grid"></div>
+      </div>
+      <div id="datasetModalityContractSection" class="section">
+        <div class="label">数据集模态要求</div>
+        <div id="datasetModalityContractCard" class="device-card ok">
+          <div class="device-title"><span>数据集级规则</span><span id="datasetModalityContractStatus">完整</span></div>
+          <div id="datasetModalityContractDetail" class="device-body mono">camera: 全部要求\ntactile: 全部要求</div>
+        </div>
+      </div>
+      <div id="hardwareAdmissionSection" class="section">
+        <div class="label">硬件连接与功能准入</div>
+        <div id="hardwareAdmissionCards" class="device-grid"></div>
+        <div class="button-grid"><button class="secondary" data-event="device_retry">重连失败设备</button></div>
       </div>
       <div id="ikTimingSection" class="section" hidden>
         <div class="label">IK 耗时诊断</div>
@@ -834,21 +928,23 @@ button.stop-ready {
       </div>
       <div id="movementMultipleStatus" class="numeric-value mono">movement_multiple=1.000</div>
       <div id="gripperForceSection" hidden>
-        <div class="control-title">左右夹爪力度（仅非数采）</div>
+        <div class="control-title">临时夹爪驱动力（归一化 0–1）</div>
         <div class="form-grid">
-          <label>左夹爪力度
+          <label>左夹爪驱动力
             <input id="leftGripperForceInput" type="number" min="0" max="1" step="0.01" value="0.20">
           </label>
-          <label>右夹爪力度
+          <label>右夹爪驱动力
             <input id="rightGripperForceInput" type="number" min="0" max="1" step="0.01" value="0.20">
           </label>
         </div>
-        <button id="gripperForceApplyButton" class="secondary">应用左右力度</button>
-        <div id="gripperForceStatus" class="numeric-value mono">仅在非数采阶段可设置；开始数采前会恢复任务配置。</div>
+        <button id="gripperForceApplyButton" class="secondary">应用临时驱动力</button>
+        <button id="gripperForcePersistButton" class="warn">保存为新数据集永久力度</button>
+        <div id="gripperForceStatus" class="numeric-value mono">这是 DM-Tac 的归一化驱动力命令，不是牛顿值；临时设置只在当前 GUI 生效，开始数采前会恢复任务配置。永久按钮只允许新建或空数据集，并会写入 dataset profile。</div>
       </div>
       <div class="control-title">流程</div>
       <div class="button-grid">
         <button class="danger" data-event="q">退出 / 停臂</button>
+        <button class="danger" data-event="init_qpos_emergency_stop">Init 急停（保持静止）</button>
         <button class="warn" data-event="r">重置</button>
         <button data-event="p">开始遥操</button>
         <button data-event="c">固定臂不可用</button>
@@ -856,6 +952,44 @@ button.stop-ready {
         <button class="secondary" data-event="n">下一步</button>
         <button class="secondary" data-event="s">保存</button>
         <button class="secondary" data-event="h">Hold / 冻结</button>
+      </div>
+      <div id="initArmSection" hidden>
+        <div class="control-title">机械臂回到初始化位姿</div>
+        <div class="form-grid">
+          <label>单臂归位目标
+            <select id="initArmSideSelect">
+              <option value="left">左臂</option>
+              <option value="right">右臂</option>
+            </select>
+          </label>
+          <label>左臂归位速度倍率
+            <input id="leftInitArmQposSpeedInput" type="number" min="0.1" max="10" step="0.1" value="5.0">
+          </label>
+          <label>右臂归位速度倍率
+            <input id="rightInitArmQposSpeedInput" type="number" min="0.1" max="10" step="0.1" value="5.0">
+          </label>
+        </div>
+        <button id="initArmQposSpeedApplyButton" class="secondary">应用左右臂归位速度</button>
+        <div id="initArmQposSpeedStatus" class="numeric-value mono">基线 1.0 = rm65_init_slow；默认左右臂均为 5.0×。碰撞/关节/力控安全限制仍优先。</div>
+        <div class="button-grid">
+          <button id="initArmMoveToQposButton" class="warn" data-event="init_arm_move_to_qpos">精确归位所选臂：左臂</button>
+          <button id="initArmMoveBothToQposButton" class="warn" data-event="init_arm_move_both_to_qpos">双臂顺序精确归位：左臂 → 右臂</button>
+          <button id="initArmToggleButton" class="secondary" data-event="init_arm_toggle">Cartesian 标准位姿：左臂</button>
+        </div>
+        <div class="gripper-status mono">推荐使用“精确归位”。单臂归位只移动所选臂；双臂归位严格先左后右，过程中不修改 tracker Home。启动前归位结束后停留在启动前 Hold，仍需点击“开始遥操”采集 runtime Home；遥操中归位结束后进入常规 Hold。任一步失败都会中止剩余动作。Cartesian 标准位姿保留用于兼容和调试。</div>
+        <div id="initArmStatus" class="numeric-value mono">-</div>
+      </div>
+      <div id="footPadTestControls" hidden>
+        <div class="control-title">脚踏板安全测试</div>
+        <div class="foot-pad-test-banner">
+          <div class="foot-pad-test-title">先测试，确认后再使用</div>
+        <div class="foot-pad-test-detail">默认 4 踏板：F13/F14 固定左右臂，F15/F16 启动左右臂精确 Init qpos 防碰撞归位；若检测到 2 踏板，则 F13/F14 只提供左右 Fix 快捷输入。踏板是可选的附加输入，不会关闭或隐藏 GUI/键盘的 Fix、Init 与精确归位。测试模式只显示踏板操作，不会执行机械臂动作或写入数采。请逐个踩踏板确认映射，确认无误后点击停止测试。</div>
+        </div>
+        <div class="button-grid">
+          <button id="footPadTestStartButton" class="warn" data-event="foot_pad_test_start">开始测试踏板</button>
+          <button id="footPadTestStopButton" class="danger" data-event="foot_pad_test_stop">停止测试踏板</button>
+        </div>
+        <div id="footPadTestStatus" class="gripper-status mono">-</div>
       </div>
       <div id="fixArmSection" hidden>
         <div class="control-title">固定臂</div>
@@ -872,23 +1006,8 @@ button.stop-ready {
         </div>
         <div id="fixArmStatus" class="numeric-value mono">-</div>
       </div>
-      <div id="initArmSection" hidden>
-        <div class="control-title">归位</div>
-        <div class="form-grid">
-          <label>归位侧
-            <select id="initArmSideSelect">
-              <option value="left">左臂</option>
-              <option value="right">右臂</option>
-            </select>
-          </label>
-        </div>
-        <div class="button-grid">
-          <button id="initArmToggleButton" data-event="init_arm_toggle">左臂归位</button>
-        </div>
-        <div id="initArmStatus" class="numeric-value mono">-</div>
-      </div>
       <div id="footPadSpecialArmHint" class="gripper-status mono" hidden>
-        Foot-pad 模式：踏板 1/2 固定左/右臂；踏板 3/4 归位左/右臂。再次踩同一踏板重采该侧 Home。
+        Foot-pad 模式：踏板 1/2 固定左/右臂；踏板 3/4 启动左/右臂精确 Init qpos 防碰撞归位。归位期间再踩同一踏板会立即冻结目标臂，仅重采该侧 Home；成功后目标臂进入 Init-fixed。
       </div>
       <div class="control-title">数采</div>
       <div class="form-grid">
@@ -919,37 +1038,78 @@ button.stop-ready {
         <button id="episodeStopButton" class="secondary" data-event="episode_stop">停止数采</button>
         <button id="roundTripToggleButton" class="secondary" data-event="round_trip_toggle">切换 in/out</button>
       </div>
+      <div class="form-grid">
+        <label>删除错误 Episode 序号
+          <input id="episodeDeleteIndexInput" type="number" min="0" step="1" inputmode="numeric" placeholder="例如 3" disabled>
+        </label>
+      </div>
+      <div class="button-grid">
+        <button id="episodeDeleteButton" class="secondary" data-event="episode_delete" disabled>删除并自动连续重编号</button>
+      </div>
+      <div class="gripper-status mono">UMI：停止录制后即可删除；真机：停止录制并进入 Hold 后删除。操作前会保留可恢复备份。</div>
       <div id="roundTripStatus" class="numeric-value mono round-trip-status">-</div>
       <div id="episodeStatus" class="gripper-status mono">-</div>
       <div id="episodeWarningBanner" class="ik-warning-banner" hidden>
-        <div class="ik-warning-title">DATA WARNING</div>
+        <div id="episodeWarningTitle" class="ik-warning-title">DATA WARNING</div>
         <div id="episodeWarningText" class="ik-warning-text mono">-</div>
+      </div>
+      <div id="plusCurationSection" class="plus-curation-section" hidden>
+        <div class="control-title">Plus episode 整理（可选旁路）</div>
+        <div class="plus-curation-phase-title">采集前：本 episode 变体</div>
+        <div class="form-grid">
+          <label>本 episode 变体（开始前）
+            <select id="plusVariantSelect"><option value="">未指定</option></select>
+          </label>
+        </div>
+        <div class="plus-curation-phase-title">保存后：用途与原因</div>
+        <div class="form-grid">
+          <label>保存后用途
+            <select id="plusDispositionSelect">
+              <option value="unknown">未确认</option>
+              <option value="keep_nominal">保留：常规</option>
+              <option value="keep_recovery">保留：恢复/修正</option>
+              <option value="exclude">排除</option>
+            </select>
+          </label>
+          <label>原因（恢复/排除时）
+            <select id="plusReasonSelect">
+              <option value="unknown">未指定</option>
+              <option value="task_failure">任务失败</option>
+              <option value="operator_recovery">操作者恢复</option>
+              <option value="system_issue">系统问题</option>
+              <option value="safety_abort">安全中止</option>
+              <option value="other">其他</option>
+            </select>
+          </label>
+        </div>
+        <div class="button-grid">
+          <button id="plusCurationSaveButton" class="secondary" type="button" data-event="plus_curation_save">提交 Plus 整理</button>
+        </div>
+        <div id="plusCurationStatus" class="gripper-status mono">-</div>
+      </div>
+      <div id="umiCalibrationSection" hidden>
+        <div class="control-title">UMI 标定</div>
+        <div class="button-grid">
+          <button id="umiRecalibrateButton" class="secondary" data-event="umi_recalibrate">重新标定左右 UMI</button>
+          <button id="angleRecalibrateButton" class="secondary" data-event="angle_recalibrate">重新标定 Angle</button>
+          <button id="angleAssignmentConfirmButton" data-event="angle_assignment_confirm">确认 Angle 左右自动判断</button>
+          <button id="angleCalibrationNextButton" data-event="angle_calibration_next">确认 / 采集当前 Angle 步骤</button>
+          <button id="umiDeviceRetryButton" class="secondary" data-event="device_retry">重试设备初始化</button>
+        </div>
+        <div class="gripper-status mono">UMI 或 Angle 标定都会先结束当前采集并释放设备；标定成功后自动恢复数采。</div>
       </div>
       <div class="control-title">可视化窗口</div>
       <div class="button-grid">
         <button id="cameraVisButton" class="secondary" data-event="toggle_camera_vis">打开图像窗口</button>
         <button id="tactileVisButton" class="secondary" data-event="toggle_tactile_vis">打开触觉窗口</button>
+        <button id="tactileSolveButton" class="secondary" data-event="enable_tactile_solving">开启解算</button>
       </div>
       <div id="visualizationStatus" class="gripper-status mono">-</div>
-      <div class="control-title">左右 / 视图</div>
+      <div class="control-title">Tracker 输入</div>
       <div class="button-grid">
-        <button data-event="1">左手</button>
-        <button data-event="2">右手</button>
-        <button data-event="t">切换左右</button>
-        <button data-event="w">交换 Tracker</button>
-        <button data-event="v">切换坐标</button>
-        <button data-event="f">翻转 XY</button>
-        <button data-event="x">清零微调</button>
+        <button data-event="w">交换左右 Tracker</button>
       </div>
-      <div class="control-title">姿态微调</div>
-      <div class="button-grid">
-        <button data-event="j">Yaw -</button>
-        <button data-event="l">Yaw +</button>
-        <button data-event="i">Pitch +</button>
-        <button data-event="k">Pitch -</button>
-        <button data-event="u">Roll -</button>
-        <button data-event="o">Roll +</button>
-      </div>
+      <div class="gripper-status mono">只交换左右 VIVE Tracker 输入映射，不交换机械臂、真手、串口或 profile。</div>
       <div id="poseSnapshotSection" hidden>
         <div class="control-title">Pose 抽帧</div>
         <div class="button-grid">
@@ -957,6 +1117,15 @@ button.stop-ready {
         </div>
         <div id="poseSnapshotStatus" class="gripper-status mono">-</div>
       </div>
+      <div class="control-title">缺失模态数据集设置（低频操作）</div>
+      <div id="datasetModalityIgnoreOptions" class="form-grid">
+        <label><input type="checkbox" data-ignore-modality="camera" value="front"> 忽视 front 相机</label>
+        <label><input type="checkbox" data-ignore-modality="camera" value="left_wrist"> 忽视 left_wrist 相机</label>
+        <label><input type="checkbox" data-ignore-modality="camera" value="right_wrist"> 忽视 right_wrist 相机</label>
+        <label><input type="checkbox" data-ignore-modality="tactile" value="left"> 忽视左侧触觉</label>
+        <label><input type="checkbox" data-ignore-modality="tactile" value="right"> 忽视右侧触觉</label>
+      </div>
+      <div class="gripper-status mono">仅用于全新/空白数据集，或与目标数据集已有声明完全一致。规则属于整个数据集，不能按 episode 改变；忽视项仍会尝试连接，采集时写为空并在数据集声明中标记。</div>
     </div>
   </section>
 </main>
@@ -1250,12 +1419,24 @@ button.stop-ready {
   function renderButtons(state) {
     var active = {};
     var controls = state.active_controls || [];
+    var footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
+    var twoPedal = footPadMode && Number(state.foot_pad_count || 0) === 2;
     var i;
     for (i = 0; i < controls.length; i += 1) active[String(controls[i])] = true;
     legacyActiveControls = active;
+    var initSection = byId("initArmSection");
+    if (initSection) initSection.hidden = !Boolean(state.init_arm_available);
     var shortcutC = byId("shortcutCLabel");
     if (shortcutC) {
-      if (state.fix_arm_available && state.teleop_running) {
+      if (footPadMode && state.fix_arm_available) {
+        shortcutC.textContent = twoPedal
+          ? "踏板 1/2：固定左右臂"
+          : "踏板 1/2：固定 / 重采左右臂 Home";
+      } else if (String(state.ui_mode || "") === "umi_collection" && state.fix_arm_available) {
+        var umiFixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+        var umiFixLabel = umiFixSide === "right" ? "右臂" : "左臂";
+        shortcutC.textContent = (state.fix_arm_active ? "取消 " : "标注 ") + umiFixLabel + " fixed";
+      } else if (state.fix_arm_available && state.teleop_running) {
         var shortcutSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
         var shortcutLabel = shortcutSide === "right" ? "右臂" : "左臂";
         shortcutC.textContent = state.fix_arm_recalibrating || state.fix_arm_active
@@ -1269,7 +1450,19 @@ button.stop-ready {
     }
     var shortcutG = byId("shortcutGLabel");
     if (shortcutG) {
-      if (state.init_arm_available && state.teleop_running) {
+      if (String(state.ui_mode || "") === "umi_collection" && footPadMode && state.init_arm_available) {
+        shortcutG.textContent = twoPedal
+          ? "2 踏板仅切换 fixed；init 标注使用 G/GUI"
+          : "踏板 3/4：切换左右 init 标注";
+      } else if (twoPedal && state.init_arm_available) {
+        shortcutG.textContent = "踏板 1/2 控制 Fix；Init 仍可使用 G/GUI";
+      } else if (footPadMode && state.init_arm_available) {
+        shortcutG.textContent = "踏板 3/4 或 G/GUI：Init 左/右臂";
+      } else if (String(state.ui_mode || "") === "umi_collection" && state.init_arm_available) {
+        var umiInitSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var umiInitLabel = umiInitSide === "right" ? "右臂" : "左臂";
+        shortcutG.textContent = (state.init_arm_active ? "取消 " : "标注 ") + umiInitLabel + " init";
+      } else if (state.init_arm_available && state.teleop_running) {
         var initShortcutSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
         var initShortcutLabel = initShortcutSide === "right" ? "右臂" : "左臂";
         shortcutG.textContent = state.init_arm_recalibrating || state.init_arm_active
@@ -1283,6 +1476,21 @@ button.stop-ready {
     for (i = 0; i < buttons.length; i += 1) {
       var eventName = buttons[i].getAttribute("data-event");
       buttons[i].disabled = !active[eventName];
+      if (
+        String(state.ui_mode || "") === "umi_collection" &&
+        (eventName === "c" || eventName === "fix_arm_toggle" || eventName === "init_arm_toggle")
+      ) {
+        var annotationSide = eventName === "init_arm_toggle"
+          ? (state.init_arm_active_side || state.init_arm_selected_side || "left")
+          : (state.fix_arm_fixed_side || state.fix_arm_selected_side || "left");
+        var annotationLabel = annotationSide === "right" ? "右臂" : "左臂";
+        var annotationActive = eventName === "init_arm_toggle"
+          ? Boolean(state.init_arm_active)
+          : Boolean(state.fix_arm_active);
+        var annotationName = eventName === "init_arm_toggle" ? "init" : "fixed";
+        buttons[i].textContent = (annotationActive ? "取消 " : "标注 ") + annotationLabel + " " + annotationName;
+        continue;
+      }
       if (eventName === "c") {
         if (state.fix_arm_available && state.teleop_running) {
           var side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -1312,9 +1520,70 @@ button.stop-ready {
           ? "重采 " + initLabel + " Home..."
           : state.init_arm_active
             ? "重采 " + initLabel + " Home"
-            : initLabel + "归位";
+            : "Cartesian 标准位姿：" + initLabel;
+      } else if (eventName === "init_arm_move_to_qpos") {
+        var moveInitSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var moveInitLabel = moveInitSide === "right" ? "右臂" : "左臂";
+        buttons[i].hidden = String(state.ui_mode || "") === "umi_collection";
+        buttons[i].disabled = !active[eventName] || Boolean(state.init_arm_active_side);
+        buttons[i].textContent = state.init_arm_active_side
+          ? moveInitLabel + "精确归位中"
+          : "精确归位所选臂：" + moveInitLabel;
+      } else if (eventName === "init_arm_move_both_to_qpos") {
+        var sequenceSide = state.init_arm_sequence_side || state.init_arm_active_side || "left";
+        var sequenceLabel = sequenceSide === "right" ? "右臂" : "左臂";
+        buttons[i].hidden = String(state.ui_mode || "") === "umi_collection";
+        buttons[i].disabled = !active[eventName] || Boolean(state.init_arm_active_side);
+        buttons[i].textContent = state.init_arm_sequence_active
+          ? "双臂顺序归位中：当前" + sequenceLabel
+          : "双臂顺序精确归位：左臂 → 右臂";
+      } else if (eventName === "toggle_camera_vis") {
+        buttons[i].textContent = state.camera_visualization_active
+          ? "关闭图像窗口"
+          : "打开图像窗口";
+      } else if (eventName === "toggle_tactile_vis") {
+        buttons[i].textContent = state.tactile_visualization_active
+          ? "关闭触觉窗口"
+          : "打开触觉窗口";
       }
     }
+    renderFootPadTestLegacy(state);
+  }
+
+  function renderFootPadTestLegacy(state) {
+    var available = Boolean(state.foot_pad_available);
+    var requested = Boolean(state.foot_pad_requested);
+    var active = Boolean(state.foot_pad_test_active);
+    var twoPedal = Number(state.foot_pad_count || 0) === 2;
+    var banner = byId("footPadTestBanner");
+    var controls = byId("footPadTestControls");
+    if (banner) {
+      banner.hidden = !(requested || available);
+      banner.className = "foot-pad-test-banner" + (active ? " active" : (!available ? " unavailable" : ""));
+    }
+    if (controls) controls.hidden = !available;
+    setText("footPadTestTitle", !available ? "踏板未连接 / 未就绪" : (active ? "脚踏测试模式已开启（仅显示，不执行操作）" : (Number(state.foot_pad_count || 0) + " 个踏板已连接")));
+    setText(
+      "footPadTestDetail",
+      !available
+        ? (state.foot_pad_status_message || "未找到可用的 2/4 踏板虚拟键盘。")
+        : active
+        ? (twoPedal
+          ? "请依次踩踏板 1、2（固定左臂、固定右臂）。测试期间不会固定、归位、移动机械臂，也不会写入数采；Init 始终可通过 G/GUI 操作。确认无误后点击“停止测试踏板”。"
+          : "请依次踩踏板 1、2、3、4。测试期间不会固定、归位、移动机械臂，也不会写入数采。确认无误后点击“停止测试踏板”。")
+        : (twoPedal
+          ? "F13/踏板1 固定左臂；F14/踏板2 固定右臂；归位操作仍使用 G。点击下方按钮开始安全测试。"
+          : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。点击下方按钮开始安全测试。")
+    );
+    setText("footPadTestLast", "最近检测：" + (state.foot_pad_test_last_event || "-"));
+    setText("footPadTestStatus", state.foot_pad_test_status || "-");
+    var start = byId("footPadTestStartButton");
+    var stop = byId("footPadTestStopButton");
+    if (start) {
+      start.className = "warn" + (!active ? " active" : "");
+      start.textContent = active ? "测试进行中" : "开始测试踏板";
+    }
+    if (stop) stop.className = "danger" + (active ? " active" : "");
   }
 
   function renderEpisodeStateLegacy(state) {
@@ -1323,11 +1592,18 @@ button.stop-ready {
     var preparing = String(state.episode_event_status || "") === "preparing";
     var finalizing = String(state.episode_event_status || "") === "finalizing";
     var startButton = byId("episodeStartButton");
+    var umiCalibrationSection = byId("umiCalibrationSection");
     var stopButton = byId("episodeStopButton");
+    var deleteInput = byId("episodeDeleteIndexInput");
+    var deleteButton = byId("episodeDeleteButton");
     var statusEl = byId("episodeStatus");
-    var warning = state.episode_frequency_warning || {};
+    var calibrationWarning = state.calibration_validity_warning || {};
+    var warning = calibrationWarning.active
+      ? calibrationWarning
+      : (state.episode_frequency_warning || {});
     var warningBanner = byId("episodeWarningBanner");
     var warningText = byId("episodeWarningText");
+    var warningTitle = byId("episodeWarningTitle");
     var status = String(state.episode_event_status || "");
     var paused = status === "paused" || status === "resume_pending";
     var statusLabels = {
@@ -1335,12 +1611,14 @@ button.stop-ready {
       idle: "未开始数采",
       preparing: "3 秒后开始数采",
       recording: "正在数采",
-      paused: "数采暂停",
+      paused: "等待有效快照",
       resume_pending: "等待恢复写入",
       finalizing: "停止中 / 后台保存",
+      delete_queued: "删除请求已排队",
       saved: "已保存",
       discarded: "已停止 / 无样本",
-      error: "保存失败"
+      error: "保存失败",
+      deleted: "已删除并重编号"
     };
     if (!available) {
       status = "unavailable";
@@ -1351,14 +1629,25 @@ button.stop-ready {
     }
     paused = status === "paused" || status === "resume_pending";
     if (startButton) {
-      startButton.textContent = paused ? "数采暂停中" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
+      startButton.textContent = paused ? "等待有效快照" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
       startButton.disabled = !legacyActiveControls.episode_start || recording || preparing || finalizing;
     }
     if (stopButton) {
       stopButton.disabled = !legacyActiveControls.episode_stop || (!recording && !preparing);
     }
-    var locked = recording || preparing || finalizing;
-    var fields = ["datasetBaseRootInput", "datasetChooseRootButton", "taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
+    var deleteAllowed = Boolean(legacyActiveControls.episode_delete) && !recording && !preparing && !finalizing;
+    if (deleteInput) deleteInput.disabled = !deleteAllowed;
+    if (deleteButton) deleteButton.disabled = !deleteAllowed;
+    var runtimeConfigured = String(state.ui_mode || "") === "umi_collection";
+    if (umiCalibrationSection) umiCalibrationSection.hidden = !runtimeConfigured;
+    var pathLocked = recording || preparing || finalizing;
+    var locked = pathLocked || runtimeConfigured;
+    var pathFields = ["datasetBaseRootInput", "datasetChooseRootButton"];
+    for (var pathIndex = 0; pathIndex < pathFields.length; pathIndex += 1) {
+      var pathField = byId(pathFields[pathIndex]);
+      if (pathField) pathField.disabled = pathLocked;
+    }
+    var fields = ["taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
     for (var i = 0; i < fields.length; i += 1) {
       var field = byId(fields[i]);
       if (field) field.disabled = locked;
@@ -1376,7 +1665,7 @@ button.stop-ready {
     if (statusEl) {
       var lines = [
         available ? "episode 录制可用" : "episode 录制不可用",
-        paused ? "状态: 暂停中" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"))
+        paused ? "状态: 等待有效传感器快照" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"))
       ];
       if (state.episode_dir) lines.push("路径: " + state.episode_dir);
       if (state.dataset_root) lines.push("保存根目录: " + state.dataset_root);
@@ -1384,6 +1673,12 @@ button.stop-ready {
       statusEl.textContent = lines.join("\\n");
     }
     if (warningBanner) warningBanner.hidden = !Boolean(warning.active);
+    if (warningBanner) {
+      warningBanner.className = "ik-warning-banner" + (calibrationWarning.active
+        ? " calibration-warning " + String(calibrationWarning.level || "warning")
+        : "");
+    }
+    if (warningTitle) warningTitle.textContent = warning.title || "DATA WARNING";
     if (warningText) warningText.textContent = warning.message || "采集频率低于目标值";
     var banner = byId("episodeBanner");
     if (banner) {
@@ -1478,13 +1773,17 @@ button.stop-ready {
   }
 
   function collectEpisodeStartPayloadLegacy() {
+    var ignoredCamera = Array.prototype.map.call(document.querySelectorAll('input[data-ignore-modality="camera"]:checked'), function (input) { return input.value; });
+    var ignoredTactile = Array.prototype.map.call(document.querySelectorAll('input[data-ignore-modality="tactile"]:checked'), function (input) { return input.value; });
     return {
       dataset_base_root: byId("datasetBaseRootInput") ? byId("datasetBaseRootInput").value : "",
       task_type: byId("taskTypeSelect") ? byId("taskTypeSelect").value : normalizeTaskTypeLegacy(legacyLatestState.collection_task_type),
       task_key: byId("taskSelect") ? byId("taskSelect").value : "",
       task_english_name: byId("taskEnglishNameInput") ? byId("taskEnglishNameInput").value : "",
       task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : "",
-      round_trip_phase: normalizeRoundTripPhaseLegacy(legacyLatestState.collection_round_trip_phase)
+      round_trip_phase: normalizeRoundTripPhaseLegacy(legacyLatestState.collection_round_trip_phase),
+      ignored_camera_keys: ignoredCamera,
+      ignored_tactile_keys: ignoredTactile
     };
   }
 
@@ -1504,7 +1803,10 @@ button.stop-ready {
       xhr.open("POST", "/event", true);
       xhr.setRequestHeader("Content-Type", "application/json");
       xhr.onreadystatechange = function () {
-        if (xhr.readyState === 4 && xhr.status >= 400) {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setText("sendStatus", eventName === "episode_delete" ? "删除请求已接收，正在处理..." : "已发送: " + eventName);
+        } else if (xhr.status >= 400) {
           setText("sendStatus", "事件未生效: HTTP " + xhr.status);
         }
       };
@@ -1602,6 +1904,7 @@ button.stop-ready {
     var buttons = document.querySelectorAll ? document.querySelectorAll("button[data-event]") : [];
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].onclick = function () {
+        if (window.__calibrationWebUiModernRefreshOk) return;
         var eventName = this.getAttribute("data-event");
         if (
           eventName === "c" &&
@@ -1611,7 +1914,24 @@ button.stop-ready {
           return;
         }
         var sendEventName = eventName === "c" ? "fix_arm_toggle" : eventName;
-        postEvent(sendEventName, eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null);
+        var extraPayload = eventName === "episode_start" ? collectEpisodeStartPayloadLegacy() : null;
+        if (eventName === "episode_delete") {
+          var deleteInput = byId("episodeDeleteIndexInput");
+          var deleteIndex = deleteInput ? String(deleteInput.value || "").trim() : "";
+          if (!/^[0-9]+$/.test(deleteIndex)) {
+            setText("sendStatus", "请输入非负整数 Episode 序号");
+            return;
+          }
+          if (!window.confirm("确认删除 episode " + deleteIndex + " 并重编号后续数据？")) return;
+          extraPayload = {episode_index: deleteIndex};
+        }
+        if (eventName === "init_arm_move_to_qpos" && !window.confirm(
+          "确认精确归位所选机械臂？只有所选臂移动，另一臂保持为静态碰撞体。到位后需重采该侧 Home 才会恢复普通遥操。请确认周围无人且没有接触负载。"
+        )) return;
+        if (eventName === "init_arm_move_both_to_qpos" && !window.confirm(
+          "确认按左臂 → 右臂顺序执行双臂精确归位？过程中不会修改 tracker Home；启动前执行时到位后停留在启动前 Hold，仍需另行点击“开始遥操”采集 runtime Home。任一步失败都会中止剩余动作并保持停止。请确认两臂周围无人且没有接触负载。"
+        )) return;
+        postEvent(sendEventName, extraPayload);
       };
     }
     var chooseButton = byId("datasetChooseRootButton");
@@ -1644,6 +1964,14 @@ const captureStatusEl = document.getElementById("captureStatus");
 const sendStatusEl = document.getElementById("sendStatus");
 const shortcutCLabelEl = document.getElementById("shortcutCLabel");
 const shortcutGLabelEl = document.getElementById("shortcutGLabel");
+const footPadTestBannerEl = document.getElementById("footPadTestBanner");
+const footPadTestTitleEl = document.getElementById("footPadTestTitle");
+const footPadTestDetailEl = document.getElementById("footPadTestDetail");
+const footPadTestLastEl = document.getElementById("footPadTestLast");
+const footPadTestControlsEl = document.getElementById("footPadTestControls");
+const footPadTestStartButtonEl = document.getElementById("footPadTestStartButton");
+const footPadTestStopButtonEl = document.getElementById("footPadTestStopButton");
+const footPadTestStatusEl = document.getElementById("footPadTestStatus");
 const viveCalibrationCalibrateButtonEl = document.getElementById("viveCalibrationCalibrateButton");
 const viveCalibrationSaveButtonEl = document.getElementById("viveCalibrationSaveButton");
 const viveCalibrationLoadButtonEl = document.getElementById("viveCalibrationLoadButton");
@@ -1654,6 +1982,7 @@ const gripperForceSectionEl = document.getElementById("gripperForceSection");
 const leftGripperForceInputEl = document.getElementById("leftGripperForceInput");
 const rightGripperForceInputEl = document.getElementById("rightGripperForceInput");
 const gripperForceApplyButtonEl = document.getElementById("gripperForceApplyButton");
+const gripperForcePersistButtonEl = document.getElementById("gripperForcePersistButton");
 const gripperForceStatusEl = document.getElementById("gripperForceStatus");
 const fixArmSectionEl = document.getElementById("fixArmSection");
 const fixArmSideSelectEl = document.getElementById("fixArmSideSelect");
@@ -1661,7 +1990,13 @@ const fixArmToggleButtonEl = document.getElementById("fixArmToggleButton");
 const fixArmStatusEl = document.getElementById("fixArmStatus");
 const initArmSectionEl = document.getElementById("initArmSection");
 const initArmSideSelectEl = document.getElementById("initArmSideSelect");
+const leftInitArmQposSpeedInputEl = document.getElementById("leftInitArmQposSpeedInput");
+const rightInitArmQposSpeedInputEl = document.getElementById("rightInitArmQposSpeedInput");
+const initArmQposSpeedApplyButtonEl = document.getElementById("initArmQposSpeedApplyButton");
+const initArmQposSpeedStatusEl = document.getElementById("initArmQposSpeedStatus");
 const initArmToggleButtonEl = document.getElementById("initArmToggleButton");
+const initArmMoveToQposButtonEl = document.getElementById("initArmMoveToQposButton");
+const initArmMoveBothToQposButtonEl = document.getElementById("initArmMoveBothToQposButton");
 const initArmStatusEl = document.getElementById("initArmStatus");
 const footPadSpecialArmHintEl = document.getElementById("footPadSpecialArmHint");
 const leftRawCardEl = document.getElementById("leftRawCard");
@@ -1699,8 +2034,15 @@ const episodeBannerCounterEl = document.getElementById("episodeBannerCounter");
 const episodeBannerDetailEl = document.getElementById("episodeBannerDetail");
 const episodeBannerMetaEl = document.getElementById("episodeBannerMeta");
 const episodeStatusEl = document.getElementById("episodeStatus");
+const plusCurationSectionEl = document.getElementById("plusCurationSection");
+const plusVariantSelectEl = document.getElementById("plusVariantSelect");
+const plusDispositionSelectEl = document.getElementById("plusDispositionSelect");
+const plusReasonSelectEl = document.getElementById("plusReasonSelect");
+const plusCurationSaveButtonEl = document.getElementById("plusCurationSaveButton");
+const plusCurationStatusEl = document.getElementById("plusCurationStatus");
 const datasetBaseRootInputEl = document.getElementById("datasetBaseRootInput");
 const datasetChooseRootButtonEl = document.getElementById("datasetChooseRootButton");
+const episodeDeleteIndexInputEl = document.getElementById("episodeDeleteIndexInput");
 const taskTypeSelectEl = document.getElementById("taskTypeSelect");
 const taskSelectEl = document.getElementById("taskSelect");
 const taskEnglishNameInputEl = document.getElementById("taskEnglishNameInput");
@@ -1708,9 +2050,12 @@ const taskChineseNameInputEl = document.getElementById("taskChineseNameInput");
 const roundTripToggleButtonEl = document.getElementById("roundTripToggleButton");
 const roundTripStatusEl = document.getElementById("roundTripStatus");
 const episodeWarningBannerEl = document.getElementById("episodeWarningBanner");
+const episodeWarningTitleEl = document.getElementById("episodeWarningTitle");
 const episodeWarningTextEl = document.getElementById("episodeWarningText");
+const umiCalibrationSectionEl = document.getElementById("umiCalibrationSection");
 const cameraVisButtonEl = document.getElementById("cameraVisButton");
 const tactileVisButtonEl = document.getElementById("tactileVisButton");
+const tactileSolveButtonEl = document.getElementById("tactileSolveButton");
 const visualizationStatusEl = document.getElementById("visualizationStatus");
 const poseSnapshotSectionEl = document.getElementById("poseSnapshotSection");
 const poseSnapshotButtonEl = document.getElementById("poseSnapshotButton");
@@ -1725,9 +2070,16 @@ const cameraSelfCheckDetailEl = document.getElementById("cameraSelfCheckDetail")
 const cameraCardsEl = document.getElementById("cameraCards");
 const tactileCameraStatusSectionEl = document.getElementById("tactileCameraStatusSection");
 const tactileCameraCardsEl = document.getElementById("tactileCameraCards");
+const datasetModalityContractCardEl = document.getElementById("datasetModalityContractCard");
+const datasetModalityContractStatusEl = document.getElementById("datasetModalityContractStatus");
+const datasetModalityContractDetailEl = document.getElementById("datasetModalityContractDetail");
+const hardwareAdmissionCardsEl = document.getElementById("hardwareAdmissionCards");
 const shutdownOverlayEl = document.getElementById("shutdownOverlay");
 const shutdownMessageEl = document.getElementById("shutdownMessage");
 const scriptHealthEl = document.getElementById("scriptHealth");
+document.querySelectorAll('input[data-ignore-modality]').forEach((input) => {
+  input.addEventListener("change", () => { input.dataset.userEdited = "true"; });
+});
 let activeControls = new Set();
 let refreshTimer = null;
 let shutdownVisible = false;
@@ -1739,6 +2091,31 @@ let stateRefreshFailureCount = 0;
 let latestState = {};
 let taskTypeOverride = null;
 let roundTripPhaseOverride = null;
+let datasetBaseRootOverride = null;
+let plusReviewDraftToken = "";
+let plusReviewDraftDisposition = "unknown";
+let plusReviewDraftReason = "unknown";
+let plusVariantDraft = null;
+if (plusVariantSelectEl) {
+  plusVariantSelectEl.addEventListener("change", () => {
+    plusVariantDraft = plusVariantSelectEl.value || "";
+  });
+}
+if (plusDispositionSelectEl) {
+  plusDispositionSelectEl.addEventListener("change", () => {
+    plusReviewDraftDisposition = plusDispositionSelectEl.value || "unknown";
+    if (!["keep_recovery", "exclude"].includes(plusReviewDraftDisposition)) {
+      plusReviewDraftReason = "unknown";
+      if (plusReasonSelectEl) plusReasonSelectEl.value = "unknown";
+    }
+    updatePlusReviewControls(latestState);
+  });
+}
+if (plusReasonSelectEl) {
+  plusReasonSelectEl.addEventListener("change", () => {
+    plusReviewDraftReason = plusReasonSelectEl.value || "unknown";
+  });
+}
 
 const stageLabels = {
   "Starting...": "启动中...",
@@ -1821,6 +2198,13 @@ function clearRefreshWarning() {
 }
 
 async function sendEvent(eventName, extraPayload) {
+  if (eventName === "episode_start" && extraPayload) {
+    const cameras = Array.isArray(extraPayload.ignored_camera_keys) ? extraPayload.ignored_camera_keys : [];
+    const tactile = Array.isArray(extraPayload.ignored_tactile_keys) ? extraPayload.ignored_tactile_keys : [];
+    if ((cameras.length || tactile.length) && !window.confirm(
+      `确认以数据集级降级规则开始数采？\n忽视相机: ${cameras.join(", ") || "无"}\n忽视触觉: ${tactile.join(", ") || "无"}\n该规则将锁定整个目标数据集，缺失模态写为空。`
+    )) return;
+  }
   const payload = {event: eventName};
   if (extraPayload && typeof extraPayload === "object") {
     Object.assign(payload, extraPayload);
@@ -1880,14 +2264,97 @@ function collectEpisodeStartPayload() {
   const selectedTaskType = taskTypeSelectEl
     ? taskTypeSelectEl.value
     : normalizeTaskType(taskTypeOverride || latestState.collection_task_type);
-  return {
+  const ignoredCameraKeys = Array.from(
+    document.querySelectorAll('input[data-ignore-modality="camera"]:checked')
+  ).map((input) => input.value);
+  const ignoredTactileKeys = Array.from(
+    document.querySelectorAll('input[data-ignore-modality="tactile"]:checked')
+  ).map((input) => input.value);
+  const payload = {
     dataset_base_root: datasetBaseRootInputEl ? datasetBaseRootInputEl.value : "",
     task_type: selectedTaskType,
     task_key: taskSelectEl ? taskSelectEl.value : "",
     task_english_name: taskEnglishNameInputEl ? taskEnglishNameInputEl.value : "",
     task_chinese_name: taskChineseNameInputEl ? taskChineseNameInputEl.value : "",
     round_trip_phase: normalizeRoundTripPhase(roundTripPhaseOverride || latestState.collection_round_trip_phase),
+    ignored_camera_keys: ignoredCameraKeys,
+    ignored_tactile_keys: ignoredTactileKeys,
   };
+  if (Boolean(latestState.plus_curation_enabled) && plusVariantSelectEl) {
+    payload.plus_variant_id = plusVariantSelectEl.value || "";
+  }
+  return payload;
+}
+
+function plusPendingRootLabel(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const parts = text.split(/[\\\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : text;
+}
+
+function updatePlusReviewControls(state) {
+  const pending = Boolean(state && state.plus_curation_pending);
+  const reviewReady = pending && activeControls.has("plus_curation_save") && String(state.plus_curation_status || "") !== "saving";
+  if (plusDispositionSelectEl) {
+    plusDispositionSelectEl.disabled = !reviewReady;
+    if (document.activeElement !== plusDispositionSelectEl) {
+      plusDispositionSelectEl.value = plusReviewDraftDisposition || "unknown";
+    }
+  }
+  if (plusReasonSelectEl) {
+    const reasonAllowed = ["keep_recovery", "exclude"].includes(plusReviewDraftDisposition);
+    plusReasonSelectEl.disabled = !reviewReady || !reasonAllowed;
+    if (!reasonAllowed) plusReviewDraftReason = "unknown";
+    if (document.activeElement !== plusReasonSelectEl) {
+      plusReasonSelectEl.value = plusReviewDraftReason || "unknown";
+    }
+  }
+}
+
+function renderPlusCuration(state) {
+  const enabled = Boolean(state.plus_curation_enabled);
+  if (plusCurationSectionEl) plusCurationSectionEl.hidden = !enabled;
+  if (!enabled) return;
+  const pending = Boolean(state.plus_curation_pending);
+  const pendingToken = pending ? String(state.plus_curation_pending_token || "") : "";
+  const reviewTokenChanged = pendingToken !== plusReviewDraftToken;
+  if (reviewTokenChanged) {
+    plusReviewDraftToken = pendingToken;
+    plusReviewDraftDisposition = String(state.plus_curation_disposition || "unknown") || "unknown";
+    plusReviewDraftReason = String(state.plus_curation_reason_code || "unknown") || "unknown";
+    if (plusDispositionSelectEl) plusDispositionSelectEl.value = plusReviewDraftDisposition;
+    if (plusReasonSelectEl) plusReasonSelectEl.value = plusReviewDraftReason;
+  }
+  const variants = Array.isArray(state.plus_curation_variants) ? state.plus_curation_variants : [];
+  if (plusVariantSelectEl) {
+    const current = plusVariantDraft !== null
+      ? plusVariantDraft
+      : (plusVariantSelectEl.value || String(state.plus_curation_variant_id || ""));
+    const desired = [{variant_id: "", label: "未指定"}].concat(variants);
+    const signature = desired.map((item) => `${item.variant_id || ""}:${item.label || ""}`).join("\\n");
+    const existing = Array.from(plusVariantSelectEl.options).map((item) => `${item.value}:${item.textContent || ""}`).join("\\n");
+    if (signature !== existing) {
+      plusVariantSelectEl.innerHTML = desired.map((item) => (
+        `<option value="${escapeHtml(item.variant_id || "")}">${escapeHtml(item.label || item.variant_id || "未指定")}</option>`
+      )).join("");
+    }
+    if (document.activeElement !== plusVariantSelectEl) {
+      plusVariantSelectEl.value = current || String(state.plus_curation_variant_id || "");
+    }
+    const busy = Boolean(state.episode_recording) || ["preparing", "finalizing"].includes(String(state.episode_event_status || ""));
+    plusVariantSelectEl.disabled = busy || !activeControls.has("episode_start");
+  }
+  if (plusCurationSaveButtonEl) {
+    plusCurationSaveButtonEl.disabled = !pending || !activeControls.has("plus_curation_save");
+  }
+  if (plusCurationStatusEl) {
+    const index = state.plus_curation_episode_index == null ? "" : `episode ${state.plus_curation_episode_index}`;
+    const root = plusPendingRootLabel(state.plus_curation_pending_dataset_root);
+    const context = root ? `dataset ${root}` : "";
+    plusCurationStatusEl.textContent = [state.plus_curation_status || "", index, context, state.plus_curation_message || ""].filter(Boolean).join(" · ") || "Plus 未启用";
+  }
+  updatePlusReviewControls(state);
 }
 
 async function chooseDatasetDirectory() {
@@ -1901,6 +2368,7 @@ async function chooseDatasetDirectory() {
     if (!response.ok) throw new Error("HTTP " + response.status);
     const result = await response.json();
     if (result && result.path) {
+      datasetBaseRootOverride = String(result.path);
       datasetBaseRootInputEl.value = result.path;
       sendStatusEl.textContent = "已选择文件夹: " + result.path;
     } else {
@@ -2010,8 +2478,50 @@ async function sendGripperForceSet() {
   }
 }
 
+async function sendGripperForcePersist() {
+  if (!gripperForcePersistButtonEl || gripperForcePersistButtonEl.disabled) return;
+  const payload = {
+    left: leftGripperForceInputEl && !leftGripperForceInputEl.disabled
+      ? gripperForceValue(leftGripperForceInputEl, "left")
+      : null,
+    right: rightGripperForceInputEl && !rightGripperForceInputEl.disabled
+      ? gripperForceValue(rightGripperForceInputEl, "right")
+      : null,
+  };
+  try {
+    await sendEvent("gripper_force_persist:" + JSON.stringify(payload));
+  } catch (error) {
+    sendStatusEl.textContent = String(error);
+  }
+}
+
+function initArmQposSpeedValue(input, side, minValue, maxValue) {
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value < minValue || value > maxValue) {
+    throw new Error(`${sideLabel(side)}归位速度倍率必须在 ${minValue} 到 ${maxValue} 之间`);
+  }
+  return value;
+}
+
+async function sendInitArmQposSpeedSet() {
+  if (!initArmQposSpeedApplyButtonEl || initArmQposSpeedApplyButtonEl.disabled) return;
+  const state = latestState || {};
+  const minValue = Number(state.init_arm_qpos_speed_scale_min == null ? 0.1 : state.init_arm_qpos_speed_scale_min);
+  const maxValue = Number(state.init_arm_qpos_speed_scale_max == null ? 10.0 : state.init_arm_qpos_speed_scale_max);
+  const payload = {
+    left: initArmQposSpeedValue(leftInitArmQposSpeedInputEl, "left", minValue, maxValue),
+    right: initArmQposSpeedValue(rightInitArmQposSpeedInputEl, "right", minValue, maxValue),
+  };
+  try {
+    await sendEvent("init_arm_qpos_speed_set:" + JSON.stringify(payload));
+  } catch (error) {
+    sendStatusEl.textContent = String(error);
+  }
+}
+
 buttons.forEach((button) => {
   button.addEventListener("click", async () => {
+    if (!window.__calibrationWebUiModernRefreshOk) return;
     if (button.disabled) return;
     try {
       const eventName = button.dataset.event;
@@ -2045,7 +2555,36 @@ buttons.forEach((button) => {
       const sendEventName = eventName === "c" ? "fix_arm_toggle" : eventName;
       if (eventName === "episode_start") {
         await sendEvent(sendEventName, collectEpisodeStartPayload());
+      } else if (eventName === "episode_delete") {
+        const input = document.getElementById("episodeDeleteIndexInput");
+        const deleteButton = document.getElementById("episodeDeleteButton");
+        const rawIndex = input ? String(input.value || "").trim() : "";
+        if (!/^[0-9]+$/.test(rawIndex)) throw new Error("请输入非负整数 Episode 序号");
+        if (!window.confirm(`确认删除 episode ${rawIndex} 并重编号后续数据？`)) return;
+        if (deleteButton) deleteButton.disabled = true;
+        try {
+          await sendEvent(sendEventName, {episode_index: rawIndex});
+          sendStatusEl.textContent = `删除请求已接收：episode ${rawIndex}，正在处理...`;
+        } catch (error) {
+          if (deleteButton) deleteButton.disabled = !activeControls.has("episode_delete");
+          throw error;
+        }
+      } else if (eventName === "plus_curation_save") {
+        const episodeIndex = latestState.plus_curation_episode_index;
+        if (episodeIndex == null) throw new Error("没有等待整理的已保存 episode");
+        await sendEvent(sendEventName, {
+          episode_index: episodeIndex,
+          pending_token: latestState.plus_curation_pending_token || "",
+          disposition: plusDispositionSelectEl ? plusDispositionSelectEl.value : "unknown",
+          reason_code: plusReasonSelectEl ? plusReasonSelectEl.value : "unknown",
+        });
       } else {
+        if (eventName === "init_arm_move_to_qpos" && !window.confirm(
+          "确认精确归位所选机械臂？只有所选臂移动，另一臂保持为静态碰撞体。到位后需重采该侧 Home 才会恢复普通遥操。请确认周围无人且没有接触负载。"
+        )) return;
+        if (eventName === "init_arm_move_both_to_qpos" && !window.confirm(
+          "确认按左臂 → 右臂顺序执行双臂精确归位？过程中不会修改 tracker Home；启动前执行时到位后停留在启动前 Hold，仍需另行点击“开始遥操”采集 runtime Home。任一步失败都会中止剩余动作并保持停止。请确认两臂周围无人且没有接触负载。"
+        )) return;
         await sendEvent(sendEventName);
       }
     } catch (error) {
@@ -2073,6 +2612,38 @@ if (gripperForceApplyButtonEl) {
   });
 }
 
+if (gripperForcePersistButtonEl) {
+  gripperForcePersistButtonEl.addEventListener("click", async () => {
+    if (!window.confirm("确认将当前夹爪力度写入新数据集 profile？该数据集后续不能混用不同力度，已有数据集会被拒绝。")) return;
+    try {
+      await sendGripperForcePersist();
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+  });
+}
+if (initArmQposSpeedApplyButtonEl) {
+  initArmQposSpeedApplyButtonEl.addEventListener("click", async () => {
+    try {
+      await sendInitArmQposSpeedSet();
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+  });
+}
+for (const input of [leftInitArmQposSpeedInputEl, rightInitArmQposSpeedInputEl]) {
+  if (!input) continue;
+  input.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    try {
+      await sendInitArmQposSpeedSet();
+    } catch (error) {
+      sendStatusEl.textContent = String(error);
+    }
+  });
+}
+
 for (const input of [leftGripperForceInputEl, rightGripperForceInputEl]) {
   if (!input) continue;
   input.addEventListener("keydown", async (event) => {
@@ -2089,6 +2660,12 @@ for (const input of [leftGripperForceInputEl, rightGripperForceInputEl]) {
 if (datasetChooseRootButtonEl) {
   datasetChooseRootButtonEl.addEventListener("click", async () => {
     await chooseDatasetDirectory();
+  });
+}
+
+if (datasetBaseRootInputEl) {
+  datasetBaseRootInputEl.addEventListener("input", () => {
+    datasetBaseRootOverride = datasetBaseRootInputEl.value;
   });
 }
 
@@ -2179,6 +2756,13 @@ function updateButtons(state) {
   const episodeStatus = String(state.episode_event_status || "");
   const episodePreparing = episodeStatus === "preparing";
   const episodeFinalizing = episodeStatus === "finalizing";
+  const episodeDeleteAllowed = (
+    activeControls.has("episode_delete") &&
+    !state.episode_recording &&
+    !episodePreparing &&
+    !episodeFinalizing &&
+    episodeStatus !== "delete_queued"
+  );
   buttons.forEach((button) => {
     const eventName = button.dataset.event;
     button.disabled = !activeControls.has(eventName);
@@ -2190,6 +2774,7 @@ function updateButtons(state) {
       button.disabled = true;
     }
     if ((state.episode_recording || episodePreparing || episodeFinalizing) && eventName === "episode_start") button.disabled = true;
+    if (eventName === "episode_delete" && !episodeDeleteAllowed) button.disabled = true;
     if (!state.episode_recording && !episodePreparing && eventName === "episode_stop") button.disabled = true;
     if ((state.episode_recording || episodePreparing) && eventName === "record_pose_snapshot") button.disabled = true;
     const isSelectedSideButton =
@@ -2197,6 +2782,10 @@ function updateButtons(state) {
       (eventName === "2" && state.selected_side === "right");
     button.classList.toggle("active", isSelectedSideButton);
   });
+  if (episodeDeleteIndexInputEl) {
+    episodeDeleteIndexInputEl.disabled = !episodeDeleteAllowed;
+  }
+  renderPlusCuration(state);
   updateIkDebugLogButton(state);
   if (viveCalibrationSaveButtonEl) {
     viveCalibrationSaveButtonEl.classList.toggle("active", Boolean(state.vive_calibration_profile_ready));
@@ -2212,11 +2801,13 @@ function updateButtons(state) {
   }
   const captureButton = Array.from(buttons).find((button) => button.dataset.event === "c");
   if (captureButton) {
-    captureButton.hidden = String(state.special_arm_control_mode || "manual") === "foot-pad";
+    captureButton.hidden = false;
     if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
-      captureButton.textContent = state.fix_arm_recalibrating
+      captureButton.textContent = String(state.ui_mode || "") === "umi_collection"
+        ? (state.fix_arm_active ? `取消 ${label} fixed 标注` : `标注 ${label} fixed`)
+        : state.fix_arm_recalibrating
         ? `重采 ${label} Home...`
         : state.fix_arm_active
           ? `重采 ${label} Home`
@@ -2227,17 +2818,66 @@ function updateButtons(state) {
       captureButton.textContent = "固定臂不可用";
     }
   }
+  renderFootPadTest(state);
+}
+
+function renderFootPadTest(state) {
+  const available = Boolean(state.foot_pad_available);
+  const requested = Boolean(state.foot_pad_requested);
+  const active = Boolean(state.foot_pad_test_active);
+  const twoPedal = Number(state.foot_pad_count || 0) === 2;
+  if (footPadTestBannerEl) {
+    footPadTestBannerEl.hidden = !(requested || available);
+    footPadTestBannerEl.classList.toggle("active", active);
+    footPadTestBannerEl.classList.toggle("unavailable", !available);
+  }
+  if (footPadTestControlsEl) footPadTestControlsEl.hidden = !available;
+  if (footPadTestTitleEl) {
+    footPadTestTitleEl.textContent = !available
+      ? "踏板未连接 / 未就绪"
+      : active
+      ? "脚踏测试模式已开启（仅显示，不执行操作）"
+      : `${Number(state.foot_pad_count || 0)} 个踏板已连接`;
+  }
+  if (footPadTestDetailEl) {
+    footPadTestDetailEl.textContent = !available
+      ? (state.foot_pad_status_message || "未找到可用的 2/4 踏板虚拟键盘。")
+      : active
+      ? (twoPedal
+        ? "请依次踩踏板 1、2（固定左臂、固定右臂）。测试期间不会固定、归位、移动机械臂，也不会写入数采；Init 始终可通过 G/GUI 操作。确认无误后点击“停止测试踏板”。"
+        : "请依次踩踏板 1、2、3、4。测试期间不会固定、归位、移动机械臂，也不会写入数采。确认无误后点击“停止测试踏板”。")
+      : (twoPedal
+        ? "F13/踏板1 固定左臂；F14/踏板2 固定右臂；归位操作仍使用 G。点击下方按钮开始安全测试。"
+        : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。点击下方按钮开始安全测试。");
+  }
+  if (footPadTestLastEl) {
+    footPadTestLastEl.textContent = "最近检测：" + (state.foot_pad_test_last_event || "-");
+  }
+  if (footPadTestStatusEl) footPadTestStatusEl.textContent = state.foot_pad_test_status || "-";
+  if (footPadTestStartButtonEl) {
+    footPadTestStartButtonEl.classList.toggle("active", !active);
+    footPadTestStartButtonEl.textContent = active ? "测试进行中" : "开始测试踏板";
+  }
+  if (footPadTestStopButtonEl) {
+    footPadTestStopButtonEl.classList.toggle("active", active);
+  }
 }
 
 function updateShortcutHints(state) {
   const footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
+  const twoPedal = footPadMode && Number(state.foot_pad_count || 0) === 2;
+  const annotationOnly = String(state.ui_mode || "") === "umi_collection";
   if (shortcutCLabelEl) {
-    if (footPadMode && state.fix_arm_available) {
+    if (footPadMode && state.fix_arm_available && annotationOnly) {
+      shortcutCLabelEl.textContent = "踏板 1/2：切换左右 fixed 标注";
+    } else if (footPadMode && state.fix_arm_available) {
       shortcutCLabelEl.textContent = "踏板 1/2：固定 / 重采左右臂 Home";
     } else if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
-      shortcutCLabelEl.textContent = state.fix_arm_recalibrating
+      shortcutCLabelEl.textContent = annotationOnly
+        ? (state.fix_arm_active ? `取消 ${label} fixed 标注` : `标注 ${label} fixed`)
+        : state.fix_arm_recalibrating
         ? `重采 ${label} Home`
         : state.fix_arm_active
           ? `重采 ${label} Home`
@@ -2249,12 +2889,20 @@ function updateShortcutHints(state) {
     }
   }
   if (shortcutGLabelEl) {
-    if (footPadMode && state.init_arm_available) {
-      shortcutGLabelEl.textContent = "踏板 3/4：归位 / 重采左右臂 Home";
+    if (annotationOnly && footPadMode && state.init_arm_available) {
+      shortcutGLabelEl.textContent = twoPedal
+        ? "2 踏板仅切换 fixed；init 标注使用 G/GUI"
+        : "踏板 3/4：切换左右 init 标注";
+    } else if (twoPedal && state.init_arm_available) {
+      shortcutGLabelEl.textContent = "踏板 1/2 控制 Fix；Init 仍可使用 G/GUI";
+    } else if (footPadMode && state.init_arm_available) {
+      shortcutGLabelEl.textContent = "踏板 3/4 或 G/GUI：Init 左/右臂";
     } else if (state.init_arm_available && state.teleop_running) {
       const side = state.init_arm_active_side || state.init_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
-      shortcutGLabelEl.textContent = state.init_arm_recalibrating
+      shortcutGLabelEl.textContent = annotationOnly
+        ? (state.init_arm_active ? `取消 ${label} init 标注` : `标注 ${label} init`)
+        : state.init_arm_recalibrating
         ? `重采 ${label} Home`
         : state.init_arm_active
           ? `重采 ${label} Home`
@@ -2307,12 +2955,15 @@ function renderGripperForce(state) {
   if (gripperForceApplyButtonEl) {
     gripperForceApplyButtonEl.disabled = !canSet || configuredCount === 0;
   }
+  if (gripperForcePersistButtonEl) {
+    gripperForcePersistButtonEl.disabled = !canSet || configuredCount === 0;
+  }
   if (gripperForceStatusEl) {
     gripperForceStatusEl.textContent = !canSet
       ? "数采录制、倒计时或保存中已锁定；当前 episode 按任务配置运行。"
       : configuredCount === 0
         ? "未检测到可设置的 DM-Tac 夹爪。"
-        : "范围 0–1；应用后立即更新已连接夹爪，开始数采前会恢复任务配置。";
+        : "归一化驱动力范围 0–1（不是牛顿值）；临时设置立即生效。永久按钮只允许新建/空数据集，并写入不可混用的 profile。";
   }
 }
 
@@ -2320,26 +2971,46 @@ function renderFixArm(state) {
   const available = Boolean(state.fix_arm_available);
   if (fixArmSectionEl) fixArmSectionEl.hidden = !available;
   const footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
-  if (footPadSpecialArmHintEl) footPadSpecialArmHintEl.hidden = !footPadMode;
+  const twoPedal = footPadMode && Number(state.foot_pad_count || 0) === 2;
+  if (footPadSpecialArmHintEl) {
+    footPadSpecialArmHintEl.hidden = !footPadMode;
+    footPadSpecialArmHintEl.textContent = twoPedal
+      ? "Foot-pad 附加输入：踏板 1/2 固定左/右臂；Fix/Init 的全部 GUI 与键盘操作始终保留。"
+      : "Foot-pad 附加输入：踏板 1/2 固定左/右臂，踏板 3/4 启动左/右臂精确 Init qpos；Fix/Init 的全部 GUI 与键盘操作始终保留。";
+    if (String(state.ui_mode || "") === "umi_collection") {
+      footPadSpecialArmHintEl.textContent = twoPedal
+        ? "UMI 标注模式：踏板 1/2 切换左右 fixed 标签；init 标签继续使用 G/GUI。"
+        : "UMI 标注模式：踏板 1/2 切换左右 fixed 标签；踏板 3/4 切换左右 init 标签。";
+    }
+  }
   if (!available) return;
   const selected = state.fix_arm_selected_side || "left";
-  const fixed = state.fix_arm_fixed_side || "";
+  const fixedSides = Array.isArray(state.fix_arm_fixed_sides)
+    ? state.fix_arm_fixed_sides.map(String)
+    : [];
+  const selectedFixed = fixedSides.length > 0
+    ? fixedSides.includes(selected)
+    : state.fix_arm_fixed_side === selected;
+  const fixed = selectedFixed ? selected : "";
   const recalibrating = Boolean(state.fix_arm_recalibrating);
   const side = fixed || selected;
   const label = side === "right" ? "右臂" : "左臂";
+  const annotationOnly = String(state.ui_mode || "") === "umi_collection";
   if (fixArmSideSelectEl) {
     if (fixArmSideSelectEl.parentElement && fixArmSideSelectEl.parentElement.parentElement) {
-      fixArmSideSelectEl.parentElement.parentElement.hidden = footPadMode;
+      fixArmSideSelectEl.parentElement.parentElement.hidden = false;
     }
-    fixArmSideSelectEl.disabled = !activeControls.has("fix_arm_select") || Boolean(fixed);
+    fixArmSideSelectEl.disabled = !activeControls.has("fix_arm_select") || recalibrating;
     if (document.activeElement !== fixArmSideSelectEl) {
       fixArmSideSelectEl.value = selected;
     }
   }
   if (fixArmToggleButtonEl) {
-    if (fixArmToggleButtonEl.parentElement) fixArmToggleButtonEl.parentElement.hidden = footPadMode;
+    if (fixArmToggleButtonEl.parentElement) fixArmToggleButtonEl.parentElement.hidden = false;
     fixArmToggleButtonEl.disabled = !activeControls.has("fix_arm_toggle");
-    fixArmToggleButtonEl.textContent = recalibrating
+    fixArmToggleButtonEl.textContent = annotationOnly
+      ? (state.fix_arm_active ? `取消 ${label} fixed 标注` : `标注 ${label} fixed`)
+      : recalibrating
       ? `重采 ${label} Home...`
       : fixed
         ? `重采 ${label} Home`
@@ -2347,7 +3018,15 @@ function renderFixArm(state) {
   }
   if (!fixArmStatusEl) return;
   const lines = [];
-  if (recalibrating) {
+  if (state.fix_hold_active) {
+    lines.push("FIX-HOLD：双侧均为 Fix/Init-fixed，当前 episode 已暂停；解除任一侧后自动恢复。");
+  }
+  if (fixedSides.length) {
+    lines.push(`已固定侧: ${fixedSides.map(item => item === "right" ? "右臂" : "左臂").join(" / ")}`);
+  }
+  if (annotationOnly) {
+    lines.push(`${label}: ${state.fix_arm_active ? "fixed 标注中" : "teleop"}`);
+  } else if (recalibrating) {
     const count = state.fix_arm_sample_count == null ? "-" : String(state.fix_arm_sample_count);
     const total = state.fix_arm_min_samples == null ? "-" : String(state.fix_arm_min_samples);
     lines.push(`${label}: 重采 home ${count}/${total}`);
@@ -2364,45 +3043,108 @@ function renderInitArm(state) {
   const available = Boolean(state.init_arm_available);
   if (initArmSectionEl) initArmSectionEl.hidden = !available;
   const footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
+  const twoPedal = footPadMode && Number(state.foot_pad_count || 0) === 2;
   if (!available) return;
   const selected = state.init_arm_selected_side || "left";
   const activeSide = state.init_arm_active_side || "";
   const recalibrating = Boolean(state.init_arm_recalibrating);
+  const qposActive = Boolean(state.init_arm_qpos_active);
+  const sequenceActive = Boolean(state.init_arm_sequence_active);
   const side = activeSide || selected;
   const label = side === "right" ? "右臂" : "左臂";
+  const annotationOnly = String(state.ui_mode || "") === "umi_collection";
   if (initArmSideSelectEl) {
-    if (initArmSideSelectEl.parentElement && initArmSideSelectEl.parentElement.parentElement) {
-      initArmSideSelectEl.parentElement.parentElement.hidden = footPadMode;
-    }
-    initArmSideSelectEl.disabled = !activeControls.has("init_arm_select") || Boolean(activeSide);
+    initArmSideSelectEl.disabled = (
+      !activeControls.has("init_arm_select") || Boolean(activeSide) || sequenceActive
+    );
     if (document.activeElement !== initArmSideSelectEl) {
       initArmSideSelectEl.value = selected;
     }
   }
+  const speedScales = state.init_arm_qpos_speed_scale_by_side || {};
+  const speedMin = Number(state.init_arm_qpos_speed_scale_min == null ? 0.1 : state.init_arm_qpos_speed_scale_min);
+  const speedMax = Number(state.init_arm_qpos_speed_scale_max == null ? 10.0 : state.init_arm_qpos_speed_scale_max);
+  const canSetSpeed = activeControls.has("init_arm_qpos_speed_set");
+  for (const [speedSide, input] of [
+    ["left", leftInitArmQposSpeedInputEl],
+    ["right", rightInitArmQposSpeedInputEl],
+  ]) {
+    if (!input) continue;
+    input.min = String(speedMin);
+    input.max = String(speedMax);
+    input.disabled = !canSetSpeed;
+    const value = Number(speedScales[speedSide] == null ? 5.0 : speedScales[speedSide]);
+    if (document.activeElement !== input && Number.isFinite(value)) {
+      input.value = value.toFixed(3);
+    }
+  }
+  if (initArmQposSpeedApplyButtonEl) {
+    initArmQposSpeedApplyButtonEl.disabled = !canSetSpeed;
+  }
+  if (initArmQposSpeedStatusEl) {
+    const leftScale = Number(speedScales.left == null ? 5.0 : speedScales.left);
+    const rightScale = Number(speedScales.right == null ? 5.0 : speedScales.right);
+    initArmQposSpeedStatusEl.textContent = canSetSpeed
+      ? `当前：左臂 ${leftScale.toFixed(3)}× / 右臂 ${rightScale.toFixed(3)}×；基线 1.0 = rm65_init_slow。`
+      : qposActive
+        ? "归位执行中已锁定速度；如需停止请使用 Init 急停。"
+        : "数采流程中已锁定速度；本次归位使用开始前设置。";
+  }
   if (initArmToggleButtonEl) {
-    if (initArmToggleButtonEl.parentElement) initArmToggleButtonEl.parentElement.hidden = footPadMode;
+    initArmToggleButtonEl.hidden = false;
     initArmToggleButtonEl.disabled = !activeControls.has("init_arm_toggle");
-    initArmToggleButtonEl.textContent = recalibrating
+    initArmToggleButtonEl.textContent = annotationOnly
+      ? (state.init_arm_active ? `取消 ${label} init 标注` : `标注 ${label} init`)
+      : recalibrating
       ? `重采 ${label} Home...`
       : activeSide
         ? `重采 ${label} Home`
-        : `${label}归位`;
+        : `Cartesian 标准位姿：${label}`;
+  }
+  if (initArmMoveToQposButtonEl) {
+    initArmMoveToQposButtonEl.hidden = annotationOnly;
+    initArmMoveToQposButtonEl.disabled = (
+      !activeControls.has("init_arm_move_to_qpos") || Boolean(activeSide)
+    );
+    initArmMoveToQposButtonEl.textContent = activeSide
+      ? `${label}精确归位中`
+      : `精确归位所选臂：${label}`;
+  }
+  if (initArmMoveBothToQposButtonEl) {
+    initArmMoveBothToQposButtonEl.hidden = annotationOnly;
+    initArmMoveBothToQposButtonEl.disabled = (
+      !activeControls.has("init_arm_move_both_to_qpos") || Boolean(activeSide)
+    );
+    initArmMoveBothToQposButtonEl.textContent = sequenceActive
+      ? `双臂顺序归位中：当前${label}`
+      : "双臂顺序精确归位：左臂 → 右臂";
   }
   if (!initArmStatusEl) return;
   const lines = [];
-  if (recalibrating) {
+  if (annotationOnly) {
+    lines.push(`${label}: ${state.init_arm_active ? "init 标注中" : "teleop"}`);
+  } else if (recalibrating) {
     const count = state.init_arm_sample_count == null ? "-" : String(state.init_arm_sample_count);
     const total = state.init_arm_min_samples == null ? "-" : String(state.init_arm_min_samples);
     lines.push(`${label}: 重采 home ${count}/${total}`);
+  } else if (qposActive) {
+    const step = state.init_arm_qpos_step_index == null ? "-" : String(state.init_arm_qpos_step_index);
+    const total = state.init_arm_qpos_step_count == null ? "-" : String(state.init_arm_qpos_step_count);
+    const error = state.init_arm_qpos_max_error_deg == null
+      ? "-"
+      : Number(state.init_arm_qpos_max_error_deg).toFixed(3) + " deg";
+    lines.push(`${label}: Init qpos ${String(state.init_arm_qpos_phase || "active")}`);
+    lines.push(`路径进度: ${step}/${total} · 实测最大误差: ${error}`);
   } else if (activeSide) {
     lines.push(`${label}: 归位中`);
   } else {
     lines.push(`${label}: 待归位`);
   }
-  if (activeSide && state.init_arm_arrival_label) {
+  if (activeSide && !qposActive && state.init_arm_arrival_label) {
     lines.push(`实际反馈: ${String(state.init_arm_arrival_label)}`);
   }
   if (state.init_arm_status) lines.push(String(state.init_arm_status));
+  if (state.init_arm_sequence_status) lines.push(String(state.init_arm_sequence_status));
   initArmStatusEl.textContent = lines.join("\\n");
 }
 
@@ -2541,7 +3283,18 @@ function formatPills(state) {
   if (state.episode_recording) items.push(["数采", "录制中"]);
   if (state.camera_visualization_active) items.push(["图像窗口", "开启"]);
   if (state.tactile_visualization_active) items.push(["触觉窗口", "开启"]);
-  return items.map(([label, value]) => `<span class="pill"><strong>${label}</strong>${value}</span>`).join("");
+  if (state.foot_pad_requested || state.foot_pad_available) {
+    const count = Number(state.foot_pad_count || 0);
+    const online = Boolean(state.foot_pad_available) && (count === 2 || count === 4);
+    items.push([
+      "踏板",
+      online ? `${count} 个已连接` : "未连接 / 未就绪",
+      online ? "ok" : "warn",
+    ]);
+  }
+  return items.map(([label, value, level]) => (
+    `<span class="pill${level ? " " + level : ""}"><strong>${label}</strong>${value}</span>`
+  )).join("");
 }
 
 function renderViveCalibrationProfile(state) {
@@ -2855,6 +3608,63 @@ function renderTactileCameraStatus(state) {
   }).join("");
 }
 
+function renderDatasetModalityContract(state) {
+  if (!datasetModalityContractCardEl || !datasetModalityContractDetailEl) return;
+  const contract = state.dataset_modality_contract || {};
+  const ignored = contract.ignored_modalities || {};
+  const cameras = Array.isArray(ignored.camera) ? ignored.camera : [];
+  const tactile = Array.isArray(ignored.tactile) ? ignored.tactile : [];
+  const degraded = cameras.length > 0 || tactile.length > 0;
+  datasetModalityContractCardEl.className = `device-card ${degraded ? "warn" : "ok"}`;
+  if (datasetModalityContractStatusEl) {
+    datasetModalityContractStatusEl.textContent = degraded ? "明确忽视 / 降级" : "完整";
+  }
+  datasetModalityContractDetailEl.textContent = [
+    `scope: dataset（同一数据集内不可更改）`,
+    `camera ignored: ${cameras.length ? cameras.join(", ") : "无"}`,
+    `tactile ignored: ${tactile.length ? tactile.join(", ") : "无"}`,
+    degraded ? "缺失模态写为空并标记无效；训练按本声明选择数据集。" : "所有配置模态均为数采必需项。",
+  ].join("\\n");
+  document.querySelectorAll('input[data-ignore-modality]').forEach((input) => {
+    const unsupportedForUmi = String(state.ui_mode || "") === "umi_collection"
+      && input.dataset.ignoreModality === "camera"
+      && input.value === "front";
+    if (input.parentElement) input.parentElement.hidden = unsupportedForUmi;
+    if (unsupportedForUmi) {
+      input.checked = false;
+      delete input.dataset.userEdited;
+      return;
+    }
+    if (input.dataset.userEdited === "true") return;
+    const selected = input.dataset.ignoreModality === "camera" ? cameras : tactile;
+    input.checked = selected.includes(input.value);
+  });
+}
+
+function renderHardwareAdmission(state) {
+  if (!hardwareAdmissionCardsEl) return;
+  const entries = Object.entries(state.hardware_status || {}).sort(([left], [right]) => left.localeCompare(right));
+  if (!entries.length) {
+    hardwareAdmissionCardsEl.innerHTML = '<div class="device-card waiting"><div class="device-title"><span>连接状态</span><span>等待</span></div><div class="device-body mono">正在尝试连接配置设备。</div></div>';
+    return;
+  }
+  hardwareAdmissionCardsEl.innerHTML = entries.map(([key, item]) => {
+    const level = statusLevelClass(item.status_level || (item.online ? "ok" : "error"));
+    const requirement = item.requirement || "feature_dependent";
+    const lines = [
+      `health: ${item.online ? "online" : (item.health || "offline")}`,
+      `requirement: ${requirement}`,
+    ];
+    if (item.label) lines.push(`device: ${item.label}`);
+    if (Number.isFinite(Number(item.elapsed_sec))) {
+      lines.push(`elapsed: ${Number(item.elapsed_sec).toFixed(1)} s`);
+    }
+    if (item.message) lines.push(`status: ${item.message}`);
+    if (item.error) lines.push(`error: ${item.error}`);
+    return `<div class="device-card ${level}"><div class="device-title"><span>${escapeHtml(key)}</span><span>${escapeHtml(item.status_label || level)}</span></div><div class="device-body mono">${escapeHtml(lines.join("\\n"))}</div></div>`;
+  }).join("");
+}
+
 function renderGripper(state) {
   const available = Boolean(state.gripper_control_available);
   gripperStatusSectionEl.hidden = !available;
@@ -2921,8 +3731,11 @@ function renderEpisode(state) {
   const preparing = status === "preparing";
   const finalizing = status === "finalizing";
   const paused = status === "paused" || status === "resume_pending";
+  if (umiCalibrationSectionEl) {
+    umiCalibrationSectionEl.hidden = String(state.ui_mode || "") !== "umi_collection";
+  }
   if (episodeStartButtonEl) {
-    episodeStartButtonEl.textContent = paused ? "数采暂停中" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
+    episodeStartButtonEl.textContent = paused ? "等待有效快照" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
     episodeStartButtonEl.classList.toggle("active", recording || preparing);
     episodeStartButtonEl.classList.toggle("recording-active", recording || preparing);
   }
@@ -2932,9 +3745,10 @@ function renderEpisode(state) {
   }
   renderEpisodeBanner(state);
   renderTaskForm(state, recording || preparing || finalizing);
+  renderPlusCuration(state);
   const lines = [
     available ? "episode 录制可用" : "episode 录制不可用",
-    paused ? "状态: 暂停中" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")),
+    paused ? "状态: 等待有效传感器快照" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制")),
   ];
   if (state.episode_dir) lines.push(`路径: ${state.episode_dir}`);
   if (state.dataset_root) lines.push(`保存根目录: ${state.dataset_root}`);
@@ -2946,6 +3760,17 @@ function renderEpisode(state) {
   }
   if (state.collection_task_name_zh) lines.push(`中文名: ${state.collection_task_name_zh}`);
   if (state.episode_frame_count != null) lines.push(`帧数: ${state.episode_frame_count}`);
+  if (state.episode_attempted_sample_count != null) {
+    const attempts = Number(state.episode_attempted_sample_count);
+    const accepted = Number(state.episode_frame_count || 0);
+    lines.push(`采样尝试/接受/拒绝: ${attempts} / ${accepted} / ${Math.max(0, attempts - accepted)}`);
+  }
+  const rejectionCounts = state.episode_rejection_counts || {};
+  const rejectionText = Object.keys(rejectionCounts)
+    .sort()
+    .map((reason) => `${reason}=${rejectionCounts[reason]}`)
+    .join(", ");
+  if (rejectionText) lines.push(`拒绝原因: ${rejectionText}`);
   if (state.episode_sample_hz != null) {
     const sampleHz = Number(state.episode_sample_hz);
     const targetHz = state.episode_target_hz == null ? null : Number(state.episode_target_hz);
@@ -2965,13 +3790,23 @@ function renderEpisode(state) {
     lines.push(`触觉写入: ${sideText}${meanText}`);
   }
   episodeStatusEl.textContent = lines.join("\\n");
+  const calibrationWarning = state.calibration_validity_warning || {};
   const frequencyWarning = state.episode_frequency_warning || {};
-  const warningActive = Boolean(frequencyWarning.active);
+  const warning = calibrationWarning.active ? calibrationWarning : frequencyWarning;
+  const warningActive = Boolean(warning.active);
   if (episodeWarningBannerEl) {
     episodeWarningBannerEl.hidden = !warningActive;
+    episodeWarningBannerEl.className = [
+      "ik-warning-banner",
+      calibrationWarning.active ? "calibration-warning" : "",
+      calibrationWarning.active ? String(calibrationWarning.level || "warning") : "",
+    ].filter(Boolean).join(" ");
+  }
+  if (episodeWarningTitleEl) {
+    episodeWarningTitleEl.textContent = warning.title || "DATA WARNING";
   }
   if (episodeWarningTextEl) {
-    episodeWarningTextEl.textContent = frequencyWarning.message || "采集频率低于目标值";
+    episodeWarningTextEl.textContent = warning.message || "采集频率低于目标值";
   }
 }
 
@@ -2996,12 +3831,14 @@ function renderEpisodeBanner(state) {
     idle: "未开始数采",
     preparing: "3 秒后开始数采",
     recording: "● 正在数采",
-    paused: "Ⅱ 数采暂停",
+    paused: "Ⅱ 等待有效快照",
     resume_pending: "等待恢复写入",
     finalizing: "停止中 / 后台保存",
+    delete_queued: "删除请求已排队",
     saved: "已保存",
     discarded: "已停止 / 无样本",
     error: "保存失败",
+    deleted: "已删除并重编号",
   };
   const className = ["episode-banner"];
   if (["preparing", "recording", "paused", "resume_pending", "finalizing", "saved", "discarded", "error", "unavailable"].includes(status)) {
@@ -3021,7 +3858,7 @@ function renderEpisodeBanner(state) {
 
   const message = state.episode_event_message || "";
   const detailFallback = paused
-    ? "当前 episode 保持打开；恢复遥操且输入稳定后会继续写入。"
+    ? "当前 episode 保持打开；所有必需传感器恢复新鲜后会自动继续接受样本。"
     : recording
     ? "正在写入正式数据集；结束前请确认画面、触觉和机械臂状态正常。"
     : available
@@ -3058,6 +3895,10 @@ function renderEpisodeBanner(state) {
   if (warning.active) {
     chips.push(["频率", "低于目标"]);
   }
+  const calibrationWarning = state.calibration_validity_warning || {};
+  if (calibrationWarning.active) {
+    chips.push(["标定", calibrationWarning.countdown || calibrationWarning.level || "提醒"]);
+  }
   episodeBannerMetaEl.innerHTML = chips.map(([label, value]) => (
     `<span class="episode-banner-chip">${escapeHtml(label)}: ${escapeHtml(value)}</span>`
   )).join("");
@@ -3067,7 +3908,11 @@ function renderTaskForm(state, recording) {
   window.__latestTaskRegistry = Array.isArray(state.task_registry) ? state.task_registry : [];
   const preparing = String(state.episode_event_status || "") === "preparing";
   const finalizing = String(state.episode_event_status || "") === "finalizing";
-  const locked = Boolean(recording || preparing || finalizing);
+  // UMI keeps task semantics in its validated runtime config, while allowing
+  // the idle dataset root to be selected for the next episode.
+  const runtimeConfigured = String(state.ui_mode || "") === "umi_collection";
+  const pathLocked = Boolean(recording || preparing || finalizing);
+  const locked = Boolean(pathLocked || runtimeConfigured);
   const selectedType = normalizeTaskType(
     taskTypeOverride
       ? taskTypeOverride
@@ -3076,13 +3921,15 @@ function renderTaskForm(state, recording) {
       : state.collection_task_type
   );
   if (datasetBaseRootInputEl) {
-    datasetBaseRootInputEl.disabled = locked;
+    datasetBaseRootInputEl.disabled = pathLocked;
     if (document.activeElement !== datasetBaseRootInputEl) {
-      datasetBaseRootInputEl.value = state.dataset_base_root || "";
+      datasetBaseRootInputEl.value = datasetBaseRootOverride !== null
+        ? datasetBaseRootOverride
+        : state.dataset_base_root || state.dataset_root || "";
     }
   }
   if (datasetChooseRootButtonEl) {
-    datasetChooseRootButtonEl.disabled = locked;
+    datasetChooseRootButtonEl.disabled = pathLocked;
   }
   if (taskTypeSelectEl) {
     taskTypeSelectEl.disabled = locked;
@@ -3158,6 +4005,8 @@ function renderVisualization(state) {
   const cameraActive = Boolean(state.camera_visualization_active);
   const tactileAvailable = Boolean(state.tactile_visualization_available);
   const tactileActive = Boolean(state.tactile_visualization_active);
+  const tactileSolveAvailable = Boolean(state.tactile_solving_available);
+  const tactileSolveActive = Boolean(state.tactile_solving_active);
   if (cameraVisButtonEl) {
     cameraVisButtonEl.textContent = cameraActive ? "关闭图像窗口" : "打开图像窗口";
     cameraVisButtonEl.classList.toggle("active", cameraActive);
@@ -3166,9 +4015,15 @@ function renderVisualization(state) {
     tactileVisButtonEl.textContent = tactileActive ? "关闭触觉窗口" : "打开触觉窗口";
     tactileVisButtonEl.classList.toggle("active", tactileActive);
   }
+  if (tactileSolveButtonEl) {
+    tactileSolveButtonEl.textContent = tactileSolveActive ? "解算已开启" : "开启解算";
+    tactileSolveButtonEl.classList.toggle("active", tactileSolveActive);
+    tactileSolveButtonEl.hidden = !tactileSolveAvailable;
+  }
   const lines = [
     `图像: ${cameraAvailable ? (cameraActive ? "已打开" : "可打开") : "不可用"}`,
     `触觉: ${tactileAvailable ? (tactileActive ? "已打开" : "可打开") : "不可用"}`,
+    `解算: ${tactileSolveAvailable ? (tactileSolveActive ? "已开启（固定标定）" : "未开启") : "不可用"}`,
   ];
   if (state.visualization_status) lines.push(String(state.visualization_status));
   visualizationStatusEl.textContent = lines.join("\\n");
@@ -3365,6 +4220,14 @@ async function refresh() {
     if (!response.ok) throw new Error("state fetch failed: " + response.status);
     const state = await response.json();
     latestState = state || {};
+    if (
+      datasetBaseRootOverride !== null &&
+      [state.dataset_base_root, state.dataset_root].some(
+        (value) => String(value || "") === String(datasetBaseRootOverride)
+      )
+    ) {
+      datasetBaseRootOverride = null;
+    }
     if (taskTypeOverride && normalizeTaskType(state.collection_task_type) === taskTypeOverride) {
       taskTypeOverride = null;
     }
@@ -3403,6 +4266,8 @@ async function refresh() {
     renderCameraSelfCheck(state);
     renderCameraStatus(state);
     renderTactileCameraStatus(state);
+    renderDatasetModalityContract(state);
+    renderHardwareAdmission(state);
     renderIkWarning(state);
     renderPoseQuality(state);
     renderIkTiming(state);
@@ -3432,6 +4297,10 @@ _FALLBACK_SCRIPT = r"""
   window.__calibrationWebUiExternalFallbackLoaded = true;
   var fallbackLatestState = {};
   var fallbackActiveControls = {};
+  var fallbackPlusReviewToken = "";
+  var fallbackPlusReviewDisposition = "unknown";
+  var fallbackPlusReviewReason = "unknown";
+  var fallbackPlusVariantDraft = null;
 
   function byId(id) {
     return document.getElementById(id);
@@ -3463,6 +4332,30 @@ _FALLBACK_SCRIPT = r"""
 
   function normalizeRoundTripPhaseFallback(value) {
     return String(value || "").trim().toLowerCase() === "out" ? "out" : "in";
+  }
+
+  function plusPendingRootLabelFallback(value) {
+    var text = String(value || "").trim();
+    if (!text) return "";
+    var parts = text.split(/[\\/]+/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : text;
+  }
+
+  function updatePlusReviewControlsFallback(state) {
+    var pending = Boolean(state && state.plus_curation_pending);
+    var reviewReady = pending && Boolean(fallbackActiveControls.plus_curation_save) && String(state.plus_curation_status || "") !== "saving";
+    var disposition = byId("plusDispositionSelect");
+    var reason = byId("plusReasonSelect");
+    if (disposition) {
+      disposition.disabled = !reviewReady;
+      if (document.activeElement !== disposition) disposition.value = fallbackPlusReviewDisposition || "unknown";
+    }
+    if (reason) {
+      var reasonAllowed = fallbackPlusReviewDisposition === "keep_recovery" || fallbackPlusReviewDisposition === "exclude";
+      reason.disabled = !reviewReady || !reasonAllowed;
+      if (!reasonAllowed) fallbackPlusReviewReason = "unknown";
+      if (document.activeElement !== reason) reason.value = fallbackPlusReviewReason || "unknown";
+    }
   }
 
   function labelStage(value) {
@@ -3632,12 +4525,22 @@ _FALLBACK_SCRIPT = r"""
   function renderButtons(state) {
     var active = {};
     var controls = state.active_controls || [];
+    var footPadMode = String(state.special_arm_control_mode || "manual") === "foot-pad";
+    var twoPedal = footPadMode && Number(state.foot_pad_count || 0) === 2;
     var i;
     for (i = 0; i < controls.length; i += 1) active[String(controls[i])] = true;
     fallbackActiveControls = active;
     var shortcutC = byId("shortcutCLabel");
     if (shortcutC) {
-      if (state.fix_arm_available && state.teleop_running) {
+      if (footPadMode && state.fix_arm_available) {
+        shortcutC.textContent = twoPedal
+          ? "踏板 1/2：固定左右臂"
+          : "踏板 1/2：固定 / 重采左右臂 Home";
+      } else if (String(state.ui_mode || "") === "umi_collection" && state.fix_arm_available) {
+        var umiFixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
+        var umiFixLabel = umiFixSide === "right" ? "右臂" : "左臂";
+        shortcutC.textContent = (state.fix_arm_active ? "取消 " : "标注 ") + umiFixLabel + " fixed";
+      } else if (state.fix_arm_available && state.teleop_running) {
         var shortcutSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
         var shortcutLabel = shortcutSide === "right" ? "右臂" : "左臂";
         shortcutC.textContent = state.fix_arm_recalibrating || state.fix_arm_active
@@ -3651,7 +4554,19 @@ _FALLBACK_SCRIPT = r"""
     }
     var shortcutG = byId("shortcutGLabel");
     if (shortcutG) {
-      if (state.init_arm_available && state.teleop_running) {
+      if (String(state.ui_mode || "") === "umi_collection" && footPadMode && state.init_arm_available) {
+        shortcutG.textContent = twoPedal
+          ? "2 踏板仅切换 fixed；init 标注使用 G/GUI"
+          : "踏板 3/4：切换左右 init 标注";
+      } else if (twoPedal && state.init_arm_available) {
+        shortcutG.textContent = "踏板 1/2 控制 Fix；Init 仍可使用 G/GUI";
+      } else if (footPadMode && state.init_arm_available) {
+        shortcutG.textContent = "踏板 3/4 或 G/GUI：Init 左/右臂";
+      } else if (String(state.ui_mode || "") === "umi_collection" && state.init_arm_available) {
+        var umiInitSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var umiInitLabel = umiInitSide === "right" ? "右臂" : "左臂";
+        shortcutG.textContent = (state.init_arm_active ? "取消 " : "标注 ") + umiInitLabel + " init";
+      } else if (state.init_arm_available && state.teleop_running) {
         var initShortcutSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
         var initShortcutLabel = initShortcutSide === "right" ? "右臂" : "左臂";
         shortcutG.textContent = state.init_arm_recalibrating || state.init_arm_active
@@ -3665,6 +4580,21 @@ _FALLBACK_SCRIPT = r"""
     for (i = 0; i < buttons.length; i += 1) {
       var eventName = buttons[i].getAttribute("data-event");
       buttons[i].disabled = !active[eventName];
+      if (
+        String(state.ui_mode || "") === "umi_collection" &&
+        (eventName === "c" || eventName === "fix_arm_toggle" || eventName === "init_arm_toggle")
+      ) {
+        var annotationSide = eventName === "init_arm_toggle"
+          ? (state.init_arm_active_side || state.init_arm_selected_side || "left")
+          : (state.fix_arm_fixed_side || state.fix_arm_selected_side || "left");
+        var annotationLabel = annotationSide === "right" ? "右臂" : "左臂";
+        var annotationActive = eventName === "init_arm_toggle"
+          ? Boolean(state.init_arm_active)
+          : Boolean(state.fix_arm_active);
+        var annotationName = eventName === "init_arm_toggle" ? "init" : "fixed";
+        buttons[i].textContent = (annotationActive ? "取消 " : "标注 ") + annotationLabel + " " + annotationName;
+        continue;
+      }
       if (eventName === "c") {
         if (state.fix_arm_available && state.teleop_running) {
           var side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -3694,9 +4624,94 @@ _FALLBACK_SCRIPT = r"""
           ? "重采 " + initLabel + " Home..."
           : state.init_arm_active
             ? "重采 " + initLabel + " Home"
-            : initLabel + "归位";
+            : "Cartesian 标准位姿：" + initLabel;
+      } else if (eventName === "init_arm_move_to_qpos") {
+        var moveInitSide = state.init_arm_active_side || state.init_arm_selected_side || "left";
+        var moveInitLabel = moveInitSide === "right" ? "右臂" : "左臂";
+        buttons[i].hidden = String(state.ui_mode || "") === "umi_collection";
+        buttons[i].disabled = !active[eventName] || Boolean(state.init_arm_active_side);
+        buttons[i].textContent = state.init_arm_active_side
+          ? moveInitLabel + "精确归位中"
+          : "精确归位所选臂：" + moveInitLabel;
+      } else if (eventName === "init_arm_move_both_to_qpos") {
+        var sequenceSide = state.init_arm_sequence_side || state.init_arm_active_side || "left";
+        var sequenceLabel = sequenceSide === "right" ? "右臂" : "左臂";
+        buttons[i].hidden = String(state.ui_mode || "") === "umi_collection";
+        buttons[i].disabled = !active[eventName] || Boolean(state.init_arm_active_side);
+        buttons[i].textContent = state.init_arm_sequence_active
+          ? "双臂顺序归位中：当前" + sequenceLabel
+          : "双臂顺序精确归位：左臂 → 右臂";
       }
     }
+    var speedScales = state.init_arm_qpos_speed_scale_by_side || {};
+    var speedMin = Number(state.init_arm_qpos_speed_scale_min == null ? 0.1 : state.init_arm_qpos_speed_scale_min);
+    var speedMax = Number(state.init_arm_qpos_speed_scale_max == null ? 10.0 : state.init_arm_qpos_speed_scale_max);
+    var speedEnabled = Boolean(active.init_arm_qpos_speed_set);
+    var speedInputs = {
+      left: byId("leftInitArmQposSpeedInput"),
+      right: byId("rightInitArmQposSpeedInput")
+    };
+    for (var speedSide in speedInputs) {
+      if (!Object.prototype.hasOwnProperty.call(speedInputs, speedSide)) continue;
+      var speedInput = speedInputs[speedSide];
+      if (!speedInput) continue;
+      speedInput.min = String(speedMin);
+      speedInput.max = String(speedMax);
+      speedInput.disabled = !speedEnabled;
+      var speedValue = Number(speedScales[speedSide] == null ? 5.0 : speedScales[speedSide]);
+      if (document.activeElement !== speedInput && isFinite(speedValue)) {
+        speedInput.value = speedValue.toFixed(3);
+      }
+    }
+    var speedApply = byId("initArmQposSpeedApplyButton");
+    if (speedApply) speedApply.disabled = !speedEnabled;
+    var leftScale = Number(speedScales.left == null ? 5.0 : speedScales.left);
+    var rightScale = Number(speedScales.right == null ? 5.0 : speedScales.right);
+    setText(
+      "initArmQposSpeedStatus",
+      speedEnabled
+        ? "当前：左臂 " + leftScale.toFixed(3) + "× / 右臂 " + rightScale.toFixed(3) + "×；基线 1.0 = rm65_init_slow。"
+        : state.init_arm_qpos_active
+          ? "归位执行中已锁定速度；如需停止请使用 Init 急停。"
+          : "数采流程中已锁定速度；本次归位使用开始前设置。"
+    );
+    renderFootPadTestFallback(state);
+  }
+
+  function renderFootPadTestFallback(state) {
+    var available = Boolean(state.foot_pad_available);
+    var requested = Boolean(state.foot_pad_requested);
+    var active = Boolean(state.foot_pad_test_active);
+    var twoPedal = Number(state.foot_pad_count || 0) === 2;
+    var banner = byId("footPadTestBanner");
+    var controls = byId("footPadTestControls");
+    if (banner) {
+      banner.hidden = !(requested || available);
+      banner.className = "foot-pad-test-banner" + (active ? " active" : (!available ? " unavailable" : ""));
+    }
+    if (controls) controls.hidden = !available;
+    setText("footPadTestTitle", !available ? "踏板未连接 / 未就绪" : (active ? "脚踏测试模式已开启（仅显示，不执行操作）" : (Number(state.foot_pad_count || 0) + " 个踏板已连接")));
+    setText(
+      "footPadTestDetail",
+      !available
+        ? (state.foot_pad_status_message || "未找到可用的 2/4 踏板虚拟键盘。")
+        : active
+        ? (twoPedal
+          ? "请依次踩踏板 1、2（固定左臂、固定右臂）。测试期间不会固定、归位、移动机械臂，也不会写入数采；Init 始终可通过 G/GUI 操作。确认无误后点击“停止测试踏板”。"
+          : "请依次踩踏板 1、2、3、4。测试期间不会固定、归位、移动机械臂，也不会写入数采。确认无误后点击“停止测试踏板”。")
+        : (twoPedal
+          ? "F13/踏板1 固定左臂；F14/踏板2 固定右臂；归位操作仍使用 G。点击下方按钮开始安全测试。"
+          : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。点击下方按钮开始安全测试。")
+    );
+    setText("footPadTestLast", "最近检测：" + (state.foot_pad_test_last_event || "-"));
+    setText("footPadTestStatus", state.foot_pad_test_status || "-");
+    var start = byId("footPadTestStartButton");
+    var stop = byId("footPadTestStopButton");
+    if (start) {
+      start.className = "warn" + (!active ? " active" : "");
+      start.textContent = active ? "测试进行中" : "开始测试踏板";
+    }
+    if (stop) stop.className = "danger" + (active ? " active" : "");
   }
 
   function renderEpisodeStateFallback(state) {
@@ -3705,11 +4720,58 @@ _FALLBACK_SCRIPT = r"""
     var preparing = String(state.episode_event_status || "") === "preparing";
     var finalizing = String(state.episode_event_status || "") === "finalizing";
     var startButton = byId("episodeStartButton");
+    var umiCalibrationSection = byId("umiCalibrationSection");
     var stopButton = byId("episodeStopButton");
+    var deleteInput = byId("episodeDeleteIndexInput");
+    var deleteButton = byId("episodeDeleteButton");
     var statusEl = byId("episodeStatus");
-    var warning = state.episode_frequency_warning || {};
+    var plusSection = byId("plusCurationSection");
+    var plusVariant = byId("plusVariantSelect");
+    var plusDisposition = byId("plusDispositionSelect");
+    var plusReason = byId("plusReasonSelect");
+    var plusSave = byId("plusCurationSaveButton");
+    var plusStatus = byId("plusCurationStatus");
+    var plusEnabled = Boolean(state.plus_curation_enabled);
+    var plusPending = Boolean(state.plus_curation_pending);
+    var plusPendingToken = plusPending ? String(state.plus_curation_pending_token || "") : "";
+    if (plusSection) plusSection.hidden = !plusEnabled;
+    if (plusPendingToken !== fallbackPlusReviewToken) {
+      fallbackPlusReviewToken = plusPendingToken;
+      fallbackPlusReviewDisposition = String(state.plus_curation_disposition || "unknown") || "unknown";
+      fallbackPlusReviewReason = String(state.plus_curation_reason_code || "unknown") || "unknown";
+      if (plusDisposition) plusDisposition.value = fallbackPlusReviewDisposition;
+      if (plusReason) plusReason.value = fallbackPlusReviewReason;
+    }
+    if (plusEnabled && plusVariant) {
+      var variants = Array.isArray(state.plus_curation_variants) ? state.plus_curation_variants : [];
+      var options = ['<option value="">未指定</option>'];
+      for (var variantIndex = 0; variantIndex < variants.length; variantIndex += 1) {
+        var variant = variants[variantIndex] || {};
+        options.push('<option value="' + escapeHtml(variant.variant_id || "") + '">' + escapeHtml(variant.label || variant.variant_id || "未指定") + '</option>');
+      }
+      plusVariant.innerHTML = options.join("");
+      if (fallbackPlusVariantDraft === null) fallbackPlusVariantDraft = state.plus_curation_variant_id || "";
+      if (document.activeElement !== plusVariant) plusVariant.value = fallbackPlusVariantDraft;
+      plusVariant.disabled = recording || preparing || finalizing || !fallbackActiveControls.episode_start;
+    }
+    if (plusSave) plusSave.disabled = !plusPending || !fallbackActiveControls.plus_curation_save;
+    if (plusStatus) {
+      var plusRoot = plusPendingRootLabelFallback(state.plus_curation_pending_dataset_root);
+      plusStatus.textContent = [
+        state.plus_curation_status || "",
+        plusPending ? "episode " + state.plus_curation_episode_index : "",
+        plusRoot ? "dataset " + plusRoot : "",
+        state.plus_curation_message || ""
+      ].filter(Boolean).join(" · ") || "Plus 未启用";
+    }
+    updatePlusReviewControlsFallback(state);
+    var calibrationWarning = state.calibration_validity_warning || {};
+    var warning = calibrationWarning.active
+      ? calibrationWarning
+      : (state.episode_frequency_warning || {});
     var warningBanner = byId("episodeWarningBanner");
     var warningText = byId("episodeWarningText");
+    var warningTitle = byId("episodeWarningTitle");
     var status = String(state.episode_event_status || "");
     var paused = status === "paused" || status === "resume_pending";
     var statusLabels = {
@@ -3717,12 +4779,14 @@ _FALLBACK_SCRIPT = r"""
       idle: "未开始数采",
       preparing: "3 秒后开始数采",
       recording: "正在数采",
-      paused: "数采暂停",
+      paused: "等待有效快照",
       resume_pending: "等待恢复写入",
       finalizing: "停止中 / 后台保存",
+      delete_queued: "删除请求已排队",
       saved: "已保存",
       discarded: "已停止 / 无样本",
-      error: "保存失败"
+      error: "保存失败",
+      deleted: "已删除并重编号"
     };
     if (!available) {
       status = "unavailable";
@@ -3733,14 +4797,25 @@ _FALLBACK_SCRIPT = r"""
     }
     paused = status === "paused" || status === "resume_pending";
     if (startButton) {
-      startButton.textContent = paused ? "数采暂停中" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
+      startButton.textContent = paused ? "等待有效快照" : (recording ? "数采进行中" : (preparing ? "准备中..." : "开始数采"));
       startButton.disabled = !fallbackActiveControls.episode_start || recording || preparing || finalizing;
     }
     if (stopButton) {
       stopButton.disabled = !fallbackActiveControls.episode_stop || (!recording && !preparing);
     }
-    var locked = recording || preparing || finalizing;
-    var fields = ["datasetBaseRootInput", "datasetChooseRootButton", "taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
+    var deleteAllowed = Boolean(fallbackActiveControls.episode_delete) && !recording && !preparing && !finalizing;
+    if (deleteInput) deleteInput.disabled = !deleteAllowed;
+    if (deleteButton) deleteButton.disabled = !deleteAllowed;
+    var runtimeConfigured = String(state.ui_mode || "") === "umi_collection";
+    if (umiCalibrationSection) umiCalibrationSection.hidden = !runtimeConfigured;
+    var pathLocked = recording || preparing || finalizing;
+    var locked = pathLocked || runtimeConfigured;
+    var pathFields = ["datasetBaseRootInput", "datasetChooseRootButton"];
+    for (var pathIndex = 0; pathIndex < pathFields.length; pathIndex += 1) {
+      var pathField = byId(pathFields[pathIndex]);
+      if (pathField) pathField.disabled = pathLocked;
+    }
+    var fields = ["taskTypeSelect", "taskSelect", "taskEnglishNameInput", "taskChineseNameInput"];
     for (var i = 0; i < fields.length; i += 1) {
       var field = byId(fields[i]);
       if (field) field.disabled = locked;
@@ -3758,7 +4833,7 @@ _FALLBACK_SCRIPT = r"""
     if (statusEl) {
       var lines = [
         available ? "episode 录制可用" : "episode 录制不可用",
-        paused ? "状态: 暂停中" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"))
+        paused ? "状态: 等待有效传感器快照" : (recording ? "状态: 录制中" : (preparing ? "状态: 倒计时准备中" : "状态: 未录制"))
       ];
       if (state.episode_dir) lines.push("路径: " + state.episode_dir);
       if (state.dataset_root) lines.push("保存根目录: " + state.dataset_root);
@@ -3766,6 +4841,12 @@ _FALLBACK_SCRIPT = r"""
       statusEl.textContent = lines.join("\n");
     }
     if (warningBanner) warningBanner.hidden = !Boolean(warning.active);
+    if (warningBanner) {
+      warningBanner.className = "ik-warning-banner" + (calibrationWarning.active
+        ? " calibration-warning " + String(calibrationWarning.level || "warning")
+        : "");
+    }
+    if (warningTitle) warningTitle.textContent = warning.title || "DATA WARNING";
     if (warningText) warningText.textContent = warning.message || "采集频率低于目标值";
     var banner = byId("episodeBanner");
     if (banner) {
@@ -4025,14 +5106,22 @@ _FALLBACK_SCRIPT = r"""
   }
 
   function collectEpisodeStartPayloadFallback() {
-    return {
+    var ignoredCamera = Array.prototype.map.call(document.querySelectorAll('input[data-ignore-modality="camera"]:checked'), function (input) { return input.value; });
+    var ignoredTactile = Array.prototype.map.call(document.querySelectorAll('input[data-ignore-modality="tactile"]:checked'), function (input) { return input.value; });
+    var payload = {
       dataset_base_root: byId("datasetBaseRootInput") ? byId("datasetBaseRootInput").value : "",
       task_type: byId("taskTypeSelect") ? byId("taskTypeSelect").value : normalizeTaskTypeFallback(fallbackLatestState.collection_task_type),
       task_key: byId("taskSelect") ? byId("taskSelect").value : "",
       task_english_name: byId("taskEnglishNameInput") ? byId("taskEnglishNameInput").value : "",
       task_chinese_name: byId("taskChineseNameInput") ? byId("taskChineseNameInput").value : "",
-      round_trip_phase: normalizeRoundTripPhaseFallback(fallbackLatestState.collection_round_trip_phase)
+      round_trip_phase: normalizeRoundTripPhaseFallback(fallbackLatestState.collection_round_trip_phase),
+      ignored_camera_keys: ignoredCamera,
+      ignored_tactile_keys: ignoredTactile
     };
+    if (Boolean(fallbackLatestState.plus_curation_enabled) && byId("plusVariantSelect")) {
+      payload.plus_variant_id = byId("plusVariantSelect").value || "";
+    }
+    return payload;
   }
 
   function postEvent(eventName, extraPayload) {
@@ -4050,7 +5139,10 @@ _FALLBACK_SCRIPT = r"""
       xhr.open("POST", "/event", true);
       xhr.setRequestHeader("Content-Type", "application/json");
       xhr.onreadystatechange = function () {
-        if (xhr.readyState === 4 && xhr.status >= 400) {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setText("sendStatus", eventName === "episode_delete" ? "删除请求已接收，正在处理..." : "已发送: " + eventName);
+        } else if (xhr.status >= 400) {
           setText("sendStatus", "事件未生效: HTTP " + xhr.status);
         }
       };
@@ -4152,7 +5244,74 @@ _FALLBACK_SCRIPT = r"""
           return;
         }
         var sendEventName = eventName === "c" ? "fix_arm_toggle" : eventName;
-        postEvent(sendEventName, eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null);
+        var extraPayload = eventName === "episode_start" ? collectEpisodeStartPayloadFallback() : null;
+        if (eventName === "episode_delete") {
+          var deleteInput = byId("episodeDeleteIndexInput");
+          var deleteIndex = deleteInput ? String(deleteInput.value || "").trim() : "";
+          if (!/^[0-9]+$/.test(deleteIndex)) {
+            setText("sendStatus", "请输入非负整数 Episode 序号");
+            return;
+          }
+          if (!window.confirm("确认删除 episode " + deleteIndex + " 并重编号后续数据？")) return;
+          extraPayload = {episode_index: deleteIndex};
+        }
+        if (eventName === "plus_curation_save") {
+          if (fallbackLatestState.plus_curation_episode_index == null) return;
+          extraPayload = {
+            episode_index: fallbackLatestState.plus_curation_episode_index,
+            pending_token: fallbackLatestState.plus_curation_pending_token || "",
+            disposition: byId("plusDispositionSelect") ? byId("plusDispositionSelect").value : "unknown",
+            reason_code: byId("plusReasonSelect") ? byId("plusReasonSelect").value : "unknown"
+          };
+        }
+        if (eventName === "init_arm_move_to_qpos" && !window.confirm(
+          "确认精确归位所选机械臂？只有所选臂移动，另一臂保持为静态碰撞体。到位后需重采该侧 Home 才会恢复普通遥操。请确认周围无人且没有接触负载。"
+        )) return;
+        if (eventName === "init_arm_move_both_to_qpos" && !window.confirm(
+          "确认按左臂 → 右臂顺序执行双臂精确归位？过程中不会修改 tracker Home；启动前执行时到位后停留在启动前 Hold，仍需另行点击“开始遥操”采集 runtime Home。任一步失败都会中止剩余动作并保持停止。请确认两臂周围无人且没有接触负载。"
+        )) return;
+        postEvent(sendEventName, extraPayload);
+      };
+    }
+    var initSpeedApply = byId("initArmQposSpeedApplyButton");
+    if (initSpeedApply) {
+      initSpeedApply.onclick = function () {
+        if (initSpeedApply.disabled) return;
+        var minValue = Number(fallbackLatestState.init_arm_qpos_speed_scale_min == null ? 0.1 : fallbackLatestState.init_arm_qpos_speed_scale_min);
+        var maxValue = Number(fallbackLatestState.init_arm_qpos_speed_scale_max == null ? 10.0 : fallbackLatestState.init_arm_qpos_speed_scale_max);
+        var leftInput = byId("leftInitArmQposSpeedInput");
+        var rightInput = byId("rightInitArmQposSpeedInput");
+        var leftValue = Number(leftInput && leftInput.value);
+        var rightValue = Number(rightInput && rightInput.value);
+        if (!isFinite(leftValue) || !isFinite(rightValue) || leftValue < minValue || leftValue > maxValue || rightValue < minValue || rightValue > maxValue) {
+          setText("sendStatus", "左右臂归位速度倍率必须在 " + minValue + " 到 " + maxValue + " 之间");
+          return;
+        }
+        postEvent("init_arm_qpos_speed_set:" + JSON.stringify({left: leftValue, right: rightValue}));
+      };
+    }
+    var plusVariant = byId("plusVariantSelect");
+    if (plusVariant) {
+      plusVariant.onchange = function () {
+        fallbackPlusVariantDraft = plusVariant.value || "";
+      };
+    }
+    var plusDisposition = byId("plusDispositionSelect");
+    if (plusDisposition) {
+      plusDisposition.onchange = function () {
+        fallbackPlusReviewDisposition = plusDisposition.value || "unknown";
+        if (fallbackPlusReviewDisposition !== "keep_recovery" && fallbackPlusReviewDisposition !== "exclude") {
+          fallbackPlusReviewReason = "unknown";
+          var plusReason = byId("plusReasonSelect");
+          if (plusReason) plusReason.value = "unknown";
+        }
+        updatePlusReviewControlsFallback(fallbackLatestState);
+      };
+    }
+    var plusReason = byId("plusReasonSelect");
+    if (plusReason) {
+      plusReason.onchange = function () {
+        fallbackPlusReviewReason = plusReason.value || "unknown";
       };
     }
     var chooseButton = byId("datasetChooseRootButton");
@@ -4172,7 +5331,7 @@ _FALLBACK_SCRIPT = r"""
 """
 
 
-_PAGE_VERSION = "real_teleop_gui_init_arm_v1"
+_PAGE_VERSION = "real_teleop_gui_init_qpos_speed_v3"
 
 
 def _html_text(value: Any) -> str:
@@ -4237,7 +5396,38 @@ def _encode_http_event_payload(payload: Mapping[str, Any]) -> str:
                 "round_trip_phase",
             )
         }
+        if event in {"episode_start", "task_select"} and "plus_variant_id" in payload:
+            details["plus_variant_id"] = str(payload.get("plus_variant_id", "") or "").strip()
+        if event == "episode_start":
+            for key in ("ignored_camera_keys", "ignored_tactile_keys"):
+                value = payload.get(key, [])
+                details[key] = (
+                    [str(item).strip() for item in value if str(item).strip()]
+                    if isinstance(value, list)
+                    else []
+                )
         event = event + ":" + json.dumps(
+            details,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    elif event == "episode_delete":
+        raw_index = str(payload.get("episode_index", "")).strip()
+        if not raw_index.isdigit():
+            return ""
+        event = f"episode_delete:{int(raw_index)}"
+    elif event == "plus_curation_save":
+        raw_index = str(payload.get("episode_index", "")).strip()
+        if not raw_index.isdigit():
+            return ""
+        details = {
+            "episode_index": int(raw_index),
+            "disposition": str(payload.get("disposition", "unknown") or "unknown").strip(),
+            "reason_code": str(payload.get("reason_code", "unknown") or "unknown").strip(),
+        }
+        if "pending_token" in payload:
+            details["pending_token"] = str(payload.get("pending_token", "") or "").strip()
+        event = "plus_curation_save:" + json.dumps(
             details,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -4620,20 +5810,40 @@ class CalibrationWebUiState:
     camera_status: dict[str, Any] = field(default_factory=dict)
     camera_self_check: dict[str, Any] = field(default_factory=dict)
     tactile_camera_status: dict[str, Any] = field(default_factory=dict)
+    dataset_modality_contract: dict[str, Any] = field(default_factory=dict)
+    hardware_status: dict[str, Any] = field(default_factory=dict)
     episode_recording_available: bool = False
     episode_recording: bool = False
     episode_dir: str = ""
     episode_frame_count: int | None = None
+    episode_attempted_sample_count: int | None = None
+    episode_rejection_counts: dict[str, Any] = field(default_factory=dict)
     episode_sample_hz: float | None = None
     episode_target_hz: float | None = None
     episode_tactile_write_hz: dict[str, Any] = field(default_factory=dict)
     episode_tactile_write_hz_mean: float | None = None
     episode_tactile_frame_counts: dict[str, Any] = field(default_factory=dict)
     episode_frequency_warning: dict[str, Any] = field(default_factory=dict)
+    calibration_validity_warning: dict[str, Any] = field(default_factory=dict)
     episode_event_status: str = "unavailable"
     episode_event_message: str = ""
     episode_last_episode_index: int | None = None
     episode_last_frame_count: int | None = None
+    # Optional Plus episode curation is a post-finalize sidecar.  These fields
+    # are inert when the feature is disabled and intentionally do not mirror
+    # any raw writer/row state.
+    plus_curation_enabled: bool = False
+    plus_curation_task_profile_id: str = ""
+    plus_curation_variants: list[dict[str, Any]] = field(default_factory=list)
+    plus_curation_variant_id: str = ""
+    plus_curation_disposition: str = "unknown"
+    plus_curation_reason_code: str = "unknown"
+    plus_curation_pending: bool = False
+    plus_curation_episode_index: int | None = None
+    plus_curation_pending_token: str = ""
+    plus_curation_pending_dataset_root: str = ""
+    plus_curation_status: str = "off"
+    plus_curation_message: str = ""
     dataset_base_root: str = ""
     dataset_root: str = ""
     dataset_dir_name: str = ""
@@ -4654,6 +5864,8 @@ class CalibrationWebUiState:
     camera_visualization_active: bool = False
     tactile_visualization_available: bool = False
     tactile_visualization_active: bool = False
+    tactile_solving_available: bool = False
+    tactile_solving_active: bool = False
     visualization_status: str = ""
     vive_calibration_profile_path: str = ""
     vive_calibration_profile_status: str = ""
@@ -4666,12 +5878,22 @@ class CalibrationWebUiState:
     fix_arm_available: bool = False
     fix_arm_selected_side: str = ""
     fix_arm_fixed_side: str = ""
+    fix_arm_fixed_sides: list[str] = field(default_factory=list)
     fix_arm_active: bool = False
     fix_arm_recalibrating: bool = False
     fix_arm_status: str = ""
     fix_arm_sample_count: int | None = None
     fix_arm_min_samples: int | None = None
     special_arm_control_mode: str = "manual"
+    foot_pad_requested: bool = False
+    foot_pad_available: bool = False
+    foot_pad_count: int = 0
+    foot_pad_status: str = "disabled"
+    foot_pad_status_label: str = "未启用"
+    foot_pad_status_message: str = ""
+    foot_pad_test_active: bool = False
+    foot_pad_test_last_event: str = ""
+    foot_pad_test_status: str = ""
     init_arm_available: bool = False
     init_arm_selected_side: str = ""
     init_arm_active_side: str = ""
@@ -4687,6 +5909,24 @@ class CalibrationWebUiState:
     init_arm_target_position_error_m: float | None = None
     init_arm_target_rotation_error_deg: float | None = None
     init_arm_stability_dwell_sec: float | None = None
+    init_arm_qpos_active: bool = False
+    init_arm_qpos_phase: str = "inactive"
+    init_arm_qpos_step_index: int | None = None
+    init_arm_qpos_step_count: int | None = None
+    init_arm_qpos_max_error_deg: float | None = None
+    init_arm_qpos_move_available: bool = False
+    startup_qpos_maintenance_enabled: bool = False
+    init_arm_sequence_active: bool = False
+    init_arm_sequence_side: str = ""
+    init_arm_sequence_phase: str = "idle"
+    init_arm_sequence_status: str = ""
+    init_arm_qpos_speed_scale_by_side: dict[str, float] = field(
+        default_factory=lambda: {"left": 5.0, "right": 5.0}
+    )
+    init_arm_qpos_speed_scale_min: float = 0.1
+    init_arm_qpos_speed_scale_max: float = 10.0
+    init_arm_qpos_speed_scale_default: float = 5.0
+    fix_hold_active: bool = False
     pose_snapshot_available: bool = False
     pose_snapshot_dir: str = ""
     pose_snapshot_count: int = 0
@@ -4842,7 +6082,11 @@ class CalibrationWebUi:
         if ":" in event_name and event_control not in {
             "movement_multiple_set",
             "gripper_force_set",
+            "gripper_force_persist",
+            "init_arm_qpos_speed_set",
             "episode_start",
+            "episode_delete",
+            "plus_curation_save",
             "task_select",
             "fix_arm_select",
             "init_arm_select",
@@ -4851,9 +6095,36 @@ class CalibrationWebUi:
         with self._state_lock:
             active_controls = set(self._state.active_controls)
             accepted = event_name in active_controls or event_control in active_controls
+            if accepted and event_control in {
+                "episode_start",
+                "episode_delete",
+                "device_retry",
+            }:
+                self._state.active_controls = [
+                    control
+                    for control in self._state.active_controls
+                    if str(control)
+                    not in {"episode_start", "episode_delete", "device_retry"}
+                ]
+            if accepted and event_control == "episode_start":
+                self._state.episode_event_status = "preparing"
+                self._state.episode_event_message = "开始数采请求已接收，正在等待运行时处理。"
+            if accepted and event_control == "episode_delete":
+                self._state.episode_event_status = "delete_queued"
+                self._state.episode_event_message = "删除请求已接收，正在等待数据集维护流程执行。"
+            if accepted and event_control == "plus_curation_save":
+                self._state.plus_curation_status = "saving"
+                self._state.plus_curation_message = "Plus 整理标签已提交，正在写入旁路 sidecar。"
             if (
-                event_name in {"c", "fix_arm_toggle", "g", "init_arm_toggle"}
-                or event_control in {"fix_arm_select", "init_arm_select"}
+                event_name in {
+                    "c",
+                    "fix_arm_toggle",
+                    "g",
+                    "init_arm_toggle",
+                    "init_arm_move_to_qpos",
+                    "init_arm_move_both_to_qpos",
+                }
+                or event_control in {"fix_arm_select", "init_arm_select", "episode_delete"}
             ):
                 status = "accepted" if accepted else "rejected"
                 controls = ",".join(sorted(str(item) for item in active_controls))
@@ -4872,13 +6143,14 @@ class CalibrationWebUi:
         self._events.put(event_name)
         return True
 
-    def consume_events(self) -> list[str]:
+    def consume_events(self, *, max_events: int = 64) -> list[str]:
         events: list[str] = []
-        while True:
+        for _ in range(max(1, int(max_events))):
             try:
                 events.append(self._events.get_nowait())
             except queue.Empty:
                 return events
+        return events
 
     def publish(self, **updates: Any) -> None:
         with self._state_lock:
@@ -4927,20 +6199,41 @@ class CalibrationWebUi:
                 "camera_status": dict(self._state.camera_status),
                 "camera_self_check": dict(self._state.camera_self_check),
                 "tactile_camera_status": dict(self._state.tactile_camera_status),
+                "dataset_modality_contract": dict(self._state.dataset_modality_contract),
+                "hardware_status": dict(self._state.hardware_status),
                 "episode_recording_available": self._state.episode_recording_available,
                 "episode_recording": self._state.episode_recording,
                 "episode_dir": self._state.episode_dir,
                 "episode_frame_count": self._state.episode_frame_count,
+                "episode_attempted_sample_count": self._state.episode_attempted_sample_count,
+                "episode_rejection_counts": dict(self._state.episode_rejection_counts),
                 "episode_sample_hz": self._state.episode_sample_hz,
                 "episode_target_hz": self._state.episode_target_hz,
                 "episode_tactile_write_hz": dict(self._state.episode_tactile_write_hz),
                 "episode_tactile_write_hz_mean": self._state.episode_tactile_write_hz_mean,
                 "episode_tactile_frame_counts": dict(self._state.episode_tactile_frame_counts),
                 "episode_frequency_warning": dict(self._state.episode_frequency_warning),
+                "calibration_validity_warning": dict(
+                    self._state.calibration_validity_warning
+                ),
                 "episode_event_status": self._state.episode_event_status,
                 "episode_event_message": self._state.episode_event_message,
                 "episode_last_episode_index": self._state.episode_last_episode_index,
                 "episode_last_frame_count": self._state.episode_last_frame_count,
+                "plus_curation_enabled": self._state.plus_curation_enabled,
+                "plus_curation_task_profile_id": self._state.plus_curation_task_profile_id,
+                "plus_curation_variants": [
+                    dict(item) for item in self._state.plus_curation_variants
+                ],
+                "plus_curation_variant_id": self._state.plus_curation_variant_id,
+                "plus_curation_disposition": self._state.plus_curation_disposition,
+                "plus_curation_reason_code": self._state.plus_curation_reason_code,
+                "plus_curation_pending": self._state.plus_curation_pending,
+                "plus_curation_episode_index": self._state.plus_curation_episode_index,
+                "plus_curation_pending_token": self._state.plus_curation_pending_token,
+                "plus_curation_pending_dataset_root": self._state.plus_curation_pending_dataset_root,
+                "plus_curation_status": self._state.plus_curation_status,
+                "plus_curation_message": self._state.plus_curation_message,
                 "dataset_base_root": self._state.dataset_base_root,
                 "dataset_root": self._state.dataset_root,
                 "dataset_dir_name": self._state.dataset_dir_name,
@@ -4961,6 +6254,8 @@ class CalibrationWebUi:
                 "camera_visualization_active": self._state.camera_visualization_active,
                 "tactile_visualization_available": self._state.tactile_visualization_available,
                 "tactile_visualization_active": self._state.tactile_visualization_active,
+                "tactile_solving_available": self._state.tactile_solving_available,
+                "tactile_solving_active": self._state.tactile_solving_active,
                 "visualization_status": self._state.visualization_status,
                 "vive_calibration_profile_path": self._state.vive_calibration_profile_path,
                 "vive_calibration_profile_status": self._state.vive_calibration_profile_status,
@@ -4973,12 +6268,22 @@ class CalibrationWebUi:
                 "fix_arm_available": self._state.fix_arm_available,
                 "fix_arm_selected_side": self._state.fix_arm_selected_side,
                 "fix_arm_fixed_side": self._state.fix_arm_fixed_side,
+                "fix_arm_fixed_sides": list(self._state.fix_arm_fixed_sides),
                 "fix_arm_active": self._state.fix_arm_active,
                 "fix_arm_recalibrating": self._state.fix_arm_recalibrating,
                 "fix_arm_status": self._state.fix_arm_status,
                 "fix_arm_sample_count": self._state.fix_arm_sample_count,
                 "fix_arm_min_samples": self._state.fix_arm_min_samples,
                 "special_arm_control_mode": self._state.special_arm_control_mode,
+                "foot_pad_requested": self._state.foot_pad_requested,
+                "foot_pad_available": self._state.foot_pad_available,
+                "foot_pad_count": self._state.foot_pad_count,
+                "foot_pad_status": self._state.foot_pad_status,
+                "foot_pad_status_label": self._state.foot_pad_status_label,
+                "foot_pad_status_message": self._state.foot_pad_status_message,
+                "foot_pad_test_active": self._state.foot_pad_test_active,
+                "foot_pad_test_last_event": self._state.foot_pad_test_last_event,
+                "foot_pad_test_status": self._state.foot_pad_test_status,
                 "init_arm_available": self._state.init_arm_available,
                 "init_arm_selected_side": self._state.init_arm_selected_side,
                 "init_arm_active_side": self._state.init_arm_active_side,
@@ -4994,6 +6299,18 @@ class CalibrationWebUi:
                 "init_arm_target_position_error_m": self._state.init_arm_target_position_error_m,
                 "init_arm_target_rotation_error_deg": self._state.init_arm_target_rotation_error_deg,
                 "init_arm_stability_dwell_sec": self._state.init_arm_stability_dwell_sec,
+                "init_arm_qpos_active": self._state.init_arm_qpos_active,
+                "init_arm_qpos_phase": self._state.init_arm_qpos_phase,
+                "init_arm_qpos_step_index": self._state.init_arm_qpos_step_index,
+                "init_arm_qpos_step_count": self._state.init_arm_qpos_step_count,
+                "init_arm_qpos_max_error_deg": self._state.init_arm_qpos_max_error_deg,
+                "init_arm_qpos_move_available": self._state.init_arm_qpos_move_available,
+                "startup_qpos_maintenance_enabled": self._state.startup_qpos_maintenance_enabled,
+                "init_arm_sequence_active": self._state.init_arm_sequence_active,
+                "init_arm_sequence_side": self._state.init_arm_sequence_side,
+                "init_arm_sequence_phase": self._state.init_arm_sequence_phase,
+                "init_arm_sequence_status": self._state.init_arm_sequence_status,
+                "fix_hold_active": self._state.fix_hold_active,
                 "pose_snapshot_available": self._state.pose_snapshot_available,
                 "pose_snapshot_dir": self._state.pose_snapshot_dir,
                 "pose_snapshot_count": self._state.pose_snapshot_count,

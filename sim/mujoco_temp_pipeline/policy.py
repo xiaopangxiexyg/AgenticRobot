@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import torch
 from torch import nn
@@ -31,17 +32,71 @@ class ActorCritic(nn.Module):
         observation_dim: int = 31,
         action_dim: int = 7,
         hidden_dim: int = 64,
+        proprio_dim: int | None = None,
+        image_shape: Sequence[int] | None = None,
+        image_pool_size: int = 1,
     ) -> None:
         super().__init__()
         self.observation_dim = int(observation_dim)
         self.action_dim = int(action_dim)
         self.hidden_dim = int(hidden_dim)
-        self.backbone = nn.Sequential(
-            nn.Linear(self.observation_dim, self.hidden_dim),
-            nn.Tanh(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.Tanh(),
-        )
+        self.image_shape = None if image_shape is None else tuple(int(v) for v in image_shape)
+        self.image_pool_size = int(image_pool_size)
+        if self.image_shape is not None:
+            if len(self.image_shape) != 3 or self.image_shape[0] <= 0:
+                raise ValueError("image_shape must be a positive CHW image shape.")
+            if self.image_shape[0] % 3 != 0:
+                raise ValueError("image_shape channel count must be a multiple of RGB channels.")
+            if any(value <= 0 for value in self.image_shape):
+                raise ValueError("image_shape dimensions must be positive.")
+            if self.image_pool_size not in {1, 3}:
+                raise ValueError("image_pool_size must be 1 or 3.")
+            self.image_dim = int(math.prod(self.image_shape))
+            self.proprio_dim = (
+                self.observation_dim - self.image_dim
+                if proprio_dim is None
+                else int(proprio_dim)
+            )
+            if self.proprio_dim <= 0 or self.proprio_dim + self.image_dim != self.observation_dim:
+                raise ValueError(
+                    "proprio_dim + image_shape product must equal observation_dim."
+                )
+            image_embedding_dim = max(16, self.hidden_dim // 2)
+            self.proprio_encoder = nn.Sequential(
+                nn.Linear(self.proprio_dim, self.hidden_dim),
+                nn.Tanh(),
+            )
+            self.image_encoder = nn.Sequential(
+                nn.Conv2d(self.image_shape[0], 16, kernel_size=5, stride=2, padding=2),
+                nn.Tanh(),
+                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                nn.Tanh(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.Tanh(),
+                nn.AdaptiveAvgPool2d((self.image_pool_size, self.image_pool_size)),
+                nn.Flatten(),
+                nn.Linear(64 * self.image_pool_size * self.image_pool_size, image_embedding_dim),
+                nn.Tanh(),
+            )
+            self.backbone = nn.Sequential(
+                nn.Linear(self.hidden_dim + image_embedding_dim, self.hidden_dim),
+                nn.Tanh(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.image_dim = 0
+            self.proprio_dim = self.observation_dim if proprio_dim is None else int(proprio_dim)
+            if self.proprio_dim != self.observation_dim:
+                raise ValueError("proprio_dim is only separate when image_shape is provided.")
+            self.proprio_encoder = None
+            self.image_encoder = None
+            self.backbone = nn.Sequential(
+                nn.Linear(self.observation_dim, self.hidden_dim),
+                nn.Tanh(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.Tanh(),
+            )
         self.actor_mean = nn.Linear(self.hidden_dim, self.action_dim)
         self.critic = nn.Linear(self.hidden_dim, 1)
         self.log_std = nn.Parameter(torch.full((self.action_dim,), -0.5))
@@ -56,13 +111,27 @@ class ActorCritic(nn.Module):
         if isinstance(module, nn.Linear):
             nn.init.orthogonal_(module.weight, gain=math.sqrt(2.0))
             nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv2d):
+            nn.init.orthogonal_(module.weight, gain=math.sqrt(2.0))
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def _features(self, observation: torch.Tensor) -> torch.Tensor:
         if observation.shape[-1] != self.observation_dim:
             raise ValueError(
                 f"Expected observation dim {self.observation_dim}, got {observation.shape}."
             )
-        return self.backbone(observation)
+        if self.image_shape is None:
+            return self.backbone(observation)
+        leading_shape = observation.shape[:-1]
+        flat = observation.reshape(-1, self.observation_dim)
+        proprio = flat[:, : self.proprio_dim]
+        image = flat[:, self.proprio_dim :].reshape(-1, *self.image_shape)
+        combined = torch.cat(
+            (self.proprio_encoder(proprio), self.image_encoder(image)), dim=-1
+        )
+        features = self.backbone(combined)
+        return features.reshape(*leading_shape, self.hidden_dim)
 
     def _distribution_and_value(
         self, observation: torch.Tensor

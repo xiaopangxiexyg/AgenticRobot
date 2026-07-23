@@ -65,8 +65,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-frame-index",
         type=int,
-        default=0,
-        help="Raw frame index used as SDK base frame before processing each stream.",
+        default=None,
+        help=(
+            "Explicit raw frame index to install as the SDK base frame before processing each "
+            "stream. Overrides any fixed sensor calibration for this run."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-policy",
+        choices=("auto", "required", "off"),
+        default="auto",
+        help="Load a fixed base frame by sensor serial when available, require one, or disable loading.",
+    )
+    parser.add_argument(
+        "--calibration-dir",
+        type=Path,
+        default=None,
+        help="Fixed calibration directory. Defaults to hardware/DMTAC_gripper/configs/tactile_calibration.",
+    )
+    parser.add_argument(
+        "--save-calibration",
+        action="store_true",
+        help="Persist the explicitly selected --base-frame-index for every sensor serial; requires one --episode.",
     )
     parser.add_argument(
         "--max-frames",
@@ -74,6 +94,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Debug limit per sensor stream. 0 processes all frames.",
     )
+    parser.add_argument(
+        "--compression",
+        choices=("zstd", "none"),
+        default="zstd",
+        help="Force stream storage compression. Zstd is lossless and enabled by default.",
+    )
+    parser.add_argument("--compression-level", type=int, default=3)
+    parser.add_argument("--chunk-frames", type=int, default=16)
     parser.add_argument(
         "--sdk-root",
         type=Path,
@@ -118,7 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         remote_addr=str(args.remote_addr),
         pc_host=str(args.pc_host),
         pc_port=int(args.pc_port),
-        base_frame_index=int(args.base_frame_index),
+        base_frame_index=(
+            None if args.base_frame_index is None else int(args.base_frame_index)
+        ),
+        calibration_policy=str(args.calibration_policy),
+        calibration_dir=args.calibration_dir,
+        save_calibration=bool(args.save_calibration),
+        compression=str(args.compression),
+        compression_level=int(args.compression_level),
+        chunk_frames=int(args.chunk_frames),
         max_frames=int(args.max_frames),
         sdk_root=args.sdk_root,
         overwrite=bool(args.overwrite),

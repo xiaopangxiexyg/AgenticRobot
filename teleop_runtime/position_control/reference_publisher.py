@@ -15,6 +15,7 @@ from robot_motion.position_control import (
     PositionReferenceFrame,
     PositionSideReference,
     ReferenceTimeline,
+    position_qref_fingerprint,
     position_reference_audit_event,
 )
 
@@ -286,6 +287,34 @@ class PositionReferencePublisher:
                 POSITION_TRANSPORT_TARGET_SEQUENCE_KEY
             ),
         }
+        qref_fingerprint = position_qref_fingerprint(q_ref)
+        candidate_selection = (
+            metadata.get("ik_candidate_selection")
+            if isinstance(metadata.get("ik_candidate_selection"), Mapping)
+            else {}
+        )
+        candidate_certificate = (
+            candidate_selection.get("candidate_certificate")
+            if isinstance(candidate_selection, Mapping)
+            and isinstance(candidate_selection.get("candidate_certificate"), Mapping)
+            else {}
+        )
+        certified_fingerprints = (
+            candidate_certificate.get("qref_fingerprint_by_side")
+            if isinstance(candidate_certificate, Mapping)
+            and isinstance(candidate_certificate.get("qref_fingerprint_by_side"), Mapping)
+            else {}
+        )
+        frame_metadata.update(
+            {
+                "qref_fingerprint": qref_fingerprint,
+                "candidate_certificate_sequence": candidate_certificate.get("sequence"),
+                "candidate_certificate_qref_fingerprint": certified_fingerprints.get(side),
+                "candidate_certificate_qref_match": bool(
+                    certified_fingerprints.get(side) == qref_fingerprint
+                ),
+            }
+        )
         urdf_root_from_base = self._urdf_root_from_base_by_side.get(side)
         source_target_pose_base = frame_metadata["source_target_pose_base"]
         if urdf_root_from_base is not None:
@@ -352,6 +381,30 @@ class PositionReferencePublisher:
                     "position_reference_sequence": int(frame.sequence),
                     "position_reference_q_ref": np.asarray(reference.q_ref, dtype=float).copy(),
                     "position_reference_pose_ref": np.asarray(reference.pose_ref, dtype=float).copy(),
+                    "position_reference_candidate_binding": {
+                        "epoch": int(frame.epoch),
+                        "sequence": int(frame.sequence),
+                        "transport_target_sequence": dict(
+                            frame.frame_metadata.get(
+                                POSITION_TRANSPORT_TARGET_SEQUENCES_KEY,
+                                {},
+                            )
+                        ).get(side),
+                        "qref_fingerprint": reference.frame_metadata.get(
+                            "qref_fingerprint"
+                        ),
+                        "candidate_certificate_sequence": (
+                            reference.frame_metadata.get(
+                                "candidate_certificate_sequence"
+                            )
+                        ),
+                        "candidate_certificate_qref_match": bool(
+                            reference.frame_metadata.get(
+                                "candidate_certificate_qref_match",
+                                False,
+                            )
+                        ),
+                    },
                 }
             )
 

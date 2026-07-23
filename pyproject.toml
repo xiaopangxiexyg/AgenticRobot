@@ -30,6 +30,7 @@ dataset = [
     "pandas==2.3.3",
     "pyarrow==24.0.0",
     "Pillow==12.3.0",
+    "zstandard==0.25.0",
 ]
 sim = [
     "mujoco==3.10.0",
@@ -44,6 +45,11 @@ model = [
 openpi = [
     "websockets==16.0",
     "msgpack==1.2.1",
+]
+vla_scratch = [
+    # Optional only for a DexTeleop process that directly owns the native
+    # vla-scratch ZMQ client. The model/server environment remains external.
+    "pyzmq==27.1.0",
 ]
 hardware = [
     "opencv-contrib-python==4.10.0.84",
@@ -68,6 +74,7 @@ hardware = [
 where = ["."]
 include = [
     "cameras*",
+    "control_station*",
     "dataset_contracts*",
     "dataset_interface*",
     "deployments*",
@@ -86,6 +93,7 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.yaml", "*.yml", "*.xml", "*.urdf", "*.obj", "*.stl"]
+control_station = ["web/static/*.html", "web/static/*.js", "web/static/*.css"]
 
 
 [tool.dexteleop.environment]

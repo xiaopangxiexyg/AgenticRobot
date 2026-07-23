@@ -1,4 +1,4 @@
-"""A minimal state-privileged Cube-Lift Gymnasium debug environment."""
+"""Minimal normal and privileged Cube-Lift Gymnasium environments."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .spec import CubeLiftActionSpec, CubeLiftObservationSpec, require_gymnasium
 
 
 DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH = Path(
-    "sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json"
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v1.json"
 )
 
 try:
@@ -32,13 +32,15 @@ except ModuleNotFoundError:
 
 
 class CubeLiftEnv(_EnvBase):
-    """Right-arm joint-delta task: lift the center-table cube above a threshold.
+    """Right-arm Cube-Lift task with pose actions for physical policies.
 
-    The robot is held through ``kinematic_direct_qpos_debug``. The temporary
-    task uses bilateral contact to acquire a debug grasp latch, after which the
-    cube follows the grasp frame until the gripper opens. This environment is
-    useful for RL API, reset, observation, clock and contact-pipeline
-    development—not sim2real or physical-grasp claims.
+    The default task uses the fitted RM65 and bilateral DM-Tac actuator paths;
+    its seven-value arm action is a bounded TCP pose increment resolved to qref
+    by the shared RM65 planner. The retained v0 task uses joint deltas.
+    The retained v0 task can still select ``kinematic_direct_qpos_debug``
+    explicitly. The default normal task uses physical contact and a
+    real-observable proprioceptive policy state. The opt-in privileged expert
+    task may acquire a debug grasp latch for teacher/curriculum experiments.
     """
 
     metadata = {"render_modes": [], "render_fps": 15}
@@ -54,13 +56,38 @@ class CubeLiftEnv(_EnvBase):
         self.config = (
             config if isinstance(config, CubeLiftTaskConfig) else CubeLiftTaskConfig.load(config)
         )
+        self._actuated_delegate = None
+        if self.config.uses_actuated_position:
+            if scene is not None:
+                raise ValueError(
+                    "Actuated CubeLiftEnv does not accept an externally owned scene; "
+                    "use CubeLiftKernel for custom scene composition."
+                )
+            # The actuated task deliberately shares the exact scalar kernel
+            # used by batch workers. This prevents viewer/debug rollout from
+            # silently substituting the legacy direct-qpos controller.
+            from .fast_env import FastCubeLiftEnv
+
+            self._actuated_delegate = FastCubeLiftEnv(self.config)
+            self.scene = self._actuated_delegate.kernel.scene
+            self.action_spec = CubeLiftActionSpec(
+                layout_version=self.config.action_layout
+            )
+            self.observation_spec = CubeLiftObservationSpec(
+                layout_version=self.config.observation_layout
+            )
+            self.action_space = self.action_spec.gym_space()
+            self.observation_space = self.observation_spec.gym_space()
+            return
         contract = self.config.base_contract()
         self._validate_base_contract(contract)
         self.scene = scene if scene is not None else MujocoScene.from_contract(contract)
         self._validate_scene()
 
-        self.action_spec = CubeLiftActionSpec()
-        self.observation_spec = CubeLiftObservationSpec()
+        self.action_spec = CubeLiftActionSpec(layout_version=self.config.action_layout)
+        self.observation_spec = CubeLiftObservationSpec(
+            layout_version=self.config.observation_layout
+        )
         self.action_space = self.action_spec.gym_space()
         self.observation_space = self.observation_spec.gym_space()
         self.controller = DirectQposDebugController(
@@ -103,6 +130,8 @@ class CubeLiftEnv(_EnvBase):
         seed: int | None = None,
         options: Mapping[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        if self._actuated_delegate is not None:
+            return self._actuated_delegate.reset(seed=seed, options=options)
         if _gymnasium is None:
             require_gymnasium()
         super().reset(seed=seed)
@@ -146,6 +175,8 @@ class CubeLiftEnv(_EnvBase):
         return observation, self._info(reset=True)
 
     def step(self, action: Any) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        if self._actuated_delegate is not None:
+            return self._actuated_delegate.step(action)
         if self._needs_reset:
             raise RuntimeError("CubeLiftEnv.reset() must be called before step().")
         values = self.action_spec.coerce(action)
@@ -222,6 +253,8 @@ class CubeLiftEnv(_EnvBase):
 
     def close(self) -> None:
         """Keep the Gymnasium lifecycle explicit; this env owns no renderer yet."""
+        if self._actuated_delegate is not None:
+            self._actuated_delegate.close()
 
     def _validate_base_contract(self, contract) -> None:
         timing = contract.timing

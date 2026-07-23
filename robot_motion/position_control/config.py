@@ -141,8 +141,9 @@ POSITION_PROFILE = PositionControlProfile(
     rates=PositionControlRates(),
 )
 
-# Deployment-compatible profile matching the accepted position-teleop clock
-# contract while keeping the historical shared default available unchanged.
+# Explicit name for the canonical real position-control clock contract.  It is
+# intentionally rate-identical to POSITION_PROFILE; the longer name remains a
+# stable CLI/config spelling for existing deployments.
 POSITION_15_60_120_PROFILE = PositionControlProfile(
     name=POSITION_15_60_120_PROFILE_NAME,
     rates=PositionControlRates(
@@ -154,12 +155,16 @@ POSITION_15_60_120_PROFILE = PositionControlProfile(
 )
 
 # Explicit compatibility profile for historical commands and datasets.  The
-# default position-control profile is 15 -> 75 -> 150 Hz, but selecting this
-# legacy name must continue to mean 15 -> 45 -> 150 Hz rather than silently
-# changing the timing contract of an existing replay/deploy command.
+# production default is 15 -> 60 -> 120 Hz; selecting this legacy name must
+# continue to mean 15 -> 45 -> 150 Hz rather than silently changing an existing
+# replay/deploy command.
 POSITION_45_150_PROFILE = PositionControlProfile(
     name=POSITION_45_150_PROFILE_NAME,
-    rates=PositionControlRates(reference_hz=45.0, ik_hz=45.0),
+    rates=PositionControlRates(
+        reference_hz=45.0,
+        ik_hz=45.0,
+        command_hz=150.0,
+    ),
 )
 
 DEFAULT_POSITION_PROFILE = POSITION_PROFILE

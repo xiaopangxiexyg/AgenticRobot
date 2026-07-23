@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from ..operator_labels import OperatorLabelStateMachine
+from ..hand_state_polling import hand_state_tactile_arrays
 from .config import UmiCollectionConfig
 from .pose_adapter import UmiPoseAdapter
 from .types import SnapshotRejection, UmiPoseMeasurement, UmiSample
@@ -36,6 +37,23 @@ def _frame_timestamp(value: Any) -> float | None:
             if result is not None:
                 return result
     return None
+
+
+def _gripper_measurement_timing(
+    state: Mapping[str, Any],
+    *,
+    cutoff_timestamp: float,
+    max_age_sec: float,
+) -> tuple[float | None, str | None]:
+    joint_timestamp = _finite(state.get("joint_timestamp"))
+    if joint_timestamp is None:
+        return None, "missing_gripper_measurement_timestamp"
+    age = float(cutoff_timestamp) - joint_timestamp
+    if age < -1e-3:
+        return age, f"future_gripper_measurement:{age:.3f}"
+    if age > float(max_age_sec):
+        return age, f"stale_gripper_measurement:{age:.3f}"
+    return age, None
 
 
 class UmiSnapshotAssembler:
@@ -69,6 +87,7 @@ class UmiSnapshotAssembler:
         reasons: list[str] = []
         channels = self.vive_source.get_latest_channels_at_or_before(t0)
         poses: dict[str, UmiPoseMeasurement] = {}
+        vive_rotation_diagnostics: dict[str, dict[str, float | bool]] = {}
         for side in ("left", "right"):
             side_config = self.config.side(side)
             channel = channels.get(side_config.tracker_channel)
@@ -94,8 +113,12 @@ class UmiSnapshotAssembler:
                 continue
             try:
                 sequence_int = int(sequence)
-                raw_pose = self.pose_adapter.raw_pose7(side, channel.value)
-                desk_pose = self.pose_adapter.desk_pose7(side, channel.value)
+                normalized_tracker, rotation_diagnostics = (
+                    self.pose_adapter.normalize_tracker_pose(channel.value)
+                )
+                raw_pose = self.pose_adapter.raw_pose7(side, normalized_tracker)
+                desk_pose = self.pose_adapter.desk_pose7(side, normalized_tracker)
+                vive_rotation_diagnostics[side] = rotation_diagnostics
                 poses[side] = UmiPoseMeasurement(
                     side=side,
                     raw_tcp_pose7=raw_pose,
@@ -114,6 +137,8 @@ class UmiSnapshotAssembler:
 
         camera_frames: dict[str, Any] = {}
         for camera_key in ("left_wrist", "right_wrist"):
+            if camera_key in self.config.ignored_camera_keys:
+                continue
             selector = self.camera_selectors.get(camera_key)
             match = None if selector is None else selector(t0)
             selected_timestamp = _frame_timestamp(match)
@@ -129,25 +154,42 @@ class UmiSnapshotAssembler:
                 continue
             camera_frames[camera_key] = deepcopy(match)
 
-        hand_states = self.hand_state_poller.latest_at_or_before(t0)
+        hand_states = {
+            str(side): dict(state)
+            for side, state in self.hand_state_poller.latest_at_or_before(t0).items()
+            if isinstance(state, Mapping)
+        }
         for side in ("left", "right"):
             state = hand_states.get(side)
             if not isinstance(state, Mapping):
                 reasons.append(f"{side}:missing_gripper_state")
                 continue
             measured = _finite(state.get("gripper_measured_scalar"))
-            telemetry_age = _finite(state.get("telemetry_snapshot_age_sec"))
             if measured is None:
                 reasons.append(f"{side}:missing_gripper_measurement")
-            if telemetry_age is None or telemetry_age > self.config.timing.gripper_max_age_sec:
-                reasons.append(f"{side}:stale_gripper")
+            joint_age, timing_rejection = _gripper_measurement_timing(
+                state,
+                cutoff_timestamp=t0,
+                max_age_sec=self.config.timing.gripper_max_age_sec,
+            )
+            state["joint_age_sec"] = joint_age
+            if timing_rejection is not None:
+                reasons.append(f"{side}:{timing_rejection}")
             tactile_age = _finite(state.get("tactile_snapshot_age_sec"))
-            if self.config.tactile_required and (
-                not state.get("tactile_dict")
+            if side not in self.config.ignored_tactile_keys and self.config.tactile_required and (
+                not hand_state_tactile_arrays(state)
                 or tactile_age is None
                 or tactile_age > self.config.timing.tactile_max_age_sec
             ):
                 reasons.append(f"{side}:missing_or_stale_tactile")
+            if side in self.config.ignored_tactile_keys:
+                state["tactile"] = None
+                state["tactile_dict"] = None
+                state["tactile_timestamp"] = None
+                state["tactile_frame_ids"] = {}
+                state["tactile_shapes"] = {}
+                state["tactile_devices"] = []
+                state["tactile_ignored_by_dataset_contract"] = True
 
         commands = {side: float(value) for side, value in self.gripper_command_provider().items()}
         if set(commands) != {"left", "right"} or any(
@@ -172,6 +214,7 @@ class UmiSnapshotAssembler:
                 "embodiment": "umi_dual_wrist",
                 "embodiment_has_arm": False,
                 "pose_action_semantics": "current_measured_tcp_absolute",
+                "vive_rotation_normalization_by_side": vive_rotation_diagnostics,
             },
         )
 

@@ -1,5 +1,8 @@
 # RM65 Control And Calibration
 
+> 本页维护 RM65 单设备控制与标定工具。整机设备检查与标定顺序统一从
+> [`docs/hardware/README.md`](../../docs/hardware/README.md) 开始。
+
 This folder wraps RealMan API2 `Robotic_Arm` version `1.1.5` for the RM65 arms.
 
 - Left arm IP: `192.168.101.21`

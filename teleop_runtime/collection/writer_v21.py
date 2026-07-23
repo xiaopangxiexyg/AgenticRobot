@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shutil
 import threading
@@ -10,8 +12,11 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from dataset_contracts.causal_snapshot import DEFAULT_CAUSAL_SNAPSHOT_CONTRACT
+from dataset_contracts.v23_validation import validate_v23_row_causal_snapshots
 from dataset_contracts.pose_frames import (
     POSE_FRAME_CONTRACT_METADATA_KEY,
+    POSE_STORAGE_FRAME_DESK,
     PoseFrameContract,
     PoseFrameContractError,
 )
@@ -39,6 +44,7 @@ from dataset_contracts.wrist_depth import (
 )
 
 from ..action import (
+    ArmActionSpec,
     arm_action_specs_metadata,
     hand_action_specs_metadata,
     normalize_arm_action_specs,
@@ -47,6 +53,12 @@ from ..action import (
 from ..recording import _to_serializable
 from .arm_mode_labels import ARM_MODE_IDS, ARM_MODE_SCHEMA
 from .async_writer import WriteJob
+from .hand_state_polling import hand_state_tactile_arrays
+from .pose_storage import (
+    bind_collection_row_pose_storage,
+    validate_v23_collection_row_actual_tcp,
+)
+from .row_encoder import CollectionRowEncoder
 from .sample_assembler import CollectorSample
 from .schema_v21 import (
     camera_video_channel,
@@ -55,12 +67,11 @@ from .schema_v21 import (
     episode_id_from_index,
     write_rows_to_parquet,
 )
-from .schema_v22 import collector_sample_to_v22_row
-from .pose_storage import (
-    bind_collection_row_pose_storage,
-    validate_v23_collection_row_actual_tcp,
+from .schema_v22 import (
+    LAST_ACTION_INITIALIZATION_METADATA_KEY,
+    STRICT_LAST_ACTION_INITIALIZATION_METADATA,
+    collector_sample_to_v22_row,
 )
-from .row_encoder import CollectionRowEncoder
 
 
 ROW_JOB_KIND = "lerobot_v21.row"
@@ -77,6 +88,52 @@ TACTILE_COMPRESSION_LZ4 = "lz4"
 TACTILE_COMPRESSION_ZSTD = "zstd"
 TACTILE_CHUNK_FRAME_COUNT = 32
 WRIST_DEPTH_STALE_REPEAT_FAILURE_STREAK = 8
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fsync_file_and_parent(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    parent_fd = os.open(path.parent, flags)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+@dataclass(frozen=True)
+class LegacyFinalizedVideoArtifact:
+    """Durable MP4 artifact facts emitted only by the opt-in finalize API."""
+
+    camera_key: str
+    artifact_relative_path: str
+    artifact_sha256: str
+    artifact_byte_count: int
+    encoding: str
+    compression: str
+    video_frame_index_by_sample_frame_index: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class LegacyEpisodeArtifactReport:
+    episode_index: int
+    video_artifacts: tuple[LegacyFinalizedVideoArtifact, ...] = ()
 
 
 def _normalize_tactile_compression(value: Any) -> str:
@@ -226,11 +283,26 @@ class LeRobotV21WriterConfig:
             raise ValueError("tactile_storage must be parquet or external.")
         self.tactile_storage = storage
         self.tactile_compression = _normalize_tactile_compression(self.tactile_compression)
-        self.arm_action_specs = normalize_arm_action_specs(self.arm_action_specs)
+        requested_arm_action_specs = self.arm_action_specs
         self.hand_action_specs = normalize_hand_action_specs(self.hand_action_specs)
         self.policy_io_layout_provenance = dict(self.policy_io_layout_provenance or {})
         self.strict_v22_policy_io = bool(self.strict_v22_policy_io)
         self.dataset_metadata = dict(self.dataset_metadata or {})
+        if self.strict_v22_policy_io and self.row_encoder is None:
+            configured_last_action = self.dataset_metadata.get(
+                LAST_ACTION_INITIALIZATION_METADATA_KEY
+            )
+            if (
+                configured_last_action is not None
+                and configured_last_action != STRICT_LAST_ACTION_INITIALIZATION_METADATA
+            ):
+                raise ValueError(
+                    "dataset_metadata last_action_initialization conflicts with the "
+                    "strict standard row encoder contract."
+                )
+            self.dataset_metadata[LAST_ACTION_INITIALIZATION_METADATA_KEY] = dict(
+                STRICT_LAST_ACTION_INITIALIZATION_METADATA
+            )
         if self.policy_io_layout is not None:
             if isinstance(self.policy_io_layout, Mapping):
                 self.policy_io_layout = PolicyIOLayout.from_dict(self.policy_io_layout)
@@ -242,6 +314,31 @@ class LeRobotV21WriterConfig:
                 )
         elif self.strict_v22_policy_io:
             raise ValueError("strict_v22_policy_io requires policy_io_layout.")
+        if requested_arm_action_specs is None and self.policy_io_layout is not None:
+            self.arm_action_specs = {
+                side: ArmActionSpec(
+                    side=side,
+                    controlled_frame=self.policy_io_layout.arm_controlled_frame_by_side[side],
+                    reference_frame=self.policy_io_layout.arm_reference_frame_by_side[side],
+                )
+                for side in ("left", "right")
+            }
+        else:
+            self.arm_action_specs = normalize_arm_action_specs(requested_arm_action_specs)
+        if self.policy_io_layout is not None:
+            for side, spec in self.arm_action_specs.items():
+                layout_controlled = self.policy_io_layout.arm_controlled_frame_by_side[side]
+                layout_reference = self.policy_io_layout.arm_reference_frame_by_side[side]
+                if (
+                    spec.controlled_frame != layout_controlled
+                    or spec.reference_frame != layout_reference
+                ):
+                    raise ValueError(
+                        "arm_action_specs disagree with policy_io_layout for "
+                        f"{side}: controlled/reference="
+                        f"{spec.controlled_frame!r}/{spec.reference_frame!r} != "
+                        f"{layout_controlled!r}/{layout_reference!r}."
+                    )
         if self.pose_frame_contract is not None:
             if isinstance(self.pose_frame_contract, Mapping):
                 self.pose_frame_contract = PoseFrameContract.from_dict(
@@ -255,6 +352,18 @@ class LeRobotV21WriterConfig:
                 raise ValueError(
                     "v2.3 pose_frame_contract requires the v2.2-compatible policy_io_layout."
                 )
+            for side in self.pose_frame_contract.source.active_sides:
+                expected_reference = (
+                    self.pose_frame_contract.canonical_absolute_frame
+                    if self.pose_frame_contract.pose_storage_frame == POSE_STORAGE_FRAME_DESK
+                    else self.pose_frame_contract.source.raw_frame(side)
+                )
+                actual_reference = self.policy_io_layout.arm_reference_frame_by_side[side]
+                if actual_reference != expected_reference:
+                    raise ValueError(
+                        "v2.3 policy_io_layout arm reference frame disagrees with pose storage "
+                        f"for {side}: {actual_reference!r} != {expected_reference!r}."
+                    )
 
 
 @dataclass
@@ -271,6 +380,9 @@ class _VideoState:
     expected_frame_count: int = 0
     written_frame_count: int = 0
     missing_frame_count: int = 0
+    video_frame_index_by_sample_frame_index: dict[int, int] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -436,6 +548,9 @@ class LeRobotV21Writer:
         self._next_episode_index = 0
         self._finalized_episode_count = 0
         self._finalized_frame_count = 0
+        self._planned_tactile_snapshot_refs: dict[
+            tuple[int, str], tuple[int, int]
+        ] = {}
         self._prepare_dataset_root()
 
     @property
@@ -463,6 +578,19 @@ class LeRobotV21Writer:
     def next_sample_index(self) -> int:
         with self._lock:
             return int(self._finalized_frame_count)
+
+    def reload_finalized_dataset_state(self) -> None:
+        """Refresh counters after an idle, out-of-band dataset maintenance operation."""
+        with self._lock:
+            if self._episodes:
+                raise RuntimeError("Cannot reload dataset state while an episode is active.")
+            self._next_episode_index = 0
+            self._finalized_episode_count = 0
+            self._finalized_frame_count = 0
+            # The complete dataset directory may have been removed while this
+            # idle writer remained alive. Recreate the required structure and
+            # then discover persisted counters from the current filesystem.
+            self._prepare_dataset_root()
 
     @property
     def policy_io_layout(self) -> PolicyIOLayout | None:
@@ -544,6 +672,7 @@ class LeRobotV21Writer:
 
     def _validate_existing_pose_frame_contract(self, existing: Mapping[str, Any]) -> None:
         configured = self.pose_frame_contract
+        populated = bool(existing.get("frame_count", 0) or existing.get("episode_count", 0))
         existing_payload = existing.get(POSE_FRAME_CONTRACT_METADATA_KEY)
         if configured is None:
             if existing_payload is not None:
@@ -552,7 +681,7 @@ class LeRobotV21Writer:
                 )
             return
         if existing_payload is None:
-            if bool(existing.get("frame_count", 0) or existing.get("episode_count", 0)):
+            if populated:
                 raise PoseFrameContractError(
                     "Refusing to append a v2.3 pose contract to a populated dataset without one."
                 )
@@ -566,6 +695,26 @@ class LeRobotV21Writer:
             raise PoseFrameContractError(
                 "Existing dataset pose_frame_contract differs from the writer configuration."
             )
+        expected_patch = self._pose_frame_metadata_patch()
+        for key in (
+            "pose_frame_contract_hash",
+            V23_POSE_STORAGE_FRAME_METADATA_KEY,
+            V23_RELATIVE_ACTION_SUPPORTED_METADATA_KEY,
+            V23_POSE_ACTION_MODE_METADATA_KEY,
+            "causal_snapshot_contract",
+            "causal_snapshot_contract_detail",
+            "causal_snapshot_contract_hash",
+        ):
+            if key not in existing:
+                if populated:
+                    raise PoseFrameContractError(
+                        f"Refusing to append without immutable v2.3 metadata {key!r}."
+                    )
+                continue
+            if existing[key] != expected_patch[key]:
+                raise PoseFrameContractError(
+                    f"Existing dataset v2.3 metadata {key!r} differs from writer configuration."
+                )
 
     def _prepare_dataset_root(self) -> None:
         self.meta_dir.mkdir(parents=True, exist_ok=True)
@@ -732,9 +881,11 @@ class LeRobotV21Writer:
         return {
             "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
             POSE_FRAME_CONTRACT_METADATA_KEY: contract.to_dict(),
+            "pose_frame_contract_hash": contract.contract_hash,
             V23_POSE_STORAGE_FRAME_METADATA_KEY: contract.pose_storage_frame,
             V23_RELATIVE_ACTION_SUPPORTED_METADATA_KEY: True,
             V23_POSE_ACTION_MODE_METADATA_KEY: "absolute",
+            **DEFAULT_CAUSAL_SNAPSHOT_CONTRACT.metadata_patch(),
         }
 
     def write_calibration_snapshot(self, name: str, payload: Any) -> Path:
@@ -877,7 +1028,13 @@ class LeRobotV21Writer:
                 raise PoseFrameContractError(
                     "Episode pose_frame_contract differs from the dataset contract."
                 )
-        metadata.update(self._pose_frame_metadata_patch())
+        patch = self._pose_frame_metadata_patch()
+        for key, expected in patch.items():
+            if key in metadata and metadata[key] != expected:
+                raise PoseFrameContractError(
+                    f"Episode v2.3 metadata {key!r} differs from the dataset contract."
+                )
+        metadata.update(patch)
 
     def _episode_parquet_relative_path(self, episode_index: int) -> str:
         chunk_id = chunk_id_from_episode_index(
@@ -1018,25 +1175,7 @@ class LeRobotV21Writer:
         self,
         hand_state: Mapping[str, Any],
     ) -> dict[str, np.ndarray]:
-        arrays: dict[str, np.ndarray] = {}
-        tactile_dict = hand_state.get("tactile_dict")
-        if isinstance(tactile_dict, Mapping):
-            for key, value in tactile_dict.items():
-                if value is None:
-                    continue
-                array = np.asarray(value)
-                if array.size <= 0:
-                    continue
-                arrays[str(key)] = array
-        if arrays:
-            return arrays
-        tactile = hand_state.get("tactile")
-        if tactile is None:
-            return {}
-        array = np.asarray(tactile, dtype=np.float32).reshape(-1)
-        if array.size <= 0:
-            return {}
-        return {"vector": array}
+        return hand_state_tactile_arrays(hand_state)
 
     def _plan_external_tactile_jobs(
         self,
@@ -1049,6 +1188,15 @@ class LeRobotV21Writer:
             hand_state = sample.hand_states.get(side) or {}
             arrays = self._tactile_arrays_from_hand_state(hand_state)
             has_tactile = bool(arrays)
+            snapshot_sequence_raw = hand_state.get("tactile_snapshot_sequence")
+            snapshot_sequence = None
+            if not isinstance(snapshot_sequence_raw, (bool, np.bool_)):
+                try:
+                    candidate = int(snapshot_sequence_raw)
+                except (TypeError, ValueError):
+                    candidate = 0
+                if candidate > 0 and candidate == snapshot_sequence_raw:
+                    snapshot_sequence = candidate
             expectations[side] = has_tactile
             if not has_tactile:
                 continue
@@ -1057,12 +1205,26 @@ class LeRobotV21Writer:
                 side,
             )
             sensor_keys = sorted(arrays)
+            planned_frame_index: int | None = None
+            is_new_snapshot = True
+            if snapshot_sequence is not None:
+                planner_key = (int(sample.episode_index), side)
+                with self._lock:
+                    previous = self._planned_tactile_snapshot_refs.get(planner_key)
+                    if previous is not None and previous[0] == snapshot_sequence:
+                        planned_frame_index = int(previous[1])
+                        is_new_snapshot = False
+                    else:
+                        planned_frame_index = 0 if previous is None else int(previous[1]) + 1
             refs[side] = {
                 "format": TACTILE_STREAM_FORMAT,
                 "path": manifest_relative_path,
-                "frame_index": None,
+                "frame_index": planned_frame_index,
                 "sensor_keys": sensor_keys,
             }
+            if not is_new_snapshot:
+                expectations[side] = False
+                continue
             jobs.append(
                 WriteJob(
                     kind=TACTILE_FRAME_JOB_KIND,
@@ -1081,6 +1243,20 @@ class LeRobotV21Writer:
                         "field_by_key": dict(hand_state.get("tactile_field_by_key", {}) or {}),
                         "fields": list(hand_state.get("tactile_fields", ()) or ()),
                         "version": hand_state.get("tactile_version"),
+                        "snapshot_sequence": snapshot_sequence,
+                        "planned_frame_index": planned_frame_index,
+                        "snapshot_source_timestamp": hand_state.get(
+                            "tactile_snapshot_source_timestamp"
+                        ),
+                        "snapshot_available_timestamp": hand_state.get(
+                            "tactile_snapshot_available_timestamp"
+                        ),
+                        "snapshot_source_clock": hand_state.get(
+                            "tactile_snapshot_source_clock"
+                        ),
+                        "snapshot_available_clock": hand_state.get(
+                            "tactile_snapshot_available_clock"
+                        ),
                     },
                 )
             )
@@ -1223,12 +1399,47 @@ class LeRobotV21Writer:
                 row,
                 contract=self.pose_frame_contract,
             )
+            arm_source_clocks = ["local_wall_time"]
+            if self.pose_frame_contract.source.source_family == "vive_umi":
+                arm_source_clocks.extend(
+                    [
+                        "vive_sender_monotonic_calibrated_to_local_wall",
+                        "vive_receiver_wall_fallback",
+                    ]
+                )
+            validate_v23_row_causal_snapshots(
+                row,
+                active_sides=self.pose_frame_contract.source.active_sides,
+                arm_source_clocks=arm_source_clocks,
+            )
             row = bind_collection_row_pose_storage(
                 row,
                 contract=self.pose_frame_contract,
             )
+            row["arm_action_specs_json"] = json.dumps(
+                arm_action_specs_metadata(self.config.arm_action_specs),
+                ensure_ascii=True,
+                sort_keys=True,
+            )
         if not self.config.write_video:
             camera_expectations = {camera_key: False for camera_key in camera_expectations}
+        # Commit tactile deduplication only after row encoding and every v2.3
+        # fail-closed check succeeded.  A rejected row must not make a later
+        # valid row believe that its large immutable snapshot was written.
+        with self._lock:
+            for tactile_job in tactile_jobs:
+                sequence = tactile_job.payload.get("snapshot_sequence")
+                frame_index = tactile_job.payload.get("planned_frame_index")
+                if sequence is None or frame_index is None:
+                    continue
+                planner_key = (
+                    int(tactile_job.payload["episode_index"]),
+                    str(tactile_job.payload["side"]),
+                )
+                self._planned_tactile_snapshot_refs[planner_key] = (
+                    int(sequence),
+                    int(frame_index),
+                )
         jobs = [
             WriteJob(
                 kind=ROW_JOB_KIND,
@@ -1606,6 +1817,9 @@ class LeRobotV21Writer:
             assert state.writer is not None
             state.writer.write(frame)
             state.written_frame_count += 1
+            state.video_frame_index_by_sample_frame_index[sample_index] = int(
+                state.next_video_frame_index
+            )
             row = episode.rows_by_frame.get(sample_index)
             if row is not None:
                 row[f"{camera_video_channel(state.camera_key)}.video_frame_index"] = int(
@@ -1707,6 +1921,11 @@ class LeRobotV21Writer:
                 "field_by_key": dict(payload.get("field_by_key", {}) or {}),
                 "fields": list(payload.get("fields", ()) or ()),
                 "version": payload.get("version"),
+                "snapshot_sequence": payload.get("snapshot_sequence"),
+                "snapshot_source_timestamp": payload.get("snapshot_source_timestamp"),
+                "snapshot_available_timestamp": payload.get("snapshot_available_timestamp"),
+                "snapshot_source_clock": payload.get("snapshot_source_clock"),
+                "snapshot_available_clock": payload.get("snapshot_available_clock"),
             }
         )
         return tactile_frame_index, sensor_keys
@@ -1978,6 +2197,9 @@ class LeRobotV21Writer:
             for state in episode.wrist_depth_states.values():
                 state.close_handle()
                 shutil.rmtree(state.path_dir, ignore_errors=True)
+            for key in tuple(self._planned_tactile_snapshot_refs):
+                if key[0] == int(episode_index):
+                    self._planned_tactile_snapshot_refs.pop(key, None)
             self._recompute_next_episode_index_locked()
             return True
 
@@ -1986,7 +2208,8 @@ class LeRobotV21Writer:
         episode_index: int,
         *,
         summary: Mapping[str, Any] | None = None,
-    ) -> None:
+        collect_artifact_report: bool = False,
+    ) -> LegacyEpisodeArtifactReport | None:
         episode = self._ensure_episode_state(int(episode_index))
         for state in episode.video_states.values():
             self._drain_video_state(episode, state)
@@ -2056,6 +2279,39 @@ class LeRobotV21Writer:
                 wrist_depth_frame_stats[key]["foreground_fraction_mean"] = (
                     0.0 if frame_count <= 0 else float(state.foreground_fraction_sum) / float(frame_count)
                 )
+
+        artifact_report = None
+        if collect_artifact_report:
+            video_artifacts: list[LegacyFinalizedVideoArtifact] = []
+            for camera_key, state in sorted(episode.video_states.items()):
+                if state.next_video_frame_index <= 0:
+                    continue
+                if not state.path.is_file():
+                    raise RuntimeError(
+                        "Finalized video artifact is missing for "
+                        f"camera {camera_key!r}."
+                    )
+                _fsync_file_and_parent(state.path)
+                stat = state.path.stat()
+                video_artifacts.append(
+                    LegacyFinalizedVideoArtifact(
+                        camera_key=camera_key,
+                        artifact_relative_path=state.relative_path,
+                        artifact_sha256=_file_sha256(state.path),
+                        artifact_byte_count=int(stat.st_size),
+                        encoding=f"mp4/{self.config.video_codec}",
+                        compression="none",
+                        video_frame_index_by_sample_frame_index=tuple(
+                            sorted(
+                                state.video_frame_index_by_sample_frame_index.items()
+                            )
+                        ),
+                    )
+                )
+            artifact_report = LegacyEpisodeArtifactReport(
+                episode_index=int(episode.episode_index),
+                video_artifacts=tuple(video_artifacts),
+            )
 
         rows = [episode.rows_by_frame[index] for index in sorted(episode.rows_by_frame)]
         if not rows:
@@ -2190,7 +2446,11 @@ class LeRobotV21Writer:
         self._finalized_episode_count += 1
         self._finalized_frame_count += int(stats.frame_count)
         self._write_info_locked()
+        for key in tuple(self._planned_tactile_snapshot_refs):
+            if key[0] == int(episode_index):
+                self._planned_tactile_snapshot_refs.pop(key, None)
         del self._episodes[episode_index]
+        return artifact_report
 
     def finalize_episode(
         self,
@@ -2200,3 +2460,20 @@ class LeRobotV21Writer:
     ) -> None:
         with self._lock:
             self._finalize_episode_locked(episode_index, summary=summary)
+
+    def finalize_episode_with_artifact_report(
+        self,
+        episode_index: int,
+        *,
+        summary: Mapping[str, Any] | None = None,
+    ) -> LegacyEpisodeArtifactReport:
+        """Finalize normally and return durable specialized-artifact facts."""
+
+        with self._lock:
+            report = self._finalize_episode_locked(
+                episode_index,
+                summary=summary,
+                collect_artifact_report=True,
+            )
+        assert report is not None
+        return report

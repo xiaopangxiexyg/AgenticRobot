@@ -154,7 +154,7 @@ def position_retargeter_stability_switches(
 ) -> dict[str, bool]:
     """Resolve live-teleop retargeter stability independently of transport mode.
 
-    The 150 Hz CANFD transport only replaces the final qpos sink.  It must not
+    The 120 Hz CANFD transport only replaces the final qpos sink.  It must not
     disable the high-rate target smoother, local safe-candidate selection, or the
     inactive-side hold that prevents a stationary arm from following nullspace
     changes caused by the moving arm's coupled IK solve.

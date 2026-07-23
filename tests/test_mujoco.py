@@ -17,8 +17,7 @@ from sim.mujoco.urdf import discover_camera_mounts, parse_urdf
 from teleop_runtime.schemas import EffectorCommand
 
 
-URDF = Path("assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf")
-V3_DUAL_URDF = Path(
+URDF = Path(
     "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 )
 
@@ -162,7 +161,7 @@ f 1 2 3
 
 
 def test_mjcf_conversion_preserves_v3_rm65_base_link_obj_mtl_colors() -> None:
-    root = ET.fromstring(convert_urdf_to_mjcf_xml(parse_urdf(V3_DUAL_URDF), camera_mounts=()))
+    root = ET.fromstring(convert_urdf_to_mjcf_xml(parse_urdf(URDF), camera_mounts=()))
     geoms = root.findall(".//geom[@name]")
     base_visuals = [
         geom

@@ -1,5 +1,25 @@
 # Dataset Interface
 
+## v2.4 ControlTrace logical readers
+
+`dataset_interface.control_trace` implements the scoped M4C.1 read boundary.
+By default it exposes an episode only when the immutable capture commit points
+to a valid seal and the canonical session WAL reproduces the sealed range,
+dependencies, membership, and hashes. A sealed episode without a commit can
+only be opened with `require_commit=False` for explicit audit use.
+
+`materialize_shadow_evaluation_view()` is rebuilt from core facts and contains
+`would_select_action` plus legacy-execution and replay-binding lineage. It never
+creates authoritative `selected_action` or a bare training `action` column.
+
+`materialize_actual_decision_view()` is the authoritative counterpart. It
+accepts only `arbitration_decision` lineage, joins the published directive,
+shared-safety result, command, dispatch receipt, and measurement facts, and
+keeps real variable decision intervals. Its `decided_at` comes from the
+recorded computation completion time rather than the scheduler tick. The row
+uses `selected_action` with `action_stage=selected_pre_safety` and never creates
+an unqualified `action` training target.
+
 `dataset_interface` 是训练时输入层，不负责离线生成或修复 mask。它读取 DexTeleop dataset
 的 RGB 视频与 wrist final keep-mask，并可在 DataLoader worker 内为 front 派生固定边界 mask，
 统一交给同一套在线 masked augmentation。
@@ -270,6 +290,15 @@ episode 的 `frame_count` 枚举合法起点，因此不会跨 episode。
 默认 `tail_policy="drop"`，只生成完整 chunk。模型可显式选择 `tail_policy="pad_last"`，
 在 pose 转换后重复最后一个有效 action。reader 不会自行从 episode 长度猜测或切换策略。
 
+native v2.3 数据进入训练前可运行：
+
+```bash
+python -m utils.dataset_postprocess validate-v23 /path/to/dataset
+```
+
+这是只读的 finalized-dataset acceptance scan，不会把 v2.2 compatibility view 改写或标记成
+native v2.3。
+
 checkpoint artifact 不能只因为 model-facing 接口是 v2.3 就把训练来源统一写成“v2.3”。
 从旧 v2.2 raw 通过默认 identity compatibility 构造 relative action 时，应显式使用：
 
@@ -286,10 +315,40 @@ pose_training_data = PoseTrainingDataContract.v22_raw_identity(
 `PolicyArtifactContract.pose_training_data`；部署据此分别限制 identity compatibility runtime
 或要求显式 canonical-desk runtime contract，避免旧 raw state checkpoint 被误当作原生 v2.3。
 
+若训练 rows 来自 `v22-to-v23-desk` 的物理坐标迁移产物，使用
+`PoseTrainingDataContract.v22_canonical_desk()`。它要求显式 canonical-desk runtime
+binding，但保留原始来源为 v2.2；不得写成 `native_v23()`。
+
 ## 训练数据有效性
 
 `meta/modality_validity.json` 是可选文件。文件不存在时，兼容历史数据集：所有 episode 和
 所有已声明视频视角默认都可训练。
+
+采集时明确忽视的相机/触觉属于数据集级契约，写在同一个文件的 `capture` 字段，而不是
+episode metadata：
+
+```json
+{
+  "schema_version": "dexteleop.modality_validity.v1",
+  "capture": {
+    "schema_version": "dexteleop.capture_modalities.v1",
+    "scope": "dataset",
+    "ignored_modalities": {
+      "camera": ["right_wrist"],
+      "tactile": ["left"]
+    },
+    "missing_value_policy": {
+      "camera": "frame_absent_valid_false",
+      "tactile": "value_absent_valid_false"
+    }
+  }
+}
+```
+
+仅全新或空白数据集可以首次绑定、改写该契约；数据集一旦包含帧或 episode，后续追加必须
+与已有契约完全一致。没有 `capture` 声明的历史非空数据集按“没有忽视项”处理。训练数据选择器
+可通过 `DexTeleopDatasetIndex.ignored_camera_keys` 和 `ignored_tactile_keys` 在加载样本前筛选
+数据集，不能假设同一数据集内存在不同的 episode 忽视规则。
 
 当采集故障导致整个 episode 或某个相机视角无效时，可以使用以下 v1 格式标记。`valid: false`
 的 episode 会被跳过；某个 `video.<camera_key>` 为 false 时，只有请求该视角的训练样本会被跳过。

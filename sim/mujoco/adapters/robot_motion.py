@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
@@ -31,8 +31,22 @@ from robot_motion.runtime import Rig, TeleopCommand
 from robot_motion.runtime.dispatch import CommandDispatchReceipt
 from sim.contracts import TimingSpec
 
+from ..actuation import (
+    GripperActuationProfile,
+    MujocoActuatedPositionExecutor,
+    MujocoDmtacGripperExecutor,
+    PositionActuationProfile,
+    identified_bimanual_dmtac_gripper_profile,
+    rm65_bimanual_udp_feedback_profile,
+)
 from ..control import DirectQposCommand, DirectQposDebugController
 from ..scene import MujocoScene
+from .reference_lineage import (
+    MujocoPlannerCommandFrameObservation,
+    MujocoReferenceTargetActivationObservation,
+    build_mujoco_planner_command_frame_observation,
+    build_mujoco_reference_target_activation_observation,
+)
 
 
 _SIDES = ("left", "right")
@@ -47,7 +61,7 @@ def _six_positive(values: Sequence[float], *, name: str) -> tuple[float, ...]:
 
 @dataclass(frozen=True)
 class MujocoPositionExecutionConfig:
-    """Real-aligned qref-to-qcmd settings for prescribed MuJoCo execution."""
+    """Real-aligned 15/60/120 settings with a selectable MuJoCo sender."""
 
     timing: TimingSpec
     active_sides: tuple[str, ...] = _SIDES
@@ -62,6 +76,15 @@ class MujocoPositionExecutionConfig:
     )
     degraded_speed_scale: float = DEFAULT_POSITION_DEGRADED_SPEED_SCALE
     follow_qpos_alpha: float = RM65_POSITION_TRACKING_FOLLOW_ALPHA
+    # Physical RM65 + DM-Tac execution is the simulation default. Callers that
+    # intentionally need the legacy prescribed-qpos path must pass both fields
+    # as ``None`` explicitly; absence is no longer an implicit debug switch.
+    actuation_profile: PositionActuationProfile | None = field(
+        default_factory=rm65_bimanual_udp_feedback_profile
+    )
+    gripper_actuation_profile: GripperActuationProfile | None = field(
+        default_factory=identified_bimanual_dmtac_gripper_profile
+    )
     realtime_worker: bool = True
     worker_join_timeout_sec: float = 2.0
 
@@ -106,14 +129,41 @@ class MujocoPositionExecutionConfig:
             raise ValueError("follow_qpos_alpha must be in (0, 1].")
         object.__setattr__(self, "degraded_speed_scale", degraded)
         object.__setattr__(self, "follow_qpos_alpha", follow)
+        if self.actuation_profile is not None:
+            if not isinstance(self.actuation_profile, PositionActuationProfile):
+                raise TypeError(
+                    "actuation_profile must be a PositionActuationProfile or None."
+                )
+            if set(self.actuation_profile.joint_names_by_side) != set(sides):
+                raise ValueError(
+                    "actuation profile sides must exactly match active_sides."
+                )
+        if self.gripper_actuation_profile is not None:
+            if self.actuation_profile is None:
+                raise ValueError(
+                    "physical gripper actuation requires the physical arm sender."
+                )
+            if not isinstance(self.gripper_actuation_profile, GripperActuationProfile):
+                raise TypeError(
+                    "gripper_actuation_profile must be a GripperActuationProfile or None."
+                )
+            if set(self.gripper_actuation_profile.side_by_gripper.values()) != set(sides):
+                raise ValueError(
+                    "gripper actuation profile sides must exactly match active_sides."
+                )
 
 
 @dataclass(frozen=True)
 class _QueuedReference:
     sequence: int
     published_monotonic_time: float
+    activate_at: float
+    reference_segment_id: str | None
+    execution_epoch: int | None
+    group_segment_generation: int | None
     qref_by_side: Mapping[str, np.ndarray]
     metadata_by_side: Mapping[str, Mapping[str, object]]
+    gripper_close_by_name: Mapping[str, float]
 
 
 class MujocoPositionExecutionRig(Rig):
@@ -146,18 +196,49 @@ class MujocoPositionExecutionRig(Rig):
         self._next_reference_sequence = 1
         self._next_command_sequence = 1
         self._pending_reference: _QueuedReference | None = None
+        self._scheduled_activation_guard: (
+            Callable[[str, int, int, float], str] | None
+        ) = None
+        self._scheduled_active_work_guard: (
+            Callable[[str, int, int, float], None] | None
+        ) = None
         self._hold_reason: str | None = None
         self._last_reference: _QueuedReference | None = None
         self._last_worker_error: str | None = None
         self._worker_physics_ticks = 0
         self._worker_deadline_misses = 0
         self._pending_proposals: dict[str, JointTrajectoryProposal] = {}
+        self._reference_activation_observations: list[
+            MujocoReferenceTargetActivationObservation
+        ] = []
+        self._planner_command_frame_observations: list[
+            MujocoPlannerCommandFrameObservation
+        ] = []
         self._planners: dict[str, AccelerationLimitedJointTrajectoryPlanner] = {}
-        self._direct = DirectQposDebugController(
-            scene,
-            config.timing,
-            active_sides=config.active_sides,
-            record_ticks=False,
+        if config.actuation_profile is None:
+            self._execution = DirectQposDebugController(
+                scene,
+                config.timing,
+                active_sides=config.active_sides,
+                record_ticks=False,
+            )
+            # Compatibility seam for existing direct-qpos diagnostics/tests.
+            self._direct: DirectQposDebugController | None = self._execution
+        else:
+            self._execution = MujocoActuatedPositionExecutor(
+                scene,
+                config.timing,
+                config.actuation_profile,
+                active_sides=config.active_sides,
+            )
+            self._direct = None
+        self._gripper_execution = (
+            None
+            if config.gripper_actuation_profile is None
+            else MujocoDmtacGripperExecutor(
+                scene,
+                config.gripper_actuation_profile,
+            )
         )
         self._accepted_qcmd_by_side: dict[str, np.ndarray] = {
             side: np.asarray(scene.get_arm_qpos(side), dtype=float).reshape(6).copy()
@@ -204,13 +285,20 @@ class MujocoPositionExecutionRig(Rig):
                     monotonic_time=self._clock_origin,
                 )
                 self._planners[side] = planner
-            self._direct.reset(
+            self._execution.reset(
                 DirectQposCommand(
                     sequence=0,
                     qpos_by_side=self._accepted_qcmd_by_side,
                     source="mujoco_position_execution_start",
                 )
             )
+            if self._gripper_execution is not None:
+                self._gripper_execution.reset(
+                    {
+                        name: self.scene.get_gripper_close(name)
+                        for name in self.config.gripper_actuation_profile.joint_names_by_gripper
+                    }
+                )
             self._stop_event.clear()
             self._started = True
             if self.config.realtime_worker:
@@ -229,6 +317,81 @@ class MujocoPositionExecutionRig(Rig):
         self,
         command: TeleopCommand,
         phase_recorder=None,
+    ) -> dict[str, CommandDispatchReceipt]:
+        return self._queue_commands(
+            command,
+            phase_recorder=phase_recorder,
+            activate_at=None,
+            reference_segment_id=None,
+            execution_epoch=None,
+            group_segment_generation=None,
+            operation="queue_mujoco_qref",
+        )
+
+    def send_scheduled_commands(
+        self,
+        command: TeleopCommand,
+        *,
+        activate_at: float,
+        reference_segment_id: str,
+        execution_epoch: int,
+        group_segment_generation: int,
+    ) -> dict[str, CommandDispatchReceipt]:
+        """Queue one qref without activating it before its segment START."""
+
+        activation = float(activate_at)
+        if not math.isfinite(activation):
+            raise ValueError("activate_at must be finite.")
+        segment_id = str(reference_segment_id).strip()
+        if not segment_id:
+            raise ValueError("reference_segment_id must be non-empty.")
+        return self._queue_commands(
+            command,
+            phase_recorder=None,
+            activate_at=activation,
+            reference_segment_id=segment_id,
+            execution_epoch=int(execution_epoch),
+            group_segment_generation=int(group_segment_generation),
+            operation="queue_mujoco_scheduled_qref",
+        )
+
+    def bind_scheduled_generation_guards(
+        self,
+        *,
+        activation_guard: Callable[[str, int, int, float], str],
+        active_work_guard: Callable[[str, int, int, float], None],
+    ) -> None:
+        """Bind the receiver-owned generation checks before this rig starts.
+
+        These guards are intentionally receiver callbacks rather than a second
+        generation registry in the Rig.  The activation check runs before a
+        future qref is accepted by the planners; the active-work check runs
+        before every subsequent planner/qcmd proposal derived from it.
+        """
+
+        if not callable(activation_guard) or not callable(active_work_guard):
+            raise TypeError("Scheduled generation guards must be callable.")
+        with self._lock:
+            if self._started:
+                raise RuntimeError("Scheduled generation guards bind before start().")
+            if (
+                self._scheduled_activation_guard is not None
+                or self._scheduled_active_work_guard is not None
+            ):
+                raise RuntimeError("Scheduled generation guards are already bound.")
+            self._scheduled_activation_guard = activation_guard
+            self._scheduled_active_work_guard = active_work_guard
+
+    def _queue_commands(
+        self,
+        command: TeleopCommand,
+        *,
+        phase_recorder,
+        activate_at: float | None,
+        reference_segment_id: str | None,
+        execution_epoch: int | None,
+        group_segment_generation: int | None,
+        operation: str,
     ) -> dict[str, CommandDispatchReceipt]:
         del phase_recorder
         expected = {f"{side}_arm" for side in self.config.active_sides}
@@ -249,9 +412,56 @@ class MujocoPositionExecutionRig(Rig):
                 raise ValueError(f"{effector.effector_name} qref must contain six finite values.")
             qref_by_side[side] = qref.copy()
             metadata_by_side[side] = dict(effector.metadata)
+        gripper_targets: dict[str, float] = {}
+        hand_receipts: dict[str, CommandDispatchReceipt] = {}
+        hand_commands = {
+            side: command.commands.get(f"{side}_hand")
+            for side in self.config.active_sides
+        }
+        present_hands = {side: value for side, value in hand_commands.items() if value is not None}
+        if present_hands and self._gripper_execution is None:
+            raise ValueError(
+                "hand commands require a configured physical gripper actuation profile."
+            )
+        if self._gripper_execution is not None:
+            assert self.config.gripper_actuation_profile is not None
+            for side, effector in present_hands.items():
+                assert effector is not None
+                if effector.command_type not in {"joint_vector", "gripper_scalar"}:
+                    raise ValueError(
+                        f"{effector.effector_name} must be joint_vector or gripper_scalar."
+                    )
+                values = np.asarray(effector.value, dtype=float).reshape(-1)
+                if values.shape == (1,):
+                    close = float(values[0])
+                elif values.shape == (6,):
+                    slot = int((effector.metadata or {}).get("gripper_slot", 0))
+                    if not 0 <= slot < 6:
+                        raise ValueError("gripper_slot must be in [0, 5].")
+                    close = float(values[slot])
+                else:
+                    raise ValueError(
+                        f"{effector.effector_name} must contain one scalar or six hand slots."
+                    )
+                if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+                    raise ValueError(
+                        f"{effector.effector_name} close target must be in [0, 1]."
+                    )
+                gripper_name = self.config.gripper_actuation_profile.gripper_for_side(side)
+                gripper_targets[gripper_name] = close
+                hand_receipts[f"{side}_hand"] = CommandDispatchReceipt(
+                    effector_name=f"{side}_hand",
+                    accepted=True,
+                    operation="queue_mujoco_gripper_close",
+                    status="queued",
+                    metadata={"gripper_name": gripper_name, "target_close": close},
+                )
         published = float(self._clock())
         if not math.isfinite(published):
             raise RuntimeError("monotonic clock returned a non-finite value.")
+        activation = published if activate_at is None else float(activate_at)
+        if activation + 1e-12 < published:
+            raise ValueError("A scheduled qref cannot activate before publication.")
         with self._lock:
             if not self._started:
                 raise RuntimeError(
@@ -267,25 +477,84 @@ class MujocoPositionExecutionRig(Rig):
             self._pending_reference = _QueuedReference(
                 sequence=sequence,
                 published_monotonic_time=published,
+                activate_at=activation,
+                reference_segment_id=reference_segment_id,
+                execution_epoch=execution_epoch,
+                group_segment_generation=group_segment_generation,
                 qref_by_side=qref_by_side,
                 metadata_by_side=metadata_by_side,
+                gripper_close_by_name=(
+                    dict(gripper_targets)
+                    if reference_segment_id is not None
+                    else {}
+                ),
             )
+            # Compatibility: immediate/manual dispatch retains the historical
+            # behavior of entering the gripper transport queue at publication.
+            # Scheduled compound references must wait for the same guarded
+            # activation point as their arm qref.
+            if gripper_targets and reference_segment_id is None:
+                assert self._gripper_execution is not None
+                self._gripper_execution.queue_close_targets(gripper_targets)
             self._hold_reason = None
-        return {
+        receipts = {
             f"{side}_arm": CommandDispatchReceipt(
                 effector_name=f"{side}_arm",
                 accepted=True,
-                operation="queue_mujoco_qref",
+                operation=operation,
                 status="queued",
-                metadata={"reference_sequence": sequence},
+                timestamp=published,
+                metadata={
+                    "reference_sequence": sequence,
+                    "activate_at": activation,
+                    "reference_segment_id": reference_segment_id,
+                    "execution_epoch": execution_epoch,
+                    "group_segment_generation": group_segment_generation,
+                },
             )
             for side in self.config.active_sides
         }
+        receipts.update(
+            {
+                name: CommandDispatchReceipt(
+                    effector_name=receipt.effector_name,
+                    accepted=receipt.accepted,
+                    operation=receipt.operation,
+                    status=receipt.status,
+                    timestamp=published,
+                    result_code=receipt.result_code,
+                    result_text=receipt.result_text,
+                    metadata=receipt.metadata,
+                )
+                for name, receipt in hand_receipts.items()
+            }
+        )
+        return receipts
 
     def hold_motion(self, reason: str = "manual hold") -> None:
         with self._lock:
             self._pending_reference = None
+            # A receiver cancellation invalidates both future activation and
+            # planner work derived from the previously active generation.
+            # Drop that reference identity and quick-stop at the last accepted
+            # command until a new scheduled reference activates.
+            self._last_reference = None
+            self._pending_proposals = {}
             self._hold_reason = str(reason).strip() or "manual hold"
+            if self._started:
+                sequence = self._next_reference_sequence
+                self._next_reference_sequence += 1
+                planner_now = (
+                    self._clock_origin + self._execution.physics_time_sec
+                )
+                for planner in self._planners.values():
+                    planner.quick_stop(
+                        sequence=sequence,
+                        monotonic_time=planner_now,
+                        reason=self._hold_reason,
+                    )
+            if self._gripper_execution is not None:
+                self._gripper_execution.hold_targets()
 
     def accepted_qcmd_by_side(self) -> dict[str, np.ndarray]:
         with self._lock:
@@ -294,13 +563,27 @@ class MujocoPositionExecutionRig(Rig):
                 for side, qpos in self._accepted_qcmd_by_side.items()
             }
 
+    @property
+    def reference_activation_observations(
+        self,
+    ) -> tuple[MujocoReferenceTargetActivationObservation, ...]:
+        with self._lock:
+            return tuple(self._reference_activation_observations)
+
+    @property
+    def planner_command_frame_observations(
+        self,
+    ) -> tuple[MujocoPlannerCommandFrameObservation, ...]:
+        with self._lock:
+            return tuple(self._planner_command_frame_observations)
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
+            execution_metadata = dict(self._execution.execution_metadata)
             return {
                 "started": self._started,
                 "ready": self._started and self._last_worker_error is None,
-                "execution_mode": "kinematic_direct_qpos_debug",
-                "robot_dynamics": "not_simulated",
+                **execution_metadata,
                 "timing": self.config.timing.to_dict(),
                 "accepted_qcmd_by_side": {
                     side: qpos.tolist()
@@ -312,13 +595,48 @@ class MujocoPositionExecutionRig(Rig):
                 "pending_reference_sequence": (
                     None if self._pending_reference is None else self._pending_reference.sequence
                 ),
+                "pending_reference_activate_at": (
+                    None if self._pending_reference is None else self._pending_reference.activate_at
+                ),
+                "pending_reference_segment_id": (
+                    None
+                    if self._pending_reference is None
+                    else self._pending_reference.reference_segment_id
+                ),
+                "reference_activation_observation_count": len(
+                    self._reference_activation_observations
+                ),
+                "planner_command_frame_observation_count": len(
+                    self._planner_command_frame_observations
+                ),
                 "last_worker_error": self._last_worker_error,
                 "physics_ticks": self._worker_physics_ticks,
                 "deadline_misses": self._worker_deadline_misses,
                 "planner_by_side": {
                     side: planner.snapshot() for side, planner in self._planners.items()
                 },
+                "execution": (
+                    self._execution.snapshot()
+                    if isinstance(self._execution, MujocoActuatedPositionExecutor)
+                    else execution_metadata
+                ),
+                "gripper_execution": (
+                    None
+                    if self._gripper_execution is None
+                    else self._gripper_execution.snapshot()
+                ),
             }
+
+    def sync_viewer(self, viewer_handle) -> None:
+        """Synchronize a passive viewer without racing the physics owner."""
+
+        if viewer_handle is None:
+            return
+        sync = getattr(viewer_handle, "sync", None)
+        if not callable(sync):
+            raise TypeError("viewer_handle must expose sync().")
+        with self._lock:
+            sync()
 
     def step_physics(self) -> None:
         """Advance one deterministic physics tick; used by tests and offline replay."""
@@ -328,15 +646,20 @@ class MujocoPositionExecutionRig(Rig):
                 raise RuntimeError("MujocoPositionExecutionRig.start() is required.")
             if self._last_worker_error is not None:
                 raise RuntimeError(self._last_worker_error)
-            planner_now = self._clock_origin + self._direct.physics_time_sec
+            planner_now = self._clock_origin + self._execution.physics_time_sec
             self._consume_reference_locked(planner_now)
             command = self._build_due_command_locked(planner_now)
             proposals = self._pending_proposals
             try:
-                self._direct.step_physics(command)
+                if self._gripper_execution is not None:
+                    self._gripper_execution.before_physics_step(
+                        physics_time_sec=self._execution.physics_time_sec,
+                        timestep_sec=self.config.timing.physics_timestep_sec,
+                    )
+                self._execution.step_physics(command)
                 if proposals:
                     accepted = {
-                        side: self._direct.accepted_arm_qpos(side)
+                        side: self._execution.accepted_arm_qpos(side)
                         for side in self.config.active_sides
                     }
                     # Validate every arm before committing either planner.  The
@@ -365,6 +688,33 @@ class MujocoPositionExecutionRig(Rig):
                     self._accepted_qcmd_by_side = {
                         side: qpos.copy() for side, qpos in accepted.items()
                     }
+                    active_reference = self._last_reference
+                    if (
+                        active_reference is not None
+                        and active_reference.reference_segment_id is not None
+                        and active_reference.execution_epoch is not None
+                        and active_reference.group_segment_generation is not None
+                        and command is not None
+                    ):
+                        self._planner_command_frame_observations.append(
+                            build_mujoco_planner_command_frame_observation(
+                                reference_segment_id=(
+                                    active_reference.reference_segment_id
+                                ),
+                                reference_sequence=active_reference.sequence,
+                                command_sequence=command.sequence,
+                                execution_epoch=active_reference.execution_epoch,
+                                group_segment_generation=(
+                                    active_reference.group_segment_generation
+                                ),
+                                scheduled_for=planner_now,
+                                observed_at=float(self._clock()),
+                                qref_by_side=active_reference.qref_by_side,
+                                proposals_by_side=proposals,
+                                follow_qcmd_by_side=command.qpos_by_side,
+                                accepted_qcmd_by_side=accepted,
+                            )
+                        )
             except Exception:
                 for side, proposal in proposals.items():
                     try:
@@ -375,7 +725,7 @@ class MujocoPositionExecutionRig(Rig):
                         # retry/recovery cannot mix two planner generations.
                         pass
                 actual = {
-                    side: self._direct.accepted_arm_qpos(side)
+                    side: self._execution.accepted_arm_qpos(side)
                     for side in self.config.active_sides
                 }
                 for side, planner in self._planners.items():
@@ -399,9 +749,9 @@ class MujocoPositionExecutionRig(Rig):
     def _consume_reference_locked(self, planner_now: float) -> None:
         reference = self._pending_reference
         hold_reason = self._hold_reason
-        self._pending_reference = None
-        self._hold_reason = None
         if hold_reason is not None:
+            self._pending_reference = None
+            self._hold_reason = None
             sequence = self._next_reference_sequence
             self._next_reference_sequence += 1
             for planner in self._planners.values():
@@ -413,6 +763,31 @@ class MujocoPositionExecutionRig(Rig):
             return
         if reference is None:
             return
+        if planner_now + 1e-12 < reference.activate_at:
+            return
+        if reference.reference_segment_id is not None:
+            if (
+                reference.execution_epoch is None
+                or reference.group_segment_generation is None
+            ):
+                raise RuntimeError(
+                    "A scheduled reference requires execution epoch and generation."
+                )
+            guard = self._scheduled_activation_guard
+            if guard is None:
+                raise RuntimeError("Scheduled reference activation guard is not bound.")
+            generation_activation_id = guard(
+                reference.reference_segment_id,
+                reference.execution_epoch,
+                reference.group_segment_generation,
+                planner_now,
+            )
+            if not str(generation_activation_id).strip():
+                raise RuntimeError("Scheduled activation guard returned no fact ID.")
+        else:
+            generation_activation_id = None
+        self._pending_reference = None
+        self._hold_reason = None
         for side in self.config.active_sides:
             metadata = reference.metadata_by_side[side]
             policy = classify_position_trajectory_policy(
@@ -438,12 +813,68 @@ class MujocoPositionExecutionRig(Rig):
                     mode=policy.mode,
                     reason=policy.reason,
                 )
+        if reference.gripper_close_by_name:
+            if self._gripper_execution is None:
+                raise RuntimeError(
+                    "Scheduled gripper targets require a configured gripper executor."
+                )
+            self._gripper_execution.queue_close_targets(
+                reference.gripper_close_by_name
+            )
         self._last_reference = reference
+        if (
+            reference.reference_segment_id is not None
+            and reference.execution_epoch is not None
+            and reference.group_segment_generation is not None
+        ):
+            self._reference_activation_observations.append(
+                build_mujoco_reference_target_activation_observation(
+                    reference_segment_id=reference.reference_segment_id,
+                    generation_activation_id=generation_activation_id,
+                    reference_sequence=reference.sequence,
+                    execution_epoch=reference.execution_epoch,
+                    group_segment_generation=reference.group_segment_generation,
+                    scheduled_for=reference.activate_at,
+                    activated_at_worker_time=planner_now,
+                    observed_at=float(self._clock()),
+                    qref_by_side=reference.qref_by_side,
+                    activation_status_by_side={
+                        side: classify_position_trajectory_policy(
+                            reference.metadata_by_side[side],
+                            metadata_mapping(
+                                reference.metadata_by_side[side].get(
+                                    "singularity_metadata"
+                                )
+                            ),
+                            degraded_speed_scale=self.config.degraded_speed_scale,
+                        ).mode
+                        for side in self.config.active_sides
+                    },
+                )
+            )
 
     def _build_due_command_locked(self, planner_now: float) -> DirectQposCommand | None:
         self._pending_proposals = {}
-        if not self._direct.command_due:
+        if not self._execution.command_due:
             return None
+        active_reference = self._last_reference
+        if active_reference is not None and active_reference.reference_segment_id is not None:
+            if (
+                active_reference.execution_epoch is None
+                or active_reference.group_segment_generation is None
+            ):
+                raise RuntimeError(
+                    "An active scheduled reference requires execution epoch and generation."
+                )
+            guard = self._scheduled_active_work_guard
+            if guard is None:
+                raise RuntimeError("Scheduled active-work generation guard is not bound.")
+            guard(
+                active_reference.reference_segment_id,
+                active_reference.execution_epoch,
+                active_reference.group_segment_generation,
+                planner_now,
+            )
         qcmd_by_side: dict[str, np.ndarray] = {}
         for side in self.config.active_sides:
             proposal = self._planners[side].propose(monotonic_time=planner_now)

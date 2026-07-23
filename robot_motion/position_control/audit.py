@@ -212,7 +212,12 @@ class PositionReferenceAuditEvent:
 
 @dataclass(frozen=True)
 class PositionCommandAuditEvent:
-    """One 150 Hz scheduler tick and its optional transport attempt/result."""
+    """One command-rate scheduler tick and its optional transport attempt/result.
+
+    ``position_command_150`` remains the compatibility event name even though
+    the production command clock is now 120 Hz; the actual rate is carried by
+    profile metadata.
+    """
 
     side: str
     tick_sequence: int
@@ -534,7 +539,7 @@ class PercentileStats:
     def snapshot(self) -> PercentileStatsSnapshot:
         with self._lock:
             # Keep the producer-side critical section to a bounded copy.  The
-            # O(n log n) sort happens after releasing the lock so a 150 Hz
+            # O(n log n) sort happens after releasing the lock so the command-rate
             # recorder is never serialized behind percentile calculation.
             values = list(self._samples)
             count = int(self._count)
@@ -612,7 +617,7 @@ class PositionAuditStatistics:
 class PositionAuditFanout:
     """Copy-on-write audit sink multiplexer with per-sink fault isolation.
 
-    The 45/150 Hz call path takes no fanout lock: add/remove replaces an
+    The reference/command-rate call path takes no fanout lock: add/remove replaces an
     immutable sink tuple, while emission snapshots that tuple and invokes each
     sink independently.  Sinks are expected to honor ``PositionAuditSink``'s
     non-blocking contract (for example, ``PositionDebugRecorder`` only performs

@@ -1,5 +1,8 @@
 # RM65 Utilities
 
+> 本页维护 RM65 utility 的局部参数。整机设备检查与标定顺序统一从
+> [`docs/hardware/README.md`](../../../docs/hardware/README.md) 开始。
+
 This folder contains calibration, validation, recording, and impedance test
 tools for both RM65 arms.
 

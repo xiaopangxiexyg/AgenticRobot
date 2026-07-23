@@ -20,7 +20,20 @@ import numpy as np
 from scipy.spatial.transform import Rotation as SciPyRotation
 
 from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
-from dataset_contracts.pose_frames import load_pose_frame_contract
+from dataset_contracts.pose_frames import legacy_rm65_source_id, load_pose_frame_contract
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_contracts.gripper_force import GripperForceDatasetContract
+from dataset_interface.capture_modalities import bind_capture_modality_contract
+from dataset_interface.gripper_force import (
+    bind_gripper_force_contract,
+    read_gripper_force_contract,
+)
+from ..action.human_shadow_frontend import (
+    RealTeleopHumanShadowProfile,
+    add_human_shadow_arguments,
+    build_real_teleop_human_shadow_frontend,
+    validate_human_shadow_arguments,
+)
 from ..backends.arms import (
     RM65ArmBackend,
     RM65ArmBackendConfig,
@@ -29,6 +42,8 @@ from ..backends.arms import (
 )
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
+    DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
     DMTAC_TACTILE_FIELDS,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
@@ -42,6 +57,8 @@ from ..backends.hands import (
 )
 from ..arm_frames import TOOL_TCP_FRAME
 from robot_motion.action import HandActionSpec
+from robot_motion.joint_limits import load_joint_velocity_limit_profiles
+from robot_motion.pose_frame_profiles import default_rm65_workspace_near_boundary_collection_pose_frame_contract
 from robot_motion.profiles import IKSafetyProfile, load_ik_safety_profiles
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -74,6 +91,10 @@ from ..collection.arm_state_polling import ArmHardwareStatePoller, ArmHardwareSt
 from ..collection.hand_state_polling import HandStateHistoryPoller, HandStateHistoryPollerConfig
 from ..collection.camera_preview import CameraPreviewConfig, CameraPreviewer
 from ..collection.build_collect_components import CollectorComponents
+from ..collection.dataset_episode_maintenance import (
+    EpisodeDeleteResult,
+    delete_episode_and_compact,
+)
 from ..collection.observers import CollectionWriterObserverConfig
 from ..collection.policy_io_runtime import resolve_collection_policy_io_layout
 from ..collection.process_writer import (
@@ -96,6 +117,7 @@ from ..collection.status_snapshot import (
 )
 from ..collection.writer_runtime import CollectionWriterRuntime
 from ..collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
+from ..control_trace.episode import EpisodeTraceRecorderSink
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     DEFAULT_ARM_WORKSPACE_CONFIG_PATH,
@@ -105,8 +127,11 @@ from ..configs import (
     load_impedance_pose_smoothing_config,
 )
 from ..configs.dmtac_hardware import (
+    add_dmtac_assignment_arguments,
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
+    manual_dmtac_backend_config_for_side,
+    require_dmtac_sides_resolved,
 )
 from ..configs.q6_hardware import load_latest_q6_ports
 from ..configs.rm65_arm_ips import (
@@ -165,11 +190,13 @@ from ..position_control import (
     DEFAULT_CONTROL_DEBUG_FLUSH_EVERY,
     DEFAULT_CONTROL_DEBUG_QUEUE_SIZE,
     DEFAULT_CONTROL_DEBUG_ROOT,
+    POSITION_15_60_120HZ_PROFILE_NAME,
     PositionDebugRecorder,
     PositionDebugRecorderConfig,
     PositionReferencePublisher,
     PositionReferencePublisherConfig,
     RealArmExecutionConfig,
+    apply_rm65_position_profile_defaults,
     resolve_control_debug_config,
     resolve_real_arm_execution_config,
 )
@@ -193,18 +220,21 @@ from ..special_tasks.fix_arm import (
     advance_fix_arm_home_capture,
     build_fix_arm_pose_snapshot_payload,
 )
+from ..special_tasks.fix_hold import SpecialArmFixHoldCoordinator
 from ..special_tasks.init_arm import (
     InitArmCommandController,
+    InitArmTransition,
     advance_init_arm_home_capture,
     load_init_arm_targets,
 )
 from ..tactile_visualizer import (
+    AsyncDMTacDistributedForceVisualizer,
     AsyncTactileUVVisualizer,
     DMTacDistributedForceVisualizer,
     DMTacForceVisualizerConfig,
     TactileUVVisualizer,
     TactileVisualizerConfig,
-    dmtac_force_by_side_from_backends,
+    dmtac_visualization_snapshot_from_backends,
     tactile_by_side_from_backends,
 )
 from ..tcp import legacy_tcp_mode_requested
@@ -219,12 +249,21 @@ from .calibration_flow import (
 )
 from ..gui import collection_tasks as gui_collection_tasks
 from ..gui.calibration_web_ui import CalibrationWebUi
+from ..gui.startup_progress import GuiStartupProgress
 from ..real_teleop.foot_pad_controls import (
     FootPadSpecialArmInput,
+    FootPadUnavailableError,
     SPECIAL_ARM_CONTROL_MODE_CHOICES,
     SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
     SPECIAL_ARM_CONTROL_MODE_MANUAL,
+    configured_foot_pad_count,
     resolve_special_arm_control_mode,
+)
+from ..real_teleop.actuator_command_trace import (
+    DEFAULT_ACTUATOR_TRACE_MAX_DURATION_SEC,
+    DEFAULT_ACTUATOR_TRACE_ROOT,
+    ActuatorCommandTraceConfig,
+    ActuatorCommandTraceRecorder,
 )
 from ..real_teleop.fix_arm_collision_guard import fixed_arm_final_collision_fault
 from ..real_teleop import dataset_layout as real_teleop_dataset_layout
@@ -273,6 +312,9 @@ from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     DualArmSceneProfile,
+    LEGACY_POSITION_CONTROL_PROFILE_NAME,
+    RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_POSITION_CONTROL_PROFILE_CHOICES,
     build_dual_arm_scene_profile,
 )
 from sim.rm65.sapien_renderer import SapienArmHandRenderer
@@ -284,6 +326,18 @@ DEFAULT_CAMERA_CONFIG_PATH = (
 )
 DEFAULT_DATASET_ROOT = default_dataset_root()
 DEFAULT_DMTAC_ROOT = Path(__file__).resolve().parents[2] / "hardware" / "DMTAC_gripper"
+DEFAULT_INIT_ARM_PROFILE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "robot_motion"
+    / "rm65"
+    / "arm_init"
+    / "qpos_targets"
+    / "measured_init_pose.json"
+)
+INIT_ARM_QPOS_SPEED_BASELINE_PROFILE = "rm65_init_slow"
+DEFAULT_INIT_ARM_QPOS_SPEED_SCALE = 5.0
+MIN_INIT_ARM_QPOS_SPEED_SCALE = 0.1
+MAX_INIT_ARM_QPOS_SPEED_SCALE = 10.0
 DEFAULT_POSITION_MAX_ACCELERATION_RAD_S2 = (7.0, 7.0, 9.0, 15.0, 15.0, 20.0)
 DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
 DEFAULT_TASKS_CONFIG_PATH = (
@@ -350,11 +404,13 @@ GRIPPER_POLICY_DEFAULTS = {
     "send_threshold": 0.002,
     "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
     "continuous_grasp": True,
-    "telemetry_hz": 10.0,
+    "telemetry_hz": DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
+    "telemetry_command_grace_s": DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
 }
 EPISODE_GUI_EVENTS = (
     "episode_start",
     "episode_stop",
+    "episode_delete",
 )
 POSE_SNAPSHOT_GUI_EVENT = "record_pose_snapshot"
 VISUALIZATION_GUI_EVENTS = (
@@ -408,6 +464,7 @@ from ..real_teleop.wrist_depth_freshness import (
 # component.  Do not add timing implementation back here while the staged
 # extraction is in progress; callers may continue to import these legacy names.
 from ..real_teleop.debug_timing import (
+    AsyncDebugTimingConsole,
     DebugTimingModules,
     RealDebugTimingState,
     debug_timing_metadata as _debug_timing_metadata,
@@ -417,10 +474,14 @@ from ..real_teleop.debug_timing import (
 
 
 def _arm_execution_profile_metadata(args: argparse.Namespace) -> dict[str, object]:
+    metadata: dict[str, object] = {}
     resolved = getattr(args, "arm_execution_config", None)
     if isinstance(resolved, RealArmExecutionConfig):
-        return {"arm_execution_profile": resolved.to_metadata()}
-    return {}
+        metadata["arm_execution_profile"] = resolved.to_metadata()
+    position_profile = getattr(args, "position_control_profile_metadata", None)
+    if isinstance(position_profile, Mapping):
+        metadata["position_control_profile"] = dict(position_profile)
+    return metadata
 
 
 def _position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, object]:
@@ -454,6 +515,17 @@ def _position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, objec
         ),
         "position_ik_iteration_reserve_ms": (
             float(getattr(args, "position_ik_iteration_reserve_ms", 5.0))
+            if position_mode
+            else None
+        ),
+        "position_ik_candidate_certification_reserve_ms": (
+            float(
+                getattr(
+                    args,
+                    "position_ik_candidate_certification_reserve_ms",
+                    0.0,
+                )
+            )
             if position_mode
             else None
         ),
@@ -496,6 +568,28 @@ def _position_ik_iteration_metadata(args: argparse.Namespace) -> dict[str, objec
             if position_mode
             else None
         ),
+        "position_prefer_non_shoulder_singular_branch": (
+            bool(
+                getattr(
+                    args,
+                    "position_prefer_non_shoulder_singular_branch",
+                    False,
+                )
+            )
+            if position_mode
+            else None
+        ),
+        "position_singularity_candidate_certificate": (
+            bool(
+                getattr(
+                    args,
+                    "position_singularity_candidate_certificate",
+                    False,
+                )
+            )
+            if position_mode
+            else None
+        ),
     }
 
 
@@ -515,6 +609,75 @@ def _attach_position_audit_sink(
         setter = getattr(backend, "set_position_audit_sink", None)
         if callable(setter):
             setter(sink)
+
+
+def _attach_actuator_command_trace_sink(
+    components: RealTeleopComponents,
+    sink: Callable[..., object] | None,
+) -> int:
+    """Attach only to the post-SDK fixed-field command trace hook."""
+
+    attached = 0
+    for backend in (
+        components.left_command_backend,
+        components.right_command_backend,
+    ):
+        setter = getattr(backend, "set_actuator_command_trace_sink", None)
+        if callable(setter):
+            setter(sink)
+            attached += 1
+    return attached
+
+
+def _attach_singularity_transition_trace_sink(
+    components: RealTeleopComponents,
+    sink: Callable[..., object] | None,
+) -> int:
+    """Attach the sparse position singularity trace beside the qcmd trace."""
+
+    attached = 0
+    for backend in (
+        components.left_command_backend,
+        components.right_command_backend,
+    ):
+        setter = getattr(backend, "set_singularity_transition_trace_sink", None)
+        if callable(setter):
+            setter(sink)
+            attached += 1
+    return attached
+
+
+def _new_actuator_command_trace_recorder(
+    args: argparse.Namespace,
+    *,
+    components: RealTeleopComponents,
+    output_dir: Path,
+) -> ActuatorCommandTraceRecorder:
+    resolved = getattr(args, "arm_execution_config", None)
+    command_hz = float(
+        getattr(resolved, "position_background_streaming_hz", 0.0)
+    )
+    metadata = {
+        "entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
+        "active_sides": list(components.active_sides),
+        "logical_arm_ip_mapping": dict(components.logical_arm_ip_mapping),
+        **_arm_execution_profile_metadata(args),
+        "effective_transport": _canfd_follow_runtime_config(args),
+        "position_command_planner": str(
+            getattr(args, "position_command_planner", "")
+        ),
+        "control_debug_level": str(args.control_debug_config.level),
+    }
+    return ActuatorCommandTraceRecorder(
+        ActuatorCommandTraceConfig(
+            output_dir=output_dir,
+            active_sides=tuple(components.active_sides),
+            command_hz=command_hz,
+            reference_hz=float(_effective_position_reference_hz(args)),
+            max_duration_sec=float(args.actuator_trace_max_duration_sec),
+            metadata=metadata,
+        )
+    )
 
 
 def _new_position_debug_recorder(
@@ -661,6 +824,32 @@ def _compose_real_command_filter(
     return filter_command
 
 
+def _compose_real_command_guard(
+    *,
+    fix_arm_controller: FixArmCommandController | None,
+    init_arm_controller: InitArmCommandController | None,
+    dual_arm_retargeter: DualArmCollisionAwareRetargeter | None,
+):
+    if dual_arm_retargeter is None:
+        return None
+
+    def guard(command: TeleopCommand, _observation, now: float):
+        if init_arm_controller is not None:
+            fault = init_arm_controller.qpos_final_collision_fault(command, now=now)
+            if fault is not None:
+                return fault
+        if fix_arm_controller is not None:
+            return fixed_arm_final_collision_fault(
+                command,
+                fix_arm_controller=fix_arm_controller,
+                dual_arm_retargeter=dual_arm_retargeter,
+                now=now,
+            )
+        return None
+
+    return guard
+
+
 def _compose_real_fault_filter(
     *,
     fix_arm_controller: FixArmCommandController | None,
@@ -686,7 +875,7 @@ def _update_init_arm_arrival_from_hardware(
     hardware_state_by_side: Mapping[str, Mapping[str, object]],
     now: float,
 ) -> bool:
-    """Feed measured TCP feedback into the display-only init arrival state."""
+    """Feed measured TCP feedback into Init arrival and init-fixed promotion."""
 
     controller = getattr(components, "init_arm_controller", None)
     if controller is None or not bool(getattr(controller, "active", False)):
@@ -976,6 +1165,7 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "telemetry_command_grace_s": ("telemetry_command_grace_s",),
         "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
         "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
@@ -998,10 +1188,19 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": getattr(args, "gripper_command_hz", None),
         "continuous_grasp": getattr(args, "gripper_continuous_grasp", None),
         "telemetry_hz": getattr(args, "gripper_telemetry_hz", None),
+        "telemetry_command_grace_s": getattr(
+            args, "gripper_telemetry_command_grace_s", None
+        ),
     }
     for key, value in cli_overrides.items():
         if value is not None:
             policy[key] = value
+
+    dataset_force_contract = _gripper_force_dataset_contract_from_args(args)
+    if dataset_force_contract is not None and len(dataset_force_contract.force_by_side) == 1:
+        # The base policy is only a compatibility summary; side-specific
+        # policies below remain authoritative for bimanual operation.
+        policy["torque"] = next(iter(dataset_force_contract.force_by_side_dict.values()))
 
     policy["source_dim"] = int(policy["source_dim"])
     policy["output_dim"] = int(policy["output_dim"])
@@ -1018,6 +1217,9 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    policy["telemetry_command_grace_s"] = float(
+        policy["telemetry_command_grace_s"]
+    )
     if policy.get("tactile_fields") is not None:
         policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
     if policy.get("tactile_compute_profile") is not None:
@@ -1036,6 +1238,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("gripper command_hz must be > 0.")
     if float(policy["telemetry_hz"]) <= 0.0:
         raise ValueError("gripper telemetry_hz must be > 0.")
+    if float(policy["telemetry_command_grace_s"]) < 0.0:
+        raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
     setattr(args, "_resolved_gripper_policy", dict(policy))
     return dict(policy)
 
@@ -1075,6 +1279,7 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "telemetry_command_grace_s": ("telemetry_command_grace_s",),
         "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
         "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
@@ -1082,6 +1287,11 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
         value = _profile_value(side_override, *aliases)
         if value is not None:
             policy[key] = value
+    dataset_force_contract = _gripper_force_dataset_contract_from_args(args)
+    if dataset_force_contract is not None:
+        force_by_side = dataset_force_contract.force_by_side_dict
+        if side in force_by_side:
+            policy["torque"] = float(force_by_side[side])
     policy["source_dim"] = int(policy["source_dim"])
     policy["output_dim"] = int(policy["output_dim"])
     policy["invert"] = bool(policy["invert"])
@@ -1095,6 +1305,9 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    policy["telemetry_command_grace_s"] = float(
+        policy["telemetry_command_grace_s"]
+    )
     if policy.get("tactile_fields") is not None:
         policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
     if policy.get("tactile_compute_profile") is not None:
@@ -1111,6 +1324,10 @@ def _resolved_gripper_policy_for_side(args: argparse.Namespace, side: str) -> di
         raise ValueError("gripper speed must be in [0, 1].")
     if not 0.0 <= float(policy["torque"]) <= 1.0:
         raise ValueError("gripper force/torque must be in [0, 1].")
+    if float(policy["telemetry_hz"]) <= 0.0:
+        raise ValueError("gripper telemetry_hz must be > 0.")
+    if float(policy["telemetry_command_grace_s"]) < 0.0:
+        raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
     by_side = dict(cached) if isinstance(cached, dict) else {}
     by_side[side] = dict(policy)
     setattr(args, "_resolved_gripper_policy_by_side", by_side)
@@ -1125,6 +1342,63 @@ def _resolved_gripper_policies_by_side(
         str(side): _resolved_gripper_policy_for_side(args, str(side))
         for side in active_sides
         if str(side) in {"left", "right"}
+    }
+
+
+def _current_gripper_force_dataset_contract(
+    args: argparse.Namespace,
+    active_sides: Sequence[str],
+) -> GripperForceDatasetContract | None:
+    """Build the immutable force/profile identity used by dataset metadata."""
+
+    dmtac_sides = tuple(
+        side for side in active_sides if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
+    )
+    if not dmtac_sides:
+        return None
+    policies = _resolved_gripper_policies_by_side(args, dmtac_sides)
+    force_by_side = {
+        side: float(policy["torque"])
+        for side, policy in policies.items()
+        if isinstance(policy, Mapping) and "torque" in policy
+    }
+    if not force_by_side:
+        return None
+    return GripperForceDatasetContract(
+        force_by_side=tuple(force_by_side.items()),
+        profile_name=str(getattr(args, "gripper_task_profile", "") or ""),
+        task=str(getattr(args, "gripper_task", "") or ""),
+    )
+
+
+def _gripper_force_dataset_contract_from_args(
+    args: argparse.Namespace,
+) -> GripperForceDatasetContract | None:
+    raw = getattr(args, "_gripper_force_dataset_contract", None)
+    if raw is None:
+        return None
+    if isinstance(raw, GripperForceDatasetContract):
+        return raw
+    if isinstance(raw, Mapping):
+        return GripperForceDatasetContract.from_dict(raw)
+    raise ValueError("_gripper_force_dataset_contract must be a mapping")
+
+
+def _gripper_force_dataset_metadata(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    *,
+    contract: GripperForceDatasetContract | None = None,
+) -> dict[str, object]:
+    effective = contract or _gripper_force_dataset_contract_from_args(args)
+    if effective is None:
+        return {}
+    policies = _resolved_gripper_policies_by_side(args, components.active_sides)
+    return {
+        "gripper_force_profile": effective.to_dict(),
+        "gripper_task_profile": str(getattr(args, "gripper_task_profile", "") or "") or None,
+        "gripper_task": str(getattr(args, "gripper_task", "") or "") or None,
+        "gripper_policy_by_side": policies,
     }
 
 
@@ -1426,33 +1700,6 @@ def _validate_required_arm_ips(args: argparse.Namespace, active_sides: tuple[str
         )
 
 
-def _manual_dmtac_config_for_side(
-    args: argparse.Namespace,
-    side: str,
-    policy: Mapping[str, Any],
-) -> DMTacGripperBackendConfig | None:
-    port = str(getattr(args, f"{side}_gripper_port", "") or "").strip()
-    if not port:
-        return None
-    return DMTacGripperBackendConfig(
-        side=side,
-        effector_name=f"{side}_hand",
-        gripper_port=port,
-        gripper_id=int(getattr(args, f"{side}_gripper_id", 1) or 1),
-        command_dim=int(policy["output_dim"]),
-        speed=float(policy["speed"]),
-        torque=float(policy["torque"]),
-        max_action=float(policy["max_action"]),
-        send_threshold=float(policy["send_threshold"]),
-        command_hz=float(policy["command_hz"]),
-        continuous_grasp=bool(policy["continuous_grasp"]),
-        enable_telemetry=True,
-        telemetry_hz=float(policy["telemetry_hz"]),
-        connect_tactile=False,
-        tactile_ids=(),
-    )
-
-
 def _apply_gripper_policy_to_dmtac_config(
     config: DMTacGripperBackendConfig,
     *,
@@ -1467,6 +1714,12 @@ def _apply_gripper_policy_to_dmtac_config(
     config.command_hz = float(policy["command_hz"])
     config.continuous_grasp = bool(policy["continuous_grasp"])
     config.telemetry_hz = float(policy["telemetry_hz"])
+    config.gripper_telemetry_command_grace_s = float(
+        policy.get(
+            "telemetry_command_grace_s",
+            DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
+        )
+    )
     tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
     if tactile_timeout_ms is not None:
         config.tactile_timeout_ms = int(tactile_timeout_ms)
@@ -1476,6 +1729,13 @@ def _apply_gripper_policy_to_dmtac_config(
     tactile_read_hz = getattr(args, "dmtac_tactile_read_hz", None)
     if tactile_read_hz is not None:
         config.tactile_read_hz = float(tactile_read_hz)
+    elif not bool(getattr(args, "no_collection", False)):
+        # Formal collection stores tactile at the sample cadence.  The legacy
+        # 1 Hz backend default remains unchanged for non-collection tools.
+        config.tactile_read_hz = min(
+            float(config.tactile_max_fps),
+            max(1.0, float(getattr(args, "hz", 15.0))),
+        )
     tactile_process_read = getattr(args, "dmtac_tactile_process_read", None)
     if tactile_process_read is not None:
         config.tactile_process_read = bool(tactile_process_read)
@@ -1498,6 +1758,17 @@ def _apply_gripper_policy_to_dmtac_config(
         config.tactile_compute_profile = str(tactile_compute_profile)
     elif policy.get("tactile_compute_profile"):
         config.tactile_compute_profile = str(policy["tactile_compute_profile"])
+    tactile_calibrate = getattr(args, "dmtac_tactile_calibrate", None)
+    if tactile_calibrate is not None:
+        config.tactile_reset_on_start = bool(tactile_calibrate)
+    tactile_calibration_policy = getattr(args, "dmtac_tactile_calibration_policy", None)
+    if tactile_calibration_policy:
+        config.tactile_calibration_policy = str(tactile_calibration_policy)
+    tactile_calibration_dir = str(
+        getattr(args, "dmtac_tactile_calibration_dir", "") or ""
+    ).strip()
+    if tactile_calibration_dir:
+        config.tactile_calibration_dir = _expand_cli_path(tactile_calibration_dir)
     tactile_max_fps = getattr(args, "dmtac_tactile_max_fps", None)
     if tactile_max_fps is not None:
         config.tactile_max_fps = int(tactile_max_fps)
@@ -1574,7 +1845,11 @@ def _dmtac_backend_configs(
             _log("DMTAC", f"WARNING: could not load DMTAC hardware assignment: {exc}")
 
     for side in dmtac_sides:
-        manual = _manual_dmtac_config_for_side(args, side, policies_by_side.get(side, policy))
+        manual = manual_dmtac_backend_config_for_side(
+            args,
+            side,
+            policies_by_side.get(side, policy),
+        )
         if manual is not None:
             configs[side] = manual
 
@@ -1587,6 +1862,12 @@ def _dmtac_backend_configs(
         for side, config in configs.items()
         if side in dmtac_sides and (config.connect_hardware or config.connect_tactile)
     }
+    if bool(getattr(args, "dmtac_config_required", False)):
+        require_dmtac_sides_resolved(
+            dmtac_sides,
+            resolved,
+            config=str(getattr(args, "dmtac_config", "latest") or "latest"),
+        )
     setattr(args, "_dmtac_backend_configs", dict(resolved))
     setattr(args, "dmtac_config_loaded_sides", sorted(resolved))
     return dict(resolved)
@@ -1818,11 +2099,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-hand-port", type=str, default="", help="Optional right hand teleop serial port")
     parser.add_argument(
         "--fix-arm",
+        dest="fix_arm",
         action="store_true",
+        default=True,
         help=(
-            "Enable fixed-arm collection mode. In this mode GUI C freezes the selected "
-            "arm/hand at the last dispatched action, and C again recaptures that side's "
-            "runtime home before releasing it."
+            "Enable fixed-arm collection mode (default: enabled for dual-arm GUI). "
+            "In this mode GUI C freezes the selected arm/hand at the last dispatched "
+            "action, and C again recaptures that side's runtime home before releasing it."
+        ),
+    )
+    parser.add_argument(
+        "--no-fix-arm",
+        dest="fix_arm",
+        action="store_false",
+        help=(
+            "Disable the default fix-arm controller and restore the legacy GUI controls."
         ),
     )
     parser.add_argument(
@@ -1836,18 +2127,28 @@ def parse_args() -> argparse.Namespace:
         "--init-arm-availabe",
         dest="init_arm_available",
         action="store_true",
+        default=True,
         help=(
-            "Enable init-arm mode. GUI G routes the selected arm to the init pose, "
-            "and G again recaptures that side's runtime home before resuming teleop."
+            "Enable init-arm mode (default: enabled for dual-arm GUI). GUI G routes "
+            "the selected arm to the init pose, and G again recaptures that side's "
+            "runtime home before resuming teleop."
         ),
+    )
+    parser.add_argument(
+        "--no-init-arm-available",
+        "--no-init-arm-availabe",
+        dest="init_arm_available",
+        action="store_false",
+        help="Disable the default init-arm controller.",
     )
     parser.add_argument(
         "--init-arm-profile",
         type=str,
-        default="",
+        default=str(DEFAULT_INIT_ARM_PROFILE_PATH),
         help=(
             "Dual-arm init pose profile JSON used by --init-arm-available. "
-            "Each side may provide arm_qpos, tcp_pose_base, or tcp_pose_desk."
+            "Each side may provide arm_qpos, tcp_pose_base, or tcp_pose_desk. "
+            f"Default: {DEFAULT_INIT_ARM_PROFILE_PATH}."
         ),
     )
     parser.add_argument(
@@ -1857,12 +2158,37 @@ def parse_args() -> argparse.Namespace:
         help="Initial side selected by --init-arm-available. The GUI can switch it while init-arm is idle.",
     )
     parser.add_argument(
+        "--init-arm-left-qpos-speed-scale",
+        type=_positive_float,
+        default=DEFAULT_INIT_ARM_QPOS_SPEED_SCALE,
+        help=(
+            "Left-arm exact Init-qpos return speed multiplier relative to "
+            f"{INIT_ARM_QPOS_SPEED_BASELINE_PROFILE}=1.0. Default: "
+            f"{DEFAULT_INIT_ARM_QPOS_SPEED_SCALE:g}. The GUI may adjust it while "
+            "no Init-qpos operation is active."
+        ),
+    )
+    parser.add_argument(
+        "--init-arm-right-qpos-speed-scale",
+        type=_positive_float,
+        default=DEFAULT_INIT_ARM_QPOS_SPEED_SCALE,
+        help=(
+            "Right-arm exact Init-qpos return speed multiplier relative to "
+            f"{INIT_ARM_QPOS_SPEED_BASELINE_PROFILE}=1.0. Default: "
+            f"{DEFAULT_INIT_ARM_QPOS_SPEED_SCALE:g}. The GUI may adjust it while "
+            "no Init-qpos operation is active."
+        ),
+    )
+    parser.add_argument(
         "--special-arm-control-mode",
         choices=SPECIAL_ARM_CONTROL_MODE_CHOICES,
         default=None,
         help=(
-            "Special-arm GUI input mode. When both --fix-arm and --init-arm-available "
-            "are set, defaults to foot-pad (F13/F14/F15/F16); otherwise defaults to manual."
+            "Optional pedal mapping for special-arm actions. Four pedals map "
+            "F13/F14/F15/F16 to Fix-left/Fix-right/Init-left/Init-right; two "
+            "pedals map F13/F14 to Fix-left/Fix-right. Pedal topology or "
+            "availability never disables the configured Fix/Init controllers, "
+            "keyboard shortcuts, or GUI buttons."
         ),
     )
     parser.add_argument(
@@ -1954,47 +2280,7 @@ def parse_args() -> argparse.Namespace:
             "between hold/restart gestures."
         ),
     )
-    parser.add_argument("--left-gripper-port", type=str, default="", help="Optional left DMTAC gripper serial port.")
-    parser.add_argument("--right-gripper-port", type=str, default="", help="Optional right DMTAC gripper serial port.")
-    parser.add_argument("--left-gripper-id", type=int, default=1, help="Left gripper Modbus id.")
-    parser.add_argument("--right-gripper-id", type=int, default=1, help="Right gripper Modbus id.")
-    parser.add_argument(
-        "--dmtac-config",
-        type=str,
-        default="latest",
-        help="DMTAC gripper/tactile assignment config used by --hand-backend dmtac-gripper.",
-    )
-    parser.add_argument(
-        "--no-dmtac-default-config",
-        dest="dmtac_default_config",
-        action="store_false",
-        default=True,
-        help="Do not auto-load DMTAC gripper/tactile ports from latest assignment.",
-    )
-    parser.add_argument(
-        "--dmtac-config-required",
-        action="store_true",
-        help="Fail if --dmtac-config cannot be loaded for --hand-backend dmtac-gripper.",
-    )
-    parser.add_argument(
-        "--dmtac-allow-missing",
-        action="store_true",
-        help="Allow configured DMTAC gripper/tactile devices to be missing during USB validation.",
-    )
-    parser.add_argument(
-        "--dmtac-no-validate-current-usb",
-        dest="dmtac_validate_current_usb",
-        action="store_false",
-        default=True,
-        help="Load DMTAC assignment without probing current USB devices.",
-    )
-    parser.add_argument(
-        "--dmtac-confirm-extra",
-        dest="dmtac_assume_yes_for_extra",
-        action="store_false",
-        default=True,
-        help="Ask before continuing when extra unassigned DMTAC devices are detected.",
-    )
+    add_dmtac_assignment_arguments(parser, assignment_includes_tactile=True)
     parser.add_argument(
         "--dmtac-tactile-backend",
         type=str,
@@ -2030,8 +2316,9 @@ def parse_args() -> argparse.Namespace:
         type=_non_negative_float,
         default=None,
         help=(
-            "Max DM-Tac tactile read rate per gripper backend. Default is backend config "
-            "1 Hz; use 0 to read every gripper telemetry cycle."
+            "Max DM-Tac tactile read rate per gripper backend. Formal collection defaults "
+            "to --hz (capped by max_fps); non-collection tools retain the 1 Hz backend "
+            "default. Use 0 to read every gripper telemetry cycle."
         ),
     )
     parser.add_argument(
@@ -2113,6 +2400,36 @@ def parse_args() -> argparse.Namespace:
             "SDK compute channels for DMTAC telemetry. Default follows backend config; "
             "use dist-only with distributed_force for the real-time force path."
         ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-calibrate",
+        dest="dmtac_tactile_calibrate",
+        action="store_true",
+        default=None,
+        help=(
+            "Explicitly capture a DM-Tac no-contact base frame before reads. "
+            "Disabled by default for raw images and solved tactile fields."
+        ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-no-calibrate",
+        dest="dmtac_tactile_calibrate",
+        action="store_false",
+        help="Do not capture a DM-Tac base frame at startup (the default).",
+    )
+    parser.add_argument(
+        "--dmtac-tactile-calibration-policy",
+        choices=("auto", "required", "off"),
+        default=None,
+        help=(
+            "Fixed per-sensor base-frame policy. GUI distributed-force solving uses "
+            "'required' so an uncalibrated sensor cannot be presented as calibrated."
+        ),
+    )
+    parser.add_argument(
+        "--dmtac-tactile-calibration-dir",
+        default="",
+        help="Optional directory containing fixed per-sensor DM-Tac base-frame calibrations.",
     )
     parser.add_argument(
         "--dmtac-tactile-denoise",
@@ -2264,6 +2581,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-command-hz", type=_positive_float, default=None)
     parser.add_argument("--gripper-telemetry-hz", type=_positive_float, default=None)
     parser.add_argument(
+        "--gripper-telemetry-command-grace-s", type=float, default=None
+    )
+    parser.add_argument(
         "--gripper-warmup-probe",
         dest="gripper_warmup_probe",
         action="store_true",
@@ -2401,6 +2721,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum tactile visualization update rate.",
     )
     parser.add_argument(
+        "--dmtac-tactile-vis-fixed-ref",
+        type=_positive_float,
+        default=1.0,
+        help=(
+            "Fixed common DM-TAC force visualization scale used for every sensor "
+            "and frame (default: 1.0). This keeps the color map and displayed "
+            "reference stable instead of amplifying per-frame startup noise."
+        ),
+    )
+    parser.add_argument(
         "--camera-config",
         type=str,
         default=str(DEFAULT_CAMERA_CONFIG_PATH),
@@ -2410,6 +2740,27 @@ def parse_args() -> argparse.Namespace:
         "--no-camera",
         action="store_true",
         help="Disable RealSense capture, preview, and video writing.",
+    )
+    parser.add_argument(
+        "--ignore-camera",
+        action="append",
+        default=[],
+        metavar="CAMERA_KEY",
+        help=(
+            "Explicitly omit one camera view for the complete target dataset. "
+            "The dataset must be new/blank or already declare the exact same ignore set."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-tactile",
+        action="append",
+        choices=("left", "right"),
+        default=[],
+        metavar="SIDE",
+        help=(
+            "Explicitly omit one tactile side for the complete target dataset. "
+            "Arm/gripper state remains required."
+        ),
     )
     parser.add_argument(
         "--vis_cam",
@@ -2486,12 +2837,23 @@ def parse_args() -> argparse.Namespace:
         choices=ARM_EXECUTION_PROFILE_CHOICES,
         default=None,
         help=(
-            "Mode-aware real-arm defaults. impedance_40hz resolves to a 30 Hz outer "
-            "reference and 40 Hz impedance backend; position resolves to the "
-            "configurable position chain (defaults: 15 Hz sampling, 75 Hz references, "
-            "150 Hz CANFD stream). "
+            "Mode-aware real-arm defaults. impedance_40hz resolves to a 15 Hz source "
+            "and 40 Hz impedance backend; position resolves to the configurable "
+            "position chain (defaults: 15 Hz sampling, 60 Hz references, "
+            "120 Hz CANFD stream). "
             "position_45_150hz remains an explicit legacy profile, and fine-grained "
             "flags remain compatible overrides."
+        ),
+    )
+    parser.add_argument(
+        "--position-control-profile",
+        choices=RM65_POSITION_CONTROL_PROFILE_CHOICES,
+        default=RM65_BIMANUAL_POSITION_V1_NAME,
+        help=(
+            "Versioned RM65 bimanual position behavior. The formal v1 profile "
+            "applies live-human source shaping plus the 15/60/120 execution chain; "
+            "legacy preserves fine-grained historical defaults for rollback/debug. "
+            "This option is ignored unless position arm control is selected."
         ),
     )
     parser.add_argument(
@@ -2897,7 +3259,7 @@ def parse_args() -> argparse.Namespace:
         "--position-reference-hz",
         type=_positive_float,
         default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
-        help="Position-mode IK/safety/qpos reference rate. Defaults to 75 Hz.",
+        help="Position-mode IK/safety/qpos reference rate. Defaults to 60 Hz.",
     )
     parser.add_argument(
         "--position-reference-max-age-sec",
@@ -2915,7 +3277,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Final position-command planner. 'linear' preserves the existing pure-position "
             "reference interpolation; 'acceleration_limited' adds velocity-continuous, "
-            "acceleration-limited online 75->150 Hz planning."
+            "acceleration-limited online 60->120 Hz planning."
         ),
     )
     parser.add_argument(
@@ -2975,7 +3337,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "RM65 backend control/streaming rate after each outer action update. "
-            "Defaults to 40 Hz for impedance and 150 Hz for position control."
+            "Defaults to 40 Hz for impedance and 120 Hz for position control."
         ),
     )
     parser.add_argument(
@@ -3017,9 +3379,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Disable all standalone debug disk outputs for this run: control/action/timing/IK "
-            "sidecars, legacy debug session JSONL, fix-arm pose snapshots, and lightweight "
-            "debug trajectories. Console/timing instrumentation and formal dataset collection "
-            "remain available. This switch overrides individual debug-write flags."
+            "sidecars, actuator traces, legacy debug session JSONL, fix-arm pose snapshots, "
+            "and lightweight debug trajectories. Console/timing instrumentation and formal "
+            "dataset collection remain available. This switch overrides individual "
+            "debug-write flags."
         ),
     )
     parser.add_argument(
@@ -3028,7 +3391,8 @@ def parse_args() -> argparse.Namespace:
         default="off",
         help=(
             "Observational runtime control-audit level: off, summary, or full. It never changes "
-            "safety, smoothing, hold, IK, or dispatch behavior."
+            "safety, smoothing, hold, IK, or dispatch behavior. Full is a heavyweight forensic "
+            "trace; use --actuator-trace by itself for real2sim actuator identification."
         ),
     )
     parser.add_argument(
@@ -3056,6 +3420,41 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Attach a second episode-scoped position audit during formal collection. "
             "Disable it to retain session audit data without duplicate JSON work."
+        ),
+    )
+    parser.add_argument(
+        "--actuator-trace",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Record only post-SDK RM65 qcmd/result/timestamps into preallocated memory, then "
+            "write once after command workers stop. Intended for low-disturbance actuator "
+            "identification; do not combine with --control-debug summary/full."
+        ),
+    )
+    parser.add_argument(
+        "--actuator-trace-root",
+        type=str,
+        default=str(DEFAULT_ACTUATOR_TRACE_ROOT),
+        help="Output root for low-overhead real-arm actuator command traces.",
+    )
+    parser.add_argument(
+        "--actuator-trace-max-duration-sec",
+        type=_positive_float,
+        default=DEFAULT_ACTUATOR_TRACE_MAX_DURATION_SEC,
+        help=(
+            "Preallocated trace duration per arm. Longer runs continue normally but excess "
+            "debug samples are counted and dropped instead of growing memory or writing disk."
+        ),
+    )
+    parser.add_argument(
+        "--actuator-singularity-trace",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --actuator-trace is enabled, also capture sparse singularity transitions "
+            "and every non-normal singular frame in the same preallocated NPZ. Disable with "
+            "--no-actuator-singularity-trace for exact qcmd-only rollback."
         ),
     )
     parser.add_argument(
@@ -3275,6 +3674,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--position-ik-candidate-certification-reserve-ms",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Position mode only: portion of the total IK iteration reserve dedicated to "
+            "base-candidate step/collision certification. The formal profile uses 3.5 ms; "
+            "set 0 to restore the historical candidate deadline split."
+        ),
+    )
+    parser.add_argument(
         "--position-ik-local-step-clip-scale",
         "--position-ik-local-step-scale",
         dest="position_ik_local_step_clip_scale",
@@ -3308,6 +3717,31 @@ def parse_args() -> argparse.Namespace:
             "candidate through the backend SDK gate. Use "
             "--no-position-prefer-non-elbow-singular-branch to restore the previous "
             "hard elbow hold-entry behavior."
+        ),
+    )
+    parser.add_argument(
+        "--position-prefer-non-shoulder-singular-branch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Position mode only: use the RM65 kinematics analyzer to prefer a "
+            "collision-safe candidate outside the shoulder/coaxial singularity "
+            "region. The formal rm65_bimanual_position_v1 profile enables it. "
+            "If every evaluated feasible candidate is singular, certify and "
+            "pass the selected safe candidate instead of entering hold. Use "
+            "--no-position-prefer-non-shoulder-singular-branch for atomic rollback "
+            "to the previous shoulder hold-entry behavior."
+        ),
+    )
+    parser.add_argument(
+        "--position-singularity-candidate-certificate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Position mode only: require singular fallback metadata to match the exact "
+            "final qref fingerprint emitted by the coupled candidate selector. The formal "
+            "profile enables this; use --no-position-singularity-candidate-certificate "
+            "to restore the previous metadata-only fallback gate."
         ),
     )
     parser.add_argument(
@@ -3416,6 +3850,15 @@ def parse_args() -> argparse.Namespace:
             "SAPIEN rendering stays disabled unless --show-viewer or --no-skip-renderer is passed."
         ),
     )
+    parser.add_argument(
+        "--hardware-admission-mode",
+        choices=("capability", "strict"),
+        default="capability",
+        help=(
+            "capability keeps the GUI and unrelated controls available when optional "
+            "camera/hand/collection devices fail; strict restores the legacy all-or-nothing startup."
+        ),
+    )
     parser.set_defaults(open_browser_gui=True)
     parser.add_argument(
         "--show-viewer",
@@ -3508,6 +3951,36 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--plus-episode-curation",
+        action="store_true",
+        help=(
+            "Enable the optional Plus episode curation sidecar and GUI panel. "
+            "Default off; raw dataset rows and lifecycle are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--plus-annotation-root",
+        type=str,
+        default="",
+        help="External directory for Plus manifest/episode_curation.jsonl (required with --plus-episode-curation).",
+    )
+    parser.add_argument(
+        "--plus-task-profile",
+        type=str,
+        default="",
+        help="Optional finite task-variant profile JSON used by the Plus GUI.",
+    )
+    parser.add_argument(
+        "--plus-source-binding",
+        choices=(
+            "v23_compat_content_locator_v1",
+            "v24_committed_capture_membership_v1",
+            "v24_compatibility_content_locator_v1",
+        ),
+        default="v23_compat_content_locator_v1",
+        help="Explicit Plus source binding; it does not infer v2.4 native identity from a path.",
+    )
+    parser.add_argument(
         "--collection-task-name",
         type=str,
         default="",
@@ -3564,15 +4037,25 @@ def parse_args() -> argparse.Namespace:
             "leaves the existing real-teleop command path unchanged."
         ),
     )
-    parser.add_argument(
+    pose_frame_group = parser.add_mutually_exclusive_group()
+    pose_frame_group.add_argument(
         "--pose-frame-contract",
         type=load_pose_frame_contract,
         default=None,
         metavar="JSON",
         help=(
-            "Optional explicit v2.3 pose-frame contract JSON for formal collection. "
-            "Requires --policy-io-layout auto or a layout JSON. It changes only detached "
-            "dataset rows, never the live teleop command path."
+            "Explicit v2.3 pose-frame contract JSON for formal collection. Requires "
+            "--policy-io-layout auto or a layout JSON. It changes only detached dataset "
+            "rows, never the live teleop command path. Dual-RM65 collection defaults to "
+            "the calibrated URDF workspace-near-boundary desk contract."
+        ),
+    )
+    pose_frame_group.add_argument(
+        "--no-pose-frame-contract",
+        action="store_true",
+        help=(
+            "Disable the default dual-RM65 v2.3 desk contract and retain the legacy "
+            "v2.2/raw collection path."
         ),
     )
     parser.add_argument("--write-video", dest="write_video", action="store_true")
@@ -3992,22 +4475,67 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N control steps, 0 means infinite")
+    add_human_shadow_arguments(parser)
     raw_argv = list(sys.argv[1:])
     args = parser.parse_args()
     if not str(getattr(args, "dataset_root", "")).strip():
         parser.error(
             "--dataset-root must not be empty; omit it to use the configured default."
         )
+    if bool(getattr(args, "plus_episode_curation", False)) and not str(
+        getattr(args, "plus_annotation_root", "") or ""
+    ).strip():
+        parser.error("--plus-annotation-root is required with --plus-episode-curation")
     raw_arg_set = set(raw_argv)
     if bool(getattr(args, "no_debug_disk_write", False)):
         args.control_debug = "off"
+        args.actuator_trace = False
         args.debug_action = False
         args.debug_timing_log = False
         args.debug_timing_auto_log = False
         args.no_record = True
         args.no_episode_recording = True
         args.debug_trajectory_recording = False
+    validate_human_shadow_arguments(args, parser)
     try:
+        requested_arm_profile = str(getattr(args, "arm_execution_profile", "") or "")
+        tentative_arm_mode = (
+            "position"
+            if requested_arm_profile.startswith("position")
+            else "impedance"
+            if requested_arm_profile == "impedance_40hz"
+            else str(getattr(args, "arm_control_mode", "impedance"))
+        )
+        explicit_compatibility_arm_profile = (
+            _argv_has_option(raw_argv, "--arm-execution-profile")
+            and requested_arm_profile
+            not in ("", POSITION_15_60_120HZ_PROFILE_NAME)
+        )
+        if explicit_compatibility_arm_profile:
+            if (
+                _argv_has_option(raw_argv, "--position-control-profile")
+                and args.position_control_profile
+                != LEGACY_POSITION_CONTROL_PROFILE_NAME
+            ):
+                raise ValueError(
+                    "a compatibility --arm-execution-profile conflicts with the formal "
+                    "--position-control-profile; use --position-control-profile legacy"
+                )
+            args.position_control_profile_resolved = (
+                LEGACY_POSITION_CONTROL_PROFILE_NAME
+            )
+            args.position_control_profile_metadata = {
+                "name": LEGACY_POSITION_CONTROL_PROFILE_NAME,
+                "compatibility_mode": True,
+                "reason": f"explicit_arm_execution_profile:{requested_arm_profile}",
+            }
+        else:
+            apply_rm65_position_profile_defaults(
+                args,
+                raw_argv=raw_argv,
+                mode=tentative_arm_mode,
+                include_source_shaping=True,
+            )
         args.arm_execution_config = resolve_real_arm_execution_config(
             args,
             raw_argv=raw_argv,
@@ -4020,6 +4548,35 @@ def parse_args() -> argparse.Namespace:
     # Fine-grained legacy fields retain their original raw values so callers can
     # still distinguish explicit overrides from mode-derived defaults.
     args.arm_control_mode = args.arm_execution_config.mode
+    if bool(getattr(args, "actuator_trace", False)):
+        if args.arm_control_mode != "position":
+            parser.error("--actuator-trace requires position arm control mode.")
+        if not args.arm_execution_config.position_background_streaming_enabled:
+            parser.error(
+                "--actuator-trace requires the position background command stream."
+            )
+        if bool(args.control_debug_config.enabled):
+            parser.error(
+                "--actuator-trace must be used with --control-debug off; summary/full retain "
+                "their existing audit overhead and would invalidate the low-disturbance capture."
+            )
+    if (
+        args.arm_control_mode == "position"
+        and not args.arm_execution_config.position_background_streaming_enabled
+        and not _argv_has_option(raw_argv, "--position-command-planner")
+    ):
+        # Explicitly disabling the follow stream is a supported compatibility
+        # override.  The formal 60->120 planner cannot run without that stream,
+        # so retain the legacy direct-reference planner unless the caller
+        # explicitly requested another (and therefore invalid) combination.
+        args.position_command_planner = POSITION_COMMAND_PLANNER_LINEAR
+        if not _argv_has_option(raw_argv, "--position-max-command-step-deg"):
+            args.position_max_command_step_deg = None
+        metadata = getattr(args, "position_control_profile_metadata", None)
+        if isinstance(metadata, dict):
+            metadata.setdefault("runtime_deviations", []).append(
+                "follow_stream_disabled_use_linear_command_planner"
+            )
     requested_collection_worker_mode = str(args.collection_worker_mode)
     args.collection_worker_mode_resolved = (
         "process"
@@ -4044,6 +4601,13 @@ def parse_args() -> argparse.Namespace:
             "--position-ik-solve-min-iterations must be <= "
             "--position-ik-solve-max-iterations."
         )
+    if float(args.position_ik_candidate_certification_reserve_ms) > float(
+        args.position_ik_iteration_reserve_ms
+    ):
+        parser.error(
+            "--position-ik-candidate-certification-reserve-ms must be <= "
+            "--position-ik-iteration-reserve-ms."
+        )
     if args.arm_control_mode != "position" and (
         args.position_ik_orientation_weight is not None
         or int(args.position_ik_solve_max_iterations) != 2
@@ -4051,6 +4615,8 @@ def parse_args() -> argparse.Namespace:
         or float(args.position_ik_damping) != 0.03
         or bool(args.position_ik_adaptive_iterations)
         or float(args.position_ik_iteration_reserve_ms) != 5.0
+        or float(args.position_ik_candidate_certification_reserve_ms) != 0.0
+        or bool(args.position_singularity_candidate_certificate)
         or float(args.position_ik_local_step_clip_scale) != 1.0
         or str(args.position_joint_velocity_limit_profile) != "rm65"
         or float(args.position_inactive_enter_threshold_scale) != 1.0
@@ -4059,6 +4625,8 @@ def parse_args() -> argparse.Namespace:
             "--position-ik-orientation-weight, --position-ik-solve-max-iterations, "
             "--position-ik-solve-min-iterations, --position-ik-damping, "
             "--position-ik-adaptive-iterations, --position-ik-iteration-reserve-ms, "
+            "--position-ik-candidate-certification-reserve-ms, "
+            "--position-singularity-candidate-certificate, "
             "--position-ik-local-step-clip-scale, and "
             "--position-joint-velocity-limit-profile, and "
             "--position-inactive-enter-threshold-scale are position-mode options and "
@@ -4119,6 +4687,37 @@ def parse_args() -> argparse.Namespace:
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
     _apply_formal_dataset_layout(args)
+    args.pose_frame_contract_source = (
+        "explicit" if args.pose_frame_contract is not None else "disabled"
+    )
+    if (
+        args.pose_frame_contract is None
+        and not bool(args.no_pose_frame_contract)
+        and not bool(args.no_collection)
+    ):
+        if (
+            _active_sides_from_args(args) == ("left", "right")
+            and not np.isclose(
+                float(args.left_right_base_distance),
+                float(ANNOTATED_DUAL_RM65_BASE_DISTANCE_M),
+                rtol=0.0,
+                atol=1e-9,
+            )
+        ):
+            parser.error(
+                "The default RM65 workspace-near-boundary pose contract is calibrated for "
+                f"--left-right-base-distance {ANNOTATED_DUAL_RM65_BASE_DISTANCE_M}. "
+                "Provide the matching --pose-frame-contract for another station, or "
+                "use --no-pose-frame-contract for the legacy v2.2/raw path."
+            )
+        default_contract = default_rm65_workspace_near_boundary_collection_pose_frame_contract(
+            _active_sides_from_args(args)
+        )
+        if default_contract is not None:
+            args.pose_frame_contract = default_contract
+            args.pose_frame_contract_source = "default_rm65_dual_arm_workspace_near_boundary_v1"
+            if not str(args.policy_io_layout).strip():
+                args.policy_io_layout = "auto"
     if args.pose_frame_contract is not None and not str(args.policy_io_layout).strip():
         parser.error(
             "--pose-frame-contract requires --policy-io-layout auto or an explicit layout JSON."
@@ -4153,15 +4752,47 @@ def parse_args() -> argparse.Namespace:
         parser.error("--wrist-cam-width and --wrist-cam-height must be set together.")
     if bool(args.no_camera) and (bool(args.wrist_depth_mask) or bool(args.wrist_depth_raw)):
         parser.error("--wrist-depth-mask/--wrist-depth-raw require cameras; remove --no-camera.")
+    # The saved foot-pad topology only selects an additional input mapping.
+    # It must not enable/disable Fix/Init controllers or GUI capabilities.
+    args.init_arm_requested = bool(getattr(args, "init_arm_available", False))
+    args.foot_pad_config_count = configured_foot_pad_count()
+    args.init_arm_disabled_reason = ""
     if bool(getattr(args, "init_arm_available", False)) and not str(
         getattr(args, "init_arm_profile", "") or ""
     ).strip():
         parser.error("--init-arm-available requires --init-arm-profile.")
+    for side in ("left", "right"):
+        try:
+            _init_arm_qpos_speed_scale_for_side(args, side)
+        except ValueError as exc:
+            parser.error(str(exc))
+    active_sides_for_special_arm = set(_active_sides_from_args(args))
+    explicit_fix_arm = bool({"--fix-arm", "--no-fix-arm"} & raw_arg_set)
+    explicit_init_arm = bool(
+        {
+            "--init-arm-available",
+            "--init-arm-availabe",
+            "--no-init-arm-available",
+            "--no-init-arm-availabe",
+        }
+        & raw_arg_set
+    )
+    # The default special-arm controllers are meaningful only for the dual-arm
+    # topology.  Preserve the historical single-arm behavior unless the user
+    # explicitly requests one of them (which is rejected below with the clear
+    # active-sides error).
+    if active_sides_for_special_arm != {"left", "right"}:
+        if not explicit_fix_arm:
+            args.fix_arm = False
+        if not explicit_init_arm:
+            args.init_arm_available = False
+    args.special_arm_control_mode_requested = getattr(args, "special_arm_control_mode", None)
     try:
         args.special_arm_control_mode = resolve_special_arm_control_mode(
             getattr(args, "special_arm_control_mode", None),
             fix_arm_enabled=bool(getattr(args, "fix_arm", False)),
             init_arm_enabled=bool(getattr(args, "init_arm_available", False)),
+            foot_pad_count=getattr(args, "foot_pad_config_count", None),
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -4209,6 +4840,13 @@ def parse_args() -> argparse.Namespace:
                     "DMTAC tactile reads; remove --dmtac-no-tactile."
                 )
             args.dmtac_tactile = True
+            requested_fields = tuple(getattr(args, "dmtac_tactile_fields", None) or ())
+            args.dmtac_tactile_fields = normalize_dmtac_tactile_fields(
+                (*requested_fields, "distributed_force")
+            )
+            args.dmtac_tactile_compute_profile = "dist-only"
+            if getattr(args, "dmtac_tactile_calibration_policy", None) is None:
+                args.dmtac_tactile_calibration_policy = "required"
         if any(
             _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE
             for side in active_sides
@@ -4325,6 +4963,249 @@ def _gripper_input_source_from_components(components: RealTeleopComponents):
         if isinstance(source, (HandQ6Source, AngleTriggerSource)):
             return source
     return None
+
+
+def _discover_runtime_q6_ports(
+    args: argparse.Namespace,
+    active_sides: Sequence[str],
+) -> dict[str, str]:
+    """Resolve newly connected Q6 devices against the saved side assignment."""
+
+    from hardware.teleop_hand import q6_assignment
+
+    sides = tuple(str(side) for side in active_sides)
+    scan = q6_assignment.scan_q6_devices(
+        probe_all_serial=True,
+        show_raw_lines=False,
+    )
+    devices = list(scan.get("q6_devices") or ())
+    if len(devices) < len(sides):
+        raise RuntimeError(
+            f"Q6 count is insufficient after reconnect: detected {len(devices)}, "
+            f"expected {len(sides)}."
+        )
+    assignment = q6_assignment.load_assignment(
+        str(getattr(args, "q6_config", "latest") or "latest")
+    )
+    comparison = q6_assignment.compare_assignment_to_scan(assignment, scan)
+    missing = [
+        item
+        for item in comparison.get("missing") or ()
+        if str(item.get("side") or "") in sides
+    ]
+    effective = comparison.get("effective_assignment")
+    if missing or not isinstance(effective, Mapping):
+        missing_sides = sorted(
+            str(item.get("side") or "unknown") for item in missing
+        )
+        raise RuntimeError(
+            "Connected Q6 devices do not match the saved left/right assignment; "
+            f"missing={missing_sides or list(sides)}. Reconfigure Q6 before retrying."
+        )
+    ports = q6_assignment.q6_ports_for_sides(
+        effective,
+        active_sides=sides,
+    )
+    unresolved = [side for side in sides if not str(ports.get(side) or "")]
+    if unresolved:
+        raise RuntimeError(
+            f"Saved Q6 assignment did not resolve ports for: {unresolved}."
+        )
+    if comparison.get("remapped"):
+        q6_assignment.save_assignment(effective)
+    return {side: str(ports[side]) for side in sides}
+
+
+def _q6_gripper_retargeter_for_side(
+    args: argparse.Namespace,
+    side: str,
+) -> ScalarToGripperRetargeter:
+    policy = _resolved_gripper_policy_for_side(args, side)
+    return ScalarToGripperRetargeter(
+        ScalarToGripperRetargeterConfig(
+            side=side,
+            input_channel_name=f"{side}_hand_q6",
+            effector_name=f"{side}_hand",
+            source_dim=int(policy["source_dim"]),
+            output_dim=int(policy["output_dim"]),
+            invert=bool(policy["invert"]),
+            alpha=float(policy["alpha"]),
+            input_min=float(policy["input_min"]),
+            input_max=float(policy["input_max"]),
+            output_max=float(policy["max_action"]),
+        )
+    )
+
+
+def _promote_angle_trigger_gripper_input_to_q6(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    *,
+    ready_timeout_sec: float = 2.0,
+) -> tuple[bool, str]:
+    """Hot-switch a healthy angle-trigger fallback to newly connected Q6 input."""
+
+    if str(getattr(components, "gripper_input_source", "") or "") != "angle_trigger":
+        return False, "当前 gripper input 不是 angle trigger fallback，无需切换。"
+
+    old_sources = [
+        source
+        for source in components.session.sources
+        if isinstance(source, AngleTriggerSource)
+    ]
+    if not old_sources:
+        raise RuntimeError("angle trigger fallback source is missing from the active session")
+
+    ports = _discover_runtime_q6_ports(args, components.active_sides)
+    q6_source = HandQ6Source.from_bimanual(
+        left_port=ports.get("left"),
+        right_port=ports.get("right"),
+        baudrate=int(getattr(args, "hand_reader_baudrate", 115200)),
+        timeout=float(getattr(args, "hand_reader_timeout", 0.05)),
+        show_raw_lines=bool(getattr(args, "show_hand_raw_lines", False)),
+        exo_hand_calibration=bool(getattr(args, "exo_hand_calibration", False)),
+        calibration_path=str(getattr(args, "exo_hand_calibration_path", "") or "") or None,
+        critical=False,
+        strict_expected=False,
+    )
+    original_session_sources = list(components.session.sources)
+    original_session_retargeters = list(components.session.retargeters)
+    original_component_source = str(components.gripper_input_source)
+    original_left_retargeter = components.left_gripper_retargeter
+    original_right_retargeter = components.right_gripper_retargeter
+    original_arg_source = getattr(args, "gripper_input_source", None)
+    original_loaded_ports = getattr(args, "q6_config_loaded_ports", None)
+    original_hand_ports = {
+        side: getattr(args, f"{side}_hand_port", None)
+        for side in components.active_sides
+    }
+    try:
+        q6_source.start()
+        deadline = time.monotonic() + max(0.0, float(ready_timeout_sec))
+        last_reason = "等待 Q6 首帧。"
+        while True:
+            now = time.time()
+            channels = q6_source.get_latest_channels()
+            failures: list[str] = []
+            for side in components.active_sides:
+                name = f"{side}_hand_q6"
+                channel = channels.get(name)
+                if channel is None:
+                    failures.append(f"{name}:missing")
+                    continue
+                age_sec = now - float(channel.timestamp)
+                values = np.asarray(channel.value, dtype=float).reshape(-1)
+                if not bool(channel.valid):
+                    failures.append(f"{name}:invalid")
+                elif values.shape != (6,) or not np.all(np.isfinite(values)):
+                    failures.append(f"{name}:bad_shape")
+                elif age_sec < -0.05 or age_sec > 0.5:
+                    failures.append(f"{name}:stale({age_sec:.3f}s)")
+            if not failures:
+                break
+            last_reason = ", ".join(failures)
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Q6 did not become ready: {last_reason}")
+            time.sleep(0.02)
+
+        replacements: dict[int, ScalarToGripperRetargeter] = {}
+        new_by_side: dict[str, ScalarToGripperRetargeter] = {}
+        for side in components.active_sides:
+            old_retargeter = _gripper_retargeter_for_side(components, side)
+            if old_retargeter is None:
+                continue
+            replacement = _q6_gripper_retargeter_for_side(args, side)
+            replacements[id(old_retargeter)] = replacement
+            new_by_side[side] = replacement
+        if not new_by_side:
+            raise RuntimeError("no active DMTAC gripper retargeter is available for Q6")
+
+        replacement_sources: list[object] = []
+        q6_inserted = False
+        for source in components.session.sources:
+            if isinstance(source, AngleTriggerSource):
+                if not q6_inserted:
+                    replacement_sources.append(q6_source)
+                    q6_inserted = True
+                continue
+            if isinstance(source, HandQ6Source):
+                continue
+            replacement_sources.append(source)
+        if not q6_inserted:
+            replacement_sources.append(q6_source)
+
+        replacement_retargeters: list[object] = []
+        inserted_retargeter_ids: set[int] = set()
+        for retargeter in components.session.retargeters:
+            replacement = replacements.get(id(retargeter))
+            if replacement is None:
+                replacement_retargeters.append(retargeter)
+                continue
+            replacement_retargeters.append(replacement)
+            inserted_retargeter_ids.add(id(replacement))
+        for replacement in new_by_side.values():
+            if id(replacement) not in inserted_retargeter_ids:
+                replacement_retargeters.append(replacement)
+
+        components.session.sources = replacement_sources
+        components.session.retargeters = replacement_retargeters
+        object.__setattr__(components, "gripper_input_source", "q6")
+        if "left" in new_by_side:
+            object.__setattr__(
+                components,
+                "left_gripper_retargeter",
+                new_by_side["left"],
+            )
+        if "right" in new_by_side:
+            object.__setattr__(
+                components,
+                "right_gripper_retargeter",
+                new_by_side["right"],
+            )
+        args.gripper_input_source = "q6"
+        args.q6_config_loaded_ports = dict(ports)
+        for side, port in ports.items():
+            setattr(args, f"{side}_hand_port", str(port))
+    except BaseException:
+        components.session.sources = original_session_sources
+        components.session.retargeters = original_session_retargeters
+        object.__setattr__(
+            components,
+            "gripper_input_source",
+            original_component_source,
+        )
+        object.__setattr__(
+            components,
+            "left_gripper_retargeter",
+            original_left_retargeter,
+        )
+        object.__setattr__(
+            components,
+            "right_gripper_retargeter",
+            original_right_retargeter,
+        )
+        args.gripper_input_source = original_arg_source
+        args.q6_config_loaded_ports = original_loaded_ports
+        for side, port in original_hand_ports.items():
+            setattr(args, f"{side}_hand_port", port)
+        try:
+            q6_source.close()
+        except Exception:
+            pass
+        raise
+
+    close_errors: list[str] = []
+    for source in old_sources:
+        try:
+            source.close()
+        except Exception as exc:  # noqa: BLE001 - new Q6 source is already committed.
+            close_errors.append(f"{type(exc).__name__}: {exc}")
+    message = (
+        "Q6 已连接并替换 angle trigger；左右 gripper retargeter 已切换到 hand_q6。"
+    )
+    if close_errors:
+        message += f" angle trigger 关闭告警：{'; '.join(close_errors)}"
+    return True, message
 
 
 def _apply_vive_tracker_mapping(
@@ -5544,10 +6425,18 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
         return {}
     config_text = str(getattr(args, "camera_config", "") or "").strip()
     if not config_text:
+        if not bool(getattr(args, "no_collection", False)):
+            raise ValueError(
+                "formal collection requires --camera-config; use --no-camera only "
+                "when the entire run intentionally has no camera modality"
+            )
         return {}
     config_path = Path(config_text).expanduser()
     if not config_path.exists():
-        if bool(getattr(args, "vis_cam", False)):
+        if (
+            bool(getattr(args, "vis_cam", False))
+            or not bool(getattr(args, "no_collection", False))
+        ):
             raise FileNotFoundError(f"Camera config not found: {config_path}")
         _log("Camera", f"optional camera config not found; preview disabled: {config_path}")
         return {}
@@ -5647,13 +6536,81 @@ def _start_camera_sources(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
     stagger_sec: float = CAMERA_START_STAGGER_SEC,
+    startup_progress: GuiStartupProgress | None = None,
 ) -> None:
     for index, (camera_key, source) in enumerate(camera_sources.items()):
+        progress_key = f"camera.{camera_key}"
+        if startup_progress is not None:
+            startup_progress.begin(
+                progress_key,
+                label=f"相机 {camera_key}",
+                message=(
+                    "等待错峰启动"
+                    if index > 0 and float(stagger_sec) > 0.0
+                    else "正在启动视频流"
+                ),
+                requirement="required_for_collection",
+            )
         if index > 0 and float(stagger_sec) > 0.0:
             _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
             time.sleep(float(stagger_sec))
+            if startup_progress is not None:
+                startup_progress.update(progress_key, message="正在启动视频流")
         _log("Camera", f"starting camera {camera_key}")
-        source.start()
+        try:
+            source.start()
+        except Exception as exc:
+            if startup_progress is not None:
+                startup_progress.fail(
+                    progress_key,
+                    f"{type(exc).__name__}: {exc}",
+                )
+            raise
+        else:
+            if startup_progress is not None:
+                startup_progress.succeed(progress_key, message="视频流已启动")
+
+
+def _start_camera_sources_best_effort(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+    *,
+    stagger_sec: float = CAMERA_START_STAGGER_SEC,
+    startup_progress: GuiStartupProgress | None = None,
+) -> dict[str, str]:
+    """Attempt every configured camera without making cameras a GUI gate."""
+
+    errors: dict[str, str] = {}
+    for index, (camera_key, source) in enumerate(camera_sources.items()):
+        progress_key = f"camera.{camera_key}"
+        if startup_progress is not None:
+            startup_progress.begin(
+                progress_key,
+                label=f"相机 {camera_key}",
+                message=(
+                    "等待错峰启动"
+                    if index > 0 and float(stagger_sec) > 0.0
+                    else "正在启动视频流"
+                ),
+                requirement="required_for_collection",
+            )
+        if index > 0 and float(stagger_sec) > 0.0:
+            _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
+            time.sleep(float(stagger_sec))
+            if startup_progress is not None:
+                startup_progress.update(progress_key, message="正在启动视频流")
+        _log("Camera", f"starting camera {camera_key}")
+        try:
+            source.start()
+        except Exception as exc:  # noqa: BLE001 - optional-device admission records failure.
+            detail = f"{type(exc).__name__}: {exc}"
+            errors[str(camera_key)] = detail
+            _log("Camera", f"WARNING: camera {camera_key} unavailable: {detail}")
+            if startup_progress is not None:
+                startup_progress.fail(progress_key, detail)
+        else:
+            if startup_progress is not None:
+                startup_progress.succeed(progress_key, message="视频流已启动")
+    return errors
 
 
 def _close_camera_sources(camera_sources: Mapping[str, RealSenseRGBSource]) -> None:
@@ -5670,6 +6627,38 @@ def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
     return parse_tactile_regions(value)
 
 
+def _normalize_init_arm_qpos_speed_scale(value: object, *, side: str) -> float:
+    scale = float(value)
+    if (
+        not np.isfinite(scale)
+        or scale < MIN_INIT_ARM_QPOS_SPEED_SCALE
+        or scale > MAX_INIT_ARM_QPOS_SPEED_SCALE
+    ):
+        raise ValueError(
+            f"{side} Init qpos speed scale must be within "
+            f"[{MIN_INIT_ARM_QPOS_SPEED_SCALE:g}, {MAX_INIT_ARM_QPOS_SPEED_SCALE:g}], "
+            f"got {value!r}."
+        )
+    return scale
+
+
+def _init_arm_qpos_speed_scale_for_side(
+    args: argparse.Namespace,
+    side: str,
+) -> float:
+    normalized_side = str(side).strip().lower()
+    if normalized_side not in {"left", "right"}:
+        raise ValueError(f"unsupported Init qpos side {side!r}.")
+    return _normalize_init_arm_qpos_speed_scale(
+        getattr(
+            args,
+            f"init_arm_{normalized_side}_qpos_speed_scale",
+            DEFAULT_INIT_ARM_QPOS_SPEED_SCALE,
+        ),
+        side=normalized_side,
+    )
+
+
 # Compatibility bridge: retain legacy status helper names while the extracted
 # read-only projection owns special-arm GUI status formatting.
 from ..real_teleop.gui_special_arm_status import (
@@ -5680,6 +6669,231 @@ from ..real_teleop.gui_special_arm_status import (
     init_arm_status_text as _init_arm_status_text,
     init_arm_ui_state as _init_arm_ui_state,
 )
+
+
+def _fresh_gui_init_qpos_by_side(
+    components: RealTeleopComponents,
+    *,
+    max_age_sec: float = 0.5,
+) -> dict[str, np.ndarray]:
+    """Read a fresh dual-arm hardware snapshot without issuing motion commands."""
+
+    backends = {
+        "left": components.left_state_backend,
+        "right": components.right_state_backend,
+    }
+    preview_backends = {
+        "left": getattr(components, "left_preview_backend", None),
+        "right": getattr(components, "right_preview_backend", None),
+    }
+    if set(components.active_sides) != {"left", "right"}:
+        raise RuntimeError("GUI Init qpos requires both arms to be active.")
+    if any(backends[side] is None for side in ("left", "right")):
+        raise RuntimeError("GUI Init qpos requires both real-arm state backends.")
+
+    states: dict[str, Mapping[str, object]] = {}
+    executor = components.arm_state_read_executor
+    if executor is not None:
+        futures = {
+            side: executor.submit(backends[side].refresh_state_from_hardware)
+            for side in ("left", "right")
+        }
+        for side, future in futures.items():
+            states[side] = future.result()
+    else:
+        for side in ("left", "right"):
+            states[side] = backends[side].refresh_state_from_hardware()
+
+    now = time.time()
+    qpos_by_side: dict[str, np.ndarray] = {}
+    for side in ("left", "right"):
+        state = states[side]
+        if not bool(state.get("hardware_read_success")):
+            raise RuntimeError(
+                f"{side} Init qpos state read failed: "
+                f"{state.get('hardware_result_text', 'unknown')}"
+            )
+        if not bool(state.get("hardware_measurement_valid")):
+            raise RuntimeError(f"{side} Init qpos hardware measurement is invalid.")
+        arm_err = state.get("hardware_arm_err")
+        sys_err = state.get("hardware_sys_err")
+        if arm_err not in {None, 0} or sys_err not in {None, 0}:
+            raise RuntimeError(f"{side} reports arm_err={arm_err}, sys_err={sys_err}.")
+        timestamp = float(
+            state.get("hardware_measurement_timestamp", state.get("hardware_refresh_time"))
+        )
+        age_sec = max(0.0, now - timestamp)
+        if not np.isfinite(timestamp) or age_sec > float(max_age_sec):
+            raise RuntimeError(
+                f"{side} Init qpos feedback is stale: age={age_sec:.3f}s "
+                f"> {float(max_age_sec):.3f}s."
+            )
+        qpos = np.asarray(state.get("hardware_qpos"), dtype=float).reshape(6)
+        if not np.all(np.isfinite(qpos)):
+            raise RuntimeError(f"{side} Init qpos feedback is non-finite.")
+        preview_backend = preview_backends[side]
+        normalizer = getattr(
+            preview_backend,
+            "normalize_local_qpos_observation",
+            None,
+        )
+        if not callable(normalizer):
+            raise RuntimeError(
+                f"{side} Init qpos requires a preview backend with "
+                "command-safe observation normalization."
+            )
+        try:
+            qpos, _normalization = normalizer(
+                qpos,
+                label=f"{side} Init qpos hardware feedback",
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{side} Init qpos feedback violates the command-safe "
+                f"observation envelope: {exc}"
+            ) from exc
+        qpos_by_side[side] = qpos.copy()
+    return qpos_by_side
+
+
+def _start_gui_qpos_init(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    *,
+    now: float,
+) -> InitArmTransition:
+    """Start background planning for the selected exact-qpos GUI operation."""
+
+    controller = getattr(components, "init_arm_controller", None)
+    if controller is None:
+        return InitArmTransition(False, "Init qpos controller is unavailable.")
+    side = str(getattr(controller, "selected_side", "left") or "left")
+    arm_control_mode = str(getattr(args, "arm_control_mode", ""))
+    if arm_control_mode not in {"position", "impedance"}:
+        return InitArmTransition(
+            False,
+            f"精确 Init qpos 不支持控制模式 {arm_control_mode!r}。",
+            side=side,
+        )
+    if (
+        not bool(getattr(components, "collision_guard_requested", False))
+        or getattr(components, "dual_arm_retargeter", None) is None
+    ):
+        return InitArmTransition(
+            False,
+            "精确 Init qpos 要求双臂碰撞保护已启用；当前拒绝规划和执行。",
+            side=side,
+        )
+    fix_controller = getattr(components, "fix_arm_controller", None)
+    if fix_controller is not None and bool(getattr(fix_controller, "fixed", False)):
+        return InitArmTransition(
+            False,
+            "Init qpos 需要锁定非目标臂为静态碰撞体；请先释放当前 Fix-arm。",
+            side=side,
+        )
+    target = controller.targets_by_side.get(side)
+    if target is None or target.arm_qpos is None:
+        return InitArmTransition(
+            False,
+            f"{side} Init profile 没有 arm_qpos，不能执行精确关节归位。",
+            side=side,
+        )
+    if arm_control_mode == "impedance":
+        not_ready_sides = _impedance_force_control_not_ready_sides(args, components)
+        if not_ready_sides:
+            side_text = "/".join(not_ready_sides)
+            return InitArmTransition(
+                False,
+                "力控尚未初始化，未启动路径规划。"
+                f"请先点击“开始遥操”初始化 {side_text} 力控；"
+                "界面提示“力控初始化完成”后，再执行机械臂精确归位。",
+                side=side,
+            )
+
+    start_qpos = _fresh_gui_init_qpos_by_side(components)
+    target_qpos = {name: value.copy() for name, value in start_qpos.items()}
+    target_qpos[side] = np.asarray(target.arm_qpos, dtype=float).reshape(6).copy()
+    speed_scale = _init_arm_qpos_speed_scale_for_side(args, side)
+    base_velocity_profile = load_joint_velocity_limit_profiles()[
+        INIT_ARM_QPOS_SPEED_BASELINE_PROFILE
+    ]
+    scaled_max_angvel_rad_s = tuple(
+        float(np.deg2rad(value * speed_scale))
+        for value in base_velocity_profile.max_velocity_deg_s
+    )
+
+    def feedback_provider() -> Mapping[str, Any]:
+        return _fresh_gui_init_qpos_by_side(components)
+
+    def plan_builder():
+        # Keep replay's hardware execution package out of multiprocessing
+        # spawn bootstrap.  This import is needed only after an operator asks
+        # for exact GUI Init planning.
+        from ..replay.arm_init.qpos_execute import (  # noqa: PLC0415
+            DEFAULT_QPOS_INIT_COLLISION_SCENE,
+            build_rm65_qpos_init_plan,
+        )
+
+        return build_rm65_qpos_init_plan(
+            start_qpos_by_side=start_qpos,
+            target_qpos_by_side=target_qpos,
+            active_sides=("left", "right"),
+            qpos_dt_sec=0.05,
+            joint_velocity_profile=INIT_ARM_QPOS_SPEED_BASELINE_PROFILE,
+            max_steps_per_side=10000,
+            collision_check=True,
+            collision_scene_profile=DEFAULT_QPOS_INIT_COLLISION_SCENE,
+            # Exact GUI Init is a single-target-arm operation.  The peer arm
+            # remains a static collision body for the entire trajectory.
+            branch_search=False,
+            branch_search_max_branches=8,
+            branch_neutral_qpos_by_side=None,
+            qpos_init_max_angvel_rad_s=scaled_max_angvel_rad_s,
+        )
+
+    transition = controller.start_qpos_planning(
+        start_qpos_by_side=start_qpos,
+        target_qpos_by_side=target_qpos,
+        feedback_provider=feedback_provider,
+        plan_builder=plan_builder,
+        now=float(now),
+        max_tracking_error_deg=15.0,
+        start_drift_tolerance_deg=1.0,
+        arrival_tolerance_deg=0.75,
+        arrival_dwell_sec=0.5,
+        settle_timeout_sec=12.0,
+        tracking_check_every=10,
+    )
+    if not transition.ok or arm_control_mode != "impedance":
+        return transition
+
+    operation_id = str(getattr(controller, "qpos_operation_id", "") or "")
+    armed_backends: list[RM65ImpedanceArmBackend] = []
+    try:
+        for side_name, backend in (
+            ("left", components.left_command_backend),
+            ("right", components.right_command_backend),
+        ):
+            if not isinstance(backend, RM65ImpedanceArmBackend):
+                raise RuntimeError(
+                    f"{side_name} command backend does not support impedance exact-qpos transit"
+                )
+            backend.begin_exact_qpos_transit(operation_id)
+            armed_backends.append(backend)
+    except Exception:
+        for backend in reversed(armed_backends):
+            try:
+                backend.end_exact_qpos_transit(operation_id)
+            except Exception as cleanup_exc:  # noqa: BLE001 - preserve admission failure.
+                _log(
+                    "InitArmQpos",
+                    "WARNING: failed to roll back impedance exact-qpos transit: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                    now=now,
+                )
+        controller.cancel_active(now=now, reason="impedance exact-qpos admission failed")
+        raise
+    return transition
 
 
 def _cancel_special_arm_modes_for_hold(
@@ -5705,6 +6919,20 @@ def _cancel_special_arm_modes_for_hold(
         if transition.ok:
             side_label = "左臂" if transition.side == "left" else "右臂"
             messages.append(f"{side_label} init-arm 已停止")
+    for side, backend in (
+        ("left", getattr(components, "left_command_backend", None)),
+        ("right", getattr(components, "right_command_backend", None)),
+    ):
+        release = getattr(backend, "end_exact_qpos_transit", None)
+        if not callable(release):
+            continue
+        try:
+            if release():
+                messages.append(f"{side} impedance exact-qpos 子模式已释放")
+        except Exception as exc:  # noqa: BLE001 - Hold must continue for the peer arm.
+            messages.append(
+                f"{side} impedance exact-qpos 释放失败: {type(exc).__name__}: {exc}"
+            )
     if messages:
         reset_smoothing = getattr(
             getattr(components, "dual_arm_retargeter", None),
@@ -5722,6 +6950,42 @@ def _cancel_special_arm_modes_for_hold(
                     now=now,
                 )
     return messages
+
+
+def _release_gui_qpos_init_transit(
+    components: RealTeleopComponents,
+    *,
+    operation_id: str,
+    now: float,
+    sides: Sequence[str] = ("left", "right"),
+) -> tuple[list[str], list[str]]:
+    """Release an impedance-only exact-qpos lease at its ownership boundary."""
+
+    messages: list[str] = []
+    errors: list[str] = []
+    backends = {
+        "left": getattr(components, "left_command_backend", None),
+        "right": getattr(components, "right_command_backend", None),
+    }
+    for side in tuple(dict.fromkeys(str(side) for side in sides)):
+        backend = backends.get(side)
+        if backend is None:
+            continue
+        release = getattr(backend, "end_exact_qpos_transit", None)
+        if not callable(release):
+            continue
+        try:
+            released = release(operation_id or None)
+        except Exception as exc:  # noqa: BLE001 - caller converts this to safe Hold.
+            errors.append(f"{side}: {type(exc).__name__}: {exc}")
+        else:
+            if released:
+                messages.append(f"{side} impedance exact-qpos 子模式已释放")
+    for message in messages:
+        _log("InitArmQpos", message, now=now)
+    for error in errors:
+        _log("InitArmQpos", f"ERROR: exact-qpos 子模式释放失败: {error}", now=now)
+    return messages, errors
 
 
 def _disengage_position_backends_for_manual_interaction(
@@ -5976,6 +7240,7 @@ def _build_episode_metadata(
             if _dmtac_sides(args, components.active_sides)
             else {}
         ),
+        **_gripper_force_dataset_metadata(args, components),
         "left_logical_tracker_name": _tracker_name_for_source_side(
             args,
             _tracker_source_side_for_logical_side(args, "left"),
@@ -6162,8 +7427,40 @@ class RealTeleopDatasetRecorder:
     ) -> None:
         self.args = args
         self.components = components
-        self.camera_sources = dict(camera_sources)
         self.dataset_root = Path(args.dataset_root)
+        configured_force_contract = _gripper_force_dataset_contract_from_args(args)
+        persisted_force_contract = read_gripper_force_contract(self.dataset_root)
+        if persisted_force_contract is not None:
+            current_force_contract = _current_gripper_force_dataset_contract(
+                args, components.active_sides
+            )
+            if current_force_contract is None or current_force_contract != persisted_force_contract:
+                raise ValueError(
+                    "dataset gripper force profile differs from the selected task/profile: "
+                    f"existing={persisted_force_contract.to_dict()}, "
+                    f"current={None if current_force_contract is None else current_force_contract.to_dict()}"
+                )
+            if configured_force_contract is not None and configured_force_contract != persisted_force_contract:
+                raise ValueError(
+                    "requested gripper force profile differs from the existing dataset profile"
+                )
+        self.gripper_force_contract = persisted_force_contract or configured_force_contract
+        self.capture_modality_contract = CaptureModalityContract(
+            ignored_camera_keys=tuple(getattr(args, "ignore_camera", ()) or ()),
+            ignored_tactile_keys=tuple(getattr(args, "ignore_tactile", ()) or ()),
+        )
+        bind_capture_modality_contract(
+            self.dataset_root,
+            self.capture_modality_contract,
+        )
+        self.all_camera_sources = {
+            str(key): source for key, source in camera_sources.items()
+        }
+        self.camera_sources = {
+            str(key): source
+            for key, source in self.all_camera_sources.items()
+            if str(key) not in self.capture_modality_contract.ignored_camera_keys
+        }
         self.arm_state_poller = self._build_arm_state_poller()
         self.hand_state_poller = self._build_hand_state_poller()
         policy_io_resolution = resolve_collection_policy_io_layout(
@@ -6177,6 +7474,18 @@ class RealTeleopDatasetRecorder:
                 "left": components.left_gripper_retargeter or components.left_hand_retargeter,
                 "right": components.right_gripper_retargeter or components.right_hand_retargeter,
             },
+            arm_reference_frame_by_side=(
+                None
+                if args.pose_frame_contract is None
+                else {
+                    side: (
+                        args.pose_frame_contract.canonical_absolute_frame
+                        if args.pose_frame_contract.pose_storage_frame == "desk_absolute"
+                        else args.pose_frame_contract.source.raw_frame(side)
+                    )
+                    for side in components.active_sides
+                }
+            ),
         )
         writer_config = LeRobotV21WriterConfig(
             root_dir=self.dataset_root,
@@ -6202,6 +7511,11 @@ class RealTeleopDatasetRecorder:
             ),
             wrist_depth_max_m=float(
                 getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)
+            ),
+            dataset_metadata=_gripper_force_dataset_metadata(
+                args,
+                components,
+                contract=self.gripper_force_contract,
             ),
         )
         self.writer_storage_config = writer_config
@@ -6277,6 +7591,12 @@ class RealTeleopDatasetRecorder:
                 "wrist_depth_min_m": float(getattr(args, "wrist_depth_min_m", DEFAULT_WRIST_DEPTH_MIN_M)),
                 "wrist_depth_max_m": float(getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)),
                 "tactile_compression": str(getattr(args, "tactile_compression", "none")),
+                "capture_modality_contract": self.capture_modality_contract.to_dict(),
+                **_gripper_force_dataset_metadata(
+                    args,
+                    components,
+                    contract=self.gripper_force_contract,
+                ),
             },
         )
         # The process worker discovers persisted episode/sample indices during
@@ -6320,18 +7640,14 @@ class RealTeleopDatasetRecorder:
             hand_state_provider=(
                 None
                 if self.hand_state_poller is None
-                else lambda _components, sample_timestamp: self.hand_state_poller.latest_by_side(
+                else lambda _components, sample_timestamp: self._collection_hand_states(
                     sample_timestamp=float(sample_timestamp)
                 )
             ),
-            # The causal history returns a deep-copied immutable selection.
-            # Avoid copying ~1.23 MiB of tactile arrays a second time only on
-            # the position-process data plane; the established thread/force
-            # path retains its previous copy semantics.
-            hand_state_provider_returns_isolated=(
-                self.collection_worker_mode == "process"
-                and self.hand_state_poller is not None
-            ),
+            # The causal history returns detached containers with shared,
+            # read-only arrays.  Avoid recopying an unchanged tactile frame at
+            # the sample rate in both thread and process collection modes.
+            hand_state_provider_returns_isolated=self.hand_state_poller is not None,
             position_reference_provider=(
                 None
                 if components.position_reference_publisher is None
@@ -6393,6 +7709,8 @@ class RealTeleopDatasetRecorder:
             self.writer_observer = self.writer_runtime.writer_observer
         self.active_episode_index: int | None = None
         self.active_started_at: float | None = None
+        self.control_trace_episode_sink: EpisodeTraceRecorderSink | None = None
+        self._active_control_trace_preparation: Any | None = None
         self.finalize_tasks: list[RealDatasetFinalizeTask] = []
         self.saved_episodes = 0
         self.discarded_episodes = 0
@@ -6404,6 +7722,7 @@ class RealTeleopDatasetRecorder:
         self._pause_started_at: float | None = None
         self._pause_started_monotonic: float | None = None
         self._pause_reason: str | None = None
+        self._pause_reasons: list[str] = []
         self._pause_started_frame_index: int | None = None
         self._pause_started_step_index: int | None = None
         self._pause_started_last_state: str | None = None
@@ -6423,8 +7742,40 @@ class RealTeleopDatasetRecorder:
         self._sample_async_skipped_busy = 0
         self._sample_process_rejected_busy = 0
         self._sample_overload_reason: str | None = None
+        self._sample_modality_reason: str | None = None
         self._process_episode_submitted_count = 0
         self._collection_integrity_reasons: list[str] = []
+
+    def _collection_hand_states(
+        self,
+        *,
+        sample_timestamp: float,
+    ) -> dict[str, dict[str, Any]]:
+        if self.hand_state_poller is None:
+            return {}
+        states = self.hand_state_poller.latest_by_side(
+            sample_timestamp=float(sample_timestamp)
+        )
+        ignored = set(self.capture_modality_contract.ignored_tactile_keys)
+        if not ignored:
+            return states
+        scrubbed: dict[str, dict[str, Any]] = {}
+        for side, raw_state in states.items():
+            state = dict(raw_state)
+            if str(side) in ignored:
+                state.update(
+                    {
+                        "tactile": None,
+                        "tactile_dict": None,
+                        "tactile_timestamp": None,
+                        "tactile_frame_ids": {},
+                        "tactile_shapes": {},
+                        "tactile_devices": [],
+                        "tactile_ignored_by_dataset_contract": True,
+                    }
+                )
+            scrubbed[str(side)] = state
+        return scrubbed
 
     def _build_arm_state_poller(self) -> ArmHardwareStatePoller | None:
         if not bool(getattr(self.args, "record_actual_wrist_camera_pose", True)):
@@ -6480,27 +7831,148 @@ class RealTeleopDatasetRecorder:
 
     def reconfigure_for_current_args(self) -> None:
         desired_root = Path(self.args.dataset_root)
-        if (
-            desired_root == self.dataset_root
-            and str(self.writer_storage_config.task_id) == str(self.args.collection_task_id)
-            and str(self.writer_storage_config.task_description) == str(self.args.collection_task_description)
-            and str(self.writer_storage_config.dataset_name) == str(self.args.dataset_name)
-        ):
+        desired_contract = CaptureModalityContract(
+            ignored_camera_keys=tuple(getattr(self.args, "ignore_camera", ()) or ()),
+            ignored_tactile_keys=tuple(getattr(self.args, "ignore_tactile", ()) or ()),
+        )
+        desired_force_contract = _gripper_force_dataset_contract_from_args(self.args)
+        if desired_force_contract is None and desired_root == self.dataset_root:
+            desired_force_contract = getattr(self, "gripper_force_contract", None)
+        if desired_force_contract is not None:
+            current_force_contract = _current_gripper_force_dataset_contract(
+                self.args, self.components.active_sides
+            )
+            if current_force_contract != desired_force_contract:
+                raise ValueError(
+                    "selected task/profile does not match the dataset gripper force profile: "
+                    f"expected={desired_force_contract.to_dict()}, "
+                    f"current={None if current_force_contract is None else current_force_contract.to_dict()}"
+                )
+        if self.configured_for_current_args():
+            self.reload_finalized_dataset_state()
+            self.write_camera_device_config()
             return
         if self.is_recording:
             raise RuntimeError("Cannot reconfigure dataset recorder while recording.")
+        trace_sink = getattr(self, "control_trace_episode_sink", None)
+        if trace_sink is not None and desired_root != self.dataset_root:
+            raise RuntimeError(
+                "Formal ControlTrace capture cannot move dataset_root within one runtime "
+                "session; restart the frontend for the new root."
+            )
+        # Validate/bind before closing the current writer.  A mismatched
+        # populated dataset must leave the currently usable recorder intact.
+        bind_capture_modality_contract(desired_root, desired_contract)
+        if desired_force_contract is not None and desired_root != self.dataset_root:
+            bind_gripper_force_contract(desired_root, desired_force_contract)
+        elif desired_force_contract is not None and getattr(self, "gripper_force_contract", None) is None:
+            bind_gripper_force_contract(desired_root, desired_force_contract)
+        all_camera_sources = dict(self.all_camera_sources)
         self.close()
+        self.__init__(
+            args=self.args,
+            components=self.components,
+            camera_sources=all_camera_sources,
+        )
+        if trace_sink is not None:
+            self.attach_control_trace_episode_sink(trace_sink)
+        self.start()
+        self.write_camera_device_config()
+
+    def configured_for_current_args(self) -> bool:
+        desired_root = Path(self.args.dataset_root)
+        desired_contract = CaptureModalityContract(
+            ignored_camera_keys=tuple(getattr(self.args, "ignore_camera", ()) or ()),
+            ignored_tactile_keys=tuple(getattr(self.args, "ignore_tactile", ()) or ()),
+        )
+        desired_force_contract = _gripper_force_dataset_contract_from_args(self.args)
+        if desired_force_contract is None and desired_root == self.dataset_root:
+            desired_force_contract = getattr(self, "gripper_force_contract", None)
+        existing_force_contract = getattr(self, "gripper_force_contract", None)
+        if existing_force_contract is not None:
+            current_force_contract = _current_gripper_force_dataset_contract(
+                self.args, self.components.active_sides
+            )
+            if current_force_contract != existing_force_contract:
+                return False
+        return bool(
+            desired_root == self.dataset_root
+            and desired_contract == self.capture_modality_contract
+            and desired_force_contract == existing_force_contract
+            and str(self.writer_storage_config.task_id) == str(self.args.collection_task_id)
+            and str(self.writer_storage_config.task_description) == str(self.args.collection_task_description)
+            and str(self.writer_storage_config.dataset_name) == str(self.args.dataset_name)
+        )
+
+    def require_configured_for_current_args(self) -> None:
+        if self.configured_for_current_args():
+            return
+        raise RuntimeError(
+            "dataset task/root/modality configuration changed after warmup started; "
+            "cancel and start collection again"
+        )
+
+    def reload_finalized_dataset_state(self) -> None:
+        """Rescan idle dataset counters before opening the next episode."""
+
+        if self.is_recording or self.finalizing:
+            raise RuntimeError("Cannot reload dataset state while recording or finalizing.")
+        writer_lifecycle = self._writer_lifecycle()
+        if writer_lifecycle is None:
+            raise RuntimeError("formal collection writer lifecycle is unavailable")
+        if getattr(self, "collection_worker_mode", "thread") == "thread":
+            self.writer_pool.join()
+        self.writer.reload_finalized_dataset_state()
+        if getattr(self, "collection_worker_mode", "thread") == "thread":
+            self.sample_builder.set_dataset_position(
+                episode_index=int(self.writer.next_episode_index),
+                sample_index=int(self.writer.next_sample_index),
+            )
+
+    def delete_episode(self, episode_index: int) -> EpisodeDeleteResult:
+        """Stop the writer lifecycle, compact one finalized episode, then resume."""
+        if self.is_recording or self.finalizing:
+            raise RuntimeError("Cannot delete an episode while recording or finalizing.")
+        trace_sink = getattr(self, "control_trace_episode_sink", None)
+        self.close()
+        result: EpisodeDeleteResult | None = None
+        maintenance_error: BaseException | None = None
+        try:
+            result = delete_episode_and_compact(self.dataset_root, int(episode_index))
+        except BaseException as exc:  # restart the writer even when validation/deletion fails
+            maintenance_error = exc
         self.__init__(
             args=self.args,
             components=self.components,
             camera_sources=self.camera_sources,
         )
+        if trace_sink is not None:
+            self.attach_control_trace_episode_sink(trace_sink)
         self.start()
         self.write_camera_device_config()
+        if maintenance_error is not None:
+            raise maintenance_error
+        assert result is not None
+        return result
 
     @property
     def is_recording(self) -> bool:
         return self.active_episode_index is not None
+
+    def attach_control_trace_episode_sink(
+        self,
+        sink: EpisodeTraceRecorderSink,
+    ) -> None:
+        """Attach one subordinate trace sink before any episode is active."""
+
+        if not isinstance(sink, EpisodeTraceRecorderSink):
+            raise TypeError("sink must be EpisodeTraceRecorderSink.")
+        if self.is_recording or self.finalizing:
+            raise RuntimeError("Cannot replace the ControlTrace sink during an episode lifecycle.")
+        current = getattr(self, "control_trace_episode_sink", None)
+        if current is not None and current is not sink:
+            raise RuntimeError("A different ControlTrace episode sink is already attached.")
+        self.control_trace_episode_sink = sink
 
     @property
     def is_paused(self) -> bool:
@@ -6513,6 +7985,14 @@ class RealTeleopDatasetRecorder:
     @property
     def pause_reason(self) -> str:
         return str(getattr(self, "_pause_reason", None) or "")
+
+    @property
+    def pause_reasons(self) -> tuple[str, ...]:
+        return tuple(str(reason) for reason in getattr(self, "_pause_reasons", ()))
+
+    @property
+    def continuity_segment_index(self) -> int:
+        return int(getattr(self, "_continuity_segment_index", 0) or 0)
 
     @property
     def frame_count(self) -> int:
@@ -6580,24 +8060,86 @@ class RealTeleopDatasetRecorder:
         ready, message = self.actual_feedback_warmup_status(now)
         if not ready:
             raise RuntimeError(f"actual TCP feedback is not ready: {message}")
-        episode_index = self.writer.start_episode(metadata=metadata)
+        trace_sink = getattr(self, "control_trace_episode_sink", None)
+        trace_preparation = None
+        metadata_payload = dict(metadata)
+        force_contract = getattr(self, "gripper_force_contract", None)
+        if force_contract is not None:
+            metadata_payload["gripper_force_profile"] = force_contract.to_dict()
+        if trace_sink is not None:
+            planned_episode_index = int(self.writer.next_episode_index)
+            trace_preparation = trace_sink.prepare_episode(
+                legacy_episode_index=planned_episode_index,
+                prepared_at=trace_sink.control_now(),
+            )
+            trace_manifest_prefix = (
+                "meta/v24/control_trace/episodes/"
+                f"{trace_preparation.episode_uuid}"
+            )
+            metadata_payload["control_trace_episode"] = {
+                "schema": "dexteleop_control_trace_episode_binding_v1",
+                "episode_uuid": trace_preparation.episode_uuid,
+                "trace_session_id": trace_sink.runtime.session.trace_session_id,
+                "profile_id": trace_sink.runtime.profile.profile_id,
+                "profile_scope": trace_sink.runtime.profile.profile_scope,
+                "seal_assessment_ref": (
+                    f"{trace_manifest_prefix}/seal_assessment.cjson"
+                ),
+                "capture_commit_ref": (
+                    f"{trace_manifest_prefix}/capture_commit.cjson"
+                ),
+            }
+        writer_start_kwargs: dict[str, Any] = {"metadata": metadata_payload}
+        if (
+            trace_preparation is not None
+            and getattr(self, "collection_worker_mode", "thread") == "process"
+            and bool(getattr(self.process_worker, "native_stream_contracts", {}))
+        ):
+            writer_start_kwargs["episode_uuid"] = trace_preparation.episode_uuid
+        try:
+            episode_index = self.writer.start_episode(**writer_start_kwargs)
+        except BaseException:
+            if trace_sink is not None and trace_preparation is not None:
+                trace_sink.cancel_prepared_episode(trace_preparation)
+            raise
+        if trace_preparation is not None and int(episode_index) != trace_preparation.legacy_episode_index:
+            self.writer.discard_episode(int(episode_index))
+            trace_sink.cancel_prepared_episode(trace_preparation)
+            raise RuntimeError(
+                "Legacy dataset episode index changed after ControlTrace preparation: "
+                f"planned={trace_preparation.legacy_episode_index} actual={int(episode_index)}"
+            )
+        if trace_sink is not None and trace_preparation is not None:
+            try:
+                trace_sink.bind_prepared_episode(
+                    trace_preparation,
+                    bound_at=trace_sink.control_now(),
+                )
+            except BaseException:
+                self.writer.discard_episode(int(episode_index))
+                trace_sink.cancel_prepared_episode(trace_preparation)
+                raise
         if getattr(self, "collection_worker_mode", "thread") == "thread":
             self.sample_builder.set_episode(episode_index)
         self._process_episode_submitted_count = 0
         self._sample_overload_reason = None
+        self._sample_modality_reason = None
         self._collection_integrity_reasons = []
         self.active_episode_index = int(episode_index)
         self.active_started_at = float(now)
+        self._active_control_trace_preparation = trace_preparation
         self._record_timestamps.clear()
         self._episode_start_monotonic = time.monotonic()
         self._pause_started_at = None
         self._pause_started_monotonic = None
         self._pause_reason = None
+        self._pause_reasons = []
         self._pause_started_frame_index = None
         self._pause_started_step_index = None
         self._pause_started_last_state = None
         self._pause_segments = []
         self._paused_accumulated_sec = 0.0
+        self._continuity_segment_index = 0
         return int(episode_index)
 
     def actual_feedback_warmup_status(self, now: float) -> tuple[bool, str]:
@@ -6668,6 +8210,9 @@ class RealTeleopDatasetRecorder:
         if not self.is_recording:
             return False
         if self.is_paused:
+            normalized_reason = str(reason)
+            if normalized_reason and normalized_reason not in self._pause_reasons:
+                self._pause_reasons.append(normalized_reason)
             return False
         # Process mode pauses must never wait on the snapshot thread from the
         # 60 Hz control loop.  At most the already accepted causal sample may
@@ -6679,6 +8224,7 @@ class RealTeleopDatasetRecorder:
         self._pause_started_at = float(now)
         self._pause_started_monotonic = time.monotonic()
         self._pause_reason = str(reason)
+        self._pause_reasons = [str(reason)]
         self._pause_started_frame_index = int(self.frame_count)
         self._pause_started_step_index = int(step_index)
         self._pause_started_last_state = last_state
@@ -6703,6 +8249,7 @@ class RealTeleopDatasetRecorder:
         )
         segment = {
             "reason": str(self._pause_reason or ""),
+            "reasons": list(self.pause_reasons),
             "resume_reason": str(resume_reason),
             "start_timestamp": float(pause_started_at or now),
             "end_timestamp": float(now),
@@ -6723,6 +8270,7 @@ class RealTeleopDatasetRecorder:
         self._pause_started_at = None
         self._pause_started_monotonic = None
         self._pause_reason = None
+        self._pause_reasons = []
         self._pause_started_frame_index = None
         self._pause_started_step_index = None
         self._pause_started_last_state = None
@@ -6736,6 +8284,24 @@ class RealTeleopDatasetRecorder:
         now: float,
         step_index: int,
     ) -> bool:
+        if not self.is_paused:
+            return False
+        # Reset model-temporal state while the recorder is still paused.  If
+        # the process worker cannot acknowledge the ordered reset, fail closed
+        # and leave the episode paused instead of reopening a mixed segment.
+        if getattr(self, "collection_worker_mode", "thread") == "thread":
+            reset_history = getattr(
+                self.sample_builder,
+                "reset_temporal_history",
+                None,
+            )
+            if callable(reset_history):
+                reset_history()
+        else:
+            process_worker = getattr(self, "process_worker", None)
+            reset_history = getattr(process_worker, "reset_temporal_history", None)
+            if callable(reset_history):
+                reset_history()
         resumed = self._close_pause_segment(
             resume_reason=reason,
             now=now,
@@ -6743,6 +8309,7 @@ class RealTeleopDatasetRecorder:
         ) is not None
         if resumed:
             self._sample_overload_reason = None
+            self._continuity_segment_index = self.continuity_segment_index + 1
         return resumed
 
     def pause_summary(self) -> dict[str, Any]:
@@ -6751,9 +8318,11 @@ class RealTeleopDatasetRecorder:
             "recording_pause_schema": "dexteleop_recording_pause_v1",
             "recording_paused": bool(self.is_paused),
             "recording_pause_reason": self.pause_reason,
+            "recording_pause_reasons": list(self.pause_reasons),
             "recording_pause_segments": [dict(segment) for segment in getattr(self, "_pause_segments", [])],
             "recording_pause_count": len(getattr(self, "_pause_segments", [])) + (1 if self.is_paused else 0),
             "recording_paused_duration_sec": self._total_paused_sec(),
+            "collection_continuity_segment_count": self.continuity_segment_index + 1,
             "recording_active_duration_sec": active_elapsed_sec,
             "recording_wall_duration_sec": wall_elapsed_sec,
         }
@@ -6929,7 +8498,11 @@ class RealTeleopDatasetRecorder:
         finally:
             self.sample_builder.include_debug_metadata = previous_include_debug_metadata
             self.sample_builder.include_action_debug_metadata = previous_include_action_debug_metadata
+        if result is None and self.sample_builder.last_camera_rejection:
+            self._sample_modality_reason = str(self.sample_builder.last_camera_rejection)
+            self._mark_collection_integrity_issue(self._sample_modality_reason)
         if result is not None:
+            self._sample_modality_reason = None
             self._note_recorded_sample()
         return result
 
@@ -6951,13 +8524,13 @@ class RealTeleopDatasetRecorder:
         """Queue one causal dataset sample without blocking the control/IK loop."""
 
         if not bool(getattr(self, "_async_sample_enabled", False)):
-            self.record_step(
+            result = self.record_step(
                 step_result,
                 include_debug_metadata=include_debug_metadata,
                 include_action_debug_metadata=include_action_debug_metadata,
                 metadata_extra=metadata_extra,
             )
-            return True
+            return result is not None
         if not self.can_record_samples:
             return False
         previous = getattr(self, "_sample_future", None)
@@ -7030,6 +8603,10 @@ class RealTeleopDatasetRecorder:
                     # sample-frequency diagnostics, not process overload.
                     return ""
         return self.collection_overload_reason
+
+    @property
+    def collection_modality_reason(self) -> str:
+        return str(getattr(self, "_sample_modality_reason", None) or "")
 
     def collection_worker_ready_status(self) -> tuple[bool, str]:
         if getattr(self, "process_worker", None) is None:
@@ -7131,8 +8708,51 @@ class RealTeleopDatasetRecorder:
                 if audit_result is not None:
                     summary_payload["position_audit_finalize"] = dict(audit_result)
             run_stage("writer_flush", self._writer_lifecycle().flush)
+            if bool(
+                getattr(
+                    getattr(self, "process_worker", None),
+                    "native_external_stream_bindings",
+                    {},
+                )
+            ):
+                trace_sink = getattr(self, "control_trace_episode_sink", None)
+                if trace_sink is None or task.control_trace_release is None:
+                    raise RuntimeError(
+                        "External native streams require an episode trace "
+                        "release before legacy finalize."
+                    )
+                task.control_trace_release = run_stage(
+                    "native_stream_release_freeze",
+                    lambda: trace_sink.resolve_release(
+                        task.control_trace_release
+                    ),
+                )
+                if task.control_trace_release is None:
+                    raise RuntimeError(
+                        "External native stream episode release resolved empty."
+                    )
             summary_payload["writer_pool_stats_after_flush"] = self._writer_stats_payload()
-            summary_payload["storage_queue_stats"] = self._storage_queue_stats_payload()
+            storage_queue_stats = self._storage_queue_stats_payload()
+            summary_payload["storage_queue_stats"] = storage_queue_stats
+            dropped_routes = {
+                str(route_key): int(route_stats.get("dropped", 0) or 0)
+                for route_key, route_stats in dict(
+                    storage_queue_stats.get("routes", {}) or {}
+                ).items()
+                if isinstance(route_stats, Mapping)
+                and int(route_stats.get("dropped", 0) or 0) > 0
+            }
+            if dropped_routes:
+                drop_reason = "storage_queue_dropped:" + ",".join(
+                    f"{key}={count}" for key, count in sorted(dropped_routes.items())
+                )
+                integrity_reasons = list(
+                    summary_payload.get("collection_integrity_reasons", ()) or ()
+                )
+                if drop_reason not in integrity_reasons:
+                    integrity_reasons.append(drop_reason)
+                summary_payload["collection_integrity_valid"] = False
+                summary_payload["collection_integrity_reasons"] = integrity_reasons
             # This is persisted with the episode record; the final writer stage
             # itself is measured on task completion and emitted in the Dataset
             # completion log because it cannot be known before the record is
@@ -7141,13 +8761,74 @@ class RealTeleopDatasetRecorder:
             summary_payload["finalize_started_at"] = float(
                 task.started_at if task.started_at is not None else time.time()
             )
-            run_stage(
+            legacy_finalize_result = run_stage(
                 "writer_finalize_episode",
                 lambda: self.writer.finalize_episode(task.episode_index, summary=summary_payload),
             )
         except BaseException as exc:  # noqa: BLE001
+            trace_sink = getattr(self, "control_trace_episode_sink", None)
+            if trace_sink is not None:
+                try:
+                    task.control_trace_finalize_report = trace_sink.legacy_finalize_failed(
+                        task.control_trace_release,
+                        completed_at=trace_sink.commit_now(),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                except BaseException as trace_exc:  # preserve legacy failure as primary
+                    task.control_trace_error = (
+                        f"legacy_finalize_failure_reporting:{type(trace_exc).__name__}: {trace_exc}"
+                    )
             task.mark_done(success=False, error=f"{type(exc).__name__}: {exc}")
             return
+        trace_sink = getattr(self, "control_trace_episode_sink", None)
+        if trace_sink is not None:
+            native_stream_artifact_receipts = tuple(
+                getattr(
+                    legacy_finalize_result,
+                    "native_stream_artifact_receipts",
+                    (),
+                )
+                or ()
+            )
+            artifact_receipt_error = str(
+                getattr(legacy_finalize_result, "artifact_receipt_error", "")
+                or ""
+            )
+            if artifact_receipt_error:
+                task.control_trace_error = (
+                    "native_artifact_receipt:"
+                    f"{artifact_receipt_error}"
+                )
+            try:
+                def complete_control_trace():
+                    kwargs: dict[str, Any] = {
+                        "completed_at": trace_sink.commit_now(),
+                    }
+                    if native_stream_artifact_receipts:
+                        kwargs["native_stream_artifact_receipts"] = (
+                            native_stream_artifact_receipts
+                        )
+                    return trace_sink.legacy_finalize_completed(
+                        task.control_trace_release,
+                        **kwargs,
+                    )
+
+                task.control_trace_finalize_report = run_stage(
+                    "control_trace_post_finalize",
+                    complete_control_trace,
+                )
+            except BaseException as trace_exc:  # legacy finalize remains successful
+                post_finalize_error = (
+                    f"post_finalize:{type(trace_exc).__name__}: {trace_exc}"
+                )
+                task.control_trace_error = ";".join(
+                    value
+                    for value in (
+                        task.control_trace_error,
+                        post_finalize_error,
+                    )
+                    if value
+                )
         task.mark_done(success=True)
 
     def _start_finalize_task(self, task: RealDatasetFinalizeTask) -> bool:
@@ -7209,18 +8890,49 @@ class RealTeleopDatasetRecorder:
         frame_count = int(self.frame_count)
         frequency_status = self.collection_frequency_status()
         pause_summary = self.pause_summary()
+        trace_sink = getattr(self, "control_trace_episode_sink", None)
+        trace_preparation = getattr(self, "_active_control_trace_preparation", None)
+        trace_release = None
+        trace_release_error = ""
+        if trace_sink is not None and trace_preparation is not None:
+            try:
+                trace_release = trace_sink.release_episode(
+                    trace_preparation,
+                    unbound_at=trace_sink.control_now(),
+                    reason=f"legacy_episode_stop:{reason}",
+                )
+            except BaseException as trace_exc:  # legacy finalize must remain available
+                trace_release_error = (
+                    f"release:{type(trace_exc).__name__}: {trace_exc}"
+                )
+                self._mark_collection_integrity_issue(
+                    f"control_trace_episode_{trace_release_error}"
+                )
+        self._active_control_trace_preparation = None
         self.active_episode_index = None
         self.active_started_at = None
         self._episode_start_monotonic = None
         self._pause_started_at = None
         self._pause_started_monotonic = None
         self._pause_reason = None
+        self._pause_reasons = []
         self._pause_started_frame_index = None
         self._pause_started_step_index = None
         self._pause_started_last_state = None
         if frame_count <= 0:
             self._writer_lifecycle().flush()
             self.writer.discard_episode(episode_index)
+            if trace_sink is not None:
+                try:
+                    trace_sink.defer_legacy_episode_discarded(
+                        trace_release,
+                        completed_at=trace_sink.commit_now(),
+                    )
+                except BaseException as trace_exc:
+                    self._mark_collection_integrity_issue(
+                        "control_trace_episode_discard_reporting:"
+                        f"{type(trace_exc).__name__}:{trace_exc}"
+                    )
             self.discarded_episodes += 1
             self._record_timestamps.clear()
             self._pause_segments = []
@@ -7232,6 +8944,8 @@ class RealTeleopDatasetRecorder:
             reason=str(reason),
             queued_at=time.time(),
             before_finalize=before_finalize,
+            control_trace_release=trace_release,
+            control_trace_error=trace_release_error,
         )
         task.summary = self._finalize_summary(
             reason=reason,
@@ -7573,6 +9287,10 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                 max_joint_step_deg=float(args.dual_arm_temp_max_joint_step_deg)
                 * qpos_limit_scale,
                 command_scale=float(args.dual_arm_temp_command_scale),
+                evidence_enabled=(
+                    str(getattr(args, "human_action_arbiter_mode", "off"))
+                    == "shadow"
+                ),
             )
         )
         if temporary_safety_enabled
@@ -7669,7 +9387,19 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             f"runtime workspace override applied: {json.dumps(workspace_overrides, sort_keys=True)}",
         )
     if _dmtac_sides(args, active_sides):
-        _dmtac_backend_configs(args, active_sides)
+        try:
+            _dmtac_backend_configs(args, active_sides)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if str(getattr(args, "hardware_admission_mode", "strict")) == "strict":
+                raise
+            args.dmtac_startup_error = f"{type(exc).__name__}: {exc}"
+            args._dmtac_backend_configs = {}
+            args.dmtac_config_loaded_sides = []
+            _log(
+                "DMTAC",
+                "WARNING: DMTAC initialization was isolated from arm/GUI startup: "
+                f"{args.dmtac_startup_error}",
+            )
     tracker_translation_offset = _vive_tracker_local_translation_offset(args)
     calibration.metadata.update(
         {
@@ -8058,6 +9788,25 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                             if arm_control_mode == "position"
                             else 5.0
                         ),
+                        candidate_certification_reserve_ms=(
+                            float(
+                                getattr(
+                                    args,
+                                    "position_ik_candidate_certification_reserve_ms",
+                                    0.0,
+                                )
+                            )
+                            if arm_control_mode == "position"
+                            else 0.0
+                        ),
+                        position_singularity_candidate_certificate_enabled=bool(
+                            arm_control_mode == "position"
+                            and getattr(
+                                args,
+                                "position_singularity_candidate_certificate",
+                                False,
+                            )
+                        ),
                         output_command_type=(
                             "cartesian_pose"
                             if arm_control_mode == "impedance"
@@ -8110,6 +9859,15 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                         ),
                         elbow_singularity_threshold_deg=3.0,
                         elbow_singularity_selection_margin_deg=1.0,
+                        prefer_non_shoulder_singular_branch=bool(
+                            arm_control_mode == "position"
+                            and getattr(
+                                args,
+                                "position_prefer_non_shoulder_singular_branch",
+                                False,
+                            )
+                        ),
+                        shoulder_singularity_threshold_m=0.05,
                         local_step_candidate_clip_scale=(
                             float(getattr(args, "position_ik_local_step_clip_scale", 1.0))
                             if arm_control_mode == "position"
@@ -8186,15 +9944,25 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         from hardware.angle_trigger.angle_trigger import prepare_reader
 
         config_root = getattr(args, "gripper_angle_trigger_config_root", None)
-        reader = prepare_reader(
-            config_root=config_root,
-            sample_hz=float(getattr(args, "gripper_angle_trigger_rate_hz", 30.0)),
-        )
-        angle_trigger_source = AngleTriggerSource(
-            reader,
-            rate_hz=float(getattr(args, "gripper_angle_trigger_rate_hz", 30.0)),
-            config_root=config_root,
-        )
+        try:
+            reader = prepare_reader(
+                config_root=config_root,
+                sample_hz=float(getattr(args, "gripper_angle_trigger_rate_hz", 30.0)),
+            )
+            angle_trigger_source = AngleTriggerSource(
+                reader,
+                rate_hz=float(getattr(args, "gripper_angle_trigger_rate_hz", 30.0)),
+                config_root=config_root,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            if str(getattr(args, "hardware_admission_mode", "strict")) == "strict":
+                raise
+            args.angle_trigger_startup_error = f"{type(exc).__name__}: {exc}"
+            _log(
+                "AngleTrigger",
+                "WARNING: input initialization was isolated from arm/GUI startup: "
+                f"{args.angle_trigger_startup_error}",
+            )
 
     left_hand_retargeter = None
     right_hand_retargeter = None
@@ -8464,6 +10232,22 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
                             True,
                         )
                     ),
+                    allow_position_shoulder_singularity_fallback=bool(
+                        arm_control_mode == "position"
+                        and getattr(
+                            args,
+                            "position_prefer_non_shoulder_singular_branch",
+                            False,
+                        )
+                    ),
+                    require_position_singularity_candidate_certificate=bool(
+                        arm_control_mode == "position"
+                        and getattr(
+                            args,
+                            "position_singularity_candidate_certificate",
+                            False,
+                        )
+                    ),
                     ik_tuning=ik_tuning,
                     ik_framework=str(getattr(args, "rm65_ik_framework", "robot_motion")),
                 )
@@ -8541,6 +10325,11 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             targets_by_side=init_targets,
             selected_side=str(getattr(args, "init_arm_side", "left") or "left"),
             use_dual_target_override=dual_arm_retargeter is not None,
+            qpos_final_collision_checker=(
+                None
+                if dual_arm_retargeter is None
+                else dual_arm_retargeter.check_qpos_pair_collision
+            ),
         )
         if dual_arm_retargeter is not None:
             dual_arm_retargeter.target_override_filter = init_arm_controller.filter_dual_arm_targets
@@ -8576,6 +10365,73 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         )
         if session_record_enabled
         else None
+    )
+    human_shadow_frontend = build_real_teleop_human_shadow_frontend(
+        RealTeleopHumanShadowProfile(
+            mode=str(getattr(args, "human_action_arbiter_mode", "off")),
+            pose_source_id=(
+                getattr(args, "pose_frame_contract").source.source_id
+                if getattr(args, "pose_frame_contract", None) is not None
+                else legacy_rm65_source_id(active_sides)
+            ),
+            active_sides=active_sides,
+            arm_reference_frame_by_side={
+                side: str(
+                    (left_retargeter if side == "left" else right_retargeter).config.output_frame_name
+                )
+                for side in active_sides
+            },
+            hand_backend_by_side=dict(hand_backend_mode_by_side),
+            session_hand_sides=tuple(
+                side
+                for side, enabled in (
+                    ("left", left_hand_control_via_rig),
+                    ("right", right_hand_control_via_rig),
+                )
+                if side in active_sides and enabled
+            ),
+            out_of_session_effectors=tuple(
+                f"{side}_hand"
+                for side, retargeter in (
+                    ("left", left_gripper_retargeter),
+                    ("right", right_gripper_retargeter),
+                )
+                if side in active_sides and retargeter is not None
+            ),
+            gripper_slot_by_side={
+                side: int(policy.get("output_dim", 0))
+                for side, policy in gripper_policies_by_side.items()
+            },
+            action_space=(
+                "bimanual_qpos_v1"
+                if dual_arm_retargeter is not None and arm_control_mode == "position"
+                else "bimanual_ee_pose_v1"
+            ),
+            arm_joint_policy=(
+                "qpos"
+                if dual_arm_retargeter is not None and arm_control_mode == "position"
+                else "source_pose_when_available"
+            ),
+            decision_hz=float(getattr(args, "human_action_arbiter_hz", 60.0)),
+            trace_capacity=int(
+                getattr(args, "human_action_shadow_trace_capacity", 262_144)
+            ),
+            observer_queue_capacity=int(
+                getattr(args, "human_action_shadow_observer_queue_size", 4096)
+            ),
+            trace_root=getattr(args, "human_action_shadow_trace_root", None),
+            wal_max_bytes=int(
+                getattr(args, "human_action_shadow_wal_max_mb", 128)
+            )
+            * 1024
+            * 1024,
+            control_domain_id=str(
+                getattr(args, "human_action_shadow_control_domain_id", "") or ""
+            ),
+            embodiment_instance_id=str(
+                getattr(args, "human_action_shadow_embodiment_instance_id", "") or ""
+            ),
+        )
     )
     session = TeleopSession(
         config=TeleopSessionConfig(
@@ -8625,21 +10481,49 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             fix_arm_controller=fix_arm_controller,
             init_arm_controller=init_arm_controller,
         ),
-        command_guard=(
-            lambda command, _observation, now: fixed_arm_final_collision_fault(
-                command,
-                fix_arm_controller=fix_arm_controller,
-                dual_arm_retargeter=dual_arm_retargeter,
-                now=now,
-            )
-            if fix_arm_controller is not None and dual_arm_retargeter is not None
-            else None
+        command_guard=_compose_real_command_guard(
+            fix_arm_controller=fix_arm_controller,
+            init_arm_controller=init_arm_controller,
+            dual_arm_retargeter=dual_arm_retargeter,
         ),
         fault_filter=_compose_real_fault_filter(
             fix_arm_controller=fix_arm_controller,
             init_arm_controller=init_arm_controller,
         ),
+        human_command_observer=(
+            None
+            if human_shadow_frontend is None
+            else human_shadow_frontend.observe_emission
+        ),
+        human_command_filter_observer=(
+            None
+            if human_shadow_frontend is None or temporary_safety_limiter is None
+            else (
+                lambda emission, command, observed_at: (
+                    human_shadow_frontend.observe_filtered_command(
+                        emission,
+                        command,
+                        observed_at,
+                        temporary_safety_limiter.last_evaluation,
+                    )
+                )
+            )
+        ),
+        human_execution_observer=(
+            None
+            if human_shadow_frontend is None
+            else human_shadow_frontend.observe_legacy_execution
+        ),
     )
+    if human_shadow_frontend is not None:
+        _log(
+            "ActionArbiter",
+            "human shadow configured observe-only "
+            f"runtime_session={human_shadow_frontend.runtime_session_id} "
+            f"control_domain={human_shadow_frontend.control_domain_id} "
+            f"decision_hz={float(args.human_action_arbiter_hz):g} "
+            f"trace={'scoped_wal' if human_shadow_frontend.wal_directory is not None else 'in_memory'}",
+        )
     _log(
         "Safety",
         "safety_freeze_hold=on auto_recovery=on for RM65 real teleop; "
@@ -8705,6 +10589,22 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "left": left_command_backend,
             "right": right_command_backend,
         }
+        if dual_arm_retargeter is not None:
+            shoulder_preference_enabled = bool(
+                getattr(
+                    args,
+                    "position_prefer_non_shoulder_singular_branch",
+                    False,
+                )
+            )
+            dual_arm_retargeter.set_position_singularity_analyzers(
+                {
+                    side: command_backends[side].analyze_position_singularity_candidate
+                    for side in active_sides
+                    if shoulder_preference_enabled
+                    and isinstance(command_backends[side], RM65ArmBackend)
+                }
+            )
         urdf_root_from_base_by_side: dict[str, np.ndarray] = {}
         if str(getattr(args, "control_debug", "off")).strip().lower() == "full":
             for side in active_sides:
@@ -8781,6 +10681,7 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
             "last_loop_time": None,
             "smoothed_loop_dt": action_dt,
         },
+        human_shadow_frontend=human_shadow_frontend,
         temporary_safety_limiter=temporary_safety_limiter,
         fix_arm_controller=fix_arm_controller,
         init_arm_controller=init_arm_controller,
@@ -8865,7 +10766,12 @@ def _sync_preview_from_real_state_real(
             parallel_submit_failed = True
         else:
             for future, (side, preview_backend) in future_map.items():
-                state = future.result()
+                try:
+                    state = future.result()
+                except Exception:
+                    if required:
+                        raise
+                    continue
                 qpos = state.get("current_qpos")
                 if qpos is None:
                     if required:
@@ -8879,7 +10785,12 @@ def _sync_preview_from_real_state_real(
         for side, state_backend, preview_backend in backends:
             if side not in components.active_sides or state_backend is None:
                 continue
-            state = state_backend.refresh_state_from_hardware()
+            try:
+                state = state_backend.refresh_state_from_hardware()
+            except Exception:
+                if required:
+                    raise
+                continue
             qpos = state.get("current_qpos")
             if qpos is None:
                 if required:
@@ -8889,7 +10800,8 @@ def _sync_preview_from_real_state_real(
                 continue
             preview_backend.set_local_qpos(qpos)
             synced[side] = True
-    _sync_dual_arm_retargeter_for_real_control(components)
+    if required or all(synced.values()):
+        _sync_dual_arm_retargeter_for_real_control(components)
     return synced
 
 
@@ -9116,7 +11028,15 @@ def _sync_dual_arm_retargeter_for_real_control(
             raise RuntimeError(
                 f"Acceleration-limited coupled IK requires an RM65 command backend for {side}."
             )
-        state = backend.get_state()
+        # This runs twice per outer-loop frame (before and after preview
+        # application). Use the real-time snapshot path: the complete
+        # get_state() default rebuilds five exact percentile windows on a
+        # one-second cache cadence and creates a visible periodic control
+        # stall once those windows grow.
+        state = _runtime_arm_backend_state(
+            backend,
+            include_derived_pose=False,
+        )
         raw_qpos = state.get("last_accepted_qpos")
         source = "last_accepted_qpos"
         if raw_qpos is None:
@@ -9167,11 +11087,38 @@ def _command_backend_for_side(
 
 
 def _active_command_backend(components: RealTeleopComponents) -> RM65ArmBackend | RM65ImpedanceArmBackend | None:
-    for side in components.active_sides:
+    for side in tuple(getattr(components, "active_sides", ("left", "right"))):
         backend = _command_backend_for_side(components, side)
         if backend is not None:
             return backend
     return None
+
+
+def _runtime_arm_backend_state(
+    backend: object | None,
+    *,
+    include_derived_pose: bool = False,
+) -> dict[str, object]:
+    """Read only the position-backend fields needed by the high-rate loop.
+
+    ``RM65ArmBackend.get_state()`` keeps its complete diagnostic default for
+    tools and compatibility callers.  The live 60 Hz loop must not repeatedly
+    sort timing windows or run diagnostic FK merely to publish health state.
+    Force/impedance backends retain their established snapshot path.
+    """
+
+    if backend is None:
+        return {}
+    if isinstance(backend, RM65ArmBackend):
+        return backend.get_state(
+            include_derived_pose=bool(include_derived_pose),
+            include_timing_percentiles=False,
+        )
+    get_state = getattr(backend, "get_state", None)
+    if not callable(get_state):
+        return {}
+    state = get_state()
+    return dict(state) if isinstance(state, Mapping) else {}
 
 
 def _active_impedance_force_backends(
@@ -9181,7 +11128,7 @@ def _active_impedance_force_backends(
     if _arm_control_mode_arg(args) != "impedance":
         return []
     backends: list[tuple[str, RM65ImpedanceArmBackend]] = []
-    for side in components.active_sides:
+    for side in tuple(getattr(components, "active_sides", ("left", "right"))):
         backend = _command_backend_for_side(components, side)
         if not isinstance(backend, RM65ImpedanceArmBackend):
             raise RuntimeError(f"{side}_arm command backend is not RM65ImpedanceArmBackend.")
@@ -9200,6 +11147,29 @@ def _impedance_force_control_warmup_backends(
         if not backend.force_control_warm_started():
             backends.append((side, backend))
     return backends
+
+
+def _impedance_force_control_not_ready_sides(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> list[str]:
+    not_ready: list[str] = []
+    for side, backend in _active_impedance_force_backends(args, components):
+        get_state = getattr(backend, "get_state", None)
+        if not callable(get_state):
+            # Compatibility/test doubles without a health surface retain the
+            # established begin_exact_qpos_transit admission contract.
+            continue
+        state = get_state()
+        if not bool(state.get("impedance_enabled")):
+            not_ready.append(side)
+            continue
+        if bool(getattr(backend.config, "connect_hardware", True)) and (
+            state.get("impedance_loop_state") != "alive"
+            or not isinstance(state.get("last_impedance_record"), Mapping)
+        ):
+            not_ready.append(side)
+    return not_ready
 
 
 def _estimate_impedance_force_control_warmup_sec(
@@ -9335,6 +11305,67 @@ def _emergency_stop_real_arms(
             )
         else:
             _log("EmergencyStop", f"{label} stop requested reason={reason}", now=stop_time)
+
+
+def _handle_init_qpos_emergency_stop(
+    components: RealTeleopComponents,
+    clutch_input: RealTeleopControlInput,
+    *,
+    now: float,
+) -> None:
+    """Abort only the GUI Init-qpos operation and leave the runtime usable.
+
+    This is intentionally not ``_emergency_stop_real_arms``: the GUI Init
+    button is an operation-level stop, not a process-wide/backend-latched
+    emergency stop.  It releases the exact-qpos lease, cancels the planner,
+    sends the normal Hold command, and leaves the operator in the GUI.
+    """
+
+    controller = getattr(components, "init_arm_controller", None)
+    operation_id = str(getattr(controller, "qpos_operation_id", "") or "")
+    release_errors: list[str] = []
+    if controller is not None and bool(getattr(controller, "qpos_active", False)):
+        _messages, release_errors = _release_gui_qpos_init_transit(
+            components,
+            operation_id=operation_id,
+            now=now,
+            sides=("left", "right"),
+        )
+        try:
+            transition = controller.cancel_active(
+                now=now,
+                reason="gui_init_qpos_emergency_stop",
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the normal Hold fallback alive.
+            release_errors.append(f"Init 状态取消异常: {type(exc).__name__}: {exc}")
+        else:
+            if not bool(getattr(transition, "ok", False)):
+                release_errors.append(
+                    "Init 状态取消失败: " + str(getattr(transition, "message", ""))
+                )
+    clutch_input._cancel_init_arm_qpos_sequence(reason="GUI Init 急停")
+    message = "Init 归位已急停并取消；机械臂保持静止，可继续使用 GUI。"
+    if release_errors:
+        message += " 精确控制权释放存在问题：" + "；".join(release_errors)
+    try:
+        components.session.hold_hardware(message)
+    except Exception as exc:  # noqa: BLE001 - report but never resume motion silently.
+        message += f" Hold 下发失败: {type(exc).__name__}: {exc}"
+    try:
+        _disengage_position_backends_for_manual_interaction(
+            components,
+            now=now,
+            reason="gui_init_qpos_emergency_stop",
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the Hold/UI path alive.
+        message += f" 位置控制流释放失败: {type(exc).__name__}: {exc}"
+    if bool(getattr(clutch_input, "_teleop_started", False)):
+        clutch_input.request_hold(reason="init_qpos_emergency_stop")
+        # The normal Hold command was issued above; avoid a duplicate command
+        # on the next loop while retaining the coordinator's Hold/UI state.
+        clutch_input._hold_requested = False
+    clutch_input._publish_init_arm_state(message=message, control_hint=message)
+    _log("InitArmQpos", message, now=now)
 
 
 def _enable_impedance_force_control_after_runtime_home(
@@ -9768,6 +11799,11 @@ def _read_gripper_backend_scalar_now(backend: object) -> float | None:
     return _gripper_state_scalar_from_payload(payload)
 
 
+def _hold_requested_pause_reason(hold_reason: object) -> str:
+    detail = str(hold_reason or "").strip() or "unspecified"
+    return f"hold_requested:{detail}"
+
+
 def _probe_gripper_backend_motion(
     backend: object,
     *,
@@ -9957,10 +11993,74 @@ def _tactile_visualization_available(
                 backend is not None
                 and bool(getattr(backend.config, "connect_tactile", False))
                 and "distributed_force" in tactile_fields
+                and str(
+                    getattr(backend.config, "tactile_calibration_policy", "auto")
+                ) == "required"
             ):
                 return True
         return False
     return any(_hand_backend_for_side(components, side) is not None for side in components.active_sides)
+
+
+def _dmtac_tactile_backends(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> tuple[DMTacGripperBackend, ...]:
+    if not _dmtac_sides(args, components.active_sides):
+        return ()
+    return tuple(
+        backend
+        for side in components.active_sides
+        if (backend := _gripper_backend_for_side(components, side)) is not None
+        and bool(getattr(backend.config, "connect_tactile", False))
+    )
+
+
+def _tactile_solving_available(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> bool:
+    backends = _dmtac_tactile_backends(args, components)
+    return bool(backends) and all(
+        bool(getattr(backend.config, "tactile_process_read", False))
+        and bool(tuple(getattr(backend.config, "tactile_ids", ()) or ()))
+        for backend in backends
+    )
+
+
+def _tactile_solving_active(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> bool:
+    backends = _dmtac_tactile_backends(args, components)
+    return bool(backends) and all(
+        "distributed_force" in tuple(getattr(backend.config, "tactile_fields", ()) or ())
+        and str(getattr(backend.config, "tactile_calibration_policy", "auto")) == "required"
+        for backend in backends
+    )
+
+
+def _enable_gui_tactile_solving(
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+) -> int:
+    backends = _dmtac_tactile_backends(args, components)
+    if not backends:
+        raise RuntimeError("没有已配置的 DMTAC 触觉采集 backend。")
+    changed = sum(bool(backend.enable_tactile_solving()) for backend in backends)
+    fields: list[str] = []
+    for backend in backends:
+        fields.extend(tuple(getattr(backend.config, "tactile_fields", ()) or ()))
+    args.dmtac_tactile_fields = normalize_dmtac_tactile_fields(
+        tuple(dict.fromkeys(fields))
+    )
+    args.dmtac_tactile_compute_profile = "dist-only"
+    args.dmtac_tactile_calibration_policy = "required"
+    args.tactile_solving_active = _tactile_solving_active(args, components)
+    args.tactile_visualization_available = _tactile_visualization_available(
+        args, components
+    )
+    return int(changed)
 
 
 
@@ -10162,9 +12262,16 @@ def _gripper_status_for_side(
         "measured": state.get("gripper_measured_scalar"),
         "state": state.get("gripper_state_scalar"),
         "last_sent_at": state.get("last_sent_command_timestamp"),
+        "joint_at": state.get("joint_timestamp"),
         "telemetry_at": state.get("telemetry_timestamp"),
         "telemetry_error": state.get("telemetry_error"),
         "gripper_read_elapsed_s": state.get("gripper_read_elapsed_s"),
+        "gripper_read_skipped": state.get("gripper_read_skipped"),
+        "gripper_read_skip_reason": state.get("gripper_read_skip_reason"),
+        "gripper_read_forced": state.get("gripper_read_forced"),
+        "gripper_telemetry_max_deferral_s": state.get(
+            "gripper_telemetry_max_deferral_s"
+        ),
         "tactile_read_elapsed_s": state.get("tactile_read_elapsed_s"),
         "tactile_gate_wait_s": state.get("tactile_gate_wait_s"),
         "tactile_timestamp": state.get("tactile_timestamp"),
@@ -10183,6 +12290,10 @@ def _gripper_status_for_side(
         "tactile_process_read": state.get("tactile_process_read"),
         "tactile_worker_alive": state.get("tactile_worker_alive"),
         "tactile_worker_receiver_alive": state.get("tactile_worker_receiver_alive"),
+        "tactile_worker_restart_pending": state.get("tactile_worker_restart_pending"),
+        "tactile_worker_restart_count": state.get("tactile_worker_restart_count"),
+        "tactile_worker_failure_count": state.get("tactile_worker_failure_count"),
+        "tactile_worker_last_exit_code": state.get("tactile_worker_last_exit_code"),
         "tactile_process_nice": state.get("tactile_process_nice"),
         "tactile_process_cpu_affinity": _json_safe_value(
             state.get("tactile_process_cpu_affinity") or ()
@@ -10252,6 +12363,8 @@ def _camera_status_for_source(
     timeout_count = _safe_int_value(info.get("timeout_count"))
     consecutive_timeout_count = _safe_int_value(info.get("consecutive_timeout_count"))
     restart_count = _safe_int_value(info.get("restart_count"))
+    restart_attempt_count = _safe_int_value(info.get("restart_attempt_count"))
+    restart_failure_count = _safe_int_value(info.get("restart_failure_count"))
     last_frame_age_sec = _safe_float_value(info.get("last_frame_age_sec"))
     stale_after_sec = _safe_float_value(info.get("stale_after_sec"))
     if stale_after_sec is None or stale_after_sec <= 0.0:
@@ -10391,6 +12504,8 @@ def _camera_status_for_source(
         "timeout_count": timeout_count,
         "consecutive_timeout_count": consecutive_timeout_count,
         "restart_count": restart_count,
+        "restart_attempt_count": restart_attempt_count,
+        "restart_failure_count": restart_failure_count,
         "last_error": last_error,
         "last_runtime_error": last_runtime_error,
         "last_restart_timestamp": info.get("last_restart_timestamp"),
@@ -10677,6 +12792,8 @@ def _gripper_runtime_status_signature(
         prefix = f"{side}=no_backend"
         measured_text = "-"
         commanded_text = "-"
+        read_text = "-"
+        joint_age_ms_text = "-"
         suffix = ""
         try:
             state = backend.get_state(include_tactile_arrays=False) if backend is not None else {}
@@ -10696,6 +12813,18 @@ def _gripper_runtime_status_signature(
                 commanded = state.get("gripper_commanded_scalar")
                 measured_text = _compact_runtime_float(measured)
                 commanded_text = _compact_runtime_float(commanded)
+                if bool(state.get("gripper_read_forced")):
+                    read_text = "forced"
+                elif bool(state.get("gripper_read_skipped")):
+                    read_text = str(state.get("gripper_read_skip_reason") or "skipped")
+                else:
+                    read_text = "read"
+                joint_at = _safe_float_value(state.get("joint_timestamp"))
+                if joint_at is not None:
+                    joint_age_ms_text = _compact_runtime_float(
+                        max(0.0, current_time - joint_at) * 1000.0,
+                        digits=1,
+                    )
                 q6_mode = str(getattr(components, "gripper_input_source", "q6")) if retargeter is not None else "manual"
                 suffix = f":{error}" if error else ""
                 prefix = f"{side}={connected}/{q6_mode}/cmd={commanded_text}/meas={measured_text}{suffix}"
@@ -10703,7 +12832,7 @@ def _gripper_runtime_status_signature(
             f"{prefix} input={getattr(components, 'gripper_input_source', 'q6')} valid={q6_valid} dim={q6_source_dim} src={q6_source} "
             f"target={q6_target} filt={q6_filtered} vals={q6_values_text} "
             f"send={cmd_text}/{sent_text} send_src={cmd_source} send_target={cmd_target} "
-            f"send_ms={cmd_send_ms}"
+            f"send_ms={cmd_send_ms} read={read_text} joint_age_ms={joint_age_ms_text}"
             + (f" skip={cmd_skip}" if cmd_skip else "")
             + (f" q6_error={q6_error}" if q6_error else "")
         )
@@ -10889,7 +13018,11 @@ def _debug_timing_report(
         ),
         "  " + _debug_timing_fault_text(result),
     ]
-    print(_DEBUG_TIMING_RED + "\n".join(lines) + _DEBUG_TIMING_RESET, flush=True)
+    message = _DEBUG_TIMING_RED + "\n".join(lines) + _DEBUG_TIMING_RESET
+    if state.console_writer is not None:
+        state.console_writer.submit(message)
+    else:
+        print(message, flush=True)
 
 
 def _debug_timing_maybe_report(
@@ -10938,16 +13071,18 @@ def _build_tactile_visualizer(
     active_sides: tuple[str, ...],
     *,
     force: bool = False,
-) -> TactileUVVisualizer | AsyncTactileUVVisualizer | DMTacDistributedForceVisualizer | None:
+) -> TactileUVVisualizer | AsyncTactileUVVisualizer | DMTacDistributedForceVisualizer | AsyncDMTacDistributedForceVisualizer | None:
     if not (bool(args.visualize_tactile) or bool(force)):
         return None
     if _dmtac_sides(args, active_sides):
-        return DMTacDistributedForceVisualizer(
-            DMTacForceVisualizerConfig(
-                enabled_sides=active_sides,
-                dmtac_root=DEFAULT_DMTAC_ROOT,
-            )
+        config = DMTacForceVisualizerConfig(
+            enabled_sides=active_sides,
+            dmtac_root=DEFAULT_DMTAC_ROOT,
+            fixed_ref=float(getattr(args, "dmtac_tactile_vis_fixed_ref", 1.0)),
         )
+        if not bool(getattr(args, "skip_renderer", False)):
+            return AsyncDMTacDistributedForceVisualizer(config)
+        return DMTacDistributedForceVisualizer(config)
     config = TactileVisualizerConfig(
         enabled_sides=active_sides,
         image_size=(int(args.tactile_vis_size), int(args.tactile_vis_size)),
@@ -10994,6 +13129,8 @@ def _build_ik_debug_log_frame(
     left_clutch: bool,
     right_clutch: bool,
     full: bool = False,
+    loop_phases: Sequence[tuple[str, float]] | None = None,
+    loop_elapsed_sec: float | None = None,
 ) -> dict[str, object]:
     fault_codes = [
         f"{fault.code}:{fault.channel_name}" if fault.channel_name else fault.code
@@ -11013,6 +13150,18 @@ def _build_ik_debug_log_frame(
         "target_step_scale": float(target_step_scale),
         "ik_timing": dict(ik_timing_payload or {}),
     }
+    if loop_elapsed_sec is not None or loop_phases:
+        base["outer_loop_timing"] = {
+            "elapsed_ms": (
+                None
+                if loop_elapsed_sec is None
+                else float(loop_elapsed_sec) * 1000.0
+            ),
+            "phases_ms": [
+                {"name": str(name), "elapsed_ms": float(elapsed) * 1000.0}
+                for name, elapsed in tuple(loop_phases or ())
+            ],
+        }
     if full:
         return {
             **base,
@@ -11770,6 +13919,197 @@ def _handle_ik_debug_log_toggle_request(
         )
 
 
+def _startup_gui_qpos_seed_command(
+    controller: InitArmCommandController,
+    *,
+    now: float,
+) -> TeleopCommand:
+    """Build the complete neutral input required by the shared qpos filter."""
+
+    qpos_by_side = controller.qpos_seed_qpos_by_side()
+    if set(qpos_by_side) != {"left", "right"}:
+        raise RuntimeError("startup Init qpos requires a complete dual-arm command seed")
+    command = TeleopCommand(
+        timestamp=float(now),
+        metadata={
+            "source": "startup_gui_qpos_maintenance",
+            "startup_qpos_maintenance": True,
+            "dataset_recording_eligible": False,
+        },
+    )
+    for side in ("left", "right"):
+        qpos = np.asarray(qpos_by_side[side], dtype=float).reshape(6)
+        if not np.all(np.isfinite(qpos)):
+            raise RuntimeError(f"startup Init qpos seed for {side} is non-finite")
+        command.add_command(
+            EffectorCommand(
+                effector_name=f"{side}_arm",
+                side=side,
+                command_type="joint_vector",
+                value=qpos.copy(),
+                frame_name="arm_base",
+                metadata={
+                    "source": "startup_gui_qpos_maintenance_seed",
+                    "startup_qpos_maintenance": True,
+                },
+            )
+        )
+    return command
+
+
+def _finish_startup_gui_qpos_terminal(
+    *,
+    components: RealTeleopComponents,
+    clutch_input: RealTeleopControlInput,
+    terminal: Mapping[str, object],
+    now: float,
+) -> None:
+    """Close one GUI qpos-maintenance operation without capturing Home."""
+
+    controller = getattr(components, "init_arm_controller", None)
+    if controller is None:
+        return
+    status = str(terminal.get("status", "failed") or "failed")
+    side = str(terminal.get("side", "") or "")
+    operation_id = str(getattr(controller, "qpos_operation_id", "") or "")
+    sequence_was_active = bool(
+        getattr(clutch_input, "_init_qpos_sequence_active", False)
+    )
+    regular_hold = bool(
+        getattr(clutch_input, "_teleop_started", False)
+        and clutch_input.hold_active()
+    )
+    maintenance_label = "Hold 归位" if regular_hold else "启动前归位"
+    hold_state_label = "常规 Hold" if regular_hold else "启动前 Hold"
+
+    release_errors: list[str] = []
+    if status == "completed" and side in {"left", "right"}:
+        support_side = "right" if side == "left" else "left"
+        _messages, release_errors = _release_gui_qpos_init_transit(
+            components,
+            operation_id=operation_id,
+            now=now,
+            sides=(support_side,),
+        )
+    if not release_errors:
+        clutch_input.handle_init_arm_qpos_terminal(terminal, now=now)
+    else:
+        clutch_input._cancel_init_arm_qpos_sequence(
+            reason="精确控制权释放失败：" + "；".join(release_errors)
+        )
+
+    # The first half of a dual sequence has already released its old leases
+    # and started a new right-arm operation inside the shared sequence handler.
+    if (
+        status == "completed"
+        and sequence_was_active
+        and bool(getattr(clutch_input, "_init_qpos_sequence_active", False))
+        and str(getattr(controller, "qpos_operation_id", "") or "") != operation_id
+    ):
+        return
+
+    _messages, final_release_errors = _release_gui_qpos_init_transit(
+        components,
+        operation_id=operation_id,
+        now=now,
+    )
+    release_errors.extend(final_release_errors)
+    if (
+        bool(getattr(controller, "active", False))
+        and str(getattr(controller, "qpos_operation_id", "") or "") == operation_id
+    ):
+        try:
+            transition = controller.cancel_active(
+                now=now,
+                reason=(
+                    f"hold_qpos_{status}_without_home_capture"
+                    if regular_hold
+                    else f"startup_qpos_{status}_without_home_capture"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - startup maintenance fails closed.
+            release_errors.append(f"Init 状态释放异常: {type(exc).__name__}: {exc}")
+        else:
+            if not bool(getattr(transition, "ok", False)):
+                release_errors.append(
+                    "Init 状态释放失败: " + str(getattr(transition, "message", ""))
+                )
+
+    if release_errors:
+        message = f"{maintenance_label}结束，但控制权释放失败：" + "；".join(release_errors)
+        components.session.hold_hardware(message)
+    elif status == "completed":
+        if sequence_was_active:
+            message = str(
+                getattr(clutch_input, "_init_qpos_sequence_status", "")
+                or f"双臂顺序归位完成；当前保持在{hold_state_label}。"
+            )
+        else:
+            side_label = "左臂" if side == "left" else "右臂"
+            message = (
+                f"{side_label}精确归位完成；未采集 tracker Home，"
+                f"当前保持在{hold_state_label}。"
+            )
+    else:
+        detail = str(terminal.get("message", "归位失败") or "归位失败")
+        message = f"{maintenance_label}失败：{detail}；机械臂保持停止，未采集 tracker Home。"
+        components.session.hold_hardware(message)
+
+    _log("InitArmQpos", message, now=now)
+    clutch_input._publish_init_arm_state(message=message, control_hint=message)
+
+
+def _advance_startup_gui_qpos_maintenance(
+    *,
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    clutch_input: RealTeleopControlInput,
+    now: float,
+) -> bool:
+    """Advance one explicit GUI exact-qpos frame outside normal teleop."""
+
+    del args  # Control-mode admission already happened in _start_gui_qpos_init.
+    controller = getattr(components, "init_arm_controller", None)
+    if controller is None or not bool(getattr(controller, "qpos_active", False)):
+        return False
+    try:
+        command = _startup_gui_qpos_seed_command(controller, now=now)
+        command_filter = getattr(components.session, "command_filter", None)
+        if not callable(command_filter):
+            raise RuntimeError("startup Init qpos shared command filter is unavailable")
+        command = command_filter(command, None, float(now))
+        guard_fault = components.session.evaluate_command_guard(command, None, float(now))
+        if guard_fault is not None:
+            raise RuntimeError(
+                f"{guard_fault.code}: {guard_fault.message}"
+            )
+        components.session.dispatch_command(command)
+    except Exception as exc:  # noqa: BLE001 - real startup motion must fail closed.
+        message = f"启动前归位下发失败：{type(exc).__name__}: {exc}"
+        _log("InitArmQpos", message, now=now)
+        try:
+            components.session.hold_hardware(message)
+        finally:
+            _cancel_special_arm_modes_for_hold(
+                components,
+                now=now,
+                reason="startup_qpos_dispatch_failed",
+            )
+            clutch_input._cancel_init_arm_qpos_sequence(reason=message)
+            clutch_input._publish_init_arm_state(message=message, control_hint=message)
+        return True
+
+    terminal = controller.consume_qpos_terminal_event()
+    if terminal is not None:
+        _finish_startup_gui_qpos_terminal(
+            components=components,
+            clutch_input=clutch_input,
+            terminal=terminal,
+            now=now,
+        )
+    return True
+
+
 def _wait_for_real_teleop_start_request(
     components: RealTeleopComponents,
     clutch_input: RealTeleopControlInput,
@@ -11779,6 +14119,9 @@ def _wait_for_real_teleop_start_request(
     control_ui: CalibrationWebUi | None,
     ik_debug_log_recorder: IkDebugLogRecorder,
     ik_debug_profile_base_enabled: bool,
+    visualization_request_handler: Callable[[float], None] | None = None,
+    visualization_update_handler: Callable[[float], None] | None = None,
+    runtime_status_update_handler: Callable[[], None] | None = None,
 ) -> str | None:
     if not clutch_input.enabled:
         _log(
@@ -11789,72 +14132,167 @@ def _wait_for_real_teleop_start_request(
 
     _log(
         "Calibration",
-        "HOME CAPTURE IS ARMED. Use GUI/keyboard: p=home capture, q=quit.",
+        "HOME CAPTURE IS ARMED. Use GUI/keyboard: p=home capture, q=quit. "
+        "Pre-Home exact-qpos maintenance is available from the GUI.",
     )
     status_gate = ChangeGate()
-    while True:
-        loop_start = time.time()
-        clutch_input.poll()
-        _handle_ik_debug_log_toggle_request(
-            args=args,
-            components=components,
-            clutch_input=clutch_input,
-            ik_debug_log_recorder=ik_debug_log_recorder,
-            control_ui=control_ui,
-            ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
-            now=loop_start,
-        )
-        if clutch_input.should_quit:
-            return None
-        if clutch_input.consume_calibration_request():
-            if _impedance_force_control_warmup_backends(args, components):
-                if _warm_start_impedance_force_control_before_home(args, components, clutch_input):
-                    clutch_input.publish_calibration_waiting(
-                        "力控冷启动完成；请再次点击“开始遥操”进入准备、采集 runtime home 并开始遥操。"
-                    )
-                    continue
-                if clutch_input.should_quit:
-                    return None
-                continue
-            if clutch_input.before_calibration_start_delay(
-                DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
-                arm_mode=arm_mode,
+    clutch_input.set_startup_qpos_maintenance_enabled(True)
+    try:
+        initial_force_sides = _impedance_force_control_not_ready_sides(args, components)
+        if initial_force_sides:
+            clutch_input.publish_calibration_waiting(
+                "力控尚未初始化。请先点击“开始遥操”初始化 "
+                + "/".join(initial_force_sides)
+                + " 力控；完成后可先执行机械臂精确归位，或再次点击“开始遥操”采集 runtime Home。"
+            )
+        while True:
+            loop_start = time.time()
+            clutch_input.poll()
+            if bool(
+                getattr(
+                    clutch_input,
+                    "consume_init_qpos_emergency_stop_request",
+                    lambda: False,
+                )()
             ):
-                return "home"
+                _handle_init_qpos_emergency_stop(
+                    components,
+                    clutch_input,
+                    now=loop_start,
+                )
+                # Stay in the startup GUI wait loop.  Init emergency stop is
+                # not a process exit and must not latch the arm backend.
+                continue
+            if runtime_status_update_handler is not None:
+                runtime_status_update_handler()
+            if visualization_request_handler is not None:
+                visualization_request_handler(loop_start)
+            _advance_startup_gui_qpos_maintenance(
+                args=args,
+                components=components,
+                clutch_input=clutch_input,
+                now=loop_start,
+            )
+            _handle_ik_debug_log_toggle_request(
+                args=args,
+                components=components,
+                clutch_input=clutch_input,
+                ik_debug_log_recorder=ik_debug_log_recorder,
+                control_ui=control_ui,
+                ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
+                now=loop_start,
+            )
             if clutch_input.should_quit:
                 return None
-            clutch_input.publish_calibration_waiting("Home 标定已取消，回到等待状态。")
+            if clutch_input.consume_calibration_request():
+                init_controller = getattr(components, "init_arm_controller", None)
+                if bool(getattr(init_controller, "qpos_active", False)):
+                    clutch_input.publish_calibration_waiting(
+                        "机械臂归位仍在规划、执行或到位确认中；请等待归位结束后再点击“开始遥操”。"
+                    )
+                    continue
+                force_sides = _impedance_force_control_not_ready_sides(args, components)
+                if force_sides:
+                    if _impedance_force_control_warmup_backends(args, components):
+                        if not _warm_start_impedance_force_control_before_home(
+                            args,
+                            components,
+                            clutch_input,
+                        ):
+                            if clutch_input.should_quit:
+                                return None
+                            continue
+                    try:
+                        _enable_impedance_force_control_after_runtime_home(
+                            args,
+                            components,
+                            home_captured=False,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - remain in startup Hold.
+                        message = f"力控初始化失败：{type(exc).__name__}: {exc}"
+                        _log("ForceControl", message, now=loop_start)
+                        clutch_input.publish_calibration_waiting(
+                            message + "；机械臂保持停止，请检查力控/传感器状态后重试。"
+                        )
+                    else:
+                        clutch_input.publish_calibration_waiting(
+                            "力控初始化完成。现在可以执行机械臂精确归位；"
+                            "如无需归位，请再次点击“开始遥操”采集 runtime Home 并进入遥操。"
+                        )
+                    continue
+                if clutch_input.before_calibration_start_delay(
+                    DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
+                    arm_mode=arm_mode,
+                ):
+                    return "home"
+                if clutch_input.should_quit:
+                    return None
+                clutch_input.publish_calibration_waiting("Home 标定已取消，回到等待状态。")
 
-        _sync_preview_from_real_state_real(components, required=False)
+            _sync_preview_from_real_state_real(components, required=False)
 
-        channels, _ = components.session.poll_sources(loop_start)
-        clutch_input.publish_raw_tracker_pose_state(channels=channels, now=loop_start)
-        ready = {
-            name: bool(channels.get(name) is not None and channels[name].valid)
-            for name in tuple(f"{side}_wrist_pose" for side in components.active_sides)
-        }
-        if status_gate.should_emit("wait_for_real_start_status", tuple(sorted(ready.items())), now=loop_start):
-            _log(
-                "Calibration",
-                f"waiting_for_gui tracker_ready={ready} ready_key='p'",
+            channels, _ = components.session.poll_sources(loop_start)
+            clutch_input.publish_raw_tracker_pose_state(channels=channels, now=loop_start)
+            ready = {
+                name: bool(channels.get(name) is not None and channels[name].valid)
+                for name in tuple(f"{side}_wrist_pose" for side in components.active_sides)
+            }
+            if status_gate.should_emit("wait_for_real_start_status", tuple(sorted(ready.items())), now=loop_start):
+                _log(
+                    "Calibration",
+                    f"waiting_for_gui tracker_ready={ready} ready_key='p'",
+                    now=loop_start,
+                )
+            elif status_gate.should_emit(
+                "wait_for_real_start_heartbeat",
+                "waiting",
                 now=loop_start,
-            )
-        elif status_gate.should_emit(
-            "wait_for_real_start_heartbeat",
-            "waiting",
-            now=loop_start,
-            heartbeat_sec=3.0,
-        ):
-            _log(
-                "Calibration",
-                f"still_waiting ready={ready} ready_key='p'",
-                now=loop_start,
-            )
-        time.sleep(0.02)
+                heartbeat_sec=3.0,
+            ):
+                _log(
+                    "Calibration",
+                    f"still_waiting ready={ready} ready_key='p'",
+                    now=loop_start,
+                )
+            if visualization_update_handler is not None:
+                visualization_update_handler(loop_start)
+            time.sleep(0.02)
+    finally:
+        clutch_input.set_startup_qpos_maintenance_enabled(False)
 
 
 def _runtime_home_failure_message(exc: BaseException) -> str:
     return f"runtime home 标定失败: {type(exc).__name__}: {exc}"
+
+
+def _restore_init_arm_after_foot_pad_fallback(
+    args: argparse.Namespace,
+    *,
+    live_foot_pad_count: int | None,
+) -> tuple[bool, str]:
+    """Restore a requested Init controller if an older caller disabled it.
+
+    Pedal topology is intentionally ignored: pedals are only an additional
+    input mapping and never own Fix/Init feature availability.
+    """
+
+    del live_foot_pad_count
+    if bool(getattr(args, "init_arm_available", False)):
+        return False, ""
+    if not bool(getattr(args, "init_arm_requested", False)):
+        return False, ""
+    profile_text = str(getattr(args, "init_arm_profile", "") or "").strip()
+    profile_path = _expand_cli_path(profile_text) if profile_text else None
+    if profile_path is None or not profile_path.is_file():
+        args.init_arm_disabled_reason = "init_arm_profile_unavailable"
+        return (
+            False,
+            "Init 已请求，但 Init profile 不可用："
+            f"{profile_text or '<empty>'}",
+        )
+    args.init_arm_available = True
+    args.init_arm_disabled_reason = ""
+    return True, "已恢复请求的机械臂精确归位功能；踏板状态不参与此功能门控。"
 
 
 def _arm_after_start_calibration(
@@ -11912,21 +14350,131 @@ def _arm_after_start_calibration(
 
 def main() -> None:
     args = parse_args()
-    foot_pad_input = (
-        FootPadSpecialArmInput.wait_until_online()
-        if str(getattr(args, "special_arm_control_mode", ""))
-        == SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
+    capability_admission = (
+        str(getattr(args, "hardware_admission_mode", "strict")) == "capability"
+    )
+    control_ui = (
+        CalibrationWebUi(open_browser=True)
+        if bool(getattr(args, "gui_requested", False))
         else None
     )
+    startup_progress: GuiStartupProgress | None = None
+    if control_ui is not None:
+        control_ui.publish(
+            stage="设备连接中",
+            control_hint="正在尝试连接全部配置设备；失败设备不会阻止进入 GUI。",
+            active_controls=["q"],
+        )
+        control_ui.start()
+        startup_progress = GuiStartupProgress(control_ui)
+        startup_progress.start()
+    foot_pad_input = None
+    foot_pad_requested = (
+        str(getattr(args, "special_arm_control_mode", ""))
+        == SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
+    )
+    args.foot_pad_requested = bool(foot_pad_requested)
+    args.foot_pad_startup_error = ""
+    if foot_pad_requested:
+        if startup_progress is not None:
+            startup_progress.begin(
+                "foot_pad",
+                label="脚踏输入",
+                message="正在查找虚拟脚踏设备",
+                requirement="optional_input",
+            )
+        try:
+            foot_pad_input = FootPadSpecialArmInput.open_online()
+        except (FootPadUnavailableError, OSError, RuntimeError, ValueError) as exc:
+            args.foot_pad_startup_error = f"{type(exc).__name__}: {exc}"
+            foot_pad_input = FootPadSpecialArmInput.waiting_for_service()
+            if startup_progress is not None:
+                startup_progress.fail(
+                    "foot_pad",
+                    args.foot_pad_startup_error,
+                    message="未就绪；点击“重连失败设备”后才会重新扫描",
+                )
+            _log(
+                "FootPad",
+                "foot-pad input is unavailable; GUI/keyboard special-arm controls "
+                "remain available; press 'retry failed devices' in the GUI to "
+                "scan for the virtual keyboard again: "
+                f"{exc}",
+            )
+        else:
+            if startup_progress is not None:
+                startup_progress.succeed("foot_pad", message="脚踏输入已连接")
+    init_restored, init_restore_message = _restore_init_arm_after_foot_pad_fallback(
+        args,
+        live_foot_pad_count=(
+            None
+            if foot_pad_input is None
+            or not bool(getattr(foot_pad_input, "is_online", False))
+            else int(getattr(foot_pad_input, "foot_pad_count", 0) or 0)
+        ),
+    )
+    if init_restore_message:
+        _log("InitArm", init_restore_message)
+        if control_ui is not None:
+            control_ui.append_message("InitArm", init_restore_message)
     tactile_visualizer = None
+    if startup_progress is not None:
+        startup_progress.begin(
+            "runtime.components",
+            label="遥操运行时组件",
+            message="正在构建机械臂、夹爪与 tracker 组件",
+            requirement="runtime_core",
+        )
     if bool(args.visualize_tactile) and not bool(args.skip_renderer):
         tactile_visualizer = _build_tactile_visualizer(args, _active_sides_from_args(args))
     try:
         components = _build_components(args)
-    except Exception:
+    except Exception as exc:
+        if startup_progress is not None:
+            startup_progress.fail(
+                "runtime.components",
+                f"{type(exc).__name__}: {exc}",
+                message="运行时组件构建失败",
+            )
+            startup_progress.close()
         if tactile_visualizer is not None:
             tactile_visualizer.close()
         raise
+    else:
+        if startup_progress is not None:
+            startup_progress.succeed(
+                "runtime.components",
+                message="运行时组件已构建，尚未启动设备",
+            )
+    init_controller_available = (
+        getattr(components, "init_arm_controller", None) is not None
+    )
+    _log(
+        "InitArm",
+        "startup "
+        f"requested={bool(getattr(args, 'init_arm_requested', False))} "
+        f"enabled={bool(getattr(args, 'init_arm_available', False))} "
+        f"controller_available={init_controller_available} "
+        f"disabled_reason={str(getattr(args, 'init_arm_disabled_reason', '') or '<none>')} "
+        f"profile={str(getattr(args, 'init_arm_profile', '') or '<none>')}",
+    )
+    if (
+        control_ui is not None
+        and bool(getattr(args, "init_arm_requested", False))
+        and not init_controller_available
+    ):
+        control_ui.append_message(
+            "InitArm",
+            "已请求机械臂归位功能，但 Init controller 未构建；"
+            f"reason={str(getattr(args, 'init_arm_disabled_reason', '') or 'unknown')}。",
+        )
+    if startup_progress is not None:
+        startup_progress.begin(
+            "camera.config",
+            label="相机配置",
+            message="正在解析相机注册表与预览配置",
+            requirement="required_for_collection",
+        )
     try:
         camera_sources = _build_camera_sources(args)
         try:
@@ -11942,11 +14490,39 @@ def main() -> None:
                 f"preview camera key {getattr(args, 'vis_cam_key', '')!r} is unavailable; preview disabled.",
             )
             preview_camera_sources = {}
-    except Exception:
-        if tactile_visualizer is not None:
-            tactile_visualizer.close()
-        raise
+    except Exception as exc:
+        if startup_progress is not None:
+            startup_progress.fail(
+                "camera.config",
+                f"{type(exc).__name__}: {exc}",
+                message="相机配置加载失败",
+            )
+        if not capability_admission:
+            if tactile_visualizer is not None:
+                tactile_visualizer.close()
+            if startup_progress is not None:
+                startup_progress.close()
+            raise
+        args.camera_startup_error = f"{type(exc).__name__}: {exc}"
+        camera_sources = {}
+        preview_camera_sources = {}
+        _log(
+            "Camera",
+            "WARNING: camera configuration/startup was isolated from GUI and arm controls: "
+            f"{args.camera_startup_error}",
+        )
+        if control_ui is not None:
+            control_ui.append_message("Camera", args.camera_startup_error)
+    else:
+        if startup_progress is not None:
+            startup_progress.succeed(
+                "camera.config",
+                message=f"已加载 {len(camera_sources)} 个相机配置",
+            )
     setattr(args, "camera_visualization_available", bool(preview_camera_sources))
+    setattr(args, "configured_camera_keys", tuple(sorted(camera_sources)))
+    setattr(args, "tactile_solving_available", _tactile_solving_available(args, components))
+    setattr(args, "tactile_solving_active", _tactile_solving_active(args, components))
     setattr(args, "tactile_visualization_available", _tactile_visualization_available(args, components))
     if tactile_visualizer is None:
         tactile_visualizer = _build_tactile_visualizer(args, components.active_sides)
@@ -11956,9 +14532,15 @@ def main() -> None:
     if tactile_visualizer is not None:
         tactile_vis_mode = (
             "subprocess"
-            if isinstance(tactile_visualizer, AsyncTactileUVVisualizer)
+            if isinstance(
+                tactile_visualizer,
+                (AsyncTactileUVVisualizer, AsyncDMTacDistributedForceVisualizer),
+            )
             else "dmtac_force"
-            if isinstance(tactile_visualizer, DMTacDistributedForceVisualizer)
+            if isinstance(
+                tactile_visualizer,
+                (DMTacDistributedForceVisualizer, AsyncDMTacDistributedForceVisualizer),
+            )
             else "same_process"
         )
         tactile_vis_detail = (
@@ -11971,11 +14553,6 @@ def main() -> None:
             f"enabled mode={tactile_vis_mode} active_sides={list(components.active_sides)} "
             f"{tactile_vis_detail}",
         )
-    control_ui = (
-        CalibrationWebUi(open_browser=True)
-        if bool(getattr(args, "gui_requested", False))
-        else None
-    )
     pose_snapshot_recorder = (
         None
         if bool(getattr(args, "no_debug_disk_write", False))
@@ -12017,16 +14594,57 @@ def main() -> None:
         episode_sidecar_attached_monotonic_time=None,
         episode_sidecars=False,
     )
-    dataset_recorder = (
-        None
-        if bool(getattr(args, "no_collection", False))
-        else RealTeleopDatasetRecorder(
-            args=args,
-            components=components,
-            camera_sources=camera_sources,
+    dataset_recorder = None
+    if not bool(getattr(args, "no_collection", False)):
+        if startup_progress is not None:
+            startup_progress.begin(
+                "dataset.writer.prepare",
+                label="数采 writer 配置",
+                message="正在校验数据集路径、模态声明与 writer 配置",
+                requirement="required_for_collection",
+            )
+        try:
+            dataset_recorder = RealTeleopDatasetRecorder(
+                args=args,
+                components=components,
+                camera_sources=camera_sources,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            if startup_progress is not None:
+                startup_progress.fail(
+                    "dataset.writer.prepare",
+                    f"{type(exc).__name__}: {exc}",
+                    message="writer 配置校验失败",
+                )
+            if not capability_admission:
+                if startup_progress is not None:
+                    startup_progress.close()
+                raise
+            args.dataset_startup_error = f"{type(exc).__name__}: {exc}"
+            _log(
+                "Dataset",
+                "WARNING: dataset writer construction was isolated from GUI and arm controls: "
+                f"{args.dataset_startup_error}",
+            )
+            if control_ui is not None:
+                control_ui.append_message("Dataset", args.dataset_startup_error)
+        else:
+            if startup_progress is not None:
+                startup_progress.succeed(
+                    "dataset.writer.prepare",
+                    message="writer 配置已就绪，尚未启动子进程",
+                )
+    if control_ui is not None:
+        control_ui.publish(
+            dataset_modality_contract=(
+                CaptureModalityContract(
+                    ignored_camera_keys=tuple(getattr(args, "ignore_camera", ()) or ()),
+                    ignored_tactile_keys=tuple(getattr(args, "ignore_tactile", ()) or ()),
+                ).to_dict()
+                if dataset_recorder is None
+                else dataset_recorder.capture_modality_contract.to_dict()
+            )
         )
-    )
-
     def update_control_debug_runtime_metadata(**updates: object) -> dict[str, object]:
         runtime_metadata = _merge_control_debug_runtime_metadata(args, **updates)
         if dataset_recorder is not None:
@@ -12039,6 +14657,177 @@ def main() -> None:
 
     camera_previewer: CameraPreviewer | None = None
     camera_preview_active = False
+    tactile_preview_rate = PreviewRateLimiter(float(getattr(args, "tactile_vis_hz", 5.0)))
+    camera_preview_rate = PreviewRateLimiter(float(getattr(args, "vis_cam_hz", 10.0)))
+
+    def close_camera_preview(status: str = "") -> None:
+        nonlocal camera_previewer, camera_preview_active
+        if camera_previewer is not None:
+            camera_previewer.close()
+            camera_previewer = None
+        camera_preview_active = False
+        clutch_input.set_visualization_state(camera_active=False, status=status)
+
+    def open_camera_preview(now: float) -> None:
+        nonlocal camera_previewer, camera_preview_active
+        if not preview_camera_sources:
+            message = "没有可用相机配置；图像窗口未打开。"
+            clutch_input.set_visualization_state(camera_active=False, status=message)
+            if control_ui is not None:
+                control_ui.append_message("Camera", message)
+            return
+        try:
+            _start_camera_sources(preview_camera_sources)
+            if camera_previewer is None:
+                camera_previewer = CameraPreviewer(CameraPreviewConfig())
+            if not camera_previewer.ensure_available():
+                reason = camera_previewer.disabled_reason or "display unavailable"
+                close_camera_preview(f"图像窗口不可用: {reason}")
+                if control_ui is not None:
+                    control_ui.append_message("Camera", f"图像窗口不可用：{reason}")
+                return
+            camera_preview_active = True
+            camera_preview_rate.reset()
+            message = f"图像窗口已打开: {', '.join(sorted(preview_camera_sources))}"
+            clutch_input.set_visualization_state(camera_active=True, status=message)
+            _log("Camera", message, now=now)
+        except Exception as exc:  # noqa: BLE001
+            close_camera_preview(f"图像窗口启动失败: {type(exc).__name__}: {exc}")
+            if control_ui is not None:
+                control_ui.append_message("Camera", f"图像窗口启动失败：{exc}")
+
+    def close_tactile_preview(status: str = "") -> None:
+        nonlocal tactile_visualizer
+        if tactile_visualizer is not None:
+            tactile_visualizer.close()
+            tactile_visualizer = None
+        clutch_input.set_visualization_state(tactile_active=False, status=status)
+
+    def open_tactile_preview(now: float) -> None:
+        nonlocal tactile_visualizer
+        if not bool(getattr(args, "tactile_visualization_available", False)):
+            message = "没有可用触觉 backend；触觉窗口未打开。"
+            clutch_input.set_visualization_state(tactile_active=False, status=message)
+            if control_ui is not None:
+                control_ui.append_message("TactileVis", message)
+            return
+        try:
+            if tactile_visualizer is None:
+                tactile_visualizer = _build_tactile_visualizer(
+                    args,
+                    components.active_sides,
+                    force=True,
+                )
+            if tactile_visualizer is None:
+                raise RuntimeError("tactile visualizer was not created")
+            tactile_preview_rate.reset()
+            message = "触觉窗口已打开"
+            clutch_input.set_visualization_state(tactile_active=True, status=message)
+            _log("TactileVis", message, now=now)
+        except Exception as exc:  # noqa: BLE001
+            close_tactile_preview(f"触觉窗口启动失败: {type(exc).__name__}: {exc}")
+            if control_ui is not None:
+                control_ui.append_message("TactileVis", f"触觉窗口启动失败：{exc}")
+
+    def handle_startup_visualization_requests(now: float) -> None:
+        """Consume visualization controls while waiting for runtime Home."""
+
+        if clutch_input.consume_device_retry_request():
+            retry_failed_devices()
+        if clutch_input.consume_camera_visualization_toggle_request():
+            if camera_preview_active or camera_previewer is not None:
+                close_camera_preview("图像窗口已关闭")
+                if control_ui is not None:
+                    control_ui.append_message("Camera", "图像窗口已关闭。")
+            else:
+                open_camera_preview(now)
+        if clutch_input.consume_tactile_solving_enable_request():
+            try:
+                changed = _enable_gui_tactile_solving(args, components)
+                message = (
+                    f"触觉解算已开启：{changed} 个 worker 已按固定传感器标定重启；"
+                    "解算保持开启，关闭窗口不会改变采集字段。"
+                )
+                clutch_input.set_visualization_state(
+                    tactile_solving_active=True,
+                    status=message,
+                )
+                if control_ui is not None:
+                    control_ui.append_message("TactileSolve", message)
+                _log("TactileSolve", message, now=now)
+            except Exception as exc:  # noqa: BLE001
+                message = f"触觉解算开启失败: {type(exc).__name__}: {exc}"
+                args.tactile_solving_active = _tactile_solving_active(args, components)
+                args.tactile_visualization_available = _tactile_visualization_available(
+                    args, components
+                )
+                clutch_input.set_visualization_state(
+                    tactile_solving_active=args.tactile_solving_active,
+                    status=message,
+                )
+                if control_ui is not None:
+                    control_ui.append_message("TactileSolve", message)
+        if clutch_input.consume_tactile_visualization_toggle_request():
+            if tactile_visualizer is not None:
+                close_tactile_preview("触觉窗口已关闭")
+                if control_ui is not None:
+                    control_ui.append_message("TactileVis", "触觉窗口已关闭。")
+            else:
+                open_tactile_preview(now)
+
+    def update_startup_visualizations(now: float) -> None:
+        """Keep native preview windows responsive before runtime Home."""
+
+        if tactile_visualizer is not None and tactile_preview_rate.should_update(now):
+            try:
+                if isinstance(
+                    tactile_visualizer,
+                    (DMTacDistributedForceVisualizer, AsyncDMTacDistributedForceVisualizer),
+                ):
+                    tactile_force, tactile_health = dmtac_visualization_snapshot_from_backends(
+                        components.active_sides,
+                        lambda side: _gripper_backend_for_side(components, side),
+                        now=now,
+                    )
+                    tactile_keys = tactile_visualizer.update(
+                        tactile_force,
+                        health_by_side=tactile_health,
+                    )
+                else:
+                    tactile_keys = tactile_visualizer.update(
+                        tactile_by_side_from_backends(
+                            components.active_sides,
+                            lambda side: _hand_backend_for_side(components, side),
+                        )
+                    ) or []
+                if any(key in {"q", "\x1b"} for key in tactile_keys):
+                    close_tactile_preview("触觉窗口已关闭")
+            except Exception as exc:  # noqa: BLE001
+                close_tactile_preview(f"触觉窗口刷新失败: {type(exc).__name__}: {exc}")
+                if control_ui is not None:
+                    control_ui.append_message("TactileVis", f"触觉窗口刷新失败：{exc}")
+
+        if (
+            camera_preview_active
+            and camera_previewer is not None
+            and camera_preview_rate.should_update(now)
+        ):
+            try:
+                camera_keys = camera_previewer.update(preview_camera_sources)
+                if any(key in {"q", "\x1b"} for key in camera_keys):
+                    close_camera_preview("图像窗口已关闭")
+            except Exception as exc:  # noqa: BLE001
+                close_camera_preview(f"图像窗口刷新失败: {type(exc).__name__}: {exc}")
+                if control_ui is not None:
+                    control_ui.append_message("Camera", f"图像窗口刷新失败：{exc}")
+
+    if startup_progress is not None:
+        startup_progress.begin(
+            "runtime.diagnostics",
+            label="输入与诊断组件",
+            message="正在准备控制输入、debug 与 actuator trace",
+            requirement="runtime_support",
+        )
     console_stream = sys.__stdout__
     silenced_stdout = None
     original_stdout = None
@@ -12055,6 +14844,8 @@ def main() -> None:
     position_debug_episode_recorder: PositionDebugRecorder | None = None
     position_debug_session_dir: Path | None = None
     position_debug_close_threads: list[threading.Thread] = []
+    actuator_trace_recorder: ActuatorCommandTraceRecorder | None = None
+    actuator_trace_session_dir: Path | None = None
     if bool(args.control_debug_config.enabled):
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -12124,23 +14915,238 @@ def main() -> None:
                 "ControlDebug",
                 f"WARNING: async audit setup failed and was isolated: {type(exc).__name__}: {exc}",
             )
+    if bool(getattr(args, "actuator_trace", False)):
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            actuator_trace_session_dir = (
+                _expand_cli_path(args.actuator_trace_root)
+                / f"{timestamp}_vive_rm65_actuator_trace"
+            )
+            actuator_trace_recorder = _new_actuator_command_trace_recorder(
+                args,
+                components=components,
+                output_dir=actuator_trace_session_dir,
+            )
+            attached_count = _attach_actuator_command_trace_sink(
+                components,
+                actuator_trace_recorder.record_command,
+            )
+            if attached_count != len(components.active_sides):
+                raise RuntimeError(
+                    "actuator trace did not attach to every active command backend: "
+                    f"attached={attached_count} active={len(components.active_sides)}"
+                )
+            singularity_attached_count = 0
+            if bool(getattr(args, "actuator_singularity_trace", True)):
+                singularity_attached_count = _attach_singularity_transition_trace_sink(
+                    components,
+                    actuator_trace_recorder.record_singularity_transition,
+                )
+                if singularity_attached_count != len(components.active_sides):
+                    raise RuntimeError(
+                        "singularity transition trace did not attach to every active "
+                        "command backend: "
+                        f"attached={singularity_attached_count} "
+                        f"active={len(components.active_sides)}"
+                    )
+            _log(
+                "ActuatorTrace",
+                "preallocated fixed-field capture attached "
+                f"output={actuator_trace_session_dir} "
+                f"capacity_per_side={actuator_trace_recorder.config.capacity_per_side} "
+                f"singularity_trace={bool(singularity_attached_count)} "
+                "hot_path_disk_write=false",
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not alter control behavior.
+            cleanup_errors: list[str] = []
+            try:
+                _attach_actuator_command_trace_sink(components, None)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors.append(
+                    f"sink_detach:{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            try:
+                _attach_singularity_transition_trace_sink(components, None)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors.append(
+                    "singularity_sink_detach:"
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            if actuator_trace_recorder is not None:
+                try:
+                    actuator_trace_recorder.close()
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    cleanup_errors.append(
+                        f"recorder_close:{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+            actuator_trace_recorder = None
+            detail = f"{type(exc).__name__}: {exc}"
+            if cleanup_errors:
+                detail += "; cleanup=" + "; ".join(cleanup_errors)
+            _log(
+                "ActuatorTrace",
+                f"WARNING: setup failed and was isolated: {detail}",
+            )
+    clutch_input.start()
+    if startup_progress is not None:
+        startup_progress.succeed(
+            "runtime.diagnostics",
+            message="输入与诊断组件已就绪",
+        )
+    startup_device_errors: dict[str, str] = {}
+
+    def startup_device_label(key: str) -> str:
+        return {
+            "arm.left.qpos": "左臂状态反馈",
+            "arm.right.qpos": "右臂状态反馈",
+            "hand.left": "左手 / 左夹爪",
+            "hand.right": "右手 / 右夹爪",
+            "rig.session": "遥操核心 Rig",
+            "human_shadow": "Human shadow 前端",
+            "vive.clock_sync": "VIVE 时钟同步",
+            "dataset.writer": "数采 writer 子进程",
+        }.get(str(key), str(key))
+
+    def startup_device_requirement(key: str) -> str:
+        if key.startswith("arm.") or key == "rig.session":
+            return "motion_safety"
+        if key.startswith("camera.") or key.startswith("dataset."):
+            return "required_for_collection"
+        return "feature_dependent"
+
+    def start_device(label: str, backend: Any | None) -> bool:
+        if backend is None:
+            return False
+        if startup_progress is not None:
+            startup_progress.begin(
+                label,
+                label=startup_device_label(label),
+                message="正在调用设备 backend.start()",
+                requirement=startup_device_requirement(label),
+            )
+        try:
+            backend.start()
+            if isinstance(backend, DMTacGripperBackend) and not backend.is_ready():
+                try:
+                    state = backend.get_state(include_tactile_arrays=False)
+                except TypeError:
+                    state = backend.get_state()
+                raise RuntimeError(
+                    str(state.get("telemetry_error") or "DMTAC backend is not ready")
+                )
+            if startup_progress is not None:
+                startup_progress.succeed(label)
+            return True
+        except Exception as exc:  # noqa: BLE001 - capability admission records device failure.
+            detail = f"{type(exc).__name__}: {exc}"
+            if startup_progress is not None:
+                startup_progress.fail(label, detail)
+            if not capability_admission:
+                if startup_progress is not None:
+                    startup_progress.close()
+                raise
+            startup_device_errors[str(label)] = detail
+            _log("Device", f"WARNING: {label} unavailable: {detail}")
+            if control_ui is not None:
+                control_ui.append_message("Device", f"{label} 连接失败：{detail}")
+            return False
+
     try:
-        if components.left_state_backend is not None:
-            components.left_state_backend.start()
-        if components.right_state_backend is not None:
-            components.right_state_backend.start()
-        if components.left_hand_backend is not None and not components.left_hand_control_via_rig:
-            components.left_hand_backend.start()
-        if components.right_hand_backend is not None and not components.right_hand_control_via_rig:
-            components.right_hand_backend.start()
-        components.session.start()
+        start_device("arm.left.qpos", components.left_state_backend)
+        start_device("arm.right.qpos", components.right_state_backend)
+        for side, backend, via_rig in (
+            ("left", components.left_hand_backend, components.left_hand_control_via_rig),
+            ("right", components.right_hand_backend, components.right_hand_control_via_rig),
+        ):
+            if backend is None:
+                continue
+            if not via_rig:
+                start_device(f"hand.{side}", backend)
+                continue
+            if start_device(f"hand.{side}", backend):
+                continue
+            # A failed optional hand must not make BimanualRig roll back the
+            # already-independent arm startup.  Remove its command producer
+            # and backend only for this runtime session.
+            effector_name = f"{side}_hand"
+            components.session.rig.backends.pop(effector_name, None)
+            failed_retargeter = (
+                components.left_hand_retargeter
+                if side == "left"
+                else components.right_hand_retargeter
+            )
+            if failed_retargeter in components.session.retargeters:
+                components.session.retargeters.remove(failed_retargeter)
+        session_started = False
+        if startup_progress is not None:
+            startup_progress.begin(
+                "rig.session",
+                label=startup_device_label("rig.session"),
+                message="正在启动 tracker、retarget 与命令 Rig",
+                requirement=startup_device_requirement("rig.session"),
+            )
+        try:
+            components.session.start()
+            session_started = True
+            if startup_progress is not None:
+                startup_progress.succeed(
+                    "rig.session",
+                    message="遥操核心 Rig 已启动",
+                )
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            if startup_progress is not None:
+                startup_progress.fail("rig.session", detail)
+            if not capability_admission:
+                if startup_progress is not None:
+                    startup_progress.close()
+                raise
+            startup_device_errors["rig.session"] = detail
+            _log(
+                "Device",
+                "WARNING: core teleop rig startup failed; GUI remains available "
+                f"for status/retry: {detail}",
+            )
+            if control_ui is not None:
+                control_ui.append_message("Device", f"遥操核心连接失败：{detail}")
+        if session_started and components.human_shadow_frontend is not None:
+            if startup_progress is not None:
+                startup_progress.begin(
+                    "human_shadow",
+                    label=startup_device_label("human_shadow"),
+                    message="正在启动 shadow 前端",
+                )
+            try:
+                components.human_shadow_frontend.start()
+            except Exception as exc:
+                if startup_progress is not None:
+                    startup_progress.fail(
+                        "human_shadow",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    startup_progress.close()
+                raise
+            else:
+                if startup_progress is not None:
+                    startup_progress.succeed("human_shadow")
         vive_source = _vive_pose_source_from_components(components)
-        if vive_source is not None and vive_source.clock_sync_enabled:
+        if session_started and vive_source is not None and vive_source.clock_sync_enabled:
             sync_wait_sec = (
                 float(args.vive_clock_sync_startup_timeout_sec)
                 if bool(args.vive_clock_sync_required)
                 else 0.0
             )
+            if startup_progress is not None:
+                startup_progress.begin(
+                    "vive.clock_sync",
+                    label=startup_device_label("vive.clock_sync"),
+                    message=(
+                        f"正在等待同步样本，最长 {sync_wait_sec:.1f}s"
+                        if sync_wait_sec > 0.0
+                        else "正在检查时钟同步状态"
+                    ),
+                    requirement="motion_timing",
+                )
             sync_ready = vive_source.wait_for_clock_sync(
                 sync_wait_sec,
                 min_samples=int(args.vive_clock_sync_min_samples),
@@ -12152,18 +15158,382 @@ def main() -> None:
                 f"ready={sync_ready} required={bool(args.vive_clock_sync_required)} "
                 f"stats={sync_stats}",
             )
+            if startup_progress is not None:
+                if sync_ready:
+                    startup_progress.succeed(
+                        "vive.clock_sync",
+                        message="VIVE 时钟同步已就绪",
+                    )
+                elif not bool(args.vive_clock_sync_required):
+                    startup_progress.warn(
+                        "vive.clock_sync",
+                        "clock synchronization is not ready",
+                        message="检查完成；当前未同步，但配置允许继续",
+                    )
+                else:
+                    startup_progress.fail(
+                        "vive.clock_sync",
+                        "clock synchronization is not ready",
+                        message="必需的时钟同步未就绪",
+                    )
             if bool(args.vive_clock_sync_required) and not sync_ready:
-                raise RuntimeError(
+                message = (
                     "Required VIVE clock synchronization did not become ready before "
                     "real teleoperation startup. Check sender --clock-sync-* settings "
                     "and the separate UDP control port."
                 )
+                if not capability_admission:
+                    if startup_progress is not None:
+                        startup_progress.close()
+                    raise RuntimeError(message)
+                startup_device_errors["vive.clock_sync"] = message
+                if control_ui is not None:
+                    control_ui.append_message("ViveClockSync", message)
         if camera_sources:
-            _start_camera_sources(camera_sources)
+            if capability_admission:
+                startup_device_errors.update(
+                    {
+                        f"camera.{key}": value
+                        for key, value in _start_camera_sources_best_effort(
+                            camera_sources,
+                            startup_progress=startup_progress,
+                        ).items()
+                    }
+                )
+            else:
+                _start_camera_sources(
+                    camera_sources,
+                    startup_progress=startup_progress,
+                )
         if dataset_recorder is not None:
-            dataset_recorder.start()
-            dataset_recorder.write_camera_device_config()
-        clutch_input.start()
+            if startup_progress is not None:
+                startup_progress.begin(
+                    "dataset.writer",
+                    label=startup_device_label("dataset.writer"),
+                    message="正在启动隔离 writer 并等待 ready 握手",
+                    requirement=startup_device_requirement("dataset.writer"),
+                )
+            try:
+                dataset_recorder.start()
+                dataset_recorder.write_camera_device_config()
+                if startup_progress is not None:
+                    startup_progress.succeed(
+                        "dataset.writer",
+                        message="writer ready 握手完成",
+                    )
+            except Exception as exc:  # noqa: BLE001 - storage must not block arm maintenance.
+                detail = f"{type(exc).__name__}: {exc}"
+                if startup_progress is not None:
+                    startup_progress.fail("dataset.writer", detail)
+                if not capability_admission:
+                    if startup_progress is not None:
+                        startup_progress.close()
+                    raise
+                startup_device_errors["dataset.writer"] = detail
+                _log(
+                    "Dataset",
+                    "WARNING: writer startup failed; teleop/arm maintenance remains available: "
+                    f"{detail}",
+                )
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", f"数采 writer 启动失败：{detail}")
+                try:
+                    dataset_recorder.close()
+                except Exception:
+                    pass
+                dataset_recorder = None
+        if getattr(args, "dmtac_startup_error", ""):
+            startup_device_errors["dmtac.assignment"] = str(args.dmtac_startup_error)
+        if getattr(args, "angle_trigger_startup_error", ""):
+            startup_device_errors["angle_trigger"] = str(
+                args.angle_trigger_startup_error
+            )
+        if getattr(args, "camera_startup_error", ""):
+            startup_device_errors["camera.config"] = str(args.camera_startup_error)
+        if getattr(args, "dataset_startup_error", ""):
+            startup_device_errors["dataset.writer"] = str(args.dataset_startup_error)
+        if bool(getattr(args, "foot_pad_requested", False)) and getattr(
+            args, "foot_pad_startup_error", ""
+        ):
+            startup_device_errors["foot_pad"] = str(args.foot_pad_startup_error)
+        if startup_progress is not None:
+            startup_progress.close()
+
+        def hardware_requirement(key: str) -> str:
+            if key.startswith("arm."):
+                return "motion_safety"
+            if key.startswith("camera."):
+                camera_key = key.split(".", 1)[1]
+                if camera_key in set(getattr(args, "ignore_camera", ()) or ()):
+                    return "ignored_by_dataset_contract"
+                return "required_for_collection"
+            if key.startswith("dataset."):
+                return "required_for_collection"
+            return "feature_dependent"
+
+        def hardware_status_item(key: str) -> dict[str, object]:
+            detail = str(startup_device_errors.get(key, "") or "")
+            if not detail:
+                return {
+                    "online": True,
+                    "health": "online",
+                    "status_level": "ok",
+                    "status_label": "在线",
+                    "requirement": hardware_requirement(key),
+                    "error": "",
+                }
+            if key == "foot_pad":
+                return {
+                    "online": False,
+                    "health": "waiting",
+                    "status_level": "warn",
+                    "status_label": "未就绪（可选）",
+                    "requirement": "optional_input",
+                    "error": detail,
+                }
+            return {
+                "online": False,
+                "health": "error",
+                "status_level": "error",
+                "status_label": "连接失败",
+                "requirement": hardware_requirement(key),
+                "error": detail,
+            }
+
+        def collection_startup_blockers() -> dict[str, str]:
+            ignored_cameras = set(getattr(args, "ignore_camera", ()) or ())
+            blockers: dict[str, str] = {}
+            for key, detail in startup_device_errors.items():
+                # Foot-pad is an operator convenience and never a data modality.
+                if key == "foot_pad":
+                    continue
+                # The writer is rebuilt/revalidated on episode start.  Its
+                # current startup error must not prevent that recovery attempt.
+                if key == "dataset.writer":
+                    continue
+                if key.startswith("camera.") and key.split(".", 1)[1] in ignored_cameras:
+                    continue
+                blockers[str(key)] = str(detail)
+            return blockers
+
+        if control_ui is not None:
+            configured_status_keys = {
+                "arm.left.qpos",
+                "arm.right.qpos",
+                *(f"camera.{key}" for key in camera_sources),
+            }
+            if components.left_hand_backend is not None:
+                configured_status_keys.add("hand.left")
+            if components.right_hand_backend is not None:
+                configured_status_keys.add("hand.right")
+            configured_status_keys.add("dataset.writer")
+            if bool(getattr(args, "foot_pad_requested", False)):
+                configured_status_keys.add("foot_pad")
+            configured_status_keys.update(startup_device_errors)
+            control_ui.publish(
+                stage=(
+                    "设备连接检查完成"
+                    if not startup_device_errors
+                    else f"设备连接检查完成 · {len(startup_device_errors)} 项未就绪"
+                ),
+                control_hint=(
+                    "全部配置设备已完成启动检查。"
+                    if not startup_device_errors
+                    else "GUI 已可用；请查看未就绪设备，可在修复后点击“重连失败设备”。"
+                ),
+                hardware_status={
+                    key: hardware_status_item(key)
+                    for key in sorted(configured_status_keys)
+                },
+                active_controls=clutch_input._current_active_controls(),
+            )
+
+        def publish_runtime_hardware_status() -> None:
+            if control_ui is None:
+                return
+            status_keys = {
+                "arm.left.qpos",
+                "arm.right.qpos",
+                *(f"camera.{key}" for key in camera_sources),
+                *startup_device_errors,
+            }
+            if components.left_hand_backend is not None:
+                status_keys.add("hand.left")
+            if components.right_hand_backend is not None:
+                status_keys.add("hand.right")
+            status_keys.add("dataset.writer")
+            if bool(getattr(args, "foot_pad_requested", False)):
+                status_keys.add("foot_pad")
+            control_ui.publish(
+                hardware_status={
+                    key: hardware_status_item(key)
+                    for key in sorted(status_keys)
+                },
+                active_controls=clutch_input._current_active_controls(),
+            )
+
+        def sync_foot_pad_runtime_status() -> None:
+            """Mirror manual foot-pad reconnect status into the GUI hardware list."""
+
+            if not bool(getattr(args, "foot_pad_requested", False)):
+                return
+            online = bool(
+                foot_pad_input is not None
+                and getattr(foot_pad_input, "is_online", False)
+            )
+            changed = False
+            if online:
+                changed = "foot_pad" in startup_device_errors
+                startup_device_errors.pop("foot_pad", None)
+                args.foot_pad_startup_error = ""
+            else:
+                detail = str(
+                    getattr(args, "foot_pad_startup_error", "") or (
+                        "FootPadUnavailableError: virtual keyboard disconnected; "
+                        "press 'retry failed devices' to scan again"
+                    )
+                )
+                if startup_device_errors.get("foot_pad") != detail:
+                    startup_device_errors["foot_pad"] = detail
+                    changed = True
+                args.foot_pad_startup_error = detail
+            if changed:
+                publish_runtime_hardware_status()
+
+        def retry_failed_devices() -> None:
+            nonlocal dataset_recorder, foot_pad_input
+            q6_retry_handled = False
+            if (
+                str(getattr(components, "gripper_input_source", "") or "")
+                == "angle_trigger"
+                and _has_dmtac_gripper_backend(components)
+            ):
+                q6_retry_handled = True
+                teleop_running = bool(
+                    getattr(clutch_input, "_teleop_started", False)
+                ) and not clutch_input.hold_active()
+                if (
+                    recording_active()
+                    or episode_start_countdown_deadline is not None
+                    or teleop_running
+                ):
+                    q6_message = (
+                        "Q6 热切换只允许在未数采且遥操尚未开始或已进入 Hold 时执行；"
+                        "请先停止 episode 并点击 Hold。"
+                    )
+                else:
+                    try:
+                        promoted, q6_message = (
+                            _promote_angle_trigger_gripper_input_to_q6(
+                                args,
+                                components,
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 - preserve working fallback.
+                        promoted = False
+                        q6_message = (
+                            "Q6 重连/切换失败，继续使用 angle trigger："
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    if promoted:
+                        clutch_input._gripper_control_enabled = False
+                        startup_device_errors.pop("angle_trigger", None)
+                        args.angle_trigger_startup_error = ""
+                        clutch_input.publish_gripper_status(force=True)
+                _log("GripperInput", q6_message)
+                if control_ui is not None:
+                    control_ui.append_message("GripperInput", q6_message)
+            if not startup_device_errors:
+                if control_ui is not None and not q6_retry_handled:
+                    control_ui.append_message("Device", "当前没有启动失败的可重连设备。")
+                publish_runtime_hardware_status()
+                return
+            retry_backends = {
+                "arm.left.qpos": components.left_state_backend,
+                "arm.right.qpos": components.right_state_backend,
+                "hand.left": components.left_hand_backend,
+                "hand.right": components.right_hand_backend,
+            }
+            for key in tuple(startup_device_errors):
+                try:
+                    if key in retry_backends and retry_backends[key] is not None:
+                        retry_backends[key].start()
+                        if (
+                            key.startswith("hand.")
+                            and isinstance(retry_backends[key], DMTacGripperBackend)
+                            and not retry_backends[key].is_ready()
+                        ):
+                            raise RuntimeError("DMTAC backend is still not ready")
+                        if key.startswith("arm."):
+                            state = retry_backends[key].refresh_state_from_hardware()
+                            if state.get("current_qpos") is None:
+                                raise RuntimeError("hardware returned no current_qpos")
+                    elif key.startswith("camera.") and key.split(".", 1)[1] in camera_sources:
+                        camera = camera_sources[key.split(".", 1)[1]]
+                        camera.close()
+                        camera.start()
+                    elif key == "dataset.writer":
+                        if dataset_recorder is None:
+                            dataset_recorder = RealTeleopDatasetRecorder(
+                                args=args,
+                                components=components,
+                                camera_sources=camera_sources,
+                            )
+                        dataset_recorder.start()
+                        dataset_recorder.write_camera_device_config()
+                    elif key == "rig.session":
+                        components.session.start()
+                        if components.human_shadow_frontend is not None:
+                            components.human_shadow_frontend.start()
+                        if (
+                            vive_source is not None
+                            and vive_source.clock_sync_enabled
+                            and bool(args.vive_clock_sync_required)
+                            and not vive_source.wait_for_clock_sync(
+                                float(args.vive_clock_sync_startup_timeout_sec),
+                                min_samples=int(args.vive_clock_sync_min_samples),
+                            )
+                        ):
+                            raise RuntimeError(
+                                "core rig reconnected but required VIVE clock sync is not ready"
+                            )
+                    elif key == "vive.clock_sync" and vive_source is not None:
+                        sync_ready = vive_source.wait_for_clock_sync(
+                            float(args.vive_clock_sync_startup_timeout_sec),
+                            min_samples=int(args.vive_clock_sync_min_samples),
+                        )
+                        if not sync_ready:
+                            raise RuntimeError("required VIVE clock sync is still not ready")
+                    elif key == "foot_pad":
+                        replacement = FootPadSpecialArmInput.open_online()
+                        if foot_pad_input is not None:
+                            foot_pad_input.close()
+                        foot_pad_input = replacement
+                        clutch_input.foot_pad_input = replacement
+                        clutch_input._last_foot_pad_online = True
+                        args.special_arm_control_mode = SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
+                        args.foot_pad_startup_error = ""
+                    elif key in {
+                        "dmtac.assignment",
+                        "camera.config",
+                        "angle_trigger",
+                    }:
+                        if control_ui is not None:
+                            control_ui.append_message(
+                                "Device",
+                                f"{key} 涉及组件重建，当前进程不能安全热重连；"
+                                "请修复配置后重启运行命令。",
+                            )
+                        continue
+                    else:
+                        continue
+                except Exception as exc:  # noqa: BLE001 - keep the failed status visible.
+                    startup_device_errors[key] = f"{type(exc).__name__}: {exc}"
+                    continue
+                startup_device_errors.pop(key, None)
+                if control_ui is not None:
+                    control_ui.append_message("Device", f"{key} 重连成功。")
+            publish_runtime_hardware_status()
         clutch_input.set_visualization_state(
             camera_active=False,
             tactile_active=tactile_visualizer is not None,
@@ -12213,8 +15583,25 @@ def main() -> None:
                     camera_previewer = None
                 clutch_input.set_visualization_state(camera_active=False, status=f"图像窗口启动失败: {exc}")
                 _log("Camera", f"preview startup failed: {type(exc).__name__}: {exc}")
-        _sync_preview_from_real_state_real(components, required=True)
-        _sync_dual_arm_retargeter_for_real_control(components)
+        initial_qpos_sync = _sync_preview_from_real_state_real(
+            components,
+            required=not capability_admission,
+        )
+        if not all(initial_qpos_sync.values()):
+            missing_sides = [side for side, synced in initial_qpos_sync.items() if not synced]
+            for side in missing_sides:
+                startup_device_errors.setdefault(
+                    f"arm.{side}.qpos",
+                    "hardware returned no fresh current_qpos during startup sync",
+                )
+            message = (
+                "机械臂 qpos 尚未就绪；GUI 与无关功能保持可用，归位/遥操/数采需重连后再执行: "
+                + ", ".join(missing_sides)
+            )
+            _log("ArmState", message)
+            if control_ui is not None:
+                control_ui.append_message("ArmState", message)
+            publish_runtime_hardware_status()
         _sync_real_execution_step_limits(components)
 
         for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
@@ -12381,10 +15768,16 @@ def main() -> None:
         _log_dual_arm_readiness(args, components)
         _emit_collision_proxy_logs(components)
         debug_timing_modules = _debug_timing_modules(args)
+        debug_timing_console_writer = (
+            AsyncDebugTimingConsole(stream=sys.stdout)
+            if bool(debug_timing_modules.console)
+            else None
+        )
         debug_timing_state = RealDebugTimingState(
             enabled=bool(debug_timing_modules.console),
             threshold_sec=float(getattr(args, "debug_timing_threshold_sec", 0.025)),
             report_interval_sec=float(getattr(args, "debug_timing_report_interval_sec", 1.0)),
+            console_writer=debug_timing_console_writer,
         )
         ik_debug_profile_base_enabled = bool(debug_timing_modules.ik_profile)
         ik_debug_log_recorder = IkDebugLogRecorder()
@@ -12605,10 +15998,33 @@ def main() -> None:
                     control_ui=control_ui,
                     ik_debug_log_recorder=ik_debug_log_recorder,
                     ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
+                    visualization_request_handler=handle_startup_visualization_requests,
+                    visualization_update_handler=update_startup_visualizations,
+                    runtime_status_update_handler=sync_foot_pad_runtime_status,
                 )
                 if requested is None:
                     return
                 startup_request = requested
+            core_startup_keys = {
+                "rig.session",
+                "vive.clock_sync",
+                *(f"arm.{side}.qpos" for side in components.active_sides),
+            }
+            core_startup_blockers = {
+                key: startup_device_errors[key]
+                for key in sorted(core_startup_keys)
+                if key in startup_device_errors
+            }
+            if core_startup_blockers:
+                detail = "; ".join(
+                    f"{key}: {value}" for key, value in core_startup_blockers.items()
+                )
+                clutch_input.publish_calibration_waiting(
+                    "机械臂安全状态尚未就绪，不能执行 runtime Home；"
+                    f"请先点击重连失败设备。\n{detail}"
+                )
+                manual_startup_request = True
+                continue
             try:
                 _runtime_home_calibration(
                     components,
@@ -12710,12 +16126,12 @@ def main() -> None:
         episode_start_countdown_reason = "manual_key_start"
         episode_start_warmup_ready_since: float | None = None
         episode_start_warmup_last_message: str | None = None
+        episode_start_failure_message: str | None = None
         episode_recording_paused = False
         episode_recording_pause_reason = ""
         episode_resume_warmup_ready_count = 0
         episode_resume_warmup_required_frames = 2
-        tactile_preview_rate = PreviewRateLimiter(float(getattr(args, "tactile_vis_hz", 5.0)))
-        camera_preview_rate = PreviewRateLimiter(float(getattr(args, "vis_cam_hz", 10.0)))
+        fix_hold_coordinator = SpecialArmFixHoldCoordinator()
         sample_rate_gate = PeriodicRateGate(float(args.hz))
         outer_control_hz = _effective_outer_control_hz(args)
         gripper_warmup_probe_lock = threading.Lock()
@@ -12729,75 +16145,6 @@ def main() -> None:
             "completed_at": None,
             "results": {},
         }
-
-        def close_camera_preview(status: str = "") -> None:
-            nonlocal camera_previewer, camera_preview_active
-            if camera_previewer is not None:
-                camera_previewer.close()
-                camera_previewer = None
-            camera_preview_active = False
-            clutch_input.set_visualization_state(camera_active=False, status=status)
-
-        def open_camera_preview(now: float) -> None:
-            nonlocal camera_previewer, camera_preview_active
-            if not preview_camera_sources:
-                message = "没有可用相机配置；图像窗口未打开。"
-                clutch_input.set_visualization_state(camera_active=False, status=message)
-                if control_ui is not None:
-                    control_ui.append_message("Camera", message)
-                return
-            try:
-                _start_camera_sources(preview_camera_sources)
-                if camera_previewer is None:
-                    camera_previewer = CameraPreviewer(CameraPreviewConfig())
-                if not camera_previewer.ensure_available():
-                    reason = camera_previewer.disabled_reason or "display unavailable"
-                    close_camera_preview(f"图像窗口不可用: {reason}")
-                    if control_ui is not None:
-                        control_ui.append_message("Camera", f"图像窗口不可用：{reason}")
-                    return
-                camera_preview_active = True
-                camera_preview_rate.reset()
-                message = f"图像窗口已打开: {', '.join(sorted(preview_camera_sources))}"
-                clutch_input.set_visualization_state(camera_active=True, status=message)
-                _log("Camera", message, now=now)
-            except Exception as exc:  # noqa: BLE001
-                close_camera_preview(f"图像窗口启动失败: {type(exc).__name__}: {exc}")
-                if control_ui is not None:
-                    control_ui.append_message("Camera", f"图像窗口启动失败：{exc}")
-
-        def close_tactile_preview(status: str = "") -> None:
-            nonlocal tactile_visualizer
-            if tactile_visualizer is not None:
-                tactile_visualizer.close()
-                tactile_visualizer = None
-            clutch_input.set_visualization_state(tactile_active=False, status=status)
-
-        def open_tactile_preview(now: float) -> None:
-            nonlocal tactile_visualizer
-            if not bool(getattr(args, "tactile_visualization_available", False)):
-                message = "没有可用触觉 backend；触觉窗口未打开。"
-                clutch_input.set_visualization_state(tactile_active=False, status=message)
-                if control_ui is not None:
-                    control_ui.append_message("TactileVis", message)
-                return
-            try:
-                if tactile_visualizer is None:
-                    tactile_visualizer = _build_tactile_visualizer(
-                        args,
-                        components.active_sides,
-                        force=True,
-                    )
-                if tactile_visualizer is None:
-                    raise RuntimeError("tactile visualizer was not created")
-                tactile_preview_rate.reset()
-                message = "触觉窗口已打开"
-                clutch_input.set_visualization_state(tactile_active=True, status=message)
-                _log("TactileVis", message, now=now)
-            except Exception as exc:  # noqa: BLE001
-                close_tactile_preview(f"触觉窗口启动失败: {type(exc).__name__}: {exc}")
-                if control_ui is not None:
-                    control_ui.append_message("TactileVis", f"触觉窗口启动失败：{exc}")
 
         def recording_active() -> bool:
             return bool(
@@ -13128,14 +16475,25 @@ def main() -> None:
                 if not worker_ready:
                     return False, worker_message
             if not bool(getattr(args, "no_camera", False)):
+                pending_contract = CaptureModalityContract(
+                    ignored_camera_keys=tuple(
+                        getattr(args, "ignore_camera", ()) or ()
+                    ),
+                    ignored_tactile_keys=tuple(
+                        getattr(args, "ignore_tactile", ()) or ()
+                    ),
+                )
+                ignored_camera_keys = set(pending_contract.ignored_camera_keys)
                 for camera_key, source in camera_sources.items():
+                    if camera_key in ignored_camera_keys:
+                        continue
                     frame = source.frame_buffer().get_latest()
                     if frame is None:
                         return False, f"等待相机 {camera_key} 首帧。"
                     camera_age = float(now) - float(frame.source_timestamp)
                     if camera_age < -0.05:
                         return False, f"等待相机 {camera_key} 时间戳稳定。"
-                    if camera_age > 1.0:
+                    if camera_age > DEFAULT_CAMERA_FRAME_MAX_AGE_SEC:
                         return False, f"等待相机 {camera_key} 最新帧，当前 age={camera_age:.2f}s。"
                 camera_status = clutch_input.publish_camera_status(
                     camera_sources=camera_sources,
@@ -13144,7 +16502,13 @@ def main() -> None:
                     now=now,
                     force=False,
                 )
-                camera_blocking_message = _camera_status_blocking_message(camera_status)
+                camera_blocking_message = _camera_status_blocking_message(
+                    {
+                        key: value
+                        for key, value in camera_status.items()
+                        if key not in ignored_camera_keys
+                    }
+                )
                 if camera_blocking_message:
                     return False, camera_blocking_message
             if any(
@@ -13162,6 +16526,58 @@ def main() -> None:
                         return False, f"等待 {side} hand_q6 时间戳稳定。"
                     if hand_age > 0.5:
                         return False, f"等待 {side} hand_q6 最新输入，当前 age={hand_age:.2f}s。"
+            for side in components.active_sides:
+                if (
+                    side
+                    in CaptureModalityContract(
+                        ignored_camera_keys=tuple(
+                            getattr(args, "ignore_camera", ()) or ()
+                        ),
+                        ignored_tactile_keys=tuple(
+                            getattr(args, "ignore_tactile", ()) or ()
+                        ),
+                    ).ignored_tactile_keys
+                ):
+                    continue
+                backend = _hand_backend_for_side(components, side)
+                if backend is None:
+                    backend = _gripper_backend_for_side(components, side)
+                if backend is None:
+                    continue
+                backend_config = getattr(backend, "config", None)
+                tactile_configured = bool(
+                    getattr(backend_config, "connect_tactile", False)
+                    or tuple(getattr(backend_config, "tactile_regions", ()) or ())
+                )
+                if not tactile_configured:
+                    continue
+                get_state = getattr(backend, "get_state")
+                try:
+                    state = get_state(include_tactile_arrays=False)
+                except TypeError:
+                    state = get_state()
+                if bool(state.get("tactile_process_read")) and not bool(
+                    state.get("tactile_worker_alive")
+                ):
+                    return False, f"等待 {side} 触觉采集子进程恢复。"
+                tactile_timestamp = state.get("tactile_timestamp")
+                if tactile_timestamp is None:
+                    error = str(state.get("telemetry_error") or "")
+                    return False, f"等待 {side} 触觉首帧{': ' + error if error else ''}。"
+                tactile_age = float(now) - float(tactile_timestamp)
+                read_hz = float(
+                    state.get("tactile_read_hz")
+                    or getattr(backend_config, "telemetry_hz", 0.0)
+                    or 0.0
+                )
+                tactile_max_age = max(0.5, 3.0 / read_hz) if read_hz > 0.0 else 1.0
+                if tactile_age < -0.05:
+                    return False, f"等待 {side} 触觉时间戳稳定。"
+                if tactile_age > tactile_max_age:
+                    return False, (
+                        f"等待 {side} 最新触觉帧，当前 age={tactile_age:.2f}s "
+                        f"> {tactile_max_age:.2f}s。"
+                    )
             probe_ready, probe_message = gripper_warmup_probe_status(now, reason="recording_warmup")
             if not probe_ready:
                 return False, probe_message
@@ -13337,21 +16753,63 @@ def main() -> None:
 
         def start_recording(now: float, *, start_reason: str) -> bool:
             nonlocal episode_last_state, last_collection_frequency_debug_at, last_collection_frequency_warning_active
-            if recording_active():
+            nonlocal episode_start_failure_message, dataset_recorder
+            episode_start_failure_message = None
+            admitted, admission_message = clutch_input.episode_start_admission()
+            if not admitted:
+                episode_start_failure_message = admission_message
+                _log("Dataset", f"recording start rejected: {admission_message}", now=now)
+                clutch_input._publish_episode_start_rejection(admission_message)
                 return False
+            if recording_active():
+                episode_start_failure_message = "数采已处于运行状态。"
+                return False
+            if (
+                dataset_recorder is None
+                and not bool(getattr(args, "no_collection", False))
+            ):
+                try:
+                    dataset_recorder = RealTeleopDatasetRecorder(
+                        args=args,
+                        components=components,
+                        camera_sources=camera_sources,
+                    )
+                    dataset_recorder.start()
+                    dataset_recorder.write_camera_device_config()
+                    startup_device_errors.pop("dataset.writer", None)
+                    publish_runtime_hardware_status()
+                except Exception as exc:  # noqa: BLE001 - keep GUI/runtime available.
+                    dataset_recorder = None
+                    detail = f"{type(exc).__name__}: {exc}"
+                    startup_device_errors["dataset.writer"] = detail
+                    publish_runtime_hardware_status()
+                    message = f"正式 dataset 当前不可用: {detail}"
+                    episode_start_failure_message = message
+                    _log("Dataset", message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", message)
+                    return False
             last_collection_frequency_warning_active = False
             last_collection_frequency_debug_at = 0.0
-            if dataset_recorder is None and not episode_recorder.config.enabled:
+            if (
+                bool(getattr(args, "no_collection", False))
+                and dataset_recorder is None
+                and not episode_recorder.config.enabled
+            ):
                 message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
+                episode_start_failure_message = message
                 _log("Dataset", message, now=now)
                 if control_ui is not None:
                     control_ui.append_message("Dataset", message)
                 return False
             if dataset_recorder is not None:
                 try:
-                    dataset_recorder.reconfigure_for_current_args()
+                    # Reconfiguration belongs before warmup/countdown.  Never
+                    # rebuild feedback pollers after readiness has passed.
+                    dataset_recorder.require_configured_for_current_args()
                 except Exception as exc:  # noqa: BLE001
-                    message = f"正式 dataset 重新配置失败: {type(exc).__name__}: {exc}"
+                    message = f"正式 dataset 配置在 warmup 后发生变化: {type(exc).__name__}: {exc}"
+                    episode_start_failure_message = message
                     _log("Dataset", message, now=now)
                     if control_ui is not None:
                         control_ui.append_message("Dataset", message)
@@ -13377,7 +16835,7 @@ def main() -> None:
                         "task_name": str(args.collection_task_name),
                         "task_name_zh": str(getattr(args, "collection_task_name_zh", "")),
                         "task_description": str(args.collection_task_description),
-                        "camera_keys": sorted(camera_sources),
+                        "camera_keys": sorted(dataset_recorder.camera_sources),
                         "camera_config_path": None if args.no_camera else str(args.camera_config),
                         "write_video": bool(args.write_video and not args.no_camera),
                         "tactile_storage": str(args.tactile_storage),
@@ -13401,10 +16859,12 @@ def main() -> None:
                             )
                         )
                     message = f"正式 dataset episode 启动失败: {type(exc).__name__}: {exc}"
+                    episode_start_failure_message = message
                     _log("Dataset", message, now=now)
                     if control_ui is not None:
                         control_ui.append_message("Dataset", message)
                     return False
+                clutch_input.begin_plus_curation_episode(int(episode_index))
                 if int(episode_index) != planned_episode_index:
                     mismatch = (
                         "dataset episode index changed after audit attachment: "
@@ -13452,15 +16912,24 @@ def main() -> None:
                     else None
                 ),
             )
-            reset_gripper_warmup_probe("recording_started")
+            # The countdown probe is the admission gate for this episode.
+            # Preserve its ready state after opening the episode; resetting it
+            # here would make the first sample-health check move the grippers
+            # again and immediately pause collection.
             return True
 
         def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
             nonlocal episode_start_countdown_deadline, episode_start_countdown_reason
             nonlocal episode_start_warmup_ready_since, episode_start_warmup_last_message
+            nonlocal dataset_recorder
             if recording_active():
                 return False
             if episode_start_countdown_deadline is not None:
+                return False
+            admitted, admission_message = clutch_input.episode_start_admission()
+            if not admitted:
+                _log("Dataset", f"recording countdown rejected: {admission_message}", now=now)
+                clutch_input._publish_episode_start_rejection(admission_message)
                 return False
             if dataset_recorder is not None and dataset_recorder.finalizing:
                 message = "上一个正式 dataset episode 仍在后台保存，暂不开始新的数采。"
@@ -13468,12 +16937,99 @@ def main() -> None:
                 if control_ui is not None:
                     control_ui.append_message("Dataset", message)
                 return False
+            hardware_blockers = collection_startup_blockers()
+            if hardware_blockers:
+                message = (
+                    "数采所需硬件仍未就绪："
+                    + ", ".join(sorted(hardware_blockers))
+                    + "。请重连，或仅对允许缺失的 camera/tactile 先设置数据集级忽视规则。"
+                )
+                _log("Dataset", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", message)
+                clutch_input.set_episode_recording_state(
+                    active=False,
+                    episode_dir=recording_path(),
+                    frame_count=recording_frame_count(),
+                    event_status="error",
+                    event_message=message,
+                )
+                return False
             if dataset_recorder is None and not episode_recorder.config.enabled:
                 message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
                 _log("Dataset", message, now=now)
                 if control_ui is not None:
                     control_ui.append_message("Dataset", message)
                 return False
+            if not bool(getattr(args, "no_collection", False)):
+                try:
+                    bind_capture_modality_contract(
+                        Path(args.dataset_root),
+                        CaptureModalityContract(
+                            ignored_camera_keys=tuple(
+                                getattr(args, "ignore_camera", ()) or ()
+                            ),
+                            ignored_tactile_keys=tuple(
+                                getattr(args, "ignore_tactile", ()) or ()
+                            ),
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    message = (
+                        "数采配置未通过数据集级忽视规则校验："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _log("Dataset", message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", message)
+                    clutch_input.set_episode_recording_state(
+                        active=False,
+                        episode_dir=recording_path(),
+                        frame_count=recording_frame_count(),
+                        event_status="error",
+                        event_message=message,
+                    )
+                    return False
+                try:
+                    if dataset_recorder is None:
+                        dataset_recorder = RealTeleopDatasetRecorder(
+                            args=args,
+                            components=components,
+                            camera_sources=camera_sources,
+                        )
+                        dataset_recorder.start()
+                    else:
+                        # Task/root/modality changes rebuild the recorder and
+                        # therefore replace its actual-state poller.  Perform
+                        # that replacement before warmup so the countdown gate
+                        # observes the exact poller that will record the episode.
+                        dataset_recorder.reconfigure_for_current_args()
+                    dataset_recorder.write_camera_device_config()
+                    startup_device_errors.pop("dataset.writer", None)
+                    publish_runtime_hardware_status()
+                except Exception as exc:  # noqa: BLE001 - keep teleop available.
+                    failed_recorder = dataset_recorder
+                    dataset_recorder = None
+                    if failed_recorder is not None:
+                        try:
+                            failed_recorder.close()
+                        except Exception:
+                            pass
+                    detail = f"{type(exc).__name__}: {exc}"
+                    startup_device_errors["dataset.writer"] = detail
+                    publish_runtime_hardware_status()
+                    message = f"正式 dataset 预备失败: {detail}"
+                    _log("Dataset", message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", message)
+                    clutch_input.set_episode_recording_state(
+                        active=False,
+                        episode_dir=recording_path(),
+                        frame_count=recording_frame_count(),
+                        event_status="error",
+                        event_message=message,
+                    )
+                    return False
             clutch_input._restore_gripper_task_policy_for_collection()
             countdown_sec = float(DEFAULT_EPISODE_START_COUNTDOWN_SEC)
             episode_start_countdown_deadline = float(now) + countdown_sec
@@ -13527,6 +17083,13 @@ def main() -> None:
                 episode_start_warmup_ready_since = None
                 episode_start_warmup_last_message = None
                 return
+            admitted, admission_message = clutch_input.episode_start_admission()
+            if not admitted:
+                cancel_recording_countdown(
+                    now,
+                    reason=f"start admission changed: {admission_message}",
+                )
+                return
             ready, warmup_message = recording_warmup_status(now, step_result=step_result)
             remaining_sec = _episode_start_countdown_remaining(now, episode_start_countdown_deadline)
             if not ready:
@@ -13570,7 +17133,10 @@ def main() -> None:
                     episode_dir=recording_path(),
                     frame_count=recording_frame_count(),
                     event_status="error",
-                    event_message="数采启动失败；请查看 Dataset 日志后重新点击“开始数采”。",
+                    event_message=(
+                        episode_start_failure_message
+                        or "数采启动失败；请查看 Dataset 日志后重新点击“开始数采”。"
+                    ),
                 )
 
         def stop_recording(
@@ -13677,7 +17243,9 @@ def main() -> None:
             if not recording_active():
                 return False
             episode_resume_warmup_ready_count = 0
-            reset_gripper_warmup_probe(f"recording_paused:{reason}")
+            # A runtime Hold must not restart the episode-start motion probe.
+            # Modality health is rechecked while resuming, using the probe's
+            # existing ready/error result.
             newly_paused = False
             if dataset_recorder is not None and dataset_recorder.is_recording:
                 newly_paused = bool(
@@ -13728,11 +17296,7 @@ def main() -> None:
             )
             if control_ui is not None:
                 control_ui.publish(
-                    active_controls=(
-                        clutch_input._hold_controls()
-                        if clutch_input.hold_active()
-                        else clutch_input._teleop_controls()
-                    )
+                    active_controls=clutch_input._current_active_controls()
                 )
             return True
 
@@ -13745,6 +17309,9 @@ def main() -> None:
             nonlocal episode_resume_warmup_ready_count
             if not recording_paused():
                 return True
+            if fix_hold_coordinator.active:
+                episode_resume_warmup_ready_count = 0
+                return False
             ready, warmup_message = recording_warmup_status(now, step_result=step_result)
             if not ready:
                 episode_resume_warmup_ready_count = 0
@@ -13792,13 +17359,36 @@ def main() -> None:
             resumed_any = False
             pause_reason = recording_pause_reason()
             if dataset_recorder is not None and dataset_recorder.is_paused:
-                resumed_any = bool(
-                    dataset_recorder.resume_episode(
+                try:
+                    dataset_resumed = dataset_recorder.resume_episode(
                         reason="runtime_running_warmup_ready",
                         now=now,
                         step_index=step_index,
                     )
-                ) or resumed_any
+                except Exception as exc:  # noqa: BLE001 - keep motion live and data paused.
+                    episode_resume_warmup_ready_count = 0
+                    message = (
+                        "数采时序 segment 重置失败，为避免跨暂停窗口已保持暂停："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _log("Dataset", message, now=now)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", message)
+                    clutch_input.set_episode_recording_state(
+                        active=True,
+                        episode_dir=recording_path(),
+                        frame_count=recording_frame_count(),
+                        frequency_status=recording_frequency_status(),
+                        event_status="resume_pending",
+                        event_message=message,
+                        episode_index=(
+                            int(dataset_recorder.active_episode_index)
+                            if dataset_recorder.active_episode_index is not None
+                            else None
+                        ),
+                    )
+                    return False
+                resumed_any = bool(dataset_resumed) or resumed_any
             if episode_recording_paused:
                 episode_recorder.record_event(
                     "recording_resumed",
@@ -13816,7 +17406,6 @@ def main() -> None:
                 resumed_any = True
             if resumed_any:
                 episode_resume_warmup_ready_count = 0
-                reset_gripper_warmup_probe("recording_resumed")
                 message = "数采已恢复：遥操 RUNNING 且输入/相机 warmup 已稳定，继续写入同一个 episode。"
                 _log("Dataset", message, now=now)
                 if control_ui is not None:
@@ -13836,6 +17425,59 @@ def main() -> None:
                 ),
             )
             return True
+
+        def sync_fix_hold(now: float) -> None:
+            transition = fix_hold_coordinator.update(
+                fix_controller=getattr(components, "fix_arm_controller", None),
+                init_controller=getattr(components, "init_arm_controller", None),
+            )
+            if not transition.changed:
+                return
+            source_text = ", ".join(
+                f"{side}={source}"
+                for side, source in sorted(transition.source_by_side.items())
+            )
+            if transition.entered:
+                message = (
+                    "左右臂均进入 Fix/Init-fixed，已进入 Fix-Hold；"
+                    "双臂保持、当前 episode 暂停。解除任一侧后自动恢复；"
+                    "再次按 Hold 将升级为常规 Hold。"
+                    f" ({source_text})"
+                )
+                clutch_input.set_fix_hold_active(True, message=message)
+                cancel_recording_countdown(
+                    now,
+                    reason="fix_hold:both_sides_fixed_like",
+                )
+                pause_recording(now, reason="fix_hold:both_sides_fixed_like")
+                if episode_recorder.is_recording:
+                    episode_recorder.record_event(
+                        "fix_hold_started",
+                        payload={
+                            "step_index": int(step_index),
+                            "locked_sides": list(transition.locked_sides),
+                            "source_by_side": dict(transition.source_by_side),
+                        },
+                        timestamp=now,
+                    )
+                _log("FixHold", message, now=now)
+            elif transition.exited:
+                message = (
+                    "Fix-Hold 已解除：至少一侧特殊固定已完成释放；"
+                    "遥操输入稳定后自动恢复当前 episode。"
+                )
+                clutch_input.set_fix_hold_active(False, message=message)
+                if episode_recorder.is_recording:
+                    episode_recorder.record_event(
+                        "fix_hold_released",
+                        payload={
+                            "step_index": int(step_index),
+                            "remaining_locked_sides": list(transition.locked_sides),
+                            "source_by_side": dict(transition.source_by_side),
+                        },
+                        timestamp=now,
+                    )
+                _log("FixHold", message, now=now)
 
         def poll_dataset_finalize(now: float) -> None:
             if dataset_recorder is None:
@@ -13864,6 +17506,10 @@ def main() -> None:
                         episode_index=int(task.episode_index),
                         frame_count=int(task.frame_count),
                     )
+                    clutch_input.set_plus_curation_pending(
+                        dataset_root=dataset_recorder.dataset_root,
+                        episode_index=int(task.episode_index),
+                    )
                 else:
                     message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
                     _log("Dataset", message, now=now)
@@ -13890,6 +17536,7 @@ def main() -> None:
                     debug_timing_modules.needs_loop_phase_timer
                     or recording_active()
                     or action_debug_log_recorder.active
+                    or ik_debug_log_recorder.active
                     or position_audit_fanout is not None
                 )
                 else None
@@ -13901,7 +17548,34 @@ def main() -> None:
                     loop_phase_timer.mark(name)
 
             clutch_input.poll()
+            mark_loop_phase("loop.control_input_poll")
+            if bool(
+                getattr(
+                    clutch_input,
+                    "consume_init_qpos_emergency_stop_request",
+                    lambda: False,
+                )()
+            ):
+                _handle_init_qpos_emergency_stop(
+                    components,
+                    clutch_input,
+                    now=loop_start,
+                )
+                # Do not run a normal control frame after the Init operation
+                # has been stopped by the operator.
+                continue
+            sync_foot_pad_runtime_status()
             poll_dataset_finalize(loop_start)
+            plus_request = clutch_input.consume_plus_curation_request()
+            if plus_request is not None:
+                # This is a tiny post-finalize JSON sidecar write.  It never
+                # enters the raw writer or issues a hardware/control call.
+                clutch_input.save_plus_curation(
+                    episode_index=int(plus_request.get("episode_index")),
+                    pending_token=str(plus_request.get("pending_token", "") or ""),
+                    disposition=str(plus_request.get("disposition", "unknown")),
+                    reason_code=str(plus_request.get("reason_code", "unknown")),
+                )
             _handle_ik_debug_log_toggle_request(
                 args=args,
                 components=components,
@@ -13911,20 +17585,78 @@ def main() -> None:
                 ik_debug_profile_base_enabled=ik_debug_profile_base_enabled,
                 now=loop_start,
             )
+            if clutch_input.consume_device_retry_request():
+                retry_failed_devices()
             if clutch_input.consume_camera_visualization_toggle_request():
-                if camera_preview_active or camera_previewer is not None:
+                if clutch_input._episode_busy():
+                    message = (
+                        "数采倒计时、录制、暂停或保存期间不能切换图像窗口；"
+                        "请等待 episode 完全结束。"
+                    )
+                    clutch_input.set_visualization_state(status=message)
+                    if control_ui is not None:
+                        control_ui.append_message("Camera", message)
+                elif camera_preview_active or camera_previewer is not None:
                     close_camera_preview("图像窗口已关闭")
                     if control_ui is not None:
                         control_ui.append_message("Camera", "图像窗口已关闭。")
                 else:
                     open_camera_preview(loop_start)
+            if clutch_input.consume_tactile_solving_enable_request():
+                if recording_active() or episode_start_countdown_deadline is not None:
+                    message = "数采或开始倒计时期间不能切换触觉解算；请停止数采并进入 Hold。"
+                    clutch_input.set_visualization_state(status=message)
+                    if control_ui is not None:
+                        control_ui.append_message("TactileSolve", message)
+                elif not clutch_input.hold_active() and bool(
+                    getattr(clutch_input, "_teleop_started", False)
+                ):
+                    message = "开启触觉解算需要先进入 Hold，避免重启触觉 worker 影响控制周期。"
+                    clutch_input.set_visualization_state(status=message)
+                    if control_ui is not None:
+                        control_ui.append_message("TactileSolve", message)
+                else:
+                    try:
+                        changed = _enable_gui_tactile_solving(args, components)
+                        message = (
+                            f"触觉解算已开启：{changed} 个 worker 已按固定传感器标定重启；"
+                            "解算保持开启，关闭窗口不会改变采集字段。"
+                        )
+                        clutch_input.set_visualization_state(
+                            tactile_solving_active=True,
+                            status=message,
+                        )
+                        if control_ui is not None:
+                            control_ui.append_message("TactileSolve", message)
+                        _log("TactileSolve", message, now=loop_start)
+                    except Exception as exc:  # noqa: BLE001
+                        message = f"触觉解算开启失败: {type(exc).__name__}: {exc}"
+                        args.tactile_solving_active = _tactile_solving_active(args, components)
+                        args.tactile_visualization_available = _tactile_visualization_available(
+                            args, components
+                        )
+                        clutch_input.set_visualization_state(
+                            tactile_solving_active=args.tactile_solving_active,
+                            status=message,
+                        )
+                        if control_ui is not None:
+                            control_ui.append_message("TactileSolve", message)
             if clutch_input.consume_tactile_visualization_toggle_request():
-                if tactile_visualizer is not None:
+                if clutch_input._episode_busy():
+                    message = (
+                        "数采倒计时、录制、暂停或保存期间不能切换触觉窗口；"
+                        "请等待 episode 完全结束。"
+                    )
+                    clutch_input.set_visualization_state(status=message)
+                    if control_ui is not None:
+                        control_ui.append_message("TactileVis", message)
+                elif tactile_visualizer is not None:
                     close_tactile_preview("触觉窗口已关闭")
                     if control_ui is not None:
                         control_ui.append_message("TactileVis", "触觉窗口已关闭。")
                 else:
                     open_tactile_preview(loop_start)
+            sync_fix_hold(loop_start)
             if clutch_input.should_quit:
                 if not emergency_stop_sent:
                     _emergency_stop_real_arms(
@@ -13946,14 +17678,47 @@ def main() -> None:
                 break
             if clutch_input.consume_hold_request():
                 hold_reason = clutch_input.hold_request_reason()
+                fix_hold_escalation = fix_hold_coordinator.escalate_to_regular_hold()
+                if fix_hold_escalation.changed:
+                    clutch_input.set_fix_hold_active(
+                        False,
+                        message=(
+                            "Fix-Hold 已由用户升级为常规 Hold；"
+                            "特殊固定状态将清除，之后必须重采双臂 Home。"
+                        ),
+                    )
+                    if episode_recorder.is_recording:
+                        episode_recorder.record_event(
+                            "fix_hold_escalated_to_regular_hold",
+                            payload={
+                                "step_index": int(step_index),
+                                "locked_sides": list(fix_hold_escalation.locked_sides),
+                                "source_by_side": dict(
+                                    fix_hold_escalation.source_by_side
+                                ),
+                            },
+                            timestamp=loop_start,
+                        )
                 if hold_reason == "q6_gesture":
                     hold_hardware_reason = "q6 gesture hold requested"
                 elif hold_reason == "tracker_loss_timeout":
                     hold_hardware_reason = "tracker target loss requires runtime home recalibration"
+                elif hold_reason.startswith("init_qpos_"):
+                    hold_hardware_reason = (
+                        "Init qpos operation completed; runtime home recalibration required"
+                        if hold_reason in {
+                            "init_qpos_completed",
+                            "init_qpos_sequence_completed",
+                        }
+                        else "Init qpos operation failed; safe Hold and runtime home recalibration required"
+                    )
                 else:
                     hold_hardware_reason = "gui hold requested"
                 if recording_active():
-                    pause_recording(loop_start, reason="hold_requested")
+                    pause_recording(
+                        loop_start,
+                        reason=_hold_requested_pause_reason(hold_reason),
+                    )
                 special_cancel_messages = _cancel_special_arm_modes_for_hold(
                     components,
                     now=loop_start,
@@ -13978,6 +17743,15 @@ def main() -> None:
                         message = "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。"
                     elif hold_reason == "tracker_loss_timeout":
                         message = "Tracker 目标持续丢失已进入手动 Hold；必须点击“开始遥操”重新采集 runtime home 后才能恢复。"
+                    elif hold_reason.startswith("init_qpos_"):
+                        message = (
+                            "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。"
+                            if hold_reason in {
+                                "init_qpos_completed",
+                                "init_qpos_sequence_completed",
+                            }
+                            else "Init qpos 未安全完成，已进入 Hold；请检查提示和机械臂状态，确认后重新采集 runtime Home。"
+                        )
                     else:
                         message = "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。"
                     control_ui.append_message("Hold", message)
@@ -14052,6 +17826,50 @@ def main() -> None:
                     )
                 else:
                     cancel_recording_countdown(loop_start, reason="manual_key_stop")
+            episode_delete_index = clutch_input.consume_episode_delete_request()
+            if episode_delete_index is not None:
+                if clutch_input.plus_curation_save_in_flight():
+                    clutch_input.set_episode_finalize_state(
+                        status="error",
+                        message="删除失败：Plus 整理旁路正在写入，请等待写入完成后重试。",
+                    )
+                elif recording_active() or episode_start_countdown_deadline is not None or dataset_recorder.finalizing:
+                    clutch_input.set_episode_finalize_state(
+                        status="error",
+                        message="删除失败：数采、开始倒计时或后台保存仍在进行，请等待空闲后重试。",
+                    )
+                elif not clutch_input.hold_active():
+                    clutch_input.set_episode_finalize_state(
+                        status="error",
+                        message="真机删除需要先进入停臂保持 / Hold，避免数据压紧阻塞活动中的控制循环。",
+                    )
+                else:
+                    clutch_input.set_episode_finalize_state(
+                        status="finalizing",
+                        message=f"正在删除 episode {episode_delete_index} 并连续重编号，请勿开始数采。",
+                    )
+                    try:
+                        deletion = dataset_recorder.delete_episode(episode_delete_index)
+                    except (ValueError, IndexError, OSError, RuntimeError) as exc:
+                        message = f"删除 episode {episode_delete_index} 失败: {type(exc).__name__}: {exc}"
+                        _log("Dataset", message, now=loop_start)
+                        clutch_input.set_episode_finalize_state(status="error", message=message)
+                    else:
+                        message = (
+                            f"已删除 episode {episode_delete_index}；剩余 {deletion.episode_count} 个，"
+                            f"下次从 {deletion.next_episode_index} 开始。备份: {deletion.backup_root}"
+                        )
+                        _log("Dataset", message, now=loop_start)
+                        clutch_input.clear_plus_curation_pending(
+                            message="episode 删除/重编号后，待整理 Plus 绑定已清除；请重新复核保存后的 episode。"
+                        )
+                        clutch_input.set_episode_finalize_state(
+                            status="deleted",
+                            message=message,
+                            episode_index=(
+                                None if deletion.episode_count <= 0 else deletion.episode_count - 1
+                            ),
+                        )
             if clutch_input.consume_episode_start_request():
                 if not recording_active():
                     schedule_recording_countdown(loop_start, start_reason="manual_key_start")
@@ -14061,6 +17879,12 @@ def main() -> None:
                 clutch_input.hold_active()
                 and components.session.state_machine.state == TeleopRunState.DEBUG_ONLY
             ):
+                _advance_startup_gui_qpos_maintenance(
+                    args=args,
+                    components=components,
+                    clutch_input=clutch_input,
+                    now=loop_start,
+                )
                 if control_ui is not None:
                     control_ui.publish(
                         stage="Hold / 停臂保持",
@@ -14112,6 +17936,55 @@ def main() -> None:
                 phase_recorder=phase_recorder,
             )
             mark_loop_phase("loop.session_run_step")
+            init_controller = getattr(components, "init_arm_controller", None)
+            qpos_terminal = (
+                init_controller.consume_qpos_terminal_event()
+                if init_controller is not None
+                and callable(getattr(init_controller, "consume_qpos_terminal_event", None))
+                else None
+            )
+            if qpos_terminal is not None:
+                qpos_status = str(qpos_terminal.get("status", "failed") or "failed")
+                qpos_message = str(qpos_terminal.get("message", "Init qpos finished") or "")
+                _log("InitArmQpos", qpos_message, now=loop_start)
+                if control_ui is not None:
+                    control_ui.append_message("InitArmQpos", qpos_message)
+                    control_ui.publish(
+                        control_hint=qpos_message,
+                        **_init_arm_ui_state(components),
+                    )
+                if qpos_status == "completed":
+                    target_side = str(qpos_terminal.get("side", "") or "")
+                    support_side = "right" if target_side == "left" else "left"
+                    _release_messages, release_errors = _release_gui_qpos_init_transit(
+                        components,
+                        operation_id=str(
+                            getattr(init_controller, "qpos_operation_id", "") or ""
+                        ),
+                        now=loop_start,
+                        sides=(support_side,),
+                    )
+                    if release_errors:
+                        clutch_input.request_hold(
+                            reason="init_qpos_support_release_failed"
+                        )
+                        continue
+                    clutch_input.handle_init_arm_qpos_terminal(
+                        qpos_terminal,
+                        now=loop_start,
+                    )
+                    if clutch_input.hold_active():
+                        # A completed dual-arm sequence requests regular Hold.
+                        # Do not let its terminal control frame reach collection;
+                        # the next loop iteration consumes the Hold transition.
+                        continue
+                else:
+                    clutch_input.handle_init_arm_qpos_terminal(
+                        qpos_terminal,
+                        now=loop_start,
+                    )
+                    clutch_input.request_hold(reason=f"init_qpos_{qpos_status}")
+                    continue
             raw_step_channels = (
                 step_result.raw_channels
                 if step_result.raw_channels
@@ -14221,8 +18094,25 @@ def main() -> None:
             )
             if fix_arm_progress.active:
                 if fix_arm_progress.completed and fix_arm_progress.side:
-                    components.session.safety_monitor.request_pose_baseline_reset_many(
-                        (f"{fix_arm_progress.side}_wrist_pose",)
+                    try:
+                        components.session.safety_monitor.request_pose_baseline_reset_many(
+                            (f"{fix_arm_progress.side}_wrist_pose",)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - keep the loop live.
+                        _log(
+                            "FixArm",
+                            "Home was applied but safety baseline reset failed; requesting Hold: "
+                            f"{type(exc).__name__}: {exc}",
+                            now=loop_start,
+                        )
+                        clutch_input.request_hold(
+                            reason="fix_arm_home_baseline_reset_failed"
+                        )
+                if fix_arm_progress.failed and bool(
+                    getattr(fix_arm_progress, "requires_hold", False)
+                ):
+                    clutch_input.request_hold(
+                        reason="fix_arm_home_recapture_apply_failed"
                     )
                 clutch_input.publish_fix_arm_home_capture_progress(fix_arm_progress)
             init_arm_progress = advance_init_arm_home_capture(
@@ -14239,9 +18129,25 @@ def main() -> None:
             )
             if init_arm_progress.active:
                 if init_arm_progress.completed and init_arm_progress.side:
-                    components.session.safety_monitor.request_pose_baseline_reset_many(
-                        (f"{init_arm_progress.side}_wrist_pose",)
+                    reset_sides = (
+                        init_arm_progress.sides
+                        if init_arm_progress.sides
+                        else (init_arm_progress.side,)
                     )
+                    try:
+                        components.session.safety_monitor.request_pose_baseline_reset_many(
+                            tuple(f"{side}_wrist_pose" for side in reset_sides)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - keep the loop live.
+                        _log(
+                            "InitArm",
+                            "Home was applied but safety baseline reset failed; requesting Hold: "
+                            f"{type(exc).__name__}: {exc}",
+                            now=loop_start,
+                        )
+                        clutch_input.request_hold(
+                            reason="init_arm_home_baseline_reset_failed"
+                        )
                     reset_smoothing = getattr(
                         getattr(components, "dual_arm_retargeter", None),
                         "reset_target_pose_smoothing",
@@ -14257,7 +18163,39 @@ def main() -> None:
                                 f"{type(exc).__name__}: {exc}",
                                 now=loop_start,
                             )
-                clutch_input.publish_init_arm_home_capture_progress(init_arm_progress)
+                    if init_arm_progress.qpos_operation_id:
+                        release_messages, release_errors = _release_gui_qpos_init_transit(
+                            components,
+                            operation_id=init_arm_progress.qpos_operation_id,
+                            now=loop_start,
+                            sides=(init_arm_progress.side,),
+                        )
+                        if control_ui is not None and release_messages:
+                            control_ui.append_message(
+                                "InitArmQpos",
+                                "；".join(release_messages) + "；已恢复普通遥操。",
+                            )
+                        if release_errors:
+                            message = (
+                                "Init qpos 已完成 Home 重采，但柔顺子模式释放失败；"
+                                "为避免控制权冲突已请求 Hold：" + "；".join(release_errors)
+                            )
+                            if control_ui is not None:
+                                control_ui.append_message("InitArmQpos", message)
+                            clutch_input.request_hold(
+                                reason="init_qpos_transit_release_failed"
+                            )
+                if init_arm_progress.failed and bool(
+                    getattr(init_arm_progress, "requires_hold", False)
+                ):
+                    clutch_input.request_hold(
+                        reason="init_arm_home_recapture_apply_failed"
+                    )
+                clutch_input.publish_init_arm_home_capture_progress(
+                    init_arm_progress,
+                    now=loop_start,
+                )
+            sync_fix_hold(loop_start)
             clutch_input.publish_camera_status(
                 camera_sources=camera_sources,
                 preview_camera_sources=preview_camera_sources,
@@ -14393,6 +18331,35 @@ def main() -> None:
                     else merge_teleop_commands((hand_command, gripper_command))
                 )
 
+            # Promote measured Init arrival to the semantic init-fixed state
+            # before collection admission.  This prevents one dual-fixed frame
+            # from leaking into the episode before Fix-Hold pauses the writer.
+            # These are the same reads used by the later GUI diagnostics; do
+            # not add a second synchronous state-backend read to the loop.
+            debug_derived_pose_requested = bool(
+                ik_debug_log_recorder.active
+                or action_debug_log_recorder.active
+                or debug_timing_log_recorder.active
+            )
+            left_hw_state = _runtime_arm_backend_state(
+                components.left_state_backend,
+                include_derived_pose=debug_derived_pose_requested,
+            )
+            right_hw_state = _runtime_arm_backend_state(
+                components.right_state_backend,
+                include_derived_pose=debug_derived_pose_requested,
+            )
+            if _update_init_arm_arrival_from_hardware(
+                components,
+                hardware_state_by_side={
+                    "left": left_hw_state,
+                    "right": right_hw_state,
+                },
+                now=loop_start,
+            ):
+                clutch_input.publish_init_arm_arrival_state()
+            sync_fix_hold(loop_start)
+
             collection_step_result = _collection_step_result(
                 step_result,
                 active_command=active_command,
@@ -14441,12 +18408,18 @@ def main() -> None:
 
             if tactile_visualizer is not None and tactile_preview_rate.should_update(loop_start):
                 try:
-                    if isinstance(tactile_visualizer, DMTacDistributedForceVisualizer):
+                    if isinstance(
+                        tactile_visualizer,
+                        (DMTacDistributedForceVisualizer, AsyncDMTacDistributedForceVisualizer),
+                    ):
+                        tactile_force, tactile_health = dmtac_visualization_snapshot_from_backends(
+                            components.active_sides,
+                            lambda side: _gripper_backend_for_side(components, side),
+                            now=loop_start,
+                        )
                         tactile_keys = tactile_visualizer.update(
-                            dmtac_force_by_side_from_backends(
-                                components.active_sides,
-                                lambda side: _gripper_backend_for_side(components, side),
-                            )
+                            tactile_force,
+                            health_by_side=tactile_health,
                         )
                     else:
                         tactile_visualizer.update(
@@ -14534,6 +18507,16 @@ def main() -> None:
                             "last_state": step_result.state.value,
                         },
                     )
+            if recording_active() and not recording_paused() and sample_due:
+                modalities_ready, modality_message = recording_warmup_status(
+                    loop_start,
+                    step_result=step_result,
+                )
+                if not modalities_ready:
+                    pause_recording(
+                        loop_start,
+                        reason=f"modality_health:{modality_message}",
+                    )
             if recording_active() and recording_paused():
                 resume_recording_if_ready(loop_start, step_result=step_result)
             if recording_active():
@@ -14554,15 +18537,19 @@ def main() -> None:
                     and dataset_recorder.can_record_samples
                     and sample_due
                 ):
-                    collection_metadata_extra = None
+                    collection_metadata_extra = {
+                        "collection_continuity_segment_index": int(
+                            dataset_recorder.continuity_segment_index
+                        )
+                    }
                     if loop_phase_timer is not None:
-                        collection_metadata_extra = {
+                        collection_metadata_extra.update({
                             "loop_phase_timings_ms": [
                                 {"name": name, "elapsed_ms": elapsed * 1000.0}
                                 for name, elapsed in loop_phase_timer.phases
                             ],
                             "loop_elapsed_before_record_s": loop_phase_timer.elapsed_sec(),
-                        }
+                        })
                     if position_reference_enabled:
                         dataset_step_result = replace(
                             collection_step_result,
@@ -14605,12 +18592,24 @@ def main() -> None:
                                 loop_start,
                                 reason=f"collection_overload:{overload_reason}",
                             )
+                        modality_reason = dataset_recorder.collection_modality_reason
+                        if not sample_accepted and modality_reason:
+                            pause_recording(
+                                loop_start,
+                                reason=f"modality_health:{modality_reason}",
+                            )
                 if dataset_recorder is not None and not recording_paused():
                     overload_reason = dataset_recorder.poll_collection_overload()
                     if overload_reason:
                         pause_recording(
                             loop_start,
                             reason=f"collection_overload:{overload_reason}",
+                        )
+                    modality_reason = dataset_recorder.collection_modality_reason
+                    if modality_reason:
+                        pause_recording(
+                            loop_start,
+                            reason=f"modality_health:{modality_reason}",
                         )
                 frequency_status = recording_frequency_status()
                 publish_collection_frequency_warning(frequency_status, now=loop_start)
@@ -14665,27 +18664,14 @@ def main() -> None:
                 jump_gate_status = active_command.metadata.get("ik_jump_gate_status")
                 branch_candidate = active_command.metadata.get("ik_branch_candidate")
                 temporary_safety_status = active_command.metadata.get("temporary_dual_arm_safety")
-            left_hw_state = components.left_state_backend.get_state() if components.left_state_backend is not None else {}
-            right_hw_state = components.right_state_backend.get_state() if components.right_state_backend is not None else {}
-            left_command_state = (
-                components.left_command_backend.get_state()
-                if components.left_command_backend is not None
-                else {}
+            left_command_state = _runtime_arm_backend_state(
+                components.left_command_backend,
+                include_derived_pose=debug_derived_pose_requested,
             )
-            right_command_state = (
-                components.right_command_backend.get_state()
-                if components.right_command_backend is not None
-                else {}
+            right_command_state = _runtime_arm_backend_state(
+                components.right_command_backend,
+                include_derived_pose=debug_derived_pose_requested,
             )
-            if _update_init_arm_arrival_from_hardware(
-                components,
-                hardware_state_by_side={
-                    "left": left_hw_state,
-                    "right": right_hw_state,
-                },
-                now=loop_start,
-            ):
-                clutch_input.publish_init_arm_arrival_state()
             ik_warning_payload = _build_ik_warning_payload(
                 active_command=active_command,
                 left_command_state=left_command_state,
@@ -14863,6 +18849,16 @@ def main() -> None:
                         left_clutch=left_clutch,
                         right_clutch=right_clutch,
                         full=bool(getattr(args, "ik_debug_log_full", False)),
+                        loop_phases=(
+                            loop_phase_timer.phases
+                            if loop_phase_timer is not None
+                            else None
+                        ),
+                        loop_elapsed_sec=(
+                            loop_phase_timer.elapsed_sec()
+                            if loop_phase_timer is not None
+                            else None
+                        ),
                     )
                 )
             hardware_snapshot = (
@@ -15063,8 +19059,14 @@ def main() -> None:
                 time.sleep(remaining)
     finally:
         shutdown_steps: list[tuple[str, Callable[[], None]]] = []
+        if startup_progress is not None:
+            shutdown_steps.append(("startup_progress", startup_progress.close))
         if "main_loop_watchdog" in locals():
             shutdown_steps.append(("main_loop_watchdog", main_loop_watchdog.stop))
+        if "debug_timing_console_writer" in locals() and debug_timing_console_writer is not None:
+            shutdown_steps.append(
+                ("debug_timing_console_writer", debug_timing_console_writer.close)
+            )
         if "debug_timing_log_recorder" in locals():
             shutdown_steps.append(
                 (
@@ -15120,6 +19122,22 @@ def main() -> None:
         if tactile_visualizer is not None:
             shutdown_steps.append(("tactile_visualizer", tactile_visualizer.close))
 
+        if actuator_trace_recorder is not None:
+            shutdown_steps.append(
+                (
+                    "actuator_trace.detach",
+                    lambda: _attach_actuator_command_trace_sink(components, None),
+                )
+            )
+            shutdown_steps.append(
+                (
+                    "actuator_trace.singularity_detach",
+                    lambda: _attach_singularity_transition_trace_sink(
+                        components,
+                        None,
+                    ),
+                )
+            )
         shutdown_steps.extend(
             [
                 (
@@ -15204,7 +19222,27 @@ def main() -> None:
             shutdown_steps.append(
                 (f"position_audit.close_thread[{close_thread.name}]", join_position_debug_thread)
             )
+        if components.human_shadow_frontend is not None:
+            shutdown_steps.append(
+                ("human_action_shadow", components.human_shadow_frontend.close)
+            )
         shutdown_steps.append(("teleop_session", components.session.close))
+        if actuator_trace_recorder is not None:
+            def close_actuator_trace(
+                recorder: ActuatorCommandTraceRecorder = actuator_trace_recorder,
+            ) -> None:
+                recorder.close()
+                snapshot = recorder.snapshot()
+                _log(
+                    "ActuatorTrace",
+                    f"capture closed output={recorder.output_dir} "
+                    f"rows={snapshot.get('rows_by_side')} "
+                    f"singularity_rows={snapshot.get('singularity_rows_by_side')} "
+                    f"drops={snapshot.get('drop_count_by_side')} "
+                    f"errors={snapshot.get('error_count_by_side')}",
+                )
+
+            shutdown_steps.append(("actuator_trace.recorder", close_actuator_trace))
         if components.arm_state_read_executor is not None:
             shutdown_steps.append(
                 (

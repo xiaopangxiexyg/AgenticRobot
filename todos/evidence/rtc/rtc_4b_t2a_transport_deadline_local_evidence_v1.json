@@ -1,0 +1,162 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t2a_transport_deadline_local_2026_07_22",
+  "scope": "non_formal_local_fake_and_localhost_no_model_transport_only",
+  "captured_at": "2026-07-22T20:39:27+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "python": "3.10.20",
+    "websockets": "16.0",
+    "localhost_no_proxy_required": true,
+    "localhost_socket_tests_run_outside_restricted_sandbox": true,
+    "external_model_server_connected": false,
+    "real_openpi_server_started": false,
+    "real_model_loaded": false,
+    "gpu_used": false,
+    "real_observation_used": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "production_entrypoint_started": false,
+    "remote_read_only_audit_performed": true,
+    "remote_openpi_server_process_found": false
+  },
+  "rtc_4b_t2a_boundary": {
+    "generic_deadline_contract": "deployments/client/rtc_transport.py",
+    "openpi_transport_mapping": "deployments/openpi/client/transport.py",
+    "openpi_rtc_adapter": "deployments/openpi/client/rtc.py",
+    "model_capability_changed": false,
+    "model_or_checkpoint_allowlist_added": false,
+    "server_payload_changed": false,
+    "ordinary_openpi_client_opted_in": false,
+    "sync_queue_v1_changed": false,
+    "control_station_dependency": false,
+    "teleop_or_replay_dependency": false,
+    "position_dependency": false,
+    "target_or_dispatch_authority": false
+  },
+  "portable_deadline_contract": {
+    "relative_monotonic_phases": [
+      "connect",
+      "metadata",
+      "inference",
+      "close"
+    ],
+    "phase_statuses": [
+      "completed",
+      "timed_out",
+      "cancelled",
+      "failed"
+    ],
+    "all_budgets_optional_and_default_none": true,
+    "deadline_spec_content_addressed": true,
+    "phase_receipt_content_addressed": true,
+    "bounded_receipt_history": 64,
+    "deadline_fields_include_model_identity": false,
+    "deadline_fields_include_action_dimension_or_horizon": false,
+    "deadline_enters_model_capability": false,
+    "deadline_replaces_request_valid_until_or_plan_ttl": false,
+    "deadline_receipt_claims_worker_or_execution_drain": false,
+    "generic_import_firewall_excludes_model_and_transport_families": true,
+    "future_transport_mappings_allowed": [
+      "websocket",
+      "http",
+      "ipc",
+      "local_runtime"
+    ]
+  },
+  "openpi_mapping_and_failure_semantics": {
+    "connect_budget_maps_to_open_timeout": true,
+    "metadata_and_inference_budgets_map_to_recv_timeout": true,
+    "close_budget_maps_to_websocket_close_timeout": true,
+    "disabled_budget_preserves_legacy_connect_and_recv_call_shape": true,
+    "disabled_budget_preserves_connection_refused_retry_behavior": true,
+    "native_timeout_without_opt_in_keeps_legacy_exception_type": true,
+    "explicit_metadata_or_inference_timeout_retires_connection": true,
+    "late_response_cannot_be_reused_by_next_request": true,
+    "timeout_produces_fallback_chunk": false,
+    "cancel_and_timeout_have_distinct_receipts": true,
+    "close_timeout_or_failure_blocks_session_rearm": true,
+    "fresh_reconnect_increments_connection_generation": true,
+    "reconnect_metadata_continuity_checked": true
+  },
+  "fake_and_localhost_robustness": {
+    "connect_retry_deadline": true,
+    "metadata_timeout_partial_connection_hidden": true,
+    "inference_timeout_and_fresh_reconnect": true,
+    "blocking_inference_cancel_wins_without_timeout_mislabel": true,
+    "close_deadline_failure_latched": true,
+    "legacy_no_deadline_call_shape": true,
+    "actual_localhost_websocket_used": true,
+    "localhost_payload": "synthetic_observation_to_final_chunk_only",
+    "localhost_reconnect_count": 2,
+    "localhost_metadata_hash_stable": true,
+    "localhost_late_chunk_rejected_without_fallback": true
+  },
+  "scoped_source_sha256": {
+    "deployments/client/rtc_transport.py": "fdeeea0056aaa84d137f8f06ebfa19e647cf2eea03a8125758575072f2df85e6",
+    "deployments/client/__init__.py": "b7f1633da68c154720ec1e994930c28bc1de10dd0448c069ae7b92c5f257b7b6",
+    "deployments/openpi/client/transport.py": "c567a05223114b93f7024aa752c6627d16b3c9bf2d50e6bb2f94c464cf9e8d32",
+    "deployments/openpi/client/rtc.py": "6cc961983b5ae0e144fb7c6805957a90a9144b73955bf60181a948b5d5fa439f",
+    "deployments/openpi/client/__init__.py": "2495813f7ba85196034f8206dfc73822f9ec6bbc497c4b45142383e65cc45639",
+    "tests/test_rtc_transport_deadline_contract.py": "95ef2acd0e2825b2d5f3be5d17fb6caa7400763ce27021673be027f579517d59",
+    "tests/test_openpi_rtc_transport_lifecycle.py": "b1654d7d0ae9e5846722504737f8f26fcaa7cfa61ae8f6905c6754b30626905d",
+    "tests/test_openpi_rtc_localhost_loopback.py": "b5f8ec6c729fb95a86917f163530732879f549e7536cca772227994008429f8b"
+  },
+  "out_of_scope_capture_sha256": {
+    "teleop_runtime/deploy/run_policy.py": "73529a2ea5a3c98e7ef34a31ca6c6d6879974f11948e5872313504a8ba9a25a5",
+    "teleop_runtime/deploy/replay.py": "984ab78db8717f42e9d0c843c282bf73546ac24e71ec2eb77ced3e5f1008bb1a",
+    "teleop_runtime/deploy/rtc_step_fanout.py": "b3e5ea886dff038a504ffe6ff211dcb4b93cfeff81642c1afa1ed56e74e7fa48",
+    "teleop_runtime/position_control/deploy_executor.py": "69eb32a1b16644d296a50ef9918cef7c981a530248ee16ce2488abb7e5af0c26",
+    "robot_motion/deploy/inference.py": "802f8a697427c4fddb75a8266501f91bf05942634708ab5f91c582ca1443f80f",
+    "robot_motion/deploy/chunk_plan.py": "64e5b705509e3645367bfb253bdc400ed4aec0b49aef8e5e4dd849a3ac54eb0a",
+    "robot_motion/deploy/async_producer.py": "52cfffbe769a2276a0d65c156d7d672588704768026c6570edebb5b7ec7fd03a",
+    "robot_motion/deploy/rtc_protocol.py": "1160600bb39d468b62a4637a86054cd3a63933d49ddbc712ca96c9d5a7e7d835",
+    "robot_motion/deploy/policy_worker.py": "52faa19b35484988c4d24984c23af60daa4374e8a6b7676b516fa2b998f2a1aa",
+    "sim/mujoco/deploy/rtc_policy.py": "b2f5e9a8e1d836cd5db87f1903c75f3bc7fbbe5672318c10acd4cf08819df7f8"
+  },
+  "verification": [
+    {
+      "command": "NO_PROXY=127.0.0.1,localhost python -m pytest -q <T2a 3-file deadline/fake/localhost subset>",
+      "result": "22 passed in 0.48s"
+    },
+    {
+      "command": "NO_PROXY=127.0.0.1,localhost python -m pytest -q <full RTC focused set>",
+      "result": "172 passed in 3.17s"
+    },
+    {
+      "command": "python -m pytest -q <OpenPI/default-deploy/position compatibility set>",
+      "result": "112 passed, 1 skipped in 3.26s"
+    },
+    {
+      "command": "python -m py_compile <rtc_4b_t2a_scoped_python_paths>",
+      "result": "passed"
+    },
+    {
+      "command": "PYTHONPATH=. uv run python -m teleop_runtime.deploy --help",
+      "result": "passed; default RTC profile remains off and sync CLI is unchanged"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "claims": [
+    "transport deadlines are reusable client mechanics and do not require a model-side RTC adapter",
+    "OpenPI maps the generic phase contract without changing ordinary websocket payloads or default construction",
+    "explicit timeout, cancellation, close, worker drain, request TTL and plan admission remain distinct facts",
+    "a late final chunk cannot become the next request response and no synchronous fallback chunk is fabricated",
+    "fake and actual localhost websocket tests pass without a model, GPU, real observation, hardware or action send",
+    "the existing OpenPI model-server no-action loopback remains a separate RTC-4b-T2b gate"
+  ],
+  "next_gate": {
+    "id": "rtc_4b_t2b_existing_openpi_model_server_loopback",
+    "requires_model_side_adapter": false,
+    "requires_real_observation": false,
+    "requires_action_send": false,
+    "current_blocker": "No existing OpenPI policy server process was running during the read-only remote audit; starting a model/GPU process requires explicit scope approval."
+  }
+}

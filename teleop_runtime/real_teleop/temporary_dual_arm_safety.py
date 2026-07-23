@@ -8,11 +8,15 @@ belong in a separate safety change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping
 
 import numpy as np
 from scipy.spatial.transform import Rotation as SciPyRotation
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.runtime import EffectorCommand, TeleopCommand
+from robot_motion.runtime.immutable import deep_freeze
 
 from ..transforms import as_pose_matrix
 
@@ -25,6 +29,72 @@ class TemporaryDualArmSafetyConfig:
     max_rot_step_deg: float = 8.0
     max_joint_step_deg: float = 6.0
     command_scale: float = 1.0
+    evidence_enabled: bool = False
+
+
+TEMPORARY_DUAL_ARM_SAFETY_EVALUATION_HASH_DOMAIN_V1 = (
+    "dexteleop.temporary_dual_arm_safety_evaluation.v1"
+)
+
+
+@dataclass(frozen=True)
+class TemporaryArmSafetyStageEvidence:
+    """Immutable evidence for one legacy arm-filter invocation.
+
+    Values are flattened tuples plus an explicit shape so an observe-only
+    consumer cannot retain or mutate the limiter's numpy state.
+    """
+
+    effector_name: str
+    command_type: str
+    input_shape: tuple[int, ...] | None
+    input_values: tuple[float, ...] | None
+    previous_anchor_shape: tuple[int, ...] | None
+    previous_anchor_values: tuple[float, ...] | None
+    output_shape: tuple[int, ...] | None
+    output_values: tuple[float, ...] | None
+    initialized: bool
+    limited: bool
+    details: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if not str(self.effector_name).strip() or not str(self.command_type).strip():
+            raise ValueError("effector_name/command_type must be non-empty.")
+        object.__setattr__(self, "details", MappingProxyType(dict(deep_freeze(dict(self.details)))))
+
+
+@dataclass(frozen=True)
+class TemporaryDualArmSafetyEvaluation:
+    """Exact legacy filter-stage anchor/input/output evidence.
+
+    This is audit evidence only.  In particular, ``output`` means the limiter
+    updated its private compatibility state; it does not mean the command was
+    accepted by a guard, backend, or execution target.
+    """
+
+    evaluation_id: str
+    filter_sequence: int
+    evaluated_at: float
+    enabled: bool
+    active_sides: tuple[str, ...]
+    max_xyz_step_m: float
+    max_rot_step_deg: float
+    max_joint_step_deg: float
+    command_scale: float
+    stages: tuple[TemporaryArmSafetyStageEvidence, ...]
+    semantic_content_hash: str
+
+
+def _value_evidence(value: object) -> tuple[tuple[int, ...] | None, tuple[float, ...] | None]:
+    try:
+        array = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return None, None
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        return None, None
+    return tuple(int(item) for item in array.shape), tuple(
+        float(item) for item in array.reshape(-1)
+    )
 
 
 class TemporaryDualArmSafetyLimiter:
@@ -48,10 +118,16 @@ class TemporaryDualArmSafetyLimiter:
     def __init__(self, config: TemporaryDualArmSafetyConfig):
         self.config = config
         self._previous_by_effector: dict[str, np.ndarray] = {}
+        self._filter_sequence = 0
+        self._last_evaluation: TemporaryDualArmSafetyEvaluation | None = None
 
     @property
     def enabled(self) -> bool:
         return bool(self.config.enabled and set(self.config.active_sides) == {"left", "right"})
+
+    @property
+    def last_evaluation(self) -> TemporaryDualArmSafetyEvaluation | None:
+        return self._last_evaluation
 
     def sync_from_command(self, command: TeleopCommand | None) -> None:
         """Observe commands sent outside the session filter, such as recovery ramps."""
@@ -69,8 +145,16 @@ class TemporaryDualArmSafetyLimiter:
         _now: float,
     ) -> TeleopCommand:
         if not self.enabled:
+            if self.config.evidence_enabled:
+                self._record_evaluation(
+                    command,
+                    command,
+                    evaluated_at=float(_now),
+                    stages=(),
+                )
             return command
         filtered = TeleopCommand(timestamp=command.timestamp, metadata=dict(command.metadata))
+        stages: list[TemporaryArmSafetyStageEvidence] = []
         summary: dict[str, object] = {
             "enabled": True,
             "limited": False,
@@ -83,15 +167,102 @@ class TemporaryDualArmSafetyLimiter:
         for effector_name, effector_command in command.commands.items():
             next_command = effector_command.copy()
             if effector_name in {"left_arm", "right_arm"}:
+                if self.config.evidence_enabled:
+                    previous_shape, previous_values = _value_evidence(
+                        self._previous_by_effector.get(effector_name)
+                    )
+                    input_shape, input_values = _value_evidence(effector_command.value)
                 next_command, effector_summary = self._filter_arm_command(next_command)
                 if effector_summary:
                     summary["effectors"][effector_name] = effector_summary
                     summary["limited"] = bool(
                         summary["limited"] or effector_summary.get("limited")
                     )
+                if self.config.evidence_enabled:
+                    output_shape, output_values = _value_evidence(next_command.value)
+                    stages.append(
+                        TemporaryArmSafetyStageEvidence(
+                            effector_name=effector_name,
+                            command_type=str(effector_command.command_type),
+                            input_shape=input_shape,
+                            input_values=input_values,
+                            previous_anchor_shape=previous_shape,
+                            previous_anchor_values=previous_values,
+                            output_shape=output_shape,
+                            output_values=output_values,
+                            initialized=bool(effector_summary.get("initialized", False)),
+                            limited=bool(effector_summary.get("limited", False)),
+                            details=dict(effector_summary),
+                        )
+                    )
             filtered.commands[effector_name] = next_command
         filtered.metadata["temporary_dual_arm_safety"] = summary
+        if self.config.evidence_enabled:
+            self._record_evaluation(
+                command,
+                filtered,
+                evaluated_at=float(_now),
+                stages=tuple(stages),
+            )
         return filtered
+
+    def _record_evaluation(
+        self,
+        input_command: TeleopCommand,
+        output_command: TeleopCommand,
+        *,
+        evaluated_at: float,
+        stages: tuple[TemporaryArmSafetyStageEvidence, ...],
+    ) -> None:
+        timestamp = float(evaluated_at)
+        if not np.isfinite(timestamp):
+            raise ValueError("temporary safety evaluation time must be finite.")
+        payload = {
+            "filter_sequence": int(self._filter_sequence),
+            "evaluated_at": timestamp,
+            "enabled": bool(self.enabled),
+            "active_sides": tuple(str(side) for side in self.config.active_sides),
+            "max_xyz_step_m": float(self.config.max_xyz_step_m),
+            "max_rot_step_deg": float(self.config.max_rot_step_deg),
+            "max_joint_step_deg": float(self.config.max_joint_step_deg),
+            "command_scale": float(self.config.command_scale),
+            "input_effectors": tuple(sorted(str(name) for name in input_command.commands)),
+            "output_effectors": tuple(sorted(str(name) for name in output_command.commands)),
+            "stages": tuple(
+                {
+                    "effector_name": stage.effector_name,
+                    "command_type": stage.command_type,
+                    "input_shape": stage.input_shape,
+                    "input_values": stage.input_values,
+                    "previous_anchor_shape": stage.previous_anchor_shape,
+                    "previous_anchor_values": stage.previous_anchor_values,
+                    "output_shape": stage.output_shape,
+                    "output_values": stage.output_values,
+                    "initialized": stage.initialized,
+                    "limited": stage.limited,
+                    "details": stage.details,
+                }
+                for stage in stages
+            ),
+        }
+        semantic_hash = canonical_content_hash(
+            payload,
+            domain=TEMPORARY_DUAL_ARM_SAFETY_EVALUATION_HASH_DOMAIN_V1,
+        )
+        self._last_evaluation = TemporaryDualArmSafetyEvaluation(
+            evaluation_id=f"temporary-dual-arm-safety:{semantic_hash}",
+            filter_sequence=int(self._filter_sequence),
+            evaluated_at=timestamp,
+            enabled=bool(self.enabled),
+            active_sides=tuple(str(side) for side in self.config.active_sides),
+            max_xyz_step_m=float(self.config.max_xyz_step_m),
+            max_rot_step_deg=float(self.config.max_rot_step_deg),
+            max_joint_step_deg=float(self.config.max_joint_step_deg),
+            command_scale=float(self.config.command_scale),
+            stages=tuple(stages),
+            semantic_content_hash=semantic_hash,
+        )
+        self._filter_sequence += 1
 
     def _filter_arm_command(
         self,
@@ -275,4 +446,10 @@ class TemporaryDualArmSafetyLimiter:
         }
 
 
-__all__ = ["TemporaryDualArmSafetyConfig", "TemporaryDualArmSafetyLimiter"]
+__all__ = [
+    "TEMPORARY_DUAL_ARM_SAFETY_EVALUATION_HASH_DOMAIN_V1",
+    "TemporaryArmSafetyStageEvidence",
+    "TemporaryDualArmSafetyConfig",
+    "TemporaryDualArmSafetyEvaluation",
+    "TemporaryDualArmSafetyLimiter",
+]

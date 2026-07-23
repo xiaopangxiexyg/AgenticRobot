@@ -8,6 +8,10 @@ from unittest import mock
 import numpy as np
 
 from robot_motion.runtime import BackendDispatchError
+from robot_motion.position_control import (
+    POSITION_QREF_FINGERPRINT_SCHEMA,
+    position_qref_fingerprint,
+)
 
 from hardware.rm65.calibration_profiles import is_position_endpoint_profile, load_profile
 from teleop_runtime.arm_frames import (
@@ -453,6 +457,38 @@ class ArmEndpointActionTest(unittest.TestCase):
         self.assertIn("below target", stream["warning"]["message"])
         self.assertAlmostEqual(stream["warning_threshold_hz"], 108.0)
         self.assertAlmostEqual(stream["last_sent_step_deg"], 1.0)
+
+    def test_rm65_realtime_state_can_skip_diagnostic_fk_and_percentiles(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                background_streaming_enabled=True,
+                initial_qpos=np.zeros(6),
+            )
+        )
+
+        state = backend.get_state(
+            include_derived_pose=False,
+            include_timing_percentiles=False,
+        )
+
+        self.assertIsNone(state["current_tcp_pose"])
+        self.assertIsNone(state["last_target_tcp_pose"])
+        self.assertNotIn("timing_percentiles", state["background_streaming"])
+
+        refreshed_state = backend.refresh_state_from_hardware(
+            include_derived_pose=False,
+            include_timing_percentiles=False,
+        )
+
+        self.assertIsNone(refreshed_state["current_tcp_pose"])
+        self.assertIsNone(refreshed_state["last_target_tcp_pose"])
+        self.assertNotIn(
+            "timing_percentiles",
+            refreshed_state["background_streaming"],
+        )
 
     def test_rm65_position_movej_canfd_passes_follow_trajectory_options(self) -> None:
         backend = RM65ArmBackend(
@@ -1262,7 +1298,104 @@ class ArmEndpointActionTest(unittest.TestCase):
         )
         self.assertAlmostEqual(rollback_arm.sent_joint_deg[-1][2], 4.0, places=6)
 
-    def test_position_singularity_fallback_never_allows_shoulder_singularity(self) -> None:
+    def test_position_singular_fallback_certificate_binds_exact_final_qref(self) -> None:
+        target = np.asarray(
+            [0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0],
+            dtype=float,
+        )
+        certificate = {
+            "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+            "sequence": 7,
+            "qref_fingerprint_schema": POSITION_QREF_FINGERPRINT_SCHEMA,
+            "qref_fingerprint_by_side": {
+                "left": position_qref_fingerprint(target),
+            },
+            "singular_fallback_claimed": True,
+            "final_qref_position_singularity": {
+                "sides": {
+                    "left": {
+                        "is_elbow_singular": True,
+                        "is_wrist_singular": False,
+                        "is_shoulder_singular": False,
+                        "analyzer_available": True,
+                    }
+                }
+            },
+        }
+
+        def command_with(candidate_certificate):
+            return EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=target.copy(),
+                metadata={
+                    "ik_candidate_selection": {
+                        "candidate_certificate": candidate_certificate,
+                        "position_singularity_preference": {
+                            "enabled": True,
+                            "fallback_to_singular": True,
+                            "fully_non_singular_count": 0,
+                            "selected": {
+                                "sides": {
+                                    "left": {"is_elbow_singular": True},
+                                }
+                            },
+                        },
+                    }
+                },
+            )
+
+        matched = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0,) * 6,
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_elbow_singularity_fallback=True,
+                require_position_singularity_candidate_certificate=True,
+            )
+        )
+        matched_arm = _SingularityFakeArm()
+        matched.arm = matched_arm
+        matched.send_command(command_with(certificate))
+        matched_metadata = matched.get_state()["singularity_metadata"]
+        self.assertEqual(
+            matched_metadata["singularity_gate_status"],
+            "allow_position_elbow_singular",
+        )
+        self.assertEqual(
+            matched_metadata["position_candidate_certificate_validation"]["status"],
+            "matched",
+        )
+
+        mismatched_certificate = dict(certificate)
+        mismatched_certificate["qref_fingerprint_by_side"] = {"left": "0" * 32}
+        mismatched = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0,) * 6,
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_elbow_singularity_fallback=True,
+                require_position_singularity_candidate_certificate=True,
+            )
+        )
+        mismatched_arm = _SingularityFakeArm()
+        mismatched.arm = mismatched_arm
+        mismatched.send_command(command_with(mismatched_certificate))
+        mismatch_metadata = mismatched.get_state()["singularity_metadata"]
+        self.assertEqual(mismatch_metadata["singularity_gate_status"], "hold_entry")
+        self.assertEqual(
+            mismatch_metadata["position_candidate_certificate_validation"]["status"],
+            "qref_fingerprint_mismatch",
+        )
+
+    def test_position_shoulder_singularity_fallback_is_explicit_and_rollbackable(self) -> None:
         backend = RM65ArmBackend(
             RM65ArmBackendConfig(
                 arm_ip="0.0.0.0",
@@ -1273,6 +1406,7 @@ class ArmEndpointActionTest(unittest.TestCase):
                 initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
                 allow_position_wrist_singularity_fallback=True,
                 allow_position_elbow_singularity_fallback=True,
+                allow_position_shoulder_singularity_fallback=False,
             )
         )
         fake_arm = _ShoulderSingularityFakeArm()
@@ -1287,11 +1421,14 @@ class ArmEndpointActionTest(unittest.TestCase):
                     "position_singularity_preference": {
                         "enabled": True,
                         "fallback_to_singular": True,
+                        "fully_non_singular_count": 0,
                         "selected": {
                             "sides": {
                                 "left": {
                                     "is_elbow_singular": True,
                                     "is_wrist_singular": True,
+                                    "is_shoulder_singular": True,
+                                    "analyzer_available": True,
                                 }
                             }
                         },
@@ -1300,6 +1437,7 @@ class ArmEndpointActionTest(unittest.TestCase):
             },
         )
 
+        enabled_command = command.copy()
         backend.send_command(command)
 
         metadata = backend.get_state()["singularity_metadata"]
@@ -1308,8 +1446,63 @@ class ArmEndpointActionTest(unittest.TestCase):
         self.assertFalse(metadata["position_singularity_fallback_allowed"])
         self.assertAlmostEqual(fake_arm.sent_joint_deg[-1][2], 4.0, places=6)
 
+        enabled_backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                control_dt=1.0,
+                max_angvel=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+                initial_qpos=(0.0, 0.0, np.deg2rad(4.0), 0.0, 0.0, 0.0),
+                allow_position_shoulder_singularity_fallback=True,
+            )
+        )
+        enabled_arm = _ShoulderSingularityFakeArm()
+        enabled_backend.arm = enabled_arm
+
+        enabled_backend.send_command(enabled_command)
+
+        enabled_metadata = enabled_backend.get_state()["singularity_metadata"]
+        self.assertEqual(
+            enabled_metadata["singularity_gate_status"],
+            "allow_position_shoulder_singular",
+        )
+        self.assertTrue(
+            enabled_metadata["position_shoulder_singularity_fallback_allowed"]
+        )
+        self.assertTrue(enabled_metadata["position_singularity_fallback_allowed"])
+        self.assertAlmostEqual(enabled_arm.sent_joint_deg[-1][2], 1.0, places=6)
+
+    def test_position_candidate_analyzer_retries_after_backend_start(self) -> None:
+        backend = RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+            )
+        )
+
+        unavailable = backend.analyze_position_singularity_candidate(np.zeros(6))
+        self.assertEqual(unavailable["status_code"], None)
+
+        fake_arm = _ShoulderSingularityFakeArm()
+        backend.arm = fake_arm
+        singular = backend.analyze_position_singularity_candidate(
+            np.asarray([0.0, 0.0, np.deg2rad(1.0), 0.0, 0.0, 0.0])
+        )
+
+        self.assertEqual(singular["status_code"], -1)
+        self.assertEqual(singular["label"], "shoulder_singularity")
+        self.assertEqual(fake_arm.thresholds, (3.0, 3.0, 0.05))
+
     def test_rm65_backend_slows_qpos_init_when_command_enters_singularity(self) -> None:
-        for source in ("replay_qpos_init", "replay_qpos_init_final_hold", "deploy_fixed_init_qpos"):
+        for source in (
+            "replay_qpos_init",
+            "replay_qpos_init_final_hold",
+            "deploy_fixed_init_qpos",
+            "gui_init_qpos_plan",
+        ):
             with self.subTest(source=source):
                 backend = RM65ArmBackend(
                     RM65ArmBackendConfig(

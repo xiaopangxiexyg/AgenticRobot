@@ -538,7 +538,8 @@ class RM65PositionCollisionPlanner:
     Inputs are already-resampled high-rate reference poses.  The
     planner uses one full dual-arm collision model, limits the resulting arm
     qpos, and rechecks collision distance on the final limited endpoint.  It
-    does not generate 150 Hz qcmd and performs no temporal smoothing.
+    does not generate the downstream 120 Hz qcmd and performs no temporal
+    smoothing.
     """
 
     def __init__(

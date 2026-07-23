@@ -13,7 +13,11 @@ from .pose_smoothing import (
     load_impedance_pose_smoothing_config,
     load_pose_smoothing_config,
 )
-from .builders import build_bimanual_session, default_vive_tracker_configs
+from .builders import (
+    build_bimanual_passive_session,
+    build_bimanual_session,
+    default_vive_tracker_configs,
+)
 from .dmtac_hardware import (
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
@@ -37,6 +41,7 @@ __all__ = [
     "build_annotated_dual_rm65_calibration",
     "BimanualPoseSmoother",
     "build_bimanual_session",
+    "build_bimanual_passive_session",
     "build_bimanual_pose_smoother",
     "default_vive_tracker_configs",
     "dmtac_backend_configs_from_assignment",

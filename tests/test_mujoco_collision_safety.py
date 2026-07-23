@@ -9,6 +9,46 @@ import pytest
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 
 
+def test_clearance_recovery_only_accepts_monotonic_retreat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sim.mujoco.collision_safety import (
+        CollisionCheckResult,
+        CollisionSafetyPolicy,
+        KinematicCollisionProjector,
+    )
+
+    projector = object.__new__(KinematicCollisionProjector)
+    projector.controlled_qpos_indices = np.asarray((0,), dtype=np.int32)
+    projector.policy = CollisionSafetyPolicy(sweep_max_joint_step_rad=0.1)
+
+    def check(_source_data, controlled_qpos):
+        distance = float(np.asarray(controlled_qpos)[0]) * 0.01
+        return CollisionCheckResult(
+            safe=distance >= projector.policy.minimum_clearance_m,
+            minimum_distance_m=distance,
+            body1_name="table",
+            body2_name="right_gripper_left_finger",
+        )
+
+    monkeypatch.setattr(projector, "_check_candidate", check)
+    recovered = projector.recover_from_clearance_violation(
+        object(),
+        start_qpos=np.asarray((0.0,)),
+        requested_qpos=np.asarray((1.0,)),
+    )
+    assert recovered.status == "recovered"
+    assert recovered.projection_alpha == pytest.approx(1.0)
+
+    worsening = projector.recover_from_clearance_violation(
+        object(),
+        start_qpos=np.asarray((0.0,)),
+        requested_qpos=np.asarray((-1.0,)),
+    )
+    assert worsening.status == "invalid_safe_state"
+    assert worsening.projection_alpha == pytest.approx(0.0)
+
+
 def test_collision_safety_oracle_keeps_active_data_immutable() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
@@ -117,7 +157,7 @@ def test_general_qpos_controller_holds_last_state_for_unsafe_target() -> None:
         controller.apply(
             {
                 "right": np.asarray(
-                    (-1.08336, 1.57079, -0.07441, -1.00963, 1.59197, -6.28),
+                    (-1.08336, 1.57079, -0.07441, -1.00963, 1.59197, -2.2),
                     dtype=float,
                 )
             }

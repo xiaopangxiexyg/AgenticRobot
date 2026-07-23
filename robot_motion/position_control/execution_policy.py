@@ -17,8 +17,10 @@ _NORMAL_SINGULARITY_STATUSES = frozenset(
         "pass",
         "disabled",
         "not_checked",
+        "allow_current_singular",
         "allow_position_wrist_singular",
         "allow_position_elbow_singular",
+        "allow_position_shoulder_singular",
     }
 )
 

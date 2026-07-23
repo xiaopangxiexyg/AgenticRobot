@@ -1,0 +1,69 @@
+{
+  "evidence_schema": "rm65_m5_8b0_stop_only_field_evidence_v1",
+  "evidence_scope": "scoped_final_call_field_evidence",
+  "lineage_completeness": "partial_v1_missing_expanded_authorization_and_receipt_ids",
+  "source": "operator_provided_console_output",
+  "payload": {
+    "authorization_id": "rm65-stop-only-authorization:9d6b75bc662c4b96c8a0e1554a435d09055f70059f8c0615def8e9056146ca46",
+    "binding": {
+      "attempted_sides": ["left", "right"],
+      "authority_epoch": 0,
+      "authorization_id": "rm65-stop-only-authorization:9d6b75bc662c4b96c8a0e1554a435d09055f70059f8c0615def8e9056146ca46",
+      "control_domain_id": "rm65-arms",
+      "dispatch_inventory_hash": "62c603cfabe0552648c7075108a7171baeecd4f1daaf13f37e461decd5c1de53",
+      "embodiment_instance_id": "rm65-bimanual-0",
+      "execution_epoch": 0,
+      "execution_manifest_hash": "964ea0f52b877eeead80145f4b50a2c7c22051f5615773faef1d504805b46bc4",
+      "motion_authorized": false,
+      "owner_token_id": "dexfact:v1:dispatch_owner_token:rm65-stop-only-ee7f492d-a73c-40b3-8e1c-45a7302cb439:rm65-arms:dispatch-owner-registry:0:0",
+      "permitted_sides": ["left", "right"],
+      "production_binding_enabled": true,
+      "receipt_count": 2,
+      "runtime_session_id": "rm65-stop-only-ee7f492d-a73c-40b3-8e1c-45a7302cb439",
+      "semantic_content_hash": "df4af943c87c27de9a354646bd0f3f4d7687e793faede420f12f26af086dd785"
+    },
+    "inventory_hash": "62c603cfabe0552648c7075108a7171baeecd4f1daaf13f37e461decd5c1de53",
+    "manifest_hash": "964ea0f52b877eeead80145f4b50a2c7c22051f5615773faef1d504805b46bc4",
+    "manifest_id": "m6_candidate_policy_arm_qpos_v1",
+    "operator_authorization_id": "operator-approved-2026-07-21-m5.8b0-stop-only",
+    "receipts": [
+      {
+        "control_context_hash": "173cb17a8e0c90eec88727529afd8f51e4916873ef2d028e173133d865329348",
+        "dispatch_accepted": true,
+        "dispatch_status": "accepted",
+        "dispatch_validation_hash": "9c54284b0a7f667c4c397ead2ae8c2f59e4244426a18da7f1108e9a8e81a87bd",
+        "sdk_result_repr": "0",
+        "side": "left"
+      },
+      {
+        "control_context_hash": "c27283908ff05c45f36dc8adc27ce70d33cfe71391378903a59774a19e100aa4",
+        "dispatch_accepted": true,
+        "dispatch_status": "accepted",
+        "dispatch_validation_hash": "5da0901e9197575496cd7c45f959557f7a7565f925e865eb7273d519f0c2eedd",
+        "sdk_result_repr": "0",
+        "side": "right"
+      }
+    ],
+    "sides": {
+      "left": {
+        "post_stop_delta_rad": 0.00005239769444731479,
+        "qpos_after": [1.528000792815923, 0.6837851188474204, 2.285892630052542, -0.0014311700261666477, -1.4297388038655416, 0.03920009589860951],
+        "qpos_before": [1.5280358133842573, 0.6837327211529731, 2.285927517462822, -0.001413716698276596, -1.4297388038655416, 0.03920009589860951],
+        "send_result_code": 0,
+        "send_result_text": "hold:Arm_Slow_Stop:0",
+        "slow_stop_latency_sec": 0.010758001008071005,
+        "stationary_drift_rad": 0.00005239769444731479
+      },
+      "right": {
+        "post_stop_delta_rad": 0.000034908216226047645,
+        "qpos_after": [-1.5739204810696685, 0.7612777136675188, 2.0132547092489883, -0.02967059811614144, -1.3089969389957472, 0.0035430182795993534],
+        "qpos_before": [-1.5739204810696685, 0.7612602699623788, 2.0132547092489883, -0.029635689899915392, -1.3089969389957472, 0.003508111883893576],
+        "send_result_code": 0,
+        "send_result_text": "hold:Arm_Slow_Stop:0",
+        "slow_stop_latency_sec": 0.008581663976656273,
+        "stationary_drift_rad": 0.000034908216226047645
+      }
+    },
+    "status": "stop_only_completed"
+  }
+}

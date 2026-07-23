@@ -181,6 +181,32 @@ class HandActionSpec:
             raise ValueError("Active hand slots contain non-finite values.")
         return active.astype(np.float32, copy=True)
 
+    def validate_vector(self, vector: Any) -> np.ndarray:
+        """Validate one canonical full-slot vector and return a detached copy.
+
+        Active slots must always be finite.  Inactive slots keep the padding
+        semantics declared by the embodiment spec; they are never interpreted
+        as actuator targets.
+        """
+
+        values = np.asarray(vector, dtype=np.float32).reshape(-1)
+        self.active_values(values)
+        inactive = ~np.asarray(self.active_mask, dtype=bool)
+        padding = self.invalid_slot_value.strip().lower()
+        if padding == "nan":
+            if np.any(~np.isnan(values[inactive])):
+                raise ValueError("inactive slots must be NaN.")
+        elif "zero" in padding:
+            if np.any(~np.isfinite(values[inactive])) or not np.allclose(
+                values[inactive],
+                0.0,
+                atol=0.0,
+            ):
+                raise ValueError("inactive slots must be finite zero padding.")
+        elif not np.all(np.isfinite(values)):
+            raise ValueError("Hand vector must be fully finite.")
+        return values.astype(np.float32, copy=True)
+
 
 def normalize_hand_action_specs(
     specs: Mapping[str, HandActionSpec | Mapping[str, Any]] | None,

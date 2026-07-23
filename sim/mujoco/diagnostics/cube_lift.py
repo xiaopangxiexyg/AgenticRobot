@@ -145,7 +145,7 @@ def run_viewer(args: argparse.Namespace) -> dict[str, object]:
             show_left_ui=not bool(args.hide_left_ui),
             show_right_ui=not bool(args.hide_right_ui),
         ) as handle:
-            handle.cam.lookat[:] = (-0.412, 0.0, 0.15)
+            handle.cam.lookat[:] = (-0.472, 0.0, 0.15)
             handle.cam.distance = 1.05
             handle.cam.azimuth = 135.0
             handle.cam.elevation = -25.0

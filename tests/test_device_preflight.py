@@ -127,6 +127,44 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertTrue(reports[0]["changed"])
         self.assertEqual(reports[0]["target_mode"], "0o666")
 
+    def test_fix_permissions_installs_persistent_foot_pad_udev_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "packaged.rules"
+            target = Path(tmp) / "etc" / "99-dexteleop-foot-pad.rules"
+            source.write_text(
+                'SUBSYSTEM=="input", ATTRS{name}=="DexTeleop foot pads", MODE:="0666"\n',
+                encoding="utf-8",
+            )
+            with patch.object(
+                device_preflight.os,
+                "geteuid",
+                return_value=0,
+            ), patch.object(
+                device_preflight,
+                "_run_command",
+                return_value={
+                    "command": "udevadm control --reload-rules",
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                },
+            ) as run_command:
+                report = device_preflight.ensure_foot_pad_udev_rule(
+                    apply=True,
+                    source_path=source,
+                    target_path=target,
+                )
+
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["installed"])
+            self.assertTrue(report["changed"])
+            self.assertEqual(target.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+            run_command.assert_called_once_with(
+                ["udevadm", "control", "--reload-rules"],
+                timeout=10.0,
+            )
+
     def test_cli_fix_permissions_does_not_validate_device_counts(self) -> None:
         permissions_result = device_preflight.DevicePreflightResult(
             ok=True,
@@ -673,12 +711,13 @@ class DevicePreflightTests(unittest.TestCase):
         with patch.object(sys, "argv", argv):
             args = real_teleop.parse_args()
 
-        # Impedance outer control runs independently from the 15 Hz sample
-        # cadence, so the automatic watchdog threshold reaches its 15 Hz cap.
-        self.assertAlmostEqual(args.minimum_control_hz, 15.0)
+        # The canonical impedance source loop is 15 Hz, so the automatic
+        # watchdog threshold uses its 90% operating floor.
+        self.assertAlmostEqual(args.minimum_control_hz, 13.5)
         self.assertTrue(args.minimum_control_hz_auto)
-        # The computed 50/30 margin is below the configured safety floor.
-        self.assertAlmostEqual(args.arm_step_dt_max_scale, 3.0)
+        # The automatic bound follows the 50/15 backend/source ratio plus its
+        # one-third scheduling margin.
+        self.assertAlmostEqual(args.arm_step_dt_max_scale, 11.0 / 3.0)
         self.assertTrue(args.arm_step_dt_max_scale_auto)
         self.assertAlmostEqual(args.dual_arm_temp_max_xyz_step_m, 0.03)
         self.assertAlmostEqual(args.dual_arm_temp_max_rot_step_deg, 8.0)

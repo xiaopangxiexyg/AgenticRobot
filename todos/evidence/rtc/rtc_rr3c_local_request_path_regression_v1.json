@@ -1,0 +1,96 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr3c_local_request_path_regression_2026_07_23",
+  "captured_at": "2026-07-23T23:30:00+08:00",
+  "scope": "local_no_device_three_camera_raw_rtc_request_path_regression",
+  "gate_result": "local_request_path_passed_real_observation_transport_rerun_required",
+  "boundary": {
+    "no_device_initialization": true,
+    "no_network_transport": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "teleop_or_replay_modified": false,
+    "sim_observation_modified": false
+  },
+  "fixture": {
+    "model_adapter": "OpenPI fake transport",
+    "camera_count": 3,
+    "camera_shape_hwc": [
+      720,
+      1280,
+      3
+    ],
+    "camera_dtype": "uint8",
+    "prediction_horizon_steps": 50,
+    "action_hz": 30.0,
+    "request_repeats_per_pose_mode": 8
+  },
+  "identity_contract": {
+    "observation_cut_domain": "dexteleop.rtc_observation_cut_identity.v2",
+    "observation_cut_bulk_payload_scanned_on_control_thread": false,
+    "work_item_hash_kind": "causal_actor_binding",
+    "worker_model_input_hash_retained": true,
+    "backend_model_input_hash_check_retained": true,
+    "response_model_input_hash_echo_retained": true
+  },
+  "absolute": {
+    "request_tick_median_sec": 0.0044420447666198015,
+    "request_tick_max_sec": 0.008034637197852135,
+    "completion_no_due_median_sec": 0.017443754943087697,
+    "completion_no_due_max_sec": 0.01831542607396841,
+    "completion_due_emission_median_sec": 0.025265717413276434,
+    "completion_due_emission_max_sec": 0.02661434095352888
+  },
+  "relative": {
+    "request_tick_median_sec": 0.0116975880227983,
+    "request_tick_max_sec": 0.012256922200322151,
+    "completion_no_due_median_sec": 0.018257631920278072,
+    "completion_no_due_max_sec": 0.01917102700099349,
+    "completion_due_emission_median_sec": 0.02505808579735458,
+    "completion_due_emission_max_sec": 0.025957259815186262
+  },
+  "control_budget": {
+    "budget_sec": 0.03333333333333333,
+    "local_measured_case_count": 64,
+    "budget_exceeded_count": 0,
+    "local_gate_passed": true
+  },
+  "remote_idle_no_device_replication": {
+    "host_alias": "dex-remote",
+    "source_sync_check_passed": true,
+    "remote_device_initialized": false,
+    "absolute_request_tick_median_sec": 0.0019909310212824494,
+    "absolute_request_tick_max_sec": 0.0033915480016730726,
+    "relative_request_tick_median_sec": 0.004413269460201263,
+    "relative_request_tick_max_sec": 0.005126181989908218,
+    "absolute_completion_due_emission_max_sec": 0.02047455101273954,
+    "relative_completion_due_emission_max_sec": 0.02195680298609659,
+    "remote_measured_case_count": 64,
+    "budget_exceeded_count": 0,
+    "replication_passed": true
+  },
+  "compatibility": {
+    "sync_queue_v1_code_path_modified": false,
+    "legacy_action_queue_used_by_rtc": false,
+    "raw_rtc_default_off": true,
+    "server_payload_changed": false,
+    "checkpoint_specific_branch_added": false
+  },
+  "verification": {
+    "rtc_and_sync_compatibility_tests": "219 passed",
+    "openpi_deploy_and_transport_tests": "90 passed, 1 skipped",
+    "deploy_help_exit_code": 0,
+    "py_compile_passed": true,
+    "json_validation_passed": true,
+    "git_diff_check_passed": true
+  },
+  "next_gate": {
+    "action_send_authorized": false,
+    "required": [
+      "restore a valid left_wrist RealSense color profile outside the RTC implementation",
+      "repeat the existing real observation/OpenPI transport no-action shadow",
+      "observe zero 30 Hz control-budget exceedances",
+      "retain request/result/epoch/plan admission and worker drain evidence"
+    ]
+  }
+}

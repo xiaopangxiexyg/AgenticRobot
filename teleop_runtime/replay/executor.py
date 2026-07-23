@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import queue
 import sys
 import threading
 import time
@@ -28,6 +29,10 @@ from robot_motion.position_control import (
 )
 from robot_motion.pose import pose6_to_matrix
 from robot_motion.replay.action_frame import replay_teleop_command_at_index
+from robot_motion.replay.proposal_source import (
+    ReplaySourceFrameEmission,
+    build_replay_source_frame_emission,
+)
 from robot_motion.replay.trajectory import (
     QPOS_INIT_AUTO,
     REPLAY_TRAJECTORY_ACTION_POSE,
@@ -36,19 +41,23 @@ from robot_motion.replay.trajectory import (
     ReplayTrajectoryGroup,
     normalize_qpos_init_source,
     normalize_replay_trajectory_source,
-    replay_action_poses_at_index,
     select_replay_qpos_init_targets,
 )
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
-    DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S,
+    IKObjectiveWeights,
+    LEGACY_POSITION_CONTROL_PROFILE_NAME,
+    RM65_BIMANUAL_POSITION_V1,
+    RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
+    load_ik_tuning_config,
 )
+from robot_motion.joint_limits import load_joint_velocity_limit_profiles
 from robot_motion.runtime.lifecycle import (
     LifecycleFailure,
     collect_lifecycle_failures,
@@ -87,7 +96,62 @@ from .hardware import (
     normalize_active_sides,
     normalize_rm65_arm_control_mode,
 )
+from .source_binding import ReplayGuiSourceBinding, build_replay_gui_source_binding
+from .pose_frames import (
+    replay_action_poses_in_hardware_base_at_index,
+    replay_group_in_hardware_base,
+)
 from .trajectory import build_replay_group_for_episode
+
+
+REPLAY_POSITION_IK_SOLVE_MIN_ITERATIONS = (
+    RM65_BIMANUAL_POSITION_V1.ik_execution.solve_min_iterations
+)
+REPLAY_POSITION_IK_SOLVE_MAX_ITERATIONS = (
+    RM65_BIMANUAL_POSITION_V1.ik_execution.solve_max_iterations
+)
+REPLAY_POSITION_IK_ORIENTATION_WEIGHT = (
+    RM65_BIMANUAL_POSITION_V1.ik_execution.orientation_weight
+)
+REPLAY_POSITION_IK_DAMPING = RM65_BIMANUAL_POSITION_V1.ik_execution.damping
+REPLAY_POSITION_IK_ITERATION_RESERVE_MS = (
+    RM65_BIMANUAL_POSITION_V1.ik_execution.iteration_reserve_ms
+)
+REPLAY_POSITION_JOINT_VELOCITY_LIMIT_PROFILE = (
+    RM65_BIMANUAL_POSITION_V1.ik_execution.joint_velocity_limit_profile
+)
+
+
+def _replay_position_joint_velocity_limit_rad_s() -> tuple[float, ...]:
+    profile = load_joint_velocity_limit_profiles()[
+        REPLAY_POSITION_JOINT_VELOCITY_LIMIT_PROFILE
+    ]
+    values = np.deg2rad(np.asarray(profile.max_velocity_deg_s, dtype=float))
+    return tuple(float(value) for value in values)
+
+
+REPLAY_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S = (
+    _replay_position_joint_velocity_limit_rad_s()
+)
+
+
+def _replay_position_ik_tuning():
+    """Build the formal replay objective without mutating shared IK defaults."""
+
+    tuning = load_ik_tuning_config()
+    mode_name = RM65_BIMANUAL_POSITION_V1_NAME
+    objective_modes = dict(tuning.objective_modes)
+    objective_modes[mode_name] = IKObjectiveWeights(
+        single_arm_position_weight=1.0,
+        single_arm_orientation_weight=REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
+        dual_arm_position_cost=1.0,
+        dual_arm_orientation_cost=REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
+    )
+    return replace(
+        tuning,
+        ik_objective_mode=mode_name,
+        objective_modes=objective_modes,
+    )
 
 
 _POSITION_COLLISION_EVENT_CAPACITY = 512
@@ -435,7 +499,7 @@ def _safe_pose_keyframes(
 
     samples: list[TimestampedMotionTarget] = []
     for index in range(int(group.frame_count)):
-        raw = replay_action_poses_at_index(
+        raw = replay_action_poses_in_hardware_base_at_index(
             group,
             active_sides,
             index=int(index),
@@ -570,6 +634,7 @@ class ReplayExecutionSettings:
     position_max_xyz_step_m: float = 0.10
     position_max_rot_step_deg: float = 15.0
     position_max_joint_step_rad: float = float(np.deg2rad(6.0))
+    position_control_profile_name: str = RM65_BIMANUAL_POSITION_V1_NAME
     position_collision_required: bool = True
     position_collision_scene_profile: str = DEFAULT_COLLISION_SCENE
     position_collision_min_distance_m: float = DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M
@@ -577,12 +642,21 @@ class ReplayExecutionSettings:
         DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M
     )
     position_collision_max_joint_velocity_rad_s: tuple[float, ...] = (
-        DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S
+        REPLAY_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S
     )
     position_collision_max_joint_step_rad: tuple[float, ...] | None = None
     position_collision_debug: bool = False
 
     def __post_init__(self) -> None:
+        profile_name = str(self.position_control_profile_name).strip()
+        if profile_name not in {
+            RM65_BIMANUAL_POSITION_V1_NAME,
+            LEGACY_POSITION_CONTROL_PROFILE_NAME,
+        }:
+            raise ValueError(
+                f"unsupported position_control_profile_name: {profile_name!r}"
+            )
+        object.__setattr__(self, "position_control_profile_name", profile_name)
         workspace_min = np.asarray(self.position_workspace_min, dtype=float).reshape(3)
         workspace_max = np.asarray(self.position_workspace_max, dtype=float).reshape(3)
         if not np.all(np.isfinite(workspace_min)) or not np.all(np.isfinite(workspace_max)):
@@ -820,6 +894,13 @@ class ReplayExecutionSettings:
                     current.position_max_joint_step_rad,
                 )
             ),
+            position_control_profile_name=str(
+                _payload_value(
+                    payload,
+                    ("position_control_profile_name", "positionControlProfileName"),
+                    current.position_control_profile_name,
+                )
+            ),
             position_collision_required=_bool_value(
                 _payload_value(
                     payload,
@@ -926,6 +1007,7 @@ class ReplayExecutionSettings:
             "position_max_xyz_step_m": float(self.position_max_xyz_step_m),
             "position_max_rot_step_deg": float(self.position_max_rot_step_deg),
             "position_max_joint_step_rad": float(self.position_max_joint_step_rad),
+            "position_control_profile_name": self.position_control_profile_name,
             "position_collision_required": bool(self.position_collision_required),
             "position_collision_scene_profile": str(self.position_collision_scene_profile),
             "position_collision_min_distance_m": float(
@@ -957,15 +1039,31 @@ class ReplayExecutionController:
         hardware_config: ReplayHardwareConfig | None = None,
         settings: ReplayExecutionSettings | None = None,
         position_collision_planner_factory: Callable[..., Any] | None = None,
+        action_observer_queue: queue.Queue[ReplaySourceFrameEmission] | None = None,
     ):
         self._lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
         self._hardware_config = hardware_config or ReplayHardwareConfig()
         self._settings = settings or ReplayExecutionSettings()
         self._position_collision_planner_factory = position_collision_planner_factory
+        if action_observer_queue is not None and not (
+            int(getattr(action_observer_queue, "maxsize", 0)) > 0
+            or bool(getattr(action_observer_queue, "nonblocking_bounded", False))
+        ):
+            raise ValueError(
+                "action_observer_queue must be explicitly bounded or expose an "
+                "explicit nonblocking_bounded sink contract."
+            )
+        self._action_observer_queue = action_observer_queue
+        self._action_observer_offer_count = 0
+        self._action_observer_drop_count = 0
+        self._action_observer_error_count = 0
+        self._action_observer_last_error = ""
         self._rig: ReplayHardwareRig | None = None
         self._group: ReplayTrajectoryGroup | None = None
         self._preflight_report: ReplayPreflightReport | None = None
+        self._source_binding: ReplayGuiSourceBinding | None = None
+        self._source_binding_error = ""
         self._state = "configured"
         self._frame_index = 0
         self._last_error = ""
@@ -1039,13 +1137,58 @@ class ReplayExecutionController:
                 self._settings = settings
             self._group = None
             self._preflight_report = None
+            self._source_binding = None
+            self._source_binding_error = ""
             self._frame_index = 0
             self._clear_qpos_init_status_locked()
             self._reset_position_collision_diagnostics_locked()
+            self._action_observer_offer_count = 0
+            self._action_observer_drop_count = 0
+            self._action_observer_error_count = 0
+            self._action_observer_last_error = ""
             self._last_error = ""
             self._last_message = "hardware replay configured"
             self._state = "connected" if self._rig is not None and self._rig.connected else "configured"
             return self.status()
+
+    def _offer_replay_source_frame(
+        self,
+        group: ReplayTrajectoryGroup,
+        *,
+        index: int,
+        observed_at: float,
+        schedule_start_at: float,
+        target_effective_at: float | None = None,
+        effective_until_at: float | None = None,
+    ) -> None:
+        """Best-effort nonblocking passive tap; never changes replay ownership."""
+
+        observer_queue = self._action_observer_queue
+        if observer_queue is None:
+            return
+        try:
+            emission = build_replay_source_frame_emission(
+                group,
+                active_sides=tuple(self._hardware_config.active_sides),
+                index=int(index),
+                include_arms=True,
+                include_end_effectors=bool(self._settings.end_effectors_enabled),
+                observed_at=float(observed_at),
+                schedule_start_at=float(schedule_start_at),
+                target_effective_at=target_effective_at,
+                effective_until_at=effective_until_at,
+                clock_domain_id="local_monotonic",
+            )
+            observer_queue.put_nowait(emission)
+            with self._lock:
+                self._action_observer_offer_count += 1
+        except queue.Full:
+            with self._lock:
+                self._action_observer_drop_count += 1
+        except Exception as exc:  # noqa: BLE001 - passive tap cannot fault legacy replay.
+            with self._lock:
+                self._action_observer_error_count += 1
+                self._action_observer_last_error = f"{type(exc).__name__}: {exc}"
 
     def configure_from_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -1083,6 +1226,8 @@ class ReplayExecutionController:
             self._ensure_idle_locked(allow_ready=True)
             self._group = None
             self._preflight_report = None
+            self._source_binding = None
+            self._source_binding_error = ""
             self._frame_index = 0
             self._clear_qpos_init_status_locked()
             self._reset_position_collision_diagnostics_locked()
@@ -1242,9 +1387,24 @@ class ReplayExecutionController:
                     },
                 )
             report = ReplayPreflightReport(checks=(*report.checks, collision_check))
+        source_binding: ReplayGuiSourceBinding | None = None
+        source_binding_error = ""
+        if report.ok and group is not None:
+            try:
+                source_binding = build_replay_gui_source_binding(
+                    group,
+                    episode_id=episode.summary.episode_id,
+                    active_sides=tuple(self._hardware_config.active_sides),
+                    include_end_effectors=bool(settings.end_effectors_enabled),
+                    trajectory_source=settings.trajectory_source,
+                )
+            except Exception as exc:  # passive typed evidence cannot alter legacy preflight.
+                source_binding_error = f"{type(exc).__name__}: {exc}"
         with self._lock:
             self._group = group
             self._preflight_report = report
+            self._source_binding = source_binding
+            self._source_binding_error = source_binding_error
             self._frame_index = 0
             self._clear_qpos_init_status_locked()
             self._last_message = "preflight ok" if report.ok else "preflight failed"
@@ -1521,6 +1681,16 @@ class ReplayExecutionController:
                 "preflight": None
                 if self._preflight_report is None
                 else self._preflight_report.to_dict(),
+                "replay_source_binding": (
+                    {
+                        "available": False,
+                        "authoritative": False,
+                        "cursor_owned": False,
+                        "error": self._source_binding_error,
+                    }
+                    if self._source_binding is None
+                    else self._source_binding.to_status()
+                ),
                 "qpos_init": {
                     "plan_summary": self._qpos_init_plan_summary,
                     "step_index": int(self._qpos_init_step_index),
@@ -1550,6 +1720,14 @@ class ReplayExecutionController:
                     "segment_collision_certified": False,
                     "last_reset": self._position_collision_reset,
                     "last": last_collision,
+                },
+                "action_observer": {
+                    "enabled": self._action_observer_queue is not None,
+                    "offer_count": int(self._action_observer_offer_count),
+                    "drop_count": int(self._action_observer_drop_count),
+                    "error_count": int(self._action_observer_error_count),
+                    "last_error": self._action_observer_last_error,
+                    "authoritative": False,
                 },
                 "last_error": self._last_error,
                 "last_message": self._last_message,
@@ -1867,7 +2045,13 @@ class ReplayExecutionController:
                     for value in self._settings.position_collision_max_joint_step_rad
                 )
             ),
+            damping=REPLAY_POSITION_IK_DAMPING,
+            solve_max_iterations=REPLAY_POSITION_IK_SOLVE_MAX_ITERATIONS,
+            solve_min_iterations=REPLAY_POSITION_IK_SOLVE_MIN_ITERATIONS,
+            solve_adaptive_iterations_enabled=True,
+            solve_iteration_reserve_ms=REPLAY_POSITION_IK_ITERATION_RESERVE_MS,
             debug_profile=bool(self._settings.position_collision_debug),
+            ik_tuning=_replay_position_ik_tuning(),
         )
         factory = (
             self._position_collision_planner_factory
@@ -1886,6 +2070,39 @@ class ReplayExecutionController:
         reset_metadata = dict(planner.reset(normalized_qpos) or {})
         reset_metadata.update(
             {
+                "replay_position_ik_profile": {
+                    "profile": self._settings.position_control_profile_name,
+                    "main_action_contract": "accepted_qref_fk_pose",
+                    "source_shaping_reapplied": False,
+                    "solve_min_iterations": REPLAY_POSITION_IK_SOLVE_MIN_ITERATIONS,
+                    "solve_max_iterations": REPLAY_POSITION_IK_SOLVE_MAX_ITERATIONS,
+                    "solve_iteration_reserve_ms": (
+                        REPLAY_POSITION_IK_ITERATION_RESERVE_MS
+                    ),
+                    "orientation_weight": REPLAY_POSITION_IK_ORIENTATION_WEIGHT,
+                    "damping": REPLAY_POSITION_IK_DAMPING,
+                    "joint_velocity_limit_profile": (
+                        (
+                            "rm65_position_2x"
+                            if self._settings.position_control_profile_name
+                            == LEGACY_POSITION_CONTROL_PROFILE_NAME
+                            else REPLAY_POSITION_JOINT_VELOCITY_LIMIT_PROFILE
+                        )
+                        if np.allclose(
+                            np.asarray(
+                                self._settings.position_collision_max_joint_velocity_rad_s,
+                                dtype=float,
+                            ),
+                            np.asarray(
+                                REPLAY_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S,
+                                dtype=float,
+                            ),
+                            rtol=0.0,
+                            atol=1e-12,
+                        )
+                        else "explicit_velocity_override"
+                    ),
+                },
                 "qpos_state_source": qpos_state_source,
                 "fresh_hardware_state_required": require_fresh_hardware_state,
                 "state_max_age_sec": (
@@ -1905,6 +2122,9 @@ class ReplayExecutionController:
     def _impedance_replay_worker(self, rig: ReplayHardwareRig, group: ReplayTrajectoryGroup) -> None:
         """Preserve the established action-rate -> 40 Hz impedance path."""
 
+        hardware_group = replay_group_in_hardware_base(
+            group, self._hardware_config.active_sides
+        )
         period = 1.0 / max(1e-6, float(group.action_hz))
         next_time = time.monotonic()
         trajectory_source = normalize_replay_trajectory_source(self._settings.trajectory_source)
@@ -1930,8 +2150,16 @@ class ReplayExecutionController:
                         )
                     )
                 else:
-                    replay_command = replay_teleop_command_at_index(
+                    self._offer_replay_source_frame(
                         group,
+                        index=index,
+                        observed_at=time.monotonic(),
+                        schedule_start_at=next_time,
+                        target_effective_at=next_time,
+                        effective_until_at=next_time + period,
+                    )
+                    replay_command = replay_teleop_command_at_index(
+                        hardware_group,
                         self._hardware_config.active_sides,
                         index=index,
                         include_arms=True,
@@ -2078,6 +2306,7 @@ class ReplayExecutionController:
             first_timestamp = float(references[0].timestamp)
             started_monotonic = time.monotonic()
             next_end_effector_index = 0
+            last_observed_source_index = -1
             for reference in references:
                 deadline = started_monotonic + max(
                     0.0,
@@ -2094,6 +2323,20 @@ class ReplayExecutionController:
                         self._state = "aborted"
                         self._finished_at = time.time()
                     return
+
+                if trajectory_source != REPLAY_TRAJECTORY_QPOS_TARGET:
+                    # Emit each source keyframe once when it becomes causal;
+                    # right_source_index may be future lookahead used only by
+                    # offline interpolation and must not advance the observer.
+                    due_source_index = int(reference.left_source_index)
+                    while last_observed_source_index < due_source_index:
+                        last_observed_source_index += 1
+                        self._offer_replay_source_frame(
+                            group,
+                            index=last_observed_source_index,
+                            observed_at=time.monotonic(),
+                            schedule_start_at=started_monotonic - first_timestamp,
+                        )
 
                 current_index = int(reference.right_source_index)
                 parent = samples[current_index]
@@ -2151,6 +2394,13 @@ class ReplayExecutionController:
                             "left_source_index": int(reference.left_source_index),
                             "right_source_index": int(reference.right_source_index),
                             "interpolation_alpha": float(reference.interpolation_alpha),
+                            "pose_action_interval_velocity": dict(
+                                reference.metadata.get(
+                                    "pose_action_interval_velocity",
+                                    {},
+                                )
+                                or {}
+                            ),
                             "temporal_smoothing_applied": False,
                         },
                     )
@@ -2410,6 +2660,17 @@ class ReplayExecutionController:
         if self._preflight_report is None or not self._preflight_report.ok:
             raise RuntimeError("Hardware replay preflight has not passed.")
         return self._group
+
+    def checked_source_binding(self) -> ReplayGuiSourceBinding:
+        """Return the typed binding for the exact preflighted replay group."""
+
+        with self._lock:
+            if self._preflight_report is None or not self._preflight_report.ok:
+                raise RuntimeError("Replay source binding requires a successful preflight.")
+            if self._source_binding is None:
+                detail = self._source_binding_error or "binding was not produced"
+                raise RuntimeError(f"Replay source binding is unavailable: {detail}")
+            return self._source_binding
 
     def _require_output_enabled_locked(self) -> None:
         if not self._settings.send_actions_enabled:

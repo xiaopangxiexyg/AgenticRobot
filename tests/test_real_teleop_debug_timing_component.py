@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from types import SimpleNamespace
+import threading
+import time
 
 from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
 from teleop_runtime.real_teleop import debug_timing
@@ -54,3 +56,27 @@ def test_extracted_debug_timing_metadata_merge_matches_legacy_contract() -> None
     )
 
     assert actual == expected == {"requested": True, "attached": True}
+
+
+def test_async_debug_timing_console_does_not_wait_for_slow_stream() -> None:
+    write_entered = threading.Event()
+    release_write = threading.Event()
+
+    class SlowStream:
+        def write(self, _message: str) -> None:
+            write_entered.set()
+            release_write.wait(timeout=1.0)
+
+        def flush(self) -> None:
+            return
+
+    writer = debug_timing.AsyncDebugTimingConsole(stream=SlowStream())
+    started = time.perf_counter()
+    try:
+        assert writer.submit("slow frame")
+        submit_elapsed = time.perf_counter() - started
+        assert submit_elapsed < 0.05
+        assert write_entered.wait(timeout=0.5)
+    finally:
+        release_write.set()
+        writer.close()

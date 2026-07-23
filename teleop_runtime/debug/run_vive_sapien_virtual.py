@@ -209,6 +209,8 @@ def _qpos_summary(qpos: np.ndarray | None) -> str:
 
 
 class TerminalClutchInput:
+    _MAX_CHARS_PER_POLL = 64
+
     def __init__(self, keyboard_source: KeyboardButtonSource):
         self.keyboard_source = keyboard_source
         self.enabled = sys.stdin.isatty()
@@ -241,7 +243,10 @@ class TerminalClutchInput:
     def poll(self) -> None:
         if not self.enabled:
             return
-        while True:
+        # Bound work per control frame. A held key, key-repeat stream, or pasted
+        # terminal input must not keep this method draining stdin indefinitely
+        # while the robot control loop is waiting to run.
+        for _ in range(self._MAX_CHARS_PER_POLL):
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.0)
             except OSError:

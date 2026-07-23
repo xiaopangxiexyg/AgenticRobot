@@ -98,6 +98,8 @@ class ArmConstrainedTransitionConfig:
     target_tolerance_rad: float = 1e-4
     max_steps: int = 1200
     max_joint_abs_deg: float = 120.0
+    joint_lower_rad: tuple[float, ...] | None = None
+    joint_upper_rad: tuple[float, ...] | None = None
     joint_slow_margin_deg: float = 12.0
     joint_hold_margin_deg: float = 3.0
     max_endpoint_excursion_m: float = 0.5
@@ -111,6 +113,7 @@ class ArmConstrainedTransitionConfig:
     singularity_stop_margin: float | None = None
     level1_speed_scale: float = 0.35
     level2_speed_scale: float = 0.0
+    allow_joint_limit_escape: bool = False
     force_slow_n: float | None = 8.0
     force_soft_n: float | None = 15.0
     force_hard_n: float | None = 25.0
@@ -121,6 +124,7 @@ class ArmConstrainedTransitionConfig:
     tracking_error_stop_m: float | None = 0.18
     backoff_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.1, 0.05)
     require_kinematic_model: bool = True
+    require_collision_check: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -182,6 +186,23 @@ class ArmConstrainedTransitionConfig:
             raise ValueError("backoff_scales must contain at least one value in (0, 1].")
         object.__setattr__(self, "backoff_scales", tuple(sorted(set(scales), reverse=True)))
         object.__setattr__(self, "require_kinematic_model", bool(self.require_kinematic_model))
+        object.__setattr__(self, "require_collision_check", bool(self.require_collision_check))
+        object.__setattr__(self, "allow_joint_limit_escape", bool(self.allow_joint_limit_escape))
+        lower = self.joint_lower_rad
+        upper = self.joint_upper_rad
+        if (lower is None) != (upper is None):
+            raise ValueError("joint_lower_rad and joint_upper_rad must be provided together.")
+        if lower is not None and upper is not None:
+            lower_values = tuple(float(value) for value in lower)
+            upper_values = tuple(float(value) for value in upper)
+            if not lower_values or len(lower_values) != len(upper_values):
+                raise ValueError("joint_lower_rad and joint_upper_rad must have the same non-zero length.")
+            if not np.all(np.isfinite(lower_values)) or not np.all(np.isfinite(upper_values)):
+                raise ValueError("joint_lower_rad and joint_upper_rad must be finite.")
+            if any(lo >= hi for lo, hi in zip(lower_values, upper_values)):
+                raise ValueError("each joint lower limit must be smaller than its upper limit.")
+            object.__setattr__(self, "joint_lower_rad", lower_values)
+            object.__setattr__(self, "joint_upper_rad", upper_values)
 
 
 class ArmTransitionModel(Protocol):
@@ -346,6 +367,8 @@ def plan_constrained_qpos_transition(
         "dt_sec": float(cfg.dt_sec),
         "max_joint_step_deg": float(cfg.max_joint_step_deg),
         "constraint_space": "qpos",
+        "allow_joint_limit_escape": bool(cfg.allow_joint_limit_escape),
+        "joint_limit_escape_used": False,
     }
     start_poses = _fk_by_side(model, start) if model is not None else None
     target_poses = _fk_by_side(model, target) if model is not None else None
@@ -400,14 +423,45 @@ def plan_constrained_qpos_transition(
             start_pose_by_side=start_poses,
             target_pose_by_side=target_poses,
         )
-        if current_assessment.stop or current_assessment.hold:
+        current_joint_limit_escape = (
+            bool(cfg.allow_joint_limit_escape)
+            and current_assessment.hold
+            and _joint_limit_hold_target_is_safe_escape(
+                current_assessment,
+                current_qpos_by_side=current,
+                target_qpos_by_side=target,
+            )
+        )
+        if current_assessment.stop or (
+            current_assessment.hold and not current_joint_limit_escape
+        ):
             status = "blocked_current" if current_assessment.stop else "hold_current"
-            return _blocked_plan(status, start, target, steps, initial_assessment, target_assessment, _first_event_code(current_assessment), metadata)
+            blocked_metadata = dict(metadata)
+            blocked_metadata["blocked_at_step_index"] = len(steps) + 1
+            blocked_metadata["blocked_current_qpos_by_side"] = _qpos_mapping_to_lists(current)
+            blocked_metadata["blocked_current_assessment"] = current_assessment.to_dict()
+            return _blocked_plan(
+                status,
+                start,
+                target,
+                steps,
+                initial_assessment,
+                target_assessment,
+                _first_event_code(current_assessment),
+                blocked_metadata,
+            )
 
         base_alpha = min(1.0, max_step_rad / max(remaining_norm, 1e-12))
+        effective_speed_scale = (
+            max(float(cfg.level1_speed_scale), 1e-6)
+            if current_joint_limit_escape
+            else max(float(current_assessment.speed_scale), 1e-6)
+        )
         accepted: tuple[dict[str, np.ndarray], ArmTransitionRiskAssessment, float] | None = None
+        accepted_joint_limit_escape = False
+        rejected_candidates: list[dict[str, Any]] = []
         for backoff in cfg.backoff_scales:
-            alpha = min(1.0, base_alpha * float(backoff) * max(float(current_assessment.speed_scale), 1e-6))
+            alpha = min(1.0, base_alpha * float(backoff) * effective_speed_scale)
             candidate = {side: current[side] + remaining[side] * alpha for side in current}
             assessment = evaluate_transition_state(
                 qpos_by_side=candidate,
@@ -419,14 +473,41 @@ def plan_constrained_qpos_transition(
                 start_pose_by_side=start_poses,
                 target_pose_by_side=target_poses,
             )
-            if assessment.stop or assessment.hold:
+            candidate_joint_limit_escape = (
+                bool(cfg.allow_joint_limit_escape)
+                and assessment.hold
+                and _joint_limit_hold_step_is_safe_escape(
+                    assessment,
+                    previous_qpos_by_side=current,
+                    candidate_qpos_by_side=candidate,
+                    target_qpos_by_side=target,
+                )
+            )
+            if assessment.stop or (
+                assessment.hold and not candidate_joint_limit_escape
+            ):
+                rejected_candidates.append(
+                    {
+                        "backoff": float(backoff),
+                        "local_alpha": float(alpha),
+                        "qpos_by_side": _qpos_mapping_to_lists(candidate),
+                        "assessment": assessment.to_dict(),
+                    }
+                )
                 continue
             accepted = (candidate, assessment, alpha)
+            accepted_joint_limit_escape = bool(candidate_joint_limit_escape)
             break
         if accepted is None:
-            return _blocked_plan("blocked_candidate", start, target, steps, initial_assessment, target_assessment, "no_constraint_satisfying_step", metadata)
+            blocked_metadata = dict(metadata)
+            blocked_metadata["blocked_candidate_rejections"] = rejected_candidates
+            blocked_metadata["blocked_at_step_index"] = len(steps) + 1
+            blocked_metadata["blocked_current_qpos_by_side"] = _qpos_mapping_to_lists(current)
+            return _blocked_plan("blocked_candidate", start, target, steps, initial_assessment, target_assessment, "no_constraint_satisfying_step", blocked_metadata)
         candidate, assessment, alpha = accepted
         current = {side: qpos.copy() for side, qpos in candidate.items()}
+        if accepted_joint_limit_escape:
+            metadata["joint_limit_escape_used"] = True
         steps.append(
             ArmTransitionPlanStep(
                 index=len(steps) + 1,
@@ -434,10 +515,124 @@ def plan_constrained_qpos_transition(
                 qpos_by_side={side: qpos.copy() for side, qpos in current.items()},
                 assessment=assessment,
                 alpha=_path_alpha(start, target, current),
-                metadata={"local_alpha": float(alpha), "remaining_max_abs_rad_before_step": float(remaining_norm)},
+                metadata={
+                    "local_alpha": float(alpha),
+                    "remaining_max_abs_rad_before_step": float(remaining_norm),
+                    "joint_limit_escape": bool(accepted_joint_limit_escape),
+                },
             )
         )
     return _blocked_plan("max_steps_exceeded", start, target, steps, initial_assessment, target_assessment, "max_steps_exceeded", metadata)
+
+
+def _joint_limit_hold_target_is_safe_escape(
+    assessment: ArmTransitionRiskAssessment,
+    *,
+    current_qpos_by_side: Mapping[str, np.ndarray],
+    target_qpos_by_side: Mapping[str, np.ndarray],
+) -> bool:
+    """Release a joint-limit hold only for static or strictly inward targets."""
+
+    hold_events = tuple(
+        event
+        for event in assessment.events
+        if event.level >= ArmTransitionRiskLevel.HOLD
+    )
+    if not hold_events or any(
+        event.level != ArmTransitionRiskLevel.HOLD
+        or event.code != "joint_limit_hold_margin"
+        for event in hold_events
+    ):
+        return False
+    for event in hold_events:
+        values = _joint_limit_escape_values(
+            event,
+            previous_qpos_by_side=current_qpos_by_side,
+            next_qpos_by_side=target_qpos_by_side,
+        )
+        if values is None:
+            return False
+        previous_distance, target_distance, threshold, previous_value, target_value = values
+        if abs(target_value - previous_value) <= 1e-12:
+            continue
+        if target_distance <= max(previous_distance, threshold) + 1e-12:
+            return False
+    return True
+
+
+def _joint_limit_hold_step_is_safe_escape(
+    assessment: ArmTransitionRiskAssessment,
+    *,
+    previous_qpos_by_side: Mapping[str, np.ndarray],
+    candidate_qpos_by_side: Mapping[str, np.ndarray],
+    target_qpos_by_side: Mapping[str, np.ndarray],
+) -> bool:
+    """Accept a candidate only when every held joint stays static or moves inward."""
+
+    if not _joint_limit_hold_target_is_safe_escape(
+        assessment,
+        current_qpos_by_side=candidate_qpos_by_side,
+        target_qpos_by_side=target_qpos_by_side,
+    ):
+        return False
+    hold_events = tuple(
+        event
+        for event in assessment.events
+        if event.level == ArmTransitionRiskLevel.HOLD
+        and event.code == "joint_limit_hold_margin"
+    )
+    for event in hold_events:
+        values = _joint_limit_escape_values(
+            event,
+            previous_qpos_by_side=previous_qpos_by_side,
+            next_qpos_by_side=candidate_qpos_by_side,
+        )
+        if values is None:
+            return False
+        (
+            previous_distance,
+            candidate_distance,
+            _threshold,
+            previous_value,
+            candidate_value,
+        ) = values
+        if abs(candidate_value - previous_value) <= 1e-12:
+            continue
+        if candidate_distance <= previous_distance + 1e-12:
+            return False
+    return True
+
+
+def _joint_limit_escape_values(
+    event: ArmTransitionRiskEvent,
+    *,
+    previous_qpos_by_side: Mapping[str, np.ndarray],
+    next_qpos_by_side: Mapping[str, np.ndarray],
+) -> tuple[float, float, float, float, float] | None:
+    side = str(event.side or "")
+    try:
+        joint_index = int(event.metadata["joint_index"]) - 1
+        lower = float(event.metadata["lower_rad"])
+        upper = float(event.metadata["upper_rad"])
+        previous = float(np.asarray(previous_qpos_by_side[side], dtype=float).reshape(-1)[joint_index])
+        next_value = float(np.asarray(next_qpos_by_side[side], dtype=float).reshape(-1)[joint_index])
+        threshold = float(event.threshold)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if (
+        joint_index < 0
+        or not np.all(np.isfinite([lower, upper, previous, next_value, threshold]))
+        or lower >= upper
+        or previous < lower
+        or previous > upper
+        or next_value < lower
+        or next_value > upper
+    ):
+        return None
+    near_lower = (previous - lower) <= (upper - previous)
+    if near_lower:
+        return previous - lower, next_value - lower, threshold, previous, next_value
+    return upper - previous, upper - next_value, threshold, previous, next_value
 
 
 def _validate_for_sides(qpos_by_side: Mapping[str, Any], *, sides: Sequence[str] | None) -> dict[str, np.ndarray]:
@@ -476,17 +671,29 @@ def _blocked_plan(
 
 
 def _append_joint_limit_events(events: list[ArmTransitionRiskEvent], qpos_by_side: Mapping[str, np.ndarray], cfg: ArmConstrainedTransitionConfig) -> None:
-    hard = np.deg2rad(float(cfg.max_joint_abs_deg))
-    slow = np.deg2rad(max(0.0, float(cfg.max_joint_abs_deg) - float(cfg.joint_slow_margin_deg)))
-    hold = np.deg2rad(max(0.0, float(cfg.max_joint_abs_deg) - float(cfg.joint_hold_margin_deg)))
+    scalar_hard = np.deg2rad(float(cfg.max_joint_abs_deg))
+    slow_margin = np.deg2rad(float(cfg.joint_slow_margin_deg))
+    hold_margin = np.deg2rad(float(cfg.joint_hold_margin_deg))
     for side, qpos in qpos_by_side.items():
-        for joint_index, value in enumerate(np.abs(np.asarray(qpos, dtype=float).reshape(-1)), start=1):
-            if value > hard:
-                level, code, threshold = ArmTransitionRiskLevel.STOP, "joint_limit_hard", hard
-            elif value >= hold:
-                level, code, threshold = ArmTransitionRiskLevel.HOLD, "joint_limit_hold_margin", hold
-            elif value >= slow:
-                level, code, threshold = ArmTransitionRiskLevel.SLOWDOWN, "joint_limit_slow_margin", slow
+        values = np.asarray(qpos, dtype=float).reshape(-1)
+        if cfg.joint_lower_rad is None or cfg.joint_upper_rad is None:
+            lower = np.full(values.shape, -scalar_hard, dtype=float)
+            upper = np.full(values.shape, scalar_hard, dtype=float)
+        else:
+            lower = np.asarray(cfg.joint_lower_rad, dtype=float).reshape(-1)
+            upper = np.asarray(cfg.joint_upper_rad, dtype=float).reshape(-1)
+            if lower.shape != values.shape or upper.shape != values.shape:
+                raise ValueError(
+                    f"joint limit shape {lower.shape}/{upper.shape} does not match {side}.qpos {values.shape}."
+                )
+        for joint_index, (value, low, high) in enumerate(zip(values, lower, upper), start=1):
+            distance_to_limit = min(float(value - low), float(high - value))
+            if value < low or value > high:
+                level, code, threshold = ArmTransitionRiskLevel.STOP, "joint_limit_hard", 0.0
+            elif distance_to_limit <= hold_margin:
+                level, code, threshold = ArmTransitionRiskLevel.HOLD, "joint_limit_hold_margin", hold_margin
+            elif distance_to_limit <= slow_margin:
+                level, code, threshold = ArmTransitionRiskLevel.SLOWDOWN, "joint_limit_slow_margin", slow_margin
             else:
                 continue
             events.append(
@@ -495,9 +702,14 @@ def _append_joint_limit_events(events: list[ArmTransitionRiskEvent], qpos_by_sid
                     code=code,
                     message=f"{side} joint {joint_index} is near or outside absolute joint limit",
                     side=side,
-                    value=float(value),
+                    value=float(distance_to_limit),
                     threshold=float(threshold),
-                    metadata={"joint_index": joint_index},
+                    metadata={
+                        "joint_index": joint_index,
+                        "qpos_rad": float(value),
+                        "lower_rad": float(low),
+                        "upper_rad": float(high),
+                    },
                 )
             )
 
@@ -518,39 +730,63 @@ def _append_endpoint_excursion_events(
         pose = as_strict_pose_matrix(np.asarray(pose_by_side[side], dtype=float))
         start_pose = as_strict_pose_matrix(np.asarray(start_pose_by_side[side], dtype=float))
         target_pose = as_strict_pose_matrix(np.asarray(target_pose_by_side[side], dtype=float))
-        measurements = {
-            "start": float(np.linalg.norm(pose[:3, 3] - start_pose[:3, 3])),
-            "target": float(np.linalg.norm(pose[:3, 3] - target_pose[:3, 3])),
+        point = pose[:3, 3]
+        start_point = start_pose[:3, 3]
+        target_point = target_pose[:3, 3]
+        segment = target_point - start_point
+        segment_norm_sq = float(np.dot(segment, segment))
+        segment_alpha = (
+            0.0
+            if segment_norm_sq <= 1e-18
+            else float(np.clip(np.dot(point - start_point, segment) / segment_norm_sq, 0.0, 1.0))
+        )
+        projection = start_point + segment_alpha * segment
+        distance = float(np.linalg.norm(point - projection))
+        distances[side] = {
+            "from_start_m": float(np.linalg.norm(point - start_point)),
+            "from_target_m": float(np.linalg.norm(point - target_point)),
+            "from_start_target_segment_m": distance,
+            "segment_alpha": segment_alpha,
         }
-        distances[side] = {"from_start_m": measurements["start"], "from_target_m": measurements["target"]}
-        for label, distance in measurements.items():
-            if distance > hard:
-                level, code, threshold = ArmTransitionRiskLevel.STOP, "endpoint_excursion_hard", hard
-            elif distance >= hold:
-                level, code, threshold = ArmTransitionRiskLevel.HOLD, "endpoint_excursion_hold_margin", hold
-            elif distance >= slow:
-                level, code, threshold = ArmTransitionRiskLevel.SLOWDOWN, "endpoint_excursion_slow_margin", slow
-            else:
-                continue
-            events.append(
-                ArmTransitionRiskEvent(
-                    level=level,
-                    code=code,
-                    message=f"{side} endpoint is near or outside excursion limit",
-                    side=side,
-                    value=distance,
-                    threshold=threshold,
-                    metadata={"reference": label},
-                )
+        if distance > hard:
+            level, code, threshold = ArmTransitionRiskLevel.STOP, "endpoint_excursion_hard", hard
+        elif distance >= hold:
+            level, code, threshold = ArmTransitionRiskLevel.HOLD, "endpoint_excursion_hold_margin", hold
+        elif distance >= slow:
+            level, code, threshold = ArmTransitionRiskLevel.SLOWDOWN, "endpoint_excursion_slow_margin", slow
+        else:
+            continue
+        events.append(
+            ArmTransitionRiskEvent(
+                level=level,
+                code=code,
+                message=f"{side} endpoint is near or outside the start-target corridor",
+                side=side,
+                value=distance,
+                threshold=threshold,
+                metadata={"reference": "start_target_segment"},
             )
+        )
     metadata["endpoint_excursion_m"] = distances
 
 
 def _append_collision_events(events: list[ArmTransitionRiskEvent], model: ArmTransitionModel, qpos_by_side: Mapping[str, np.ndarray], cfg: ArmConstrainedTransitionConfig, metadata: dict[str, Any]) -> None:
     value = model.min_collision_distance(qpos_by_side)
     metadata["min_collision_distance_m"] = None if value is None else float(value)
+    details_method = getattr(model, "collision_distance_details", None)
+    collision_details = dict(details_method()) if callable(details_method) else {}
+    if collision_details:
+        metadata["collision_details"] = collision_details
     if value is None:
         metadata["collision_check"] = "unavailable"
+        if cfg.require_collision_check:
+            events.append(
+                ArmTransitionRiskEvent(
+                    level=ArmTransitionRiskLevel.STOP,
+                    code="collision_check_unavailable",
+                    message="required collision distance check is unavailable",
+                )
+            )
         return
     distance = float(value)
     if distance < float(cfg.collision_stop_distance_m):
@@ -561,7 +797,16 @@ def _append_collision_events(events: list[ArmTransitionRiskEvent], model: ArmTra
         level, code, threshold = ArmTransitionRiskLevel.SLOWDOWN, "collision_near", float(cfg.collision_slow_distance_m)
     else:
         return
-    events.append(ArmTransitionRiskEvent(level=level, code=code, message="collision distance is near or below margin", value=distance, threshold=threshold))
+    events.append(
+        ArmTransitionRiskEvent(
+            level=level,
+            code=code,
+            message="collision distance is near or below margin",
+            value=distance,
+            threshold=threshold,
+            metadata=collision_details,
+        )
+    )
 
 
 def _append_singularity_events(events: list[ArmTransitionRiskEvent], model: ArmTransitionModel, qpos_by_side: Mapping[str, np.ndarray], cfg: ArmConstrainedTransitionConfig, metadata: dict[str, Any]) -> None:

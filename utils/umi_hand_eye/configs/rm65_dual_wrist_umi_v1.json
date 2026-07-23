@@ -1,23 +1,26 @@
 {
   "schema": "dexteleop.umi_hand_eye.config.v1",
-  "validity_seconds": 3600.0,
+  "validity_seconds": 10800.0,
   "vive_host": "0.0.0.0",
   "vive_port": 9999,
   "vive_clock_sync_port": 10001,
-  "camera_resolution": [640, 480],
+  "camera_resolution": [1280, 720],
   "camera_fps": 15,
+  "urdf_path": "../../../assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
   "sides": {
     "left": {
       "camera_serial": "261122273924",
       "tracker_name": "tracker_1",
       "tracker_role": "left_wrist",
-      "channel_name": "left_wrist_pose"
+      "channel_name": "left_wrist_pose",
+      "tcp_profile": "dmgripper"
     },
     "right": {
       "camera_serial": "260522278055",
       "tracker_name": "tracker_2",
       "tracker_role": "right_wrist",
-      "channel_name": "right_wrist_pose"
+      "channel_name": "right_wrist_pose",
+      "tcp_profile": "dmgripper"
     }
   },
   "target": {
@@ -29,6 +32,7 @@
     "charuco_squares_y": 7,
     "charuco_square_length_m": 0.035,
     "charuco_marker_length_m": 0.026,
-    "min_charuco_corners": 12
+    "min_charuco_corners": 12,
+    "allow_aruco_board_fallback": true
   }
 }

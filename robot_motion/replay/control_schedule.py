@@ -86,7 +86,7 @@ def position_qpos_segment_duration(
 
     ``control_hz`` remains a required compatibility argument and is validated,
     but the default segment duration now has reference semantics: one high-rate
-    period, rather than one 150 Hz command period.
+    period, rather than one 120 Hz command period.
     """
 
     validate_replay_rate(control_hz, name="control_hz")

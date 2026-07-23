@@ -1,0 +1,141 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t2e_vla_scratch_additive_local_2026_07_23",
+  "scope": "external_vla_scratch_processed_sample_and_native_zmq_no_model_loopback_no_action",
+  "captured_at": "2026-07-23T01:32:45+08:00",
+  "repositories": {
+    "dexteleop_commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "dexteleop_worktree_global_state": "dirty_concurrent_work_preserved",
+    "vla_scratch_path": "/home/zc/HandMotion/vla-scratch",
+    "vla_scratch_commit": "fa3cb37a6f3ba620bd2c167a97035b5431f31d19",
+    "vla_scratch_status_before": "clean",
+    "vla_scratch_status_after": "clean",
+    "vla_scratch_modified_by_t2e": false,
+    "full_dexteleop_suite_rerun": false
+  },
+  "baseline_audit": {
+    "policy_entry": "BasePolicy.sample_actions(observation, num_steps)",
+    "serving_entry": "ServePolicy.infer(dict)",
+    "transport_shape": "ZmqPolicyClient.infer(dict) -> dict",
+    "input_keys": [
+      "observation.images",
+      "observation.image_masks",
+      "observation.state",
+      "task"
+    ],
+    "output_key": "action_chunk.actions",
+    "server_metadata_handshake_present": false,
+    "serve_dims_derived_from_selected_dataset": true,
+    "serve_warmup_uses_selected_dataset_sample": true,
+    "existing_libero_action_semantics_promoted_to_dexteleop": false
+  },
+  "additive_implementation": {
+    "processed_sample_contract": "dataset_contracts.vla_scratch.VlaScratchProcessedSampleSpec",
+    "generic_final_chunk_backend": "deployments.client.FinalChunkRtcBackend",
+    "framework_extraction_seam": "deployments.vla_scratch.client.rtc.VlaScratchFinalChunkRtcBackend",
+    "runtime_composition": "deployments.client.SimpleRtcModelRuntimeAdapter",
+    "imports_external_vla_scratch_package": false,
+    "imports_zmq_or_torch": false,
+    "framework_subclass_required": false,
+    "framework_registry_added": false,
+    "production_caller_added": false,
+    "dependency_or_lock_change": false
+  },
+  "native_zmq_loopback": {
+    "transport_client": "unchanged vla_scratch.utils.serving.ZmqPolicyClient",
+    "transport_server": "unchanged vla_scratch.utils.serving.ZmqPolicyServer",
+    "host_scope": "127.0.0.1",
+    "model_loaded": false,
+    "checkpoint_loaded": false,
+    "gpu_used": false,
+    "synthetic_processed_observation": true,
+    "server_images_shape": [2, 3, 8, 10],
+    "server_state_shape": [1, 7],
+    "returned_chunk_shape": [4, 7],
+    "rtc_response_validation_accepted": true,
+    "action_send_enabled": false,
+    "dispatch_attempted": false,
+    "cleanup_completed": true
+  },
+  "observed_baseline_lifecycle_risk": {
+    "issue": "ZmqPolicyServer.close closes the socket before its polling thread has exited",
+    "probe_resolution": "test-only orderly stop flag and thread join",
+    "baseline_fix_applied": false,
+    "inference_wire_contract_affected": false,
+    "must_be_isolated_or_fixed_before_long_running_live_gate": true
+  },
+  "boundary": {
+    "real_observation_used": false,
+    "dataset_episode_read": false,
+    "training_started": false,
+    "hardware_accessed": false,
+    "safety_or_reference_called": false,
+    "teleop_or_replay_path_changed": false,
+    "position_executor_path_changed": false,
+    "control_station_dependency_added": false,
+    "true_prefix_conditioning_claimed": false
+  },
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_vla_scratch_rtc_adapter.py",
+      "result": "8 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_rtc_final_chunk_backend.py",
+      "result": "3 passed"
+    },
+    {
+      "command": "python /tmp/dexteleop_vla_scratch_zmq_rtc_loopback.py with DexTeleop plus existing vla-scratch source/site-packages",
+      "result": "passed and exited; native ZMQ 2-camera/state -> 4x7 final chunk"
+    },
+    {
+      "command": "python -m pytest -q <full RTC focused set including vla-scratch>",
+      "result": "187 passed"
+    },
+    {
+      "command": "python -m pytest -q <OpenPI/default-deploy/position/MuJoCo compatibility set>",
+      "result": "160 passed, 1 skipped"
+    }
+  ],
+  "scoped_source_sha256": {
+    "dataset_contracts/vla_scratch.py": "28c503c828c44f5a56eef9f478c5b1d720efd4b75556dcb4f6c77c6408b2f615",
+    "deployments/client/rtc_final_chunk.py": "363c4d626d4bdb50f411f502f6ffe1363ee7a4ca1865a2303c39f325d376f396",
+    "deployments/client/__init__.py": "e8d7050dcfc0c69fcc583885fc57a48036377a05e9d9db64878f37b9918a1d54",
+    "deployments/vla_scratch/client/rtc.py": "2113ff85ed165f96283efa0990ba5831d17dc4118d52b69113bee84d4f27da32",
+    "deployments/vla_scratch/client/__init__.py": "a45e5551d01e2799853505cc79e143755bc58b244fc2e8ffaa5e476605a78bd6",
+    "deployments/vla_scratch/README.md": "22361cbcf40819a76536cd598b84422568b6f1de29f06a579b263525547ecac9",
+    "tests/test_rtc_final_chunk_backend.py": "9826441383f0b44c02cd1f77feccdbd2797e456f6daa26c18ac0dfdbfb14f5d2",
+    "tests/test_vla_scratch_rtc_adapter.py": "9632fa148c73968ec00b02f9ce9a3a6b3e850c8659d2026866e076ab7153ab15",
+    "tmp_native_zmq_loopback_probe.py": "d889453ef554028e0b850a0905f9b9210b0b55cfd834c3de6feb024a9f7443c0",
+    "vla_scratch/scripts/serve_policy.py": "c61cf25f5fa7e28c7e89980981f087b0a3d85113d171ba836973e98058a657fd",
+    "vla_scratch/zmq_policy_client.py": "5dea25df869dde788a2d1b28799e14a2d73d2bdccea0ae311fe3ff73223a3b11",
+    "vla_scratch/zmq_policy_server.py": "be8adbd2ec4c5cc78dfc29a57d040be9eb7033cc0ef9ce00575b607a96be9800",
+    "vla_scratch/transforms/data_keys.py": "a389b8badf625ab1c8a61da84397976ba8b803f505a0de81f83a2b5d3ee2edce"
+  },
+  "claims": [
+    "a second model framework can reuse the generic RTC adapter without a framework subclass or scheduler copy",
+    "final-chunk capability, request, timing and response-envelope boilerplate is now shared by the RTC main project",
+    "the existing vla-scratch ZMQ infer wire accepts the shared processed observation and returns a validated final chunk",
+    "training and deployment can share one explicit camera/state/action sample binding",
+    "the integration is additive and leaves the vla-scratch baseline repository unchanged",
+    "missing or malformed chunk output fails before plan admission"
+  ],
+  "non_claims": [
+    "no vla-scratch checkpoint or GPU model was loaded",
+    "no existing LIBERO checkpoint is claimed compatible with DexTeleop representations",
+    "no DexTeleop collected episode was consumed",
+    "no authenticated server metadata or capability continuity is claimed",
+    "no real observation, action safety, reference, dispatch or motion authority is claimed",
+    "no true prefix-conditioned RTC capability is claimed"
+  ],
+  "next_gate": {
+    "id": "rtc_4b_t2f_vla_scratch_artifact_and_dataset_view_preflight",
+    "goal": "materialize an external DexTeleop dataset view and artifact-derived sample binding without editing the baseline model stack",
+    "requires_checkpoint_selection": false,
+    "requires_training": false,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false,
+    "requires_position_change": false,
+    "following_gate": "vla_scratch_loaded_model_synthetic_no_action"
+  }
+}

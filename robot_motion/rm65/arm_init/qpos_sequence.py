@@ -20,7 +20,11 @@ from robot_motion.arm_init import (
 
 from .qpos_init import DEFAULT_QPOS_TARGET_PATH
 from ..constants import QPOS_UNIT
-from ..qpos_layout import normalize_sides, validate_qpos_by_side
+from ..qpos_layout import (
+    normalize_sides,
+    validate_qpos_by_side,
+    validate_qpos_within_absolute_limits,
+)
 
 
 QPOS_TEST_SEQUENCE_DATA_TYPE = "rm65_arm_init_qpos_test_sequence"
@@ -303,6 +307,8 @@ def sample_episode_qpos_records(
     data = table.to_pydict()
 
     valid_records: list[dict[str, Any]] = []
+    finite_qpos_row_count = 0
+    absolute_limit_rejected_row_count = 0
     for row_index in range(table.num_rows):
         qpos_by_side: dict[str, np.ndarray] = {}
         valid = True
@@ -313,6 +319,15 @@ def sample_episode_qpos_records(
                 break
             qpos_by_side[side] = qpos
         if not valid:
+            continue
+        finite_qpos_row_count += 1
+        try:
+            qpos_by_side = validate_qpos_within_absolute_limits(
+                qpos_by_side,
+                label=f"{episode_path}:row_{row_index}",
+            )
+        except ValueError:
+            absolute_limit_rejected_row_count += 1
             continue
         source = {
             "row_index": int(row_index),
@@ -334,6 +349,8 @@ def sample_episode_qpos_records(
     summary = {
         "episode_path": str(episode_path),
         "row_count": int(table.num_rows),
+        "finite_qpos_row_count": finite_qpos_row_count,
+        "absolute_limit_rejected_row_count": absolute_limit_rejected_row_count,
         "valid_qpos_row_count": len(valid_records),
         "sample_count": sample_count,
         "sampled_row_indices": [int(record["source"]["row_index"]) for record in sampled],
@@ -355,7 +372,10 @@ def dry_run_qpos_test_sequence(
     max_steps_json: int = 0,
 ) -> dict[str, Any]:
     cfg = config if config is not None else ArmQposTransitionConfig()
-    current = validate_qpos_by_side(current_qpos_by_side)
+    current = validate_qpos_within_absolute_limits(
+        current_qpos_by_side,
+        label="current_qpos_by_side",
+    )
     sides = _resolve_active_sides(sequence, current, active_sides)
     results: list[dict[str, Any]] = []
     total_steps = 0
@@ -364,6 +384,10 @@ def dry_run_qpos_test_sequence(
 
     for entry in entries:
         target = {side: entry.qpos_by_side[side] for side in sides}
+        target = validate_qpos_within_absolute_limits(
+            target,
+            label=f"sequence_entry_{entry.index}",
+        )
         plan = plan_slow_qpos_transition(
             start_qpos_by_side={side: current[side] for side in sides},
             target_qpos_by_side=target,
@@ -447,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument(
         "--current-qpos",
         default=str(DEFAULT_QPOS_TARGET_PATH),
-        help="Starting qpos JSON. Defaults to bench_init_pose.",
+        help="Starting qpos JSON. Defaults to the measured init profile.",
     )
     dry_run.add_argument("--arm", default="both", help="left, right, or both.")
     dry_run.add_argument("--qpos-dt-sec", type=float, default=0.05)

@@ -18,7 +18,7 @@ from robot_motion.rm65.qpos_layout import normalize_sides, validate_qpos_by_side
 from .schema import load_qpos_target
 
 
-DEFAULT_QPOS_TARGET_PATH = Path("robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json")
+DEFAULT_QPOS_TARGET_PATH = Path("robot_motion/rm65/arm_init/qpos_targets/measured_init_pose.json")
 
 
 def build_rm65_slow_qpos_init_plan_from_files(

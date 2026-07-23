@@ -348,6 +348,14 @@ class ArmHardwareStatePoller:
             kwargs["hardware_read_retry_delay_sec"] = float(
                 self.config.hardware_read_retry_delay_sec
             )
+        # This poller runs at 30 Hz per arm and consumes measured qpos/pose
+        # fields only.  RM65's complete diagnostic snapshot performs FK and
+        # exact percentile sorting; requesting it here periodically competes
+        # for the GIL with the real-time command loop.
+        if "include_derived_pose" in arg_names:
+            kwargs["include_derived_pose"] = False
+        if "include_timing_percentiles" in arg_names:
+            kwargs["include_timing_percentiles"] = False
         return dict(refresh(**kwargs))
 
     @staticmethod

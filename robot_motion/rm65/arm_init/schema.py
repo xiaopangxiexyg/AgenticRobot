@@ -47,7 +47,9 @@ class ArmQposSpec:
             raise ValueError(f"{side}.qpos spec must be a mapping.")
         qpos = payload.get("qpos")
         if qpos is None:
-            raise ValueError(f"{side}.qpos is required.")
+            qpos = payload.get("arm_qpos")
+        if qpos is None:
+            raise ValueError(f"{side}.qpos or {side}.arm_qpos is required.")
         return cls(
             side=side,
             qpos=qpos,
@@ -111,20 +113,32 @@ class QposTargetSpec:
     def from_dict(cls, payload: Mapping[str, Any]) -> "QposTargetSpec":
         if not isinstance(payload, Mapping):
             raise ValueError("qpos target payload must be a mapping.")
+        source_format = str(payload.get("format") or "")
         data_type = str(payload.get("data_type") or QPOS_TARGET_DATA_TYPE)
         if data_type != QPOS_TARGET_DATA_TYPE:
             raise ValueError(f"unsupported qpos target data_type={data_type!r}.")
         arms_payload = payload.get("arms")
         if not isinstance(arms_payload, Mapping) or not arms_payload:
-            raise ValueError("qpos target payload must contain a non-empty arms mapping.")
+            sides_payload = payload.get("sides")
+            if source_format == "teleop_initial_alignment" and isinstance(sides_payload, Mapping):
+                arms_payload = sides_payload
+        if not isinstance(arms_payload, Mapping) or not arms_payload:
+            raise ValueError(
+                "qpos target payload must contain a non-empty arms mapping, or a "
+                "teleop_initial_alignment sides mapping."
+            )
+        metadata = dict(payload.get("metadata", {})) if isinstance(payload.get("metadata", {}), Mapping) else {}
+        if source_format:
+            metadata.setdefault("source_format", source_format)
+            metadata.setdefault("source_format_version", payload.get("format_version"))
         return cls(
             arms={
                 normalize_side(str(side)): ArmQposSpec.from_dict(str(side), dict(arm_payload))
                 for side, arm_payload in arms_payload.items()
             },
-            name=str(payload.get("name") or "rm65_init_qpos_target"),
+            name=str(payload.get("name") or ("measured_init_pose" if source_format else "rm65_init_qpos_target")),
             schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
-            metadata=dict(payload.get("metadata", {})) if isinstance(payload.get("metadata", {}), Mapping) else {},
+            metadata=metadata,
         )
 
 

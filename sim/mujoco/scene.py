@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
@@ -13,6 +13,10 @@ from .config import ArmSpec, CameraMount, GripperSpec
 from .mjcf import MJCFConversion, write_mjcf
 from .transforms import pose_to_xyz_quat_xyzw
 from .urdf import discover_camera_mounts, parse_urdf
+
+if TYPE_CHECKING:
+    from .actuation.gripper_profile import GripperActuationProfile
+    from sim.rm65.actuation import PositionActuationProfile
 
 
 @dataclass(frozen=True)
@@ -206,6 +210,8 @@ class MujocoScene:
         mjcf_path: str | Path | None = None,
         debug_proxy_visuals: bool = False,
         gripper_specs: Mapping[str, GripperSpec] | Sequence[GripperSpec] | None = None,
+        position_actuation_profile: PositionActuationProfile | None = None,
+        gripper_actuation_profile: GripperActuationProfile | None = None,
     ) -> "MujocoScene":
         """Build the canonical MuJoCo scene from one versioned contract."""
 
@@ -219,6 +225,8 @@ class MujocoScene:
             debug_proxy_visuals=debug_proxy_visuals,
             gripper_specs=gripper_specs,
             scene_spec=contract.scene,
+            position_actuation_profile=position_actuation_profile,
+            gripper_actuation_profile=gripper_actuation_profile,
         )
 
     @classmethod
@@ -275,6 +283,8 @@ class MujocoScene:
         debug_proxy_visuals: bool = False,
         gripper_specs: Mapping[str, GripperSpec] | Sequence[GripperSpec] | None = None,
         scene_spec: SceneSpec | None = None,
+        position_actuation_profile: PositionActuationProfile | None = None,
+        gripper_actuation_profile: GripperActuationProfile | None = None,
     ) -> "MujocoScene":
         mujoco = _load_mujoco()
         urdf_model = parse_urdf(urdf_path)
@@ -295,6 +305,8 @@ class MujocoScene:
             gravity=gravity,
             debug_proxy_visuals=debug_proxy_visuals,
             scene_spec=scene_spec,
+            position_actuation_profile=position_actuation_profile,
+            gripper_actuation_profile=gripper_actuation_profile,
         )
         model = mujoco.MjModel.from_xml_path(str(conversion.mjcf_path))
         return cls._from_compiled_model(

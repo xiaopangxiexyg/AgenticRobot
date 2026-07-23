@@ -214,8 +214,8 @@ class JointTrajectoryProposal:
 class AccelerationLimitedJointTrajectoryPlanner:
     """Preemptible qpos planner with continuous commanded velocity.
 
-    Safe qpos references are accepted at an arbitrary outer rate (75 Hz in the
-    current teleop profile) and sampled at a higher sink rate (150 Hz). Target
+    Safe qpos references are accepted at an arbitrary outer rate (60 Hz in the
+    current teleop profile) and sampled at a higher sink rate (120 Hz). Target
     velocity is estimated causally from accepted safe-reference history. A new
     target never resets the current planned velocity; its desired velocity is
     reached under the configured acceleration bound.
@@ -444,7 +444,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
             )
 
             # Retain an already accepted endpoint in the current velocity
-            # direction.  A 75 Hz reference may reverse every other 150 Hz
+            # direction.  A 60 Hz reference may reverse every other 120 Hz
             # transport tick; replacing the previous endpoint immediately in
             # that case can leave less stopping distance than qdd allows.
             assert self._braking_guard_q is not None
@@ -987,7 +987,7 @@ class AccelerationLimitedJointTrajectoryPlanner:
             # trajectory timestamp remains the scheduler sample time. Using
             # SDK-return time here would subtract every SDK call duration from
             # the next integration interval and systematically under-speed the
-            # 150 Hz path.
+            # 120 Hz path.
             self._last_commit_monotonic = proposal.sample_monotonic_time
             self._pending = None
 

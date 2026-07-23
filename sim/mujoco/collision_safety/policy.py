@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CollisionSafetyPolicy:
-    """Hard safety policy for prescribed robot motion.
+    """Hard safety policy for robot command targets and active contacts.
 
     Object/table and gripper/object contact remain physical task contacts.  A
-    prescribed robot is not allowed to enter fixed environment geometry, hit
+    commanded robot is not allowed to enter fixed environment geometry, hit
     task objects with non-gripper links, or self-collide.
     """
 
@@ -43,4 +43,3 @@ class CollisionSafetyPolicy:
     @property
     def distance_query_limit_m(self) -> float:
         return max(0.05, self.minimum_clearance_m * 2.0)
-

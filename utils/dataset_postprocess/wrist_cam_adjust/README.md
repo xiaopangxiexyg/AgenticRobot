@@ -182,7 +182,7 @@ python -m utils.dataset_postprocess.wrist_cam_adjust visualize-depth-mask \
 python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
   --dataset-root datasets/2026-07-04_vive_rm65_real_teleop \
   --output-root datasets/2026-07-04_vive_rm65_real_teleop_wrist_masked \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --left-body-mask utils/wrist_cam_fixed_mask/painting/left_dmtac_m_mask_01.png \
   --right-body-mask utils/wrist_cam_fixed_mask/painting/right_dmtac_m_mask_01.png \
   --output-kind masked \
@@ -196,7 +196,7 @@ python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
 python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
   --dataset-root datasets/2026-07-04_vive_rm65_real_teleop \
   --output-root utils/dataset_postprocess/wrist_cam_adjust/outputs/wrist_mask_debug \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --camera right_wrist \
   --episode 0 \
   --max-frames 80 \
@@ -217,7 +217,7 @@ python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
 python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
   --dataset-root datasets/2026-07-09_vive_rm65_real_teleop \
   --output-root utils/dataset_postprocess/wrist_cam_adjust/outputs/2026-07-09_vive_rm65_real_teleop_table_keep_mask \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --output-kind keep-mask \
   --table-mask-mode sampled-raycast \
   --table-raycast-stride 2 \
@@ -233,7 +233,7 @@ python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
 ```bash
 SESSION=datasets/2026-07-09_vive_rm65_real_teleop
 NAME=${SESSION##*/}
-URDF=assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf
+URDF=assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf
 TABLE_MASK_ROOT=utils/dataset_postprocess/wrist_cam_adjust/outputs/${NAME}_table_keep_mask
 DEPTH_MASK_ROOT=utils/dataset_postprocess/wrist_cam_adjust/outputs/depth_mask_postprocess
 FINAL_MASK_ROOT=utils/dataset_postprocess/wrist_cam_adjust/outputs/final_keep_mask

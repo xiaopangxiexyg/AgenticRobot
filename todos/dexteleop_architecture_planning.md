@@ -1,2241 +1,3694 @@
-# DexTeleop：模型输出、人类数采与 sim/真机控制流架构规划
+# DexTeleop：多源动作、多速率策略与 sim/真机统一控制架构规划
+
+更新日期：2026-07-23
+
+## 阅读导航
+
+本文保留完整的长期架构、契约语义和数据集规划，适合作为设计事实源；不建议从头顺序阅读全部内容。
+
+| 想回答的问题 | 建议入口 |
+|---|---|
+| 最终系统要形成什么闭环 | [结论](#结论)、[目标逻辑架构](#三目标逻辑架构) |
+| 当前代码已经做到哪里 | [当前代码基线与准确边界](#一当前代码基线与准确边界) |
+| 哪些原则不能在迁移中改变 | [架构不变量](#二必须长期保持的架构不变量) |
+| 多速率、快慢策略如何共存 | [多速率时间模型](#四多速率时间模型)、[PolicyGraph](#六policynoderuntime逻辑-policygraph-与部署绑定) |
+| proposal 如何统一为实际动作 | [ActionArbiter](#七actionproposalproposalbuffer-与-actionarbiter)、[现有链路接入](#八如何接入现有-canonical-action-与-position-链路) |
+| human/replay/policy 与 real/sim 如何由统一 GUI 管理 | [`Control Station` 专项规划](dexteleop_control_station_plan.md) |
+| v2.4 如何支持 DAgger/RL/replay/sim2real | [v2.4 数据集格式](#九v24-数据集格式多来源多频率与训练事实层) |
+| 下一步按什么顺序实施 | [最佳实施路径](#十二最佳实施路径)、[阶段验收标准](#十四阶段验收标准) |
+
+配套文档：
+
+- [`dexteleop_control_core_landing_plan.md`](dexteleop_control_core_landing_plan.md)：实际文件、批次、前提、退出条件和回滚；
+- [`dexteleop_architecture_visual_guide.md`](dexteleop_architecture_visual_guide.md)：用流程图、状态图和缺口表快速说明当前实现；
+- [`dexteleop_rtc_landing_plan.md`](dexteleop_rtc_landing_plan.md)：异步 action chunk/RTC producer 的独立实施计划；
+- [`dexteleop_control_station_plan.md`](dexteleop_control_station_plan.md)：多 source/target 控制实验台与最小统一 GUI；
+- 本文负责回答“目标语义是什么”，各 landing plan 负责回答“下一批怎样安全落地”，visual guide 不新增规范。
+
+### 当前一句话状态
+
+控制 contract、单策略/回放 shadow、authoritative sim、确定性快慢 composition，以及 shared-execution/safety-anchor
+纯链路已经形成；真实执行 owner 仍是 legacy。**M5.7e2-a typed reference-segment contract 已在纯层落地**：
+已确认
+60 Hz position worker 的 reference 可以同时依赖相邻两个 15 Hz safe keyframe，必须以 segment 记录多 parent
+lineage；未来 endpoint 的 admission 不能提前覆盖当前 safety anchor，每个高频 reference 也不能伪装成新的
+safety-anchor commit。M5.7e2-b1 已将默认不绑定的 raw observer scoped 接到 legacy executor，e2-b2 pure bound
+projection也已落地；e2-b3 post-resolver outcome和e2-b4 local-generation terminal也已在scoped observer中落地。
+e2-b5又从现有planner/resolver/command-construction显式失败分支旁路产生non-authoritative failure observation；它不改变
+原fault/hold/dispatch，也不把失败冒充shared rejection。上述事实均不生成 canonical `ReferenceSegmentAdmission`，也不推进 shared anchor；production binding仍未接，只有 shared
+worker 真正执行 M1C epoch/generation校验后才允许生成 authoritative admission。M5.7e2-c0 已补 permit 后的 immutable authoritative dispatch context，使 receiver 能获得 exact
+decision/safety/command/target-time/epoch/generation lineage，但它本身不是 admission。当前 MuJoCo profile仍为zero
+target lead，无法诚实表达END前 admission与future pending commit。目标不是替换现有行为：zero-lead保留为
+`immediate_qref_sim_v1`，另增`scheduled_reference_segment_sim_v1`验证future segment；scheduled profile冻结并通过
+前不进入M5.8真机dispatch gate。当前e2-c1 pure contract与e2-c2 scoped deterministic sim receiver已落地：默认
+immediate runtime不变，scheduled profile按30/60 Hz fixture绑定50 ms lead；receiver二次核验live owner/epoch/generation，
+形成canonical admission与pending anchor timeline，并延迟到START才激活qref。它仍不代表真实多线程worker guard或硬件ack。
+
+主线准备工作曾增加CS-6a最小human/replay混合执行证据：exact synthetic-human q6与已有immutable qpos replay emission
+共享一个scheduled MuJoCo authoritative core，通过显式`HOLD/cancel → release/takeover → READY`完成一次单向authority
+交接，并在同一episode WAL中seal/commit/rebuild两个ActualDecision。authority admission同时同步唯一dispatch-owner registry
+的epoch；HOLD清除已取消scheduled reference并quick-stop planner。v1明确禁止同session重新激活曾经使用过的source，直到
+typed proposal invalidation或新producer epoch落地，避免旧future proposal复活。该fixture没有真实遥操设备、dataset
+cursor、Station Web入口、real backend、policy或RTC依赖；policy部署接入仍等待RTC独立支线完成，不阻塞当前replay+human
+sim与数采主线。
+
+2026-07-23进一步冻结representation边界：上述CS-6a/CS-6b direct-qpos mixed实现只保留为debug/contract fixture，用于验证
+authority、epoch、cancellation、readiness与capture因果，不是主线机械臂动作语义。除显式debug外，human/replay/policy的
+**arm component**在source、selected和canonical-safe层均必须是pose；target侧可以在verified frame transform和coupled IK之后
+生成独立arm qpos execution target，但该qpos不得回流成arm mixed source contract。该限制不适用于夹爪/灵巧手：1DoF gripper、
+q6手和q16手保持各自typed qpos/native continuous representation，并在独立component strategy中做active-mask-aware插值，之后
+才与arm pose decision组成compound action。direct arm-qpos mixed仅延后到规划中的同构臂profile。
+
+CS-6b1d第一段现已于2026-07-23 scoped落地：synthetic human与replay在source/proposal/selected/canonical-safe层保持
+`bimanual_ee_pose_v1`，target内部才经既有coupled IK生成resolved qpos execution target；exact frame/component/action hash、
+一次formal human promotion以及原HOLD/cancel/producer epoch/authority transaction均复用既有契约。与此同时新增backend/model/
+device-neutral的pure arm-pose-mixing strategy seam。输入是同一arbitration cut下的admitted arm pose candidates与可选history、future-action、
+modality、label、policy-context事实；这些context必须携带source fact/hash、receiver `available_at`、control admission sequence、
+clock domain与冻结payload。strategy只产出pose decision/lineage，不得推进authority/epoch、读mutable backend、消费queue、执行
+safety/IK或dispatch。首版`discrete_authority_owner_pose_v1`仅以shadow运行并与现有ActionArbiter比较selection/output-pose parity，
+因此启停或strategy异常都不改变production路径。未来的SE(3) residual、component routing或learned gating必须作为版本化strategy
+另过proposal admission、ControlTrace、latency/fallback、canonical safety与shadow parity gate，不得把任意pose平均或GUI比例blend
+直接插入执行链。当前v1 slice只覆盖arms，并显式拒绝hand/end-effector payload，避免把末端执行器静默绑定到arm owner；
+hand qpos interpolation与compound component assembly需单独版本化后再接入。
+
+CS-6b1g现已补齐一个仍为pure/shadow的固定权重SE(3) pose融合实现：
+`weighted_se3_pose_fusion_v1`只读取同一receiver cut内已接纳、同action space/reference frame/controlled frame的arm
+pose candidates；平移采用归一化加权Euclidean mean，旋转采用确定性reference上的shortest-path SO(3) tangent mean。
+strategy spec显式记录source-slot weights、平移/旋转最大分歧阈值、missing candidate的`no_action`或
+`renormalize_available`语义以及reference选择规则；frame不一致、非法quaternion、越过分歧阈值均fail closed。它不拥有
+source、模型、sim、真机、authority、safety、IK或dispatch，hand/gripper仍由独立qpos/native strategy处理。当前既有
+数值核心现也由generic `CompositionSpec(algebra="weighted_se3_pose_fusion")`复用，旧component-union/base+residual
+spec/hash不变；`PolicyTopologyRuntime.evaluate_composition()`与MuJoCo shadow facade可以形成并记录composition
+snapshot/result，但绝不发布proposal。方案1的scoped sim接线现已落地：显式传入`pose_fusion_shadow_spec`时，
+passive human与正式replay adapter输出都以`authority_candidate=false`进入authoritative receiver的同一causal prefix，
+fusion严格复用本轮authoritative proposal cut，不另取“最新值”。human source emission、adapter receipt、
+composition input/snapshot/result均进入同一ControlTrace，重复passive emission按原identity幂等，后续正式human
+promotion复用同一source fact而不重复接纳。该profile默认关闭；关闭时既有proposal ID/hash、cut、decision、replay pop和
+dispatch不变。开启后新增admission会按设计改变cut sequence与decision trace hash，但正式replay proposal、selected action、
+safety/reference/command和dispatch仍不变。TTL缺失、pose分歧越界或shadow异常只产生`no_action/invalid/error` shadow结果，
+不得改变authority、HOLD/FAULT或canonical execution。该结论只覆盖deterministic MuJoCo shadow，不是正式融合authority，
+也不接真机、policy或RTC。
+
+CS-6b1f现把这一pose分支推进到一个明确的sim-only、default-off human-in-the-loop formal capture slice：
+`build_scoped_cs6b1f_mujoco_pose_human_replay_station()`复用CS-6b1d data plane、typed
+`request_human_takeover`、Station publication barriers、SideEffect coordinator和外部
+`EpisodeTraceRecorderSink`，不创建新的queue、cursor、epoch或episode owner。replay初始保持authority；
+`VirtualSimHumanTakeoverReadinessProvider`只在sim worker上等待post-boundary passive emission并注入虚拟
+deadman/rebase evidence，READY后同一emission identity只promotion/admit一次。profile
+`deployable_sim_scheduled_pose_human_replay_station_v1`要求Station/source/authority/gate/cancellation与scheduled
+pose→qpos lineage，在`hold_before_unbind`后完成WAL/seal/commit和ActualDecisionView重建。该profile不是real human
+readiness、Web/production entrypoint或RTC接线；新机械臂、遥操设备、sim或模型继续通过既有typed source/target/provider
+seam复用，只有生命周期/协议真正不同才新增composition。
+
+该后续hand seam的第一版pure contract现已落地但保持未接线：`LinearHandQposInterpolationStrategy`按同一component的
+admitted proposals做active-mask-aware convex interpolation，支持DMTAC 1DoF、q6和q16；q16 inactive/NaN padding不参与计算，
+缺少正权重candidate默认返回`no_action`。`assemble_compound_component_action`只做严格结构join并拒绝重复hand ownership或
+native end-effector target；它不拥有authority、queue、canonical safety、IK、dispatch或episode。当前已增加
+`evaluate_component_mixing_shadow`，在同一arbitration cut上执行arm pose projection、hand qpos strategy和strict compound
+preview，并通过`project_component_mixing_shadow`写入显式、`non_authoritative`的ControlTrace事实；sim-only fixture复用唯一
+episode owner验证HOLD/no-action、abort/restart、WAL failure和terminal closure。该实现仍只作为virtual-policy/component
+shadow的可替换分支，未改变任何现有sim/real/replay/deploy行为；正式compound execution仍需hand spec/joint-order/units/
+active-mask/bounds/safety与downstream admission receipt gate。
+
+CS-6b2a现补齐了正式接线前的passive source边界，但没有扩大执行面。
+`PassiveTeleopComponentSessionSource`与pose-only facade共享唯一non-dispatching `TeleopSession` lifecycle和observer
+fanout；profile只需以`PassiveTeleopComponentSpec`声明arm pose或hand/gripper qpos component，不因VIVE、手套、串口、
+sim、模型或机械臂品牌新增Station source类。arm component固定校验typed `ArmActionSpec`、reference frame与SE(3)；
+hand component固定校验typed `HandActionSpec`、canonical full-slot vector、active mask及padding。hand-only emission的
+whole-action space由绑定的`ActionComponentCatalog`决定，不能再根据单帧是否含arm猜测为arm-qpos profile；representation
+冲突直接拒绝。旧pose-only source仍精确拒绝hand/qpos，既有入口与authority不变。该实现只证明source emission与adapter
+binding，不是formal component composition/admission，也未补hand safety、anchor、reference或MuJoCo compound scheduling。
+当前`RobotAction` v1仍只有left/right arm/hand和q6/q16 slot；结构复用不等于已经支持任意本体。第三effector、7DoF或动态
+payload必须通过EG2/EG3的generic component-action bridge与schema-visible core落地，禁止继续在v1 source中按shape扩展。
+
+CS-6b2b现进一步落地正式执行前的通用边界，但仍不接末端驱动器或MuJoCo hand actuator。`ObservationSampleTracker`
+为任意`ObservationChannel`分配receiver-local稳定sample ID、sequence、measured/available clock和payload hash；同一
+latest sample跨多个control step复用identity，值、时间、validity或上游sequence变化才产生新sample。该sample set随
+`HumanCommandEmission`进入v2.4 `human_command_emission`事实，避免只保存retarget后command而丢失本次决策实际看到的
+VIVE/Q6/AngleTrigger输入。正式human接纳已抽成target-neutral `admit_human_command_emission()`，现有MuJoCo handoff复用
+同一接缝；它只调用现有ProposalBuffer，重复emission由原proposal identity拒绝，不增加queue、去重器或authority owner。
+canonical keyframe safety新增显式`HandQposSafetyLimits`：按绑定`HandActionSpec`只处理active slots，保留NaN/zero padding，
+复用位控遥操的finite target、absolute clamp与可选step clamp语义；未配置hand profile时仍保持旧
+`keyframe_safety_v1_hand_unsupported`。安全anchor现在可原子保存arm pose/qpos与hand qpos，HOLD/FAULT/epoch失效仍复用
+原整组rebase-required生命周期。MuJoCo执行侧又补齐两个不改变默认authority的前置：canonical-desk transform和coupled
+pose→qpos resolver可在派生contract下原值携带already-safe hand qpos；scheduled rig只在arm reference通过
+epoch/generation guard正式激活时，才将同一pending reference携带的DMTAC目标送入gripper transport，HOLD或被替换的future
+reference不会提前影响gripper。即时旧路径仍在publication时入队，纯arm resolver仍保留原contract hash。
+
+CS-6b2c现按opt-in profile冻结multi-group执行语义：保留既有`arms`，新增`left_hand`/`right_hand`；每组可选择不同
+proposal，但下发前必须生成immutable `CompoundDispatchManifest`，精确绑定dispatch context hash、safe-action hash、
+三组selected proposal、generation、component coverage和唯一`target_effective_at`。arm仍由唯一qref
+`ReferenceSegment`表达，position-like hand是同一时刻生效的held target，不伪造三条插值segment。receiver先验证完整
+context/manifest/resolution，再接纳arm target；START时core先校验全部pending group/generation，随后原子提升三组，rig才将
+DMTAC目标送入transport。START前HOLD会同时清除三组pending、receiver reservation和未入队hand target。MuJoCo profile以
+空`compound_hand_action_specs_by_side`保持default-off；启用时要求显式canonical shared safety、scheduled pose execution和
+已有DMTAC q6 profile，暂拒绝replay/composer authority及非DMTAC hand spec。formal sim fixture已覆盖独立VIVE-arm、
+left-Q6、right-Q6 emission→proposal→Arbiter→safety→manifest→guarded activation与HOLD-before-START。
+
+CS-6b2d现补齐sim范围内的causal input/native stream第一段。通用`ReceiverObservationCutBuilder`将任意lower source sample
+保留原sample/payload/measured identity，并增加receiver-local available time、clock和admission evidence；同一未变化样本跨
+cut复用identity。多个arm/hand emission可共享一个recorded `ObservationCutRecord`，各proposal只引用该cut且仍保留独立
+emission/proposal/group身份。v2.4新增纯`NativeStreamContract/SampleRecord/EpisodeManifest`、append-only episode writer与
+validated reader；数据按stable sample ID去重，payload content-addressed，index/contract/manifest带hash，seal后不可追加，
+显式保存valid/stale/drop/gap与measured/available/written clocks。opt-in MuJoCo fixture现同时保存双VIVE pose、双Q6 input、
+sim arm/hand measurement和真正进入DMTAC executor后的command；START前HOLD的command stream保持空。该writer仍是
+subordinate storage primitive，尚未接现有production `CollectionWriterRuntime`/process worker、RGBD/tactile native
+producer或真实deadman/rebase receipt，因此仍不能称完整production数采闭环或
+真机HIL。Inspire/其他灵巧手sim/real driver继续明确后置。
+
+CS-6b2e已把上述primitive以default-off方式接到唯一`EpisodeTraceRecorderSink`生命周期，而未增加episode owner。
+factory只能使用prepared episode的同一UUID和legacy index；release在同一锁内摘取writer，先seal native manifest，再评估
+ControlTrace seal。`native_streams` capability必须与writer同时启用，v2.4 capture commit显式绑定manifest hash，manifest
+store和dataset reader都会复核同UUID、sealed状态及hash。native seal失败时legacy finalize仍完成，但v2.4 commit保持
+`not_eligible`，不得发布半完整episode。正式MuJoCo human-only fixture已验证同UUID/seal/commit/readback；默认commit payload
+与hash保持不变。该slice仍未把高频append接入现有bounded process writer，因此不能从control loop直接做同步文件I/O；
+process protocol、backpressure/drop receipt及RGBD/tactile producer接线是下一独立gate。
+
+CS-6b2f已完成该process gate的低带宽部分：现有`ProcessCollectionWorker`可选接收stream contracts，并为同一episode创建
+parent-side subordinate capture proxy。pose/qpos sample只做有界、non-blocking queue submit；queue busy或inline消息超过显式
+上限时返回typed rejection，proxy在seal前把drop count/reason有序提交给child manifest。child独占native writer，严格要求
+episode UUID/index一致，并禁止native未seal时legacy finalize。该功能无contracts时完全关闭，现有snapshot/legacy writer路径
+不变。它只批准小型pose/qpos等inline payload；RGBD/tactile等大数组不得经pickle queue，仍需复用现有shared-memory snapshot
+transport并建立sample identity映射。顶层GUI/真机profile尚未启用该capability。
+
+CS-6b2g已补齐external payload的纯契约和本地两阶段seal机制，仍保持default-off。capture阶段只登记
+`NativeStreamExternalSampleIntent`，冻结后由既有specialized writer提供dataset-relative locator、logical payload hash、
+artifact hash/size、encoding/compression和durability receipt；native writer逐项复核路径、文件和sample identity后，才写
+sample index并seal manifest。`EpisodeTraceRecorderSink`仅对显式external profile采用
+`freeze → legacy finalize → receipt bind → native seal`；原inline profile仍在release时直接seal，原payload/hash不变。
+validated reader即使不加载payload也会复核external artifact，加载时返回typed locator而不伪装成已解码数组。fake
+video/tactile已覆盖完整receipt、缺失receipt、越界locator与artifact篡改；任一失败只禁止v2.4 commit，不改变legacy
+finalize结果。该slice尚未让现有video/tactile writer实际生成receipt，也未把shared-memory slot映射成stable intent，
+因此不表示production RGBD/tactile已接通。
+
+CS-6b2h已将上述机制接到现有process collection的首个真实specialized artifact，但仍是显式opt-in。当前只支持
+`selected_rgb`：child从既有shared-memory snapshot登记stable source-frame intent，同一源帧跨多个sample复用时只登记一次；
+legacy `LeRobotV21Writer`继续按原顺序写MP4，只有新artifact-report API会在close后fsync并返回文件hash/size及
+`sample_frame_index → video_frame_index`映射。episode release先flush/freeze，legacy finalize成功后把逐sample receipt交给
+原`EpisodeTraceRecorderSink`完成native seal；receipt投影或seal失败不回滚已完成的legacy episode，只令v2.4 commit
+不合格。无contract/binding时finalize、MP4数值/顺序和旧sink调用签名不变，GUI/真机profile未打开。该流严格表示
+decision/sample-selected RGB，不得宣称camera native-rate；原生RGBD与高频tactile仍需各自producer-level capture和artifact
+bundle契约。
+
+下一轮arm pose fusion规划必须单独核对以下缺口后再选实现批次：同一receiver cut上的时钟/新鲜度与history/future
+窗口；source pose到统一reference frame及immutable anchor；平移与SO(3) log/exp的版本化融合规则、奇异/大分歧处理；
+authority/component ownership与strategy context lineage；融合后统一canonical safety、workspace/速度/加速度限制及coupled
+IK顺序；输入缺失、stale、策略异常或source冲突时退回discrete owner还是HOLD的显式gate；以及deterministic replay、
+shadow parity、延迟预算和一次正式admission。hand/gripper仍走独立typed qpos interpolation，不进入arm SE(3)融合。
+
+2026-07-22对pause/episode/human-connected corner case复核后进一步冻结三项边界。第一，source connected只表示输入资源
+可读，不是candidate、authority或接管许可；policy/replay停止后默认留在HOLD，禁止自动human takeover。第二，现有teleop
+`episode_stop`保持capture-only兼容语义，新的mixed formal profile另用`hold_before_unbind`，recorder/episode sink本身永不
+拥有motion lifecycle。第三，human takeover必须是两阶段事务：旧source publication关闭、HOLD/cancel和producer
+invalidation/drain完成后，可在HOLD下转移authority；只有post-takeover fresh human emission、fresh measured state、deadman
+重新武装、retargeter rebase和canonical safety evidence齐备后才允许READY。CS-6a的immediate-READY只保留为synthetic
+fixture证据，不能升级为真实human或policy→human语义；第一批实现限定为root `control_station`纯契约、虚拟source与MuJoCo
+scoped验证，不改teleop/replay legacy执行和episode行为，也不接RTC producer或真机。
+
+该第一批CS-6b0实现现已按上述边界完成scoped落地。`control_station/handoff.py`是纯receipt reducer，不导入model、sim、
+hardware或teleop；MuJoCo bridge只增加一个显式单向`replay→synthetic human`入口，原CS-6a immediate-READY入口与既有
+human/replay submission保持不变。bridge在publication关闭后消费真实HOLD/cancellation ack并推进旧replay producer epoch，
+所以历史proposal只保留为trace fact，不再进入active-epoch arbitration cut；随后在HOLD下完成release/takeover。post-takeover
+human adapter/canonical-safety仅作为non-publishing preview，真实MuJoCo qpos作为fresh measurement；READY后必须由同一emission
+identity/content/timing经原submission seam完成且仅完成一次formal emission/admission。当前deadman/rebase证据仍来自虚拟fixture；
+其后的CS-6b1已增加Station typed operation；CS-6b1f现将device-neutral passive pose接入一个显式、虚拟readiness的
+sim-only formal episode profile，但实际遥操deadman/rebase receipt、真机target和real/RTC接线仍不存在，不能从本轮测试外推为
+production human takeover。
+
+CS-6b1接线前曾有一个必须显式冻结的control-plane选择：现有`release_motion_authority(old)`完成后会把Station正确latch在
+HOLD，而generic reducer在HOLD下禁止`request_motion_authority(human)`；若先请求human，old source的Station状态又仍是active。
+因此不能靠两条现有single-source intent在GUI或coordinator层拼接事务，也不能简单放宽HOLD allowlist。冻结方案是新增一个
+typed、multi-source、multi-phase的`request_human_takeover` operation，将old/target slot、CS-6b0 request hash、lower HOLD/
+invalidation/authority evidence与最终readiness receipt绑定为一次pending operation；该schema现已落地，Web allowlist仍未开放。
+
+该public pure contract现已冻结为CS-6b1a：`StationIntent.subject_id`绑定目标human slot，`resource_binding_id`绑定当前
+non-human active slot，`operation_spec_id`绑定不可变CS-6b0 request/spec hash；`PendingStationOperation`同时冻结两个source的
+先验状态。请求阶段不提前修改任一source状态，只有带aggregate control evidence且terminal status为
+`human_takeover_ready`的唯一completion，才能原子提交old→preflighted、human→active并保持RUNNING。失败只能落到HOLD/FAULT；
+takeover pending期间其他source/target operation被拒绝，HOLD/ESTOP会终止pending transaction，迟到success不得恢复RUNNING。
+这些规则只依赖manifest source capability、target contract和typed identity，不包含MuJoCo、Vive、RM65、dataset或模型分支；
+pure handoff/coordinator/barrier回归已通过。CS-6b1b scoped sim executor也已把既有CS-6b0 transaction接入现有
+SideEffect coordinator与两个publication barrier：pre-request `HumanTakeoverOperationSpec`只绑定source/action/target/observer
+compatibility和timeout，不携带raw action或live epoch；post-result `HumanTakeoverOperationEvidence`聚合真实request/state/receipt。
+readiness provider等待在worker上，最终safety/measurement/READY通过Station pending-finalization CAS提交；若HOLD/ESTOP先赢，
+finalizer不会执行lower READY。无scheduled work但backend已HOLD时使用显式`force_cancellation=True`推进execution epoch并产生真实
+cancellation evidence，不伪造ack。scoped synthetic/replay fixture验证exact一次formal promotion、timeout/stale保持HOLD、late
+completion不复活lower READY。加入passive human ingress后，Control Station、MuJoCo deploy与底层
+authority/epoch/cancellation/owner相关回归共221 passed。
+随后CS-6b1c又在root增加bounded latest-preserving human emission ingress与exception-isolated observer fanout；它只接收既有
+`HumanCommandEmission`并保持exact object identity，不修改`TeleopSession`、retargeter或dispatch。该ingress刻意不实现readiness
+provider：当前真实遥操没有typed post-takeover deadman-rearm和retargeter-rebase receipt，Q6手势`rearmed`不能替代前者。因此
+真实human READY接线在这两个lower receipt落地前保持fail-closed；replay one-emission fanout与canonical GUI pose emission已有
+通用seam，下一步应将CS-6 handoff事务接到现有arm-pose safety/transform/IK target pipeline，而不是为arm qpos mixed增加
+兼容层；hand/gripper qpos component另走其typed interpolation/safety contract。Web allowlist、实际设备、component-aware mixed
+formal episode与RTC仍未开放。
+
+该接线前架构整理现已于2026-07-22完成，并把扩展边界冻结为可复用的窄seam，而不是按设备、模型或backend复制
+composition。`control_station/targets/authoritative.py`只依赖共享`AuthoritativeControlRuntime`，为后续MuJoCo、其他sim与
+real target复用同一Station lifecycle/evidence；`control_station/sources/{replay,policy,rtc_policy}.py`只保存lower-owned
+source binding，不导入具体sim或hardware。exact MuJoCo source/target匹配仍留在现有`composition/mujoco_*.py`，因此新增
+checkpoint、模型server或遥操设备在typed emission seam不变时不新增composition。manifest现统一以`AuthorityStore`作为
+canonical authority epoch source，`DispatchOwnerRegistry`只作为permit enforcement mirror。RobotMotion新增typed execution-
+gate transition outcome、公共gate snapshot和producer activation返回值；sim新增不携带policy/human/replay identity的raw qpos
+measurement seam。CS-6b0已改为消费这些typed结果，不再切片全局trace、读取ack store或直读`rig.scene`。旧import路径、
+`set_execution_gate()`返回值、teleop/replay数据面和入口均保持兼容。Control Station/RTC shadow聚焦回归133 passed，底层
+authority/cancellation/MuJoCo/RTC回归78 passed；周期性边界检查记录在`control_station/README.md`。CS-6b1f sim HIL已在该窄
+seam上完成；仍不得重新引入backend-specific source contract、每设备/模型一文件或第二套queue/cursor/episode owner。
+
+2026-07-21 对并行工作树的集成复核还确认：默认 pose-frame、camera transport/placement 与 collection timing
+profile 已变化，必须以 exact manifest/hash 重新做 artifact preflight。该轮发现的无硬件回归已收口：RM65
+absolute limit 的静态运行时镜像与三个 RL task profile 已改为 active URDF 的 J4 ±2.44346 rad，并由解析 URDF
+的漂移测试锁定；历史 right-J4≈3.10 fallback 已从共享 preview/recovery seed 移除，真实 startup/recovery仍必须
+使用显式 station alignment 或 fresh measured state。M0 typed-receipt marker与foot-pad同poll安全顺序fixture也已更新。
+其后并行sim actuation工作将默认RM65 profile推进到v2，曾造成task config、test expectation和real2sim artifact
+SHA漂移；该漂移已由2026-07-21全量2605 passed、6 skipped关闭。CS-0/RTC/Arbiter/owner/trace聚焦回归保持全绿，
+M5.5/Control Station CS-2的baseline gate已恢复。已commit v2.4 的episode compact和tactile in-place recompress现已在
+任何staging/删除前fail closed，原capture保持byte-immutable；copy-on-write derived maintenance仍是后续能力，
+不能通过重写原commit替代。详细evidence、责任边界和解除条件见landing plan的“并行工作树集成复核”。
+
+状态词统一按 landing plan 使用：`contract complete`、`compatibility seam active`、
+`production authoritative`、`durable capture` 和 `local only` 互不等价；文中“完成”均应结合其限定范围理解。
+
+异步 action chunk 并行边界已完成RTC-4b-T2c live worker/timed-plan synthetic no-action shadow：RTC-1 immutable inference/plan、RTC-2
+deterministic authoritative MuJoCo runner、RTC-3a bounded OS-thread carrier、RTC-3b split sync-parity seam及RTC-3b.5
+single-admission snapshot均完成；显式、默认关闭的RTC-3c profile现已在现有deploy application内组合同一个timed-plan
+owner、worker与正式`PolicyActionEmission` seam；commit-through只在当前popped keyframe形成正式emission后推进。六组RTC
+直接fixture为60 passed，RTC-4a以42个pure/local test冻结scheduler/continuation分轴、capability/envelope/receipt、
+continuous/discrete输出与两个local backend迁移；RTC-4b-A再以28个fake transport/policy test完成现有OpenPI artifact、
+server metadata、exact observation payload、continuous/int64 discrete output和V22 codec的final-chunk离线往返。RTC-1～4b-A
+聚焦回归130 passed；2026-07-22随当前主线复跑兼容矩阵为154 passed、1 skipped，早期evidence中的152 passed、
+1 skipped保留为历史计数；
+默认`run_policy.py`仍同步调用`predict_and_queue()`，RTC profile仅允许`send_actions=false`且RTC-only
+lookahead disabled，`sync_queue_v1` lookahead不变；RTC-3c仍只允许builtin hold。通用RTC协议仍不导入具体
+模型/transport/sim/real backend；OpenPI RTC-4b-A只是首个可替换的 raw-RTC final-chunk adapter并且只声明
+`continuation=none`。T2c的caller-free live composition已保留为证据；随后新增的T3 caller只在 OpenPI 显式
+raw profile 下复用同一 transport/client 接入 shared worker/coordinator，强制`send_actions=false`，不改变默认同步路径。
+RTC-4b-T1/T2a又完成session cancel/close/re-arm、通用connect/metadata/inference/close预算、typed phase receipt、
+fake socket压力矩阵与synthetic final-chunk localhost websocket；该范围无模型/GPU/真实observation/action send，deadline
+不绑定checkpoint/config/action dimension/horizon，也不替代request TTL或worker drain。T2b随后直接复用一个现有
+OpenPI observation→final-chunk loaded model server完成两次synthetic live no-action loopback：两代connection的
+artifact/metadata/layout/horizon一致、metadata hash相同，返回50×16 finite chunk；它无需模型适配且仍是
+`continuation=none`。该模型/checkpoint只是代表性证据，不进入通用启用条件；T2b也尚未接bounded worker/timed-plan、真实
+observation或action send。T2c现已在caller-free synthetic shadow中把现有adapter→worker调用推进到普通OpenPI server：
+组合探针发现immutable prepared payload的嵌套`mappingproxy`不能直接msgpack，现只在transport edge递归`deep_thaw`为
+detached plain containers，内部hash事实、wire字段、模型和sync路径均不变，本地/远端adapter回归各`32 passed`。修复后
+live请求已到`Policy.infer()`，但同机既有训练占用约44/49 GiB显存，首次JIT因额外约2.0 GiB申请失败；RTC按typed fault、
+TTL和FAULT fail closed，30 Hz fault批次901 ticks的control-side wall最大约7.4 ms。GPU释放后又以同一artifact-derived配置
+完成cold-late→warm-accepted：cold约9.85 s只因TTL拒绝，warm约0.687 s将44个future keyframes唯一接纳并丢弃6个obsolete；
+320 ticks无预算超限，零emission/零legacy-pop，worker/transport完整drain且close后plan归零。
+当前完整RTC聚焦回归`172 passed`，OpenPI/default deploy/position/MuJoCo兼容矩阵`160 passed, 1 skipped`；本批没有编辑
+teleop/replay/position路径，RTC profile仍禁用lookahead且默认sync路径不变。
+T2d随后在`deployments.client`增加纯结构化framework composition helper：任意本地runtime、HTTP、websocket或IPC adapter
+只提供instance-derived capability、request spec和worker executor factory，helper在worker创建前协商并精确投影七组
+identity/horizon、核对cadence，再返回未启动frontend。现有OpenPI无需shim；generic/OpenPI聚焦`42 passed`，完整RTC聚焦
+更新为`176 passed`。无自定义session生命周期的backend可直接用无继承`SimpleRtcModelRuntimeAdapter`传入四件套；OpenPI
+这类session-aware框架仍实现同一protocol。该helper没有模型名称registry、observation/target/dispatcher或motion authority；
+OpenPI raw-RTC caller由显式 launcher factory 持有，model-RTC仍不在本批。
+2026-07-23 已将该 caller 接入 `deployments.openpi.client.real` 的显式
+`raw_rtc_final_chunk_15_30_60_120_v1` profile：复用同一 OpenPI transport/client，固定
+`send_actions=false` 与 lookahead disabled，缺少 artifact、normalization/frame identity 或 capability 协商时 fail closed；
+raw-RTC 四文件回归 `82 passed`，仓内 RTC/OpenPI 全集 `213 passed, 1 skipped`，尚无真实 observation/action-send 证据。
+随后授权的real observation no-action shadow已让双臂、两侧DM-Tac gripper和三路RealSense通过现有deploy入口形成
+1200个30 Hz step，并向relative `149999/h50` OpenPI server完成30个non-authoritative final-chunk exchange；没有
+position/lookahead/dispatch/action-send事件。该结果没有开放下一gate：现有10-step validity将cold与warm result全部按
+TTL拒绝，completion-side control最大约`104 ms`，close为`ABANDONED_UNDRAINED`。随后增加的显式
+`rtc_request_validity_steps`/`rtc_worker_stop_timeout_sec`保持10/0默认值不变且非RTC caller不能设置；50-step/2 s复跑
+接纳7个warm result、形成240个唯一formal emission并完整drain，仍为零dispatch。当前唯一实测阻塞是completion-side：
+8/8 completion step超33.3 ms、最大约`101.8 ms`。因此仍须在model-neutral RTC层profile并收敛admission/hash工作，
+再以零budget exceedance复跑no-action shadow。
+T2e再以只读`vla-scratch`基础VLA验证第二框架：基线revision `fa3cb37a6f3ba620bd2c167a97035b5431f31d19`
+保持clean，DexTeleop外置pure processed-sample binding与只依赖既有`infer(dict)`的final-chunk backend。原生ZMQ no-model
+loopback已让2-camera/state输入和4x7 chunk通过generic RTC client，8项local fixture通过；未加载checkpoint/GPU或动作链。
+第二框架暴露的capability/request/response样板已回收到主链`FinalChunkRtcBackend`，VLA层只保留sample校验、调用和row提取；
+3项generic fixture覆盖continuous/discrete、input-hash-before-call和typed cancel。
+该server尚无metadata handshake且依赖dataset推导dimension/warmup，因此只能证明接入摩擦低，真实模型仍需先形成
+artifact-derived camera/state/action/frame/normalization binding，不能把LIBERO默认7D输出猜成DexTeleop action。加入T2e后
+完整RTC聚焦矩阵为`187 passed`，既有兼容矩阵仍为`160 passed, 1 skipped`。
+T2f现已补齐其中不依赖checkpoint的dataset/sample部分：纯`dataset_interface.vla_scratch`从v2.3 artifact派生ordered
+camera、layout/chunk/frame identity与processed sample spec；完整fixture以`front/left_wrist/right_wrist`、左右pose7加双侧
+连续q6末端组成26D state/action和4-step chunk，并由未修改基线`ToDataSample`接受。上述数值均来自fixture artifact，不是
+adapter常量；discrete channel、未契约的state transform与padded tail因当前baseline无法无损表达而fail closed。两仓环境
+依赖不重合部分保留在后续additive dataset plugin/进程边界处理，不修改基线依赖。新增5项后同口径RTC聚焦矩阵为
+`192 passed`；仍未读取真实episode、加载VLA checkpoint/GPU或接入action链，下一VLA gate需兼容训练artifact、normalization
+digest和decoder后才能进行loaded-model synthetic no-action。
+随后T2g在未修改的vla-scratch虚拟环境中完成独立进程virtual-policy wire probe：server进程由原生
+`ServePolicy`承载一个确定性的virtual `BasePolicy`模型实例，client进程使用原生`ZmqPolicyClient`；三相机/1×26
+state进入server并返回4×26 finite chunk。这里没有两个模型 policy：`ServePolicy`是包装层，`ZmqPolicyClient`是传输层。
+该结果确认两仓依赖不重合不阻塞server-client；combined environment只属于可选同进程训练plugin，不属于RTC gate。
+caller-free RTC-4b-B1 remote source seam也已完成：独立Pi0/Pi0.5 hard-prefix sampler与
+`Policy.infer_rtc()`默认关闭，原sampler/infer/server未改，相关pure/fake测试16 passed、2 deselected，V22回归10 passed、
+3 skipped。带discrete token输出的model-RTC continuation在typed discrete prefix/receipt之前fail closed。其后可选门槛
+RTC-4b-B2才是capability-driven模型侧prefix→suffix continuation接线与可验证conditioning receipt：能力必须由loaded model instance、artifact、
+transform、norm stats和实际sampling参数生成，不得绑定某个checkpoint/config/horizon/dimension；RTC default-off，legacy
+`Policy.infer()`与sampler保持独立原路径。真实observation/transport shadow仍属RTC-6。Control Station只
+显示和编排该producer，不得自行predict、merge或pop，也不得把local virtual dry-run显示成real shadow或motion ready。
 
 ## 结论
 
-需要调整项目结构，但不建议现在进行大规模目录搬迁或重写。当前项目已经具备不少关键基础：
+当前方向不需要推翻。以下基础应继续作为唯一事实来源：
 
-- robot_motion 中已有统一动作语义、Rig、因果历史、安全过滤、位置控制。
-- dataset_contracts 已有 v2.2/v2.3 的策略输入输出和时间因果约束。
-- teleop_runtime 已有正式 GUI 真机 teleop、headless 兼容数采和 policy deployment；
-  `RuntimeKernel` 目前仍是 experimental，不作为生产入口。
-- sim 已有 MuJoCo、CubeLift、快速执行器和向量化雏形。
+- `robot_motion.action.RobotAction` 的统一动作语义；
+- `robot_motion.runtime` 的 Rig、dispatch receipt、生命周期和因果历史；
+- `robot_motion.deploy` 的 policy artifact、v2.3 表示适配、chunk transaction 和 canonical deploy seam；
+- `robot_motion.position_control`/`robot_motion.rm65` 的 reference、IK、trajectory、command 和 safety 语义；
+- v2.3 的 absolute pose storage、relative model view 和严格 causal snapshot 契约；
+- GUI/headless 已共享的 `TeleopSession.dispatch_command()` 与 writer 生命周期；
+- sim/real 共用纯 contract、分别持有 backend adapter 的依赖方向。
 
-第一批收敛已经完成了 record 生命周期和 human/headless 的最终 dispatch seam；随后又把
-policy loader、v2.3 表示适配，以及更完整的 policy stream 状态继续抽到了
-`robot_motion`。当前仍没有形成一个真正统一的：
+需要修正的是此前规划中仍然存在的三个隐含假设：
 
-> 人类动作 / 模型动作 / replay 动作 → 统一仲裁 → 统一安全与控制 → sim/真机执行 → 统一轨迹记录
+1. 系统只有一个策略实例和一个 action chunk queue；
+2. RGBD、policy inference、action proposal 和 Arbiter 共用一个 15 Hz 时钟；
+3. 单进程运行方式可以作为逻辑 contract 的一部分。
 
-这里的“统一轨迹记录”不能只保存最终发送给 Rig 的一个 action 向量。数采时必须在控制 cut内实时保存每个 action component 的来源、proposal、选择结果、安全修改、command lineage和 measured 对齐关系；否则后续无法可靠区分 DAgger 的 expert label、policy intent、人工接管和真正执行的行为。
+还必须准确限定当前的本体通用性：**DexTeleop 已经具备本体无关的控制协议骨架，但当前 canonical
+action/execution v1 仍是 RM65 左右双臂形态；系统对 contract-compatible embodiment 可替换，尚不是任意
+本体无关框架。** 首个真机候选继续固定为 `m6_candidate_policy_arm_qpos_v1`，不在该路径上重构
+`RobotAction`、26D/38D policy layout、RM65 safety 数值或公开兼容列。真机前只建立禁止新增泄漏的泛化
+防火墙；任意 payload、任意 DOF 和 manifest-driven builder 的重构由第二种明确本体驱动。
 
-这正是 DAgger、human-in-the-loop RL、真机 RL 后续会遇到的核心问题。
+另有一个当前必须作为发布策略处理的工程事实：现阶段稳定的双臂 coupled IK 验收上限约为 60 Hz；当前
+**DexTeleop production decision policy v1 将 `ActionArbiter` 的 authoritative 动作决策发布率限制为不超过
+60 Hz**。二者需要同时写入 execution manifest，但不能混成同一个时钟或同一个代码级限制。Arbiter 上限
+只属于当前 production decision profile；sensor、policy/proposal、reference、IK、command、backend/physics
+和 recording clock 仍然独立，不复用这个校验。具体 control domain 是否能在某个 reference/IK/command
+profile 下稳定执行，由单独版本化的 `ExecutionCapabilityProfile` 和时延证据决定。未来 hand-only、
+joint-space 或经验证可接受更高 keyframe rate 的 embodiment 若需提高 Arbiter 上限，必须发布新的
+decision-rate policy、execution capability、验收 fixture 和 release note，不能通过临时 CLI flag 绕过 v1。
+高于 60 Hz 的 producer 结果在下一次合法 decision cut 被归并消费，更高频下游可以继续持有、重采样或
+展开当前 selected action。
 
-因此当前应继续做边界收敛，而不是再增加新的控制入口。正式接入模型前，仍需要冻结控制语义和数据契约；工作树中的其他并行修改不属于本次架构收敛范围。本轮暂不实现 sim frontend，sim 只保留为后续复用约束。
+目标架构应调整为：
+
+> 在统一的因果观测时间线之上，允许任意数量、不同频率的 human、policy、replay 和 scripted
+> producer 产生版本化 context 或 absolute `RobotAction` proposal；所有 proposal 经过唯一的
+> authority/ActionArbiter 和 canonical execution pipeline，最终进入每个 control domain 唯一的逻辑执行出口，
+> 并以 component-level lineage 写入统一 ControlTrace。v2.4 数据集将这条时间线作为训练事实层，
+> 同时保留 v2.3 的 absolute/relative pose 语义，并支持多来源 action、多频率 modality、reward、
+> DAgger、快慢策略、真机 RL 和 sim2real 的可重放训练视图。
+
+最终交付目标不是单向“把 action 发给机器人”，而是可重复迭代的闭环：多种遥操设备、policy、replay
+产生 proposal 并控制目标 embodiment；同一运行时原位采集 observation、全部候选/选择/执行和 outcome；
+sealed capture 生成可审计 TrainingView；learner 输出带完整 provenance/compatibility contract 的 policy
+artifact；artifact 再经 deployment preflight、shadow 和 authority gate 回到同一控制链继续采集。更换遥操
+设备或机器人 backend 时不重写 Arbiter、ControlTrace、TrainingView 和 learner 接口，只替换显式
+source/embodiment adapter 并重新做 compatibility/safety 验收。
+
+这里“允许任意数量、任意频率、任意部署位置”是 contract 能力，不代表近期要实现一个通用分布式
+计算框架。最佳落地路径仍是：先冻结拓扑无关 contract，用单策略证明行为兼容，再用 synthetic
+快慢策略验证多速率，之后接 deployable sim 和真机 shadow。
 
 ---
 
-## 一、当前项目结构判断
+## 一、当前代码基线与准确边界
 
-| 模块 | 当前状态 | 判断 |
+### 1. 当前正式入口
+
+- GUI human teleop 与正式数采：
+  `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui`
+- headless/兼容数采：
+  `python -m teleop_runtime.collection`
+- 真机 policy deployment：
+  `python -m teleop_runtime.deploy`
+
+`teleop_runtime.collection` 继续作为 headless/兼容 frontend，不发展第二套 GUI/control semantics；
+`teleop_runtime/core/kernel.py` 仍为 experimental；`robot_motion.deploy.DeployRuntime` 和
+`deployments.client.DeploymentClientRuntime` 仍是窄 scaffold，不是 production loop。
+
+### 2. 已经可以直接复用或已完成 contract 落地的实现
+
+截至 2026-07-19，需要区分“已有 production owner”“已接 production 兼容 seam”和“只有 additive
+contract/test”三种状态：
+
+| 当前模块 | 已有事实能力 | 当前接入层级 |
 |---|---|---|
-| robot_motion | 已抽出 `action`、`runtime`、`deploy`、`position_control` 和 RM65 耦合规划；拥有 RobotAction、通用 contracts、policy stream、canonical action、位置/IK/安全语义 | 继续作为 sim/真机共享的控制语义层；下一步只补 proposal/arbiter/trace，不重复抽 control loop |
-| teleop_runtime | 仍负责真机数采、TeleopSession、硬件观测、启动/恢复、fault/hold、position executor 和部署 frontend；入口文件仍较大 | 保留真机编排职责，不应成为 sim 依赖；逐步改成共享 core 的 composition layer |
-| sim | MuJoCo/CubeLift/VectorExecutor 已存在，但任务和动作维度强绑定 | 目前更像仿真验证和 RL embryo，还不是完整 deployable sim |
-| deployments | 有 OpenPI client、模型握手和 artifact 元数据 | 可以作为模型服务/策略客户端层 |
-| dataset_contracts | schema 较完整，有 v2.2 PolicyIOLayout、v2.3 因果快照 | 还缺统一控制时间线、跨 source provenance 和按 component 的 action attribution |
-| dataset_interface | 有 PolicyIO batch、图像和 state pipeline | 还缺多模态、时间窗口化的统一轨迹接口 |
-| model | 当前没有真正的训练/策略/rollout 包 | 必须新增 |
-| umi_runtime | 当前基本为空 | 不建议直接作为通用学习框架入口，除非明确其职责 |
+| `tests/fixtures/control_core/*`、`tests/test_control_core_baseline.py` | v2.3 单策略 relative decode→safe action→command、dry-run dispatch、position keyframe、入口调度与 `last_action` 基线 | M0 无硬件 golden baseline；不是硬件 acceptance |
+| `dataset_contracts.canonical_encoding`、`robot_motion.runtime.{identity,control_admission,producer_epoch,observation_cut}` | canonical hash、runtime fact ID、receiver-side committed admission、producer epoch、ObservationCut record/bundle | M1A additive contract；除后续 shadow 使用外未成为全局 observation hub |
+| `robot_motion.deploy.observation_view`、`PolicyDeployRuntime` | artifact-bound `PolicyObservationView`、strict actor input、sanitized object-policy compatibility | M1A.5 已接当前 policy deploy prediction；GUI/collection 不是 policy actor caller |
+| `robot_motion.deploy.{inference,chunk_plan,async_producer}`、`deployments.client.{rtc,rtc_executor,rtc_transport}`、`deployments.openpi.client.{rtc,transport}`、`sim.mujoco.deploy.rtc_policy`、RTC deploy compatibility frontend | immutable async inference request/result、target-time mutable plan/merge、single-admission producer snapshot、单due-keyframe pop、emission后current-only commit、deterministic authoritative sim、session-bound bounded OS-thread carrier、model-neutral capability/executor/deadline与OpenPI final-chunk/transport映射 | RTC-1～4b-T2c scoped已落地；默认sync，显式RTC仍仅builtin-hold/no-action。T2c已完成immutable→wire thaw、live worker、cold TTL拒绝、warm 44-keyframe single admission、零emission/legacy-pop与完整drain。正式trace、真实observation、M1C execution drain、real shadow和authority未接 |
+| `robot_motion.deploy.action_adapter`、`PolicyActionEmission` | 同一次正式 queue pop 产生 pre-safety absolute `RobotAction`、source validation、chunk/inference/effective-time lineage | M2 已接 deploy queue-pop seam；legacy canonical safety/command 仍是执行 owner |
+| `robot_motion.action.{proposal,snapshot,authority,candidate_authorization,arbitration_input,arbiter,arbitration_runtime,persistence,safety,authoritative_control}` | immutable proposal、完整 arbitration input、target-specific candidate authorization、pure Arbiter、publication gate、per-group persistence、typed safety 与 backend-neutral authoritative orchestration | M1B contract 完成；M3 shadow 与 M5.5a–c policy/replay/cancellation deployable sim 已复用，real frontend 尚未接 authority |
+| `robot_motion.runtime.cancellation` | execution epoch、group generation、worker guard、ack/deadline contract | M1C fake-worker + M5.5c MuJoCo software-queue/hold scoped integration；real reference/command/SDK worker 未接 |
+| `robot_motion.runtime.{dispatch_owner,dispatch_seam,dispatch_inventory,worker_drain}` + `teleop_runtime.backends.arms.{rm65_dispatch_call,rm65_control_dispatch_call,rm65_dispatch_inventory,rm65_worker_drain}` | 同进程 owner token、motion/safety/lifecycle permit、handoff、纯 final-call gate/legacy callback adapter、不授予执行权的 profile-specific seam inventory，以及逐participant旧epoch drain证据 | M1D/M5.8-a fake-backend + M5.5a–c MuJoCo motion/safety-control seam；首个arms-only候选已有16条typed seam和三个scoped-unbound drain participant。joint-target三类语义及七条stop/start/cleanup SDK seam已有真实函数内default-off typed adapter，共10条标记`pure_wrapper_validated`；production未注入provider、其余6条仍unwrapped、worker无receipt，因此评估仍明确`legacy_mediation_ready=false`、`confers_execution_authorization=false` |
+| `robot_motion.action.{execution_shadow,keyframe_safety,safety_anchor,execution_target,reference_segment,safety_migration}` + policy/human safety shadow | 纯 proposed persistence→显式 shared safety→immutable command-intent evaluation；显式 anchor/profile 的 pose/qpos keyframe safety adapter；按 group/epoch/generation 的 previous-safe-committed/measured-rebase 生命周期；ordered segment endpoint、receiver admission/guarantee、terminal 与 target-time-aware pending/effective anchor timeline；分M5.8-a/M5.8-b/M6且带证据的per-profile migration gate；policy legacy-aligned numeric 双算；human exact legacy-filter evidence/pose/qpos pure parity | M5.7a/b/e1/e2-a、M5.7c1/c2、M5.7d-a/b和M5.7f pure gate contract已接；首个arms-only profile已有绑定manifest/inventory的scoped matrix，只签署M5.8-a inventory ready，所有included rule在M5.8-b/M6仍逐条blocked。scheduled MuJoCo receiver已有canonical admission/anchor/reference lineage，legacy real worker仍仅有non-authoritative observation；无真机shared segment/permit/backend owner；measured divergence阈值、hand safety、human position-backend lineage和pose/per-tick IK reference尚未完成 |
+| `teleop_runtime.deploy.arbiter_shadow` | passive single-policy proposal→snapshot→pure Arbiter→`ArbitrationEvaluation`，并与 legacy execution 分型 | M3 已接 `run_policy.py`，默认 off，且与 `--send-actions` fail closed；只写 debug event |
+| `dataset_contracts.{v24,control_trace,completeness}`、`teleop_runtime.control_trace` | event registry、M3/M5 explicit record schema、六个分作用域 profile、branch/per-lineage completeness、episode membership provenance、logical envelope 与有界内存 journal | M4A.1 contract/test；M5 opt-in GUI human shadow 默认只接 subordinate runtime journal，formal capture 需显式组合 M4B.2 sink |
+| `dataset_contracts.{control_trace_episode,control_trace_wal}`、`teleop_runtime.control_trace.{episode,episode_manifest,spool,health_ledger,sink}` | per-episode range/dependency/seal/commit、subordinate owner seam、atomic manifest publisher、canonical WAL、durable ack/high-water、FIFO release barrier 与 torn-tail recovery | M4B.2a/b human fixture及CS-2b-c dataset-backed replay formal fixture；seal-before-commit已验证，production builder尚未attach，任意crash点/长稳/目标机验收与policy formal profile仍未完成 |
+| `dataset_interface.control_trace` | committed seal/session-WAL locator、range/dependency/membership/hash 校验、可重建 `ShadowEvaluationView` 与 authoritative variable-dt `ActualDecisionView` | M4C.1 + scoped M4C.2；deterministic与真实`MujocoScene + actuated rig` formal fixture均已seal/commit/read；seal后无commit默认拒绝、审计模式可重建；不写Parquet cache，production composition仍未验收 |
+| `teleop_runtime.action.{human_proposal,human_shadow,human_shadow_frontend,human_position_shadow}`、`TeleopSession` passive hooks | strict human action adaptation、同一 emission 的 pre-filter/post-dispatch lineage、typed backend receipt preservation、position transport-target→audit pure join、profile-derived identity/component/spec、shared-Arbiter evaluation和bounded observer queue | M5/M5.7d canonical GUI arm/Inspire默认关闭wiring；pose/qpos limiter parity与position pure binding已有，production position-audit async join/ControlTrace未接；legacy owner不变，DMTAC session外分支fail closed |
+| `robot_motion.deploy.{policy_node,context,topology_runtime}`、`robot_motion.action.composition`、`sim.mujoco.deploy.async_topology` | transport-neutral node protocol、receiver-admitted context/internal composition input、同-cut context/input freshness gate、target-time snapshot、component union/qpos bounded residual、typed composite lineage与确定性受限 async completion queue | M5.2 pure harness + M5.5d 10/40/30 Hz deterministic fixture + M5.5e1 latency/jitter/deadline/cutoff/restart/burst/HOLD fixture；无 production PolicyGraph、OS/GPU worker scheduler、distributed binding、dispatcher 或 action queue owner |
+| `dataset_contracts.replay`、`dataset_interface.replay`、`robot_motion.replay.{proposal_source,compatibility,control_trace}`、`teleop_runtime.action.{replay_binding,replay_proposal,replay_shadow_frontend}` | replay mode/action-stage/schedule、typed source/target contract、三态 binding assessment、scoped eligibility、execution authorization、canonical replay proposal | M5.3/M5.3a complete；M5.3b GUI passive consumer 保持 legacy owner；M5.5b 仅 sim authority 已接，真机未授权 |
+| `teleop_runtime.collection.CollectorSample`/`LeRobotV21Writer` | 单主表 row、外置 video/tactile/depth、v2.2 layout 与 v2.3 pose/causal 校验 | 当前正式 dataset owner 基础；尚未挂 v2.4 ControlTrace sink |
+| `robot_motion.position_control`、`teleop_runtime.position_control.PositionDeployExecutor` | causal resampling、reference/IK/trajectory/command 和 real position execution | 当前 legacy execution owner 的下游能力；尚未消费 authoritative Arbiter decision/epoch permit |
+| `sim.contracts.TimingSpec`、`sim.mujoco.{actuation,deploy}` | 独立 timing 字段、既有 actuated position sender/plant、per-node state ObservationCut/action adapter、policy topology、scheduled qref receiver/reference lineage 与 shared authoritative runtime binding | M5.5a–e scoped 接入；scheduled profile已有canonical segment/admission、active/pending generation、target-time anchor和120 Hz planner-command lineage，immediate profile不伪造segment；deterministic与真实MuJoCo formal fixture、START前HOLD和seal-before-commit恢复已验证；OS/GPU worker和pose/per-tick IK reference仍未验收 |
 
-已有设计文档其实已经指出了正确方向，尤其是：
+### 3. 当前仍未统一或尚未接入的事实
 
-- [sim/STRUCTURE_PLAN.md](/home/zc/HandMotion/Developing/DexTeleop/sim/STRUCTURE_PLAN.md)
-- [sim/SIM_ENV_TODO.md](/home/zc/HandMotion/Developing/DexTeleop/sim/SIM_ENV_TODO.md)
-- [sim/REAL2SIM_SIM2REAL_TODO_TMP.md](/home/zc/HandMotion/Developing/DexTeleop/sim/REAL2SIM_SIM2REAL_TODO_TMP.md)
+- `run_policy.py` 仍只构造一个 policy、一个 `PolicyDeployRuntime`、一个 action queue；真实 observation、
+  startup/readiness、fault、position executor 与 legacy dispatch 仍在入口中，没有 `PolicyGraph` 或多实例调度。
+- strict `PolicyObservationView` 已解决当前 deploy actor 的 control-private 泄漏；但 arm/hand/tactile 仍被组装成
+  单一 `DeploymentObservation`，尚无支持多个策略按各自 cut/window 投影的 Temporal Observation Hub。
+- pre-safety absolute `RobotAction` 和 policy proposal 已能在 M3 shadow 中生成；human 的 canonical GUI
+  arm/Inspire 路径可在 M5 opt-in frontend 中从同一次 `TeleopCommand` emission 被动生成 proposal/evaluation，
+  但仍不是 authoritative producer。DMTAC gripper 仍在 `TeleopSession` 外独立下发，启用 shadow 时 fail closed；
+  replay 的 debug policy 与 canonical GUI compatibility owner 现都可从同一次 immutable emission 被动生成
+  `producer_kind=replay` proposal/evaluation；CS-2b-c测试侧composition还可将该GUI worker emission接入MuJoCo
+  authority并formal seal/commit/read，但production GUI与真机仍不是authoritative producer。
+- `ActionArbiter`/`ArbitrationRuntime` 已有 M5.5 sim authoritative caller，但 real production frontend 仍无
+  authoritative publication caller；M3 只运行 non-authoritative evaluation，真机 selected/safe/command/receipt
+  事实仍由 legacy path 决定。
+- M1C/M1D 的 cancellation 与 dispatch-owner guard 已在 MuJoCo authoritative seam 验证 motion/safety permit、
+  execution epoch、pending reference 清除与 software-queue ack；现有 `TeleopSession`、real
+  `PositionDeployExecutor`、Rig/SDK 仍没有校验这些 epoch/token，且 sim 结果不等于真实停止确认。M5.8-a 已新增
+  未接 production 的纯 `DispatchSeamGate` 并完成第一轮调用点 inventory：Rig 只是 logical fan-out，RM65
+  position/impedance 的后台 worker、Inspire retry 和 DMTAC direct bypass 都要求各自最终 pre-SDK gate；一个上层
+  keyframe permit 不能复用于多个高频 SDK tick。
+- shared runtime 不得在M6 owner切换时另建一套registry。当前runtime已支持全量注入并验证同一
+  `DispatchOwnerRegistry/current token/ExecutionEpochRegistry`；部分注入、legacy token或epoch不一致均fail closed。
+  这只是composition prerequisite，canonical frontend还没有production legacy owner/epoch lifecycle。
+- M3 policy 的 `ArbitrationEvaluationEvent` 与 `LegacyExecutionObservationEvent` 仍只进入 debug JSONL；M5
+  human frontend 已把 explicit projector/`ControlTraceRuntime` 挂到 canonical GUI 的 opt-in shadow 路径，并已
+  用显式 recorder composition fixture 验证 episode membership、dataset-local WAL、FIFO release barrier 与
+  seal/commit；production builder 仍未 attach。M5.3b replay GUI 的默认production路径仍只是subordinate
+  RuntimeTraceSession/可选debug WAL；CS-2b-c仅在test-side application composition中复用同一loader/preflight/worker
+  emission与唯一episode owner，并完成replay-specific seal/commit/read，不能据此声称production capture已激活。
+- M4A.1 已对当前 M3 policy-shadow 子集检查 queue-pop emission→source validation→proposal admission、snapshot
+  child、computation/evaluation 和 legacy execution 的 branch/per-lineage 引用与 hash；M5/M5.2 已增加 human、
+  context/composition producer、explicit record/projection 和 fixture，但尚未把 context/composition 纳入
+  branch-aware completeness。M5.3a/b 已增加 replay source/target assessment、eligibility、GUI source-frame/
+  proposal/evaluation 的 lineage fixture；authoritative、DMTAC session 外 human 和 replay post-dispatch
+  safe/command/receipt lineage 仍无 producer/fixture，完整因果时间、
+  stream integrity也未实现。generic/policy formal profile仍显式标记`planned`；replay现只有
+  `deployable_sim_scheduled_pose_to_qpos_station_v1`这一窄profile为`runtime_integrated`，不能泛化为全部replay或real
+  capture。human scoped formal fixture同样尚未production激活。
+- M4B 已把 logical envelope 编码移出 `ControlTraceRuntime.issue()` 的 admission lock；runtime 使用增量
+  accepted/durable high-water，并在锁内只复制 diagnostic snapshot 所需的标量/集合，排序与 fact-ID 物化在锁外
+  完成，避免高频 reader 长时间占用 control-facing admission lock。本地 contention fixture对 256 个小型事实
+  记录 p50/p95/p99/deadline miss，并验证 spool I/O/fsync 只由 storage-worker sink 调用。但
+  该证据不是 formal real profile 的长稳/大 action payload/OS worst-case acceptance；M5 只把相同 sink/worker
+  接成显式 debug WAL，没有 episode owner、formal profile 或 seal。
+- 当前 v2.3 `CollectorSample.action`/parquet 根 `action` 仍是合并动作；没有持久化全部 proposal、selection、
+  safe/reference/command/receipt/measured lineage，也没有 ActualDecisionView、reward 或 transition overlay。
+  M4C.1 已能从 committed ControlTrace facts 重建独立 `ShadowEvaluationView`，但尚未成为 production capture
+  reader，也不覆盖 v2.3 根 `action`。
+- `observation.last_action` 仍按入口保留不同 stage：collection 是上一条 session command 派生 action，deploy
+  是 accepted canonical safe action。它们已被 M0/M1A.5 显式隔离，但尚未进入 v2.4 per-policy view contract。
+- external tactile 仍由主 sample 触发落盘，不能完整保存高于 decision/sample rate 的 native stream；RGBD
+  frame reuse、tactile window 和多速率 stream eligibility 尚未落地。
+- sim 已在 M5.5a–e1 作为 deployable shared control-core backend 覆盖单策略、verified replay、cancellation/hold、
+  deterministic 10/40/30 Hz 快慢 composition，以及受限 async completion/cutoff/restart/burst fixture；scheduled qpos
+  profile已有receiver-side canonical reference admission、active/pending generation和实际120 Hz planner/qcmd lineage；
+  测试侧 deterministic-scene composition 已复用真实 WAL/seal/commit/reader 完成 formal fixture，但不等于真实
+  MuJoCo backend 或 production entrypoint。尚无 production PolicyGraph、真实OS/GPU worker/模型或pose/per-tick IK
+  reference publication。replay proposal 已完成 typed dry-run/core、三态 binding evidence、
+  debug dataset replay passive wiring 和 canonical GUI 默认关闭 consumer/RuntimeTraceSession，但 formal
+  episode/post-dispatch trace 未接且 owner 未迁移；TrainingView、learner/artifact provenance 和闭环再部署
+  均未开始实现。
+- 当前工作树包含大量并行修改，M0–M4A 新文件仍处于本地未提交状态；本文中的“已完成”只表示当前工作树
+  内实现和已运行测试，不表示已合并、发布或通过真实硬件验收。
 
-当前最重要的不是再设计一套完全不同的结构，而是把这些文档中的边界真正落地。
+### 4. 当前频率的真实含义
+
+`PositionControlRates` 已明确 sample/reference/IK/command 字段相互独立。当前代码中至少存在三套 position
+profile：
+
+- library 默认：`15 sample → 75 reference、75 nominal IK → 150 command`；
+- 真机遥操对齐 profile：`15 → 60 reference、60 nominal IK → 120`；
+- compatibility profile：`15 → 45 reference、45 nominal IK → 150`。
+
+`sample_hz=15` 不是全系统主时钟。但当前真机 `PositionDeployExecutor` 的 coupled IK 实际在 reference
+worker 中调用；`dual_arm_ik_hz` 目前是 nominal solver budget，不是独立 scheduler。因而 library 默认的
+75 Hz reference 配置不能被解释为“coupled IK 已在真机 75 Hz 稳定验收”；是否每个 reference tick 运行
+coupled IK 还取决于 action space、collision profile 和 executor 路径。当前 policy deployment 的
+`effective_policy_hz`、action keyframe rate、position executor `sample_hz`、reference rate 和 command rate
+也不是天然同一含义。
+
+因此后续不能再以 `15→75→150` 或 `15→60→120` 代表完整架构。它们只应是运行 profile；其中现有
+`15→75→150` library default 和 `15→60→120` real-aligned profile 都继续按各自 contract 演进，不在本次
+Arbiter 迁移中被静默改值。新增的 production decision policy v1 约束是
+`ActionArbiter.decision_hz <= 60 Hz`，不能借此改写其他链路的频率语义。另一方面，正式启用 coupled IK 的
+real profile 必须单独声明并验收实际 IK call clock；若要得到“60 Hz solve + 75 Hz joint reference
+interpolation”，必须先实现对应的缓存/插值边界，不能只改配置名称假装已经解耦。
 
 ---
 
-## 二、结构性问题与当前收敛状态
-
-### 1. 控制入口已经分层，但还没有统一 proposal/arbiter
-
-当前审计后应将入口分为四类，而不是把它们都视为等价的生产控制循环：
-
-- **正式 human/GUI 控制**：[teleop_runtime/debug/run_vive_rm65_real_teleop.py](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/debug/run_vive_rm65_real_teleop.py)，其控制 step 由
-  [teleop_runtime/session.py](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/session.py) 统一承载。
-- **headless/兼容数采**：[teleop_runtime/collection](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/collection)，复用 `TeleopSession`，不再发展为第二套正式 GUI 控制语义。
-- **正式 policy deployment**：[teleop_runtime/deploy/run_policy.py](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/deploy/run_policy.py)，当前是带真机资源编排的正式 frontend；policy rate、action chunk、v2.3 decode、canonical action 和位置控制的共享语义已有较多部分抽到 `robot_motion`，入口仍负责真机资源与最终执行，不能让 sim 直接复用整个真机入口。
-- **实验/脚手架**：`teleop_runtime/core/kernel.py`、`robot_motion/deploy/DeployRuntime` 和 `deployments/client/DeploymentClientRuntime`，目前不能当作正式入口。
-
-原问题不是入口数量本身，而是多个入口分别持有 observation、action、dispatch、fault、record 的部分所有权。
-前一批已将 GUI/headless 的 writer 生命周期和 `TeleopSession -> Rig` 最终 dispatch 收敛；本轮
-`robot_motion` 又进一步抽出了跨入口可复用的 action/runtime/deploy/position 边界，但
-observation/fault/authority 的跨 human、policy、replay 统一仍未完成。尤其是当前
-`TeleopSession` 中各 retargeter 的 `TeleopCommand` 会在合并后覆盖同名 effector；如果在合并后
-才记录 action，就无法知道某一侧或某个 hand slot 原本来自 human、policy 还是 replay。
-
-当前抽取边界应按下面的事实理解：
-
-- `robot_motion.action` 已有 canonical `RobotAction`、vector codec/layout、source protocol、
-  `RobotActionResolver` 和通用 `ActionExecutor`/dispatcher seam；它们可以服务 synthetic/replay
-  和后续 proposal adapter，但还不是 `ActionArbiter`，`run_policy.py` 也没有被强行改成通用
-  `ActionExecutor`。
-- `robot_motion.runtime` 已有 `TeleopObservation`/`TeleopCommand`、source/backend/retargeter/Rig
-  interfaces、dispatch receipt、lifecycle cleanup、`BimanualRig` 和 causal history；
-  `teleop_runtime` 中相应路径主要负责兼容和真机 composition。
-- `robot_motion.deploy` 已有 `DeploymentObservation`、pose/frame adapter、artifact/session
-  contract、`CanonicalDeployActionPipeline` 和 `PolicyDeployRuntime`。其中后者已经拥有
-  policy-rate、prediction transaction、chunk queue、IK discard、queue pop，并通过注入的
-  preparer 调用 canonical action boundary。
-- `robot_motion.position_control` 和 `robot_motion.rm65` 已承载 reference/command contract、
-  resampling/interpolation、trajectory policy、position audit、coupled IK/collision/hold 等共享
-  语义；`teleop_runtime` 的 `PositionDeployExecutor` 仍是面向真实硬件的 adapter。
-
-所以现在需要补的是“候选 proposal 的并行保留、authority/selection、per-component attribution
-和 ControlTrace”，不是再抽一个 `PolicyRuntime`、`ActionExecutor` 或 position loop。
-
-现在接入 DAgger 后，很容易出现：
-
-~~~text
-人类控制循环 ────────┐
-                      ├── 同时写入真机 backend
-模型控制循环 ────────┘
-~~~
-
-这会带来动作竞争、时间错位、双重安全过滤和无法解释的训练数据。
-
-必须改成：
-
-~~~text
-人类动作 ────────┐
-模型动作 ────────┼── ActionArbiter ── Safety ── Planner ── Dispatcher
-Replay 动作 ────┘             │
-                             └── per-component ControlTrace / lineage
-~~~
-
-目标仍然是整个系统只能有一个最终动作拥有者和一个最终 dispatcher；当前只完成了
-human/headless 路径的 dispatch seam，尚未实现 `ActionProposal`、`ActionArbiter` 和实时
-per-component attribution。
-
-#### 1.1 正式 policy deployment 适配 sim：复用控制核心，不复用真机入口
-
-`teleop_runtime/deploy/run_policy.py` 目前是正式真机应用入口，不是一个可以直接被 sim import
-的通用 runtime。它的 `main()` 仍包含 policy artifact/config 绑定、模型加载、真实机械臂/手/相机
-初始化、ready/fault/hold、startup init、键盘交互、position executor、真实 dispatch 和 debug
-记录；不过 policy observation view、v2.3 decode、policy-rate、prediction transaction、chunk
-queue 和 action preparation 的共享边界已经抽到 `robot_motion.deploy`。即使增加一个 `--sim`
-分支，也会让入口拥有两套资源生命周期和 fault 语义，最终形成另一种“入口内分叉”，而不是复用。
-
-最佳路径是：**继续沿现有 `robot_motion` shared policy boundary 收敛，保留 `run_policy.py` 为
-真机 frontend；未来 sim frontend 只注入自己的 observation source 和 execution backend。** sim 不应直接
-依赖 `teleop_runtime`，因此不能让 `sim/...` 反向 import `teleop_runtime.deploy.run_policy`。
-
-目标结构应是：
-
-~~~text
-real CLI / run_policy.py ───────┐
-                                ├─ PolicyDeployRuntime（robot_motion）
-sim CLI / sim/mujoco/deploy ────┘      ├─ policy schedule / chunk transaction
-                                       ├─ observation pose-mode preparation
-                                       ├─ policy.predict
-                                       ├─ normalize + v2.3 pose decode
-                                       ├─ ActionProposal / ActionArbiter
-                                       ├─ CanonicalDeployActionPipeline
-                                       ├─ shared position/reference clocks
-                                       └─ backend adapter + ControlTrace
-~~~
-
-这里的 shared policy stream 以现有 `robot_motion/deploy/runtime.py` 的
-`PolicyDeployRuntime` 为边界，而不是再新增第三个 runtime。旧的
-`robot_motion.deploy.DeployRuntime` 与 `deployments.client.DeploymentClientRuntime` 仍只是窄
-scaffold/兼容 seam；后续应合并职责或保留兼容 re-export，不能继续各自发展一份 single-step loop。
-
-##### 1.1.1 `run_policy.py` 中哪些逻辑可以直接复用
-
-| 当前逻辑 | sim 处理方式 | 复用判断 |
-|---|---|---|
-| `LoadedPolicy`/`load_policy` 通用 wrapper | 已迁移到 `deployments/client/policy.py` 的无硬件 policy loader，real/sim 注入同一 `PolicyLike` | 复用 loader 契约，不让 sim import teleop_runtime |
-| policy artifact/layout/frame contract 绑定 | 由 shared runtime 接收已解析的 artifact binding；real/sim 使用同一校验 | 复用契约和校验，不复制 v2.3 分支 |
-| `DeploymentObservation` | sim 直接生成同类型 observation，保持 state/image/tactile/last_action layout | 原样复用类型 |
-| `prepare_observation_for_policy_pose_mode` | 使用 sim measured TCP 和同一 `PoseFrameContract` | 原样复用 |
-| `normalize_policy_output` | 同一 policy 输出、chunk shape、layout、padding 规则 | 原样复用 |
-| `convert_normalized_action_chunk_to_absolute` | 使用 sim 当前实测 TCP，固定 chunk anchor | 原样复用 |
-| policy chunk 的预测、替换、padding、sequence | `robot_motion.deploy.runtime.PolicyDeployRuntime`、`robot_motion.deploy.actions.ActionChunkBuffer` | `run_policy` 只注入 policy、clock 和 queue policy；后续 source adapter 提交已解码 proposal |
-| `CanonicalDeployActionPipeline` | safety/filter/resolver 输入仍是 absolute runtime action | 原样复用 |
-| `PositionControlRates`/position trajectory/audit | `robot_motion.position_control`、`robot_motion.rm65`；真机 executor 只做硬件适配 | 原样复用共享语义，不复用硬件 callback |
-| `ArmStateReader`、`build_arm_backends` | 改为 `MujocoDeploymentObservationSource` | 不复用真机实现 |
-| `build_camera_sources` | 改为 scene render/frame provider，使用 sim time 戳 | 不复用 RealSense 初始化 |
-| `PositionDeployExecutor` 的真实 callback | 拆出共享 reference/interpolation 语义，sim 使用自己的 sink | 不直接复用硬件 executor |
-| `dispatch_teleop_command`、CAN/串口/SDK ready 检查 | 由 `MujocoDeploymentExecutor` 生成 sim receipt | 不复用 |
-| startup init/键盘/真实 recovery | 由 frontend/backend 生命周期适配 | 只复用状态语义，不复用实现 |
-| `DeploymentDebugLogger` | 仍由 real frontend 持有；后续抽取 typed event/trace sink | 复用事件契约，不绑定硬件 |
-
-这意味着真正需要复制的只有两类东西：
-
-1. sim 如何从 `MujocoScene` 读取 measured state、TCP、图像和 tactile；
-2. sim 如何把 canonical command 变成 qpos/reference，并返回 receipt。
-
-policy 的输入、relative decode、action chunk、Arbiter、canonical safety 和数据 lineage 都不应
-复制。
-
-其中无硬件的 `LoadedPolicy`、`HoldPolicy` 和 module/file loader 已经迁移到
-`deployments/client/policy.py`；`teleop_runtime/deploy/policy.py` 现在只保留兼容 re-export，
-因此 sim 可以直接依赖 `deployments.client.policy`，也可以注入外部 `PolicyLike`，不需要依赖
-`teleop_runtime` 或 `run_policy.py`。这次迁移保留了现有 replay 所需的 prediction transaction
-方法，没有改变 real deployment 的模型调用语义。artifact pose-mode binding 也已提升到
-`robot_motion.deploy.session_contract.resolve_policy_action_pose_mode_from_artifact()`；
-`run_policy.py` 只保留 raw argv 的“CLI 是否显式指定”判断和兼容 wrapper。real frontend 仍负责
-把 argparse/config 转成输入，不再持有 artifact agreement 的业务规则。
-
-##### 1.1.2 Shared `PolicyDeployRuntime` 的当前边界
-
-当前不再把 `PolicyDeployRuntime` 描述成只完成单步表示适配的“未来 runner”。它已经承载完整
-的 policy stream 状态：policy-rate 判定、prediction transaction、chunk queue、恢复期丢弃、
-queue pop/lookahead，以及通过注入的 `ActionPreparer` 调用 canonical action boundary。它仍然
-不是一个独立生产入口，也不负责 observation source、fault gate、硬件执行或 trace writer。
-
-~~~text
-real frontend observation/lifecycle
-  → DeploymentObservation (immutable control cut)
-  → PolicyDeployRuntime.should_predict(now, interval, min_queue)
-  → PolicyDeployRuntime.predict_and_queue(...)
-       → prepare policy observation
-       → prediction transaction
-       → policy.predict
-       → normalize output
-       → v2.3 relative → absolute decode
-       → chunk queue replace/append
-  → PolicyDeployRuntime.prepare_next_action(
-       preparer=CanonicalDeployActionPipeline)
-       → queued absolute action
-       → injected canonical preparation result
-  → real frontend fault/hold/position/reference/dispatch
-~~~
-
-当前已经落地的共享边界是：`robot_motion/deploy/runtime.py` 中的
-`PolicyDeployRuntime`/`PolicyDeployRuntimeConfig` 统一封装
-`prepare_policy_observation()` 和 `normalize_and_decode()`，前者调用现有
-`prepare_observation_for_policy_pose_mode()`，后者调用现有 `normalize_policy_output()` 和
-`convert_normalized_action_chunk_to_absolute()`。`run_policy.py` 已经通过这个边界完成
-model-view preparation 与 v2.3 decode；同时 `PolicyDeployRuntime` 已接管 policy-rate decision、
-prediction transaction、`ActionChunkBuffer` 生命周期、IK recovery discard、queue pop/lookahead
-和调用注入的 canonical preparer。canonical filter/resolver 的共享实现位于
-`robot_motion.deploy.canonical_action`，但其 real 配置、fault latch、position/reference sink 和
-最终 hardware dispatch 仍由 `run_policy.py` 编排。
-
-因此当前已统一“policy 输入/输出 → 绝对 action → canonical preparation seam”的共享部分，
-但还没有实现 `ActionProposal`、`ActionArbiter`、per-component attribution、统一 observation/
-fault gate、reference sink 和 `ControlTrace` writer。
-
-`PolicyDeployRuntime` 的职责必须限定为 policy stream 与 injected preparation seam，不拥有：
-
-- 真实设备对象、MuJoCo `model/data` 或 GUI/键盘；
-- wall-clock、sleep 或整数频率比假设；clock 由 frontend/backend 注入；
-- 真机 enable/disable、home、servo、emergency stop 或硬件 fault 清除；
-- episode writer 的具体线程实现；未来只向 typed trace sink 提交 event；
-- raw relative action 的几何实现；只调用已有 `pose_adapter`；
-- policy artifact 文件路径的 CLI 解析；只接收已验证的 artifact binding。
-
-旧 `DeployRuntime.step()` 仍只有“单次 predict → prepare → dispatch”的最小 scaffold，缺少
-action chunk、v2.3 decode、prediction rollback、fault/hold、position/reference 和 trace；不能
-把它当作最终 runtime。它已有的 `source/policy/preparer/dispatcher` seam 可继续作为兼容 API，
-但生产 policy stream 统一以 `PolicyDeployRuntime` 为唯一共享实现，不能让两个 runtime 并行演进。
-
-##### 1.1.3 真机 frontend 如何收敛
-
-`teleop_runtime/deploy/run_policy.py` 的最终目标只保留真机 composition 职责；当前已经把 policy
-observation preparation、prediction/queue transaction、output decode 和 queued-action preparation
-委托给 `PolicyDeployRuntime`，而共享 canonical pipeline 的实现也已位于 `robot_motion.deploy`。
-入口仍负责真实配置、生命周期、安全锁存和最终执行，便于保持现有真机行为：
-
-~~~text
-CLI/config/artifact parsing
-  → build real policy client
-  → build RealDeploymentObservationSource
-  → build canonical safety/preparer and real action sink
-  → build real startup/recovery/keyboard/debug observers
-  → PolicyDeployRuntime.run(...)
-~~~
-
-现有真实链路的行为保持不变：
-
-- `ArmStateReader`、hand polling、RealSense source 继续由 real frontend 构造；
-- startup init、ready confirmation、IK recovery 和 manual rearm 仍由真机 lifecycle/adapter
-  提供，并在 real frontend 内形成 readiness/fault/hold gate；不能假设这些状态已经被
-  `PolicyDeployRuntime` 统一拥有；
-- direct/position 两种执行模式仍可存在，但它们都是 `DeploymentActionSink` 的实现；
-- 真机 `PositionDeployExecutor` 中的 arm backend callback、CAN 状态检查和 hold callback 留在
-  real sink，不进入 shared policy loop；
-- 当前 policy output 的 queue、prediction transaction、v2.3 decode 和 queued-action preparation
-  已由 shared runtime 承载；`CanonicalDeployActionPipeline` 的实现由 `robot_motion.deploy`
-  复用，但真实入口仍负责 safety 配置、fault latch、position executor、debug 和 dispatch，
-  不再维护另一份 predict/normalize/queue 代码。
-- `robot_motion.action.ActionExecutor`/`RigCommandDispatcher` 已可用于通用或 synthetic/replay
-  seam，但不应为了表面统一而直接替换当前 `run_policy` 的 real execute 分支；position mode、
-  hand/arm 组合 receipt、hold 和硬件故障语义仍属于 real frontend adapter。
-
-##### 1.1.4 sim frontend 应怎样实现（暂缓）
-
-本阶段暂不实现 sim frontend；以下内容只保留为后续设计约束，不纳入本次迁移和验收范围。
-
-建议新增的是 `sim/mujoco/deploy/` 或 `sim/mujoco/adapters/deployment.py`，而不是
-`sim` 直接调用 `run_policy.py`：
-
-~~~text
-MujocoDeploymentObservationSource
-  ├─ scene.data.time 作为 deterministic observation timestamp
-  ├─ MuJoCo measured qpos/qvel 与 FK TCP pose
-  ├─ scene.render/render_depth 作为带 sim timestamp 的 image provider
-  ├─ simulated tactile/contact（没有则显式 invalid）
-  ├─ last_action 与 state_valid
-  └─ finite/collision/scene readiness faults
-
-MujocoDeploymentActionSink
-  ├─ 接收 canonical absolute RobotAction/TeleopCommand
-  ├─ coupled pose → qpos planner（复用 robot_motion RM65 planner）
-  ├─ PositionReferenceTimeline + JointCommandInterpolator
-  ├─ MuJoCo arm/gripper joint sink
-  ├─ physics tick / command tick scheduling
-  └─ SimDispatchReceipt + measured_state_id
-~~~
-
-sim observation 必须与 real 使用相同的 `DeploymentObservation` 和 observation contract：
-
-- arm `current_qpos` 和 `actual_tcp_pose` 都来自当前 scene measured state；relative policy 的
-  anchor 只能来自该 state，不能使用上一条 target/reference；
-- TCP 必须使用显式 side-specific tool profile 和 `tool_tcp`/arm-base frame，不能因为是 sim
-  就把 controlled body 或 arm_link6 默认为 TCP；
-- camera frame 的 timestamp 使用 `scene.data.time` 或明确的 sim clock，并遵守
-  `latest_not_after_observation`，不能使用真实 wall-clock；
-- 没有 tactile/hand sensor 时必须写 `valid=false`/fault 或按 artifact contract 禁用该 modality，
-  不能填零后伪装成有效 observation；
-- `state_valid`、frame contract hash、policy artifact hash、simulation contract hash 都进入
-  observation metadata 和 ControlTrace。
-
-sim action sink 的关键是复用已有语义、替换 backend：
-
-1. `CanonicalDeployActionPipeline` 仍先产生带 safety metadata 的 absolute `RobotAction` 和
-   `TeleopCommand`；它不直接写 MuJoCo qpos。
-2. Cartesian arm command 进入 group-level `RM65CanonicalIK`/
-   `RM65PositionCollisionPlanner`，保持与真机 position path 相同的 coupled、frame、joint-limit
-   和 hold 语义；不能让左右臂各自调用一个独立 IK 后再拼接。
-3. planner 的 `q_ref` 进入已有 `PositionReferenceFrame`/`ReferenceTimeline`，由
-   `JointCommandInterpolator` 生成 profile-defined command tick；sim physics 只消费最终
-   qcmd/reference，不在 physics loop 重新做 policy、relative decode 或 authority decision。
-4. `MuJoCoArmBackend` 可以作为已经规划好的 joint-vector leaf sink；它不能接收 raw
-   `cartesian_pose`，仍由 group planner 先完成 pose→qpos。
-5. 现有 `DirectQposDebugController` 只作为 `task_native/debug` 或早期 kinematic bridge，不能
-   被标成 deployable sim 的默认 policy executor。它不模拟真实 servo/target tracking，且会绕过
-   deployable position-control 语义。
-
-##### 1.1.5 sim 与 real 的复用验收标准
-
-不能以“两个入口都能调用 `policy.predict`”作为复用完成。至少要验证以下等价关系：
-
-| 阶段 | 要求 |
-|---|---|
-| artifact binding | 同一 policy artifact、layout hash、pose chunk/frame contract 在 real/sim 都通过同一校验 |
-| observation | 同一 state layout、frame、last_action、causal cutoff 和 validity 语义 |
-| v2.3 decode | 给定同一 observation/anchor/chunk，relative→absolute 的结果逐元素或按 SE(3) tolerance 等价 |
-| chunk scheduling | 同一 policy/reference profile 下，keyframe、padding、queue replace/append 结果一致 |
-| safety | 给定相同 absolute observation/action，`CanonicalDeployActionPipeline` 的 filter/result 一致 |
-| arbitration | 同一 proposal snapshot 的 selected source、decision reason、component mask 一致 |
-| position | reference/IK 的 contract、epoch/sequence、lineage 一致；qcmd 允许 backend 数值差异但必须可解释 |
-| execution | real 产生 hardware receipt，sim 产生 `SimDispatchReceipt`，二者都能关联 command/reference/measured id |
-| data | ControlTrace 字段一致；sim 不因没有真实 SDK 而退回只写一个 action vector |
-
-推荐的 golden test 是：同一 `DeploymentObservation` 和同一 policy output 分别经过 real/sim
-前端的 shared runner，比较 `policy model view`、decoded absolute action、safety result、
-proposal/decision lineage；只有最后的 backend receipt 和 measured state 允许不同。之后再用
-实际 MuJoCo observation 做 deterministic replay，验证不存在“sim 一套相对 anchor、real 一套
-相对 anchor”的隐性分叉。
-
-##### 1.1.6 分阶段落地顺序
-
-1. **[已完成] 抽出 policy representation 与 artifact binding。** 已从 `run_policy.py` 抽出
-   model-view preparation、normalize/decode 和 artifact pose-mode agreement；由
-   `robot_motion.deploy.runtime.PolicyDeployRuntime` 与
-   `robot_motion.deploy.session_contract` 调用现有实现。无硬件 policy loader 也已移到
-   `deployments/client/policy.py`，旧 import path 仅作兼容 re-export。
-2. **[已完成] 抽出真机 policy stream 状态。** `PolicyDeployRuntime` 已接管 policy-rate decision、
-   prediction transaction、chunk queue replace/append、IK recovery discard、schedule reset、
-   queue pop/lookahead 和注入的 canonical-preparation seam；`robot_motion.deploy.canonical_action`
-   提供可复用的 filter/resolver 实现。`run_policy.py` 继续持有真机 lifecycle、fault/hold、safety
-   fault latch、position executor、debug 和 hardware dispatch。
-3. **[下一步] 收敛 real frontend 的剩余编排。** 把 observation source snapshot、readiness/fault
-   gate、startup/recovery 状态和 position/reference sink 逐一整理成真机 frontend adapter；不把
-   硬件对象、wall-clock 或 operator keyboard 放入 `robot_motion`，也不在本阶段实现 sim。
-4. **[下一步] 接入 ActionArbiter 与 attribution。** 在已解码的 absolute `RobotAction` 和
-   canonical preparation 之间生成 proposal；先记录 raw model-view、decode anchor、selected
-   source 和 per-component lineage，再切换执行权。
-5. **[后续] 真机 shadow 与人工接管。** 先 policy shadow，再显式 human override；policy-only
-   需要在 ActionArbiter、ControlTrace 和安全验收完成后另行开启。
-
-因此，sim 不是 `run_policy.py` 的一个新 backend flag，而是同一个 shared policy-control core
-的另一个 frontend/backend 组合。复用比例最高、边界最清晰，也符合 `sim` 不依赖
-`teleop_runtime` 的目录约束。
-
-### 2. RuntimeKernel 仍不能直接晋升为共享内核
-
-[teleop_runtime/core/kernel.py](/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/core/kernel.py) 的思路可以作为实验参考，但它现在有三个限制：
-
-- 位于 teleop_runtime，sim 无法自然依赖它。
-- 一个 step 只有一个 RobotActionSource，不能表达 human/policy/replay 同时存在时的 authority。
-- 没有明确区分 policy rate、human input rate、reference rate、command rate 和 physics rate。
-
-因此当前不把它接入正式 GUI、headless 或 deploy loop，也不把它与 `TeleopSession` 并列为第二套生产状态机。
-
-共享部分确实应继续位于 `robot_motion`，但当前不应把 `RuntimeKernel` 整体搬过去，也不应
-因为 `robot_motion/runtime` 已经存在就立即新增一套 kernel/scheduler。当前已经抽出的基础边界是：
-
-~~~text
-robot_motion/runtime/
-├── contracts.py       # TeleopObservation/TeleopCommand/effector contracts
-├── interfaces.py      # source/backend/retargeter/Rig protocols
-├── dispatch.py        # receipt/error contracts
-├── lifecycle.py       # startup/cleanup failure aggregation
-├── causal_history.py  # causal observation history
-└── rig.py             # shared BimanualRig/CompositeRig
-~~~
-
-后续只有在 `ActionProposal`、authority、scheduler、ControlTrace 契约冻结后，才评估增加
-`scheduler.py` 或 `trace.py`；proposal/authority/arbiter 属于 `robot_motion.action`，不放回
-`teleop_runtime/core/kernel.py`。`teleop_runtime/core` 继续作为 experimental/synthetic 兼容层，
-不能与 `TeleopSession` 或 policy stream 并列为第二套生产状态机，也不能让 sim 反向依赖
-`teleop_runtime`。
-
-### 3. 当前 sim 控制流还不是 deployable policy 控制流
-
-当前 [sim/mujoco/tasks/cube_lift/env.py](/home/zc/HandMotion/Developing/DexTeleop/sim/mujoco/tasks/cube_lift/env.py) 大致是：
-
-~~~text
-7D task action
-    → DirectQposDebugController
-    → MuJoCo scene
-    → 31D privileged observation
-~~~
-
-这对于 CubeLift 的任务调试和快速 RL 是合理的，但它与真机部署仍不是同一条语义链路：
-
-- action 是 task-local 7D。
-- observation 包含 privileged state。
-- 控制器是 direct-qpos。
-- [sim/mujoco/runtime/cube_lift_vector.py](/home/zc/HandMotion/Developing/DexTeleop/sim/mujoco/runtime/cube_lift_vector.py) 仍然硬编码动作和观测维度。
-- 没有统一使用 DeploymentObservation、PolicyIOLayout 和完整的 CanonicalDeployActionPipeline。
-
-建议保留当前 CubeLift 快速路径，但明确标记为：
-
-~~~text
-task_native / privileged / non_deployable
-~~~
-
-同时新增一条 deployable sim 路径：
-
-~~~text
-MujocoObservationProvider
-    → DeploymentObservation
-    → PolicyIOLayout adapter
-    → RobotAction
-    → CanonicalActionPipeline
-    → MuJoCo Rig/backend
-~~~
-
-这样才能真正验证“同一个 policy artifact 是否可以切换 sim 和真机”。
+## 二、必须长期保持的架构不变量
+
+1. **每个 control domain 一个执行事实源。** producer 可以很多，但每个 `control_domain_id` 只有一条
+   authority、canonical safety/planner/reference 链和一个逻辑 dispatch port；任何 policy node 都不能
+   直接调用 Rig、MuJoCo actuator 或硬件 SDK。vector sim 可批量承载多个 domain，但不能共享 authority 状态。
+2. **proposal 统一到 absolute `RobotAction`。** raw model vector、relative action、human clutch delta、
+   replay row 都在各自 source adapter 内转换；Arbiter 不做 frame/anchor/SE(3) 解码。
+3. **观测、proposal 和执行全部因果。** 所有 cut 只能使用 source timestamp 与 available timestamp
+   都不晚于 causal cutoff 的数据；远端晚到结果不能回写过去。
+4. **模型边界位于 Arbiter 之上。** actor 只看到其 artifact 声明的 observation/context；selected owner、
+   safety clamp、IK/fault、command、reward 和 trace metadata 默认不可见。
+5. **安全反射不可参与普通竞争。** 触觉 policy 是 proposal producer；过力、碰撞、失联、hold 等硬安全
+   是 Arbiter 后的 veto/modification 或独立高优先级安全状态。
+6. **component attribution 与控制同 cut 生成。** 不能从最终 command 数值反推 human/policy 来源。
+7. **v2.4 事实层使用显式 `selected_action` 表示 authoritative Arbiter 统一后的 canonical intent。** shadow
+   只产生 `ArbitrationEvaluation`/`would_select_action`，不得填充 authoritative `selected_action`。safety/reference/
+   command/receipt/measured 等下游事实另存并默认对 actor 不可见；裸 `action` 只允许由带
+   `action_stage` 的 materialized/training view 映射生成，不得在事实层同时表示 intent 和 hardware
+   behavior。事实层不指定任何默认训练 target。
+8. **逻辑拓扑与部署拓扑解耦。** 单进程、IPC、共享内存、远端 RPC 只更换 transport adapter，不改变
+   ID、时间戳、validity、action 和 trace contract。
+9. **不要求整数频率比。** 调度、因果选择和重放基于 timestamp/deadline，不依赖“每 4 帧取 1 帧”。
+10. **production decision policy v1 的 ActionArbiter 不超过 60 Hz。** 使用该发布策略的 production
+    control domain 必须满足 `arbiter_decision_hz <= 60 Hz`。该约束不限制 producer、sensor、reference、
+    IK、command、backend 或 recording clock；安全 veto/hold 可异步立即生效，但不得借事件旁路发布超过
+    60 Hz 的普通 selected action。更高上限必须通过新的版本化 policy/capability 和安全验收发布。
+11. **兼容路径先包裹、后替换。** 不一次重写 GUI、`run_policy.py`、writer 或 position executor；先
+   observe-only，再切换 authority owner。
+12. **动作阶段不共享一个假 component schema。** selected、reference、IK、command、measurement 分别
+    绑定自己的 schema，并通过可多对多的 transformation lineage 关联。
+13. **source device 与 embodiment 分别适配。** VIVE、其他 tracker、手柄或离线 replay 的 raw schema 只在
+    source adapter 内存在；robot topology、kinematics、actuator/backend 只在 embodiment/execution adapter
+    内存在。两侧通过 canonical observation/action/component/frame contract 连接，不能让设备字段或 RM65
+    SDK 类型进入 Arbiter、TrainingView 或 policy artifact tensor contract。
+14. **闭环 artifact 必须可追溯并 fail closed。** learner 产物必须引用 parent capture/derived overlay、
+    TrainingView、PolicyIOLayout、observation/action/frame/component contract 和代码/配置 hash；deployment
+    只有在当前 source/embodiment capability 满足 artifact compatibility spec 时才能进入 shadow/authority。
+15. **“对更换不敏感”不等于任意硬件零适配。** compatible adapter 更换不得改变 control-core API 和事实
+    语义；运动学、DOF、frame 或 action schema 不兼容时必须显式 retarget、重新训练或拒绝启动，不能静默
+    reshape/截断动作。
+16. **一次 arbitration 只由一个完整不可变输入决定。** `ActionArbiter` 只消费可 hash 的
+    `ArbitrationInputSnapshot`，不得在计算中读取 ProposalBuffer、AuthorityStore、RuntimeSupervisor、frontend
+    变量或“当前最新”状态。snapshot 后到达的 proposal/authority/gate/producer-epoch transition 只进入下一
+    decision；但异步 safety/HOLD/FAULT 仍可使尚未发布或执行的旧 result 立即失效。
+17. **执行资格由接收端 admission 线性化。** producer 只声明 `produced_at`、effective interval 和 provenance；
+    本地 `available_at` 只能在 receiver 完成 validation、deep-freeze、epoch/sequence 检查并原子接纳后赋值。
+    context、authority event 和 producer-epoch activation 遵守同一原则。
+18. **Composition 与 Arbitration 分离。** base/residual、component union 或 SE(3) composition 由版本化、
+    确定性的 Composer 在 admission 前生成新的 composite proposal；Arbiter 只做 authority/selection，不做
+    数值 blend，也不全局假设权重和为 1。
+19. **`no_action` 不等于无限延续旧动作。** selected segment 必须有明确 expiry；`no_action` 不创建或续期
+    segment，`hold/fault` 通过 execution epoch 取消尚未执行的旧 reference/command。具体持续语义由版本化
+    `ActionPersistencePolicy` 冻结，不能散落在 frontend/backend。
+20. **最终 dispatch 有代码级硬互斥。** 每个 control domain 的 logical dispatch port 必须校验当前
+    motion dispatch-owner generation 以及 command 的 authority/execution epoch；配置开关不能作为 legacy/new
+    owner 互斥的唯一保证。human/policy/replay 是 proposal authority，不分别拥有 dispatcher token；安全与
+    lifecycle 命令使用各自窄 permit，不能借 motion owner 或通用 bypass 混发。
+21. **sealed/committed capture 不允许原地维护。** episode 一旦发布 v2.4 capture commit，删除 episode、重排
+    legacy episode index、重压缩或替换 stream、修改 manifest/registry 都不能回写原 capture root，也不能保留
+    原 commit identity 后重算内容。此类操作必须生成带 parent dataset/commit hash、derivation spec 和新 identity
+    的 copy-on-write derived dataset；只有 legacy v2.2/v2.3 或尚未 commit 的 staging capture 可以在显式 profile
+    下做原地维护。
+22. **默认配置名不构成兼容证据。** pose/frame、camera transport、timing、component 和 artifact compatibility
+    只能由实际 canonical payload/hash 与 `EpisodeExecutionManifest` 判断。历史文件名、CLI 默认值、数组长度或
+    “同为 RM65”都不能替代 exact contract preflight；兼容 alias 不得被解释为旧语义仍然存在。
+23. **关节位置限位由 embodiment URDF contract 决定。** 当前 execution manifest绑定的URDF是kinematic joint
+    position range的唯一事实源；SDK/hardware envelope只能提供额外更窄的backend guard，不能放宽URDF。default、home、
+    recovery、replay和policy seed都必须在进入执行链前通过同一URDF限位；历史fallback不得被静默clip成新的home。
+24. **Profile 复用实现与证据，但不继承授权结论。** 新profile可以按hash引用相同的generic contract、URDF、
+    component、backend seam和pure/sim evidence，只补自己的delta；真机motion authorization、stop/latency、
+    measured safety与operator approval始终绑定具体`ExecutionManifest`，不能因共享机器人名称自动传递。
+25. **GUI/Control Station 只是控制平面。** 它只能提交receiver-admitted typed operator intent和展示可重建状态，
+    不得读取第二份device/dataset/model stream，不得拥有ActionArbiter、policy chunk plan、dispatcher、owner/epoch registry
+    或episode lifecycle。浏览器连接、断线、重连和status polling不得改变queue pop、replay cursor、inference schedule、
+    dispatch或capture事实。
+
+泛化防火墙中的`robot_motion/action/pose_transform.py`当前登记为显式v1 compatibility surface：其
+`CanonicalDeskToRuntimePoseTransformer`只服务`bimanual_ee_pose_v1`的left/right coupled pose事实。该例外不表示
+generic core可以继续新增名称解析或固定DOF；在第二本体EG2/EG3前保留现有数值与CS-2b replay证据，届时再由
+component/schema驱动的transform binding替代。
 
 ---
 
-## 三、推荐的统一运行时模型
+## 三、目标逻辑架构
 
-核心对象不要混在一起，建议分成以下几层。
+```text
+RGBD / depth ───────────────┐
+tactile / force ────────────┤
+robot state ────────────────┼── Temporal Observation Hub
+human device ───────────────┘      │
+                                   ├── per-policy ObservationCutRecord/View
+                                   │
+                    ┌──────────────┴───────────────┐
+                    │                              │
+             slow/context policy             action policy node(s)
+                    │                              │
+             versioned PolicyContext               │
+                    └──────────────┬───────────────┘
+                                   │
+                          fast/action policy
+                                   │
+                             ActionProposal
+human / replay / scripted proposal ┤
+                                   ▼
+                           ProposalBuffer snapshot
+                                   ▼
+                             ActionArbiter
+                         control port │ attribution port
+                                      │──────────────→ ControlTrace
+                                   ▼
+                 canonical safety / IK / planner / reference
+                                   ▼
+                     command interpolation / scheduling
+                                   ▼
+                 one logical dispatch port per control domain
 
-### 1. PolicyIOLayout
+All lifecycle/health ─────────────→ RuntimeSupervisor
+```
 
-负责模型张量语义：
+### Control Station 应用控制平面
 
-- 输入字段和维度
-- 相机顺序
-- 图像预处理
-- state layout
-- action layout
-- 单位、坐标系、TCP
-- absolute/relative action
-- action horizon
-- control frequency
-- normalization
-- layout hash
+human、replay和policy最终由同一个应用层实验台按source slot管理，null/MuJoCo/real由execution-domain binding
+替换；但Control Station不插入proposal到dispatch的数值路径。它只负责manifest选择、连接、preflight、shadow、
+authority/lifecycle请求、状态展示和capture请求。每个source继续使用唯一既有emission seam：human不重复读取遥操设备，
+replay不建立第二个dataset cursor，policy不重复消费action chunk。
 
-它是模型接口契约，不应直接承担硬件 dispatch。
+代码落位固定为仓库根级`control_station/`，而不是`teleop_runtime/control_station/`。它是顶层application leaf，可按
+显式adapter导入human/replay/deploy/dataset/sim/real模块；所有下层模块均不得反向导入它。这样本体或real/sim替换只改变
+composition binding，不会让通用控制、仿真或真机runtime天然依赖GUI平台。
 
-### 2. DeploymentObservation
+```text
+minimal GUI / headless client
+        ↓ typed StationIntent
+ControlStationRuntime（application composition only）
+        ├── human source adapter  ─┐
+        ├── replay source adapter ─┼→ existing proposal/Arbiter/execution core
+        └── policy source adapter ─┘
+                                   ├→ null target
+                                   ├→ MuJoCo target
+                                   └→ real target（另行manifest/authorization）
+```
 
-负责控制时刻的观测快照：
+详细 contract、文件落位、CS-0–CS-7迁移和真机human/replay/deploy分开验收顺序见
+[`dexteleop_control_station_plan.md`](dexteleop_control_station_plan.md)。正式入口在sim parity和legacy-real passive
+parity前保持不变，不以新GUI为由复制owner、dispatcher或episode lifecycle。当前CS-0a pure contract与CS-0b
+null/fake no-I/O composition已落地；CS-1a另有一个不自启动、仅loopback、只提供health/state GET且拒绝全部POST的
+read-only server builder。CS-1b现已增加仅适用于null/no-motion manifest的authenticated typed-intent builder；Web token
+不替代operator lease，HTTP response明确`adapter_executed_inline=false`，raw action和motion intent在runtime admission前拒绝。
+CS-1c又增加bounded、non-authoritative UI event ring与独立no-I/O operation coordinator：capacity覆盖queued+in-flight，
+并在intent admission前预留；HTTP线程不执行adapter，completion由worker回到唯一runtime result-admission seam；event eviction
+显式报告gap且不改变ControlTrace/capture completeness。CS-2a1现已增加一个独立scoped application slice：无设备synthetic
+human qpos经现有human emission/adapter进入同一MuJoCo authoritative core并留下source→proposal→decision lineage；它不创建
+第二action queue/owner/epoch/dispatcher。CS-2a1 binding只证明authoritative data plane精确接通；CS-2a2b另以scoped fixture
+证明candidate/authority必须经过typed completion，完成后才开放publication，release会关闭publication并通过同一core进入
+HOLD/cancellation，且Station保持hold latch。该scoped binding仍不是production async/web authority入口。CS-2a2a现已用scheduled-qpos source-specific execution manifest
+与真实WAL/episode owner/seal/commit/reader完成test-side formal capture；immediate-qref仍是fixture-only且不可commit。
+source-agnostic原子publication barrier现已接到测试侧bounded side-effect worker，release在入队前关闭barrier，异常不会遗留pending；
+Station manifest/intent/result/barrier事实又已通过注入式bridge进入专用scheduled-sim formal profile，并用真实
+WAL/seal/commit/reader重建；旧profile仍将这些新增事件视为optional。现有CS-1c Web仍以exact no-I/O类型防火墙
+拒绝该worker；另一个明确标为`cs2a2b_scoped_sim_authority_api`的loopback builder现已只对exact sim manifest/side-effect
+coordinator开放typed lifecycle/candidate/authority intent，raw action、real target和production entrypoint均fail closed。
+Web token不替代lease/completion/barrier/owner-epoch。CS-2b-a现已按同样边界接入qpos-compatible immutable replay。
+CS-2b-b又增加exact arm-base pose和verified canonical-desk两种独立manifest：pose始终保留为proposal/selected/safe，
+canonical desk到arm base的版本化变换只发生在shared safety后、coupled IK前，IK输出另建qpos execution target。现有
+replay executor仍只构造一次immutable source-frame emission；lower-owned bounded fanout向GUI shadow和root Station
+consumer传递同一对象，branch failure不反向影响cursor/resample/legacy dispatch。CS-2b-c现已在测试侧复用真实dataset
+loader/preflight/GUI worker与同一个checked group，并用replay专用pose→resolved-qpos profile完成WAL/seal/commit/read；
+该成熟度是formal fixture，不是production GUI replay、真机authority或新entrypoint。`qpos_target` GUI branch仍因缺少
+lower-owned immutable emission seam而fail closed。CS-2c首个sync-policy data-plane slice也已落地：根级composition只消费
+现有`PolicyDeployRuntime`唯一queue pop产生的exact `PolicyActionEmission`，并保留emission/target interval/inference/chunk
+lineage进入MuJoCo proposal；它不调用predict/merge/pop，也不拥有action queue。独立exact manifest已进一步接入typed
+Station lifecycle：completion后才开放publication，release先关闭barrier再由同一lower core接纳HOLD/cancellation。当前尚未
+接artifact preflight；policy-specific formal fixture已用专用profile把exact emission/validation设为required，并完成
+scheduled execution的WAL/seal/commit/read与ActualDecisionView重建。该结果仍不是production policy source。下一RTC
+Station slice的data plane现已接通lower-owned完整`RtcFrontendStep`：root composition逐项验证RTC due-pop、emission commit、
+producer/plan identity与exact `PolicyActionEmission`，拒绝裸emission绕过和scheduled-segment伪装，然后复用同一MuJoCo
+authoritative core。异步推理期间deterministic fixture只同步推进既有target physics clock，不新增policy scheduler。
+downstream publication的Station lifecycle现已按该边界接入：connect/preflight不启动producer，release先关闭barrier再
+HOLD execution core，且不改变RTC producer snapshot/worker session/plan/epoch。专用immediate-qref formal profile又将
+exact emission、source validation、Station lifecycle、execution manifest、receipt和measurement纳入真实WAL/seal/commit/
+committed-reader闭环，并把scheduled-reference family显式标为不适用。human/replay/sync-policy/RTC policy仍须按
+单source分别验收；该fixture不是artifact/transport/production/real证据，不能接真机或替换现有GUI。
+CS-3a现又把existing deploy的唯一RTC frontend返回点暴露为default-off bounded passive fanout；root Station只接收
+target-neutral source binding和同一个immutable `RtcFrontendStep`，不接收frontend对象。null-target manifest仅允许shadow，
+同队列ordered fence界定observer可见区间；connect/preflight/start/stop已验证不会改变producer snapshot、worker/plan、
+selected-emission count或lower queue-pop。该seam没有artifact/transport/real-observation preflight、target execution、
+ControlTrace episode或motion authority，不能由“existing frontend已接”外推为RTC-6 real shadow或production Station。
+CS-3b-a现已在root application层增加纯OpenPI RTC source assessment：只比较已有artifact preflight、
+capability/request negotiation、backend构造时已验证的server metadata与CS-3a source binding，并绑定到仍为null-target、
+shadow-only的manifest。该assessment固定将live transport、real observation和target binding标为`not_assessed`，将execution/
+motion标为denied；它不读取会主动连接的transport metadata property，也不创建websocket、加载artifact或启动producer。
+CS-3b-T仍需lower-owned transport session/health与真实observation evidence，不能由CS-3b-a外推。
+scoped loopback API只允许typed connect/preflight/start/stop通过bounded side-effect worker完成，浏览器不能提交action或
+candidate/authority intent，且任何状态投影都固定`motion_authorized=false`；没有正式入口调用该builder。
 
-- 机器人状态
-- 相机帧
-- tactile/depth
-- 时间戳
-- valid mask
-- frame age
-- observation/sensor validity；内部 fault 原因默认不进入 model view
-- artifact 明确定义的 history/last-action 字段
+CS-6b1e现已增加device-neutral passive pose session：application profile提供任意既有`ObservationSource`、pose retargeter和
+calibration，root仅构造`TeleopSession(rig=None, recorder=None)`并拒绝record/hardware-arm eligibility。CS-6b1d可在human slot
+的typed connect后启动该source和执行单次observe-only poll；emission必须精确匹配source spec声明的pose effectors、frame与
+finite homogeneous pose，默认spec仍为RM65双臂tuple，`PassiveTeleopPoseSourceSpec.for_arm/for_effectors`可构造单臂或其它
+明确topology；
+但当前不进入proposal admission，replay仍为唯一active authority。虚拟测试已覆盖non-pose/frame/rig/observer冲突、外部ARMED
+跃迁、subscriber failure和replay dispatch parity。该结果不修改canonical遥操/replay入口，不绑定Vive、具体机器人、sim或模型，
+也不提供真实human READY；后者仍需lower typed deadman-rearm与retargeter-rebase receipts。
 
-现有 [robot_motion/deploy/observation.py](/home/zc/HandMotion/Developing/DexTeleop/robot_motion/deploy/observation.py) 可以继续演进。
+真实设备接线的配置事实源固定为当前正式真机遥操数采链路：`teleop_runtime.collection.run_collect.build_collect_app`已经统一
+组合Vive tracker/clock sync、HandQ6 source、arm/hand retargeter、工具TCP、collision/safety、各后端与`BimanualRig`。现已提供
+公开的`teleop_runtime.configs.build_bimanual_passive_session` projection：复用该链路的source/retargeter/calibration构造，
+但强制`rig=None`、`recorder=None`且拒绝hardware-arm eligibility；构造本身不启动source。Control Station及后续composition
+必须调用该公开profile，而不是复制端口默认值、tracker对齐或手部映射，也不能直接import私有`_build_*`函数。新增机械臂、
+遥操设备或sim仍通过相同public profile projection和typed component contracts接入；target backend/rig继续由各自target
+composition持有。既有`build_bimanual_session`默认路径和canonical遥操/数采入口保持不变。
 
-### 2.1 Policy view 与 control plane 的可见性边界
+单策略模式只是 topology 中只有一个 action policy node：
 
-必须把“模型需要什么输入”与“控制系统为了安全、执行和训练记录产生什么状态”分成两条数据面。
-模型输出的是 proposal/intent，不是对 `ActionArbiter` 以下链路的直接控制；`ActionArbiter` 以下
-的实现细节对 actor 模型不可见，也不应成为 actor 的输入契约：
+```text
+Observation Hub → one PolicyDeployRuntime → ActionProposal
+                → ActionArbiter → existing canonical execution
+```
 
-~~~text
-PolicyIOLayout + allowlisted DeploymentObservation
-  → model-facing observation view
-  → policy output
-  → existing normalize / v2.3 decode
-  → absolute RobotAction proposal
-  ║  visibility firewall：不把 control-plane metadata 回灌给 policy
-  → ActionArbiter
-  → selected action
-  → safety / IK / collision / trajectory / reference
-  → command / dispatch / measured alignment
-  → ControlTrace + reward/label adapter（训练侧读取）
-~~~
+快慢系统则是多一个 context edge，不产生第二套控制系统。
 
-模型可以看到的内容只由 `PolicyIOLayout` 和已冻结的 observation contract 白名单决定，通常包括
-当前 measured state、图像、tactile、显式 validity/age，以及 artifact 已声明的 policy history。
-它不能直接看到或依赖：
+### 1. 控制—采集—训练—再部署闭环
 
-- `ActionArbiter` 的 `control_mode`、authority epoch、source kind、proposal id、selected owner、
-  rejected/expired proposal、human takeover 或 per-component mask；
-- safety filter、IK/collision/planner 的 clamp、hold、降级、失败原因和内部 solver 状态；
-- `PositionReferenceFrame`、`PositionCommandTick`、command/dispatch receipt、hardware status、
-  measured-state id、writer queue 或 `ControlTrace` id；
-- `expert_label_mask`、`policy_behavior_mask`、reward、intervention reason 和训练标签。
+```text
+human device(s) ─→ SourceAdapter ─┐
+policy artifact ─→ PolicyNode ────┼→ ActionProposal → Arbiter → canonical execution
+dataset replay ─→ ReplayAdapter ──┘                         │            │
+                                                            └────┬───────┘
+                                                                 ▼
+                                              native streams + ControlTrace + task facts
+                                                                 ▼
+                                                    sealed v2.4 capture dataset
+                                                                 ▼
+                                      TrainingView / reward overlay / transition view
+                                                                 ▼
+                                                BC / DAgger / RL / fast-slow learner
+                                                                 ▼
+                                       TrainingRunManifest + PolicyArtifactContract
+                                                                 ▼
+                                          deployment compatibility preflight
+                                                                 ▼
+                                                   shadow → authority → new capture
+```
 
-下一控制 cut 的 measured state 可以自然反映实际执行结果，这是环境反馈，不等于把 Arbiter 或
-safety 的内部决策暴露给模型。尤其是 `last_action` 必须保持现有 artifact contract 的明确语义：
-不能在未声明的情况下把 selected、safe、commanded 或 measured action 任意替换进去；如果未来
-需要提供实际执行反馈，必须作为独立、显式版本化的 observation field，而不是复用含义不清的
-`last_action`。
+每次迭代都必须能回答：模型看到了哪些 cut/context、target 来自哪个 source/component、实际 behavior 到了
+selected/safe/commanded/measured 哪一层、reward/outcome 如何计算、checkpoint 使用了哪些 capture/view，
+以及该 checkpoint 在哪个 source/embodiment binding 上通过了 shadow/authority 验收。
 
-当前实现有一个需要在下一步修正的边界风险：
-`robot_motion.deploy.observation.DeploymentObservation.model_input()` 目前会直接带出 `faults`
-和完整 `metadata`。这会让 runtime-private 信息有机会穿过 model wrapper。后续应改为
-`PolicyObservationView`/allowlist projection，只复制 PolicyIO 声明的 tensor、validity 和 history
-字段；`ActionAttributionFrame`、ArbitrationResult、SafetyResult 和 trace metadata 必须走旁路
-ControlTrace，禁止放入 policy observation 的任意 metadata。
+采集能力不能绑定 human GUI。GUI/headless、policy deployment、replay 和 sim rollout 都可以通过同一个
+`EpisodeLifecycleOwner` protocol 挂接 native streams + ControlTrace sinks，生成正式 v2.4 capture；区别只在
+谁创建 episode/task metadata 和哪些 completeness capability 可用。没有正式 episode 的普通 deploy debug
+仍使用 `RuntimeTraceSession`，不能冒充训练数据。v2.3-compatible row 只在需要兼容 reader 时物化，不是
+policy/replay capture 的前提。
 
-这条隔离不妨碍训练：actor 只消费 policy view，critic/reward/DAgger exporter 在训练侧读取
-ControlTrace；若某个算法确实需要 owner/mask 作为 auxiliary input，必须另立 training-only
-contract，不能悄悄污染部署 actor 的 observation schema。
+这里必须区分两个终点：`runtime_trace_terminal` 终止一次完整 `RuntimeTraceSession`；dataset episode 的
+finalize/seal 则以该 episode 的 bind/unbind、journal sequence range、durable high-water mark 和 profile
+lineage 为依据。canonical GUI 的一个 runtime session 可以包含多个 episode，因此单个 episode finalize
+不得写入 runtime terminal 或关闭后续 trace admission。episode seal assessment 是 subordinate sink 的
+不可变完整性证据，不拥有或替代现有 recorder 的 commit/finalize；runtime shutdown 也不得重写已经 seal
+的 episode。M4B.2 正式接线前需先冻结这一级 contract 和 crash-recovery 规则。
 
-### 2.5 v2.3 相对控制链路：复用表示适配层，不扩展仲裁层
+### 2. 遥操设备与 embodiment 的可替换边界
 
-v2.3 的 relative action 不能被理解为另一种需要重新实现的 runtime 控制语义。当前代码已经
-形成了一条可复用的表示转换链路，最佳方案是把它固定为 **model-facing representation adapter**：
-模型可以输出 relative，数据集可以提供 relative 视图，但进入 `ActionArbiter` 之前必须已经
-还原为带有明确 frame、单位和 active component 的绝对 `RobotAction`。这样 human、policy、replay
-和 scripted source 才能在同一个语义层竞争控制权。
+```text
+SourceDeviceContract + calibration/retarget spec（human device）
+ReplaySourceContract + action-stage/schedule spec（dataset replay）
+  raw human input or typed replay record
+  → SourceAdapter
+  → absolute RobotAction proposal + SourceAdapterReceipt
 
-#### 2.5.1 当前 v2.3 链路和唯一事实来源
+canonical control core
+  ObservationCut / ActionProposal / Arbiter / ControlTrace / TrainingView
 
-当前应把下面这条链路视为 v2.3 的基线，不要另起一个 `RelativeActionPipeline`：
+EmbodimentContract + ExecutionBindingSpec
+  selected RobotAction
+  → safety/kinematics/reference/command adapter
+  → backend-specific command + receipt/measurement
+```
 
-~~~text
-v2.3 dataset rows
-  (absolute pose + actual TCP anchor + PoseFrameContract)
-    → dataset_interface.pose_action / pose_chunk
-    → PoseActionChunkContract
-    → model-facing action chunk
-       (absolute or relative, with action_is_pad)
-    → policy.predict
-    → PolicyDeployRuntime.prepare_policy_observation
-    → PolicyDeployRuntime.normalize_and_decode
-       → normalize_policy_output
-       → robot_motion.deploy.pose_adapter
-          (measured TCP anchor, frame conversion, relative → absolute)
-    → absolute runtime RobotAction
-    → CanonicalDeployActionPipeline
-    → TeleopCommand / PositionReferencePublisher
-    → ReferenceTimeline / JointCommandInterpolator
-    → dispatch receipt → measured state
-~~~
+- 更换 VIVE/其他 tracker/手柄只新增或替换 `SourceDeviceContract`、calibration/retarget adapter；同一 canonical
+  component/frame 语义下，Arbiter 和数据 schema 不变，raw device stream 仍可作为审计输入保存。
+- 更换 RM65、sim robot 或 hand topology 时替换 `EmbodimentContract` 与 execution adapter；proposal/selected
+  事实尽量保持 canonical，command/measured schema 允许不同并由 transformation lineage 连接。
+- policy artifact 不直接绑定某个 USB/SDK 类，但必须声明所需 observation/action/component/frame 和
+  embodiment capability。满足同一 compatibility spec 的 backend 可复用 artifact；不满足时 fail closed。
+- 数据集可以联合多个 source device/domain，但一个 TrainingView 只能联合 contract-compatible 的 canonical
+  字段。跨 embodiment retarget 是版本化 derived transform，不修改 sealed capture。
 
-这条链路中各部分的职责应冻结如下：
+“不敏感”按兼容层级验收，而不是按设备名称判断：
 
-| 语义 | 现有唯一 owner | ActionArbiter 的关系 |
+| 变更 | 允许保持不变的核心 | 必须更新/验收 |
 |---|---|---|
-| v2.3 物理存储 | `dataset_contracts.v23`、现有 writer | 不改变 parquet 的 absolute storage 约定 |
-| 绝对/相对模型视图 | `PoseActionChunkContract`、`dataset_interface.pose_action`、`dataset_interface.pose_chunk` | 作为 policy/replay source 的输入契约 |
-| SE(3) 相对变换 | `robot_motion.relative_action` | Arbiter 不实现、不调用 anchor math |
-| runtime raw/canonical desk frame 转换 | `robot_motion.deploy.pose_adapter`、`PoseFrameContract` | 在 proposal 生成前完成 |
-| policy chunk 的预测、替换、padding、sequence | `robot_motion.deploy.runtime.PolicyDeployRuntime`、`robot_motion.deploy.actions.ActionChunkBuffer` | `run_policy` 负责注入真实 policy/clock/gate；source adapter 后续只提交已解码 proposal |
-| 绝对动作语义 | `RobotAction`、`PolicyIOLayout`、`ArmActionSpec` | Arbiter 只接收这一层 |
-| safety、IK、coupled planner | `CanonicalDeployActionPipeline` 及现有 resolver/planner | 在 selected proposal 之后统一执行 |
-| reference/command 时序 | `PositionControlRates`、`PositionReferenceFrame`、`ReferenceTimeline`、`PositionCommandTick` | 传递 decision/lineage，不新建 timeline |
-| dispatch 和 measured 对齐 | 现有 `TeleopCommand`、receipt、`PositionAuditEvent`、sample assembler | 作为 trace 的后续阶段补全 |
+| 兼容 human device | Arbiter、canonical proposal、TrainingView schema | source contract、标定/retarget、adapter receipt |
+| 同一 embodiment 的 backend/SDK | proposal、decision、policy artifact | execution binding、command/receipt schema、safety capability |
+| canonical component/frame 兼容的 embodiment | control-core API、可兼容的 actor/action view | embodiment contract、kinematics/safety/执行适配与 artifact preflight |
+| DOF/frame/component 不兼容的 embodiment | 事实层与闭环协议本身 | 显式 retarget/新 TrainingView/重新训练；不能直接复用旧 artifact |
 
-特别要保留三个容易被混淆的边界：
+### 3. 当前实现的本体通用性边界
 
-1. **v2.3 dataset canonical `desk` 不等于历史 VIVE virtual-desk retarget frame。**
-   policy 的 canonical desk 与真机 runtime raw/base frame 的转换必须由
-   `PoseFrameContract` 明确声明，不能通过字段名或矩阵形状猜测。
-2. **policy relative 与 human `delta_clutch` 不是同一种 relative。** policy chunk 使用
-   chunk 起点的实测 TCP anchor，human retargeter 使用 tracker/home/clutch/session anchor。
-   二者都应在 source adapter 内还原为绝对 `RobotAction`，但不得共用一个含义模糊的
-   `relative_mode` 分支或相互替换 anchor。
-3. **`last_action` 不等于上一条 command。** 现有 v2.3 contract 对 action chunk 和
-   `last_action` 有独立的 anchor/转换语义；在 artifact 尚未明确支持 mixed mode 之前，保留
-   `run_policy` 当前要求 `action_pose_mode == last_action_pose_mode` 的 fail-closed gate，
-   不在 Arbiter 中临时放宽，也不通过条件分支伪造兼容。
+当前“可替换”分为两层，不能混称为已经支持任意机器人：
 
-#### 2.5.2 ActionArbiter 的准确插入点
+| 当前层级 | 已有能力 | 尚未具备 |
+|---|---|---|
+| 控制协议 | control domain、clock/epoch、authority、cancellation、proposal snapshot、selection group、dispatch permit、ControlTrace、episode seal/reader | 无明显 RM65 语义依赖；新增实现仍须通过依赖防火墙 |
+| action/execution v1 | 左右 component、6DoF arm qpos、xyz+quat pose、q6/q16 hand、RM65 sim/IK/safety profile | 单 7DoF、异构 6+7DoF、非 left/right component、任意末端和 payload-neutral Arbiter |
 
-推荐的最终 source flow 是：
+同构 backend 替换也必须重新验证 joint order/方向/单位/零位、frame/state schema、worker/retry、HOLD/ESTOP/
+home/rearm、receipt/cancellation acknowledgement 和每个最终设备调用的 permit；统一 Python 接口不构成
+execution compatibility evidence。
 
-~~~text
-human PoseToArmRetargeter / delta_clutch
-  → absolute runtime RobotAction
-  → human ActionProposal
+真机前的泛化防火墙冻结为：
 
-policy v2.3 relative chunk
-  → existing pose chunk contract
-  → existing pose_adapter decode
-  → absolute runtime RobotAction
-  → policy ActionProposal
+- `robot_motion.action/runtime` 的 generic 模块不得新增 RM65/Inspire/DMTAC import；现有 profile-specific
+  `robot_motion.rm65` 和 v1 compatibility surface 允许保留；
+- generic Arbiter 不得新增 `left/right` 名称解析、q6/q16 shape 分支或按数组长度推断 action space；
+- `dataset_contracts`/`dataset_interface` 不得依赖 hardware、teleop runtime、sim 或 vendor SDK；offline
+  postprocess 的 runtime bridge 必须显式隔离，普通包 import 不得加载这些依赖；
+- 新 contract 必须以 typed schema/hash 声明 DOF、frame、units 和 component，不得根据 payload shape 猜测；
+- RM65 profile-specific、v1 compatibility、generic-core leak、legacy materialized view 四类债务分别登记，
+  不把合法的 embodiment 实现误判为核心泄漏。
 
-v2.3 replay / scripted source
-  → same dataset/model-view adapter as policy
-  → absolute runtime RobotAction
-  → replay/scripted ActionProposal
+当前防火墙已 scoped 落地：shared action/runtime 的禁止依赖和 v1 hardcode 文件采用 allowlist 测试；离线
+postprocess 普通 import 已不再加载 hardware/robot runtime；DM-Tac calibration 文件契约已与 hardware 默认
+provider 分离。这里的“通过”只证明依赖方向和已知债务不再扩散，不证明 7DoF、第三 component 或动态 payload
+已经可执行。
 
-all ActionProposal
-  → ActionArbiter
-  → selected absolute RobotAction
-  → existing safety / IK / planner / reference / interpolation
-  → existing TeleopCommand / Rig or MuJoCo backend
-~~~
+第二本体前只规划三个批次，不进入当前 RM65 真机变更面：
 
-因此 `ActionProposal.action` 的类型仍是绝对的 typed `RobotAction`。proposal 可以携带一份
-representation/decode provenance，但不能把 raw relative vector、anchor 或归一化参数作为
-Arbiter 的输入，让 Arbiter 现场推导 absolute action。这样可以避免以下重复实现：
+1. **EG1 contract/binding**：冻结 `EmbodimentContract`、`EmbodimentBindingAssessment`、
+   `ControlComponentSpec`、`ActionPayloadSchema`、`EffectorActionCapabilitySpec` 和 topology binding；contract
+   compatibility、validated execution capability、motion authorization 始终独立。
+2. **EG2 v1 bridge/fixture**：建立唯一 `RobotActionV1 → generic component-action` 无损投影；用单 7DoF、
+   6+7DoF coupled、1DoF gripper、q16 hand 和第三 manipulator component 做无硬件正向 fixture。迁移期仍只有
+   一个 canonical 事实源。
+3. **EG3 second embodiment**：由明确的第二本体驱动 payload-opaque/schema-visible Arbiter、按 schema/profile
+   注册的 safety/execution、manifest-driven builder 和 v2.4 native per-component facts；旧 left/right 字段只作
+   compatibility materialized view。
 
-- 在 `robot_motion/action/arbiter.py` 再实现一套 SE(3) relative conversion；
-- 在 safety 层分别为 absolute 和 relative action 做两次约束；
-- 在 150 Hz command loop 里重新解码或重新 anchor；
-- 在 sim 里另建一个 relative-to-qpos executor；
-- 在数据写入侧从最终 command 数值反推 source。
+Arbiter 的目标是数值不透明而非语义不透明：它仍必须验证 component ID、payload schema hash、coverage、
+selection group、coupled 原子性和输出 action schema，但不解释 6/7DoF、pose 数组、q6/q16 或数值 safety。
+不同 action schema 的 safety state 也不能统一成一种 previous-safe：position、velocity/twist、torque、trajectory
+和 discrete mode 分别需要自己的版本化状态与 handler。Policy artifact 仍保持固定 `PolicyIOLayout`，控制 core
+通用不意味着模型 tensor 动态化。
 
-Arbiter 只负责“选择哪个已经具有相同语义的 proposal”，不负责“把不同表示变成相同语义”。
-这也是 human、policy 和 replay 可以共享同一个 `component_schema_hash`、selection group 和
-lineage contract 的前提。
+---
 
-#### 2.5.3 不新增数学模块，只增加一个轻量 decode receipt
+## 四、多速率时间模型
 
-现有 `pose_adapter` 已经能完成部署所需的关键工作：从 immutable observation 读取
-`actual_tcp_pose`，按 `PoseFrameContract` 做 frame 转换，并调用
-`robot_motion.relative_action.convert_arm_pose_chunk`。建议只增加一个很薄的 typed
-`ActionRepresentationTrace`（可放在已有 `robot_motion/action/attribution.py`，不单独创建
-runner/executor），由 source adapter 产生并由 `ActionProposal` 引用：
+### 1. Clock 与 timestamp taxonomy
 
-~~~text
-ActionRepresentationTrace
-├── representation_trace_id
-├── input_action_mode: absolute / relative
-├── input_last_action_mode
-├── output_action_mode: absolute_runtime
-├── input_frame / output_frame
-├── pose_chunk_contract_hash
-├── pose_frame_contract_hash
-├── chunk_id / keyframe_index / valid_action_count
-├── action_is_pad / valid_mask
-├── anchor_id / anchor_source: current_actual_tcp
-├── anchor_observation_id / anchor_measurement_timestamp
-├── anchor_pose_by_side
-├── anchor_frame
-├── conversion_status: decoded / invalid / stale / blocked
-├── conversion_error_code
-└── metadata: normalization/layout/source artifact ids
-~~~
+系统仍需分别配置 sensor、observation cut、inference、context、proposal、decision、reference/IK、
+command、backend/physics 和 trace/media clock；`observation_hz != inference_hz != proposal_hz !=
+decision_hz` 是合法配置。但频率配置不能替代事件时间语义。
 
-其中 raw model output、decoded absolute action 和 anchor 不一定都复制进每一个高频 command；
-它们应在 policy keyframe 的 proposal/trace event 中保存，后续 `reference_segment_id`、
-`command_id` 和 `dispatch_receipt_id` 只引用该 `representation_trace_id`。
+v2.4 不给所有对象复用含义模糊的 `source_timestamp`，而是按事件角色冻结：
 
-必须遵守以下 anchor 规则：
+```text
+SensorSampleRecord
+  measured_at / available_at
 
-- policy relative action 的一个 chunk 使用 chunk 起点的 **实测** TCP anchor，并对该 chunk 的
-  所有有效 keyframe 固定；不能用上一条 commanded pose，也不能在每个 150 Hz tick 重新 anchor；
-- anchor 缺失、过期、frame hash 不匹配或非 finite 时，decode 结果为 invalid/hold，不能回退
-  到当前 commanded target 或把零 relative action 当作安全动作；
-- `last_action` 按当前已有 contract 的 `current_actual_tcp` 规则独立转换，并在 trace 中明确
-  `last_action_anchor_id`，不能与 action chunk anchor 混为一个字段；
-- `action_is_pad` 的 padded row 不生成新的 proposal，也不能作为 DAgger expert label 或 RL
-  behavior action；`valid_action_count` 和 padding mask 必须沿 chunk、proposal、trace 传递；
-- 解码只做 representation/frame conversion，不在这里做第二次 safety、IK 或 position
-  interpolation。解码后的绝对动作只经过一次 canonical safety/planner pipeline。
+ObservationCutRecord
+  cutoff_at / built_at
 
-#### 2.5.4 最少新增、最大复用的接入方式
+PolicyInferenceEvent
+  triggered_at / started_at / completed_at / received_at
 
-建议不是新建一套 `PolicyActionRuntime`，而是继续使用现有 `PolicyDeployRuntime` 作为 policy
-stream 的共享边界，在 `run_policy` 和 human source adapter 外面补 proposal/arbiter 编排。
-当前 `PolicyDeployRuntime` 已经不是只包住两个函数的薄 facade：它拥有 policy schedule、prediction
-transaction、chunk queue、recovery discard、queue pop/lookahead，并通过 `ActionPreparer` 接入
-canonical preparation；它仍不拥有 safety 配置、reference、hardware dispatch 或 authority：
+PolicyContextRecord / ActionProposal
+  produced_at / available_at / effective_from / effective_until
 
-~~~text
-PolicyDeployRuntime (shared policy stream boundary)
-  ├── bind artifact → PoseActionChunkContract + frame hashes
-  ├── should_predict(...) / predict_and_queue(...)
-  │      ├── prepare_policy_observation(...)
-  │      ├── policy.predict + prediction transaction
-  │      ├── normalize_and_decode(...)
-  │      │      └── existing normalize + pose_adapter conversion
-  │      └── ActionChunkBuffer replace/append
-  ├── prepare_next_action(preparer=CanonicalDeployActionPipeline)
-  │      └── queued absolute action → injected canonical preparation result
-  ├── attach ActionRepresentationTrace (下一阶段)
-  └── emit one absolute RobotAction proposal per valid keyframe (下一阶段)
-~~~
+ActionKeyframe
+  target_effective_at
 
-它不是新的控制 loop，也不拥有 authority、safety、reference 或 dispatch。当前 policy stream
-boundary 已完成；`ActionRepresentationTrace`、proposal emission 和 outer shared runner 仍按
-以下顺序落地：
+ProposalSnapshot / ArbitrationDecision
+  snapshot_cutoff_at / snapshot_created_at
+  decision_cutoff_at / decided_at / target_effective_at
 
-1. **冻结 v2.3 contract。** 继续使用现有 v2.3 absolute storage、`PoseFrameContract`、
-   `PoseActionChunkContract` 和 artifact hash；先完成 dataset row → model chunk → runtime
-   decode 的 golden round-trip。对 absolute→relative→absolute 做 SE(3) 误差、padding、episode
-   boundary 和 frame mismatch 测试。
-2. **[已完成] 把 policy stream 和 pose adapter 包成共享 boundary。**
-   `PolicyDeployRuntime` 复用 `relative_action`、`pose_adapter` 和现有 normalization，已经接管
-   chunk/keyframe queue、prediction transaction、policy rate 和 recovery discard；不再由
-   `run_policy` 维护另一份这些状态。尚未完成的是把 chunk/keyframe 标识、anchor 和
-   `ActionRepresentationTrace` 作为 typed proposal lineage 接出。
-3. **先生成 proposal，再改变执行权。** policy decoder 和 human retarget adapter 都输出
-   absolute `RobotAction` proposal；第一阶段以 observe-only 方式把 proposal/decision/trace
-   接到现有 GUI 主线，实际 selected/dispatch 仍走当前 `TeleopSession` seam。
-4. **把 selected action 接入已有 canonical pipeline。** Arbiter 输出的 absolute action 进入
-   已抽到 `robot_motion.deploy.canonical_action.CanonicalDeployActionPipeline`，再进入现有
-   `RobotActionResolver`、`PositionReferencePublisher`、`ReferenceTimeline` 和
-   `JointCommandInterpolator`。不要让 Arbiter 直接调用 `BimanualRig`，也不要把 position
-   executor 复制一份到 `robot_motion/action`。
-5. **让现有 position/audit seam 承载 lineage。** `robot_motion.position_control` 已拥有
-   reference/command contracts、resampling/interpolation、trajectory policy 和 position audit；
-   将 `control_tick_id`、`decision_id`、
-   `proposal_id_by_component`、`representation_trace_id`、anchor id、contract hashes 和
-   source/mask 作为 typed metadata/contract 从 selected action 传到
-   `PositionReferenceFrame`、`PositionCommandTick`、`PositionReferenceAuditEvent` 和
-   `CommandDispatchAuditEvent`。现有 `PositionReferencePublisher` 是唯一推荐的 reference
-   边界；它目前已有 causal timeline、sequence、epoch 和 audit observer，应扩展而不是旁路。
-6. **最后才切换真机 owner。** 先做 policy shadow，再做显式 human override 和允许的 group
-   override；policy-only 先在 sim/dry-run 验证。每一步都必须能够从 trace 重建 raw relative
-   intent → decoded absolute → selected → safe → reference → command → receipt → measured。
+CommandEvent
+  scheduled_for / sent_at / result_received_at
 
-#### 2.5.5 为什么这是当前的最佳路径
+MeasurementSample
+  measured_at / available_at
+```
 
-它同时满足三个目标：
+每个时间值都携带 `clock_domain`；控制 eligibility 只使用同一 `control_domain_id` 下的本地 control
+clock，目标是 local monotonic：
 
-- **最少重复：** v2.3 已有的 contract、几何转换、anchor 读取、chunk transaction、位置控制
-  和 writer lifecycle 都继续作为唯一 owner；新增的只是 proposal provenance 和跨层 lineage；
-- **最小风险：** relative decode 在进入 Arbiter 前完成，Arbiter 仍是纯 absolute-action 选择器，
-  不改变现有 safety/IK/dispatch 的输入语义；可以先 observe-only，随时回退到当前 GUI 主线；
-- **可训练、可重放：** raw policy intent、decode anchor、component selected source、safe/
-  commanded/executed 值都在同一个 causal tick 下可关联，DAgger 与 RL 不需要从最终向量猜测
-  人类介入或 policy behavior。
+```text
+proposal.available_at <= decision.decision_cutoff_at
+proposal.effective_from <= decision.target_effective_at < proposal.effective_until
+```
 
-不推荐的方案及原因：
+模型输入对应的历史时刻由 `observation_cut_id` 及其 sample refs 表达，不用 proposal 的
+`produced_at` 猜测。远端 producer 的原始 wall/monotonic time 只作为 clock evidence；真正执行资格由
+control 进程的 `received_at/available_at` 决定。
 
-| 方案 | 问题 |
-|---|---|
-| Arbiter 直接接收 relative vector 并自行找 anchor | 侵入 runtime ownership，容易用错 observation/commanded anchor，且 sim/real 会出现两套解码 |
-| 在 `CanonicalDeployActionPipeline` 之外另建 relative safety pipeline | 同一动作被重复过滤，safe 结果和 attribution 语义不一致 |
-| 每个 150 Hz tick 重新把 relative 转 absolute | 改变 chunk 语义，产生漂移和不可重放的 anchor |
-| 为 v2.3 新建 relative parquet layout | 与当前 absolute storage + model view contract 冲突，增加 writer/reader 分叉 |
-| 新建 `RelativeReferenceTimeline` 或 policy 专属 position executor | 重复已有 `ReferenceTimeline`、interpolator 和 receipt/audit 链路 |
-| 通过最终 command 与 policy/human 数值差异推断来源 | 对 clamp、IK、coupling、hold 和插值不可逆，不能生成可靠 DAgger label |
+`available_at` 的生成过程固定为 receiver-side admission 线性化点：
 
-### 3. ActionProposal：统一在 RobotAction 语义层，不在 TeleopCommand 层仲裁
+```text
+ActionProposalDraft
+  produced_at / effective interval / producer identity+epoch+sequence / payload
+  → receiver validation + semantic-field validation
+  → detached deep-freeze
+  → ProducerEpochRegistry / sequence check
+  → atomic ProposalBuffer admission
+  → receiver stamps available_at + admission_sequence
+  → immutable ActionProposal + ProposalAdmissionReceipt
+```
 
-当前代码有两个不同层级的动作对象：
+draft 不包含 authoritative `available_at`；transport receive time 只是证据，不能替代成功 admission。
+`ProposalAdmissionReceipt` 明确 accepted/rejected、proposal ID、可空的 receiver `available_at`/admission
+sequence 和 typed rejection reason；只有 accepted receipt 拥有执行资格时间/序号。`PolicyContextDraft`、
+`AuthorityEventDraft` 与 producer-epoch activation 使用同样规则，
+避免远端或 frontend 自报的“已可用”状态进入本地因果选择。
 
-- `RobotAction` 是跨 collection、replay、policy、sim、real 的语义动作，包含
-  `action_space`、arm pose/qpos、hand qpos/end-effector target、active effectors、frame 和 source metadata。
-- `TeleopCommand` 是已经接近 Rig/backend 的 transport command，按 effector 携带具体的
-  `cartesian_pose`、`joint_vector` 或 end-effector command。
+控制域维护 `ProducerEpochRegistry`，记录每个 producer 的 active epoch、activation event ID、`activated_at`、
+previous epoch 与 activation reason。Arbiter 不读取可变 registry；每次 decision 将其不可变投影放入
+`ArbitrationInputSnapshot`。旧 epoch proposal 保留审计事实，但在新 epoch activation 后不得进入后续候选集。
 
-因此 `ActionArbiter` 不应接收原始 policy vector，也不应直接合并多个
-`TeleopCommand`。推荐的边界是：
+多个 Store 还必须共享同一个因果 prefix。每个 control domain 持有 `ControlAdmissionCoordinator`；所有会
+影响 arbitration 的 proposal、authority/mode event、execution-gate transition 和 producer-epoch activation
+在各自 validation/deep-freeze 完成后，通过 coordinator 的同一 commit 临界区写入目标 Store、获得递增
+`control_admission_sequence`，最后才原子推进 `committed_high_watermark`。仅“预分配 sequence 后异步写
+Store”不算线性化，因为 snapshot 可能看到 watermark 却看不到对应事实。
 
-~~~text
-human retargeter / policy / replay
-    → source adapter
-    → RobotAction
-    → ActionProposal
-    → ActionArbiter
-    → selected RobotAction
-    → safety / resolver / reference executor
-    → TeleopCommand
-    → Rig 或 MuJoCo backend
-~~~
+`DecisionScheduleTick` 在 coordinator 下冻结 `(decision_cutoff_at, cutoff_admission_sequence=
+committed_high_watermark)`；各 Store 只返回同时满足 `available_at<=cutoff_at` 和
+`control_admission_sequence<=cutoff_admission_sequence` 的不可变记录。这样完整 snapshot 是某个已提交
+prefix，而不是分别读取多个 Store 拼出的、从未同时存在过的混合状态。validation 可在临界区外完成；commit
+区只负责短时的 store insertion、receiver `available_at`/sequence stamping 和 watermark publish。
 
-当前 human retargeter 仍直接产生 `TeleopCommand`，而 policy 的 v2.3 链路应明确为
-`policy output -> existing pose_adapter decode -> absolute RobotAction ->
-CanonicalDeployActionPipeline -> TeleopCommand`。所以第一阶段不能强行把旧 human command
-当成 canonical proposal；应增加一个窄的 `TeleopCommand -> RobotAction` 适配器，并用 golden
-round-trip 测试确认语义不变。policy source 则复用 2.5 节的 decoder，不应在 Arbiter 或
-`CanonicalDeployActionPipeline` 中再次解析 relative action。
+v1 的 `capture_cut()` 在同一 coordinator read barrier 内要求各注册 Store 只做内存中的 immutable
+state/candidate projection，全部 child snapshot 建成后再释放 barrier；不得在 barrier 内做 policy、hashing、
+I/O 或 Arbiter 计算。这样也避免 bounded Store 在 cut 与分次查询之间淘汰所需记录。若实测 admission pause
+超出预算，再演进为 versioned/MVCC read lease，但不能退回无 pin 的跨 Store 分次“最新值”读取。
 
-适配器至少要明确支持：
+`clock_domain` 不能只是自由字符串。v2.4 Core 同时冻结 `ClockDomainDescriptor`：clock kind、session/boot
+identity、resolution、monotonic guarantee、reset epoch，以及可选的 wall/remote mapping evidence、offset
+uncertainty 和采样区间。跨进程传输只能比较共享本地 control clock，或使用接收端重新赋予的
+`available_at`；clock reset/进程重启必须产生新 epoch，不能延续旧 sequence 假装连续。
 
-- `cartesian_pose`：矩阵/pose 转为 `RobotAction.arm_pose_by_side`，保留 reference frame、
-  controlled frame 和 `ArmActionSpec`；
-- arm `joint_vector`：转为 `arm_qpos_by_side`；
-- hand `joint_vector`：转为 `hand_qpos_by_side`，保留 active mask 和 hand spec；
-- `end_effector_continuous/discrete`：转为 `EndEffectorTarget`；
-- 未识别的 command type：生成 invalid proposal 并 fail closed，不能绕过 Arbiter 继续直发。
+当前 v2.3 `CausalSnapshotContract` 已冻结
+`source_timestamp<=T0_and_available_timestamp<=T0` 且主要使用 local/receiver wall time，不能原地改 hash。
+v2.4 adapter 保留这些字段作为兼容 evidence，并在在线运行可获得时增加 local-monotonic time；历史
+v2.3 数据缺少 monotonic evidence 时明确标记 unavailable，不伪造换算。
 
-`RobotAction` 当前虽然是 frozen dataclass，但内部 mapping/array 仍可能被 producer 修改。
-在 proposal 边界必须做 snapshot/copy，并为 proposal 分配稳定的 `proposal_id`；不能让异步
-policy chunk 或 GUI 临时 buffer 在仲裁之后改变已选动作。
+### 1.1 Canonical encoding、ID 与 hash
 
-建议的最小不可变契约为：
+Phase 1A 必须与时间 contract 同时冻结 `CanonicalEncodingSpec v1`，不能只在各模块中约定“canonical hash”。
+它至少规定：map key/string 编码、enum/tuple/optional/bytes 表示、float 精度与 `-0.0`、NaN/Inf policy、
+numpy dtype/shape/endianness、timestamp 单位、四元数是否做符号 canonicalization、hash 算法及 event/schema
+domain separator。运行时 proposal/snapshot、dataset record、manifest 和 replay 必须使用同一纯实现或通过
+同一组跨层 conformance fixture，禁止 Python `repr()`、对象地址、dict 插入顺序和 Parquet row offset 进入
+semantic hash。
 
-~~~text
+stable ID 与 content hash 分工明确：ID 表示一次事实对象的 identity，hash 表示其 canonical content；同一
+内容的两次 producer emission 可以有不同 ID，但不能因 serialize/deserialize、transport binding 或输入
+map 顺序不同而改变 content hash。含 numpy/mapping 的 frozen dataclass 在 proposal 边界深复制并转为只读
+canonical payload；仅 `dataclass(frozen=True)` 不视为深不可变。
+
+v1 的具体默认值已经冻结：唯一实现位于 `dataset_contracts.canonical_encoding`，使用 SHA-256 与显式
+schema/domain separator；ndarray 编码 dtype、shape 和 little-endian bytes；NaN 使用固定 bit pattern，Inf
+拒绝，`-0.0` 归一为 `+0.0`。generic encoder 不改变 quaternion 符号，几何 canonicalization 仍由
+action/pose contract 负责。每类 record 显式投影 canonical payload，不自动 hash 任意 metadata/dataclass。
+
+这里明确允许 `robot_motion → dataset_contracts.canonical_encoding`：`dataset_contracts` 是无 I/O、无 Torch、
+无硬件/runtime 反向依赖的底层纯 contract package。`dataset_contracts` 不得导入 `robot_motion`；若未来纯
+contract 明显扩展为独立顶层包，再整体迁移，M1A 不为命名问题复制第二份 encoder。
+
+事实 ID 由 `runtime_session_id/control_domain_id/producer_id/producer_epoch/sequence` 组成，和 content hash
+分工；可空 `episode_uuid` 只表达 capture membership。
+一个 policy chunk 的每个 keyframe 形成一个 proposal，共享 inference/output/chunk lineage。proposal 边界
+冻结 detached `RobotAction` snapshot；M1A 不全局改变现有 `RobotAction` caller 的可变性。
+
+例如 RGBD 只有 15 Hz，但存在两种合法的 30 Hz action 生成方式：
+
+1. 30 Hz 快策略每次使用最新 RGBD latent、最新 tactile/state 推理；
+2. 15 Hz 推理一次产生两个 30 Hz keyframe，每个 keyframe 记录 `target_effective_at`。
+
+当前 `PolicyDeployRuntime` 的 chunk 只有 chunk ID/index 和 queue schedule；迁移期若 keyframe 时间由
+profile 推导，必须记录 `ActionEmissionScheduleSpec`、推导起点和 receipt，不能把 queue pop 时刻当成模型
+产生时刻。这两种方式在 trace 中均需区分 `inference_id`、`policy_output_id` 和 `proposal_id`。
+
+### 2. 推荐 profile，而不是全局固定频率
+
+无论当前采用哪种 profile，只要绑定 production decision policy v1，`ActionArbiter` 都必须满足：
+
+```text
+0 < arbiter_decision_hz <= 60 Hz
+```
+
+这是 Arbiter 自身的发布率上限，不是系统统一时钟，也不限制下列其他 clock。
+
+当前单策略 profile 可以继续是：
+
+```text
+RGBD/policy proposal   15 Hz
+Arbiter decision       15 Hz
+pose reference         60 或 75 Hz（按 profile）
+coupled IK solve       当前 real executor 随 reference tick；必须受 capability 验收
+joint reference        可与 pose reference/IK 同频；未来可显式插值解耦
+command                120 或 150 Hz
+```
+
+快慢策略 profile 可以是：
+
+```text
+RGBD                    15 Hz
+slow vision policy      10–15 Hz
+tactile/state           30–100+ Hz
+fast action policy      30 Hz
+Arbiter decision        30 Hz
+pose reference          60 Hz
+coupled IK solve        由 action space/execution capability 决定
+joint reference         60 Hz
+command                 120 Hz
+```
+
+如果 human authority 必须以 60 Hz 响应，可以选择：
+
+- normal Arbiter 仍为 30 Hz，takeover/hold/fault 作为 60 Hz 或异步 authority/safety event；或
+- Arbiter 为 60 Hz，30 Hz fast proposal 保持两个 tick、15 Hz slow proposal 保持四个 tick。
+
+选择由 profile 和延迟预算决定；v1 不得超过 60 Hz。硬安全 veto 永远不能等待低频 policy tick；它可以
+立即使当前 selected action 失效并进入 HOLD/FAULT，但新的普通 selected action 仍只在受限 Arbiter cut
+发布。
+
+### 3. 对当前字段的兼容处理
+
+- `PositionControlRates.sample_hz` 暂不破坏性改名；在 position executor 中继续表示输入 keyframe rate。
+- 系统层新增明确的 `decision_rate_policy_id/version`、`decision_hz`、per-policy
+  `inference_hz/proposal_hz` 和 per-stream sensor rate。
+- `decision_hz` 在 production arbitration runtime 的配置校验、实际 decision publication gate 和运行审计
+  三处执行 `<=60 Hz`；不能只依赖 frontend CLI 默认值。其他 clock 不复用这个上限。
+- execution manifest 另行绑定 `ExecutionCapabilityProfile`：至少声明 validated/configured selected-keyframe、
+  coupled-IK、reference-resample、command/backend rate、适用 action space/selection group 及验收证据。
+  `validated_ceiling_hz` 与留有余量的 `configured_operating_hz` 必须分开，不能默认把 ceiling 当工作点。
+- 进入 `PositionDeployExecutor` 时，把 selected action keyframe stream 的实际 rate 映射为兼容
+  `sample_hz`；不要再从 RGBD 或单个 policy rate 推导它。
+- 当前 real executor 的 `dual_arm_ik_hz` 仅是 nominal budget；在独立 IK scheduler 真正实现前，manifest
+  还必须记录 `actual_ik_call_clock=reference_worker`，不能声称 reference 与 IK 已物理解耦。
+- `sim.contracts.TimingSpec.policy_hz` 暂时保留单策略兼容；多策略频率放入新的 PolicyGraph/execution profile
+  contract，待 sim frontend 使用后再考虑 schema 升级。
+- 所有 scheduler 使用 injected clock 和 deadline；测试应包含非整数频率组合，避免隐含取模逻辑。
+
+---
+
+## 五、Temporal Observation Hub：复用因果历史，不重造全模态同步帧
+
+### 1. 演进方式
+
+不新建另一套 frame buffer。建议把 `TemporalObservationHub` 实现为一个很薄的 registry/coordinator：
+
+```text
+TemporalObservationHub
+├── arm_state        -> CausalSnapshotHistory
+├── hand_telemetry   -> CausalSnapshotHistory
+├── tactile          -> CausalSnapshotHistory
+├── human_input      -> CausalSnapshotHistory
+├── camera streams   -> existing causal frame buffers / immutable frame refs
+└── external streams -> CausalSnapshotHistory or adapter
+```
+
+`CausalSnapshotHistory` 已经提供 immutable copy、sequence、source timestamp、available timestamp 和
+`latest_at_or_before(T0)`，应直接复用。`dataset_contracts.CausalSnapshotContract` v1 已固定 arm、
+hand、tactile、camera 的语义；新增通用 stream/cut contract 时应版本化扩展，不要静默改变 v1 hash。
+
+当前 `CausalSnapshotHistory` 会深拷贝 payload，适合低维 state/tactile snapshot，但不应要求高分辨率
+RGBD 在每个 policy cut 中重复复制。必须把可持久化记录与运行时 handle 分开，不能让一个
+`payload_ref` 同时表示 Python object、共享内存地址和 dataset URI。
+
+### 2. ObservationCutRecord 与 ObservationBundle
+
+每个 policy trigger 先形成可序列化、可 hash 的 `ObservationCutRecord`：
+
+```text
+ObservationCutRecord
+├── observation_cut_id
+├── control_domain_id / policy_node_id
+├── cutoff_at / built_at
+├── selected_sample_by_stream
+│   ├── stream_id / frame_id / sequence
+│   ├── measured_at / available_at
+│   ├── measured_age_sec / available_age_sec（v2.3 可保留 source alias）
+│   ├── valid / stale / missing
+│   └── stable payload object ID / content metadata
+├── context_dependencies
+├── contract/layout hashes
+└── trigger_reason
+```
+
+本地模型调用使用运行时对象：
+
+```text
+ObservationBundle
+├── record: ObservationCutRecord
+└── payload_handles_by_stream   # 仅当前进程/transport 生命周期有效
+```
+
+dataset/ControlTrace 只持久化 record 和稳定 object ID；in-process、shared-memory、RPC adapter 分别构造
+自己的 bundle/envelope。RPC 的临时 blob/共享内存 descriptor 属于 transport envelope，不进入 record，
+也不得被 writer 序列化。replay 先由稳定 ID 解析 payload，再重建新的 bundle。
+
+各 policy 的 observation builder 决定如何投影和聚合：
+
+- slow vision policy：最新 RGBD、与图像时间对齐的 state、tactile summary；
+- fast tactile policy：最新 tactile/state、指定 `PolicyContext`、最近 RGBD 及其 age；
+- replay policy：按记录的 observation cut ID 重建，不重新查询“当前最新值”。
+
+同一 RGBD 被 30 Hz policy 连续使用时，`frame_id` 和真实采集时间保持不变，只更新当前 cut 下的 age。
+不得复制成不同 frame ID，也不得把没有更新的图像伪装成新帧。
+
+### 3. PolicyObservationView
+
+`DeploymentObservation` 暂时继续作为当前单策略和 v2.3 adapter 的兼容容器；在它与 model wrapper
+之间新增 allowlist projection：
+
+```text
+ObservationBundle
+  → PolicyObservationBuilder
+  → PolicyObservationView
+  → existing pose-mode preparation
+  → policy.predict
+```
+
+`PolicyObservationView` 只包含 artifact/layout 声明的：
+
+- image/depth/tactile/state/history；
+- per-modality validity、age 和 frame ID；
+- 由 `LastActionContract` 明确声明的 last-action stage、producer scope、pose mode 和 anchor；
+- 上游 `PolicyContext` 的公开字段和 context ID。
+
+allowlist 不是简单删除 `faults`/`metadata` 两个顶层 key，而是 artifact-bound typed field contract；每个
+field path 声明 dtype/shape、required/optional、access role、missing policy 和（若适用）last-action stage。
+projection 输出也必须与 runtime payload 隔离，避免模型原地修改共享 numpy/mapping。测试必须向私有
+metadata 注入 selected owner、fault、receipt、reward、writer/backend 状态并证明 actor view 无法读取。
+
+默认禁止进入 actor view：
+
+- observation/control faults 的内部原因；
+- authority epoch、selected owner、proposal/decision ID；
+- safety/IK/planner/dispatch 状态；
+- ControlTrace、reward、expert/policy mask；
+- writer queue、backend health 和任意 frontend 私有 metadata。
+
+M0 已冻结 `DeploymentObservation.model_input()` 的 legacy 泄漏负面基线；M1A.5 后当前 deploy
+`policy.predict()` 不再把该 unrestricted projection 作为事实源，而是只使用 strict `PolicyObservationView`，
+object-style compatibility 也由 strict view 重建 sanitized observation。legacy `model_input()` 方法仍存在供兼容
+代码使用，因此新增 actor caller 仍必须经过 firewall，不能直接调用它。训练侧 critic 或 reward 若需要
+privileged data，应通过独立 training-only view 读取 ControlTrace，不能污染部署 actor contract。
+
+### 4. 分布式时钟规则
+
+- sensor 的 measured/source time 表示数据测量时间；所有对象的 local `available_at` 表示控制进程可安全
+  消费的时间。proposal/context 不再借用 sensor `source_timestamp` 一词。
+- 不同步的远端时钟不能直接与本地 control clock 比较；transport 必须提供 clock-domain/offset
+  evidence，或者只以本地 receive/available time 参与执行 eligibility。
+- 远端 policy 返回结果必须引用原 `observation_cut_id`；晚到结果只能从当前时刻起成为候选，不能
+  retroactively 改写旧 decision。
+- replay 使用记录的 causal IDs 和 logical timestamps，不重新采用 wall-clock “最新值”。
+
+---
+
+## 六、PolicyNodeRuntime、逻辑 PolicyGraph 与部署绑定
+
+### 1. 共同节点接口与现有 `PolicyDeployRuntime`
+
+当前 `PolicyDeployRuntime` 明确拥有 normalize/decode、action chunk queue、lookahead 和 schedule reset，
+所以它只适合 action-producing policy，不能作为所有 context node 的通用基类。目标接口应更窄：
+
+```text
+PolicyNodeRuntime
+  consume(ObservationBundle) -> PolicyNodeOutput
+
+ActionPolicyNodeRuntime
+  wraps existing PolicyDeployRuntime
+  output = ActionProposal(s)
+
+ContextPolicyNodeRuntime
+  output = PolicyContextRecord/Bundle
+  no action queue / v2.3 decode / RobotAction conversion
+
+DeterministicComposerNode
+  input = context/base/residual
+  output = ActionProposal(s) + composition lineage
+```
+
+现有 `PolicyDeployRuntime` 继续唯一持有一个 action policy 的 observation pose preparation、prediction
+transaction、v2.3 relative→absolute decode、chunk replace/append/pop/lookahead 和 recovery discard。每个
+action node 有独立实例/queue；context node 不复制这些行为。所有 node 都不拥有 observation acquisition、
+authority、safety、reference、dispatch、writer 或设备 lifecycle。
+
+M2/M3 迁移期固定 `admission_mode=on_emission_pop_v1`：inference 完成时只记录 PolicyOutput 和完整
+`ActionEmissionScheduleSpec`，未来 keyframe 仍留在现有 ActionChunkBuffer；唯一一次
+`prepare_next_action()` pop 产生 immutable `PolicyActionEmission`，随后才构造 Draft 并 admission。时间语义为：
+
+```text
+proposal.produced_at        = 对应 inference/output completed time
+proposal.available_at       = 本 keyframe pop 后 receiver admission commit time
+proposal.target_effective_at = schedule spec 预先推导的逻辑 keyframe time
+```
+
+因此 future keyframe 不会绕过 legacy queue 提前参与 authority，shadow 也不二次 pop。proposal 是否 selected
+不反向控制 policy queue：shadow、human takeover 或 proposal rejection 时 stream 仍按其 schedule 前进，被 pop
+但未 selected 的 proposal 保留 trace，恢复 authority 时不能倒退使用旧 keyframe。未来若需要 inference 完成
+时整 chunk admission，必须发布新的 producer schedule/admission mode、buffer/replay contract 和 parity fixture，
+不能静默改变 v1。
+
+### 2. 逻辑 PolicyNodeSpec / PolicyGraphSpec
+
+逻辑 contract 只描述算法语义：
+
+```text
+PolicyNodeSpec
+├── policy_node_id / output_kind
+├── artifact/layout/frame/context schema hashes
+├── input ObservationContract
+├── trigger_kind / inference_hz / proposal_hz
+├── deadline budget / result validity policy
+├── context dependencies
+└── action component coverage（仅 action/composer node）
+
+PolicyGraphSpec
+├── nodes
+├── versioned PolicyContextEdgeSpec
+├── deterministic composer edges
+└── graph validation/hash
+```
+
+`inference_hz` 和 `proposal_hz` 可以不同；每个 action keyframe 使用 `target_effective_at`。artifact 仍使用
+per-policy `PolicyIOLayout`，不能把所有模型塞进一个全局 layout。`AuthorityPolicySpec` 属于 control
+configuration，不属于 policy graph；graph 只发布结果，不能决定最终 owner。
+
+### 3. PolicyOrchestrator 与 RuntimeSupervisor 的边界
+
+使用 `PolicyOrchestrator` 名称避免与全局监督混淆。它负责：
+
+- 验证/实例化受限 policy DAG；
+- inference trigger、deadline 和 context 路由；
+- policy timeout/late-result 检测；
+- 发布 context/proposal/health event。
+
+`RuntimeSupervisor` 负责 sensor/backend/writer/process health、restart/producer epoch、mode transition 和
+degradation request。两者都不能直接 fallback 或 dispatch。fast policy timeout 后只能发布 health event、
+mode-transition request 或 fallback-producer-enable event；实际 owner 变化必须由
+`ControlMode + AuthorityPolicySpec + ActionArbiter` 在后续 decision cut 中确定。
+
+M2–M6 继续使用现有单个 `PolicyDeployRuntime` + 窄 `arbiter_shadow` wiring，不提前引入 Orchestrator。到 M7C
+production multi-policy shadow 阶段，`run_policy.py` 才演进为注入 `PolicyOrchestrator`：先注册一个 action
+node 并证明 timing/queue/decode/pause-reset parity，再接 context/composer node 和真实 fast/slow topology。
+
+### 4. `PolicyContextRecord` 与 runtime payload
+
+慢策略可以输出 task/skill intent、subgoal/waypoint、contact phase、constraint、trajectory plan 或 latent，
+但持久化 record 与运行时 payload 同样必须分开：
+
+```text
+PolicyContextRecord
+├── context_id / producer_node_id / producer_epoch / sequence
+├── source_observation_cut_id
+├── produced_at / available_at / effective_from / effective_until
+├── context_kind
+├── context_schema_hash / producer_artifact_hash
+└── semantic payload 或 stable blob object ID
+
+PolicyContextBundle
+├── record
+└── runtime tensor/blob handles
+```
+
+`context_kind` 至少区分 `semantic_subgoal`、`skill_state`、`trajectory_plan`、`constraint` 和
+`artifact_bound_latent`。opaque latent 必须绑定 producer artifact、context schema 及允许的 consumer
+contract，不能作为跨模型/跨版本的通用任务事实。快策略的 cut/proposal 必须引用 context ID；乱序旧版本
+不得覆盖新版本。
+
+只有可执行 control action 进入 `ActionProposal`。slow base + fast residual 由显式、版本化
+`DeterministicComposerNode` 在 Arbiter 前完成，并记录 base/residual/composed lineage；Arbiter 第一版不做
+pose blend。
+
+Composer 自身也必须是 snapshot-driven 的纯节点：
+
+```text
+base/residual/context draft
+  → receiver-side internal admission
+  → immutable CompositionInputRecord(authority_candidate=false)
+  → CompositionInputStore
+  → CompositionInputSnapshot
+
+CompositionInputSnapshot
+  base/context/residual IDs + content hashes + effective intervals
+  internal admission sequence/cutoff
+  frame/component schema hashes + CompositionSpec hash
+  → DeterministicComposerNode
+  → CompositeActionProposalDraft
+  → normal receiver admission
+```
+
+Composer 不消费未 admission 的临时 Python 对象。internal input 复用 control-domain admission coordinator、
+stable ID/content hash 和 receiver `available_at`，但默认不写入 global ProposalBuffer，也不能被 Arbiter 单独
+选择；只有成功 admission 的 CompositeActionProposal 是 authority candidate。若某个上游输出确实同时需要
+独立 authority 和 composition input，必须显式发布两个有 lineage 的 typed fact，不能因共享对象引用而隐式
+双重候选。
+
+第一版只支持可证明确定性的 component union、base + bounded residual、fixed semantic transform 和显式
+SE(3) composition。base/context 缺失、residual 缺失、frame 不兼容和 late input 的行为由
+`CompositionSpec` 明确为 invalid/no-action/zero-residual 等结果；snapshot 后晚到输入只能进入下一次 composition。
+近期不实现 confidence blend、freshness 自动权重、latency-driven 连续调权、Arbiter 内 pose averaging 或未版本化
+renormalization。未来新增比例混合时，由具体 composition algebra 定义 source role、temporal validity、fallback
+和 weight policy，系统不强制所有 algebra 的权重和为 1。
+
+### 5. DeploymentBindingSpec
+
+placement/transport 不进入 `PolicyNodeSpec` 或其 semantic hash，而由独立部署 manifest 描述：
+
+```text
+DeploymentBindingSpec
+├── policy_node_id
+├── process/machine placement
+├── transport kind / endpoint
+├── queue/QoS
+└── timeout/reconnect policy
+```
+
+同一个 PolicyGraph 可映射为单进程、单机多进程或多机；更换 in-process/shared-memory/RPC 只改变
+deployment hash，不改变 policy semantic hash。第一阶段只实现 in-process binding，核心 contract 不依赖
+Python 对象地址、共享内存名或具体 RPC 框架。
+
+---
+
+## 七、ActionProposal、ProposalBuffer 与 ActionArbiter
+
+### 1. ActionProposal
+
+proposal 必须在 absolute runtime `RobotAction` 层生成：
+
+```text
 ActionProposal
 ├── proposal_id
-├── action: absolute runtime RobotAction
-├── source_kind: human / policy / replay / scripted / recovery
-├── source_id
-├── source_timestamp
-├── received_timestamp
-├── observation_timestamp
-├── valid_from
-├── valid_until
+├── control_domain_id / embodiment_instance_id
+├── producer_kind: human / policy / replay / scripted / recovery
+├── producer_id / policy_node_id / producer_epoch
+├── action: immutable absolute RobotAction
+├── produced_at / available_at
+├── control_admission_sequence
+├── effective_from / effective_until / target_effective_at
 ├── sequence
-├── causal_observation_id / causal_cutoff
-├── requested_effectors
-├── component_schema_hash / component_coverage
+├── observation_cut_id
+├── policy_output_id / inference_id
+├── context_dependency_ids
 ├── representation_trace_id
-│   # raw relative/absolute intent、frame、contract hash、measured anchor 的引用
-├── confidence                  # 只记录，第一版不用于抢占
-├── inference_latency
-├── authority_request           # optional explicit takeover request
-├── validity: valid / stale / invalid / blocked
-└── metadata
-~~~
+├── component_schema_hash / component_coverage
+├── selection_group requirements
+├── confidence                 # 第一版只记录，不用于隐式抢权
+├── validity/status
+├── semantic_content_hash
+└── audit_metadata             # 不参与任何控制判断
+```
 
-时间字段必须在同一个 control clock 语义下比较。设备原始时间、VIVE 时间和网络接收时间
-可以保留在 metadata，但不能未经 clock-sync 转换就互相比较。`valid_until` 是硬边界：
-过期 proposal 不得因为“上一帧可用”而无限复用。
+`RobotAction` 虽为 frozen dataclass，但内部 numpy/mapping 仍需在 proposal 边界复制并冻结。raw relative
+vector、anchor、normalization、frame conversion 写入 `ActionRepresentationTrace`，不交给 Arbiter 计算。
+proposal 不再使用 sensor 风格的 `source_timestamp`；输入历史完全由 `observation_cut_id` 表达。
 
-`requested_effectors` 必须与 `RobotAction.active_effectors` 一致；每个 proposal 还要声明
-其动作是否要求成组选择。双臂 collision/coupled planner 场景应把左右臂作为一个
-`selection_group`，不能在 Arbiter 中独立选择后再把不相容的两侧拼起来。
+proposal 的有效期是硬边界；旧 action 只能在 `effective_until` 前继续使用。queue empty、timeout 和 stale
+都必须显式产生状态，不能无限 hold 最近 proposal。
 
-### 4. ActionArbiter：只做候选选择和 authority decision
+proposal 的 priority、authority request、validity、fallback、component coverage、frame/action space、selection
+group、timing/context 和 safety 语义必须是 typed field 并进入 `semantic_content_hash`，禁止藏入
+`audit_metadata`。Arbiter、Composer、safety 和 persistence 不得读取 audit metadata；目标持久化 record 另用
+storage envelope 的 `record_integrity_hash` 防篡改。该 hash 由 M4B/M4C 的 dataset/trace encoder 在加入
+episode membership、journal sequence、schema registry refs 等持久化字段后计算，不放在 runtime
+`ActionProposal` 本体中，也不与控制 semantic hash 混用。当前 M4A 同名 logical envelope 只用于内存
+conformance，不代表 storage encoder 已实现。
 
-`ActionArbiter` 的职责是确定当前 control cut 中“哪些 source 的哪些 effector/group
-proposal 可以成为 selected action”。它不负责：
+现有 `RobotAction.metadata` 不能在 M1A 被粗暴改名或全部排除：当前 resolver 会读取其中的
+`arm_action_specs_by_side`/`hand_action_specs_by_side`。proposal admission 必须对这些已知 execution-relevant key
+做 typed allowlist/canonical projection 并纳入 semantic hash，未知且会影响 resolver 的字段 fail closed；待
+兼容 caller 迁移后再提升为显式 typed action spec。纯 debug/source note 才进入 audit metadata。
 
-- 轮询相机、VIVE、手或 policy；
-- 解析原始 policy output；
-- 执行 IK、workspace/joint safety、collision planner；
-- 访问真实 backend、调用 `Rig.send_commands`；
-- 启动/停止 episode writer；
-- 自己拥有 fault/recovery 状态机。
+#### 1.1 Admission contract
 
-建议接口保持纯进程内、无硬件依赖：
+producer 先提交 `ActionProposalDraft`，receiver 仅在完整 validation/deep-freeze/epoch-sequence 检查成功后
+原子写入 buffer，并返回 `ProposalAdmissionReceipt`。rejected draft 产生 admission fact，但绝不能获得可执行
+`available_at` 或进入 snapshot。buffer capacity failure、duplicate、sequence rollback、inactive epoch、schema/
+frame mismatch 和 non-finite payload 都使用 typed rejection reason；不能静默 drop 或靠日志文本解释。
 
-~~~text
-result = arbiter.arbitrate(
-    proposals_by_source,
-    context=ArbitrationContext(
-        now,
-        control_mode,
-        safety_status,
-        active_groups,
-        previous_selection,
-    ),
-)
-~~~
+### 2. ProposalBuffer
 
-其中：
+`ProposalBuffer` 是 bounded、multi-producer、只保存 immutable proposal 的因果缓冲区：
 
-~~~text
-ArbitrationContext
-├── now / clock_domain
-├── control_mode
-├── safety_status: READY / HOLD / FAULT / RECOVERING
-├── active_selection_groups
-├── previous_selection / authority_epoch
-├── explicit authority events
-└── metadata
+- 按 producer ID/sequence 拒绝 rollback 和重复发布；
+- 在 `decision_cutoff_at` 获取“截至此时已 available 的 proposal snapshot”；
+- snapshot 后 producer 的写入不能改变本次 arbitration；
+- expired/invalid proposal 仍可产生 trace event，但不进入有效候选集；
+- buffer 不运行 policy、不做 authority、不做 safety。
 
+每次提交 Arbiter 的对象必须是可重放的 `ProposalSnapshot`：
+
+```text
+ProposalSnapshot
+├── proposal_snapshot_id / control_domain_id
+├── snapshot_cutoff_at / snapshot_created_at
+├── control_cutoff_admission_sequence / included sequence range
+├── reduction_policy_id/hash
+├── candidate proposal IDs + proposal content hashes
+├── producer_epoch_summary
+└── canonical snapshot hash
+```
+
+snapshot hash 同时覆盖 `proposal_id` 与对应 `proposal_content_hash`，防止 ID 错误复用或持久化内容损坏只靠
+ID 列表无法发现。
+
+`ProposalSnapshot` 只冻结候选集，不足以单独决定 authority。每个 scheduler tick 必须继续冻结完整输入：
+
+```text
+ArbitrationInputSnapshot
+├── arbitration_input_snapshot_id / control_domain_id / embodiment_instance_id
+├── control_cutoff_admission_sequence
+├── proposal_snapshot_id / hash
+├── AuthorityStateSnapshot
+│   └── policy hash / mode / leases / causal event IDs / authority_epoch
+├── ExecutionGateSnapshot
+│   └── status / gate_epoch / reason / source event IDs
+├── ProducerEpochRegistrySnapshot
+├── previous_authoritative_decision_id / previous_selection_by_group
+├── active selection groups / action+component schema hashes
+├── DecisionScheduleTick
+├── per-store included admission sequence ranges
+└── canonical input hash
+```
+
+pure Arbiter 的唯一逻辑输入是该对象：
+
+```text
+ActionArbiter.arbitrate(snapshot: ArbitrationInputSnapshot) -> ArbitrationResult
+```
+
+不得在调用时另外传入 `frontend.mode`、`runtime.fault` 或 `authority_store.current()`。snapshot 后状态变化不
+修改本次纯计算结果；若 gate/fault/execution epoch 在 publication 前变化，publication/dispatch gate 必须拒绝
+旧 result 并触发 cancellation，下一 tick 再反映新状态。
+
+decision scheduler 使用版本化 `DecisionScheduleSpec`：
+
+```text
+DecisionScheduleSpec
+  schedule_mode: fixed / event_limited
+  decision_period / cutoff_policy / target_lead_time
+  publication_deadline_offset / max_target_lateness
+  late_decision_policy / missed_tick_policy / trigger_coalescing_policy
+
+DecisionScheduleTick
+  schedule_tick_id / scheduled_decision_at / decision_cutoff_at
+  cutoff_admission_sequence
+  target_effective_at / publication_deadline_at
+  trigger IDs+reasons / schedule_spec_hash
+```
+
+`decided_at` 表示 pure calculation 完成，`published_at` 表示 authoritative result 成功通过 publication gate 并
+交给执行链。二者与 scheduler 晚醒、下游 IK/reference deadline 分开审计，不能共用一个 timestamp。
+
+第一版 candidate reduction 必须以本次 `target_effective_at` 为中心，而不是笼统选择“最后发布的一条”：
+
+```text
+eligible =
+  proposal.available_at <= snapshot_cutoff_at
+  and proposal.control_admission_sequence <= control_cutoff_admission_sequence
+  and proposal.effective_from <= target_effective_at < proposal.effective_until
+  and proposal.producer_epoch == active_producer_epoch
+
+per-producer/group winner ordering =
+  max(effective_from)
+  then max(sequence)
+  then lexical-min(proposal_id) deterministic tie-break
+```
+
+effective interval 固定为半开区间 `[effective_from, effective_until)`，相邻 keyframe 在边界处不能同时
+eligible。chunk keyframe interval 由版本化 `ActionEmissionScheduleSpec` 的推导起点、keyframe cadence、
+artifact horizon/maximum hold 或显式 validity duration 给出；最后一个 interval 不能由实际 queue pop 时间
+临时决定。
+
+同一 producer/group 的普通 keyframe effective interval 默认不得重叠；确需重叠时必须由版本化 overlap
+policy 明确选择，不能让较大的 chunk index 或较晚 arrival 隐式抢占当前 target。所有 raw proposal 继续留在
+trace；snapshot 只冻结实际提交 Arbiter 的 reduced candidate set。replay 直接校验 snapshot hash，不依赖
+未来版本的 buffer 实现重新推断候选集。测试覆盖同一 chunk 的多个未来 keyframe、replace/append chunk、
+late chunk、overlapping interval、相同 cutoff 和无序输入。
+
+decision runtime 还需声明 `max_target_lateness` 与 `late_decision_policy`。若 `decided_at-target_effective_at`
+超过预算，不能把已经过期的目标照常发布；v1 由 profile 显式选择 `no_action` 或 `hold`，并记录 deadline
+miss。candidate reduction 产生的 `superseded_before_snapshot`、decision gate 合并导致的
+`coalesced_before_decision`、以及没有任何合法 decision target 覆盖的 `effective_interval_missed` 是 proposal
+disposition/审计原因，不得改写原始 proposal validity，也不能统称为 stale。
+
+固定频率 Arbiter 第一版直接在每个 decision tick 获取 snapshot，配置和实际 decision publication 均不得
+超过 60 Hz。事件触发加 rate limit 可以作为后续模式，但事件 burst 必须 coalesce 到同一个受限 decision
+gate；contract 从一开始保留 trigger reason、cutoff、decided 和 target-effective time。
+
+### 3. ActionArbiter
+
+`ActionArbiter` 的纯选择函数本身没有 wall-clock 频率概念；production frontend 不得因此直接无限频调用并
+发布 decision。共享 `ArbitrationRuntime`/decision gate 必须是唯一生产调用入口，并同时保证：
+
+- configured `decision_hz <= 60 Hz`，大于 60 的配置 fail closed；
+- 相邻普通 `ArbitrationDecision` 的发布时间满足 60 Hz 最小周期，事件 burst 合并后只消费最新合法
+  `ProposalSnapshot`；
+- 记录 configured/effective/measured decision rate 和被 coalesce 的 trigger 数；
+- safety veto、FAULT、HOLD 可立即生效，但只产生 safety/mode event，不伪造一个超频 selected action；
+- 该 gate 不限制 proposal、reference、IK、command 或 backend tick。
+
+production decision policy v1 支持最高 60 Hz 的 authoritative learned-action 更新。100/500 Hz producer
+表示更高频候选生成，不保证每个 proposal 成为 selected action；普通 learned correction 若确实要求
+超过 60 Hz，必须发布新的 decision-rate policy，或定义一条单独受安全/authority/trace 约束的下游局部
+controller contract，不能偷偷塞进 command worker。另一种兼容方式是由不超过 60 Hz 的 policy 输出带显式
+horizon 的高频 trajectory/reference，由现有执行层展开。
+
+rate gate 只证明“没有超频”，不证明 deadline 可满足。execution manifest 还需记录
+`decision_runtime_budget`、`ik_runtime_budget`、`end_to_end_control_budget` 和 `late_decision_policy`；synthetic
+测试覆盖 deadline/miss 语义，真实 profile 在获得明确硬件测试授权后验收 proposal available→snapshot→
+arbitration→shared safety→IK/planner→reference publish→first command send 的 p50/p95/p99 与 miss count。
+
+Arbiter 只负责 authority 与确定性选择：
+
+```text
 ArbitrationResult
+├── computation_id / result_id / control_domain_id / embodiment_instance_id
+├── arbitration_input_snapshot_id / input_hash / proposal_snapshot_id
+├── arbiter_contract_id/hash / arbiter_implementation_hash
+├── authority_policy_hash / component_selection_policy_hash
+├── decision_schedule_spec_hash / canonical_encoding_version
+├── schedule_tick_id / decision_cutoff_at / decided_at / target_effective_at
+├── authority_epoch / control_mode / execution_gate_status
 ├── selected_by_group
 ├── selected_by_component
-├── proposal_id_by_component
-├── source_kind_by_component
+├── proposal_id/source_id by component
 ├── composed_action: RobotAction | None
-├── decision_by_group
-├── decision_by_component
-├── rejected_proposals
-├── expired_proposals
-├── authority_epoch
-├── handoff_event | None
+├── rejected/expired/incompatible decisions
 ├── output_status: selected / no_action / hold / fault
-└── trace_metadata
-~~~
+└── attribution
+```
 
-`ArbitrationResult` 必须有两个明确的出口，不能把它作为一个无边界的大对象继续向下游和
-模型传递：
+它不负责 sensor polling、policy inference、relative decode、IK、workspace/collision safety、trajectory、
+dispatch、reward 或 writer lifecycle。
 
-1. **control port**：只向后续 safety/IK/reference/dispatch 提供 selected absolute
-   `RobotAction` 及其最小 `decision_id`/lineage 引用；这些下游可以消费 selected action，但不
-   需要知道 policy 的 raw vector 或其他 source 的完整 proposal。
-2. **attribution port**：向 `ControlTrace`/reward/label adapter 提供每个 component 的
-   owner、proposal、decision reason、mask 和依赖关系；该端口只写训练/审计数据，禁止回流到
-   actor 的 `PolicyObservationView`。
+选择规则不能埋在 frontend priority 常量中。M1B 同时冻结最小 `AuthorityPolicySpec`、`AuthorityEvent` 和
+`AuthorityLease` contract，明确 source/group priority、takeover/release、lease expiry、human proposal 失效时
+hold/fallback、recovery producer 权限和 shadow 固定 owner。完整多策略 policy 可以后置，但 M5 human shadow
+不得再发明一套硬编码 authority 规则。
 
-Arbiter 本身不实现 reward，也不根据 task reward 改变 selection。reward adapter 应读取
-`component_id` 对齐的 attribution 和执行结果，按任务定义计算 credit；这样动作选择与奖励定义
-解耦，DAgger、RL 和 offline analysis 可以使用同一份事实记录。
+每次 arbitration 按固定顺序执行：
 
-`ArbitrationResult` 要保留“为什么选中/拒绝”的结构化原因，不能只返回一个 action；至少要能
-对 `ActionComponentCatalog` 中的每个 `component_id` 给出一条 decision：
+1. 验证 action space、frame、shape、finite、component coverage、sequence 和时间字段；
+2. 以 available/effective interval 检查因果性和 freshness；
+3. 应用外部 `ExecutionGateStatus`/readiness veto；
+4. 按 `ControlMode` 和显式 authority lease/takeover 过滤候选；
+5. 按 selection group、priority、sequence 和 timestamp 做确定性选择；
+6. 检查 coupled group 完整性与 component compatibility；
+7. 输出 control port 与 attribution port。
 
-~~~text
-ProposalDecision
-├── group
-├── component_id | component_set
-├── selected_proposal_id | None
-├── owner: human / policy / replay / none
-├── reason: priority / takeover / stale / invalid / fault_veto / mode_blocked / incompatible
-├── age_sec
-├── valid_until
-└── metadata
-~~~
+第一版不根据 confidence、动作幅度或“人是否移动”隐式抢权，不做 raw pose blend。handoff 平滑由
+selected action 以下的 reference/trajectory 层完成。
 
-#### 4.1 选择顺序
+#### 3.1 Action persistence 与 publication
 
-每个 control cut 按固定顺序执行，保证结果可重放：
+Arbiter 的 `selected/no_action/hold/fault` 不能直接交给各 backend 自行解释。共享纯转换固定为：
 
-1. **结构验证**：检查 action space、active effectors、frame、shape、finite value、source、
-   component schema/coverage 和 proposal 时间字段；失败直接标记 invalid。component coverage
-   与 `RobotAction` 的 active fields 不一致时，不能只按 effector 名称继续发送。
-2. **因果/新鲜度验证**：检查 `observation_timestamp <= source_timestamp <= valid_until`、
-   clock skew、sequence 单调性和 observation age；过期 proposal 不进入候选集。
-3. **安全状态 veto**：`FAULT`、manual hold、tracker hold、startup not-ready 等状态不允许
-   普通 source 获得执行权；Arbiter 输出 `hold/fault`，不能用旧 action 填充。
-4. **控制模式过滤**：根据 `human_only`、`policy_only`、`policy_shadow`、`human_override`
-   或 `per_effector_override` 过滤 source。
-5. **显式 authority**：处理 GUI/foot-pad/脚本产生的 takeover/release event。第一版不根据
-   confidence、动作幅度或“人类是否移动”隐式抢占控制权。
-6. **确定性优先级**：在同一 group 中按 mode policy、authority lease、proposal sequence、
-   source priority 和 timestamp 做确定性选择；所有 tie-break 规则写入 config 和 trace。
-7. **组完整性检查**：coupled group 必须整体选中同一 proposal 或明确进入 hold，不能静默拼接
-   不同 frame/action space 的左右臂。
-8. **组合与输出**：不同 group 可以组合为一个 `RobotAction`；同一 effector 只能有一个 owner。
-   组合失败时返回 fault/hold，不回退到任意 raw `TeleopCommand`。
-
-第一版不做任意 pose blend。Arbiter 只选择 owner；handoff 的平滑应由后续 reference/trajectory
-layer 在已知 frame、当前 measured state 和安全约束下完成。四元数不能直接逐元素线性混合。
-
-#### 4.2 ControlMode 与 SafetyStatus 分离
-
-不要把 `POLICY`、`HUMAN`、`HOLD`、`FAULT` 混成一个 enum。建议分成两层：
-
-~~~text
-ControlMode:
-  HUMAN_ONLY
-  POLICY_ONLY
-  POLICY_SHADOW
-  HUMAN_OVERRIDE
-  PER_EFFECTOR_OVERRIDE
-
-SafetyStatus:
-  READY
-  HOLD
-  FAULT
-  RECOVERING
-  NOT_READY
-~~~
-
-`ControlMode` 表达“允许谁提出/获得动作”，`SafetyStatus` 表达“当前是否允许执行”。
-SafetyStatus 是上游 session/backend 的 veto，不能由普通 policy proposal 清除；恢复必须
-经过现有 `TeleopSession` 或 deployment recovery 流程，并生成明确的 authority epoch。
-
-推荐的初始模式行为：
-
-| 模式 | policy proposal | human proposal | 实际执行 | 用途 |
-|---|---|---|---|---|
-| `HUMAN_ONLY` | 可不产生/只记录 | 选中 | human | 当前 GUI/headless 默认兼容行为 |
-| `POLICY_SHADOW` | 产生并记录 | 选中 | human | 真机第一阶段，验证时序和数据 |
-| `HUMAN_OVERRIDE` | 持续产生 | 显式接管 group | human selected group | DAgger/human intervention |
-| `PER_EFFECTOR_OVERRIDE` | 选未接管 group | 选接管 group | 按 group 组合 | 仅在 coupling 规则允许时启用 |
-| `POLICY_ONLY` | 选中 | 只作 emergency override | policy | 先在 sim/dry-run，最后才考虑真机 |
-
-当显式要求 human override 但 human proposal 已过期或无效时，默认进入 `HOLD`，不能静默
-回退到 policy。fallback policy 必须是单独、可审计的模式，而不是 Arbiter 的隐式行为。
-
-#### 4.3 Handoff、hold 和 action chunk
-
-- authority 变化产生 `handoff_event` 和新的 `authority_epoch`，并清除旧 owner 的未消费
-  proposal；不能让旧 chunk 跨 owner 继续执行。
-- handoff 第一版只做“切 owner + reference anchor reset/hold”，不在 Arbiter 中做数值 blend。
-- policy action chunk 由 `PolicyProposalSource` 按 action/reference clock 拆成带 sequence 和
-  `valid_until` 的 proposal；policy prediction、reference/IK 和 command 使用
-  `PositionControlRates` 的 profile-defined clocks，不应混成一个 Arbiter 频率。当前默认 profile
-  是约 `15 → 75 → 150 Hz`，另有显式的 `15 → 45 → 150 Hz` compatibility profile；Arbiter 不应
-  写死 45 或 75。
-- 对 v2.3 relative policy，proposal 的有效边界是已解码 chunk/keyframe 的边界；同一 chunk 的
-  measured TCP anchor 不能因为 reference tick 或 command tick 变快而重新计算。
-- Arbiter 在 keyframe/reference boundary 运行；150 Hz command worker 或 position executor
-  只消费已选且仍有效的结果，不重新做 authority decision。
-- queue empty、policy error、tracker loss、backend not-ready 都要产生显式 no-action/hold
-  decision；不能把最后一个 proposal 当成无限期有效。
-
-#### 4.4 fault 与安全层的落位
-
-Arbiter 不是新的 SafetyMonitor。推荐顺序为：
-
-~~~text
-observation/source fault
-  → source proposal validation
-  → ActionArbiter selection
-  → backend-specific safety filter / command guard
-  → RobotActionResolver / reference executor
-  → TeleopCommand / Rig
-~~~
-
-当前 policy 的 `ActionSafetyFilter` 主要接收 `NormalizedAction + DeploymentObservation`，
-当前 human 的 `TeleopSession.command_filter/command_guard` 主要接收 `TeleopCommand +
-TeleopObservation`。第一阶段不应把 policy filter 直接套到 human command 上造成双重或错误
-参考；应先抽取统一的 safety result/trace contract，再分别提供 human/policy/sim adapter。
-
-安全层应至少返回：
-
-~~~text
-SafetyResult
-├── input_action / selected_proposal_id(s) by component
-├── safe_action | None
-├── modified_effectors / modified_components
-├── dependency_proposal_ids_by_component
-├── faults
-├── blocked: bool
-├── reference_timestamp
-└── metadata
-~~~
-
-这样可以区分“Arbiter 没选到动作”“安全层修改了动作”“backend 拒绝了 command”和“实际
-dispatch 成功”。真机 RL/DAgger 训练标签只能按数据契约选择 safe/executed action，不能把
-未通过安全层的 policy intent 误当成实际动作。
-
-#### 4.5 Action attribution：数采时实时区分每个 action 的对应部分
-
-统一发送和执行只解决“最后由谁把 command 发给 Rig”的问题；对 DAgger、human-in-the-loop
-RL 和 offline RL 来说，还必须解决“当前控制结果的每一部分究竟来自哪个 action source”的问题。
-这个归因必须在 Arbiter 做 selection 的同一个 control cut 中生成，不能在 episode 结束后只看
-最终 command 向量、再用数值差异猜测来源。
-
-当前 `build_collection_action_record()` 从最终 `TeleopCommand` 反推一个 `RobotAction`，
-`CollectorSample` 也主要保存单一 action vector。这些对象可以继续作为 v2.1/v2.2 兼容数据，
-但不能作为新 DAgger/RL 数据的唯一事实来源，因为 merge、safety、IK 和 interpolation 之后，
-source identity 已经不可逆。
-
-##### 4.5.1 先定义 action component，而不是只定义一个整 action
-
-需要引入稳定的 `ActionComponentCatalog`。它是 action layout 的版本化清单，把 canonical
-`RobotAction`、`PolicyIOLayout`、dataset feature 和 backend command 的字段对应起来。
-component 至少采用以下层级：
-
-~~~text
-component group / selection group
-  → effector
-    → typed field
-      → optional slot
-
-left_arm_coupled
-  → left_arm
-    → pose / qpos
-      → position.x, position.y, ...       # 只有 layout 定义时才下沉到 scalar slot
-left_hand
-  → left_hand
-    → qpos / end_effector_target
-      → q0, q1, ...
-~~~
-
-第一版的 authority 和 safety granularity 默认是 effector 或 coupled group；dataset 可以同时
-保存更细的 field/slot mask。不能把任意向量 slice 自动当成独立可接管 component：例如四元数
-不能被任意 source 分别占用，双臂 coupled planner 也不能把左右两侧拆成互不相关的 scalar。
-
-每个 component key 必须是稳定的 typed name，而不是“当前 Python 实现里的第几个数组元素”。
-例如 `left_arm.pose`、`right_hand.qpos[3]`；实际可用 component 由
-`PolicyIOLayout`/`ActionComponentCatalog` 的 `schema_hash` 冻结。不同 action space、frame
-或单位不能直接合并；必须先通过 adapter 投影到同一个 component profile，否则记录为
-`incompatible`，不生成虚假的 attribution。
-
-需要明确区分两个概念：
-
-- `selection_group`：Arbiter 是否必须原子地选择一组动作，例如双臂 coupled planner。
-- `component`：trace 和训练标签要归因的最小字段，例如 `left_arm`、`left_hand.qpos[2]`。
-
-一个 selection group 可以包含多个 component；一个 proposal 也可以声明只覆盖 group 中的
-部分 component，但只有在 group contract 明确允许 partial ownership 时才可组合。
-
-##### 4.5.2 归因不是一个 bool，而是多层 source mask 和 lineage
-
-建议新增 `ActionAttributionFrame`（名称可在实现阶段调整），每个 arbitration/control tick
-至少包含：
-
-~~~text
-ActionAttributionFrame
-├── trace_id / episode_id / control_tick_id
-├── observation_id / causal_cutoff / decision_id
-├── authority_epoch / control_mode / safety_status
-├── component_schema_id / component_schema_hash
-├── proposal_id_by_component
-├── source_kind_by_component: human / policy / replay / scripted / recovery / none
-├── available_mask_by_source_and_component
-├── selected_mask_by_source_and_component
-├── selected_action_by_component
-├── safety_modified_mask_by_component
-├── safe_action_by_component
-├── commanded_mask / command_id / reference_segment_id
-├── executed_action_by_component / dispatch_receipt_id
-├── measured_state_id / measured_valid_mask
-├── hold_mask / invalid_mask / stale_mask / incompatible_mask
-└── decision_reason_by_component
-~~~
-
-其中以下 mask 语义必须固定，不能继续用一个含义不明确的 `intervention_mask`：
-
-| 字段 | 语义 | 不能替代的字段 |
-|---|---|---|
-| `available_mask` | 该 source 在这个 control cut 是否提供了有效 proposal | 不代表它被选中 |
-| `selected_mask` | 该 source 是否成为该 component 的 authority | 不代表安全层未修改 |
-| `expert_label_mask` | 该 component 是否有可用于 DAgger 的有效 human/expert label | 不等同于 human proposal 存在或数值变化 |
-| `policy_behavior_mask` | 该 component 是否由 policy 成为 selected owner 并进入有效 command path | 不等同于 policy proposal 存在；safety 修改和 measured validity 另记 |
-| `safety_modified_mask` | safety/planner 是否改变了该 component 或其依赖输出 | 不代表 source 发生切换 |
-| `command_valid_mask` | 对应 component 是否进入有效 command/reference | 不代表 backend 已执行 |
-| `measured_valid_mask` | 对应 transition 是否有有效 measured 对齐 | 不代表 action 成功 |
-| `hold_mask` | 当前 component 被明确 hold/no-action | 不允许用旧 proposal 填充 |
-
-`proposal_id_by_component` 和 `source_kind_by_component` 是身份归因；action 数值字段是各阶段
-的值归因。两者必须同时保存。只保存 `human_action`、`policy_action` 和最终 action 三个向量，
-但没有 per-component mask，仍然不能判断 policy 是否只控制了右臂、human 是否只接管了左手。
-
-##### 训练信号读取边界：Arbiter 记录，reward adapter 解释
-
-`ActionArbiter` 只负责产生可重放的 selection/ownership facts，不负责定义 task reward，也不把
-这些 facts 回传给 policy。训练侧单独读取：
-
-~~~text
-ControlTrace + task outcome/measured transition + ActionComponentCatalog
-  → RewardAttributionAdapter
-  ├─ DAgger expert label/value/mask
-  ├─ RL policy-behavior transition/mask
-  ├─ safety/intervention/constraint penalty
-  └─ mixed-source component credit
-~~~
-
-推荐固定以下推导关系：
-
-- `policy_behavior_mask` 表示 policy 在 Arbiter 中成为 component owner 且进入有效 command
-  path；safe action 被 clamp 不会抹掉 policy ownership，但必须同时置上
-  `safety_modified_mask`，把 policy intent 与 safe value 分开保存；hold、no-action、无效
-  command 则不算 policy behavior。
-- `measured_valid_mask` 独立存在。训练 exporter 可以再派生
-  `policy_learning_mask = policy_behavior_mask & command_valid_mask & measured_valid_mask &
-  transition_valid`，但这个派生 mask 不是 Arbiter 的 authority 结果，也不能覆盖原始 mask。
-- `expert_label_mask` 由有效 human/expert component proposal 和当前 mode/selection 规则派生；
-  在 policy shadow 中，即使 policy proposal 没有被选中，也应保留它的 `available_mask`，而
-  human selected component 才能作为对应的 DAgger label。
-- task reward 从 measured transition/objective 计算，safety/intervention penalty 从
-  `SafetyResult` 与 attribution 计算；两者都在 reward adapter 中合成，不让 Arbiter 依赖 task
-  或 RL 算法。
-- 混合 source 的 global reward 若无法可靠分摊到 component，必须记录
-  `mixed_source=true` 并由 exporter 按 mask 排除或单独处理，不能把整条 transition 伪装成
-  policy-only behavior。
-
-因此 actor 的部署输入仍只有 `PolicyObservationView`，actor 输出仍只有 policy intent；
-`RewardAttributionAdapter` 可以服务 actor-critic/DAgger 数据准备，但不能把
-`selected_by_component`、`safety_modified_mask` 或 reward 偷渡进 actor observation。
-
-##### 4.5.3 lineage 必须随控制结果穿过每个阶段
-
-推荐的最小 lineage 是引用关系，不把大数组复制到每一个 150 Hz event：
-
-~~~text
-ActionProposal
-  └─ proposal_id + component coverage
-       ↓
+```text
 ArbitrationResult
-  └─ decision_id + selected proposal/source per component
-       ↓
-SafetyResult
-  └─ selected proposal ids + modified component/dependency mask
-       ↓
-Reference / IK / planner output
-  └─ reference_segment_id + dependency proposal ids per output component
-       ↓
-TeleopCommand
-  └─ command_id + source/lineage metadata per effector command
-       ↓
-CommandDispatchReceipt
-  └─ dispatch_id + sent/rejected/fault + dispatch timestamp
-       ↓
-Measured state
-  └─ measured_state_id + interval/age/validity
-~~~
+  + ActiveExecutionSnapshot
+  + ActionPersistencePolicy
+  → ExecutionDirective
 
-这里有两个必须单独记录的情况：
+ExecutionDirective:
+  global_status: normal / hold_all / fault_all
+  directive_by_selection_group:
+    group_id
+    publish_selected / keep_existing_until_expiry / cancel_group_and_hold /
+    keep_backend_hold
+    selected_action_ref / existing_segment_id / segment_expiry
+    group_segment_generation
+  persistence_policy_hash
+  publication_fallback: no_action / hold / null
+```
 
-1. **安全修改不改变 source identity。** 人类或 policy proposal 被 clamp 后，仍然是原 source
-   的 selected action，但 `safety_modified_mask` 为 true，safe value 与 intent value 分开保存。
-2. **IK/planner 可能是多输入变换。** 如果一个 coupled planner 的右臂 joint command 同时依赖
-   左右臂 proposal，不能伪造一个唯一 source；应记录 `primary_owner`（用于 authority）以及
-   `dependency_proposal_ids`/`dependency_component_mask`（用于可解释性）。如果未来真的加入
-   blend，必须保存每个 source 的权重和 blend algorithm version，不能由训练脚本事后推断。
+`ActionPersistencePolicy` 至少声明 selected segment maximum lifetime、no-action、proposal starvation、segment
+expiry、hold/fault 和 backend-hold behavior，均能按 selection group 配置。v1 语义是：selected 为对应 group
+建立带 expiry 的新 segment；普通 no-action 只让该 group 的旧 segment 运行到原 expiry，不阻止其他独立
+group 发布；coupled group 始终原子处理。全局 safety HOLD/FAULT 覆盖全部 group，递增 domain
+`execution_epoch` 并取消旧 command；局部 cancel 递增该 group 的 `segment_generation`。若 backend/
+ExecutionCapabilityProfile 不支持某 group 独立停止，局部 cancel 必须显式升级为 coupled-group 或 hold-all，
+不能假装已局部生效。fault 额外 latch，只有显式 recovery 才进入可执行新 epoch。
 
-因此 `TeleopCommand.metadata` 可以暂时携带 `command_id` 等兼容信息，但不能把完整 lineage
-塞成非结构化 JSON。后续应有 typed `ActionLineage`/`ControlTrace` contract，resolver、reference
-executor、Rig 和 MuJoCo backend 都只传递或补充该 contract，不重新计算 source attribution。
+authoritative publication barrier 校验 live gate、deadline/rate 和 target-specific candidate authorization；最终
+motion/safety permit 在 backend 调用前校验 dispatch-owner generation、authority epoch 和 execution epoch。这些
+检查不会回写或改变已经生成的纯 `ArbitrationResult`。只有 accepted selected result 产生
+`ArbitrationDecisionEvent` 并可激活 `publish_selected`；`no_action/hold/fault` 或 rejected-selected 的显式
+publication fallback 仍产生不含 selected action 的 `ExecutionDirective`，允许旧 segment 保持至原 expiry，或
+触发 cancellation/backend hold。此类 directive 的 `decision_id=null`，必须引用 publication attempt，不能进入
+`ActualDecisionView`。已经处于 backend hold 时使用 `keep_backend_hold`，不得每个 decision tick 重复递增 epoch。
 
-##### 4.5.4 实时采集时的 control cut 与写入边界
+### 4. ControlMode、ExecutionGateStatus 与三层 safety
 
-一个正式 control cut 的顺序应固定为：
+建议保留两套正交状态：
 
-~~~text
-observation snapshot
-  → assign observation_id / causal cutoff
-  → proposal buffer snapshot
-  → ActionArbiter
-  → create decision + per-component attribution
-  → safety / planner / reference
-  → attach lineage to TeleopCommand
-  → dispatch and receipt
-  → close with measured state / next observation
-  → mandatory lightweight ControlTrace sink
-  → asynchronous dataset/media writer
-~~~
+```text
+ControlMode:
+  HUMAN_ONLY / POLICY_SHADOW / HUMAN_OVERRIDE /
+  PER_GROUP_OVERRIDE / POLICY_ONLY
 
-`ActionAttributionFrame` 在 Arbiter 返回时先创建 selection 部分；safe、commanded、receipt 和
-measured 信息在同一个 `control_tick_id` 下按事件补齐。为了保证实时性：
+ExecutionGateStatus:
+  NOT_READY / READY / HOLD / FAULT / RECOVERING
+```
 
-- control loop 只构造 immutable 的小型 typed frame、整数 ID、mask 和必要的 canonical action
-  数值，不在 150 Hz 路径做 JSON 序列化、视频编码或大对象深拷贝；
-- `ControlTraceSink` 先写入进程内 bounded ring/轻量队列，异步 writer 再写 Arrow/Parquet/sidecar；
-- action lineage、decision、mask 和 dispatch receipt 属于 mandatory trace，不能像视频一样静默
-  drop。mandatory trace 队列失败必须暴露为 recording/trace fault，由 episode policy 决定进入
-  hold、结束 episode 或标记数据无效；默认正式数采不允许无提示地继续产生不可训练数据；
-- 图像、depth、tactile 等大对象仍可按现有 DropOldest/异步策略丢帧，但必须在 trace 中保留
-  `frame_id`、`valid_mask`、age 和 drop reason；
-- 现有 GUI/headless 的 sample-rate gate 只是存储/视频采样频率，不是 authority 或 attribution
-  频率。即使 LeRobot sample 低于 reference/control rate，也必须保存每个 decision/reference
-  interval 的 `decision_id`、component lineage 和 effective interval；降采样时要显式记录
-  `latest/hold/interval` 对齐规则，不能用 sample timestamp 事后猜测 action 来源；
-- `ControlTrace` 生命周期必须与当前 GUI/headless 共用的 `CollectionWriterRuntime` 对齐，
-  不能为 policy shadow、DAgger 再建立一套独立 writer。
+`ExecutionGateStatus` 表示是否允许选择/继续执行，来自现有 `TeleopSession`、deploy lifecycle、backend
+health 或 safety/reflex guard；它与 Arbiter 后可能修改动作的 `SharedCanonicalSafetyResult` 不是同一层。
+普通
+proposal 不能清除 fault。显式 human takeover 可以更新 authority epoch；若要求接管但 human proposal
+已过期，默认 HOLD，不静默回退 policy。
 
-snapshot 之后新来的 proposal 只能进入下一个 control cut。这样同一个 tick 的
-`selected_source_by_component`、`expert_label_mask` 和 `command_id` 可重放，也不会因线程调度
-造成“action 数值是这一帧、source id 却是下一帧”的错配。
+迁移时不能把当前 policy `ActionSafetyFilter` 原样套到所有 human action。现有代码中 human 路径已有
+`SafetyMonitor`、`command_filter/command_guard`，policy 路径有 `ActionSafetyFilter`，position 层另有
+keyframe/joint/collision constraints，backend 还会返回 SDK receipt。目标语义明确分为：
 
-##### 4.5.5 当前 human 数采链路需要怎样改
+```text
+SourceValidationResult
+  source-specific frame/shape/finite/representation/coverage validation
 
-第一阶段不直接改真机行为，但接入 observe-only attribution 时必须改变记录边界：
+SharedCanonicalSafetyResult
+  Arbiter 后唯一的 workspace/joint/collision/force constraint modification/veto
 
-1. `TeleopSession._build_command()` 在 `merge_teleop_commands()` 之前，为每个 retargeter
-   保存 source id、timestamp、覆盖的 effector/component 和原始 typed action；不能只保留 merge
-   之后的 `TeleopCommand`。
-2. `TeleopCommand -> RobotAction` adapter 输出 `ActionProposal` 时，带上来源和 component coverage；
-   同名 effector 的覆盖关系由 Arbiter/decision 记录，不能在 merge 时静默丢弃。
-3. `SessionStepResult` 需要携带 `proposal_snapshot`、`ArbitrationResult` 或等价的
-   `ActionAttributionFrame` 引用；`build_collection_action_record()` 只能作为兼容 fallback，
-   不能再次从最终 command 猜 source。
-4. `CollectionWriterObserver`/`CollectionWriterRuntime` 同步提交 lightweight control trace
-   job；`CollectorSample.action` 继续保存兼容的最终 action，但新 trace 保存 per-source action、
-   selected/safe/commanded/measured 以及 masks。
-5. policy shadow 时，即使 policy 没有 selected component，也必须保存其有效 proposal 和
-   `available_mask`；否则后续无法构造“policy 看到了什么、human 在哪里接管”的 DAgger 样本。
+BackendCommandGuardResult
+  SDK ready、servo/fault、command range、transport reject/hold
+```
 
-这样，现有 GUI/headless 的实际发送顺序、fault/hold 和 writer 行为可以在 observe-only 阶段
-保持不变，同时把丢失的 action provenance 在正确位置补回来。
+source validation 可以按 human/policy/replay 使用不同 adapter，但不改变 authority；shared canonical
+safety 只有一套；backend guard 只能 accept/reject/hold，不能产生另一套 action。三层结果和修改原因都写入
+lineage。近期迁移先把现有 filter 分类、包成 typed result 并做 parity，不提前合并语义不同的 guard。
 
-#### 4.6 代码落位与现有模块复用
+shared safety 还必须把四类常被混称为“anchor”的语义分开：representation/decode anchor、artifact-specific
+model last-action、canonical keyframe safety anchor，以及 planner/reference segment anchor。目标 keyframe safety
+的正常 continuity 使用 per-selection-group `previous_safe_committed`；startup、HOLD/FAULT recovery 和 execution
+epoch 变化后必须用 fresh measured state 显式 rebase。`previous_selected` 只用于 intent audit/独立 limiter，
+`previous_commanded` 只用于 backend slew 或 legacy-aligned comparison，不能作为跨 action/reference/command schema
+的全局 anchor。
 
-建议先在共享层增加小模块，不把 Arbiter 放回 `teleop_runtime/core/kernel.py`：
+`committed` 不是 safety 计算完成，而是 safe action 经显式 resolved execution target admission，或 direct backend
+command receipt accepted 后的事实。shadow、publication/queue/planner/backend rejection 不更新 authoritative
+anchor。anchor state 的 scope 是 control domain + selection group + execution epoch + segment generation，而不是
+producer，因此 compatible source handoff 可保持连续性；hold/fault/group cancel/epoch change 则产生 typed
+invalidation 并要求 measured rebase。正常 previous-safe continuity 之外，fresh measured-state divergence 是独立
+guard：它限制 target 与真实状态漂移，但不改变 actor `LastActionContract`，也不把 noisy/stale measured state变成
+每 tick 唯一 continuity anchor。
 
-~~~text
-robot_motion/action/
-├── schema.py                 # 现有 RobotAction
-├── sources.py                # 现有 RobotActionSource protocol
-├── codec.py/vector_pipeline.py # 现有 vector↔RobotAction contracts
-├── executor.py               # 现有 resolver/dispatcher seam；不是 Arbiter
-├── proposal.py               # 后续：ActionProposal、ProposalDecision、ArbitrationResult
-├── attribution.py            # 后续：component catalog、ActionLineage、AttributionFrame
-└── arbiter.py                # 后续：纯 ActionArbiter、ControlMode、Authority lease
+当前代码并不统一遵守上述目标语义：policy pose 优先 deploy `last_action`、qpos 每 tick 使用 measured qpos；
+direct dry-run 和 position queue admission 都可能更新 deploy `last_action`；human temporary limiter 在 guard/dispatch
+前推进内部 previous command；只有 scoped authoritative sim 在 permit 与全部 receipt accepted 后才建立 active
+segment。因此迁移必须同时记录 `LEGACY_ALIGNED`（复现旧 anchor，验证 numeric primitive）和
+`COUNTERFACTUAL_SHARED`（独立 shadow anchor state，预测 owner 切换后行为），不能把 anchor-policy difference
+误判为 primitive mismatch。
 
-robot_motion/runtime/
-├── contracts.py              # 现有 TeleopObservation/TeleopCommand
-├── interfaces.py              # 现有 source/backend/retargeter/Rig protocols
-├── dispatch.py               # 现有 receipt/failure contract
-├── lifecycle.py              # 现有 startup/cleanup failure aggregation
-├── causal_history.py         # 现有 causal history
-├── rig.py                    # 现有 shared BimanualRig/CompositeRig
-└── trace.py                  # 后续：ControlTrace sink/codec 与 lightweight event
+触觉用途必须区分：
 
-teleop_runtime/action/
-├── proposal_adapters.py      # human TeleopCommand、policy chunk、replay adapters
-└── attribution_adapters.py   # legacy session/recorder 到 typed trace 的桥接
+- learned tactile correction：30 Hz+ `ActionProposal` producer；
+- over-force/collision/lost-communication：高频 safety veto/modification，不参与普通 priority 竞争。
 
-dataset_contracts/
-└── control_trace.py          # 跨 sim/real/replay 的 trace、lineage、mask schema
-~~~
+异步 safety/HOLD/FAULT 不能只写一条 event；它必须通过正式 control seam 取消已进入 reference/command
+worker 的旧执行段：
 
-可以复用现有 `robot_motion/action/sources.py` 的 source lifecycle、
-`RobotActionResolver`/`ActionExecutor` 的 resolve/dispatch seam、
-`CommandDispatchReceipt` 的 backend receipt、`robot_motion.deploy.canonical_action` 的
-canonical filter/resolver 和 `PolicyDeployRuntime` 的 policy queue，
-不要再创建第二套 vector/action/dispatcher protocol。`ActionArbiter` 和 `ActionLineage` 本身
-不得 import `teleop_runtime`、hardware、MuJoCo 或 GUI；`dataset_contracts.control_trace` 也
-不能依赖 Torch、writer thread 或具体 backend。
+```text
+ExecutionCancellation
+├── cancellation_id / control_domain_id / execution_epoch
+├── invalidated decision/reference segment IDs
+├── effective_at / reason / latch policy
+└── authority_epoch evidence
 
-建议的测试落位：
+ExecutionCancellationReceipt
+├── software_queue_ack
+├── sdk_request_ack
+├── backend_state_ack（若 backend 可提供）
+└── measured_motion_stopped_ack（若测量可判定）
+```
 
-~~~text
-tests/test_action_proposal_contracts.py
-tests/test_action_arbiter_selection.py
-tests/test_action_arbiter_timing.py
-tests/test_action_arbiter_authority.py
-tests/test_action_attribution.py
-tests/test_control_trace_contract.py
-tests/test_human_command_robot_action_adapter.py
-tests/test_action_arbiter_integration.py
-~~~
+`authority_epoch` 与 `execution_epoch` 分开：owner 切换不必等同于 fault cancellation，fault cancellation 也
+不一定改变 owner。恢复产生新的 execution epoch；旧 reference segment、queued command 和 lookahead 因
+epoch 不匹配自动失效，不能只依赖某个 frontend 尽力调用 `clear()`。
 
-其中纯逻辑测试必须覆盖：同一输入的 deterministic decision、proposal 过期、future timestamp、
-clock skew、sequence rollback、source exception、显式 takeover/release、policy shadow、
-human override、per-group selection、coupled group 原子性、action space/frame mismatch、
-no proposal、fault veto、queue empty 和 handoff 后旧 proposal 清理。attribution 测试还必须
-覆盖：human 左臂 + policy 右臂、human hand + policy arm、同一 effector 的覆盖与拒绝、
-component mask 与 action layout 对齐、安全 clamp 前后 lineage 不变、coupled planner 多 proposal
-依赖、hold/no-action 不复用旧 source、150 Hz command 继承正确的 decision/reference id、
-mandatory trace queue failure 和异步媒体丢帧标记。集成测试使用 fake resolver、
-`NullCommandDispatcher` 或 MuJoCo backend，不连接真实硬件。
+取消的线性化点固定为 control domain 内 `execution_epoch` 的原子递增。`ReferenceSegment`、
+`PositionCommandTick` 和 backend command 都携带 epoch；worker 至少在 dequeue 和真正调用 backend/SDK 前
+各检查一次，不匹配则拒绝发送。顺序是先递增 epoch，再发布 cancellation、停止旧 reference/command、
+请求 backend hold 并收集分层 acknowledgement。SDK 调用成功只表示 request ack，不能冒充机械臂已停止。
+profile 声明 `cancellation_ack_deadline` 和必需 ack level；超时升级为 FAULT。已经发送的旧命令仍保留原
+receipt，不宣称可被撤回。
 
-## 4.7 Proposal source 与并发边界
+### 5. Component catalog 与 selection group
 
-Proposal source 可以在自己的线程/进程中做 policy inference 或设备读取，但 Arbiter 每次只
-接受一个 immutable snapshot：
+`ActionComponentCatalog` 应版本化描述 `RobotAction`、PolicyIO 和 dataset 中的稳定字段，例如：
 
-~~~text
-source worker / frontend
-  -> thread-safe ProposalBuffer.publish(proposal)
-  -> control/reference tick snapshot(cutoff)
-  -> ActionArbiter.arbitrate(snapshot)
-  -> selected action
-~~~
+```text
+left_arm.pose
+right_arm.pose
+left_hand.qpos[0..N]
+right_hand.target
+```
 
-`ProposalBuffer` 负责容量、sequence、丢弃策略和 source transaction；`ActionArbiter` 不负责
-等待慢 source，也不直接读取 queue。snapshot 后新到达的 proposal 只能进入下一控制 cut，避免
-同一 tick 因线程调度不同而产生不可重放的选择结果。
+Arbiter 的默认 authority 粒度是 effector 或 coupled selection group；trace 可以保存到 field/slot。
+四元数 scalar、双臂 coupled IK 等不能被错误拆成独立 owner。
 
-policy prediction transaction、chunk replace/append、IK recovery discard 由唯一的
-`PolicyDeployRuntime` 管理；Arbiter 只看到已经提交的 proposal。human source 的 VIVE/键盘/脚踏
-事件也应先转成带 timestamp 的 source event，再影响下一次 authority decision。
+每个 decision 同时生成：
 
-### 5. CanonicalActionPipeline
+- available mask；
+- selected owner/mask；
+- rejected/expired/invalid reason；
+- proposal ID 和 context dependency；
+- component/group compatibility 结果。
 
-仲裁之后统一经过：
+`ActionComponentCatalog` 只描述 proposal/selected canonical `RobotAction`。selected 以下分别绑定
+`ReferenceSchema`、`CommandSchema` 和 `MeasurementSchema`：
 
-~~~text
-RobotAction
-    → action validation
-    → safety filter
-    → IK / coupled planner
-    → reference trajectory
-    → command interpolation
-    → real Rig 或 MuJoCo Rig
-~~~
+```text
+selected Cartesian component(s)
+  → reference pose/qpos component(s)
+  → actuator command component(s)
+  → measured joint/TCP component(s)
+```
 
-现有 [robot_motion/deploy/canonical_action.py](/home/zc/HandMotion/Developing/DexTeleop/robot_motion/deploy/canonical_action.py) 和 robot_motion/position_control 可以复用。
-
-尤其要保留现在已经形成的多频率架构：
-
-~~~text
-human input       高频
-policy inference  约 15 Hz
-reference / IK    profile-defined（当前默认约 75 Hz；兼容 profile 约 45 Hz）
-command           约 150 Hz
-physics           约 1000 Hz
-~~~
-
-模型推理不能放在 150 Hz command loop 中。模型只产生新 action chunk；高频 reference/command
-线程消费最近一个有效、已解码且经过 Arbiter 选择的 absolute action，并继承其 proposal、decision
-和 representation trace id。
+每次转换记录 transform contract hash、input/output component set 和 dependency proposal IDs。双臂 coupled
+IK 允许多对多依赖；command 的 `primary_authority_owner` 只是审计摘要，不能替代完整 dependency set。
 
 ---
 
-## 四、DAgger 和真机 RL 应如何共用一套框架
+## 八、如何接入现有 canonical action 与 position 链路
 
-### DAgger
+### 1. 目标边界
 
-DAgger 的样本主键应是
-`(episode_id, observation_id, control_tick_id, component_schema_hash)`，而不是只有一个
-`timestamp` 或一条整体 action vector。每个 policy tick 至少记录：
+```text
+source-specific representation
+  → source validation + existing decode/frame/anchor adapter
+  → absolute RobotAction proposal
+  → ActionProposal / ActionArbiter
+  → selected RobotAction
+  → shared canonical safety
+  → planner / resolver / reference / IK
+  → TeleopCommand
+  → command schema / backend command guard
+  → logical dispatch port / receipt / measurement
+```
 
-~~~text
-observation_t
-observation_id_t
-policy_proposal_id_t + policy_action_t + policy_available_mask_t
-expert_proposal_id_t + expert_action_t + expert_label_mask_t
-selected_action_t + selected_source_by_component_t
-safety_filtered_action_t + safety_modified_mask_t
-commanded_action_t + command_valid_mask_t
-executed_action_t + executed_valid_mask_t
-behavior_source_by_component_t
-policy_behavior_mask_t
-expert_selected_mask_t
-authority_epoch
-decision_id + decision_reason_by_component
-component_schema_hash
-takeover_reason
-policy_latency
-observation_timestamp + action_effective_interval
-dispatch_timestamp + measured_state_id
-measured_state_{t+1} + measured_valid_mask_t
-~~~
+#### 1.1 最终 dispatch ownership gate
 
-“expert label”与“实际执行 source”必须拆开：
+当前 `TeleopSession.dispatch_command()` 是 human/recovery 共用 seam，`PositionDeployExecutor` 另有 generation、
+dispatch lock 和 callback 前检查；这些能阻止各自 executor 内的旧任务，却不能证明 legacy frontend 与未来
+shared arbitration runtime 不会同时调用最终 backend。因此 M6 切换前增加 control-domain 级硬互斥：
 
-- `expert_action_t` 保存 causally valid 的 human/expert proposal；只有对应
-  `expert_label_mask_t=1` 的 component 才能作为 DAgger label。human 没有提供该 component、
-  proposal 已过期、group 不完整或进入 hold 时，label 必须是 invalid/masked，而不是复用上一帧。
-- `selected_action_t` 是 Arbiter 在该 tick 选择的 composition，`selected_source_by_component_t`
-  是每个 component 的 authority；它可能与 expert label 不同，例如 policy 正在执行而 human
-  同时提供了可用于学习的纠正 proposal。
-- `safety_filtered_action_t`/`safe_action_t` 是安全层后的 canonical action，
-  `safety_modified_mask_t` 用来判断安全层改变了哪些部分。
-- `executed_action_t` 只表示已进入有效 dispatch/reference 的 action；必须有
-  `executed_valid_mask_t` 和 receipt，不能把 command 被拒绝的 action 标成 executed。
-- `expert_selected_mask_t` 表示 human 是否实际拥有 authority，不能用 action 数值差异代替；
-  数值差异可以另存为 debug metric，但不能作为 DAgger intervention 的定义。
+```text
+DispatchOwnerToken
+  token_id / control_domain_id / owner_runtime_id
+  owner_kind: legacy_control_path | shared_arbitration_runtime
+  owner_generation / acquired_at / revoked_at
 
-典型的 per-component 结果应能表达：
+DispatchPermit
+  kind: MOTION | SAFETY_CONTROL | LIFECYCLE_CONTROL
+  token_id + owner_generation
+  authority_epoch + execution_epoch
+  command/directive lineage ID
+```
 
-| component | policy proposal | human proposal | selected source | expert label | policy behavior |
-|---|---|---|---|---:|---:|
-| `left_arm` | 有 | 有 | human | 1 | 0 |
-| `right_arm` | 有 | 无 | policy | 0 | 1 |
-| `left_hand` | 无 | 有 | human | 1 | 0 |
-| `right_hand` | 有 | 有但未接管 | policy | 按模式 | 1 |
+token 只表示哪个 runtime 拥有 logical dispatch port；human/policy/replay 仍是 proposal/authority source，不
+创建各自 token。`MOTION` 用于 pose/qpos/hand/trajectory target，最终 backend seam 在每次实际 SDK/sim call
+前校验 current token generation、control domain、current authority/execution epoch 和 command permit，失败产生
+typed reject receipt，不能静默 drop。
 
-这类样本不能通过最终的双臂/双手 action vector 反推，必须在 Arbiter 选择时直接产生
-`proposal_id_by_component` 和 masks。policy shadow 即使 policy 没有被选中，也要保留它的
-proposal/action/latency；human override 则同时保存 policy intent 和 human expert label，避免
-训练数据只剩“最终由谁执行”的信息。
+`SAFETY_CONTROL` 用于 emergency stop、hold、disable motion、collision stop 和 cancellation request，不依赖
+普通 motion owner token，但必须引用已 admission 的 safety/cancellation event、目标 execution epoch、授权的
+safety source 和 control domain；它不是通用 bypass。`LIFECYCLE_CONTROL` 用于 startup/home/servo enable/
+rearm，只能由显式 lifecycle state machine 和 operator/safety policy 授权，普通 human/policy/replay authority
+不能构造。三类 permit 使用不同 capability/validation path 和 typed receipt。
 
-不能只记录最终执行动作，否则无法区分：
+owner 切换固定为 gate→HOLD/TRANSITIONING、execution epoch 递增并取消旧队列、revoke old token、等待 profile
+要求的 cancellation acknowledgement、原子 grant new token、更新 authority state、再允许新 segment。短暂
+无 owner/HOLD 合法，双 token 同时有效不合法。第一版 registry 是同进程原子对象；跨进程/多机 owner lease
+必须等 DeploymentBinding 实现共享一致性机制，不能把进程内 token 当作分布式锁。
 
-~~~text
-模型主动控制
-人类接管
-安全层修改
-人类只控制某一个末端
-~~~
+### 2. 当前 policy 路径的必要小重构
 
-现有 [robot_motion/runtime/causal_history.py](/home/zc/HandMotion/Developing/DexTeleop/robot_motion/runtime/causal_history.py) 的
-`source_timestamp <= cutoff` 机制非常适合作为 DAgger 的时间对齐基础，可以避免把未来的人类
-动作泄漏到当前 observation。每个 label 还要保存 `action_effective_interval`：label 属于哪个
-observation/control cut，而不是简单按 writer 完成时间归档。policy chunk 需要保存
-`chunk_id`、keyframe index 和 proposal timestamp，不能把一个 chunk 的所有插值 command 当成
-多个独立 policy decision。
+当前 `CanonicalDeployActionPipeline.prepare()` 是：
 
-#### DAgger 的 v2.3 representation boundary
+```text
+NormalizedAction
+  → ActionSafetyFilter
+  → robot_action_from_vector_action
+  → RobotActionResolver
+```
 
-如果 policy 的训练输入是 relative action view，DAgger 不能只保存一个名为 `policy_action` 的
-向量。至少应同时保存以下三种语义，并且三者使用同一个 `control_tick_id` 关联：
+这与 proposal 需要在 pre-safety absolute `RobotAction` 层生成存在顺序差异。最佳迁移方式不是复制一套
+safety，而是拆出并复用现有转换：
 
-~~~text
-policy_action_model_view
-  = policy 实际看到/输出的 relative 或 absolute chunk keyframe
+1. 从 `CanonicalDeployActionPipeline` 提取纯 `DeployRobotActionAdapter` 和 `SourceValidationResult`，内部
+   继续调用现有 `robot_action_from_vector_action()` 和同一 layout/spec；
+2. `PolicyDeployRuntime` 的 decoded `NormalizedAction` 先经 adapter 生成 absolute `RobotAction` 和
+   representation receipt，再形成 proposal；
+3. 为 canonical pipeline 增加 `prepare_robot_action()`/typed safety seam；policy parity 期可通过现有
+   codec 把 selected `RobotAction` 投影到兼容 filter 输入，但只允许一次 safety pass，且不宣称当前
+   policy filter 已经等价于 human shared safety；
+4. 现有 `prepare(NormalizedAction, ...)` 保留为兼容 wrapper，并委托新内部步骤，保证当前
+   `run_policy.py` 行为和测试不变；
+5. Arbiter observe-only 稳定后，才把 selected `RobotAction` 接入该 typed seam。
 
-policy_action_decoded_absolute
-  = 使用该 observation 的 actual TCP anchor 解码后的 runtime-frame absolute action
+不得在 proposal 前过滤一次、selected 后再过滤一次，也不得让不同 policy node 各自拥有 safety。
 
-expert_action_model_view
-  = 用同一个 PoseActionChunkContract、同一个 frame contract、同一 causal observation
-    生成的 human/expert label view
-~~~
+### 3. human 路径
 
-其中 `policy_action_model_view` 记录 `action_is_pad`、normalization/layout hash、
-`pose_chunk_contract_hash` 和 `pose_frame_contract_hash`；`policy_action_decoded_absolute` 记录
-`representation_trace_id`、`anchor_observation_id`、实测 TCP anchor 的时间戳/frame 和 decode
-状态。两者不能只靠后处理重新生成，因为后处理可能已经丢失当时的 artifact、anchor 或 mode
-绑定。
+human retargeter 的 `TeleopCommand` 暂不一次改写。增加窄 adapter：
 
-expert label 的转换也必须复用现有 `dataset_interface.pose_action/pose_chunk` 和
-`robot_motion.relative_action`，不能把 dataset 中的 absolute storage row 直接当作 relative
-label。对于每个有效 label：
+```text
+TeleopCommand before merge
+  → RobotAction snapshot
+  → HumanActionProposal
+```
 
-1. 先按 episode 的 `PoseFrameContract` 验证 human action 与 observation frame 一致；
-2. 再按 policy artifact 的 `PoseActionChunkContract` 生成模型所需的 relative/absolute view；
-3. relative label 的 anchor 规则必须写入 trace，且只能使用 causally valid 的 measured TCP；
-4. human 没有提供该 component、anchor 不可用、chunk 跨 episode、row 是 padding 或 action
-   过期时，`expert_label_mask` 必须为 0，不能用上一条 action 补齐；
-5. policy 的 raw intent 和 human expert label 即使都被解码为 absolute，也必须保留各自的
-   `representation_trace_id`，避免 exporter 把两个来源误认为同一 action。
+adapter 支持 cartesian pose、arm qpos、hand qpos 和 native end-effector target；保留 reference frame、
+controlled frame、hand mask 和 human `delta_clutch` anchor provenance。未知 command type 产生 invalid
+proposal 并 fail closed。每次 mapping 产生 `SourceAdapterReceipt`，按 component 标记 `lossless`、
+`lossy_but_explicit` 或 `unsupported`；默认补 frame、丢弃字段、猜 backend mode 或无法恢复 partial hand mask
+都不能静默成为 authoritative proposal。
 
-因此 DAgger 的最终读取接口应同时能返回：
+第一阶段只 observe-only：现有 `TeleopSession.command_filter/guard/fault/hold/dispatch` 完全不变；记录
+proposal/decision 与实际 command 的对照。切换 owner 后，human/policy/replay 都通过同一 selected
+`RobotAction` safety/resolver seam，旧 merge 不再承担 authority。
 
-~~~text
-policy_model_view / policy_decoded_absolute
-expert_model_view / expert_decoded_absolute
-expert_label_mask_by_component
-selected_source_by_component
-pose_anchor_id_by_source
-pose_chunk_contract_hash / pose_frame_contract_hash
-~~~
+### 4. replay 路径：从现有兼容实现收敛为 proposal source
 
-这样训练器可以使用 relative label，评估器可以比较 canonical absolute intent，运行时仍只
-执行安全后的 absolute action；数据表示、控制语义和执行行为不会被一个字段混在一起。
+当前已有两套可复用能力，但尚未形成统一 owner：
 
-### 真机 RL
+- `teleop_runtime.deploy.replay.DatasetReplayPolicy` 把 dataset action 伪装成 policy output，复用
+  `PolicyDeployRuntime` queue/decode；
+- `teleop_runtime.replay`/`robot_motion.replay` 已有 dataset preflight、轨迹分组、position resampling 和真机
+  replay executor。
 
-真机 RL 的 rollout 应记录：
+它们当前都不能直接被称为最终 replay architecture。目标是保留 reader/preflight/resampling 数学，将
+replay action 在 dispatch 前收敛为 `producer_kind=replay` 的 `ActionProposal`，经过相同
+AuthorityPolicySpec、snapshot、Arbiter、shared safety、execution cancellation 和 ControlTrace。现有 frontend
+先作为 compatibility owner 保留，完成 shadow parity 后才迁移，不因本规划直接归档。
 
-~~~text
-observation / observation_id
-behavior_action = safe/executed absolute action aligned to the control interval
-behavior_action_model_view (optional, generated by the same v2.3 chunk contract)
-selected_action / commanded_action / executed_action
-behavior_source_by_component
-policy_behavior_mask / policy_logprob_mask
-proposal_id_by_component / decision_id
-reward
-terminated
-truncated
-next_observation
-next_observation_id
-faults
-latency / action_effective_interval
-safety_modified_mask / command_valid_mask / measured_valid_mask
-authority_epoch / control_mode
-policy_artifact_id
-environment_id
-episode_id
-~~~
+replay 分成四种明确能力，不能混名：
 
-真机 RL 的 `behavior_action` 默认使用与该 transition 对齐的 safe/executed canonical action，
-而不是未经安全层处理的 policy intent；`commanded_action` 和 backend receipt 仍要保留，以便
-区分“安全动作”和“实际送到 backend 的 transport/reference”。如果 backend 没有可靠的
-canonical inverse，不能伪造一个 measured action，应使用 safe action 加
-`command_valid_mask`/receipt 表示可用性。
+```text
+decision replay     proposals/snapshot → pure Arbiter，验证相同 decision
+policy replay       recorded ObservationCut/View → artifact inference，比较新旧 proposal
+action replay       recorded canonical proposal/selected/safe stage → replay proposal → normal control
+command audit       读取 backend command/receipt 作审计；默认不得跨 embodiment 再发送
+```
 
-若 policy 本身以 v2.3 relative chunk 训练，`behavior_action_model_view` 只能由同一个
-`PoseActionChunkContract` 从已记录的 canonical control interval 重新组织，并保留对应的
-actual TCP anchor、padding mask 和 frame hash。它是训练/回放视图，不是新的 executed action；
-RL 的 `policy_logprob` 也只能与 `policy_behavior_mask` 为 1 的 model-view component 对齐。
-不能把 relative vector 直接标成 `executed_action`，也不能用当前 commanded target 代替
-缺失的 measured TCP anchor。
+`dataset_interface.replay` 只读取 sealed facts/materialized view，`robot_motion.replay` 持有无 I/O 的 schedule/
+canonical replay primitive，`teleop_runtime.action.replay_proposal` 负责 real frontend wiring。replay 必须显式
+选择 source action stage、resampling policy、pose/frame/action schema 和 target embodiment compatibility；禁止
+把旧 qpos/servo packet 当成跨本体可移植的 canonical action。真机 action replay 仍是高风险控制行为，必须
+单独 preflight、安全授权和互斥 authority owner；“数据可 replay”不等于自动允许运动。
 
-混合 human/policy rollout 也必须按 component 标记：
+若 replay source 选择历史 `safe` stage，它只表示来源动作曾通过旧 safety profile；转换出的 replay proposal
+仍必须经过目标运行时当前 shared safety，不能携带 bypass。新 safe result 可以因 embodiment、calibration、
+state 或 safety profile 不同而变化，并同时记录 old-safe provenance 与 new safety lineage。
 
-- policy 只在 `policy_behavior_mask=1` 的 component 上拥有 behavior policy/log-prob；human
-  component 不应被当作 policy action 计算 log-prob 或 advantage。
-- 一个 transition 可以使用完整的 measured reward，但训练 sampler 必须根据 source mask 决定
-  是否作为 on-policy policy transition、human intervention transition 或仅作为 offline data。
-- safety 修改、hold、fault、tracker loss、backend reject 和 trace loss 都要影响
-  `terminated/truncated/valid_mask`，不能把故障前后的 action 无条件拼成正常 rollout。
-- DAgger 的 expert label 可以来自同一 ControlTrace，但 RL 的 behavior action 必须取实际
-  selected/safe/executed 层；两者不能通过一个叫 `action` 的字段混用。
+当前落地边界（2026-07-19）：上述 contract 已在 typed dry-run 与默认关闭 canonical GUI passive shadow 层实现。debug `DatasetReplayPolicy` 不再在
+shadow facts 中冒充普通 policy source，而是从既有唯一 queue-pop emission 被动生成内容寻址的
+`ReplayActionRecord`、`ReplaySourceAdapterReceipt` 和 `producer_kind=replay` proposal；source/local frame
+index、source stage、capture-relative time、runtime effective interval、frame/component binding 均显式保留。
+`replay_shadow_dry_run_v1` 已能从 replay record 追到 proposal/snapshot/evaluation/legacy execution，并用同一
+frozen snapshot 重放 pure Arbiter。`robot_motion.replay` 的既有 trajectory action 已有无 I/O parity adapter，
+`ReplayExecutionController` 已可选向 bounded nonblocking queue 发布该 immutable source-frame emission：
+impedance 在 action tick 发布，position 在 causal left source keyframe 到期时发布，不把 offline interpolation
+使用的未来 right lookahead 提前暴露；qpos/SDK packet 仍不进入 canonical proposal。默认无 queue 时不构造
+emission，queue full/consumer error 不改变 init、resampling、dispatch 或 completion。source-relative time
+作为 capture provenance 原样保留；position effective interval 跟随 source-time resampling，而 impedance
+effective interval 跟随原有固定 `action_hz` tick，带抖动的 capture frame time 不改变 legacy impedance
+schedule。canonical GUI 现可显式启用 bounded consumer：成功 preflight 后绑定 source context，第一次同一
+immutable source-frame emission 才惰性创建 replay-specific Arbiter shadow、RuntimeTraceSession 和可选 debug
+WAL；它不申请 DispatchOwnerToken，也不调用 backend。target frame/capability evidence 不充分时只产生带完整
+assessment lineage 的 conditional evaluation；source frame/component contract 不充分时只记录 rejection。由于
+tap 位于 legacy dispatch 前，当前不能宣称已有 post-dispatch safe/command/receipt 或 formal episode capture，
+也不得把这一状态称为真机 replay authority complete。
 
-视频、tactile 原始数据和大对象不应该阻塞控制线程。建议采用：
+#### replay compatibility 不是一个布尔值
 
-~~~text
-ControlLoop
-    → lightweight RolloutSink
-    → bounded queue
-    → asynchronous media/dataset writer
-~~~
+M5.3a 已移除 typed core 中曾经混合多种语义的 `ReplayTargetBinding.compatible: bool`。canonical GUI 与未来
+authoritative 路径统一使用四层事实：
 
-这与现有 DropOldestAsyncObserver 思路一致。
+```text
+source interpretation
+  → ReplaySourceActionContract / LegacyReplayContractDerivationReceipt
+target relation
+  → ReplayTargetBindingSpec + ReplayBindingAssessment
+candidate use
+  → CandidateBindingEligibility
+execution authority
+  → ReplayExecutionAuthorization
+```
+
+`ReplayBindingAssessment.verdict` 使用 `VERIFIED_COMPATIBLE`、`VERIFIED_INCOMPATIBLE`、`INDETERMINATE`；每个
+action-stage/action-space/frame/transform/unit/component/spec/selection-group/execution-capability 维度分别记录
+EXACT/DERIVED/TRANSFORM/SUBSET/UNKNOWN/MISMATCH/NOT_APPLICABLE。source contract 必须来自 explicit dataset
+contract 或版本化 deterministic legacy derivation；字段不足保持 unknown，禁止按数组宽度、当前设备默认值或
+旧 executor 能否运行来猜 source frame。
+
+assessment 只描述 source 与一个 immutable `TargetRuntimeActionContract` 的关系，不授予 motion authority。
+同一 source 换 target contract 必须得到不同 assessment；target profile 变化后旧 assessment 不可复用。
+`VERIFIED_COMPATIBLE` 可成为后续 execution candidate，但仍需 current safety/capability、operator authorization、
+execution gate 与 DispatchOwnerToken。`VERIFIED_INCOMPATIBLE` 只能 record/rejected。
+
+为不阻塞 non-authoritative GUI shadow，M5.3a/b 实现了一个严格限定的 conditional 分支：source interpretation 已
+verified、没有已知 mismatch、且输入来自当前 legacy replay 的同一次 immutable emission 时，indeterminate
+assessment 可以得到 `PASSIVE_SHADOW` eligibility；它必须记录 `evaluation_allowed=true`、
+`authoritative_allowed=false`，语义是“would select if target binding is valid”，不能写成 verified compatibility。
+若 source canonical frame/spec 本身不确定，则不能进入 Arbiter candidate，只能保留 source/derivation rejection。
+
+M5.3a/b 的 replay 专属 eligibility gate 继续只支持 passive evaluation。M5.5b 为 authoritative 路径新增独立、
+receiver-admitted 的 `CandidateAuthorizationRecord/Snapshot`：它同时绑定已 admission proposal 的 content hash、
+binding eligibility、typed execution authorization 和 exact target contract，并随完整 `ArbitrationInputSnapshot`
+冻结。pure Arbiter 不读取 live verifier/store；publication barrier 只对被选中的 replay proposal检查冻结证据。
+因此晚到证据只能影响下一 decision，缺失/denied/target mismatch 在 backend 前 fail closed，且不会把 conditional
+shadow 升格为 compatible。
+
+### 5. position/reference/command
+
+在 production decision policy v1 下，selected action 是不超过 60 Hz 的 Arbiter decision/keyframe，
+不是 60/120/150 Hz 每个执行 tick 的新 policy action；Arbiter 上限不限制下游 reference、IK 或 command
+clock：
+
+```text
+selected RobotAction keyframes
+  → ResolvedExecutionTarget
+      ├─ direct command intent
+      │    → backend acceptance
+      │    → eligible anchor commit
+      └─ pose/qpos/trajectory reference
+           → ReferenceSegmentAdmission
+           → derived PositionReferenceFrame / per-tick IK result
+           → PositionCommandTick
+           → backend dispatch receipt
+  → measured state alignment
+```
+
+继续复用 `ReferenceTimeline`、`PositionDeployExecutor`、`JointCommandInterpolator` 和 position audit。
+只扩展 lineage：
+
+```text
+decision_id
+proposal_id_by_component
+policy_node/context IDs
+representation_trace_id
+reference_segment_id
+command_id
+dispatch_receipt_id
+measurement_alignment_id
+```
+
+每条 edge 还记录 input/output schema hash、transform contract hash 和 component dependency set；不能把
+Cartesian selected action、qpos reference、actuator command 和 measured TCP 都解释为同一个 action vector。
+
+`PositionReferencePublisher` 仍是现有 real teleop 接受并发布已 dispatch target 的边界，不新增 policy
+专属 timeline。60/120 Hz execution event 继承所属 decision，不被记录为新的 source proposal。direct command
+与 reference target 必须分支表达：direct command 只有 required backend receipt 全部 accepted 后才能形成 anchor
+commit evidence；reference target 必须先成为 typed segment，不能把 frontend queue submit、单个 reference emission
+或 command receipt混名为 segment admission。
+
+当前 `CausalMotionResampler` 已证明一个 reference 可同时引用时间上较早和较晚的两个 source keyframe，并保存
+parent index/timestamp/alpha；这里的 earlier/later 不是 left/right arm。M5.7e2 将这层关系冻结为有序、带角色的
+endpoint parent：`START` 可以来自 fresh measured rebase 或已 committed safe endpoint，`END` 来自当前 safe
+target。每个 parent 内部仍可包含 coupled 双臂 component projection。
+
+segment admission 与 anchor 生效是两个时间事实：worker 可以提前接纳未来 endpoint，但该 endpoint 只能在
+`effective_from <= next_safety_target_effective_at`、commit evidence 已在 safety cutoff 前 admission、且 segment
+未 supersede/cancel、epoch/generation 仍匹配时参与 anchor 选择。实现不维护一个会被未来 admission 立即覆盖的
+mutable `current_anchor`；admission、commit candidate 和 terminal/invalidation 都是不可变事实，某个 target time 下的
+`PENDING_EFFECTIVE/ACTIVE/SUPERSEDED/INVALIDATED` 由窄 per-group timeline resolver 派生。
+segment 还必须显式区分 `legacy_execution_observation`、`counterfactual_shadow` 和
+`authoritative_shared`；前两者不能因数值/时间 eligible 而推进真实 anchor。
+
+`ReferenceSegmentAdmission` 只说明 worker 原子接纳了一个 segment，不自动证明 endpoint 可执行、backend 已接受或
+连续轨迹安全。profile 必须声明 `admission_guarantee`/`required_anchor_commit_guarantee`；当前 collision-aware pose
+worker 在每个高频 reference tick 才运行 coupled IK/planner，因此 segment admission 默认最多声明
+`ENDPOINTS_ONLY`，每个 `ReferenceFrameEmission` 还要引用该 tick 实际使用的 measured/solver input 和 result。
+只有显式连续认证才能声明 `CONTINUOUS_CERTIFIED`。
+
+legacy 迁移期间必须再分三层成熟度：`LegacyPositionReferenceSegmentObservation` 只记录 worker 实际选择 parent pair
+并由 observer 首次看到其派生 reference 的事实；`BoundLegacyReferenceSegmentObservation` 可绑定 typed domain/group/parent 和调用方
+execution context，但仍是 non-authoritative observation；只有真正执行 shared M1C guard 的 worker 才能产生
+`ReferenceSegmentAdmission`。当前 position worker 没有独立 segment queue/admission 点，因此第一层采用
+`first_observed_reference_derived_from_exact_parent_pair` 观察语义，不能把 `_accept_submission()`、`submit()` 或 debug callback
+改称 admission。executor-local generation 使用独立 namespace；调用方附带 execution epoch/generation 只证明上下文
+绑定，除非同时有 creation/dequeue/pre-backend guard evidence，否则不能声称这些语义已被 worker enforce。
+
+legacy parent provenance 允许 `LEGACY_POST_SAFETY_KEYFRAME`、`LEGACY_POSITION_KEYFRAME` 和
+`MEASURED_REBASE` 等真实 stage；projection 不得将其升级成不存在的 shared safety result。raw/bound observation 均
+固定不能产生 anchor commit、authority、permit 或 backend side effect。插值 frame 引用其 raw segment；exact/hold
+frame 单独记录 derivation，不伪造双端点 segment。public ControlTrace schema 等 runtime producer 稳定后再冻结。
+
+当前 scoped e2-b1 已在 `PositionDeployExecutor` 增加默认不绑定的非阻塞 observer：它在 resampler 选定真实 parent 后、
+per-tick resolver/IK/planner 前生成 `resampled_pre_resolver` fact，并按 modality/generation/parent pair去重 segment。
+这证明 reference derivation lineage，但不证明 solver input/result、segment terminal、backend acceptance或M1C enforcement；
+bound projection目前只有 pure fixture，无 production binding caller。上述缺口补齐前仍不得生成 canonical admission。
+
+legacy pre-resolver frame、post-resolver outcome和backend receipt是三个不同事实。post-resolver observation只能在
+resolver/planner成功、command intent已构造且 executor-local generation/fault二次检查通过后产生；它记录 actual
+planner input/output和 command-intent hash，但固定声明 enforcement namespace仍为 legacy local generation。它不能
+因“pre-backend checked”而升级成 shared M1C admission，也不能将 backend accepted置真。planner内部 measured state
+尚无 typed ID时必须显式标记不可完整重放，不从 debug metadata猜测。
+
+legacy local-generation terminal同样只是观察事实：clear/close可产生 canceled，fault可产生 faulted；它只证明旧
+generation失效，不证明backend停止。当前worker没有正常 completed或同-generation supersession原子事件，禁止离线
+猜测。production bound caller还必须等待shared execution epoch/group generation owner和正式sink，不能只复用
+Arbiter shadow的control-domain ID补齐缺失语义。
+
+authoritative receiver还需要一个与普通command payload分离的不可变dispatch context。该context在最终motion permit
+通过后携带decision/directive/shared-safety/command lineage、target effective time、authority/execution epoch和
+per-group generation；receiver必须在实际mailbox/timeline接纳点再次校验live scope，才能生成canonical admission。
+context被传入不等于worker已enforce。当前MuJoCo e2-c0已提供该seam，但现有zero target lead使qref admission与END
+effective time重合，不能形成future pending segment；必须用版本化nonzero target-lead/activation profile验证，或将
+zero-lead路径明确保持为immediate qref admission而非reference segment。两种语义使用独立版本化
+`ReferenceActivationSpec`，不得根据lead是否为零或payload字段是否存在临时推断mode。
+
+scheduled profile v1要求receiver在segment START前完成接纳，late admission固定reject-and-hold，不实现
+mid-segment catch-up。target lead至少覆盖一个selected-keyframe period、validated publication→receiver budget和
+scheduling guard margin；deterministic 30/60 Hz sim fixture先使用`1/30 + 1/60 = 50 ms`，其中一个reference period
+只是fixture margin，不是real默认值。startup/recovery的START来自同schema fresh measured rebase并对齐下一reference
+tick，steady-state START来自previous committed endpoint，END来自current shared-safe target。
+
+terminal同样是因果事实而非事后标签：`available_at`决定某次safety cutoff能否看到terminal，`effective_at`决定目标
+时刻是否已失效，同时间由receiver admission sequence排序。只有在cutoff前可用的cancel/supersede/fault才能影响该次
+在线timeline resolution；离线reader不得把晚到terminal倒灌进过去decision。
+
+### 6. real policy frontend
+
+`teleop_runtime/deploy/run_policy.py` 继续持有：
+
+- real CLI/config/artifact binding；
+- arm/hand/camera construction；
+- startup/readiness/recovery/keyboard；
+- real fault latch、hold 和 manual rearm；
+- position executor、hardware dispatch 和 real debug observer。
+
+当前 `PolicyDeployRuntime.prepare_next_action()` 是 action queue 唯一 pop 点，并已返回 raw action、
+lookahead 和 pop 前后 queue length。迁移时将其结果扩展为 typed、immutable `PolicyActionEmission`，但不
+新增第二个消费 API：
+
+```text
+PolicyDeployRuntime.prepare_next_action()   # 唯一一次 pop
+  → PolicyActionEmission(chunk/keyframe/inference/output/target-time lineage)
+      ├─→ legacy canonical execution owner
+      └─→ passive arbiter_shadow adapter
+```
+
+shadow coordinator 不持有 queue、不调用 prediction transaction、不调用 `pop_action()`/`prepare_next_action()`，
+只消费 frontend 已取得的同一个 emission。lookahead 的 peek/validation 不能被误记成已消费 keyframe。启停
+shadow 必须保持 queue pop count、chunk index、queue length、prediction schedule、replace/append、
+`last_action` 和 dispatch count 完全一致。
+
+它先通过窄 `arbiter_shadow` 组合现有“一个 policy 变量 + 一个 runtime”，不把真机对象移入
+`robot_motion`。单实例 parity 完成后，只增加用于 synthetic 的最小 context/action node protocol；完整
+production `PolicyOrchestrator` 仍等确有多节点需求时再引入。
+
+### 7. deployable sim
+
+未来 `sim/mujoco/deploy/` 只提供：
+
+- deterministic sim clock；
+- scene state/RGBD/tactile observation producer；
+- `RobotAction`/qpos sink；
+- `SimDispatchReceipt` 和 measured state。
+
+它复用同一 ObservationCutRecord/Bundle、policy node、proposal/arbiter、canonical action、position 和 trace
+contract。现有 `sim.mujoco.actuation.MujocoActuatedPositionExecutor` 已验证 15/60/120 的 sender/plant
+边界，可作为 command/physics backend；CubeLift task-native RL 路径继续保留，不冒充 deployable sim。
 
 ---
 
-## 五、建议新增或调整的目录
+## 九、v2.4 数据集格式：多来源、多频率与训练事实层
 
-推荐目标结构如下：
+### 1. v2.4 与 v2.3 的关系
 
-~~~text
+建议正式使用：
+
+```text
+dexteleop_dataset_v2.4
+```
+
+v2.4 不是替换 v2.3 pose contract，而是在其上增加 control/learning trace：
+
+| 版本 | 核心增量 |
+|---|---|
+| v2.1-style | episode parquet、video 和外置 tactile/depth 的基础物理布局 |
+| v2.2 | 可配置 `PolicyIOLayout`、连续/离散 action/state 和 layout hash |
+| v2.3 | absolute pose storage、relative model/deploy view、pose/frame contract、严格 causal snapshot |
+| v2.4 | 可扩展的 control/learning facts：多来源 proposal→selected action、multi-rate stream、context、execution 与派生训练层 |
+
+v2.4 必须继承以下 v2.3 规则：
+
+- pose 落盘仍为 explicit raw absolute 或 canonical desk absolute；默认 native v2.4 使用 desk absolute；
+- relative action 仍是 reader/deployment representation，不另建相互漂移的 relative parquet 真相；
+- relative chunk anchor 仍来自 causal measured actual TCP，并固定引用 anchor observation ID；
+- 每个 sensor/action/control event 都保留其角色对应的 timestamp 和 clock domain；sensor 兼容保留
+  v2.3 source/available evidence，proposal/context 使用 produced/available/effective taxonomy；
+- 所有 model-facing view 仍绑定 `PolicyIOLayout`、pose/frame、chunk 和 artifact hash。
+
+v2.4 新增的是“谁提出了哪些 action、如何变成统一 action，以及统一 action 执行后的真实结果”，而不是
+修改 v2.3 的几何定义。`dexteleop_dataset_v2.4` 通过 capability 渐进实现，不要求第一版同时完成全部
+learning/sim2real schema：
+
+```text
+control_trace_core       # 第一批 mandatory
+native_streams           # 可按 stream 声明
+policy_context           # topology 使用时 mandatory
+learning_overlay         # reward/labels/training views
+domain_manifest          # sim2real extension
+```
+
+reader 必须按 capability 和 completeness matrix 判断可用性，不能仅凭版本号假定所有扩展都存在。
+
+### 2. 四层事实模型与三类存储
+
+v2.4 先区分语义层级：
+
+1. **原始事实：** SensorSample、HumanInput、PolicyInference/Output、PolicyContext、ActionProposal、
+   task/termination fact；这些不能由最终 command 反推。
+2. **在线控制事实：** ProposalSnapshot、ArbitrationEvaluation/ArbitrationDecision、
+   LegacyExecutionObservation、SafetyResult、ReferenceSegment、Command、
+   DispatchReceipt、MeasurementAlignment；这些由当时在线控制过程产生。
+3. **派生学习事实：** expert/policy/learning mask、reward、transition、credit window 和 training target；
+   必须携带 derivation spec/version，可离线重算。
+4. **物化视图：** actual-decision、fixed-rate compatibility、BC、DAgger、fast-policy、RL view；它们是可
+   重建缓存，不改变前两层原始含义。
+
+物理存储仍采用三类组织：
+
+```text
+native streams       # sensor/state/reference/command 等按真实频率存储
+typed control trace  # 第一、二层事实事件
+materialized views   # actual-decision / fixed-rate / training compatibility cache
+```
+
+各层职责如下：
+
+1. **native stream 是原始时间事实。** RGBD、tactile、state、force、human input、reference、command
+   各自按 retention profile 保存，不因某个 decision row 没有产生就自动丢失。
+2. **ControlTrace 是关系事实。** capture 保存 ObservationCutRecord、policy output、proposal、Arbiter
+   decision、safety、dispatch 等第一/二层事件；reward overlay 通过稳定 ID 引用它们。
+3. **materialized view 是兼容与快速读取层。** 不代表所有 modality 都产生了一帧，也不承载所有高频
+   execution sample；任何 view 都必须声明 source IDs 和 materialization spec。
+
+不建议继续给 `CollectorSample`/单 parquet row 增加任意数量的 `policy_0.*`、`policy_1.*`、tactile
+window 或 120 Hz command 列。那会导致 schema 随策略数变化、重复大 payload，并使频率语义再次退化为
+nominal 15 Hz。
+
+### 3. 逻辑表与可演进物理布局
+
+冻结逻辑 table family，不冻结“每 episode、每 family 一个 Parquet 文件”。capture root 保持
+LeRobot-v2.1-style 兼容外形，并通过 manifest 定位实际分区：
+
+```text
+datasets/<capture_name>/
+  meta/
+    info.json
+    capture_manifest.json       # live/sealed、capture hash
+    episodes.jsonl
+    episodes_stats.jsonl
+    tasks.jsonl
+    logical_table_layout.json   # family -> partition/fragment locator
+    contracts/
+      action_component_catalog.json
+      reference_command_measurement_schemas.json
+      stream_catalog.json
+      control_trace_contract.json
+      policy_graphs.jsonl
+      deployment_bindings.jsonl
+      execution_manifests.jsonl
+      policy_io_layouts.jsonl
+      domain_contracts.jsonl
+
+  data/
+    chunk-000/episode_000000.parquet
+      # manifest-selected materialization；authoritative 时可为 ActualDecisionView，
+      # shadow 期继续保留 legacy row，不让 would_select 覆盖实际执行事实
+
+  trace/
+    <logical_family>/<manifest-selected fragments or chunk parts>.parquet
+
+  streams/
+    <stream_id>/chunk-000/episode_000000/manifest.json + payload
+
+  videos/...
+  tactile/...
+  wrist_depth/...
+```
+
+typed family 保持为 `observation_cuts`、`policy_events`、`action_events`、`execution_events` 和
+`task_events`；派生层另有 `reward_events`/`annotation_events`。高频 reference/command 数值放 native
+stream 时，execution event 只保存 segment/range ID 和语义事件。
+
+路径和 partition strategy 由 `logical_table_layout.json` 声明。现有 writer 每个 episode 原子 finalize，
+所以 v2.4 Core 第一版可以先写 episode fragment；数据量增大后可将 sealed fragments copy-on-write compact
+为 `trace/<family>/chunk-xxx.parquet`，以 `episode_uuid + row group + event_sequence` 索引。reader 只依赖
+logical table locator，不依赖文件名。这样既避免早期改写 writer 原子性，也不会把大量小文件固化为 contract。
+
+现有 `videos/`、`tactile/` 和 `wrist_depth/` 可以继续作为特化 stream encoding；`StreamCatalog` 为它们
+提供统一逻辑索引，不要求第一版搬文件。
+
+capture root 在采集期间可以按 episode append；一旦 `capture_manifest.status=sealed`，streams、第一/二层
+trace、contracts 和 checksum 全部不可变。离线 reward、annotation 和新 training view 写入独立 derived
+overlay：
+
+```text
+derived/<derivation_id>/
+  meta/derivation_manifest.json   # parent_capture_hash + spec/code/model hashes
+  trace/reward_events/...
+  trace/annotation_events/...
+  views/...
+```
+
+多个 overlay 由 `DatasetDerivationManifest`/collection manifest 组合，不回写 sealed capture。在线环境
+提供的 success/contact/termination 先作为 capture task fact；具体 reward 仍按 spec 进入 overlay。
+
+### 4. ID 与时间主键
+
+v2.4 不能只靠 `episode_index + frame_index` 关联数据。建议所有对象使用稳定 ID：
+
+```text
+episode_uuid
+runtime_session_id
+control_domain_id / embodiment_instance_id
+stream_id / stream_sample_id
+observation_cut_id
+policy_inference_id / policy_output_id
+context_id
+representation_trace_id
+proposal_id
+proposal_snapshot_id
+decision_id
+safety_decision_id
+reference_segment_id
+command_id
+dispatch_receipt_id
+measurement_id
+task_event_id / reward_event_id / transition_id
+```
+
+runtime fact ID 统一由
+`runtime_session_id + control_domain_id + producer_id + producer_epoch + monotonic sequence` 组成；不能依赖
+物理 row offset，也不能因为进入/离开一个 dataset episode 而改变。dataset record 另带可空
+`episode_uuid` 作为 capture membership；policy deploy 在没有数采 episode 时仍可产生稳定 fact ID，同一
+runtime session 中多个 episode 也不重编号 producer。所有 ControlTrace Core event 必须显式携带
+`control_domain_id`；存在多 embodiment 时还要携带 `embodiment_instance_id`，不能只靠文件路径推断。所有
+事件至少包含：
+
+- 该 event type 规定的 role-specific timestamps；
+- 每个 timestamp 的 clock domain 和可选 clock evidence；
+- sequence 和 producer epoch；
+- valid/invalid/drop 状态；
+- contract/schema hash。
+
+必须区分三类 materialization：
+
+```text
+ActualDecisionView
+  一行一个 authoritative ArbitrationDecision
+  decision_index / decision_cutoff_at / decided_at
+  effective_interval_start/end / dt_sec
+  variable dt；不声明真实 decision 等间隔
+
+FixedRateCompatibilityView
+  15/30 Hz 等显式 materialization profile
+  is_resampled = true
+  source_decision_ids
+  hold/skip/interpolate policy + hash
+
+ShadowEvaluationView
+  一行一个非权威 ArbitrationEvaluation
+  would_select_action / would_select_owner_by_component
+  legacy execution comparison IDs
+```
+
+native v2.4 的 authoritative capture 才可将 `data/...episode.parquet` 物化为 ActualDecisionView；其
+`frame_index` 仅兼容映射到
+`decision_index`，`frame_count` 是真实 decision row 数。`nominal_fps` 只允许出现在 fixed-rate view 或
+作为旧 reader 的 target-profile metadata，不能用来断言真实 decision 均匀。每个 stream 的 sample count、
+measured rate 和 drop count 单独写入 manifest/episode summary。
+
+M3–M5 shadow capture 不生成 ActualDecisionView：旧 v2.3 row 继续表示 legacy execution fact，v2.4 使用
+`ShadowEvaluationView` 保存反事实结果，并用独立 `LegacyExecutionObservationEvent` 保存实际进入旧
+safety/command/dispatch 的 action 与 receipt。`legacy_control_path` 是 execution lineage origin，不伪装成
+`ArbitrationDecisionEvent`。
+
+### 5. 多来源 action 如何形成统一 action
+
+v2.4 固定 action lineage：
+
+```text
+raw policy/human/replay representation
+  → absolute RobotAction proposal(s)
+  → ActionArbiter selected canonical RobotAction
+  → safety modification / planner / reference
+  → command / dispatch receipt
+  → measured state and task outcome
+```
+
+#### 5.1 proposal 事实
+
+`action_events` 中每条 `ActionProposalEvent` 保存：
+
+- control domain、producer kind/id、policy node/artifact/producer epoch；
+- produced/available/effective interval 和 keyframe target effective time；
+- observation cut、policy output、context dependency IDs；
+- absolute canonical `RobotAction` 值；
+- `ActionComponentCatalog` 下的 coverage/valid mask；
+- representation mode、v2.3 anchor 和 frame/contract receipt；
+- raw validity/status，以及与具体 snapshot/decision 关联的 superseded/coalesced/interval-missed disposition；
+  shadow 是 consumer/evaluation mode，不改写 proposal 自身 validity。
+
+多个 proposal 使用同一个 dataset-level `ActionComponentCatalog` 投影。continuous float 与 discrete
+token 分开保存；partial proposal 使用 mask，不用零或 NaN 猜 source coverage。raw relative output 可作为
+representation payload/sidecar 保存，但 Arbiter 和统一 action 只引用 decoded absolute proposal。
+
+#### 5.2 computation、shadow evaluation 与 authoritative publication 事实
+
+pure calculation、shadow 解释和 authoritative publication 分型，避免“算出了动作”被误记为“系统正式发布
+了动作”：
+
+```text
+ArbitrationComputationEvent
+  input_snapshot_id / arbiter contract+implementation hashes
+  result ID/hash / decided_at
+
+ArbitrationEvaluationEvent
+  non_authoritative = true
+  computation/result ID
+  would_select_action / would_select_owner_by_component
+  evaluation_reason
+
+PublicationAttemptEvent
+  computation/result ID / ExecutionDirective ID
+  live gate evidence / dispatch owner generation
+  authority epoch / execution epoch / attempted_at
+
+ArbitrationDecisionEvent
+  authoritative = true
+  publication_attempt_id / published_at
+  authority_epoch / execution_epoch
+  selected_action / ExecutionDirective
+  actual control lineage
+
+ArbitrationPublicationRejectedEvent
+  publication_attempt_id / computation/result ID
+  rejection reason + conflicting gate/epoch/token evidence
+  cancellation ID | null
+```
+
+shadow 只生成 computation + evaluation；authoritative runtime 生成 computation 后必须经过 publication attempt。
+barrier 成功才生成 `ArbitrationDecisionEvent`，失败只生成 rejection，不能创建 selected/reference segment。
+
+每条 `ArbitrationDecisionEvent` 保存：
+
+- control domain、schedule tick/cutoff/decided/published/target-effective time、trigger、authority epoch；
+- `arbitration_input_snapshot_id/hash`、`proposal_snapshot_id/hash`、authority/gate/producer-epoch snapshot IDs；
+- 每个 selection group/component 的 selected proposal/source；
+- available/selected/rejected/expired/incompatible masks 和 reason；
+- 组合后的 selected canonical `RobotAction`；
+- handoff、hold/no-action/fault 状态。
+
+只有 authoritative event 能生成事实层 `selected_action` 和 ActualDecisionView。shadow evaluation 只能
+生成 `would_select_action`/ShadowEvaluationView；M6 owner 切换前不得覆盖 v2.3 compatibility row 的实际
+动作。computation 是确定性计算事实但不是控制决定；proposal/snapshot 本身仍是事实，evaluation 是明确
+标记的反事实计算结果，publication rejection 也必须可审计。
+
+#### 5.3 事实层 `selected_action` 与 materialized `action`
+
+native v2.4 的 `data/...episode.parquet` 中：
+
+```text
+selected_action                         = authoritative Arbiter selected canonical intent（pre-safety）
+selected_action.discrete                = selected canonical discrete token
+selected_action.component_valid_mask    = 本次 selected action 的有效 component
+selected_action.decision_id             = 对应 ArbitrationDecisionEvent
+decision.previous_selected_action_id = 上一个有效 selected decision/action ID
+```
+
+`selected_action` 就是事实层的“统一动作”。它可以由 human 左臂、policy 右臂和另一个 policy 的 hand
+component 组成，但每个
+component 的 owner/proposal ID 必须可查。
+
+事实层不提供含义未声明的裸 `action`。只有 `ActualDecisionView`、`FixedRateCompatibilityView` 或
+`TrainingViewContract` 可以将某个显式 stage 映射为兼容列 `action`，并强制写入例如
+`action_stage=selected_pre_safety`、source schema hash 和 materialization spec hash。这样旧/第三方 reader
+不能在未读取 contract 时把 intent 自动当成 hardware behavior 或默认训练 target。
+
+以下内容不得复用 `selected_action` 的名字：
+
+```text
+action.proposal.<source>
+action.safe
+action.reference
+action.commanded
+action.executed
+action.measured_effect
+```
+
+它们分别存在 proposal/execution trace 中。HOLD、FAULT 或无有效 selected action 时，decision view 使用显式
+status/valid mask；不能把零向量或无限期重复的 last action 伪装成新统一动作。
+
+native v2.4 不在 dataset-level 定义 `observation.last_action`。事实层通过前序 event ID 保存
+previous selected/safe/commanded/measurement 关系，policy event 另存每个 node 的 raw output 和 decoded
+proposal。`PolicyObservationView` 只有在 artifact 的 `LastActionContract` 声明后才投影：
+
+```text
+last_action_semantics:
+  previous_policy_output
+  previous_decoded_proposal
+  previous_selected
+  previous_safe
+  previous_commanded
+  previous_executed_feedback
+```
+
+contract 同时绑定 producer scope、action/command schema、pose mode、anchor 和 unavailable policy。v2.3
+compatibility row 继续保留其现有 `observation.last_action`，不能在 dual-write 时改含义。
+
+长序列 policy 不能把整个 action history 继续压缩成一个 `last_action`。artifact 必须另行声明
+`HistoryActionContract`，至少区分 policy/raw proposal history 与实际 behavior history，并规定 human override
+期间使用 counterfactual policy、human behavior、二者带 source token，还是 mask。它与 relative decode anchor、
+`LastActionContract`、`previous_safe_committed` 和 backend slew anchor 是五个独立 contract。
+
+### 6. 统一动作以下对模型不可见
+
+“对模型不可见”指默认 actor input/target contract 不可见，不代表数据集不记录。v2.4 为字段和 stream
+定义 access role：
+
+```text
+actor_observation
+actor_target
+policy_context
+critic_only
+reward_only
+audit_only
+control_private
+```
+
+默认规则：
+
+- actor observation 只读取 `PolicyObservationView` allowlist；
+- 事实层不定义默认 actor target；每个 target 必须由版本化 `TrainingViewContract` 显式选择；
+- safety result、IK/planner、reference、command、receipt、hardware fault detail、reward 和 attribution
+  不能作为下一步 actor input；
+- critic/reward/offline analysis 可以通过显式 training-only view 读取执行事实；
+- 如果算法确实需要执行反馈，必须新增版本化 observation field，例如
+  `previous_executed_action_feedback`，不能偷换 `observation.last_action` 语义。
+
+### 6.1 Learning observability：只前移不可恢复事实
+
+控制事实与 learner 实现之间增加一个窄的、可选的 learning-observability 层。它不进入 Arbiter，不改变 actor
+allowlist，也不拥有训练线程。以下证据只有 policy adapter 在 inference 时实际提供，才可成为 capture fact：
+
+```text
+PolicyInferenceObservability
+├── observation cut / policy output / model-side chunk
+├── artifact-bound adaptation state before/after
+└── generative sampler/noise evidence
+```
+
+`PolicyAdaptationStateRecord` 表示 RNN/KV/fast-weight/test-time-adapter 等模型内部顺序状态；它不是可被其他 node
+通用消费的 `PolicyContext`。state transition 绑定 inference，而不是 chunk queue 中之后发生的每次 keyframe pop。
+普通 capture 不要求逐步保存完整权重；profile 可以只要求 state identity/checksum 和周期 checkpoint，也必须声明
+其只能 semantic replay、不能 bitwise replay。若模型是 stateless，显式 `not_applicable`，不能制造空 state。
+
+生成式 policy 的 evidence 同样由 capability/profile 驱动。需要 exact-noise 或 FlowDAgger 类训练的 profile 应保存
+实际 initial-noise tensor/blob、sampler/solver/action-head/artifact hash 和生成出的 model-side chunk；仅有 seed/RNG
+receipt 只能声明较弱的重建能力，不能冒充实际 noise。当前通用 `PolicyLike.predict()`/OpenPI client 只返回最终
+output，因此在具体 server/client 增加 typed hook 前，这些字段必须 unavailable/not-applicable，不能由 output
+反推。
+
+`PolicyActionCodecContract` 连接 model action chunk 与 canonical trajectory：decode 是现有 v2.3 执行事实，encode
+是 human correction 回到模型原生 chunk 的独立能力。encode 必须绑定 observation/anchor、frame、horizon/cadence、
+rotation convention、normalization、padding、component mask 和 effective-time schedule；没有 round-trip fixture 时
+不得声明 bidirectional。通用框架不实现一个猜测性的 inverse。
+
+这些事实加入 formal trace 前必须有具体 producer 和最小消费 fixture。ControlTrace admission 失败只使声明依赖
+它的 learning profile/view 不完整，不改变 motion；runtime object、CUDA pointer、共享内存 handle 不可持久化。
+
+`dataset_interface` 不应向模型返回完整 parquet row。每个模型使用 `TrainingViewContract`：
+
+```text
+TrainingViewContract
+├── view_id / policy_node_role
+├── PolicyIOLayout / ActionComponentCatalog hashes
+├── observation cut/window specification
+├── context dependencies
+├── action target kind: human_expert_proposal / selected_human_components /
+│                      selected_action / policy_proposal / safe_action / behavior_action
+├── target component mask / action stage / provenance
+├── behavior action stage: selected / safe / commanded（仅 RL/critic）
+├── reward/task spec
+├── field/stream allowlist by access role
+└── resampling/window/padding rules
+```
+
+这样 BC、DAgger 和 RL 可以基于同一份事实选择不同 target，而不改变原始数据含义；缺少显式 target
+provenance/mask 的 view 必须 fail closed。
+
+### 7. 多频率 modality 的 native stream contract
+
+`StreamCatalog` 为每个 stream 定义：
+
+```text
+stream_id / modality / producer_id
+value schema、shape、dtype、units、frame
+measured/available clock domain（兼容 v2.3 source alias）
+nominal/min/max expected rate
+encoding/compression/payload location
+retention policy
+validity/freshness policy
+access role
+stream contract hash
+```
+
+每个 `SensorSampleRecord`/stream index 保存 sequence、measured/available timestamp、stable payload object
+ID、validity 和 drop/gap reason；runtime handle 只存在于 bundle。ObservationCutRecord 只引用：
+
+- point selection：`latest_at_or_before(T0)` 的 sample ID；
+- aligned selection：与 RGBD measured time 对齐的 state sample ID；
+- window selection：tactile/state 的 `[start, end]` sample range 和 aggregation contract；
+- held context：同一 frame/context ID 及其当前 age。
+
+不得在主表中复制高频样本，也不得用简单的 frame number 比例对齐。重复使用同一 15 Hz RGBD 时，30 Hz
+fast-policy cut 引用相同 frame ID；tactile 仍可引用新的 sample/window。
+
+现有 writer 的 external tactile dedup 是很好的兼容基础，但 native v2.4 还需要独立 stream ingestion：
+
+- v2.3 兼容模式继续只写被主 sample 选中的 tactile snapshot；
+- v2.4 native 模式允许 tactile producer 按 retention profile 独立写入 30–1000 Hz stream；
+- raw tactile、derived force/slip feature 可作为两个 stream，以 derivation contract 关联；
+- 若因带宽只保留 decimated/window feature，必须保存明确 decimation/filter contract，不能声称是 raw；
+- video/RGBD 每个真实 sensor frame 只编码一次，decision/cut 通过 frame ID 引用；
+- episode summary 为每个 stream 保存 produced/written/dropped/gap/rate/latency 统计。
+
+### 8. Reward、task outcome 与 transition
+
+reward 不应直接写进 ActionArbiter，也不应只有一个不可解释的 `reward` float。v2.4 先记录 task facts：
+
+```text
+TaskEvent
+├── task/phase/skill/contact-state
+├── source: env / online operator event / online detector
+├── event interval / confidence / validity
+├── success / failure / termination / truncation / reason
+└── referenced observation/measurement IDs
+```
+
+再允许一个或多个版本化 reward 定义产生 `RewardEvent`：
+
+```text
+RewardEvent
+├── reward_event_id
+├── parent_capture_hash / derivation_id
+├── reward_spec_id / code-or-config hash / version
+├── interval [decision_i, decision_j) / dt_sec
+├── total reward
+├── named reward terms
+├── source: online_env / offline_recompute / human_label / learned_reward
+├── referenced decisions/actions/measurements/task events
+├── terminated / truncated / bootstrap_allowed
+└── validity/confidence
+```
+
+同一个 episode 可以并存多个 reward spec，但这些 event 写入 immutable derived overlay；sealed capture
+不追加文件、不改 checksum。human/offline annotation 使用独立 `AnnotationEvent` 进入带 parent hash 的
+overlay。RL transition 由
+`TransitionViewContract` 构造：
+
+```text
+(observation_cut_t,
+ actor_action_t,
+ environment_behavior_action_t,
+ selected/proposal attribution,
+ reward over [t, t_next),
+ next_observation_cut,
+ dt_sec,
+ terminated,
+ truncated,
+ bootstrap mask)
+```
+
+`actor_action_t` 保留 policy 原生 action/chunk schema；`environment_behavior_action_t` 必须显式选择 selected、
+safe、reference 或 commanded stage。真机 RL 通常需要 safe/commanded
+及 dispatch/measured validity 来描述真实环境行为，但这些字段只进入 learner/critic/reward view，不成为
+部署 actor 的在线输入。每个 behavior stage 还必须绑定自己的 action/command schema；joint command 不能
+因为被选作 behavior fact，就伪装成与 actor `RobotAction` 同空间的训练 target。只有有显式 codec/transform
+证据时，critic/Q learner 才能把两个 action space 关联。
+
+离线 reward/annotation 的 available time 可以晚于 episode；它们只能作为版本化训练派生事实，不能被
+回填成当时 actor 已知的 observation/context。是否允许某个 learner view 使用它，由 access role 和
+`TrainingViewContract` 决定。
+
+### 9. 面向训练任务的 v2.4 视图
+
+| 用途 | observation/target | 必需 lineage |
+|---|---|---|
+| BC | 指定 policy view + selected human action 或 human proposal | observation cut、proposal/decision、component mask |
+| DAgger/intervention | failure 前 policy proposal/history + human correction sequence；按 component/phase 派生 label | policy/human proposal、authority/clutch/release、selected/safe/commanded/measured、derived segmentation/mask |
+| 快慢系统 | slow observation→context；fast observation+context→action | context version、fast cut、proposal、后续 outcome window |
+| 真机 RL | actor view、真实 behavior stage、reward、next cut | policy proposal、selected/safe/commanded、receipt/measured、termination |
+| sim RL | 与真机相同 canonical actor/action；可增加 privileged critic/reward-only stream | domain、randomization、physics state、同一 action/trace contract |
+| sim2real | 多 dataset root 的同构 training view | pose/action/layout/view hashes、domain contract、sensor/control profile |
+
+component mask 分为两类，不能继续只用一个 `intervention_mask`：
+
+- 第一/二层事实 mask：`proposal_available_mask`、`selected_mask`、`safety_modified_mask`、
+  `command_valid_mask`、`receipt_valid_mask`、`measurement_valid_mask`；
+- 第三层派生 mask：`expert_label_mask`、`policy_behavior_mask`、`policy_learning_mask`。
+
+派生 mask 必须绑定 `training_view_id + derivation_spec_hash`；尤其 `policy_learning_mask` 取决于算法、target
+stage、reward 和 transition validity，不能作为一个无版本的 capture 原始列。
+
+capture 只保存可观察的 takeover/release、human raw/canonical proposal、policy counterfactual proposal、实际
+behavior 和 safety projection。`PRE_FAILURE/TAKEOVER_ALIGNMENT/STABLE_CORRECTION/RECOVERY_AND_RELEASE` 以及
+context/action/inversion/preference/risk/recovery/value mask 由 immutable overlay 版本化派生，不写死在 sealed
+capture。post-safety action 也不是默认 expert target：projection 足够小时可由 view 选择 safe target；大幅 clamp
+的数据保留 raw intent 与 constraint evidence，但普通 BC/inversion view 应 fail closed 或降级到 risk/preference
+用途。
+
+快慢 credit 规则必须显式：slow context 的 reward/outcome window 由 slow-view contract 定义；fast policy
+使用真实 30 Hz action transition。若窗口中发生 context switch、human takeover、safety modification 或
+episode boundary，必须拆分或标记，不能静默归到单一 source。
+
+### 9.1 训练产物如何回到部署
+
+现有 `dataset_contracts.policy_artifact.PolicyArtifactContract` v1 继续保持兼容。v2.4 learner 通过 additive、
+content-addressed artifact bundle 绑定 base checkpoint 与 adaptation modules，不在 v1 dataclass 中追加会改变旧 hash
+的可选字段。learner 输出至少包含：
+
+```text
+TrainingRunManifest
+├── parent capture/derived overlay hashes
+├── DatasetCollectionManifest / TrainingViewContract hashes
+├── reward/transition spec hashes（若适用）
+├── learner code/config/dependency/seed hashes
+├── train/validation split 与 metrics
+└── produced checkpoint/artifact digest
+
+PolicyArtifactBundle / v2.4 extension
+├── exact base policy/model/action-head digest
+├── adaptation module digests + composition order
+├── adaptation-state init/reset contract（若适用）
+├── generative sampler/noise adapter contract（若适用）
+├── PolicyIOLayout / PolicyObservationContract / LastActionContract
+├── HistoryActionContract / PolicyActionCodecContract（若适用）
+├── action representation/chunk/frame/component contract hashes
+├── required context contracts
+├── EmbodimentCompatibilitySpec
+├── training_run_manifest_hash
+└── model/checkpoint digest
+```
+
+`deployments` 继续只负责 client/protocol/artifact transport；`robot_motion.deploy` 做纯 compatibility/session
+contract 解析；`teleop_runtime.deploy` 在构造设备前或进入 readiness 前执行 deployment preflight。preflight
+校验 observation streams、frames/calibration、action component coverage、end-effector capability、timing/
+decision policy 和 embodiment adapter。通过后仍先 shadow，不能因为 artifact 来自本仓库训练就自动获得
+authority。
+
+闭环验收不是“checkpoint 文件生成成功”，而是同一个 artifact 能：
+
+1. 从声明的 TrainingView fixture 重建模型输入并离线推理；
+2. 在 deterministic replay/sim 中生成 contract-compatible proposal；
+3. 在目标 embodiment binding 上通过 preflight 和 shadow parity；
+4. 产生新 capture，并让新 trace 反向引用 artifact/training-run hash。
+
+DAgger 的迭代闭环因此是
+`policy+human proposal capture → expert/component TrainingView → updated artifact → shadow/deploy → new capture`；
+RL 是 `behavior/reward/next-cut capture → transition view → updated artifact → sim/real rollout → new capture`。
+二者共用事实层和 artifact gate，不各建一套数据/部署协议。
+
+### 10. sim2real 与 domain contract
+
+为避免把“机器人本体”“遥操输入设备”和“本次运行环境”混成一个 hash，先分型：
+
+```text
+SourceDeviceContract
+  physical human-input schema / clock / calibration / retarget capability
+
+ReplaySourceContract
+  source capture/event / action stage / schedule / resampling / retarget contract
+
+EmbodimentContract
+  robot topology / effectors / canonical component+frame capability
+  kinematics / actuator interface requirements / safety capability
+
+DomainContract
+  domain: real / sim
+  embodiment_contract_hash / station_id
+  pose-frame/calibration binding
+  sensor/backend/physics/latency/noise/randomization contract
+```
+
+`DomainContract` 不包含本次跑了哪个 policy，也不把当前使用的 VIVE 当作 embodiment 属性：
+
+```text
+domain_id / domain_hash
+domain: real / sim
+embodiment_contract_hash / station_id
+pose-frame/calibration contract
+sensor/actuator capability profiles
+backend/physics/simulator versions
+actuator/sensor latency and noise model
+domain randomization distribution/range contract
+```
+
+每个 episode 另保存 `EpisodeExecutionManifest`：
+
+```text
+episode_uuid / control_domain_ids / embodiment_instance_ids
+source_device or replay_source contracts / source_adapter_receipts
+embodiment_contract_hash / execution_binding_hash
+policy_graph_hash / deployment_binding_hash
+policy artifact versions / producer epochs
+authority and safety profiles
+trace requirement / action persistence profiles
+decision/reference/command/physics timing profiles
+task contract / active streams / randomization sample and seed
+```
+
+因此同一 station 更换 policy 或兼容遥操设备不改变 embodiment hash，同一 sim scene 更换快慢 topology 也
+不创建新 domain；更换机器人 topology 才产生新的 EmbodimentContract。randomization sample/seed 是 episode
+domain binding，可引用稳定的 base domain contract。
+
+sim privileged state 必须标记 `critic_only`、`reward_only` 或 `audit_only`；它不能因为存在于同一 row 就被
+actor reader 读取。real/sim 或不同 embodiment 的 actor-facing ActionComponentCatalog、PolicyIOLayout、
+canonical frame 和 TrainingViewContract 必须满足 artifact 声明的 compatibility spec；DomainContract 与
+EpisodeExecutionManifest 可以不同。若需要跨 embodiment action retarget，结果写入 derived overlay 并绑定
+transform hash，不能修改原 capture 或假装原 action 天然同构。
+
+由于 v2.3 pose source/frame contract 当前是 dataset-level immutable，初期不建议把不同 station 的 real
+数据和不同 sim source 强行写进同一个物理 root。更稳妥的 sim2real 方式是：
+
+```text
+DatasetCollectionManifest
+├── real dataset roots
+├── sim dataset roots
+├── capture/derived overlay hashes
+├── required compatible contract hashes
+├── domain sampling/weight policy
+└── allowed missing/privileged modalities
+```
+
+各 root 保持内部同质，训练时由 collection manifest 联合采样。这也便于对 real/sim 分别做质量验收和
+数据版本冻结。
+
+### 11. dataset/episode metadata 与 contract registry
+
+`meta/info.json` 至少增加：
+
+```text
+dexteleop_dataset_schema = dexteleop_dataset_v2.4
+base_pose_contract = v2.3
+capabilities
+capture_status / capture_hash
+action_component_catalog_hash
+reference/command/measurement schema hashes
+stream_catalog_hash
+control_trace_contract_hash
+policy_io/graph registry hashes
+deployment/execution/domain registry hashes
+source-device/embodiment registry hashes
+training-run/policy-artifact registry hashes（capture 只引用当次 deployed artifact）
+logical table layout hash
+completeness matrix schema
+```
+
+dataset-level 固定 action component、pose 和基础 stream schema；episode metadata 绑定本次实际启用的：
+
+- `DomainContract` binding 和 `EpisodeExecutionManifest`；
+- policy graph、deployment binding、policy artifacts 和 producer epochs；
+- source device/adapter receipt、control domain/embodiment contract+instance、station 和 task spec；
+- decision/reference/command/physics profiles；
+- active stream IDs 和 per-stream integrity；
+- authority mode 与 session/termination summary。
+
+允许 episode 使用 registry 中不同的 policy graph/artifact，但不得改变共享 action/pose/component 语义。
+live capture append 只能新增 registry entry，不能原地修改已有 ID 对应的内容；seal 后 registry 也不可变。
+training view、reward 和 annotation registry 位于 derived overlay。所有 entry 使用 canonical hash。
+
+### 12. v2.3 兼容与迁移
+
+v2.4 reader 可以为 v2.3 提供明确标记的 compatibility view，但不能伪造不存在的事实：
+
+- 每个 v2.3 row 可映射为一个 compatibility step/observation cut；除非有证据，否则不声称存在真实
+  `ArbitrationDecision`；
+- 现有根 `action` 只有在 human-only/command lineage 证据充分时，映射为一个 human proposal 和
+  selected action；
+- 没有保存的 policy proposal、slow context、Arbiter candidate、safety modification、reward 或
+  dispatch receipt 一律标记 unavailable，不能从最终数值猜测；
+- existing causal camera/arm/hand/tactile snapshot columns 可以转换为 stream sample refs；
+- compatibility view 保存 completeness matrix、`compatibility_origin=v2.3_single_action_row` 和
+  `arbitration_unavailable=true`。
+
+如需物理转换，必须 copy-on-write。native v2.4 writer 在过渡期可同时生成：
+
+1. v2.3-compatible decision main row；
+2. v2.4 stream/trace events。
+
+这是同一个 `CollectionWriterRuntime` 的多 sink 输出，不是第二个控制 loop，也不为每个 policy 新建 writer
+lifecycle。不要继续把 v2.4 typed event 全部塞进 `schema_v21.py`；新增纯 contract/encoder，并保留旧
+row encoder 作为 compatibility materializer。
+
+### 13. writer、完整性与验收
+
+持久化层统一包裹：
+
+```text
+PersistedRecordEnvelope
+  fact_id / semantic_content_hash
+  encoded record + schema/registry refs
+  episode membership / journal sequence
+  record_integrity_hash
+```
+
+`record_integrity_hash` 覆盖最终 encoded envelope；runtime fact 不预先声称自己拥有 dataset row 的完整性 hash。
+
+mandatory 不能用“信息存在时”或一个全局列表表达。每个 runtime/capture 绑定版本化
+`TraceRequirementProfile`：
+
+```text
+TraceRequirementProfile
+  profile_id / runtime_mode
+  required / optional / not-applicable event types
+  required streams / receipt+measurement policy
+  completeness and writer-failure behavior
+
+current profiles:
+  plain_dry_run_v1 / policy_shadow_dry_run_v1 / replay_shadow_dry_run_v1
+  formal_real_shadow_v1 / authoritative_real_v1 / deployable_sim_v1
+```
+
+例如 authoritative real 要求 proposal admission、ProposalSnapshot、ArbitrationInputSnapshot、computation、
+publication attempt、successful decision 或 typed rejection、proposed/published ExecutionDirective、shared safety、
+reference/command lineage、dispatch owner/receipt 和 terminal；policy/replay shadow 要求 computation/evaluation、
+legacy execution observation 及 legacy safe/command/receipt，而不允许把 `would_select` 当 authoritative
+decision。not-applicable 与 missing 必须分开。
+
+- profile-required facts 无法 admission/durable 时必须留下 sequence gap/health evidence并使 capture
+  uncommitted；这里的“required”不承诺任意故障下零丢失；
+- RGBD/depth/raw tactile payload 可使用明确 drop/retention policy，但 index 必须记录 gap/drop；
+- finalize 前验证所有 ID 引用存在、producer sequence 单调；所有声明为 causal dependency 的
+  measured/available/produced/effective timestamp 满足对应 consumer cutoff；
+- selected action 的每个有效 component 必须能追溯 proposal，safe/command/receipt 必须追溯 decision；
+- derived overlay finalize 时，reward/transition 必须追溯 task fact、measurement、parent capture 和 reward
+  spec hash；
+- stream manifest 的 count/range/checksum 必须与 payload 和 ObservationCutRecord refs 一致；
+- 不使用单一 `training_valid`。capture episode finalize 生成事实完整性，derived overlay 再按 view 生成
+  eligibility；reader 合并为完整性矩阵：
+
+  ```text
+  episode_commit_status
+  control_trace_core_complete
+  event_family_complete
+  stream_integrity_by_stream_id
+  replay_capability: decision / control / sensor / full_environment
+  training_view_eligibility_by_view_id   # derived overlay/index
+  ```
+
+- mandatory writer 失败时 `episode_commit_status` 不能为 committed；某个可选 stream 缺失只使依赖它的
+  view/replay level invalid，不能自动废弃仍完整的 BC view；反之 receipt 缺失的数据不能进入 real-RL view；
+- 是否因 writer failure 触发真机 HOLD 由 runtime profile 决定，writer 不直接控制机器人；
+- control loop 不得阻塞于 Parquet/media I/O，但 bounded async journal 也不能承诺“任意故障下零丢失”。
+  required ControlTrace 使用与 media 分离的有界 event journal/episode spool，并分别审计 producer event
+  sequence、journal `issued_sequence`、sink `accepted_sequence`、sink `durable_sequence`、durable high-water mark 和明确的
+  dropped/gap range：`issued>accepted` 表示 admission/overflow 缺口，`accepted>durable` 表示持久化缺口；
+  queue overflow/disk failure 发布 typed writer-health event，不能伪装为普通 media drop；
+- shadow profile 可以在 mandatory sink 失败后继续控制但 episode 必须 uncommitted；authoritative profile
+  是否进入 HOLD 由显式 runtime policy 决定。finalize 只能 seal 到 durable high-water mark，进程崩溃恢复
+  必须截断未完成 fragment 并保留 gap/failure evidence；
+- 现有 `modality_validity` 已有 dataset/episode/video 的 fail-closed 基础，v2.4 将其版本化扩展到
+  stream/event-family/view/replay 粒度，reader 在 payload I/O 前检查 eligibility；
+- dataset episode 的 begin/finalize/abort/commit authority 仍属于现有 frontend/recorder；
+  `CollectionWriterRuntime` 按当前代码只拥有 sample→jobs→flush/close，不拥有 episode。ControlTrace journal、
+  legacy row、stream/media 都是该 episode owner 下的 subordinate sink，不得各自建立 episode 状态机。
+  policy deploy 没有 dataset episode 时使用独立命名的 `RuntimeTraceSession`，不能冒充 committed capture。
+
+进程崩溃后，纯内存 `issued_sequence` 无法证明所有 issued-but-not-accepted 范围。ControlTrace 分级落地：
+
+```text
+M4A  deterministic in-memory admission/completeness semantics
+M4B  preallocated local spool/WAL 与 crash recovery
+M4C  Parquet/materialized views
+```
+
+只有 M4B 后才能声明跨进程崩溃的 durable high-water recovery；M4A 只能保证进程存活期间有证据地标记
+overflow/failure，并使 capture uncommitted。
+
+当前落地状态（2026-07-19，M4A.1）：在原 M4A generic journal 之上，当前 M3 policy-shadow 事件已改为
+explicit top-level allowlist projection；runtime dataclass 新增字段不会静默进入 record/hash，未知字段 fail
+closed。trace 新增独立 `policy_action_emission`/`source_validation`，保留唯一 queue-pop lineage；M3
+completeness 已从 event presence 提升到 branch/per-lineage 引用与 hash 检查。profile 已拆分 plain dry-run、
+policy/replay shadow dry-run、formal real shadow、authoritative real 和 deployable sim；尚无 fixture 的 formal
+profile 标记 `planned` 并强制 incomplete。episode envelope 记录 lifecycle owner、binding event、membership
+epoch/bound time，bind/unbind 是 typed transition event；authority/gate admission event 也已有 explicit
+projection。durable high-water 仍固定为 0，未接 frontend、WAL、writer-health reserve、latency acceptance、
+Parquet 或真机 capture；context/composition 和 authoritative event schema 仍须在对应 producer 落地时补齐。
+实现仍位于 `teleop_runtime/control_trace/`，以避开现有生产模块 `teleop_runtime/recording.py` 的命名冲突。
+
+随后 scoped M4B 已在无 frontend fixture 中落地：`canonical_loads` 与
+`dataset_contracts.control_trace_wal` 定义 64-byte versioned frame header、payload SHA-256、header CRC、sequence
+trailer 和 canonical decode；`ControlTraceSpool` 使用固定最大文件、`pwrite+fsync`、严格递增 journal sequence
+和 deterministic torn/corrupt-tail scan/recovery；独立 fixed-slot health ledger 在主 spool 满或恢复丢弃 tail 时
+保存 durable evidence；`ControlTraceSpoolSink` 只有在 fsync 后才能向 runtime 回报 durable sequence/high-water。
+独立 worker 只管理 notify/flush/stop，不拥有 episode；`issue()` 只 admission immutable
+fact/sequence/membership snapshot，storage envelope/hash 在锁外由 sink materialize。
+这仍不是正式 capture：没有 frontend wiring、episode seal、formal profile fixture、后台 worker lifecycle、长稳/
+power-loss 测试或 Parquet reader，`capture_commit_eligible` 继续为 false。
+
+---
+
+## 十、Lifecycle 与监督
+
+`RuntimeSupervisor` 统一观察但不吞并现有 backend 状态机：
+
+```text
+sensor health
+policy node ready/alive/timeout
+context stale/rollback
+transport partition
+proposal starvation
+Arbiter status
+backend fault/hold/recovery
+writer health
+mode/authority transition request
+```
+
+第一阶段 real startup/recovery 仍由 `TeleopSession` 和 `run_policy.py` 持有，Supervisor 只接收 typed
+health event。后续收敛时必须显式定义降级规则，但 Supervisor 只请求状态变化：
+
+- slow context stale：fast policy fallback、hold 或禁用，由 profile 决定；
+- fast policy timeout：使用仍有效 proposal、fallback producer 或 hold；
+- remote policy partition：旧 proposal 到 `effective_until` 后失效；
+- policy restart：新 producer epoch，旧 queue/context 不得跨 epoch 使用；
+- safety FAULT：清空/隔离旧 selected segment，恢复必须由现有安全流程产生新 authority epoch。
+
+execution cancellation 只能使尚未 dispatch 的 queue item、旧 reference segment 和后续 command generation
+失效；已经发送给 SDK/backend 的 command 不声明“撤回”。其原 receipt 保留，并另行记录 hold request、
+hold result 和 backend state acknowledgement。该 contract 属于 `robot_motion.runtime`，不属于 action
+selection 语义。
+
+不能让各 policy worker 自行 dispatch、清 fault 或偷偷选择 fallback。
+所有 health/mode/fallback event 携带 `control_domain_id`；一个 sim env 的 timeout 不能污染另一个 env 的
+authority epoch。
+
+---
+
+## 十一、建议目录调整
+
+本节只描述长期 ownership；结合当前文件和调用链的最小落地批次、前置门槛与回滚点，见
+[`dexteleop_control_core_landing_plan.md`](dexteleop_control_core_landing_plan.md)。实现时不应一次创建
+下列所有文件。
+
+先增量增加文件，不大规模移动入口：
+
+```text
 robot_motion/
 ├── action/
-│   ├── schema.py                 # 现有 RobotAction
-│   ├── sources.py                # 现有 source protocol
-│   ├── codec.py/vector_pipeline.py # 现有 action 编解码与 layout
-│   ├── executor.py               # 现有 resolver/dispatcher seam
-│   ├── proposal.py               # 后续 ActionProposal contract
-│   ├── attribution.py            # 后续 component lineage/trace
-│   └── arbiter.py                # 后续纯逻辑 authority/selection
+│   ├── proposal.py          # ActionProposal / ProposalBuffer contracts
+│   ├── snapshot.py          # ProposalSnapshot / reduction policy
+│   ├── components.py        # ActionComponentCatalog / selection groups
+│   ├── authority.py         # AuthorityPolicySpec / Event / Lease
+│   ├── arbitration_input.py # authority/gate/epoch + proposal 的完整 immutable snapshot
+│   ├── arbiter.py           # pure deterministic ActionArbiter
+│   ├── arbitration_runtime.py # production decision gate；唯一落实 <=60 Hz 的位置
+│   ├── persistence.py       # ActionPersistencePolicy / ExecutionDirective
+│   ├── composition.py       # CompositionInputSnapshot/Spec；首版仅确定性 composer
+│   ├── mixing_strategy.py   # pure pose strategy；causal context输入，不拥有authority/safety/dispatch
+│   ├── safety.py            # typed source/shared/backend safety results
+│   └── attribution.py       # decision/control lineage contracts
 ├── runtime/
-│   ├── contracts.py              # 现有 observation/command contracts
-│   ├── interfaces.py              # 现有 source/backend/Rig protocols
-│   ├── dispatch.py               # 现有 receipt/error contracts
-│   ├── lifecycle.py              # 现有 lifecycle cleanup contracts
-│   ├── causal_history.py         # 现有 causal history
-│   ├── rig.py                    # 现有 shared Rig
-│   └── trace.py                  # 后续 ControlTrace sink/codec
-├── deploy/
-│   ├── runtime.py              # 现有 PolicyDeployRuntime；旧 DeployRuntime 仅兼容 scaffold
-│   ├── observation.py          # DeploymentObservation + source-neutral builders
-│   ├── pose_adapter.py         # v2.3 relative/frame decode
-│   ├── canonical_action.py     # shared safety → RobotAction → TeleopCommand
-│   └── actions.py              # normalization/chunk-compatible action contracts
-└── position_control/
-
-sim/
-├── core/
-│   ├── protocols.py
-│   ├── task_spec.py
-│   ├── env_adapter.py
-│   └── vector_env.py
-├── adapters/
-├── tasks/
-└── mujoco/
-    ├── adapters/
-    ├── backend.py
-    ├── deploy/
-    │   ├── observation.py      # MujocoDeploymentObservationSource
-    │   ├── executor.py         # MujocoDeploymentActionSink / SimDispatchReceipt
-    │   └── run_policy.py       # sim frontend，只组装 shared runtime
-    ├── runtime/
-    └── tasks/
-
-model/
-├── core/
-│   ├── policy.py
-│   ├── learner.py
-│   ├── rollout.py
-│   └── artifacts.py
-├── policies/
-├── data/
-│   ├── trajectory.py
-│   ├── rollout_buffer.py
-│   └── replay_buffer.py
-├── algorithms/
-│   ├── il/
-│   │   ├── bc/
-│   │   └── dagger/
-│   └── rl/
-│       ├── ppo/
-│       └── sac/
-├── sampling/
-├── artifacts/
-└── runners/
-
-dataset_contracts/
-├── policy_io/
-├── control_trace.py
-├── cross_domain.py
-└── io/
-
-dataset_interface/
-├── policy_io.py
-├── trajectory.py
-└── windows.py
+│   ├── causal_history.py    # 已有，继续复用
+│   ├── observation_cut.py   # ObservationCutRecord / runtime Bundle
+│   ├── control_admission.py # per-domain commit sequence/high-watermark/cut
+│   ├── producer_epoch.py    # receiver-side activation registry/snapshot
+│   ├── execution_gate.py    # immutable gate snapshot/publication barrier
+│   ├── dispatch_owner.py    # per-domain token/generation/permit hard gate
+│   └── cancellation.py      # execution epoch、异步取消及 acknowledgement contract
+├── position_control/
+│   └── capability.py        # ExecutionCapabilityProfile；与 Arbiter rate policy 分型
+└── deploy/
+    ├── observation_view.py  # per-policy allowlist projection
+    ├── policy_node.py       # common node protocol + action-runtime wrapper
+    ├── policy_graph.py      # PolicyNodeSpec / PolicyGraphSpec
+    ├── context.py           # PolicyContextRecord/Bundle + store
+    ├── orchestrator.py      # DAG scheduling/context routing，不做 authority
+    ├── deployment.py        # DeploymentBindingSpec
+    ├── action_adapter.py    # pre-safety RobotAction + PolicyActionEmission seam
+    └── canonical_action.py  # 保留兼容 wrapper/typed safety seam
 
 teleop_runtime/
 ├── action/
-│   ├── proposal_adapters.py
-│   └── attribution_adapters.py
-├── sources/
+│   ├── human_proposal.py    # TeleopCommand -> RobotAction/proposal
+│   ├── replay_proposal.py   # replay record -> ActionProposal real wiring
+│   └── real_adapters.py     # real observation/health/action sink adapters
 ├── collection/
-├── deploy/
-└── adapters/
-
-deployments/
-├── client/
-│   └── policy.py               # 无硬件 LoadedPolicy/loader（已从 teleop_runtime 提升）
-├── openpi/
-└── artifacts/
-~~~
-
-几个边界需要明确：
-
-- model/algorithms 不得依赖 MuJoCo、硬件或 teleop_runtime。
-- dataset_contracts 不得依赖 Torch、MuJoCo、硬件和训练器。
-- sim 不得依赖 teleop_runtime。
-- teleop_runtime 可以依赖 robot_motion、硬件和部署 client。
-- deployments 负责策略调用和 artifact，不负责训练循环。
-- robot_motion/runtime 只提供通用运行时和控制语义，不放真机设备初始化。
-
----
-
-## 六、数据结构方面必须补齐的内容
-
-目前 dataset_contracts 已有 Policy I/O，但还缺一个跨域控制轨迹契约。建议新增：
-
-### CrossDomainManifest
-
-至少包含：
-
-- domain：sim / real / replay
-- policy_io_layout_hash
-- simulation_contract_hash
-- action/observation frame
-- TCP、tool、calibration 信息
-- 相机预处理和相机顺序
-- policy/reference/command/physics frequency
-- timestamp policy
-- policy artifact id
-- source dataset
-- code revision
-- random seed
-- environment/task profile
-
-### ControlTrace 或 InterventionFrame
-
-用于描述一个控制时刻，不建议继续把所有字段都塞进现有 ActionRecord。这样可以避免破坏已有
-v2.1/v2.2 数据，同时为 per-component attribution 保留结构化扩展空间。
-
-建议将它拆成“一条 control tick 主记录 + 若干可关联的事件/lineage 记录”，而不是在每个 sample
-里嵌套任意深的 JSON：
-
-~~~text
-control_ticks
-├── episode/control/observation/decision ids
-├── timestamps and effective interval
-├── mode, safety status, authority epoch
-├── policy observation view reference/contract hash (allowlisted input only)
-├── policy intent action and representation/decode provenance
-├── policy model-view action + decoded absolute action
-├── expert model-view action + decoded absolute label
-├── pose anchor ids/timestamps and v2.3 contract hashes
-├── canonical policy/expert/selected/safe/commanded/executed action values
-├── source/proposal/component masks
-└── reward/termination/measured alignment
-
-proposal_events
-├── proposal_id, source, sequence, causal timestamps
-├── typed RobotAction and component coverage
-├── representation_trace_id, input/output action mode and frame
-├── pose chunk/frame contract hashes and measured anchor provenance
-├── validity/rejection/expiry reason
-└── policy chunk/keyframe/latency metadata
-
-component_lineage
-├── control_tick_id + component_id
-├── selected/proposal/source ids
-├── safety/reference/command dependency ids
-├── decision reason and modified/valid masks
-└── dependency proposal ids for coupled transforms
-
-execution_events
-├── command_id, reference_segment_id, dispatch_receipt_id
-├── sent/rejected/fault/latency
-└── measured_state_id, age and validity
-~~~
-
-这里的 `control_ticks` 是 recording/training 的完整事实快照，不是 actor 的输入结构。它可以同时
-保存 policy view、Arbiter decision、safe/commanded/measured 和 reward 对齐，但写入 policy view
-的字段必须来自独立 allowlist；下游字段只能通过 trace/event 关联，不能因为处于同一条记录就被
-`DeploymentObservation.model_input()` 或 policy wrapper 自动暴露。
-
-其中：
-
-- `control_ticks` 是 DAgger/RL 的主要读取入口，值和 mask 按
-  `component_schema_hash` 对齐；
-- `proposal_events` 保留“当时有哪些 action 候选”，包括 policy shadow 中未被选中的 policy
-  action，不能只写 selected proposal；
-- `component_lineage` 是 source attribution 的事实来源，至少能够从一个 component 追到
-  proposal、decision、safe result、command 和 measured state；
-- `execution_events` 允许同一个 reference decision 关联多个高频 command，不把每一个 150 Hz
-  command 误认为一次新的 Arbiter decision；
-- `ActionRecord`、`CollectorSample.action` 和已有 v2.x writer 可以继续输出兼容字段，但新
-  `ControlTrace` 缺失时，新的 DAgger/RL exporter 应拒绝生成“看似完整”的训练样本。
-
-### dataset_interface/trajectory.py
-
-建议形成统一的时间窗口读取接口：
-
-~~~text
-TrajectoryWindow
-├── observation
-├── images / depth / tactile
-├── robot_state
-├── policy_action_model_view + policy_available_mask
-├── policy_action_decoded_absolute + policy_decode_valid_mask
-├── expert_action_model_view + expert_label_mask
-├── expert_action_decoded_absolute + expert_decode_valid_mask
-├── selected_action + selected_source_by_component
-├── safe_action + safety_modified_mask
-├── commanded_action + executed_action + valid masks
-├── behavior_source_by_component
-├── pose_anchor_id / representation_trace_id
-├── pose_chunk_contract_hash / pose_frame_contract_hash
-├── proposal/decision/lineage ids
-├── valid_mask
-├── timestamps
-├── effective_intervals
-├── domain
-└── provenance
-~~~
-
-新的 DAgger 和 RL 数据应以此为入口。v2.1/v2.2 保留兼容读取，v2.3 数据以 absolute storage
-和 `PoseActionChunkContract` model view 共存；新数据默认必须带 component schema、因果时间线、
-representation trace 和 contract hashes。`intervention_mask` 如果继续对外提供，只能作为由
-`expert_selected_mask` 派生的兼容字段，并明确其 component granularity；不能再作为唯一 source
-标记。
-
----
-
-## 七、现有代码迁移策略
-
-第一批不重写 `run_collect.py`、`run_policy.py` 或 GUI 大入口；writer 生命周期和现有 human
-dispatch seam 已先在入口内收敛，policy stream 也已迁到 `robot_motion.deploy`。`ActionArbiter`
-应按以下顺序接入，避免一次迁移改变真机行为：
-
-1. 在 `robot_motion/action/` 增加纯 contract、validation、deterministic arbiter 和 fake source，
-   先不连接任何真实 Rig。
-2. 在 `teleop_runtime/action/` 增加 human `TeleopCommand -> RobotAction` adapter，完成
-   pose/qpos/hand/end-effector 的 round-trip golden tests。
-3. 在 GUI/headless human-only 模式接入 observe-only Arbiter：只生成 decision/trace，不改变
-   原有 `TeleopSession` command_filter、guard、hold 和 dispatch。
-4. 将 policy chunk 和 replay 分别包装成 `ActionProposalSource`；policy prediction、queue、
-   transaction 和 v2.3 decode 继续由唯一的 `PolicyDeployRuntime` 管理，Arbiter 只在
-   keyframe/reference boundary 读取已经解码的候选。
-5. 在 sim/dry-run 先启用 selected action，再接入 human override 和 per-group override；通过
-   回归后才进入真机 `policy_shadow`。
-6. 用统一 trace 写入 proposal、decision、safe result、backend receipt 和 measured state；最后
-   再把入口简化成组装层。
-
-尤其要避免让 `TeleopSession`、新的 RuntimeKernel 和 policy loop 各自保留一套独立的：
-
-- armed/fault 状态机
-- hold/recovery 逻辑
-- action dispatch
-- safety filter
-
-最终应该只有一套控制权和故障状态源。
-
----
-
-## 八、实现前建议冻结的几个决策
-
-建议默认采用以下方案：
-
-1. 模型、human、replay 的 proposal 统一使用 `RobotAction` 语义；`TeleopCommand` 只作为
-   resolver/backend transport，不作为 Arbiter 的公共输入。
-2. 第一版人机协同使用显式 mode/priority/authority event 和 selection group，不做任意连续
-   pose blend；handoff 平滑放在 reference layer。
-3. `ControlMode` 与 `SafetyStatus` 分离；fault/hold/recovery 仍由 session/backend 产生 veto，
-   Arbiter 不能自行清除 fault。
-4. Arbiter 在 policy/reference keyframe 边界运行，不能放进 150 Hz command worker 或 physics loop。
-5. policy observation 禁止 privileged state；privileged state 只提供给 critic、reward 或 debug info。
-6. 新数据以 v2.2 typed action 为主，v2.1 只作为兼容适配层。
-7. sim 和真机必须共享 `RobotAction` 语义，并分别复用适合 backend 的 Safety/Planner adapter。
-8. 每个 episode 必须有明确的 episode_id、domain、task profile、policy artifact 和 seed。
-9. 所有动作必须尽可能区分 intent、proposal、selected、safe、commanded、executed、measured，
-   且每一层都要保留 per-component source/proposal lineage 和明确 mask。
-10. DAgger 的 expert label 与 RL 的 behavior action 使用不同字段和 validity mask；不能把
-    人类接管 action、policy intent 或最终 command 统称为 `action`。
-11. ControlTrace 是正式数采的强制旁路记录；视频/tactile 可以按策略丢帧，action attribution、
-    decision、receipt 和 source lineage 不得静默丢失。
-12. v2.3 relative 只作为 dataset/model-facing representation；`PoseActionChunkContract`、
-    `PoseFrameContract`、`robot_motion.relative_action` 和 `robot_motion.deploy.pose_adapter`
-    是唯一转换 owner。进入 Arbiter 的 proposal 必须是 absolute runtime `RobotAction`，并携带
-    decode anchor、contract hash 和 representation trace 引用。
-
----
-
-## 九、推荐实施顺序
-
-### Phase 0：冻结基线
-
-在正式接入真机模型前，整理当前工作树，形成一个可追踪的 baseline，并记录：
-
-- 当前 v2.1/v2.2/v2.3 状态
-- 哪些文件属于正在进行的迁移
-- 目标 policy action profile
-- deployable sim 与 task-native sim 的区别
-- v2.3 的 absolute storage、model-view chunk、artifact binding 和 runtime decode 的对应关系
-- 当前默认 `15→75→150` 与显式 `15→45→150` compatibility profile，禁止在新模块中硬编码频率
-- policy relative anchor 必须来自 measured actual TCP；缺失/过期时的 fail-closed 行为
-
-### Phase 1：ActionArbiter 共享契约与纯逻辑实现
-
-先不接真机、不改变 GUI/headless 行为、不训练模型，按四个小阶段完成：
-
-#### Phase 1A：契约与时钟
-
-- `ActionProposal`、`ActionProposalSource`、`ArbitrationContext`、`ArbitrationResult`、
-  `ProposalDecision`、`ControlMode`、`SafetyStatus`。
-- `PolicyObservationView` 的 allowlist projection：明确 actor 可见字段与 runtime-private 字段，
-  并用 contract test 保证 `ArbitrationResult`、`SafetyResult`、lineage、reward 和 trace metadata
-  不会通过 observation `metadata` 回灌模型。
-- 统一 control clock、sequence、`valid_from/valid_until`、causal cutoff 和 active effectors。
-- `RobotAction` snapshot/copy/freeze 规则，以及不兼容 frame/action space 的明确错误。
-- `ActionComponentCatalog`、component schema hash、selection group 与 component coverage；
-  明确 effector/field/slot 的 label granularity。
-- 不新增 relative 数学实现；复用现有 `PoseActionChunkContract`、`PoseFrameContract`、
-  `robot_motion.relative_action` 和 `robot_motion.deploy.pose_adapter`，只定义
-  `ActionRepresentationTrace`/decode receipt 的 provenance 字段。
-- `ActionLineage`/`ActionAttributionFrame` 的 proposal、selected、safe、commanded、executed、
-  measured id 和 source/mask 语义；明确 `expert_label_mask` 与 `policy_behavior_mask` 的区别。
-
-#### Phase 1B：纯 Arbiter 与组合器
-
-- deterministic freshness/authority/mode/group selection。
-- 每个 `component_id` 输出 owner、selected/proposal/availability mask、decision reason 和
-  selection-group 依赖；同时生成 control port 与 attribution port，reward 不写入 Arbiter。
-- human-only、policy-only、policy-shadow、human-override、per-group override。
-- coupled group 原子选择；不同 group 的安全组合；不做 raw pose blend。
-- no-action、hold、fault-veto、stale、invalid、incompatible 的结构化 decision。
-- `selected_source_by_component`、`proposal_id_by_component` 和 decision reason 必须是 Arbiter
-  的正式输出，而不是由 recorder 从最终 action 猜测。
-
-#### Phase 1C：synthetic source 和 trace
-
-- static human/policy/replay sources、clock skew、slow source、empty queue、sequence rollback
-  的 synthetic tests。
-- 记录所有候选、拒绝原因、selected owner、authority epoch、handoff、每个 component 的 source
-  mask 和 safety boundary。
-- 用一个 mixed-source fixture 验证 human 左臂 + policy 右臂/手部的 action 值、proposal id、
-  selected/safe/commanded/masked 数据能够逐层重建；验证 policy shadow 未被选中也不会丢失。
-- 验证 reference/IK 输出的 dependency lineage、150 Hz command 对 decision/reference 的继承、
-  mandatory trace queue failure 和媒体丢帧标记。
-- 使用 `NullCommandDispatcher`/fake resolver 验证 Arbiter 不触碰硬件。
-
-#### Phase 1D：human legacy adapter
-
-- 将现有 retargeter 的 `TeleopCommand` 转为 `RobotAction`，完成 pose/qpos/hand/end-effector
-  round-trip golden tests。
-- 保留 human `delta_clutch` 自己的 tracker/home/session anchor 语义；不要把它误接成 v2.3
-  policy 的 chunk-start measured-TCP anchor。两者只在 source adapter 输出的 absolute
-  `RobotAction` 层汇合。
-- adapter 遇到未知 command type 时返回 invalid proposal；不得绕过 Arbiter 继续发送。
-- 在 `merge_teleop_commands()` 之前保留每个 retargeter 的 source/component coverage，并把
-  merge 覆盖关系记录到 attribution；不能让同名 effector 的后写值覆盖掉前一候选而无 trace。
-- 先以 observe-only 方式接入 `TeleopSession`，确保原有 command_filter、guard、fault/hold、
-  `BimanualRig` dispatch 和 writer 输出不变。
-
-当前已有的 `TeleopSession.dispatch_command()` 和共享 writer runtime 不重复实现；本阶段要把
-它们作为集成 seam，而不是再创建一套新的 loop。
-
-### Phase 2：统一 sim 路径
-
-新增 MuJoCo observation/action adapter，使一个 deployable policy 可以走：
-
-~~~text
-v2.3 model view → existing pose_adapter → absolute RobotAction
-  → ActionProposal → ActionArbiter
-  → common pipeline → MuJoCo backend
-~~~
-
-同时保留现有 CubeLift fast/native RL 路径，避免为了 deploy parity 破坏快速实验效率。deployable
-sim 必须保留与真机相同的 proposal/decision/lineage/ControlTrace 字段，即使 MuJoCo 没有真实
-dispatch receipt，也要使用 backend receipt adapter 和 measured validity 标记，不能因为是 sim
-就退回只记录一个 action vector。
-
-sim 的 relative decode 必须和真机调用同一套 chunk/frame contract 与
-`robot_motion.deploy.pose_adapter`；sim backend 只消费 decoded absolute `RobotAction`。在
-进入真机 shadow 前至少完成：dataset absolute row → relative model view → decoded absolute
-action 的 golden round-trip、frame/hash mismatch fail-closed、固定 chunk anchor、padding mask
-和 `15→75/45→150` position profile 的时序回放。
-
-### Phase 3：真机 shadow 与人工接管
-
-在 Phase 1/2 contract 和回放验证通过后，按风险逐步运行：
-
-- GUI `policy_shadow`：模型只预测和记录，真人实际控制，selected action 仍为 human。
-- policy 的下一次输入仍只使用原有 `PolicyObservationView`/环境 measured observation；不能把
-  “本次 human 取代了 policy”或 Arbiter decision 注入下一次 actor input。该事实只写入 trace，
-  由训练侧 mask/label adapter 使用。
-- policy shadow 同时记录 raw model-view、decoded absolute action、measured anchor 和 decode
-  receipt；没有 selected 的 policy proposal 也不能从 trace 中丢掉。
-- `human_override`：模型持续预测，使用显式 authority event 接管指定 group。
-- `per-group override`：只接管已声明允许独立运行的 group；双臂 coupled group 不拆开。
-- 真机阶段只允许记录 proposal/decision/trace，不直接从新 Arbiter 开启 policy-only；每个
-  control cut 必须能够实时导出 policy/human proposal、per-component selected source 和
-  safe/commanded/receipt lineage。
-
-policy-only 先在 sim 和 dry-run 完成，真机 policy-only 需要另行通过安全评审和验收。
-
-### Phase 4：统一 DAgger / RL 数据
-
-实现：
-
-- `dataset_contracts.control_trace` 和 component lineage schema
-- `RewardAttributionAdapter`：从 component attribution、safe/executed/measured values 和 task
-  outcome 派生 `expert_label_mask`、`policy_behavior_mask`、`policy_learning_mask` 及安全/接管
-  penalty；不把这些字段加入 actor observation
-- TrajectoryWindow
-- DAgger expert label export
-- RL rollout buffer
-- v2.3 model-view/decoded-absolute 双视图 exporter；缺少 chunk/frame contract hash 或 measured
-  anchor provenance 时拒绝生成训练样本
-- 按 `expert_label_mask`/`policy_behavior_mask` 的 source-aware sampler
-- 异步视频/tactile writer
-- episode manifest
-- policy artifact 与数据集绑定
-
-### Phase 5：新增 model/
-
-最后再逐步加入：
-
-- BC
-- DAgger
-- PPO/SAC
-- sim rollout collector
-- real rollout collector
-- checkpoint/export/eval runner
-
-训练依赖应放到独立 optional dependency，不要把 Torch、训练器和 RL 库加入 robot_motion 或 dataset_contracts 的基础依赖。
-
----
-
-## 当前架构状态与最终建议（2026-07-17）
-
-### 已确认的正式入口
-
-当前正式真机 teleop/数采入口确定为：
-
-```text
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
+│   ├── v24_encoder.py       # decision view + typed event encoding
+│   ├── control_trace_sink.py # mandatory journal/durable high-water mark
+│   └── stream_sink.py       # native-rate stream sink；复用现有 writer runtime
+└── control_trace/
+    ├── runtime.py          # deploy/collection 共用 subordinate journal/spool
+    ├── lifecycle.py       # EpisodeLifecycleOwner adapter / RuntimeTraceSession
+    └── projection.py      # 当前 generic；M4B 前改 explicit event projection
+
+dataset_contracts/
+├── canonical_encoding.py    # ID/hash 的跨 runtime/dataset canonical encoding v1
+├── v24.py                   # capability + ControlTrace Core root contract
+├── time.py                  # role-specific timestamp/clock evidence
+├── control_trace.py         # 当前 generic envelope；M4B 前补 explicit event/lineage schema
+├── stream_catalog.py        # native stream、sample ref、retention/integrity
+├── stage_schemas.py         # action/reference/command/measurement schemas
+├── completeness.py         # commit/completeness/view/replay matrix
+├── execution_manifest.py    # execution/deployment/domain bindings
+├── source_device.py         # physical teleop device + calibration/adapter contract
+├── replay.py                # ReplaySourceContract/action-stage/schedule identity
+├── embodiment.py            # topology/component/frame/capability contract
+├── training_run.py          # capture/view/learner/checkpoint provenance
+├── domain.py                # real/sim domain 与 privileged-field contract
+├── policy_graph.py          # serializable logical graph manifest
+├── training_view.py         # Learning Extension；actor/critic/DAgger/RL view
+├── task_reward.py           # Learning Extension；reward/transition overlay
+└── dataset_collection.py    # Domain Extension；capture/overlay/sim2real manifest
+
+dataset_interface/
+├── control_trace.py         # readers/index
+├── replay.py                # sealed facts/view -> typed replay records
+├── streams.py               # native stream lookup/window/alignment
+├── training_view.py         # role-aware projection，禁止整 row 直通模型
+└── trajectory.py            # variable-dt、15/30 Hz 等训练 view/window
+
+sim/mujoco/deploy/
+├── observation.py
+├── action_sink.py
+└── runner.py
+
+robot_motion/replay/
+└── proposal_source.py       # 无 I/O replay schedule/record -> proposal primitive
 ```
 
-`teleop_runtime.collection` 不再作为第二个正式 GUI 控制实现，而保留为
-**headless/兼容 frontend**。它可以用于无 GUI、回放、自动化检查和旧脚本过渡；新功能不应
-再只在 `collection` 中实现一份、再在 GUI 主线中复制一份。
+目录名可在实现时微调，但 ownership 不变：
 
-### 当前实际主链路
+- `robot_motion` 不依赖真机 SDK、MuJoCo、Torch 或 RPC 框架；
+- `robot_motion` 可以依赖 `dataset_contracts` 中无 I/O 的 canonical encoding primitive；
+- `dataset_contracts` 不得反向导入 `robot_motion`；
+- `dataset_contracts` 只放可序列化纯 contract；
+- `teleop_runtime` 只实现 real composition/adapters；
+- `sim` 只实现 sim adapter；
+- `deployments` 继续持有模型 client/protocol/artifact transport；
+- `model/` 等 trace/rollout contract 稳定后再加入 learner，不作为当前 runtime 入口。
 
-#### GUI 真机 teleop + 正式数采
+---
+
+## 十二、最佳实施路径
+
+### Phase 0：冻结当前行为基线
+
+当前状态：已由 landing M0 的无硬件 golden fixture/固定 SHA-256 覆盖；不包含真实硬件时延或安全验收。
+
+- 固定 GUI/headless/deploy 三条入口及当前 real fault/hold/dispatch 行为；
+- 生成版本化 baseline manifest，记录 fixture/hash、单 policy output、decoded absolute action、safety result、
+  `RobotAction`、`TeleopCommand`、position keyframe、dispatch intent、timestamp/anchor evidence 和当前
+  `last_action` stage；不能只依赖会随实现一起修改的测试期望；
+- 固定 `DeploymentObservation`、pose/frame/anchor 和 causal snapshot contract hash；
+- 为 `DeploymentObservation.model_input()` 冻结 control-private 泄漏负面测试；
+- 选取最小 v2.3 fixture，冻结当前主 row、external tactile 去重/引用及 relative training view 行为；
+- 明确旧数据中根 `action` 的实际生成位置和已知 lineage 缺口，作为 v2.4 compatibility completeness 基线；
+- 不移动当前仍有 caller 的代码到 `legacy`。
+- baseline 固定在 `tests/fixtures/control_core/v23_single_policy_baseline_v1.json`，普通测试只验证而不自动
+  重写；变更必须显式维护并说明行为差异。
+
+### Phase 1A：在线时间与动作 contract
+
+当前状态：M1A/M1A.5/M1B/M1C/M1D 的 contract 与 deterministic tests 已落地；其中只有 strict actor view
+已成为当前 deploy prediction 输入，pure Arbiter 只接 M3 shadow，cancellation/dispatch-owner 尚未接
+production worker/backend。因此本 Phase 是“contract 完成、执行迁移未完成”。
+
+只冻结跑通控制闭环不可缺少的语义：
+
+本节是架构层的一组能力；实施时先完成 M0 baseline，再按 landing plan 拆为 M1A
+identity/admission/proposal、M1A.5 observation-firewall activation、M1B complete arbitration input/schedule/
+persistence、M1C cancellation/epoch 和 M1D dispatch ownership gate，不能一次大批量落地。
+
+- `control_domain_id`/`embodiment_instance_id` 和 role-specific timestamp taxonomy；
+- `ClockDomainDescriptor`、reset epoch 及 `CanonicalEncodingSpec v1`/跨层 hash conformance fixture；
+- `StreamSampleRef`、`ObservationCutRecord`/`ObservationBundle`；
+- `PolicyNodeSpec` identity、`LastActionContract` 和 `PolicyObservationView` firewall；
+- `ActionProposalDraft`/receiver admission receipt、per-domain ControlAdmissionCoordinator/committed prefix、
+  ProducerEpochRegistry、immutable `ActionProposal`；
+- target-time-aware `ProposalSnapshot` 与完整 `ArbitrationInputSnapshot`、DecisionScheduleSpec、
+  ActionPersistencePolicy/ExecutionDirective；
+- reduction/input hash、
+  `ArbitrationEvaluation`/authoritative `ArbitrationDecision` 分型；
+- `ActionComponentCatalog`、authority/attribution ports 和 independent decision clock；
+- production Arbiter `decision_hz<=60 Hz` 的配置、发布 gate 与审计契约；不把该上限传播到其他 clock；
+- source/shared/backend 三层 safety result，以及 action/reference/command/measurement schema 边界。
+- `ExecutionGateStatus`、`ExecutionCancellation`/receipt 与独立 execution epoch。
+- final dispatch-owner token/generation 与 per-command authority/execution epoch permit。
+
+M1A 先实现 artifact-bound typed `PolicyObservationView` 而不接 production；M1A.5 通过 legacy/strict 双生成
+和 tensor/path/shape/value parity 后，才让正式 actor 只消费 strict view，修正
+`DeploymentObservation.model_input()` 的 metadata/fault 泄漏。暂不冻结 reward、训练 mask、完整
+sim2real sampler 或通用 RPC。
+
+### Phase 1B：最小 v2.4 ControlTrace Core
+
+当前状态：M4A.1 已完成当前 M3/M5 子集的 explicit record schema、policy/human-shadow branch/per-lineage
+completeness、profile scope 拆分、authority/gate event projection 和 episode membership provenance；M5 又补入
+`HumanCommandEmission`、独立 `SourceAdapterReceipt`、source validation 及 `human_shadow_dry_run_v1` lineage
+fixture；M5.2 又补入 PolicyContext/context-admission 与 composition input/snapshot/result 的 explicit schema/
+projection，但尚未进入 branch-aware completeness。仍无 replay/authoritative lineage schema。scoped M4B 已完成当前 explicit schema 的 WAL codec、bounded
+spool、fsync durable ack、tail recovery、writer-health reserve 和小型 admission contention fixture；M5 opt-in
+GUI frontend 可启用同一 scoped debug spool worker，但没有 formal dataset episode lifecycle、formal profile、
+production episode 自动接线或 ActualDecisionView，不能把本 Phase 称为完整 authoritative capture。
+M4B 只能持久化已显式冻结的 schema，不能为尚无 producer/fixture 的 planned event 猜测 payload。
+
+实现 `control_trace_core` capability：
+
+- observation/sample selection event；
+- policy inference/context reference event；
+- proposal admission/producer epoch、ProposalSnapshot/DecisionScheduleTick/authority+gate snapshot、
+  ArbitrationInputSnapshot/computation/evaluation/publication-attempt/authoritative-decision/publication-rejection/
+  proposed-or-published ExecutionDirective/legacy-execution event；
+- source validation、shared safety、reference/command/dispatch/measurement event；
+- execution cancellation/acknowledgement 和 writer issued/accepted/durable high-water mark；
+- episode task termination/truncation fact；
+- TraceRequirementProfile、ShadowEvaluationView、authoritative ActualDecisionView、logical table locator 和
+  completeness matrix。
+
+这一完整阶段只定义第一/二层控制事实和 capture seal；learner/Domain Extension 不进入实现关键路径。后续前移的
+Phase 5L 只增加不可恢复 policy evidence 的 pure contract/fixture，不改变这里的 ControlTrace owner 或完成口径。
+capture seal 属于 M4B/M4C，不属于已完成的 M4A。
+
+### Phase 2：单策略按新边界运行，保持行为一致
+
+当前状态：M2 pre-safety `PolicyActionEmission` 和 M3 deploy shadow 已落地；legacy safety/command/dispatch 仍是
+唯一 owner。M5 已完成 strict human adapter、不可变 pre-merge provenance、默认关闭的 `TeleopSession`
+pre-filter/post-dispatch passive hooks，以及复用同一 ProposalBuffer/input snapshot/pure Arbiter 的 human dry-run
+fixture；`HumanProposalShadowRuntime` 已由 `HumanShadowFrontend` 接入 canonical GUI 的 arm/Inspire 路径，按实际
+profile 构造 runtime identity、component catalog、arm/hand spec，并通过 bounded non-blocking observer queue
+生成 component parity/legacy trace。默认仍为 off，双臂 position collision-aware 路径按现有 IK 后 seam 如实
+记录 absolute qpos，其他已覆盖路径记录 absolute pose；该过渡边界不代表 Arbiter 已移动到 IK 之前。
+DMTAC gripper 仍由 `TeleopSession` 外的独立分支下发，启用 human shadow 时 fail closed。默认 trace 是无
+episode membership 的 `RuntimeTraceSession`；可选 WAL 也只是 scoped debug durability，不是 formal capture。
+shared execution shadow 尚未开始。
+
+- 拆出 `DeployRobotActionAdapter` 和 typed canonical safety seam，保留旧 `prepare()` wrapper；
+- 先用窄 `teleop_runtime.deploy.arbiter_shadow` 包住当前单个 `PolicyDeployRuntime`；完整
+  `PolicyOrchestrator` 等单策略 shadow parity 后、确有多节点需求时再引入；
+- policy 输出生成 proposal/snapshot/`ArbitrationEvaluation` trace，但先 observe-only，现有执行仍是 owner；
+  只有后续 authoritative owner 才发布 `ArbitrationDecision`；human proposal 按
+  landing plan 的后续独立门槛接入，不与 policy shadow 同批切换；
+- 对比 decoded absolute action、safe action、command 和 position keyframe golden output，并验证当前
+  deploy/collection 各自的 `last_action` 语义没有被 v2.4 静默改写；
+- 先用 subordinate `ControlTraceJournal` 承担 deploy/collection 共用 event admission/spool；dataset episode
+  仍由现有 frontend/recorder owner 管理，`CollectionWriterRuntime` 通过 composition 接入，而不是把其
+  `SessionStepResult/CollectorComponents` 依赖带入 policy deploy；同时保留 v2.3-compatible row 作为对照；
+- 第一版只引用现有已采集的 RGBD/state/tactile，不要求高频 native ingestion；completeness matrix 必须
+  准确说明哪些 stream/replay/view 尚不可用。
+
+M5 余项必须保持被动语义：DMTAC 若纳入 shadow，只能在现有唯一 gripper action 消费/下发位置旁增加
+immutable emission 与 legacy-execution tap，不能重新读取输入、再次计算 target 或创建第二个 send loop。
+正式 capture 则由既有 dataset episode owner bind subordinate ControlTrace journal；普通 GUI debug session
+不得自行升级为 episode owner。
+
+这一阶段不接第二个真实策略、不改变真机 authority、不为当前 real control domain 增加第二个 dispatch port。
+
+### Phase 3：deterministic 多速率/快慢 synthetic 验证
+
+当前状态：M5.2 pure contract/harness 已完成。当前工作树已有 transport-neutral `PolicyNodeRuntime`、
+receiver-admitted `PolicyContextStore`/snapshot、internal-only `CompositionInputStore`/snapshot、版本化
+`CompositionSpec` 与 `DeterministicComposer`；context/composition event 已有 explicit ControlTrace schema/projection。
+fixture 验证 15 Hz RGBD stable-ID reuse、100 Hz tactile latest sample、10 Hz slow context、40 Hz fast residual、
+context sequence rollback/stale/restart/cut isolation，以及 30/45/60 Hz Arbiter。v1 composer 只支持 component
+union 和 qpos base-plus-bounded-residual；没有 production caller、PolicyOrchestrator、通用 DAG/RPC、真实第二模型
+或 pose/SE(3) residual。普通 proposal 的 `semantic.v1` payload/hash 保持不变，带 composition lineage 的 proposal
+使用显式 `semantic.v2` domain。source/embodiment 可替换性目前也只是 test-local fake conformance，不是正式 backend
+binding contract。
+
+使用 injected fake clock 和 fake producers：
 
 ```text
-debug.main
-  -> _build_components
-  -> TeleopSession.run_step
-       -> sources causal observation
-       -> SafetyMonitor / fault / tracker hold
-       -> retargeters
-       -> command filter / guard
-       -> TeleopSession.dispatch_command
-       -> BimanualRig.send_commands       # 唯一最终硬件 dispatch
-  -> recovery / gripper / preview post-process
-  -> collection_step_result(T0 snapshot)
-  -> PositionReferencePublisher.publish_step   # 只发布已 dispatch command 的 reference
-  -> RealTeleopDatasetRecorder.record_step_async
-       -> CollectionWriterRuntime
-       -> CollectionWriterObserver
-       -> AsyncWriterPool -> LeRobotV21Writer
+15 Hz fake RGBD
+100 Hz fake tactile/state
+10 Hz fake slow context policy
+30 或 40 Hz fake fast action policy
+30/45/60 Hz configurable Arbiter
+60/75 Hz reference
+120/150 Hz command
 ```
 
-这里的 `SessionRecorder`/`EpisodeRecorder` 是可选的 JSONL/debug sidecar；正式训练数据的
-主写入是 `RealTeleopDatasetRecorder` 里的 LeRobot writer，二者不能混为一个 action source。
-`PositionReferencePublisher` 也不是第二个硬件 dispatcher，它只消费当前控制 cut 的命令并
-建立因果 reference timeline。
+该阶段只实现最小 synthetic topology contract/harness：`PolicyNodeRuntime` protocol、
+`PolicyContextRecord`/minimal store、`FakeContextPolicyNode`、`FakeActionPolicyNode`、一个 bounded-residual
+`DeterministicComposer` fixture 和确定性 context edge；
+不接 `run_policy.py`，不实现通用 DAG、RPC 或 production `PolicyOrchestrator`。
 
-#### headless/兼容数采
+必须验证：
 
-```text
-collection.main
-  -> build_collect_app
-  -> CollectionRuntime.control_step
-       -> TeleopSession.run_step
-       -> TeleopSession.dispatch_command
-       -> BimanualRig.send_commands
-  -> sample rate gate
-  -> CollectionRuntime.record_step
-       -> CollectionWriterRuntime
-       -> CollectionWriterObserver
-       -> AsyncWriterPool -> LeRobotV21Writer
-```
+- 同一 RGBD 重用时 frame ID 不变、age 正确；
+- fast proposal 引用准确的 observation cut 和 slow context version；
+- action/context node 使用不同 runtime，context node 不出现 action queue/decode；
+- proposal produced/available/effective time 和 chunk `target_effective_at` 正确；
+- snapshot reduction、proposal snapshot ID/hash 和 replay candidate set 一致；
+- 相同 `ArbitrationInputSnapshot` + arbiter contract/implementation/selection-policy hash 得到完全相同 result
+  hash；snapshot 后到达的 proposal、authority event、
+  gate/producer epoch transition 只影响下一计算，而 live fault/cancellation 可阻止旧 result 发布；
+- base/residual composition input snapshot、缺失/late fallback 和 lineage 可重放，不使用隐式 freshness weight；
+- 同一 chunk 多未来 keyframe、重叠 effective interval、replace/append 和 late chunk 按 target-time policy
+  确定性选择；
+- 不使用未来 sample/context，旧 context 乱序到达不覆盖新 context；
+- late inference、empty queue、stale context、producer restart 和 authority takeover 结果确定；
+- 非整数频率组合不依赖 frame-count modulo；
+- `decision_hz>60` 配置 fail closed；高频 proposal/event burst 被确定性 coalesce，且 reference/IK/command
+  仍可独立使用高于或不同于 Arbiter 的频率；
+- 单进程运行和 envelope serialize/deserialize replay 得到相同 decision；
+- mixed-source component attribution 可完整重建；
+- ActualDecisionView 保留 variable `dt`，FixedRateCompatibilityView 显式记录 resampling；
+- 多个 `control_domain_id` 的 proposal/authority/producer epoch/replay 互不污染；
+- 15 Hz RGBD sample 被 30/40 Hz cut 通过同一 stable ID 正确复用；
+- 事实层 `selected_action`、proposal、safe/commanded/measured 阶段不混名，裸 `action` 只由声明 stage 的
+  view 生成，actor view 无法读取 control-private 字段；
+- 不同缺失事件/stream 产生正确的 view-specific completeness，而不是一个全局 training-valid。
+- `no_action` 不刷新旧 segment expiry，hold/fault 产生 cancellation directive；
 
-这条路径与 GUI 主线已经共享 `TeleopSession`、`BimanualRig`、causal observation、fault/hold
-语义和 writer observer；原先两处各自管理 writer/observer 生命周期，前一批已收敛到
-`teleop_runtime.collection.writer_runtime.CollectionWriterRuntime`。episode 按键、暂停/恢复、
-相机预览和 finalize policy 仍属于 frontend 层，暂不强行合并。
+实际 IPC/RPC 可以延期，先证明 contract 与 transport 无关。
 
-`collection` 的 trajectory replay 分支仍有一条兼容性特例：它在读取并通过
-`ActionSafetyFilter` 后直接调用 rig，并走独立的 replay sample 提交逻辑。这不是当前 GUI
-正式主链路；后续应把它改成 `ReplayActionProposal -> canonical safety/dispatch -> shared trace`
-适配器，或将仅供历史数据回放的部分移入 `legacy`，不能继续扩展成第三套生产控制循环。
+### Phase 4：可选 native stream capability（对应 landing M7A）
 
-#### 真机 policy deployment
+该能力可在 landing M5–M7A 之间独立推进，不是所有单策略 M6 authority 迁移的全局前提。若目标
+ExecutionManifest、PolicyObservationContract 或 TraceRequirementProfile 声明依赖某个 native stream，则该
+stream capability 必须在对应 shadow/authority gate 前完成；不依赖高频 tactile 的当前单策略 profile 不因
+此被阻塞。
 
-```text
-teleop_runtime.deploy.cli
-  -> teleop_runtime.deploy.run_policy.main
-  -> build_deployment_observation (causal hardware/camera/hand snapshot)
-  -> bind policy artifact pose chunk/frame contract
-  -> PolicyDeployRuntime.predict_and_queue
-       -> policy-rate decision / prediction transaction
-       -> prepare_policy_observation
-       -> policy.predict
-       -> normalize_and_decode
-            -> normalize_policy_output
-            -> robot_motion.deploy.pose_adapter
-                 -> measured actual TCP anchor
-                 -> v2.3 relative/absolute + frame conversion
-                 -> absolute runtime RobotAction
-       -> ActionChunkBuffer replace/append
-  -> PolicyDeployRuntime.prepare_next_action
-       -> CanonicalDeployActionPipeline
-       -> ActionSafetyFilter
-       -> RobotActionResolver
-       -> TeleopCommand
-  -> execute_prepared_action
-       -> direct dispatch (impedance/direct mode)
-       -> PositionDeployExecutor (position/reference mode)
-```
+- 在同一 `CollectionWriterRuntime` 中增加独立 stream sink，不让主 decision row 触发高频数据是否存在；
+- 先接 state/tactile 的可控频率 fixture，再接真实 30 Hz+ tactile/state retention profile；
+- 验证一个真实 RGBD frame 只编码一次、window/cut 只引用 stable sample IDs；
+- 保存 produced/written/dropped/gap/rate/latency 和 decimation/filter contract；
+- 不把“支持最高 1000 Hz”误写为第一版必须无条件全量保存 1000 Hz raw tactile。
 
-这里已经有可直接复用、并已由 `PolicyDeployRuntime` 接管的 v2.3 runtime decode seam；下一阶段的唯一插入点是
-`absolute runtime RobotAction` 与 `CanonicalDeployActionPipeline` 之间：
+### Phase 5：deployable sim
 
-~~~text
-absolute runtime RobotAction
-  → ActionProposal + ActionRepresentationTrace
-  → ActionArbiter
-  → selected absolute RobotAction
-  → existing CanonicalDeployActionPipeline
-~~~
+- 新增 `sim/mujoco/deploy` observation/action adapter；
+- 先跑单策略 profile，再跑 fake slow/fast profile；
+- 将 v2.3 compatibility action 和 v2.4 canonical action replay 都转换为 replay proposal，通过同一
+  Arbiter/safety/execution 链在 sim authoritative 运行；command/servo packet 只做 audit，不跨 embodiment
+  直接发送；
+- 复用现有 actuated position sender、position rates、Arbiter 和 ControlTrace；
+- 优先验证 timestamp taxonomy、proposal snapshot、stage transformation、ControlTrace Core 和
+  control-domain isolation；
+- sim 输出同一 v2.4 trace/stream core，并记录最小 backend/physics/randomization execution facts；完整
+  DomainContract、privileged training view 和 sim2real sampling 延后到 Phase 7；
+- 用 deterministic golden replay 比较 sim/real shared boundary，不要求 backend qcmd/measured 数值相同；
+- 保留 CubeLift native RL 路径，不强行统一其高性能内部 loop。
 
-这意味着 v2.3 relative action 不应让 `ActionArbiter`、`ActionSafetyFilter`、
-`PositionDeployExecutor` 或 `BimanualRig` 感知 raw relative vector；它们只处理已有的绝对
-runtime action。policy shadow 阶段可以暂时保留当前 direct canonical path，同时旁路生成
-proposal/decision/trace；selected action 切换到 Arbiter 后，后面的 safety、reference、command
-和 dispatch 链路不再另起一份。
+M5.5d 已完成测试驱动的 10 Hz context/base、40 Hz residual、30 Hz Arbiter fixture；M5.5e1 已进一步完成确定性
+受限 async harness（latency/jitter/deadline/stale/cutoff/restart/burst/cancellation competition），所有输出仍经既有
+receiver admission，且 context freshness 与 composition input 在同一 causal cut 冻结；它不等同于真实线程、GPU
+inference、generic DAG、RPC 或 production multi-policy。
+M5.7e2-c 的 sim segment producer 完成后，M5.5e2 才做 formal sim capture。第一阶段使用测试侧composition fixture，
+但只负责wiring，必须复用真实MuJoCo runtime、ControlTrace/WAL、唯一episode owner、seal/commit与committed reader；
+hash不得包含测试路径/case/tmpdir/object identity。其成熟度只称`formal_sim_capture_fixture_complete`。`sim`不能import
+`teleop_runtime`，也不能复制journal/lifecycle；production application root在fixture证明依赖关系后再决定。
 
-当前 position profile 也必须从文档和实现中统一引用 `PositionControlRates`：默认是约
-`15 Hz policy/sample → 75 Hz reference/IK → 150 Hz command`，另有显式的
-`15 → 45 → 150 Hz` compatibility profile。relative chunk 的解码发生在 policy/keyframe
-边界，不参与 75/45→150 的插值；插值和 audit 继续由现有 position-control 链路负责。
+当前该测试侧composition已在`dexteleop310`中同时通过deterministic facade和真实MuJoCo actuated backend。scheduled
+completeness按分支验证：START前取消不要求也不允许伪造activation/frame；accepted segment仍必须闭合
+admission/candidate/reservation/terminal。seal后、commit前进程终止留下明确uncommitted episode，默认reader拒绝训练消费，
+审计模式可从seal/WAL恢复。该结论仍不代表production sim entrypoint、长稳或目标机性能验收。
 
-`deployments.openpi.client.real` 只是 OpenPI 参数/模型组装后委托到同一个
-`run_policy.main`，没有发现第二个 policy 控制 loop。当前真正被 run_policy 使用的共享 policy
-stream 是 `robot_motion.deploy.PolicyDeployRuntime`；旧 `robot_motion.deploy.DeployRuntime` 和
-`deployments.client.DeploymentClientRuntime` 仍是通用 scaffold/test seam，不是正式真机部署入口。
+首个M6 release candidate冻结为`m6_candidate_policy_arm_qpos_v1`：policy是唯一motion authority；operator/runtime
+safety supervisor通过独立`SAFETY_CONTROL`执行HOLD/ESTOP/manual stop，operator-authorized recovery state machine通过
+`LIFECYCLE_CONTROL`执行recovery/home/rearm，human motion proposal不适用。双臂coupled qpos、30 Hz decision、scheduled
+segment；planner/qcmd cadence profile化，当前sim证据为120 Hz。60 Hz只可作为已有activation/velocity/capability timing
+语义，不得记成不存在的reference producer。hand、DMTAC、replay、pose impedance、fix-arm human与human takeover均以
+manifest/component catalog hash显式排除。
 
-### “已废弃不用”判断
+当前工作树已将该候选实现为backend-neutral `ControlExecutionManifest`。它作为scheduled formal episode的WAL依赖事实
+持久化，并校验component catalog/action schema lineage；它不携带dispatch token，也不能替代SafetyMigrationMatrix或
+ExecutionAuthorization。policy safety override已另行收敛为启动期static typed admission，RM65 quick-stop已具有bounded
+operation与per-tick one-shot safety permit的pure/fake fixture；两者均尚未接production caller或真机SDK seam。
 
-目前没有足够证据把正式 `debug`、headless `collection` 或 `deploy.run_policy` 整体移入
-`legacy`：它们仍被 README、测试和/或 OpenPI launcher 使用。当前应这样处理：
+M5.8-a 的arms-only调用点现具有分层成熟度事实：generic `DispatchSeamInventoryManifest`冻结profile、实现路径、调用
+阶段、permit/operation要求和集成成熟度；RM65-specific builder则按当前代码登记`send_command` target admission、
+background worker dequeue、最终`_send_joint_target()`、qpos-init home、local rearm、force-position startup、quick-stop
+operation/tick、hold/disengage/fault/ESTOP/rollback/close stop与disconnect。相同`_send_joint_target()`分别登记普通MOTION、
+quick-stop `SAFETY_CONTROL` tick和home `LIFECYCLE_CONTROL`三种语义，避免按Python方法名错误合并权限。三条共享
+joint-target调用及七条hold/disengage/fault/rollback/startup/ESTOP/close-stop SDK seam已在真实函数内加入default-off typed
+adapter，并经逐调用one-shot fake gate验证，10条状态为`pure_wrapper_validated`；其余6条entry仍为
+`inventoried_unwrapped`。production未注入provider，worker epoch也未执行，故全部required seam仍属于unmediated，结构
+完整不表示硬件已授权或M5.8-b/M6已放行。首个manifest显式排除的Inspire/DMTAC不会被静默加入该清单，其各自profile
+仍需独立inventory。
 
-| 部分 | 当前处理 | 原因 |
-|---|---|---|
-| `debug.run_vive_rm65_real_teleop` | 保留为正式 GUI 主入口，继续拆 coordinator | 仍拥有真机 GUI、校准、hold/recovery 和正式数采完整生命周期 |
-| `teleop_runtime.collection` | 保留为 headless/兼容 frontend | 用户确认需要保留可能性；旧脚本和测试仍大量依赖 |
-| `teleop_runtime.deploy.run_policy` | 保留为正式 policy deploy loop | CLI、OpenPI launcher 和部署 README 都明确依赖 |
-| `teleop_runtime.deploy.*` re-export shims | 暂不移动 | 兼容 import 仍存在，且 `legacy` 默认不打包 |
-| `teleop_runtime/core/kernel.py` | 标记 experimental，暂不接入生产 | 仅 synthetic action tests 使用，不能与 `TeleopSession` 再形成第三套生产状态机 |
-| `robot_motion.deploy.PolicyDeployRuntime` | 保留为唯一共享 policy stream core，不作为 CLI 入口 | 已被 `run_policy.py` 使用；不拥有真机 observation/lifecycle/dispatch |
-| `robot_motion.deploy.DeployRuntime`、`deployments.client.DeploymentClientRuntime` | 保留窄 scaffold/兼容 seam，禁止扩展 | 不能再各自发展成第二、第三套 production loop |
-| `collection` trajectory replay 特例 | P1 隔离/适配，暂不扩展 | 当前存在 direct-rig dispatch 和独立 episode 逻辑，是最接近“第二套 action path”的部分 |
+在此之上已有一个严格default-off的`LegacyControlDomainExecutionContext` composition prerequisite。它将一个manifest、
+对应inventory/assessment、唯一`DispatchOwnerRegistry + legacy token`、唯一`ExecutionEpochRegistry`和
+`ExecutionEpochGuard`绑定到同一session/domain/clock/group作用域；当前唯一模式是`fake_only_unbound`，明确没有backend
+binding或hardware authorization。fake final-call preparation先用同一epoch registry核验`ExecutionWorkItem`的domain、
+execution epoch和group generation，再签发一次性motion permit，由`DispatchSeamGate`复查owner/authority/execution。
+logical target admission不能被当作final motion seam。该顺序只证明composition可行：group check与owner gate分属两个锁，
+尚未成为真实worker内紧邻SDK调用的原子线性化点，因此仍不能升级任何inventory entry为`production_mediated`。
 
-因此本阶段没有机械搬文件到 `legacy`。只有在 `rg` 确认没有生产调用方、兼容 shim 和测试
-依赖，并保留迁移说明后，才移动实现；否则先在原路径保留兼容入口并把实现收敛到共享边界。
+M1C 的`software_queue` acknowledgement现另有pure worker-drain证据层：每个
+`ExecutionCancellationParticipantSpec`声明worker种类、影响group与可提供证据；`WorkerEpochDrainReceipt`必须证明worker
+已观察新execution epoch、旧epoch in-flight计数为零且不会再产生旧epoch调用，单纯`queue.clear()`不能通过。一个
+`WorkerEpochDrainAggregate`只有收到本profile全部required participant的accepted receipt后，才能投影成现有
+`CancellationAcknowledgementTracker`中的单个`software_queue` ack。该contract本身不会停止线程。M5.8-b1已在
+`PositionDeployExecutor`和`RM65ArmBackend`中增加严格default-off的typed work carrier/checkpoint/drain方法，并以真实
+worker代码路径的fake阻塞SDK fixture验证：reference submission绑定epoch后才入队，position dequeue/callback、backend
+target admission/background dequeue/pre-SDK均保留并复查同一个work envelope；ordered coordinator必须先drain上游，再
+drain左右sender，旧SDK调用未退出时不得签发receipt。默认legacy构造不注入guard，因而数值和调用路径不变。
 
-### 本次 robot_motion 抽取后的真机 policy deployment 状态
+这仍不是production participant evidence：fake-only composition已能将唯一owner/execution registry注入三个真实worker
+class，canonical policy builder也已有无CLI开关的default-off seam，但真实IP会fail closed且硬件没有运行该模式。
+普通motion item不得被quick-stop沿用；当前pure/default-off实现已增加独立
+`safety_backend_command`，强制引用新execution epoch中的`RM65_QUICK_STOP` operation和逐tick evidence，fault latch只对
+这种显式safety work放行而继续阻止普通motion。晚到ack不能消除deadline FAULT；operation/tick、worker receipt/aggregate
+及fault escalation已有explicit ControlTrace schema/projection，但尚无canonical真机producer/WAL evidence。完成production
+现场production binding与验证前，drain plan继续
+标记`scoped_unbound`，不能投影真实software-queue acknowledgement；当前RM65构造器对
+`connect_hardware=True + partial epoch/drain binding`直接fail closed。
 
-本轮代码审计确认：共享 motion/deploy 语义已经进一步落到 `robot_motion`，但没有改变真机
-backend、position executor、fault/hold 或控制频率：
+ControlTrace持久化故障与安全取消已明确解耦：worker drain先完成，再投影receipt/aggregate；sink异常形成显式partial
+admission report并使相应capture/eligibility不完整，不得静默忽略，但也不得阻止HOLD、FAULT或旧epoch drain。这个隔离
+只证明错误处理contract，现场runtime尚未产生durable WAL evidence。
 
-- `robot_motion/deploy/runtime.py` 的 `PolicyDeployRuntime` 和
-  `PolicyDeployRuntimeConfig` 现在统一封装 `DeploymentObservation` 的 policy pose-mode preparation、
-  output normalization、v2.3 relative→absolute decode、policy-rate decision、prediction
-  transaction、chunk queue、IK recovery discard、queue pop/lookahead 和注入的 canonical
-  preparation seam。
-- `robot_motion/deploy/canonical_action.py` 已提供共享的 safety-filter → `RobotAction` →
-  `TeleopCommand` preparation；real `run_policy.py` 仍负责实例化配置、safety fault latch、
-  position/reference execution 和硬件 dispatch。
-- `robot_motion/action/` 已提供 canonical `RobotAction`、action layout/codec/source protocol、
-  `RobotActionResolver` 以及通用 `ActionExecutor`/dispatcher seam；它目前服务通用/synthetic/
-  replay 路径和后续 adapter，不等于已经完成 `ActionArbiter`，也没有强行替换 real deploy executor。
-- `robot_motion/runtime/` 已提供 observation/command contracts、interfaces、dispatch receipt、
-  lifecycle cleanup、causal history 和 shared Rig；`robot_motion.position_control`/`rm65` 已提供
-  position reference/command、resampling/interpolation、trajectory policy、audit、coupled IK/
-  collision/hold 等共享实现。
-- `teleop_runtime/deploy/run_policy.py` 已实际调用完整的 shared policy stream boundary；真机入口仍
-  持有 observation snapshot、startup/readiness/fault/hold、safety fault latch、position executor、
-  debug logger 和最终 dispatch。
-- `robot_motion/deploy/session_contract.py` 承载 artifact pose-mode agreement；入口只保留 CLI
-  显式参数判定的兼容 wrapper。
-- `deployments/client/policy.py` 承载无硬件的 `LoadedPolicy`/`HoldPolicy`/`load_policy`；
-  `teleop_runtime.deploy.policy` 保留兼容 re-export，包含现有 replay 所需的 prediction
-  transaction 方法。
-- 本次还没有把真机 observation source、startup/recovery、safety fault latch、position sink、
-  `ActionProposal`/`ActionArbiter`、per-component attribution 或 `ControlTrace` 移动；sim
-  implementation 明确延期，不作为本次验收项。
+首个arms-only候选还具有确定性的scoped `SafetyMigrationProfileMatrix`：matrix强绑定同一execution manifest、exact RM65
+inventory及其结构评估；9条included rule冻结目标disposition并引用typed contract/inventory evidence，在
+`m5_8a_inventory`为ready，但在`m5_8b_legacy_mediation`和`m6_shared_authority`分别保留production caller、worker guard、
+real receipt/ack、hardware threshold/parity等具体blocking reason。hand、DMTAC、replay、pose impedance、fix-arm human与
+human takeover由manifest exclusion在三个gate均明确not-applicable。该matrix是“可审计地完成盘点”的证据，不是profile
+owner硬件签署，不改变全部RM65 seam的`inventoried_unwrapped`状态。
 
-增量验证：`tests/test_robot_motion_deploy_contracts.py` 及 v2.3/deploy/OpenPI 相关回归共
-**109 passed, 1 skipped**；deployment `--help`、相关模块 `py_compile` 和 `git diff --check`
-通过。未启动相机、机械臂、夹爪、脚踏或网络控制。
+### Phase 5L：Learning Observability（与 M5.7/5.5e 并行）
 
-### 前一批 writer/dispatch 收敛状态与验证结果
+只实现 transport-neutral pure contract 和一个端到端消费 fixture：policy-observability capability、inference-bound
+adaptation state、generative sample evidence、HistoryActionContract 和 decode/optional-encode codec identity。随后
+为一个明确的 model adapter 增加 opt-in evidence hook，并用 policy+human raw event 构造双历史/sequence fixture。
+没有 concrete adapter 时停在 pure contract，不猜 noise/fast weights；没有 encoder round-trip 时不声明 correction
+chunk 可用于 inversion。该阶段不依赖 M6 authority，也不引入 learner/Torch。
 
-前一批实际改动集中在以下边界，未扩散到 robot driver、真机参数或控制策略：
+### Phase 6：真机 shadow 与单策略 authority 迁移
 
-- `teleop_runtime/collection/writer_runtime.py`：GUI 与 headless 共用
-  `CollectionWriterObserver -> AsyncWriterPool` 的 sample/job/flush/close 生命周期。
-- `teleop_runtime/session.py`：正常 `run_step()`、GUI recovery 和 headless 外部 command
-  共用 `TeleopSession.dispatch_command()`。
-- `teleop_runtime/collection/run_collect.py`：replay、return-home、recovery 等历史外部
-  command 通过统一 seam 进入；旧 fake session 仅保留窄 fallback。
-- `teleop_runtime/debug/run_vive_rm65_real_teleop.py`：接入共享 writer runtime，同时保留
-  旧测试和诊断代码替换 `writer_observer` 的兼容能力。
+按风险逐步进行：
 
-GUI 的 episode、pause/resume、异步 sample、finalize、debug metadata，以及 headless 的
-sample gate、replay、键盘和 finalize 行为均保留；`TeleopSession` 的控制频率、fault/hold
-规则、`BimanualRig` dispatch 和真机参数没有改变。
+1. M3 仅做 dry-run/replay/non-capture single-policy shadow；M4B durable spool 完成后才允许正式 real shadow
+   capture；
+2. explicit human override/per-group override shadow；
+3. M5.7b 先冻结 per-group/epoch 的 previous-safe-committed/measured-rebase anchor lifecycle；M5.7c1 已用
+   policy 唯一 emission、实际 observation 和旧 post-safety result 完成 legacy-aligned arm pose/qpos numeric 双算；
+   旧 anchor 的 whole-vector finite 条件和 qpos frame representation 差异均显式记录；
+4. M5.7e1 已冻结 direct-command/pose/qpos/trajectory `ResolvedExecutionTarget` admission 与 per-group safe-action
+   projection；其“reference target admission 即刻 commit”的 pure fixture 只适用于明确声明足够 guarantee 的窄
+   profile，不能用于 future/lookahead segment。M5.7c2 已证明 measured rebase→safe→typed shadow admission 的基础
+   连续状态，但 M5.7e2 必须将其升级为 target-time-aware commit timeline；M5.7d-a 已接 human temporary limiter 的
+   exact legacy anchor/filter evidence 与 pose pure parity，仍需 qpos/position profile；
+5. M5.7e2-a 冻结 ordered endpoint parent、segment admission/terminal、admission guarantee 和 pending/effective commit；
+   e2-b 只对 legacy position worker 做 passive instrumentation，e2-c 接 sim authoritative，e2-d 在真实 producer
+   存在后再冻结 ControlTrace/completeness；随后 M5.7f 按 execution profile 关闭 SafetyMigrationMatrix；
+6. M5.8-a 先做所有 backend seam inventory 和无行为 permit wrapper；M5.8-b 取得硬件授权后才做 legacy-owner real
+   mediation、epoch 二次检查和 latency/ack 验收。整个 M5.8 中 legacy 仍是唯一 motion owner；未验收的 measured
+   divergence 可在该 legacy-owner gate profile 中显式 disabled，但 M6 前必须具备有效阈值和硬件 evidence；
+7. single-policy + human authority policy 的 dry-run/sim 互斥 owner 切换；
+8. 通过独立安全验收后，M6 只切已验证 control domain 的 dispatch token owner，不在同批首次接线；
+9. fast policy、slow context→fast proposal 的 production shadow 和 authority 切换作为后续独立门槛。
 
-验证结果：
+replay 在本阶段先做 proposal/selected/safe/command parity shadow；真机 authoritative replay 是独立高风险
+授权，不由 single-policy authority 自动覆盖。它必须使用相同 embodiment/frame/action preflight、互斥 owner
+和 cancellation contract。
 
-- collection、real teleop、deploy、recovery、queue、lifecycle 回归：**351 passed, 2 skipped**；
-- GUI、headless collection、deploy 三个模块的 `--help` 检查通过；
-- 相关模块 `py_compile` 和 `git diff --check` 通过；
-- 未启动真实相机、串口、机械臂、夹爪、脚踏或网络控制，未执行 motion、servo、force-control。
+shadow 中未选中的 proposal、context、decode anchor 和 per-component evaluation 也必须写入 trace；actor
+observation 仍不得包含 Arbiter/safety/reward 内部状态。episode finalize 必须验证 mandatory lineage 和
+stream manifest；completeness matrix 必须按用途拒绝不完整 view。
 
-### 下一阶段统一控制入口的实施顺序
+### Phase 7：Learner/Artifact/Domain Extension 与 model package
 
-前一批解决了 writer 生命周期和现有 human/headless dispatch seam；本批又落地了 policy
-loader 与“模型 observation view → v2.3 decoded absolute action”的共享边界。下一阶段首先
-落地 ActionArbiter 的纯逻辑和兼容适配，而不是直接重写所有入口：
+- sealed capture 之外实现 immutable reward/annotation/training-view overlay；
+- `dataset_interface` 从统一 ControlTrace/native streams 生成 slow/fast/DAgger/RL views，不向模型返回
+  未投影的完整 row；
+- 实现版本化 reward recompute、`RewardAttributionAdapter`、expert/policy masks 和 variable-`dt` rollout buffer；
+- 冻结完整 `DomainContract`、`DatasetDerivationManifest` 和跨 homogeneous real/sim roots 的
+  `DatasetCollectionManifest` sampler；
+- 检查 action/pose/layout/view/domain hash，并隔离 sim privileged critic/reward streams；
+- 某个 view 所依赖的 observation/context/proposal/safety/receipt lineage 缺失时，只拒绝该 view，不以
+  单一全局布尔值误杀其他仍完整用途；
+- 消费 Phase 5L 的 inference/history/codec evidence，离线生成 intervention segmentation、action inversion、support
+  assessment 和 safety-projection eligibility；这些都是带 parent/spec hash 的 derived overlay；
+- 最后再增加 BC/DAgger/RL learner 和 sim/real rollout collector；Torch/RL 依赖保持 optional。
+- learner 必须输出 `TrainingRunManifest + PolicyArtifactContract`，把 capture/overlay/view、代码配置、
+  checkpoint digest 和 embodiment compatibility 绑定起来；
+- 新 artifact 必须完成 offline view reconstruction、deterministic replay/sim proposal parity、目标 binding
+  preflight 和 shadow，随后产生引用该 artifact/training-run hash 的新 capture，才算闭环验收完成。
 
-1. 完成 Phase 1A/1B 的 contract、时钟、authority、group selection、component catalog 和
-   deterministic decision。
-2. 用 synthetic source、fake resolver、fake dispatcher 覆盖 stale、timeout、takeover、hold、
-   fault、coupled group、clock skew、queue empty、action space mismatch 和 mixed-source partial
-   action。
-3. 完成 human `TeleopCommand -> RobotAction` adapter 的 round-trip/golden tests；在
-   `merge_teleop_commands()` 前保留 source/component proposal，并以 observe-only 接入
-   `TeleopSession`。
-4. **[已完成第一阶段]** `PolicyDeployRuntime` 已从 `run_policy` 的 normalization/decode 外围
-   继续接管 `prepare_observation_for_policy_pose_mode`、`normalize_policy_output`、
-   `convert_normalized_action_chunk_to_absolute`、policy queue、prediction transaction、policy
-   schedule 和注入的 canonical-preparation seam。下一步必须在不改变这些语义的前提下记录未被
-   选中的 policy proposal、raw model-view、decode anchor 和 decoded absolute action。
-5. **[下一步，仍不做 sim]** 先在真机 dry-run/observe-only 语义下验证
-   `model view -> absolute RobotAction -> canonical preparation -> existing executor`，然后在 GUI
-   真机启用 policy shadow 和显式 human override；实现 `PolicyObservationView` 的 allowlist，确保
-   ActionArbiter 以下的 selected/safe/planner/dispatch/trace 状态不回流给模型。
-6. 为 `ArbitrationResult` 固定 control port/attribution port；按 `ActionComponentCatalog` 输出
-   每个 component 的 owner、proposal、selection group、decision reason、available/selected/
-   policy/expert/safety/command/measured masks，并由独立 `RewardAttributionAdapter` 解释，不让
-   reward 逻辑进入 Arbiter。
-7. 扩展现有 `PositionReferenceFrame`、`PositionCommandTick`、position audit 和共享 writer
-   runtime 以承载 `representation_trace_id`、proposal/decision/anchor/contract hashes；不要新建
-   relative timeline 或 policy 专属 writer。最终每个 tick 能关联 proposal、component owner、
-   expert/policy masks、safe action、command id、dispatch receipt 和 measured state；在此之前不
-   启动真机 policy-only。
+---
 
-ActionArbiter 阶段的完成条件：
+## 十三、近期明确不做的事情
 
-- 不依赖 hardware、teleop_runtime、MuJoCo 或 GUI 的纯逻辑测试全部通过；
-- human-only 现有 GUI/headless 回归行为不变；
-- policy-shadow 能记录 policy proposal，但实际 selected/executed action 仍由 human 控制；
-- actor 的 model-facing observation 不包含 Arbiter/safety/reference/dispatch/trace/reward 内部字段；
-- 每个 `component_id` 都能独立生成 policy behavior、expert label、safety modification 和
-  measured validity mask，reward/exporter 不需要从最终 action 数值反推 source；
-- 过期、无效、fault、未 ready 和显式 takeover 缺少有效 proposal 时均 fail closed；
-- 任意 selected action 的每个 component 都能追溯到 proposal、authority epoch、causal observation、
-  safety result、command/receipt 和 measured validity；
-- mixed-source 数采可以在不做 post-hoc 数值猜测的情况下重建 human/policy/replay 各自的 action
-  部分；DAgger 只导出 `expert_label_mask` 有效部分，RL 只把 `policy_behavior_mask` 有效部分
-  当作 policy behavior；
-- mandatory action trace、decision 和 lineage 不会被异步 writer 静默丢弃，媒体丢帧有明确标记；
-- 未引入第二个 policy loop、第二个 writer lifecycle 或新的 direct-rig dispatch 路径。
+- 不把所有 sensor 或 policy 强制 resample 成一个 15/30 Hz tensor；
+- 不让 proposal/context 复用含义不清的 `source_timestamp`，也不把远端 producer clock 直接用于本地 eligibility；
+- 不在 native v2.4 全局定义 `observation.last_action` 或默认 actor target；
+- 不把 `ActionArbiter` 绑定到 RGBD、某个 policy 或 reference clock；
+- 不为 fast/slow policy 各建一套 safety、position executor、dispatcher 或 writer；
+- 不在 Arbiter 中重新解码 relative action、查 measured anchor 或做任意 pose blend；
+- 不让 Arbiter 在调用期间读取 mutable store/frontend 状态，也不把 snapshot 后的 fault 解释为旧 result 仍可
+  执行；纯 result 可重放，publication/dispatch eligibility 必须重新校验；
+- 不把 priority、authority、validity、frame/component、persistence 或 safety 语义藏入 audit metadata；
+- 不把硬安全反射包装成普通 policy proposal；
+- 不把 proposal、selected、safe、commanded 和 measured action 压成一个含义随 reader 改变的 `action`；
+- 不把所有 policy/event/高频 modality 展开进单个超宽 parquet row，也不因主 row 未触发就声称高频流不存在；
+- 不从 v2.3 最终 action 数值反推没有记录的 proposal、Arbiter、safety、reward 或 dispatch lineage；
+- 不让 actor reader 读取完整 dataset row，或把 sim privileged state、reward、fault/dispatch detail 意外泄漏给模型；
+- 不把 placement/transport 写入 logical PolicyGraph hash，也不把 policy artifact 写入 DomainContract；
+- 不修改 sealed capture 来追加 reward/annotation，不把派生 mask 冒充原始事实；
+- 不把 trace logical family 固化为每 episode 六个物理文件；
+- 初期不把 pose/source contract 不同的 real station 和 sim domain 强行 append 到同一 dataset root；
+- 不立即实现通用分布式 DAG/RPC 框架；只先冻结 transport-neutral envelope；
+- 不直接让 sim import `teleop_runtime.deploy.run_policy`；
+- 不把 recorded SDK/servo command 当成跨 embodiment replay action；replay 默认回到 canonical proposal stage；
+- 不以“设备无关”为由忽略 SourceDevice/Embodiment compatibility preflight，或对不兼容 DOF/frame 静默
+  reshape/截断；
+- 不把当前仍有 production/test/docs caller 的 collection、deploy 或 compatibility shim 移入 `legacy`；
+- 不在 ControlTrace Core 稳定前启动真机 policy-only；不在 Learning Extension/对应 view eligibility 完成前
+  启动真机 RL 训练。
+
+---
+
+## 十四、阶段验收标准
+
+### Contract/单策略兼容完成（当前：contract 基本完成，production 迁移部分完成）
+
+M0–M3 已覆盖当前单 policy deploy 的 baseline、strict observation、emission 和 passive arbitration；M1C/M1D
+仍无 production worker/backend caller，collection/human/replay 也未迁入 proposal core。因此以下列表是本阶段
+最终验收，不应全部勾为当前已满足。
+
+- baseline manifest 可重复生成；canonical encoding 在 runtime record、dataset record 和 transport round-trip
+  后得到相同 content hash；
+- 当前单 policy 的 model view、v2.3 decode、chunk queue 和 canonical command golden 行为不变；
+- v2.3 wall-time causal hash 不变，v2.4 role-specific/local-monotonic time 通过 adapter 增量提供；
+- deploy 与 collection 当前不同的 `last_action` stage 均被显式记录，没有被统一成错误的 previous selected；
+- actor observation 不含 Arbiter/safety/trace/reward 私有字段；
+- producer 不能自报 authoritative available time；accepted proposal 有 receiver admission receipt，rejected draft
+  永不进入 snapshot；proposal 是 immutable absolute `RobotAction`，可追溯 cut 和 representation receipt；
+- proposal/authority/gate/epoch event 共享 per-domain committed admission sequence；完整 snapshot 只覆盖一个
+  time+sequence committed prefix，不包含 in-flight Store write；
+- 当前 real control domain 没有新增第二个 production loop/dispatch port 或 writer lifecycle。
+
+### 多速率/多策略 contract 完成（当前：M5.2 pure synthetic 完成，production 未开始）
+
+- action/context node 使用共同 `PolicyNodeRuntime` 协议，但只有 action node 拥有独立 action queue/decode；
+- logical PolicyGraph hash 不因 in-process/shared-memory/RPC binding 改变；
+- RGBD 15 Hz、tactile/action 30 Hz+ 可以因果组合，不伪造 frame；
+- Arbiter 在独立 decision clock 上确定性运行，proposal timeout/stale 时 fail closed 或按显式 profile 降级；
+- production Arbiter 的配置值和实测 decision publication rate 均不超过 60 Hz；大于 60 的配置拒绝启动，
+  event burst 不绕过 gate，其他链路没有被错误套用这一上限；
+- fast proposal 能精确引用 slow context version，重放不依赖隐式“当前最新值”。
+- Composer 使用 immutable input snapshot；base/residual 缺失与 late fallback 由版本化 spec 决定，Arbiter 不
+  做 blend。
+
+### ActionArbiter/trace 完成（当前：纯 contract + policy/human/replay scoped shadow，未 authoritative）
+
+当前已满足 immutable input/pure result/60 Hz gate 的单元测试、policy `would_select` shadow，以及 canonical
+GUI arm/Inspire 的默认关闭 human `would_select`/legacy-execution trace。M5.3/M5.3a typed replay dry-run 已接
+三态 source/target assessment 与 `would_select` lineage；M5.3b 已在 canonical GUI 接入默认关闭、无 authority
+的 source-frame consumer/RuntimeTraceSession，可选 debug WAL 仍不是 formal capture。DMTAC human branch、shared
+execution、production backend token、cancellation acknowledgement 和 formal durable capture 均未接入。
+
+- human、policy、replay 的每个 component 都能追溯 proposal、owner、decision reason 和 authority epoch；
+- decision 引用完整 `ArbitrationInputSnapshot` ID/hash 和稳定 ProposalSnapshot；相同 input、arbiter contract/
+  implementation 与 selection-policy hash 得到相同 result hash，snapshot 后状态只影响下一计算，live
+  safety/cancellation 可阻止旧 result 发布；
+- no-action 不延长旧 segment，hold/fault 产生带 execution epoch 的 cancellation directive；
+- per-group no-action/segment expiry 不阻塞独立 group，coupled group 原子；不支持局部 stop 的 backend 显式
+  升级 cancellation scope；
+- selected、safe、reference、commanded、receipt、measured 使用各自 schema 并可多对多关联；
+- 每个 control domain 的 authority/epoch/dispatch lineage 隔离；
+- 最终 backend seam 校验唯一 motion dispatch-owner token/generation 与 command authority/execution epoch，legacy/new
+  owner 不可能同时有效；
+- motion、安全、lifecycle permit 分型；motion token revoke 后安全 hold 仍可执行，普通 authority 不能借安全/
+  lifecycle permit 绕过 gate；
+- HOLD/FAULT 的 execution cancellation 可使旧 reference/command segment 因 execution epoch 失效，并能取得
+  reference、command 和 backend acknowledgement；
+- TraceRequirementProfile 按 runtime mode 区分 required/optional/not-applicable；required trace 不静默丢失，
+  媒体 drop 有明确记录。
+- computation、publication attempt、successful decision 和 rejection 分型；只有 successful publication 产生
+  selected_action、ActualDecisionView 和新 reference segment。
+
+### v2.4 ControlTrace Core 完成（当前：M4A.1 explicit schema + scoped M4B durable-spool milestone）
+
+当前已具备 M3 policy-shadow 与 M5 human-shadow 子集的 explicit payload allowlist、queue-pop/source/proposal/
+decision/legacy 逐 lineage 检查、profile scope、membership provenance、WAL/spool/fsync/tail recovery 和 health
+evidence fixture，并有 M5.2 context/composition explicit record 与 deterministic fixture、M5.3 replay
+source-frame/record/receipt/proposal 以及 M5.3a/b binding/eligibility/GUI conditional-evaluation branch-aware
+fixture。M5.5a 又由实际 deployable-sim producer 冻结 authoritative publication/decision/directive/shared-safety/
+command/dispatch/measurement schema，并可重建 ActualDecisionView；但 DMTAC human、replay authoritative/formal
+episode、context/composition branch-aware completeness、formal sim capture/seal 和 native stream 验收仍未满足。
+
+- v2.4 继承 v2.3 absolute storage/relative view/causal anchor；事实层 `selected_action` 只表示 authoritative selected
+  canonical pre-safety intent，裸 `action` 只由声明 `action_stage` 的 materialized/training view 生成，所有
+  下游 action stage 使用独立名称和 ID；
+- native v2.4 不全局定义 `observation.last_action`，也不定义默认训练 target；
+- 每个有效 selected component 都可回溯 producer/proposal/observation cut，未选择 proposal 也能用于
+  DAgger、intervention 和 reward attribution；
+- ActualDecisionView 只来自 authoritative decision 并保留真实 variable `dt`；shadow 使用独立
+  ShadowEvaluationView，fixed-rate view 显式记录 resampling 和 source decision IDs；
+- 声明 `native_streams` capability 后，RGBD、tactile、state、human input、reference/command 等按 native
+  stream 存储和引用；同一真实 frame 被多个 policy cut 重用时只存一次，不伪造新帧；
+- v2.3 compatibility view 明确标记 unavailable lineage 和 completeness matrix，不制造不存在的 Arbiter；
+- episode finalize 检测悬空 ID、因果越界、stream gap/checksum 和缺失 mandatory trace，并分别给出 commit、
+  core、stream、view 和 replay eligibility；
+- mandatory journal 的 issued/accepted/durable sequence、overflow/crash recovery 和 seal high-water mark 可审计，
+  writer failure 不阻塞 control loop，也不静默提交不完整 episode；
+- capture seal 后不可变，trace logical family 的物理 partition 可由 manifest 演进。
+
+### Learning/Domain Extension 完成（当前：M4L.1 pure observability 已开始，learner/domain 未开始）
+
+- `dataset_contracts.learning_observability` 已冻结 artifact-bound state/sample/inference join、history 与 codec
+  identity，并有 deterministic consumer fixture；尚无真实 model adapter producer、ControlTrace event 或 blob store；
+- 事实层不定义默认 target；BC/DAgger/fast/slow/RL target 和派生 mask 均绑定 TrainingView/derivation hash；
+- reward/annotation 位于 parent-hash immutable overlay，可重算 variable-`dt` transition，不修改 capture；
+- DomainContract 不含 policy topology/artifact；EpisodeExecutionManifest 单独记录本次运行配置；
+- sim privileged data 只进入显式 critic/reward/audit view，DatasetCollectionManifest 校验 real/sim 兼容 hash；
+- TrainingRunManifest 可从 artifact 追溯 capture/overlay/view/code/config/checkpoint digest；部署产生的新 capture
+  反向记录 deployed artifact/training-run hash，BC/DAgger/RL 至少各有一个 deterministic round-trip fixture。
+
+### source/replay/embodiment 可替换闭环完成（当前：typed replay dry-run 起步，闭环未完成）
+
+- human、policy、replay 都只通过 ActionProposal 进入 authority；现有 replay reader/scheduler 被复用，但最终
+  authoritative replay 不保留独立 dispatch owner；
+- 替换两个 contract-compatible source-device adapter 时，canonical proposal/decision 语义不变，raw source
+  provenance/adapter receipt 可区分；
+- 替换两个 compatible real/sim embodiment adapter 时，proposal/decision/TrainingView contract 不变，
+  command/measurement lineage 按各自 schema 变化；不兼容 binding 在 dispatch 前 fail closed；
+- sealed capture 可生成 replay record 和 TrainingView；训练 artifact 经 offline→sim/replay→shadow→authority
+  gate 回到同一控制链，并产生下一代可追溯 capture。
+
+### sim/real 共享完成（当前：M5.5a/b 单策略与 verified replay sim 已接 shared core，real/multi-policy 未完成）
+
+- real/sim 使用同一 ObservationCutRecord/Bundle、PolicyNode、ActionProposal、Arbiter、absolute `RobotAction`、
+  position 和 ControlTrace contract；
+- backend 只替换 observation producer、clock、action sink 和 receipt；
+- task-native sim 与 deployable sim 目标清晰，不互相伪装；
+- 真机 shadow 之前所有 shared contract 都可在 deterministic sim/dry-run 重放验证。
+
+---
+
+## 最终判断
+
+DexTeleop 下一阶段不应围绕“把 15 Hz policy 插入 60/120 Hz 控制 loop”继续扩展，而应把现有基础
+提升为一个多流、异步、因果、可追溯的统一执行系统：
+
+> RGBD 15 Hz 只是一个 sensor stream；slow/fast policy 是 topology 中不同的 producer；
+> `PolicyDeployRuntime` 是 action policy node 的现有 stream core；ActionArbiter 在独立 decision clock 上
+> 按 production decision policy v1 以不超过 60 Hz 消费 versioned proposal；该限制不约束其余链路，
+> 60/120/150 Hz 仍可作为 selected
+> action 以下的执行展开；所有 source、
+> context、decision、safety 和 execution 通过稳定 ID 写入 ControlTrace。
+
+这套系统最终形成的不是一次性数据导出，而是：
+
+> source/embodiment adapter → unified control + capture → replay/training view → versioned artifact →
+> compatibility preflight + shadow/authority → next capture。
+
+真机 preflight 的证据等级必须保持分层：ping/TCP port 可达只属于 network evidence；SDK session/state read、
+backend ready、safety/lifecycle state、worker drain、stop acknowledgement 与 motion authorization 是后续独立事实。
+某一层通过不得自动提升下一层。站点配置若仍含 TEST-NET/placeholder 地址，真机运行必须 fail closed 或要求显式
+站点 IP；不得为了让 preflight 通过而把占位配置静默改为可运动地址。
+
+2026-07-21 的远端现场证据已将 `SDK session/state read` 子层关闭：严格只读入口在两侧各完成 5 次
+`Get_Current_Arm_State/Get_Current_Tool_Frame`，返回码均为 0，5 轮 `arm_err/sys_err` 也均为 0；未开启 background streaming/force-position，且未发送
+运动命令；两侧均加载明确的 `DMTAC_M` TCP profile。读取 qpos 均在当前 active URDF 限位内，最小余量为左 J3
+0.069 rad、右 J3 0.342 rad。该记录不包含 backend motion-ready、急停/使能链、drain、stop acknowledgement 或
+motion authorization；尤其左 J3 余量较小，任何后续运动批次都必须重新读取 fresh state 并在调用前完成 URDF 与
+目标方向检查。
+
+在上述只读层之后，首个获授权的状态改变被进一步缩窄为`M5.8-b0 stationary stop-only`：每侧最多一次
+`Arm_Slow_Stop`，由exact safety-control one-shot permit保护；同一组合中的joint-target adapter无条件拒绝，lifecycle、
+force-position、background streaming和其他stop seam也不在授权范围。该批只验证真实final-call gate、SDK返回和
+调用前后状态，不提供motion authority，不证明worker drain或机器人已经物理停止，也不能作为M6放行证据。
+现场执行已验证两侧one-shot permit与真实`Arm_Slow_Stop` final call：dispatch均accepted、SDK均返回0，时延为
+10.758/8.582 ms，调用后qpos变化不超过`5.24e-5 rad`，且binding继续声明`motion_authorized=false`。该结果只作为
+scoped final-call evidence。首轮控制台payload没有展开authorization有效期和permit/validation receipt ID，故标记为
+partial lineage；输出schema随后已补齐，但不会为了元数据重复调用硬件。本证据不得提升为完整M5.8-b、drain、
+measured-stop或M6 authority。
+
+后续无硬件M5.8-b1已关闭“旧work identity在异步边界丢失”的代码缺口：`ExecutionWorkItem`作为typed字段随
+reference/command传递，RM65 mailbox保存派生的per-side backend work，而不是在最终调用时读取当前epoch后回填。worker
+drain取得其自身发送锁后才可声明old-epoch in-flight为零，并清除旧target；三个participant的聚合顺序固定为上游
+reference worker后左右backend sender。该能力默认关闭，尚未由production builder启用，且没有替代stop、SDK ack或
+measured-stop证据。
+
+M5.8-b1-real-A 进一步建立了一个独立的硬件诊断 composition，但没有改变上述 production 结论。其 profile 为
+`m5_8b1_real_a_idle_worker_drain_stop_only_v1`：只允许无target的真实background worker、同一execution epoch下的
+三participant drain，以及drain完成后每侧一次`Arm_Slow_Stop`；MOTION与LIFECYCLE_CONTROL始终未授权。
+该profile的authorization/registry/token/WAL均为进程局部且运行结束即失效，不写入正式deploy配置，也不改变
+`m6_candidate_policy_arm_qpos_v1`的manifest/hash、默认cadence或safety参数。其trace属于runtime diagnostic，明确
+不可作为公开v2.4 capture commit或M6 authority evidence。后续真实操作必须重新构造相应execution profile和授权，
+不得继承这个窄批次为排除风险而采用的保守配置。
+
+该profile的现场运行现已完成：两侧真实background worker分别运行103/93个idle tick，均未激活target且
+joint-target send count为0；execution epoch由0推进至1，三个required participant均生成accepted drain receipt，
+aggregate与software-queue acknowledgement完整。drain后两侧独立Slow-Stop permit和SDK调用均accepted/result 0，
+trace的10个issued fact全部durable，且capture仍不可commit。由于本次没有target、discarded work或in-flight旧调用，
+证据等级严格限定为`scoped_idle_worker_drain_stop_field_evidence`：它证明真实idle worker执行了同一epoch barrier，
+不证明target-bearing worker、pre-SDK旧调用竞争、physical measured-stop、production composition或M6 authority。
+
+遥操设备和本体可以替换，核心闭环不改；只有 source calibration/retarget、embodiment execution binding 和
+compatibility evidence 随硬件变化。若 canonical action/frame/component 不兼容，系统明确拒绝复用，而不是
+以“设备无关”掩盖需要 retarget 或重新训练的事实。
+
+截至本次复盘，前期 identity/admission/observation/emission/Arbiter/cancellation/dispatch-owner 的纯 contract
+已经建立，最重要的近期工作应改为依次完成七件事：
+
+1. M5.3/M5.3a typed replay core、source-frame queue、三态 assessment 与 scoped eligibility 已完成；M5.3b
+   默认关闭 canonical GUI consumer/RuntimeTraceSession/可选 debug WAL 也已接入，继续保持 legacy owner，
+   不把 conditional evaluation 或 pre-dispatch tap 冒充 motion authority/actual receipt；
+2. M4B.2a 已补 per-episode bind/unbind、dependency closure、durable range seal、trace clock domain、commit
+   candidate 及 recorder 可选 seam；M4B.2b 已补 human/policy/replay source-specific formal profile 和原子
+   seal/commit publisher，并保持 legacy finalize 失败隔离。human scoped runtime fixture 已完成 session WAL 共址、
+   observer FIFO release barrier、多 episode session 和后台 finalize 验证；legacy metadata 只保存 immutable
+   sidecar refs；seal-before-commit process-kill 已证明“有 seal 无 commit 即 uncommitted”。下一步覆盖更多
+   crash 点、长稳、大 payload、目标机器 latency/power-loss acceptance。CS-2b-c现只将
+   `deployable_sim_scheduled_pose_to_qpos_station_v1`窄replay profile接成runtime-integrated，尚未接入的policy、generic/
+   real replay formal profile继续不得标为完成；
+3. M4C.1 logical reader/ShadowEvaluationView 已完成；M5.5a 已由真实 authoritative sim producer 冻结
+   publication→decision→directive→safety→command→receipt/measured schema，并据此完成 scoped variable-dt
+   ActualDecisionView；deterministic facade与真实MuJoCo的测试侧formal episode seal/commit/read已完成，仍缺
+   production sim entrypoint、长稳/power-loss/目标机验收与Parquet cache；
+4. 为 DMTAC 的 session 外既有下发补 passive human emission seam；若 formal profile 不启用 DMTAC 则明确
+   `not_applicable`，不能声称已覆盖；
+5. M5.2 deterministic slow/fast/context/composer harness 已通过；M5.5a 单策略、M5.5b verified replay、
+   M5.5c cancellation/hold 与 M5.5d minimal slow/fast composer
+   deployable sim 已复用 shared authoritative core，且 replay eligibility/execution authorization 已冻结进
+   authoritative input/publication barrier；gate/safety cancellation 独立于 Arbiter tick，当前只证明 MuJoCo
+   software-queue ack。`PolicyTopologyRuntime` 位于 authority 之上，只发布 composite proposal；10 Hz context/base、
+   40 Hz residual、30 Hz Arbiter 的确定性 fixture 已验证高频 producer 不提升 authority publication rate。下一步补
+   真实异步 scheduling 与 formal capture；M5.7a 已提供无副作用 shared-execution comparison seam、
+   SafetyMigrationMatrix v1 和显式 anchor/profile 的 arm pose/qpos keyframe-safety adapter；M5.7b 已增加
+   previous-safe-committed/measured-rebase 纯 lifecycle、typed commit evidence 和 safety input snapshot；M5.7c1
+   已在 policy dry-run shadow 中接同一 emission 的 legacy-aligned arm pose/qpos 双算，observer error 不进入旧 fault
+   或执行状态，numeric parity 与 representation mismatch 分开。M5.7c2 又以 pure fixture 验证 measured rebase→
+   shared safe→typed shadow target admission→previous-safe-committed 的两步连续性；rejected/direct-command admission
+   不提交。measured-divergence 数值阈值、frontend counterfactual binding、hand 与 human/position parity尚未冻结。
+   M5.7e1 已有 pure resolved-target/admission contract，但尚无 worker caller；
+   typed reference 必须等 shared resolver/planner publication seam 明确后再记录，
+   不能从 `TeleopCommand` 或 backend receipt 反推，也不能复制 Arbiter/composer；
+   public execution 选择已冻结：目标 shared profile 在 typed `POSE_REFERENCE`/`QPOS_REFERENCE` admission
+   提交 safe anchor；现有 direct command path 是独立 compatibility profile，且只能在 backend/command acceptance
+   后提交。`PositionDeployExecutor.submit()` 不是 reference admission，direct-command shadow 不能产生 committed
+   anchor。ordered reference-segment/target-time contract、legacy scoped lineage、双activation profile与authoritative
+   qpos segment receiver与实际120 Hz planner proposal/follow/accepted qcmd lineage已按deterministic sim范围落地；现有sim
+   没有、也不新增独立60 Hz reference producer。scheduled successor必须将active generation与future reservation分开：
+   admission只reserve，START才在predecessor END candidate提交后原子activate；正常handoff不是supersession或measured
+   completion。v1 supersession仅允许START前显式替换pending segment，START后必须cancel/rebase。e2-d explicit
+   ControlTrace projection与conditional lineage已按scoped sim落地；当前下一门槛是generation reservation/successor竞争
+   fixture与formal sim capture；
+6. 明确各 frontend 的 previous selected/safe/commanded/measured anchor、freshness 与 coupled-group 策略后，在
+   sim/无副作用 shadow 中完成 persistence→shared safety→reference/command intent parity，然后在 legacy owner
+   下把 M1C/M1D guard 接到所有最终 backend seam；
+7. 最后才迁移单策略/replay authority，随后按 profile 需求推进 native streams、Learning/Domain Extension 和
+   production multi-policy；所有真机步骤仍需独立安全授权。
+
+这条路径最大化复用当前已经抽到 `robot_motion` 的链路，也避免未来加入 30 Hz 触觉策略、慢 VLA、
+远端 GPU 或多模型协作时重新改写控制语义。

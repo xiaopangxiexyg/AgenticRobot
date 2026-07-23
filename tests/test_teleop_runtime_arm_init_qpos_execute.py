@@ -6,13 +6,16 @@ from typing import Mapping
 import numpy as np
 import pytest
 
+from robot_motion.rm65 import RM65SamplingTransitionConfig
+from robot_motion.rm65.constants import RM65_ABSOLUTE_Q_MAX_RAD
+
 from robot_motion.arm_init.constrained_transition import (
     ArmConstrainedTransitionPlan,
     ArmTransitionRiskAssessment,
     ArmTransitionRiskEvent,
     ArmTransitionRiskLevel,
 )
-from robot_motion.rm65.arm_init.schema import QposTargetSpec, save_qpos_target
+from robot_motion.rm65.arm_init.schema import QposTargetSpec, load_qpos_target, save_qpos_target
 from robot_motion.rm65.arm_init.qpos_sequence import (
     QposSequenceEntry,
     QposTestSequence,
@@ -25,6 +28,7 @@ from teleop_runtime.replay.arm_init.qpos_execute import (
     _require_plan_completed,
     build_rm65_qpos_init_plan,
     execute_rm65_live_qpos_init,
+    QPOS_INIT_PLANNER_CAPABILITY,
     read_current_qpos_by_side,
     resolve_rm65_arm_ips,
 )
@@ -55,6 +59,21 @@ def test_live_qpos_init_requires_confirmation_for_real_execution(tmp_path: Path)
             execute=True,
             confirm="",
         )
+
+
+def test_qpos_target_loader_accepts_measured_initial_alignment_schema(tmp_path: Path) -> None:
+    path = tmp_path / "measured.json"
+    path.write_text(
+        '{"format":"teleop_initial_alignment","format_version":1,"sides":'
+        '{"left":{"arm_qpos":[1,2,3,4,5,6]},"right":{"arm_qpos":[-1,-2,-3,-4,-5,-6]}}}',
+        encoding="utf-8",
+    )
+
+    target = load_qpos_target(path)
+
+    assert target.name == "measured_init_pose"
+    np.testing.assert_allclose(target.qpos_by_side()["left"], [1, 2, 3, 4, 5, 6])
+    assert target.metadata["source_format"] == "teleop_initial_alignment"
 
 
 def test_live_qpos_init_executes_plan_with_fake_robot(tmp_path: Path) -> None:
@@ -130,6 +149,21 @@ def test_single_arm_qpos_init_rejects_delta_over_120_deg() -> None:
         )
 
 
+def test_single_arm_qpos_init_rejects_j6_outside_absolute_limit() -> None:
+    target = np.zeros(6)
+    target[5] = np.deg2rad(120.1)
+
+    with pytest.raises(ValueError, match=r"target_qpos_by_side\.right\.joint6=.*outside"):
+        build_rm65_qpos_init_plan(
+            start_qpos_by_side={"right": np.zeros(6)},
+            target_qpos_by_side={"right": target},
+            active_sides=("right",),
+            qpos_dt_sec=0.25,
+            joint_velocity_profile="rm65_init_slow",
+            max_steps_per_side=10000,
+        )
+
+
 def test_qpos_init_blocked_start_error_mentions_safe_pose_recovery() -> None:
     assessment = ArmTransitionRiskAssessment(
         events=(
@@ -178,6 +212,66 @@ def test_dual_arm_qpos_init_branch_search_recovers_from_direct_collision_band() 
     assert plan.metadata["branch_name"] == "both_arms_j1_to_j6"
     assert plan.metadata["direct_plan_summary"]["status"] == "blocked_candidate"
     np.testing.assert_allclose(plan.final_qpos_by_side["left"], target_left)
+
+
+def test_dual_arm_qpos_init_safely_escapes_joint_hold_margin() -> None:
+    start_left = np.zeros(6)
+    start_left[1] = float(RM65_ABSOLUTE_Q_MAX_RAD[1] - np.deg2rad(0.5))
+    start = {"left": start_left, "right": np.zeros(6)}
+    target = {"left": np.zeros(6), "right": np.zeros(6)}
+
+    plan = build_rm65_qpos_init_plan(
+        start_qpos_by_side=start,
+        target_qpos_by_side=target,
+        active_sides=("left", "right"),
+        qpos_dt_sec=0.05,
+        joint_velocity_profile="rm65_init_slow",
+        max_steps_per_side=10000,
+        collision_model=_DirectPathCollisionBandModel(),
+        branch_search=False,
+    )
+
+    assert plan.completed, plan.summary()
+    assert plan.metadata["allow_joint_limit_escape"]
+    assert plan.metadata["planner_capability"] == QPOS_INIT_PLANNER_CAPABILITY
+    assert plan.metadata["joint_limit_escape_used"]
+    assert plan.steps[0].qpos_by_side["left"][1] < start_left[1]
+    assert all(
+        step.qpos_by_side["left"][1] <= RM65_ABSOLUTE_Q_MAX_RAD[1]
+        for step in plan.steps
+    )
+    np.testing.assert_allclose(plan.final_qpos_by_side["left"], target["left"], atol=1e-4)
+
+
+def test_dual_arm_qpos_init_sampling_recovers_when_fixed_branches_are_exhausted() -> None:
+    target_left = np.zeros(6)
+    target_left[:2] = [1.0, 1.0]
+
+    plan = build_rm65_qpos_init_plan(
+        start_qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+        target_qpos_by_side={"left": target_left, "right": np.zeros(6)},
+        active_sides=("left", "right"),
+        qpos_dt_sec=0.25,
+        joint_velocity_profile="rm65_init_slow",
+        max_steps_per_side=10000,
+        collision_model=_DetourCollisionModel(),
+        branch_search=True,
+        branch_search_max_branches=8,
+        sampling_search_config=RM65SamplingTransitionConfig(
+            seed=7,
+            max_iterations=1000,
+            max_nodes=1800,
+            extension_step_deg=15.0,
+            edge_resolution_deg=1.0,
+            sample_padding_deg=45.0,
+        ),
+    )
+
+    assert plan.completed, plan.summary()
+    assert plan.metadata["planner"] == "bounded_birrt_connect"
+    assert plan.metadata["branch_search_status"] == "failed"
+    assert len(plan.metadata["branch_search_attempts"]) == 8
+    np.testing.assert_allclose(plan.final_qpos_by_side["left"], target_left, atol=1e-4)
 
 
 def test_resolve_rm65_arm_ips_rejects_documentation_ip_in_latest_without_fallback(tmp_path: Path) -> None:
@@ -338,6 +432,19 @@ class _DirectPathCollisionBandModel:
     def singularity_margin_by_side(self, qpos_by_side: Mapping[str, np.ndarray]) -> Mapping[str, float]:
         del qpos_by_side
         return {}
+
+
+class _DetourCollisionModel(_DirectPathCollisionBandModel):
+    def min_collision_distance(self, qpos_by_side: Mapping[str, np.ndarray]) -> float:
+        x, y = np.asarray(qpos_by_side["left"], dtype=float)[:2]
+        blocked = (
+            (0.2 < x < 0.8 and abs(x - y) < 0.04)
+            or (0.45 < x < 0.55 and abs(y) < 0.04)
+            or (abs(x - 1.0) < 0.04 and 0.45 < y < 0.55)
+            or (abs(x) < 0.04 and 0.45 < y < 0.55)
+            or (0.45 < x < 0.55 and abs(y - 1.0) < 0.04)
+        )
+        return 0.0 if blocked else 1.0
 
 
 def _write_sequence(tmp_path: Path) -> Path:

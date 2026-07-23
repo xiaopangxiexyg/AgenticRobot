@@ -1,5 +1,8 @@
 # Simulation Architecture
 
+> 本页说明仿真架构和模块边界。当前可直接运行的仿真命令统一从
+> [`docs/sim/README.md`](../docs/sim/README.md) 复制。
+
 ## Backend roles
 
 - **MuJoCo is the canonical task-physics backend** for real2sim, task scenes,
@@ -28,7 +31,13 @@ sim/
       spec.py                 # composes the versioned SceneSpec
     manifest.py               # one validated contract bundle
   configs/                    # reproducible contract profiles
+  rm65/                       # engine-independent RM65 embodiment behavior/evidence
+    actuation/                # causal qcmd -> actuator-target profile and core
+    real2sim/                 # fit indexes, manifests and fidelity contracts
+    sapien_renderer.py        # SAPIEN operator/debug preview adapter
   mujoco/
+    actuation/                # thin MuJoCo bindings for RM65/DM-Tac actuators
+    deploy/                   # shared-control observation/action/backend binding; no teleop_runtime dependency
     modeling/                 # MJCF construction helpers only
       geometry.py             # shared visual/collision geometry conversion
       collision.py            # group masks and allow/deny body pairs
@@ -53,10 +62,10 @@ The first versioned profile is:
 sim/configs/rm65_bimanual_physics_v1.json
 ```
 
-It pins the existing 26D action and 38D observation contracts, the existing
-15/45/150 Hz position-control clocks, a separate 1000 Hz MuJoCo physics clock,
+It pins the existing 26D action and 38D observation contracts, the current
+15/60/120 Hz position-control clocks, a separate 1000 Hz MuJoCo physics clock,
 the v3 RM65 URDF, collision profile, gravity, ground, and a minimal freejoint
-debug cube. Values that still require real 150 Hz system identification are
+debug cube. Values that still require dedicated real 120 Hz identification are
 marked as pending rather than presented as identified truth.
 
 Generate/inspect its MJCF without advancing physics:
@@ -80,14 +89,17 @@ python -m sim.mujoco.run_control \
 ## Current physical boundary
 
 This stage provides collision geometry, group/mask filtering, gravity, ground,
-and dynamic rigid-object composition. It does **not** yet provide RM65 arm
-actuators. Advancing the complete articulated robot with `mj_step` under
-gravity would therefore let passive joints collapse and is not a valid robot
-rollout. Two explicitly limited runtime paths are currently valid: the
-isolated ground + freejoint cube smoke test, and `CubeLiftEnv`, which holds
-both arms with the declared 150 Hz `kinematic_direct_qpos_debug` bridge while
-only the cube evolves as a free rigid body. Neither path validates a real
-actuator, tracking residual, grasp force, or sim2real transfer.
+dynamic rigid objects, and a provisional RM65 position-actuator model. The
+actuated path preserves 15 Hz policy targets, the shared acceleration-limited
+planner, 120 Hz qcmd transport, fitted per-joint causal delay/high-speed target
+lag, and 1000 Hz MuJoCo dynamics. Position gains, torque limits, damping and
+friction remain pending dedicated plant identification, so this is a physical
+rollout model, not a validated RM65 servo twin.
+
+The accepted-qcmd/delay/filter state machine and current actuator v4 profile live in
+`sim/rm65/actuation`; MuJoCo owns only actuator binding, physical stepping, and
+measured qpos. The fourteen-trace fit evidence lives in `sim/rm65/real2sim` and
+has no untouched v4 held-out capture yet.
 
 The v3 URDF already contains one table collision body. The scene profile adds
 a ground plane below it; it does not synthesize a second table.
@@ -95,8 +107,8 @@ a ground plane below it; it does not synthesize a second table.
 ## Minimal Cube-Lift RL environment
 
 `sim.mujoco.tasks.cube_lift.CubeLiftEnv` is the first headless environment for
-RL plumbing. It holds the complete dual-arm qpos command through the existing
-150 Hz `kinematic_direct_qpos_debug` bridge, advances MuJoCo at 1000 Hz, and
+RL plumbing. It can use either the retained 150 Hz direct-qpos diagnostic or
+the 15/60/120/1000 Hz actuated-position chain, selected by task config, and
 lets the right arm control the red 3 cm cube at the physical table center.
 The agent action is a 7-D normalized right-arm joint/gripper delta; the initial
 31-D observation is explicitly `state_privileged`, not a real/deploy policy
@@ -107,9 +119,17 @@ constructing this environment. The task config is:
 
 ```text
 sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json
+sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v1.json
+sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v2.json
 ```
 
-Success is deliberately only `height_only_lift_success`: the cube must remain
+The actuated v1 task keeps the gripper prescribed and the grasp helper as
+`contact_latch_debug` while validating physical arm execution. Actuated v2 is
+the default training environment: both arms and both DM-Tac grippers use
+MuJoCo actuators, policy observation reports measured gripper close, and the
+identified free-motion profile is bound by name and SHA-256. The latch remains
+a temporary grasp helper because contact force is not Newton-calibrated. Success is
+deliberately only `height_only_lift_success`: the cube must remain
 above its settled center height plus 8 cm and leave table contact for a short
 physics-tick hold. This is an environment/API milestone, not evidence of
 actuator dynamics, physical grasp stability, or sim2real transfer.
@@ -127,8 +147,11 @@ single_env = FastCubeLiftEnv()
 vector_env = CubeLiftVectorEnv(num_envs=16)
 ```
 
-The fast kernel preserves the temporary `kinematic_direct_qpos_debug` execution
-semantics while caching numeric MuJoCo indices, avoiding rich contact/audit
+Both default constructors select actuated v2. Pass the v0 or v1 task path
+explicitly only for regression diagnostics.
+
+The fast kernel preserves the task-selected execution semantics while caching
+numeric MuJoCo indices, avoiding rich contact/audit
 objects in the hot loop, restoring a settled-state snapshot on repeated resets,
 and loading a versioned MJB artifact from `.cache/mujoco/`. Override the cache
 with `SIM_MUJOCO_CACHE_DIR` or the `model_cache_dir` constructor argument. MJB
@@ -156,5 +179,6 @@ The vector executor transfers actions, observations, rewards, done flags and
 terminal observations through fixed shared-memory arrays. Pipes carry only
 commands and compact metadata. It supports selective reset, deterministic
 `(master_seed, env_id, episode_id)` random streams, same-step auto-reset, worker
-error propagation and bounded shutdown. Use the reference environment for
-viewer, named contacts, detailed scheduler information and full tick audit.
+error propagation and bounded shutdown. Actuated Viewer rollout deliberately
+delegates to this same scalar kernel so deployment cannot silently substitute
+the direct-qpos backend.

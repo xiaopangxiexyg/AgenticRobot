@@ -5,13 +5,14 @@ import pyrealsense2 as rs
 import numpy as np
 import cv2
 import time
+from hardware.realsense.color import color_format_value, color_image_to_bgr
 
 def get_rs_pipeline(cam_id):
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_device(CAMERA_IDS[cam_id])
     config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 6)
-    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 6)
+    config.enable_stream(rs.stream.color, 1280, 720, color_format_value(rs, "yuyv"), 6)
     profile = pipeline.start(config)
     intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
     pinhole_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(intr.width, intr.height, intr.fx, intr.fy, intr.ppx, intr.ppy)
@@ -41,7 +42,7 @@ def get_aligned_images(pipeline, align):
     intr_matrix = np.array([
         [intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]
     ])
-    color_image = np.asanyarray(color_frame.get_data())
+    color_image = color_image_to_bgr(np.asanyarray(color_frame.get_data()), "yuyv")
     return color_image, depth_image, intr_matrix, np.array(intr.coeffs)
 
 

@@ -53,6 +53,7 @@ class DevicePreflightResult:
     camera_config_path: str | None = None
     permission_fixes: list[dict[str, Any]] = field(default_factory=list)
     serial_conflict_report: dict[str, Any] | None = None
+    foot_pad_udev_rule_report: dict[str, Any] | None = None
 
     def add(self, message: str) -> None:
         self.messages.append(str(message))
@@ -94,6 +95,19 @@ def _usb_bus_device_paths() -> list[str]:
     return sorted(str(path) for path in Path("/dev/bus/usb").glob("*/*"))
 
 
+def _input_device_paths() -> list[str]:
+    """Return Linux event/uinput nodes needed by keyboard-like inputs.
+
+    Foot-pad forwarding reads physical ``/dev/input/event*`` nodes and creates
+    its virtual keyboard through ``/dev/uinput``.  Keeping these nodes in the
+    same preflight permission pass makes a missing ``input``/uinput permission
+    actionable instead of silently looking like an absent foot-pad device.
+    """
+
+    paths = [*Path("/dev/input").glob("event*"), Path("/dev/uinput")]
+    return sorted(str(path) for path in paths)
+
+
 _BRLTTY_UDEV_RULE_PATHS = (
     Path("/etc/udev/rules.d/85-brltty.rules"),
     Path("/lib/udev/rules.d/85-brltty.rules"),
@@ -101,6 +115,16 @@ _BRLTTY_UDEV_RULE_PATHS = (
 )
 _BRLTTY_UNITS = ("brltty.service", "brltty-udev.service")
 _SERIAL_DRIVER_MODULES = ("ch341", "cp210x")
+_FOOT_PAD_UDEV_RULE_SOURCE = (
+    Path(__file__).resolve().parents[1]
+    / "hardware"
+    / "foot_pad"
+    / "udev"
+    / "99-dexteleop-foot-pad.rules"
+)
+_FOOT_PAD_UDEV_RULE_TARGET = Path(
+    "/etc/udev/rules.d/99-dexteleop-foot-pad.rules"
+)
 
 
 def _run_command(command: Sequence[str], *, timeout: float = 5.0) -> dict[str, Any]:
@@ -324,6 +348,122 @@ def _append_serial_conflict_report(
         result.ok = False
 
 
+def ensure_foot_pad_udev_rule(
+    *,
+    apply: bool = False,
+    source_path: str | Path = _FOOT_PAD_UDEV_RULE_SOURCE,
+    target_path: str | Path = _FOOT_PAD_UDEV_RULE_TARGET,
+) -> dict[str, Any]:
+    """Install the persistent permission rule for the virtual foot-pad node."""
+
+    source = Path(source_path)
+    target = Path(target_path)
+    report: dict[str, Any] = {
+        "source_path": str(source),
+        "target_path": str(target),
+        "installed": False,
+        "changed": False,
+        "ok": True,
+        "actions": [],
+    }
+    try:
+        desired = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        report["ok"] = False
+        report["error"] = f"cannot read packaged udev rule: {type(exc).__name__}: {exc}"
+        return report
+    try:
+        current = target.read_text(encoding="utf-8") if target.is_file() else ""
+    except OSError:
+        current = ""
+    if current == desired:
+        report["installed"] = True
+        return report
+    if not apply:
+        return report
+    if getattr(os, "geteuid", lambda: 1)() != 0:
+        report["ok"] = False
+        report["error"] = "root_required: rerun --fix-permissions with sudo."
+        return report
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(desired, encoding="utf-8")
+        target.chmod(0o644)
+    except OSError as exc:
+        report["ok"] = False
+        report["error"] = f"cannot install udev rule: {type(exc).__name__}: {exc}"
+        return report
+    report["changed"] = True
+    report["installed"] = True
+    reload_action = _run_command(
+        ["udevadm", "control", "--reload-rules"],
+        timeout=10.0,
+    )
+    report["actions"].append(reload_action)
+    if reload_action.get("returncode") != 0:
+        report["ok"] = False
+        report["error"] = (
+            "udev rule was written but udevadm could not reload rules: "
+            f"{reload_action.get('stderr') or reload_action.get('stdout')}"
+        )
+    return report
+
+
+def _foot_pad_udev_rule_text(
+    report: Mapping[str, Any] | None,
+    *,
+    applied: bool,
+) -> str:
+    if not isinstance(report, Mapping):
+        return ""
+    if report.get("installed") and report.get("ok"):
+        if applied and report.get("changed"):
+            return (
+                "Installed the persistent DexTeleop foot-pad udev rule; future "
+                "virtual event nodes will be readable by the teleop process."
+            )
+        return ""
+    python = sys.executable or "python"
+    lines = [
+        "Persistent DexTeleop foot-pad udev permission rule is not active.",
+        "Without it, the forwarding service can run while its virtual event node "
+        "remains unreadable by the GUI.",
+    ]
+    if report.get("error"):
+        lines.append(f"  error: {report.get('error')}")
+    lines.append(
+        "Run once: "
+        f"sudo -E {python} -m teleop_runtime.configure_devices --fix-permissions"
+    )
+    return "\n".join(lines)
+
+
+def _append_foot_pad_udev_rule_report(
+    result: DevicePreflightResult,
+    *,
+    fix_permissions: bool,
+) -> None:
+    report = ensure_foot_pad_udev_rule(apply=bool(fix_permissions))
+    result.foot_pad_udev_rule_report = report
+    text = _foot_pad_udev_rule_text(report, applied=bool(fix_permissions))
+    if text:
+        result.add(text)
+    if not bool(report.get("ok", True)):
+        result.ok = False
+
+
+def _foot_pad_udev_rule_needs_attention(
+    report: Mapping[str, Any] | None,
+) -> bool:
+    return bool(
+        isinstance(report, Mapping)
+        and (
+            not bool(report.get("installed"))
+            or not bool(report.get("ok", True))
+        )
+    )
+
+
 def _existing_unique_paths(paths: Sequence[str | Path]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -441,7 +581,10 @@ def _permission_error_text(reports: Sequence[Mapping[str, Any]]) -> str:
         "Run the permission script with sudo, for example: "
         f"sudo -E {python} -m teleop_runtime.configure_devices --fix-permissions"
     )
-    lines.append("Long term: install udev rules or add the user to dialout/video, then re-login and replug USB.")
+    lines.append(
+        "Long term: install udev rules or add the user to dialout/video/input, "
+        "then re-login and replug USB/input devices."
+    )
     return "\n".join(lines)
 
 
@@ -1143,6 +1286,14 @@ def _print_dmtac_scan_progress(payload: Mapping[str, Any]) -> None:
             + (f" ({', '.join(extra)})" if extra else ""),
             flush=True,
         )
+        return
+    if event == "gripper_probe_early_stop":
+        print(
+            "[DevicePreflight] DMTAC gripper probe stopped early: "
+            f"found {int(payload.get('reachable_count') or 0)} reachable gripper(s), "
+            f"skipped {int(payload.get('skipped_count') or 0)} remaining candidate(s).",
+            flush=True,
+        )
 
 
 def prepare_dmtac(
@@ -1377,7 +1528,16 @@ def prepare_devices_for_teleop(options: DevicePreflightOptions) -> DevicePreflig
         raise DevicePreflightError("Q6/DMTAC force reconfigure requires auto-configure; remove --check-only.")
     result = DevicePreflightResult(ok=True)
     _append_serial_conflict_report(result, fix_serial_conflicts=bool(options.fix_serial_conflicts))
-    permission_paths = [*_serial_device_paths(), *_video_device_paths(), *_usb_bus_device_paths()]
+    _append_foot_pad_udev_rule_report(
+        result,
+        fix_permissions=bool(options.fix_permissions),
+    )
+    permission_paths = [
+        *_serial_device_paths(),
+        *_video_device_paths(),
+        *_usb_bus_device_paths(),
+        *_input_device_paths(),
+    ]
     result.permission_fixes = repair_device_permissions(permission_paths, apply=bool(options.fix_permissions))
     permission_text = _permission_error_text(result.permission_fixes)
     if permission_text:
@@ -1401,7 +1561,16 @@ def prepare_device_permissions(
 ) -> DevicePreflightResult:
     result = DevicePreflightResult(ok=True)
     _append_serial_conflict_report(result, fix_serial_conflicts=bool(fix_serial_conflicts))
-    permission_paths = [*_serial_device_paths(), *_video_device_paths(), *_usb_bus_device_paths()]
+    _append_foot_pad_udev_rule_report(
+        result,
+        fix_permissions=bool(fix_permissions),
+    )
+    permission_paths = [
+        *_serial_device_paths(),
+        *_video_device_paths(),
+        *_usb_bus_device_paths(),
+        *_input_device_paths(),
+    ]
     result.permission_fixes = repair_device_permissions(permission_paths, apply=bool(fix_permissions))
     permission_text = _permission_error_text(result.permission_fixes)
     if permission_text:
@@ -1409,7 +1578,10 @@ def prepare_device_permissions(
             result.ok = False
         result.add(permission_text)
     else:
-        result.add("Current USB serial, video/media, and USB bus device permissions are readable/writable.")
+        result.add(
+            "Current USB serial, video/media, USB bus, input-event, and uinput "
+            "device permissions are readable/writable."
+        )
     return result
 
 
@@ -1460,7 +1632,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fix-permissions",
         action="store_true",
-        help="chmod 666 current USB serial, video/media, and USB bus device nodes. Run with sudo.",
+        help=(
+            "chmod 666 current device nodes and install the persistent DexTeleop "
+            "virtual foot-pad udev rule. Run with sudo."
+        ),
     )
     parser.add_argument(
         "--fix-serial-conflicts",
@@ -1496,7 +1671,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         needs_permission_attention = _permission_reports_need_attention(result.permission_fixes)
         needs_serial_attention = _serial_conflict_reports_need_attention(result.serial_conflict_report)
-        if needs_permission_attention or needs_serial_attention:
+        needs_foot_pad_rule_attention = _foot_pad_udev_rule_needs_attention(
+            result.foot_pad_udev_rule_report
+        )
+        if (
+            needs_permission_attention
+            or needs_serial_attention
+            or needs_foot_pad_rule_attention
+        ):
             print("[DevicePermissions] WARNING")
             return 0
         print("[DevicePermissions] OK")

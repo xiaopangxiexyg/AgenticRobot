@@ -25,7 +25,10 @@ from .transforms import (
 )
 
 
-DEFAULT_DUAL_ARM_URDF = "assets/rm65_inspire_tac/rm65_dual_arm.urdf"
+DEFAULT_DUAL_ARM_URDF = (
+    "assets/rm65_inspire_gripper_v3/"
+    "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+)
 LEFT_ARM_JOINT = "left_arm"
 RIGHT_ARM_JOINT = "right_arm"
 

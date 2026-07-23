@@ -35,21 +35,25 @@ class FastCubeLiftEnv(_EnvBase):
         use_settled_snapshot: bool = True,
         use_model_cache: bool = True,
         model_cache_dir: str | Path | None = None,
+        include_training_reward_state: bool = False,
     ) -> None:
         if _gymnasium is None:
             require_gymnasium()
-        self.action_spec = CubeLiftActionSpec()
-        self.observation_spec = CubeLiftObservationSpec()
-        self.action_space = self.action_spec.gym_space()
-        self.observation_space = self.observation_spec.gym_space()
         self.kernel = CubeLiftKernel(
             config,
             info_mode=info_mode,
             use_settled_snapshot=use_settled_snapshot,
             use_model_cache=use_model_cache,
             model_cache_dir=model_cache_dir,
+            include_training_reward_state=include_training_reward_state,
         )
         self.config = self.kernel.config
+        self.action_spec = CubeLiftActionSpec(layout_version=self.config.action_layout)
+        self.observation_spec = CubeLiftObservationSpec(
+            layout_version=self.config.observation_layout
+        )
+        self.action_space = self.action_spec.gym_space()
+        self.observation_space = self.observation_spec.gym_space()
         self.last_physics_ticks = 0
 
     def reset(

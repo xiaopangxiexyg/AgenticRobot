@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from robot_motion.pose import interpolate_pose
 from robot_motion.transforms import parse_pose_matrix, validate_pose_matrix
@@ -17,6 +18,9 @@ from .interpolation import DEFAULT_POSITION_REFERENCE_HZ
 
 
 _TIME_EPSILON_SEC = 1e-12
+POSE_ACTION_INTERVAL_VELOCITY_SCHEMA = (
+    "robot_motion.pose_action_interval_velocity/v1"
+)
 
 
 def _finite_time(value: float, *, name: str) -> float:
@@ -370,6 +374,128 @@ def _interpolate_targets(
     return pose_by_side, qpos_by_side
 
 
+def _pose_action_interval_velocity(
+    samples: Sequence[TimestampedMotionTarget],
+    *,
+    query_timestamp: float,
+    right_position: int,
+    causal: bool,
+) -> dict[str, Any] | None:
+    """Resolve pose speed from adjacent source actions, never 60 Hz deltas.
+
+    At an exact source-action timestamp the forward ``current -> next`` pair is
+    preferred when that next action is already available.  A single-action
+    chunk and the final action of a chunk therefore fall back to
+    ``previous -> current``.  The causal resampler only passes samples that
+    were available at emission time, so this rule cannot look across an
+    unknown chunk boundary.
+    """
+
+    if not samples or not samples[0].pose_by_side:
+        return None
+
+    query = float(query_timestamp)
+    start: TimestampedMotionTarget | None = None
+    end: TimestampedMotionTarget | None = None
+    selection: str
+
+    if 0 < right_position < len(samples):
+        current = samples[right_position - 1]
+        successor = samples[right_position]
+        # bisect_right means this is either the exact current action or a
+        # query inside current -> successor.  Both use the same source-action
+        # interval velocity.
+        start, end = current, successor
+        selection = (
+            "current_to_next"
+            if math.isclose(
+                query,
+                current.timestamp,
+                rel_tol=0.0,
+                abs_tol=_TIME_EPSILON_SEC,
+            )
+            else "bracketing_current_to_next"
+        )
+    elif len(samples) >= 2 and right_position >= len(samples):
+        # No available successor: single-frame/final chunk step fallback.
+        start, end = samples[-2], samples[-1]
+        selection = "previous_to_current_fallback"
+    elif len(samples) >= 2 and right_position == 0:
+        # Offline queries before the first action are unusual, but a known
+        # successor still provides the only non-fabricated source interval.
+        start, end = samples[0], samples[1]
+        selection = "first_to_next_fallback"
+    else:
+        return {
+            "schema": POSE_ACTION_INTERVAL_VELOCITY_SCHEMA,
+            "source": "adjacent_pose_actions",
+            "quality_valid": False,
+            "quality_reason": "no_adjacent_pose_action",
+            "causal": bool(causal),
+            "selection": "unavailable",
+            "by_side": {},
+        }
+
+    duration = float(end.timestamp - start.timestamp)
+    if not math.isfinite(duration) or duration <= _TIME_EPSILON_SEC:
+        return {
+            "schema": POSE_ACTION_INTERVAL_VELOCITY_SCHEMA,
+            "source": "adjacent_pose_actions",
+            "quality_valid": False,
+            "quality_reason": "invalid_action_interval_duration",
+            "causal": bool(causal),
+            "selection": selection,
+            "start_source_index": int(start.source_index),
+            "end_source_index": int(end.source_index),
+            "by_side": {},
+        }
+
+    by_side: dict[str, dict[str, Any]] = {}
+    for side in start.pose_by_side:
+        start_pose = np.asarray(start.pose_by_side[side], dtype=float)
+        end_pose = np.asarray(end.pose_by_side[side], dtype=float)
+        translation_delta = end_pose[:3, 3] - start_pose[:3, 3]
+        # This is the shortest world-frame rotation vector, consistent with
+        # the quaternion shortest-path SLERP used for the pose references.
+        rotation_delta = Rotation.from_matrix(
+            end_pose[:3, :3] @ start_pose[:3, :3].T
+        ).as_rotvec()
+        linear_velocity = translation_delta / duration
+        angular_velocity = rotation_delta / duration
+        linear_speed = float(np.linalg.norm(linear_velocity))
+        angular_speed = float(np.linalg.norm(angular_velocity))
+        by_side[side] = {
+            "quality_valid": True,
+            "linear_velocity_m_s": linear_velocity.astype(float).tolist(),
+            "angular_velocity_rad_s": angular_velocity.astype(float).tolist(),
+            # Keep the speed field names consumed by the shared adaptive
+            # output stage.  These are one action-interval values, not a
+            # percentile recomputed over 60 Hz references.
+            "linear_speed_p90_m_s": linear_speed,
+            "angular_speed_p90_rad_s": angular_speed,
+            "translation_span_m": float(np.linalg.norm(translation_delta)),
+            "rotation_span_rad": float(np.linalg.norm(rotation_delta)),
+            "speed_source": "adjacent_pose_action_interval",
+        }
+    return {
+        "schema": POSE_ACTION_INTERVAL_VELOCITY_SCHEMA,
+        "source": "adjacent_pose_actions",
+        "quality_valid": True,
+        "quality_reason": None,
+        "causal": bool(causal),
+        "selection": selection,
+        "start_source_index": int(start.source_index),
+        "end_source_index": int(end.source_index),
+        "start_source_timestamp": float(start.timestamp),
+        "end_source_timestamp": float(end.timestamp),
+        "duration_sec": duration,
+        "source_rate_hz": 1.0 / duration,
+        "velocity_frame": "source_pose_reference_frame",
+        "rotation_velocity_convention": "shortest_world_rotvec_per_sec",
+        "by_side": by_side,
+    }
+
+
 def _resample_at(
     samples: Sequence[TimestampedMotionTarget],
     *,
@@ -438,6 +564,14 @@ def _resample_at(
         ),
         "qpos_interpolation": "linear" if qpos_by_side else None,
     }
+    pose_action_velocity = _pose_action_interval_velocity(
+        samples,
+        query_timestamp=query,
+        right_position=right_position,
+        causal=causal,
+    )
+    if pose_action_velocity is not None:
+        metadata["pose_action_interval_velocity"] = pose_action_velocity
     return ResampledMotionReference(
         sequence=sequence,
         timestamp=query,
@@ -576,6 +710,7 @@ class CausalMotionResampler:
 
 __all__ = [
     "CausalMotionResampler",
+    "POSE_ACTION_INTERVAL_VELOCITY_SCHEMA",
     "ResampledMotionReference",
     "TimestampedMotionTarget",
     "build_uniform_time_grid",

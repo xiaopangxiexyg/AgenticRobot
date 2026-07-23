@@ -1,8 +1,13 @@
 # DexTeleop 环境与复现指南
 
-本文是环境安装、更新和验收的唯一入口。项目主环境统一使用 Python 3.10 conda 环境
-`dexteleop310`；`core`、`test`、`dataset`、`sim`、`model`、`openpi`、`hardware` 是同一个环境内的
-依赖分组，不是七个 conda 环境。
+本文是环境依赖、安装细节和复现约束的权威说明；可直接复制的最短安装/检查命令见
+[`docs/setup/README.md`](./docs/setup/README.md)。项目主环境统一使用 Python 3.10 conda 环境
+`dexteleop310`；`core`、`test`、`dataset`、`sim`、`model`、`openpi`、`vla_scratch`、`hardware` 是同一个环境内的
+依赖分组，不是八个 conda 环境。
+
+快速路径：首次安装看第 1–2 节；验证主环境看第 4 节；Isaac Gym 单独看第 5 节；
+MuJoCo/SAPIEN 看第 6 节；只有设备权限问题才进入第 7 节。项目运行命令不在本文维护，完成
+环境后回到 [运行文档索引](./docs/README.md)。
 
 ## 1. 环境边界与唯一来源
 
@@ -14,9 +19,9 @@
 
 项目环境的机器可读来源如下：
 
-- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和七个 PyPI extras；
+- [`pyproject.toml`](./pyproject.toml)：项目元数据、Python 版本和八个 PyPI extras；
 - [`environment.yml`](./environment.yml)：conda 基础层，包括 Python、NumPy、SciPy 和 Pinocchio；
-- [`uv.lock`](./uv.lock)：七个 extras 的 PyPI 版本、来源与 hash 锁定结果；
+- [`uv.lock`](./uv.lock)：八个 extras 的 PyPI 版本、来源与 hash 锁定结果；
 - [`scripts/install_conda_env.sh`](./scripts/install_conda_env.sh)：创建、更新和验收完整环境的入口。
 
 Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的可移植范围；它们的边界和安装方式
@@ -34,11 +39,15 @@ Isaac Gym、OpenPI server 和真实设备的系统驱动不属于 `uv.lock` 的�
 首次创建完整环境：
 
 ```bash
-cd /home/zc/HandMotion/Developing/DexTeleop
-export REPO="$PWD"
+cd /path/to/DexTeleop
+export DEXTELEOP_ROOT="$PWD"
 bash scripts/install_conda_env.sh
+eval "$(conda shell.bash hook)"
 conda activate dexteleop310
 ```
+
+`/path/to/DexTeleop` 必须替换为本机 clone 路径。本文后续用 `DEXTELEOP_ROOT` 表示该目录；
+另开 shell 时需要重新导出它。
 
 如果 SDK 位于仓库外：
 
@@ -75,7 +84,7 @@ bash scripts/install_conda_env.sh
 安装脚本会依次完成：
 
 1. 创建 Python 3.10、NumPy、SciPy、conda-forge Pinocchio 基础环境；
-2. 使用 `uv.lock` 的 hash 锁定结果安装全部七个 PyPI 依赖分组；
+2. 使用 `uv.lock` 的 hash 锁定结果安装全部八个 PyPI 依赖分组；
 3. 以 editable 方式安装本仓库；
 4. 以 `--no-deps` 安装 `pin-pink==4.2.0`，避免错误拉取 pip 包 `pin`；
 5. 以 editable 方式安装本地 `dmrobotics==1.2.10` SDK（除非使用 `--skip-vendor-sdk`）；
@@ -91,6 +100,7 @@ bash scripts/install_conda_env.sh
 | `sim` | MuJoCo、Gymnasium、SAPIEN | 是 |
 | `model` | PyTorch 2.10、临时 PPO 训练与 checkpoint 推理 | 是 |
 | `openpi` | DexTeleop OpenPI websocket/msgpack client | 是 |
+| `vla_scratch` | 直接运行 vla-scratch 原生 ZMQ client 所需的 `pyzmq`；不包含模型/server | 是 |
 | `hardware` | RealSense、串口、Modbus、USB、DM-Tac SDK 运行库 | 是 |
 
 extras 也可以在已有 Python 3.10 环境中按需安装，例如：
@@ -98,6 +108,7 @@ extras 也可以在已有 Python 3.10 环境中按需安装，例如：
 ```bash
 python -m pip install -e '.[core,test]'
 python -m pip install -e '.[core,dataset]'
+python -m pip install -e '.[core,vla_scratch]'
 ```
 
 按需安装只适合临时减少 PyPI 依赖；它不会安装 conda-only 的 `pinocchio`、特殊处理的 `pin-pink` 或
@@ -110,13 +121,17 @@ python -m pip install -e '.[core,dataset]'
 版本在独立的 OpenPI `uv` 环境运行。详细的 server/client 启动流程见
 [`deployments/openpi/README.md`](./deployments/openpi/README.md)。
 
+`vla_scratch` 同样只覆盖 DexTeleop 侧直接使用原生 ZMQ client 的传输依赖。vla-scratch
+server、模型权重和训练依赖仍留在其自己的环境；采用 HTTP、websocket 或外部 relay 时不需要在
+DexTeleop 侧安装 `pyzmq`。
+
 ## 4. 主环境验证
 
 激活环境后，从仓库根目录执行基本 smoke test：
 
 ```bash
 conda activate dexteleop310
-cd /home/zc/HandMotion/Developing/DexTeleop
+cd "${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}"
 
 PYTHONNOUSERSITE=1 python - <<'PY'
 import importlib.metadata as metadata
@@ -199,12 +214,14 @@ PY
 
 ```bash
 PYTHONNOUSERSITE=1 python - <<'PY'
+import control_station
 from hardware.rm65.robotic_arm_package.robotic_arm import RM65, dllPath
 from teleop_runtime.backends.arms import RM65ArmBackend, RM65ImpedanceArmBackend
 from teleop_runtime.backends.grippers import DMTacGripperBackend
 from teleop_runtime.backends.hands import InspireTacHandBackend
 
 print("RM65 SDK", RM65, dllPath)
+print("control_station import ok", control_station.__name__)
 print("teleop_runtime imports ok")
 PY
 ```
@@ -217,7 +234,7 @@ import pyrealsense2 as rs
 print("pyrealsense2", getattr(rs, "__version__", "unknown"))
 PY
 
-cd /home/zc/HandMotion/Developing/DexTeleop/hardware/DMTAC_gripper
+cd "${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}/hardware/DMTAC_gripper"
 python run_gripper.py --help
 ```
 
@@ -231,8 +248,8 @@ Isaac Gym Preview 4 需要从 NVIDIA Developer 下载离线包。下载后设置
 `ISAACGYM_ROOT` 即可：
 
 ```bash
-export ISAACGYM_ARCHIVE=<IsaacGym_Preview_4_Package.tar.gz>
-export ISAACGYM_ROOT=<isaacgym解压目录>
+export ISAACGYM_ARCHIVE=/path/to/IsaacGym_Preview_4_Package.tar.gz
+export ISAACGYM_ROOT=/path/to/isaacgym
 ```
 
 如果 `ISAACGYM_ROOT` 不存在，先解压：
@@ -306,7 +323,7 @@ python joint_monkey.py
 如果 viewer 找不到 NVIDIA Vulkan 设备，可先指定 NVIDIA ICD：
 
 ```bash
-export VK_ICD_FILENAMES=<path-to-nvidia_icd.json>
+export VK_ICD_FILENAMES=/path/to/nvidia_icd.json
 ```
 
 官方脚本可作为替代方案：
@@ -322,7 +339,7 @@ conda activate rlgpu
 后续 real2sim 相机检查优先使用这里生成的双臂 URDF：
 
 ```bash
-export DEXTELEOP_REAL2SIM_URDF="/home/zc/HandMotion/Developing/DexTeleop/assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf"
+export DEXTELEOP_REAL2SIM_URDF="${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}/assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 ```
 
 该 URDF 是自包含相对 mesh 路径，已包含：
@@ -364,7 +381,7 @@ Gymnasium 的标准 `reset/step` API 和 `Box` spaces。环境实现本身不导
 CUDA 12.6 wheel。未安装 NVIDIA driver 的 debug 机器会自动使用 CPU。
 
 ```bash
-cd /home/zc/HandMotion/Developing/DexTeleop
+cd "${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}"
 PYTHONPATH=. python - <<'PY'
 import gymnasium
 import mujoco
@@ -388,7 +405,7 @@ CUDA runtime，通常不需要在 conda 环境重复安装完整 CUDA Toolkit。
 后续 real2sim 相机检查仍然优先使用同一个双臂 URDF：
 
 ```bash
-export DEXTELEOP_REAL2SIM_URDF="/home/zc/HandMotion/Developing/DexTeleop/assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf"
+export DEXTELEOP_REAL2SIM_URDF="${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}/assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 ```
 
 先做最小加载检查：
@@ -419,11 +436,7 @@ MJCF 用于 MuJoCo 检查，避免为了仿真破坏原始坐标定义。
 
 ## 7. 设备权限
 
-运行 GUI 遥操作前先检查 USB、相机、串口和配置：
-
-```bash
-python -m teleop_runtime.configure_devices --check
-```
+运行 GUI 遥操作前，先按 [硬件入口](./docs/hardware/README.md)检查 USB、相机、串口和配置。
 
 如果提示权限不足，执行：
 
@@ -447,9 +460,11 @@ sudo -E "$CONDA_PREFIX/bin/python" \
 
 ## 8. 运行文档索引
 
-本文只负责环境，不重复维护真机命令和设备配置。环境准备完成后，按用途阅读：
+环境准备完成后，按用途阅读：
 
-- [根目录运行流程](./README.md)：VIVE、SAPIEN、真机 teleop、数据采集和回放；
+- [项目运行文档](./docs/README.md)：按 setup/real/sim/hardware/data 领域查找简洁命令与
+  详细说明；
+- [根目录项目入口](./README.md)：项目边界、安全原则和各领域导航；
 - [`teleop_runtime/README.md`](./teleop_runtime/README.md)：teleop runtime、标定和 dry-run；
 - [`hardware/DMTAC_gripper/README.md`](./hardware/DMTAC_gripper/README.md)：DM-Tac USB 配置、触觉和夹爪调试；
 - [`sim/mujoco/README.md`](./sim/mujoco/README.md)：MuJoCo real2sim、任务和数据回放；
@@ -462,7 +477,8 @@ sudo -E "$CONDA_PREFIX/bin/python" \
 - `pymodbus` import 路径错误：确认版本是 `pymodbus==2.5.3`。
 - RealSense 找不到：检查 librealsense/udev 规则和相机是否被其他进程占用。
 - Isaac Gym import 失败：确认在 `isaacgym38` 或 `rlgpu` 环境中，且 Python 版本是 3.6/3.7/3.8。
-- Isaac Gym viewer 黑屏或无法创建设备：先检查 `nvidia-smi`，再尝试设置 `VK_ICD_FILENAMES=<path-to-nvidia_icd.json>`。
+- Isaac Gym viewer 黑屏或无法创建设备：先检查 `nvidia-smi`，再尝试设置
+  `VK_ICD_FILENAMES=/path/to/nvidia_icd.json`。
 - Isaac Gym 报 `libpython3.x` 或 `libstdc++`：优先设置 `LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"`，再重新运行 smoke test。
 - MuJoCo import 失败：确认已激活 `dexteleop310`，然后重新执行 `bash scripts/install_conda_env.sh --update`。
 - MuJoCo viewer 无法打开：先确认当前会话有桌面显示权限；远程或无显示环境下优先做 import 和模型加载检查。

@@ -210,7 +210,7 @@ teleop_runtime.deploy.cli
 
 ### 5.2 v2.3 pose frame 与 UMI
 
-v2.3 的关键变化不是简单增加一个数组，而是把源坐标系写进契约：包含 `source_id`、原始 frame 和变换信息，消费方必须显式绑定 source frame，不能凭上下文猜测坐标系。当前运行时区分 collection desk frame 与 RM65 runtime raw/table-center 语义，需要在数据元信息和部署 artifact 中保留这条边界。
+v2.3 的关键变化不是简单增加一个数组，而是把源坐标系写进契约：包含 `source_id`、原始 frame 和变换信息，消费方必须显式绑定 source frame，不能凭上下文猜测坐标系。当前运行时区分 collection desk frame 与 RM65 runtime raw/workspace-near-boundary 语义，需要在数据元信息和部署 artifact 中保留这条边界。
 
 固定 horizon 的 `PoseActionChunkContract` 使用 episode-local start，短 chunk 必须明确选择 `drop` 或 `pad_last`，不能隐式重复或跨 episode 拼接。
 
@@ -313,7 +313,7 @@ VIVE sender/source 当前已向 300 Hz 语义收敛：单个 OpenVR pose snapsho
 
 ### 8.3 RM65 frame/IK/tool safety
 
-新的 RM65 相关能力包括 table-center frame 配置、双臂 IK、单臂 IK、IK tuning、target solver 和 tool safety。现有测试要求活跃 RM65 URDF 具有 table-center frame，并共享目标 profile；这有助于消除 collection desk frame 与 runtime raw frame 的隐式混淆。
+新的 RM65 相关能力包括 workspace-near-boundary frame 配置、双臂 IK、单臂 IK、IK tuning、target solver 和 tool safety。现有测试要求活跃 RM65 URDF 具有 workspace-near-boundary frame，并共享目标 profile；这有助于消除 collection desk frame 与 runtime raw frame 的隐式混淆。
 
 后续仍需把 frame profile、tool proxy、IK tuning、collision scene profile 和实际机器人固件/工具版本一起写入可复现的运行 manifest，否则同一个数据集或策略 artifact 仍可能在不同坐标/工具假设下运行。
 
@@ -369,7 +369,9 @@ VIVE sender/source 当前已向 300 Hz 语义收敛：单个 OpenVR pose snapsho
 
    冻结测试期望 GUI 主入口基线为 14536 行，当前实际约 15188 行。代码已经有抽取模块，但入口仍继续变化；这是 refactor line-count baseline 与当前树不一致的信号，不应通过修改测试基线来掩盖尚未复核的结构变化。
 
-这两个失败都没有在本轮修复，因为本轮明确只做分析和报告。
+   后续处理（2026-07-19）：该临时精确行数/模块数量冻结测试已取消。它将非语义实现度量作为 pytest 硬 gate，且长期随合法功能修改失效；同文件中的入口签名、共享 writer 边界、依赖方向和 compatibility bridge 等结构契约测试继续保留。入口体积如需跟踪，应由非阻塞审计报告承担。
+
+上述原始审计轮次没有修复这两个失败，因为当时明确只做分析和报告；后续处理状态以各项下方的更新说明为准。
 
 ### 10.3 验证边界
 

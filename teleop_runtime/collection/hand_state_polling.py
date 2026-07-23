@@ -71,6 +71,27 @@ def _has_tactile(state: Mapping[str, Any]) -> bool:
     return bool(state.get("tactile_dict") or state.get("tactile") is not None)
 
 
+def hand_state_tactile_arrays(state: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    """Normalize the tactile arrays accepted by the shared external writer."""
+
+    arrays: dict[str, np.ndarray] = {}
+    tactile_dict = state.get("tactile_dict")
+    if isinstance(tactile_dict, Mapping):
+        for key, value in tactile_dict.items():
+            if value is None:
+                continue
+            array = np.asarray(value)
+            if array.size > 0:
+                arrays[str(key)] = array
+    if arrays:
+        return arrays
+    tactile = state.get("tactile")
+    if tactile is None:
+        return {}
+    array = np.asarray(tactile, dtype=np.float32).reshape(-1)
+    return {} if array.size <= 0 else {"vector": array}
+
+
 @dataclass(frozen=True)
 class HandStateHistoryPollerConfig:
     poll_hz: float = 60.0
@@ -118,6 +139,7 @@ class HandStateHistoryPoller:
             side: CausalSnapshotHistory(
                 maxlen=int(self.config.tactile_history_size),
                 name=f"hand:{side}:tactile",
+                copy_arrays_on_read=False,
             )
             for side in self.backends_by_side
         }
@@ -214,12 +236,14 @@ class HandStateHistoryPoller:
 
     @staticmethod
     def _telemetry_source_timestamp(state: Mapping[str, Any]) -> float | None:
-        timestamps = [
-            _finite(state.get("joint_timestamp")),
-            _finite(state.get("telemetry_timestamp")),
-        ]
-        valid = [value for value in timestamps if value is not None]
-        return max(valid) if valid else None
+        # Position feedback is only new when the hardware joint registers were
+        # read successfully.  A telemetry worker loop may still complete while
+        # that read is deliberately skipped, so its loop timestamp must not
+        # make cached joint feedback appear fresh.
+        joint_timestamp = _finite(state.get("joint_timestamp"))
+        if joint_timestamp is not None:
+            return joint_timestamp
+        return _finite(state.get("telemetry_timestamp"))
 
     def _poll_once(self, side: str, backend: Any) -> None:
         try:
@@ -276,8 +300,18 @@ class HandStateHistoryPoller:
                 state, telemetry_selection = telemetry
                 state.pop("snapshot_stream", None)
                 state.pop("snapshot_source", None)
+                telemetry_source_clock = state.pop("source_clock", None)
+                telemetry_available_clock = state.pop("available_clock", None)
+                state.pop("source_timestamp", None)
+                state.pop("available_timestamp", None)
+                state.pop("snapshot_sequence", None)
+            else:
+                telemetry_source_clock = None
+                telemetry_available_clock = None
             if tactile is not None:
                 tactile_state, tactile_selection = tactile
+                tactile_source_clock = tactile_state.get("source_clock")
+                tactile_available_clock = tactile_state.get("available_clock")
                 for key, value in tactile_state.items():
                     if key.startswith("tactile") or key in {
                         "tactile",
@@ -286,12 +320,23 @@ class HandStateHistoryPoller:
                     }:
                         state[key] = value
             if telemetry_selection is not None:
+                telemetry_available_age = telemetry_selection.age_sec
+                telemetry_source_age = telemetry_selection.source_age_sec
+                telemetry_effective_age = max(
+                    value
+                    for value in (telemetry_available_age, telemetry_source_age)
+                    if value is not None
+                )
                 state.update(
                     {
                         "telemetry_snapshot_sequence": telemetry_selection.sequence,
                         "telemetry_snapshot_source_timestamp": telemetry_selection.source_timestamp,
                         "telemetry_snapshot_available_timestamp": telemetry_selection.available_timestamp,
-                        "telemetry_snapshot_age_sec": telemetry_selection.age_sec,
+                        "telemetry_snapshot_age_sec": telemetry_effective_age,
+                        "telemetry_snapshot_source_age_sec": telemetry_source_age,
+                        "telemetry_snapshot_available_age_sec": telemetry_available_age,
+                        "telemetry_snapshot_source_clock": telemetry_source_clock,
+                        "telemetry_snapshot_available_clock": telemetry_available_clock,
                     }
                 )
             else:
@@ -301,15 +346,30 @@ class HandStateHistoryPoller:
                         "telemetry_snapshot_source_timestamp": None,
                         "telemetry_snapshot_available_timestamp": None,
                         "telemetry_snapshot_age_sec": None,
+                        "telemetry_snapshot_source_age_sec": None,
+                        "telemetry_snapshot_available_age_sec": None,
+                        "telemetry_snapshot_source_clock": None,
+                        "telemetry_snapshot_available_clock": None,
                     }
                 )
             if tactile_selection is not None:
+                tactile_available_age = tactile_selection.age_sec
+                tactile_source_age = tactile_selection.source_age_sec
+                tactile_effective_age = max(
+                    value
+                    for value in (tactile_available_age, tactile_source_age)
+                    if value is not None
+                )
                 state.update(
                     {
                         "tactile_snapshot_sequence": tactile_selection.sequence,
                         "tactile_snapshot_source_timestamp": tactile_selection.source_timestamp,
                         "tactile_snapshot_available_timestamp": tactile_selection.available_timestamp,
-                        "tactile_snapshot_age_sec": tactile_selection.age_sec,
+                        "tactile_snapshot_age_sec": tactile_effective_age,
+                        "tactile_snapshot_source_age_sec": tactile_source_age,
+                        "tactile_snapshot_available_age_sec": tactile_available_age,
+                        "tactile_snapshot_source_clock": tactile_source_clock,
+                        "tactile_snapshot_available_clock": tactile_available_clock,
                     }
                 )
             else:
@@ -319,9 +379,17 @@ class HandStateHistoryPoller:
                         "tactile_snapshot_source_timestamp": None,
                         "tactile_snapshot_available_timestamp": None,
                         "tactile_snapshot_age_sec": None,
+                        "tactile_snapshot_source_age_sec": None,
+                        "tactile_snapshot_available_age_sec": None,
+                        "tactile_snapshot_source_clock": None,
+                        "tactile_snapshot_available_clock": None,
                     }
                 )
             state["causal_snapshot_cutoff_timestamp"] = cutoff
+            joint_timestamp = _finite(state.get("joint_timestamp"))
+            state["joint_age_sec"] = (
+                None if joint_timestamp is None else cutoff - joint_timestamp
+            )
             state["causal_snapshot_contract"] = (
                 "source_timestamp<=T0_and_available_timestamp<=T0"
             )

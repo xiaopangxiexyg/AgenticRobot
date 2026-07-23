@@ -1,0 +1,308 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v1",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-v1",
+    "artifact_kind": "simulation_contract",
+    "sha256": "3b6323249db329d8c2078890900bca6e18279f268ef1d6fef47f30cd5c27f1f9",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-profile-source-20260721-v1",
+      "artifact_kind": "actuation_profile",
+      "sha256": "8c4ae0b7c1a7ee749d80c6aff55f229b032e081762c5dd33006625835bb2480c",
+      "locator": "sim/mujoco/actuation/profile.py"
+    },
+    {
+      "artifact_id": "fit-1550-qcmd",
+      "artifact_kind": "real_trace",
+      "sha256": "112dcd65e0607c06a0a5ecd72de53b22c73e0ab8b94c25c749fd6021de118e9a",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_155029_348429_vive_rm65_actuator_trace/command_trace.npz"
+    },
+    {
+      "artifact_id": "fit-1550-command-manifest",
+      "artifact_kind": "capture_manifest",
+      "sha256": "0e52b53a1f69d32b7748954a175ad8364ed03e1c8eff00eb2ad12258d4b31e0b",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_155029_348429_vive_rm65_actuator_trace/manifest.json"
+    },
+    {
+      "artifact_id": "fit-1550-feedback",
+      "artifact_kind": "real_trace",
+      "sha256": "9f2ae6f2bd69202c0e1d285666766f3ab9c95615efb4de926ee0c39fa2b9bf3d",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_155023_820044.jsonl"
+    },
+    {
+      "artifact_id": "fit-1550-recovery",
+      "artifact_kind": "recovery_journal",
+      "sha256": "87dfb416d1b583cbbeb1e264f57dc454dd7fef0d9ace41f93cd9d38b7789bf17",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_155023_820044.recovery.json"
+    },
+    {
+      "artifact_id": "fit-1649-qcmd",
+      "artifact_kind": "real_trace",
+      "sha256": "1d56fa9512b58c3dd33b214378ac0103fd0e10447c1d6fa3ba7400dc43f72e83",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_164947_845670_vive_rm65_actuator_trace/command_trace.npz"
+    },
+    {
+      "artifact_id": "fit-1649-command-manifest",
+      "artifact_kind": "capture_manifest",
+      "sha256": "e34c9a22c4f104f271c6cc1ff4a12e915cee6fbcd245eb1e73642d3b5be1c4ba",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_164947_845670_vive_rm65_actuator_trace/manifest.json"
+    },
+    {
+      "artifact_id": "fit-1649-feedback",
+      "artifact_kind": "real_trace",
+      "sha256": "e85e315dc2699cda56d3ba6bc86cf2e3e7b451e70f18484edf2fb88d3c49efba",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_164941_498524.jsonl"
+    },
+    {
+      "artifact_id": "fit-1649-recovery",
+      "artifact_kind": "recovery_journal",
+      "sha256": "4ea17d8a713ac8b9f9fe03e10c7aa3534994ad02e476f9de42701bba1c0c31a8",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_164941_498524.recovery.json"
+    },
+    {
+      "artifact_id": "fit-1710-qcmd",
+      "artifact_kind": "real_trace",
+      "sha256": "68ad5010557ab1a2f010ec3cd9f3739d8a6dd80728d4a490e849a61a06711c54",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_171013_962138_vive_rm65_actuator_trace/command_trace.npz"
+    },
+    {
+      "artifact_id": "fit-1710-command-manifest",
+      "artifact_kind": "capture_manifest",
+      "sha256": "2d3cc593e34e006fc6e2fccc68db1fc02182521c37b8b2aa6727dfef2d67d07d",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_171013_962138_vive_rm65_actuator_trace/manifest.json"
+    },
+    {
+      "artifact_id": "fit-1710-feedback",
+      "artifact_kind": "real_trace",
+      "sha256": "4878fa7258e52e3ab4f1e1b00292b53e10974e2637bf120aa789679ba281d090",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_170948_339800.jsonl"
+    },
+    {
+      "artifact_id": "fit-1710-recovery",
+      "artifact_kind": "recovery_journal",
+      "sha256": "8e85d93b6a29baf7edccc9897a69f57eb60074a35f09496d0d392924c9af67ce",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_170948_339800.recovery.json"
+    },
+    {
+      "artifact_id": "validation-1712-qcmd",
+      "artifact_kind": "real_trace",
+      "sha256": "8b9d56f217dbcd8120c3dd0cfb8b52cc7007e0f1db8437165dff38daccb989e3",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_171259_038735_vive_rm65_actuator_trace/command_trace.npz"
+    },
+    {
+      "artifact_id": "validation-1712-command-manifest",
+      "artifact_kind": "capture_manifest",
+      "sha256": "dcb19572de1417c5e766dde1ef6e17f4d46cab19b2b15c3da7c7536e2c38aa5d",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_171259_038735_vive_rm65_actuator_trace/manifest.json"
+    },
+    {
+      "artifact_id": "validation-1712-feedback",
+      "artifact_kind": "real_trace",
+      "sha256": "56b5e24e60ef21f9b3510f4338ba59cda7643e75a4083015038800e526baa796",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_171252_700872.jsonl"
+    },
+    {
+      "artifact_id": "validation-1712-recovery",
+      "artifact_kind": "recovery_journal",
+      "sha256": "c8e9fe71095ba1baa73200c58e3b2b4a22cb4f12f15f32ef8dd135a050cc6e94",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_171252_700872.recovery.json"
+    },
+    {
+      "artifact_id": "heldout-1918-qcmd",
+      "artifact_kind": "real_trace",
+      "sha256": "fcee05320551382a75183a96c71e0174fd8b1b63cb59d870edc0fd09c3b7463e",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_191916_445493_vive_rm65_actuator_trace/command_trace.npz"
+    },
+    {
+      "artifact_id": "heldout-1918-command-manifest",
+      "artifact_kind": "capture_manifest",
+      "sha256": "97f35555c7c55152f7904d3b2ddf86b58d8187f5227a4c3da46c1bf4523319ee",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_191916_445493_vive_rm65_actuator_trace/manifest.json"
+    },
+    {
+      "artifact_id": "heldout-1918-feedback",
+      "artifact_kind": "real_trace",
+      "sha256": "50b340e01560c00ff4e32c43689412892430ed9a7ace79cf72ae36acedcb9d74",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_191842_086968.jsonl"
+    },
+    {
+      "artifact_id": "heldout-1918-recovery",
+      "artifact_kind": "recovery_journal",
+      "sha256": "62a3dca775da91a5570a763315c61e2137098645a8102b14a6fe9a511352479a",
+      "locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_191842_086968.recovery.json"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-arm-profile-source-20260721-v1",
+        "fit-1550-qcmd",
+        "fit-1550-command-manifest",
+        "fit-1550-feedback",
+        "fit-1550-recovery",
+        "fit-1649-qcmd",
+        "fit-1649-command-manifest",
+        "fit-1649-feedback",
+        "fit-1649-recovery",
+        "fit-1710-qcmd",
+        "fit-1710-command-manifest",
+        "fit-1710-feedback",
+        "fit-1710-recovery",
+        "validation-1712-qcmd",
+        "validation-1712-command-manifest",
+        "validation-1712-feedback",
+        "validation-1712-recovery",
+        "heldout-1918-qcmd",
+        "heldout-1918-command-manifest",
+        "heldout-1918-feedback",
+        "heldout-1918-recovery"
+      ],
+      "limitations": [
+        "The untouched clean held-out trace passed qpos error thresholds but failed the predeclared effective-delay threshold on high-speed distal joints.",
+        "Force limits, motor torque, payload dependence, contact, and saturation were not identifiable from free-motion qpos feedback.",
+        "High-speed guardian-restored traces show additional velocity-dependent lag, especially on distal joints, that this nominal fixed profile does not model.",
+        "Natural teleoperation trajectories do not isolate step settling, overshoot, acceleration error, or saturation rate."
+      ],
+      "notes": "Only simulation-owned actuator parameters changed; real command and capture paths are read-only evidence."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "three-clean-session-fit-replay",
+      "split": "fit",
+      "status": "passed",
+      "metrics": {
+        "session_count": 3.0,
+        "mean_per_joint_qpos_rmse_deg": 0.18033055555555555,
+        "max_per_joint_qpos_rmse_deg": 0.6754,
+        "command_hz": 120.0,
+        "feedback_nominal_hz": 200.0
+      },
+      "evidence_artifact_ids": [
+        "fit-1550-qcmd",
+        "fit-1550-command-manifest",
+        "fit-1550-feedback",
+        "fit-1550-recovery",
+        "fit-1649-qcmd",
+        "fit-1649-command-manifest",
+        "fit-1649-feedback",
+        "fit-1649-recovery",
+        "fit-1710-qcmd",
+        "fit-1710-command-manifest",
+        "fit-1710-feedback",
+        "fit-1710-recovery"
+      ],
+      "notes": "All command manifests were closed with zero drops/errors; all UDP captures contain stop rows and capture_finally restoration."
+    },
+    {
+      "validation_id": "clean-1712-mujoco-replay",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "previous_profile_mean_per_joint_qpos_rmse_deg": 1.3259249999999998,
+        "candidate_mean_per_joint_qpos_rmse_deg": 0.29836666666666667,
+        "candidate_left_mean_per_joint_qpos_rmse_deg": 0.27386666666666665,
+        "candidate_right_mean_per_joint_qpos_rmse_deg": 0.32286666666666664,
+        "candidate_max_joint_qpos_rmse_deg": 0.7568,
+        "candidate_max_abs_qpos_error_deg": 7.2453,
+        "mean_rmse_reduction_ratio": 0.7749747031946251,
+        "max_effective_delay_error_sec": 0.003
+      },
+      "evidence_artifact_ids": [
+        "validation-1712-qcmd",
+        "validation-1712-command-manifest",
+        "validation-1712-feedback",
+        "validation-1712-recovery"
+      ],
+      "notes": "Complete 93.2 s overlap, approximately 200 Hz feedback, zero command drops/errors and capture_finally restoration."
+    },
+    {
+      "validation_id": "untouched-clean-held-out",
+      "split": "held_out",
+      "status": "failed",
+      "metrics": {
+        "overlap_sec": 44.555,
+        "mean_per_joint_qpos_rmse_deg": 0.35086666666666666,
+        "left_mean_per_joint_qpos_rmse_deg": 0.2789333333333333,
+        "right_mean_per_joint_qpos_rmse_deg": 0.4228,
+        "max_joint_qpos_rmse_deg": 0.7069,
+        "max_abs_qpos_error_deg": 6.6188,
+        "mean_qpos_rmse_threshold_deg": 0.5,
+        "max_joint_qpos_rmse_threshold_deg": 1.0,
+        "max_effective_delay_error_sec": 0.009,
+        "max_effective_delay_error_threshold_sec": 0.005,
+        "command_drop_count": 0.0,
+        "command_error_count": 0.0,
+        "feedback_queue_drop_count": 0.0
+      },
+      "evidence_artifact_ids": [
+        "heldout-1918-qcmd",
+        "heldout-1918-command-manifest",
+        "heldout-1918-feedback",
+        "heldout-1918-recovery"
+      ],
+      "notes": "Profile parameters were frozen before inspection. Qpos thresholds passed; the 9 ms distal-joint phase mismatch exceeded the predeclared 5 ms limit."
+    }
+  ],
+  "code_revision": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+  "environment_fingerprint": {
+    "python": "3.10.20",
+    "mujoco": "3.10.0",
+    "worktree": "dirty-concurrent-development"
+  },
+  "metadata": {
+    "owner": "sim",
+    "profile_name": "rm65_bimanual_udp_feedback_20260721.v1",
+    "fit_capture_ids": ["155023/155029", "164941/164947", "170948/171013"],
+    "validation_capture_ids": ["171252/171259"],
+    "heldout_capture_ids": ["191842/191916"],
+    "auxiliary_guardian_capture_ids": ["171731/172022", "172343/172455", "172739/172746", "173045/173052"],
+    "auxiliary_guardian_policy": "cross_check_only_no_in_band_stop_row",
+    "real_effective_delay_sec_by_side_joint": {
+      "left": [0.027, 0.027, 0.028, 0.033, 0.029, 0.039],
+      "right": [0.028, 0.029, 0.029, 0.029, 0.029, 0.038]
+    },
+    "sim_effective_delay_sec_by_side_joint": {
+      "left": [0.029, 0.030, 0.030, 0.033, 0.031, 0.040],
+      "right": [0.028, 0.029, 0.029, 0.032, 0.030, 0.039]
+    },
+    "validation_qpos_rmse_deg_by_side_joint": {
+      "left": [0.0719, 0.1317, 0.2317, 0.3142, 0.1369, 0.7568],
+      "right": [0.1275, 0.2827, 0.4732, 0.2239, 0.1280, 0.7019]
+    },
+    "validation_max_abs_qpos_error_deg_by_side_joint": {
+      "left": [0.7891, 1.9544, 3.7276, 3.7528, 1.6288, 7.2453],
+      "right": [1.9659, 3.5487, 5.1507, 2.7823, 1.5126, 6.8473]
+    },
+    "heldout_real_effective_delay_sec_by_side_joint": {
+      "left": [0.026, 0.027, 0.029, 0.030, 0.038, 0.032],
+      "right": [0.027, 0.029, 0.027, 0.036, 0.039, 0.039]
+    },
+    "heldout_qpos_rmse_deg_by_side_joint": {
+      "left": [0.0541, 0.1092, 0.2609, 0.3365, 0.5992, 0.3137],
+      "right": [0.1389, 0.2081, 0.1309, 0.6511, 0.7009, 0.7069]
+    },
+    "heldout_max_abs_qpos_error_deg_by_side_joint": {
+      "left": [0.3369, 0.4373, 3.1711, 4.0137, 4.7150, 2.0464],
+      "right": [1.6045, 2.4832, 1.3713, 5.8257, 5.5431, 6.6188]
+    }
+  },
+  "artifact_sha256": "bc2bde3a49bd702922e380c8ee84b19256117cc74cbf2dc9cc44636a3b54694a"
+}

@@ -1,0 +1,65 @@
+{
+  "schema": "dexteleop_rtc_local_evidence_v1",
+  "evidence_id": "rtc_rr1_openpi_relative_adapter_local_v1",
+  "recorded_on": "2026-07-23",
+  "scope": {
+    "model_server_started": false,
+    "hardware_observation_read": false,
+    "action_sent": false,
+    "sim_observation_modified": false,
+    "teleop_or_replay_modified": false
+  },
+  "implementation": {
+    "adapter": "deployments.openpi.client.rtc.OpenPIFinalChunkRtcBackend",
+    "absolute_default_result": "legacy_normalized_v1",
+    "relative_required_result": "typed_canonical_v1",
+    "relative_anchor": "original_request_chunk_start_actual_tcp",
+    "model_server_payload_changed": false,
+    "shared_worker_timed_plan": true
+  },
+  "actual_artifact_contract_checks": [
+    {
+      "model_id": "0712-wrist-cube",
+      "checkpoint_step": 92599,
+      "action_pose_mode": "absolute",
+      "expected_action_horizon": null,
+      "rtc_artifact_hash": "7296af228a4475138c22af42674df82bd8b4cf5a5dc6f77ec279ad479382ff4a"
+    },
+    {
+      "model_id": "0715-cube-front-ready-mix-4to1-h16-relative",
+      "checkpoint_step": 150000,
+      "action_pose_mode": "relative",
+      "expected_action_horizon": 16,
+      "arm_pose_slices": {
+        "left": [0, 7],
+        "right": [7, 14]
+      },
+      "canonical_arm_frame": "canonical_desk",
+      "rtc_artifact_hash": "0df09f9829842b9e59e5b4e91be893baded6ccccbdc352c08d59b62385cd332b"
+    }
+  ],
+  "verification": [
+    {
+      "command_scope": "OpenPI adapter and launcher focused tests",
+      "result": "69 passed"
+    },
+    {
+      "command_scope": "RTC and OpenPI no-hardware matrix with loopback proxies unset",
+      "result": "246 passed, 1 skipped"
+    },
+    {
+      "command_scope": "canonical action, position, deploy contract, v2.3 equivalence compatibility",
+      "result": "83 passed"
+    },
+    {
+      "command_scope": "git diff --check for touched files",
+      "result": "passed"
+    }
+  ],
+  "remaining_gates": [
+    "actual OpenPI server metadata and response against the selected relative checkpoint",
+    "captured observation no-action worker and timed-plan shadow",
+    "formal proposal and target caller",
+    "real safety profile and separately authorized motion"
+  ]
+}

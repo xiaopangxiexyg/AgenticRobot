@@ -7,10 +7,6 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from dataset_contracts.v22 import (
-    DEXTELEOP_DATASET_SCHEMA_V22,
-    policy_io_layout_from_metadata,
-)
 from robot_motion.deploy.schema import ACTION_DIM, ARM_JOINT_DOF
 from robot_motion.replay.trajectory import (
     QPOS_INIT_AUTO,
@@ -38,11 +34,10 @@ from ..replay.arm_init.qpos_execute import (
     normalize_qpos_init_max_angvel,
 )
 from .replay import (
-    load_replay_actions_from_parquet,
+    load_contract_replay_actions_from_parquet,
     load_replay_arm_joint_targets_from_parquet,
     load_replay_arm_observation_qpos_from_parquet,
     load_replay_arm_qpos_audit_from_parquet,
-    load_v22_replay_actions_from_parquet,
     resolve_replay_parquet_path,
 )
 
@@ -112,32 +107,22 @@ def _load_policy_qpos_init_actions(
     must take the same explicit bridge used by dataset replay.
     """
 
-    dataset_info = resolved_metadata.get("dataset_info")
-    if (
-        isinstance(dataset_info, Mapping)
-        and str(dataset_info.get("dexteleop_dataset_schema") or "")
-        == DEXTELEOP_DATASET_SCHEMA_V22
-    ):
-        layout = policy_io_layout_from_metadata(dataset_info, allow_legacy_v21=False)
-        actions, action_metadata = load_v22_replay_actions_from_parquet(
+    actions, action_metadata, _pose_contract, is_typed = (
+        load_contract_replay_actions_from_parquet(
             source_path,
-            layout=layout,
+            resolved_metadata=resolved_metadata,
+            action_column=action_column,
             start_index=frame_index,
             end_index=frame_index + 1,
         )
-        return actions, {
-            "action_encoding": "v22_layout_to_legacy_q6_bridge",
-            "policy_io_layout_hash": layout.layout_hash,
-            "action_metadata": dict(action_metadata),
-        }
-
-    actions = load_replay_actions_from_parquet(
-        source_path,
-        action_column=action_column,
-        start_index=frame_index,
-        end_index=frame_index + 1,
     )
-    return actions, {"action_encoding": "legacy_26d"}
+    return actions, {
+        "action_encoding": (
+            "typed_layout_to_legacy_q6_bridge" if is_typed else "legacy_26d"
+        ),
+        "policy_io_layout_hash": action_metadata.get("policy_io_layout_hash"),
+        "action_metadata": dict(action_metadata),
+    }
 
 
 def load_deploy_policy_qpos_init_plan(
@@ -257,6 +242,7 @@ class DeployPolicyQposInitController:
         self._step_count = 0
         self._next_send_at = 0.0
         self._started_monotonic: float | None = None
+        self._effective_timeout_s = float(self.settings.move_to_start_timeout_s)
         self._last_message = ""
         self._last_qpos_error_text = ""
 
@@ -300,6 +286,7 @@ class DeployPolicyQposInitController:
         self._step_index = 0
         self._plan_steps = ()
         self._step_count = 0
+        self._effective_timeout_s = float(self.settings.move_to_start_timeout_s)
         self._last_qpos_error_text = ""
         try:
             self._build_plan(arm_backends)
@@ -438,11 +425,17 @@ class DeployPolicyQposInitController:
         _require_plan_completed(plan)
         self._plan_steps = tuple(getattr(plan, "steps", ()))
         self._step_count = len(self._plan_steps)
+        planned_duration_s = self._step_count * max(0.001, float(self.settings.qpos_init_dt_sec))
+        execution_margin_s = max(5.0, planned_duration_s * 0.25)
+        self._effective_timeout_s = max(
+            float(self.settings.move_to_start_timeout_s),
+            planned_duration_s + execution_margin_s,
+        )
 
     def _timeout_message(self, arm_backends: Mapping[str, Any]) -> str:
         if self._started_monotonic is None:
             return ""
-        if time.monotonic() - float(self._started_monotonic) <= float(self.settings.move_to_start_timeout_s):
+        if time.monotonic() - float(self._started_monotonic) <= float(self._effective_timeout_s):
             return ""
         _, error_text = _qpos_reached_status(
             self.plan.target_qpos_by_side,
@@ -455,7 +448,7 @@ class DeployPolicyQposInitController:
             "[PolicyQposInit] timed out while moving to dataset frame; "
             "policy remains blocked and no further qpos-init commands will be sent. "
             f"state={self.state} step={self._step_index}/{self._step_count} "
-            f"timeout_s={float(self.settings.move_to_start_timeout_s):.2f} "
+            f"timeout_s={float(self._effective_timeout_s):.2f} "
             f"tolerance_rad={float(self.settings.qpos_reached_tolerance_rad):.4f} "
             f"{error_text}"
         )
@@ -499,7 +492,13 @@ def _current_qpos_by_side(
         if backend is None:
             raise RuntimeError(f"Policy qpos init requires {side}_arm backend.")
         state = _backend_state(backend)
-        for key in ("hardware_qpos", "current_qpos", "last_target_qpos"):
+        state_source = str(state.get("_qpos_state_source") or "")
+        keys = (
+            ("hardware_qpos", "measured_qpos")
+            if state_source == "hardware_refresh"
+            else ("hardware_qpos", "measured_qpos", "current_qpos")
+        )
+        for key in keys:
             value = state.get(key)
             if value is None:
                 continue
@@ -513,10 +512,17 @@ def _current_qpos_by_side(
 
 
 def _backend_state(backend: Any) -> Mapping[str, Any]:
-    try:
-        return dict(backend.refresh_state_from_hardware())
-    except Exception:
-        return dict(backend.get_state())
+    refresh = getattr(backend, "refresh_state_from_hardware", None)
+    if callable(refresh):
+        state = dict(refresh())
+        state["_qpos_state_source"] = "hardware_refresh"
+        return state
+    get_state = getattr(backend, "get_state", None)
+    if not callable(get_state):
+        raise RuntimeError("arm backend exposes neither hardware refresh nor state read.")
+    state = dict(get_state())
+    state["_qpos_state_source"] = "compatibility_state"
+    return state
 
 
 def _send_qpos_targets(

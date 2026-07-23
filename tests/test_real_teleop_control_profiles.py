@@ -30,7 +30,7 @@ def _execution_args(**overrides):
         "arm_execution_profile": None,
         "arm_control_mode": "impedance",
         "hz": 15.0,
-        "position_reference_hz": 75.0,
+        "position_reference_hz": 60.0,
         "dual_arm_ik_hz": None,
         "arm_control_hz": None,
         "arm_canfd_follow": None,
@@ -55,13 +55,13 @@ def _parse_real_teleop_args(argv: list[str]) -> argparse.Namespace:
         return real_teleop.parse_args()
 
 
-def test_default_common_position_profile_contract_has_independent_15_75_150_clocks() -> None:
+def test_default_common_position_profile_contract_has_independent_15_60_120_clocks() -> None:
     rates = POSITION_PROFILE.rates
 
     assert rates.sample_hz == 15.0
-    assert rates.reference_hz == 75.0
-    assert rates.ik_hz == 75.0
-    assert rates.command_hz == 150.0
+    assert rates.reference_hz == 60.0
+    assert rates.ik_hz == 60.0
+    assert rates.command_hz == 120.0
     assert rates.ordering_warnings == ()
     assert rates.to_metadata()["independent_clocks"] is True
 
@@ -181,6 +181,8 @@ def test_real_teleop_position_ik_iteration_options_are_exposed_and_position_only
     assert defaults.position_ik_damping == pytest.approx(0.03)
     assert defaults.position_ik_adaptive_iterations is False
     assert defaults.position_ik_iteration_reserve_ms == pytest.approx(5.0)
+    assert defaults.position_ik_candidate_certification_reserve_ms == pytest.approx(0.0)
+    assert defaults.position_singularity_candidate_certificate is False
     assert defaults.position_ik_local_step_clip_scale == pytest.approx(1.0)
     assert defaults.position_joint_velocity_limit_profile == "rm65"
     assert defaults.position_inactive_enter_threshold_scale == pytest.approx(1.0)
@@ -200,6 +202,9 @@ def test_real_teleop_position_ik_iteration_options_are_exposed_and_position_only
             "--position-ik-adaptive-iterations",
             "--position-ik-iteration-reserve-ms",
             "6.5",
+            "--position-ik-candidate-certification-reserve-ms",
+            "3.0",
+            "--position-singularity-candidate-certificate",
             "--position-ik-local-step-clip-scale",
             "2.5",
             "--position-inactive-enter-threshold-scale",
@@ -214,6 +219,8 @@ def test_real_teleop_position_ik_iteration_options_are_exposed_and_position_only
     assert tuned.position_ik_damping == pytest.approx(0.04)
     assert tuned.position_ik_adaptive_iterations is True
     assert tuned.position_ik_iteration_reserve_ms == pytest.approx(6.5)
+    assert tuned.position_ik_candidate_certification_reserve_ms == pytest.approx(3.0)
+    assert tuned.position_singularity_candidate_certificate is True
     assert tuned.position_ik_local_step_clip_scale == pytest.approx(2.5)
     assert tuned.position_inactive_enter_threshold_scale == pytest.approx(0.5)
     assert tuned.position_joint_velocity_limit_profile == "rm65_position_2x"
@@ -299,24 +306,48 @@ def test_position_runtime_ik_weight_and_inactive_tightening_are_scoped() -> None
     assert impedance_intent.enter_translation_span_m == pytest.approx(0.0025)
 
 
-def test_position_elbow_singularity_preference_has_atomic_rollback_switch() -> None:
+def test_position_singularity_preferences_have_atomic_rollback_switches() -> None:
     enabled = _parse_real_teleop_args(
-        ["--arm-execution-profile", "position"]
+        [
+            "--position-control-profile",
+            "rm65_bimanual_position_v1",
+            "--arm-control-mode",
+            "position",
+        ]
     )
     assert enabled.position_prefer_non_elbow_singular_branch is True
+    assert enabled.position_prefer_non_shoulder_singular_branch is True
+    assert enabled.position_ik_candidate_certification_reserve_ms == pytest.approx(3.5)
+    assert enabled.position_singularity_candidate_certificate is True
     enabled_metadata = real_teleop._position_ik_iteration_metadata(enabled)
     assert enabled_metadata["position_prefer_non_elbow_singular_branch"] is True
+    assert enabled_metadata["position_prefer_non_shoulder_singular_branch"] is True
 
     rollback = _parse_real_teleop_args(
         [
-            "--arm-execution-profile",
+            "--position-control-profile",
+            "rm65_bimanual_position_v1",
+            "--arm-control-mode",
             "position",
             "--no-position-prefer-non-elbow-singular-branch",
+            "--no-position-prefer-non-shoulder-singular-branch",
+            "--position-ik-candidate-certification-reserve-ms",
+            "0",
+            "--no-position-singularity-candidate-certificate",
         ]
     )
     assert rollback.position_prefer_non_elbow_singular_branch is False
+    assert rollback.position_prefer_non_shoulder_singular_branch is False
+    assert rollback.position_ik_candidate_certification_reserve_ms == pytest.approx(0.0)
+    assert rollback.position_singularity_candidate_certificate is False
     rollback_metadata = real_teleop._position_ik_iteration_metadata(rollback)
     assert rollback_metadata["position_prefer_non_elbow_singular_branch"] is False
+    assert rollback_metadata["position_prefer_non_shoulder_singular_branch"] is False
+
+    legacy = _parse_real_teleop_args(["--arm-execution-profile", "position"])
+    assert legacy.position_prefer_non_shoulder_singular_branch is False
+    assert legacy.position_ik_candidate_certification_reserve_ms == pytest.approx(0.0)
+    assert legacy.position_singularity_candidate_certificate is False
 
 
 @pytest.mark.parametrize("value", ["0", "-0.5", "1.01", "nan"])
@@ -414,7 +445,7 @@ def test_legacy_position_profile_selects_mode_and_resolves_15_45_150() -> None:
     assert resolved.arm_canfd_radio == 0
 
 
-def test_default_position_profile_selects_mode_and_resolves_15_75_150() -> None:
+def test_default_position_profile_selects_mode_and_resolves_15_60_120() -> None:
     args = _execution_args(arm_execution_profile="position")
 
     resolved = resolve_real_arm_execution_config(
@@ -426,16 +457,16 @@ def test_default_position_profile_selects_mode_and_resolves_15_75_150() -> None:
     assert resolved.resolved_profile == "position"
     assert resolved.mode == "position"
     assert resolved.sample_hz == 15.0
-    assert resolved.outer_control_hz == 75.0
-    assert resolved.position_reference_hz == 75.0
-    assert resolved.dual_arm_ik_hz == 75.0
-    assert resolved.arm_control_hz == 150.0
-    assert resolved.position_background_streaming_hz == 150.0
+    assert resolved.outer_control_hz == 60.0
+    assert resolved.position_reference_hz == 60.0
+    assert resolved.dual_arm_ik_hz == 60.0
+    assert resolved.arm_control_hz == 120.0
+    assert resolved.position_background_streaming_hz == 120.0
     assert resolved.arm_canfd_follow is True
     assert resolved.position_background_streaming_enabled is True
 
 
-def test_unnamed_position_mode_uses_default_15_75_150_profile() -> None:
+def test_unnamed_position_mode_uses_default_15_60_120_profile() -> None:
     args = _execution_args(arm_control_mode="position")
 
     resolved = resolve_real_arm_execution_config(args)
@@ -443,9 +474,10 @@ def test_unnamed_position_mode_uses_default_15_75_150_profile() -> None:
     assert resolved.requested_profile is None
     assert resolved.resolved_profile == "position"
     assert resolved.sample_hz == 15.0
-    assert resolved.position_reference_hz == 75.0
-    assert resolved.dual_arm_ik_hz == 75.0
-    assert resolved.arm_control_hz == 150.0
+    assert resolved.position_reference_hz == 60.0
+    assert resolved.dual_arm_ik_hz == 60.0
+    assert resolved.arm_control_hz == 120.0
+    assert resolved.position_post_ik_qpos_smoothing_alpha == pytest.approx(0.9)
 
 
 def test_position_profile_allows_stage_overrides_and_marks_legacy_stream_precedence() -> None:

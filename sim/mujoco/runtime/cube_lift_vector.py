@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import sys
 import traceback
 from multiprocessing.connection import Connection
 from multiprocessing.shared_memory import SharedMemory
@@ -11,31 +13,54 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+
+def _prepare_worker_runtime_library_path() -> None:
+    """Prefer the active Python environment's C++ runtime in spawned workers.
+
+    Pinocchio is optional for sim, but when it is available the canonical
+    pose-to-qref planner should be used consistently by the parent and worker
+    processes.  Some hosts prepend an older system ``libstdc++``; placing the
+    active environment's ``lib`` directory first fixes that loader mismatch
+    without changing the policy or actuator contract.  The pose-action module
+    still has a MuJoCo DLS fallback for genuinely unavailable optional wheels.
+    """
+
+    runtime_lib = Path(sys.prefix) / "lib"
+    if not runtime_lib.is_dir():
+        return
+    current = [item for item in os.environ.get("LD_LIBRARY_PATH", "").split(":") if item]
+    runtime_text = str(runtime_lib)
+    if runtime_text in current:
+        current.remove(runtime_text)
+    os.environ["LD_LIBRARY_PATH"] = ":".join((runtime_text, *current))
+
 try:
     from gymnasium.vector import VectorEnv as _VectorEnvBase
 except ModuleNotFoundError:
     _VectorEnvBase = object
 
 
-_ARRAY_LAYOUT = {
-    "actions": ((7,), np.dtype(np.float32)),
-    "observations": ((31,), np.dtype(np.float32)),
-    "final_observations": ((31,), np.dtype(np.float32)),
-    "rewards": ((), np.dtype(np.float32)),
-    "terminated": ((), np.dtype(np.uint8)),
-    "truncated": ((), np.dtype(np.uint8)),
-    "final_valid": ((), np.dtype(np.uint8)),
-    "physics_ticks": ((), np.dtype(np.int32)),
-}
+def _array_layout(observation_dim: int) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
+    return {
+        "actions": ((7,), np.dtype(np.float32)),
+        "observations": ((observation_dim,), np.dtype(np.float32)),
+        "final_observations": ((observation_dim,), np.dtype(np.float32)),
+        "rewards": ((), np.dtype(np.float32)),
+        "terminated": ((), np.dtype(np.uint8)),
+        "truncated": ((), np.dtype(np.uint8)),
+        "final_valid": ((), np.dtype(np.uint8)),
+        "physics_ticks": ((), np.dtype(np.int32)),
+    }
 
 
 def _attach_arrays(
     names: dict[str, str],
     num_envs: int,
+    observation_dim: int,
 ) -> tuple[dict[str, SharedMemory], dict[str, np.ndarray]]:
     segments: dict[str, SharedMemory] = {}
     arrays: dict[str, np.ndarray] = {}
-    for name, (tail, dtype) in _ARRAY_LAYOUT.items():
+    for name, (tail, dtype) in _array_layout(observation_dim).items():
         segment = SharedMemory(name=names[name])
         segments[name] = segment
         arrays[name] = np.ndarray((num_envs, *tail), dtype=dtype, buffer=segment.buf)
@@ -51,17 +76,19 @@ def _worker_main(
     cache_dir: str | None,
     auto_reset: bool,
     master_seed: int,
+    observation_dim: int,
 ) -> None:
     segments: dict[str, SharedMemory] = {}
     env = None
     try:
-        segments, arrays = _attach_arrays(shared_names, num_envs)
+        segments, arrays = _attach_arrays(shared_names, num_envs, observation_dim)
         from ..tasks.cube_lift.fast_env import FastCubeLiftEnv
 
         env = FastCubeLiftEnv(
             config_path,
             info_mode="compact",
             model_cache_dir=cache_dir,
+            include_training_reward_state=True,
         )
         episode_id = 0
         connection.send(("ready", None))
@@ -147,7 +174,7 @@ class CubeLiftVectorExecutor:
         self,
         num_envs: int,
         *,
-        config_path: str | Path = "sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json",
+        config_path: str | Path = "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v1.json",
         model_cache_dir: str | Path | None = None,
         auto_reset: bool = True,
         master_seed: int = 0,
@@ -160,10 +187,15 @@ class CubeLiftVectorExecutor:
             raise ValueError(f"Unsupported multiprocessing start method {start_method!r}.")
         self.auto_reset = bool(auto_reset)
         self.master_seed = int(master_seed)
+        from ..tasks.cube_lift.config import CubeLiftTaskConfig
+
+        self.observation_dim = CubeLiftTaskConfig.load(config_path).observation_dim
+        self.action_dim = 7
+        self._array_layout = _array_layout(self.observation_dim)
         self._closed = False
         self._segments: dict[str, SharedMemory] = {}
         self._arrays: dict[str, np.ndarray] = {}
-        for name, (tail, dtype) in _ARRAY_LAYOUT.items():
+        for name, (tail, dtype) in self._array_layout.items():
             shape = (self.num_envs, *tail)
             size = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
             segment = SharedMemory(create=True, size=size)
@@ -172,6 +204,7 @@ class CubeLiftVectorExecutor:
             self._arrays[name].fill(0)
 
         context = mp.get_context(start_method)
+        _prepare_worker_runtime_library_path()
         self._connections: list[Connection] = []
         self._processes: list[mp.Process] = []
         names = {name: segment.name for name, segment in self._segments.items()}
@@ -189,6 +222,7 @@ class CubeLiftVectorExecutor:
                         None if model_cache_dir is None else str(model_cache_dir),
                         self.auto_reset,
                         self.master_seed,
+                        self.observation_dim,
                     ),
                     name=f"cube-lift-worker-{env_id}",
                     daemon=True,
@@ -355,13 +389,16 @@ class CubeLiftVectorEnv(_VectorEnvBase):
             raise ModuleNotFoundError("CubeLiftVectorEnv requires gymnasium.") from exc
 
         self.num_envs = int(num_envs)
+        self.executor = CubeLiftVectorExecutor(self.num_envs, **executor_kwargs)
         self.single_action_space = spaces.Box(-1.0, 1.0, shape=(7,), dtype=np.float32)
         self.single_observation_space = spaces.Box(
-            -1e6, 1e6, shape=(31,), dtype=np.float32
+            -1e6,
+            1e6,
+            shape=(self.executor.observation_dim,),
+            dtype=np.float32,
         )
         self.action_space = batch_space(self.single_action_space, self.num_envs)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
-        self.executor = CubeLiftVectorExecutor(self.num_envs, **executor_kwargs)
 
     def reset(
         self,

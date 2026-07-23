@@ -1,38 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from robot_motion.action import (
+    CanonicalActionSafetyAnchor,
+    CanonicalKeyframeSafetyProfile,
     RobotAction,
     RobotActionResolver,
+    SharedCanonicalSafetyResult,
+    SourceValidationResult,
     VectorActionLayout,
-    robot_action_from_vector_action,
+    apply_canonical_keyframe_safety,
 )
 from robot_motion.runtime import TeleopCommand
 
 from .actions import ActionSafetyFilter, FilteredNormalizedAction, NormalizedAction
+from .action_adapter import (
+    DEPLOY_VECTOR_ACTION_LAYOUT,
+    DeployActionRepresentationReceipt,
+    DeployRobotActionAdapter,
+    DeployRobotActionAdapterResult,
+)
 from .observation import DeploymentObservation
-from .schema import (
-    ACTION_ARM_POSE_SLICES,
-    ACTION_DIM,
-    ACTION_HAND_SLICES,
-    ALL_SIDES,
-    ARM_JOINT_DOF,
-    ARM_POSE_DOF,
-    HAND_DOF,
-)
-
-
-DEPLOY_VECTOR_ACTION_LAYOUT = VectorActionLayout(
-    action_dim=ACTION_DIM,
-    arm_pose_slices=ACTION_ARM_POSE_SLICES,
-    hand_slices=ACTION_HAND_SLICES,
-    arm_pose_dof=ARM_POSE_DOF,
-    arm_joint_dof=ARM_JOINT_DOF,
-    hand_dof=HAND_DOF,
-    side_order=ALL_SIDES,
-)
+from .canonical_policy_action import CanonicalPolicyAction
 
 
 @dataclass(frozen=True)
@@ -41,6 +32,8 @@ class CanonicalDeployActionResult:
     robot_action: RobotAction | None = None
     command: TeleopCommand | None = None
     faults: tuple[str, ...] = ()
+    source_validation: SourceValidationResult | None = None
+    representation_receipt: DeployActionRepresentationReceipt | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -71,6 +64,28 @@ class CanonicalDeployActionPipeline:
         self.hands_enabled = bool(hands_enabled)
         self.resolver = resolver if resolver is not None else RobotActionResolver()
         self.layout = layout
+        self.action_adapter = DeployRobotActionAdapter(
+            active_sides=self.active_sides,
+            arms_enabled=self.arms_enabled,
+            hands_enabled=self.hands_enabled,
+            layout=self.layout,
+        )
+
+    def adapt_pre_safety(
+        self,
+        action: NormalizedAction | Any,
+        observation: DeploymentObservation,
+        *,
+        policy_name: str = "",
+    ) -> DeployRobotActionAdapterResult:
+        """Expose the decoded absolute intent without applying policy safety."""
+
+        return self.action_adapter.adapt(
+            action,
+            observation,
+            policy_name=policy_name,
+            input_stage="decoded_absolute_pre_safety",
+        )
 
     def prepare(
         self,
@@ -110,27 +125,17 @@ class CanonicalDeployActionPipeline:
 
         if not isinstance(filtered, FilteredNormalizedAction):
             raise TypeError("filtered must be a FilteredNormalizedAction")
-        metadata = dict(filtered.action.metadata)
-        action_source = str(metadata.get("source") or "").strip()
-        if not action_source:
-            action_source = f"deploy_policy:{policy_name}" if policy_name else "deploy_policy"
-            metadata["source"] = action_source
-
-        build = robot_action_from_vector_action(
-            vector=filtered.action.vector,
-            arm_joint_targets=filtered.action.arm_joint_targets,
-            metadata=metadata,
-            active_sides=self.active_sides,
-            arms_enabled=self.arms_enabled,
-            hands_enabled=self.hands_enabled,
-            layout=self.layout,
-            timestamp=observation.timestamp,
-            source=action_source,
+        adapted = self.action_adapter.adapt(
+            filtered.action,
+            observation,
+            policy_name=policy_name,
+            input_stage="legacy_policy_safety_output",
         )
-        faults = [*filtered.faults, *build.faults]
+        faults = [*filtered.faults, *adapted.faults]
         command = None
-        if build.robot_action is not None and not faults:
-            command = self.resolver.resolve(build.robot_action)
+        compatibility_robot_action = adapted.compatibility_robot_action
+        if compatibility_robot_action is not None and not faults:
+            command = self.resolver.resolve(compatibility_robot_action)
         if command is not None:
             _annotate_canonical_command(
                 command,
@@ -139,14 +144,130 @@ class CanonicalDeployActionPipeline:
             )
         return CanonicalDeployActionResult(
             filtered=filtered,
-            robot_action=build.robot_action,
+            robot_action=compatibility_robot_action,
             command=command,
             faults=tuple(faults),
+            source_validation=adapted.source_validation,
+            representation_receipt=adapted.representation_receipt,
             metadata={
                 "canonical_action_path": True,
                 "command_blocked_by_faults": bool(faults),
-                "vector_build": dict(build.metadata),
+                "vector_build": dict(adapted.vector_build_metadata),
                 "safety": dict(filtered.metadata),
+                "representation_trace_id": (
+                    adapted.representation_receipt.representation_trace_id
+                ),
+            },
+        )
+
+
+@dataclass(frozen=True)
+class CanonicalPolicyActionResult:
+    """Typed canonical preparation result without a legacy vector round-trip."""
+
+    canonical_action: CanonicalPolicyAction
+    safety_result: SharedCanonicalSafetyResult
+    robot_action: RobotAction | None = None
+    command: TeleopCommand | None = None
+    faults: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "faults", tuple(str(value) for value in self.faults))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+class CanonicalPolicyActionPipeline:
+    """Prepare one typed policy action through shared safety and resolution.
+
+    The caller-provided anchor provider remains the safety-anchor owner.  This
+    class performs no observation reads beyond the immutable observation value
+    passed by the control thread and owns no backend or dispatch authority.
+    """
+
+    def __init__(
+        self,
+        *,
+        safety_profile: CanonicalKeyframeSafetyProfile,
+        anchor_provider: Callable[
+            [CanonicalPolicyAction, DeploymentObservation, float],
+            CanonicalActionSafetyAnchor,
+        ],
+        resolver: RobotActionResolver | None = None,
+    ) -> None:
+        if not isinstance(safety_profile, CanonicalKeyframeSafetyProfile):
+            raise TypeError(
+                "safety_profile must be a CanonicalKeyframeSafetyProfile."
+            )
+        if not callable(anchor_provider):
+            raise TypeError("anchor_provider must be callable.")
+        self.safety_profile = safety_profile
+        self.anchor_provider = anchor_provider
+        self.resolver = resolver if resolver is not None else RobotActionResolver()
+
+    def prepare_canonical(
+        self,
+        action: CanonicalPolicyAction,
+        observation: DeploymentObservation,
+        *,
+        policy_name: str = "",
+        input_action_id: str,
+        target_effective_at: float,
+    ) -> CanonicalPolicyActionResult:
+        if not isinstance(action, CanonicalPolicyAction):
+            raise TypeError("action must be a CanonicalPolicyAction.")
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError("observation must be a DeploymentObservation.")
+        target_at = float(target_effective_at)
+        anchor = self.anchor_provider(action, observation, target_at)
+        if not isinstance(anchor, CanonicalActionSafetyAnchor):
+            raise TypeError(
+                "anchor_provider must return CanonicalActionSafetyAnchor."
+            )
+        safety = apply_canonical_keyframe_safety(
+            action.action,
+            str(input_action_id),
+            anchor=anchor,
+            profile=self.safety_profile,
+            target_effective_at=target_at,
+        )
+        safe_action = safety.safe_action
+        command = None
+        faults: tuple[str, ...] = ()
+        if safety.status in {"fault", "hold"} or safe_action is None:
+            faults = tuple(safety.reasons) or (
+                f"canonical_policy_safety_{safety.status}",
+            )
+        else:
+            command = self.resolver.resolve(safe_action)
+            _annotate_canonical_command(
+                command,
+                policy_name=policy_name,
+                safety_metadata={
+                    "status": safety.status,
+                    "reasons": safety.reasons,
+                    "modified_components": safety.modified_components,
+                    "safety_contract_id": safety.safety_contract_id,
+                    "safety_contract_hash": safety.safety_contract_hash,
+                    "anchor_id": safety.anchor_id,
+                    "anchor_kind": safety.anchor_kind,
+                    "anchor_hash": safety.anchor_hash,
+                },
+            )
+        return CanonicalPolicyActionResult(
+            canonical_action=action,
+            safety_result=safety,
+            robot_action=safe_action,
+            command=command,
+            faults=faults,
+            metadata={
+                "canonical_action_path": True,
+                "typed_policy_action": True,
+                "command_blocked_by_faults": bool(faults),
+                "canonicalization_receipt_id": (
+                    action.canonicalization_receipt.receipt_id
+                ),
+                "safety_status": safety.status,
             },
         )
 
@@ -169,5 +290,7 @@ def _annotate_canonical_command(
 __all__ = [
     "CanonicalDeployActionPipeline",
     "CanonicalDeployActionResult",
+    "CanonicalPolicyActionPipeline",
+    "CanonicalPolicyActionResult",
     "DEPLOY_VECTOR_ACTION_LAYOUT",
 ]

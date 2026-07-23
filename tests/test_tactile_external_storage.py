@@ -133,6 +133,61 @@ def _step(timestamp: float = 20.0) -> SessionStepResult:
 
 
 class TactileExternalStorageTest(unittest.TestCase):
+    def test_external_writer_reuses_unchanged_causal_tactile_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_video=False,
+                    write_parquet=False,
+                    tactile_storage="external",
+                )
+            )
+            writer.start_episode(episode_index=0)
+            tactile_job_count = 0
+            for frame_index in range(2):
+                sample = _raw_tactile_sample(frame_index=frame_index)
+                state = sample.hand_states["left"]
+                state.update(
+                    {
+                        "tactile_snapshot_sequence": 11,
+                        "tactile_snapshot_source_timestamp": 9.9,
+                        "tactile_snapshot_available_timestamp": 9.95,
+                        "tactile_snapshot_source_clock": "local_wall_time",
+                        "tactile_snapshot_available_clock": "local_wall_time",
+                        "tactile_timestamp": 9.9,
+                        "tactile_version": 3,
+                    }
+                )
+                jobs = writer.plan_sample_jobs(sample)
+                tactile_job_count += sum(
+                    job.kind == TACTILE_FRAME_JOB_KIND for job in jobs
+                )
+                for job in jobs:
+                    writer.handle_job(job)
+
+            self.assertEqual(tactile_job_count, 1)
+            self.assertEqual(
+                writer._episodes[0].rows_by_frame[0][
+                    "observation.hand.left.tactile_frame_index"
+                ],
+                0,
+            )
+            self.assertEqual(
+                writer._episodes[0].rows_by_frame[1][
+                    "observation.hand.left.tactile_frame_index"
+                ],
+                0,
+            )
+            writer.finalize_episode(0)
+            manifest_path = (
+                Path(tmpdir)
+                / "tactile/observation.hand.left.tactile/chunk-000/episode_000000/manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["frame_count"], 1)
+            self.assertEqual(manifest["frames"][0]["snapshot_sequence"], 11)
+
     def test_writer_defaults_to_external_tactile_storage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = LeRobotV21Writer(

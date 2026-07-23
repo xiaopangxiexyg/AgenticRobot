@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import numpy as np
 
 from teleop_runtime.sources.camera import realsense_rgb
 from teleop_runtime.sources.camera.realsense_rgb import RealSenseRGBCameraConfig, RealSenseRGBSource
@@ -64,7 +65,7 @@ class _FakePipeline:
 class _FakeRealSense:
     def __init__(self) -> None:
         self.stream = SimpleNamespace(color="color", depth="depth")
-        self.format = SimpleNamespace(bgr8="bgr8", z16="z16")
+        self.format = SimpleNamespace(bgr8="bgr8", yuyv="yuyv", z16="z16")
         self.camera_info = SimpleNamespace(serial_number="serial_number")
         self.last_pipeline: _FakePipeline | None = None
         self.pipelines: list[_FakePipeline] = []
@@ -124,7 +125,7 @@ def test_realsense_startup_resets_and_warms_up_front_without_depth() -> None:
     assert pipeline is fake_rs.last_pipeline
     assert fake_rs.last_config is not None
     assert fake_rs.last_config.device == "FRONT123"
-    assert fake_rs.last_config.streams == [("color", 640, 480, "bgr8", 15)]
+    assert fake_rs.last_config.streams == [("color", 640, 480, "yuyv", 15)]
     assert pipeline.stop_calls == 1
     assert pipeline.wait_timeouts == [1000, 1000, 1000]
     sleep_mock.assert_called_once_with(0.2)
@@ -153,7 +154,7 @@ def test_realsense_startup_depth_stream_is_only_enabled_when_requested() -> None
     assert pipeline.stop_calls == 0
     assert fake_rs.last_config is not None
     assert fake_rs.last_config.streams == [
-        ("color", 640, 480, "bgr8", 15),
+        ("color", 640, 480, "yuyv", 15),
         ("depth", 424, 240, "z16", 15),
     ]
     assert fake_rs.align_requests == ["color"]
@@ -178,13 +179,13 @@ def test_realsense_startup_can_hardware_reset_matched_serial_before_start() -> N
         )
     )
 
-    with patch.object(realsense_rgb.time, "sleep") as sleep_mock:
+    with patch.object(source._shutdown_event, "wait", return_value=False) as wait_mock:
         pipeline, _ = source._start_pipeline(fake_rs)
 
     assert pipeline.stop_calls == 0
     assert other_device.hardware_reset_calls == 0
     assert target_device.hardware_reset_calls == 1
-    sleep_mock.assert_called_once_with(1.25)
+    wait_mock.assert_called_once_with(1.25)
 
 
 def test_realsense_startup_retries_after_connection_error_with_hardware_reset() -> None:
@@ -205,14 +206,14 @@ def test_realsense_startup_retries_after_connection_error_with_hardware_reset() 
         )
     )
 
-    with patch.object(realsense_rgb.time, "sleep") as sleep_mock:
+    with patch.object(source._shutdown_event, "wait", return_value=False) as wait_mock:
         pipeline, _ = source._start_pipeline(fake_rs)
 
     assert pipeline is fake_rs.pipelines[1]
     assert len(fake_rs.pipelines) == 2
     assert fake_rs.pipelines[0].stop_calls == 1
     assert target_device.hardware_reset_calls == 1
-    sleep_mock.assert_called_once_with(1.25)
+    wait_mock.assert_called_once_with(1.25)
 
 
 def test_realsense_startup_does_not_hardware_reset_unsupported_profile() -> None:
@@ -265,20 +266,59 @@ def test_realsense_startup_retries_when_warmup_gets_no_frames() -> None:
         )
     )
 
-    with patch.object(realsense_rgb.time, "sleep") as sleep_mock:
+    with patch.object(source._shutdown_event, "wait", return_value=False) as wait_mock:
         pipeline, _ = source._start_pipeline(fake_rs)
 
     assert pipeline is fake_rs.pipelines[1]
     assert len(fake_rs.pipelines) == 2
     assert fake_rs.pipelines[0].stop_calls == 1
     assert target_device.hardware_reset_calls == 1
-    sleep_mock.assert_called_once_with(1.25)
+    wait_mock.assert_called_once_with(1.25)
+
+
+def test_realsense_startup_aborts_warmup_after_timeout_threshold() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 10
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=10,
+            restart_after_timeouts=3,
+            startup_hardware_reset_on_failure=False,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="no_frames_after=10"):
+        source._start_pipeline(fake_rs)
+
+    assert fake_rs.pipelines[0].wait_timeouts == [1000, 1000, 1000]
+
+
+def test_realsense_warmup_honours_shutdown_request() -> None:
+    fake_rs = _FakeRealSense()
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=10,
+        )
+    )
+    pipeline = fake_rs.pipeline()
+    source._shutdown_event.set()
+
+    with pytest.raises(RuntimeError, match="startup_cancelled"):
+        source._warmup_pipeline(pipeline)
+
+    assert pipeline.wait_timeouts == []
 
 
 def test_realsense_startup_reset_defaults_are_serialized() -> None:
     payload = RealSenseRGBCameraConfig(serial="ABC").to_dict()
 
+    assert payload["color_format"] == "yuyv"
     assert payload["startup_reset"] is True
+    assert payload["restart_on_runtime_error"] is True
     assert payload["startup_reset_sleep_sec"] == 0.2
     assert payload["startup_warmup_frames"] == 10
     assert payload["startup_hardware_reset"] is False
@@ -287,6 +327,33 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     assert payload["startup_hardware_reset_sleep_sec"] == 2.0
     assert payload["startup_hardware_reset_reconnect_timeout_sec"] == 6.0
     assert payload["startup_hardware_reset_reconnect_poll_sec"] == 0.25
+    assert payload["restart_on_black_frames"] is True
+    assert payload["restart_after_black_frames"] == 5
+
+
+def test_realsense_near_zero_frames_are_dropped_and_restart_pipeline() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            restart_after_black_frames=2,
+            black_frame_max_value=1,
+        )
+    )
+    black = np.zeros((48, 64, 3), dtype=np.uint8)
+    low_light_but_valid = np.zeros_like(black)
+    low_light_but_valid[::8, ::8] = 3
+
+    with patch.object(source, "_restart_pipeline") as restart:
+        assert source._handle_black_frame(black) is True
+        restart.assert_not_called()
+        assert source._handle_black_frame(black) is True
+        restart.assert_called_once()
+
+    assert source._handle_black_frame(low_light_but_valid) is False
+    info = source.device_info()
+    assert info["black_frame_count"] == 2
+    assert info["consecutive_black_frame_count"] == 0
+    assert info["last_sampled_max_value"] == 3
 
 
 def test_realsense_frame_timeouts_mark_stale_and_request_restart() -> None:
@@ -335,3 +402,12 @@ def test_realsense_frame_timeout_before_stale_is_runtime_warning_only() -> None:
     assert info["consecutive_timeout_count"] == 1
     assert info["last_error"] is None
     assert message in str(info["last_runtime_error"])
+
+
+def test_realsense_classifies_disconnect_errors_for_pipeline_restart() -> None:
+    assert RealSenseRGBSource._is_recoverable_runtime_error("Device disconnected")
+    assert RealSenseRGBSource._is_recoverable_runtime_error("UVC backend failure")
+    assert RealSenseRGBSource._is_recoverable_runtime_error(
+        "wait_for_frames cannot be called before start()"
+    )
+    assert not RealSenseRGBSource._is_recoverable_runtime_error("bad image shape")

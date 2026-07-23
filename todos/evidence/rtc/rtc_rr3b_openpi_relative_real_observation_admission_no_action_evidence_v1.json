@@ -1,0 +1,143 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr3b_openpi_relative_real_observation_admission_no_action_2026_07_23",
+  "captured_at": "2026-07-23T22:17:25+08:00",
+  "scope": "real_observation_openpi_raw_rtc_explicit_validity_admission_emission_and_bounded_drain_no_action",
+  "gate_result": "admission_emission_and_drain_passed_control_budget_not_passed",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "teleop_or_replay_modified": false,
+    "sim_observation_modified": false,
+    "openpi_checkout_modified": false
+  },
+  "loaded_instance": {
+    "evidence_only_not_compatibility_allowlist": true,
+    "model_id": "0715-cube-front-ready-mix-4to1-relative",
+    "checkpoint_step": 149999,
+    "action_pose_mode": "relative",
+    "prediction_horizon_steps": 50,
+    "model_action_dim": 16,
+    "camera_source_keys": [
+      "front",
+      "left_wrist",
+      "right_wrist"
+    ]
+  },
+  "explicit_rtc_parameters": {
+    "profile": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "request_validity_steps": 50,
+    "worker_stop_timeout_sec": 2.0,
+    "effective_action_hz": 30.0,
+    "effective_policy_hz": 30.0,
+    "continuation_mode": "none"
+  },
+  "boundary": {
+    "rtc_real_shadow": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "arm_observation_only": true,
+    "left_gripper_observation_only": true,
+    "right_gripper_observation_only": true,
+    "gripper_send_commands": false,
+    "tactile_enabled": false,
+    "position_reference_called": false,
+    "dispatch_called": false,
+    "all_transport_exchanges_non_authoritative": true,
+    "action_send_authority": false
+  },
+  "real_observation": {
+    "loop_steps": 900,
+    "state_valid_after_warmup": "38/38",
+    "front_camera_frames_at_last_status": 598,
+    "left_wrist_camera_frames_at_last_status": 479,
+    "right_wrist_camera_frames_at_last_status": 452,
+    "terminal_runtime_exit_code": 0
+  },
+  "transport": {
+    "completed_exchange_count": 8,
+    "unique_request_id_count": 8,
+    "source_chunk_size": 50,
+    "cold_inference_duration_sec": 10.730272979009897,
+    "warm_inference_duration_median_sec": 0.7259750210214406
+  },
+  "plan_and_emission": {
+    "accepted_merge_count": 7,
+    "rejected_merge_count": 1,
+    "rejection_reasons": {
+      "request_deadline_expired": 1
+    },
+    "admitted_keyframe_count": 256,
+    "discarded_obsolete_count": 94,
+    "maximum_live_plan_keyframe_count": 38,
+    "formal_emission_count": 240,
+    "unique_emission_id_count": 240,
+    "selected_emission_count": 240,
+    "duplicate_formal_emission_detected": false,
+    "gate_passed": true
+  },
+  "control_loop": {
+    "blocking_model_inference_ran_in_worker": true,
+    "control_budget_sec": 0.03333333333333333,
+    "completion_count": 8,
+    "total_control_budget_exceeded_count": 8,
+    "control_duration_max_sec": 0.1017965060309507,
+    "request_submission_tick_count": 8,
+    "request_submission_budget_exceeded_count": 8,
+    "request_submission_duration_median_sec": 0.0988168120093178,
+    "request_submission_duration_max_sec": 0.1017965060309507,
+    "completion_without_request_submission_count": 7,
+    "completion_without_request_submission_budget_exceeded_count": 0,
+    "completion_without_request_submission_duration_median_sec": 0.012203357997350395,
+    "completion_without_request_submission_duration_max_sec": 0.013676383998245,
+    "emission_without_request_submission_count": 234,
+    "emission_without_request_submission_budget_exceeded_count": 0,
+    "emission_without_request_submission_duration_median_sec": 0.007820153521606699,
+    "emission_without_request_submission_duration_max_sec": 0.015905645966995507,
+    "all_budget_exceeded_ticks_submitted_a_request": true,
+    "posthoc_reanalysis_at": "2026-07-23T23:00:00+08:00",
+    "superseded_interpretation": "every completion/admission step exceeds the 30 Hz control budget",
+    "interpretation": "warm completion/admission and ordinary emission remain below budget; every over-budget tick constructs and submits a new three-camera request",
+    "gate_passed": false,
+    "reanalysis_source": "the exact debug JSONL identified by debug_jsonl_sha256"
+  },
+  "shutdown": {
+    "worker_session_state": "DRAINED",
+    "worker_thread_exited_at_frontend_close": true,
+    "client_process_exited": true,
+    "server_process_cleaned_by_exact_validated_pid": true,
+    "loopback_port_8078_closed": true,
+    "gate_passed": true
+  },
+  "compatibility": {
+    "new_parameters_are_model_neutral": true,
+    "rtc_request_validity_default_remains": 10,
+    "rtc_worker_stop_timeout_default_remains_sec": 0.0,
+    "non_rtc_override_rejected": true,
+    "sync_queue_v1_default_keyframe_hz_remains": 15.0
+  },
+  "raw_log_attestation": {
+    "debug_jsonl_sha256": "cc6d14cd5f7d1393110124c9446f6c6b4ec0b400aa8cbea139d238acef203960",
+    "wrapper_log_sha256": "7a29f986fdf19429e58eed80e5cac71552096a4931f514059060ca4330788cf5",
+    "debug_event_counts": {
+      "startup": 1,
+      "rtc_frontend_step": 900,
+      "rtc_transport_exchange": 8,
+      "rtc_frontend_close": 1
+    }
+  },
+  "post_capture_local_remediation": {
+    "evidence": "todos/evidence/rtc/rtc_rr3c_local_request_path_regression_v1.json",
+    "observation_cut_bulk_payload_hash_removed": true,
+    "worker_model_input_hash_retained": true,
+    "local_three_camera_budget_exceeded_count": 0,
+    "does_not_retroactively_change_this_real_run_result": true
+  },
+  "next_gate": {
+    "action_send_authorized": false,
+    "required": [
+      "repeat the same real-observation no-action shadow with the locally verified request-path remediation",
+      "observe zero control-budget exceedances while retaining request/result/epoch/plan admission and worker-side model_input_hash attestation"
+    ]
+  }
+}

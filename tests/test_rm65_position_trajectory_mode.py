@@ -320,6 +320,52 @@ def test_acceleration_mode_coupled_ik_sync_uses_accepted_qcmd_not_preview_qref()
     }
 
 
+def test_acceleration_mode_coupled_ik_sync_skips_percentile_snapshot_hot_path(
+    monkeypatch,
+) -> None:
+    left_backend, _ = _backend()
+    right_backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="right",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        )
+    )
+    retargeter = _RecordingDualArmRetargeter()
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        left_command_backend=left_backend,
+        right_command_backend=right_backend,
+        left_preview_backend=left_backend,
+        right_preview_backend=right_backend,
+        dual_arm_retargeter=retargeter,
+        arm_loop_step_dt_tracker={},
+    )
+
+    def fail_if_percentiles_are_built():
+        raise AssertionError("coupled IK sync entered diagnostic percentile hot path")
+
+    monkeypatch.setattr(
+        left_backend,
+        "_background_stream_timing_percentiles_snapshot",
+        fail_if_percentiles_are_built,
+    )
+    monkeypatch.setattr(
+        right_backend,
+        "_background_stream_timing_percentiles_snapshot",
+        fail_if_percentiles_are_built,
+    )
+
+    real_teleop._sync_dual_arm_retargeter_for_real_control(
+        components,
+        reset_tracking=False,
+    )
+
+    assert len(retargeter.calls) == 1
+
+
 def test_linear_mode_coupled_ik_sync_retains_preview_behavior() -> None:
     left_backend = RM65ArmBackend(
         RM65ArmBackendConfig(
@@ -415,6 +461,22 @@ def test_position_trajectory_policy_distinguishes_stop_degrade_and_normal() -> N
     )
     assert accepted_elbow_fallback.mode == "tracking"
     assert accepted_elbow_fallback.speed_scale == 1.0
+
+    accepted_shoulder_fallback = _position_trajectory_policy(
+        {"collision_avoidance_status": "tracking"},
+        {"singularity_gate_status": "allow_position_shoulder_singular"},
+        degraded_speed_scale=0.1,
+    )
+    assert accepted_shoulder_fallback.mode == "tracking"
+    assert accepted_shoulder_fallback.speed_scale == 1.0
+
+    accepted_current_singular = _position_trajectory_policy(
+        {"collision_avoidance_status": "tracking"},
+        {"singularity_gate_status": "allow_current_singular"},
+        degraded_speed_scale=0.1,
+    )
+    assert accepted_current_singular.mode == "tracking"
+    assert accepted_current_singular.speed_scale == 1.0
 
     normal = _position_trajectory_policy(
         {"collision_avoidance_status": "tracking"},

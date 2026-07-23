@@ -19,6 +19,10 @@ from robot_motion.replay.trajectory import (
     normalize_replay_trajectory_source,
     select_replay_qpos_init_targets,
 )
+from .pose_frames import (
+    replay_action_pose_frame,
+    replay_action_poses_in_hardware_base_at_index,
+)
 
 
 @dataclass(frozen=True)
@@ -411,7 +415,33 @@ def run_replay_preflight(
     dataset_tcp, dataset_tcp_checks = dataset_tcp_by_side(group, sides)
     checks.extend(dataset_tcp_checks)
 
-    first_action = group.actions[0]
+    try:
+        action_pose_frame = replay_action_pose_frame(group)
+        first_hardware_poses = replay_action_poses_in_hardware_base_at_index(
+            group, sides, index=0
+        )
+        checks.append(
+            ReplayCheckResult(
+                name="action_pose_frame_contract",
+                ok=True,
+                level="info",
+                message=(
+                    f"replay action poses resolved from {action_pose_frame} "
+                    "to RM65 controller base"
+                ),
+                details={"source_frame": action_pose_frame, "hardware_frame": "arm_base"},
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        first_hardware_poses = {}
+        checks.append(
+            ReplayCheckResult(
+                name="action_pose_frame_contract",
+                ok=False,
+                message=str(exc),
+            )
+        )
+
     for side in sides:
         if trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
             _, qpos_checks = _qpos_trajectory_checks(group, side=side)
@@ -520,7 +550,7 @@ def run_replay_preflight(
             )
 
         current_pose = _as_pose_matrix(current_tcp_pose_by_side.get(side))
-        target_pose = xyzquat_to_pose_matrix(first_action[ACTION_ARM_POSE_SLICES[side]])
+        target_pose = xyzquat_to_pose_matrix(first_hardware_poses.get(side))
         if current_pose is None or target_pose is None:
             checks.append(
                 ReplayCheckResult(

@@ -1,0 +1,132 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t1_transport_lifecycle_local_2026_07_22",
+  "scope": "non_formal_local_fake_transport_only",
+  "captured_at": "2026-07-22T17:37:45+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "python": "3.10.20",
+    "test_interpreter": "uv run python / dexteleop310",
+    "real_model_loaded": false,
+    "external_network_accessed": false,
+    "real_openpi_server_started": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "production_entrypoint_started": false
+  },
+  "rtc_4b_t1_boundary": {
+    "shared_worker": "robot_motion/deploy/policy_worker.py",
+    "generic_client": "deployments/client/rtc.py",
+    "generic_executor": "deployments/client/rtc_executor.py",
+    "openpi_adapter": "deployments/openpi/client/rtc.py",
+    "openpi_transport": "deployments/openpi/client/transport.py",
+    "control_station_dependency": false,
+    "teleop_or_replay_dependency": false,
+    "position_dependency": false,
+    "target_or_dispatch_authority": false,
+    "sync_queue_v1_changed": false
+  },
+  "lifecycle_contract": {
+    "executor_cancel_hook_optional": true,
+    "cancel_hook_dispatched_at_most_once_per_worker_session": true,
+    "cancel_hook_isolated_from_control_stop": true,
+    "cancellation_statuses": [
+      "not_supported",
+      "pending",
+      "requested",
+      "declined",
+      "failed"
+    ],
+    "cancel_acceptance_claims_worker_drain": false,
+    "worker_thread_exit_is_separate_drain_fact": true,
+    "transport_cancel_latched": true,
+    "transport_close_idempotent_and_async": true,
+    "transport_begin_cancel_receipt_typed": true,
+    "transport_close_completion_receipt_typed": true,
+    "rearm_rejected_while_close_pending": true,
+    "rearm_rejected_after_close_failure": true,
+    "connection_and_session_generations_monotonic": true,
+    "reconnect_metadata_hash_revalidated": true,
+    "old_epoch_or_session_completion_requires_receiver_rejection": true
+  },
+  "fake_policy_and_transport_robustness": {
+    "backend_without_cancel_hook_preserves_existing_stop_behavior": true,
+    "invalid_cancel_return_becomes_typed_failure": true,
+    "blocking_cancel_hook_cannot_block_zero_timeout_stop": true,
+    "blocking_infer_released_by_cancel": true,
+    "cancelled_infer_fault_completion_observed": true,
+    "repeated_cancel_is_idempotent": true,
+    "pending_close_blocks_rearm": true,
+    "failed_close_latches_and_blocks_rearm": true,
+    "fresh_session_reconnects_after_rearm": true,
+    "metadata_drift_after_handshake_rejected": true,
+    "model_horizon_sweep_steps": [2, 4, 8]
+  },
+  "scoped_source_sha256": {
+    "robot_motion/deploy/policy_worker.py": "52faa19b35484988c4d24984c23af60daa4374e8a6b7676b516fa2b998f2a1aa",
+    "robot_motion/deploy/__init__.py": "f1a3ee5b4d349b6b2ea2234c14e93f5d4d413643ccda603764e140b8ab1d78a0",
+    "deployments/client/rtc.py": "242ab1aabe2eaf62143ed4a6ec831883c65bdbb16c4f70de84d449628a75636d",
+    "deployments/client/rtc_executor.py": "f6c876c249f90dbdc2159bb2d40abd13cf3e9f0780ca29d5e85fb5de9c6eb47d",
+    "deployments/openpi/client/rtc.py": "b396d95ea5468b59df09dc40927e063d2333cbcad677b40c95836a03426ad136",
+    "deployments/openpi/client/transport.py": "45fd5261cfdc3f7b8a52d6fcba51943ab65d2a891daffe7c6dcd5a17c1dc6fc0",
+    "tests/test_deploy_rtc_policy_worker.py": "ebadfd26afb10357dfc66ce58f8fca8199afc2af9aa55d275ead83b79ac595b8",
+    "tests/test_rtc_model_agnostic_protocol.py": "19b6981c40a495d2e2c40afbfbcdfc354583c58a0b71f023ad07be9f587c2c36",
+    "tests/test_openpi_rtc_final_chunk_adapter.py": "7f58deee54efe8856db1f5f8f8d09a37790869049d6773779ed6d50303b86f31",
+    "tests/test_openpi_rtc_transport_lifecycle.py": "00bc2858edc9681ece93245f0c4ea88096ac1b3ed7f94d54e279b91e7635fd54"
+  },
+  "out_of_scope_capture_sha256": {
+    "teleop_runtime/deploy/run_policy.py": "73529a2ea5a3c98e7ef34a31ca6c6d6879974f11948e5872313504a8ba9a25a5",
+    "teleop_runtime/deploy/replay.py": "984ab78db8717f42e9d0c843c282bf73546ac24e71ec2eb77ced3e5f1008bb1a",
+    "teleop_runtime/deploy/rtc_step_fanout.py": "b3e5ea886dff038a504ffe6ff211dcb4b93cfeff81642c1afa1ed56e74e7fa48",
+    "teleop_runtime/position_control/deploy_executor.py": "69eb32a1b16644d296a50ef9918cef7c981a530248ee16ce2488abb7e5af0c26",
+    "sim/mujoco/deploy/rtc_policy.py": "b2f5e9a8e1d836cd5db87f1903c75f3bc7fbbe5672318c10acd4cf08819df7f8"
+  },
+  "verification": [
+    {
+      "command": "PYTHONPATH=. uv run pytest -q <T1 worker/openpi/generic fake subset>",
+      "result": "51 passed in 0.81s"
+    },
+    {
+      "command": "PYTHONPATH=. uv run pytest -q tests/test_rtc_model_agnostic_protocol.py",
+      "result": "44 passed in 0.37s"
+    },
+    {
+      "command": "NO_PROXY=127.0.0.1,localhost PYTHONPATH=. uv run pytest -q <full RTC focused set>",
+      "result": "154 passed in 3.04s"
+    },
+    {
+      "command": "PYTHONPATH=. uv run pytest -q <OpenPI/deploy/position compatibility set>",
+      "result": "120 passed, 1 skipped in 3.25s"
+    },
+    {
+      "command": "python -m py_compile <rtc_4b_t1_scoped_python_paths>",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "claims": [
+    "a replaceable RTC backend may expose optional cancellation without changing generic request, result, timed-plan, safety or dispatch ownership",
+    "worker stop remains bounded even when a third-party cancellation hook blocks",
+    "OpenPI RTC transport cancellation, close completion and reconnect have separate local typed lifecycle facts while preserving the existing final-chunk payload",
+    "reconnect metadata drift fails closed before a result can enter plan admission",
+    "default deployment, position and RTC compatibility fixtures remain green"
+  ],
+  "non_claims": [
+    "not a real websocket or OpenPI server loopback result",
+    "not connect, infer or close deadline evidence on a live transport",
+    "not half-open network recovery evidence",
+    "not real observation or no-action shadow readiness",
+    "not true prefix-conditioned model RTC evidence",
+    "not M1C or M1D execution drain evidence",
+    "not simulation or hardware motion evidence",
+    "not motion authorization",
+    "not full-suite green evidence"
+  ]
+}

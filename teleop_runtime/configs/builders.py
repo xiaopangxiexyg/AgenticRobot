@@ -13,6 +13,7 @@ from ..hand_tcp_alignment import (
 )
 from ..rigs import BimanualRig
 from ..session import TeleopSession, TeleopSessionConfig
+from ..safety import TeleopSafetyConfig
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
@@ -140,6 +141,8 @@ def build_bimanual_session(
     vive_tracker_height_correction_m: float = (
         DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m
     ),
+    safety_config: TeleopSafetyConfig | None = None,
+    _build_rig: bool = True,
 ) -> TeleopSession:
     sources = []
     retargeters = []
@@ -287,22 +290,90 @@ def build_bimanual_session(
             )
         )
 
-    if left_arm_backend_config is not None:
-        backends["left_arm"] = RM65ArmBackend(left_arm_backend_config)
-    if right_arm_backend_config is not None:
-        backends["right_arm"] = RM65ArmBackend(right_arm_backend_config)
-    if left_hand_backend_config is not None:
-        left_backend = _build_hand_backend(left_hand_backend_config)
-        backends[left_backend.name] = left_backend
-    if right_hand_backend_config is not None:
-        right_backend = _build_hand_backend(right_hand_backend_config)
-        backends[right_backend.name] = right_backend
-
-    rig = BimanualRig(backends=backends)
+    if not _build_rig and (
+        left_arm_backend_config is not None or right_arm_backend_config is not None
+    ):
+        raise ValueError("Passive bimanual session cannot receive arm backend configs.")
+    if _build_rig:
+        if left_arm_backend_config is not None:
+            backends["left_arm"] = RM65ArmBackend(left_arm_backend_config)
+        if right_arm_backend_config is not None:
+            backends["right_arm"] = RM65ArmBackend(right_arm_backend_config)
+        if left_hand_backend_config is not None:
+            left_backend = _build_hand_backend(left_hand_backend_config)
+            backends[left_backend.name] = left_backend
+        if right_hand_backend_config is not None:
+            right_backend = _build_hand_backend(right_hand_backend_config)
+            backends[right_backend.name] = right_backend
+        rig = BimanualRig(backends=backends)
+    else:
+        rig = None
     return TeleopSession(
         config=session_config or TeleopSessionConfig(mode="bimanual"),
         sources=sources,
         retargeters=retargeters,
         rig=rig,
         calibration=calibration,
+        safety_config=safety_config,
+    )
+
+
+def build_bimanual_passive_session(
+    *,
+    calibration: TeleopCalibration,
+    session_config: TeleopSessionConfig | None = None,
+    vive_port: int = 9999,
+    vive_clock_sync_port: int | None = None,
+    vive_tracker_configs: list[ViveTrackerConfig] | None = None,
+    left_hand_serial_port: str | None = None,
+    right_hand_serial_port: str | None = None,
+    left_hand_backend_config: HandBackendConfig | None = None,
+    right_hand_backend_config: HandBackendConfig | None = None,
+    hand_serial_config: str = "latest",
+    load_default_hand_serial_ports: bool = True,
+    keyboard_source: KeyboardButtonSource | None = None,
+    vive_tracker_height_correction: bool = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_enabled
+    ),
+    vive_tracker_height_correction_m: float = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m
+    ),
+    safety_config: TeleopSafetyConfig | None = None,
+) -> TeleopSession:
+    """Build the collection-profile input side without a rig or backend.
+
+    This reuses the same Vive/hand source, tracker alignment, calibration and
+    hand retargeter construction as :func:`build_bimanual_session`.  It never
+    creates an arm backend or ``BimanualRig``; the caller must still start the
+    returned session explicitly, and a passive wrapper must keep it outside
+    ``ARMED/RUNNING``.
+    """
+
+    config = session_config or TeleopSessionConfig(
+        mode="bimanual_passive_pose",
+        record_enabled=False,
+        allow_hardware_after_debug_pass=False,
+    )
+    if config.record_enabled:
+        raise ValueError("Passive bimanual session forbids session recording.")
+    if config.allow_hardware_after_debug_pass:
+        raise ValueError("Passive bimanual session forbids hardware-arm eligibility.")
+    return build_bimanual_session(
+        calibration=calibration,
+        session_config=config,
+        vive_port=vive_port,
+        vive_clock_sync_port=vive_clock_sync_port,
+        vive_tracker_configs=vive_tracker_configs,
+        left_hand_serial_port=left_hand_serial_port,
+        right_hand_serial_port=right_hand_serial_port,
+        left_hand_backend_config=left_hand_backend_config,
+        right_hand_backend_config=right_hand_backend_config,
+        hand_serial_config=hand_serial_config,
+        load_default_hand_serial_ports=load_default_hand_serial_ports,
+        keyboard_source=keyboard_source,
+        enable_dual_arm_collision_avoidance=False,
+        vive_tracker_height_correction=vive_tracker_height_correction,
+        vive_tracker_height_correction_m=vive_tracker_height_correction_m,
+        safety_config=safety_config,
+        _build_rig=False,
     )

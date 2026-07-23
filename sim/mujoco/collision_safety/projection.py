@@ -157,3 +157,82 @@ class KinematicCollisionProjector:
             sweep_samples=sample_count,
             blocking_check=upper_check,
         )
+
+    def recover_from_clearance_violation(
+        self,
+        source_data,
+        *,
+        start_qpos: np.ndarray,
+        requested_qpos: np.ndarray,
+    ) -> CollisionProjectionResult:
+        """Allow only a monotonic retreat from a soft clearance violation.
+
+        Physical actuator tracking can place the measured state inside the
+        preventive clearance envelope without exceeding the hard penetration
+        limit. A projector that requires a safe start would then reject even a
+        command that retreats from contact. This recovery path samples the
+        complete segment and accepts it only when distance never worsens, hard
+        penetration is never crossed, and the requested endpoint is safe.
+        """
+
+        start = np.asarray(start_qpos, dtype=np.float64).reshape(-1)
+        requested = np.asarray(requested_qpos, dtype=np.float64).reshape(-1)
+        expected = self.controlled_qpos_indices.size
+        if start.shape != (expected,) or requested.shape != (expected,):
+            raise ValueError(f"Collision recovery expects {expected} controlled qpos values.")
+        start_check = self._check_candidate(source_data, start)
+        if start_check.safe:
+            return self.project(
+                source_data,
+                start_qpos=start,
+                requested_qpos=requested,
+            )
+        delta = requested - start
+        sample_count = max(
+            1,
+            int(np.ceil(np.max(np.abs(delta)) / self.policy.sweep_max_joint_step_rad)),
+        )
+        previous_distance = float(start_check.minimum_distance_m)
+        last_check = start_check
+        tolerance = 1e-9
+        for sample_index in range(1, sample_count + 1):
+            alpha = sample_index / sample_count
+            check = self._check_candidate(source_data, start + alpha * delta)
+            distance = float(check.minimum_distance_m)
+            if (
+                check.penetration_depth_m > self.policy.hard_penetration_m
+                or distance + tolerance < previous_distance
+            ):
+                return CollisionProjectionResult(
+                    status="invalid_safe_state",
+                    requested_qpos=requested.copy(),
+                    accepted_qpos=start.copy(),
+                    projection_alpha=0.0,
+                    modified=True,
+                    check=start_check,
+                    sweep_samples=sample_index,
+                    blocking_check=check,
+                )
+            previous_distance = distance
+            last_check = check
+        if not last_check.safe:
+            return CollisionProjectionResult(
+                status="invalid_safe_state",
+                requested_qpos=requested.copy(),
+                accepted_qpos=start.copy(),
+                projection_alpha=0.0,
+                modified=True,
+                check=start_check,
+                sweep_samples=sample_count,
+                blocking_check=last_check,
+            )
+        return CollisionProjectionResult(
+            status="recovered",
+            requested_qpos=requested.copy(),
+            accepted_qpos=requested.copy(),
+            projection_alpha=1.0,
+            modified=False,
+            check=last_check,
+            sweep_samples=sample_count,
+            blocking_check=start_check,
+        )

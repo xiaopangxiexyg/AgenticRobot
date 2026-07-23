@@ -1,5 +1,8 @@
 # Teleop Runtime
 
+> 本页说明模块接口和局部示例。正式真机遥操/数采的组合命令统一从
+> [`docs/real/README.md`](../docs/real/README.md) 复制。
+
 `teleop_runtime` 是新的通用遥操作运行时骨架。当前版本已经能把下面两条链路接到统一接口里：
 
 - `VIVE tracker -> pose_to_arm -> RM65`
@@ -184,7 +187,7 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 - `build_annotated_dual_rm65_calibration(...)`
 - `left_right_base_distance = 0.525`
-- `desk` 轴定义固定为 `+x=forward, +y=left, +z=up`
+- `desk` 轴定义固定为：`+X` 是操作者面向桌面的方向，`+Y` 是从 workspace near-boundary 原点朝向操作者左侧的方向，`+Z` 是垂直桌面向上的方向
 - 默认双臂 base 摆放为 `left_arm @ -y`, `right_arm @ +y`
 - 所有共享 SAPIEN viewer 统一使用“从 `desk +x` 看向原点”的视角，因此屏幕左边就是逻辑 `left_arm(-y)`，屏幕右边就是逻辑 `right_arm(+y)`
 

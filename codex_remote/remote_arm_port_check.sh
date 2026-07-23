@@ -12,11 +12,12 @@ TIMEOUT=2
 usage() {
   cat <<'EOF'
 Usage:
-  remote_arm_port_check.sh -H dex-remote --arm-ip 192.168.1.18 --port 8080
+  remote_arm_port_check.sh -H dex-remote --arm-ip 192.168.1.18 --arm-port 8080
 
 Options:
       --arm-ip HOST  Robot/controller IP or hostname.
-      --port PORT    TCP port to probe.
+      --arm-port PORT Robot/controller TCP port to probe.  ``--port`` remains
+                      reserved for the remote SSH port in common options.
       --timeout SEC  Connect timeout. Default: 2.
 
 Safety: L1, remote read-only network check.
@@ -36,7 +37,7 @@ while [[ $# -gt 0 ]]; do
       ARM_IP="$2"
       shift 2
       ;;
-    --port|--arm-port)
+    --arm-port)
       [[ $# -ge 2 ]] || die "$1 requires a value"
       ARM_PORT="$2"
       shift 2

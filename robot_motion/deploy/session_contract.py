@@ -24,8 +24,8 @@ from dataset_contracts.pose_frames import (
     PoseFrameContract,
 )
 from dataset_contracts.pose_training import (
-    POSE_TRAINING_ORIGIN_NATIVE_V23,
     POSE_TRAINING_ORIGIN_V22_RAW_IDENTITY,
+    RUNTIME_POSE_BINDING_EXPLICIT_CANONICAL_DESK,
 )
 from dataset_contracts.state_input import STATE_INPUT_MODE_RAW, normalize_state_input_mode
 from dataset_contracts.v22 import (
@@ -37,6 +37,7 @@ from dataset_contracts.v22 import (
     SIDES,
 )
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
+from robot_motion.action.keyframe_safety import EndEffectorSafetyCapability
 
 from .schema import ACTION_DIM, OBSERVATION_STATE_DIM
 
@@ -239,6 +240,7 @@ class RuntimeEndEffectorCapability:
     backend: str
     enabled: bool = True
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    safety: EndEffectorSafetyCapability | None = None
 
     def __post_init__(self) -> None:
         side = str(self.side).strip().lower()
@@ -255,6 +257,18 @@ class RuntimeEndEffectorCapability:
         object.__setattr__(self, "backend", backend or "none")
         object.__setattr__(self, "enabled", bool(self.enabled))
         object.__setattr__(self, "metadata", dict(self.metadata))
+        safety = self.safety
+        if safety is not None:
+            if not isinstance(safety, EndEffectorSafetyCapability):
+                raise TypeError(
+                    "Runtime end-effector safety must be "
+                    "EndEffectorSafetyCapability."
+                )
+            if safety.adapter != (adapter or "none_v1"):
+                raise DatasetLayoutBindingError(
+                    "Runtime end-effector adapter differs from its safety "
+                    "capability."
+                )
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeEndEffectorCapability":
@@ -264,16 +278,26 @@ class RuntimeEndEffectorCapability:
             backend=str(payload.get("backend", "none")),
             enabled=bool(payload.get("enabled", True)),
             metadata=dict(payload.get("metadata", {})),
+            safety=(
+                None
+                if payload.get("safety") is None
+                else EndEffectorSafetyCapability.from_dict(
+                    payload["safety"]  # type: ignore[arg-type]
+                )
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "side": self.side,
             "adapter": self.adapter,
             "backend": self.backend,
             "enabled": bool(self.enabled),
             "metadata": dict(self.metadata),
         }
+        if self.safety is not None:
+            payload["safety"] = self.safety.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -512,11 +536,13 @@ def resolve_deploy_session_contract(
     )
     runtime_pose_binding_was_explicit = runtime_pose_frames is not None
     if (
-        pose_training_origin == POSE_TRAINING_ORIGIN_NATIVE_V23
+        pose_training_data is not None
+        and pose_training_data.runtime_pose_binding
+        == RUNTIME_POSE_BINDING_EXPLICIT_CANONICAL_DESK
         and runtime_pose_frames is None
     ):
         raise DatasetLayoutBindingError(
-            "A native v2.3 pose policy requires an explicit "
+            "A canonical-desk pose policy requires an explicit "
             "runtime_pose_frame_contract. Identity fallback is reserved for the "
             "separately declared v2.2 raw identity compatibility path."
         )
@@ -669,6 +695,54 @@ def resolve_deploy_session_contract(
         raise DatasetLayoutBindingError(
             "v22_q6_bridge requires legacy_q6_slot_indices for every configured action channel."
         )
+    if resolved_mode == POLICY_CONTRACT_V22_NATIVE and hardware_output:
+        missing_native_safety = tuple(
+            side
+            for side in expected_sides
+            if side in runtime
+            and runtime[side].enabled
+            and runtime[side].safety is None
+        )
+        if missing_native_safety:
+            raise DatasetLayoutBindingError(
+                "Real v22_native runtime is missing end-effector safety "
+                f"capability for side(s): {list(missing_native_safety)}."
+            )
+        for side in expected_sides:
+            if side not in runtime or not runtime[side].enabled:
+                continue
+            safety = runtime[side].safety
+            if safety is None:
+                continue
+            channel = policy_io_layout.channel("action", side)
+            expected_units = (
+                ("token",) * channel.dim
+                if channel.value_type == "discrete"
+                else (
+                    ()
+                    if channel.units is None
+                    else (str(channel.units),) * channel.dim
+                )
+            )
+            if (
+                safety.value_type != channel.value_type
+                or safety.names != channel.names
+                or safety.units != expected_units
+            ):
+                raise DatasetLayoutBindingError(
+                    f"{side} native safety capability differs from the "
+                    "policy action channel type/names/units."
+                )
+            if channel.value_type == "discrete":
+                for index, token_spec in enumerate(channel.tokens):
+                    declared = set(
+                        safety.allowed_tokens_by_component[index]
+                    )
+                    if not declared.issubset(token_spec.category_ids):
+                        raise DatasetLayoutBindingError(
+                            f"{side} native safety token allowlist exceeds "
+                            f"layout vocabulary for {token_spec.name!r}."
+                        )
 
     return ResolvedDeploySessionContract(
         deploy_schema_version=DEPLOY_SCHEMA_V2,

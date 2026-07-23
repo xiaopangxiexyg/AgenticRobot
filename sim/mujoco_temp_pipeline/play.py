@@ -63,9 +63,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
 
     from sim.mujoco.diagnostics.cube_drop import _load_mujoco_gui, _require_interactive_display
+    from sim.mujoco.viewer import passive_viewer_handle
 
     _require_interactive_display()
-    _mujoco, viewer = _load_mujoco_gui()
+    # Keep the existing display/GLFW preflight, but use the shared viewer
+    # context below so the daemon GUI thread is drained before env/model
+    # teardown. Direct ``viewer.launch_passive`` can segfault at interpreter
+    # shutdown on Linux after a successful replay.
+    _load_mujoco_gui()
     env = CubeLiftEnv(args.task_config)
     episodes = 0
     successes = 0
@@ -75,17 +80,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     rejected_actions = 0
     minimum_safety_distance = float("inf")
     hard_penetrations = 0
+    tracking_error_sum = 0.0
+    tracking_error_max = 0.0
+    gripper_tracking_error_sum = 0.0
+    gripper_tracking_error_max = 0.0
     last_safety_signature: tuple[object, ...] | None = None
     started = time.monotonic()
     try:
         observation, _info = env.reset(seed=args.seed)
-        with viewer.launch_passive(
-            env.scene.model,
-            env.scene.data,
+        with passive_viewer_handle(
+            env.scene,
             show_left_ui=not args.hide_left_ui,
             show_right_ui=not args.hide_right_ui,
         ) as handle:
-            handle.cam.lookat[:] = (-0.412, 0.0, 0.15)
+            handle.cam.lookat[:] = (-0.472, 0.0, 0.15)
             handle.cam.distance = 1.05
             handle.cam.azimuth = 135.0
             handle.cam.elevation = -25.0
@@ -106,11 +114,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 total_raw_reward += reward
                 policy_steps += 1
                 safety = info.get("safety") or {}
-                modified = bool(safety.get("modified", False))
-                alpha = float(safety.get("projection_alpha", 1.0))
+                modified = bool(
+                    safety.get("modified", info.get("safety_modified", False))
+                )
+                alpha = float(
+                    safety.get(
+                        "projection_alpha",
+                        info.get("safety_projection_alpha", 1.0),
+                    )
+                )
                 projected_actions += int(modified)
                 rejected_actions += int(alpha <= 1e-8)
-                distance_value = safety.get("minimum_distance_m")
+                distance_value = safety.get(
+                    "minimum_distance_m",
+                    info.get("safety_minimum_distance_m"),
+                )
                 if distance_value is not None:
                     distance = float(distance_value)
                     if np.isfinite(distance):
@@ -120,6 +138,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 hard_penetrations += int(
                     info.get("termination_reason")
                     == "robot_environment_penetration"
+                )
+                tracking_error_sum += float(
+                    info.get("arm_tracking_error_rad_mean", 0.0)
+                )
+                tracking_error_max = max(
+                    tracking_error_max,
+                    float(info.get("arm_tracking_error_rad_max", 0.0)),
+                )
+                gripper_error = abs(
+                    float(info.get("right_gripper_tracking_error", 0.0))
+                )
+                gripper_tracking_error_sum += gripper_error
+                gripper_tracking_error_max = max(
+                    gripper_tracking_error_max, gripper_error
                 )
                 if getattr(args, "print_safety_events", False) and modified:
                     signature = (
@@ -174,6 +206,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             else minimum_safety_distance
         ),
         "hard_penetration_count": hard_penetrations,
+        "arm_tracking_error_rad_mean": tracking_error_sum / max(policy_steps, 1),
+        "arm_tracking_error_rad_max": tracking_error_max,
+        "gripper_tracking_error_mean": (
+            gripper_tracking_error_sum / max(policy_steps, 1)
+        ),
+        "gripper_tracking_error_max": gripper_tracking_error_max,
         "device": str(device),
     }
 

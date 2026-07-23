@@ -40,7 +40,7 @@
         "name": "debug_cube",
         "shape": "box",
         "size_m": [0.03, 0.03, 0.03],
-        "initial_position_m": [-0.412, 0.0, 0.026],
+        "initial_position_m": [-0.472, 0.0, 0.026],
         "initial_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
         "mass_kg": 0.05,
         "inertia_diagonal_kg_m2": [0.0000075, 0.0000075, 0.0000075],
@@ -75,7 +75,7 @@
   },
   "metadata": {
     "sapien_role": "teleop_debug_preview_only",
-    "robot_dynamics_status": "actuator_model_pending",
-    "real_150hz_system_id_status": "pending_data"
+    "robot_dynamics_status": "rm65_general_actuator_fourteen_trace_distal_refit_force_contact_provisional",
+    "real_120hz_arm_system_id_status": "v4_stage_fit_complete_new_clean_held_out_pending"
   }
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -236,13 +237,25 @@ class TactileUVVisualizer:
     def _ensure_window(self, canvas: np.ndarray) -> None:
         if self._window_created:
             return
-        flag = (
-            self._cv2.WINDOW_NORMAL
-            if self.config.resizable_window
-            else self._cv2.WINDOW_AUTOSIZE
-        )
+        flag = self._cv2.WINDOW_AUTOSIZE
+        if self.config.resizable_window:
+            flag = self._cv2.WINDOW_NORMAL | int(
+                getattr(self._cv2, "WINDOW_FREERATIO", 0)
+            )
         self._cv2.namedWindow(self.config.window_name, flag)
         if self.config.resizable_window:
+            set_property = getattr(self._cv2, "setWindowProperty", None)
+            aspect_property = getattr(self._cv2, "WND_PROP_ASPECT_RATIO", None)
+            free_ratio = getattr(self._cv2, "WINDOW_FREERATIO", None)
+            if (
+                callable(set_property)
+                and aspect_property is not None
+                and free_ratio is not None
+            ):
+                try:
+                    set_property(self.config.window_name, aspect_property, free_ratio)
+                except Exception:
+                    pass
             height, width = canvas.shape[:2]
             self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
         self._window_created = True
@@ -439,7 +452,10 @@ class DMTacForceVisualizerConfig:
     scale: int = 1
     arrow_scale: float = 0.42
     min_arrow_norm: float = 0.02
-    fixed_ref: float | None = None
+    # Use one physical scale across every sensor and frame. Per-frame robust
+    # normalization makes arbitrarily small startup noise appear fully
+    # saturated and prevents visual comparison between sensors.
+    fixed_ref: float | None = 1.0
     normal_sign: float = 1.0
     mode: str = "absolute"
     resizable_window: bool = True
@@ -637,23 +653,44 @@ class DMTacDistributedForceVisualizer:
             return
         self._ensure_cv2()
         assert self._cv2 is not None
-        flag = (
-            self._cv2.WINDOW_NORMAL
-            if self.config.resizable_window
-            else self._cv2.WINDOW_AUTOSIZE
-        )
+        flag = self._cv2.WINDOW_AUTOSIZE
+        if self.config.resizable_window:
+            flag = self._cv2.WINDOW_NORMAL | int(
+                getattr(self._cv2, "WINDOW_FREERATIO", 0)
+            )
         self._cv2.namedWindow(self.config.window_name, flag)
         if self.config.resizable_window:
+            set_property = getattr(self._cv2, "setWindowProperty", None)
+            aspect_property = getattr(self._cv2, "WND_PROP_ASPECT_RATIO", None)
+            free_ratio = getattr(self._cv2, "WINDOW_FREERATIO", None)
+            if (
+                callable(set_property)
+                and aspect_property is not None
+                and free_ratio is not None
+            ):
+                try:
+                    set_property(self.config.window_name, aspect_property, free_ratio)
+                except Exception:
+                    pass
             height, width = canvas.shape[:2]
             self._cv2.resizeWindow(self.config.window_name, int(width), int(height))
         self._window_created = True
 
-    def update(self, tactile_by_side: dict[str, dict[str, np.ndarray] | None]) -> list[str]:
+    def update(
+        self,
+        tactile_by_side: dict[str, dict[str, np.ndarray] | None],
+        *,
+        health_by_side: dict[str, dict[str, Any]] | None = None,
+    ) -> list[str]:
         if self._closed:
             return []
         side_panels: list[np.ndarray] = []
         for side in tuple(str(side) for side in self.config.enabled_sides):
             tactile_dict = tactile_by_side.get(side) or {}
+            health = (health_by_side or {}).get(side) or {}
+            status = str(health.get("status") or "ok")
+            if status != "ok":
+                tactile_dict = {}
             sensor_panels: list[np.ndarray] = []
             for sensor_key, force in sorted(tactile_dict.items(), key=lambda item: str(item[0])):
                 sensor_panels.append(
@@ -663,7 +700,10 @@ class DMTacDistributedForceVisualizer:
                     )
                 )
             if not sensor_panels:
-                sensor_panels.append(self._render_blank(title=f"{side}: no DMTAC tactile"))
+                detail = str(health.get("message") or status)
+                sensor_panels.append(
+                    self._render_blank(title=f"{side}: DMTAC {detail}")
+                )
             side_panels.append(self._hstack_equal_height(sensor_panels))
         if not side_panels:
             side_panels.append(self._render_blank(title="no DMTAC tactile"))
@@ -712,6 +752,138 @@ class DMTacDistributedForceVisualizer:
             pass
 
 
+_ASYNC_DMTAC_CLOSE_SENTINEL = "__teleop_dmtac_visualizer_close__"
+
+
+def _run_dmtac_visualizer_process(
+    config: DMTacForceVisualizerConfig,
+    input_queue: Any,
+    event_queue: Any,
+    ready_queue: Any,
+) -> None:
+    visualizer: DMTacDistributedForceVisualizer | None = None
+    try:
+        visualizer = DMTacDistributedForceVisualizer(config)
+        visualizer.update({})
+    except Exception as exc:  # noqa: BLE001
+        ready_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return
+    ready_queue.put({"ok": True})
+    try:
+        while True:
+            try:
+                payload = input_queue.get(timeout=0.015)
+            except queue.Empty:
+                keys = visualizer.poll_events()
+            else:
+                if isinstance(payload, str) and payload == _ASYNC_DMTAC_CLOSE_SENTINEL:
+                    break
+                if not isinstance(payload, dict):
+                    continue
+                keys = visualizer.update(
+                    payload.get("tactile") or {},
+                    health_by_side=payload.get("health") or {},
+                )
+            for key in keys:
+                try:
+                    event_queue.put_nowait(str(key))
+                except queue.Full:
+                    break
+    finally:
+        visualizer.close()
+
+
+class AsyncDMTacDistributedForceVisualizer:
+    """Run the relatively expensive DMTAC grid renderer off the control loop."""
+
+    def __init__(self, config: DMTacForceVisualizerConfig, *, startup_timeout_sec: float = 3.0):
+        self.config = config
+        self._closed = False
+        self._ctx = mp.get_context("spawn")
+        self._input_queue = self._ctx.Queue(maxsize=2)
+        self._event_queue = self._ctx.Queue(maxsize=8)
+        self._ready_queue = self._ctx.Queue(maxsize=1)
+        self._process = self._ctx.Process(
+            target=_run_dmtac_visualizer_process,
+            args=(self.config, self._input_queue, self._event_queue, self._ready_queue),
+            name="dmtac_force_visualizer",
+            daemon=True,
+        )
+        self._process.start()
+        try:
+            ready = self._ready_queue.get(timeout=float(startup_timeout_sec))
+        except queue.Empty:
+            if self._process.is_alive():
+                return
+            raise RuntimeError("DMTAC visualizer process exited during startup.")
+        if not isinstance(ready, dict) or ready.get("ok") is not True:
+            error = ready.get("error") if isinstance(ready, dict) else repr(ready)
+            self.close()
+            raise RuntimeError(f"DMTAC visualizer process failed to start: {error}")
+
+    def update(
+        self,
+        tactile_by_side: dict[str, dict[str, np.ndarray] | None],
+        *,
+        health_by_side: dict[str, dict[str, Any]] | None = None,
+    ) -> list[str]:
+        if self._closed or not self._process.is_alive():
+            return []
+        payload = {
+            "tactile": {
+                str(side): None
+                if tactile is None
+                else {
+                    str(key): np.asarray(value, dtype=np.float32)
+                    for key, value in tactile.items()
+                }
+                for side, tactile in tactile_by_side.items()
+            },
+            "health": dict(health_by_side or {}),
+        }
+        try:
+            self._input_queue.put_nowait(payload)
+        except queue.Full:
+            try:
+                self._input_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._input_queue.put_nowait(payload)
+            except queue.Full:
+                pass
+        keys: list[str] = []
+        while True:
+            try:
+                keys.append(str(self._event_queue.get_nowait()))
+            except queue.Empty:
+                return keys
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.is_alive():
+            try:
+                self._input_queue.put_nowait(_ASYNC_DMTAC_CLOSE_SENTINEL)
+            except queue.Full:
+                try:
+                    self._input_queue.get_nowait()
+                    self._input_queue.put_nowait(_ASYNC_DMTAC_CLOSE_SENTINEL)
+                except queue.Empty:
+                    pass
+            self._process.join(timeout=2.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1.0)
+        for q in (self._input_queue, self._event_queue, self._ready_queue):
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
+
+
 def tactile_by_side_from_backends(
     active_sides: object,
     backend_for_side: Callable[[str], InspireTacHandBackend | None],
@@ -754,6 +926,89 @@ def dmtac_force_by_side_from_backends(
             if value is not None
         }
     return tactile_by_side
+
+
+def dmtac_visualization_snapshot_from_backends(
+    active_sides: object,
+    backend_for_side: Callable[[str], Any | None],
+    *,
+    now: float | None = None,
+) -> tuple[
+    dict[str, dict[str, np.ndarray] | None],
+    dict[str, dict[str, Any]],
+]:
+    """Return cached force arrays plus explicit freshness for visualization."""
+
+    current_time = time.time() if now is None else float(now)
+    tactile_by_side: dict[str, dict[str, np.ndarray] | None] = {
+        "left": None,
+        "right": None,
+    }
+    health_by_side: dict[str, dict[str, Any]] = {}
+    for side in tuple(str(side) for side in active_sides):
+        backend = backend_for_side(side)
+        if backend is None:
+            health_by_side[side] = {"status": "unavailable", "message": "backend unavailable"}
+            continue
+        get_state = getattr(backend, "get_state")
+        try:
+            state = get_state(
+                include_tactile_vector=False,
+                copy_tactile_arrays=False,
+            )
+        except TypeError:
+            state = get_state()
+        tactile_dict = state.get("tactile_dict")
+        field_by_key = state.get("tactile_field_by_key")
+        field_by_key = field_by_key if isinstance(field_by_key, dict) else {}
+        configured_fields = tuple(state.get("tactile_fields") or ())
+        if isinstance(tactile_dict, dict):
+            tactile_by_side[side] = {
+                str(key): np.asarray(value, dtype=np.float32)
+                for key, value in tactile_dict.items()
+                if value is not None
+                and (
+                    str(field_by_key.get(str(key), "")) == "distributed_force"
+                    or (
+                        not field_by_key
+                        and configured_fields == ("distributed_force",)
+                    )
+                )
+            }
+        timestamp = state.get("tactile_timestamp")
+        try:
+            age_sec = None if timestamp is None else max(0.0, current_time - float(timestamp))
+        except (TypeError, ValueError):
+            age_sec = None
+        try:
+            read_hz = float(state.get("tactile_read_hz") or 0.0)
+        except (TypeError, ValueError):
+            read_hz = 0.0
+        max_age_sec = max(0.5, 2.0 / read_hz) if read_hz > 0.0 else 1.0
+        worker_required = bool(state.get("tactile_process_read"))
+        worker_alive = bool(state.get("tactile_worker_alive"))
+        error = str(state.get("telemetry_error") or "")
+        if error or (worker_required and not worker_alive):
+            status = "disconnected"
+            message = error or "worker disconnected"
+        elif age_sec is None:
+            status = "waiting"
+            message = "waiting for tactile frame"
+        elif age_sec > max_age_sec:
+            status = "stale"
+            message = f"stale age={age_sec:.2f}s"
+        else:
+            status = "ok"
+            message = f"age={age_sec:.2f}s"
+        health_by_side[side] = {
+            "status": status,
+            "message": message,
+            "age_sec": age_sec,
+            "max_age_sec": max_age_sec,
+            "worker_alive": worker_alive,
+            "error": error or None,
+        }
+    return tactile_by_side, health_by_side
 
 
 def tactile_by_side_from_hand_states(

@@ -257,7 +257,10 @@ def _rewrite_paths_in_value(value: Any, *, output_episode_index: int, chunk_size
     """Rewrite only values that visibly contain episode/chunk path tokens."""
 
     if isinstance(value, str):
-        if "episode_" not in value:
+        # Runtime metadata also contains semantic event names such as
+        # ``episode_start``.  Only numbered artifact tokens are paths that can
+        # be re-indexed.
+        if _EPISODE_TOKEN_RE.search(value) is None:
             return value
         return _output_relative_path(
             Path(value),
@@ -762,7 +765,14 @@ def _rewrite_episode_record(
     record = dict(source_record)
     record["episode_index"] = int(output_episode_index)
     record["episode_id"] = f"episode_{int(output_episode_index):06d}"
-    for key in ("parquet_path", "video_paths", "tactile_paths", "wrist_depth_mask_paths", "wrist_depth_raw_paths"):
+    for key in (
+        "parquet_path",
+        "video_paths",
+        "tactile_paths",
+        "wrist_depth_mask_paths",
+        "wrist_depth_raw_paths",
+        "summary",
+    ):
         if key in record:
             record[key] = _rewrite_paths_in_value(
                 record[key],

@@ -10,9 +10,15 @@ DEFAULT_LEFT_ARM_QPOS = np.array(
     dtype=float,
 )
 DEFAULT_RIGHT_ARM_QPOS = np.array(
-    [-1.57, -0.47, 1.94, 3.10, -0.70, -1.57],
+    [-1.57, -0.47, 1.94, 0.0, -0.70, -1.57],
     dtype=float,
 )
+
+# These values are URDF-valid preview/solver seeds, not a calibrated station
+# home.  Real startup/recovery must prefer an explicit alignment profile or
+# fresh measured state.  In particular, the historical right-J4 ~= pi
+# visualizer fallback is outside the active RM65 URDF and must never be
+# silently clipped into an execution seed.
 
 # Position execution envelope validated by the current 60 Hz accepted-qref /
 # 120 Hz command-stream teleop path. These are shared motion defaults rather

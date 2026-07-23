@@ -40,6 +40,11 @@ def init_arm_ui_state(components: object) -> dict[str, object]:
             "init_arm_target_position_error_m": None,
             "init_arm_target_rotation_error_deg": None,
             "init_arm_stability_dwell_sec": None,
+            "init_arm_qpos_active": False,
+            "init_arm_qpos_phase": "inactive",
+            "init_arm_qpos_step_index": None,
+            "init_arm_qpos_step_count": None,
+            "init_arm_qpos_max_error_deg": None,
         }
     return controller.status_payload()
 
@@ -85,6 +90,11 @@ def init_arm_debug_state(components: object) -> dict[str, object]:
         "min_samples": state.get("init_arm_min_samples"),
         "arrival_status": str(state.get("init_arm_arrival_status", "") or ""),
         "arrival_label": str(state.get("init_arm_arrival_label", "") or ""),
+        "qpos_active": bool(state.get("init_arm_qpos_active", False)),
+        "qpos_phase": str(state.get("init_arm_qpos_phase", "") or ""),
+        "qpos_step_index": state.get("init_arm_qpos_step_index"),
+        "qpos_step_count": state.get("init_arm_qpos_step_count"),
+        "qpos_max_error_deg": state.get("init_arm_qpos_max_error_deg"),
     }
 
 

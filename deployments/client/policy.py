@@ -10,6 +10,7 @@ from types import ModuleType
 from typing import Any, Mapping
 
 from robot_motion.deploy.observation import DeploymentObservation
+from robot_motion.deploy.observation_view import PolicyObservationView
 
 
 @dataclass
@@ -26,14 +27,21 @@ class LoadedPolicy:
         if callable(reset):
             reset()
 
-    def predict(self, observation: DeploymentObservation) -> Any:
+    def predict(self, observation: DeploymentObservation | PolicyObservationView) -> Any:
+        model_observation: DeploymentObservation | PolicyObservationView = observation
+        if isinstance(observation, PolicyObservationView):
+            # Existing object-style policies keep their public observation API,
+            # but the object is rebuilt only from the strict actor view.  It
+            # cannot expose runtime faults, authority, safety, writer or backend
+            # state through the legacy DeploymentObservation surface.
+            model_observation = observation.to_deployment_observation()
         predict = getattr(self.policy, "predict", None)
         if callable(predict):
-            return predict(observation)
+            return predict(model_observation)
         if callable(self.policy):
             if self.call_with_model_input:
                 return self.policy(observation.model_input())
-            return self.policy(observation)
+            return self.policy(model_observation)
         raise TypeError(f"Loaded policy {self.name!r} is not callable and has no predict().")
 
     def begin_prediction_transaction(self) -> Any:
@@ -51,6 +59,21 @@ class LoadedPolicy:
         rollback = getattr(self.policy, "rollback_prediction_transaction", None)
         if callable(rollback):
             rollback(checkpoint)
+
+    def create_raw_rtc_adapter(self, **kwargs: Any) -> Any:
+        """Forward the optional model-package raw-RTC capability explicitly.
+
+        ``LoadedPolicy`` remains the stable owner returned by the common loader.
+        Model packages opt in by implementing the same named capability on the
+        wrapped policy; no capability is inferred from a policy name or model.
+        """
+
+        creator = getattr(self.policy, "create_raw_rtc_adapter", None)
+        if not callable(creator):
+            raise TypeError(
+                f"Loaded policy {self.name!r} does not expose create_raw_rtc_adapter()."
+            )
+        return creator(**kwargs)
 
 
 class HoldPolicy:

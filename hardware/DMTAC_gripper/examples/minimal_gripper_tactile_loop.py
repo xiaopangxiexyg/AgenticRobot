@@ -17,7 +17,9 @@ def main() -> None:
         backend="cpu",
         fields=("distributed_force",),
         max_fps=120,
+        denoise_distributed_force=True,
         denoise_config=TactileDenoiseConfig(
+            enabled=True,
             mode="delta",
             baseline_frames=20,
             deadband_abs=5e-5,

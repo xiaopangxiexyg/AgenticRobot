@@ -14,6 +14,13 @@ from utils.hand_eye.calibration import (
 )
 from utils.hand_eye.transforms import as_transform, invert_transform, transform_to_list
 
+from .tcp_extrinsic import (
+    DEFAULT_TCP_PROFILE,
+    DEFAULT_URDF,
+    UmiTcpExtrinsic,
+    derive_umi_tcp_extrinsic,
+)
+
 
 SAMPLE_SCHEMA = "dexteleop.umi_hand_eye.samples.v1"
 RESULT_SCHEMA = "dexteleop.umi_hand_eye.result.v1"
@@ -108,6 +115,7 @@ class UmiCalibrationResult:
     method: str
     metrics: dict[str, Any]
     sample_count: int
+    tcp_extrinsic: UmiTcpExtrinsic | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -121,6 +129,8 @@ class UmiCalibrationResult:
             raise ValueError("side must be left or right")
         if _parse_utc(self.expires_at_utc) <= _parse_utc(self.created_at_utc):
             raise ValueError("expires_at_utc must be later than created_at_utc")
+        if self.tcp_extrinsic is not None and self.tcp_extrinsic.side != self.side:
+            raise ValueError("UMI TCP extrinsic side does not match calibration side")
 
     @property
     def T_tracker_to_camera(self) -> np.ndarray:
@@ -134,6 +144,12 @@ class UmiCalibrationResult:
     @property
     def T_desk_to_vive_world(self) -> np.ndarray:
         return self.T_board_to_vive_world.copy()
+
+    @property
+    def T_tcp_to_tracker(self) -> np.ndarray | None:
+        if self.tcp_extrinsic is None:
+            return None
+        return self.tcp_extrinsic.T_tcp_to_tracker.copy()
 
     def is_valid_at(self, when: datetime | None = None) -> bool:
         instant = _utc_now() if when is None else _datetime_utc(when)
@@ -154,6 +170,17 @@ class UmiCalibrationResult:
             raise RuntimeError("UMI calibration camera serial does not match the active camera")
         if tracker_name is not None and str(tracker_name) != self.tracker_name:
             raise RuntimeError("UMI calibration tracker name does not match the active tracker")
+
+    def require_tcp_profile(self, tcp_profile: str) -> None:
+        if self.tcp_extrinsic is None:
+            raise RuntimeError(
+                "UMI calibration does not contain T_tcp_to_tracker; recalibration is required"
+            )
+        if self.tcp_extrinsic.tcp_profile.lower() != str(tcp_profile).strip().lower():
+            raise RuntimeError(
+                f"UMI TCP profile mismatch: result={self.tcp_extrinsic.tcp_profile!r}, "
+                f"expected={tcp_profile!r}"
+            )
 
     def pose_frame_contract(self, *, storage_frame: str = "desk_absolute") -> dict[str, Any]:
         if storage_frame not in {"desk_absolute", "raw_absolute"}:
@@ -187,6 +214,12 @@ class UmiCalibrationResult:
                     "created_at_utc": self.created_at_utc,
                     "expires_at_utc": self.expires_at_utc,
                     "desk_definition": "calibration_board_frame",
+                    "canonical_desk_urdf_frame": "workspace_near_boundary_frame",
+                    "canonical_desk_definition": (
+                        "Left-right centered on the tabletop surface and located at the "
+                        "operator/robot-near boundary of the valid tabletop workspace "
+                        "along the tabletop-center-to-operator/robot direction."
+                    ),
                 },
             },
             "metadata": {
@@ -215,6 +248,9 @@ class UmiCalibrationResult:
             "T_board_to_vive_world": transform_to_list(self.T_board_to_vive_world),
             "T_desk_to_vive_world": transform_to_list(self.T_desk_to_vive_world),
             "T_vive_world_to_desk": transform_to_list(self.T_vive_world_to_desk),
+            "tcp_extrinsic": (
+                None if self.tcp_extrinsic is None else self.tcp_extrinsic.to_dict()
+            ),
             "metrics": self.metrics,
             "metadata": self.metadata,
             "matrix_convention": {
@@ -242,6 +278,11 @@ class UmiCalibrationResult:
             method=str(payload["method"]),
             metrics=dict(payload.get("metrics") or {}),
             sample_count=int(payload["sample_count"]),
+            tcp_extrinsic=(
+                None
+                if payload.get("tcp_extrinsic") is None
+                else UmiTcpExtrinsic.from_dict(payload["tcp_extrinsic"])
+            ),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -253,8 +294,10 @@ def solve_umi_hand_eye(
     camera_serial: str,
     tracker_name: str,
     tracker_role: str,
-    validity_seconds: float = 3600.0,
+    validity_seconds: float = 10800.0,
     method: str = "AUTO",
+    tcp_profile: str = DEFAULT_TCP_PROFILE,
+    urdf_path: str | Path = DEFAULT_URDF,
     created_at: datetime | None = None,
     metadata: Mapping[str, Any] | None = None,
     **solver_options: Any,
@@ -271,18 +314,26 @@ def solve_umi_hand_eye(
     )
     created = _utc_now() if created_at is None else _datetime_utc(created_at)
     expires = created + timedelta(seconds=float(validity_seconds))
+    side_value = str(side).strip().lower()
+    tcp_extrinsic = derive_umi_tcp_extrinsic(
+        side=side_value,
+        T_camera_to_tracker=hand_eye.T_camera_to_gripper,
+        tcp_profile=tcp_profile,
+        urdf_path=urdf_path,
+    )
     return UmiCalibrationResult(
         T_camera_to_tracker=hand_eye.T_camera_to_gripper,
         T_board_to_vive_world=hand_eye.T_target_to_base,
         created_at_utc=_iso_utc(created),
         expires_at_utc=_iso_utc(expires),
-        side=str(side).strip().lower(),
+        side=side_value,
         camera_serial=str(camera_serial),
         tracker_name=str(tracker_name),
         tracker_role=str(tracker_role),
         method=hand_eye.method,
         metrics=dict(hand_eye.metrics),
         sample_count=len(samples),
+        tcp_extrinsic=tcp_extrinsic,
         metadata=dict(metadata or {}),
     )
 

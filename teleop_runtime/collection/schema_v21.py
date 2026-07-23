@@ -32,6 +32,68 @@ OBSERVATION_STATE_DIM = 38
 VIVE_RETARGET_FRAME_NAME = "vive_retarget_frame"
 
 
+def bind_hand_state_snapshot_fields(
+    row: dict[str, Any],
+    *,
+    side: str,
+    hand_state: Mapping[str, Any],
+) -> None:
+    """Bind the shared hand telemetry/tactile causal-audit columns."""
+
+    prefix = f"observation.hand.{side}."
+    row[f"{prefix}tactile_timestamp"] = hand_state.get("tactile_timestamp")
+    row[f"{prefix}telemetry_timestamp"] = hand_state.get("telemetry_timestamp")
+    for stream in ("telemetry", "tactile"):
+        for suffix in (
+            "sequence",
+            "source_timestamp",
+            "available_timestamp",
+            "age_sec",
+            "source_age_sec",
+            "available_age_sec",
+            "source_clock",
+            "available_clock",
+        ):
+            key = f"{stream}_snapshot_{suffix}"
+            row[f"{prefix}{key}"] = hand_state.get(key)
+    row[f"{prefix}causal_snapshot_cutoff_timestamp"] = hand_state.get(
+        "causal_snapshot_cutoff_timestamp"
+    )
+    row[f"{prefix}causal_snapshot_contract"] = hand_state.get(
+        "causal_snapshot_contract"
+    )
+
+
+def bind_hand_runtime_diagnostic_fields(
+    row: dict[str, Any],
+    *,
+    side: str,
+    hand_state: Mapping[str, Any],
+) -> None:
+    """Bind command/read timing needed to separate plant and observation lag."""
+
+    prefix = f"observation.hand.{side}."
+    for name in (
+        "joint_age_sec",
+        "gripper_measurement_timestamp",
+        "last_sent_command_timestamp",
+        "last_sent_command_completed_timestamp",
+        "gripper_read_elapsed_s",
+        "gripper_read_skipped",
+        "gripper_read_skip_reason",
+        "gripper_read_forced",
+        "gripper_telemetry_max_deferral_s",
+        "gripper_send_attempt_timestamp",
+        "gripper_send_elapsed_s",
+        "gripper_send_lock_wait_s",
+        "gripper_last_send_status",
+        "gripper_last_send_skip_reason",
+        "gripper_last_send_target_scalar",
+        "telemetry_elapsed_s",
+    ):
+        row[f"{prefix}{name}"] = hand_state.get(name)
+
+
 def _vector_list(value: Any, *, length: int | None = None) -> list[float] | None:
     if value is None:
         return None
@@ -281,6 +343,9 @@ def collector_sample_to_row(
         "timestamp": float(sample.timestamp),
         "session_state": sample.session_state,
         "control_hz": float(sample.control_hz),
+        "collection.continuity_segment_index": int(
+            sample.metadata.get("collection_continuity_segment_index", 0) or 0
+        ),
         "arm_state_source": sample.arm_state_source,
         "active_sides": list(sample.active_sides),
         "camera_keys": sorted(sample.camera_frames.keys()),
@@ -726,38 +791,8 @@ def collector_sample_to_row(
         row[f"observation.hand.{side}.tactile"] = (
             _vector_list(hand_state.get("tactile")) if inline_tactile else None
         )
-        row[f"observation.hand.{side}.tactile_timestamp"] = hand_state.get("tactile_timestamp")
-        row[f"observation.hand.{side}.telemetry_timestamp"] = hand_state.get("telemetry_timestamp")
-        row[f"observation.hand.{side}.telemetry_snapshot_sequence"] = hand_state.get(
-            "telemetry_snapshot_sequence"
-        )
-        row[f"observation.hand.{side}.telemetry_snapshot_source_timestamp"] = hand_state.get(
-            "telemetry_snapshot_source_timestamp"
-        )
-        row[f"observation.hand.{side}.telemetry_snapshot_available_timestamp"] = hand_state.get(
-            "telemetry_snapshot_available_timestamp"
-        )
-        row[f"observation.hand.{side}.telemetry_snapshot_age_sec"] = hand_state.get(
-            "telemetry_snapshot_age_sec"
-        )
-        row[f"observation.hand.{side}.tactile_snapshot_sequence"] = hand_state.get(
-            "tactile_snapshot_sequence"
-        )
-        row[f"observation.hand.{side}.tactile_snapshot_source_timestamp"] = hand_state.get(
-            "tactile_snapshot_source_timestamp"
-        )
-        row[f"observation.hand.{side}.tactile_snapshot_available_timestamp"] = hand_state.get(
-            "tactile_snapshot_available_timestamp"
-        )
-        row[f"observation.hand.{side}.tactile_snapshot_age_sec"] = hand_state.get(
-            "tactile_snapshot_age_sec"
-        )
-        row[f"observation.hand.{side}.causal_snapshot_cutoff_timestamp"] = hand_state.get(
-            "causal_snapshot_cutoff_timestamp"
-        )
-        row[f"observation.hand.{side}.causal_snapshot_contract"] = hand_state.get(
-            "causal_snapshot_contract"
-        )
+        bind_hand_state_snapshot_fields(row, side=side, hand_state=hand_state)
+        bind_hand_runtime_diagnostic_fields(row, side=side, hand_state=hand_state)
         row[f"observation.hand.{side}.gripper_read_elapsed_s"] = hand_state.get(
             "gripper_read_elapsed_s"
         )
@@ -922,6 +957,24 @@ def collector_sample_to_row(
         row[f"{prefix}.receive_timestamp"] = None if frame is None else frame.receive_timestamp
         row[f"{prefix}.available_timestamp"] = (
             None if frame is None else frame.available_timestamp
+        )
+        row[f"{prefix}.source_clock"] = (
+            None if frame is None else frame.metadata.get("source_clock", "receiver_wall_time")
+        )
+        row[f"{prefix}.available_clock"] = (
+            None if frame is None else frame.metadata.get("available_clock", "local_wall_time")
+        )
+        row[f"{prefix}.camera_timestamp_sec"] = (
+            None if frame is None else frame.metadata.get("camera_timestamp_sec")
+        )
+        row[f"{prefix}.timestamp_domain"] = (
+            None if frame is None else frame.metadata.get("timestamp_domain")
+        )
+        row[f"{prefix}.sensor_timestamp_ms"] = (
+            None if frame is None else frame.metadata.get("sensor_timestamp_ms")
+        )
+        row[f"{prefix}.sensor_frame_number"] = (
+            None if frame is None else frame.metadata.get("color_frame_number")
         )
         row[f"{prefix}.age_sec"] = match.age_sec
         row[f"{prefix}.source_frame_index"] = None if frame is None else frame.frame_index

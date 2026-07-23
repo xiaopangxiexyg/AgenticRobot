@@ -144,9 +144,28 @@ class RM65CanonicalIK:
     def reset_from_scene(self) -> Mapping[str, Any]:
         """Reset the planner from the complete authoritative MuJoCo qpos."""
 
-        return self.planner.reset(
+        return self.reset_from_qpos(
             {
                 side: self.scene.get_arm_qpos(side).copy()
+                for side in ("left", "right")
+            }
+        )
+
+    def reset_from_qpos(
+        self,
+        qpos_by_side: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Reset the planner from an explicit complete dual-arm qpos snapshot.
+
+        The MuJoCo pose adapter uses this seam to pass a numerically sanitized
+        snapshot when the simulator's soft joint-limit solver leaves a tiny
+        residual outside the canonical limit.  The MuJoCo scene itself is not
+        mutated and the shared RM65 planner limits are unchanged.
+        """
+
+        return self.planner.reset(
+            {
+                side: np.asarray(qpos_by_side[side], dtype=float).reshape(6).copy()
                 for side in ("left", "right")
             }
         )

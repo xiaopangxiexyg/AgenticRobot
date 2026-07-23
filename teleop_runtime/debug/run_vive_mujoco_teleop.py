@@ -1,10 +1,9 @@
-"""VIVE -> shared RM65 position retargeting -> MuJoCo debug teleoperation.
+"""VIVE -> shared RM65 position retargeting -> MuJoCo teleoperation.
 
 This is deliberately a thin debug composition root.  Device-neutral IK and
 qref/qcmd execution live in ``robot_motion`` and ``sim`` respectively; no real
-arm or deployment frontend is imported here.  MuJoCo currently executes
-prescribed qpos, so this validates retargeting/timing/collision semantics but
-not a physical RM65 servo model.
+arm or deployment frontend is imported here.  The runtime exposes only the
+real-aligned 15 Hz -> 60 Hz -> 120 Hz position chain and physical MuJoCo plant.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,22 +21,32 @@ from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     IKObjectiveWeights,
+    LEGACY_POSITION_CONTROL_PROFILE_NAME,
+    RM65_BIMANUAL_POSITION_V1,
+    RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_POSITION_CONTROL_PROFILE_CHOICES,
     load_ik_tuning_config,
     load_rm65_tool_profile,
     tool_tcp_pose_flange_m_rad,
 )
 from sim.contracts import SimulationContract, TimingSpec
+from sim.mujoco.actuation import (
+    rm65_bimanual_udp_feedback_profile,
+    temporary_bimanual_dmtac_gripper_profile,
+)
 from sim.mujoco.adapters import (
     MujocoPositionExecutionConfig,
     MujocoPositionExecutionRig,
 )
 from sim.mujoco.scene import MujocoScene
+from sim.mujoco.viewer import passive_viewer_handle
 
 from ..calibration import TeleopCalibration
 from ..configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     build_annotated_dual_rm65_calibration,
     default_vive_tracker_configs,
+    load_latest_q6_ports,
 )
 from ..configs.pose_smoothing import (
     build_bimanual_pose_smoother,
@@ -53,12 +63,16 @@ from ..retargeters import (
     DualArmCollisionAwareRetargeterConfig,
     PoseToArmRetargeter,
     PoseToArmRetargeterConfig,
+    ScalarToGripperRetargeter,
+    ScalarToGripperRetargeterConfig,
 )
 from ..safety import TeleopSafetyConfig
 from ..session import TeleopSession, TeleopSessionConfig
 from ..sources.pose import DEFAULT_VIVE_CLOCK_SYNC_PORT, VivePoseSource
 from ..sources.pose.vive_motion import TrackerMotionIntentConfig
+from ..sources.hand import HandQ6Source
 from ..transforms import as_pose_matrix
+from ..position_control.formal_profile import argv_has_option
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -83,10 +97,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Debug the real-aligned 15 Hz target / 60 Hz IK-qref / 120 Hz qcmd "
-            "pipeline against a 1000 Hz prescribed-qpos MuJoCo scene."
+            "pipeline against a 1000 Hz MuJoCo scene."
         )
     )
     parser.add_argument("--contract", type=Path, default=_DEFAULT_CONTRACT)
+    parser.add_argument(
+        "--position-control-profile",
+        choices=RM65_POSITION_CONTROL_PROFILE_CHOICES,
+        default=RM65_BIMANUAL_POSITION_V1_NAME,
+        help=(
+            "Formal live-human position profile, or legacy to restore the previous "
+            "MuJoCo debug defaults."
+        ),
+    )
+    parser.add_argument(
+        "--viewer",
+        action="store_true",
+        help="Open a passive MuJoCo GUI synchronized by the 120 Hz execution rig.",
+    )
     parser.add_argument("--load-profile", type=Path, default=None)
     parser.add_argument(
         "--left-right-base-distance",
@@ -110,6 +138,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--left-tracker-name", default="tracker_1")
     parser.add_argument("--right-tracker-name", default="tracker_2")
+    parser.add_argument(
+        "--q6-config",
+        default="latest",
+        help="Q6 side/serial assignment; explicit hand ports take precedence.",
+    )
+    parser.add_argument(
+        "--q6-config-required",
+        action="store_true",
+        help="Fail unless both Q6 sides resolve from explicit ports/config.",
+    )
+    parser.add_argument("--left-hand-port", default="")
+    parser.add_argument("--right-hand-port", default="")
+    parser.add_argument("--hand-reader-baudrate", type=int, default=115200)
+    parser.add_argument("--hand-reader-timeout", type=_positive_float, default=0.05)
+    parser.add_argument("--show-hand-raw-lines", action="store_true")
+    parser.add_argument("--exo-hand-calibration", action="store_true")
+    parser.add_argument("--exo-hand-calibration-path", default="")
+    parser.add_argument("--gripper-source-dim", type=int, default=2)
+    parser.add_argument("--gripper-command-alpha", type=_unit_float, default=1.0)
+    parser.add_argument("--gripper-input-min", type=float, default=0.1)
+    parser.add_argument("--gripper-input-max", type=float, default=0.9)
     parser.add_argument(
         "--control-mode",
         choices=("absolute",),
@@ -148,6 +197,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--position-ik-iteration-reserve-ms", type=float, default=5.0
     )
     parser.add_argument(
+        "--position-ik-candidate-certification-reserve-ms",
+        type=float,
+        default=3.5,
+    )
+    parser.add_argument(
+        "--position-singularity-candidate-certificate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--position-joint-velocity-limit-profile",
         default="rm65_position_8x",
     )
@@ -178,7 +237,89 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument("--status-hz", type=_positive_float, default=2.0)
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    if args.position_control_profile != LEGACY_POSITION_CONTROL_PROFILE_NAME:
+        profile = RM65_BIMANUAL_POSITION_V1
+        ik = profile.ik_execution
+        command = profile.command_execution
+        source = profile.source_shaping
+
+        def formal_default(attr: str, value: object, *options: str) -> None:
+            if not argv_has_option(raw_argv, *options):
+                setattr(args, attr, value)
+
+        formal_default(
+            "position_inactive_enter_threshold_scale",
+            source.inactive_enter_threshold_scale,
+            "--position-inactive-enter-threshold-scale",
+        )
+        formal_default(
+            "position_ik_orientation_cost",
+            ik.orientation_weight,
+            "--position-ik-orientation-cost",
+        )
+        formal_default(
+            "position_ik_damping", ik.damping, "--position-ik-damping"
+        )
+        formal_default(
+            "position_ik_solve_min_iterations",
+            ik.solve_min_iterations,
+            "--position-ik-solve-min-iterations",
+        )
+        formal_default(
+            "position_ik_solve_max_iterations",
+            ik.solve_max_iterations,
+            "--position-ik-solve-max-iterations",
+        )
+        if not argv_has_option(raw_argv, "--no-position-ik-adaptive-iterations"):
+            args.no_position_ik_adaptive_iterations = not ik.adaptive_iterations
+        formal_default(
+            "position_ik_iteration_reserve_ms",
+            ik.iteration_reserve_ms,
+            "--position-ik-iteration-reserve-ms",
+        )
+        formal_default(
+            "position_joint_velocity_limit_profile",
+            ik.joint_velocity_limit_profile,
+            "--position-joint-velocity-limit-profile",
+        )
+        formal_default(
+            "position_ik_local_step_clip_scale",
+            ik.local_step_candidate_clip_scale,
+            "--position-ik-local-step-clip-scale",
+        )
+        formal_default(
+            "position_post_ik_qpos_smoothing_alpha",
+            source.post_ik_qpos_smoothing_alpha,
+            "--position-post-ik-qpos-smoothing-alpha",
+        )
+        formal_default(
+            "position_post_ik_qpos_smoothing_fast_alpha",
+            source.post_ik_qpos_smoothing_fast_alpha,
+            "--position-post-ik-qpos-smoothing-fast-alpha",
+        )
+        formal_default(
+            "position_max_command_step_deg",
+            command.max_command_step_deg,
+            "--position-max-command-step-deg",
+        )
+        formal_default(
+            "arm_follow_qpos_alpha",
+            command.follow_qpos_alpha,
+            "--arm-follow-qpos-alpha",
+        )
+        formal_default(
+            "position_target_velocity_filter_tau_sec",
+            command.target_velocity_filter_tau_sec,
+            "--position-target-velocity-filter-tau-sec",
+        )
+        args.position_control_profile_metadata = profile.to_metadata()
+    else:
+        args.position_control_profile_metadata = {
+            "name": LEGACY_POSITION_CONTROL_PROFILE_NAME,
+            "compatibility_mode": True,
+        }
     if args.vive_tracker_height_correction_m < 0.0:
         parser.error("--vive-tracker-height-correction-m must be >= 0")
     if args.position_ik_solve_min_iterations <= 0:
@@ -187,8 +328,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("IK max iterations must be >= min iterations")
     if args.position_ik_iteration_reserve_ms < 0.0:
         parser.error("--position-ik-iteration-reserve-ms must be >= 0")
+    if not (
+        0.0
+        <= args.position_ik_candidate_certification_reserve_ms
+        <= args.position_ik_iteration_reserve_ms
+    ):
+        parser.error(
+            "--position-ik-candidate-certification-reserve-ms must be in [0, "
+            "--position-ik-iteration-reserve-ms]"
+        )
     if args.position_target_velocity_filter_tau_sec < 0.0:
         parser.error("--position-target-velocity-filter-tau-sec must be >= 0")
+    if args.hand_reader_baudrate <= 0:
+        parser.error("--hand-reader-baudrate must be positive")
+    if not 0 <= args.gripper_source_dim < 6:
+        parser.error("--gripper-source-dim must be in [0, 5]")
+    if not 0.0 <= args.gripper_input_min < args.gripper_input_max <= 1.0:
+        parser.error(
+            "--gripper-input-min/max must satisfy 0 <= min < max <= 1"
+        )
     if args.calibration_samples <= 0:
         parser.error("--calibration-samples must be positive")
     if args.max_seconds < 0.0:
@@ -196,7 +354,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _position_timing(base: TimingSpec) -> TimingSpec:
+def _position_timing(
+    base: TimingSpec,
+    *,
+    parameter_source: str = RM65_BIMANUAL_POSITION_V1_NAME,
+) -> TimingSpec:
     return TimingSpec(
         sample_hz=15.0,
         policy_hz=15.0,
@@ -207,8 +369,34 @@ def _position_timing(base: TimingSpec) -> TimingSpec:
         camera_hz=base.camera_hz,
         interpolation=base.interpolation,
         command_hold=base.command_hold,
-        parameter_source="vive_mujoco_position_15_60_120_debug",
+        parameter_source=str(parameter_source),
     )
+
+
+def _resolve_q6_ports(args: argparse.Namespace) -> dict[str, str]:
+    explicit = {
+        "left": str(args.left_hand_port).strip(),
+        "right": str(args.right_hand_port).strip(),
+    }
+    resolved = {side: port for side, port in explicit.items() if port}
+    missing = tuple(side for side in ("left", "right") if side not in resolved)
+    if missing:
+        loaded = load_latest_q6_ports(
+            active_sides=missing,
+            config=str(args.q6_config or "latest"),
+            allow_missing=not bool(args.q6_config_required),
+        )
+        resolved.update(
+            (side, str(port).strip())
+            for side, port in loaded.items()
+            if str(port).strip()
+        )
+    if args.q6_config_required and set(resolved) != {"left", "right"}:
+        raise RuntimeError(
+            "Q6 gripper control requires left/right ports; "
+            f"resolved={sorted(resolved)}"
+        )
+    return resolved
 
 
 def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
@@ -323,9 +511,21 @@ def _capture_runtime_home(
 
 def _build(args: argparse.Namespace):
     base_contract = SimulationContract.load(args.contract)
-    timing = _position_timing(base_contract.timing)
+    timing = _position_timing(
+        base_contract.timing,
+        parameter_source=str(args.position_control_profile),
+    )
     contract = replace(base_contract, timing=timing)
-    scene = MujocoScene.from_contract(contract)
+    actuation_profile = rm65_bimanual_udp_feedback_profile()
+    q6_ports = _resolve_q6_ports(args)
+    gripper_actuation_profile = (
+        temporary_bimanual_dmtac_gripper_profile() if q6_ports else None
+    )
+    scene = MujocoScene.from_contract(
+        contract,
+        position_actuation_profile=actuation_profile,
+        gripper_actuation_profile=gripper_actuation_profile,
+    )
     try:
         # This is a simulation reset, not a commanded transition from the
         # URDF's all-zero qpos. Validate the final reset state directly; a
@@ -385,6 +585,12 @@ def _build(args: argparse.Namespace):
                     not args.no_position_ik_adaptive_iterations
                 ),
                 solve_iteration_reserve_ms=float(args.position_ik_iteration_reserve_ms),
+                candidate_certification_reserve_ms=float(
+                    args.position_ik_candidate_certification_reserve_ms
+                ),
+                position_singularity_candidate_certificate_enabled=bool(
+                    args.position_singularity_candidate_certificate
+                ),
                 bimanual_result_contract_enabled=True,
                 enforce_realistic_joint_step=True,
                 left_initial_qpos=initial["left"],
@@ -428,6 +634,8 @@ def _build(args: argparse.Namespace):
                     args.position_target_velocity_filter_tau_sec
                 ),
                 follow_qpos_alpha=float(args.arm_follow_qpos_alpha),
+                actuation_profile=actuation_profile,
+                gripper_actuation_profile=gripper_actuation_profile,
             ),
         )
         source = VivePoseSource(
@@ -439,6 +647,44 @@ def _build(args: argparse.Namespace):
             port=args.port,
             clock_sync_port=args.vive_clock_sync_port,
         )
+        sources = [source]
+        retargeters = [dual]
+        if q6_ports:
+            sources.append(
+                HandQ6Source.from_bimanual(
+                    left_port=q6_ports.get("left"),
+                    right_port=q6_ports.get("right"),
+                    baudrate=int(args.hand_reader_baudrate),
+                    timeout=float(args.hand_reader_timeout),
+                    show_raw_lines=bool(args.show_hand_raw_lines),
+                    exo_hand_calibration=bool(args.exo_hand_calibration),
+                    calibration_path=(
+                        str(args.exo_hand_calibration_path).strip() or None
+                    ),
+                    critical=False,
+                    strict_expected=False,
+                )
+            )
+            for side in ("left", "right"):
+                if side not in q6_ports:
+                    continue
+                retargeters.append(
+                    ScalarToGripperRetargeter(
+                        ScalarToGripperRetargeterConfig(
+                            side=side,
+                            input_channel_name=f"{side}_hand_q6",
+                            effector_name=f"{side}_hand",
+                            source_dim=int(args.gripper_source_dim),
+                            output_dim=0,
+                            invert=False,
+                            alpha=float(args.gripper_command_alpha),
+                            input_min=float(args.gripper_input_min),
+                            input_max=float(args.gripper_input_max),
+                            output_min=0.0,
+                            output_max=1.0,
+                        )
+                    )
+                )
         session = TeleopSession(
             TeleopSessionConfig(
                 mode="vive_mujoco_position_debug",
@@ -447,8 +693,8 @@ def _build(args: argparse.Namespace):
                 allow_hardware_after_debug_pass=True,
                 tracker_channel_names=("left_wrist_pose", "right_wrist_pose"),
             ),
-            sources=[source],
-            retargeters=[dual],
+            sources=sources,
+            retargeters=retargeters,
             rig=rig,
             calibration=calibration,
             safety_config=TeleopSafetyConfig(
@@ -470,59 +716,77 @@ def main(argv: list[str] | None = None) -> None:
     try:
         session, rig, dual, pose_retargeters, timing = _build(args)
         scene = rig.scene
-        session.start()
-        print(
-            "[vive-mujoco] execution=kinematic_direct_qpos_debug "
-            f"rates={timing.sample_hz:g}/{timing.ik_hz:g}/"
-            f"{timing.command_hz:g}/{timing.physics_hz:g}Hz"
+        viewer_context = (
+            passive_viewer_handle(scene) if args.viewer else nullcontext(None)
         )
-        print(
-            "[vive-mujoco] MuJoCo is the simulation chain; no real-arm, force-control, "
-            "dataset, or deployment process is started."
-        )
-        if not args.auto_home and sys.stdin.isatty():
-            input(
-                "Place both trackers at runtime home, keep them steady, then press Enter... "
+        with viewer_context as viewer_handle:
+            session.start()
+            snapshot = rig.snapshot()
+            print(
+                f"[vive-mujoco] execution={snapshot['execution_mode']} "
+                f"rates={timing.sample_hz:g}/{timing.ik_hz:g}/"
+                f"{timing.command_hz:g}/{timing.physics_hz:g}Hz"
             )
-        _capture_runtime_home(
-            session=session,
-            rig=rig,
-            dual=dual,
-            pose_retargeters=pose_retargeters,
-            calibration=session.calibration,
-            samples_required=int(args.calibration_samples),
-            timeout_sec=float(args.calibration_timeout),
-        )
-        session.set_calibration_ready()
-        session.mark_debug_passed()
-        session.arm_hardware()
-
-        started = time.monotonic()
-        next_status = started
-        period = 1.0 / timing.ik_hz
-        while args.max_seconds <= 0.0 or time.monotonic() - started < args.max_seconds:
-            loop_started = time.monotonic()
-            result = session.run_step(now=time.time())
-            accepted = rig.accepted_qcmd_by_side()
-            dual.set_current_qpos_pair(
-                left_qpos=accepted["left"],
-                right_qpos=accepted["right"],
-                reset_tracking=False,
-            )
-            if loop_started >= next_status:
-                snapshot = rig.snapshot()
+            gripper_snapshot = snapshot.get("gripper_execution")
+            if gripper_snapshot is not None:
                 print(
-                    "[vive-mujoco] "
-                    f"state={result.state.value} control_hz={result.control_hz:.1f} "
-                    f"dispatched={result.command_dispatched} faults={len(result.faults)} "
-                    f"qref_seq={snapshot['last_reference_sequence']} "
-                    f"physics_ticks={snapshot['physics_ticks']} "
-                    f"deadline_misses={snapshot['deadline_misses']}"
+                    "[vive-mujoco] Q6 grippers enabled: 0=open, 1=closed, "
+                    f"gate={gripper_snapshot['command_hz']:g}Hz, "
+                    "temporary command-to-measured delay fit=0.20s"
                 )
-                next_status = loop_started + 1.0 / float(args.status_hz)
-            remaining = period - (time.monotonic() - loop_started)
-            if remaining > 0.0:
-                time.sleep(remaining)
+            print(
+                "[vive-mujoco] MuJoCo is the simulation chain; no real-arm, force-control, "
+                "dataset, or deployment process is started."
+            )
+            if not args.auto_home and sys.stdin.isatty():
+                input(
+                    "Place both trackers at runtime home, keep them steady, then press Enter... "
+                )
+            _capture_runtime_home(
+                session=session,
+                rig=rig,
+                dual=dual,
+                pose_retargeters=pose_retargeters,
+                calibration=session.calibration,
+                samples_required=int(args.calibration_samples),
+                timeout_sec=float(args.calibration_timeout),
+            )
+            session.set_calibration_ready()
+            session.mark_debug_passed()
+            session.arm_hardware()
+
+            started = time.monotonic()
+            next_status = started
+            period = 1.0 / timing.ik_hz
+            while (
+                args.max_seconds <= 0.0
+                or time.monotonic() - started < args.max_seconds
+            ) and (
+                viewer_handle is None or viewer_handle.is_running()
+            ):
+                loop_started = time.monotonic()
+                result = session.run_step(now=time.time())
+                accepted = rig.accepted_qcmd_by_side()
+                dual.set_current_qpos_pair(
+                    left_qpos=accepted["left"],
+                    right_qpos=accepted["right"],
+                    reset_tracking=False,
+                )
+                rig.sync_viewer(viewer_handle)
+                if loop_started >= next_status:
+                    snapshot = rig.snapshot()
+                    print(
+                        "[vive-mujoco] "
+                        f"state={result.state.value} control_hz={result.control_hz:.1f} "
+                        f"dispatched={result.command_dispatched} faults={len(result.faults)} "
+                        f"qref_seq={snapshot['last_reference_sequence']} "
+                        f"physics_ticks={snapshot['physics_ticks']} "
+                        f"deadline_misses={snapshot['deadline_misses']}"
+                    )
+                    next_status = loop_started + 1.0 / float(args.status_hz)
+                remaining = period - (time.monotonic() - loop_started)
+                if remaining > 0.0:
+                    time.sleep(remaining)
     except KeyboardInterrupt:
         print("\n[vive-mujoco] stopped")
     finally:

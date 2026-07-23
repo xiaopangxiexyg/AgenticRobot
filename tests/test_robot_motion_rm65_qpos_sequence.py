@@ -78,6 +78,22 @@ def test_dry_run_qpos_test_sequence_chains_targets() -> None:
     np.testing.assert_allclose(report["final_qpos_by_side"]["left"], _qpos(left0=np.deg2rad(8.0))["left"])
 
 
+def test_dry_run_qpos_test_sequence_rejects_j6_outside_120_deg() -> None:
+    target = _qpos()
+    target["right"][5] = np.deg2rad(120.1)
+    sequence = QposTestSequence(
+        name="invalid_j6",
+        entries=(QposSequenceEntry(index=7, name="invalid", qpos_by_side=target),),
+    )
+
+    with pytest.raises(ValueError, match=r"sequence_entry_7\.right\.joint6=.*outside"):
+        dry_run_qpos_test_sequence(
+            sequence=sequence,
+            current_qpos_by_side=_qpos(),
+            config=_test_transition_config(),
+        )
+
+
 def test_sample_episode_qpos_records_from_parquet(tmp_path: Path) -> None:
     pq, pa = _require_pyarrow()
     episode_path = tmp_path / "episode_000000.parquet"
@@ -92,7 +108,9 @@ def test_sample_episode_qpos_records_from_parquet(tmp_path: Path) -> None:
 
     assert len(records) == 3
     assert summary["row_count"] == 5
-    assert summary["valid_qpos_row_count"] == 5
+    assert summary["finite_qpos_row_count"] == 5
+    assert summary["absolute_limit_rejected_row_count"] == 1
+    assert summary["valid_qpos_row_count"] == 4
     assert summary["sampled_row_indices"] == sorted(summary["sampled_row_indices"])
     for record in records:
         assert record["qpos_by_side"]["left"].shape == (6,)

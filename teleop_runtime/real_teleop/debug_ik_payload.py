@@ -112,27 +112,67 @@ def _candidate_selection_compact_debug(metadata: object) -> dict[str, object]:
         "candidate_eval_elapsed_ms",
         "candidate_eval_pre_selection_elapsed_ms",
         "candidate_eval_branch_budget_ms",
+        "candidate_certification_reserve_ms",
+        "candidate_post_selection_reserve_ms",
         "candidate_eval_stopped_early",
         "candidate_eval_stop_reason",
         "collision_distance_m",
         "inactive_side_hold_active",
         "expanded_for_elbow_singularity",
-        "position_singularity_preference",
-        "wrist_singularity_preference",
     )
     out = {
         key: _compact_debug_value(metadata.get(key))
         for key in keys
         if key in metadata
     }
-    if "wrist_singularity_preference" in metadata:
-        out["wrist_singularity_preference"] = _compact_debug_value(
-            metadata.get("wrist_singularity_preference"), max_items=32
-        )
-    if "position_singularity_preference" in metadata:
-        out["position_singularity_preference"] = _compact_debug_value(
-            metadata.get("position_singularity_preference"), max_items=48
-        )
+    for key in ("wrist_singularity_preference", "position_singularity_preference"):
+        preference = metadata.get(key)
+        if not isinstance(preference, Mapping):
+            continue
+        out[key] = {
+            name: _compact_debug_value(preference.get(name), max_items=8)
+            for name in (
+                "enabled",
+                "threshold_deg",
+                "evaluated_feasible_count",
+                "fully_non_singular_count",
+                "minimum_singular_side_count",
+                "minimum_singularity_depth_score",
+                "fallback_to_singular",
+            )
+            if name in preference
+        }
+        selected_preference = preference.get("selected")
+        if isinstance(selected_preference, Mapping):
+            out[key]["selected"] = {
+                name: _compact_debug_value(selected_preference.get(name), max_items=8)
+                for name in (
+                    "elbow_singular_side_count",
+                    "wrist_singular_side_count",
+                    "shoulder_singular_side_count",
+                    "singular_side_count",
+                    "singularity_depth_score",
+                    "any_elbow_singular",
+                    "any_wrist_singular",
+                    "any_shoulder_singular",
+                    "any_singular",
+                )
+                if name in selected_preference
+            }
+    certificate = metadata.get("candidate_certificate")
+    if isinstance(certificate, Mapping):
+        out["candidate_certificate"] = {
+            name: _compact_debug_value(certificate.get(name), max_items=4)
+            for name in (
+                "schema",
+                "sequence",
+                "selected_branch",
+                "selection_status",
+                "selection_reason",
+                "singular_fallback_claimed",
+            )
+            if name in certificate
+        }
     selected = metadata.get("selected_metadata")
     if isinstance(selected, Mapping):
         selected_keys = (
@@ -149,14 +189,31 @@ def _candidate_selection_compact_debug(metadata: object) -> dict[str, object]:
             "dual_max_position_progress_m",
             "dual_max_orientation_progress_deg",
             "within_pose_tolerance",
-            "position_singularity",
-            "wrist_singularity",
         )
         out["selected_metadata"] = {
             key: _compact_debug_value(selected.get(key), max_items=12)
             for key in selected_keys
             if key in selected
         }
+        for singularity_key in ("position_singularity", "wrist_singularity"):
+            singularity = selected.get(singularity_key)
+            if not isinstance(singularity, Mapping):
+                continue
+            out["selected_metadata"][singularity_key] = {
+                name: _compact_debug_value(singularity.get(name), max_items=8)
+                for name in (
+                    "elbow_singular_side_count",
+                    "wrist_singular_side_count",
+                    "shoulder_singular_side_count",
+                    "singular_side_count",
+                    "singularity_depth_score",
+                    "any_elbow_singular",
+                    "any_wrist_singular",
+                    "any_shoulder_singular",
+                    "any_singular",
+                )
+                if name in singularity
+            }
     return out
 
 
@@ -175,6 +232,7 @@ def _command_metadata_compact_debug(metadata: Mapping[str, object] | None) -> di
         "ik_solve_iteration_min",
         "ik_damping",
         "ik_solve_iteration_reserve_ms",
+        "ik_candidate_certification_reserve_ms",
         "ik_solve_iteration_budget_ms",
         "ik_solve_iteration_budget_exhausted",
         "ik_solve_iteration_stop_reason",
@@ -185,7 +243,6 @@ def _command_metadata_compact_debug(metadata: Mapping[str, object] | None) -> di
         "ik_jump_gate_hold_frames",
         "ik_jump_gate_metrics",
         "joint_limit_margin",
-        "ik_candidate_selection",
         "target_pose_smoothing",
         "output_qpos_smoothing",
         "target_activity",
@@ -236,7 +293,6 @@ def _teleop_command_metadata_compact_debug(command: TeleopCommand | None) -> dic
         "collision_distance_m",
         "ik_branch_candidate",
         "ik_jump_gate_status",
-        "ik_candidate_selection",
         "target_pose_smoothing",
         "output_qpos_smoothing",
         "target_activity",
@@ -253,6 +309,10 @@ def _teleop_command_metadata_compact_debug(command: TeleopCommand | None) -> dic
     }
     if "ik_debug_profile" in metadata:
         out["ik_debug_profile"] = _ik_profile_compact_debug(metadata.get("ik_debug_profile"))
+    if "ik_candidate_selection" in metadata:
+        out["ik_candidate_selection"] = _candidate_selection_compact_debug(
+            metadata.get("ik_candidate_selection")
+        )
     if "temporary_dual_arm_safety" in metadata:
         out["temporary_dual_arm_safety"] = _compact_debug_value(
             metadata.get("temporary_dual_arm_safety"),
@@ -544,8 +604,9 @@ def _backend_ik_metadata_compact_debug(metadata: object) -> dict[str, object]:
         "position_wrist_singularity_fallback",
         "position_elbow_singularity_fallback_requested",
         "position_elbow_singularity_fallback_allowed",
+        "position_shoulder_singularity_fallback_requested",
+        "position_shoulder_singularity_fallback_allowed",
         "position_singularity_fallback_allowed",
-        "position_singularity_fallback",
     )
     out = {
         key: _compact_debug_value(metadata.get(key))
@@ -554,6 +615,66 @@ def _backend_ik_metadata_compact_debug(metadata: object) -> dict[str, object]:
     }
     if "ik_debug_profile" in metadata:
         out["ik_debug_profile"] = _ik_profile_compact_debug(metadata.get("ik_debug_profile"))
+    return out
+
+
+def _background_streaming_compact_debug(state: object) -> dict[str, object]:
+    if not isinstance(state, Mapping):
+        return {}
+    keys = (
+        "enabled",
+        "hz",
+        "thread_alive",
+        "target_active",
+        "target_source",
+        "target_sequence",
+        "target_age_sec",
+        "target_max_age_sec",
+        "target_stale",
+        "continuous_hold",
+        "quick_stop_active",
+        "quick_stop_reason",
+        "position_command_planner",
+        "trajectory_policy_mode",
+        "trajectory_policy_speed_scale",
+        "trajectory_policy_reason",
+        "command_control_dt_sec",
+        "tick_sequence",
+        "send_count",
+        "accepted_send_count",
+        "failed_send_count",
+        "deadline_miss_count",
+        "actual_hz",
+        "last_call_ms",
+        "last_deadline_lag_ms",
+        "last_sent_step_deg",
+        "stale_count",
+        "fault",
+        "fault_count",
+        "healthy",
+        "health_reasons",
+    )
+    out = {
+        key: _compact_debug_value(state.get(key), max_items=8)
+        for key in keys
+        if key in state
+    }
+    trajectory_debug = state.get("last_trajectory_debug")
+    if isinstance(trajectory_debug, Mapping):
+        out["last_trajectory_debug"] = {
+            key: _compact_debug_value(trajectory_debug.get(key), max_items=8)
+            for key in (
+                "planner_mode",
+                "trajectory_mode",
+                "trajectory_reason",
+                "trajectory_quick_stop",
+                "trajectory_speed_scale",
+                "trajectory_qd_command_rad_s",
+                "trajectory_qdd_command_rad_s2",
+                "target_velocity_filter_tau_sec",
+            )
+            if key in trajectory_debug
+        }
     return out
 
 
@@ -567,9 +688,8 @@ def _backend_compact_debug_payload(state: Mapping[str, object] | None) -> dict[s
         "send_result_text": state.get("send_result_text"),
         "effective_control_dt_sec": state.get("effective_control_dt_sec"),
         "effective_step_scale": state.get("effective_step_scale"),
-        "background_streaming": _compact_debug_value(
-            state.get("background_streaming"),
-            max_items=32,
+        "background_streaming": _background_streaming_compact_debug(
+            state.get("background_streaming")
         ),
         "canfd_follow": state.get("canfd_follow"),
         "canfd_trajectory_mode": state.get("canfd_trajectory_mode"),
@@ -585,7 +705,6 @@ def _backend_compact_debug_payload(state: Mapping[str, object] | None) -> dict[s
             max_items=80,
         ),
         "last_command_controlled_frame": state.get("last_command_controlled_frame"),
-        "last_command": _command_compact_debug_payload(state.get("last_command")),
         "last_command_timestamp": state.get("last_command_timestamp"),
         "last_command_sequence": state.get("last_command_sequence"),
         "command_sequence": state.get("command_sequence"),
@@ -654,6 +773,7 @@ def _command_debug_payload(command) -> dict[str, object] | None:
         "ik_solve_iteration_min",
         "ik_damping",
         "ik_solve_iteration_reserve_ms",
+        "ik_candidate_certification_reserve_ms",
         "ik_solve_iteration_budget_ms",
         "ik_solve_iteration_budget_exhausted",
         "ik_solve_iteration_stop_reason",
@@ -734,6 +854,7 @@ def _teleop_command_metadata_debug(command: TeleopCommand | None) -> dict[str, o
         "ik_solve_iteration_min",
         "ik_damping",
         "ik_solve_iteration_reserve_ms",
+        "ik_candidate_certification_reserve_ms",
         "ik_solve_iteration_budget_ms",
         "ik_solve_iteration_budget_exhausted",
         "ik_solve_iteration_stop_reason",

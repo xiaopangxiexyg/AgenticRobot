@@ -1,0 +1,166 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr2_openpi_relative_live_no_action_2026_07_23",
+  "captured_at": "2026-07-23T21:32:29+08:00",
+  "scope": "registered_openpi_relative_checkpoint_synthetic_observation_same_chunk_gold_and_worker_timed_plan_single_emission_no_action",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "remote_openpi_source_changed": false,
+    "remote_dexteleop_source_changed": false,
+    "production_entrypoint_started": false
+  },
+  "loaded_instance": {
+    "evidence_only_not_compatibility_allowlist": true,
+    "model_id": "0715-cube-front-ready-mix-4to1-relative",
+    "checkpoint_step": 149999,
+    "action_pose_mode": "relative",
+    "relative_action_anchor": "chunk_start_actual_tcp",
+    "prediction_horizon_steps": 50,
+    "model_state_dim": 32,
+    "base_state_dim": 16,
+    "action_dim": 16,
+    "camera_source_keys": [
+      "front",
+      "left_wrist",
+      "right_wrist"
+    ]
+  },
+  "identity_bindings": {
+    "artifact_hash": "f59b441831eeb402ea77f45ac6a9f2331cb46f1b510eea2460a4db662b171741",
+    "layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+    "frame_contract_hash": "sha256:c8d881305707dc8d83da3a4d0dab9c3bbb0057ecfd560a9e9ac4ae00fb66b71c",
+    "normalization_hash": "sha256:66debe51033f068bcb71029799dd26fe9e523c4aaef068e4746c60c997dbae6b",
+    "normalization_hash_scope": "exact_bytes_of_loaded_checkpoint_norm_stats_json",
+    "action_codec_hash": "c442cf6f7905ff01f533cb4493a522670791314b1936b31f7d2f3cee58c38a61",
+    "server_metadata_hash": "4a5f958bfd5606e7f1c1576e6ea7e99236122bef68aeefc150d090569956a1b1"
+  },
+  "boundary": {
+    "synthetic_observation_used": true,
+    "real_observation_used": false,
+    "model_server_payload_changed": false,
+    "hardware_or_camera_module_initialized": false,
+    "target_backend_initialized": false,
+    "safety_called": false,
+    "position_called": false,
+    "dispatch_called": false,
+    "action_send_enabled": false,
+    "position_lookahead_enabled": false,
+    "teleop_or_replay_modified": false,
+    "sim_observation_modified": false,
+    "forbidden_runtime_modules_imported": []
+  },
+  "same_live_chunk_gold": {
+    "response_validation_accepted": true,
+    "model_space_shape": [
+      50,
+      16
+    ],
+    "model_space_dtype": "float32",
+    "model_space_all_finite": true,
+    "sync_relative_vs_rtc_typed_max_arm_pose_abs_diff": 0.0,
+    "sync_relative_vs_rtc_typed_max_end_effector_abs_diff": 0.0,
+    "rtc_source_indices_contiguous": true,
+    "rtc_original_request_anchor_unique": true,
+    "cold_inference_duration_sec": 11.22219437174499
+  },
+  "worker_timed_plan": {
+    "request_ids": [
+      "rtc-request:session:openpi-relative-worker-live:0"
+    ],
+    "request_ids_unique": true,
+    "result_admission_accepted": true,
+    "source_chunk_size": 50,
+    "discarded_obsolete_count": 38,
+    "admitted_keyframe_count": 12,
+    "formal_emission_count": 1,
+    "emitted_source_index": 38,
+    "emitted_source_pose_mode": "relative",
+    "emitted_left_frame": "canonical_desk",
+    "emitted_right_frame": "canonical_desk",
+    "send_actions": false,
+    "legacy_queue_pop_count": 0,
+    "tick_count": 41,
+    "control_duration_max_sec": 0.018780427984893322,
+    "wall_tick_duration_max_sec": 0.0188674652017653,
+    "warm_inference_duration_sec": 1.189199361950159
+  },
+  "transport_lifecycle": {
+    "phase_order": [
+      "connect",
+      "metadata",
+      "inference",
+      "inference",
+      "close"
+    ],
+    "all_phase_receipts_completed": true,
+    "worker_stop_status": "stopped",
+    "worker_thread_exited": true,
+    "transport_close_status": "closed",
+    "server_wrapper_left_exact_processes_after_terminal_interrupt": true,
+    "exact_cleanup_pids": [
+      3888789,
+      3888786
+    ],
+    "cleanup_signal": "SIGTERM",
+    "post_cleanup_server_process_found": false,
+    "post_cleanup_port_open": false
+  },
+  "verification": [
+    {
+      "scope": "OpenPI RTC adapter, common deploy, frontend, and transport lifecycle",
+      "result": "92 passed",
+      "note": "91 passed in the restricted sandbox; the one loopback-socket case passed separately with proxies unset outside the socket sandbox"
+    },
+    {
+      "scope": "temporary live probe py_compile",
+      "result": "passed"
+    },
+    {
+      "scope": "evidence JSON parse and scoped git diff --check",
+      "result": "passed"
+    }
+  ],
+  "probe_retries": {
+    "production_failure_observed": false,
+    "first_retry_reason": "temporary evidence serializer used action_chunk_id instead of PolicyActionEmission.chunk_id",
+    "second_retry_reason": "temporary evidence serializer used position_lookahead instead of position_lookahead_enabled",
+    "third_retry_reason": "server wrapper 300 second protection timeout elapsed before reconnect",
+    "final_clean_probe_result": "passed"
+  },
+  "scoped_source_sha256": {
+    "deployments/openpi/client/rtc.py": "107ef0b530dc0167370991dfab9436a3bcb798570b43e992ee17ad4716a2176e",
+    "deployments/openpi/client/policy.py": "b7835c662cb7b21ba7312bd18faaaf99172339d40ae7d6c6ad0fc35e5953ae49",
+    "deployments/openpi/client/transport.py": "c567a05223114b93f7024aa752c6627d16b3c9bf2d50e6bb2f94c464cf9e8d32",
+    "robot_motion/deploy/rtc_runtime.py": "55c48bc03480094517ecb8df075c664fd326c0ce6864e2279ea19417e9e2ba1c",
+    "robot_motion/deploy/runtime.py": "85d5b255a81b64b55a3da25244701c9ba82677e51bd33926d8854b1808864694",
+    "temporary_live_probe.py": "9f7cbe7c7b8501bd8d88c0089edd032fd7e5d821c8254398315a901ca26ee3e3",
+    "checkpoint_policy_artifact.json": "cfd6a27a86a016069da69cf2b1529954aafa13c68c77188bb5477149ac657349",
+    "checkpoint_norm_stats.json": "66debe51033f068bcb71029799dd26fe9e523c4aaef068e4746c60c997dbae6b"
+  },
+  "claims": [
+    "the registered OpenPI relative checkpoint can serve an unchanged final action chunk to the generic raw-RTC adapter",
+    "for the exact same live model-space chunk, the existing synchronous relative decoder and typed RTC canonical decoder produce numerically identical arm poses and end-effector targets",
+    "the relative typed result is bound to the immutable original request TCP anchor and preserves contiguous source identity",
+    "the live blocking inference runs in the bounded worker while control-side ticks remain below 50 ms in this scoped probe",
+    "one result is admitted once into the unique timed plan and one due keyframe produces one formal no-action emission",
+    "the probe initializes no target, safety, position, dispatcher, camera, teleop, replay, or sim module"
+  ],
+  "non_claims": [
+    "no real or dataset-captured observation was exercised",
+    "no safety, IK, position reference, backend command, dispatch, or motion authority was exercised",
+    "no production p99, long-duration stability, or true real-time guarantee is claimed",
+    "this checkpoint is not a compatibility allowlist",
+    "no model-RTC continuation or future-prefix capability is claimed",
+    "real-machine deployment is not authorized or proven"
+  ],
+  "next_gate": {
+    "id": "rtc_relative_real_observation_transport_no_action",
+    "goal": "bind the separately owned real observation source to the same default-off profile while retaining send_actions=false",
+    "requires_real_observation_scope": true,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false,
+    "requires_sim_observation_change": false,
+    "later_gate": "formal target safety and separately authorized stationary motion"
+  }
+}

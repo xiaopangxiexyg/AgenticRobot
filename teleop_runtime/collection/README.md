@@ -1,5 +1,8 @@
 # Teleop Collection README
 
+> 本页维护 headless/兼容 collection 的模块参数。正式 GUI 遥操与数采命令统一从
+> [`docs/real/README.md`](../../docs/real/README.md) 复制。
+
 ## 1. 目的
 
 这份 README 只说明当前仓库里 `teleop_runtime.collection` 的真实可用数据采集链路，不讨论更早期的 blueprint 规划。
@@ -23,6 +26,15 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
 `multiprocessing.Queue`复制大数组。位控进程模式下，嵌套在hand state中的原始触觉
 ndarray也使用同一共享内存槽；`--collection-process-extra-array-mb`控制每槽为这些
 非相机数组预留的容量，默认8 MiB。队列/共享槽过载会显式暂停episode，不能阻塞位控。
+
+v2.4 native stream仍为default-off。process worker现提供小型pose/qpos的bounded inline
+接缝：提交不等待写盘，queue full或消息超限返回typed rejection，并在episode seal时记入
+drop/gap。RGBD和tactile大数组禁止使用该pickle通道。首个opt-in `selected_rgb` bridge会从
+现有shared-memory snapshot建立stable source-frame identity，并复用legacy MP4：
+capture-time intent在release时freeze，legacy specialized writer完成后提交dataset-relative
+artifact receipt，native manifest才seal；reader会复核artifact hash并返回typed locator。
+它只保存decision/sample已选中的RGB，同一源帧复用时native index只记一次，不等于相机
+native-rate stream。高频RGBD/tactile artifact bundle及GUI/真机profile仍未启用。
 
 `--collection-worker-mode thread` 保留原实现作为回退。force/impedance的 `auto` 始终
 解析为 `thread`，因此该变更不改变力控数采链路。这里的headless兼容入口也仍使用原有
@@ -487,7 +499,7 @@ qpos 数据要求：
 - 未提供 v2.3 pose contract 时，arm action 的 pose frame 是历史 robot base frame
 - 未启用 side 的槽位按空值写出
 
-### 7.2.1 v2.3 pose contract 显式启用
+### 7.2.1 v2.3 pose contract 与默认 RM65 desk
 
 GUI 正式数采和 headless/兼容数采都接受：
 
@@ -496,8 +508,10 @@ GUI 正式数采和 headless/兼容数采都接受：
 --pose-frame-contract /abs/path/to/pose_frame_contract.json
 ```
 
-该选项默认关闭，不改变现有控制或 v2.2 落盘。contract 在进程创建硬件前完成加载，
-且 `active_sides` 必须与本次采集一致。启用后 writer 将同一 contract 固定写入
+双臂 RM65 正式采集默认加载
+`rm65_dual_arm_workspace_near_boundary_v1_collection_desk_absolute.json`，并在未指定 layout 时自动使用
+`--policy-io-layout auto`。contract 在进程创建硬件前完成加载，且 `active_sides` 必须与
+本次采集一致。writer 将同一 contract 固定写入
 `meta/info.json` 和 episode metadata：
 
 - `pose_storage_frame=raw_absolute`：pose 数值保持当前左右 robot-base raw 值，只增加
@@ -506,21 +520,39 @@ GUI 正式数采和 headless/兼容数采都接受：
   raw→canonical-desk，不修改 `TeleopCommand`、backend state 或位控 target。
 
 历史 Vive `desk/T_D_B` 不等于 canonical dataset desk，不能直接作为这里的 contract。
-真实 raw→desk 外参尚未确认时，应先使用显式 `raw_absolute` contract。
+单臂 RM65 不会复用双臂 station 外参，必须为其安装方式提供独立 contract。需要兼容旧
+v2.2/raw 落盘时显式传 `--no-pose-frame-contract`；v2.3 强制 raw 则显式传对应的
+`raw_absolute` contract。
 
-当前 RM65 v3 双臂桌面中心的显式 collection contract 为：
+当前默认值也可以显式写成：
 
 ```bash
 --policy-io-layout auto \
 --pose-frame-contract \
-  robot_motion/configs/pose_frames/rm65_dual_arm_table_center_v1_collection_desk_absolute.json
+  robot_motion/configs/pose_frames/rm65_dual_arm_workspace_near_boundary_v1_collection_desk_absolute.json
 ```
 
-它将 canonical dataset `desk` 绑定到 URDF `table_center_frame`，即桌面表面中心
-`world xyz=(-0.412, 0, 0.010)`，朝向与 URDF 根坐标系一致。左右 RM65 base 的
-`-90/+90 deg` 安装旋转包含在 per-side raw→desk 外参中。该 profile 当前来源是
-annotated station URDF，metadata 明确标记为 `hardware_measurement_status=not_measured`；
-真实安装外参完成测量前不得把它描述为 measured calibration。
+旧 `rm65_dual_arm_table_center_v1_*` 文件名仅保留为内容完全相同的路径兼容副本；新代码、
+元数据和文档统一使用 `workspace_near_boundary` 名称，它们不表示第二套坐标系。
+
+它将 canonical dataset `desk` 绑定到 URDF `workspace_near_boundary_frame`。该原点在
+桌面表面上左右居中，并且沿“桌面中心到操作者/机械臂”的方向位于有效操作空间最靠近
+操作者/机械臂一侧的边界；数值仍为 `world xyz=(-0.472, 0, 0.010)`。desk 的 `+X` 是
+操作者面向桌面的方向，`+Y` 是从该原点朝向操作者左侧的方向，`+Z` 是垂直桌面向上的方向。左右 RM65 base 的
+`-90/+90 deg` 安装旋转包含在 per-side raw→desk 外参中。该 URDF 是当前已标定 station
+geometry 的权威来源；metadata 标记为 `calibrated_station_urdf`，并由测试直接从 URDF
+fixed joints 重算矩阵，防止 JSON 与机器人布局漂移。
+
+也可显式选择与 desk storage 匹配的 checked-in layout：
+
+```bash
+--policy-io-layout \
+  teleop_runtime/configs/policy_io_layouts/dual_arm_bimanual_dmtac_gripper_v23_desk.json
+```
+
+`auto` 会根据 desk storage 生成相同的 arm reference frame；旧
+`dual_arm_bimanual_dmtac_gripper_v22.json` 声明左右 RM65 base，不能与 desk storage
+contract 混用。
 
 ### 7.2.2 hand16 空槽语义
 
@@ -636,8 +668,8 @@ dataset_root/
       chunk-000/
         episode_000000/
           manifest.json
-          L_IN.float32.bin.lz4
-          L_OUT.float32.bin.lz4
+          L_IN.float32.bin
+          L_OUT.float32.bin
 ```
 
 说明：
@@ -654,6 +686,15 @@ dataset_root/
   对齐关系。选择 `lz4`/`zstd` 时每个 stream spec 还包含对应的 chunk encoding、
   `compression` 和 `chunks` 索引；默认 `--tactile-compression none` 时
   `.float32.bin`/`.uint8.bin` 是按 frame 顺序追加的原始数组。
+
+正式 v2.3 episode 全部 finalize 后，执行只读验收：
+
+```bash
+python -m utils.dataset_postprocess validate-v23 /path/to/dataset
+```
+
+命令成功返回 `0`；任何 contract/hash、causal timestamp、pose 副本、计数或外置文件错误
+均返回 `1` 并输出 JSON 诊断，不会修改原数据。
 
 ## 10. SAPIEN 数据集回放
 
@@ -961,6 +1002,14 @@ find /tmp/collect_bimanual_bihand_short -maxdepth 3 -type f | sort
 - `meta/episodes_stats.jsonl`
 - `meta/calibration/teleop_profile.json`
 - `data/chunk-000/episode_000000.parquet`
+
+#### 删除错误 Episode
+
+真机和 UMI 正式数采 GUI 都可在空闲状态输入非负 episode 序号并点击
+“删除并自动连续重编号”（真机需先进入 Hold）。后端会同步处理 Parquet、视频、外置触觉、腕部深度、
+元数据和 v2.4 episode 级 ControlTrace 绑定；后续 episode 会向前连续压紧，writer
+刷新后下一次采集从新的末尾序号继续。操作期间不能开始数采。为便于误操作恢复，
+原数据集会以 `*.before_delete_episode_*` 目录保留在数据集旁边。
 
 #### F. 加相机短测
 

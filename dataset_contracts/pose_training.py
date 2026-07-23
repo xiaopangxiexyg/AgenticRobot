@@ -19,9 +19,11 @@ from .v23 import DEXTELEOP_DATASET_SCHEMA_V23
 POSE_TRAINING_DATA_METADATA_KEY = "pose_training_data_contract"
 POSE_TRAINING_DATA_SCHEMA_V1 = "dexteleop_pose_training_data_v1"
 POSE_TRAINING_ORIGIN_NATIVE_V23 = "native_v23_dataset"
+POSE_TRAINING_ORIGIN_V22_CANONICAL_DESK = "v22_canonical_desk_migration"
 POSE_TRAINING_ORIGIN_V22_RAW_IDENTITY = "v22_raw_identity_compatibility"
 POSE_TRAINING_ORIGINS = (
     POSE_TRAINING_ORIGIN_NATIVE_V23,
+    POSE_TRAINING_ORIGIN_V22_CANONICAL_DESK,
     POSE_TRAINING_ORIGIN_V22_RAW_IDENTITY,
 )
 
@@ -77,7 +79,7 @@ class PoseTrainingDataContract:
                     "native v2.3 pose training must not pin one runtime source_id; "
                     "the explicit canonical-desk runtime contract provides the binding."
                 )
-        else:
+        elif origin == POSE_TRAINING_ORIGIN_V22_RAW_IDENTITY:
             if source_schema != DEXTELEOP_DATASET_SCHEMA_V22:
                 raise DatasetLayoutBindingError(
                     "v22_raw_identity_compatibility requires source dataset schema "
@@ -86,6 +88,17 @@ class PoseTrainingDataContract:
             if expected_source is None:
                 raise DatasetLayoutBindingError(
                     "v22 raw identity pose training requires expected_runtime_source_id."
+                )
+        else:
+            if source_schema != DEXTELEOP_DATASET_SCHEMA_V22:
+                raise DatasetLayoutBindingError(
+                    "v22_canonical_desk_migration requires original source dataset "
+                    f"schema {DEXTELEOP_DATASET_SCHEMA_V22!r}."
+                )
+            if expected_source is not None:
+                raise DatasetLayoutBindingError(
+                    "v2.2 canonical-desk migration must use an explicit canonical-desk "
+                    "runtime binding instead of pinning an identity source_id."
                 )
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "source_dataset_schema", source_schema)
@@ -109,6 +122,15 @@ class PoseTrainingDataContract:
             origin=POSE_TRAINING_ORIGIN_V22_RAW_IDENTITY,
             source_dataset_schema=DEXTELEOP_DATASET_SCHEMA_V22,
             expected_runtime_source_id=legacy_rm65_source_id(active_sides),
+        )
+
+    @classmethod
+    def v22_canonical_desk(cls) -> "PoseTrainingDataContract":
+        """Describe v2.2 rows physically migrated to canonical desk storage."""
+
+        return cls(
+            origin=POSE_TRAINING_ORIGIN_V22_CANONICAL_DESK,
+            source_dataset_schema=DEXTELEOP_DATASET_SCHEMA_V22,
         )
 
     @property
@@ -157,6 +179,7 @@ __all__ = [
     "POSE_TRAINING_DATA_METADATA_KEY",
     "POSE_TRAINING_DATA_SCHEMA_V1",
     "POSE_TRAINING_ORIGIN_NATIVE_V23",
+    "POSE_TRAINING_ORIGIN_V22_CANONICAL_DESK",
     "POSE_TRAINING_ORIGIN_V22_RAW_IDENTITY",
     "POSE_TRAINING_ORIGINS",
     "RUNTIME_POSE_BINDING_EXPLICIT_CANONICAL_DESK",

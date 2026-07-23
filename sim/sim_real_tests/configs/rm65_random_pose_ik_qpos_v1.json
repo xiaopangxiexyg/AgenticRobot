@@ -1,0 +1,16 @@
+{
+  "schema_version": "sim_real_test.rm65_random_pose_ik_qpos.v1",
+  "scenario": "rm65_random_pose_ik_qpos_transition",
+  "seed": 20260721,
+  "sample_count": 4,
+  "max_target_attempts_per_sample": 30,
+  "qpos_perturbation_deg": 2.0,
+  "collision_scene_profile": "dual_arm_hand_proxy_strict",
+  "collision_slow_distance_m": 0.07,
+  "collision_hold_distance_m": 0.025,
+  "collision_stop_distance_m": 0.012,
+  "max_position_error_m": 0.003,
+  "max_orientation_error_deg": 1.0,
+  "min_qpos_change_deg": 0.05,
+  "init_qpos_path": "robot_motion/rm65/arm_init/qpos_targets/measured_init_pose.json"
+}

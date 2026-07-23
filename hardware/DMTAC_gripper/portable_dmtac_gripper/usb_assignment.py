@@ -24,6 +24,7 @@ DEFAULT_GRIPPER_MAX_ACTION = 1.0
 LATEST_CONFIG_NAME = "latest.json"
 DEFAULT_GRIPPER_ID_SCAN_HINTS = (32, 46)
 DEFAULT_GRIPPER_BAUDRATE_SCAN_ORDER = (115200, 57600, 19200)
+DEFAULT_MAX_REACHABLE_GRIPPERS = 2
 _UNEXPECTED_SLAVE_ID_RE = re.compile(
     r"Unexpected slave id in response:\s*(\d+)\s*,\s*expect\s*(\d+)"
 )
@@ -205,6 +206,14 @@ def _preferred_port_from_aliases(
     port_info: Mapping[str, Any] | None = None,
 ) -> str:
     stable_aliases = _stable_gripper_aliases(aliases, port_info)
+    # The UMI collection station power-cycles the gripper pair as a unit.  On
+    # that station the USB topology path may change across a power cycle while
+    # the kernel tty assignment remains the operator-managed side contract.
+    # Prefer the tty endpoint for both persisted assignments and runtime opens;
+    # keep by-id/by-path aliases below for identity matching and diagnostics.
+    for alias in stable_aliases:
+        if _is_kernel_assigned_serial_path(alias):
+            return alias
     for prefix in ("/dev/serial/by-id/", "/dev/serial/by-path/"):
         for alias in aliases:
             if alias not in stable_aliases:
@@ -217,6 +226,25 @@ def _preferred_port_from_aliases(
 def preferred_port(port: str | None, port_info: Mapping[str, Any] | None = None) -> str:
     aliases = port_aliases(port)
     return _preferred_port_from_aliases(aliases, fallback=str(port or ""), port_info=port_info)
+
+
+def _gripper_runtime_port(item: Mapping[str, Any]) -> str:
+    aliases = _unique_text(
+        (
+            str(item.get("port") or ""),
+            str(item.get("device") or ""),
+            *(str(alias) for alias in item.get("port_aliases") or ()),
+            str(item.get("preferred_port") or ""),
+        )
+    )
+    fallback = str(
+        item.get("port") or item.get("device") or item.get("preferred_port") or ""
+    )
+    return _preferred_port_from_aliases(
+        aliases,
+        fallback=fallback,
+        port_info=item,
+    )
 
 
 def _latest_config_path_in_dir(root: Path) -> Path | None:
@@ -618,8 +646,14 @@ def scan_usb_devices(
     timeout: float = 0.03,
     scan_gripper_ids: bool = True,
     scan_baudrates: Sequence[int] | None = None,
+    max_reachable_grippers: int | None = DEFAULT_MAX_REACHABLE_GRIPPERS,
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    reachable_limit = (
+        0 if max_reachable_grippers is None else int(max_reachable_grippers)
+    )
+    if reachable_limit < 0:
+        raise ValueError("max_reachable_grippers must be >= 0")
     serial_ports = []
     for index, item in enumerate(list_serial_devices()):
         port = dict(item)
@@ -642,6 +676,7 @@ def scan_usb_devices(
             and (probe_all_serial or port["probable_gripper_serial"])
         )
         port["probe_attempted"] = should_probe
+        port["probe_skipped_reason"] = None
         port["probe"] = None
         serial_ports.append(port)
 
@@ -653,10 +688,13 @@ def scan_usb_devices(
             "serial_count": int(len(serial_ports)),
             "probe_count": int(len(probe_ports)),
             "probe_all_serial": bool(probe_all_serial),
+            "max_reachable_grippers": int(reachable_limit),
         },
     )
     probe_index = 0
-    for port in serial_ports:
+    reachable_count = 0
+    stopped_early = False
+    for serial_index, port in enumerate(serial_ports):
         should_probe = bool(port.get("probe_attempted") and port.get("port"))
         if should_probe and port["port"]:
             probe_index += 1
@@ -707,6 +745,28 @@ def scan_usb_devices(
                     "attempted_setting_count": probe.get("attempted_setting_count"),
                 },
             )
+            if probe.get("reachable") is True:
+                reachable_count += 1
+            if reachable_limit > 0 and reachable_count >= reachable_limit:
+                skipped = 0
+                for remaining in serial_ports[serial_index + 1 :]:
+                    if bool(remaining.get("probe_attempted") and remaining.get("port")):
+                        remaining["probe_attempted"] = False
+                        remaining["probe_skipped_reason"] = "reachable_gripper_limit"
+                        skipped += 1
+                stopped_early = skipped > 0
+                if stopped_early:
+                    _emit_scan_progress(
+                        progress_callback,
+                        {
+                            "event": "gripper_probe_early_stop",
+                            "reachable_count": int(reachable_count),
+                            "max_reachable_grippers": int(reachable_limit),
+                            "attempted_count": int(probe_index),
+                            "skipped_count": int(skipped),
+                        },
+                    )
+                break
 
     tactile_devices = []
     for index, item in enumerate(discover_devices()):
@@ -728,6 +788,10 @@ def scan_usb_devices(
         "grippers": serial_ports,
         "tactile": tactile_devices,
         "tactile_candidates": tactile_candidates,
+        "gripper_probe_limit": int(reachable_limit),
+        "gripper_probe_attempted_count": int(probe_index),
+        "gripper_probe_reachable_count": int(reachable_count),
+        "gripper_probe_stopped_early": bool(stopped_early),
     }
 
 
@@ -769,12 +833,25 @@ def _normalize_gripper_assignment(value: Any) -> dict[str, Any] | None:
     if not port:
         raise ValueError("gripper assignment requires port.")
     out["enabled"] = bool(out.get("enabled", True))
-    out["port"] = str(port)
+    aliases = _unique_text(tuple(out.get("port_aliases") or (str(port),)))
+    out["port_aliases"] = aliases
+    port_text = str(port)
+    if port_text.startswith("/dev/serial/by-path/"):
+        out["port"] = _preferred_port_from_aliases(
+            aliases,
+            fallback=port_text,
+            port_info=(
+                out.get("identity")
+                if isinstance(out.get("identity"), Mapping)
+                else out
+            ),
+        )
+    else:
+        out["port"] = port_text
     out["gripper_id"] = int(out.get("gripper_id", 1))
     out["baudrate"] = int(out.get("baudrate", 115200))
     out["timeout"] = float(out.get("timeout", 0.03))
     out["identity"] = dict(out.get("identity") or {})
-    out["port_aliases"] = _unique_text(tuple(out.get("port_aliases") or (str(port),)))
     return out
 
 
@@ -866,7 +943,7 @@ def _gripper_assignment_from_scan(item: Mapping[str, Any] | None) -> dict[str, A
     }
     return {
         "enabled": True,
-        "port": str(item.get("preferred_port") or item.get("port") or item.get("device")),
+        "port": _gripper_runtime_port(item),
         "gripper_id": int(detected_gripper_id),
         "baudrate": int(detected_baudrate),
         "timeout": 0.03,
@@ -1055,10 +1132,10 @@ def _find_current_gripper(
     if not _is_unstable_gripper_by_id(
         configured_port,
         configured.get("identity") if isinstance(configured.get("identity"), Mapping) else configured,
-    ) and not (
-        _is_kernel_assigned_serial_path(configured_port)
-        and any(not _is_kernel_assigned_serial_path(alias) for alias in configured_aliases)
     ):
+        # A primary tty port is an explicit side binding.  Keep topology
+        # aliases for identity-first matching, but do not discard that primary
+        # endpoint merely because an older by-path alias is also recorded.
         configured_aliases.add(configured_port)
     for item in ports:
         raw_candidates = [
@@ -1112,7 +1189,7 @@ def compare_assignment_to_scan(
                     })
                 else:
                     matched.append({"kind": "gripper", "side": side, "configured": configured_gripper, "current": current})
-                    current_port = str(current.get("preferred_port") or current.get("port") or current.get("device"))
+                    current_port = _gripper_runtime_port(current)
                     if current_port and current_port != configured_gripper.get("port"):
                         remapped.append({
                             "kind": "gripper",

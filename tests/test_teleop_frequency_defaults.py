@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from dataset_contracts.pose_frames import PoseFrameContract
+from dataset_contracts.pose_training import PoseTrainingDataContract
 from robot_motion.rm65 import RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S
 from teleop_runtime.collection import run_collect
 from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
@@ -195,7 +196,56 @@ def test_lerobot_writer_default_nominal_fps_is_15hz(tmp_path) -> None:
     assert config.nominal_fps == DEFAULT_TELEOP_SAMPLE_HZ
 
 
-def test_collection_pose_contract_is_explicit_opt_in_and_loaded_before_runtime(tmp_path) -> None:
+def test_dual_rm65_collection_defaults_to_workspace_near_boundary_desk() -> None:
+    args = _parse_collect_args(
+        ["--active-sides", "both", "--no-camera", "--no-video"]
+    )
+
+    assert args.pose_frame_contract is not None
+    assert args.pose_frame_contract.pose_storage_frame == "desk_absolute"
+    assert (
+        args.pose_frame_contract.source.source_id
+        == "rm65_real_dual_arm_workspace_near_boundary_v1"
+    )
+    assert args.policy_io_layout == "auto"
+    assert args.pose_frame_contract_source == "default_rm65_dual_arm_workspace_near_boundary_v1"
+
+
+def test_collection_can_explicitly_disable_default_pose_contract() -> None:
+    args = _parse_collect_args(
+        [
+            "--active-sides",
+            "both",
+            "--no-camera",
+            "--no-video",
+            "--no-pose-frame-contract",
+        ]
+    )
+
+    assert args.pose_frame_contract is None
+    assert args.policy_io_layout == ""
+    assert args.pose_frame_contract_source == "disabled"
+
+
+def test_real_teleop_custom_station_geometry_requires_explicit_pose_choice() -> None:
+    with pytest.raises(SystemExit):
+        _parse_real_teleop_args(["--left-right-base-distance", "0.6"])
+
+    args = _parse_real_teleop_args(
+        ["--left-right-base-distance", "0.6", "--no-pose-frame-contract"]
+    )
+    assert args.pose_frame_contract is None
+
+
+def test_single_rm65_collection_does_not_reuse_dual_station_extrinsics() -> None:
+    args = _parse_collect_args(
+        ["--active-sides", "right", "--no-camera", "--no-video"]
+    )
+
+    assert args.pose_frame_contract is None
+
+
+def test_collection_explicit_pose_contract_is_loaded_before_runtime(tmp_path) -> None:
     contract = PoseFrameContract.legacy_v22_raw(active_sides=("left", "right"))
     path = tmp_path / "pose_contract.json"
     path.write_text(
@@ -224,6 +274,38 @@ def test_collection_pose_contract_is_explicit_opt_in_and_loaded_before_runtime(t
         ]
     )
     assert real_args.pose_frame_contract.to_dict() == contract.to_dict()
+
+
+def test_native_v23_deploy_defaults_to_rm65_workspace_near_boundary_runtime_contract() -> None:
+    artifact = SimpleNamespace(pose_training_data=PoseTrainingDataContract.native_v23())
+
+    contract, source = run_policy._resolve_runtime_pose_frame_contract(
+        None,
+        policy_artifact=artifact,
+        policy_metadata={},
+    )
+
+    assert contract is not None
+    assert contract.pose_storage_frame == "raw_absolute"
+    assert contract.source.source_id == "rm65_real_dual_arm_workspace_near_boundary_v1"
+    assert source == "default_rm65_dual_arm_workspace_near_boundary_v1"
+
+
+def test_v22_identity_deploy_does_not_receive_workspace_near_boundary_default() -> None:
+    artifact = SimpleNamespace(
+        pose_training_data=PoseTrainingDataContract.v22_raw_identity(
+            active_sides=("left", "right")
+        )
+    )
+
+    contract, source = run_policy._resolve_runtime_pose_frame_contract(
+        None,
+        policy_artifact=artifact,
+        policy_metadata={},
+    )
+
+    assert contract is None
+    assert source == "v22_identity_compatibility"
 
 
 def test_collection_pose_contract_requires_typed_layout(tmp_path) -> None:
@@ -301,8 +383,19 @@ def test_real_teleop_actual_wrist_camera_pose_recording_defaults_on() -> None:
 
 
 def test_real_teleop_actual_wrist_camera_pose_recording_can_be_disabled() -> None:
-    args = _parse_real_teleop_args(["--no-record-actual-wrist-camera-pose"])
+    args = _parse_real_teleop_args(
+        ["--no-pose-frame-contract", "--no-record-actual-wrist-camera-pose"]
+    )
 
+    assert args.record_actual_wrist_camera_pose is False
+
+
+def test_real_teleop_without_collection_does_not_bind_dataset_pose_contract() -> None:
+    args = _parse_real_teleop_args(
+        ["--no-collection", "--no-record-actual-wrist-camera-pose"]
+    )
+
+    assert args.pose_frame_contract is None
     assert args.record_actual_wrist_camera_pose is False
 
 
@@ -591,15 +684,33 @@ def test_real_teleop_canfd_follow_defaults_to_backend_or_profile() -> None:
     assert real_teleop._effective_arm_canfd_follow(args) is False
 
 
-def test_real_teleop_position_defaults_to_canfd_follow_150hz() -> None:
+def test_real_teleop_position_defaults_to_formal_120hz_profile() -> None:
     args = _parse_real_teleop_args(["--arm-control-mode", "position"])
 
     assert args.hz == DEFAULT_TELEOP_SAMPLE_HZ
     assert args.position_reference_hz == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
     assert real_teleop._effective_outer_control_hz(args) == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
     assert real_teleop._effective_dual_arm_ik_hz(args) == DEFAULT_TELEOP_POSITION_REFERENCE_HZ
-    assert args.arm_control_hz is None
-    assert args.arm_canfd_follow is None
+    assert args.arm_control_hz == 120.0
+    assert args.arm_canfd_follow is True
+    assert args.position_control_profile_resolved == "rm65_bimanual_position_v1"
+    assert args.position_control_profile_metadata["source_shaping_applied"] is True
+    assert args.position_reference_max_age_sec == pytest.approx(0.2)
+    assert args.arm_canfd_trajectory_mode == 0
+    assert args.arm_canfd_radio == 0
+    assert args.position_post_ik_qpos_smoothing_alpha == pytest.approx(0.14)
+    assert args.arm_execution_config.position_post_ik_qpos_smoothing_alpha == pytest.approx(
+        0.14
+    )
+    assert real_teleop._effective_position_post_ik_qpos_smoothing_alpha(
+        args
+    ) == pytest.approx(0.14)
+    assert args.position_post_ik_qpos_smoothing_fast_alpha == pytest.approx(0.45)
+    assert args.position_post_ik_qpos_smoothing_adaptive is True
+    assert (
+        args.position_post_ik_qpos_smoothing_fast_alpha
+        >= real_teleop._effective_position_post_ik_qpos_smoothing_alpha(args)
+    )
     assert real_teleop._effective_arm_control_hz(args) == DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
     assert real_teleop._effective_arm_canfd_follow(args) is True
     canfd_config = real_teleop._canfd_follow_runtime_config(args)
@@ -952,9 +1063,12 @@ def test_deploy_default_fallback_action_hz_is_15hz_for_bimanual() -> None:
     assert args.arm_control_hz == 120.0
     assert args.position_chunk_lookahead is True
     assert args.position_ik_solve_min_iterations == 2
-    assert args.position_ik_solve_max_iterations == 2
+    assert args.position_ik_solve_max_iterations == 4
     assert args.position_ik_damping == pytest.approx(0.03)
-    assert args.position_ik_adaptive_iterations is False
+    assert args.position_ik_adaptive_iterations is True
+    assert args.position_control_profile_resolved == "rm65_bimanual_position_v1"
+    assert args.position_control_profile_metadata["source_shaping_applied"] is False
+    assert args.position_control_profile_metadata["source_shaping_reapplied"] is False
     assert args.position_ik_iteration_reserve_ms == pytest.approx(5.0)
     assert hz == DEFAULT_TELEOP_SAMPLE_HZ
     assert info["source"] == "cli.hz"
@@ -1091,8 +1205,8 @@ def test_deploy_named_execution_profiles_use_shared_real_config_resolver() -> No
     position_args = _parse_deploy_args(position_argv)
     run_policy.validate_args(position_args, raw_argv=position_argv)
     assert position_args.arm_control_mode == "position"
-    assert position_args.position_reference_hz == 75.0
-    assert position_args.arm_control_hz == 150.0
+    assert position_args.position_reference_hz == 60.0
+    assert position_args.arm_control_hz == 120.0
     assert position_args.arm_canfd_follow is True
     assert (
         position_args._real_arm_execution_config.resolved_profile

@@ -1,16 +1,12 @@
-"""Temporary reward shaping computed only from the existing 31-D observation."""
+"""Temporary reward shaping from a simulator-only 31-D training state."""
 
 from __future__ import annotations
 
 import numpy as np
 
+from sim.mujoco.tasks.cube_lift.reward_adapter import CubeLiftRewardState
+
 from .config import RewardShapingConfig
-
-
-CUBE_TO_GRASP_SLICE = slice(20, 23)
-GRIPPER_CLOSE_INDEX = 6
-CUBE_Z_INDEX = 9
-LAST_ACTION_SLICE = slice(23, 30)
 
 
 def shape_rewards(
@@ -24,7 +20,7 @@ def shape_rewards(
     success: np.ndarray | None = None,
     grasp_latched: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Compute staged reach, grasp and lift rewards from the 31-D state."""
+    """Compute staged rewards without exposing this state to a normal policy."""
 
     previous = np.asarray(observations, dtype=np.float32)
     current = np.asarray(next_observations, dtype=np.float32)
@@ -33,11 +29,15 @@ def shape_rewards(
         raise ValueError("Reward shaping expects matching (N, 31) observations.")
     if raw.shape != (previous.shape[0],):
         raise ValueError("Reward shaping expects one raw reward per environment.")
+    previous_state = CubeLiftRewardState.from_flat(previous)
+    current_state = CubeLiftRewardState.from_flat(current)
+    previous_state.validate_batch(raw.shape[0])
+    current_state.validate_batch(raw.shape[0])
 
     if lift_delta_m <= 0.0:
         raise ValueError("lift_delta_m must be positive.")
     if resting_cube_z_m is None:
-        resting_z = previous[:, CUBE_Z_INDEX]
+        resting_z = previous_state.cube_z
     else:
         resting_z = np.broadcast_to(
             np.asarray(resting_cube_z_m, dtype=np.float32), raw.shape
@@ -58,11 +58,11 @@ def shape_rewards(
     pre_latch = 1.0 - latched
 
     previous_gripper_close = np.clip(
-        previous[:, GRIPPER_CLOSE_INDEX], 0.0, 1.0
+        previous_state.right_gripper_close, 0.0, 1.0
     )
-    gripper_close = np.clip(current[:, GRIPPER_CLOSE_INDEX], 0.0, 1.0)
-    previous_error = previous[:, CUBE_TO_GRASP_SLICE].copy()
-    current_error = current[:, CUBE_TO_GRASP_SLICE].copy()
+    gripper_close = np.clip(current_state.right_gripper_close, 0.0, 1.0)
+    previous_error = previous_state.cube_to_grasp.copy()
+    current_error = current_state.cube_to_grasp.copy()
     # Observation stores cube - grasp. A positive height offset therefore has
     # the target relative z = -offset, which keeps the fingers above the table
     # while approaching a cube resting on it.
@@ -81,7 +81,7 @@ def shape_rewards(
     # independent closed-grasp target: arriving at pre-grasp already exposes a
     # strong closure gradient, while descending the final few millimetres makes
     # bilateral contact progressively easier.
-    grasp_error = current[:, CUBE_TO_GRASP_SLICE].copy()
+    grasp_error = current_state.cube_to_grasp.copy()
     grasp_error[:, 2] += config.closed_grasp_height_offset_m
     grasp_distance = np.linalg.norm(grasp_error, axis=1)
     grasp_gate = 1.0 / (
@@ -95,41 +95,93 @@ def shape_rewards(
             )
         )
     )
+    if config.staged_grasp:
+        close_gate = 1.0 / (
+            1.0
+            + np.exp(
+                np.clip(
+                    (grasp_distance - config.close_gate_distance_m)
+                    / config.close_gate_width_m,
+                    -60.0,
+                    60.0,
+                )
+            )
+        )
+        reach_phase_weight = 1.0 - config.near_reach_decay * close_gate
+    else:
+        close_gate = grasp_gate
+        reach_phase_weight = np.ones_like(grasp_gate)
     gripper_progress = gripper_close - previous_gripper_close
     previous_lift = np.clip(
-        (previous[:, CUBE_Z_INDEX] - resting_z) / lift_delta_m, 0.0, 1.0
+        (previous_state.cube_z - resting_z) / lift_delta_m, 0.0, 1.0
     )
     current_lift = np.clip(
-        (current[:, CUBE_Z_INDEX] - resting_z) / lift_delta_m, 0.0, 1.0
+        (current_state.cube_z - resting_z) / lift_delta_m, 0.0, 1.0
     )
     lift_progress = current_lift - previous_lift
 
-    reach_term = config.reach_reward_scale * reach_score * pre_latch
-    reach_progress_term = config.reach_progress_scale * reach_progress * pre_latch
+    reach_term = (
+        config.reach_reward_scale
+        * reach_score
+        * reach_phase_weight
+        * pre_latch
+    )
+    reach_progress_term = (
+        config.reach_progress_scale
+        * reach_progress
+        * reach_phase_weight
+        * pre_latch
+    )
     grasp_region_term = config.grasp_region_reward_scale * grasp_gate * pre_latch
     gripper_term = (
-        config.gripper_reward_scale * grasp_gate * gripper_close * pre_latch
+        config.gripper_reward_scale * close_gate * gripper_close * pre_latch
     )
     gripper_progress_term = (
-        config.gripper_progress_scale * grasp_gate * gripper_progress * pre_latch
+        config.gripper_progress_scale * close_gate * gripper_progress * pre_latch
     )
     premature_close_term = (
         -config.premature_close_penalty
-        * (1.0 - grasp_gate)
+        * (1.0 - close_gate)
         * gripper_close
         * pre_latch
     )
+    close_confidence = (
+        1.0
+        / (
+            1.0
+            + np.exp(
+                np.clip(
+                    (config.grasp_acquire_close - gripper_close)
+                    / config.grasp_close_confidence_width,
+                    -60.0,
+                    60.0,
+                )
+            )
+        )
+        if config.staged_grasp
+        else gripper_close
+    )
+    grasp_acquire = (
+        (
+            (previous_gripper_close < config.grasp_acquire_close)
+            & (gripper_close >= config.grasp_acquire_close)
+            & (grasp_gate >= config.grasp_acquire_gate)
+        ).astype(np.float32)
+        if config.staged_grasp
+        else np.zeros_like(raw)
+    )
+    grasp_acquire_term = config.grasp_acquire_bonus * grasp_acquire * pre_latch
     # A lifted cube is the reliable grasp signal available in the current
     # observation. Gate the sustained lift reward by proximity and closure so
     # table jitter alone cannot be harvested as task progress.
     latch_term = config.latch_reward_scale * latched
-    grasp_confidence = np.maximum(grasp_gate * gripper_close, latched)
+    grasp_confidence = np.maximum(grasp_gate * close_confidence, latched)
     lift_term = config.lift_reward_scale * current_lift * grasp_confidence
     lift_progress_term = (
         config.lift_progress_scale * lift_progress * grasp_confidence
     )
     action_term = -config.action_penalty * np.mean(
-        np.square(current[:, LAST_ACTION_SLICE]), axis=1
+        np.square(current_state.last_action), axis=1
     )
     success_term = config.success_bonus * succeeded
     if safety_projection_alpha is None:
@@ -147,6 +199,7 @@ def shape_rewards(
         + gripper_term
         + gripper_progress_term
         + premature_close_term
+        + grasp_acquire_term
         + latch_term
         + lift_term
         + lift_progress_term
@@ -164,6 +217,8 @@ def shape_rewards(
         ).astype(np.float32),
         "vertical_error_m": np.abs(current_error[:, 2]).astype(np.float32),
         "grasp_gate": grasp_gate.astype(np.float32),
+        "close_gate": close_gate.astype(np.float32),
+        "reach_phase_weight": reach_phase_weight.astype(np.float32),
         "gripper_close": gripper_close.astype(np.float32),
         "grasp_latched": latched.astype(np.float32),
         "lift_fraction": current_lift.astype(np.float32),
@@ -173,6 +228,8 @@ def shape_rewards(
         "gripper_term": gripper_term.astype(np.float32),
         "gripper_progress_term": gripper_progress_term.astype(np.float32),
         "premature_close_term": premature_close_term.astype(np.float32),
+        "grasp_close_confidence": close_confidence.astype(np.float32),
+        "grasp_acquire_term": grasp_acquire_term.astype(np.float32),
         "latch_term": latch_term.astype(np.float32),
         "lift_term": lift_term.astype(np.float32),
         "lift_progress_term": lift_progress_term.astype(np.float32),

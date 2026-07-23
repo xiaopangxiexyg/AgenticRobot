@@ -1,5 +1,8 @@
 # teleop_runtime.deploy
 
+> 本页维护 deploy 的完整模块参数和 contract。当前部署运行入口统一从
+> [`docs/real/README.md`](../../docs/real/README.md#3-deploy) 复制。
+
 `teleop_runtime.deploy` 是独立于采集主循环和左臂实验模式的策略部署入口，面向 RM65 单臂/双臂，可选 InspireTac 手、DMTac 1D gripper 和 RealSense。默认 dry-run；真实下发必须显式加 `--send-actions`，且默认要求先用数据集帧 qpos 初始化。
 
 当前推荐的 shell 入口是 `python -m teleop_runtime.deploy`。它的薄包装
@@ -51,6 +54,65 @@ policy output (15 Hz)
 因此模型部署、dataset replay debug 和未来 sim deploy 都应以 `RobotAction` 作为语义边界，
 以 `TeleopCommand` 作为下发边界，不再让 policy adapter 直接生成 backend command。
 
+正式 prediction 默认启用 `--policy-observation-firewall-mode strict`：模型输入先投影为与
+artifact/layout 绑定的 `PolicyObservationView`，旧 object-style policy 也只会收到由该 view 重建的净化兼容
+对象，不能读取 runtime fault、authority、safety、writer/backend 或任意 frontend metadata。
+`dual-validate` 仅用于无动作兼容检查，与 `--send-actions` 同时使用会直接拒绝。
+
+### RTC-3c default-off virtual shadow
+
+`--rtc-profile rtc_3c_virtual_shadow_15_30_60_120_v1`提供第一版增量RTC接线。它只允许builtin `hold`
+虚拟policy，并强制`send_actions=false`、15 Hz observation request、30 Hz decision/action、60 Hz position
+reference、120 Hz command cadence。该profile只在RTC分支关闭position chunk lookahead；未指定
+`--rtc-profile`时默认仍是`off`，既有`sync_queue_v1`的replace/append、逐项pop、same-chunk lookahead与
+`PolicyActionEmission`语义保持不变。
+
+RTC coordinator在control thread上按“poll completion → matching-only result admission → 最多pop一个due
+keyframe → 同一个正式`PolicyActionEmission`/canonical preparation → current-only commit-through →
+coverage-triggered request”的顺序执行。commit transition绑定同一个pop receipt与emission identity，只接受已pop且
+已形成正式emission的当前target；future successor无法构造合法due-pop receipt，并另有`target_not_popped`防御检查。
+blocking inference只运行在capacity-1 request、bounded result、single-in-flight worker中；HOLD/FAULT先使producer
+epoch/plan失效，旧worker session drain后才允许显式rearm。RTC timed plan不会写入legacy action deque，也不会把
+尚未正式emission的future successor提前交给position resampler。
+
+当前状态仅为`rtc_3c_virtual_shadow_ready_local_only`：本地virtual-policy long-run/lifecycle fixture不初始化设备；
+production application只检查过`--help`，没有以RTC profile启动camera/backend。它不是OpenPI true RTC、真实
+observation/transport shadow、typed preview receipt、M1C drain或motion authority。RTC-3d完成typed preview
+identity/TTL/safety/downstream acceptance/reference lineage/promotion之前，RTC lookahead必须保持关闭。
+
+现有control loop还提供一个仅供application composition注入的
+`RtcFrontendStepFanout`参数：它在唯一一次`rtc_frontend.step()`返回后，将同一个immutable
+`RtcFrontendStep`以`put_nowait`方式送往显式有界subscriber。full/error只计入对应observer状态，不传播到deploy；
+fanout不拥有worker、plan、predict、merge、pop、emission commit或execution。根级Control Station的CS-3a fixture可用
+target-neutral source binding消费该seam，并以同队列有序fence开关passive shadow，但当前没有CLI开关、production
+composition、target owner、capture owner或motion authority。
+当fanout被显式注入时，`run_policy`会在RTC frontend构造完成后一次性发布由真实frontend/runtime/preparer生成的
+source binding；root bootstrap可以在此之前只准备queue，不能靠重复CLI参数猜测binding hash。该握手仍不启动Station
+server，也不改变camera/backend或RTC producer lifecycle。
+
+RTC-4a另在`robot_motion.deploy.rtc_protocol`与`deployments.client.rtc`提供模型/transport/sim/real无关的
+capability、envelope、conditioning receipt和local/remote backend seam。它目前只有纯本地迁移fixture，没有接到本
+RTC-3c frontend；因此不改变默认同步路径、RTC-3c限制、worker/plan owner或任何设备行为。RTC-4b-A已另在
+`deployments.openpi.client.rtc`增加只支持`continuation=none`的离线final-chunk adapter，并以fake transport/policy
+验证artifact、server metadata、exact OpenPI payload、continuous/int64 discrete output与V22 codec。该adapter没有从本
+runtime导入或注册caller，也不启动server、相机、仿真或设备；RTC-3c仍使用builtin hold。下一步RTC-4b-B必须先完成具体
+模型侧prefix→suffix continuation及可验证conditioning receipt，不能把RTC-4b-A表述为true RTC。
+
+### M3 passive ActionArbiter shadow
+
+`--action-arbiter-mode shadow` 仅在 dry-run 或 dataset replay 调试中启用单策略、非权威的
+ActionArbiter 对照。它被动消费现有 `prepare_next_action()` 唯一 queue pop 产生的同一个
+`PolicyActionEmission`，生成 `would_select` evaluation；现有 canonical safety、command 和 legacy
+execution 仍是唯一执行事实。shadow 不持有 action queue、不申请 dispatch owner token，也不会调用
+backend。启用 `--send-actions` 时该模式会 fail closed；正式真机 shadow capture 要等 M4B durable trace
+完成。配合 `--debug` 时，当前临时 JSONL 会记录 `arbitration_shadow_step` 和
+`legacy_execution_observation`。非 replay policy 在成功生成 shadow evaluation 时，还会从同一个 emission、
+同一个 observation 和已经由旧 owner 计算出的 post-safety result 生成
+`policy_safety_shadow_comparison`：它只重算 shared arm pose/qpos numeric primitive，不再次调用旧 filter，
+并把 frame/controlled-frame 等 representation 差异单独记录。该 observer 不推进 anchor、不消费 action queue、
+不修改 fault/last-action/dispatch；异常只记录 `policy_safety_shadow_error`。这些 JSONL 仍不是 v2.4 durable
+ControlTrace。
+
 ### v2.3 absolute/relative 虚拟等价验收
 
 不连接设备即可运行双路部署验收：
@@ -71,6 +133,78 @@ policy observation frame adapter、policy output normalization、chunk decoder�
 部署边界等价，但不替代真机 A/B：RM65 SDK、IK 数值解、position collision planner、通信时序
 和机械跟踪误差仍需在机械臂在线后单独验收。
 
+### v2.2 raw→v2.3 relative 真机 A/B 闭环验收
+
+该验收只使用同一段已确认安全的 v2.2 impedance episode。两次运行必须使用相同代码、
+数据集、frame range、chunk size、初始化帧、tool profile 和安全参数；唯一允许变化的是
+`absolute/relative` 两个 pose-mode 参数。以下命令直接在真机所在远端仓库运行，不使用
+`remote_python`。
+
+先确认双臂在线、工作区无人/无障碍、急停可用，并让操作员全程观察。绝对分支：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate dexteleop310
+
+python -m teleop_runtime.deploy \
+  --send-actions \
+  --active-sides left right \
+  --end-effector-sides none \
+  --camera-mode none \
+  --left-arm-ip 192.168.101.21 --right-arm-ip 192.168.1.20 \
+  --arm-control-mode impedance \
+  --debug-replay-dataset /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success \
+  --debug-replay-episode 0 \
+  --debug-replay-start-index 0 --debug-replay-end-index 20 \
+  --debug-replay-chunk-size 4 \
+  --init-source replay \
+  --policy-action-pose-mode absolute \
+  --debug-replay-output-pose-mode absolute \
+  --debug --debug-dir /home/user/zc/DexTeleop/logs/v23_real_pair/absolute \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success \
+  --policy-qpos-init-episode 0 --policy-qpos-init-frame 0 \
+  --auto-start --no-wait-for-ready-confirm --max-steps 600
+```
+
+机械臂完全停止后，再运行 relative 分支；除下面三行外保持参数完全相同：
+
+```bash
+  --policy-action-pose-mode relative \
+  --debug-replay-output-pose-mode relative \
+  --debug --debug-dir /home/user/zc/DexTeleop/logs/v23_real_pair/relative
+```
+
+当前 `--init-source replay` 会把第 0 帧用于 startup target 并从 policy replay 中跳过，因此
+`[0,20)` 正常应执行并对齐 source action index `1..19`，共 19 个 action。两次都完成后执行
+只读比对；目录参数会自动选择其中最新的 `deploy_debug_*.jsonl`：
+
+```bash
+python -m teleop_runtime.deploy.acceptance \
+  /home/user/zc/DexTeleop/logs/v23_real_pair/absolute \
+  /home/user/zc/DexTeleop/logs/v23_real_pair/relative \
+  --expected-actions 19 \
+  --output /home/user/zc/DexTeleop/logs/v23_real_pair/acceptance.json
+```
+
+退出码 `0` 且报告 `passed=true` 才通过。验收器按 dataset source action index 对齐，不受启动
+IK recovery rollback/chunk-id 变化影响，并分别检查：
+
+- relative 解码后的 runtime-absolute target 与 absolute target：默认 `2e-6 m / 0.002°`；
+- canonical command target：默认 `2 mm / 0.5°`；
+- 两次 measured TCP 轨迹：首轮建议门槛 `30 mm / 5°`；
+- 两次 measured qpos：首轮建议最大单关节差 `0.15 rad`；
+- source index 集合完全相同，且无 policy/dispatch/cleanup fault。
+
+前两项是 representation/command 硬门槛；后两项包含两次独立真机运行的跟踪和初始化误差，
+当前只是保守首轮门槛。首轮真实分布确认后应通过 CLI 参数收紧，不能把放宽 measured 门槛
+用于掩盖 decoded/command 不一致。旧日志没有 `debug_replay_source_action_index` 时 fail-closed，
+必须用当前代码重新运行。
+
+本 episode metadata 声明为 impedance，不能拿它绕过 mode binding 去验收 position。position
+分支需要另选一段已经确认安全、metadata 明确为 position 的 v2.2/v2.3 episode，再以同样 A/B
+方式运行；position 报告还必须没有 `position_executor_*fault`、dispatch reject、collision hold
+或 debug-event drop。验收器只是日志读取器，不初始化 backend、不访问设备、不下发命令。
+
 当前目录边界为：
 
 - `robot_motion`：`RobotAction` schema/spec、vector adapter、canonical deploy preparation、value-level safety、时间戳 motion resampling。
@@ -79,7 +213,7 @@ policy observation frame adapter、policy output normalization、chunk decoder�
 
 部署频率与 action chunk 执行：
 
-- position deploy 默认使用共享 profile `position_15_60_120hz`：15 Hz policy
+- position deploy 默认使用正式 profile `rm65_bimanual_position_v1`：15 Hz policy
   action、60 Hz pose-reference/IK、120 Hz command stream。`position` 和
   `position_45_150hz` 仅作显式兼容 profile；`impedance_40hz` 仍属于独立的力控链路。
   `--arm-control-mode`、`--position-reference-hz` 和 `--arm-control-hz` 可显式覆盖。
@@ -109,18 +243,26 @@ policy observation frame adapter、policy output normalization、chunk decoder�
 - deploy debug replay 识别 v2.2 和 v2.3 typed layout。v2.3 的 `raw_absolute` 或
   `desk_absolute` action 都先统一为 policy-facing canonical desk，再由当前机器的 runtime
   pose contract 解成 runtime raw 后进入 safety/IK。canonical desk 绑定到 RM65 v3
-  `table_center_frame` 的部署应显式传：
-  `--runtime-pose-frame-contract robot_motion/configs/pose_frames/rm65_dual_arm_table_center_v1_runtime_raw_absolute.json`。
+  `workspace_near_boundary_frame`；native v2.3 policy 或 v2.3 debug replay 未显式传 contract 时，
+  RM65 deploy CLI 默认加载：
+  `--runtime-pose-frame-contract robot_motion/configs/pose_frames/rm65_dual_arm_workspace_near_boundary_v1_runtime_raw_absolute.json`。
   collection 的 `desk_absolute` contract 不能代替这个 runtime `raw_absolute` contract。
   policy artifact 的 `pose_training_data_contract.origin` 决定两条不可混用的路径：
-  `native_v23_dataset` 必须显式传 runtime contract；
+  `native_v23_dataset` 使用上述 RM65 默认值，也可显式传其他当前机器的 runtime contract；
   `v22_raw_identity_compatibility` 只允许相同 RM65 `source_id` 的 identity raw→desk，
   可显式传 `rm65_real_dual_arm_v1_identity.json`，省略时生成同语义的审计 identity binding。
-  后者误传 table-center/non-identity contract 会在 backend 创建前失败，因为旧模型的
+  后者误传 workspace-near-boundary/non-identity contract 会在 backend 创建前失败，因为旧模型的
   absolute state 数值仍绑定左右臂各自 raw base；这不影响 relative action 的 SE(3) 不变性，
   但会改变模型 state 分布。
 - 也可以用 `--action-hz-dataset` 单独指定一个参考数据集来推断发送频率，而不进入 replay 模式。
 - `--policy-hz` 可以省略；省略时按现有 resolver 选择 policy/action 频率。
+- `--action-chunk-execution-steps X` 显式启用 receding-horizon chunk：每次收到模型
+  chunk 只把前 `X` 个动作放入 real runtime queue，随后再请求/消费下一个 chunk；省略
+  时保持完整 chunk 行为。该选项只改变 chunk 边界，不改变 action 的 pose、relative
+  anchor、safety 或 position resampling 语义。需要严格按 X 步切换时配合
+  `--action-queue-policy replace --min-action-queue 0` 使用。
+- 当前第一阶段只落地统一的“前 X 步”消费边界和连续时间排程，不启动新的推理线程；
+  后续异步 worker 可以复用同一配置而不改变动作语义。
 - position 在线插值严格因果：只使用在当前时刻已由 chunk 产生的右端点。
   xyz 线性、quaternion 最短弧 SLERP、qpos 线性，不增加 low-pass/EMA。
 - position 真机输出默认强制双臂模式：15 Hz target pose 先按时间插值为 60 Hz pose，
@@ -474,5 +616,7 @@ python -m teleop_runtime.deploy \
 - arm pose 每个 action keyframe 默认限速：`--max-arm-xyz-step-m 0.10`、`--max-arm-rot-step-deg 15`。
 - arm joint target 每个 action keyframe 默认限速：`--max-arm-joint-step-rad 0.10472`（约 `6deg`）。
 - hand q6 当前只会 clip 到 `[0, 1]`；`--max-hand-step` 是保留参数，hand rate-limit 暂未启用。
+- DMTAC 位置反馈以 `joint_timestamp` 为权威采样时间。真机部署默认拒绝年龄超过
+  0.2 s 的夹爪状态；新的 telemetry 循环时间不能掩盖被跳过读取的旧位置。
 - `--require-ready-observation` 会在 active state 或图像缺失时跳过策略和下发。
 - `--inspire-hand-max-force` 默认继承 `teleop_runtime` 的 `800`。

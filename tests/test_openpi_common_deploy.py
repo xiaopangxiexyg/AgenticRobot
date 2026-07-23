@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -10,6 +11,7 @@ import numpy as np
 
 from deployments.client import (
     DeployPolicyContract,
+    LoadedPolicy,
     RemoteModelPolicy,
     RemotePolicyConfig,
     ServerMetadataError,
@@ -31,11 +33,14 @@ from dataset_contracts import (
     PolicyCameraInput,
     PolicyCameraInputContract,
 )
+from dataset_contracts.pose_chunk import PoseActionChunkContract
+from dataset_contracts.pose_training import PoseTrainingDataContract
 from teleop_runtime.deploy.actions import normalize_policy_output
 from teleop_runtime.deploy import cli as deploy_cli
 from teleop_runtime.deploy.observation import DeploymentObservation
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
+from robot_motion.deploy import RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
 
 
 def _server_metadata() -> dict:
@@ -541,6 +546,17 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertIn("--arm-canfd-follow", launched_args)
         self.assertIn("--position-collision-check", launched_args)
 
+    def test_runtime_keyframe_period_changes_only_for_explicit_rtc_profile(self) -> None:
+        legacy_period = run_policy._runtime_action_keyframe_period_sec(
+            SimpleNamespace(rtc_profile="off")
+        )
+        raw_rtc_period = run_policy._runtime_action_keyframe_period_sec(
+            SimpleNamespace(rtc_profile=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1)
+        )
+
+        self.assertEqual(legacy_period, 1.0 / 15.0)
+        self.assertEqual(raw_rtc_period, 1.0 / 30.0)
+
     def test_openpi_real_launcher_passes_explicit_wrist_image_map(self) -> None:
         with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
             result = openpi_real_launcher.main(
@@ -563,6 +579,155 @@ class OpenPICommonDeployTest(unittest.TestCase):
             {"left_wrist": "observation.images.base_0_rgb"},
         )
         self.assertEqual(kwargs["required_image_keys"], ["left_wrist"])
+
+    def test_openpi_real_launcher_wires_raw_rtc_only_when_explicit(self) -> None:
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            model_id="raw-rtc-openpi-unit",
+            checkpoint_step=123,
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="front",
+                        model_input_key="observation.images.base_0_rgb",
+                        server_camera_slot="base_0_rgb",
+                    ),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            artifact_path = f"{tmp_dir}/policy_artifact.json"
+            with open(artifact_path, "w", encoding="utf-8") as stream:
+                json.dump(artifact.to_dict(), stream)
+            with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
+                result = openpi_real_launcher.main(
+                    [
+                        "--policy-artifact-json",
+                        artifact_path,
+                        "--rtc-profile",
+                        RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+                        "--rtc-normalization-hash",
+                        "normalization:openpi-unit-v1",
+                        "--rtc-frame-contract-hash",
+                        "frame:openpi-unit-v1",
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        delegated = run_main.call_args.args[0]
+        self.assertIn("--rtc-profile", delegated)
+        self.assertIn(RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1, delegated)
+        factory = run_main.call_args.kwargs["rtc_model_adapter_factory"]
+        self.assertTrue(callable(factory))
+        creator = mock.Mock(return_value="absolute-adapter")
+        result = factory(
+            policy=SimpleNamespace(create_raw_rtc_adapter=creator),
+            deploy_session_contract=SimpleNamespace(
+                runtime_pose_frame_contract=None,
+            ),
+            policy_artifact=artifact,
+            args=SimpleNamespace(policy_action_pose_mode="absolute"),
+            active_sides=("left", "right"),
+        )
+        self.assertEqual(result, "absolute-adapter")
+        self.assertEqual(
+            creator.call_args.kwargs["result_action_representation"],
+            "legacy_normalized_v1",
+        )
+        self.assertEqual(creator.call_args.kwargs["action_pose_mode"], "absolute")
+
+        loaded_policy = LoadedPolicy(
+            policy=SimpleNamespace(create_raw_rtc_adapter=creator),
+            name="framework-policy:test",
+        )
+        creator.reset_mock(return_value=True)
+        creator.return_value = "wrapped-adapter"
+        wrapped_result = factory(
+            policy=loaded_policy,
+            deploy_session_contract=SimpleNamespace(
+                runtime_pose_frame_contract=None,
+            ),
+            policy_artifact=artifact,
+            args=SimpleNamespace(policy_action_pose_mode="absolute"),
+            active_sides=("left", "right"),
+        )
+        self.assertEqual(wrapped_result, "wrapped-adapter")
+        self.assertEqual(creator.call_count, 1)
+
+    def test_openpi_real_launcher_selects_typed_results_for_relative_artifact(
+        self,
+    ) -> None:
+        frame_hash = "sha256:" + "3" * 64
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            model_id="raw-rtc-openpi-relative-unit",
+            checkpoint_step=456,
+            dataset_schema="dexteleop_dataset_v2.3",
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="front",
+                        model_input_key="observation.images.base_0_rgb",
+                        server_camera_slot="base_0_rgb",
+                    ),
+                ),
+            ),
+            pose_action_chunk=PoseActionChunkContract(
+                action_horizon=16,
+                action_pose_mode="relative",
+                last_action_pose_mode="relative",
+            ),
+            pose_training_data=PoseTrainingDataContract.v22_raw_identity(
+                active_sides=("left", "right"),
+            ),
+            pose_frame_contract_hashes=(frame_hash,),
+            metadata={
+                "pose_representation": {
+                    "action": "relative",
+                    "last_action": "relative",
+                }
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            artifact_path = f"{tmp_dir}/policy_artifact.json"
+            with open(artifact_path, "w", encoding="utf-8") as stream:
+                json.dump(artifact.to_dict(), stream)
+            with mock.patch(
+                "teleop_runtime.deploy.run_policy.main",
+                return_value=0,
+            ) as run_main:
+                result = openpi_real_launcher.main(
+                    [
+                        "--policy-artifact-json",
+                        artifact_path,
+                        "--rtc-profile",
+                        RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+                        "--rtc-normalization-hash",
+                        "normalization:openpi-relative-unit-v1",
+                        "--rtc-frame-contract-hash",
+                        frame_hash,
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        factory = run_main.call_args.kwargs["rtc_model_adapter_factory"]
+        creator = mock.Mock(return_value="relative-adapter")
+        adapter = factory(
+            policy=SimpleNamespace(create_raw_rtc_adapter=creator),
+            deploy_session_contract=SimpleNamespace(
+                runtime_pose_frame_contract=None,
+            ),
+            policy_artifact=artifact,
+            args=SimpleNamespace(policy_action_pose_mode="relative"),
+            active_sides=("left", "right"),
+        )
+        self.assertEqual(adapter, "relative-adapter")
+        self.assertEqual(
+            creator.call_args.kwargs["result_action_representation"],
+            "typed_canonical_v1",
+        )
+        self.assertEqual(creator.call_args.kwargs["action_pose_mode"], "relative")
+        self.assertEqual(creator.call_args.kwargs["frame_contract_hash"], frame_hash)
 
     def test_openpi_real_launcher_forwards_policy_artifact_to_client_and_runtime(self) -> None:
         artifact = PolicyArtifactContract(
@@ -681,8 +846,8 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(
             resolved,
             [
-                ("position", 75.0, 150.0, True),
-                ("impedance", 75.0, 40.0, False),
+                ("position", 60.0, 120.0, True),
+                ("impedance", 60.0, 40.0, False),
             ],
         )
 

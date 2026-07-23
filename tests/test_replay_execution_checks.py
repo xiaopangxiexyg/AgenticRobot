@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import tempfile
 import threading
 import time
@@ -40,7 +41,10 @@ from teleop_runtime.replay.executor import ReplayExecutionController, ReplayExec
 from teleop_runtime.replay.hardware import ReplayHardwareConfig, ReplayHardwareRig
 from teleop_runtime.replay.session import ReplayGuiSession
 from teleop_runtime.replay.trajectory import REPLAY_TRAJECTORY_QPOS_TARGET, ReplayTrajectoryGroup
-from teleop_runtime.replay.web_gui import build_parser as build_replay_web_gui_parser
+from teleop_runtime.replay.web_gui import (
+    _resolve_replay_dmtac_fields,
+    build_parser as build_replay_web_gui_parser,
+)
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 
 
@@ -733,7 +737,11 @@ class ReplayExecutionChecksTest(unittest.TestCase):
     def test_replay_action_frame_builds_dmtac_end_effector_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             profile = _write_profile(Path(tmpdir) / "right.json", side="right", tcp=[0.01, 0, 0, 0, 0, 0])
-            group = _group(profile, hand_targets=True, hand_spec=True)
+            group = _group(
+                profile,
+                hand_targets=True,
+                hand_spec=True,
+            )
 
             command = replay_teleop_command_at_index(
                 group,
@@ -1044,6 +1052,10 @@ class ReplayExecutionChecksTest(unittest.TestCase):
         )
 
         payload = settings.to_dict()
+        self.assertEqual(
+            payload["position_control_profile_name"],
+            "rm65_bimanual_position_v1",
+        )
         self.assertFalse(payload["position_collision_required"])
         self.assertEqual(payload["position_collision_scene_profile"], "test_scene")
         self.assertEqual(
@@ -1067,6 +1079,7 @@ class ReplayExecutionChecksTest(unittest.TestCase):
         self.assertFalse(args.position_collision_required)
         self.assertEqual(args.position_collision_scene_profile, "test_scene")
         self.assertTrue(args.position_collision_debug)
+        self.assertEqual(args.position_control_profile, "rm65_bimanual_position_v1")
 
     def test_replay_hardware_config_passes_qpos_init_singularity_slowdown_to_arm_backend(self) -> None:
         config = ReplayHardwareConfig.from_payload(
@@ -1177,6 +1190,16 @@ class ReplayExecutionChecksTest(unittest.TestCase):
     def test_replay_web_gui_parser_defers_hz_and_follow_to_mode_defaults(self) -> None:
         parser = build_replay_web_gui_parser()
         position_args = parser.parse_args([])
+        self.assertEqual(position_args.active_sides, "both")
+        np.testing.assert_allclose(
+            [
+                float(value)
+                for value in (
+                    position_args.position_collision_max_joint_velocity_rad_s.split(",")
+                )
+            ],
+            np.deg2rad([170.0, 170.0, 190.0, 210.0, 240.0, 240.0]),
+        )
         position_config = ReplayHardwareConfig(
             active_sides=("right",),
             arm_control_mode=position_args.arm_control_mode,
@@ -1199,6 +1222,107 @@ class ReplayExecutionChecksTest(unittest.TestCase):
 
         self.assertEqual(impedance_config.arm_control_hz, DEFAULT_RM65_ARM_CONTROL_HZ)
         self.assertFalse(impedance_config.arm_canfd_follow)
+
+    def test_replay_hardware_config_defaults_to_collision_safe_dual_arm_topology(self) -> None:
+        self.assertEqual(ReplayHardwareConfig(connect_hardware=False).active_sides, ("left", "right"))
+        self.assertEqual(
+            ReplayHardwareConfig.from_payload({"connect_hardware": False}).active_sides,
+            ("left", "right"),
+        )
+
+    def test_replay_web_gui_resolves_shared_dmtac_assignment_and_manual_override(self) -> None:
+        parser = build_replay_web_gui_parser()
+        args = parser.parse_args(
+            [
+                "--active-sides",
+                "both",
+                "--end-effectors-enabled",
+                "--hand-backend",
+                "dmtac-gripper",
+                "--dmtac-config",
+                "fixture-assignment",
+                "--right-gripper-port",
+                "/dev/manual-right",
+                "--right-gripper-id",
+                "9",
+                "--right-gripper-baudrate",
+                "19200",
+                "--right-gripper-timeout",
+                "0.2",
+            ]
+        )
+        assignment_configs = {
+            "left": SimpleNamespace(
+                connect_hardware=True,
+                gripper_port="/dev/shared-left",
+                gripper_id=3,
+                gripper_baudrate=57600,
+                gripper_timeout=0.04,
+            ),
+            "right": SimpleNamespace(
+                connect_hardware=True,
+                gripper_port="/dev/shared-right",
+                gripper_id=4,
+                gripper_baudrate=38400,
+                gripper_timeout=0.05,
+            ),
+        }
+        with (
+            mock.patch(
+                "teleop_runtime.replay.web_gui.load_dmtac_hardware_assignment",
+                return_value={"schema": "fixture"},
+            ) as load_assignment,
+            mock.patch(
+                "teleop_runtime.replay.web_gui.dmtac_backend_configs_from_assignment",
+                return_value=assignment_configs,
+            ),
+        ):
+            fields = _resolve_replay_dmtac_fields(
+                args,
+                active_sides=("left", "right"),
+                end_effector_backend_by_side={
+                    "left": "dmtac_gripper",
+                    "right": "dmtac_gripper",
+                },
+            )
+
+        load_assignment.assert_called_once_with(
+            "fixture-assignment",
+            validate_current_usb=True,
+            allow_missing=False,
+            assume_yes_for_extra=True,
+        )
+        self.assertEqual(fields["port"]["left"], "/dev/shared-left")
+        self.assertEqual(fields["id"]["left"], 3)
+        self.assertEqual(fields["baudrate"]["left"], 57600)
+        self.assertEqual(fields["timeout"]["left"], 0.04)
+        self.assertEqual(fields["port"]["right"], "/dev/manual-right")
+        self.assertEqual(fields["id"]["right"], 9)
+        self.assertEqual(fields["baudrate"]["right"], 19200)
+        self.assertEqual(fields["timeout"]["right"], 0.2)
+
+    def test_replay_hardware_config_preserves_dmtac_transport_settings(self) -> None:
+        config = ReplayHardwareConfig.from_payload(
+            {
+                "active_sides": "left",
+                "end_effectors_enabled": True,
+                "end_effector_backend_by_side": {"left": "dmtac_gripper"},
+                "gripper_port_by_side": {"left": "/dev/shared-left"},
+                "gripper_id_by_side": {"left": 7},
+                "gripper_baudrate_by_side": {"left": 57600},
+                "gripper_timeout_by_side": {"left": 0.04},
+                "connect_hardware": False,
+            }
+        )
+        self.assertEqual(config.to_dict()["gripper_baudrate_by_side"]["left"], 57600)
+        self.assertEqual(config.to_dict()["gripper_timeout_by_side"]["left"], 0.04)
+
+        rig = ReplayHardwareRig(config)
+        backend = rig._build_end_effector_backend("left")
+        self.assertEqual(backend.config.gripper_port, "/dev/shared-left")
+        self.assertEqual(backend.config.gripper_id, 7)
+        self.assertEqual(backend.config.gripper_baudrate, 57600)
+        self.assertEqual(backend.config.gripper_timeout, 0.04)
 
     def test_replay_configure_payload_mode_switch_recomputes_mode_defaults(self) -> None:
         controller = ReplayExecutionController(
@@ -1292,6 +1416,19 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             np.testing.assert_allclose(
                 factory_kwargs["endpoint_to_tool_by_side"]["left"][:3, 3],
                 [0.01, 0.0, 0.0],
+            )
+            planner_config = factory_kwargs["config"]
+            self.assertEqual(planner_config.solve_min_iterations, 2)
+            self.assertEqual(planner_config.solve_max_iterations, 4)
+            self.assertTrue(planner_config.solve_adaptive_iterations_enabled)
+            self.assertAlmostEqual(planner_config.solve_iteration_reserve_ms, 5.0)
+            self.assertAlmostEqual(planner_config.damping, 0.03)
+            objective = planner_config.ik_tuning.objective_weights()
+            self.assertAlmostEqual(objective.dual_arm_position_cost, 1.0)
+            self.assertAlmostEqual(objective.dual_arm_orientation_cost, 0.35)
+            np.testing.assert_allclose(
+                planner_config.max_joint_velocity_rad_s,
+                np.deg2rad([170.0, 170.0, 190.0, 210.0, 240.0, 240.0]),
             )
             np.testing.assert_allclose(
                 rig.sent_joint_targets[-1]["right"],
@@ -1750,12 +1887,14 @@ class ReplayExecutionChecksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             profile = _write_profile(Path(tmpdir) / "right.json", side="right", tcp=[0.01, 0, 0, 0, 0, 0])
             group = _group(profile, hand_targets=True, hand_spec=True)
+            observer_queue: queue.Queue = queue.Queue(maxsize=4)
             controller = ReplayExecutionController(
                 hardware_config=ReplayHardwareConfig(active_sides=("right",), connect_hardware=False),
                 settings=ReplayExecutionSettings(
                     send_actions_enabled=True,
                     position_collision_required=False,
                 ),
+                action_observer_queue=observer_queue,
             )
             rig = _FakeReplayWorkerRig()
 
@@ -1796,11 +1935,25 @@ class ReplayExecutionChecksTest(unittest.TestCase):
                 ),
             )
             self.assertFalse(rig.sent_action_metadata[1]["temporal_smoothing_applied"])
+            observed = [observer_queue.get_nowait(), observer_queue.get_nowait()]
+            self.assertEqual([item.local_frame_index for item in observed], [0, 1])
+            self.assertEqual([item.source_action_index for item in observed], [0, 1])
+            self.assertTrue(
+                observed[0].target_effective_at < observed[1].target_effective_at
+            )
+            self.assertEqual(controller.status()["action_observer"]["offer_count"], 2)
+            self.assertEqual(controller.status()["action_observer"]["drop_count"], 0)
 
     def test_replay_worker_preserves_impedance_action_rate_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             profile = _write_profile(Path(tmpdir) / "right.json", side="right", tcp=[0.01, 0, 0, 0, 0, 0])
-            group = _group(profile, hand_targets=True, hand_spec=True)
+            group = _group(
+                profile,
+                hand_targets=True,
+                hand_spec=True,
+                frame_times_sec=(100.0, 100.073),
+            )
+            observer_queue: queue.Queue = queue.Queue(maxsize=4)
             controller = ReplayExecutionController(
                 hardware_config=ReplayHardwareConfig(
                     active_sides=("right",),
@@ -1808,6 +1961,7 @@ class ReplayExecutionChecksTest(unittest.TestCase):
                     connect_hardware=False,
                 ),
                 settings=ReplayExecutionSettings(send_actions_enabled=True),
+                action_observer_queue=observer_queue,
             )
             rig = _FakeReplayWorkerRig()
 
@@ -1818,6 +1972,56 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             self.assertEqual(len(rig.sent_action_poses), 0)
             self.assertEqual(len(rig.sent_commands), 2)
             self.assertEqual(set(rig.sent_commands[0].commands), {"right_arm"})
+            observed = [observer_queue.get_nowait(), observer_queue.get_nowait()]
+            self.assertEqual([item.local_frame_index for item in observed], [0, 1])
+            self.assertAlmostEqual(
+                observed[1].source_relative_time - observed[0].source_relative_time,
+                0.073,
+            )
+            self.assertAlmostEqual(
+                observed[1].target_effective_at - observed[0].target_effective_at,
+                0.1,
+            )
+            self.assertAlmostEqual(
+                observed[0].effective_until - observed[0].effective_from,
+                0.1,
+            )
+            self.assertEqual(controller.status()["action_observer"]["offer_count"], 2)
+
+    def test_replay_action_observer_failure_never_changes_legacy_dispatch(self) -> None:
+        class FailingObserverQueue(queue.Queue):
+            def __init__(self) -> None:
+                super().__init__(maxsize=4)
+
+            def put_nowait(self, _item: object) -> None:
+                raise RuntimeError("observer unavailable")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = _write_profile(
+                Path(tmpdir) / "right.json",
+                side="right",
+                tcp=[0.01, 0, 0, 0, 0, 0],
+            )
+            group = _group(profile)
+            controller = ReplayExecutionController(
+                hardware_config=ReplayHardwareConfig(
+                    active_sides=("right",),
+                    arm_control_mode="impedance",
+                    connect_hardware=False,
+                ),
+                settings=ReplayExecutionSettings(send_actions_enabled=True),
+                action_observer_queue=FailingObserverQueue(),
+            )
+            rig = _FakeReplayWorkerRig()
+
+            controller._replay_worker(rig, group)  # type: ignore[arg-type]
+
+            status = controller.status()
+            self.assertEqual(status["state"], "finished")
+            self.assertEqual(len(rig.sent_commands), 2)
+            self.assertEqual(status["action_observer"]["offer_count"], 0)
+            self.assertEqual(status["action_observer"]["error_count"], 2)
+            self.assertIn("observer unavailable", status["action_observer"]["last_error"])
 
     def test_position_replay_limits_keyframe_before_reference_interpolation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

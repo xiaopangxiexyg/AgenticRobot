@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from hardware.VIVE.mocap import clock_sync as shared_clock_sync
 from hardware.VIVE.mocap import vive_data_sender, vive_data_sender_legacy
 from teleop_runtime.sources.pose.vive_clock_sync import (
     ViveClockSyncConfig,
@@ -48,9 +51,49 @@ def test_vive_data_sender_defaults_to_300hz(monkeypatch) -> None:
     args = vive_data_sender.parse_args()
 
     assert args.hz == 300.0
+    assert args.tracker_count == 2
     assert args.clock_sync_mode == "optional"
     assert args.clock_sync_port == 10001
     assert args.clock_sync_port != args.port
+
+
+def test_embedded_clock_sync_wire_format_matches_shared_protocol() -> None:
+    values = {
+        "sender_instance_id": "sender-instance",
+        "probe_id": 7,
+        "t1_sender_monotonic_ns": 1_000,
+    }
+    assert vive_data_sender.make_probe(**values) == shared_clock_sync.make_probe(**values)
+
+    reply_packet = shared_clock_sync.make_reply(
+        **values,
+        t2_collector_monotonic_ns=1_100,
+        t3_collector_monotonic_ns=1_120,
+    )
+    reply = vive_data_sender.parse_reply(reply_packet)
+    assert reply is not None
+    assert vars(reply) == {
+        **values,
+        "t2_collector_monotonic_ns": 1_100,
+        "t3_collector_monotonic_ns": 1_120,
+    }
+
+    result_values = {
+        **vars(reply),
+        "t4_sender_monotonic_ns": 1_250,
+    }
+    assert vive_data_sender.make_result(**result_values) == shared_clock_sync.make_result(
+        **result_values
+    )
+    embedded_measurement = vive_data_sender.measurement_from_result(
+        vive_data_sender.ClockSyncResult(**result_values)
+    )
+    shared_measurement = shared_clock_sync.measurement_from_result(
+        shared_clock_sync.ClockSyncResult(**result_values)
+    )
+    assert embedded_measurement is not None
+    assert shared_measurement is not None
+    assert vars(embedded_measurement) == vars(shared_measurement)
 
 
 def test_legacy_sender_entrypoint_pins_clock_control_off(monkeypatch) -> None:
@@ -168,7 +211,7 @@ def test_missing_clock_sync_helper_fails_open_for_new_optional_mode(monkeypatch)
     assert vive_data_sender.start_clock_sync_client(args) is None
 
 
-def test_sender_uses_only_canonical_triad_openvr_package_file() -> None:
+def test_sender_preferred_triad_openvr_package_file_is_repository_copy() -> None:
     module_path = vive_data_sender.canonical_triad_openvr_module_path()
 
     assert module_path == (
@@ -178,6 +221,58 @@ def test_sender_uses_only_canonical_triad_openvr_package_file() -> None:
     )
     assert module_path.is_file()
     assert module_path.parent.name == "triad_openvr"
+    assert vive_data_sender.find_triad_openvr_module_path() == module_path
+
+
+@pytest.mark.parametrize(
+    "relative_driver_path",
+    [
+        Path("triad_openvr.py"),
+        Path("triad_openvr") / "triad_openvr.py",
+        Path("vendor") / "triad_openvr.py",
+        Path("vendor") / "openvr_driver" / "triad_openvr.py",
+        Path("..") / "triad_openvr" / "triad_openvr.py",
+        Path("..") / "vendor" / "triad_openvr.py",
+        Path("..") / "vendor" / "openvr_driver" / "triad_openvr.py",
+    ],
+)
+def test_find_triad_openvr_supports_portable_relative_layouts(
+    tmp_path,
+    relative_driver_path: Path,
+) -> None:
+    sender_path = tmp_path / "bundle" / "mocap" / "vive_data_sender.py"
+    sender_path.parent.mkdir(parents=True)
+    sender_path.touch()
+    driver_path = (sender_path.parent / relative_driver_path).resolve()
+    driver_path.parent.mkdir(parents=True, exist_ok=True)
+    driver_path.write_text("class triad_openvr:\n    pass\n", encoding="utf-8")
+
+    assert vive_data_sender.find_triad_openvr_module_path(sender_path) == driver_path
+
+
+def test_find_triad_openvr_prefers_sender_local_file(tmp_path) -> None:
+    sender_path = tmp_path / "bundle" / "mocap" / "vive_data_sender.py"
+    sender_path.parent.mkdir(parents=True)
+    sender_path.touch()
+    local_driver = sender_path.parent / "triad_openvr.py"
+    sibling_driver = sender_path.parent.parent / "vendor" / "triad_openvr.py"
+    local_driver.write_text("LOCAL = True\n", encoding="utf-8")
+    sibling_driver.parent.mkdir()
+    sibling_driver.write_text("LOCAL = False\n", encoding="utf-8")
+
+    assert vive_data_sender.find_triad_openvr_module_path(sender_path) == local_driver
+
+
+def test_find_triad_openvr_skips_hidden_repository_metadata(tmp_path) -> None:
+    sender_path = tmp_path / "bundle" / "mocap" / "vive_data_sender.py"
+    sender_path.parent.mkdir(parents=True)
+    sender_path.touch()
+    hidden_driver = sender_path.parent.parent / ".git" / "triad_openvr.py"
+    hidden_driver.parent.mkdir()
+    hidden_driver.write_text("SHOULD_NOT_LOAD = True\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="triad_openvr.py was not found"):
+        vive_data_sender.find_triad_openvr_module_path(sender_path)
 
 
 def test_load_triad_openvr_supports_explicit_canonical_file(tmp_path) -> None:
@@ -188,6 +283,114 @@ def test_load_triad_openvr_supports_explicit_canonical_file(tmp_path) -> None:
 
     assert module.__file__ == str(module_path)
     assert module.triad_openvr.__name__ == "triad_openvr"
+
+
+def test_load_triad_openvr_searches_relative_to_sender(monkeypatch, tmp_path) -> None:
+    sender_path = tmp_path / "bundle" / "mocap" / "vive_data_sender.py"
+    sender_path.parent.mkdir(parents=True)
+    sender_path.touch()
+    module_path = (
+        sender_path.parent.parent
+        / "portable_driver"
+        / "lib"
+        / "triad_openvr.py"
+    )
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("class triad_openvr:\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(vive_data_sender, "__file__", str(sender_path))
+
+    module = vive_data_sender.load_triad_openvr()
+
+    assert module.__file__ == str(module_path)
+    assert module.triad_openvr.__name__ == "triad_openvr"
+
+
+def test_load_triad_openvr_falls_back_to_embedded_for_one_file_copy(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sender_path = tmp_path / "portable" / "vive_data_sender.py"
+    sender_path.parent.mkdir()
+    sender_path.touch()
+    monkeypatch.setattr(vive_data_sender, "__file__", str(sender_path))
+
+    module = vive_data_sender.load_triad_openvr()
+
+    assert module.triad_openvr is vive_data_sender.EmbeddedTriadOpenVR
+
+
+def test_one_file_sender_runs_with_only_openvr_dependency(tmp_path) -> None:
+    sender_dir = tmp_path / "isolated_bundle" / "sender_host"
+    sender_dir.mkdir(parents=True)
+    sender_copy = sender_dir / "vive_data_sender.py"
+    sender_copy.write_bytes(Path(vive_data_sender.__file__).read_bytes())
+    (sender_dir / "openvr.py").write_text(
+        """
+VRApplication_Other = 3
+TrackingUniverseStanding = 1
+k_unMaxTrackedDeviceCount = 2
+TrackedDeviceClass_Controller = 2
+TrackedDeviceClass_HMD = 1
+TrackedDeviceClass_GenericTracker = 3
+TrackedDeviceClass_TrackingReference = 4
+Prop_SerialNumber_String = 1000
+Prop_ModelNumber_String = 1001
+VREvent_TrackedDeviceActivated = 100
+VREvent_TrackedDeviceDeactivated = 101
+
+class _Pose:
+    bDeviceIsConnected = True
+    bPoseIsValid = True
+    mDeviceToAbsoluteTracking = (
+        (1.0, 0.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+    )
+    vVelocity = (0.0, 0.0, 0.0)
+    vAngularVelocity = (0.0, 0.0, 0.0)
+
+class _System:
+    def getDeviceToAbsoluteTrackingPose(self, universe, prediction, count):
+        return [_Pose(), _Pose()]
+    def getTrackedDeviceClass(self, index):
+        return TrackedDeviceClass_GenericTracker
+    def getStringTrackedDeviceProperty(self, index, prop):
+        return ("SERIAL-" if prop == Prop_SerialNumber_String else "MODEL-") + str(index)
+    def pollNextEvent(self, event):
+        return False
+
+class VREvent_t:
+    eventType = 0
+    trackedDeviceIndex = 0
+
+_SYSTEM = _System()
+def init(application):
+    return _SYSTEM
+def VRSystem():
+    return _SYSTEM
+def shutdown():
+    pass
+""".lstrip(),
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, "-S", str(sender_copy), "--list-devices"],
+        cwd=sender_dir,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "using embedded dependency-light OpenVR adapter" in completed.stdout
+    assert "Found 2 Trackers" in completed.stdout
+    assert "tracker_1 (SERIAL-0, MODEL-0)" in completed.stdout
+    assert "tracker_2 (SERIAL-1, MODEL-1)" in completed.stdout
 
 
 def test_pose_sample_clock_uses_high_resolution_perf_counter(monkeypatch) -> None:
@@ -279,10 +482,54 @@ def test_vive_data_sender_assigns_trackers_by_lexical_device_name() -> None:
     ]
 
 
+def test_vive_data_sender_supports_explicit_additional_trackers() -> None:
+    vive = _FakeViveTrackers(
+        ["tracker_e", "tracker_c", "tracker_a", "tracker_d", "tracker_b"]
+    )
+
+    specs = vive_data_sender.auto_tracker_specs(vive, tracker_count=5)
+
+    assert [(spec.device_name, spec.tracker_role) for spec in specs] == [
+        ("tracker_a", "left_wrist"),
+        ("tracker_b", "right_wrist"),
+        ("tracker_c", "auxiliary"),
+        ("tracker_d", "auxiliary_2"),
+        ("tracker_e", "auxiliary_3"),
+    ]
+
+
 @pytest.mark.parametrize("names", [[], ["tracker_a"], ["tracker_a", "tracker_b", "tracker_c"]])
 def test_vive_data_sender_requires_exactly_two_trackers(names: list[str]) -> None:
     with pytest.raises(ValueError, match="exactly 2 GenericTrackers"):
         vive_data_sender.auto_tracker_specs(_FakeViveTrackers(names))
+
+
+def test_vive_data_sender_explicit_tracker_count_is_still_exact() -> None:
+    with pytest.raises(ValueError, match="exactly 3 GenericTrackers"):
+        vive_data_sender.auto_tracker_specs(
+            _FakeViveTrackers(["tracker_a", "tracker_b", "tracker_c", "tracker_d"]),
+            tracker_count=3,
+        )
+
+
+def test_vive_data_sender_waits_for_explicit_tracker_count() -> None:
+    vive = _FakeViveTrackers(["tracker_c", "tracker_a", "tracker_b"])
+
+    specs = vive_data_sender.wait_for_trackers(vive, 1.0, tracker_count=3)
+
+    assert specs is not None
+    assert [(spec.device_name, spec.tracker_role) for spec in specs] == [
+        ("tracker_a", "left_wrist"),
+        ("tracker_b", "right_wrist"),
+        ("tracker_c", "auxiliary"),
+    ]
+
+
+def test_vive_data_sender_tracker_count_cli_is_opt_in() -> None:
+    assert vive_data_sender.parse_args(["--tracker-count", "3"]).tracker_count == 3
+
+    with pytest.raises(SystemExit):
+        vive_data_sender.parse_args(["--tracker-count", "1"])
 
 
 def test_send_error_backoff_is_bounded() -> None:

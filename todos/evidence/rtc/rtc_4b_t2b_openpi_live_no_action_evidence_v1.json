@@ -1,0 +1,181 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t2b_openpi_live_no_action_2026_07_22",
+  "scope": "remote_existing_openpi_model_server_synthetic_observation_final_chunk_no_action",
+  "captured_at": "2026-07-22T20:53:44+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "production_source_changed_by_t2b": false,
+    "remote_openpi_source_changed_by_t2b": false,
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "remote_host_alias": "dex-remote",
+    "openpi_project": "/home/user/zc/openpi",
+    "openpi_environment": "/home/user/zc/openpi/.venv",
+    "numpy": "1.26.4",
+    "websockets": "15.0.1",
+    "msgpack": "1.1.0",
+    "server_bind": "127.0.0.1:8078",
+    "gpu_model_loaded": true,
+    "synthetic_observation_used": true,
+    "real_observation_used": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "dispatch_attempted": false,
+    "production_entrypoint_started": false,
+    "control_station_started": false
+  },
+  "representative_loaded_instance": {
+    "evidence_only_not_enable_allowlist": true,
+    "model_id": "0712-wrist-cube",
+    "config_name": "0712-wrist-cube",
+    "checkpoint_step": 92599,
+    "action_horizon": 50,
+    "state_dim": 16,
+    "action_dim": 16,
+    "state_discrete_dim": 0,
+    "action_discrete_dim": 0,
+    "policy_io_layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+    "required_synthetic_image_keys": [
+      "observation.images.left_wrist",
+      "observation.images.right_wrist"
+    ],
+    "requires_model_side_rtc_adapter": false,
+    "continuation_mode_claimed": "none"
+  },
+  "probe_boundary": {
+    "client_location": "remote_/tmp_only",
+    "client_source_promoted_to_production": false,
+    "client_imports_control_station": false,
+    "client_imports_teleop_runtime": false,
+    "client_imports_robot_motion": false,
+    "client_imports_hardware": false,
+    "client_imports_sim": false,
+    "observation_state": "zeros_float32_16",
+    "observation_images": "zeros_uint8_rgb_hwc_224x224_two_wrist",
+    "response_consumption": "shape_dtype_finite_hash_only",
+    "planner_called": false,
+    "safety_called": false,
+    "executor_called": false,
+    "robot_or_camera_module_initialized": false
+  },
+  "transport_deadline_spec": {
+    "connect_timeout_sec": 15.0,
+    "metadata_timeout_sec": 15.0,
+    "inference_timeout_sec": 120.0,
+    "close_timeout_sec": 5.0,
+    "semantic_content_hash": "c642d9b74d493a8072b131626f7041208ba32c5233b833f749a5e550cc2f30a9"
+  },
+  "metadata_validation": {
+    "protocol_version": "openpi.local_policy.websocket.v1",
+    "deploy_schema_version": "dexteleop_deploy_v2",
+    "metadata_content_hash_first": "cae16c83e099cc681393c182165b716c65a219de6c3b67e96408938b151cea70",
+    "metadata_content_hash_second": "cae16c83e099cc681393c182165b716c65a219de6c3b67e96408938b151cea70",
+    "metadata_hash_continuous_across_reconnect": true,
+    "model_deployment_artifact_identity_equal": true,
+    "shape_and_horizon_equal_registry_and_artifact": true
+  },
+  "final_chunk_results": [
+    {
+      "connection_generation": 1,
+      "actions_shape": [50, 16],
+      "actions_dtype": "float32",
+      "actions_all_finite": true,
+      "actions_discrete_shape": [50, 0],
+      "policy_io_layout_hash_valid": true,
+      "actions_content_hash": "0c7ca4baf2e2a99f1fc252c331342f57221c01b3ac298fab653bdef31764e234",
+      "inference_duration_sec": 9.785010863968637
+    },
+    {
+      "connection_generation": 2,
+      "actions_shape": [50, 16],
+      "actions_dtype": "float32",
+      "actions_all_finite": true,
+      "actions_discrete_shape": [50, 0],
+      "policy_io_layout_hash_valid": true,
+      "actions_content_hash": "4447f9b9ab7ca15e0b1c71da0377b5032ed23ed85603c936331d2e3bb319db9a",
+      "inference_duration_sec": 0.8037159960367717
+    }
+  ],
+  "lifecycle_results": {
+    "first_cancel_status": "cancellation_latched",
+    "first_close_status": "closed",
+    "rearm_status": "session_armed",
+    "second_cancel_status": "cancellation_latched",
+    "second_close_status": "closed",
+    "connection_generations": [1, 2],
+    "phase_order": [
+      "connect",
+      "metadata",
+      "inference",
+      "close",
+      "connect",
+      "metadata",
+      "inference",
+      "close"
+    ],
+    "all_phase_receipts_completed": true,
+    "timeout_or_fallback_observed": false
+  },
+  "cleanup": {
+    "server_wrapper_disconnect_left_remote_process": true,
+    "exact_resolved_server_pids": [154414, 154410],
+    "cleanup_signal": "SIGTERM",
+    "only_exact_run_pids_signalled": true,
+    "post_cleanup_port": 8078,
+    "post_cleanup_connect_ex": 111,
+    "post_cleanup_port_closed": true,
+    "post_cleanup_server_python_process_found": false,
+    "remote_tmp_probe_left_for_audit": "/tmp/dexteleop_rtc_t2b_client_20260722"
+  },
+  "scoped_source_sha256": {
+    "deployments/client/rtc_transport.py": "fdeeea0056aaa84d137f8f06ebfa19e647cf2eea03a8125758575072f2df85e6",
+    "deployments/openpi/client/transport.py": "c567a05223114b93f7024aa752c6627d16b3c9bf2d50e6bb2f94c464cf9e8d32",
+    "dataset_contracts/canonical_encoding.py": "d4e34543a70e2a30d55484faf5e0dba7ac6208e91455084b33fa0324db827591",
+    "remote_tmp_live_no_action_probe.py": "ab0d0c70ece9de13cd2ba5411a4d4a626fb7199f9502481a49693b7e4babeb13",
+    "remote_openpi/scripts/serve_dexteleop_policy.py": "341d716a20b654d9e1539482e6722d261465eabb77a45913145ea0e14534fa44",
+    "remote_openpi/src/openpi/policies/dexteleop_v22_policy.py": "6a8c78a1798901168c0e0835ee88ddb3e2bcf997c4b92eaef3c53d46891414eb",
+    "remote_openpi/configs/dexteleop_policy_registry.json": "f1f82756b2bcc4fe4b6b1ea7a002617085dc15f9e827e3132531f23407af37b1",
+    "remote_openpi/checkpoint/policy_artifact.json": "ade133634ea77c645f9e3ecbb98113c2ac3c73512b65e1e5ef9b43238acfcb54"
+  },
+  "out_of_scope_capture_sha256": {
+    "teleop_runtime/deploy/run_policy.py": "73529a2ea5a3c98e7ef34a31ca6c6d6879974f11948e5872313504a8ba9a25a5",
+    "teleop_runtime/deploy/replay.py": "984ab78db8717f42e9d0c843c282bf73546ac24e71ec2eb77ced3e5f1008bb1a",
+    "teleop_runtime/deploy/rtc_step_fanout.py": "b3e5ea886dff038a504ffe6ff211dcb4b93cfeff81642c1afa1ed56e74e7fa48",
+    "teleop_runtime/position_control/deploy_executor.py": "69eb32a1b16644d296a50ef9918cef7c981a530248ee16ce2488abb7e5af0c26",
+    "robot_motion/deploy/inference.py": "802f8a697427c4fddb75a8266501f91bf05942634708ab5f91c582ca1443f80f",
+    "robot_motion/deploy/chunk_plan.py": "64e5b705509e3645367bfb253bdc400ed4aec0b49aef8e5e4dd849a3ac54eb0a",
+    "robot_motion/deploy/async_producer.py": "52cfffbe769a2276a0d65c156d7d672588704768026c6570edebb5b7ec7fd03a",
+    "robot_motion/deploy/rtc_protocol.py": "1160600bb39d468b62a4637a86054cd3a63933d49ddbc712ca96c9d5a7e7d835",
+    "robot_motion/deploy/policy_worker.py": "52faa19b35484988c4d24984c23af60daa4374e8a6b7676b516fa2b998f2a1aa",
+    "sim/mujoco/deploy/rtc_policy.py": "b2f5e9a8e1d836cd5db87f1903c75f3bc7fbbe5672318c10acd4cf08819df7f8"
+  },
+  "claims": [
+    "the existing OpenPI observation-to-final-chunk server works with the current deadline-aware DexTeleop websocket transport without a model-side RTC adapter",
+    "loaded-instance metadata, artifact identity, layout, dimensions and horizon can be validated before accepting a final chunk",
+    "fresh reconnect preserves metadata identity and retires the previous socket before the next request",
+    "the live final chunk can be observed without importing deployment control, teleop, replay, position, sim or hardware modules",
+    "this representative model instance is evidence only and does not become a checkpoint/config compatibility allowlist"
+  ],
+  "non_claims": [
+    "no real observation path was exercised",
+    "no bounded worker-to-timed-plan live integration was exercised",
+    "no control-loop latency or underrun claim is made",
+    "no action admission, safety, reference, dispatch or motion authority was exercised",
+    "no prefix-conditioned continuation capability is claimed",
+    "no production enablement or true real-time guarantee is claimed"
+  ],
+  "next_gate": {
+    "id": "rtc_4b_t2c_live_synthetic_worker_timed_plan_shadow",
+    "goal": "compose the existing final-chunk adapter, bounded worker and single timed-plan producer against a live server using synthetic observations and send_actions=false",
+    "requires_model_side_adapter": false,
+    "requires_real_observation": false,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false,
+    "requires_position_change": false,
+    "must_remain_default_off_and_caller_free": true,
+    "later_gate": "rtc_4b_t3_real_observation_no_action_shadow_requires_separate_camera_scope"
+  }
+}

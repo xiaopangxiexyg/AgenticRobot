@@ -30,6 +30,10 @@ class InspireTacHandBackendConfig:
     modbus_timeout_sec: float = 0.5
     reconnect_on_error: bool = True
     reconnect_cooldown_sec: float = 1.0
+    # Deployment-only live observation shadow.  Kept after the existing public
+    # fields so legacy positional construction keeps its old meaning.  The
+    # hand may be polled for state/tactile data but never accepts a command.
+    observation_only: bool = False
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
@@ -143,6 +147,10 @@ class InspireTacHandBackend(EffectorBackend):
         if command.effector_name != self.name:
             raise ValueError(
                 f"{self.name} received command for effector '{command.effector_name}'."
+            )
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; refusing hand command dispatch."
             )
         if command.command_type != "joint_vector":
             raise ValueError(
@@ -342,6 +350,7 @@ class InspireTacHandBackend(EffectorBackend):
                 "tactile_regions": tuple(self.config.tactile_regions),
                 "telemetry_error": self._telemetry_error,
                 "connect_hardware": bool(self.config.connect_hardware),
+                "observation_only": bool(self.config.observation_only),
                 "is_connected": self.hand is not None,
                 "reconnect_count": int(self._reconnect_count),
                 "max_fingertip_force": int(self.config.max_fingertip_force),

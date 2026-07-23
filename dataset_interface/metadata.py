@@ -13,11 +13,14 @@ from dataset_contracts.v22 import (
 from dataset_contracts.v23 import V23DatasetContract, resolve_v23_dataset_contract
 from dataset_contracts.pose_frames import PoseFrameContract
 from dataset_contracts.pose_chunk import PoseActionChunkContract
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_contracts.episode_curation import EpisodeCurationRecord
 
 from .pose_chunk import (
     PoseActionChunkLocation,
     pose_action_chunk_start_indices,
 )
+from .episode_curation import EpisodeCurationReader
 
 
 MODALITY_VALIDITY_SCHEMA_VERSION = "dexteleop.modality_validity.v1"
@@ -177,12 +180,27 @@ class DexTeleopDatasetIndex:
         self.modality_validity_path = self.dataset_root / "meta" / "modality_validity.json"
         self.info = _read_json(self.info_path)
         self.modality_validity = _read_json(self.modality_validity_path)
+        capture_payload = self.modality_validity.get("capture")
+        self.capture_modality_contract = (
+            CaptureModalityContract()
+            if capture_payload is None
+            else CaptureModalityContract.from_dict(capture_payload)
+        )
         records = [EpisodeRecord(self.dataset_root, row) for row in _read_jsonl(self.episodes_path)]
         self._episodes = {record.episode_index: record for record in records}
         if len(self._episodes) != len(records):
             raise ValueError(f"duplicate episode_index in {self.episodes_path}")
         self._declared_camera_keys = _camera_keys_from_records(records)
         self._training_validity = self._parse_training_validity()
+        self._plus_curation_readers: dict[Path, EpisodeCurationReader] = {}
+
+    @property
+    def ignored_camera_keys(self) -> tuple[str, ...]:
+        return self.capture_modality_contract.ignored_camera_keys
+
+    @property
+    def ignored_tactile_keys(self) -> tuple[str, ...]:
+        return self.capture_modality_contract.ignored_tactile_keys
 
     @property
     def dataset_name(self) -> str:
@@ -242,6 +260,26 @@ class DexTeleopDatasetIndex:
             return self._episodes[int(episode_index)]
         except KeyError as exc:
             raise KeyError(f"episode_index {episode_index} not found in {self.episodes_path}") from exc
+
+    def plus_episode_curation(
+        self,
+        episode_index: int,
+        annotation_root: str | Path | None,
+    ) -> EpisodeCurationRecord | None:
+        """Return optional Plus curation without invalidating legacy datasets.
+
+        ``None`` for ``annotation_root`` or a missing sidecar is the normal
+        compatibility result, not a dataset validation error.
+        """
+
+        if annotation_root is None or not str(annotation_root).strip():
+            return None
+        root = Path(annotation_root).expanduser().resolve()
+        reader = self._plus_curation_readers.get(root)
+        if reader is None:
+            reader = EpisodeCurationReader(root)
+            self._plus_curation_readers[root] = reader
+        return reader.for_episode(self.dataset_root, int(episode_index))
 
     def pose_action_chunk_locations(
         self,

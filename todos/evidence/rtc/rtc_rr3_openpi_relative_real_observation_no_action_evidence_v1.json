@@ -1,0 +1,113 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr3_openpi_relative_real_observation_no_action_2026_07_23",
+  "captured_at": "2026-07-23T22:06:02+08:00",
+  "scope": "real_arm_gripper_camera_observation_to_openpi_raw_rtc_transport_no_action_shadow",
+  "gate_result": "observation_and_transport_passed_timing_and_shutdown_gate_not_passed",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "teleop_or_replay_modified": false,
+    "sim_observation_modified": false,
+    "openpi_checkout_modified": false
+  },
+  "loaded_instance": {
+    "evidence_only_not_compatibility_allowlist": true,
+    "model_id": "0715-cube-front-ready-mix-4to1-relative",
+    "checkpoint_step": 149999,
+    "action_pose_mode": "relative",
+    "prediction_horizon_steps": 50,
+    "model_action_dim": 16,
+    "model_state_dim": 32,
+    "camera_source_keys": [
+      "front",
+      "left_wrist",
+      "right_wrist"
+    ]
+  },
+  "identity_bindings": {
+    "layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+    "frame_contract_hash": "sha256:c8d881305707dc8d83da3a4d0dab9c3bbb0057ecfd560a9e9ac4ae00fb66b71c",
+    "normalization_hash": "sha256:66debe51033f068bcb71029799dd26fe9e523c4aaef068e4746c60c997dbae6b",
+    "continuation_mode": "none"
+  },
+  "boundary": {
+    "rtc_profile": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "rtc_real_shadow": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "arm_observation_only": true,
+    "left_gripper_observation_only": true,
+    "right_gripper_observation_only": true,
+    "gripper_send_commands": false,
+    "tactile_enabled": false,
+    "position_reference_called": false,
+    "dispatch_called": false,
+    "action_send_authority": false
+  },
+  "real_observation": {
+    "loop_steps": 1200,
+    "effective_action_hz": 30.0,
+    "effective_policy_hz": 30.0,
+    "state_valid_after_warmup": "38/38",
+    "front_camera_frames_at_last_status": 780,
+    "left_wrist_camera_frames_at_last_status": 663,
+    "right_wrist_camera_frames_at_last_status": 631,
+    "transient_camera_stale_faults_observed": true,
+    "terminal_runtime_exit_code": 0
+  },
+  "transport_and_admission": {
+    "completed_transport_exchanges": 30,
+    "unique_request_ids": 30,
+    "source_chunk_size": 50,
+    "all_exchanges_non_authoritative": true,
+    "cold_inference_duration_sec": 10.167643413995393,
+    "warm_inference_duration_median_sec": 0.7054428469855338,
+    "warm_inference_duration_min_sec": 0.7007933099521324,
+    "formal_emission_count": 0,
+    "maximum_plan_keyframe_count": 0,
+    "rejection_reason": "request_deadline_expired",
+    "rejected_completion_count": 30,
+    "request_validity_steps": 10
+  },
+  "control_loop": {
+    "worker_inference_blocked_control_loop": false,
+    "control_budget_sec": 0.03333333333333333,
+    "control_budget_exceeded_count": 31,
+    "control_duration_max_sec": 0.10398985299980268,
+    "gate_passed": false,
+    "interpretation": "blocking inference stayed in the worker, but completion admission and hashing exceeded the 30 Hz control budget"
+  },
+  "shutdown": {
+    "worker_session_state": "ABANDONED_UNDRAINED",
+    "worker_thread_exited_at_frontend_close": false,
+    "client_process_exited": true,
+    "server_process_cleaned": true,
+    "loopback_port_8078_closed": true,
+    "gate_passed": false
+  },
+  "implementation_repairs_required_to_reach_the_shadow": [
+    "LoadedPolicy explicitly forwards an opt-in model-package create_raw_rtc_adapter capability",
+    "zero-dimensional discrete outputs ignore an inactive discrete key name while non-zero discrete outputs remain strict",
+    "explicit RTC profiles bind PolicyDeployRuntime keyframe period to 30 Hz while sync_queue_v1 retains 15 Hz"
+  ],
+  "raw_log_attestation": {
+    "debug_jsonl_sha256": "f51f834351047dfbdab0a749c8bb875f21c5d5ce8e30e45507cf754a71ebbfe7",
+    "wrapper_log_sha256": "4baa45083a00a406f50d3c9a0805e71ba2f47400d330a6e9a0fc0b96ffaae051",
+    "debug_event_counts": {
+      "startup": 1,
+      "rtc_frontend_step": 1200,
+      "rtc_transport_exchange": 30,
+      "rtc_frontend_close": 1
+    }
+  },
+  "next_gate": {
+    "action_send_authorized": false,
+    "required": [
+      "make request validity and delay-estimator semantics explicit enough to admit a warm result without weakening default fail-closed behavior",
+      "move or reduce completion-side work until the 30 Hz control budget is met",
+      "obtain a bounded worker drain receipt on normal frontend close",
+      "repeat real observation no-action shadow and observe at least one unique formal emission with zero dispatch"
+    ]
+  }
+}

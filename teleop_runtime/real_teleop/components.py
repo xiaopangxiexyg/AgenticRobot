@@ -49,6 +49,7 @@ class RealTeleopComponents:
     joint_distance_weights: np.ndarray
     arm_state_read_executor: ThreadPoolExecutor | None
     arm_loop_step_dt_tracker: dict[str, float | None]
+    human_shadow_frontend: HumanShadowFrontend | None
     temporary_safety_limiter: TemporaryDualArmSafetyLimiter | None
     fix_arm_controller: FixArmCommandController | None
     init_arm_controller: InitArmCommandController | None

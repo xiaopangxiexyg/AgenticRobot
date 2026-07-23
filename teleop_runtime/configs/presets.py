@@ -80,8 +80,10 @@ def build_annotated_dual_rm65_calibration(
             "preset": "annotated_dual_rm65",
             "base_distance_m": float(left_right_base_distance),
             "note": (
-                "Dual-arm desk/base relation for teleop_runtime where desk axes are "
-                "+x=forward, +y=left, +z=up, while the default viewer places "
+                "Dual-arm desk/base relation for teleop_runtime; desk axes are "
+                "defined with +X pointing from the operator toward the tabletop, "
+                "+Y pointing from the workspace-near-boundary origin toward the operator's left, "
+                "and +Z pointing upward, while the default viewer places "
                 "left_arm at desk -Y (screen-left) and right_arm at desk +Y (screen-right)."
             ),
         },

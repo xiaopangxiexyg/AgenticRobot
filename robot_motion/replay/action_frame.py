@@ -5,6 +5,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.pose_frames import PoseFrameContract, PoseFrameContractError
 from robot_motion.action.hand_spec import hand_action_specs_from_metadata
 from robot_motion.action.executor import RobotActionResolver
 from robot_motion.action.schema import RobotAction
@@ -19,10 +20,55 @@ COMMON_REPLAY_MIGRATION_NOTE = (
     "surface used by sim and real dispatchers."
 )
 
+CANONICAL_DESK_ACTION_FRAME = "canonical_desk"
+HARDWARE_ARM_BASE_ACTION_FRAME = "arm_base"
+
 
 def _source_metadata(group: ReplayTrajectoryGroup) -> Mapping[str, Any]:
     source = group.metadata.get("source_metadata")
     return source if isinstance(source, Mapping) else {}
+
+
+def _action_metadata(group: ReplayTrajectoryGroup) -> Mapping[str, Any]:
+    value = group.metadata.get("action_metadata")
+    return value if isinstance(value, Mapping) else {}
+
+
+def replay_action_pose_frame(group: ReplayTrajectoryGroup) -> str:
+    """Return the explicit pose frame carried by the replay action slots.
+
+    Legacy groups with no frame marker retain arm-base semantics.  A
+    canonical-desk marker is accepted only with a valid serialized contract;
+    the emission seam must never guess from vector shape or current robot
+    defaults.
+    """
+
+    metadata = _action_metadata(group)
+    frame = str(metadata.get("pose_action_absolute_frame") or "").strip()
+    contract = metadata.get("pose_frame_contract")
+    if not frame and contract is None:
+        return HARDWARE_ARM_BASE_ACTION_FRAME
+    if frame == HARDWARE_ARM_BASE_ACTION_FRAME:
+        return frame
+    if frame != CANONICAL_DESK_ACTION_FRAME:
+        raise RuntimeError(
+            "Replay action pose frame is incomplete or unsupported: "
+            f"pose_action_absolute_frame={frame!r}."
+        )
+    if not isinstance(contract, Mapping):
+        raise RuntimeError(
+            "Canonical-desk replay is missing its serialized pose_frame_contract."
+        )
+    try:
+        parsed = PoseFrameContract.from_dict(contract)
+    except (PoseFrameContractError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Replay pose_frame_contract is invalid: {exc}") from exc
+    if parsed.canonical_absolute_frame != "desk":
+        raise RuntimeError(
+            "Replay canonical absolute frame is not the supported desk frame: "
+            f"{parsed.canonical_absolute_frame!r}."
+        )
+    return frame
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -156,6 +202,7 @@ def replay_robot_action_at_index(
     include_arms: bool = True,
     include_end_effectors: bool = False,
     source: str = "replay_action",
+    timestamp: float | None = None,
 ) -> RobotAction:
     arm_pose_by_side = (
         replay_action_poses_at_index(group, active_sides, index=int(index))
@@ -169,15 +216,36 @@ def replay_robot_action_at_index(
     )
     if not arm_pose_by_side and not hand_qpos_by_side:
         raise RuntimeError("Replay frame produced no active arm or end-effector action.")
-    return RobotAction.bimanual_ee_pose(
-        left_arm=arm_pose_by_side.get("left"),
-        right_arm=arm_pose_by_side.get("right"),
-        left_hand=hand_qpos_by_side.get("left"),
-        right_hand=hand_qpos_by_side.get("right"),
-        timestamp=time.time(),
+    metadata = replay_action_metadata(group, active_sides=active_sides)
+    pose_frame = replay_action_pose_frame(group) if arm_pose_by_side else None
+    frames = {
+        f"{side}_arm": (
+            CANONICAL_DESK_ACTION_FRAME
+            if pose_frame == CANONICAL_DESK_ACTION_FRAME
+            else str(
+                dict(metadata.get("arm_reference_frame_by_side") or {}).get(side)
+                or f"{side}_arm_base"
+            )
+        )
+        for side in arm_pose_by_side
+    }
+    controlled_frames = {
+        f"{side}_arm": str(
+            dict(metadata.get("arm_controlled_frame_by_side") or {}).get(side)
+            or "tool_tcp"
+        )
+        for side in arm_pose_by_side
+    }
+    return RobotAction(
+        action_space="bimanual_ee_pose_v1",
+        arm_pose_by_side=arm_pose_by_side,
+        hand_qpos_by_side=hand_qpos_by_side,
+        timestamp=time.time() if timestamp is None else float(timestamp),
+        frame_by_effector=frames,
+        controlled_frame_by_effector=controlled_frames,
         source=str(source),
         metadata={
-            **replay_action_metadata(group, active_sides=active_sides),
+            **metadata,
             "replay_source": str(source),
             "replay_frame_index": int(index),
         },
@@ -226,8 +294,11 @@ def replay_teleop_command_at_index(
 
 __all__ = [
     "COMMON_REPLAY_MIGRATION_NOTE",
+    "CANONICAL_DESK_ACTION_FRAME",
+    "HARDWARE_ARM_BASE_ACTION_FRAME",
     "annotate_replay_command_metadata",
     "replay_action_metadata",
+    "replay_action_pose_frame",
     "replay_end_effector_targets_at_index",
     "replay_robot_action_at_index",
     "replay_teleop_command_at_index",

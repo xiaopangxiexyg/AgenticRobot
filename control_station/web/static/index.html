@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DexTeleop Control Station</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div>
+        <p id="maturity" class="eyebrow">CS-1a · READ ONLY</p>
+        <h1>DexTeleop Control Station</h1>
+        <p class="subtitle">统一查看 source、execution target、authority 边界与 trace 状态。</p>
+      </div>
+      <div id="health" class="badge neutral">连接中</div>
+    </header>
+
+    <main>
+      <section class="panel" id="run-panel">
+        <h2>Run / Domain</h2>
+        <dl id="run-state"></dl>
+      </section>
+
+      <section class="panel span-two" id="sources-panel">
+        <h2>Sources</h2>
+        <div id="source-list" class="card-grid"></div>
+      </section>
+
+      <section class="panel" id="target-panel">
+        <h2>Execution Target</h2>
+        <dl id="target-state"></dl>
+      </section>
+
+      <section class="panel" id="authority-panel">
+        <h2>Authority &amp; Safety</h2>
+        <p id="authority-boundary" class="warning">Web API token和operator lease都不构成motion authorization；CS-1a/1b/1c均禁止motion。</p>
+        <dl id="authority-state"></dl>
+      </section>
+
+      <section class="panel span-two" id="intent-panel">
+        <h2>Typed Operator Intent</h2>
+        <p id="intent-boundary" class="warning">当前server为只读模式，intent submission不可用。</p>
+        <form id="intent-form">
+          <label>Local bearer token<input id="access-token" type="password" autocomplete="off" disabled></label>
+          <label>Intent
+            <select id="intent-kind" disabled></select>
+          </label>
+          <label>Subject ID（按intent需要）<input id="intent-subject" type="text" disabled></label>
+          <button id="intent-submit" type="submit" disabled>Submit typed intent</button>
+        </form>
+        <pre id="intent-result">CS-1a: POST disabled</pre>
+      </section>
+
+      <section class="panel span-two" id="trace-panel">
+        <h2>Trace / Pending Operations</h2>
+        <pre id="trace-state">等待状态…</pre>
+      </section>
+    </main>
+
+    <footer>状态视图可丢弃重建；Web token和operator lease都不是motion authority。</footer>
+  </body>
+</html>

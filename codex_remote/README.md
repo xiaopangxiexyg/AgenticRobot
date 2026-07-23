@@ -1081,7 +1081,11 @@ remote_sync_check.sh
 
 常见真机开发时，本地工作目录已经通过上层脚本
 `/home/user/Release/util_scripts/Connection/realtime_sync_ssh.sh` 以 no-delete
-模式实时同步到远程指定工作目录。此时应按下面的边界工作：
+模式实时同步到远程指定工作目录。同步脚本必须加载项目根目录的
+`.realtime_sync_ssh.exclude`；设备发现/分配、标定结果、相机注册表、工作站几何、
+数据集和本机路径配置均由远端机器持有，不得由本地同路径文件实时覆盖。
+修改排除清单后需要重启既有实时同步进程，lsyncd 才会重新生成配置并生效。
+此时应按下面的边界工作：
 
 ```text
 代码修改类任务

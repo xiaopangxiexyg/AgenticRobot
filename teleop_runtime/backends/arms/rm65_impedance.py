@@ -378,6 +378,9 @@ class RM65ImpedanceArmBackendConfig:
     side: str
     effector_name: str | None = None
     connect_hardware: bool = True
+    # Deployment-only live observation shadow.  It keeps RM65 feedback and
+    # local FK available while forbidding tool-frame writes, force-control
+    # startup, periodic output, stop commands, and command dispatch.
     tool_profile: str | Path | None = None
     auto_load_tool_profile: bool = True
     strict_tool_profile: bool = True
@@ -397,6 +400,9 @@ class RM65ImpedanceArmBackendConfig:
     scale_outer_execution_step_by_actual_dt: bool = False
     debug_timing: bool = False
     impedance_overrides: Mapping[str, Any] = field(default_factory=dict)
+    # Kept after the existing public fields so legacy positional construction
+    # keeps its old meaning.
+    observation_only: bool = False
 
     def __post_init__(self) -> None:
         if self.side not in {"left", "right"}:
@@ -442,6 +448,12 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._last_measured_pose: list[float] | None = None
         self._last_measurement_timestamp: float | None = None
         self._last_measurement_sequence: int | None = None
+        self._observation_state: dict[str, list[float]] | None = None
+        self._observation_raw_joint_deg: list[float] | None = None
+        self._observation_read_timestamp: float | None = None
+        self._observation_read_sequence = 0
+        self._observation_read_success = False
+        self._observation_read_error: str | None = None
         self._last_fault: str | None = None
         self._last_send_result_code: int | None = None
         self._last_send_result_text: str | None = None
@@ -457,6 +469,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._last_effective_step_scale = 1.0
         self._last_send_command_timing: dict[str, object] | None = None
         self._last_impedance_loop_timing: dict[str, object] | None = None
+        self._exact_qpos_transit_operation_id: str | None = None
 
     @property
     def name(self) -> str:
@@ -502,7 +515,11 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         self._active_tool_name = self._read_active_tool_name()
         self._profile = self._load_profile(self._active_tool_name)
         self._validate_profile(self._profile, self._active_tool_name, check_active_tool=False)
-        self._active_tool_name = self._sync_profile_tool_frame(self._profile, self._active_tool_name)
+        if not self.config.observation_only:
+            self._active_tool_name = self._sync_profile_tool_frame(
+                self._profile,
+                self._active_tool_name,
+            )
         self._active_tool_frame_snapshot = self._read_active_tool_frame_snapshot()
         self._validate_profile(self._profile, self._active_tool_name)
         tcp = self._profile.get("tcp") if isinstance(self._profile.get("tcp"), Mapping) else {}
@@ -522,12 +539,25 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             left_ip=self.config.arm_ip,
             right_ip=self.config.arm_ip,
         )
+        if self.config.observation_only:
+            state = self.refresh_state_from_hardware()
+            if not bool(state.get("hardware_read_success")):
+                raise RuntimeError(
+                    f"{self.name} observation-only startup did not obtain a trusted "
+                    "RM65 state sample."
+                )
 
     def is_ready(self) -> bool:
         return (not self.config.connect_hardware) or self.arm is not None
 
     def hold_motion(self, reason: str = "manual hold") -> None:
         del reason
+        if self.config.observation_only:
+            with self._state_lock:
+                self._last_send_result_code = 0
+                self._last_send_result_text = "observation_only_hold"
+            return
+        self._release_exact_qpos_transit_best_effort(reason="hold")
         with self._send_lock:
             self._loop_stop_event.set()
             with self._state_lock:
@@ -628,6 +658,10 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     self._active_impedance_config["action_hz"] = effective_action_hz
 
     def enable_force_control(self) -> None:
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; force control is disabled."
+            )
         if self._enabled:
             return
         if self._loop_thread is not None:
@@ -684,7 +718,109 @@ class RM65ImpedanceArmBackend(EffectorBackend):
         controller = self._controller
         return bool(getattr(controller, "_started", False))
 
+    @property
+    def exact_qpos_transit_active(self) -> bool:
+        with self._state_lock:
+            return bool(self._exact_qpos_transit_operation_id)
+
+    @property
+    def exact_qpos_transit_operation_id(self) -> str:
+        with self._state_lock:
+            return str(self._exact_qpos_transit_operation_id or "")
+
+    def begin_exact_qpos_transit(
+        self,
+        operation_id: str,
+        *,
+        max_force_n: float = 20.0,
+        max_torque_nm: float = 5.0,
+        max_record_age_sec: float = 0.25,
+    ) -> None:
+        """Arm a force-monitored, compliance-suspended qpos transition."""
+
+        normalized = str(operation_id or "").strip()
+        if not normalized:
+            raise ValueError(f"{self.name} exact qpos transit requires operation_id")
+        with self._send_lock:
+            with self._state_lock:
+                active = self._exact_qpos_transit_operation_id
+                if active is not None:
+                    if active == normalized:
+                        return
+                    raise RuntimeError(
+                        f"{self.name} exact qpos transit {active!r} is already active"
+                    )
+                if not self._enabled or self._last_fault is not None:
+                    raise RuntimeError(
+                        f"{self.name} force control is not healthy: {self.force_control_status_text()}"
+                    )
+                controller = self._controller
+                record = None if self._last_step_record is None else dict(self._last_step_record)
+            if controller is None:
+                raise RuntimeError(f"{self.name} impedance controller is unavailable")
+            if self.config.connect_hardware:
+                if record is None:
+                    raise RuntimeError(
+                        f"{self.name} has no fresh impedance/force sample; retry after the control loop is ready"
+                    )
+                sampled_at = record.get("backend_controller_step_end_wall_time")
+                if sampled_at is None:
+                    raise RuntimeError(f"{self.name} force sample timestamp is unavailable")
+                age_sec = max(0.0, time.time() - float(sampled_at))
+                if age_sec > max(0.01, float(max_record_age_sec)):
+                    raise RuntimeError(
+                        f"{self.name} force sample is stale ({age_sec:.3f}s)"
+                    )
+                force_n = float(record.get("force_norm_n", float("inf")))
+                torque_nm = float(record.get("torque_norm_nm", float("inf")))
+                if not np.isfinite(force_n) or not np.isfinite(torque_nm):
+                    raise RuntimeError(f"{self.name} force sample is non-finite")
+                if force_n >= float(max_force_n) or torque_nm >= float(max_torque_nm):
+                    raise RuntimeError(
+                        f"{self.name} refuses exact qpos transit under contact: "
+                        f"force={force_n:.3f}N/{float(max_force_n):.3f}N "
+                        f"torque={torque_nm:.3f}Nm/{float(max_torque_nm):.3f}Nm"
+                    )
+            controller.begin_exact_qpos_transit(normalized)
+            with self._state_lock:
+                self._exact_qpos_transit_operation_id = normalized
+                self._last_send_result_text = "exact_qpos_transit_armed"
+
+    def end_exact_qpos_transit(self, operation_id: str | None = None) -> bool:
+        """Release the temporary exact-qpos authority without closing hardware."""
+
+        with self._send_lock:
+            with self._state_lock:
+                active = self._exact_qpos_transit_operation_id
+                controller = self._controller
+            if active is None:
+                return False
+            expected = str(operation_id or "").strip()
+            if expected and expected != active:
+                raise RuntimeError(
+                    f"{self.name} exact qpos transit id mismatch: {expected!r} != {active!r}"
+                )
+            if controller is not None:
+                controller.end_exact_qpos_transit(active)
+            with self._state_lock:
+                self._exact_qpos_transit_operation_id = None
+                if self._last_fault is None:
+                    self._last_send_result_text = "exact_qpos_transit_released"
+            return True
+
+    def _release_exact_qpos_transit_best_effort(self, *, reason: str) -> None:
+        try:
+            self.end_exact_qpos_transit()
+        except Exception as exc:  # noqa: BLE001 - stopping motion has priority.
+            with self._state_lock:
+                self._exact_qpos_transit_operation_id = None
+                self._last_send_result_text = (
+                    f"exact_qpos_release_failed:{reason}:{type(exc).__name__}: {exc}"
+                )
+
     def warm_start_force_control(self) -> None:
+        if self.config.observation_only:
+            return
         if self.force_control_warm_started():
             return
         if not self.config.connect_hardware:
@@ -717,6 +853,54 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     f"within {timeout_sec:.3f}s: {self.force_control_status_text()}"
                 )
             time.sleep(0.005)
+
+    def refresh_state_from_hardware(self) -> dict[str, Any]:
+        """Refresh a live observation-only sample without starting impedance output.
+
+        The ordinary impedance backend obtains measured state from its periodic
+        controller step.  A raw-RTC shadow must not start that loop, because the
+        loop owns force/admittance and can issue output.  The controller's
+        private ``_read_state`` helper is deliberately reused here: it performs
+        only ``Get_Current_Arm_State`` plus local normalization and does not
+        activate force control or CANFD follow.
+        """
+
+        if not self.config.observation_only:
+            return self.get_state()
+        controller = self._controller
+        if controller is None or self.arm is None:
+            return self.get_state()
+        timestamp = time.time()
+        try:
+            state = dict(controller._read_state())
+            joint_deg = np.asarray(state.get("joint_deg"), dtype=float).reshape(6)
+            pose = np.asarray(state.get("pose"), dtype=float).reshape(6)
+            if not np.all(np.isfinite(joint_deg)) or not np.all(np.isfinite(pose)):
+                raise ValueError("RM65 observation contains non-finite state")
+            raw_joint = getattr(controller, "_last_raw_observed_joint_deg", None)
+            with self._state_lock:
+                self._observation_state = {
+                    "joint_deg": [float(value) for value in joint_deg.tolist()],
+                    "pose": [float(value) for value in pose.tolist()],
+                }
+                self._observation_raw_joint_deg = (
+                    None
+                    if raw_joint is None
+                    else [float(value) for value in np.asarray(raw_joint, dtype=float).reshape(6).tolist()]
+                )
+                self._observation_read_timestamp = timestamp
+                self._observation_read_sequence += 1
+                self._observation_read_success = True
+                self._observation_read_error = None
+                self._last_fault = None
+        except Exception as exc:  # noqa: BLE001 - state becomes invalid, never a command.
+            with self._state_lock:
+                self._observation_read_timestamp = timestamp
+                self._observation_read_sequence += 1
+                self._observation_read_success = False
+                self._observation_read_error = f"{type(exc).__name__}: {exc}"
+                self._last_fault = self._observation_read_error
+        return self.get_state()
 
     def compute_tcp_pose(
         self,
@@ -767,6 +951,27 @@ class RM65ImpedanceArmBackend(EffectorBackend):
     def send_command(self, command: EffectorCommand) -> None:
         if command.effector_name != self.name:
             raise ValueError(f"{self.name} received command for effector '{command.effector_name}'.")
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; refusing impedance command dispatch."
+            )
+        metadata = dict(command.metadata or {})
+        requested_exact = bool(metadata.get("init_arm_qpos_active", False))
+        requested_operation_id = str(
+            metadata.get("init_arm_qpos_operation_id", "") or ""
+        ).strip()
+        with self._state_lock:
+            active_operation_id = str(self._exact_qpos_transit_operation_id or "")
+        if active_operation_id:
+            if not requested_exact or requested_operation_id != active_operation_id:
+                raise RuntimeError(
+                    f"{self.name} exact qpos transit only accepts commands from "
+                    f"operation {active_operation_id!r}"
+                )
+        elif requested_exact:
+            raise RuntimeError(
+                f"{self.name} received exact qpos command without an armed impedance transit"
+            )
         if command.command_type == "joint_vector":
             command = self._joint_vector_command_as_cartesian(command)
         if command.command_type != "cartesian_pose":
@@ -1184,8 +1389,12 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     self._last_send_result_code = -1
                     self._last_send_result_text = fault
                     self._enabled = False
+                    self._exact_qpos_transit_operation_id = None
                 try:
-                    self._controller.stop_motion()
+                    try:
+                        self._controller.end_exact_qpos_transit()
+                    finally:
+                        self._controller.stop_motion()
                 finally:
                     self._loop_stop_event.set()
                 break
@@ -1225,6 +1434,23 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             profile_tcp = (
                 None if self._profile_tcp_snapshot is None else dict(self._profile_tcp_snapshot)
             )
+            observation_state = (
+                None
+                if self._observation_state is None
+                else {
+                    "joint_deg": list(self._observation_state.get("joint_deg", ())),
+                    "pose": list(self._observation_state.get("pose", ())),
+                }
+            )
+            observation_raw_joint_deg = (
+                None
+                if self._observation_raw_joint_deg is None
+                else list(self._observation_raw_joint_deg)
+            )
+            observation_read_timestamp = self._observation_read_timestamp
+            observation_read_sequence = int(self._observation_read_sequence)
+            observation_read_success = bool(self._observation_read_success)
+            observation_read_error = self._observation_read_error
             if self._loop_thread is None:
                 loop_state = "not_started"
             elif self._loop_thread.is_alive():
@@ -1290,6 +1516,35 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                     * np.pi
                 )
                 current_pose = _pose6_to_matrix(self._last_measured_pose)
+            if self.config.observation_only and not measurement_valid and observation_read_success:
+                measured_joint_deg = observation_state.get("joint_deg") if observation_state else None
+                measured_pose6 = observation_state.get("pose") if observation_state else None
+                if measured_joint_deg is not None and measured_pose6 is not None:
+                    current_qpos = (
+                        np.asarray(measured_joint_deg, dtype=float).reshape(6)
+                        / 180.0
+                        * np.pi
+                    )
+                    current_pose = _pose6_to_matrix(measured_pose6)
+                    raw_hardware_qpos = (
+                        None
+                        if observation_raw_joint_deg is None
+                        else (
+                            np.asarray(observation_raw_joint_deg, dtype=float).reshape(6)
+                            / 180.0
+                            * np.pi
+                        )
+                    )
+                    controller = self._controller
+                    observed_qpos_normalization = (
+                        None
+                        if controller is None
+                        else dict(getattr(controller, "_last_observed_joint_normalization", {}))
+                    )
+                    measurement_timestamp = observation_read_timestamp
+                    measurement_timestamp_monotonic = None
+                    measurement_sequence = observation_read_sequence
+                    measurement_valid = True
             return {
                 "current_qpos": current_qpos,
                 # Normalized measured qpos is the only state anchor exposed to
@@ -1309,28 +1564,55 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 "latest_target_tcp_pose6": latest_target_pose6,
                 "latest_target_joint_deg": latest_target_joint_deg,
                 "latest_target_sequence": latest_target_sequence,
-                "arm_state_source": "pose_impedance_command",
+                "arm_state_source": (
+                    "hardware_observation_only"
+                    if self.config.observation_only
+                    else "pose_impedance_command"
+                ),
                 "hardware_refresh_time": measurement_timestamp,
                 "hardware_measurement_timestamp": measurement_timestamp,
                 "hardware_measurement_timestamp_monotonic": measurement_timestamp_monotonic,
                 "hardware_measurement_sequence": measurement_sequence,
                 "hardware_measurement_valid": measurement_valid,
-                "hardware_read_success": measurement_valid,
-                "hardware_pose_6d": (
-                    None
-                    if record is None
-                    else record.get("measured_pose")
+                "hardware_read_success": bool(
+                    observation_read_success
+                    if self.config.observation_only
+                    else measurement_valid
                 ),
-                "hardware_result_code": 0 if self._last_fault is None else -1,
-                "hardware_result_text": self._last_fault or "ok",
+                "hardware_pose_6d": (
+                    (
+                        None
+                        if observation_state is None
+                        else observation_state.get("pose")
+                    )
+                    if self.config.observation_only
+                    else (None if record is None else record.get("measured_pose"))
+                ),
+                "hardware_result_code": (
+                    0
+                    if (observation_read_success if self.config.observation_only else self._last_fault is None)
+                    else -1
+                ),
+                "hardware_result_text": (
+                    (observation_read_error or "ok")
+                    if self.config.observation_only
+                    else (self._last_fault or "ok")
+                ),
                 "send_result_code": self._last_send_result_code,
                 "send_result_text": self._last_send_result_text,
                 "emergency_stopped": emergency_stopped,
                 "effective_control_dt_sec": float(self._last_effective_control_dt),
                 "effective_step_scale": float(self._last_effective_step_scale),
-                "impedance_enabled": bool(self._enabled),
+                "impedance_enabled": bool(self._enabled) and not self.config.observation_only,
+                "exact_qpos_transit_active": bool(
+                    self._exact_qpos_transit_operation_id
+                ),
+                "exact_qpos_transit_operation_id": str(
+                    self._exact_qpos_transit_operation_id or ""
+                ),
                 "impedance_loop_state": loop_state,
                 "impedance_mode": self.config.impedance_mode,
+                "observation_only": bool(self.config.observation_only),
                 "force_tare_sec": float(self.config.force_tare_sec),
                 "active_tool_name": self._active_tool_name,
                 "active_tool_profile_path": self._active_tool_profile_path,
@@ -1350,6 +1632,14 @@ class RM65ImpedanceArmBackend(EffectorBackend):
             }
 
     def emergency_stop(self) -> None:
+        if self.config.observation_only:
+            with self._state_lock:
+                self._enabled = False
+                self._emergency_stopped = True
+                self._last_send_result_code = 0
+                self._last_send_result_text = "observation_only_emergency_stop"
+            return
+        self._release_exact_qpos_transit_best_effort(reason="emergency_stop")
         with self._send_lock:
             self._loop_stop_event.set()
             with self._state_lock:
@@ -1381,6 +1671,8 @@ class RM65ImpedanceArmBackend(EffectorBackend):
                 raise RuntimeError(f"{self.name} {stop_label} failed with return code {stop_text}")
 
     def close(self) -> None:
+        if not self.config.observation_only:
+            self._release_exact_qpos_transit_best_effort(reason="close")
         self._loop_stop_event.set()
         failures: list[LifecycleFailure] = []
         if self._loop_thread is not None:
@@ -1410,6 +1702,11 @@ class RM65ImpedanceArmBackend(EffectorBackend):
 
         def close_arm_socket() -> None:
             assert arm is not None
+            if controller is not None and controller.follow_stream_worker_alive():
+                raise RuntimeError(
+                    f"{self.name} refuses to close the RM65 socket while the CANFD "
+                    "follow stream worker is still alive"
+                )
             try:
                 arm.Arm_Socket_Close()
             finally:
@@ -1417,7 +1714,7 @@ class RM65ImpedanceArmBackend(EffectorBackend):
 
         steps = []
         if controller is not None:
-            if not self._emergency_stopped:
+            if not self._emergency_stopped and not self.config.observation_only:
                 steps.append(("controller.stop_motion", controller.stop_motion))
             steps.append(("controller.close", close_controller))
         if arm is not None:

@@ -47,6 +47,10 @@ class OpenPIClientPolicyConfig:
     retry_interval_s: float = 2.0
     policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None
     policy_artifact: PolicyArtifactContract | Mapping[str, Any] | None = None
+    # Explicit numeric contract carried to the OpenPI observation boundary.
+    # The server remains the owner for non-identity transforms unless a future
+    # model-specific adapter implements a client-owned executor.
+    normalization_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "port", int(self.port))
@@ -55,6 +59,26 @@ class OpenPIClientPolicyConfig:
             artifact = policy_artifact_from_metadata(artifact)
         elif artifact is not None and not isinstance(artifact, PolicyArtifactContract):
             raise TypeError("policy_artifact must be a PolicyArtifactContract, mapping, or None.")
+        artifact_normalization_contract = None
+        if artifact is not None and isinstance(artifact.metadata, Mapping):
+            candidate = artifact.metadata.get("normalization_contract")
+            if candidate is not None:
+                artifact_normalization_contract = candidate
+        requested_normalization_contract = self.normalization_contract
+        if requested_normalization_contract is None:
+            requested_normalization_contract = artifact_normalization_contract
+        elif artifact_normalization_contract is not None:
+            requested_config = OpenPIObservationAdapterConfig(
+                normalization_contract=requested_normalization_contract,
+            )
+            artifact_config = OpenPIObservationAdapterConfig(
+                normalization_contract=artifact_normalization_contract,
+            )
+            if requested_config.normalization_hash != artifact_config.normalization_hash:
+                raise ValueError(
+                    "normalization_contract disagrees with policy_artifact metadata."
+                )
+            requested_normalization_contract = requested_config.normalization_contract
         layout = self.policy_io_layout
         if isinstance(layout, Mapping):
             layout = PolicyIOLayout.from_dict(layout)
@@ -160,6 +184,13 @@ class OpenPIClientPolicyConfig:
         object.__setattr__(self, "required_image_keys", required_image_keys)
         object.__setattr__(self, "image_key_map", image_key_map)
         object.__setattr__(self, "retry_interval_s", float(self.retry_interval_s))
+        if requested_normalization_contract is not None:
+            # Reuse the observation adapter's strict parser so a policy cannot
+            # carry a malformed or ambiguously named normalization payload.
+            normalized_contract = OpenPIObservationAdapterConfig(
+                normalization_contract=requested_normalization_contract,
+            ).normalization_contract
+            object.__setattr__(self, "normalization_contract", normalized_contract)
 
 
 class OpenPIClientPolicy:
@@ -177,6 +208,11 @@ class OpenPIClientPolicy:
             and self.config.deploy_schema_version == DEXTELEOP_DEPLOY_SCHEMA_V2
         )
         artifact = self.config.policy_artifact
+        normalization_hash = None
+        if self.config.normalization_contract is not None:
+            normalization_hash = OpenPIObservationAdapterConfig(
+                normalization_contract=self.config.normalization_contract,
+            ).normalization_hash
         contract = DeployPolicyContract(
             protocol_version=OPENPI_LOCAL_PROTOCOL_VERSION,
             deploy_schema_version=self.config.deploy_schema_version,
@@ -212,6 +248,7 @@ class OpenPIClientPolicy:
             require_active_sides_match=self.config.require_active_sides_match,
             required_camera_slots=self.config.required_camera_slots,
             hand_layout=self.config.hand_layout,
+            normalization_hash=normalization_hash,
         )
         if remote_policy is None:
             observation_config = OpenPIObservationAdapterConfig(
@@ -223,6 +260,7 @@ class OpenPIClientPolicy:
                 state_discrete_key=(
                     artifact.state_discrete_key if artifact is not None else "state_discrete"
                 ),
+                normalization_contract=self.config.normalization_contract,
             )
             transport = OpenPIWebsocketTransport(
                 host=self.config.host,
@@ -267,6 +305,52 @@ class OpenPIClientPolicy:
     def reset(self) -> None:
         self.remote_policy.reset()
 
+    def create_raw_rtc_adapter(
+        self,
+        *,
+        frame_contract_hash: str,
+        normalization_hash: str,
+        active_sides: tuple[str, ...] | list[str] | None = None,
+        action_pose_mode: str = "absolute",
+        minimum_execution_horizon_steps: int = 1,
+        result_action_representation: str = "legacy_normalized_v1",
+    ):
+        """Build the OpenPI raw-RTC adapter around this policy's transport.
+
+        The existing ``RemoteModelPolicy``/transport remains the only model
+        client owned by the OpenPI policy instance.  The returned adapter
+        reuses that client for prepared payload decoding; it does not create a
+        second model, policy client, server session, worker, plan, or dispatch
+        owner.
+        """
+
+        from .rtc import OpenPIFinalChunkRtcBackend, OpenPIFinalChunkRtcConfig
+
+        artifact = self.config.policy_artifact
+        if artifact is None:
+            raise ValueError(
+                "OpenPI raw-RTC requires the policy artifact bound at policy construction."
+            )
+        resolved_sides = (
+            self.config.active_sides
+            if active_sides is None
+            else tuple(str(side) for side in active_sides)
+        )
+        return OpenPIFinalChunkRtcBackend(
+            transport=self.remote_policy.transport,
+            remote_policy=self.remote_policy,
+            config=OpenPIFinalChunkRtcConfig(
+                artifact=artifact,
+                frame_contract_hash=frame_contract_hash,
+                normalization_hash=normalization_hash,
+                active_sides=resolved_sides,
+                action_pose_mode=action_pose_mode,
+                minimum_execution_horizon_steps=minimum_execution_horizon_steps,
+                prompt=self.config.prompt,
+                result_action_representation=result_action_representation,
+            ),
+        )
+
     def predict(self, observation: Any):
         if self.v22_adapter is None:
             return self.remote_policy.predict(observation)
@@ -300,6 +384,7 @@ def create_policy(
     retry_interval_s: float = 2.0,
     policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None,
     policy_artifact: PolicyArtifactContract | Mapping[str, Any] | None = None,
+    normalization_contract: Mapping[str, Any] | None = None,
 ) -> OpenPIClientPolicy:
     return OpenPIClientPolicy(
         OpenPIClientPolicyConfig(
@@ -334,6 +419,7 @@ def create_policy(
             retry_interval_s=float(retry_interval_s),
             policy_io_layout=policy_io_layout,
             policy_artifact=policy_artifact,
+            normalization_contract=normalization_contract,
         )
     )
 

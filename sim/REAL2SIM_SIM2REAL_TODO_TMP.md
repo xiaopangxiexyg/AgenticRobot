@@ -104,7 +104,9 @@ sim/contracts/ ────────> sim/mujoco/
 dataset_contracts <──── sim/mujoco/replay + sim/mujoco/dataset_v22
 dataset_interface      (format adapters; not hardware)
 
-sim/rm65/  ── SAPIEN renderer/preview only
+sim/rm65/  ── RM65 embodiment: reusable actuator + evidence + SAPIEN preview
+     │
+     └──────── actuator target ────────> sim/mujoco/actuation adapter
 ```
 
 当前责任应保持如下：
@@ -121,7 +123,10 @@ sim/rm65/  ── SAPIEN renderer/preview only
 | `dataset_contracts/` | v2.2 schema/layout/parquet/validity 等纯契约 | 不应依赖 MuJoCo 内部对象 |
 | `sim/mujoco/replay/` | 真实数据 qpos/gripper replay、媒体诊断和 legacy export | 明确是 kinematic diagnostic，不是动态机器人 rollout |
 | `sim/mujoco/dataset_v22/` | native v2.2 policy-I/O sim export | 已绑定 real collector layout，但仍是 sim 数据 producer |
-| `sim/rm65/` | SAPIEN RM65 renderer/preview | 不是 canonical task physics 或执行后端 |
+| `sim/rm65/actuation/` | RM65 profile、120 Hz qcmd 接受、逐关节 causal delay、raw/filtered actuator target | 后端无关的 sim 执行器；不依赖 MuJoCo、SAPIEN 或真机 |
+| `sim/rm65/real2sim/` | RM65 数据索引、拟合/验证 manifest、fidelity claim | 证据属于 embodiment，不再占用 `sim/real2sim` 顶层 |
+| `sim/rm65/sapien_renderer.py` | SAPIEN RM65 renderer/preview | 只做 operator/debug preview，不是 canonical task physics |
+| `sim/mujoco/actuation/` | 将通用 RM65 target 写入 MuJoCo actuator，并读取 measured qpos | 后端适配层，不拥有 RM65 transport/filter 语义 |
 | `sim/mujoco_temp_pipeline/` | 临时 PPO smoke/evaluate/play/checkpoint/records | 不是长期 `model/` 包，也不是 real deployment policy |
 
 `sim/STRUCTURE_PLAN.md` 规划的顶层 `model/` 当前仍不存在。PPO/BC/SAC 等长期训练域不应因为临时 pipeline 已出现就直接把 `sim/` 变成训练包。
@@ -161,14 +166,24 @@ postprocess history、随机种子、实际 dispatch/applied timeline 和 fideli
 - gravity `[0, 0, -9.81]`；
 - ground 和 URDF 中的一张 table collision body；
 - 一个 `0.03 × 0.03 × 0.03 m`、质量 `0.05 kg` 的 `debug_cube` free body；
-- cube 初始中心约为 `(-0.412, 0, 0.026)`，table top `0.01 m`，保留 `1 mm` settle clearance；
+- cube 初始中心约为 `(-0.472, 0, 0.026)`，table top `0.01 m`，保留 `1 mm` settle clearance；
 - collision safety 参数：minimum clearance `0.002 m`、hard penetration `0.001 m`、sweep max joint step `0.01 rad`、projection iterations `8`；
 - physics `1000 Hz`、sim camera `30 Hz`；
-- `actuator_model_pending` 和 `real_150hz_system_id_status=pending_data`。
+- arm free-motion v4 已纳入十四组有效配对数据；四组晚间数据先在冻结 v3 上保留
+  failed held-out 结论，再转入 v4 fit；无时间交集的 `220204/220211` 与无命令配对的
+  `223212` 被剔除；v4 仅重拟合双臂 J5/J6，相对不稳定的 J1-J4 保持冻结；
+- `real_120hz_arm_system_id_status=v4_stage_fit_complete_new_clean_held_out_pending`，
+  force/contact、tail error 和 guardian-restored 子集仍为 provisional。
 
-该 JSON 没有显式写 reference/IK/command 频率，因此 `TimingSpec` 会继承项目默认的 15→75→75→150 口径；而 `sim/README.md` 仍把 canonical profile 描述为 15/45/150。这是当前必须修正/冻结的文档与 profile 漂移。
+该 JSON 没有显式写 sample/policy/reference/IK/command 频率，因此 `TimingSpec` 当前解析为
+15/15/60/60/120 Hz，与本轮真机主位控 profile 一致；但为了避免以后代码默认值变化造成静默漂移，
+`sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json` 已把 resolved timing、输入哈希和
+限制项冻结下来。后续仍应考虑把这些频率直接写入 canonical JSON。
 
-`sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json` 是 task-local config，不是第二个 `SimulationContract`。它通过 base contract SHA-256 绑定场景，并冻结：右臂控制、左臂 home、7D action、31D privileged observation、15 Hz policy、150 Hz command、1000 Hz physics、cube reset、episode limit、height threshold、reward 和 `contact_latch_debug` provenance。
+`sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json` 是 task-local config，不是第二个
+`SimulationContract`。它通过 base contract SHA-256 绑定场景，并冻结：右臂控制、左臂 home、
+7D action、31D privileged observation、15 Hz policy、120 Hz command、1000 Hz physics、
+cube reset、episode limit、height threshold、reward 和 `contact_latch_debug` provenance。
 
 ## 4. Real2Sim 当前执行链路
 
@@ -414,11 +429,11 @@ TODO：建立 `CrossDomainRunManifest` 或等价纯数据 contract，绑定 `Sim
 
 ### 9.1 当前没有完成的物理层
 
-- RM65 joint actuator、servo/ideal position actuator、damping/friction/armature、latency、tracking residual 和 controller gains 未完成 system identification。
+- RM65 已有基于十四组 free-motion qpos 的 provisional delay/target-lag 模型；servo gains、damping/friction/armature、力矩/饱和、负载与接触响应仍未完成 system identification。
 - full articulated robot 在 gravity 下直接 `mj_step` 会因无 actuator 让 passive joints collapse；这不是 valid robot rollout。
 - 夹爪当前是 normalized scalar → finger qpos mapping，加上 task-local latch；没有可靠 mimic/coupling、finger pad force/contact、motor delay、closing force 和 grasp stability model。
 - force control、impedance、gravity compensation、real hardware streaming 和 measured state feedback 不是当前 MuJoCo mainline 能力。
-- real 150 Hz system-ID status 在 canonical profile 中仍是 pending。
+- real 120 Hz arm free-motion v4 stage fit 已完成，但新的 untouched held-out、force/contact 与 tail-error gate 仍是 pending。
 
 ### 9.2 Sim2Real gate 还缺什么
 
@@ -429,7 +444,7 @@ TODO：建立 `CrossDomainRunManifest` 或等价纯数据 contract，绑定 `Sim
 | action layout、TCP、joint order、units、frame hash 一致 | 部分已有，需统一到 run manifest |
 | source/policy/reference/command/physics clocks 可追溯 | 各入口已有局部 metadata，未统一 |
 | qref→qcmd 与真实 controller deadline/latency 对齐 | 仿真 adapter 有 60→120→1000 debug path，真实认证未完成 |
-| actuator tracking residual 与 measured qpos 对齐 | 未完成 system ID |
+| actuator tracking residual 与 measured qpos 对齐 | 十四组 free-motion 阶段拟合已采用；新 held-out、tail 和载荷/接触仍未通过 |
 | collision segment、tool geometry、table/camera scene 对齐 | 仿真有 projection；真实连续段和任意 tool 未认证 |
 | gripper contact/force/grasp/release | 当前只有 qpos/latch debug |
 | real/sim paired episode 与阈值 verdict | 未建立 |

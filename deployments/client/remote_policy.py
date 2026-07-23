@@ -83,6 +83,7 @@ class RemotePolicyConfig:
                     require_active_sides_match=self.contract.require_active_sides_match,
                     required_camera_slots=self.contract.required_camera_slots,
                     hand_layout=self.contract.hand_layout,
+                    normalization_hash=self.contract.normalization_hash,
                     metadata_required=self.contract.metadata_required,
                     extra=self.contract.extra,
                 ),
@@ -120,6 +121,22 @@ class RemoteModelPolicy:
 
     def predict_chunk(self, observation: Any) -> UnifiedActionChunk:
         request = self.observation_adapter(observation)
+        return self.predict_prepared_chunk(request)
+
+    def predict_prepared_chunk(
+        self,
+        request: Mapping[str, Any],
+    ) -> UnifiedActionChunk:
+        """Decode one already-prepared transport payload with this policy client.
+
+        Model-family adapters use this seam when the observation preparation
+        is owned by a typed RTC adapter.  It reuses the same transport,
+        response contract and metadata validation as ``predict_chunk``; it
+        does not create another model or policy server session.
+        """
+
+        if not isinstance(request, Mapping):
+            raise TypeError("Prepared remote policy request must be a mapping.")
         response = dict(self.transport.infer(request))
         if self.config.action_key not in response:
             raise ValueError(

@@ -32,6 +32,7 @@ from .schema import (
 
 
 DEFAULT_CAMERA_FRAME_MAX_AGE_SEC = 0.1
+DEFAULT_HAND_STATE_MAX_AGE_SEC = 0.2
 
 
 def normalize_end_effector_sides(
@@ -345,6 +346,7 @@ def observation_faults(
     hand_states: Mapping[str, Mapping[str, Any] | None],
     observation_timestamp: float | None = None,
     max_image_age_sec: float | None = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+    max_hand_state_age_sec: float | None = None,
 ) -> list[str]:
     faults: list[str] = []
     effective_end_effector_sides = set(
@@ -370,9 +372,25 @@ def observation_faults(
         if side in effective_end_effector_sides:
             if not np.all(state_valid[STATE_HAND_SLICES[side]]):
                 faults.append(f"{side}_hand_state_unavailable")
-            error = (hand_states.get(side) or {}).get("telemetry_error")
+            hand_state = hand_states.get(side) or {}
+            error = hand_state.get("telemetry_error")
             if error:
                 faults.append(f"{side}_hand_telemetry:{error}")
+            if observation_timestamp is not None and max_hand_state_age_sec is not None:
+                joint_timestamp = hand_state.get("joint_timestamp")
+                try:
+                    joint_timestamp = float(joint_timestamp)
+                except (TypeError, ValueError):
+                    joint_timestamp = float("nan")
+                if not np.isfinite(joint_timestamp):
+                    faults.append(f"{side}_hand_state_timestamp_unavailable")
+                else:
+                    age_sec = float(observation_timestamp) - joint_timestamp
+                    max_age = float(max_hand_state_age_sec)
+                    if age_sec > max_age:
+                        faults.append(f"{side}_hand_state_stale:{age_sec:.6f}")
+                    elif age_sec < -max_age:
+                        faults.append(f"{side}_hand_state_timestamp_in_future:{age_sec:.6f}")
     if require_images:
         if not image_timestamps:
             faults.append("camera_frame_unavailable:no_configured_camera")
@@ -413,6 +431,7 @@ def build_deployment_observation(
     timestamp: float | None = None,
     require_images: bool = False,
     camera_frame_max_age_sec: float | None = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+    hand_state_max_age_sec: float | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> DeploymentObservation:
     active = normalize_active_sides(active_sides)
@@ -448,10 +467,23 @@ def build_deployment_observation(
         camera_frame_max_age_sec = float(camera_frame_max_age_sec)
         if camera_frame_max_age_sec <= 0.0:
             raise ValueError("camera_frame_max_age_sec must be positive or None.")
+    if hand_state_max_age_sec is not None:
+        hand_state_max_age_sec = float(hand_state_max_age_sec)
+        if hand_state_max_age_sec <= 0.0:
+            raise ValueError("hand_state_max_age_sec must be positive or None.")
     image_ages_sec = {
         key: None if value is None else float(now - float(value))
         for key, value in image_timestamps.items()
     }
+    hand_state_ages_sec: dict[str, float | None] = {}
+    for side in effective_end_effector_sides:
+        try:
+            joint_timestamp = float((hand_states.get(side) or {}).get("joint_timestamp"))
+        except (TypeError, ValueError):
+            joint_timestamp = float("nan")
+        hand_state_ages_sec[side] = (
+            float(now - joint_timestamp) if np.isfinite(joint_timestamp) else None
+        )
     faults = observation_faults(
         active_sides=active,
         arms_enabled=bool(arms_enabled),
@@ -464,6 +496,7 @@ def build_deployment_observation(
         hand_states=hand_states,
         observation_timestamp=now,
         max_image_age_sec=camera_frame_max_age_sec,
+        max_hand_state_age_sec=hand_state_max_age_sec,
     )
     last = nan_vector(ACTION_DIM) if last_action is None else np.asarray(last_action, dtype=np.float32).reshape(-1)
     if last.shape != (ACTION_DIM,):
@@ -496,6 +529,11 @@ def build_deployment_observation(
     observation_metadata.setdefault("hand_spec_required", True)
     observation_metadata.setdefault("end_effector_enabled_sides", list(effective_end_effector_sides))
     observation_metadata.setdefault("camera_frame_max_age_sec", camera_frame_max_age_sec)
+    observation_metadata.setdefault("hand_state_max_age_sec", hand_state_max_age_sec)
+    observation_metadata.setdefault(
+        "hand_state_age_sec_by_side",
+        dict(hand_state_ages_sec),
+    )
     observation_metadata.setdefault("camera_frame_age_sec_by_key", dict(image_ages_sec))
     observation_metadata.setdefault(
         "camera_frame_source_timestamp_by_key", dict(image_timestamps)
@@ -540,6 +578,7 @@ def build_deployment_observation(
 
 __all__ = [
     "DEFAULT_CAMERA_FRAME_MAX_AGE_SEC",
+    "DEFAULT_HAND_STATE_MAX_AGE_SEC",
     "DeploymentObservation",
     "build_deployment_observation",
     "build_state_vector",

@@ -21,11 +21,13 @@ from .tracker_replay import (
 
 SIDES = ("left", "right")
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_VIEWER_URDF = REPO_ROOT / "assets/rm65_inspire_tac/rm65_dual_arm_hand_proxy_open.urdf"
-FALLBACK_VIEWER_URDF = (
+# V3 is the canonical visualization model; collision avoidance remains a
+# separately selected robot_motion scene profile.
+DEFAULT_VIEWER_URDF = (
     REPO_ROOT
-    / "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf"
+    / "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 )
+FALLBACK_VIEWER_URDF = DEFAULT_VIEWER_URDF
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -75,8 +77,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "URDF loaded by MuJoCo. Default: assets/rm65_inspire_tac/"
-            "rm65_dual_arm_hand_proxy_open.urdf"
+            "URDF loaded by MuJoCo. Default: assets/rm65_inspire_gripper_v3/"
+            "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
         ),
     )
     parser.add_argument(

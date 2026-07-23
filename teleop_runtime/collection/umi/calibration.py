@@ -35,6 +35,11 @@ class UmiCalibrationBinding:
     T_vive_world_to_desk: np.ndarray
     created_at: datetime
     expires_at: datetime
+    side: str
+    camera_serial: str
+    tracker_name: str
+    tcp_profile: str | None
+    T_tcp_to_tracker: np.ndarray | None
 
     @classmethod
     def load(cls, path: str | Path) -> "UmiCalibrationBinding":
@@ -51,6 +56,40 @@ class UmiCalibrationBinding:
             payload.get("T_vive_world_to_desk"),
             name="T_vive_world_to_desk",
         )
+        side = str(payload.get("side", "")).strip().lower()
+        tcp_payload = payload.get("tcp_extrinsic")
+        tcp_profile = None
+        tcp_transform = None
+        if tcp_payload is not None:
+            if not isinstance(tcp_payload, Mapping):
+                raise ValueError("UMI tcp_extrinsic must be an object")
+            if str(tcp_payload.get("schema")) != "dexteleop.umi_tcp_extrinsic.v1":
+                raise ValueError(
+                    f"unsupported UMI TCP extrinsic schema {tcp_payload.get('schema')!r}"
+                )
+            if str(tcp_payload.get("side", "")).strip().lower() != side:
+                raise ValueError("UMI tcp_extrinsic side does not match calibration side")
+            tcp_profile = str(tcp_payload.get("tcp_profile", "")).strip()
+            if not tcp_profile:
+                raise ValueError("UMI tcp_extrinsic is missing tcp_profile")
+            tcp_transform = as_rigid_transform(
+                tcp_payload.get("T_tcp_to_tracker"),
+                name="tcp_extrinsic.T_tcp_to_tracker",
+            )
+            inverse_value = tcp_payload.get("T_tracker_to_tcp")
+            if inverse_value is not None:
+                inverse_transform = as_rigid_transform(
+                    inverse_value,
+                    name="tcp_extrinsic.T_tracker_to_tcp",
+                )
+                if not np.allclose(
+                    inverse_transform @ tcp_transform,
+                    np.eye(4),
+                    atol=1e-6,
+                ):
+                    raise ValueError(
+                        "UMI TCP extrinsic forward/inverse transforms are inconsistent"
+                    )
         return cls(
             path=source,
             payload=dict(payload),
@@ -58,6 +97,11 @@ class UmiCalibrationBinding:
             T_vive_world_to_desk=transform.copy(),
             created_at=_utc(str(payload["created_at_utc"])),
             expires_at=_utc(str(payload["expires_at_utc"])),
+            side=side,
+            camera_serial=str(payload.get("camera_serial", "")),
+            tracker_name=str(payload.get("tracker_name", "")),
+            tcp_profile=tcp_profile,
+            T_tcp_to_tracker=None if tcp_transform is None else tcp_transform.copy(),
         )
 
     def require_valid(
@@ -76,14 +120,32 @@ class UmiCalibrationBinding:
             raise RuntimeError(
                 "UMI calibration validity exceeds the configured maximum lifetime"
             )
-        calibration_side = str(self.payload.get("side", ""))
+        calibration_side = self.side
         if calibration_side not in {"left", "right"}:
             raise RuntimeError("UMI calibration side binding is invalid")
         side = config.side(calibration_side)
-        if str(self.payload.get("camera_serial")) != side.camera_serial:
+        if self.camera_serial != side.camera_serial:
             raise RuntimeError("UMI calibration camera serial does not match active config")
-        if str(self.payload.get("tracker_name")) != side.tracker_name:
+        if self.tracker_name != side.tracker_name:
             raise RuntimeError("UMI calibration tracker name does not match active config")
+
+    def require_tcp_extrinsic(self, config: UmiCollectionConfig, *, side: str) -> np.ndarray:
+        side_config = config.side(side)
+        if self.side != side:
+            raise RuntimeError(
+                f"UMI TCP calibration side mismatch: result={self.side!r}, expected={side!r}"
+            )
+        if self.T_tcp_to_tracker is None or self.tcp_profile is None:
+            raise RuntimeError(
+                f"{side} UMI calibration has no recorded TCP extrinsic; recalibrate with "
+                "the current umi_hand_eye tool"
+            )
+        if self.tcp_profile.lower() != side_config.tcp_profile.lower():
+            raise RuntimeError(
+                f"{side} UMI TCP profile mismatch: result={self.tcp_profile!r}, "
+                f"config={side_config.tcp_profile!r}"
+            )
+        return self.T_tcp_to_tracker.copy()
 
     def pose_frame_contract(self) -> PoseFrameContract:
         transform = self.T_vive_world_to_desk.tolist()
@@ -113,6 +175,13 @@ class UmiCalibrationBinding:
                         "created_at_utc": self.created_at.isoformat(),
                         "expires_at_utc": self.expires_at.isoformat(),
                         "desk_definition": "calibration_board_frame",
+                        "canonical_desk_urdf_frame": "workspace_near_boundary_frame",
+                        "canonical_desk_definition": (
+                            "Left-right centered on the tabletop surface and located at "
+                            "the operator/robot-near boundary of the valid tabletop "
+                            "workspace along the tabletop-center-to-operator/robot "
+                            "direction."
+                        ),
                     },
                 },
                 "metadata": {
@@ -124,4 +193,63 @@ class UmiCalibrationBinding:
         )
 
 
-__all__ = ["RESULT_SCHEMA", "UmiCalibrationBinding"]
+@dataclass(frozen=True)
+class UmiCalibrationSet:
+    desk: UmiCalibrationBinding
+    by_side: Mapping[str, UmiCalibrationBinding]
+    T_tcp_to_tracker_by_side: Mapping[str, np.ndarray]
+
+    @property
+    def path(self) -> Path:
+        return self.desk.path
+
+    @property
+    def sha256(self) -> str:
+        return self.desk.sha256
+
+    @property
+    def created_at(self) -> datetime:
+        return self.desk.created_at
+
+    @property
+    def expires_at(self) -> datetime:
+        return min(
+            (binding.expires_at for binding in self.by_side.values()),
+            default=self.desk.expires_at,
+        )
+
+    def require_valid(
+        self,
+        config: UmiCollectionConfig,
+        *,
+        when: datetime | None = None,
+    ) -> None:
+        self.desk.require_valid(config, when=when)
+        for binding in self.by_side.values():
+            binding.require_valid(config, when=when)
+
+    @classmethod
+    def load(cls, config: UmiCollectionConfig) -> "UmiCalibrationSet":
+        bindings: dict[str, UmiCalibrationBinding] = {}
+        transforms: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            result_path = config.side(side).hand_eye_result
+            if result_path is None:
+                if not config.allow_identity_tcp_placeholder:
+                    raise RuntimeError(f"{side} UMI hand-eye result is not configured")
+                transforms[side] = config.side(side).tcp_transform
+                continue
+            binding = UmiCalibrationBinding.load(result_path)
+            binding.require_valid(config)
+            bindings[side] = binding
+            transforms[side] = binding.require_tcp_extrinsic(config, side=side)
+
+        desk = bindings.get(config.desk_calibration_side)
+        if desk is None:
+            # Legacy configurations may still provide a separate desk-only result.
+            desk = UmiCalibrationBinding.load(config.calibration_result)
+            desk.require_valid(config)
+        return cls(desk=desk, by_side=bindings, T_tcp_to_tracker_by_side=transforms)
+
+
+__all__ = ["RESULT_SCHEMA", "UmiCalibrationBinding", "UmiCalibrationSet"]

@@ -13,9 +13,16 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class GuiControlEvents:
-    episode_events: tuple[str, ...] = ("episode_start", "episode_stop")
+    episode_events: tuple[str, ...] = (
+        "episode_start",
+        "episode_stop",
+        "episode_delete",
+    )
     pose_snapshot_event: str = "record_pose_snapshot"
     gripper_force_event: str = "gripper_force_set"
+    gripper_force_persist_event: str = "gripper_force_persist"
+    emergency_stop_event: str = "init_qpos_emergency_stop"
+    init_arm_qpos_speed_event: str = "init_arm_qpos_speed_set"
     vive_calibration_events: tuple[str, ...] = (
         "calibrate_vive_coordinate_profile",
         "save_vive_calibration_profile",
@@ -35,15 +42,25 @@ class GuiControlState:
     hold_active: bool = False
     episode_recording_available: bool = False
     episode_recording_active: bool = False
+    recording_paused: bool = False
     episode_countdown_active: bool = False
     episode_finalizing_active: bool = False
     camera_visualization_available: bool = False
     tactile_visualization_available: bool = False
+    tactile_solving_available: bool = False
+    tactile_solving_active: bool = False
     fix_arm_available: bool = False
     init_arm_available: bool = False
+    init_arm_qpos_active: bool = False
+    fix_hold_active: bool = False
+    init_arm_qpos_move_available: bool = True
+    startup_qpos_maintenance_enabled: bool = False
     pose_snapshot_available: bool = False
     active_side_count: int = 0
     special_arm_control_mode: str = "manual"
+    foot_pad_available: bool = False
+    foot_pad_count: int = 0
+    foot_pad_test_active: bool = False
 
 
 def episode_busy(state: GuiControlState) -> bool:
@@ -54,12 +71,43 @@ def episode_busy(state: GuiControlState) -> bool:
     )
 
 
+def _apply_foot_pad_test_controls(
+    state: GuiControlState,
+    controls: list[str],
+) -> list[str]:
+    """Add pedal diagnostics without taking ownership of the GUI.
+
+    Pedal presses remain diagnostic-only while the test is active, but explicit
+    GUI and keyboard controls retain their normal, robot-state-based
+    availability.
+    """
+
+    if not state.foot_pad_available:
+        return controls
+    if state.foot_pad_test_active:
+        if "foot_pad_test_stop" not in controls:
+            controls.append("foot_pad_test_stop")
+        return controls
+    if episode_busy(state) or (state.teleop_started and not state.hold_active):
+        return controls
+    if "foot_pad_test_start" not in controls:
+        controls.append("foot_pad_test_start")
+    return controls
+
+
 def visualization_controls(state: GuiControlState) -> list[str]:
     controls: list[str] = []
-    if state.camera_visualization_available:
+    if state.camera_visualization_available and not episode_busy(state):
         controls.append("toggle_camera_vis")
-    if state.tactile_visualization_available:
+    if state.tactile_visualization_available and not episode_busy(state):
         controls.append("toggle_tactile_vis")
+    if (
+        state.tactile_solving_available
+        and not state.tactile_solving_active
+        and not episode_busy(state)
+        and (not state.teleop_started or state.hold_active)
+    ):
+        controls.append("enable_tactile_solving")
     return controls
 
 
@@ -101,7 +149,10 @@ def gripper_force_controls(
 ) -> list[str]:
     """Allow direct gripper force changes only outside episode collection."""
 
-    return [] if episode_busy(state) else [events.gripper_force_event]
+    return [] if episode_busy(state) else [
+        events.gripper_force_event,
+        events.gripper_force_persist_event,
+    ]
 
 
 def episode_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
@@ -125,18 +176,67 @@ def fix_init_allowed_in_controls(state: GuiControlState) -> bool:
 
 def fix_arm_controls(state: GuiControlState) -> list[str]:
     return ["fix_arm_select"] if (
-        state.fix_arm_available and state.special_arm_control_mode == "manual"
+        state.fix_arm_available and manual_fix_arm_controls(state)
     ) else []
 
 
 def init_arm_controls(state: GuiControlState) -> list[str]:
-    return ["init_arm_select"] if (
-        state.init_arm_available and state.special_arm_control_mode == "manual"
-    ) else []
+    return ["init_arm_select"] if state.init_arm_available else []
+
+
+def init_arm_move_controls(state: GuiControlState) -> list[str]:
+    """Expose the explicit GUI move button without enabling the G shortcut.
+
+    Four-pedal mode routes pedals 3/4 to this same exact-qpos operation. Foot
+    pads are additional inputs and never remove the GUI operation.
+    """
+
+    if not state.init_arm_available or not state.init_arm_qpos_move_available:
+        return []
+    if (
+        state.episode_countdown_active
+        or state.episode_finalizing_active
+        or state.init_arm_qpos_active
+    ):
+        return []
+    return ["init_arm_move_to_qpos", "init_arm_move_both_to_qpos"]
+
+
+def init_arm_qpos_speed_controls(
+    state: GuiControlState,
+    events: GuiControlEvents,
+) -> list[str]:
+    if (
+        not state.init_arm_available
+        or state.init_arm_qpos_active
+        or episode_busy(state)
+    ):
+        return []
+    return [events.init_arm_qpos_speed_event]
 
 
 def manual_special_arm_controls(state: GuiControlState) -> bool:
-    return state.special_arm_control_mode == "manual"
+    del state
+    return True
+
+
+def manual_fix_arm_controls(state: GuiControlState) -> bool:
+    """Whether keyboard/GUI fix-arm controls are available.
+
+    Foot pads supplement these controls; they never own them exclusively.
+    """
+
+    return manual_special_arm_controls(state)
+
+
+def manual_init_arm_controls(state: GuiControlState) -> bool:
+    """Whether keyboard/GUI init-arm controls are available.
+
+    Foot pads supplement these controls; every supported topology retains
+    GUI/keyboard Init operations.
+    """
+
+    return manual_special_arm_controls(state)
 
 
 def pose_snapshot_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
@@ -158,7 +258,7 @@ def recording_controls(
         controls.append("h")
         if (
             state.fix_arm_available
-            and manual_special_arm_controls(state)
+            and manual_fix_arm_controls(state)
             and fix_init_allowed_in_controls(state)
         ):
             controls.append("c")
@@ -166,14 +266,19 @@ def recording_controls(
             controls.extend(fix_arm_controls(state))
         if (
             state.init_arm_available
-            and manual_special_arm_controls(state)
+            and manual_init_arm_controls(state)
             and fix_init_allowed_in_controls(state)
         ):
             controls.append("g")
             controls.append("init_arm_toggle")
             controls.extend(init_arm_controls(state))
+        if state.init_arm_available and fix_init_allowed_in_controls(state):
+            controls.extend(
+                control for control in init_arm_controls(state) if control not in controls
+            )
+            controls.extend(init_arm_move_controls(state))
     controls.extend(visualization_controls(state))
-    return controls
+    return _apply_foot_pad_test_controls(state, controls)
 
 
 def finalizing_controls(state: GuiControlState) -> list[str]:
@@ -181,14 +286,49 @@ def finalizing_controls(state: GuiControlState) -> list[str]:
     if state.teleop_started and not state.hold_active:
         controls.append("h")
     controls.extend(visualization_controls(state))
-    return controls
+    return _apply_foot_pad_test_controls(state, controls)
+
+
+def paused_recording_controls(state: GuiControlState) -> list[str]:
+    controls = ["q", "d", "h", "episode_stop"]
+    controls.extend(visualization_controls(state))
+    return _apply_foot_pad_test_controls(state, controls)
+
+
+def fix_hold_controls(state: GuiControlState) -> list[str]:
+    """Expose only release/stop operations while both sides are fixed-like."""
+
+    controls = ["q", "d", "h"]
+    if state.episode_recording_active or state.episode_countdown_active:
+        controls.append("episode_stop")
+    if state.fix_arm_available and manual_fix_arm_controls(state):
+        controls.extend(("c", "fix_arm_toggle"))
+        controls.extend(fix_arm_controls(state))
+    if state.init_arm_available and manual_init_arm_controls(state):
+        controls.extend(("g", "init_arm_toggle"))
+        controls.extend(init_arm_controls(state))
+    controls.extend(visualization_controls(state))
+    return _apply_foot_pad_test_controls(state, list(dict.fromkeys(controls)))
+
+
+def qpos_active_controls(state: GuiControlState) -> list[str]:
+    controls = ["q", "d", "h", "init_qpos_emergency_stop"]
+    if state.episode_recording_active or state.episode_countdown_active:
+        controls.append("episode_stop")
+    if state.init_arm_available and manual_init_arm_controls(state):
+        controls.extend(("g", "init_arm_toggle"))
+    if state.fix_hold_active and state.fix_arm_available and manual_fix_arm_controls(state):
+        controls.extend(("c", "fix_arm_toggle"))
+        controls.extend(fix_arm_controls(state))
+    controls.extend(visualization_controls(state))
+    return _apply_foot_pad_test_controls(state, list(dict.fromkeys(controls)))
 
 
 def teleop_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
     controls = ["q", "d", "h"]
     if (
         state.fix_arm_available
-        and manual_special_arm_controls(state)
+        and manual_fix_arm_controls(state)
         and fix_init_allowed_in_controls(state)
     ):
         controls.append("c")
@@ -196,34 +336,47 @@ def teleop_controls(state: GuiControlState, events: GuiControlEvents) -> list[st
         controls.extend(fix_arm_controls(state))
     if (
         state.init_arm_available
-        and manual_special_arm_controls(state)
+        and manual_init_arm_controls(state)
         and fix_init_allowed_in_controls(state)
     ):
         controls.append("g")
         controls.append("init_arm_toggle")
         controls.extend(init_arm_controls(state))
+    if state.init_arm_available and fix_init_allowed_in_controls(state):
+        controls.extend(
+            control for control in init_arm_controls(state) if control not in controls
+        )
+        controls.extend(init_arm_qpos_speed_controls(state, events))
+        controls.extend(init_arm_move_controls(state))
     if not episode_busy(state):
         controls.extend(pose_snapshot_controls(state, events))
     if state.episode_recording_available:
-        controls.extend(episode_controls(state, events))
+        controls.extend(
+            control
+            for control in episode_controls(state, events)
+            if control != "episode_delete"
+        )
     controls.extend(collection_task_controls(state))
     controls.extend(gripper_force_controls(state, events))
     controls.extend(visualization_controls(state))
     if not episode_busy(state):
         controls.extend(vive_calibration_controls(events, allow_load=False))
-    return controls
+    return _apply_foot_pad_test_controls(state, controls)
 
 
 def pre_home_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
     controls = ["p", "w", "d", "q"]
     controls.extend(fix_arm_controls(state))
     controls.extend(init_arm_controls(state))
+    controls.extend(init_arm_qpos_speed_controls(state, events))
+    if state.startup_qpos_maintenance_enabled:
+        controls.extend(init_arm_move_controls(state))
     controls.extend(visualization_controls(state))
     controls.extend(vive_calibration_controls(events, allow_load=True))
     controls.extend(movement_multiple_controls(state, events))
     controls.extend(collection_task_controls(state))
     controls.extend(gripper_force_controls(state, events))
-    return controls
+    return _apply_foot_pad_test_controls(state, controls)
 
 
 def hold_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
@@ -231,9 +384,15 @@ def hold_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]
     if not episode_busy(state):
         controls.extend(fix_arm_controls(state))
         controls.extend(init_arm_controls(state))
+        controls.extend(init_arm_qpos_speed_controls(state, events))
+        controls.extend(init_arm_move_controls(state))
     if int(state.active_side_count) == 1:
         controls.append("w")
-    controls.extend(episode_controls(state, events))
+    controls.extend(
+        control
+        for control in episode_controls(state, events)
+        if control != "episode_start"
+    )
     controls.append("q")
     controls.extend(visualization_controls(state))
     if not episode_busy(state):
@@ -241,7 +400,7 @@ def hold_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]
     controls.extend(movement_multiple_controls(state, events))
     controls.extend(collection_task_controls(state))
     controls.extend(gripper_force_controls(state, events))
-    return controls
+    return _apply_foot_pad_test_controls(state, controls)
 
 
 def episode_countdown_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
@@ -252,24 +411,45 @@ def episode_countdown_controls(state: GuiControlState, events: GuiControlEvents)
             "episode_start",
             events.pose_snapshot_event,
             events.gripper_force_event,
+            events.gripper_force_persist_event,
+            "task_select",
+            "round_trip_toggle",
         }
     ]
 
 
 def current_active_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
-    if state.teleop_started and state.hold_active:
-        return hold_controls(state, events)
-    if state.episode_finalizing_active:
-        return finalizing_controls(state)
-    if state.episode_recording_active:
-        return recording_controls(state, events, hold=state.hold_active)
-    if state.episode_countdown_active:
-        return episode_countdown_controls(state, events)
-    if state.teleop_started and not state.hold_active:
-        return teleop_controls(state, events)
-    if state.teleop_started:
-        return hold_controls(state, events)
-    return pre_home_controls(state, events)
+    controls: list[str]
+    if state.init_arm_qpos_active:
+        controls = qpos_active_controls(state)
+    elif state.fix_hold_active:
+        controls = fix_hold_controls(state)
+    elif state.teleop_started and state.hold_active:
+        controls = hold_controls(state, events)
+    elif state.episode_finalizing_active:
+        controls = finalizing_controls(state)
+    elif state.episode_recording_active:
+        if state.recording_paused:
+            controls = paused_recording_controls(state)
+        else:
+            controls = recording_controls(state, events, hold=state.hold_active)
+    elif state.episode_countdown_active:
+        controls = episode_countdown_controls(state, events)
+    elif state.teleop_started and not state.hold_active:
+        controls = teleop_controls(state, events)
+    elif state.teleop_started:
+        controls = hold_controls(state, events)
+    else:
+        controls = pre_home_controls(state, events)
+    if (
+        not episode_busy(state)
+        and not state.init_arm_qpos_active
+        and not state.fix_hold_active
+        and (not state.teleop_started or state.hold_active)
+        and "device_retry" not in controls
+    ):
+        controls.append("device_retry")
+    return controls
 
 
 def single_arm_tracker_swap_allowed_in_hold(state: GuiControlState) -> bool:
@@ -290,7 +470,11 @@ __all__ = [
     "gripper_force_controls",
     "hold_controls",
     "init_arm_controls",
+    "init_arm_move_controls",
+    "init_arm_qpos_speed_controls",
     "manual_special_arm_controls",
+    "manual_fix_arm_controls",
+    "manual_init_arm_controls",
     "movement_multiple_controls",
     "pose_snapshot_controls",
     "pre_home_controls",

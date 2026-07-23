@@ -1,0 +1,76 @@
+{
+  "schema": "dexteleop.sim.rm65_actuator_heldout_sources.v1",
+  "profile_name": "rm65_bimanual_udp_feedback_20260721.v3",
+  "validation_policy": {
+    "parameters_frozen_before_capture": true,
+    "command_signal": "sdk_accepted_qcmd_120hz",
+    "measurement_signal": "udp_measured_qpos_approximately_200hz",
+    "common_window_policy": "intersection_of_left_right_command_and_udp_intervals",
+    "mean_qpos_rmse_threshold_deg": 0.5,
+    "max_joint_qpos_rmse_threshold_deg": 1.0,
+    "max_effective_delay_error_threshold_sec": 0.005,
+    "iteration_policy": "Record the frozen v3 result first; only afterward may the four valid captures become v4 fit data."
+  },
+  "sessions": [
+    {
+      "id": "221544/221548",
+      "quality": "clean",
+      "overlap_sec": 36.442334277002374,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_221548_318672_vive_rm65_actuator_trace",
+      "command_trace_sha256": "cfb19ce4166a95f071e699126777333db8ee83d624c4133f54b727a0eeee4946",
+      "command_manifest_sha256": "7911430ef86966e4c5d5971e77357bb2260f9811fa9a0971d60c9a6236d3f31c",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_221544_231904.jsonl",
+      "feedback_trace_sha256": "75ebe9ccd0cc6988263b5a72c47d4bc5a9b7c3815df898e5d148b44ecabc29ff",
+      "recovery_journal_sha256": "dd6a9acd1154496621bd416cfac10f7d8b7482e8289b982aada8ccb905c4bada"
+    },
+    {
+      "id": "222640/222650",
+      "quality": "clean",
+      "overlap_sec": 95.87501628699829,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_222650_557730_vive_rm65_actuator_trace",
+      "command_trace_sha256": "aa09bb0cdc5ceed7a4cffdf453146a5551e0acf1e413c74a99d4d3208e9c252a",
+      "command_manifest_sha256": "1cc24f6d5de094c816f6c1efb51cf8a131ebe68c115757de1b53439078168c0c",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_222640_266557.jsonl",
+      "feedback_trace_sha256": "66c75f63a0a0ddbc51ca8df96fe9a6dd9b4e537d2e3b36e4b2d17509c296cb3d",
+      "recovery_journal_sha256": "8eba3e907dc07e957549c9a087cfc1e9bf4c2832554d969c09da272083141f31"
+    },
+    {
+      "id": "224159/224204",
+      "quality": "clean",
+      "overlap_sec": 62.349926572002005,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_224204_306028_vive_rm65_actuator_trace",
+      "command_trace_sha256": "1a131c84557058d11c7195112eb32bf488976db3901fc2ed79ccf5d15b603c5b",
+      "command_manifest_sha256": "45e68b610892f8b2db4217e1fa36f8772bbee6d8df38a49135cac910bb1e578f",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_224159_754956.jsonl",
+      "feedback_trace_sha256": "5f15164bf9295ffbecc7b92777dc613dcb502edaf9c96a6bb9a1d12ee150f35c",
+      "recovery_journal_sha256": "203013d32fa7876689e04fd70d1312ba043749ba6b13b60aab7d7ab5a4ebe3b5"
+    },
+    {
+      "id": "224526/224530",
+      "quality": "clean",
+      "overlap_sec": 42.699805043987,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_224530_254745_vive_rm65_actuator_trace",
+      "command_trace_sha256": "1c670e16c1b8b00e5df339c0d4533dec20c43ce259e6f0420477a8073865fb0a",
+      "command_manifest_sha256": "74fb8a60b03169d880d2a0671a027352879e86761b718e74c30688bd53fc8315",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_224526_602620.jsonl",
+      "feedback_trace_sha256": "3284c69b6e9ab59613cd6c1cf2c49a14771c74bf573009a76b4377b5a6b8d7ac",
+      "recovery_journal_sha256": "c26f51a3983124abf4c84cac6573fbc68b569165f774454adb04a84bfa7d9973"
+    }
+  ],
+  "excluded_records": [
+    {
+      "id": "220204/220211",
+      "reason": "Both traces are individually clean, but accepted qcmd begins after UDP feedback ended; left/right overlap is negative and the pair is unusable.",
+      "command_trace_sha256": "4df82019824f826b3c3cb14412692366729c45e01de64db1545be36e88998d46",
+      "command_manifest_sha256": "48545874f2edadbf27dfbdbfada38436cb4d232366bfa1ceb02da3c73816baeb",
+      "feedback_trace_sha256": "0a07c236a1d82b91188cd5cb0f0b30bcf7ddaa0420f9c3d9230e5332b23d7369",
+      "recovery_journal_sha256": "c3dbf69770a5b8455a6796371a74746196c0a3de3e565647d5c494c1e9ee347d"
+    },
+    {
+      "id": "223212",
+      "reason": "Orphan UDP feedback trace without any overlapping actuator command trace; detached guardian restored UDP configuration and no in-band stop row exists.",
+      "feedback_trace_sha256": "b8e4d1dff552e2a85084cdce750a3dfb6bf157422b52647f6f3b8646a2e75479",
+      "recovery_journal_sha256": "d037d4afaa56a6d4c47d6c59aeb7240ba453133643181fad7eb4dad85fb78022"
+    }
+  ]
+}

@@ -30,6 +30,17 @@ def project_grippers_then_arms(
         qpos_by_side,
         gripper_close_by_name=gripper_close_by_name,
     )
+    start_check = projector.check_qpos(source_data, start)
+    if not start_check.safe:
+        # Physical measured states may sit just inside the preventive
+        # clearance envelope. Preserve independent gripper/arm staging for
+        # normal commands, but allow a combined monotonic retreat so a blocked
+        # gripper cannot prevent the arm from backing out.
+        return projector.recover_from_clearance_violation(
+            source_data,
+            start_qpos=start,
+            requested_qpos=combined_requested,
+        )
     gripper_requested = scene.kinematic_target_vector(
         start,
         {},

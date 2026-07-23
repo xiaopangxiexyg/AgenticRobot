@@ -9,6 +9,7 @@ from robot_motion.action.hand_mapping import (
     DEFAULT_INSPIRE_HAND_JOINT_ORDER,
     map_q6_to_dexhand_target,
 )
+from robot_motion.action.hand_spec import HandActionSpec
 
 from ..calibration import TeleopCalibration
 from ..interfaces import Retargeter
@@ -102,6 +103,9 @@ class JointsToDexHandRetargeter(Retargeter):
                     "bias": self._bias.copy(),
                     "alpha": self.config.alpha,
                     "source_q6": mapped.source_q6.copy(),
+                    "hand_action_spec": HandActionSpec.inspire_tac(
+                        self.config.side
+                    ).to_metadata(),
                 },
             )
         )

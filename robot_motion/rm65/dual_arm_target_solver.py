@@ -43,6 +43,10 @@ from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
 )
 from robot_motion.posture_preferences import JointPosturePreference, posture_preference_from_metadata
+from robot_motion.position_control import (
+    POSITION_QREF_FINGERPRINT_SCHEMA,
+    position_qref_fingerprint,
+)
 from robot_motion.profiles import IKSafetyProfile, load_ik_safety_profiles
 from robot_motion.runtime import EffectorCommand, Retargeter, TeleopCommand, TeleopObservation
 from robot_motion.tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
@@ -447,7 +451,7 @@ class BimanualIKResult:
 
 
 @dataclass
-class DualArmCollisionAwareTargetSolverConfig:
+class DualArmCollisionAwareRetargeterConfig:
     left_input_channel_name: str = "left_wrist_pose"
     right_input_channel_name: str = "right_wrist_pose"
     left_effector_name: str = "left_arm"
@@ -487,6 +491,10 @@ class DualArmCollisionAwareTargetSolverConfig:
     # their historical behavior.
     solve_adaptive_iterations_enabled: bool = False
     solve_iteration_reserve_ms: float = 5.0
+    # Portion of ``solve_iteration_reserve_ms`` assigned to certifying at
+    # least the base/original candidate.  Zero exactly restores the historical
+    # fixed 5 ms post-selection subtraction.
+    candidate_certification_reserve_ms: float = 0.0
     solve_translation_tolerance_m: float = 2e-3
     solve_orientation_tolerance_deg: float = 0.5
     enforce_realistic_joint_step: bool = True
@@ -534,6 +542,14 @@ class DualArmCollisionAwareTargetSolverConfig:
     prefer_non_elbow_singular_branch: bool = False
     elbow_singularity_threshold_deg: float = 3.0
     elbow_singularity_selection_margin_deg: float = 1.0
+    # Shoulder singularity cannot be classified reliably from one joint angle.
+    # Position runtimes may inject the vendor/local kinematics analyzer through
+    # set_position_singularity_analyzers().  The default stays off so force and
+    # compatibility callers neither acquire a hardware dependency nor change
+    # their branch ordering.
+    prefer_non_shoulder_singular_branch: bool = False
+    shoulder_singularity_threshold_m: float = 0.05
+    position_singularity_candidate_certificate_enabled: bool = False
     # Multiplies only the candidate-local clip used while scoring/selecting an
     # IK branch. The final qref execution velocity cap remains independent.
     local_step_candidate_clip_scale: float = 1.0
@@ -589,6 +605,21 @@ class DualArmCollisionAwareTargetSolverConfig:
         if not np.isfinite(float(self.solve_iteration_reserve_ms)) or self.solve_iteration_reserve_ms < 0.0:
             raise ValueError("solve_iteration_reserve_ms must be finite and >= 0.")
         self.solve_iteration_reserve_ms = float(self.solve_iteration_reserve_ms)
+        if (
+            not np.isfinite(float(self.candidate_certification_reserve_ms))
+            or float(self.candidate_certification_reserve_ms) < 0.0
+        ):
+            raise ValueError(
+                "candidate_certification_reserve_ms must be finite and >= 0."
+            )
+        self.candidate_certification_reserve_ms = float(
+            self.candidate_certification_reserve_ms
+        )
+        if self.candidate_certification_reserve_ms > self.solve_iteration_reserve_ms:
+            raise ValueError(
+                "candidate_certification_reserve_ms must be <= "
+                "solve_iteration_reserve_ms."
+            )
         if self.solve_translation_tolerance_m < 0.0:
             raise ValueError("solve_translation_tolerance_m must be >= 0.")
         if self.solve_orientation_tolerance_deg < 0.0:
@@ -613,6 +644,12 @@ class DualArmCollisionAwareTargetSolverConfig:
         self.prefer_non_elbow_singular_branch = bool(
             self.prefer_non_elbow_singular_branch
         )
+        self.prefer_non_shoulder_singular_branch = bool(
+            self.prefer_non_shoulder_singular_branch
+        )
+        self.position_singularity_candidate_certificate_enabled = bool(
+            self.position_singularity_candidate_certificate_enabled
+        )
         if (
             not np.isfinite(float(self.wrist_singularity_threshold_deg))
             or float(self.wrist_singularity_threshold_deg) < 0.0
@@ -624,6 +661,7 @@ class DualArmCollisionAwareTargetSolverConfig:
         for name in (
             "elbow_singularity_threshold_deg",
             "elbow_singularity_selection_margin_deg",
+            "shoulder_singularity_threshold_m",
         ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
@@ -745,7 +783,7 @@ class DualArmCollisionAwareTargetSolverConfig:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
 
 
-class DualArmCollisionAwareTargetSolver(Retargeter):
+class DualArmCollisionAwareRetargeter(Retargeter):
     """Device-neutral coupled target-pose to safe-qref controller.
 
     Operator-specific pose adapters may be injected by ``teleop_runtime``.
@@ -755,7 +793,7 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
 
     def __init__(
         self,
-        config: DualArmCollisionAwareTargetSolverConfig,
+        config: DualArmCollisionAwareRetargeterConfig,
         *,
         left_pose_retargeter: Any | None = None,
         right_pose_retargeter: Any | None = None,
@@ -880,6 +918,13 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "left": None,
             "right": None,
         }
+        self._position_singularity_analyzers: dict[
+            str, Callable[[np.ndarray], Mapping[str, object]]
+        ] = {}
+        self._position_singularity_metadata_cache: dict[
+            tuple[float, ...], dict[str, object]
+        ] = {}
+        self._candidate_certificate_sequence = 0
 
         self.set_current_qpos_pair(
             left_qpos=config.left_initial_qpos,
@@ -899,6 +944,27 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
         self._last_output_qpos_smoothing_full_q = None
         self._reset_output_qpos_smoothing_alpha_state()
         self._clear_hold()
+
+    def set_position_singularity_analyzers(
+        self,
+        analyzers: Mapping[str, Callable[[np.ndarray], Mapping[str, object]]] | None,
+    ) -> None:
+        """Inject per-arm candidate analyzers without coupling robot_motion to hardware.
+
+        This hook is used only by the opt-in position singularity preference.
+        Passing ``None`` (or an empty mapping) is the atomic rollback path: the
+        existing J3/J5 proxies remain available and shoulder classification is
+        reported as unavailable.
+        """
+
+        resolved: dict[str, Callable[[np.ndarray], Mapping[str, object]]] = {}
+        for side, analyzer in dict(analyzers or {}).items():
+            normalized_side = self._validated_side(side)
+            if not callable(analyzer):
+                raise TypeError(f"position singularity analyzer for {side!r} must be callable.")
+            resolved[normalized_side] = analyzer
+        self._position_singularity_analyzers = resolved
+        self._position_singularity_metadata_cache.clear()
 
     def _reset_output_qpos_smoothing_alpha_state(self) -> None:
         slow_alpha = float(self.config.output_qpos_smoothing_alpha)
@@ -1190,6 +1256,9 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "solve_iteration_min": int(self.config.solve_min_iterations),
             "ik_damping": float(self.config.damping),
             "solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+            "candidate_certification_reserve_ms": float(
+                self.config.candidate_certification_reserve_ms
+            ),
             "solve_iteration_budget_ms": max(
                 0.0,
                 float(self.config.solve_time_budget_ms or 0.0)
@@ -1880,6 +1949,53 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
         if output_qpos_smoothing.get("enabled", False):
             self.ik_solver.set_configuration_q(active_q)
             self._last_safe_full_q = active_q.copy()
+        if (
+            candidate_selection_metadata
+            and self.config.position_singularity_candidate_certificate_enabled
+        ):
+            self._candidate_certificate_sequence += 1
+            position_preference = dict(
+                candidate_selection_metadata.get(
+                    "position_singularity_preference",
+                    {},
+                )
+                or {}
+            )
+            wrist_preference = dict(
+                candidate_selection_metadata.get(
+                    "wrist_singularity_preference",
+                    {},
+                )
+                or {}
+            )
+            singular_fallback_claimed = bool(
+                position_preference.get("fallback_to_singular", False)
+                or wrist_preference.get("fallback_to_singular", False)
+            )
+            certificate: dict[str, object] = {
+                "schema": "robot_motion.rm65.position_candidate_certificate/v1",
+                "sequence": int(self._candidate_certificate_sequence),
+                "qref_fingerprint_schema": POSITION_QREF_FINGERPRINT_SCHEMA,
+                "qref_fingerprint_by_side": {
+                    "left": position_qref_fingerprint(left_qpos),
+                    "right": position_qref_fingerprint(right_qpos),
+                },
+                "selected_branch": str(branch_candidate),
+                "selection_status": candidate_selection_metadata.get("status"),
+                "selection_reason": candidate_selection_metadata.get("reason"),
+                "singular_fallback_claimed": singular_fallback_claimed,
+            }
+            if singular_fallback_claimed:
+                # The SDK-backed shoulder classification is intentionally
+                # repeated only on the rare fallback path.  Normal 60 Hz
+                # tracking pays only the fixed 48-byte qref fingerprint cost.
+                certificate["final_qref_position_singularity"] = (
+                    self._position_singularity_metadata(active_q)
+                )
+                certificate["final_qref_wrist_singularity"] = (
+                    self._wrist_singularity_metadata(active_q)
+                )
+            candidate_selection_metadata["candidate_certificate"] = certificate
         left_limit_margin = self._joint_limit_margin_metadata("left", left_qpos)
         right_limit_margin = self._joint_limit_margin_metadata("right", right_qpos)
         raw_left_qpos = None
@@ -1911,6 +2027,9 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                 "ik_solve_iteration_min": int(self.config.solve_min_iterations),
                 "ik_damping": float(self.config.damping),
                 "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+                "ik_candidate_certification_reserve_ms": float(
+                    self.config.candidate_certification_reserve_ms
+                ),
                 "ik_solve_iteration_budget_ms": max(
                     0.0,
                     float(self.config.solve_time_budget_ms or 0.0)
@@ -1971,6 +2090,9 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "ik_solve_iteration_min": int(self.config.solve_min_iterations),
             "ik_damping": float(self.config.damping),
             "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+            "ik_candidate_certification_reserve_ms": float(
+                self.config.candidate_certification_reserve_ms
+            ),
             "ik_solve_iteration_budget_ms": max(
                 0.0,
                 float(self.config.solve_time_budget_ms or 0.0)
@@ -2027,6 +2149,9 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "ik_solve_iteration_min": int(self.config.solve_min_iterations),
             "ik_damping": float(self.config.damping),
             "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
+            "ik_candidate_certification_reserve_ms": float(
+                self.config.candidate_certification_reserve_ms
+            ),
             "ik_solve_iteration_budget_ms": max(
                 0.0,
                 float(self.config.solve_time_budget_ms or 0.0)
@@ -3325,17 +3450,14 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                     self._full_joint_distance_score(reference_full, candidate_q) + posture_penalty,
                 )
             )
-        if self.config.prefer_non_elbow_singular_branch:
+        if (
+            self.config.prefer_non_elbow_singular_branch
+            or self.config.prefer_non_wrist_singular_branch
+            or self.config.prefer_non_shoulder_singular_branch
+        ):
             ranked.sort(
                 key=lambda item: (
                     int(self._position_singularity_metadata(item[1])["singular_side_count"]),
-                    item[2],
-                )
-            )
-        elif self.config.prefer_non_wrist_singular_branch:
-            ranked.sort(
-                key=lambda item: (
-                    int(self._wrist_singularity_metadata(item[1])["singular_side_count"]),
                     item[2],
                 )
             )
@@ -3377,20 +3499,36 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
 
         Wrist classification preserves the existing J5 proxy.  Elbow
         classification uses J3 plus a conservative selection-only margin; the
-        backend SDK remains authoritative and can still reject a target that
-        this lightweight candidate classifier considers normal.
+        injected analyzer is authoritative for shoulder singularity and also
+        augments the two joint proxies when available.  The analyzer boundary
+        is vendor-neutral so this shared solver remains usable in simulation.
         """
 
-        left_q, right_q = self._split_solution(
-            np.asarray(full_qpos, dtype=float).reshape(-1)
+        normalized_q = np.asarray(full_qpos, dtype=float).reshape(-1)
+        cache_key = (
+            float(self.config.prefer_non_elbow_singular_branch),
+            float(self.config.prefer_non_wrist_singular_branch),
+            float(self.config.prefer_non_shoulder_singular_branch),
+            float(self.config.elbow_singularity_threshold_deg),
+            float(self.config.elbow_singularity_selection_margin_deg),
+            float(self.config.wrist_singularity_threshold_deg),
+            float(self.config.shoulder_singularity_threshold_m),
+            *(float(value) for value in normalized_q),
         )
+        cached = self._position_singularity_metadata_cache.get(cache_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
+
+        left_q, right_q = self._split_solution(normalized_q)
         wrist_threshold_deg = float(self.config.wrist_singularity_threshold_deg)
         elbow_threshold_deg = float(self.config.elbow_singularity_threshold_deg)
         elbow_margin_deg = float(self.config.elbow_singularity_selection_margin_deg)
         elbow_selection_threshold_deg = elbow_threshold_deg + elbow_margin_deg
+        shoulder_threshold_m = float(self.config.shoulder_singularity_threshold_m)
         sides: dict[str, dict[str, object]] = {}
         for side, arm_q in (("left", left_q), ("right", right_q)):
-            joint_deg = np.rad2deg(np.asarray(arm_q, dtype=float).reshape(6))
+            arm_q = np.asarray(arm_q, dtype=float).reshape(6)
+            joint_deg = np.rad2deg(arm_q)
             j3_deg = float(joint_deg[2])
             j5_deg = float(joint_deg[4])
             elbow_singular = bool(
@@ -3403,6 +3541,65 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                 and wrist_threshold_deg > 0.0
                 and abs(j5_deg) < wrist_threshold_deg
             )
+            analyzer_metadata: dict[str, object] = {
+                "status_code": None,
+                "label": "unavailable",
+                "reason": "analyzer_not_configured",
+            }
+            analyzer = self._position_singularity_analyzers.get(side)
+            if analyzer is not None and self.config.prefer_non_shoulder_singular_branch:
+                try:
+                    raw_analysis = analyzer(arm_q.copy())
+                    if isinstance(raw_analysis, Mapping):
+                        analyzer_metadata = dict(raw_analysis)
+                    else:
+                        analyzer_metadata = {
+                            "status_code": None,
+                            "label": "unavailable",
+                            "reason": f"invalid_result_type:{type(raw_analysis).__name__}",
+                        }
+                except Exception as exc:  # noqa: BLE001 - preference must fail open.
+                    analyzer_metadata = {
+                        "status_code": None,
+                        "label": "unavailable",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+            analyzer_label = str(analyzer_metadata.get("label") or "unknown")
+            analyzer_code = analyzer_metadata.get("status_code")
+            analyzer_available = analyzer_code is not None
+            if self.config.prefer_non_elbow_singular_branch and analyzer_label == "elbow_singularity":
+                elbow_singular = True
+            if self.config.prefer_non_wrist_singular_branch and analyzer_label == "wrist_singularity":
+                wrist_singular = True
+            shoulder_singular = bool(
+                self.config.prefer_non_shoulder_singular_branch
+                and analyzer_label == "shoulder_singularity"
+            )
+            shoulder_distance: float | None = None
+            raw_distance = analyzer_metadata.get("wrist_center_distance_m")
+            try:
+                shoulder_distance = abs(float(raw_distance))
+            except (TypeError, ValueError):
+                pass
+
+            elbow_depth = (
+                max(0.0, elbow_selection_threshold_deg - abs(j3_deg))
+                / max(elbow_selection_threshold_deg, 1e-12)
+                if elbow_singular
+                else 0.0
+            )
+            wrist_depth = (
+                max(0.0, wrist_threshold_deg - abs(j5_deg))
+                / max(wrist_threshold_deg, 1e-12)
+                if wrist_singular
+                else 0.0
+            )
+            shoulder_depth = (
+                max(0.0, shoulder_threshold_m - shoulder_distance)
+                / max(shoulder_threshold_m, 1e-12)
+                if shoulder_singular and shoulder_distance is not None
+                else float(shoulder_singular)
+            )
             sides[side] = {
                 "j3_deg": j3_deg,
                 "abs_j3_deg": abs(j3_deg),
@@ -3412,7 +3609,21 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                 "abs_j5_deg": abs(j5_deg),
                 "wrist_margin_deg": abs(j5_deg) - wrist_threshold_deg,
                 "is_wrist_singular": wrist_singular,
-                "is_singular": bool(elbow_singular or wrist_singular),
+                "is_shoulder_singular": shoulder_singular,
+                "shoulder_wrist_center_distance_m": shoulder_distance,
+                "shoulder_margin_m": (
+                    None
+                    if shoulder_distance is None
+                    else shoulder_distance - shoulder_threshold_m
+                ),
+                "analyzer_available": bool(analyzer_available),
+                "analyzer": analyzer_metadata,
+                "singularity_depth_score": float(
+                    elbow_depth + wrist_depth + shoulder_depth
+                ),
+                "is_singular": bool(
+                    elbow_singular or wrist_singular or shoulder_singular
+                ),
             }
         elbow_sides = [
             side for side, values in sides.items() if bool(values["is_elbow_singular"])
@@ -3420,19 +3631,24 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
         wrist_sides = [
             side for side, values in sides.items() if bool(values["is_wrist_singular"])
         ]
+        shoulder_sides = [
+            side for side, values in sides.items() if bool(values["is_shoulder_singular"])
+        ]
         singular_sides = [
             side for side, values in sides.items() if bool(values["is_singular"])
         ]
-        return {
+        result: dict[str, object] = {
             "enabled": bool(
                 self.config.prefer_non_elbow_singular_branch
                 or self.config.prefer_non_wrist_singular_branch
+                or self.config.prefer_non_shoulder_singular_branch
             ),
-            "criterion": "J3 elbow proxy or J5 wrist proxy",
+            "criterion": "J3 elbow proxy, J5 wrist proxy, or injected analyzer",
             "elbow_threshold_deg": elbow_threshold_deg,
             "elbow_selection_margin_deg": elbow_margin_deg,
             "elbow_selection_threshold_deg": elbow_selection_threshold_deg,
             "wrist_threshold_deg": wrist_threshold_deg,
+            "shoulder_threshold_m": shoulder_threshold_m,
             "sides": sides,
             "elbow_singular_sides": elbow_sides,
             "elbow_singular_side_count": len(elbow_sides),
@@ -3440,10 +3656,28 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "wrist_singular_sides": wrist_sides,
             "wrist_singular_side_count": len(wrist_sides),
             "any_wrist_singular": bool(wrist_sides),
+            "shoulder_singular_sides": shoulder_sides,
+            "shoulder_singular_side_count": len(shoulder_sides),
+            "any_shoulder_singular": bool(shoulder_sides),
             "singular_sides": singular_sides,
             "singular_side_count": len(singular_sides),
+            "singularity_depth_score": float(
+                sum(float(values["singularity_depth_score"]) for values in sides.values())
+            ),
             "any_singular": bool(singular_sides),
         }
+        analyzer_results_cacheable = bool(
+            not self.config.prefer_non_shoulder_singular_branch
+            or all(
+                bool(sides[side]["analyzer_available"])
+                for side in self._position_singularity_analyzers
+            )
+        )
+        if analyzer_results_cacheable:
+            if len(self._position_singularity_metadata_cache) >= 128:
+                self._position_singularity_metadata_cache.clear()
+            self._position_singularity_metadata_cache[cache_key] = copy.deepcopy(result)
+        return result
 
     def _position_singularity_selection_metadata(
         self,
@@ -3455,6 +3689,7 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             self._position_singularity_metadata(item.output_qpos) for item in evaluated
         ]
         counts = [int(item["singular_side_count"]) for item in classifications]
+        depth_scores = [float(item["singularity_depth_score"]) for item in classifications]
         selected_classification = (
             None
             if selected is None
@@ -3465,6 +3700,7 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "enabled": bool(
                 self.config.prefer_non_elbow_singular_branch
                 or self.config.prefer_non_wrist_singular_branch
+                or self.config.prefer_non_shoulder_singular_branch
             ),
             "prefer_non_elbow_singular_branch": bool(
                 self.config.prefer_non_elbow_singular_branch
@@ -3472,9 +3708,13 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             "prefer_non_wrist_singular_branch": bool(
                 self.config.prefer_non_wrist_singular_branch
             ),
+            "prefer_non_shoulder_singular_branch": bool(
+                self.config.prefer_non_shoulder_singular_branch
+            ),
             "evaluated_feasible_count": len(evaluated),
             "fully_non_singular_count": fully_non_singular_count,
             "minimum_singular_side_count": min(counts) if counts else None,
+            "minimum_singularity_depth_score": min(depth_scores) if depth_scores else None,
             "fallback_to_singular": bool(
                 selected_classification is not None
                 and bool(selected_classification["any_singular"])
@@ -3602,6 +3842,9 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                     "prefer_non_wrist_singular_branch": bool(
                         self.config.prefer_non_wrist_singular_branch
                     ),
+                    "prefer_non_shoulder_singular_branch": bool(
+                        self.config.prefer_non_shoulder_singular_branch
+                    ),
                     "evaluated_feasible_count": 1,
                     "fully_non_singular_count": int(
                         not bool(selected_position_singularity["any_singular"])
@@ -3655,8 +3898,18 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             else 0.0
         )
         deadline_enabled = bool(time_budget_ms > 0.0)
+        post_candidate_reserve_ms = max(
+            0.0,
+            float(self.config.solve_iteration_reserve_ms)
+            - float(self.config.candidate_certification_reserve_ms),
+        )
         branch_budget_ms = (
-            max(0.0, time_budget_ms - pre_selection_elapsed_ms - 5.0)
+            max(
+                0.0,
+                time_budget_ms
+                - pre_selection_elapsed_ms
+                - post_candidate_reserve_ms,
+            )
             if deadline_enabled
             else 0.0
         )
@@ -3829,6 +4082,12 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                 "candidate_eval_branch_budget_ms": (
                     float(branch_budget_ms) if deadline_enabled else None
                 ),
+                "candidate_certification_reserve_ms": float(
+                    self.config.candidate_certification_reserve_ms
+                ),
+                "candidate_post_selection_reserve_ms": float(
+                    post_candidate_reserve_ms
+                ),
                 "candidate_eval_stopped_early": bool(candidate_eval_stopped_early),
                 "candidate_eval_stop_reason": candidate_eval_stop_reason,
                 "reference_collision_distance_m": reference_min_distance,
@@ -3849,6 +4108,7 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             if (
                 self.config.prefer_non_elbow_singular_branch
                 or self.config.prefer_non_wrist_singular_branch
+                or self.config.prefer_non_shoulder_singular_branch
             ):
                 singular_counts = [
                     int(
@@ -3936,7 +4196,16 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
             and base_selected_singularity.get("any_elbow_singular", False)
             and not candidate_eval_stopped_early
         )
-        if base_selection is not None and not expand_for_elbow_singularity:
+        expand_for_shoulder_singularity = bool(
+            base_selection is not None
+            and self.config.prefer_non_shoulder_singular_branch
+            and base_selected_singularity.get("any_shoulder_singular", False)
+            and not candidate_eval_stopped_early
+        )
+        expand_for_position_singularity = bool(
+            expand_for_elbow_singularity or expand_for_shoulder_singularity
+        )
+        if base_selection is not None and not expand_for_position_singularity:
             base_selection[4]["candidate_eval_mode"] = (
                 "deadline_partial" if candidate_eval_stopped_early else "base_only"
             )
@@ -3991,13 +4260,19 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
         if auxiliary_selection is not None:
             if candidate_eval_stopped_early:
                 candidate_eval_mode = "deadline_partial"
-            elif expand_for_elbow_singularity:
+            elif expand_for_position_singularity:
                 candidate_eval_mode = "base_then_auxiliary_singularity_search"
             else:
                 candidate_eval_mode = "base_then_auxiliary"
             auxiliary_selection[4]["candidate_eval_mode"] = candidate_eval_mode
             auxiliary_selection[4]["expanded_for_elbow_singularity"] = bool(
                 expand_for_elbow_singularity
+            )
+            auxiliary_selection[4]["expanded_for_shoulder_singularity"] = bool(
+                expand_for_shoulder_singularity
+            )
+            auxiliary_selection[4]["expanded_for_position_singularity"] = bool(
+                expand_for_position_singularity
             )
             return auxiliary_selection
 
@@ -5071,6 +5346,17 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                 if source_metadata_by_side is None
                 else source_metadata_by_side.get(side)
             )
+            pose_action_intent_raw = (
+                source_metadata.get("pose_action_motion_intent")
+                if source_metadata is not None
+                else (
+                    None
+                    if cartesian_command is None
+                    else cartesian_command.metadata.get(
+                        "pose_action_motion_intent"
+                    )
+                )
+            )
             tracker_intent_raw = (
                 source_metadata.get("tracker_motion_intent")
                 if source_metadata is not None
@@ -5080,31 +5366,45 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
                     else cartesian_command.metadata.get("tracker_motion_intent")
                 )
             )
+            motion_intent_raw = (
+                pose_action_intent_raw
+                if isinstance(pose_action_intent_raw, dict)
+                else tracker_intent_raw
+            )
             if (
                 bool(self.config.inactive_side_hold_enabled)
-                and isinstance(tracker_intent_raw, dict)
-                and tracker_intent_raw.get("state") != "DISABLED"
+                and isinstance(motion_intent_raw, dict)
+                and motion_intent_raw.get("state") != "DISABLED"
             ):
-                tracker_intent = dict(tracker_intent_raw)
+                motion_intent = dict(motion_intent_raw)
                 hold_weight = max(
                     0.0,
-                    min(1.0, float(tracker_intent.get("hold_weight", 0.0) or 0.0)),
+                    min(1.0, float(motion_intent.get("hold_weight", 0.0) or 0.0)),
                 )
                 metadata[side] = {
-                    "source": "tracker_motion_state_machine",
+                    "source": str(
+                        motion_intent.get(
+                            "source",
+                            (
+                                "pose_action_interval_velocity_state_machine"
+                                if isinstance(pose_action_intent_raw, dict)
+                                else "tracker_motion_state_machine"
+                            ),
+                        )
+                    ),
                     "previous_target_available": self._last_target_poses.get(side)
                     is not None,
                     "translation_m": None,
                     "rotation_deg": None,
                     "activity_ratio": None,
                     "hold_weight": hold_weight,
-                    "inactive": bool(tracker_intent.get("inactive", False)),
-                    "state": tracker_intent.get("state"),
-                    "quiet_dwell_sec": tracker_intent.get("quiet_dwell_sec"),
-                    "exit_dwell_sec": tracker_intent.get("exit_dwell_sec"),
-                    "transition_reason": tracker_intent.get("transition_reason"),
-                    "evidence": tracker_intent.get("evidence"),
-                    "motion_window": tracker_intent.get("motion_window"),
+                    "inactive": bool(motion_intent.get("inactive", False)),
+                    "state": motion_intent.get("state"),
+                    "quiet_dwell_sec": motion_intent.get("quiet_dwell_sec"),
+                    "exit_dwell_sec": motion_intent.get("exit_dwell_sec"),
+                    "transition_reason": motion_intent.get("transition_reason"),
+                    "evidence": motion_intent.get("evidence"),
+                    "motion_window": motion_intent.get("motion_window"),
                 }
                 continue
             previous_target = self._last_target_poses.get(side)
@@ -5688,3 +5988,10 @@ class DualArmCollisionAwareTargetSolver(Retargeter):
         finally:
             self.ik_solver.set_configuration_q(reference_full_q)
         return best_result
+
+
+# Compatibility names for callers that use the narrower target-solver
+# terminology.  The object is a complete robot_motion Retargeter and the
+# retargeter name is canonical for new composition roots, including sim.
+DualArmCollisionAwareTargetSolverConfig = DualArmCollisionAwareRetargeterConfig
+DualArmCollisionAwareTargetSolver = DualArmCollisionAwareRetargeter

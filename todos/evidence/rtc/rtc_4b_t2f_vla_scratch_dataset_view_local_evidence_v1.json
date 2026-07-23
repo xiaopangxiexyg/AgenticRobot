@@ -1,0 +1,124 @@
+{
+  "schema": "dexteleop_rtc_scoped_evidence_v1",
+  "evidence_id": "rtc_4b_t2f_vla_scratch_dataset_view_local_2026_07_23",
+  "captured_at": "2026-07-23T02:00:14+08:00",
+  "scope": "local synthetic artifact and arrays; unchanged external baseline type probe; no model, device, or action",
+  "external_baseline": {
+    "path": "/home/zc/HandMotion/vla-scratch",
+    "revision": "fa3cb37a6f3ba620bd2c167a97035b5431f31d19",
+    "status_before": "clean",
+    "status_after": "clean",
+    "modified_by_gate": false
+  },
+  "canonical_fixture": {
+    "dataset_schema": "dexteleop_dataset_v2.3",
+    "active_sides": [
+      "left",
+      "right"
+    ],
+    "camera_source_keys_in_artifact_order": [
+      "front",
+      "left_wrist",
+      "right_wrist"
+    ],
+    "images_shape": [
+      3,
+      3,
+      6,
+      8
+    ],
+    "image_masks_shape": [
+      3,
+      1
+    ],
+    "state_shape": [
+      1,
+      26
+    ],
+    "action_shape": [
+      4,
+      26
+    ],
+    "continuous_layout": "left pose7 + right pose7 + left q6 end-effector + right q6 end-effector",
+    "pose_frame": "canonical_desk",
+    "action_pose_mode": "absolute",
+    "tail_policy": "drop",
+    "fixture_values_are_framework_constants": false
+  },
+  "binding_rules": {
+    "camera_order_source": "PolicyArtifactContract.camera_input.inputs",
+    "state_action_dimensions_source": "PolicyArtifactContract.policy_io_layout",
+    "horizon_and_pose_mode_source": "PolicyArtifactContract.pose_action_chunk",
+    "required_identity_checks": [
+      "policy_io_layout_hash",
+      "pose_action_chunk_contract_hash",
+      "pose_frame_contract_hash"
+    ],
+    "source_revision_explicit": true,
+    "state_history_explicit": true,
+    "discrete_channels_supported_by_current_baseline_view": false,
+    "padded_action_loss_supported_by_current_baseline": false,
+    "uncontracted_transformed_state_supported": false
+  },
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_vla_scratch_dexteleop_dataset_view.py",
+      "result": "5 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_vla_scratch_dexteleop_dataset_view.py tests/test_dataset_pose_chunk.py tests/test_dataset_v22_deploy.py tests/test_vla_scratch_rtc_adapter.py tests/test_rtc_final_chunk_backend.py",
+      "result": "64 passed"
+    },
+    {
+      "command": "NO_PROXY=127.0.0.1,localhost python -m pytest -q <full RTC focused set including T2f>",
+      "result": "192 passed"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/zc/HandMotion/vla-scratch /home/zc/HandMotion/vla-scratch/.venv/bin/python /tmp/dexteleop_vla_scratch_full_sample_probe.py",
+      "result": "unchanged baseline ToDataSample accepted 3-camera/1x26-state/4x26-action with exact uint8/bool/float32 dtypes"
+    },
+    {
+      "command": "direct cross-repository import attempts in each repository's existing virtual environment",
+      "result": "observed only: vla-scratch environment lacks scipy and DexTeleop environment lacks jaxtyping; this does not affect serialized server-client inference"
+    }
+  ],
+  "scoped_source_sha256": {
+    "dataset_interface/vla_scratch.py": "4f55af39a2178d5afb16930826fc0d00b1f14c116c12b25abd6686da88b2abb7",
+    "dataset_contracts/vla_scratch.py": "28c503c828c44f5a56eef9f478c5b1d720efd4b75556dcb4f6c77c6408b2f615",
+    "tests/test_vla_scratch_dexteleop_dataset_view.py": "d16796a2284ceab416da3c32a848761c2f77ecfd64ac1f337fa556affddc0edd",
+    "deployments/vla_scratch/README.md": "62c782f2c2e88adcd1a2dc5504abf5ca3e07dd752287dd1ca7502d3813376f90",
+    "DEPLOY_SCHEMA.md": "d9d4a4f505691ccee12fac7998b39e4045a60aa73c826bbc6654b766722589f0",
+    "tmp_baseline_type_probe.py": "eafaa2e3db8f073dd9116021d86cf1816155871f79eea51a4f5c1c51bce21ccf",
+    "vla_scratch/transforms/common.py": "a1e24ea35c67d1d1a329b0227fd3a1e5ba9d86d1c998d99b6d9a99210b457d13",
+    "vla_scratch/transforms/data_types.py": "366e49238d93f5eecc4079cd109cde049f371feacd74e2be91bda1d92be3451b"
+  },
+  "claims": [
+    "a full dual-arm three-camera DexTeleop v2.3 canonical sample can be projected into the existing vla-scratch processed keys",
+    "artifact order remains authoritative even when the input image mapping insertion order differs",
+    "state/action dimensions, history, horizon, pose semantics, and identities are not selected from a checkpoint or config name",
+    "the same VlaScratchProcessedObservation type is shared by the dataset view and RTC deployment adapter",
+    "unsupported discrete, padded-tail, frame-drift, and history-drift cases fail before model or plan admission",
+    "the integration remains additive and leaves the external baseline clean"
+  ],
+  "non_claims": [
+    "no real DexTeleop episode or video was read",
+    "no normalization statistics were generated or attested",
+    "no vla-scratch checkpoint, GPU, trainer, or model server was loaded",
+    "no existing LIBERO checkpoint is compatible with the 26D DexTeleop fixture",
+    "no production dataset plugin exists yet; a combined Python environment is not required for server-client inference",
+    "no real observation, worker/timed-plan, safety, target, dispatch, or motion authority was used",
+    "no teleop, replay, position-control, or external baseline source was modified"
+  ],
+  "next_gate": {
+    "id": "vla_scratch_loaded_model_synthetic_no_action",
+    "requires": [
+      "a trained model artifact matching this sample binding",
+      "normalization-stat digest",
+      "canonical action decoder and codec digest",
+      "the existing serialized server-client launcher; a combined environment is optional only for an in-process training plugin"
+    ],
+    "requires_real_observation": false,
+    "requires_action_send": false,
+    "requires_teleop_replay_or_position_change": false
+  }
+}

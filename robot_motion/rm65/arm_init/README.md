@@ -8,7 +8,7 @@ Use the new qpos-only init planner when the target is a known qpos:
 ```bash
 PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
   --current-qpos current_qpos.json \
-  --qpos-target robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json \
+  --qpos-target robot_motion/rm65/arm_init/qpos_targets/measured_init_pose.json \
   --arm both \
   --output /tmp/rm65_qpos_init_plan.json \
   --include-steps
@@ -17,6 +17,14 @@ PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
 The command is read-only: it does not connect to hardware and does not send
 motion commands. The output steps can be consumed later by a sim or real
 executor.
+
+The measured init profile is the default qpos target and branch-neutral pose.
+The constrained planner first checks the direct synchronized qpos segment.
+Runtime adapters may try deterministic joint-order waypoints and then the
+shared bounded bidirectional sampling fallback. A sampling budget failure is
+reported as `search_exhausted`; it is not presented as proof that no path
+exists. Every returned execution sample is rechecked against joint limits,
+the TCP start-target corridor, and the selected collision scene.
 
 ## Batch Qpos Test Sequence
 
@@ -36,6 +44,10 @@ The default output is:
 ```text
 robot_motion/rm65/arm_init/qpos_test_sequences/2026-07-05_vive_rm65_real_teleop_3_per_episode_seed0.json
 ```
+
+Generated test targets outside the canonical RM65 absolute joint envelope are
+discarded. The checked-in sequence preserves the original entry indices; its
+rejected historical targets are archived under `legacy/rm65_qpos_test_sequences/`.
 
 Then dry-run the full chain from the bench init qpos:
 

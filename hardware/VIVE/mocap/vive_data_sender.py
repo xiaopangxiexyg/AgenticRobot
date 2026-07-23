@@ -1,54 +1,286 @@
+"""Portable VIVE pose sender.
+
+This file is intentionally self-contained so it can be copied by itself to a
+Windows SteamVR host.  Its normal runtime dependency is only the ``openvr``
+Python package; clock synchronization and the minimal tracker adapter needed
+by the sender are implemented below with the Python standard library.
+"""
+
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import math
 import socket
 import threading
 import time
+import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from .clock_sync import (
-        ClockSyncResult,
-        ClockSyncSampleStore,
-        make_probe,
-        make_result,
-        measurement_from_result,
-        new_sender_instance_id,
-        parse_reply,
-    )
+from typing import Any, Mapping
 
 
+# This compatibility hook remains mutable for tests and legacy callers.  The
+# production sender no longer imports ``clock_sync.py`` and therefore has no
+# clock-sync helper that can be missing after a one-file migration.
 _CLOCK_SYNC_IMPORT_ERROR: ImportError | None = None
-try:  # Support both ``python -m`` and direct Windows script execution.
-    from .clock_sync import (
-        ClockSyncResult,
-        ClockSyncSampleStore,
-        make_probe,
-        make_result,
-        measurement_from_result,
-        new_sender_instance_id,
-        parse_reply,
-    )
-except ImportError:
-    try:
-        from clock_sync import (  # type: ignore[no-redef]
-            ClockSyncResult,
-            ClockSyncSampleStore,
-            make_probe,
-            make_result,
-            measurement_from_result,
-            new_sender_instance_id,
-            parse_reply,
+
+CLOCK_SYNC_PROTOCOL = "teleop_runtime.vive.clock_sync/v1"
+CLOCK_SYNC_PROBE = "probe"
+CLOCK_SYNC_REPLY = "reply"
+CLOCK_SYNC_RESULT = "result"
+
+
+@dataclass(frozen=True)
+class ClockSyncReply:
+    sender_instance_id: str
+    probe_id: int
+    t1_sender_monotonic_ns: int
+    t2_collector_monotonic_ns: int
+    t3_collector_monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class ClockSyncResult:
+    sender_instance_id: str
+    probe_id: int
+    t1_sender_monotonic_ns: int
+    t2_collector_monotonic_ns: int
+    t3_collector_monotonic_ns: int
+    t4_sender_monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class ClockSyncMeasurement:
+    sender_instance_id: str
+    probe_id: int
+    t1_sender_monotonic_ns: int
+    t2_collector_monotonic_ns: int
+    t3_collector_monotonic_ns: int
+    t4_sender_monotonic_ns: int
+    collector_minus_sender_offset_ns: int
+    round_trip_ns: int
+    uncertainty_ns: int
+
+
+@dataclass(frozen=True)
+class ClockSyncEstimate:
+    sender_instance_id: str
+    collector_minus_sender_offset_ns: int
+    round_trip_ns: int
+    uncertainty_ns: int
+    sample_count: int
+    reference_sender_monotonic_ns: int
+    reference_collector_monotonic_ns: int
+
+
+class ClockSyncSampleStore:
+    """Retain bounded samples and select the best recent low-RTT mapping."""
+
+    def __init__(
+        self,
+        *,
+        max_samples: int = 64,
+        selection_window: int = 8,
+        max_round_trip_ns: int | None = None,
+    ) -> None:
+        self.max_samples = max(1, int(max_samples))
+        self.selection_window = max(1, int(selection_window))
+        self.max_round_trip_ns = (
+            None if max_round_trip_ns is None else max(0, int(max_round_trip_ns))
         )
-    except ImportError as exc:  # Keep legacy --clock-sync-mode off standalone.
-        _CLOCK_SYNC_IMPORT_ERROR = exc
+        self._sender_instance_id: str | None = None
+        self._samples: deque[ClockSyncMeasurement] = deque(maxlen=self.max_samples)
+
+    def begin_instance(self, sender_instance_id: str) -> None:
+        if self._sender_instance_id != sender_instance_id:
+            self._sender_instance_id = sender_instance_id
+            self._samples.clear()
+
+    def add(self, measurement: ClockSyncMeasurement) -> ClockSyncEstimate | None:
+        self.begin_instance(measurement.sender_instance_id)
+        if (
+            self.max_round_trip_ns is not None
+            and measurement.round_trip_ns > self.max_round_trip_ns
+        ):
+            return self.estimate()
+        self._samples.append(measurement)
+        return self.estimate()
+
+    def estimate(self) -> ClockSyncEstimate | None:
+        if not self._samples or self._sender_instance_id is None:
+            return None
+        recent = list(self._samples)[-self.selection_window :]
+        selected = min(
+            recent,
+            key=lambda sample: (sample.round_trip_ns, -sample.probe_id),
+        )
+        offset_spread_ns = max(
+            abs(
+                sample.collector_minus_sender_offset_ns
+                - selected.collector_minus_sender_offset_ns
+            )
+            for sample in recent
+        )
+        return ClockSyncEstimate(
+            sender_instance_id=self._sender_instance_id,
+            collector_minus_sender_offset_ns=(
+                selected.collector_minus_sender_offset_ns
+            ),
+            round_trip_ns=selected.round_trip_ns,
+            uncertainty_ns=selected.uncertainty_ns + offset_spread_ns,
+            sample_count=len(self._samples),
+            reference_sender_monotonic_ns=(
+                selected.t1_sender_monotonic_ns
+                + selected.t4_sender_monotonic_ns
+            )
+            // 2,
+            reference_collector_monotonic_ns=(
+                selected.t2_collector_monotonic_ns
+                + selected.t3_collector_monotonic_ns
+            )
+            // 2,
+        )
 
 
+def new_sender_instance_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _encode_clock_sync_message(message: Mapping[str, Any]) -> bytes:
+    return json.dumps(message, allow_nan=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def make_probe(
+    *,
+    sender_instance_id: str,
+    probe_id: int,
+    t1_sender_monotonic_ns: int,
+) -> bytes:
+    return _encode_clock_sync_message(
+        {
+            "protocol": CLOCK_SYNC_PROTOCOL,
+            "type": CLOCK_SYNC_PROBE,
+            "sender_instance_id": str(sender_instance_id),
+            "probe_id": int(probe_id),
+            "t1_sender_monotonic_ns": int(t1_sender_monotonic_ns),
+        }
+    )
+
+
+def make_result(
+    *,
+    sender_instance_id: str,
+    probe_id: int,
+    t1_sender_monotonic_ns: int,
+    t2_collector_monotonic_ns: int,
+    t3_collector_monotonic_ns: int,
+    t4_sender_monotonic_ns: int,
+) -> bytes:
+    return _encode_clock_sync_message(
+        {
+            "protocol": CLOCK_SYNC_PROTOCOL,
+            "type": CLOCK_SYNC_RESULT,
+            "sender_instance_id": str(sender_instance_id),
+            "probe_id": int(probe_id),
+            "t1_sender_monotonic_ns": int(t1_sender_monotonic_ns),
+            "t2_collector_monotonic_ns": int(t2_collector_monotonic_ns),
+            "t3_collector_monotonic_ns": int(t3_collector_monotonic_ns),
+            "t4_sender_monotonic_ns": int(t4_sender_monotonic_ns),
+        }
+    )
+
+
+def _required_nonempty_string(
+    message: Mapping[str, Any],
+    key: str,
+) -> str | None:
+    value = message.get(key)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _required_nonnegative_int(
+    message: Mapping[str, Any],
+    key: str,
+) -> int | None:
+    value = message.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > (2**63 - 1):
+        return None
+    return int(value)
+
+
+def parse_reply(packet: bytes) -> ClockSyncReply | None:
+    try:
+        message = json.loads(packet.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(message, dict):
+        return None
+    if (
+        message.get("protocol") != CLOCK_SYNC_PROTOCOL
+        or message.get("type") != CLOCK_SYNC_REPLY
+    ):
+        return None
+    sender_instance_id = _required_nonempty_string(message, "sender_instance_id")
+    probe_id = _required_nonnegative_int(message, "probe_id")
+    t1 = _required_nonnegative_int(message, "t1_sender_monotonic_ns")
+    t2 = _required_nonnegative_int(message, "t2_collector_monotonic_ns")
+    t3 = _required_nonnegative_int(message, "t3_collector_monotonic_ns")
+    if (
+        sender_instance_id is None
+        or probe_id is None
+        or t1 is None
+        or t2 is None
+        or t3 is None
+        or t3 < t2
+    ):
+        return None
+    return ClockSyncReply(sender_instance_id, probe_id, t1, t2, t3)
+
+
+def measurement_from_result(
+    result: ClockSyncResult,
+) -> ClockSyncMeasurement | None:
+    processing_ns = (
+        result.t3_collector_monotonic_ns - result.t2_collector_monotonic_ns
+    )
+    sender_elapsed_ns = (
+        result.t4_sender_monotonic_ns - result.t1_sender_monotonic_ns
+    )
+    round_trip_ns = sender_elapsed_ns - processing_ns
+    if round_trip_ns < 0:
+        return None
+    offset_numerator = (
+        result.t2_collector_monotonic_ns
+        - result.t1_sender_monotonic_ns
+        + result.t3_collector_monotonic_ns
+        - result.t4_sender_monotonic_ns
+    )
+    return ClockSyncMeasurement(
+        sender_instance_id=result.sender_instance_id,
+        probe_id=result.probe_id,
+        t1_sender_monotonic_ns=result.t1_sender_monotonic_ns,
+        t2_collector_monotonic_ns=result.t2_collector_monotonic_ns,
+        t3_collector_monotonic_ns=result.t3_collector_monotonic_ns,
+        t4_sender_monotonic_ns=result.t4_sender_monotonic_ns,
+        collector_minus_sender_offset_ns=int(round(offset_numerator / 2.0)),
+        round_trip_ns=round_trip_ns,
+        uncertainty_ns=(round_trip_ns + 1) // 2,
+    )
+
+
+# The sender remains strict by default: without an explicit CLI override it
+# requires exactly two trackers, preserving the released left/right mapping.
 EXPECTED_TRACKER_COUNT = 2
 
 DEFAULT_SEND_BUFFER_BYTES = 1024 * 1024
@@ -66,6 +298,22 @@ DEFAULT_CLOCK_SYNC_MAX_RTT_MS = 25.0
 DEFAULT_CLOCK_SYNC_STARTUP_INTERVAL_SEC = 0.02
 DEFAULT_CLOCK_SYNC_REFRESH_SEC = 5.0
 DEFAULT_CLOCK_SYNC_STARTUP_TIMEOUT_SEC = 5.0
+TRIAD_OPENVR_MAX_SEARCH_DEPTH = 4
+TRIAD_OPENVR_SEARCH_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".svn",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        "venv",
+    }
+)
 # ``vive_data_sender.py`` is the local/new entry point.  The separately named
 # ``vive_data_sender_legacy.py`` entry point pins this to ``off`` instead.
 DEFAULT_CLOCK_SYNC_MODE = "optional"
@@ -75,6 +323,15 @@ DEFAULT_CLOCK_SYNC_MODE = "optional"
 class TrackerSpec:
     device_name: str
     tracker_role: str
+
+
+def tracker_count_arg(value: str) -> int:
+    tracker_count = int(value)
+    if tracker_count < EXPECTED_TRACKER_COUNT:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {EXPECTED_TRACKER_COUNT}"
+        )
+    return tracker_count
 
 
 def parse_args(
@@ -89,8 +346,9 @@ def parse_args(
         )
     parser = argparse.ArgumentParser(
         description=(
-            "Read exactly two VIVE GenericTrackers via triad_openvr, assign them by "
-            "device-name order, and send structured UDP JSON packets to the teleop runtime receiver."
+            "Read an exact number of VIVE GenericTrackers via triad_openvr, assign them "
+            "by device-name order, and send structured UDP JSON packets to the teleop "
+            "runtime receiver. The default remains exactly two trackers."
         )
     )
     parser.add_argument("--host", type=str, default="192.168.0.2", help="UDP receiver host")
@@ -147,7 +405,16 @@ def parse_args(
         "--wait-for-trackers",
         type=float,
         default=0.0,
-        help="Seconds to wait for exactly two GenericTrackers before sending.",
+        help="Seconds to wait for exactly --tracker-count GenericTrackers before sending.",
+    )
+    parser.add_argument(
+        "--tracker-count",
+        type=tracker_count_arg,
+        default=EXPECTED_TRACKER_COUNT,
+        help=(
+            "Exact number of GenericTrackers to send. The strict default is 2; "
+            "set this explicitly to 3 or more to enable additional trackers."
+        ),
     )
     parser.add_argument(
         "--list-devices",
@@ -260,19 +527,51 @@ def discovered_tracker_names(vive: Any) -> list[str]:
     return sorted(names, key=lambda name: (name.casefold(), name))
 
 
-def auto_tracker_specs(vive: Any) -> list[TrackerSpec]:
-    """Assign the two discovered trackers to left/right by device name."""
+def tracker_role_for_index(index: int) -> str:
+    """Return the stable role assigned to a lexically ordered tracker."""
+
+    if index < 0:
+        raise ValueError("tracker index must be non-negative")
+    if index == 0:
+        return "left_wrist"
+    if index == 1:
+        return "right_wrist"
+    if index == 2:
+        return "auxiliary"
+    return f"auxiliary_{index - 1}"
+
+
+def auto_tracker_specs(
+    vive: Any,
+    *,
+    tracker_count: int = EXPECTED_TRACKER_COUNT,
+) -> list[TrackerSpec]:
+    """Assign exactly ``tracker_count`` trackers by lexical device name.
+
+    The first two roles retain the historical left/right mapping. Additional
+    trackers receive ``auxiliary``, ``auxiliary_2``, ... in the same stable
+    order.
+    """
+
+    if tracker_count < EXPECTED_TRACKER_COUNT:
+        raise ValueError(
+            f"tracker_count must be at least {EXPECTED_TRACKER_COUNT}; "
+            f"got {tracker_count}"
+        )
 
     names = discovered_tracker_names(vive)
-    if len(names) != EXPECTED_TRACKER_COUNT:
+    if len(names) != tracker_count:
         available = ", ".join(names) or "<none>"
         raise ValueError(
-            "exactly 2 GenericTrackers are required; "
+            f"exactly {tracker_count} GenericTrackers are required; "
             f"found {len(names)} ({available})"
         )
     return [
-        TrackerSpec(device_name=names[0], tracker_role="left_wrist"),
-        TrackerSpec(device_name=names[1], tracker_role="right_wrist"),
+        TrackerSpec(
+            device_name=device_name,
+            tracker_role=tracker_role_for_index(index),
+        )
+        for index, device_name in enumerate(names)
     ]
 
 
@@ -425,25 +724,32 @@ def tracker_mapping_text(specs: list[TrackerSpec]) -> str:
     return ", ".join(f"{spec.device_name}:{spec.tracker_role}" for spec in specs)
 
 
-def wait_for_tracker_pair(
+def wait_for_trackers(
     vive: Any,
     timeout_sec: float,
+    *,
+    tracker_count: int = EXPECTED_TRACKER_COUNT,
 ) -> list[TrackerSpec] | None:
+    if tracker_count < EXPECTED_TRACKER_COUNT:
+        raise ValueError(
+            f"tracker_count must be at least {EXPECTED_TRACKER_COUNT}; "
+            f"got {tracker_count}"
+        )
     deadline = time.monotonic() + max(0.0, timeout_sec)
     next_status = 0.0
     while time.monotonic() < deadline:
         names = discovered_tracker_names(vive)
-        if len(names) > EXPECTED_TRACKER_COUNT:
+        if len(names) > tracker_count:
             raise ValueError(
-                "more than 2 GenericTrackers are connected; "
+                f"more than {tracker_count} GenericTrackers are connected; "
                 f"found {len(names)} ({', '.join(names)})"
             )
-        if len(names) == EXPECTED_TRACKER_COUNT:
-            return auto_tracker_specs(vive)
+        if len(names) == tracker_count:
+            return auto_tracker_specs(vive, tracker_count=tracker_count)
         now = time.monotonic()
         if now >= next_status:
             print(
-                f"[Wait] waiting for exactly {EXPECTED_TRACKER_COUNT} GenericTrackers; "
+                f"[Wait] waiting for exactly {tracker_count} GenericTrackers; "
                 f"found {len(names)} ({', '.join(names) or '<none>'})"
             )
             next_status = now + 1.0
@@ -451,6 +757,19 @@ def wait_for_tracker_pair(
             vive.poll_vr_events()
         time.sleep(0.1)
     return None
+
+
+def wait_for_tracker_pair(
+    vive: Any,
+    timeout_sec: float,
+) -> list[TrackerSpec] | None:
+    """Compatibility wrapper retaining the historical strict two-tracker wait."""
+
+    return wait_for_trackers(
+        vive,
+        timeout_sec,
+        tracker_count=EXPECTED_TRACKER_COUNT,
+    )
 
 
 def update_vive_device_registry(vive: Any, *, refresh: bool = False) -> tuple[int, str | None]:
@@ -497,23 +816,439 @@ def format_position(pose_matrix: list[list[float]]) -> str:
     )
 
 
+def _openvr_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+class EmbeddedOpenVRTrackedDevice:
+    """Small tracked-device wrapper used by the one-file sender backend."""
+
+    def __init__(
+        self,
+        vr_system: Any,
+        index: int,
+        device_class: str,
+        openvr_module: Any,
+    ) -> None:
+        self.vr = vr_system
+        self.index = int(index)
+        self.device_class = str(device_class)
+        self._openvr = openvr_module
+
+    def get_serial(self) -> str:
+        return _openvr_text(
+            self.vr.getStringTrackedDeviceProperty(
+                self.index,
+                self._openvr.Prop_SerialNumber_String,
+            )
+        )
+
+    def get_model(self) -> str:
+        return _openvr_text(
+            self.vr.getStringTrackedDeviceProperty(
+                self.index,
+                self._openvr.Prop_ModelNumber_String,
+            )
+        )
+
+    def get_pose_matrix(self, pose_snapshot: object | None = None) -> object:
+        snapshot = pose_snapshot
+        if snapshot is None:
+            snapshot = _embedded_get_pose(self.vr, self._openvr)
+        tracked_pose = snapshot[self.index]  # type: ignore[index]
+        if not tracked_pose.bPoseIsValid:
+            return None
+        return tracked_pose.mDeviceToAbsoluteTracking
+
+    def get_velocity(self, pose_snapshot: object | None = None) -> object:
+        snapshot = pose_snapshot
+        if snapshot is None:
+            snapshot = _embedded_get_pose(self.vr, self._openvr)
+        tracked_pose = snapshot[self.index]  # type: ignore[index]
+        return tracked_pose.vVelocity if tracked_pose.bPoseIsValid else None
+
+    def get_angular_velocity(
+        self,
+        pose_snapshot: object | None = None,
+    ) -> object:
+        snapshot = pose_snapshot
+        if snapshot is None:
+            snapshot = _embedded_get_pose(self.vr, self._openvr)
+        tracked_pose = snapshot[self.index]  # type: ignore[index]
+        return tracked_pose.vAngularVelocity if tracked_pose.bPoseIsValid else None
+
+
+def _embedded_get_pose(vr_system: Any, openvr_module: Any) -> object:
+    return vr_system.getDeviceToAbsoluteTrackingPose(
+        openvr_module.TrackingUniverseStanding,
+        0,
+        openvr_module.k_unMaxTrackedDeviceCount,
+    )
+
+
+class EmbeddedTriadOpenVR:
+    """Dependency-light subset of triad_openvr required by this sender.
+
+    It intentionally implements only discovery, naming, pose/velocity reads,
+    and device refresh.  Unlike the full repository driver, it does not need
+    numpy or transforms3d.
+    """
+
+    DEVICE_TYPES = ("Tracking Reference", "HMD", "Controller", "Tracker")
+
+    def __init__(self, configfile_path: str | None = None) -> None:
+        self._shutdown = False
+        self._config_mode = configfile_path is not None
+        try:
+            self._openvr = importlib.import_module("openvr")
+        except ModuleNotFoundError as exc:
+            raise SystemExit(
+                "[Error] the portable VIVE sender requires the 'openvr' Python "
+                "package. Install it in the sender environment and retry."
+            ) from exc
+
+        try:
+            self.vr = self._openvr.init(self._openvr.VRApplication_Other)
+            self.vrsystem = self._openvr.VRSystem()
+        except Exception as exc:
+            raise SystemExit(f"[Error] failed to initialize SteamVR/OpenVR: {exc}") from exc
+
+        self.object_names = {device_type: [] for device_type in self.DEVICE_TYPES}
+        self.devices: dict[str, EmbeddedOpenVRTrackedDevice] = {}
+        self.device_index_map: dict[int, str] = {}
+        self.device_serial_map: dict[int, str] = {}
+        self.serial_device_name_map: dict[str, str] = {}
+        self.config_devices_by_serial: dict[str, dict[str, str]] = {}
+        self.refresh_interval = 0.5
+        self._last_refresh_time = 0.0
+        self._load_config(configfile_path)
+        self.refresh_discovered_devices()
+
+    def _load_config(self, configfile_path: str | None) -> None:
+        if not configfile_path:
+            return
+        try:
+            with Path(configfile_path).open("r", encoding="utf-8") as stream:
+                config = json.load(stream)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"[Error] failed to read triad_openvr config {configfile_path}: {exc}"
+            ) from exc
+        if not isinstance(config, dict):
+            raise SystemExit("[Error] triad_openvr config root must be a JSON object")
+        devices = config.get("devices", [])
+        if not isinstance(devices, list):
+            raise SystemExit("[Error] triad_openvr config 'devices' must be a list")
+        for raw_device in devices:
+            if not isinstance(raw_device, dict):
+                continue
+            serial = _openvr_text(raw_device.get("serial")).strip()
+            name = _openvr_text(raw_device.get("name")).strip()
+            device_type = _openvr_text(raw_device.get("type")).strip()
+            if not serial or not name or device_type not in self.object_names:
+                print(f"[Warn] skipping invalid triad_openvr config device: {raw_device}")
+                continue
+            self.config_devices_by_serial[serial] = {
+                "name": name,
+                "type": device_type,
+                "serial": serial,
+            }
+            self.serial_device_name_map[serial] = name
+
+    def close(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        try:
+            self._openvr.shutdown()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        self.close()
+
+    def get_pose(self) -> object:
+        return _embedded_get_pose(self.vr, self._openvr)
+
+    def poll_vr_events(self) -> int:
+        changes = 0
+        event = self._openvr.VREvent_t()
+        while self.vrsystem.pollNextEvent(event):
+            if event.eventType == self._openvr.VREvent_TrackedDeviceActivated:
+                changes += int(self.add_tracked_device(event.trackedDeviceIndex))
+            elif event.eventType == self._openvr.VREvent_TrackedDeviceDeactivated:
+                changes += int(self.remove_tracked_device(event.trackedDeviceIndex))
+        if changes or time.monotonic() - self._last_refresh_time >= self.refresh_interval:
+            changes += self.refresh_discovered_devices()
+        return changes
+
+    def refresh_discovered_devices(self, poses: object | None = None) -> int:
+        snapshot = self.get_pose() if poses is None else poses
+        connected_indexes = {
+            index
+            for index in range(self._openvr.k_unMaxTrackedDeviceCount)
+            if snapshot[index].bDeviceIsConnected  # type: ignore[index]
+        }
+        changes = 0
+        for index in list(self.device_index_map):
+            if index not in connected_indexes:
+                changes += int(self.remove_tracked_device(index))
+        for index in sorted(connected_indexes):
+            changes += int(self.add_tracked_device(index))
+        self._last_refresh_time = time.monotonic()
+        return changes
+
+    def add_tracked_device(self, tracked_device_index: int) -> bool:
+        registration = self._resolve_device_registration(tracked_device_index)
+        if registration is None:
+            return self.remove_tracked_device(tracked_device_index)
+        device_name, device_type, serial = registration
+        previous_name = self.device_index_map.get(tracked_device_index)
+        if previous_name == device_name and device_name in self.devices:
+            self.devices[device_name].index = tracked_device_index
+            self.device_serial_map[tracked_device_index] = serial
+            return False
+        if previous_name and previous_name != device_name:
+            self.remove_tracked_device(tracked_device_index)
+        previous_device = self.devices.get(device_name)
+        if previous_device is not None and previous_device.index != tracked_device_index:
+            self.remove_tracked_device(previous_device.index)
+        if device_name not in self.object_names[device_type]:
+            self.object_names[device_type].append(device_name)
+        self.devices[device_name] = EmbeddedOpenVRTrackedDevice(
+            self.vr,
+            tracked_device_index,
+            device_type,
+            self._openvr,
+        )
+        self.device_index_map[tracked_device_index] = device_name
+        self.device_serial_map[tracked_device_index] = serial
+        if serial:
+            self.serial_device_name_map[serial] = device_name
+        if device_type == "Tracker":
+            print(f"Added tracker: {device_name}\n Index: {tracked_device_index}")
+        return True
+
+    def remove_tracked_device(self, tracked_device_index: int) -> bool:
+        if tracked_device_index not in self.device_index_map:
+            return False
+        device_name = self.device_index_map.pop(tracked_device_index)
+        self.device_serial_map.pop(tracked_device_index, None)
+        device = self.devices.pop(device_name, None)
+        if device is not None and device_name in self.object_names[device.device_class]:
+            self.object_names[device.device_class].remove(device_name)
+        return True
+
+    def _resolve_device_registration(
+        self,
+        tracked_device_index: int,
+    ) -> tuple[str, str, str] | None:
+        device_type = self._device_type_from_index(tracked_device_index)
+        if device_type is None:
+            return None
+        serial = self._get_device_serial(tracked_device_index)
+        configured = self.config_devices_by_serial.get(serial)
+        if configured is not None:
+            return configured["name"], configured["type"], serial
+        if self._config_mode and device_type != "Tracker":
+            return None
+        device_name = self.serial_device_name_map.get(serial) if serial else None
+        if not device_name:
+            previous_name = self.device_index_map.get(tracked_device_index)
+            previous_device = self.devices.get(previous_name or "")
+            if previous_device is not None and previous_device.device_class == device_type:
+                device_name = previous_name
+        if not device_name:
+            device_name = self._next_device_name(device_type)
+        return device_name, device_type, serial
+
+    def _device_type_from_index(self, tracked_device_index: int) -> str | None:
+        device_class = self.vr.getTrackedDeviceClass(tracked_device_index)
+        class_map = {
+            self._openvr.TrackedDeviceClass_Controller: "Controller",
+            self._openvr.TrackedDeviceClass_HMD: "HMD",
+            self._openvr.TrackedDeviceClass_GenericTracker: "Tracker",
+            self._openvr.TrackedDeviceClass_TrackingReference: "Tracking Reference",
+        }
+        return class_map.get(device_class)
+
+    def _get_device_serial(self, tracked_device_index: int) -> str:
+        try:
+            value = self.vr.getStringTrackedDeviceProperty(
+                tracked_device_index,
+                self._openvr.Prop_SerialNumber_String,
+            )
+        except Exception:
+            return ""
+        return _openvr_text(value).strip()
+
+    def _next_device_name(self, device_type: str) -> str:
+        prefixes = {
+            "Controller": "controller",
+            "HMD": "hmd",
+            "Tracker": "tracker",
+            "Tracking Reference": "tracking_reference",
+        }
+        prefix = prefixes[device_type]
+        used_names = set(self.devices)
+        used_names.update(self.object_names[device_type])
+        used_names.update(self.serial_device_name_map.values())
+        suffix = 1
+        while f"{prefix}_{suffix}" in used_names:
+            suffix += 1
+        return f"{prefix}_{suffix}"
+
+    def print_discovered_objects(self) -> None:
+        for device_type, names in self.object_names.items():
+            plural = device_type if len(names) == 1 else f"{device_type}s"
+            print(f"Found {len(names)} {plural}")
+            for name in names:
+                device = self.devices[name]
+                try:
+                    serial = device.get_serial()
+                except Exception:
+                    serial = "unknown-serial"
+                try:
+                    model = device.get_model()
+                except Exception:
+                    model = "unknown-model"
+                print(f"  {name} ({serial}, {model})")
+
+
+class EmbeddedTriadOpenVRModule:
+    """Module-shaped holder matching the external triad_openvr API."""
+
+    triad_openvr = EmbeddedTriadOpenVR
+    __file__ = str(Path(__file__).resolve())
+
+
 def canonical_triad_openvr_module_path() -> Path:
-    """Return the one repository-owned OpenVR implementation used by the sender."""
+    """Return the preferred repository-owned OpenVR implementation path."""
     return Path(__file__).resolve().parents[1] / "triad_openvr" / "triad_openvr.py"
 
 
-def load_triad_openvr(module_path: Path | None = None) -> Any:
-    # Load by an explicit file path so direct Windows execution and ``python -m``
-    # use the same implementation.  In particular, never prefer the obsolete
-    # hardware/VIVE/triad_openvr.py file or an unrelated installed package.
-    resolved_path = (
-        canonical_triad_openvr_module_path()
-        if module_path is None
-        else Path(module_path).resolve()
+def _recursive_triad_openvr_candidates(
+    root: Path,
+    *,
+    max_depth: int = TRIAD_OPENVR_MAX_SEARCH_DEPTH,
+) -> list[Path]:
+    """Find driver files below ``root`` without following unbounded trees."""
+
+    if max_depth < 0 or not root.is_dir():
+        return []
+
+    matches: list[Path] = []
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            entries = sorted(
+                directory.iterdir(),
+                key=lambda path: (path.name.casefold(), path.name),
+                reverse=True,
+            )
+        except OSError:
+            continue
+
+        for entry in entries:
+            if entry.is_file() and entry.name.casefold() == "triad_openvr.py":
+                matches.append(entry.resolve())
+                continue
+            if depth >= max_depth or entry.is_symlink() or not entry.is_dir():
+                continue
+            if entry.name.casefold() in TRIAD_OPENVR_SEARCH_SKIP_DIRS:
+                continue
+            pending.append((entry, depth + 1))
+
+    return sorted(
+        matches,
+        key=lambda path: (
+            len(path.relative_to(root).parts),
+            str(path).casefold(),
+            str(path),
+        ),
     )
+
+
+def triad_openvr_module_candidates(
+    sender_path: Path | None = None,
+) -> list[Path]:
+    """Return deterministic local candidates for the triad_openvr driver.
+
+    Portable VIVE sender bundles are not always copied with the repository's
+    original directory shape. Search relative to the sender itself so the
+    driver may live beside it, in one of its subdirectories, or in a sibling
+    subtree below its parent directory.
+    """
+
+    sender_file = Path(__file__ if sender_path is None else sender_path).resolve()
+    sender_dir = sender_file.parent
+    parent_dir = sender_dir.parent
+
+    local_preferred = [
+        sender_dir / "triad_openvr.py",
+        sender_dir / "triad_openvr" / "triad_openvr.py",
+    ]
+    parent_preferred = [
+        parent_dir / "triad_openvr" / "triad_openvr.py",
+        parent_dir / "triad_openvr.py",
+    ]
+    ordered = [
+        *local_preferred,
+        *_recursive_triad_openvr_candidates(sender_dir),
+        *parent_preferred,
+        *_recursive_triad_openvr_candidates(parent_dir),
+    ]
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in ordered:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(resolved)
+    return candidates
+
+
+def find_triad_openvr_module_path(sender_path: Path | None = None) -> Path:
+    """Find the first usable local triad_openvr implementation."""
+
+    candidates = triad_openvr_module_candidates(sender_path)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    sender_file = Path(__file__ if sender_path is None else sender_path).resolve()
+    search_roots = (sender_file.parent, sender_file.parent.parent)
+    raise SystemExit(
+        "[Error] triad_openvr.py was not found beside the VIVE sender, in its "
+        "subdirectories, or in sibling subdirectories below its parent. "
+        f"Searched roots: {', '.join(str(root) for root in search_roots)}"
+    )
+
+
+def load_triad_openvr(module_path: Path | None = None) -> Any:
+    # Load by an explicit local file path so direct Windows execution and
+    # ``python -m`` never fall through to an unrelated installed package.
+    if module_path is None:
+        try:
+            resolved_path = find_triad_openvr_module_path()
+        except SystemExit:
+            print(
+                "[Info] no external triad_openvr.py found; using embedded "
+                "dependency-light OpenVR adapter"
+            )
+            return EmbeddedTriadOpenVRModule
+    else:
+        resolved_path = Path(module_path).resolve()
     if not resolved_path.is_file():
         raise SystemExit(
-            "[Error] canonical triad_openvr implementation is missing: "
+            "[Error] triad_openvr implementation is missing: "
             f"{resolved_path}"
         )
 
@@ -523,14 +1258,21 @@ def load_triad_openvr(module_path: Path | None = None) -> Any:
     )
     if spec is None or spec.loader is None:
         raise SystemExit(
-            "[Error] cannot load canonical triad_openvr implementation: "
+            "[Error] cannot load triad_openvr implementation: "
             f"{resolved_path}"
         )
 
     module = importlib.util.module_from_spec(spec)
+    print(f"[Info] loading triad_openvr from: {resolved_path}")
     try:
         spec.loader.exec_module(module)
     except ModuleNotFoundError as exc:
+        if module_path is None:
+            print(
+                f"[Warn] external triad_openvr dependency '{exc.name}' is unavailable; "
+                "using embedded dependency-light OpenVR adapter"
+            )
+            return EmbeddedTriadOpenVRModule
         missing = exc.name or "openvr"
         raise SystemExit(
             f"[Error] failed to import '{missing}' from {resolved_path}. "
@@ -1004,16 +1746,24 @@ def main(
     if args.list_devices:
         return
 
+    tracker_count = int(args.tracker_count)
     try:
         if args.wait_for_trackers > 0.0:
-            tracker_specs = wait_for_tracker_pair(vive, args.wait_for_trackers)
+            tracker_specs = wait_for_trackers(
+                vive,
+                args.wait_for_trackers,
+                tracker_count=tracker_count,
+            )
             if tracker_specs is None:
                 raise ValueError(
-                    f"did not find exactly {EXPECTED_TRACKER_COUNT} GenericTrackers "
+                    f"did not find exactly {tracker_count} GenericTrackers "
                     f"within {args.wait_for_trackers:.1f}s"
                 )
         else:
-            tracker_specs = auto_tracker_specs(vive)
+            tracker_specs = auto_tracker_specs(
+                vive,
+                tracker_count=tracker_count,
+            )
     except ValueError as exc:
         raise SystemExit(f"[Error] {exc}") from exc
 
@@ -1101,14 +1851,17 @@ def main(
                     next_device_refresh_time = loop_start + device_refresh_sec
 
                 current_tracker_names = discovered_tracker_names(vive)
-                if len(current_tracker_names) > EXPECTED_TRACKER_COUNT:
+                if len(current_tracker_names) > tracker_count:
                     raise SystemExit(
-                        "[Error] more than 2 GenericTrackers are connected; "
+                        f"[Error] more than {tracker_count} GenericTrackers are connected; "
                         f"found {len(current_tracker_names)} "
                         f"({', '.join(current_tracker_names)})"
                     )
-                if len(current_tracker_names) == EXPECTED_TRACKER_COUNT:
-                    current_specs = auto_tracker_specs(vive)
+                if len(current_tracker_names) == tracker_count:
+                    current_specs = auto_tracker_specs(
+                        vive,
+                        tracker_count=tracker_count,
+                    )
                     if current_specs != tracker_specs:
                         tracker_specs = current_specs
                         print(

@@ -205,6 +205,28 @@ class RobotActionResolver:
         return command
 
 
+def teleop_command_semantic_payload(command: TeleopCommand) -> dict[str, Any]:
+    """Return the transport-neutral semantic payload of a resolved command."""
+
+    if not isinstance(command, TeleopCommand):
+        raise TypeError("command must be a TeleopCommand.")
+    return {
+        "timestamp": command.timestamp,
+        "commands": {
+            name: {
+                "effector_name": item.effector_name,
+                "side": item.side,
+                "command_type": item.command_type,
+                "value": item.value,
+                "frame_name": item.frame_name,
+                "metadata": item.metadata,
+            }
+            for name, item in sorted(command.commands.items())
+        },
+        "metadata": command.metadata,
+    }
+
+
 class NullCommandDispatcher:
     def __init__(self):
         self.commands: list[TeleopCommand] = []
@@ -315,5 +337,6 @@ __all__ = [
     "NullCommandDispatcher",
     "RigCommandDispatcher",
     "RobotActionResolver",
+    "teleop_command_semantic_payload",
     "xyzquat_to_matrix",
 ]

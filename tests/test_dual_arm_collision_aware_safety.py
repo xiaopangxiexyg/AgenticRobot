@@ -12,6 +12,7 @@ from robot_motion.rm65 import (
     BimanualPoseTarget,
     BimanualPoseTargetSource,
 )
+from robot_motion.rm65.dual_arm_ik import MultiTaskIKSolver
 from robot_motion.types import PoseTolerance
 import teleop_runtime.retargeters.dual_arm_collision_aware as dual_module
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
@@ -70,6 +71,20 @@ class _FakeDualArmSolver:
     def compute_min_collision_distance(self, q: np.ndarray | None = None) -> float:
         del q
         return float(self.min_collision_distance)
+
+
+def test_solver_generated_configuration_is_strictly_clamped_before_pink_update() -> None:
+    solver = object.__new__(MultiTaskIKSolver)
+    solver.robot = _FakeRobot(
+        lower=np.array([-2.355, -np.inf, -1.0]),
+        upper=np.array([2.355, np.inf, 1.0]),
+    )
+
+    bounded = solver._clamp_integrated_configuration_to_limits(
+        np.array([2.3585, 42.0, -1.2])
+    )
+
+    np.testing.assert_allclose(bounded, [2.355, 42.0, -1.0])
 
 
 def _rm65_posture_metadata(*, local_escape_enabled: bool = True) -> dict[str, object]:
@@ -286,6 +301,37 @@ def test_dual_arm_target_activity_prefers_tracker_motion_state_machine() -> None
     assert activity["left"]["state"] == "INACTIVE"
     assert activity["left"]["hold_weight"] == 1.0
     assert activity["right"]["source"] == "target_delta_legacy"
+
+
+def test_dual_arm_target_activity_accepts_pose_action_interval_intent() -> None:
+    retargeter = _retargeter(_FakeDualArmSolver())
+    targets = retargeter.current_world_targets()
+    activity = retargeter._target_activity_metadata(
+        targets,
+        source_metadata_by_side={
+            "left": {
+                "pose_action_motion_intent": {
+                    "source": "pose_action_interval_velocity_state_machine",
+                    "state": "ACTIVE",
+                    "inactive": False,
+                    "hold_weight": 0.0,
+                    "evidence": {
+                        "quality_valid": True,
+                        "linear_speed_p90_m_s": 0.12,
+                        "angular_speed_p90_rad_s": 0.3,
+                    },
+                }
+            },
+            "right": None,
+        },
+    )
+
+    assert activity["left"]["source"] == (
+        "pose_action_interval_velocity_state_machine"
+    )
+    assert activity["left"]["state"] == "ACTIVE"
+    assert activity["left"]["inactive"] is False
+    assert activity["left"]["evidence"]["quality_valid"] is True
 
 
 def test_dual_arm_public_kinematics_interface_is_read_only() -> None:
@@ -905,6 +951,146 @@ def test_position_candidate_layer_marks_elbow_fallback_when_no_clean_candidate(
     assert rollback["any_elbow_singular"] is False
 
 
+def test_position_candidate_layer_prefers_clean_shoulder_branch_and_is_rollbackable(
+    monkeypatch,
+) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver, rm65_posture=True)
+    retargeter.config.prefer_non_elbow_singular_branch = False
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    retargeter.config.prefer_non_shoulder_singular_branch = True
+    reference = np.zeros(12, dtype=float)
+    reference[0] = 0.2
+    reference[6] = 0.2
+    shoulder_singular = reference.copy()
+    shoulder_singular[0] = 0.0
+    shoulder_clean = reference.copy()
+    shoulder_clean[0] = 0.3
+    base = dual_module._DualArmCandidate(
+        "original", shoulder_singular, "multitask", "original"
+    )
+    auxiliary = dual_module._DualArmCandidate(
+        "shoulder_escape", shoulder_clean, "posture_escape", "shoulder_escape"
+    )
+
+    def analyze(qpos: np.ndarray) -> dict[str, object]:
+        singular = abs(float(np.asarray(qpos)[0])) < 0.05
+        return {
+            "status_code": -1 if singular else 0,
+            "label": "shoulder_singularity" if singular else "normal",
+            "wrist_center_distance_m": 0.01 if singular else 0.20,
+        }
+
+    retargeter.set_position_singularity_analyzers(
+        {"left": analyze, "right": analyze}
+    )
+
+    def candidates(**kwargs):
+        if kwargs.get("include_posture_escape", False):
+            return [auxiliary], {
+                "posture_escape": {"enabled": True, "status": "active"}
+            }
+        return [base], {"enabled": False, "status": "deferred"}
+
+    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", candidates)
+    monkeypatch.setattr(
+        retargeter,
+        "_evaluate_dual_arm_step_candidate",
+        lambda *, candidate, **_kwargs: (
+            True,
+            candidate.qpos.copy(),
+            {"score": 1.0 if candidate.name == "original" else 100.0},
+        ),
+    )
+    monkeypatch.setattr(
+        retargeter, "_profiled_min_collision_distance", lambda *_a, **_k: 1.0
+    )
+
+    qpos, name, _score, _distance, metadata = (
+        retargeter._select_safe_tracking_candidate(
+            raw_full_q=shoulder_singular,
+            reference_full_q=reference,
+            current_targets=retargeter.current_world_targets(),
+            profile=None,
+        )
+    )
+
+    assert name == "shoulder_escape"
+    assert np.allclose(qpos, shoulder_clean)
+    assert metadata["expanded_for_shoulder_singularity"] is True
+    preference = metadata["position_singularity_preference"]
+    assert preference["fully_non_singular_count"] == 1
+    assert preference["fallback_to_singular"] is False
+    assert preference["selected"]["any_shoulder_singular"] is False
+
+    retargeter.config.prefer_non_shoulder_singular_branch = False
+    rollback = retargeter._position_singularity_metadata(shoulder_singular)
+    assert rollback["any_shoulder_singular"] is False
+
+
+def test_position_candidate_layer_certifies_shoulder_fallback_when_no_clean_branch(
+    monkeypatch,
+) -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.prefer_non_elbow_singular_branch = False
+    retargeter.config.prefer_non_wrist_singular_branch = False
+    retargeter.config.prefer_non_shoulder_singular_branch = True
+    reference = np.full(12, 0.2, dtype=float)
+    singular = reference.copy()
+    singular[0] = 0.0
+    candidate = dual_module._DualArmCandidate(
+        "original", singular, "multitask", "original"
+    )
+
+    def analyze(qpos: np.ndarray) -> dict[str, object]:
+        singular_side = abs(float(np.asarray(qpos)[0])) < 0.05
+        return {
+            "status_code": -1 if singular_side else 0,
+            "label": "shoulder_singularity" if singular_side else "normal",
+            "wrist_center_distance_m": 0.01 if singular_side else 0.20,
+        }
+
+    retargeter.set_position_singularity_analyzers(
+        {"left": analyze, "right": analyze}
+    )
+    monkeypatch.setattr(
+        retargeter,
+        "_dual_arm_tracking_candidates",
+        lambda **_kwargs: ([candidate], {"enabled": False, "status": "deferred"}),
+    )
+    monkeypatch.setattr(
+        retargeter,
+        "_evaluate_dual_arm_step_candidate",
+        lambda *, candidate, **_kwargs: (
+            True,
+            candidate.qpos.copy(),
+            {"score": 1.0},
+        ),
+    )
+    monkeypatch.setattr(
+        retargeter, "_profiled_min_collision_distance", lambda *_a, **_k: 1.0
+    )
+
+    qpos, name, _score, _distance, metadata = (
+        retargeter._select_safe_tracking_candidate(
+            raw_full_q=singular,
+            reference_full_q=reference,
+            current_targets=retargeter.current_world_targets(),
+            profile=None,
+        )
+    )
+
+    assert name == "original"
+    assert np.allclose(qpos, singular)
+    preference = metadata["position_singularity_preference"]
+    assert preference["fully_non_singular_count"] == 0
+    assert preference["fallback_to_singular"] is True
+    selected_left = preference["selected"]["sides"]["left"]
+    assert selected_left["analyzer_available"] is True
+    assert selected_left["is_shoulder_singular"] is True
+
+
 def test_dual_arm_candidate_deadline_holds_without_fallback_or_auxiliary_expansion(monkeypatch) -> None:
     solver = _FakeDualArmSolver()
     retargeter = _retargeter(solver)
@@ -976,6 +1162,44 @@ def test_dual_arm_candidate_deadline_accounts_for_pre_selection_frame_time(monke
     assert evaluation_calls == []
     assert metadata["candidate_eval_stop_reason"] == "branch_budget_exhausted_before_candidates"
     assert metadata["candidate_eval_pre_selection_elapsed_ms"] == 10.0
+
+
+def test_candidate_certification_reserve_reassigns_existing_total_reserve() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    retargeter.config.solve_time_budget_ms = 10.0
+    retargeter.config.solve_iteration_reserve_ms = 5.0
+    reference = np.zeros(12, dtype=float)
+    raw = np.deg2rad(np.arange(1.0, 13.0, dtype=float))
+    solver.set_configuration_q(reference)
+    targets = retargeter.current_world_targets()
+
+    retargeter.config.candidate_certification_reserve_ms = 3.5
+    _qpos, _name, _score, _distance, reserved = (
+        retargeter._select_safe_tracking_candidate(
+            raw_full_q=raw,
+            reference_full_q=reference,
+            current_targets=targets,
+            profile=None,
+            elapsed_before_selection_ms=4.0,
+        )
+    )
+    assert reserved["candidate_certification_reserve_ms"] == pytest.approx(3.5)
+    assert reserved["candidate_post_selection_reserve_ms"] == pytest.approx(1.5)
+    assert reserved["candidate_eval_branch_budget_ms"] == pytest.approx(4.5)
+
+    retargeter.config.candidate_certification_reserve_ms = 0.0
+    _qpos, _name, _score, _distance, rollback = (
+        retargeter._select_safe_tracking_candidate(
+            raw_full_q=raw,
+            reference_full_q=reference,
+            current_targets=targets,
+            profile=None,
+            elapsed_before_selection_ms=4.0,
+        )
+    )
+    assert rollback["candidate_post_selection_reserve_ms"] == pytest.approx(5.0)
+    assert rollback["candidate_eval_branch_budget_ms"] == pytest.approx(1.0)
 
 
 def test_dual_arm_candidate_deadline_selects_best_already_safe_candidate(monkeypatch) -> None:

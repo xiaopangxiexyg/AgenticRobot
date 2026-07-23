@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from xml.etree import ElementTree
 
 import numpy as np
 import pytest
@@ -8,6 +9,10 @@ import pytest
 from robot_motion.rm65 import (
     DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
     DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES,
+    DEFAULT_LEFT_ARM_QPOS,
+    DEFAULT_RIGHT_ARM_QPOS,
+    RM65_ABSOLUTE_Q_MAX_RAD,
+    RM65_ABSOLUTE_Q_MIN_RAD,
 )
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
@@ -79,3 +84,35 @@ def test_rm65_qpos_layout_validation():
 def test_rm65_qpos_layout_rejects_bad_shape():
     with pytest.raises(ValueError, match="6 finite"):
         as_rm65_qpos([0.0, 1.0], label="bad_qpos")
+
+
+def test_default_rm65_seeds_respect_active_urdf_joint_limits():
+    urdf = Path(
+        "assets/rm65_inspire_gripper_v3/"
+        "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+    )
+    root = ElementTree.parse(urdf).getroot()
+
+    limits_by_side: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for side, qpos in (
+        ("left", DEFAULT_LEFT_ARM_QPOS),
+        ("right", DEFAULT_RIGHT_ARM_QPOS),
+    ):
+        lower: list[float] = []
+        upper: list[float] = []
+        for joint_index in range(1, 7):
+            joint = root.find(f"./joint[@name='{side}_arm_joint{joint_index}']")
+            assert joint is not None
+            limit = joint.find("limit")
+            assert limit is not None
+            lower.append(float(limit.attrib["lower"]))
+            upper.append(float(limit.attrib["upper"]))
+        values = np.asarray(qpos, dtype=float)
+        assert np.all(values >= np.asarray(lower))
+        assert np.all(values <= np.asarray(upper))
+        limits_by_side[side] = (np.asarray(lower), np.asarray(upper))
+
+    np.testing.assert_allclose(limits_by_side["left"][0], RM65_ABSOLUTE_Q_MIN_RAD)
+    np.testing.assert_allclose(limits_by_side["left"][1], RM65_ABSOLUTE_Q_MAX_RAD)
+    np.testing.assert_allclose(limits_by_side["right"][0], RM65_ABSOLUTE_Q_MIN_RAD)
+    np.testing.assert_allclose(limits_by_side["right"][1], RM65_ABSOLUTE_Q_MAX_RAD)

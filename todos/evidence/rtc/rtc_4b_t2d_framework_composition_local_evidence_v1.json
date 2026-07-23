@@ -1,0 +1,99 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t2d_framework_composition_local_2026_07_22",
+  "scope": "pure_local_model_framework_composition_no_action",
+  "captured_at": "2026-07-22T23:35:28+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_suite_rerun": false
+  },
+  "composition_contract": {
+    "structural_protocol": "deployments.client.RtcModelRuntimeAdapter",
+    "sessionless_adapter": "deployments.client.SimpleRtcModelRuntimeAdapter",
+    "required_sessionless_pieces": [
+      "instance_derived_backend_capability",
+      "exact_request_spec",
+      "model_input_preparer",
+      "model_space_decoder"
+    ],
+    "custom_session_adapter_method": "create_worker_executor",
+    "framework_name_registry_used": false,
+    "checkpoint_or_config_allowlist_used": false,
+    "frontend_started_by_builder": false,
+    "production_caller_added": false
+  },
+  "boundary": {
+    "hardware_accessed": false,
+    "real_observation_used": false,
+    "network_or_model_server_used": false,
+    "action_send_enabled": false,
+    "dispatch_attempted": false,
+    "teleop_or_replay_path_changed": false,
+    "position_executor_path_changed": false,
+    "control_station_dependency_added": false,
+    "forbidden_upper_or_target_imports": []
+  },
+  "verified_behavior": {
+    "capability_negotiated_before_worker_creation": true,
+    "request_identity_projected_exactly": true,
+    "capability_drift_fails_before_worker": true,
+    "action_cadence_mismatch_fails_before_worker": true,
+    "tested_prediction_horizons": [2, 4, 8],
+    "blocking_backend_does_not_block_control_step": true,
+    "openpi_satisfies_structural_protocol_without_shim": true,
+    "legacy_queue_pop_count_in_generic_round_trip": 0
+  },
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_rtc_generic_deploy_runtime.py tests/test_openpi_rtc_final_chunk_adapter.py",
+      "result": "42 passed"
+    },
+    {
+      "command": "python -m pytest -q <full RTC focused set>",
+      "result": "176 passed"
+    },
+    {
+      "command": "python -m pytest -q <OpenPI/default-deploy/position/MuJoCo compatibility set>",
+      "result": "160 passed, 1 skipped"
+    },
+    {
+      "command": "python -m py_compile <T2d scoped Python files>",
+      "result": "passed"
+    },
+    {
+      "command": "python -m teleop_runtime.deploy --help",
+      "result": "passed; rtc-profile default remains off"
+    }
+  ],
+  "scoped_source_sha256": {
+    "deployments/client/rtc_frontend.py": "56f0efc651467aa717816e6b6a31777c50fd677d13b7b03a791d0517f180cd4a",
+    "deployments/client/rtc.py": "242ab1aabe2eaf62143ed4a6ec831883c65bdbb16c4f70de84d449628a75636d",
+    "deployments/client/rtc_executor.py": "f6c876c249f90dbdc2159bb2d40abd13cf3e9f0780ca29d5e85fb5de9c6eb47d",
+    "deployments/openpi/client/rtc.py": "c87fa86a4acc72ab2c1ce71548a787ca18542f83a7e1f0a91bd6b86a111e7c14",
+    "tests/test_rtc_generic_deploy_runtime.py": "ee7a742bed98681f4893d62c9fd916c020d3c1263321489cc6ccd97d7b3188f8",
+    "tests/test_openpi_rtc_final_chunk_adapter.py": "09f116587ae0bf886a8a17dfd1036785a0f9d4aa80947e167d82ae5657cc45c7"
+  },
+  "claims": [
+    "a sessionless local, HTTP or IPC model can integrate without subclassing or copying coordinator identity fields",
+    "a session-aware framework can implement the same structural protocol without a framework-name branch",
+    "capability, representation identity and horizons remain facts of the loaded model instance and exact request spec",
+    "the helper leaves lifecycle, observation, safety, reference, target and dispatch ownership with the embedding application",
+    "the convenience layer preserves the existing worker, timed-plan and formal-emission contracts"
+  ],
+  "non_claims": [
+    "no additional model framework was connected to a production caller",
+    "no real observation, GPU inference, network transport or hardware was exercised",
+    "no true prefix-conditioned continuation capability is claimed",
+    "no production RTC enablement or motion authority is claimed",
+    "no full repository test-suite result is claimed"
+  ],
+  "next_gate": {
+    "id": "rtc_4b_t3_real_observation_no_action_shadow",
+    "requires_separate_observation_scope": true,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false,
+    "requires_position_change": false,
+    "alternative_framework_gate": "add_one_non_openpi_adapter_using_only_the_structural_contract"
+  }
+}

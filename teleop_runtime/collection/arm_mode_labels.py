@@ -102,6 +102,9 @@ def _active_sides(command: TeleopCommand | None, *, active_key: str, side_key: s
 
 
 def _init_sides(command: TeleopCommand | None) -> set[str]:
+    label_active = _first_metadata(command, "init_arm_label_active")
+    if label_active is not None and not _boolish(label_active):
+        return set()
     sides = _active_sides(command, active_key="init_arm_active", side_key="init_arm_side")
     side = _normalize_side(_first_metadata(command, "init_arm_active_side"))
     if side:
@@ -114,6 +117,29 @@ def _fix_sides(command: TeleopCommand | None) -> set[str]:
     side = _normalize_side(_first_metadata(command, "fix_arm_active_side"))
     if side:
         sides.add(side)
+    return sides
+
+
+def _explicit_stopped_sides(command: TeleopCommand | None) -> set[str]:
+    sides: set[str] = set()
+    raw_sides = _first_metadata(command, "arm_mode_stopped_sides")
+    if isinstance(raw_sides, str):
+        raw_sides = (raw_sides,)
+    if isinstance(raw_sides, Sequence):
+        sides.update(
+            normalized
+            for normalized in (_normalize_side(side) for side in raw_sides)
+            if normalized
+        )
+    if command is None:
+        return sides
+    for effector_command in command.commands.values():
+        metadata = effector_command.metadata or {}
+        if not _boolish(metadata.get("arm_mode_stopped")):
+            continue
+        side = _normalize_side(effector_command.side)
+        if side:
+            sides.add(side)
     return sides
 
 
@@ -365,6 +391,7 @@ def build_arm_mode_metadata(
     stopped_by_session = bool(recording_paused or state_upper not in {"RUNNING"})
     init_sides = _init_sides(command)
     fix_sides = _fix_sides(command)
+    explicit_stopped_sides = _explicit_stopped_sides(command)
     audit_by_side = init_audit_by_side if isinstance(init_audit_by_side, Mapping) else {}
 
     sides: dict[str, dict[str, Any]] = {}
@@ -383,12 +410,31 @@ def build_arm_mode_metadata(
                 source=source,
                 detail=detail,
             )
+        elif side in explicit_stopped_sides:
+            sides[side] = _side_payload(
+                mode="stopped",
+                source="command_hold",
+                tags=("home_recapture",),
+                detail={
+                    **detail,
+                    "stop_reason": _first_metadata(command, "arm_mode_stop_reason"),
+                },
+            )
         elif side in init_sides:
             sides[side] = _side_payload(
                 mode="init_pose",
                 source="init_arm",
                 tags=("init_arm",),
-                detail={**detail, "init_arm_mode": _first_metadata(command, "init_arm_mode")},
+                detail={
+                    **detail,
+                    "init_arm_mode": _first_metadata(command, "init_arm_mode"),
+                    "init_arm_qpos_operation_id": _first_metadata(
+                        command, "init_arm_qpos_operation_id"
+                    ),
+                    "init_arm_qpos_step_index": _first_metadata(
+                        command, "init_arm_qpos_step_index"
+                    ),
+                },
                 audit=init_audit or _default_init_audit(phase="unknown", reason="audit_not_collected"),
             )
         elif side in fix_sides:

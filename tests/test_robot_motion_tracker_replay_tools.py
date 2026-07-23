@@ -156,7 +156,7 @@ def test_offline_tracker_viewer_helpers_use_dual_rm65_defaults() -> None:
     assert _parse_active_sides("both") == ("left", "right")
     assert _parse_active_sides("right") == ("right",)
 
-    assert _resolve_viewer_urdf(None).name == "rm65_dual_arm_hand_proxy_open.urdf"
+    assert _resolve_viewer_urdf(None).name == "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 
 
 def test_offline_tracker_viewer_progress_predicate_is_keyword_only() -> None:

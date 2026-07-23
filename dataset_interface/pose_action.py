@@ -193,6 +193,14 @@ def pose_policy_window_from_rows(
 
     if not rows:
         raise PosePolicyViewError("Cannot build a pose policy window from zero rows.")
+    continuity_segments = {
+        int(row.get("collection.continuity_segment_index", 0) or 0)
+        for row in rows
+    }
+    if len(continuity_segments) != 1:
+        raise PosePolicyViewError(
+            "Pose policy window crosses a collection pause/resume continuity segment."
+        )
     action_mode = _normalize_mode(action_pose_mode)
     last_mode = _normalize_mode(last_action_pose_mode or action_mode)
     sides = tuple(dict.fromkeys(str(side).strip().lower() for side in active_sides))
@@ -258,6 +266,7 @@ def pose_policy_window_from_rows(
             "last_action_anchor_policy": "current_actual_tcp",
             "source_pose_storage_frame": pose_frame_contract.pose_storage_frame,
             "source_id": pose_frame_contract.source_id,
+            "continuity_segment_index": next(iter(continuity_segments)),
         },
     )
 

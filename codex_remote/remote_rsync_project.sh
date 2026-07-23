@@ -44,6 +44,8 @@ Options:
       --yes             Skip interactive confirmation for a non-empty remote target.
 
 Safety: L2, remote non-motion write.
+If LOCAL/.realtime_sync_ssh.exclude exists, its non-comment patterns are also
+applied so one-shot sync cannot bypass machine-local protections.
 EOF
   common_ssh_usage
 }
@@ -110,6 +112,19 @@ require_cmd rsync
 LOCAL_DIR="$(expand_local_path "$LOCAL_DIR")"
 [[ -d "$LOCAL_DIR" ]] || die "local directory does not exist: $LOCAL_DIR"
 LOCAL_DIR="$(cd "$LOCAL_DIR" && pwd -P)"
+
+project_exclude_file="$LOCAL_DIR/.realtime_sync_ssh.exclude"
+if [[ -f "$project_exclude_file" ]]; then
+  exclude_count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    pattern="${line%$'\r'}"
+    [[ "$pattern" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$pattern" =~ ^[[:space:]]*# ]] && continue
+    EXCLUDES+=("$pattern")
+    ((exclude_count += 1))
+  done < "$project_exclude_file"
+  info "Loaded $exclude_count exclude pattern(s) from: $project_exclude_file"
+fi
 
 print_wrapper_header "L2"
 printf '[sync] local=%s\n' "$LOCAL_DIR"

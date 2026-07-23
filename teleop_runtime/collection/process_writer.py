@@ -11,23 +11,39 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import sys
 import time
 import traceback
 import uuid
+from multiprocessing.reduction import ForkingPickler
 from collections import deque
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
+
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.stream_catalog import (
+    NativeStreamContract,
+    NativeStreamEpisodeManifest,
+    NativeStreamExternalArtifactReceipt,
+    NativeStreamExternalSampleIntent,
+)
+from robot_motion.runtime.observation_cut import ObservationSampleRef
 
 from .sample_assembler import (
     CollectorSampleBuilder,
     CollectorSampleBuilderConfig,
     CollectorSampleSnapshot,
 )
+from .stream_sink import NativeStreamEpisodeWriter
 from .video_frame import VideoFrame
-from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
+from .writer_v21 import (
+    LegacyEpisodeArtifactReport,
+    LeRobotV21Writer,
+    LeRobotV21WriterConfig,
+)
 
 
 _ALIGNMENT = 64
@@ -52,6 +68,7 @@ class ProcessCollectionConfig:
     request_timeout_sec: float = 30.0
     worker_cpus: tuple[int, ...] = ()
     worker_nice: int = 5
+    native_inline_message_max_bytes: int = 256 * 1024
 
     def __post_init__(self) -> None:
         if int(self.queue_size) <= 0:
@@ -64,6 +81,42 @@ class ProcessCollectionConfig:
             raise ValueError("startup_timeout_sec must be positive.")
         if float(self.request_timeout_sec) <= 0.0:
             raise ValueError("request_timeout_sec must be positive.")
+        if int(self.native_inline_message_max_bytes) <= 0:
+            raise ValueError("native_inline_message_max_bytes must be positive.")
+
+
+@dataclass(frozen=True)
+class ProcessExternalNativeStreamBinding:
+    """Data-driven projection from one specialized writer source."""
+
+    stream_id: str
+    source_kind: str
+    source_key: str
+
+    def __post_init__(self) -> None:
+        stream_id = str(self.stream_id).strip()
+        source_kind = str(self.source_kind).strip()
+        source_key = str(self.source_key).strip()
+        if not stream_id or not source_key:
+            raise ValueError("External stream binding identity must be non-empty.")
+        if source_kind != "selected_rgb":
+            raise ValueError(
+                "Process external stream binding currently supports only "
+                "selected_rgb."
+            )
+        object.__setattr__(self, "stream_id", stream_id)
+        object.__setattr__(self, "source_kind", source_kind)
+        object.__setattr__(self, "source_key", source_key)
+
+
+@dataclass(frozen=True)
+class ProcessLegacyFinalizeResult:
+    episode_index: int
+    legacy_finalized: bool
+    native_stream_artifact_receipts: tuple[
+        NativeStreamExternalArtifactReceipt, ...
+    ] = ()
+    artifact_receipt_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -77,11 +130,179 @@ class ProcessCollectionStats:
     slot_count: int
     worker_alive: bool
     worker_error: str | None
+    worker_traceback: str | None
     active_episode_frame_count: int
     sample_process_ms_p50: float | None
     sample_process_ms_p95: float | None
     timing_ms: dict[str, dict[str, float | int | None]]
     shared_payload_bytes: dict[str, float | int | None]
+    submitted_native_stream_samples: int
+    completed_native_stream_samples: int
+    rejected_native_stream_samples: int
+
+
+@dataclass(frozen=True)
+class ProcessNativeStreamSubmissionReceipt:
+    episode_uuid: str
+    legacy_episode_index: int
+    stream_id: str
+    sample_id: str
+    accepted: bool
+    rejection_reason: str | None
+    serialized_message_bytes: int
+
+
+class ProcessNativeStreamEpisodeCapture:
+    """Parent-side subordinate capture proxy for inline or external streams."""
+
+    def __init__(
+        self,
+        worker: "ProcessCollectionWorker",
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+    ) -> None:
+        self.worker = worker
+        self.episode_uuid = str(episode_uuid)
+        self.legacy_episode_index = int(legacy_episode_index)
+        self._pending_drop_counts: dict[tuple[str, str], int] = {}
+        self._closed = False
+        self._frozen = False
+
+    @property
+    def requires_post_finalize_seal(self) -> bool:
+        return bool(self.worker.native_external_stream_bindings)
+
+    def append(self, **sample: Any) -> ProcessNativeStreamSubmissionReceipt:
+        if self._closed:
+            raise RuntimeError("Native stream process capture is closed.")
+        if self._frozen:
+            raise RuntimeError("Native stream process capture is frozen.")
+        receipt = self.worker.submit_native_stream_sample(
+            episode_uuid=self.episode_uuid,
+            legacy_episode_index=self.legacy_episode_index,
+            **sample,
+        )
+        if not receipt.accepted:
+            key = (
+                str(sample.get("stream_id", "")),
+                str(receipt.rejection_reason or "process_queue_busy"),
+            )
+            self._pending_drop_counts[key] = (
+                self._pending_drop_counts.get(key, 0) + 1
+            )
+        return receipt
+
+    def note_drop(self, stream_id: str, *, reason: str) -> None:
+        if self._closed:
+            raise RuntimeError("Native stream process capture is closed.")
+        if self._frozen:
+            raise RuntimeError("Native stream process capture is frozen.")
+        key = (str(stream_id), str(reason))
+        self._pending_drop_counts[key] = self._pending_drop_counts.get(key, 0) + 1
+
+    def append_observation_sample(
+        self,
+        sample: ObservationSampleRef,
+        payload: Any,
+        *,
+        written_at: float,
+        written_clock_domain_id: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ProcessNativeStreamSubmissionReceipt:
+        if not isinstance(sample, ObservationSampleRef):
+            raise TypeError("sample must be an ObservationSampleRef.")
+        return self.append(
+            stream_id=sample.stream_id,
+            sample_id=sample.sample_id,
+            sequence=sample.sequence,
+            measured_at=sample.measured_at,
+            measured_clock_domain_id=sample.measured_clock_domain_id,
+            available_at=sample.available_at,
+            available_clock_domain_id=sample.available_clock_domain_id,
+            source_payload_object_id=sample.payload_object_id,
+            payload=payload,
+            valid=sample.valid,
+            stale=sample.stale,
+            gap_reason=None,
+            written_at=written_at,
+            written_clock_domain_id=written_clock_domain_id,
+            metadata={
+                **dict(sample.content_metadata),
+                **dict(metadata or {}),
+            },
+        )
+
+    def seal(
+        self,
+        *,
+        sealed_at: float,
+        sealed_clock_domain_id: str,
+    ) -> NativeStreamEpisodeManifest:
+        if self._closed:
+            raise RuntimeError("Native stream process capture is closed.")
+        if self.requires_post_finalize_seal:
+            raise RuntimeError(
+                "External native streams must seal after legacy finalize."
+            )
+        manifest = self.worker.seal_native_stream_episode(
+            episode_uuid=self.episode_uuid,
+            legacy_episode_index=self.legacy_episode_index,
+            sealed_at=sealed_at,
+            sealed_clock_domain_id=sealed_clock_domain_id,
+            drop_counts=self._pending_drop_counts,
+        )
+        self._closed = True
+        return manifest
+
+    def freeze_ingestion(self) -> None:
+        if self._closed:
+            raise RuntimeError("Native stream process capture is closed.")
+        if not self.requires_post_finalize_seal:
+            raise RuntimeError(
+                "Inline native streams do not use post-finalize freeze."
+            )
+        if self._frozen:
+            return
+        self.worker.freeze_native_stream_episode(
+            episode_uuid=self.episode_uuid,
+            legacy_episode_index=self.legacy_episode_index,
+            drop_counts=self._pending_drop_counts,
+        )
+        self._pending_drop_counts.clear()
+        self._frozen = True
+
+    def seal_after_legacy_finalize(
+        self,
+        receipts: Iterable[NativeStreamExternalArtifactReceipt],
+        *,
+        sealed_at: float,
+        sealed_clock_domain_id: str,
+    ) -> NativeStreamEpisodeManifest:
+        if self._closed:
+            raise RuntimeError("Native stream process capture is closed.")
+        if not self._frozen:
+            raise RuntimeError(
+                "External native stream capture must freeze before seal."
+            )
+        manifest = self.worker.seal_native_stream_episode_after_legacy_finalize(
+            episode_uuid=self.episode_uuid,
+            legacy_episode_index=self.legacy_episode_index,
+            receipts=tuple(receipts),
+            sealed_at=sealed_at,
+            sealed_clock_domain_id=sealed_clock_domain_id,
+        )
+        self._closed = True
+        return manifest
+
+    def close_unsealed(self) -> None:
+        if self._closed:
+            return
+        self.worker.close_native_stream_episode(
+            episode_uuid=self.episode_uuid,
+            legacy_episode_index=self.legacy_episode_index,
+        )
+        self._closed = True
 
 
 def camera_shared_slot_bytes(
@@ -330,10 +551,192 @@ def _configure_worker_process(config: ProcessCollectionConfig) -> dict[str, Any]
     return status
 
 
+def _selected_rgb_sample_id(
+    binding: ProcessExternalNativeStreamBinding,
+    frame: VideoFrame,
+) -> str:
+    source_identity: dict[str, Any] = {
+        "stream_id": binding.stream_id,
+        "camera_key": binding.source_key,
+        "source_frame_index": frame.frame_index,
+        "source_timestamp": frame.source_timestamp,
+    }
+    if frame.frame_index is None:
+        source_identity["payload_content_hash"] = canonical_content_hash(
+            frame.image,
+            domain="dexteleop.selected_rgb_source_payload.v1",
+        )
+    identity_hash = canonical_content_hash(
+        source_identity,
+        domain="dexteleop.selected_rgb_sample_identity.v1",
+    )
+    return f"selected-rgb:{identity_hash}"
+
+
+def _selected_rgb_payload(frame: VideoFrame) -> np.ndarray:
+    payload = np.asarray(frame.image)
+    color_space = str(frame.metadata.get("color_space", "rgb")).strip().lower()
+    if color_space == "rgb":
+        return np.ascontiguousarray(payload)
+    if color_space == "bgr":
+        if payload.ndim != 3 or payload.shape[-1] != 3:
+            raise ValueError("BGR selected frame must have exactly three channels.")
+        return np.ascontiguousarray(payload[..., ::-1])
+    raise ValueError(
+        "selected_rgb requires source color_space 'rgb' or 'bgr', "
+        f"got {color_space!r}."
+    )
+
+
+def _stage_selected_rgb_intents(
+    sample: Any,
+    *,
+    native_writer: NativeStreamEpisodeWriter,
+    native_stream_contracts: Mapping[str, NativeStreamContract],
+    external_stream_bindings: Mapping[
+        str, ProcessExternalNativeStreamBinding
+    ],
+    next_sequence_by_stream: dict[str, int],
+    intent_and_sample_frame_by_identity: dict[
+        tuple[str, str], tuple[NativeStreamExternalSampleIntent, int]
+    ],
+) -> None:
+    for stream_id, binding in external_stream_bindings.items():
+        contract = native_stream_contracts[stream_id]
+        match = sample.camera_frames.get(binding.source_key)
+        frame = None if match is None else match.frame
+        if frame is None:
+            native_writer.note_drop(
+                stream_id,
+                reason="selected_rgb_frame_missing",
+            )
+            continue
+        sample_id = _selected_rgb_sample_id(binding, frame)
+        identity = (stream_id, sample_id)
+        if identity in intent_and_sample_frame_by_identity:
+            continue
+        available_at = frame.available_timestamp
+        availability_fallback = "frame.available_timestamp"
+        if available_at is None:
+            available_at = frame.receive_timestamp
+            availability_fallback = "frame.receive_timestamp"
+        if available_at is None:
+            available_at = sample.timestamp
+            availability_fallback = "collector_sample.timestamp"
+        sequence = int(next_sequence_by_stream.get(stream_id, 0))
+        intent = NativeStreamExternalSampleIntent.create(
+            contract=contract,
+            sample_id=sample_id,
+            sequence=sequence,
+            measured_at=float(frame.source_timestamp),
+            measured_clock_domain_id=contract.measured_clock_domain_id,
+            available_at=float(available_at),
+            available_clock_domain_id=contract.available_clock_domain_id,
+            source_payload_object_id=(
+                f"selected-rgb:{binding.source_key}:{sample_id}"
+            ),
+            payload=_selected_rgb_payload(frame),
+            metadata={
+                "source_kind": binding.source_kind,
+                "source_key": binding.source_key,
+                "source_frame_index": frame.frame_index,
+                "collector_sample_frame_index": int(sample.frame_index),
+                "availability_source": availability_fallback,
+                "logical_color_space": "rgb",
+                "source_color_space": str(
+                    frame.metadata.get("color_space", "rgb")
+                ).strip().lower(),
+            },
+        )
+        native_writer.stage_external_sample(intent)
+        next_sequence_by_stream[stream_id] = sequence + 1
+        intent_and_sample_frame_by_identity[identity] = (
+            intent,
+            int(sample.frame_index),
+        )
+
+
+def _selected_rgb_artifact_receipts(
+    report: LegacyEpisodeArtifactReport,
+    *,
+    episode_uuid: str,
+    native_stream_contracts: Mapping[str, NativeStreamContract],
+    external_stream_bindings: Mapping[
+        str, ProcessExternalNativeStreamBinding
+    ],
+    intent_and_sample_frame_by_identity: Mapping[
+        tuple[str, str], tuple[NativeStreamExternalSampleIntent, int]
+    ],
+) -> tuple[NativeStreamExternalArtifactReceipt, ...]:
+    artifact_by_camera = {
+        artifact.camera_key: artifact
+        for artifact in report.video_artifacts
+    }
+    receipts: list[NativeStreamExternalArtifactReceipt] = []
+    durable_at = time.time()
+    for (stream_id, _sample_id), (
+        intent,
+        sample_frame_index,
+    ) in sorted(
+        intent_and_sample_frame_by_identity.items(),
+        key=lambda item: (item[0][0], item[1][0].sequence),
+    ):
+        binding = external_stream_bindings[stream_id]
+        contract = native_stream_contracts[stream_id]
+        artifact = artifact_by_camera.get(binding.source_key)
+        if artifact is None:
+            raise RuntimeError(
+                "Finalized RGB artifact report is missing camera "
+                f"{binding.source_key!r}."
+            )
+        frame_index_by_sample = dict(
+            artifact.video_frame_index_by_sample_frame_index
+        )
+        if sample_frame_index not in frame_index_by_sample:
+            raise RuntimeError(
+                "Finalized RGB artifact lacks the selected sample frame "
+                f"{sample_frame_index}."
+            )
+        if (
+            artifact.encoding != contract.encoding
+            or artifact.compression != contract.compression
+        ):
+            raise RuntimeError(
+                "Finalized RGB artifact encoding/compression differs from "
+                "the native stream contract."
+            )
+        video_frame_index = frame_index_by_sample[sample_frame_index]
+        receipts.append(
+            NativeStreamExternalArtifactReceipt(
+                episode_uuid=episode_uuid,
+                legacy_episode_index=int(report.episode_index),
+                stream_id=stream_id,
+                sample_id=intent.sample_id,
+                payload_content_hash=intent.payload_content_hash,
+                stored_payload_object_id=(
+                    f"dataset:{artifact.artifact_relative_path}"
+                    f"#video_frame={video_frame_index}"
+                ),
+                artifact_relative_path=artifact.artifact_relative_path,
+                artifact_sha256=artifact.artifact_sha256,
+                artifact_byte_count=artifact.artifact_byte_count,
+                encoding=artifact.encoding,
+                compression=artifact.compression,
+                durable_at=durable_at,
+                durable_clock_domain_id="local_wall_clock",
+            )
+        )
+    return tuple(receipts)
+
+
 def _worker_main(
     writer_config: LeRobotV21WriterConfig,
     sample_builder_config: CollectorSampleBuilderConfig,
     process_config: ProcessCollectionConfig,
+    native_stream_contracts: Mapping[str, NativeStreamContract],
+    external_stream_bindings: Mapping[
+        str, ProcessExternalNativeStreamBinding
+    ],
     shm_names: tuple[str, ...],
     input_queue: Any,
     reply_queue: Any,
@@ -341,6 +744,12 @@ def _worker_main(
 ) -> None:
     blocks: dict[str, shared_memory.SharedMemory] = {}
     writer: LeRobotV21Writer | None = None
+    native_writer: NativeStreamEpisodeWriter | None = None
+    native_ingestion_frozen = False
+    next_external_sequence_by_stream: dict[str, int] = {}
+    external_intent_and_sample_frame_by_identity: dict[
+        tuple[str, str], tuple[NativeStreamExternalSampleIntent, int]
+    ] = {}
     try:
         process_status = _configure_worker_process(process_config)
         blocks = {
@@ -373,6 +782,7 @@ def _worker_main(
             if kind == "sample":
                 slot_id = message.get("slot_id")
                 started = time.perf_counter()
+                active_stage = "worker.hydrate_shared"
                 try:
                     stage_started = started
                     snapshot, hydrated_slot = _hydrate_snapshot(
@@ -385,6 +795,7 @@ def _worker_main(
                     }
                     if hydrated_slot is not None:
                         slot_id = int(hydrated_slot)
+                    active_stage = "worker.build_sample"
                     stage_started = time.perf_counter()
                     sample = builder.build_from_snapshot(snapshot)
                     stage_ms["worker.build_sample"] = float(
@@ -396,12 +807,34 @@ def _worker_main(
                     metadata_extra = message.get("metadata_extra")
                     if isinstance(metadata_extra, Mapping):
                         sample.metadata.update(dict(metadata_extra))
+                    active_stage = "worker.plan_jobs"
                     stage_started = time.perf_counter()
                     jobs = writer.plan_sample_jobs(sample)
                     stage_ms["worker.plan_jobs"] = float(
                         (time.perf_counter() - stage_started) * 1000.0
                     )
+                    if native_writer is not None and external_stream_bindings:
+                        active_stage = "worker.stage_external_selected_rgb"
+                        stage_started = time.perf_counter()
+                        _stage_selected_rgb_intents(
+                            sample,
+                            native_writer=native_writer,
+                            native_stream_contracts=native_stream_contracts,
+                            external_stream_bindings=external_stream_bindings,
+                            next_sequence_by_stream=(
+                                next_external_sequence_by_stream
+                            ),
+                            intent_and_sample_frame_by_identity=(
+                                external_intent_and_sample_frame_by_identity
+                            ),
+                        )
+                        stage_ms[
+                            "worker.stage_external_selected_rgb"
+                        ] = float(
+                            (time.perf_counter() - stage_started) * 1000.0
+                        )
                     for job in jobs:
+                        active_stage = f"worker.handle.{job.kind}"
                         job_started = time.perf_counter()
                         writer.handle_job(job)
                         job_key = f"worker.handle.{job.kind}"
@@ -431,7 +864,43 @@ def _worker_main(
                     ack_queue.put(
                         {
                             "kind": "worker_error",
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": f"{active_stage}: {type(exc).__name__}: {exc}",
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+                continue
+
+            if kind == "native_stream_sample":
+                active_stage = "worker.native_stream_append"
+                try:
+                    if native_writer is None:
+                        raise RuntimeError(
+                            "No native stream episode is active in the process worker."
+                        )
+                    if (
+                        str(message.get("episode_uuid", ""))
+                        != native_writer.episode_uuid
+                        or int(message.get("legacy_episode_index", -1))
+                        != native_writer.legacy_episode_index
+                    ):
+                        raise ValueError(
+                            "Native stream sample does not match the active episode."
+                        )
+                    native_writer.append(**dict(message["sample"]))
+                    ack_queue.put(
+                        {
+                            "kind": "native_stream_sample_done",
+                            "stream_id": str(message["sample"]["stream_id"]),
+                            "sample_id": str(message["sample"]["sample_id"]),
+                        }
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    ack_queue.put(
+                        {
+                            "kind": "worker_error",
+                            "error": (
+                                f"{active_stage}: {type(exc).__name__}: {exc}"
+                            ),
                             "traceback": traceback.format_exc(),
                         }
                     )
@@ -440,9 +909,39 @@ def _worker_main(
             request_id = message.get("request_id")
             try:
                 if kind == "start_episode":
+                    episode_uuid = str(message.get("episode_uuid") or "").strip()
+                    if native_stream_contracts and not episode_uuid:
+                        raise ValueError(
+                            "Native stream process mode requires an episode UUID."
+                        )
+                    if not native_stream_contracts and episode_uuid:
+                        raise ValueError(
+                            "episode_uuid was provided without native stream contracts."
+                        )
+                    if native_writer is not None:
+                        raise RuntimeError(
+                            "Previous native stream episode is still active."
+                        )
                     episode_index = writer.start_episode(
                         metadata=dict(message.get("metadata") or {})
                     )
+                    if native_stream_contracts:
+                        try:
+                            native_writer = NativeStreamEpisodeWriter(
+                                writer_config.root_dir,
+                                episode_uuid=episode_uuid,
+                                legacy_episode_index=int(episode_index),
+                                contracts=native_stream_contracts,
+                                external_payload_stream_ids=tuple(
+                                    external_stream_bindings
+                                ),
+                            )
+                        except BaseException:
+                            writer.discard_episode(int(episode_index))
+                            raise
+                    native_ingestion_frozen = False
+                    next_external_sequence_by_stream.clear()
+                    external_intent_and_sample_frame_by_identity.clear()
                     builder.set_episode(int(episode_index))
                     result: Any = int(episode_index)
                 elif kind == "write_device_config":
@@ -453,14 +952,216 @@ def _worker_main(
                     result = True
                 elif kind == "flush":
                     result = True
-                elif kind == "finalize_episode":
-                    writer.finalize_episode(
-                        int(message["episode_index"]),
-                        summary=dict(message.get("summary") or {}),
-                    )
+                elif kind == "reset_temporal_history":
+                    builder.reset_temporal_history()
                     result = True
+                elif kind == "freeze_native_stream_episode":
+                    if native_writer is None:
+                        raise RuntimeError(
+                            "No native stream episode is active in the process worker."
+                        )
+                    if not native_writer.requires_post_finalize_seal:
+                        raise RuntimeError(
+                            "Inline native streams do not use post-finalize freeze."
+                        )
+                    if (
+                        str(message.get("episode_uuid", ""))
+                        != native_writer.episode_uuid
+                        or int(message.get("legacy_episode_index", -1))
+                        != native_writer.legacy_episode_index
+                    ):
+                        raise ValueError(
+                            "Native stream freeze does not match the active episode."
+                        )
+                    native_writer.freeze_ingestion()
+                    native_ingestion_frozen = True
+                    result = True
+                elif kind == "finalize_episode":
+                    if native_writer is not None:
+                        if (
+                            int(message["episode_index"])
+                            != native_writer.legacy_episode_index
+                        ):
+                            raise ValueError(
+                                "Legacy finalize index does not match the active "
+                                "native stream episode."
+                            )
+                        if not native_writer.requires_post_finalize_seal:
+                            raise RuntimeError(
+                                "Inline native stream episode must seal before "
+                                "legacy finalize."
+                            )
+                        if not native_ingestion_frozen:
+                            raise RuntimeError(
+                                "External native stream episode must freeze "
+                                "before legacy finalize."
+                            )
+                        report = writer.finalize_episode_with_artifact_report(
+                            int(message["episode_index"]),
+                            summary=dict(message.get("summary") or {}),
+                        )
+                        try:
+                            receipts = _selected_rgb_artifact_receipts(
+                                report,
+                                episode_uuid=native_writer.episode_uuid,
+                                native_stream_contracts=(
+                                    native_stream_contracts
+                                ),
+                                external_stream_bindings=(
+                                    external_stream_bindings
+                                ),
+                                intent_and_sample_frame_by_identity=(
+                                    external_intent_and_sample_frame_by_identity
+                                ),
+                            )
+                            receipt_error = ""
+                        except BaseException as exc:  # legacy is finalized
+                            receipts = ()
+                            receipt_error = f"{type(exc).__name__}: {exc}"
+                        result = ProcessLegacyFinalizeResult(
+                            episode_index=int(message["episode_index"]),
+                            legacy_finalized=True,
+                            native_stream_artifact_receipts=receipts,
+                            artifact_receipt_error=receipt_error,
+                        )
+                    else:
+                        writer.finalize_episode(
+                            int(message["episode_index"]),
+                            summary=dict(message.get("summary") or {}),
+                        )
+                        result = ProcessLegacyFinalizeResult(
+                            episode_index=int(message["episode_index"]),
+                            legacy_finalized=True,
+                        )
                 elif kind == "discard_episode":
+                    if native_writer is not None:
+                        if (
+                            int(message["episode_index"])
+                            != native_writer.legacy_episode_index
+                        ):
+                            raise ValueError(
+                                "Discard index does not match native stream episode."
+                            )
+                        native_writer.close_unsealed()
+                        native_writer = None
+                        native_ingestion_frozen = False
+                        next_external_sequence_by_stream.clear()
+                        external_intent_and_sample_frame_by_identity.clear()
                     result = bool(writer.discard_episode(int(message["episode_index"])))
+                elif kind == "native_stream_note_drops":
+                    if native_writer is None:
+                        raise RuntimeError(
+                            "No native stream episode is active in the process worker."
+                        )
+                    if (
+                        str(message.get("episode_uuid", ""))
+                        != native_writer.episode_uuid
+                        or int(message.get("legacy_episode_index", -1))
+                        != native_writer.legacy_episode_index
+                    ):
+                        raise ValueError(
+                            "Native stream drops do not match the active episode."
+                        )
+                    for item in tuple(message.get("drop_counts") or ()):
+                        stream_id = str(item["stream_id"])
+                        reason = str(item["reason"])
+                        count = int(item["count"])
+                        if count <= 0:
+                            raise ValueError(
+                                "Native stream drop count must be positive."
+                            )
+                        for _ in range(count):
+                            native_writer.note_drop(stream_id, reason=reason)
+                    result = True
+                elif kind == "seal_native_stream_episode":
+                    if native_writer is None:
+                        raise RuntimeError(
+                            "No native stream episode is active in the process worker."
+                        )
+                    if (
+                        str(message.get("episode_uuid", ""))
+                        != native_writer.episode_uuid
+                        or int(message.get("legacy_episode_index", -1))
+                        != native_writer.legacy_episode_index
+                    ):
+                        raise ValueError(
+                            "Native stream seal does not match the active episode."
+                        )
+                    if native_writer.requires_post_finalize_seal:
+                        raise RuntimeError(
+                            "External native streams must seal after legacy finalize."
+                        )
+                    result = native_writer.seal(
+                        sealed_at=float(message["sealed_at"]),
+                        sealed_clock_domain_id=str(
+                            message["sealed_clock_domain_id"]
+                        ),
+                    )
+                    native_writer = None
+                    native_ingestion_frozen = False
+                    next_external_sequence_by_stream.clear()
+                    external_intent_and_sample_frame_by_identity.clear()
+                elif kind == "seal_native_stream_episode_after_legacy_finalize":
+                    if native_writer is None:
+                        raise RuntimeError(
+                            "No native stream episode is active in the process worker."
+                        )
+                    if (
+                        str(message.get("episode_uuid", ""))
+                        != native_writer.episode_uuid
+                        or int(message.get("legacy_episode_index", -1))
+                        != native_writer.legacy_episode_index
+                    ):
+                        raise ValueError(
+                            "Post-finalize native stream seal does not match "
+                            "the active episode."
+                        )
+                    if (
+                        not native_writer.requires_post_finalize_seal
+                        or not native_ingestion_frozen
+                    ):
+                        raise RuntimeError(
+                            "Post-finalize native stream seal requires a frozen "
+                            "external capture."
+                        )
+                    result = native_writer.seal_after_legacy_finalize(
+                        tuple(message.get("receipts") or ()),
+                        sealed_at=float(message["sealed_at"]),
+                        sealed_clock_domain_id=str(
+                            message["sealed_clock_domain_id"]
+                        ),
+                    )
+                    native_writer = None
+                    native_ingestion_frozen = False
+                    next_external_sequence_by_stream.clear()
+                    external_intent_and_sample_frame_by_identity.clear()
+                elif kind == "close_native_stream_episode":
+                    if native_writer is not None:
+                        if (
+                            str(message.get("episode_uuid", ""))
+                            != native_writer.episode_uuid
+                            or int(message.get("legacy_episode_index", -1))
+                            != native_writer.legacy_episode_index
+                        ):
+                            raise ValueError(
+                                "Native stream close does not match the active episode."
+                            )
+                        native_writer.close_unsealed()
+                        native_writer = None
+                        native_ingestion_frozen = False
+                        next_external_sequence_by_stream.clear()
+                        external_intent_and_sample_frame_by_identity.clear()
+                    result = True
+                elif kind == "reload_finalized_dataset_state":
+                    writer.reload_finalized_dataset_state()
+                    builder.set_dataset_position(
+                        episode_index=int(writer.next_episode_index),
+                        sample_index=int(writer.next_sample_index),
+                    )
+                    result = {
+                        "next_episode_index": int(writer.next_episode_index),
+                        "next_sample_index": int(writer.next_sample_index),
+                    }
                 elif kind == "status":
                     episode_index = message.get("episode_index")
                     result = {
@@ -474,6 +1175,12 @@ def _worker_main(
                         ),
                     }
                 elif kind == "close":
+                    if native_writer is not None:
+                        native_writer.close_unsealed()
+                        native_writer = None
+                    native_ingestion_frozen = False
+                    next_external_sequence_by_stream.clear()
+                    external_intent_and_sample_frame_by_identity.clear()
                     reply_queue.put(
                         {
                             "kind": "reply",
@@ -514,6 +1221,8 @@ def _worker_main(
             }
         )
     finally:
+        if native_writer is not None:
+            native_writer.close_unsealed()
         for block in blocks.values():
             block.close()
 
@@ -527,8 +1236,79 @@ class ProcessCollectionWorker:
         writer_config: LeRobotV21WriterConfig,
         sample_builder_config: CollectorSampleBuilderConfig,
         config: ProcessCollectionConfig,
+        native_stream_contracts: Mapping[str, NativeStreamContract] | None = None,
+        native_external_stream_bindings: Mapping[
+            str, ProcessExternalNativeStreamBinding
+        ]
+        | None = None,
     ) -> None:
         self.writer_config = writer_config
+        self.native_stream_contracts = dict(
+            sorted(dict(native_stream_contracts or {}).items())
+        )
+        for stream_id, contract in self.native_stream_contracts.items():
+            if not isinstance(contract, NativeStreamContract):
+                raise TypeError(
+                    "native_stream_contracts must contain NativeStreamContract values."
+                )
+            if str(stream_id) != contract.stream_id:
+                raise ValueError(
+                    "Native stream contract mapping key must match contract.stream_id."
+                )
+        self.native_external_stream_bindings = dict(
+            sorted(dict(native_external_stream_bindings or {}).items())
+        )
+        seen_external_sources: set[tuple[str, str]] = set()
+        for stream_id, binding in self.native_external_stream_bindings.items():
+            if not isinstance(binding, ProcessExternalNativeStreamBinding):
+                raise TypeError(
+                    "native_external_stream_bindings must contain "
+                    "ProcessExternalNativeStreamBinding values."
+                )
+            if str(stream_id) != binding.stream_id:
+                raise ValueError(
+                    "External stream binding key must match binding.stream_id."
+                )
+            contract = self.native_stream_contracts.get(stream_id)
+            if contract is None:
+                raise ValueError(
+                    "External stream binding requires a matching native "
+                    "stream contract."
+                )
+            if contract.modality != "selected_rgb":
+                raise ValueError(
+                    "selected_rgb binding requires contract.modality="
+                    "'selected_rgb'."
+                )
+            if (
+                tuple(contract.shape[-1:]) != (3,)
+                or np.dtype(contract.dtype) != np.dtype(np.uint8)
+                or contract.units != "rgb_u8"
+            ):
+                raise ValueError(
+                    "selected_rgb contract requires three-channel uint8 "
+                    "shape and units='rgb_u8'."
+                )
+            if (
+                contract.encoding
+                != f"mp4/{writer_config.video_codec}"
+                or contract.compression != "none"
+            ):
+                raise ValueError(
+                    "selected_rgb contract encoding/compression must match "
+                    "the legacy video writer."
+                )
+            if not bool(writer_config.write_video):
+                raise ValueError(
+                    "selected_rgb external binding requires write_video=True."
+                )
+            source_identity = (binding.source_kind, binding.source_key)
+            if source_identity in seen_external_sources:
+                raise ValueError(
+                    "One specialized writer source cannot bind multiple "
+                    "external native streams."
+                )
+            seen_external_sources.add(source_identity)
         # Never pass frontend camera buffers through multiprocessing ``spawn``.
         # NearestFrameBuffer intentionally owns a threading.Lock and is only
         # consumed while snapshotting in the parent.  The child receives fully
@@ -554,6 +1334,8 @@ class ProcessCollectionWorker:
                 writer_config,
                 self.sample_builder_config,
                 config,
+                self.native_stream_contracts,
+                self.native_external_stream_bindings,
                 self._slots.names,
                 self._input_queue,
                 self._reply_queue,
@@ -568,9 +1350,16 @@ class ProcessCollectionWorker:
         self._submitted_samples = 0
         self._completed_samples = 0
         self._rejected_busy = 0
+        self._submitted_native_stream_samples = 0
+        self._completed_native_stream_samples = 0
+        self._rejected_native_stream_samples = 0
+        self._active_native_episode_uuid: str | None = None
+        self._active_native_episode_index: int | None = None
+        self._active_native_episode_frozen = False
         self._queue_high_water = 0
         self._active_episode_frame_count = 0
         self._worker_error: str | None = None
+        self._worker_traceback: str | None = None
         self._sample_process_ms: deque[float] = deque(maxlen=2048)
         self._parent_pack_ms: deque[float] = deque(maxlen=2048)
         self._parent_queue_put_ms: deque[float] = deque(maxlen=2048)
@@ -589,14 +1378,38 @@ class ProcessCollectionWorker:
         except BaseException:  # noqa: BLE001 - release preallocated shared memory.
             self.close(force=True)
             raise
-        try:
-            ready = self._reply_queue.get(
-                timeout=float(self.config.startup_timeout_sec)
-            )
-        except queue.Empty as exc:
-            self.close(force=True)
-            raise RuntimeError("collection worker did not become ready") from exc
+        deadline = time.monotonic() + float(self.config.startup_timeout_sec)
+        ready: Any
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                self.close(force=True)
+                raise RuntimeError("collection worker did not become ready")
+            try:
+                ready = self._reply_queue.get(timeout=min(0.05, remaining))
+                break
+            except queue.Empty:
+                if self._process.is_alive():
+                    continue
+                exitcode = self._process.exitcode
+                self.close(force=True)
+                raise RuntimeError(
+                    "collection worker exited before becoming ready "
+                    f"(exitcode={exitcode})"
+                )
         if not isinstance(ready, Mapping) or not bool(ready.get("ok")):
+            worker_traceback = (
+                str(ready.get("traceback") or "").strip()
+                if isinstance(ready, Mapping)
+                else ""
+            )
+            if worker_traceback:
+                print(
+                    "[CollectionWorker] startup failed:\n"
+                    f"{worker_traceback}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self.close(force=True)
             raise RuntimeError(
                 "collection worker startup failed: "
@@ -639,8 +1452,22 @@ class ProcessCollectionWorker:
                     self._tactile_counts_by_episode[episode_index] = {
                         str(side): int(value) for side, value in counts.items()
                     }
+            elif kind == "native_stream_sample_done":
+                self._completed_native_stream_samples += 1
             elif kind == "worker_error":
-                self._worker_error = str(message.get("error") or "collection worker error")
+                if self._worker_error is None:
+                    self._worker_error = str(
+                        message.get("error") or "collection worker error"
+                    )
+                    worker_traceback = str(message.get("traceback") or "").strip()
+                    self._worker_traceback = worker_traceback or None
+                    if self._worker_traceback:
+                        print(
+                            "[CollectionWorker] sample processing failed:\n"
+                            f"{self._worker_traceback}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
     def _raise_if_failed(self) -> None:
         self._drain_acks()
@@ -655,6 +1482,18 @@ class ProcessCollectionWorker:
         self._raise_if_failed()
         request_id = uuid.uuid4().hex
         message = {"kind": str(kind), "request_id": request_id, **payload}
+        # ``multiprocessing.Queue.put`` serializes on a background feeder
+        # thread.  Without this synchronous preflight, an unpicklable runtime
+        # metadata value is only printed by that thread and the caller sees a
+        # misleading request timeout.  Use multiprocessing's own serializer so
+        # the check has exactly the same boundary semantics as the real queue.
+        try:
+            ForkingPickler.dumps(message)
+        except BaseException as exc:  # noqa: BLE001 - preserve serializer detail.
+            raise TypeError(
+                f"collection worker request {kind!r} is not serializable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         with self._request_lock:
             self._input_queue.put(
                 message,
@@ -674,6 +1513,14 @@ class ProcessCollectionWorker:
                 if reply.get("request_id") != request_id:
                     raise RuntimeError("collection worker reply ordering mismatch")
                 if not bool(reply.get("ok")):
+                    worker_traceback = str(reply.get("traceback") or "").strip()
+                    if worker_traceback:
+                        print(
+                            f"[CollectionWorker] request {kind!r} failed:\n"
+                            f"{worker_traceback}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     raise RuntimeError(
                         f"collection worker {kind} failed: {reply.get('error')}"
                     )
@@ -729,13 +1576,300 @@ class ProcessCollectionWorker:
             pass
         return True
 
-    def start_episode(self, metadata: Mapping[str, Any]) -> int:
+    def start_episode(
+        self,
+        metadata: Mapping[str, Any],
+        *,
+        episode_uuid: str | None = None,
+    ) -> int:
+        normalized_uuid = str(episode_uuid or "").strip()
+        if self.native_stream_contracts and not normalized_uuid:
+            raise ValueError(
+                "episode_uuid is required when native streams are configured."
+            )
+        if not self.native_stream_contracts and normalized_uuid:
+            raise ValueError(
+                "episode_uuid is only accepted when native streams are configured."
+            )
         episode_index = int(
-            self._request("start_episode", metadata=dict(metadata))
+            self._request(
+                "start_episode",
+                metadata=dict(metadata),
+                episode_uuid=normalized_uuid or None,
+            )
         )
         self.next_episode_index = episode_index + 1
         self._active_episode_frame_count = 0
+        self._active_native_episode_uuid = normalized_uuid or None
+        self._active_native_episode_index = (
+            episode_index if normalized_uuid else None
+        )
+        self._active_native_episode_frozen = False
         return episode_index
+
+    def create_native_stream_capture(
+        self,
+        prepared: Any,
+    ) -> ProcessNativeStreamEpisodeCapture:
+        if not self.native_stream_contracts:
+            raise RuntimeError(
+                "Process collection worker has no native stream contracts."
+            )
+        return ProcessNativeStreamEpisodeCapture(
+            self,
+            episode_uuid=str(prepared.episode_uuid),
+            legacy_episode_index=int(prepared.legacy_episode_index),
+        )
+
+    def submit_native_stream_sample(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        stream_id: str,
+        sample_id: str,
+        **sample: Any,
+    ) -> ProcessNativeStreamSubmissionReceipt:
+        self._raise_if_failed()
+        normalized_uuid = str(episode_uuid)
+        normalized_index = int(legacy_episode_index)
+        normalized_stream_id = str(stream_id)
+        normalized_sample_id = str(sample_id)
+        if (
+            normalized_uuid != self._active_native_episode_uuid
+            or normalized_index != self._active_native_episode_index
+        ):
+            raise ValueError(
+                "Native stream submission does not match the active process episode."
+            )
+        if normalized_stream_id not in self.native_stream_contracts:
+            raise KeyError(f"Unknown native stream {normalized_stream_id!r}.")
+        sample_payload = {
+            "stream_id": normalized_stream_id,
+            "sample_id": normalized_sample_id,
+            **sample,
+        }
+        message = {
+            "kind": "native_stream_sample",
+            "episode_uuid": normalized_uuid,
+            "legacy_episode_index": normalized_index,
+            "sample": sample_payload,
+        }
+        try:
+            encoded = ForkingPickler.dumps(message)
+        except BaseException as exc:  # noqa: BLE001
+            raise TypeError(
+                "native stream process sample is not serializable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        message_bytes = len(encoded)
+        if message_bytes > int(self.config.native_inline_message_max_bytes):
+            self._rejected_native_stream_samples += 1
+            return ProcessNativeStreamSubmissionReceipt(
+                episode_uuid=normalized_uuid,
+                legacy_episode_index=normalized_index,
+                stream_id=normalized_stream_id,
+                sample_id=normalized_sample_id,
+                accepted=False,
+                rejection_reason="inline_message_too_large",
+                serialized_message_bytes=message_bytes,
+            )
+        try:
+            self._input_queue.put_nowait(message)
+        except queue.Full:
+            self._rejected_native_stream_samples += 1
+            return ProcessNativeStreamSubmissionReceipt(
+                episode_uuid=normalized_uuid,
+                legacy_episode_index=normalized_index,
+                stream_id=normalized_stream_id,
+                sample_id=normalized_sample_id,
+                accepted=False,
+                rejection_reason="process_queue_busy",
+                serialized_message_bytes=message_bytes,
+            )
+        self._submitted_native_stream_samples += 1
+        try:
+            self._queue_high_water = max(
+                self._queue_high_water, int(self._input_queue.qsize())
+            )
+        except (NotImplementedError, OSError):
+            pass
+        return ProcessNativeStreamSubmissionReceipt(
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+            stream_id=normalized_stream_id,
+            sample_id=normalized_sample_id,
+            accepted=True,
+            rejection_reason=None,
+            serialized_message_bytes=message_bytes,
+        )
+
+    def seal_native_stream_episode(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        sealed_at: float,
+        sealed_clock_domain_id: str,
+        drop_counts: Mapping[tuple[str, str], int] | None = None,
+    ) -> NativeStreamEpisodeManifest:
+        normalized_uuid = str(episode_uuid)
+        normalized_index = int(legacy_episode_index)
+        if (
+            normalized_uuid != self._active_native_episode_uuid
+            or normalized_index != self._active_native_episode_index
+        ):
+            raise ValueError(
+                "Native stream seal does not match the active process episode."
+            )
+        self._submit_native_stream_drop_counts(
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+            drop_counts=drop_counts,
+        )
+        manifest = self._request(
+            "seal_native_stream_episode",
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+            sealed_at=float(sealed_at),
+            sealed_clock_domain_id=str(sealed_clock_domain_id),
+        )
+        if not isinstance(manifest, NativeStreamEpisodeManifest):
+            raise RuntimeError(
+                "Process worker returned an invalid native stream manifest."
+            )
+        self._active_native_episode_uuid = None
+        self._active_native_episode_index = None
+        self._active_native_episode_frozen = False
+        self._drain_acks()
+        return manifest
+
+    def _submit_native_stream_drop_counts(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        drop_counts: Mapping[tuple[str, str], int] | None,
+    ) -> None:
+        normalized_drops = tuple(
+            {
+                "stream_id": str(stream_id),
+                "reason": str(reason),
+                "count": int(count),
+            }
+            for (stream_id, reason), count in sorted(
+                dict(drop_counts or {}).items()
+            )
+            if int(count) > 0
+        )
+        if normalized_drops:
+            self._request(
+                "native_stream_note_drops",
+                episode_uuid=str(episode_uuid),
+                legacy_episode_index=int(legacy_episode_index),
+                drop_counts=normalized_drops,
+            )
+
+    def freeze_native_stream_episode(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        drop_counts: Mapping[tuple[str, str], int] | None = None,
+    ) -> None:
+        normalized_uuid = str(episode_uuid)
+        normalized_index = int(legacy_episode_index)
+        if not self.native_external_stream_bindings:
+            raise RuntimeError(
+                "Process collection worker has no external native streams."
+            )
+        if (
+            normalized_uuid != self._active_native_episode_uuid
+            or normalized_index != self._active_native_episode_index
+        ):
+            raise ValueError(
+                "Native stream freeze does not match the active process episode."
+            )
+        if self._active_native_episode_frozen:
+            return
+        self._submit_native_stream_drop_counts(
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+            drop_counts=drop_counts,
+        )
+        self._request(
+            "freeze_native_stream_episode",
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+        )
+        self._active_native_episode_frozen = True
+
+    def seal_native_stream_episode_after_legacy_finalize(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        receipts: Iterable[NativeStreamExternalArtifactReceipt],
+        sealed_at: float,
+        sealed_clock_domain_id: str,
+    ) -> NativeStreamEpisodeManifest:
+        normalized_uuid = str(episode_uuid)
+        normalized_index = int(legacy_episode_index)
+        if (
+            normalized_uuid != self._active_native_episode_uuid
+            or normalized_index != self._active_native_episode_index
+        ):
+            raise ValueError(
+                "Post-finalize native stream seal does not match the active "
+                "process episode."
+            )
+        if not self._active_native_episode_frozen:
+            raise RuntimeError(
+                "External native stream episode must freeze before seal."
+            )
+        manifest = self._request(
+            "seal_native_stream_episode_after_legacy_finalize",
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+            receipts=tuple(receipts),
+            sealed_at=float(sealed_at),
+            sealed_clock_domain_id=str(sealed_clock_domain_id),
+        )
+        if not isinstance(manifest, NativeStreamEpisodeManifest):
+            raise RuntimeError(
+                "Process worker returned an invalid native stream manifest."
+            )
+        self._active_native_episode_uuid = None
+        self._active_native_episode_index = None
+        self._active_native_episode_frozen = False
+        self._drain_acks()
+        return manifest
+
+    def close_native_stream_episode(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+    ) -> None:
+        normalized_uuid = str(episode_uuid)
+        normalized_index = int(legacy_episode_index)
+        if self._active_native_episode_uuid is None:
+            return
+        if (
+            normalized_uuid != self._active_native_episode_uuid
+            or normalized_index != self._active_native_episode_index
+        ):
+            raise ValueError(
+                "Native stream close does not match the active process episode."
+            )
+        self._request(
+            "close_native_stream_episode",
+            episode_uuid=normalized_uuid,
+            legacy_episode_index=normalized_index,
+        )
+        self._active_native_episode_uuid = None
+        self._active_native_episode_index = None
+        self._active_native_episode_frozen = False
 
     def write_device_config(self, device_name: str, payload: Mapping[str, Any]) -> None:
         self._request(
@@ -748,17 +1882,52 @@ class ProcessCollectionWorker:
         self._request("flush")
         self._drain_acks()
 
-    def finalize_episode(self, episode_index: int, *, summary: Mapping[str, Any]) -> None:
-        self._request(
+    def reset_temporal_history(self) -> None:
+        self._request("reset_temporal_history")
+
+    def finalize_episode(
+        self,
+        episode_index: int,
+        *,
+        summary: Mapping[str, Any],
+    ) -> ProcessLegacyFinalizeResult:
+        if self._active_native_episode_uuid is not None:
+            if not self.native_external_stream_bindings:
+                raise RuntimeError(
+                    "Inline native stream episode must seal before legacy finalize."
+                )
+            if not self._active_native_episode_frozen:
+                raise RuntimeError(
+                    "External native stream episode must freeze before "
+                    "legacy finalize."
+                )
+        result = self._request(
             "finalize_episode",
             episode_index=int(episode_index),
             summary=dict(summary),
         )
+        if not isinstance(result, ProcessLegacyFinalizeResult):
+            raise RuntimeError(
+                "Process worker returned an invalid legacy finalize result."
+            )
+        return result
 
     def discard_episode(self, episode_index: int) -> bool:
-        return bool(
+        discarded = bool(
             self._request("discard_episode", episode_index=int(episode_index))
         )
+        if int(episode_index) == self._active_native_episode_index:
+            self._active_native_episode_uuid = None
+            self._active_native_episode_index = None
+            self._active_native_episode_frozen = False
+        return discarded
+
+    def reload_finalized_dataset_state(self) -> None:
+        result = self._request("reload_finalized_dataset_state")
+        if not isinstance(result, Mapping):
+            raise RuntimeError("collection worker returned invalid dataset reload state")
+        self.next_episode_index = int(result.get("next_episode_index", 0))
+        self.next_sample_index = int(result.get("next_sample_index", 0))
 
     def tactile_frame_counts(self, episode_index: int) -> dict[str, int]:
         self._drain_acks()
@@ -791,6 +1960,7 @@ class ProcessCollectionWorker:
             slot_count=len(self._slots.blocks),
             worker_alive=bool(self._started and self._process.is_alive()),
             worker_error=self._worker_error,
+            worker_traceback=self._worker_traceback,
             active_episode_frame_count=int(self._active_episode_frame_count),
             sample_process_ms_p50=_percentile(values, 50),
             sample_process_ms_p95=_percentile(values, 95),
@@ -798,13 +1968,22 @@ class ProcessCollectionWorker:
             shared_payload_bytes=_metric_summary(
                 list(self._shared_payload_bytes)
             ),
+            submitted_native_stream_samples=int(
+                self._submitted_native_stream_samples
+            ),
+            completed_native_stream_samples=int(
+                self._completed_native_stream_samples
+            ),
+            rejected_native_stream_samples=int(
+                self._rejected_native_stream_samples
+            ),
         )
 
     def quick_status(self) -> dict[str, Any]:
         """Cheap status for the 60 Hz frontend; avoids percentile recomputation."""
 
         self._drain_acks()
-        return {
+        status = {
             "submitted_samples": int(self._submitted_samples),
             "completed_samples": int(self._completed_samples),
             "rejected_busy": int(self._rejected_busy),
@@ -813,6 +1992,7 @@ class ProcessCollectionWorker:
             "slot_count": len(self._slots.blocks),
             "worker_alive": bool(self._started and self._process.is_alive()),
             "worker_error": self._worker_error,
+            "worker_traceback": self._worker_traceback,
             "active_episode_frame_count": int(self._active_episode_frame_count),
             "parent_pack_ms_latest": (
                 None if not self._parent_pack_ms else float(self._parent_pack_ms[-1])
@@ -828,6 +2008,21 @@ class ProcessCollectionWorker:
                 else int(self._shared_payload_bytes[-1])
             ),
         }
+        if self.native_stream_contracts:
+            status.update(
+                {
+                    "submitted_native_stream_samples": int(
+                        self._submitted_native_stream_samples
+                    ),
+                    "completed_native_stream_samples": int(
+                        self._completed_native_stream_samples
+                    ),
+                    "rejected_native_stream_samples": int(
+                        self._rejected_native_stream_samples
+                    ),
+                }
+            )
+        return status
 
     def close(self, *, flush: bool = True, force: bool = False) -> None:
         if self._closed:
@@ -864,6 +2059,10 @@ __all__ = [
     "ProcessCollectionConfig",
     "ProcessCollectionStats",
     "ProcessCollectionWorker",
+    "ProcessExternalNativeStreamBinding",
+    "ProcessLegacyFinalizeResult",
+    "ProcessNativeStreamEpisodeCapture",
+    "ProcessNativeStreamSubmissionReceipt",
     "SharedArrayRef",
     "camera_shared_slot_bytes",
 ]

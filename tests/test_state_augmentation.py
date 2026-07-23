@@ -28,6 +28,24 @@ def test_disabled_state_augmentation_is_an_exact_noop_with_all_available_mask() 
     np.testing.assert_array_equal(result.model_input(), state)
 
 
+def test_initial_mask_is_preserved_through_normalized_state_augmentation() -> None:
+    layout = _layout()
+    state = np.ones(layout.state_dim, dtype=np.float32)
+    initial_mask = np.ones(layout.state_dim, dtype=np.float32)
+    initial_mask[:3] = 0.0
+
+    result = augment_normalized_state(
+        state,
+        layout=layout,
+        config=StateAugmentationConfig(enabled=False),
+        initial_mask=initial_mask,
+    )
+
+    np.testing.assert_array_equal(result.state_augmented, state * initial_mask)
+    np.testing.assert_array_equal(result.mask, initial_mask)
+    np.testing.assert_array_equal(result.noise, np.zeros_like(state))
+
+
 def test_normalized_noise_is_independent_per_element_and_seeded_by_training_rng() -> None:
     layout = _layout()
     state = np.zeros((2, layout.state_dim), dtype=np.float32)

@@ -47,7 +47,7 @@ python -m utils.head_eye \
 
 ### RealSense profile 兼容
 
-默认先严格使用 `--resolution` / `--fps` 请求的 color + depth profile。仅当这个请求被相机拒绝时，才会自动选择一个同时存在的、分辨率和帧率匹配的 `bgr8` color / `z16` depth profile；可用 `--no-auto-select-supported-profile` 关闭该兜底并直接报错。
+默认先严格使用 `--resolution` / `--fps` 请求的原生 `yuyv` color + `z16` depth profile，读取后在相机边界转换为公共接口的 BGR 图像；仅当这个请求被相机拒绝时，才会自动选择一个同时存在的、分辨率和帧率匹配的 color / depth profile。可用 `--no-auto-select-supported-profile` 关闭该兜底并直接报错。
 
 `--list-cameras --show-profiles` 可在实际设备上列出可用 profile。新保存的 samples 与结果 JSON 会记录请求 profile、是否发生 fallback，以及实际选择的 profile。该字段只用于溯源：不会改写既有 JSON/NPZ/NPY 标定结果，旧结果仍可直接加载。
 
@@ -108,7 +108,7 @@ python -m utils.head_eye.dual_arm \
   --output-dir teleop_records/headeye
 ```
 
-该转换默认读取 `assets/rm65_inspire_tac/rm65_dual_arm.urdf`：`T_camera_to_left_base = T_right_base_to_left_base @ T_camera_to_right_base`。反向同理。
+该转换默认读取 `assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf`：`T_camera_to_left_base = T_right_base_to_left_base @ T_camera_to_right_base`。反向同理。
 
 ## 高精度建议
 

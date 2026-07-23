@@ -589,8 +589,20 @@ class V22DeploymentAdapter:
                     adapter=self.layout.end_effector(side).adapter,
                     names=channel.names,
                     metadata={
-                        "policy_io_layout_hash": self.layout.layout_hash,
-                        "v22_policy_action_index": int(index),
+                        **(
+                            {
+                                "units": tuple(
+                                    str(channel.units)
+                                    for _ in range(channel.dim)
+                                )
+                            }
+                            if channel.units is not None
+                            else (
+                                {"units": ("token",) * channel.dim}
+                                if channel.value_type == "discrete"
+                                else {}
+                            )
+                        ),
                     },
                 )
             actions.append(
@@ -601,12 +613,16 @@ class V22DeploymentAdapter:
                         "right": float_action[7:ARM_ACTION_DIM],
                     },
                     end_effector_targets_by_side=targets,
-                    source=str(source),
-                    metadata={
-                        **dict(chunk.metadata),
-                        "policy_io_layout_hash": self.layout.layout_hash,
-                        "v22_policy_action_index": int(index),
+                    frame_by_effector={
+                        f"{side}_arm": self.layout.arm_reference_frame_by_side[side]
+                        for side in SIDES
                     },
+                    controlled_frame_by_effector={
+                        f"{side}_arm": self.layout.arm_controlled_frame_by_side[side]
+                        for side in SIDES
+                    },
+                    source=str(source),
+                    metadata={},
                 )
             )
         return actions

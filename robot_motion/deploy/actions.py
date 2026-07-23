@@ -792,7 +792,7 @@ class ActionSafetyFilter:
                 faults.append(f"{side}_arm_qpos_constraint_infeasible")
             else:
                 # Preserve float64 here: a float32 cast can round a value just
-                # above an RM65 hard upper limit (notably +/-6.28 rad).
+                # above an RM65 hard upper limit.
                 qpos = np.asarray(constrained.value, dtype=float)
         return np.asarray(qpos, dtype=float).copy(), not faults, faults, metadata
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from teleop_runtime.debug import run_vive_sapien_virtual as virtual_entrypoint
 from teleop_runtime.real_teleop.gui_controls import (
     GuiControlEvents,
     GuiControlState,
@@ -69,6 +70,7 @@ def test_extracted_gui_controls_preserve_pre_home_and_running_control_order() ->
         "q",
         "fix_arm_select",
         "init_arm_select",
+        "init_arm_qpos_speed_set",
         "toggle_camera_vis",
         "toggle_tactile_vis",
         "calibrate_vive_coordinate_profile",
@@ -81,6 +83,7 @@ def test_extracted_gui_controls_preserve_pre_home_and_running_control_order() ->
         "task_select",
         "round_trip_toggle",
         "gripper_force_set",
+        "gripper_force_persist",
     ]
 
     running = GuiControlState(
@@ -99,12 +102,16 @@ def test_extracted_gui_controls_preserve_pre_home_and_running_control_order() ->
         "g",
         "init_arm_toggle",
         "init_arm_select",
+        "init_arm_qpos_speed_set",
+        "init_arm_move_to_qpos",
+        "init_arm_move_both_to_qpos",
         "record_pose_snapshot",
         "episode_start",
         "episode_stop",
         "task_select",
         "round_trip_toggle",
         "gripper_force_set",
+        "gripper_force_persist",
         "toggle_camera_vis",
         "toggle_tactile_vis",
         "save_vive_calibration_profile",
@@ -114,6 +121,25 @@ def test_extracted_gui_controls_preserve_pre_home_and_running_control_order() ->
     assert "task_select" in pre_home_controls(no_recording, events)
     assert "round_trip_toggle" not in pre_home_controls(no_recording, events)
     assert "gripper_force_set" in pre_home_controls(no_recording, events)
+
+
+def test_pre_home_exact_qpos_controls_require_live_startup_executor() -> None:
+    events = GuiControlEvents()
+    unavailable = GuiControlState(
+        init_arm_available=True,
+        init_arm_qpos_move_available=True,
+    )
+    assert "init_arm_move_to_qpos" not in pre_home_controls(unavailable, events)
+    assert "init_arm_move_both_to_qpos" not in pre_home_controls(unavailable, events)
+
+    available = GuiControlState(
+        init_arm_available=True,
+        init_arm_qpos_move_available=True,
+        startup_qpos_maintenance_enabled=True,
+    )
+    controls = pre_home_controls(available, events)
+    assert "init_arm_move_to_qpos" in controls
+    assert "init_arm_move_both_to_qpos" in controls
 
 
 def test_extracted_gui_controls_preserve_countdown_and_single_arm_hold_boundaries() -> None:
@@ -131,7 +157,6 @@ def test_extracted_gui_controls_preserve_countdown_and_single_arm_hold_boundarie
         "d",
         "h",
         "episode_stop",
-        "toggle_camera_vis",
     ]
     assert current_active_controls(countdown, events) == episode_countdown_controls(countdown, events)
 
@@ -148,9 +173,12 @@ def test_extracted_gui_controls_preserve_countdown_and_single_arm_hold_boundarie
         "d",
         "fix_arm_select",
         "init_arm_select",
+        "init_arm_qpos_speed_set",
+        "init_arm_move_to_qpos",
+        "init_arm_move_both_to_qpos",
         "w",
-        "episode_start",
         "episode_stop",
+        "episode_delete",
         "q",
         "calibrate_vive_coordinate_profile",
         "save_vive_calibration_profile",
@@ -162,4 +190,150 @@ def test_extracted_gui_controls_preserve_countdown_and_single_arm_hold_boundarie
         "task_select",
         "round_trip_toggle",
         "gripper_force_set",
+        "gripper_force_persist",
     ]
+
+
+def test_device_retry_is_only_available_before_home_or_in_regular_hold() -> None:
+    events = GuiControlEvents()
+    assert "device_retry" in current_active_controls(GuiControlState(), events)
+    assert "device_retry" not in current_active_controls(
+        GuiControlState(teleop_started=True),
+        events,
+    )
+    assert "device_retry" in current_active_controls(
+        GuiControlState(teleop_started=True, hold_active=True),
+        events,
+    )
+
+
+def test_visualization_toggles_are_disabled_for_every_episode_busy_phase() -> None:
+    events = GuiControlEvents()
+    for busy_state in (
+        {"episode_countdown_active": True},
+        {"episode_recording_active": True},
+        {"episode_recording_active": True, "recording_paused": True},
+        {"episode_finalizing_active": True},
+    ):
+        controls = current_active_controls(
+            GuiControlState(
+                teleop_started=True,
+                camera_visualization_available=True,
+                tactile_visualization_available=True,
+                **busy_state,
+            ),
+            events,
+        )
+        assert "toggle_camera_vis" not in controls
+        assert "toggle_tactile_vis" not in controls
+
+
+def test_terminal_poll_bounds_continuous_keyboard_input(monkeypatch) -> None:
+    class KeyboardSource:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def set_button(self, name, value, **_kwargs) -> None:
+            self.calls.append((str(name), bool(value)))
+
+    fake_stdin = SimpleNamespace(read=lambda _count: "z", isatty=lambda: True)
+    monkeypatch.setattr(virtual_entrypoint.sys, "stdin", fake_stdin)
+    monkeypatch.setattr(
+        virtual_entrypoint.select,
+        "select",
+        lambda *_args, **_kwargs: ([fake_stdin], [], []),
+    )
+    keyboard = KeyboardSource()
+    terminal = virtual_entrypoint.TerminalClutchInput(keyboard)
+    terminal.enabled = True
+
+    terminal.poll()
+
+    assert len(keyboard.calls) == terminal._MAX_CHARS_PER_POLL * 2
+
+
+def test_exact_qpos_move_is_available_during_episode_recording_for_labeled_collection() -> None:
+    state = GuiControlState(
+        teleop_started=True,
+        episode_recording_available=True,
+        episode_recording_active=True,
+        init_arm_available=True,
+        init_arm_qpos_move_available=True,
+        active_side_count=2,
+    )
+
+    controls = current_active_controls(state, GuiControlEvents())
+
+    assert "init_arm_move_to_qpos" in controls
+    assert "init_arm_toggle" in controls
+    assert "init_arm_qpos_speed_set" not in controls
+    assert "episode_stop" in controls
+
+
+def test_exact_qpos_move_is_available_in_regular_hold_without_episode_start() -> None:
+    state = GuiControlState(
+        teleop_started=True,
+        hold_active=True,
+        episode_recording_available=True,
+        init_arm_available=True,
+        init_arm_qpos_move_available=True,
+        active_side_count=2,
+    )
+
+    controls = current_active_controls(state, GuiControlEvents())
+
+    assert "init_arm_move_to_qpos" in controls
+    assert "init_arm_move_both_to_qpos" in controls
+    assert "episode_start" not in controls
+
+
+def test_exact_qpos_operation_keeps_home_recapture_hold_quit_and_debug_controls() -> None:
+    state = GuiControlState(
+        teleop_started=True,
+        camera_visualization_available=True,
+        tactile_visualization_available=True,
+        init_arm_available=True,
+        init_arm_qpos_active=True,
+        active_side_count=2,
+    )
+
+    assert current_active_controls(state, GuiControlEvents()) == [
+        "q",
+        "d",
+        "h",
+        "init_qpos_emergency_stop",
+        "g",
+        "init_arm_toggle",
+        "toggle_camera_vis",
+        "toggle_tactile_vis",
+    ]
+
+
+def test_impedance_gui_exposes_exact_qpos_only_with_capable_dual_backends() -> None:
+    class CapableBackend:
+        def begin_exact_qpos_transit(self, _operation_id: str) -> None:
+            pass
+
+    control = legacy_entrypoint.RealTeleopControlInput.__new__(
+        legacy_entrypoint.RealTeleopControlInput
+    )
+    control.args = SimpleNamespace(
+        arm_control_mode="impedance",
+        no_collection=False,
+        no_episode_recording=False,
+    )
+    control.components = SimpleNamespace(
+        active_sides=("left", "right"),
+        fix_arm_controller=None,
+        init_arm_controller=SimpleNamespace(qpos_active=False),
+        collision_guard_requested=True,
+        dual_arm_retargeter=object(),
+        left_command_backend=CapableBackend(),
+        right_command_backend=CapableBackend(),
+    )
+    control.foot_pad_input = None
+
+    assert control._gui_control_state().init_arm_qpos_move_available
+
+    control.components.right_command_backend = object()
+    assert not control._gui_control_state().init_arm_qpos_move_available

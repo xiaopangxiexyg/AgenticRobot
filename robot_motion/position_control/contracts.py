@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -10,6 +11,24 @@ import numpy as np
 
 
 POSITION_CONTROL_PIPELINE_VERSION = "position_control.v1"
+POSITION_QREF_FINGERPRINT_SCHEMA = "position_qref.blake2b128_f64le.v1"
+
+
+def position_qref_fingerprint(
+    value: np.ndarray | Sequence[float],
+) -> str:
+    """Return a stable fingerprint for one finite executable qref.
+
+    The explicit little-endian float64 encoding makes the certificate portable
+    across the runtime, reference publisher, and offline tools.  This is an
+    integrity/lineage token, not a security boundary.
+    """
+
+    qref = np.asarray(value, dtype="<f8").reshape(-1)
+    if qref.size == 0 or not np.all(np.isfinite(qref)):
+        raise ValueError("qref fingerprint input must contain finite values")
+    payload = np.ascontiguousarray(qref, dtype="<f8").tobytes(order="C")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
 def _finite_time(value: float, *, name: str) -> float:
@@ -236,6 +255,12 @@ class PositionReferenceFrame:
         )
 
     @property
+    def execution_epoch(self) -> int:
+        """Explicit M1C name for the existing epoch compatibility field."""
+
+        return self.epoch
+
+    @property
     def sides(self) -> tuple[str, ...]:
         return tuple(self.references)
 
@@ -370,6 +395,12 @@ class PositionCommandTick:
         )
 
     @property
+    def execution_epoch(self) -> int:
+        """Explicit M1C name for the existing epoch compatibility field."""
+
+        return self.epoch
+
+    @property
     def sides(self) -> tuple[str, ...]:
         return tuple(self.q_cmd_by_side)
 
@@ -394,7 +425,9 @@ def _freeze_qpos_mapping(
 
 __all__ = [
     "POSITION_CONTROL_PIPELINE_VERSION",
+    "POSITION_QREF_FINGERPRINT_SCHEMA",
     "PositionCommandTick",
     "PositionReferenceFrame",
     "PositionSideReference",
+    "position_qref_fingerprint",
 ]

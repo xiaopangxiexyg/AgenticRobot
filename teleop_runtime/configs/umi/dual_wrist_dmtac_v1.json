@@ -1,6 +1,6 @@
 {
   "dataset_root": "../../../datasets/umi_dual_wrist",
-  "calibration_result": "../../../teleop_records/umi_calibration/latest.json",
+  "desk_calibration_side": "left",
   "policy_io_layout": "../policy_io_layouts/dual_umi_dmtac_v23.json",
   "task_id": "umi_collection",
   "task_description": "Dual-wrist UMI collection with DMTac grippers",
@@ -8,13 +8,21 @@
   "vive_port": 9999,
   "vive_clock_sync_port": 10001,
   "angle_trigger_rate_hz": 30.0,
-  "allow_identity_tcp_placeholder": true,
-  "calibration_validity_sec": 3600.0,
+  "allow_identity_tcp_placeholder": false,
+  "calibration_validity_hours": 3.0,
+  "calibration_warning_sec": 600.0,
+  "calibration_critical_sec": 300.0,
+  "hand_eye_config": "../../../utils/umi_hand_eye/configs/rm65_dual_wrist_umi_v1.json",
+  "hand_eye_output_dir": "../../../teleop_records/umi_hand_eye",
   "tactile_required": true,
   "tactile_compression": "none",
+  "dmtac_tactile_read_hz": 15.0,
+  "dmtac_gripper_command_hz": 20.0,
+  "dmtac_gripper_telemetry_hz": 20.0,
+  "dmtac_gripper_telemetry_command_grace_s": 0.02,
   "send_gripper_commands": true,
   "dmtac_assignment": "latest",
-  "foot_pad_enabled": false,
+  "foot_pad_enabled": true,
   "gui_host": "127.0.0.1",
   "gui_port": 0,
   "open_browser": true,
@@ -33,20 +41,22 @@
       "tracker_role": "left_wrist",
       "tracker_channel": "left_wrist_pose",
       "camera_serial": "261122273924",
+      "hand_eye_result": "../../../teleop_records/umi_hand_eye/latest_left.json",
+      "tcp_profile": "dmgripper",
       "gripper_port": "",
       "tactile_ids": [],
-      "T_tcp_to_tracker": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-      "tcp_extrinsic_status": "identity_placeholder_unmeasured"
+      "tcp_extrinsic_status": "hand_eye_result"
     },
     "right": {
       "tracker_name": "tracker_2",
       "tracker_role": "right_wrist",
       "tracker_channel": "right_wrist_pose",
       "camera_serial": "260522278055",
+      "hand_eye_result": "../../../teleop_records/umi_hand_eye/latest_right.json",
+      "tcp_profile": "dmgripper",
       "gripper_port": "",
       "tactile_ids": [],
-      "T_tcp_to_tracker": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-      "tcp_extrinsic_status": "identity_placeholder_unmeasured"
+      "tcp_extrinsic_status": "hand_eye_result"
     }
   }
 }

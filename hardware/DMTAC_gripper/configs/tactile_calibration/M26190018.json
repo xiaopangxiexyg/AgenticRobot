@@ -1,0 +1,24 @@
+{
+  "format": "dexteleop_dmtac_base_frame_v1",
+  "sensor_key": "M26190018",
+  "created_at": "2026-07-20T16:41:15+00:00",
+  "frame_file": "M26190018.base_frame.npy",
+  "shape": [
+    480,
+    640
+  ],
+  "dtype": "uint8",
+  "sha256": "38fdc86c6f8ca632d4b9407de80eef1af40d6b84b13b4bd13a67252b6fa588c9",
+  "source": {
+    "kind": "live_sensor_median_capture",
+    "frames": 30,
+    "warmup_frames": 10,
+    "backend": "cpu",
+    "mode": "standard",
+    "stability": {
+      "mean_abs_deviation": 2.0153349609375,
+      "p99_abs_deviation": 11.0,
+      "max_abs_deviation": 54.0
+    }
+  }
+}

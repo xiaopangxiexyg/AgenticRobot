@@ -11,6 +11,11 @@ from dataset_contracts.pose_frames import (
     PoseFrameContractError,
     PoseSourceProfile,
 )
+from dataset_contracts.v23_validation import (
+    V23RowValidationError,
+    validate_v23_row_causal_snapshots,
+)
+from dataset_interface.validation import validate_v23_dataset
 from dataset_contracts.v22 import PolicyIOLayout
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from teleop_runtime.collection.pose_storage import (
@@ -18,7 +23,11 @@ from teleop_runtime.collection.pose_storage import (
     validate_v23_collection_row_actual_tcp,
 )
 from teleop_runtime.collection.sample_assembler import CollectorSample
-from teleop_runtime.collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
+from teleop_runtime.collection.writer_v21 import (
+    TACTILE_FRAME_JOB_KIND,
+    LeRobotV21Writer,
+    LeRobotV21WriterConfig,
+)
 
 
 def _translation(x: float) -> np.ndarray:
@@ -54,6 +63,9 @@ def _row() -> dict[str, object]:
         "dexteleop.dataset_schema": "dexteleop_dataset_v2.2",
         "action": arm_prefix + [0.0] * 12,
         "action.arm.pose": list(arm_prefix),
+        "action.left_arm.pose": _pose7(0.1),
+        "action.right_arm.pose": _pose7(0.2),
+        "action.reference.left_arm.pose_ref": _pose7(0.15),
         "observation.state": arm_prefix + [0.0] * 24,
         "observation.arm.pose": list(arm_prefix),
         "observation.last_action": arm_prefix + [0.0] * 12,
@@ -72,6 +84,11 @@ def _valid_v23_feedback_row() -> dict[str, object]:
     row = _row()
     row["timestamp"] = 10.0
     for side, pose_x in (("left", 0.3), ("right", 0.4)):
+        start = 0 if side == "left" else 7
+        for key in ("observation.state", "observation.arm.pose"):
+            values = list(row[key])
+            values[start : start + 7] = _pose7(pose_x)
+            row[key] = values
         prefix = f"observation.arm.{side}."
         row[f"observation.{side}_arm.pose"] = _pose7(pose_x)
         row[f"{prefix}actual_tcp_pose"] = _pose7(pose_x)
@@ -94,6 +111,9 @@ def _valid_v23_feedback_row() -> dict[str, object]:
 def _sample_with_feedback(*, available_timestamp: float = 9.99) -> CollectorSample:
     arm_states: dict[str, dict[str, object]] = {}
     observation_state = np.zeros(38, dtype=np.float32)
+    action = np.zeros(26, dtype=np.float32)
+    action[6] = 1.0
+    action[13] = 1.0
     for side, pose_x in (("left", 0.3), ("right", 0.4)):
         pose = _translation(pose_x)
         arm_states[side] = {
@@ -124,9 +144,9 @@ def _sample_with_feedback(*, available_timestamp: float = 9.99) -> CollectorSamp
         timestamp=10.0,
         session_state="running",
         control_hz=15.0,
-        action=np.zeros(26, dtype=np.float32),
+        action=action,
         observation_state=observation_state,
-        observation_last_action=np.zeros(26, dtype=np.float32),
+        observation_last_action=action.copy(),
         arm_state_source="causal_measured_hardware",
         active_sides=("left", "right"),
         arm_states=arm_states,
@@ -143,6 +163,8 @@ def test_writer_row_adapter_converts_only_detached_standard_arm_pose_copies() ->
     assert source_row["action"][0] == pytest.approx(0.1)
     assert output["action"][0] == pytest.approx(1.1)
     assert output["action"][7] == pytest.approx(2.2)
+    assert output["action.left_arm.pose"][0] == pytest.approx(1.1)
+    assert output["action.right_arm.pose"][0] == pytest.approx(2.2)
     assert output["observation.state"][0] == pytest.approx(1.1)
     assert output["observation.last_action"][7] == pytest.approx(2.2)
     assert output["observation.arm.left.actual_tcp_pose"][0] == pytest.approx(1.3)
@@ -161,6 +183,10 @@ def test_writer_row_adapter_converts_only_detached_standard_arm_pose_copies() ->
     assert output["teleop.action_source.left_wrist_pose_desk_frame"] == (
         "vive_retarget_frame"
     )
+    assert output["action.reference.left_arm.pose_ref"] == source_row[
+        "action.reference.left_arm.pose_ref"
+    ]
+    assert output["action.reference.left_arm.pose_ref_frame"] == "left_rm65_base"
     assert output["dexteleop.dataset_schema"] == DEXTELEOP_DATASET_SCHEMA_V23
     assert output["dexteleop.pose_storage_frame"] == "desk_absolute"
 
@@ -182,7 +208,12 @@ def test_writer_freezes_pose_contract_in_dataset_and_episode_metadata(tmp_path) 
         LeRobotV21WriterConfig(
             root_dir=tmp_path,
             write_video=False,
-            policy_io_layout=PolicyIOLayout(),
+            policy_io_layout=PolicyIOLayout(
+                arm_reference_frame_by_side={
+                    "left": "left_rm65_base",
+                    "right": "right_rm65_base",
+                }
+            ),
             pose_frame_contract=contract,
         )
     )
@@ -201,6 +232,35 @@ def test_writer_freezes_pose_contract_in_dataset_and_episode_metadata(tmp_path) 
             1,
             metadata={POSE_FRAME_CONTRACT_METADATA_KEY: conflicting.to_dict()},
         )
+    with pytest.raises(PoseFrameContractError, match="causal_snapshot_contract_hash"):
+        writer._ensure_episode_state(
+            2,
+            metadata={"causal_snapshot_contract_hash": "sha256:wrong"},
+        )
+
+
+def test_v23_writer_refuses_append_with_different_causal_contract(tmp_path) -> None:
+    contract = PoseFrameContract.v23_forced_raw(_source())
+    config = LeRobotV21WriterConfig(
+        root_dir=tmp_path,
+        write_video=False,
+        policy_io_layout=PolicyIOLayout(
+            arm_reference_frame_by_side={
+                "left": "left_rm65_base",
+                "right": "right_rm65_base",
+            }
+        ),
+        pose_frame_contract=contract,
+    )
+    LeRobotV21Writer(config)
+    info_path = tmp_path / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["frame_count"] = 1
+    info["causal_snapshot_contract_hash"] = "sha256:wrong"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises(PoseFrameContractError, match="causal_snapshot_contract_hash"):
+        LeRobotV21Writer(config)
 
 
 def test_v23_writer_requires_v22_compatible_layout(tmp_path) -> None:
@@ -248,7 +308,12 @@ def test_v23_writer_validates_feedback_before_planning_any_jobs(tmp_path) -> Non
             root_dir=tmp_path,
             write_parquet=False,
             write_video=False,
-            policy_io_layout=PolicyIOLayout(),
+            policy_io_layout=PolicyIOLayout(
+                arm_reference_frame_by_side={
+                    "left": "left_rm65_base",
+                    "right": "right_rm65_base",
+                }
+            ),
             pose_frame_contract=PoseFrameContract.v23_forced_raw(_source()),
         )
     )
@@ -256,3 +321,107 @@ def test_v23_writer_validates_feedback_before_planning_any_jobs(tmp_path) -> Non
     assert writer.plan_sample_jobs(_sample_with_feedback())
     with pytest.raises(PoseFrameContractError, match="available_timestamp_after_T0"):
         writer.plan_sample_jobs(_sample_with_feedback(available_timestamp=10.01))
+
+
+def test_rejected_v23_row_does_not_commit_tactile_dedup_state(tmp_path) -> None:
+    writer = LeRobotV21Writer(
+        LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            write_parquet=False,
+            write_video=False,
+            policy_io_layout=PolicyIOLayout(
+                arm_reference_frame_by_side={
+                    "left": "left_rm65_base",
+                    "right": "right_rm65_base",
+                }
+            ),
+            pose_frame_contract=PoseFrameContract.v23_forced_raw(_source()),
+        )
+    )
+
+    def with_tactile(sample: CollectorSample) -> CollectorSample:
+        sample.hand_states["left"] = {
+            "tactile_dict": {"raw": np.arange(4, dtype=np.uint8).reshape(2, 2)},
+            "tactile_snapshot_sequence": 8,
+            "tactile_snapshot_source_timestamp": 9.8,
+            "tactile_snapshot_available_timestamp": 9.9,
+            "tactile_snapshot_source_clock": "local_wall_time",
+            "tactile_snapshot_available_clock": "local_wall_time",
+        }
+        return sample
+
+    with pytest.raises(PoseFrameContractError):
+        writer.plan_sample_jobs(
+            with_tactile(_sample_with_feedback(available_timestamp=10.01))
+        )
+    jobs = writer.plan_sample_jobs(with_tactile(_sample_with_feedback()))
+    assert sum(job.kind == TACTILE_FRAME_JOB_KIND for job in jobs) == 1
+
+
+def test_v23_causal_validator_rejects_future_hand_snapshot() -> None:
+    row = _valid_v23_feedback_row()
+    prefix = "observation.hand.left.telemetry_snapshot_"
+    row.update(
+        {
+            f"{prefix}sequence": 3,
+            f"{prefix}source_timestamp": 10.01,
+            f"{prefix}available_timestamp": 9.99,
+            f"{prefix}source_clock": "local_wall_time",
+            f"{prefix}available_clock": "local_wall_time",
+        }
+    )
+    with pytest.raises(V23RowValidationError, match="source_timestamp_after_T0"):
+        validate_v23_row_causal_snapshots(row)
+
+
+def test_native_v23_dataset_acceptance_scan(tmp_path) -> None:
+    pytest.importorskip("pyarrow")
+    contract = PoseFrameContract.v23_forced_raw(_source())
+    writer = LeRobotV21Writer(
+        LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            write_video=False,
+            policy_io_layout=PolicyIOLayout(
+                arm_reference_frame_by_side={
+                    "left": "left_rm65_base",
+                    "right": "right_rm65_base",
+                }
+            ),
+            pose_frame_contract=contract,
+        )
+    )
+    writer.start_episode(metadata={"active_sides": ["left", "right"]})
+    for job in writer.plan_sample_jobs(_sample_with_feedback()):
+        writer.handle_job(job)
+    writer.finalize_episode(0)
+
+    report = validate_v23_dataset(tmp_path)
+    assert report.ok, report.errors
+    assert report.episode_count == 1
+    assert report.frame_count == 1
+
+    episodes_path = tmp_path / "meta" / "episodes.jsonl"
+    episode = json.loads(episodes_path.read_text(encoding="utf-8"))
+    video_relative = "videos/observation.images.front/chunk-000/episode_000000.mp4"
+    (tmp_path / video_relative).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / video_relative).write_bytes(b"fixture")
+    episode["video_paths"] = {"front": video_relative}
+    episode["summary"] = {
+        "video_frame_stats": {
+            "front": {
+                "path": "videos/observation.images.front/chunk-000/episode_000001.mp4"
+            }
+        }
+    }
+    episodes_path.write_text(json.dumps(episode) + "\n", encoding="utf-8")
+    stale_summary = validate_v23_dataset(tmp_path)
+    assert not stale_summary.ok
+    assert any("summary.video_frame_stats.front.path differs" in error for error in stale_summary.errors)
+
+    info_path = tmp_path / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["causal_snapshot_contract_hash"] = "sha256:wrong"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    invalid = validate_v23_dataset(tmp_path)
+    assert not invalid.ok
+    assert any("causal_snapshot_contract_hash mismatch" in error for error in invalid.errors)

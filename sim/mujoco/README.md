@@ -1,5 +1,8 @@
 # MuJoCo Real2Sim
 
+> 本页维护 MuJoCo 模块参数和局部示例。当前 canonical 仿真命令统一从
+> [`docs/sim/README.md`](../../docs/sim/README.md) 复制。
+
 MuJoCo is the canonical task-physics backend for this project. SAPIEN remains
 the teleop/debug preview. Cross-domain action, observation, timing, and scene
 semantics are versioned in `sim/contracts/`, with the first physical profile at
@@ -12,9 +15,10 @@ sensor, gravity compensation, impedance control, or hardware streaming.
 
 The existing dataset replay remains an explicit kinematic diagnostic path. The
 physical profile additionally compiles URDF collision geoms, contact
-group/masks, gravity, ground, and a freejoint debug object. Full articulated
-robot actuator stepping still waits for the 150 Hz target/actuator model; do
-not call a passive full-scene `mj_step` result a dynamic robot rollout.
+group/masks, gravity, ground, a freejoint debug object, and opt-in RM65
+position actuators. The VIVE position path uses the same 15 Hz input, 60 Hz
+qref/IK, and shared 120 Hz trajectory/follow-control semantics as the real
+chain. Only its final sender/plant is replaced by MuJoCo.
 
 Compile the canonical physical profile:
 
@@ -37,7 +41,8 @@ solver cannot silently substitute a flange/identity TCP.
 ```bash
 PYTHONPATH=. python -m teleop_runtime.debug.run_vive_mujoco_teleop \
   --left-tool-profile position_endpoint \
-  --right-tool-profile position_endpoint
+  --right-tool-profile position_endpoint \
+  --viewer
 ```
 
 Keep both trackers steady at the desired runtime home and press Enter. Add
@@ -45,10 +50,127 @@ Keep both trackers steady at the desired runtime home and press Enter. Add
 1.0/0.2 IK objectives, use the default command above and then add
 `--position-ik-orientation-cost 0.2`.
 
-This entry is intentionally arms-only and headless. MuJoCo owns task physics;
-SAPIEN may later subscribe as a renderer, but it is not an execution backend.
-The bridge remains `kinematic_direct_qpos_debug`, so it does not validate a
-physical RM65 servo, force control, or actuator dynamics.
+This entry exposes only the current 15/60/120 position-control chain. MuJoCo
+owns task physics, while `--viewer` opens a passive GUI that does not create a
+second step loop. The final 120 Hz sender replaces the real backend's
+`Movej_CANFD` call: SDK acceptance is modeled separately from measured joint
+state, the fitted per-controller transport delay is applied before the MuJoCo
+position target changes, and the robot moves through torque-limited MuJoCo
+actuators. Old 150 Hz, RL, and prescribed-qpos diagnostics are not selectable
+from this runtime entry.
+
+## Deployable shared-control fixture
+
+`sim.mujoco.deploy` is the first backend binding for the shared authoritative
+control core. It is a library fixture, not a new production entrypoint. The
+single-policy profile samples measured MuJoCo arm qpos into a causal
+`ObservationCutRecord/Bundle`, admits an absolute bimanual-qpos proposal, and
+runs the common immutable snapshot, ActionArbiter publication, persistence,
+shared-safety, resolver, one-shot dispatch permit, position rig, receipt, and
+measurement lineage. The ActionArbiter is capped at 60 Hz; reference, command,
+and physics clocks remain independent.
+
+This scoped M5.5a/b path has no `teleop_runtime` dependency and does not copy
+`run_policy.py`. In addition to deterministic single-policy tests, an explicitly
+enabled canonical replay source may become sim authority only when its source
+contract is verified-compatible with the exact immutable MuJoCo target contract.
+Binding eligibility and typed execution authorization are receiver-admitted and
+frozen into the arbitration input; missing, denied, or wrong-target evidence is
+rejected before backend publication. This does not authorize real replay.
+Slow/fast topology, hold/fault cancellation, formal sim episode sealing, and
+validated sim2real dynamics are later milestones.
+
+For policy outputs that contain action chunks, call
+`MujocoDeployRuntime.submit_policy_action_chunk(...)`. Its
+`action_chunk_execution_steps` argument (or the matching
+`MujocoDeployConfig` field) admits only the first `X` actions and assigns them
+consecutive decision timestamps. If the next chunk is submitted without an
+explicit start time, it begins at the previous prefix's end, so an asynchronous
+producer can prepare it ahead of execution. `None` keeps the existing full
+chunk/single-action behavior.
+
+For model deployment, `MujocoDeploymentObservationAdapter` is the read-only
+scene bridge: it samples explicit TCP body poses, arm qpos, gripper closure,
+and optional renderer images into the common `DeploymentObservation` contract.
+`deployments.openpi.client.OpenPISimAdapter` can consume that observation and
+returns a decoded chunk; neither adapter steps physics or submits a target.
+`MujocoPolicyRollout` is the model-neutral sim-only composition seam: it
+captures one observation cut, calls any decoded policy adapter, adapts every
+keyframe through `DeployRobotActionAdapter`, and submits the whole chunk once
+to `MujocoDeployRuntime`. A failed keyframe rejects the whole chunk and, when
+the runtime exposes the gate transition, requests a fault/hold. It does not
+construct an OpenPI client or choose an IK/pose-frame profile; those remain
+explicit caller configuration. The existing generic action adapter and this
+runtime's explicit target profile therefore remain the only execution path.
+
+The RM65-specific accepted-qcmd/delay/filter state machine now lives in
+`sim/rm65/actuation`; this package only maps its target to MuJoCo position
+actuators and reads measured qpos. The historical v3 free-motion profile used
+ten paired command/UDP traces and conservatively refit only left J6. The
+canonical v4 profile extends that history to fourteen valid pairs and refits
+bilateral J5-J6 phase terms while freezing J1-J4. Position
+gains, damping, torque limits, armature, force/contact behavior, and payload
+dependence remain provisional, and v4 still needs a new untouched held-out
+capture. This path is therefore a physical rollout model, not yet a validated
+RM65 servo twin.
+
+The same lower path is available to batched Cube-Lift through the main task
+config below; the implementation lives in `sim.mujoco`, not in a training
+package:
+
+```text
+sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v1.json
+sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v2.json
+```
+
+Its model artifact cache fingerprints the full actuation profile and compiles
+stiff servos with MuJoCo `implicitfast`. The policy observes measured arm qpos,
+while compact task info reports mean/max target-tracking error. V1 retains a
+prescribed gripper for regression. V2 is the default training task and compiles
+four additional DM-Tac finger actuators; its observation and latch use measured
+gripper closure after the identified delay and acceleration-limited response.
+
+The camera-conditioned policy variants are explicit task configs:
+
+```text
+sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json
+sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_rgb_v2.json
+```
+
+They append only the active `right_wrist` RGB camera as a fixed 3x48x48 CHW
+input; the pose action and fitted arm/gripper actuators are unchanged. The
+earlier 3x32x32 RGB configs remain available as compatibility baselines.
+
+If the latest Q6 assignment is available, the same command starts the
+left/right Q6 readers and adds two continuous DM-Tac grippers. Explicit ports
+override the assignment:
+
+```bash
+PYTHONPATH=. python -m teleop_runtime.debug.run_vive_mujoco_teleop \
+  --left-tool-profile position_endpoint \
+  --right-tool-profile position_endpoint \
+  --left-hand-port /dev/serial/by-id/LEFT_Q6 \
+  --right-hand-port /dev/serial/by-id/RIGHT_Q6 \
+  --q6-config-required \
+  --viewer
+```
+
+The Q6 mapping follows the current real profile: source dimension 2,
+`input_min=0.1`, `input_max=0.9`, no inversion, and `0=open, 1=closed`. The
+gripper transport gate is 20 Hz; this is an endpoint-device gate attached to
+the 15/60/120 arm chain, not another arm-control path. The 2026-07-22 V1 profile
+uses independent left/right and close/open free-motion fits, with directional
+delays of roughly 0.047--0.064 s and maximum normalized rates of
+1.377--1.502/s. Combined with MuJoCo servo response, this
+gives approximately 0.131 s to visible motion and 0.851 s to measured full
+travel from software command acceptance. The symmetric model lies between the
+repeat-3 hardware close/open means of approximately 0.829/0.870 s.
+Hold-last-target is preserved. The 20 N
+per-finger limit, normalized torque, contact material,
+short-step and preemption behavior remain explicitly provisional because the
+trace had no external force gauge and did not identify those regimes. Pad
+friction and `solref`/`solimp` remain explicit unset tuning interfaces in
+`sim/mujoco/actuation/gripper_profile.py`.
 
 ## v3 RM65 CAD Colors
 
@@ -215,16 +337,16 @@ Compile the explicit URDF and list arms/cameras:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --dump-mjcf-only \
-  --mjcf-out sim/outputs/rm65_dual_arm_wrist_cameras_v2_head_camera.xml
+  --mjcf-out sim/outputs/rm65_dual_arm_wrist_cameras_v3_head_camera.xml
 ```
 
 Right-arm qpos check without rendering:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode right \
   --control qpos \
   --right-qpos 0 0 0 0 0 0 \
@@ -235,7 +357,7 @@ Interactive MuJoCo GUI viewer:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode right \
   --control qpos \
   --right-qpos 0 0 0 0 0 0 \
@@ -248,7 +370,7 @@ check:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode right \
   --control qpos \
   --right-qpos 0 0 0 0 0 0 \
@@ -344,15 +466,33 @@ export MUJOCO_GL=egl
 export MUJOCO_GL=osmesa
 ```
 
-## Dataset QPOS Replay
+## Canonical Dataset Replay (default)
 
-Replay recorded robot joint positions from a LeRobot-style dataset:
+The normal dataset replay entrypoint consumes canonical `desk_absolute`
+left/right tool-TCP actions (UMI 16D or real-teleop 26D), then runs the shared
+collision-aware dual-arm retargeter and the physical MuJoCo actuator path:
+
+```bash
+python -m sim.mujoco.replay \
+  --dataset-root <dataset-root> \
+  --episode 0 \
+  --viewer
+```
+
+It does not derive arm motion from recorded qpos. See
+[`replay/README_UMI.md`](replay/README_UMI.md) for the action/frame contracts,
+TCP target overlay, and headless options.
+
+## Debug-only Dataset QPOS Replay
+
+For joint-space diagnosis only, replay recorded robot joint positions from a
+LeRobot-style dataset with the explicit `.runner` entrypoint:
 
 ```bash
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode dual \
   --qpos-source auto \
   --no-render
@@ -414,7 +554,7 @@ Right-arm-only replay keeps the left arm fixed at the first recorded frame:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode right \
   --qpos-source auto \
   --no-render
@@ -426,7 +566,7 @@ Open the MuJoCo GUI while replaying:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode dual \
   --viewer \
   --no-render
@@ -439,7 +579,7 @@ the viewer open after loading the selected frame and highlights proxy boxes:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-04_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode dual \
   --qpos-source auto \
   --start-frame 75 \
@@ -463,7 +603,7 @@ export MUJOCO_GL=egl
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode dual \
   --record \
   --record-dir sim/outputs
@@ -477,7 +617,7 @@ export MUJOCO_GL=egl
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
   --mode dual \
   --qpos-source auto \
   --export-dataset datasets/2026-07-03_mujoco_replay
@@ -538,23 +678,29 @@ they are not represented by fabricated zero-valued rows. Wrist depth and
 pointcloud export are intentionally not accepted by this new path yet, rather
 than falling back to the legacy writer.
 
-## Teleop Integration Direction
+## Current Teleop Integration
 
 The reusable position-control path is:
 
 ```text
-RobotAction tool_tcp pose
-  -> timestamp pose resampling
-  -> robot_motion.rm65 coupled IK / collision / limits / hold
-  -> joint TeleopCommand
-  -> shared 75 Hz -> 150 Hz joint interpolation (pending sim actuator wiring)
-  -> MuJoCoArmBackend joint sink
-  -> shared MujocoScene
-  -> MuJoCo physics feedback / cameras / recorder
+VIVE target update (15 Hz)
+  -> robot_motion.rm65 coupled IK / collision / limits (60 Hz qref)
+  -> shared acceleration-limited qref -> qcmd planner (120 Hz)
+  -> delayed, force-limited MuJoCo position actuators (1000 Hz physics)
+
+Q6 scalar (source dim 2, 0=open, 1=closed)
+  -> shared ScalarToGripperRetargeter
+  -> DM-Tac threshold / 40 Hz transport gate / 0.10 s post-command delay
+  -> acceleration/braking-limited, provisionally force-limited finger actuators
+  -> the same shared MujocoScene and MjData owner
 ```
 
-`MuJoCoArmBackend` therefore rejects per-arm `cartesian_pose` commands. A
-per-effector backend cannot see both arm targets and must not run independent
-single-arm IK. Tool-TCP feedback is reported only when its side-specific tool
-profile was supplied; `arm_link6` is always reported separately as the arm
-endpoint.
+The simulation rig receives joint commands only. A per-effector backend cannot
+see both arm targets and must not run independent single-arm IK. Tool-TCP
+feedback is reported only when its side-specific tool profile was supplied;
+`arm_link6` is always reported separately as the arm endpoint.
+
+Canonical desk-TCP UMI data must use the separate physical replay path; it
+does not fabricate qpos or write MuJoCo qpos directly. See
+[`replay/README_UMI.md`](replay/README_UMI.md) for its frame contracts, control
+chain, headless validation, and viewer commands.

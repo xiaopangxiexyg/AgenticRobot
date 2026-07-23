@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -16,11 +17,150 @@ from .checkpoint import file_sha256, save_checkpoint
 from .config import PPOConfig, RewardShapingConfig
 from .ppo import PPOSmokeTrainer
 from .records import RunRecorder
+from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
 
 
-DEFAULT_TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
+# New training defaults to the real-observable, no-episode-clock profile.  The
+# older v1/v3 profiles remain explicit compatibility options for old runs.
+DEFAULT_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json"
+)
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "latest.pt"
 DEFAULT_RECORD_ROOT = Path(__file__).resolve().parent / "records"
+
+
+def _format_duration(seconds: float | None) -> str:
+    """Format a duration for the human terminal summary."""
+
+    if seconds is None or not math.isfinite(float(seconds)):
+        return "--:--:--"
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds_value = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds_value:02d}"
+
+
+def _format_metric(
+    value: Any,
+    *,
+    decimals: int = 3,
+    suffix: str = "",
+    fallback: str = "-",
+    scientific: bool = False,
+) -> str:
+    if value is None:
+        return fallback
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if math.isnan(number):
+        return fallback
+    if math.isinf(number):
+        return "inf" if number > 0 else "-inf"
+    if scientific:
+        return f"{number:.{decimals}e}{suffix}"
+    return f"{number:.{decimals}f}{suffix}"
+
+
+def format_training_progress(
+    record: Mapping[str, Any],
+    *,
+    total_timesteps: int,
+    next_checkpoint: int | None = None,
+    checkpoint_saved: bool = False,
+) -> str:
+    """Return the compact, human-readable line printed during training.
+
+    The complete record is still persisted by :class:`RunRecorder`; this line
+    deliberately contains only progress and the metrics needed while watching
+    a run.  Keeping this formatter pure also makes the terminal contract easy
+    to test without starting MuJoCo workers.
+    """
+
+    total = max(int(total_timesteps), 1)
+    step = max(int(record.get("global_step", 0)), 0)
+    progress = min(100.0, 100.0 * step / total)
+    elapsed = float(record.get("wall_time_seconds", 0.0) or 0.0)
+    tps = float(record.get("transitions_per_second", 0.0) or 0.0)
+    remaining = max(total - step, 0)
+    eta = remaining / tps if tps > 1e-9 else None
+    success_rate = 100.0 * float(record.get("success_rate", 0.0) or 0.0)
+    checkpoint = "saved" if checkpoint_saved else (
+        f"next={int(next_checkpoint):,}" if next_checkpoint is not None else "final"
+    )
+    rgb_health = ""
+    if record.get("wrist_rgb_health_rate") is not None:
+        rgb_health = (
+            f" rgbstd={_format_metric(record.get('wrist_rgb_std'), decimals=1)}"
+            f" rgbok={_format_metric(100.0 * float(record.get('wrist_rgb_health_rate', 0.0) or 0.0), decimals=1, suffix='%')}"
+        )
+    return (
+        f"[train] steps={step:,}/{total:,} ({progress:5.1f}%) "
+        f"u={int(record.get('update', 0)):04d} "
+        f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta)} "
+        f"tps={tps:,.1f} "
+        f"ep={int(record.get('completed_episodes', 0))} "
+        f"succ={int(record.get('successful_episodes', 0))}({success_rate:4.1f}%) "
+        f"rew={_format_metric(record.get('raw_reward_mean'), decimals=4)} "
+        f"shape={_format_metric(record.get('shaped_reward_mean'), decimals=4)} "
+        f"return={_format_metric(record.get('recent_episode_raw_return_mean'), decimals=3)} "
+        f"reach={_format_metric(record.get('reward_distance_m_mean'), suffix='m')} "
+        f"close={_format_metric(record.get('reward_gripper_close_mean'))} "
+        f"lift={_format_metric(record.get('reward_lift_fraction_mean'))} "
+        f"proj={_format_metric(100.0 * float(record.get('safety_projection_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
+        f"reject={_format_metric(100.0 * float(record.get('safety_rejection_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
+        f"clr={int(record.get('clearance_violation_count', 0))} "
+        f"pen={int(record.get('hard_penetration_count', 0))} "
+        f"armerr={_format_metric(record.get('arm_tracking_error_rad_mean'), decimals=4)}rad "
+        f"griperr={_format_metric(record.get('gripper_tracking_error_mean'), decimals=3)} "
+        f"{rgb_health}"
+        f"loss={_format_metric(record.get('policy_loss'), decimals=3)} "
+        f"v={_format_metric(record.get('value_loss'), decimals=3)} "
+        f"kl={_format_metric(record.get('approx_kl'), decimals=2, scientific=True)} "
+        f"ckpt={checkpoint}"
+    )
+
+
+def format_training_start(
+    *,
+    task_name: str,
+    policy_class: str,
+    observation_dim: int,
+    action_dim: int,
+    total_timesteps: int,
+    num_envs: int,
+    rollout_steps: int,
+    device: str,
+    seed: int,
+    reward_shaping: bool,
+    checkpoint: Path,
+    record_directory: Path,
+) -> str:
+    return (
+        f"[train] start task={task_name} policy={policy_class} "
+        f"obs={observation_dim} action={action_dim} "
+        f"envs={num_envs} rollout={rollout_steps} "
+        f"total={int(total_timesteps):,} device={device} seed={seed} "
+        f"reward={'shaped' if reward_shaping else 'raw'} "
+        f"checkpoint={checkpoint} records={record_directory}"
+    )
+
+
+def format_training_complete(summary: Mapping[str, Any]) -> str:
+    return (
+        f"[train] done steps={int(summary.get('global_step', 0)):,} "
+        f"updates={int(summary.get('updates', 0))} "
+        f"elapsed={_format_duration(summary.get('elapsed_seconds'))} "
+        f"tps={_format_metric(summary.get('transitions_per_second'), decimals=1)} "
+        f"episodes={int(summary.get('completed_episodes', 0))} "
+        f"success={int(summary.get('successful_episodes', 0))} "
+        f"rate={100.0 * float(summary.get('success_rate', 0.0) or 0.0):.1f}% "
+        f"device={summary.get('device', '-')} "
+        f"checkpoint={summary.get('checkpoint', '-')} "
+        f"records={summary.get('record_directory', '-')}"
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -44,14 +184,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-interval", type=int, default=50_000)
     parser.add_argument("--model-cache-dir", type=Path, default=None)
     parser.add_argument(
+        "--log-interval-updates",
+        type=int,
+        default=1,
+        help=(
+            "Print one compact progress line every N PPO updates; complete "
+            "metrics are always written to metrics.jsonl/csv."
+        ),
+    )
+    parser.add_argument(
+        "--print-full-metrics",
+        action="store_true",
+        help="Print the complete per-update JSON records instead of compact lines.",
+    )
+    parser.add_argument(
         "--no-reward-shaping",
         action="store_true",
         help="Train on the original sparse Cube-Lift reward only.",
+    )
+    parser.add_argument(
+        "--require-rgb-health",
+        action="store_true",
+        help=(
+            "Abort immediately when the reset wrist RGB frame is flat/dark/"
+            "saturated; diagnostics are still recorded without this flag."
+        ),
     )
     return parser
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    if int(args.log_interval_updates) <= 0:
+        raise ValueError("log_interval_updates must be positive.")
     ppo_config = PPOConfig(
         total_timesteps=args.total_timesteps,
         num_envs=args.num_envs,
@@ -65,7 +229,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         start_method=args.start_method,
         device=args.device,
     )
-    reward_config = RewardShapingConfig(enabled=not args.no_reward_shaping)
+    task_config = CubeLiftTaskConfig.load(args.task_config)
+    reward_values = dict(task_config.reward_shaping)
+    reward_values["enabled"] = not args.no_reward_shaping
+    reward_config = RewardShapingConfig.from_dict(reward_values)
     trainer = PPOSmokeTrainer(
         ppo_config,
         reward_config,
@@ -73,6 +240,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         model_cache_dir=(
             None if args.model_cache_dir is None else str(args.model_cache_dir)
         ),
+        require_wrist_rgb_health=bool(args.require_rgb_health),
     )
     recorder = RunRecorder(
         args.record_root,
@@ -83,6 +251,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "reward_shaping": reward_config.to_dict(),
             "task_config": str(Path(args.task_config).resolve()),
             "task_config_sha256": file_sha256(args.task_config),
+            "task_metadata": trainer.task_config.to_metadata(),
+            "learning_contract": build_learning_metadata(trainer.task_config),
             "checkpoint_target": str(Path(args.checkpoint).resolve()),
             "model_cache_dir": (
                 None if args.model_cache_dir is None else str(Path(args.model_cache_dir).resolve())
@@ -93,8 +263,51 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "torch_cuda": torch.version.cuda,
             "cuda_available": torch.cuda.is_available(),
             "resolved_device": str(trainer.device),
+            "log_interval_updates": int(args.log_interval_updates),
+            "print_full_metrics": bool(args.print_full_metrics),
+            "require_rgb_health": bool(args.require_rgb_health),
         },
     )
+    if args.print_full_metrics:
+        print(
+            json.dumps(
+                {
+                    "event": "train_start",
+                    "task": trainer.task_config.name,
+                    "policy_class": trainer.task_config.policy_class,
+                    "observation_dim": trainer.observation_dim,
+                    "action_dim": trainer.task_config.action_dim,
+                    "total_timesteps": ppo_config.total_timesteps,
+                    "num_envs": ppo_config.num_envs,
+                    "rollout_steps": ppo_config.rollout_steps,
+                    "device": str(trainer.device),
+                    "seed": ppo_config.seed,
+                    "reward_shaping": reward_config.enabled,
+                    "checkpoint": str(Path(args.checkpoint).resolve()),
+                    "record_directory": str(recorder.directory),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    else:
+        print(
+            format_training_start(
+                task_name=trainer.task_config.name,
+                policy_class=trainer.task_config.policy_class,
+                observation_dim=trainer.observation_dim,
+                action_dim=trainer.task_config.action_dim,
+                total_timesteps=ppo_config.total_timesteps,
+                num_envs=ppo_config.num_envs,
+                rollout_steps=ppo_config.rollout_steps,
+                device=str(trainer.device),
+                seed=ppo_config.seed,
+                reward_shaping=reward_config.enabled,
+                checkpoint=Path(args.checkpoint).resolve(),
+                record_directory=recorder.directory,
+            ),
+            flush=True,
+        )
     started = time.monotonic()
     next_checkpoint = ppo_config.checkpoint_interval
     completed_episodes = 0
@@ -134,15 +347,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "learning_rate": float(trainer.optimizer.param_groups[0]["lr"]),
                 "safety_projection_rate": rollout.safety_projection_rate,
                 "safety_rejection_rate": rollout.safety_rejection_rate,
+                "safety_recovery_rate": rollout.safety_recovery_rate,
                 "safety_projection_alpha_mean": rollout.safety_projection_alpha_mean,
                 "safety_minimum_distance_m": rollout.safety_minimum_distance_m,
                 "hard_penetration_count": rollout.hard_penetration_count,
                 "clearance_violation_count": rollout.clearance_violation_count,
+                "arm_tracking_error_rad_mean": rollout.arm_tracking_error_rad_mean,
+                "arm_tracking_error_rad_max": rollout.arm_tracking_error_rad_max,
+                "gripper_tracking_error_mean": rollout.gripper_tracking_error_mean,
+                "gripper_tracking_error_max": rollout.gripper_tracking_error_max,
+                "wrist_rgb_mean": rollout.wrist_rgb_mean,
+                "wrist_rgb_std": rollout.wrist_rgb_std,
+                "wrist_rgb_health_rate": rollout.wrist_rgb_health_rate,
                 **rollout.reward_term_means,
                 **losses,
             }
             recorder.record_update(record, rollout.episodes)
-            print(json.dumps(record, sort_keys=True), flush=True)
+            checkpoint_saved = False
             if trainer.global_step >= next_checkpoint:
                 save_checkpoint(
                     args.checkpoint,
@@ -168,6 +389,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 while next_checkpoint <= trainer.global_step:
                     next_checkpoint += ppo_config.checkpoint_interval
+                checkpoint_saved = True
+            should_print = (
+                args.print_full_metrics
+                or checkpoint_saved
+                or trainer.update_index % int(args.log_interval_updates) == 0
+                or trainer.global_step >= ppo_config.total_timesteps
+            )
+            if should_print:
+                if args.print_full_metrics:
+                    print(json.dumps(record, sort_keys=True), flush=True)
+                else:
+                    print(
+                        format_training_progress(
+                            record,
+                            total_timesteps=ppo_config.total_timesteps,
+                            next_checkpoint=next_checkpoint,
+                            checkpoint_saved=checkpoint_saved,
+                        ),
+                        flush=True,
+                    )
 
         destination = save_checkpoint(
             args.checkpoint,
@@ -219,7 +460,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     summary = run(args)
-    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    if args.print_full_metrics:
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_training_complete(summary), flush=True)
     return 0
 
 

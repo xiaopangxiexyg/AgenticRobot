@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import numpy as np
 import pytest
@@ -28,6 +29,7 @@ from deployments.client import (
     deploy_contract_from_policy_artifact,
     validate_server_metadata,
 )
+from robot_motion.action import EndEffectorSafetyCapability
 from robot_motion.deploy import (
     ActionSafetyFilter,
     ActionSafetyFilterConfig,
@@ -56,6 +58,7 @@ from robot_motion.replay.trajectory import (
     ReplayTrajectoryGroup,
     select_replay_qpos_init_targets,
 )
+from robot_motion.replay.action_frame import replay_action_metadata
 from robot_motion.deploy.observation import observation_faults
 from teleop_runtime.deploy.replay import (
     DatasetReplayPolicy,
@@ -64,9 +67,12 @@ from teleop_runtime.deploy.replay import (
     resolve_replay_parquet_path,
     v22_replay_rows_to_legacy_actions,
 )
+from teleop_runtime.deploy.run_policy import _debug_replay_execution_exhausted
 from teleop_runtime.deploy.policy import LoadedPolicy
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.collection import run_collect
+from teleop_runtime.replay.dataset import ReplayDatasetIndex
+from teleop_runtime.replay.executor import build_episode_replay_group
 
 
 def _pose(x: float) -> np.ndarray:
@@ -219,6 +225,103 @@ def test_v22_dual_continuous_dmtac_native_selects_end_effector_components() -> N
     np.testing.assert_allclose(right.values, [0.8])
 
 
+def test_gui_episode_replay_group_bridges_v23_umi_16d_action_to_canonical_26d(
+    tmp_path: Path,
+) -> None:
+    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    layout = _dual_dmtac_continuous_layout()
+    source = PoseSourceProfile(
+        source_id="umi_dual_wrist_test_v1",
+        source_family="real_robot",
+        source_description="dual-wrist UMI replay fixture",
+        topology="dual_arm",
+        raw_absolute_frame_by_side={
+            "left": "left_rm65_base",
+            "right": "right_rm65_base",
+        },
+    )
+    pose_contract = PoseFrameContract.v23_default_desk(source)
+    root = tmp_path / "umi_v23"
+    parquet_path = root / "data" / "chunk-000" / "episode_000000.parquet"
+    parquet_path.parent.mkdir(parents=True)
+    (root / "meta").mkdir(parents=True)
+    dataset_info = {
+        "dexteleop_dataset_schema": DEXTELEOP_DATASET_SCHEMA_V23,
+        "nominal_fps": 15.0,
+        **layout.binding_metadata(),
+        "pose_frame_contract": pose_contract.to_dict(),
+        "pose_storage_frame": pose_contract.pose_storage_frame,
+    }
+    (root / "meta" / "info.json").write_text(
+        json.dumps(dataset_info), encoding="utf-8"
+    )
+    (root / "meta" / "episodes.jsonl").write_text(
+        json.dumps(
+            {
+                "episode_index": 0,
+                "episode_id": "episode_000000",
+                "frame_count": 1,
+                "parquet_path": "data/chunk-000/episode_000000.parquet",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    compact_action = np.concatenate(
+        (_pose(-0.1), _pose(0.1), np.asarray([0.25, 0.75], dtype=np.float32))
+    ).astype(np.float32)
+    assert compact_action.shape == (16,)
+    pq.write_table(
+        pyarrow.Table.from_pylist(
+            [
+                {
+                    "action": compact_action.tolist(),
+                    "policy_io_layout_hash": layout.layout_hash,
+                    "timestamp": 0.0,
+                    "control_hz": 15.0,
+                }
+            ]
+        ),
+        parquet_path,
+    )
+
+    episode = ReplayDatasetIndex(root).load_episode(0)
+    group = build_episode_replay_group(
+        episode,
+        active_sides=("left", "right"),
+    )
+
+    assert group.actions.shape == (1, ACTION_DIM)
+    np.testing.assert_allclose(
+        group.actions[0, ACTION_HAND_SLICES["left"]],
+        [0.25, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    np.testing.assert_allclose(
+        group.actions[0, ACTION_HAND_SLICES["right"]],
+        [0.75, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    assert group.metadata["typed_action_contract"] is True
+    action_metadata = group.metadata["action_metadata"]
+    assert action_metadata["end_effector_enabled_sides"] == ["left", "right"]
+    assert action_metadata["hand_active_mask_by_side"] == {
+        "left": [True, False, False, False, False, False],
+        "right": [True, False, False, False, False, False],
+    }
+    for side in ("left", "right"):
+        spec = action_metadata["hand_action_specs_by_side"][side]
+        assert spec["hand_model"] == "dmtac_gripper_v1"
+        assert spec["slot_map"] == {"gripper_close": 0}
+        assert spec["invalid_slot_value"] == "zero_padding"
+    replay_metadata = replay_action_metadata(
+        group, active_sides=("left", "right")
+    )
+    assert replay_metadata["hand_action_specs_by_side"] == action_metadata[
+        "hand_action_specs_by_side"
+    ]
+
+
 def test_v22_q6_bridge_requires_explicit_backend_slot_mapping() -> None:
     layout = _right_discrete_layout(legacy_slots=None)
     adapter = V22DeploymentAdapter(layout)
@@ -322,6 +425,10 @@ def test_replay_prediction_transaction_rolls_back_chunk_discarded_by_ik_recovery
     checkpoint = policy.begin_prediction_transaction()
     predicted = policy.predict(_observation())
     assert len(predicted["action_chunk"]) == 4
+    assert [
+        action.metadata["debug_replay_source_action_index"]
+        for action in predicted["action_chunk"]
+    ] == [0, 1, 2, 3]
     assert replay.cursor == 4
     assert gate.discards_policy_output
     policy.rollback_prediction_transaction(checkpoint)
@@ -335,6 +442,10 @@ def test_replay_prediction_transaction_rolls_back_chunk_discarded_by_ik_recovery
     checkpoint = policy.begin_prediction_transaction()
     predicted = policy.predict(_observation())
     assert len(predicted["action_chunk"]) == 4
+    assert [
+        action.metadata["debug_replay_source_action_index"]
+        for action in predicted["action_chunk"]
+    ] == [0, 1, 2, 3]
     policy.commit_prediction_transaction(checkpoint)
     gate.mark_policy_output_accepted()
     assert replay.cursor == 4
@@ -364,6 +475,23 @@ def test_looping_replay_prediction_rollback_restores_pass_and_finished_state(
     assert replay.cursor == 3
     assert replay.completed_passes == 5
     assert replay.finished is True
+
+
+def test_finished_non_loop_replay_stops_prediction_only_after_queue_drains(tmp_path) -> None:
+    replay = DatasetReplayPolicy(
+        actions=np.zeros((2, ACTION_DIM), dtype=np.float32),
+        source_path=tmp_path / "episode.parquet",
+        chunk_size=2,
+    )
+    policy = LoadedPolicy(policy=replay, name="dataset_replay:test")
+
+    replay.predict(_observation())
+    assert replay.finished is True
+    assert not _debug_replay_execution_exhausted(policy, queued_actions=2)
+    assert _debug_replay_execution_exhausted(policy, queued_actions=0)
+
+    replay.loop = True
+    assert not _debug_replay_execution_exhausted(policy, queued_actions=0)
 
 
 def test_v22_replay_binds_metadata_to_runtime_arm_only_selection(monkeypatch) -> None:
@@ -865,6 +993,55 @@ def test_deploy_session_contract_uses_native_for_non_bridge_layout() -> None:
 
     assert contract.policy_contract_mode == POLICY_CONTRACT_V22_NATIVE
     assert contract.warnings == ()
+
+
+def test_real_native_session_requires_typed_end_effector_safety() -> None:
+    layout = _right_discrete_layout(legacy_slots=None)
+    artifact = PolicyArtifactContract(policy_io_layout=layout)
+    runtime_without_safety = RuntimeEndEffectorCapability(
+        side="right",
+        adapter="two_state_gripper_v1",
+        backend="mock",
+    )
+
+    with pytest.raises(
+        DatasetLayoutBindingError,
+        match="missing end-effector safety capability",
+    ):
+        resolve_deploy_session_contract(
+            policy_artifact=artifact,
+            runtime_end_effectors={"right": runtime_without_safety},
+            hardware_output=True,
+        )
+
+    safety = EndEffectorSafetyCapability(
+        adapter="two_state_gripper_v1",
+        value_type="discrete",
+        names=("mode",),
+        units=("token",),
+        allowed_tokens_by_component=((0, 1),),
+        allowed_transitions_by_component=(
+            ((0, 0), (0, 1), (1, 0), (1, 1)),
+        ),
+    )
+    contract = resolve_deploy_session_contract(
+        policy_artifact=artifact,
+        runtime_end_effectors={
+            "right": RuntimeEndEffectorCapability(
+                side="right",
+                adapter="two_state_gripper_v1",
+                backend="mock",
+                safety=safety,
+            )
+        },
+        hardware_output=True,
+    )
+
+    assert contract.policy_contract_mode == POLICY_CONTRACT_V22_NATIVE
+    assert contract.runtime_end_effectors["right"].safety == safety
+    assert contract.to_dict()["runtime_end_effectors"]["right"]["safety"] == (
+        safety.to_dict()
+    )
 
 
 def test_deploy_session_contract_rejects_real_missing_or_wrong_end_effector() -> None:

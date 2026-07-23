@@ -66,6 +66,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     minimum_safety_distance = float("inf")
     hard_penetrations = 0
     clearance_violations = 0
+    tracking_error_sum = 0.0
+    tracking_error_samples = 0
+    tracking_error_max = 0.0
+    gripper_tracking_error_sum = 0.0
+    gripper_tracking_error_max = 0.0
     try:
         observation, _infos = env.reset()
         max_steps = args.episodes * 600
@@ -80,6 +85,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
             evaluated_actions += args.num_envs
             for info in infos:
+                tracking_error_sum += float(info.get("arm_tracking_error_rad_mean", 0.0))
+                tracking_error_max = max(
+                    tracking_error_max,
+                    float(info.get("arm_tracking_error_rad_max", 0.0)),
+                )
+                tracking_error_samples += 1
+                gripper_error = abs(
+                    float(info.get("right_gripper_tracking_error", 0.0))
+                )
+                gripper_tracking_error_sum += gripper_error
+                gripper_tracking_error_max = max(
+                    gripper_tracking_error_max, gripper_error
+                )
                 projected_actions += int(info.get("safety_modified", False))
                 rejected_actions += int(
                     float(info.get("safety_projection_alpha", 1.0)) <= 1e-8
@@ -92,7 +110,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 clearance_violations += int(
                     info.get("termination_reason")
-                    == "robot_environment_clearance_violation"
+                    in {
+                        "robot_environment_clearance_violation",
+                        "sim_collision_margin_violation",
+                    }
                 )
             returns += reward
             lengths += 1
@@ -133,6 +154,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         ),
         "hard_penetration_count": hard_penetrations,
         "clearance_violation_count": clearance_violations,
+        "arm_tracking_error_rad_mean": (
+            tracking_error_sum / max(tracking_error_samples, 1)
+        ),
+        "arm_tracking_error_rad_max": tracking_error_max,
+        "gripper_tracking_error_mean": (
+            gripper_tracking_error_sum / max(tracking_error_samples, 1)
+        ),
+        "gripper_tracking_error_max": gripper_tracking_error_max,
         "device": str(device),
     }
 

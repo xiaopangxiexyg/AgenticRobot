@@ -1,0 +1,184 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v4",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-v1-v4-fit-status",
+    "artifact_kind": "simulation_contract",
+    "sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-profile-source-20260721-v4",
+      "artifact_kind": "actuation_profile",
+      "sha256": "551b8a832f97d6e4fdfaef96b0cd3ff8b7dee46f4610ac948e23ff13602c48de",
+      "locator": "sim/rm65/actuation/profile.py"
+    },
+    {
+      "artifact_id": "rm65-arm-actuator-core-source-20260721-v4",
+      "artifact_kind": "sim_actuator_core_source",
+      "sha256": "f37393bd9d0b46ca2810967a0ccdda717feb47a558219da0ccfa5371b1090f16",
+      "locator": "sim/rm65/actuation/core.py"
+    },
+    {
+      "artifact_id": "rm65-arm-mujoco-adapter-source-20260721-v4",
+      "artifact_kind": "sim_backend_adapter_source",
+      "sha256": "214d47466cb37bf90fbfd9fe95c2ae46002e38afda3d16fde8356ad29308edd0",
+      "locator": "sim/mujoco/actuation/executor.py"
+    },
+    {
+      "artifact_id": "rm65-arm-all-valid-fit-source-index-20260721-v4",
+      "artifact_kind": "fit_source_index",
+      "sha256": "d52c53279d8b48bbae3413fbea0e5294971b30493dabe579d4a27dcf791e3cdf",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_all_valid_fit_20260721_v4_sources.json"
+    },
+    {
+      "artifact_id": "rm65-arm-historical-v3-manifest",
+      "artifact_kind": "historical_real2sim_manifest",
+      "sha256": "706dd0db0cd094af9187b2fad63f931f8c81bdd17dc481d3d2eb6177eb17fff7",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v3.json"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-arm-profile-source-20260721-v4",
+        "rm65-arm-actuator-core-source-20260721-v4",
+        "rm65-arm-mujoco-adapter-source-20260721-v4",
+        "rm65-arm-all-valid-fit-source-index-20260721-v4",
+        "rm65-arm-historical-v3-manifest"
+      ],
+      "limitations": [
+        "The four later clean captures first failed the frozen v3 5 ms effective-delay gate, and that result remains preserved before they were converted to v4 fit data.",
+        "The individually clean 220204/220211 traces are excluded because accepted qcmd starts after UDP feedback ends; the 223212 UDP trace is excluded because it has no command pair.",
+        "V4 improves the declared weighted and clean-session mean RMSE, but guardian-restored mean RMSE, worst-joint RMSE, and maximum absolute error regress slightly.",
+        "J1-J4 remain frozen because their millisecond-scale refits were inconsistent across clean sessions.",
+        "Four high-speed records are downweighted because guardian restoration leaves no in-band UDP stop row.",
+        "Force limits, motor torque, payload dependence, contact, saturation, and gripper response remain uncalibrated by arm free-motion qpos data.",
+        "Natural teleoperation trajectories do not isolate step settling, overshoot, acceleration error, saturation rate, or temperature dependence."
+      ],
+      "notes": "The backend-independent v4 core owns accepted qcmd, per-joint causal delay, raw target, and filtered target; MuJoCo only supplies the physical servo and measured qpos."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "all-fourteen-session-exact-mujoco-fit-replay",
+      "split": "fit",
+      "status": "passed",
+      "metrics": {
+        "session_count": 14.0,
+        "clean_session_count": 10.0,
+        "guardian_session_count": 4.0,
+        "v3_all_mean_per_joint_qpos_rmse_deg": 0.3600077545713298,
+        "v4_all_mean_per_joint_qpos_rmse_deg": 0.3584484236895014,
+        "all_mean_rmse_reduction_ratio": 0.0043313813717292815,
+        "v3_clean_mean_per_joint_qpos_rmse_deg": 0.26456635453245914,
+        "v4_clean_mean_per_joint_qpos_rmse_deg": 0.2612739019768233,
+        "clean_mean_rmse_reduction_ratio": 0.01244471377116052,
+        "v3_guardian_mean_per_joint_qpos_rmse_deg": 0.5986112546685064,
+        "v4_guardian_mean_per_joint_qpos_rmse_deg": 0.6013847279711969,
+        "guardian_mean_rmse_regression_ratio": 0.004633179348133565,
+        "v3_weighted_mean_per_joint_qpos_rmse_deg": 0.3202405045551337,
+        "v4_weighted_mean_per_joint_qpos_rmse_deg": 0.3179590396425523,
+        "weighted_mean_rmse_reduction_ratio": 0.007124223451217548,
+        "v3_old_clean_mean_per_joint_qpos_rmse_deg": 0.25153724532731886,
+        "v4_old_clean_mean_per_joint_qpos_rmse_deg": 0.24949460755920624,
+        "old_clean_mean_rmse_reduction_ratio": 0.008120617546934605,
+        "v3_new_clean_mean_per_joint_qpos_rmse_deg": 0.28411001834016947,
+        "v4_new_clean_mean_per_joint_qpos_rmse_deg": 0.2789428436032489,
+        "new_clean_mean_rmse_reduction_ratio": 0.018187231717868624,
+        "v3_max_joint_qpos_rmse_deg": 1.1687413378000429,
+        "v4_max_joint_qpos_rmse_deg": 1.1850456085056726,
+        "v3_max_abs_qpos_error_deg": 9.17751160897675,
+        "v4_max_abs_qpos_error_deg": 9.206430780689768,
+        "excluded_new_record_count": 2.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-arm-profile-source-20260721-v4",
+        "rm65-arm-actuator-core-source-20260721-v4",
+        "rm65-arm-mujoco-adapter-source-20260721-v4",
+        "rm65-arm-all-valid-fit-source-index-20260721-v4",
+        "rm65-arm-historical-v3-manifest"
+      ],
+      "notes": "Exact 1000 Hz MuJoCo replay over fourteen paired traces selected the 50 deg/s J5-J6 hinge update. Passing means only that the declared weighted fit objective improved; the tail regression prevents a stronger fidelity claim."
+    },
+    {
+      "validation_id": "new-untouched-clean-held-out-v4",
+      "split": "held_out",
+      "status": "not_run",
+      "metrics": {},
+      "evidence_artifact_ids": [],
+      "notes": "All available valid captures are now fit data. A later clean capture must remain untouched before v4 can pass held-out validation."
+    }
+  ],
+  "code_revision": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+  "environment_fingerprint": {
+    "python": "3.10.20",
+    "mujoco": "3.10.0",
+    "worktree": "dirty-concurrent-development"
+  },
+  "metadata": {
+    "owner": "sim.rm65",
+    "profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+    "profile_metadata_sha256": "507827a3403c1b01a5050fd1575ff07a407371558aa13477b9be0497db158e40",
+    "actuator_core": "sim.rm65.actuation.Rm65PositionActuator",
+    "backend_adapter": "sim.mujoco.actuation.MujocoActuatedPositionExecutor",
+    "fit_method": "weighted_fourteen_trace_bilateral_j5_j6_hinge_scan_then_exact_mujoco_replay",
+    "clean_weight": 1.0,
+    "guardian_restored_weight": 0.5,
+    "refitted_joints": ["left_joint5", "left_joint6", "right_joint5", "right_joint6"],
+    "velocity_lag_threshold_deg_s": 50.0,
+    "velocity_lag_fit_cap_deg_s": 75.0,
+    "transport_delay_sec_by_side_joint": {
+      "left": [0.018, 0.018, 0.018, 0.018, 0.01789449411045608, 0.009527118125949966],
+      "right": [0.017, 0.017, 0.017, 0.017, 0.01648800307798916, 0.010008068766796585]
+    },
+    "observed_effective_base_delay_sec_by_side_joint": {
+      "left": [0.029, 0.030, 0.030, 0.033, 0.03089449411045608, 0.031527118125949966],
+      "right": [0.028, 0.029, 0.029, 0.032, 0.02948800307798916, 0.032008068766796585]
+    },
+    "velocity_lag_tau_gain_sec_per_deg_s_by_side_joint": {
+      "left": [0.0, 0.0, 0.0, 0.0, 0.0007381414409301171, 0.0005112003462640944],
+      "right": [0.0, 0.0, 0.0, 0.0, 0.0006118011925206194, 0.0004656704072877366]
+    },
+    "velocity_lag_max_tau_sec_by_side_joint": {
+      "left": [0.0, 0.0, 0.0, 0.0, 0.01845353602325293, 0.01278000865660236],
+      "right": [0.0, 0.0, 0.0, 0.0, 0.015295029813015485, 0.011641760182193415]
+    },
+    "causal_target_ordering": "fixed_per_joint_transport_delay_plus_first_order_target_filter",
+    "historical_v3_manifest": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v3.json",
+    "converted_fit_capture_ids": ["193628/193634", "221544/221548", "222640/222650", "224159/224204", "224526/224530"],
+    "excluded_new_capture_ids": ["220204/220211", "223212"],
+    "session_mean_joint_rmse_deg": {
+      "1550_baseline": {"v3": 0.1908477278557463, "v4": 0.19096052029378663},
+      "1649_clean": {"v3": 0.2012896123233634, "v4": 0.19592303446454926},
+      "1710_clean": {"v3": 0.13860672717537717, "v4": 0.1361254422445207},
+      "1712_clean": {"v3": 0.3006636573648805, "v4": 0.29929651652086836},
+      "1720_guardian": {"v3": 0.5696959718068796, "v4": 0.5715775716684858},
+      "1724_guardian": {"v3": 0.6454000446577722, "v4": 0.6491297524179752},
+      "1727_guardian": {"v3": 0.656671625774173, "v4": 0.6601906183449181},
+      "1730_guardian": {"v3": 0.5226773764352007, "v4": 0.5246409694534083},
+      "1918_clean": {"v3": 0.3359190222885569, "v4": 0.3362953747574384},
+      "1936_clean": {"v3": 0.34189672495598905, "v4": 0.33836675707407404},
+      "2215_clean": {"v3": 0.3868434165978209, "v4": 0.386383854539558},
+      "2226_clean": {"v3": 0.2737392598189117, "v4": 0.2705274426676972},
+      "2241_clean": {"v3": 0.2982395980809738, "v4": 0.29245892340731866},
+      "2245_clean": {"v3": 0.17761779886297155, "v4": 0.16640115379842188}
+    }
+  },
+  "artifact_sha256": "501702e3b741096fc3038b082405073bad51f63626b7296b75d2847e85df778d"
+}

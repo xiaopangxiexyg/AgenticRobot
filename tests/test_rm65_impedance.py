@@ -227,7 +227,7 @@ class RM65ImpedanceTest(unittest.TestCase):
         override = RM65ImpedanceConfig.from_profile(profile, mode="pose", follow=False)
         self.assertFalse(override.canfd_follow)
 
-    def test_config_defaults_to_no_follow_with_150hz_follow_stream_when_enabled(self) -> None:
+    def test_config_defaults_to_no_follow_with_current_position_stream_when_enabled(self) -> None:
         config = RM65ImpedanceConfig(tool_name="DMTAC_M")
 
         self.assertFalse(config.canfd_follow)
@@ -250,6 +250,27 @@ class RM65ImpedanceTest(unittest.TestCase):
                     config.direct_joint_hint_max_angular_offset_rad,
                     np.deg2rad(0.5),
                 )
+
+    def test_hard_deadline_rejects_blocking_rm65_sdk_candidate_provider(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-blocking candidate providers"):
+            RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                ik_hard_deadline_enabled=True,
+                ik_resolver_candidate_provider_names=["rm65_sdk"],
+            )
+        with self.assertRaisesRegex(ValueError, "non-blocking candidate providers"):
+            RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                ik_hard_deadline_enabled=True,
+                ik_resolver_candidate_provider_names=[],
+            )
+
+        config = RM65ImpedanceConfig(
+            tool_name="DMTAC_L",
+            ik_hard_deadline_enabled=False,
+            ik_resolver_candidate_provider_names=["rm65_sdk"],
+        )
+        self.assertEqual(config.ik_resolver_candidate_provider_names, ["rm65_sdk"])
 
     def test_config_from_profile_allows_canfd_trajectory_override(self) -> None:
         profile = {
@@ -1474,6 +1495,85 @@ class RM65ImpedanceTest(unittest.TestCase):
         backend.warm_start_force_control()
         self.assertEqual(controller.start_count, 1)
 
+    def test_impedance_backend_exact_qpos_lease_rejects_unrelated_commands(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.begin_calls: list[str] = []
+                self.end_calls: list[str] = []
+
+            def begin_exact_qpos_transit(self, operation_id: str) -> None:
+                self.begin_calls.append(operation_id)
+
+            def end_exact_qpos_transit(self, operation_id: str) -> None:
+                self.end_calls.append(operation_id)
+
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="192.0.2.10",
+                side="right",
+                connect_hardware=False,
+            )
+        )
+        controller = FakeController()
+        backend._controller = controller
+        backend._enabled = True
+        backend.begin_exact_qpos_transit("operation-lease")
+
+        ordinary = EffectorCommand(
+            effector_name="right_arm",
+            side="right",
+            command_type="cartesian_pose",
+            value=np.eye(4),
+            metadata={"solver_output_qpos": [0.0] * 6},
+        )
+        with self.assertRaisesRegex(RuntimeError, "only accepts commands"):
+            backend.send_command(ordinary)
+
+        exact = ordinary.copy()
+        exact.metadata.update(
+            {
+                "init_arm_qpos_active": True,
+                "init_arm_qpos_operation_id": "operation-lease",
+            }
+        )
+        backend.send_command(exact)
+
+        self.assertEqual(controller.begin_calls, ["operation-lease"])
+        self.assertTrue(backend.exact_qpos_transit_active)
+        self.assertTrue(backend.end_exact_qpos_transit("operation-lease"))
+        self.assertEqual(controller.end_calls, ["operation-lease"])
+        self.assertFalse(backend.exact_qpos_transit_active)
+
+    def test_impedance_backend_exact_qpos_preflight_rejects_contact(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.begin_calls: list[str] = []
+
+            def begin_exact_qpos_transit(self, operation_id: str) -> None:
+                self.begin_calls.append(operation_id)
+
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="192.0.2.10",
+                side="right",
+                connect_hardware=True,
+            )
+        )
+        controller = FakeController()
+        backend._controller = controller
+        backend._enabled = True
+        backend._last_step_record = {
+            "backend_controller_step_end_wall_time": time.time(),
+            "force_norm_n": 21.0,
+            "torque_norm_nm": 0.0,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "under contact"):
+            backend.begin_exact_qpos_transit("operation-contact")
+
+        self.assertEqual(controller.begin_calls, [])
+        self.assertFalse(backend.exact_qpos_transit_active)
+
     def test_impedance_backend_send_command_does_not_wait_for_step_lock(self) -> None:
         backend = RM65ImpedanceArmBackend(
             RM65ImpedanceArmBackendConfig(
@@ -1658,6 +1758,86 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertEqual(record["ik_metadata"]["source"], "retargeter_solver_output_qpos")
         self.assertEqual(robot.movej_calls[-1], target_joint)
         self.assertEqual(len(robot.ik_calls), preflight_ik_calls)
+
+    def test_exact_qpos_transit_suspends_compliance_but_keeps_force_monitoring(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_joint = [1.0, 2.0, 20.0, 3.0, 4.0, 5.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            force_sequence=[[0.0] * 6, [10.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                force_deadband_n=0.0,
+                linear_compliance_m_per_n=0.004,
+                max_linear_velocity_m_s=1.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+                direct_joint_hint_max_linear_offset_m=0.0,
+                direct_joint_hint_max_angular_offset_rad=0.0,
+                direct_joint_hint_force_guard_enabled=False,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller.begin_exact_qpos_transit("operation-1")
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(current_pose, target_joint_deg=target_joint)
+
+        self.assertTrue(record["exact_qpos_transit_active"])
+        self.assertEqual(record["exact_qpos_transit_operation_id"], "operation-1")
+        self.assertEqual(record["force_norm_n"], 10.0)
+        self.assertEqual(record["command_joint_deg"], target_joint)
+        self.assertEqual(record["applied_offset"], [0.0] * 6)
+        self.assertEqual(record["offset"], [0.0] * 6)
+        self.assertEqual(
+            record["ik_metadata"]["direct_joint_hint_reason"],
+            "exact_qpos_transit",
+        )
+        self.assertTrue(controller.end_exact_qpos_transit("operation-1"))
+        self.assertFalse(controller.exact_qpos_transit_active)
+
+    def test_exact_qpos_transit_does_not_bypass_force_hard_stop(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            force_sequence=[[0.0] * 6, [60.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                force_deadband_n=0.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                joint_rate_limiter_enabled=False,
+                ik_resolver_enabled=False,
+                hard_stop_force_n=50.0,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller.begin_exact_qpos_transit("operation-2")
+        with self.assertRaisesRegex(RuntimeError, "hard_stop_force_n"):
+            controller.step(current_pose, target_joint_deg=current_joint)
 
     def test_pose_controller_rate_limits_anomalous_prelimited_joint_hint(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
@@ -1936,12 +2116,49 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertEqual(record["joint_velocity_limit_profile"], "rm65")
         self.assertTrue(np.allclose(record["command_joint_deg"], [0.0, 0.0, 20.0, 2.625, 0.0, 0.0], atol=1e-2))
         self.assertAlmostEqual(record["command_joint_step_deg"], 2.625, places=2)
+        self.assertAlmostEqual(record["allowed_command_joint_step_deg"], 3.0, places=2)
         self.assertAlmostEqual(record["joint_velocity_limit_observed_dt_sec"], 0.2, places=2)
         self.assertAlmostEqual(record["joint_velocity_limit_effective_dt_sec"], 0.025, places=3)
         self.assertEqual(record["joint_velocity_limit_max_dt_sec"], 0.025)
         self.assertEqual(record["joint_velocity_limit_dt_policy"], "nominal_control_period")
         self.assertEqual(record["joint_safety"]["status_text"], "position_limit=ok self_collision=ok")
         self.assertTrue(np.allclose(robot.movej_calls[-1], [0.0, 0.0, 20.0, 2.625, 0.0, 0.0], atol=1e-2))
+
+    def test_pose_controller_absolute_step_cap_is_final_upper_bound(self) -> None:
+        current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
+        current_pose = [0.0, 0.0, 0.35, 0.0, 0.0, 0.0]
+        target_pose = [0.04, 0.0, 0.35, 0.0, 0.0, 0.0]
+        robot = _FakeRobot(
+            tool_name="DMTAC_L",
+            tool_pose=[0.0] * 6,
+            current_joint=current_joint,
+            current_pose=current_pose,
+            model_fk_pose=current_pose,
+            ik_success_pose=target_pose,
+            ik_success_joint=[0.0, 0.0, 20.0, 30.0, 0.0, 0.0],
+            ik_retry_pose=current_pose,
+        )
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(
+                tool_name="DMTAC_L",
+                tare_sec=0.0,
+                lowpass_alpha=1.0,
+                max_command_joint_step_deg=1.0,
+                max_command_joint_velocity_deg_s=1000.0,
+                ik_resolver_enabled=False,
+            ),
+            robot=robot,
+        )
+
+        controller.start()
+        controller._last_step_time = time.perf_counter() - 0.2
+        record = controller.step(target_pose)
+
+        self.assertAlmostEqual(record["allowed_command_joint_step_deg"], 1.0, places=6)
+        self.assertAlmostEqual(record["command_joint_step_deg"], 1.0, places=6)
+        self.assertTrue(record["final_command_step_guard_applied"])
+        np.testing.assert_allclose(robot.movej_calls[-1], [0.0, 0.0, 20.0, 1.0, 0.0, 0.0])
 
     def test_pose_controller_step_policy_holds_when_prelimited_hint_cannot_be_bounded(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]
@@ -2048,6 +2265,7 @@ class RM65ImpedanceTest(unittest.TestCase):
                 joint_rate_limiter_enabled=False,
                 ik_resolver_include_pinocchio=False,
                 ik_resolver_candidate_provider_names=["rm65_sdk"],
+                ik_hard_deadline_enabled=False,
             ),
             robot=robot,
         )
@@ -2509,6 +2727,68 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertEqual(sequence, 3)
         self.assertAlmostEqual(alpha, 0.375, places=6)
         np.testing.assert_allclose(joint, [5.625, 0.0, 20.0, 0.0, 0.0, 0.0], atol=1e-9)
+
+    def test_canfd_follow_stop_retains_and_faults_live_worker(self) -> None:
+        class StuckThread:
+            def __init__(self) -> None:
+                self.join_timeouts: list[float | None] = []
+
+            def is_alive(self) -> bool:
+                return True
+
+            def join(self, timeout: float | None = None) -> None:
+                self.join_timeouts.append(timeout)
+
+        controller = RM65PoseImpedanceController(
+            arm="right",
+            config=RM65ImpedanceConfig(tool_name="DMTAC_L"),
+            robot=None,
+        )
+        worker = StuckThread()
+        controller._follow_stream_thread = worker
+
+        with self.assertRaisesRegex(RuntimeError, "did not stop within 1.000s"):
+            controller._stop_follow_stream()
+
+        self.assertIs(controller._follow_stream_thread, worker)
+        self.assertTrue(controller.follow_stream_worker_alive())
+        self.assertEqual(worker.join_timeouts, [1.0])
+        self.assertIn("did not stop", str(controller._follow_stream_fault))
+
+    def test_backend_close_refuses_socket_close_with_live_follow_worker(self) -> None:
+        class LiveWorkerController:
+            def stop_motion(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+            def follow_stream_worker_alive(self) -> bool:
+                return True
+
+        class RecordingArm:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def Arm_Socket_Close(self) -> None:
+                self.close_count += 1
+
+        backend = RM65ImpedanceArmBackend(
+            RM65ImpedanceArmBackendConfig(
+                arm_ip="127.0.0.1",
+                side="right",
+                connect_hardware=False,
+            )
+        )
+        arm = RecordingArm()
+        backend._controller = LiveWorkerController()
+        backend.arm = arm
+
+        with self.assertRaisesRegex(RuntimeError, "refuses to close the RM65 socket"):
+            backend.close()
+
+        self.assertEqual(arm.close_count, 0)
+        self.assertIs(backend.arm, arm)
 
     def test_pose_controller_records_offset_command_realization_metrics(self) -> None:
         current_joint = [0.0, 0.0, 20.0, 0.0, 0.0, 0.0]

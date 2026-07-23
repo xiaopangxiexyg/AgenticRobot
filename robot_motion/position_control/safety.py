@@ -26,6 +26,7 @@ class PositionKeyframeSafetyConfig:
 
     workspace_min: tuple[float, float, float] = (-0.60, -0.80, 0.00)
     workspace_max: tuple[float, float, float] = (0.60, 0.80, 0.90)
+    workspace_enabled: bool = True
     workspace_soft_margin_m: float = 0.05
     max_translation_step_m: float = 0.10
     max_rotation_step_deg: float = 15.0
@@ -40,6 +41,7 @@ class PositionKeyframeSafetyConfig:
             raise ValueError("workspace bounds must be finite")
         if np.any(lower_xyz > upper_xyz):
             raise ValueError("workspace_min must not exceed workspace_max")
+        object.__setattr__(self, "workspace_enabled", bool(self.workspace_enabled))
         for name in (
             "workspace_soft_margin_m",
             "max_translation_step_m",
@@ -121,23 +123,46 @@ def limit_pose_keyframes(
         if reference is not None:
             raw_translation_step = float(np.linalg.norm(target[:3] - reference[:3]))
 
-        translation = constrain_translation_l2(
-            target[:3],
-            reference=(reference[:3] if reference is not None else None),
-            workspace_lower=workspace_min,
-            workspace_upper=workspace_max,
-            workspace_soft_margin_m=float(config.workspace_soft_margin_m),
-            max_step_m=float(config.max_translation_step_m),
-        )
-        if translation.workspace_limited:
-            side_reasons.append("workspace_soft_limit")
-        if translation.step_limited:
-            side_reasons.append("translation_step_limit")
         side_faults: list[str] = []
-        if translation.infeasible or translation.value is None:
-            side_faults.append("translation_constraint_infeasible")
+        target_workspace_distance_m: float | None
+        reference_workspace_distance_m: float | None
+        if config.workspace_enabled:
+            translation = constrain_translation_l2(
+                target[:3],
+                reference=(reference[:3] if reference is not None else None),
+                workspace_lower=workspace_min,
+                workspace_upper=workspace_max,
+                workspace_soft_margin_m=float(config.workspace_soft_margin_m),
+                max_step_m=float(config.max_translation_step_m),
+            )
+            if translation.workspace_limited:
+                side_reasons.append("workspace_soft_limit")
+            if translation.step_limited:
+                side_reasons.append("translation_step_limit")
+            if translation.infeasible or translation.value is None:
+                side_faults.append("translation_constraint_infeasible")
+            else:
+                target[:3] = np.asarray(translation.value, dtype=float)
+            target_workspace_distance_m = float(
+                translation.target_workspace_distance_m
+            )
+            reference_workspace_distance_m = (
+                None
+                if translation.reference_workspace_distance_m is None
+                else float(translation.reference_workspace_distance_m)
+            )
         else:
-            target[:3] = np.asarray(translation.value, dtype=float)
+            target_workspace_distance_m = None
+            reference_workspace_distance_m = None
+            if reference is not None:
+                delta = target[:3] - reference[:3]
+                delta_norm = float(np.linalg.norm(delta))
+                max_step = float(config.max_translation_step_m)
+                if max_step > 0.0 and delta_norm > max_step:
+                    target[:3] = reference[:3] + delta * (
+                        max_step / max(delta_norm, 1e-12)
+                    )
+                    side_reasons.append("translation_step_limit")
         if reference is not None:
             applied_translation_step = float(np.linalg.norm(target[:3] - reference[:3]))
 
@@ -163,12 +188,9 @@ def limit_pose_keyframes(
         metadata[side] = {
             "raw_translation_step_m": raw_translation_step,
             "applied_translation_step_m": applied_translation_step,
-            "target_workspace_distance_m": float(translation.target_workspace_distance_m),
-            "reference_workspace_distance_m": (
-                None
-                if translation.reference_workspace_distance_m is None
-                else float(translation.reference_workspace_distance_m)
-            ),
+            "workspace_enabled": bool(config.workspace_enabled),
+            "target_workspace_distance_m": target_workspace_distance_m,
+            "reference_workspace_distance_m": reference_workspace_distance_m,
             "workspace_soft_margin_m": float(config.workspace_soft_margin_m),
             "raw_rotation_step_deg": raw_rotation_step_deg,
             "applied_rotation_step_deg": applied_rotation_step_deg,

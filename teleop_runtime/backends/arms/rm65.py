@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import math
 import threading
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import time
@@ -56,6 +56,10 @@ from robot_motion.position_control.execution_policy import (
     classify_position_trajectory_policy as _position_trajectory_policy,
     final_follow_qpos_target as _final_follow_qpos_target,
 )
+from robot_motion.position_control.contracts import (
+    POSITION_QREF_FINGERPRINT_SCHEMA,
+    position_qref_fingerprint,
+)
 from robot_motion.position_control.trajectory import (
     AccelerationLimitedJointTrajectoryPlanner,
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -68,11 +72,26 @@ from robot_motion.position_control.trajectory import (
     normalize_position_command_planner,
 )
 from robot_motion.runtime.dispatch import BackendDispatchError, CommandDispatchReceipt
+from robot_motion.runtime import (
+    ExecutionCancellation,
+    ExecutionCancellationParticipantSpec,
+    ExecutionEpochGuard,
+    ExecutionWorkItem,
+    WorkerEpochDrainReceipt,
+)
 
 from ...interfaces import EffectorBackend
 from ...registry import register_backend
 from ...schemas import EffectorCommand
 from ...defaults import DEFAULT_RM65_POSITION_ARM_CONTROL_HZ
+from .rm65_dispatch_call import (
+    RM65JointTargetDispatchContext,
+    RM65PreSdkDispatchAdapter,
+)
+from .rm65_control_dispatch_call import (
+    RM65ControlDispatchContext,
+    RM65PreSdkControlAdapter,
+)
 
 
 RM65_IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
@@ -86,6 +105,7 @@ _SINGULARITY_QPOS_INIT_SLOW_SOURCES = frozenset(
         "replay_qpos_init",
         "replay_qpos_init_final_hold",
         "deploy_fixed_init_qpos",
+        "gui_init_qpos_plan",
     }
 )
 _SINGULARITY_LABELS = {
@@ -113,6 +133,31 @@ _RM65_LOCAL_QPOS_OBSERVATION_TOLERANCE_RAD = float(np.deg2rad(0.01))
 _BACKGROUND_AUDIT_STATS_MAX_SAMPLES = 20_000
 _BACKGROUND_AUDIT_SNAPSHOT_CACHE_SEC = 1.0
 _BACKGROUND_WORKER_TERMINAL_STAGE = "rm65_background_stream_worker_terminal"
+
+
+def _derive_backend_execution_work_item(
+    upstream: ExecutionWorkItem | None,
+    *,
+    side: str,
+    target_sequence: int | None,
+) -> ExecutionWorkItem | None:
+    if upstream is None:
+        return None
+    sequence_label = "direct" if target_sequence is None else str(int(target_sequence))
+    return ExecutionWorkItem(
+        work_item_id=(
+            f"{upstream.work_item_id}:rm65:{str(side)}:target:{sequence_label}"
+        ),
+        work_kind="backend_command",
+        control_domain_id=upstream.control_domain_id,
+        authority_epoch=upstream.authority_epoch,
+        execution_epoch=upstream.execution_epoch,
+        segment_generation_by_group=dict(upstream.segment_generation_by_group),
+        source_decision_id=upstream.source_decision_id,
+        source_reference_segment_id=upstream.source_reference_segment_id,
+    )
+
+
 def _metadata_mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
@@ -341,6 +386,10 @@ class RM65ArmBackendConfig:
     default_tcp_frame: str = TOOL_TCP_FRAME
     arm_urdf_path: str | Path | None = None
     connect_hardware: bool = True
+    # Deployment-only live observation shadow.  This is intentionally opt-in
+    # and leaves teleop/replay/default dry-run semantics unchanged.  When set,
+    # startup may read feedback but must not configure, stream, stop, or send
+    # any RM65 motion command.
     control_dt: float = 0.02
     max_angvel: tuple[float, ...] = (0.35, 0.35, 0.35, 0.5, 0.5, 0.5)
     dry_run_fast: bool = True
@@ -393,8 +442,16 @@ class RM65ArmBackendConfig:
     allow_position_wrist_singularity_fallback: bool = False
     # Position-teleop-only opt-in.  The backend still requires an upstream
     # candidate-selection certificate that no fully non-singular feasible
-    # candidate was found.  Shoulder singularity is never included.
+    # candidate was found.
     allow_position_elbow_singularity_fallback: bool = False
+    # Position-only shoulder counterpart.  This must be enabled explicitly and
+    # is ignored unless the upstream candidate selector certifies that it
+    # evaluated the shoulder state and found no clean feasible alternative.
+    allow_position_shoulder_singularity_fallback: bool = False
+    # Position-only certificate hardening.  When enabled, a singular fallback
+    # must be bound to the exact final qref emitted by the coupled selector.
+    # False preserves direct/replay compatibility and the previous gate.
+    require_position_singularity_candidate_certificate: bool = False
     configure_singularity_thresholds: bool = True
     singularity_elbow_threshold_deg: float = 3.0
     singularity_wrist_threshold_deg: float = 3.0
@@ -406,10 +463,22 @@ class RM65ArmBackendConfig:
     ik_framework: str = RM65_IK_FRAMEWORK_ROBOT_MOTION
     builtin_empty_tool_frame: bool = field(default=False, init=False, repr=False)
     position_endpoint_profile: bool = field(default=False, init=False, repr=False)
+    # Deployment-only live observation shadow.  Kept at the end of the public
+    # init fields so legacy positional construction keeps its old meaning.
+    observation_only: bool = False
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
             self.effector_name = f"{self.side}_arm"
+        if bool(self.observation_only):
+            # These are safety-side effects, not observation prerequisites.
+            # Normalize them at the config boundary so an accidental caller
+            # cannot re-enable them after the deploy profile has been chosen.
+            self.background_streaming_enabled = False
+            self.force_position_control = False
+            self.force_clear_on_start = False
+            self.configure_singularity_thresholds = False
+            self.canfd_follow = False
         self.default_tcp_frame = canonical_arm_controlled_frame(self.default_tcp_frame)
         if len(self.max_angvel) != 6:
             raise ValueError("max_angvel must contain 6 joint velocity limits.")
@@ -570,8 +639,111 @@ class RM65ArmBackendConfig:
 
 @register_backend("rm65_arm")
 class RM65ArmBackend(EffectorBackend):
-    def __init__(self, config: RM65ArmBackendConfig):
+    def __init__(
+        self,
+        config: RM65ArmBackendConfig,
+        *,
+        pre_sdk_dispatch_adapter: RM65PreSdkDispatchAdapter | None = None,
+        pre_sdk_control_adapter: RM65PreSdkControlAdapter | None = None,
+        execution_epoch_guard: ExecutionEpochGuard | None = None,
+        worker_drain_participant: ExecutionCancellationParticipantSpec | None = None,
+        hardware_idle_worker_preflight_binding: object | None = None,
+    ):
         self.config = config
+        self._hardware_idle_worker_preflight_binding_id: str | None = None
+        if hardware_idle_worker_preflight_binding is not None:
+            from .rm65_idle_worker_preflight_binding import (
+                RM65IdleWorkerBackendBinding,
+            )
+
+            if not isinstance(
+                hardware_idle_worker_preflight_binding,
+                RM65IdleWorkerBackendBinding,
+            ):
+                raise TypeError(
+                    "hardware_idle_worker_preflight_binding has an unsupported type"
+                )
+            if any(
+                value is not None
+                for value in (
+                    pre_sdk_dispatch_adapter,
+                    pre_sdk_control_adapter,
+                    execution_epoch_guard,
+                    worker_drain_participant,
+                )
+            ):
+                raise ValueError(
+                    "The isolated hardware idle-worker binding owns all adapters "
+                    "and epoch/drain inputs; explicit duplicates are forbidden."
+                )
+            hardware_idle_worker_preflight_binding.validate_config(
+                side=config.side,
+                connect_hardware=config.connect_hardware,
+                background_streaming_enabled=config.background_streaming_enabled,
+                force_position_control=config.force_position_control,
+                configure_singularity_thresholds=(
+                    config.configure_singularity_thresholds
+                ),
+                initial_qpos=config.initial_qpos,
+                now=time.monotonic(),
+            )
+            pre_sdk_dispatch_adapter = (
+                hardware_idle_worker_preflight_binding.pre_sdk_dispatch_adapter
+            )
+            pre_sdk_control_adapter = (
+                hardware_idle_worker_preflight_binding.pre_sdk_control_adapter
+            )
+            execution_epoch_guard = (
+                hardware_idle_worker_preflight_binding.execution_epoch_guard
+            )
+            worker_drain_participant = (
+                hardware_idle_worker_preflight_binding.worker_drain_participant
+            )
+            self._hardware_idle_worker_preflight_binding_id = (
+                hardware_idle_worker_preflight_binding.binding_id
+            )
+        if pre_sdk_dispatch_adapter is not None and not callable(
+            getattr(pre_sdk_dispatch_adapter, "invoke", None)
+        ):
+            raise TypeError("pre_sdk_dispatch_adapter must provide invoke().")
+        # Default-off M5.8-a seam.  No production composition currently binds
+        # this adapter, so the legacy path remains the sole real motion owner.
+        self._pre_sdk_dispatch_adapter = pre_sdk_dispatch_adapter
+        if pre_sdk_control_adapter is not None and not callable(
+            getattr(pre_sdk_control_adapter, "invoke", None)
+        ):
+            raise TypeError("pre_sdk_control_adapter must provide invoke().")
+        self._pre_sdk_control_adapter = pre_sdk_control_adapter
+        if (execution_epoch_guard is None) != (worker_drain_participant is None):
+            raise ValueError(
+                "execution_epoch_guard and worker_drain_participant must be configured together"
+            )
+        if execution_epoch_guard is not None and not isinstance(
+            execution_epoch_guard,
+            ExecutionEpochGuard,
+        ):
+            raise TypeError("execution_epoch_guard must be an ExecutionEpochGuard")
+        if worker_drain_participant is not None:
+            if not isinstance(
+                worker_drain_participant,
+                ExecutionCancellationParticipantSpec,
+            ):
+                raise TypeError(
+                    "worker_drain_participant must be an ExecutionCancellationParticipantSpec"
+                )
+            if worker_drain_participant.worker_kind != "backend_stream_worker":
+                raise ValueError("RM65 drain participant must be a backend_stream_worker")
+        if (
+            config.connect_hardware
+            and execution_epoch_guard is not None
+            and hardware_idle_worker_preflight_binding is None
+        ):
+            raise RuntimeError(
+                "default-off RM65 epoch/drain binding is fake-only until the "
+                "production owner/quick-stop/trace preflight is complete"
+            )
+        self._execution_epoch_guard = execution_epoch_guard
+        self._worker_drain_participant = worker_drain_participant
         self.arm = None
         self._solvers: dict[str, object] = {}
         self._current_qpos = (
@@ -637,6 +809,7 @@ class RM65ArmBackend(EffectorBackend):
         self._prepared_effective_step_time: float | None = None
         self._state_lock = threading.RLock()
         self._send_lock = threading.RLock()
+        self._singularity_analysis_lock = threading.RLock()
         self._emergency_stopped = False
         self._stream_target_qpos: np.ndarray | None = None
         self._stream_target_source = ""
@@ -648,6 +821,12 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_segment_duration_sec = self._base_control_dt
         self._stream_reference_epoch: int | None = None
         self._stream_reference_sequence: int | None = None
+        self._stream_execution_work_item: ExecutionWorkItem | None = None
+        self._execution_inflight_work_item: ExecutionWorkItem | None = None
+        self._last_completed_execution_work_item: ExecutionWorkItem | None = None
+        self._last_old_epoch_invocation_started_at: float | None = None
+        self._last_old_epoch_invocation_completed_at: float | None = None
+        self._execution_epoch_rejected_count = 0
         self._stream_planner_mode = normalize_position_command_planner(
             config.position_command_planner
         )
@@ -758,6 +937,13 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_timing_snapshot_cache: dict[str, dict[str, int | float | None]] = {}
         self._stream_timing_snapshot_cache_monotonic = 0.0
         self._position_audit_sink: PositionAuditSink | None = None
+        self._actuator_command_trace_sink: Callable[..., object] | None = None
+        self._actuator_command_trace_error_count = 0
+        self._last_actuator_command_trace_error: str | None = None
+        self._singularity_transition_trace_sink: Callable[..., object] | None = None
+        self._singularity_transition_trace_error_count = 0
+        self._last_singularity_transition_trace_error: str | None = None
+        self._last_singularity_transition_trace_key: tuple[object, ...] | None = None
         self._position_audit_urdf_root_from_base: np.ndarray | None = None
         self._position_audit_error_count = 0
         self._last_position_audit_error: str | None = None
@@ -824,6 +1010,137 @@ class RM65ArmBackend(EffectorBackend):
             raise TypeError("Position audit sink must be callable or None.")
         with self._state_lock:
             self._position_audit_sink = sink
+
+    def set_actuator_command_trace_sink(
+        self,
+        sink: Callable[..., object] | None,
+    ) -> None:
+        """Attach the fixed-field, post-SDK actuator-identification trace sink."""
+        if sink is not None and not callable(sink):
+            raise TypeError("Actuator command trace sink must be callable or None.")
+        # Attachment happens before the worker starts and detachment happens
+        # before shutdown.  The worker-side attribute read stays lock-free so
+        # enabling this diagnostic does not add another hot-path lock.
+        with self._state_lock:
+            self._actuator_command_trace_sink = sink
+
+    def set_singularity_transition_trace_sink(
+        self,
+        sink: Callable[..., object] | None,
+    ) -> None:
+        """Attach a sparse, memory-only position singularity trace sink."""
+
+        if sink is not None and not callable(sink):
+            raise TypeError("Singularity transition trace sink must be callable or None.")
+        with self._state_lock:
+            self._singularity_transition_trace_sink = sink
+            self._last_singularity_transition_trace_key = None
+
+    def _emit_singularity_transition_trace(
+        self,
+        *,
+        target_sequence: int,
+        monotonic_time: float,
+        qref: np.ndarray,
+        reference_qpos: np.ndarray,
+        command_metadata: Mapping[str, object],
+    ) -> None:
+        sink = self._singularity_transition_trace_sink
+        if sink is None:
+            return
+        singularity = _metadata_mapping(command_metadata.get("singularity_metadata"))
+        certificate_validation = _metadata_mapping(
+            singularity.get("position_candidate_certificate_validation")
+        )
+        gate = str(singularity.get("singularity_gate_status") or "")
+        target_code = singularity.get("target_singularity_code")
+        current_code = singularity.get("current_singularity_code")
+        fallback_requested = bool(
+            singularity.get("position_wrist_singularity_fallback_requested", False)
+            or singularity.get("position_elbow_singularity_fallback_requested", False)
+            or singularity.get("position_shoulder_singularity_fallback_requested", False)
+        )
+        fallback_allowed = bool(
+            singularity.get("position_singularity_fallback_allowed", False)
+        )
+        key = (
+            gate,
+            target_code,
+            current_code,
+            fallback_requested,
+            fallback_allowed,
+            certificate_validation.get("status"),
+        )
+        normal = bool(
+            gate in {"pass", "not_checked", "disabled"}
+            and target_code in {0, None}
+            and current_code in {0, None}
+            and not fallback_requested
+            and not fallback_allowed
+        )
+        if normal and key == self._last_singularity_transition_trace_key:
+            return
+        self._last_singularity_transition_trace_key = key
+        try:
+            sink(
+                self.config.side,
+                int(target_sequence),
+                float(monotonic_time),
+                singularity,
+                np.asarray(qref, dtype=float).reshape(6),
+                np.asarray(reference_qpos, dtype=float).reshape(6),
+            )
+        except Exception as exc:  # noqa: BLE001 - tracing must never stop control.
+            self._singularity_transition_trace_error_count += 1
+            self._last_singularity_transition_trace_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _emit_actuator_command_trace(
+        self,
+        side: str,
+        tick_sequence: int,
+        target_sequence: int | None,
+        reference_epoch: int | None,
+        reference_sequence: int | None,
+        scheduled_monotonic_time: float,
+        wakeup_monotonic_time: float,
+        sdk_attempt_sequence: int | None,
+        sdk_attempt_wall_time: float | None,
+        sdk_attempt_monotonic_time: float | None,
+        sdk_result_monotonic_time: float | None,
+        q_cmd: np.ndarray,
+        sdk_result_code: int | None,
+        sdk_accepted: bool | None,
+        sdk_accepted_sequence: int | None,
+    ) -> None:
+        sink = self._actuator_command_trace_sink
+        if sink is None:
+            return
+        try:
+            sink(
+                side,
+                tick_sequence,
+                target_sequence,
+                reference_epoch,
+                reference_sequence,
+                scheduled_monotonic_time,
+                wakeup_monotonic_time,
+                sdk_attempt_sequence,
+                sdk_attempt_wall_time,
+                sdk_attempt_monotonic_time,
+                sdk_result_monotonic_time,
+                q_cmd,
+                sdk_result_code,
+                sdk_accepted,
+                sdk_accepted_sequence,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never stop control.
+            with self._state_lock:
+                self._actuator_command_trace_error_count += 1
+                self._last_actuator_command_trace_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     def set_position_audit_urdf_root_from_base(
         self,
@@ -956,6 +1273,7 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_segment_start_time = None
         self._stream_reference_epoch = None
         self._stream_reference_sequence = None
+        self._stream_execution_work_item = None
         # Invalidate a target already copied by the worker before it can enter
         # the SDK call.  This is what makes hold/close a hard send boundary.
         self._stream_target_sequence += 1
@@ -1085,7 +1403,15 @@ class RM65ArmBackend(EffectorBackend):
                     if not callable(method):
                         continue
                     try:
-                        raw_result = method()
+                        raw_result = self._invoke_pre_sdk_control(
+                            seam_id="rm65.safety.background_fault.stop_fallback_loop",
+                            permit_kind="safety_control",
+                            operation="stop",
+                            source="background_stream_fault",
+                            sdk_method=method_name,
+                            attempt_sequence=len(attempts) + 1,
+                            backend_call=method,
+                        )
                         result_code, result_text = _parse_rm65_result(raw_result)
                         attempts.append(
                             {
@@ -1202,6 +1528,21 @@ class RM65ArmBackend(EffectorBackend):
         }
         return normalized.copy(), metadata
 
+    def normalize_local_qpos_observation(
+        self,
+        qpos: object,
+        *,
+        label: str = "local qpos",
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        """Return a command-safe anchor for a hardware-observed qpos.
+
+        This is deliberately an observation-only normalization API.  It
+        permits only the tiny SDK degree/radian quantization tolerance used by
+        ``set_local_qpos`` and never changes the strict final transport gate.
+        """
+
+        return self._normalize_local_qpos_observation(qpos, label=label)
+
     def start(self) -> None:
         if not self.config.connect_hardware:
             return
@@ -1218,8 +1559,9 @@ class RM65ArmBackend(EffectorBackend):
         self.arm = Arm(RM65, self.config.arm_ip)
         try:
             self._auto_load_active_tool_profile()
-            self._configure_singularity_protection()
-            if self.config.force_position_control:
+            if not self.config.observation_only:
+                self._configure_singularity_protection()
+            if self.config.force_position_control and not self.config.observation_only:
                 self._start_force_position_control()
             state = self.refresh_state_from_hardware()
             trusted_hardware_qpos = (
@@ -1296,7 +1638,14 @@ class RM65ArmBackend(EffectorBackend):
             stop_force = getattr(arm, "Stop_Force_Position_Move", None)
             if callable(stop_force):
                 try:
-                    stop_force(True)
+                    self._invoke_pre_sdk_control(
+                        seam_id="rm65.cleanup.startup_rollback.force_stop",
+                        permit_kind="safety_control",
+                        operation="stop",
+                        source="startup_rollback",
+                        sdk_method="Stop_Force_Position_Move",
+                        backend_call=lambda: stop_force(True),
+                    )
                 except Exception:
                     pass
             self._force_position_active = False
@@ -1323,6 +1672,11 @@ class RM65ArmBackend(EffectorBackend):
             return bool(self.arm is not None and self._hardware_ready)
 
     def hold_motion(self, reason: str = "manual hold") -> None:
+        if self.config.observation_only:
+            with self._state_lock:
+                self._last_send_result_code = 0
+                self._last_send_result_text = f"observation_only_hold:{reason}"
+            return
         quick_stop_queued = False
         with self._send_lock:
             with self._state_lock:
@@ -1376,7 +1730,14 @@ class RM65ArmBackend(EffectorBackend):
                     self._last_send_result_code = 0
                     self._last_send_result_text = "hold_no_stop_method"
                 return
-            stop_result = stop_method()
+            stop_result = self._invoke_pre_sdk_control(
+                seam_id="rm65.safety.hold.direct_stop",
+                permit_kind="safety_control",
+                operation="hold",
+                source=f"manual_hold:{reason}",
+                sdk_method=stop_label,
+                backend_call=stop_method,
+            )
             stop_code, stop_text = _parse_rm65_result(stop_result)
             with self._state_lock:
                 self._last_send_result_code = stop_code
@@ -1401,6 +1762,16 @@ class RM65ArmBackend(EffectorBackend):
         """
 
         normalized_reason = str(reason).strip() or "manual interaction"
+        if self.config.observation_only:
+            with self._state_lock:
+                self._clear_stream_target_locked()
+                self._last_target_qpos = None
+                self._last_target_pose = None
+                self._last_send_result_code = 0
+                self._last_send_result_text = (
+                    f"observation_only_disengaged:{normalized_reason}"
+                )
+            return
         with self._send_lock:
             with self._state_lock:
                 self._clear_stream_target_locked()
@@ -1422,7 +1793,14 @@ class RM65ArmBackend(EffectorBackend):
                     f"{self.name} RM65 SDK exposes no stop method while disengaging "
                     "the position command stream"
                 )
-            stop_result = stop_method()
+            stop_result = self._invoke_pre_sdk_control(
+                seam_id="rm65.safety.position_stream_disengage.stop",
+                permit_kind="safety_control",
+                operation="disable_motion",
+                source=f"position_stream_disengage:{normalized_reason}",
+                sdk_method=stop_label,
+                backend_call=stop_method,
+            )
             stop_code, stop_text = _parse_rm65_result(stop_result)
             with self._state_lock:
                 self._last_send_result_code = stop_code
@@ -1482,12 +1860,24 @@ class RM65ArmBackend(EffectorBackend):
                 self._jump_hold_frames = 0
 
     def _configure_singularity_protection(self) -> None:
+        if self.config.observation_only:
+            return
+        with self._singularity_analysis_lock:
+            self._configure_singularity_protection_unlocked()
+
+    def _configure_singularity_protection_unlocked(self) -> None:
         if self._singularity_config_attempted:
             return
-        self._singularity_config_attempted = True
         self._singularity_protection_ready = False
-        if not self.config.singularity_protection_enabled or self.arm is None:
+        if not self.config.singularity_protection_enabled:
+            self._singularity_config_attempted = True
             return
+        # ``arm is None`` is a transient pre-start state.  Candidate analysis
+        # may be wired before the backend connects, so do not permanently burn
+        # the one configuration attempt here.
+        if self.arm is None:
+            return
+        self._singularity_config_attempted = True
         analyzer = getattr(self.arm, "Algo_Kin_Singularity_Analyse", None)
         if analyzer is None:
             print(f"WARNING: {self.name} RM65 SDK does not expose singularity analysis; backend gate disabled.")
@@ -1531,16 +1921,23 @@ class RM65ArmBackend(EffectorBackend):
             print(f"WARNING: {self.name} failed to read singularity thresholds after setting: {exc}")
 
     def _analyze_singularity(self, qpos_rad: Sequence[float] | np.ndarray) -> dict[str, object]:
-        if self.arm is None:
-            return {"status_code": None, "label": "unavailable", "reason": "no_arm"}
-        analyzer = getattr(self.arm, "Algo_Kin_Singularity_Analyse", None)
-        if analyzer is None:
-            return {"status_code": None, "label": "unavailable", "reason": "missing_sdk_method"}
-        joint_deg = (np.asarray(qpos_rad, dtype=float).reshape(6) / np.pi * 180.0).tolist()
-        try:
-            result = analyzer(joint_deg)
-        except Exception as exc:  # noqa: BLE001 - protection should fail open for teleop.
-            return {"status_code": None, "label": "unavailable", "reason": str(exc)}
+        with self._singularity_analysis_lock:
+            if self.arm is None:
+                return {"status_code": None, "label": "unavailable", "reason": "no_arm"}
+            analyzer = getattr(self.arm, "Algo_Kin_Singularity_Analyse", None)
+            if analyzer is None:
+                return {
+                    "status_code": None,
+                    "label": "unavailable",
+                    "reason": "missing_sdk_method",
+                }
+            joint_deg = (
+                np.asarray(qpos_rad, dtype=float).reshape(6) / np.pi * 180.0
+            ).tolist()
+            try:
+                result = analyzer(joint_deg)
+            except Exception as exc:  # noqa: BLE001 - protection should fail open for teleop.
+                return {"status_code": None, "label": "unavailable", "reason": str(exc)}
         if not isinstance(result, tuple) or len(result) < 2:
             return {
                 "status_code": None,
@@ -1565,6 +1962,21 @@ class RM65ArmBackend(EffectorBackend):
         except (TypeError, ValueError):
             metadata["wrist_center_distance_m"] = str(distance)
         return metadata
+
+    def analyze_position_singularity_candidate(
+        self,
+        qpos_rad: Sequence[float] | np.ndarray,
+    ) -> dict[str, object]:
+        """Read-only SDK classification for the shared position candidate selector."""
+
+        self._configure_singularity_protection()
+        if not self._singularity_protection_ready:
+            return {
+                "status_code": None,
+                "label": "unavailable",
+                "reason": "singularity_protection_unavailable",
+            }
+        return self._analyze_singularity(qpos_rad)
 
     def prepare_replay_singularity_target(
         self,
@@ -1640,6 +2052,76 @@ class RM65ArmBackend(EffectorBackend):
         with self._state_lock:
             self._last_singularity_metadata = dict(metadata)
 
+    def _position_candidate_certificate_validation(
+        self,
+        qpos_target: np.ndarray,
+        candidate_selection: Mapping[str, object],
+    ) -> dict[str, object]:
+        certificate = _metadata_mapping(
+            candidate_selection.get("candidate_certificate")
+        )
+        if not certificate:
+            return {
+                "status": "missing",
+                "valid": False,
+                "required": bool(
+                    self.config.require_position_singularity_candidate_certificate
+                ),
+            }
+        schema = str(certificate.get("schema") or "")
+        fingerprint_schema = str(
+            certificate.get("qref_fingerprint_schema") or ""
+        )
+        raw_sequence = certificate.get("sequence")
+        fingerprints = _metadata_mapping(
+            certificate.get("qref_fingerprint_by_side")
+        )
+        expected = str(fingerprints.get(self.config.side) or "")
+        try:
+            sequence = int(raw_sequence)
+            sequence_valid = not isinstance(raw_sequence, bool) and sequence >= 0
+        except (TypeError, ValueError):
+            sequence = -1
+            sequence_valid = False
+        actual = position_qref_fingerprint(qpos_target)
+        valid = bool(
+            schema == "robot_motion.rm65.position_candidate_certificate/v1"
+            and fingerprint_schema == POSITION_QREF_FINGERPRINT_SCHEMA
+            and sequence_valid
+            and expected
+            and expected == actual
+        )
+        if valid:
+            status = "matched"
+        elif schema != "robot_motion.rm65.position_candidate_certificate/v1":
+            status = "schema_mismatch"
+        elif fingerprint_schema != POSITION_QREF_FINGERPRINT_SCHEMA:
+            status = "fingerprint_schema_mismatch"
+        elif not sequence_valid:
+            status = "invalid_sequence"
+        elif not expected:
+            status = "side_fingerprint_missing"
+        else:
+            status = "qref_fingerprint_mismatch"
+        result: dict[str, object] = {
+            "status": status,
+            "valid": valid,
+            "required": bool(
+                self.config.require_position_singularity_candidate_certificate
+            ),
+            "sequence": sequence if sequence_valid else None,
+            "schema": schema,
+            "qref_fingerprint_schema": fingerprint_schema,
+            "expected_qref_fingerprint": expected or None,
+            "actual_qref_fingerprint": actual,
+            "singular_fallback_claimed": bool(
+                certificate.get("singular_fallback_claimed", False)
+            ),
+        }
+        if not valid or bool(certificate.get("singular_fallback_claimed", False)):
+            result["certificate"] = certificate
+        return result
+
     def _emit_singularity_warning(self, metadata: dict[str, object]) -> None:
         now = time.time()
         key = (
@@ -1672,7 +2154,9 @@ class RM65ArmBackend(EffectorBackend):
         allow_position_wrist_fallback: bool = False,
         position_wrist_fallback_metadata: Mapping[str, object] | None = None,
         allow_position_elbow_fallback: bool = False,
+        allow_position_shoulder_fallback: bool = False,
         position_singularity_fallback_metadata: Mapping[str, object] | None = None,
+        position_candidate_certificate_validation: Mapping[str, object] | None = None,
     ) -> np.ndarray:
         target = np.asarray(qpos_target, dtype=float).reshape(6)
         reference = np.asarray(reference_qpos, dtype=float).reshape(6)
@@ -1731,11 +2215,21 @@ class RM65ArmBackend(EffectorBackend):
             and allow_position_elbow_fallback
             and target_status.get("label") == "elbow_singularity"
         )
-        allow_position_fallback = bool(allow_wrist_fallback or allow_elbow_fallback)
+        allow_shoulder_fallback = bool(
+            entering_singularity
+            and self.config.allow_position_shoulder_singularity_fallback
+            and allow_position_shoulder_fallback
+            and target_status.get("label") == "shoulder_singularity"
+        )
+        allow_position_fallback = bool(
+            allow_wrist_fallback or allow_elbow_fallback or allow_shoulder_fallback
+        )
         if allow_wrist_fallback:
             gate_status = "allow_position_wrist_singular"
         elif allow_elbow_fallback:
             gate_status = "allow_position_elbow_singular"
+        elif allow_shoulder_fallback:
+            gate_status = "allow_position_shoulder_singular"
         slow_singularity_mode: str | None = None
         if (
             qpos_init_slow_source
@@ -1787,8 +2281,18 @@ class RM65ArmBackend(EffectorBackend):
                 allow_position_elbow_fallback
             ),
             "position_elbow_singularity_fallback_allowed": bool(allow_elbow_fallback),
+            "position_shoulder_singularity_fallback_requested": bool(
+                allow_position_shoulder_fallback
+            ),
+            "position_shoulder_singularity_fallback_allowed": bool(
+                allow_shoulder_fallback
+            ),
             "position_singularity_fallback_allowed": bool(allow_position_fallback),
         }
+        if position_candidate_certificate_validation is not None:
+            metadata["position_candidate_certificate_validation"] = dict(
+                position_candidate_certificate_validation
+            )
         if position_wrist_fallback_metadata is not None:
             metadata["position_wrist_singularity_fallback"] = dict(
                 position_wrist_fallback_metadata
@@ -1879,10 +2383,81 @@ class RM65ArmBackend(EffectorBackend):
         if command.command_type == "joint_vector":
             command.value = qpos.copy()
 
+    def drain_execution_cancellation(
+        self,
+        cancellation: ExecutionCancellation,
+    ) -> WorkerEpochDrainReceipt:
+        """Drain one bound RM65 background sender without issuing a stop.
+
+        The caller must first advance the shared execution epoch and must
+        drain the upstream reference worker before draining this backend.  The
+        send lock waits for an SDK call already in flight; clearing the target
+        under the state lock then prevents another old-epoch tick from being
+        formed.
+        """
+
+        if not isinstance(cancellation, ExecutionCancellation):
+            raise TypeError("cancellation must be an ExecutionCancellation")
+        guard = self._execution_epoch_guard
+        participant = self._worker_drain_participant
+        if guard is None or participant is None:
+            raise RuntimeError("RM65 execution drain is not configured")
+        snapshot = guard.registry.snapshot()
+        if (
+            snapshot.control_domain_id != cancellation.control_domain_id
+            or snapshot.execution_epoch != cancellation.execution_epoch
+        ):
+            raise RuntimeError(
+                "RM65 drain requires the cancellation execution epoch to be current"
+            )
+
+        discarded: tuple[str, ...] = ()
+        started_at: float | None = None
+        completed_at: float | None = None
+        with self._send_lock:
+            with self._state_lock:
+                if self._execution_inflight_work_item is not None:
+                    raise RuntimeError(
+                        "RM65 SDK invocation remained in flight while holding send lock"
+                    )
+                item = self._stream_execution_work_item
+                if (
+                    item is not None
+                    and item.execution_epoch
+                    == cancellation.previous_execution_epoch
+                ):
+                    discarded = (item.work_item_id,)
+                    self._clear_stream_target_locked()
+                completed_item = self._last_completed_execution_work_item
+                if (
+                    completed_item is not None
+                    and completed_item.execution_epoch
+                    == cancellation.previous_execution_epoch
+                ):
+                    started_at = self._last_old_epoch_invocation_started_at
+                    completed_at = self._last_old_epoch_invocation_completed_at
+
+        acknowledged_at = max(time.monotonic(), cancellation.effective_at)
+        return WorkerEpochDrainReceipt.evaluate(
+            cancellation=cancellation,
+            participant=participant,
+            observed_execution_epoch=snapshot.execution_epoch,
+            discarded_work_ids=discarded,
+            last_old_epoch_invocation_started_at=started_at,
+            last_old_epoch_invocation_completed_at=completed_at,
+            in_flight_old_epoch_count=0,
+            no_future_old_epoch_calls=True,
+            acknowledged_at=acknowledged_at,
+        )
+
     def send_command(self, command: EffectorCommand) -> CommandDispatchReceipt:
         if command.effector_name != self.name:
             raise ValueError(
                 f"{self.name} received command for effector '{command.effector_name}'."
+            )
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; refusing RM65 command dispatch."
             )
         with self._state_lock:
             if self._closed:
@@ -1905,6 +2480,29 @@ class RM65ArmBackend(EffectorBackend):
                 self._current_qpos = reference_qpos.copy()
         command_start_time = time.time()
         command_source = _command_source(command)
+        upstream_execution_work = command.execution_work_item
+        guard = self._execution_epoch_guard
+        if guard is not None:
+            if not isinstance(upstream_execution_work, ExecutionWorkItem):
+                raise RuntimeError(
+                    f"{self.name} epoch-mediated dispatch requires typed execution work"
+                )
+            if upstream_execution_work.work_kind not in {
+                "position_command",
+                "backend_command",
+            }:
+                raise RuntimeError(
+                    f"{self.name} received unsupported execution work kind "
+                    f"{upstream_execution_work.work_kind!r}"
+                )
+            dequeue_check = guard.check_at_dequeue(upstream_execution_work)
+            if not dequeue_check.accepted:
+                with self._state_lock:
+                    self._execution_epoch_rejected_count += 1
+                raise RuntimeError(
+                    f"{self.name} rejected stale execution work at target admission: "
+                    f"{dequeue_check.status}"
+                )
         command_metadata = command.metadata if isinstance(command.metadata, Mapping) else {}
         replay_slowdown_preapplied = bool(
             command_metadata.get("singularity_replay_slowdown_preapplied", False)
@@ -1967,16 +2565,44 @@ class RM65ArmBackend(EffectorBackend):
         )
         command_metadata = command.metadata if isinstance(command.metadata, Mapping) else {}
         candidate_selection = _metadata_mapping(command_metadata.get("ik_candidate_selection"))
+        candidate_certificate_validation = (
+            self._position_candidate_certificate_validation(
+                qpos_target,
+                candidate_selection,
+            )
+        )
+        candidate_certificate = _metadata_mapping(
+            candidate_selection.get("candidate_certificate")
+        )
+        certificate_valid = bool(candidate_certificate_validation.get("valid", False))
+        certificate_claims_singular_fallback = bool(
+            candidate_certificate.get("singular_fallback_claimed", False)
+        )
+        certificate_allows_fallback = bool(
+            (certificate_valid and certificate_claims_singular_fallback)
+            or not self.config.require_position_singularity_candidate_certificate
+        )
         wrist_preference = _metadata_mapping(
             candidate_selection.get("wrist_singularity_preference")
         )
         selected_wrist = _metadata_mapping(wrist_preference.get("selected"))
         selected_wrist_sides = _metadata_mapping(selected_wrist.get("sides"))
         selected_side_wrist = _metadata_mapping(selected_wrist_sides.get(self.config.side))
+        certified_wrist = _metadata_mapping(
+            candidate_certificate.get("final_qref_wrist_singularity")
+        )
+        certified_wrist_sides = _metadata_mapping(certified_wrist.get("sides"))
+        certified_side_wrist = _metadata_mapping(
+            certified_wrist_sides.get(self.config.side)
+        )
+        fallback_side_wrist = (
+            certified_side_wrist if certificate_valid else selected_side_wrist
+        )
         allow_position_wrist_fallback = bool(
             wrist_preference.get("enabled", False)
             and wrist_preference.get("fallback_to_singular", False)
-            and selected_side_wrist.get("is_wrist_singular", False)
+            and fallback_side_wrist.get("is_wrist_singular", False)
+            and certificate_allows_fallback
         )
         position_singularity_preference = _metadata_mapping(
             candidate_selection.get("position_singularity_preference")
@@ -1990,10 +2616,44 @@ class RM65ArmBackend(EffectorBackend):
         selected_position_side = _metadata_mapping(
             selected_position_sides.get(self.config.side)
         )
+        certified_position = _metadata_mapping(
+            candidate_certificate.get("final_qref_position_singularity")
+        )
+        certified_position_sides = _metadata_mapping(
+            certified_position.get("sides")
+        )
+        certified_position_side = _metadata_mapping(
+            certified_position_sides.get(self.config.side)
+        )
+        fallback_position_side = (
+            certified_position_side if certificate_valid else selected_position_side
+        )
         allow_position_elbow_fallback = bool(
             position_singularity_preference.get("enabled", False)
             and position_singularity_preference.get("fallback_to_singular", False)
-            and selected_position_side.get("is_elbow_singular", False)
+            and int(
+                position_singularity_preference.get(
+                    "fully_non_singular_count", 0
+                )
+                or 0
+            )
+            == 0
+            and fallback_position_side.get("is_elbow_singular", False)
+            and certificate_allows_fallback
+        )
+        allow_position_shoulder_fallback = bool(
+            position_singularity_preference.get("enabled", False)
+            and position_singularity_preference.get("fallback_to_singular", False)
+            and int(
+                position_singularity_preference.get(
+                    "fully_non_singular_count", 0
+                )
+                or 0
+            )
+            == 0
+            and fallback_position_side.get("analyzer_available", False)
+            and fallback_position_side.get("is_shoulder_singular", False)
+            and certificate_allows_fallback
         )
         qpos_target = self._apply_singularity_protection(
             qpos_target,
@@ -2004,7 +2664,11 @@ class RM65ArmBackend(EffectorBackend):
             allow_position_wrist_fallback=allow_position_wrist_fallback,
             position_wrist_fallback_metadata=wrist_preference,
             allow_position_elbow_fallback=allow_position_elbow_fallback,
+            allow_position_shoulder_fallback=allow_position_shoulder_fallback,
             position_singularity_fallback_metadata=position_singularity_preference,
+            position_candidate_certificate_validation=(
+                candidate_certificate_validation
+            ),
         )
         qpos_target = self._validate_final_joint_target(qpos_target, label="final target")
         self._stamp_final_action_target(command, qpos_target, source=command_source)
@@ -2036,6 +2700,11 @@ class RM65ArmBackend(EffectorBackend):
                     "position_trajectory_policy_reasons": list(trajectory_policy.reasons),
                 }
             )
+            if guard is not None and trajectory_policy.quick_stop:
+                raise RuntimeError(
+                    "epoch-mediated RM65 quick-stop cannot inherit ordinary motion "
+                    "work; admit a new-epoch SafetyControlOperation tick instead"
+                )
 
         if self.arm is not None and self.config.background_streaming_enabled:
             with self._send_lock:
@@ -2059,6 +2728,11 @@ class RM65ArmBackend(EffectorBackend):
                     transport_target_wall_time = time.time()
                     transport_target_monotonic = time.monotonic()
                     transport_target_sequence = int(self._stream_target_sequence + 1)
+                    backend_execution_work = _derive_backend_execution_work_item(
+                        upstream_execution_work,
+                        side=str(self.config.side),
+                        target_sequence=transport_target_sequence,
+                    )
                     if trajectory_policy is not None and trajectory_policy.quick_stop:
                         transport_target_sequence = self._activate_stream_quick_stop_locked(
                             reason=trajectory_policy.reason,
@@ -2129,6 +2803,7 @@ class RM65ArmBackend(EffectorBackend):
                         command.metadata,
                         "position_reference_sequence",
                     )
+                    self._stream_execution_work_item = backend_execution_work
                     command.metadata.update(
                         {
                             POSITION_TRANSPORT_TARGET_SEQUENCE_KEY: transport_target_sequence,
@@ -2151,6 +2826,17 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 with self._state_lock:
                     self._last_command = command.copy()
+            self._emit_singularity_transition_trace(
+                target_sequence=transport_target_sequence,
+                monotonic_time=transport_target_monotonic,
+                qref=qpos_target,
+                reference_qpos=reference_qpos,
+                command_metadata=(
+                    command.metadata
+                    if isinstance(command.metadata, Mapping)
+                    else {}
+                ),
+            )
             return CommandDispatchReceipt(
                 effector_name=self.name,
                 accepted=True,
@@ -2183,7 +2869,17 @@ class RM65ArmBackend(EffectorBackend):
                 )
             if self.arm is not None:
                 try:
-                    raw_send_result = self._send_joint_target(qpos_target)
+                    backend_execution_work = _derive_backend_execution_work_item(
+                        upstream_execution_work,
+                        side=str(self.config.side),
+                        target_sequence=None,
+                    )
+                    raw_send_result = self._send_joint_target(
+                        qpos_target,
+                        command_source=command_source,
+                        call_path="direct",
+                        execution_work_item=backend_execution_work,
+                    )
                 except Exception as exc:
                     with self._state_lock:
                         self._last_send_result_code = None
@@ -2599,6 +3295,18 @@ class RM65ArmBackend(EffectorBackend):
             "target_timestamp": self._stream_target_timestamp,
             "target_timestamp_monotonic": self._stream_target_monotonic,
             "target_sequence": int(self._stream_target_sequence),
+            "execution_epoch_binding_enabled": self._execution_epoch_guard is not None,
+            "hardware_idle_worker_preflight_binding_id": (
+                self._hardware_idle_worker_preflight_binding_id
+            ),
+            "execution_work_item_id": (
+                None
+                if self._stream_execution_work_item is None
+                else self._stream_execution_work_item.work_item_id
+            ),
+            "execution_epoch_rejected_count": int(
+                self._execution_epoch_rejected_count
+            ),
             "target_age_sec": target_age_sec,
             "target_max_age_sec": target_max_age_sec,
             "target_stale": target_stale,
@@ -2666,6 +3374,24 @@ class RM65ArmBackend(EffectorBackend):
             "audit_sink_attached": self._position_audit_sink is not None,
             "audit_sink_error_count": int(self._position_audit_error_count),
             "last_audit_sink_error": self._last_position_audit_error,
+            "actuator_command_trace_sink_attached": (
+                self._actuator_command_trace_sink is not None
+            ),
+            "actuator_command_trace_error_count": int(
+                self._actuator_command_trace_error_count
+            ),
+            "last_actuator_command_trace_error": (
+                self._last_actuator_command_trace_error
+            ),
+            "singularity_transition_trace_sink_attached": (
+                self._singularity_transition_trace_sink is not None
+            ),
+            "singularity_transition_trace_error_count": int(
+                self._singularity_transition_trace_error_count
+            ),
+            "last_singularity_transition_trace_error": (
+                self._last_singularity_transition_trace_error
+            ),
             "healthy": not health_reasons,
             "health_reasons": health_reasons,
             "warning": None if self._stream_warning is None else dict(self._stream_warning),
@@ -3015,6 +3741,7 @@ class RM65ArmBackend(EffectorBackend):
                 segment_duration_sec = float(self._stream_segment_duration_sec)
                 reference_epoch = self._stream_reference_epoch
                 reference_sequence = self._stream_reference_sequence
+                execution_work_item = self._stream_execution_work_item
                 anchor_qpos = self._command_anchor_qpos_locked()
                 if target_qpos is None:
                     planned_tick = None
@@ -3111,20 +3838,59 @@ class RM65ArmBackend(EffectorBackend):
                             else:
                                 sdk_attempt_wall_time = time.time()
                                 sdk_attempt_monotonic_time = time.monotonic()
-                                sdk_attempt_sequence = self._record_command_attempt_locked(
-                                    next_qpos,
-                                    timestamp=sdk_attempt_wall_time,
-                                    monotonic_time=sdk_attempt_monotonic_time,
-                                )
-                                sdk_attempted = True
+                                guard = self._execution_epoch_guard
+                                if guard is not None:
+                                    if execution_work_item is None:
+                                        transport_block_reason = (
+                                            "execution_work_item_missing"
+                                        )
+                                        self._execution_epoch_rejected_count += 1
+                                    else:
+                                        epoch_check = guard.check_before_backend_call(
+                                            execution_work_item
+                                        )
+                                        if not epoch_check.accepted:
+                                            transport_block_reason = epoch_check.status
+                                            self._execution_epoch_rejected_count += 1
+                                            if target_is_current:
+                                                self._clear_stream_target_locked()
+                                if transport_block_reason is None:
+                                    sdk_attempt_sequence = self._record_command_attempt_locked(
+                                        next_qpos,
+                                        timestamp=sdk_attempt_wall_time,
+                                        monotonic_time=sdk_attempt_monotonic_time,
+                                    )
+                                    self._execution_inflight_work_item = (
+                                        execution_work_item
+                                    )
+                                    self._last_old_epoch_invocation_started_at = (
+                                        sdk_attempt_monotonic_time
+                                    )
+                                    sdk_attempted = True
                         if sdk_attempted:
                             call_started = time.monotonic()
                             raw_send_result: object = None
                             try:
-                                raw_send_result = self._send_joint_target(next_qpos)
+                                raw_send_result = self._send_joint_target(
+                                    next_qpos,
+                                    command_source=target_source or "background_joint_target",
+                                    call_path="background_worker",
+                                    quick_stop_active=quick_stop_active,
+                                    target_sequence=target_sequence,
+                                    execution_work_item=execution_work_item,
+                                )
                             except Exception as exc:  # audited below, then fault-latched by caller.
                                 sdk_exception = exc
-                            call_finished = time.monotonic()
+                            finally:
+                                call_finished = time.monotonic()
+                                with self._state_lock:
+                                    self._last_old_epoch_invocation_completed_at = (
+                                        call_finished
+                                    )
+                                    self._last_completed_execution_work_item = (
+                                        execution_work_item
+                                    )
+                                    self._execution_inflight_work_item = None
                             sdk_result_monotonic_time = call_finished
                             sdk_call_ms = (call_finished - call_started) * 1000.0
                             if sdk_exception is None:
@@ -3177,91 +3943,127 @@ class RM65ArmBackend(EffectorBackend):
                 skipped_tick_count=tick_timing.skipped_tick_count,
                 deadline_missed=deadline_missed,
             )
-            self._emit_position_audit_event(
-                PositionCommandAuditEvent(
-                    side=str(self.config.side),
-                    tick_sequence=tick_sequence,
-                    timestamp_wall=time.time(),
-                    timestamp_monotonic=finished_monotonic,
-                    scheduled_monotonic_time=tick_timing.scheduled_monotonic_time,
-                    wakeup_monotonic_time=wakeup_monotonic,
-                    deadline_monotonic_time=tick_timing.deadline_monotonic_time,
-                    wakeup_lag_sec=tick_timing.wakeup_lag_sec,
-                    raw_wakeup_lag_sec=tick_timing.raw_wakeup_lag_sec,
-                    skipped_tick_count=tick_timing.skipped_tick_count,
-                    deadline_missed=deadline_missed,
-                    planner_sample_monotonic_time=planner_sample_monotonic,
-                    planner_lock_delay_sec=planner_lock_delay_sec,
-                    wakeup_gap_sec=wakeup_gap_sec,
-                    target_active=target_qpos is not None,
-                    target_sequence=target_sequence,
-                    target_source=target_source,
-                    target_timestamp_wall=target_timestamp_wall,
-                    target_timestamp_monotonic=target_timestamp_monotonic,
-                    target_age_sec=target_age_sec,
-                    reference_epoch=reference_epoch,
-                    reference_sequence=reference_sequence,
-                    segment_start_qpos=segment_start_qpos,
-                    segment_target_qpos=target_qpos,
-                    segment_start_monotonic_time=segment_start_time,
-                    segment_duration_sec=(
-                        segment_duration_sec
-                        if target_qpos is not None
-                        and trajectory_proposal is None
-                        else None
-                    ),
-                    interpolation_alpha=interpolation_alpha,
-                    q_cmd=next_qpos,
-                    sdk_attempted=sdk_attempted,
-                    sdk_attempt_sequence=sdk_attempt_sequence,
-                    sdk_attempt_wall_time=sdk_attempt_wall_time,
-                    sdk_attempt_monotonic_time=sdk_attempt_monotonic_time,
-                    sdk_result_monotonic_time=sdk_result_monotonic_time,
-                    sdk_send_gap_sec=sdk_send_gap_sec,
-                    sdk_call_ms=sdk_call_ms,
-                    sdk_result_code=send_code,
-                    sdk_result_text=send_text,
-                    sdk_accepted=accepted,
-                    sdk_accepted_sequence=accepted_sequence,
-                    stale_target_expired=stale_target_expired,
-                    metadata={
-                        "effector_name": self.name,
-                        "segment_planner": (
-                            "robot_motion.position_control."
-                            + (
-                                "AccelerationLimitedJointTrajectoryPlanner"
-                                if trajectory_proposal is not None
-                                else "JointCommandInterpolator"
-                            )
-                        ),
-                        "position_command_planner": self._stream_planner_mode,
-                        "scheduler_original_scheduled_monotonic_time": (
-                            tick_timing.original_scheduled_monotonic_time
-                        ),
-                        "scheduled_period_sec": period_sec,
-                        "transport_block_reason": transport_block_reason,
-                        "arm_follow_qpos_alpha": float(self.config.arm_follow_qpos_alpha),
-                        "arm_follow_qpos_smoothing_applied": bool(
-                            follow_smoothing_applied
-                        ),
-                        "arm_follow_qpos_pre_smoothing": (
-                            None
-                            if planned_qpos_before_follow_smoothing is None
-                            else planned_qpos_before_follow_smoothing.tolist()
-                        ),
-                        **(
-                            {}
-                            if not accepted
-                            else self._accepted_qcmd_fk_audit_metadata(next_qpos)
-                        ),
-                        **(
-                            {}
-                            if trajectory_proposal is None
-                            else trajectory_proposal.debug_metadata()
-                        ),
-                    },
+            if (
+                sdk_attempted
+                and next_qpos is not None
+                and self._actuator_command_trace_sink is not None
+            ):
+                # Post-SDK fixed-field capture only: no FK, JSON, queueing, or
+                # disk I/O is allowed in this callback.
+                self._emit_actuator_command_trace(
+                    str(self.config.side),
+                    tick_sequence,
+                    target_sequence,
+                    reference_epoch,
+                    reference_sequence,
+                    tick_timing.scheduled_monotonic_time,
+                    wakeup_monotonic,
+                    sdk_attempt_sequence,
+                    sdk_attempt_wall_time,
+                    sdk_attempt_monotonic_time,
+                    sdk_result_monotonic_time,
+                    next_qpos,
+                    send_code,
+                    accepted,
+                    accepted_sequence,
                 )
-            )
+            # Constructing a full command-audit event is deliberately lazy.  In
+            # particular, accepted-qcmd FK and metadata freezing are sizeable
+            # Python/GIL work at two 120 Hz command workers.  The production
+            # collection profile has no position-audit sink, so doing that work
+            # before _emit_position_audit_event() discovers ``sink is None``
+            # only steals scheduler budget without producing an observation.
+            # Sink attachment happens before a diagnostic session and detach is
+            # best-effort during shutdown; a stale positive read is harmless
+            # because the emitter rechecks under _state_lock.
+            if self._position_audit_sink is not None:
+                self._emit_position_audit_event(
+                    PositionCommandAuditEvent(
+                        side=str(self.config.side),
+                        tick_sequence=tick_sequence,
+                        timestamp_wall=time.time(),
+                        timestamp_monotonic=finished_monotonic,
+                        scheduled_monotonic_time=tick_timing.scheduled_monotonic_time,
+                        wakeup_monotonic_time=wakeup_monotonic,
+                        deadline_monotonic_time=tick_timing.deadline_monotonic_time,
+                        wakeup_lag_sec=tick_timing.wakeup_lag_sec,
+                        raw_wakeup_lag_sec=tick_timing.raw_wakeup_lag_sec,
+                        skipped_tick_count=tick_timing.skipped_tick_count,
+                        deadline_missed=deadline_missed,
+                        planner_sample_monotonic_time=planner_sample_monotonic,
+                        planner_lock_delay_sec=planner_lock_delay_sec,
+                        wakeup_gap_sec=wakeup_gap_sec,
+                        target_active=target_qpos is not None,
+                        target_sequence=target_sequence,
+                        target_source=target_source,
+                        target_timestamp_wall=target_timestamp_wall,
+                        target_timestamp_monotonic=target_timestamp_monotonic,
+                        target_age_sec=target_age_sec,
+                        reference_epoch=reference_epoch,
+                        reference_sequence=reference_sequence,
+                        segment_start_qpos=segment_start_qpos,
+                        segment_target_qpos=target_qpos,
+                        segment_start_monotonic_time=segment_start_time,
+                        segment_duration_sec=(
+                            segment_duration_sec
+                            if target_qpos is not None
+                            and trajectory_proposal is None
+                            else None
+                        ),
+                        interpolation_alpha=interpolation_alpha,
+                        q_cmd=next_qpos,
+                        sdk_attempted=sdk_attempted,
+                        sdk_attempt_sequence=sdk_attempt_sequence,
+                        sdk_attempt_wall_time=sdk_attempt_wall_time,
+                        sdk_attempt_monotonic_time=sdk_attempt_monotonic_time,
+                        sdk_result_monotonic_time=sdk_result_monotonic_time,
+                        sdk_send_gap_sec=sdk_send_gap_sec,
+                        sdk_call_ms=sdk_call_ms,
+                        sdk_result_code=send_code,
+                        sdk_result_text=send_text,
+                        sdk_accepted=accepted,
+                        sdk_accepted_sequence=accepted_sequence,
+                        stale_target_expired=stale_target_expired,
+                        metadata={
+                            "effector_name": self.name,
+                            "segment_planner": (
+                                "robot_motion.position_control."
+                                + (
+                                    "AccelerationLimitedJointTrajectoryPlanner"
+                                    if trajectory_proposal is not None
+                                    else "JointCommandInterpolator"
+                                )
+                            ),
+                            "position_command_planner": self._stream_planner_mode,
+                            "scheduler_original_scheduled_monotonic_time": (
+                                tick_timing.original_scheduled_monotonic_time
+                            ),
+                            "scheduled_period_sec": period_sec,
+                            "transport_block_reason": transport_block_reason,
+                            "arm_follow_qpos_alpha": float(
+                                self.config.arm_follow_qpos_alpha
+                            ),
+                            "arm_follow_qpos_smoothing_applied": bool(
+                                follow_smoothing_applied
+                            ),
+                            "arm_follow_qpos_pre_smoothing": (
+                                None
+                                if planned_qpos_before_follow_smoothing is None
+                                else planned_qpos_before_follow_smoothing.tolist()
+                            ),
+                            **(
+                                {}
+                                if not accepted
+                                else self._accepted_qcmd_fk_audit_metadata(next_qpos)
+                            ),
+                            **(
+                                {}
+                                if trajectory_proposal is None
+                                else trajectory_proposal.debug_metadata()
+                            ),
+                        },
+                    )
+                )
 
             if sdk_exception is not None:
                 raise sdk_exception
@@ -3447,16 +4249,34 @@ class RM65ArmBackend(EffectorBackend):
         return candidate_qpos.copy()
 
     def _start_force_position_control(self) -> None:
+        if self.config.observation_only:
+            return
         if self.arm is None:
             return
         if self.config.force_clear_on_start:
-            clear_result = self.arm.Clear_Force_Data(True)
+            clear_result = self._invoke_pre_sdk_control(
+                seam_id="rm65.lifecycle.force_position.start",
+                permit_kind="lifecycle_control",
+                operation="startup",
+                source="force_position_startup",
+                sdk_method="Clear_Force_Data",
+                attempt_sequence=1,
+                backend_call=lambda: self.arm.Clear_Force_Data(True),
+            )
             clear_code, clear_text = _parse_rm65_result(clear_result)
             if clear_code != 0:
                 raise RuntimeError(
                     f"{self.name} failed to clear force data before force-position control: {clear_text}"
                 )
-        start_result = self.arm.Start_Force_Position_Move(True)
+        start_result = self._invoke_pre_sdk_control(
+            seam_id="rm65.lifecycle.force_position.start",
+            permit_kind="lifecycle_control",
+            operation="startup",
+            source="force_position_startup",
+            sdk_method="Start_Force_Position_Move",
+            attempt_sequence=2 if self.config.force_clear_on_start else 1,
+            backend_call=lambda: self.arm.Start_Force_Position_Move(True),
+        )
         start_code, start_text = _parse_rm65_result(start_result)
         if start_code != 0:
             raise RuntimeError(
@@ -3464,35 +4284,116 @@ class RM65ArmBackend(EffectorBackend):
             )
         self._force_position_active = True
 
-    def _send_joint_target(self, qpos_rad: np.ndarray) -> object:
+    def _invoke_pre_sdk_control(
+        self,
+        *,
+        seam_id: str,
+        permit_kind: str,
+        operation: str,
+        source: str,
+        sdk_method: str,
+        backend_call: Callable[[], object],
+        attempt_sequence: int = 1,
+    ) -> object:
+        """Invoke one safety/lifecycle SDK call through the optional gate."""
+
+        adapter = self._pre_sdk_control_adapter
+        if adapter is None:
+            return backend_call()
+        context = RM65ControlDispatchContext.create(
+            side=str(self.config.side),
+            seam_id=seam_id,
+            permit_kind=permit_kind,
+            operation=operation,
+            source=source,
+            sdk_method=sdk_method,
+            attempt_sequence=attempt_sequence,
+        )
+        return adapter.invoke(context=context, backend_call=backend_call)
+
+    def _send_joint_target(
+        self,
+        qpos_rad: np.ndarray,
+        *,
+        command_source: str | None = None,
+        call_path: str = "direct",
+        quick_stop_active: bool = False,
+        target_sequence: int | None = None,
+        execution_work_item: ExecutionWorkItem | None = None,
+    ) -> object:
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; refusing RM65 transport call."
+            )
         qpos = self._validate_final_joint_target(qpos_rad, label="transport joint target")
         if self.arm is None:
             return None
+        guard = self._execution_epoch_guard
+        if guard is not None:
+            if not isinstance(execution_work_item, ExecutionWorkItem):
+                raise RuntimeError(
+                    "RM65 epoch-mediated SDK call requires typed execution work"
+                )
+            epoch_check = guard.check_before_backend_call(execution_work_item)
+            if not epoch_check.accepted:
+                with self._state_lock:
+                    self._execution_epoch_rejected_count += 1
+                raise RuntimeError(
+                    "RM65 final execution epoch check rejected SDK call: "
+                    f"{epoch_check.status}"
+                )
         joint_deg = qpos / np.pi * 180.0
-        if self.config.force_position_control:
-            return self.arm.Force_Position_Move_Joint(
+
+        def backend_call() -> object:
+            if self.config.force_position_control:
+                return self.arm.Force_Position_Move_Joint(
+                    joint_deg,
+                    sensor=self.config.force_sensor,
+                    mode=self.config.force_mode,
+                    dir=self.config.force_dir,
+                    force=self.config.force,
+                    follow=self.config.force_follow,
+                )
+            return self.arm.Movej_CANFD(
                 joint_deg,
-                sensor=self.config.force_sensor,
-                mode=self.config.force_mode,
-                dir=self.config.force_dir,
-                force=self.config.force,
-                follow=self.config.force_follow,
+                follow=bool(self.config.canfd_follow),
+                trajectory_mode=int(self.config.canfd_trajectory_mode),
+                radio=int(self.config.canfd_radio),
             )
-        return self.arm.Movej_CANFD(
-            joint_deg,
-            follow=bool(self.config.canfd_follow),
-            trajectory_mode=int(self.config.canfd_trajectory_mode),
-            radio=int(self.config.canfd_radio),
+
+        adapter = self._pre_sdk_dispatch_adapter
+        if adapter is None:
+            return backend_call()
+        source = str(command_source or "").strip()
+        if not source:
+            raise RuntimeError(
+                "RM65 pre-SDK dispatch mediation requires an explicit command source."
+            )
+        context = RM65JointTargetDispatchContext.create(
+            side=str(self.config.side),
+            qpos_rad=qpos,
+            command_source=source,
+            call_path=call_path,
+            quick_stop_active=bool(quick_stop_active),
+            lifecycle_home=_is_qpos_init_slow_singularity_source(source),
+            target_sequence=target_sequence,
+            execution_work_item=execution_work_item,
         )
+        return adapter.invoke(context=context, backend_call=backend_call)
 
     def refresh_state_from_hardware(
         self,
         *,
         hardware_read_retries: int | None = None,
         hardware_read_retry_delay_sec: float | None = None,
+        include_derived_pose: bool = True,
+        include_timing_percentiles: bool = True,
     ) -> dict[str, object]:
         if self.arm is None:
-            return self.get_state()
+            return self.get_state(
+                include_derived_pose=bool(include_derived_pose),
+                include_timing_percentiles=bool(include_timing_percentiles),
+            )
         retry_count = max(
             1,
             int(
@@ -3565,9 +4466,24 @@ class RM65ArmBackend(EffectorBackend):
                 if self.config.connect_hardware and self.arm is not None:
                     self._hardware_ready = True
                     self._hardware_ready_source = "hardware_feedback"
-        return self.get_state()
+        return self.get_state(
+            include_derived_pose=bool(include_derived_pose),
+            include_timing_percentiles=bool(include_timing_percentiles),
+        )
 
-    def get_state(self) -> dict[str, object]:
+    def get_state(
+        self,
+        *,
+        include_derived_pose: bool = True,
+        include_timing_percentiles: bool = True,
+    ) -> dict[str, object]:
+        """Return a backend snapshot.
+
+        The compatibility default remains the complete diagnostic snapshot.
+        High-rate callers may omit FK-derived poses and percentile sorting;
+        neither field participates in command admission or transport safety.
+        """
+
         with self._state_lock:
             current_qpos = None if self._current_qpos is None else self._current_qpos.copy()
             attempted_qpos = (
@@ -3605,17 +4521,18 @@ class RM65ArmBackend(EffectorBackend):
             singularity_metadata = dict(self._last_singularity_metadata)
             emergency_stopped = bool(self._emergency_stopped)
             background_streaming = self._background_stream_snapshot_locked()
-        background_streaming["timing_percentiles"] = (
-            self._background_stream_timing_percentiles_snapshot()
-        )
+        if include_timing_percentiles:
+            background_streaming["timing_percentiles"] = (
+                self._background_stream_timing_percentiles_snapshot()
+            )
         current_tcp_pose = None
-        if current_qpos is not None:
+        if include_derived_pose and current_qpos is not None:
             try:
                 current_tcp_pose = self.compute_tcp_pose(qpos=current_qpos)
             except Exception:
                 current_tcp_pose = None
         last_target_tcp_pose = None
-        if last_target_qpos is not None:
+        if include_derived_pose and last_target_qpos is not None:
             try:
                 last_target_tcp_pose = self.compute_tcp_pose(qpos=last_target_qpos)
             except Exception:
@@ -3627,7 +4544,11 @@ class RM65ArmBackend(EffectorBackend):
         return {
             "current_qpos": current_qpos,
             "current_tcp_pose": current_tcp_pose,
-            "current_qpos_source": "last_accepted_command_or_local_anchor",
+            "current_qpos_source": (
+                "hardware_feedback"
+                if self.config.observation_only
+                else "last_accepted_command_or_local_anchor"
+            ),
             "last_attempted_qpos": attempted_qpos,
             "last_attempted_timestamp": self._last_attempted_timestamp,
             "last_attempted_timestamp_monotonic": self._last_attempted_monotonic,
@@ -3646,7 +4567,12 @@ class RM65ArmBackend(EffectorBackend):
             "last_target_tcp_pose": last_target_tcp_pose,
             "last_command": last_command,
             "last_command_timestamp": self._last_command_timestamp,
-            "arm_state_source": "last_commanded_action",
+            "arm_state_source": (
+                "hardware_observation_only"
+                if self.config.observation_only
+                else "last_commanded_action"
+            ),
+            "observation_only": bool(self.config.observation_only),
             "hardware_pose_6d": hardware_pose_6d,
             # Compatibility name: this is the timestamp of the last successful
             # 6D joint measurement, never the timestamp of a failed read.
@@ -3695,7 +4621,7 @@ class RM65ArmBackend(EffectorBackend):
                 "tolerance_deg": float(np.rad2deg(_RM65_LOCAL_QPOS_OBSERVATION_TOLERANCE_RAD)),
             }
         else:
-            qpos_array, normalization = self._normalize_local_qpos_observation(
+            qpos_array, normalization = self.normalize_local_qpos_observation(
                 qpos,
                 label="local qpos",
             )
@@ -3738,6 +4664,12 @@ class RM65ArmBackend(EffectorBackend):
         return self._pose_from_solver_frame(tcp_frame, solver_pose)
 
     def emergency_stop(self) -> None:
+        if self.config.observation_only:
+            with self._state_lock:
+                self._emergency_stopped = True
+                self._last_send_result_code = 0
+                self._last_send_result_text = "observation_only_emergency_stop"
+            return
         with self._send_lock:
             self._stream_stop_event.set()
             with self._state_lock:
@@ -3749,8 +4681,17 @@ class RM65ArmBackend(EffectorBackend):
                     self._last_send_result_code = 0
                     self._last_send_result_text = "emergency_stop_no_arm"
                 return
-            if self._force_position_active:
-                self.arm.Stop_Force_Position_Move(True)
+            force_stop_called = bool(self._force_position_active)
+            if force_stop_called:
+                self._invoke_pre_sdk_control(
+                    seam_id="rm65.safety.emergency_stop.force_and_arm",
+                    permit_kind="safety_control",
+                    operation="stop",
+                    source="emergency_stop",
+                    sdk_method="Stop_Force_Position_Move",
+                    attempt_sequence=1,
+                    backend_call=lambda: self.arm.Stop_Force_Position_Move(True),
+                )
                 self._force_position_active = False
             stop_method = getattr(self.arm, "Arm_Stop", None)
             stop_label = "Arm_Stop"
@@ -3759,7 +4700,15 @@ class RM65ArmBackend(EffectorBackend):
                 stop_label = "Arm_Slow_Stop"
             if stop_method is None:
                 raise RuntimeError(f"{self.name} RM65 SDK exposes no Arm_Stop/Arm_Slow_Stop method")
-            stop_result = stop_method()
+            stop_result = self._invoke_pre_sdk_control(
+                seam_id="rm65.safety.emergency_stop.force_and_arm",
+                permit_kind="safety_control",
+                operation="stop",
+                source="emergency_stop",
+                sdk_method=stop_label,
+                attempt_sequence=2 if force_stop_called else 1,
+                backend_call=stop_method,
+            )
             stop_code, stop_text = _parse_rm65_result(stop_result)
             with self._state_lock:
                 self._last_send_result_code = stop_code
@@ -3809,8 +4758,20 @@ class RM65ArmBackend(EffectorBackend):
         if self.arm is None:
             return
         try:
-            if self._force_position_active:
-                self.arm.Stop_Force_Position_Move(True)
+            if self.config.observation_only:
+                self.arm.RM_API_UnInit()
+                return
+            force_stop_called = bool(self._force_position_active)
+            if force_stop_called:
+                self._invoke_pre_sdk_control(
+                    seam_id="rm65.cleanup.close.stop_before_disconnect",
+                    permit_kind="safety_control",
+                    operation="stop",
+                    source="close_pre_disconnect",
+                    sdk_method="Stop_Force_Position_Move",
+                    attempt_sequence=1,
+                    backend_call=lambda: self.arm.Stop_Force_Position_Move(True),
+                )
                 self._force_position_active = False
             if stop_before_disconnect:
                 stop_method = getattr(self.arm, "Arm_Slow_Stop", None)
@@ -3822,7 +4783,15 @@ class RM65ArmBackend(EffectorBackend):
                     raise RuntimeError(
                         f"{self.name} RM65 SDK exposes no stop method for safe disconnect"
                     )
-                stop_result = stop_method()
+                stop_result = self._invoke_pre_sdk_control(
+                    seam_id="rm65.cleanup.close.stop_before_disconnect",
+                    permit_kind="safety_control",
+                    operation="stop",
+                    source="close_pre_disconnect",
+                    sdk_method=stop_label,
+                    attempt_sequence=2 if force_stop_called else 1,
+                    backend_call=stop_method,
+                )
                 stop_code, stop_text = _parse_rm65_result(stop_result)
                 with self._state_lock:
                     self._last_send_result_code = stop_code

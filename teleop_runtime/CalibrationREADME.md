@@ -30,7 +30,11 @@
 
 - `W`: `vive_world`
 - `V`: `virtual desk`
-- `D`: 机器人侧当前 preset 使用的 desk frame
+- `D`: 机器人侧历史 preset 使用的 retarget frame（代码兼容名 `desk`，语义上是
+  `vive_retarget_frame`，原点位于双臂 base 中点）
+- `C`: v2.3 canonical dataset desk，即已标定 RM65 URDF 的
+  `workspace_near_boundary_frame`；原点在桌面表面上左右居中，并沿“桌面中心到
+  操作者/机械臂”的方向位于有效操作空间的近侧边界
 - `B_left / B_right`: 左右机械臂 base
 - `T_left / T_right`: 左右 wrist tracker
 - `H_left / H_right`: 左右人手控制参考系
@@ -46,6 +50,12 @@
 
 - `T_D_B_left/right`
 
+这里的 `D` 不等于 `C`。默认 station 下 `D` 到左右 base 只含 `y=±0.2625 m` 和
+`yaw=∓90°`；v2.3 raw→`C` 还包含 workspace near-boundary 原点相对 base 中点的
+`x=+0.472 m`、
+`z=-0.010 m`。canonical 数据转换由 pose-frame contract 从同一份 URDF fixed joints
+推导，不读取或复用本文件的 Vive retarget `T_D_B/T_VR_B`。
+
 当前 `teleop_runtime` 的 `D` 约定固定为：
 
 - `+X_D`: forward
@@ -56,8 +66,8 @@
 
 在默认双臂 preset 下：
 
-- `B_left` 位于 `D.y > 0`
-- `B_right` 位于 `D.y < 0`
+- `B_left` 位于 `D.y < 0`
+- `B_right` 位于 `D.y > 0`
 - 所有共享 SAPIEN viewer 统一从 `D.x < 0` 一侧看向原点，所以屏幕左边就是逻辑左臂，屏幕右边就是逻辑右臂
 
 ## 2. 这套流程为什么叫“虚拟 desk”
@@ -356,7 +366,8 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 
 对于旧版 `vive_rm65_virtual_desk` profile，如果当时是按旧说明做的 `X: 前 -> 后`、`Y: 左 -> 右` 扫动，
 当前 runtime 会在加载时自动补一次等效 `post_yaw=180deg` 的兼容修正，
-把虚拟 desk 统一到 `+x=forward, +y=left, +z=up`。
+把虚拟 desk 统一到：`+X` 是操作者面向桌面的方向，`+Y` 是从 workspace near-boundary
+原点朝向操作者左侧的方向，`+Z` 是垂直桌面向上的方向。
 
 如果你还希望连 `run_vive_sapien_virtual.py` 的起始机械臂姿态也一起复用，可以先在
 `teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz` 里按 `s` 保存一份

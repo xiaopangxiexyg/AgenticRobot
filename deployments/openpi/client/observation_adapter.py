@@ -5,6 +5,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from robot_motion.deploy.normalization import (
+    NormalizationContract,
+    NormalizationContractError,
+    normalization_contract_hash,
+)
+
 
 DEFAULT_IMAGE_KEY_MAP: dict[str, str] = {
     "front": "observation.images.front",
@@ -21,6 +27,11 @@ class OpenPIObservationAdapterConfig:
     include_debug_metadata: bool = True
     state_key: str = "state"
     state_discrete_key: str = "state_discrete"
+    # Optional explicit numeric contract.  ``None`` preserves the historical
+    # payload shape; when present it is carried in debug metadata so the server
+    # can bind the same owner/hash.  This adapter does not infer or execute a
+    # non-identity transform from a legacy ``normalized`` label.
+    normalization_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         image_key_map = DEFAULT_IMAGE_KEY_MAP if self.image_key_map is None else dict(self.image_key_map)
@@ -53,6 +64,34 @@ class OpenPIObservationAdapterConfig:
         object.__setattr__(self, "required_image_keys", required_image_keys)
         object.__setattr__(self, "state_key", str(self.state_key))
         object.__setattr__(self, "state_discrete_key", str(self.state_discrete_key))
+        if self.normalization_contract is not None:
+            try:
+                parsed = NormalizationContract.from_optional_mapping(
+                    self.normalization_contract,
+                    allow_legacy=True,
+                )
+            except NormalizationContractError as exc:
+                raise ValueError(str(exc)) from exc
+            if parsed is not None:
+                if parsed.has_client_owned_transform:
+                    raise ValueError(
+                        "OpenPI observation adapter does not execute client-owned "
+                        "normalization; provide a model-specific executor or declare "
+                        "the server as owner."
+                    )
+                object.__setattr__(self, "normalization_contract", parsed.to_dict())
+            else:
+                object.__setattr__(
+                    self,
+                    "normalization_contract",
+                    {str(key): value for key, value in self.normalization_contract.items()},
+                )
+
+    @property
+    def normalization_hash(self) -> str | None:
+        if self.normalization_contract is None:
+            return None
+        return normalization_contract_hash(self.normalization_contract)
 
 
 def deployment_observation_to_openpi(
@@ -87,21 +126,38 @@ def deployment_observation_to_openpi(
         output["prompt"] = prompt
 
     if config.include_debug_metadata:
-        output["dexteleop"] = {
+        debug_metadata = {
             "timestamp": float(getattr(observation, "timestamp", 0.0) or 0.0),
             "step_index": int(getattr(observation, "step_index", 0) or 0),
             "active_sides": list(getattr(observation, "active_sides", ()) or ()),
             "arms_enabled": bool(getattr(observation, "arms_enabled", False)),
             "hands_enabled": bool(getattr(observation, "hands_enabled", False)),
-            "faults": list(getattr(observation, "faults", ()) or ()),
             "policy_io_layout_hash": getattr(observation, "policy_io_layout_hash", None),
         }
+        if config.normalization_contract is not None:
+            parsed = NormalizationContract.from_optional_mapping(
+                config.normalization_contract,
+                allow_legacy=True,
+            )
+            debug_metadata.update(
+                {
+                    "normalization_hash": config.normalization_hash,
+                    "normalization_contract_status": (
+                        "explicit" if parsed is not None else "legacy_opaque"
+                    ),
+                }
+            )
+        output["dexteleop"] = debug_metadata
     return output
 
 
 def _resolve_prompt(observation: Any, config: OpenPIObservationAdapterConfig) -> str | None:
     if config.prompt:
         return str(config.prompt)
+    for key in ("prompt", "instruction", "task_instruction"):
+        value = getattr(observation, key, None)
+        if value:
+            return str(value)
     metadata = getattr(observation, "metadata", {}) or {}
     if isinstance(metadata, Mapping):
         for key in ("prompt", "instruction", "task_instruction"):

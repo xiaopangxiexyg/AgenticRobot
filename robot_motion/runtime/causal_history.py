@@ -17,6 +17,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+import numpy as np
+
 
 def _finite_or_none(value: Any) -> float | None:
     try:
@@ -53,12 +55,14 @@ class CausalSnapshotHistory:
         maxlen: int = 256,
         clock: Any = time.time,
         name: str = "snapshot",
+        copy_arrays_on_read: bool = True,
     ) -> None:
         if int(maxlen) <= 0:
             raise ValueError("maxlen must be positive")
         self.maxlen = int(maxlen)
         self.clock = clock
         self.name = str(name)
+        self.copy_arrays_on_read = bool(copy_arrays_on_read)
         self._lock = threading.RLock()
         self._sequence = 0
         self._items: deque[dict[str, Any]] = deque(maxlen=self.maxlen)
@@ -80,7 +84,7 @@ class CausalSnapshotHistory:
         taken immediately after the deep copy.
         """
 
-        frozen = copy.deepcopy(payload)
+        frozen = _freeze_record(payload)
         source = _finite_or_none(source_timestamp)
         if available_timestamp is None:
             available = _finite_or_none(self.clock())
@@ -102,7 +106,7 @@ class CausalSnapshotHistory:
             record["source_clock"] = str(source_clock)
             record["available_clock"] = str(available_clock)
             self._items.append(record)
-            return copy.deepcopy(record)
+            return _copy_record(record, copy_arrays=self.copy_arrays_on_read)
 
     def latest_at_or_before(
         self,
@@ -123,7 +127,7 @@ class CausalSnapshotHistory:
                     continue
                 if require_source_timestamp and (source is None or source > cutoff):
                     continue
-                selected = copy.deepcopy(record)
+                selected = _copy_record(record, copy_arrays=self.copy_arrays_on_read)
                 selection = CausalSnapshotSelection(
                     sequence=int(record["snapshot_sequence"]),
                     source_timestamp=source,
@@ -138,7 +142,9 @@ class CausalSnapshotHistory:
         with self._lock:
             if not self._items:
                 return None
-            record = copy.deepcopy(self._items[-1])
+            record = _copy_record(
+                self._items[-1], copy_arrays=self.copy_arrays_on_read
+            )
             source = _finite_or_none(record.get("source_timestamp"))
             available = _finite_or_none(record.get("available_timestamp"))
             if available is None:
@@ -155,3 +161,40 @@ class CausalSnapshotHistory:
         with self._lock:
             return len(self._items)
 
+
+def _freeze_record(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            frozen = copy.deepcopy(value)
+            frozen.setflags(write=False)
+            return frozen
+        contiguous = np.ascontiguousarray(value)
+        # bytes is immutable, so a zero-copy query cannot re-enable ndarray
+        # writes and mutate the history behind another selected sample.
+        return np.frombuffer(contiguous.tobytes(order="C"), dtype=value.dtype).reshape(
+            value.shape
+        )
+    if isinstance(value, Mapping):
+        return {key: _freeze_record(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_freeze_record(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_freeze_record(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _copy_record(value: Any, *, copy_arrays: bool) -> Any:
+    if isinstance(value, np.ndarray):
+        if copy_arrays:
+            return value.copy()
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _copy_record(item, copy_arrays=copy_arrays)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_copy_record(item, copy_arrays=copy_arrays) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_record(item, copy_arrays=copy_arrays) for item in value)
+    return copy.deepcopy(value)

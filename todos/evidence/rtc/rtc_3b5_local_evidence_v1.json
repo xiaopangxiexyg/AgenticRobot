@@ -1,0 +1,82 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_3b5_single_admission_truth_local_2026_07_21",
+  "scope": "non_formal_local_only",
+  "captured_at": "2026-07-21T22:43:32+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "python": "3.10.12",
+    "hardware_accessed": false,
+    "production_entrypoint_called": false
+  },
+  "rtc_profile": {
+    "profile_id": "rtc_3c_virtual_shadow_15_30_60_120_v1",
+    "semantic_content_hash": "e6145d5d50023de025e1d8ce4f1f843729348dce644da7fbf6ff7d15b21a4022",
+    "rtc_mode": "async_aligned_chunk_v1",
+    "position_lookahead_enabled": false,
+    "send_actions": false,
+    "observation_hz": 15.0,
+    "decision_hz": 30.0,
+    "action_hz": 30.0,
+    "position_sample_hz": 15.0,
+    "position_reference_hz": 60.0,
+    "position_command_hz": 120.0
+  },
+  "scoped_source_sha256": {
+    "robot_motion/deploy/async_producer.py": "c905a34c815d0d44421e7629f126c901f80c4b3e666048bcde803e1ba1918874",
+    "robot_motion/deploy/chunk_plan.py": "de4fe534f8b12e17467af0a165248d807f900d6fce756a581a98e82583ae7def",
+    "robot_motion/deploy/__init__.py": "0d072653738dba22ad95aa90c3cf7c3d0ed6d8752362708ab981ab2db025aff4",
+    "teleop_runtime/deploy/policy_worker.py": "63227e760ea4657945b4c4829360f9bc725fd54e4d30d203e96fc8fcd9f9fff2",
+    "tests/test_deploy_rtc_producer_state.py": "9a7bb01d9ac60aebabfd9f3a5d03cd935633d3e73cfba670cf971635eeb65a99",
+    "tests/test_deploy_rtc_policy_worker.py": "c8b48661d99623c979c65cbbb4fbec6abccaabb2a792098ea9340734878be181",
+    "tests/test_policy_chunk_plan.py": "0f539431d27c5a34b3e05af030afe7e4254fafb580265e0803212d513e42c169",
+    "tests/test_mujoco_rtc_virtual_policy.py": "7e2939873e6a9c8c50569c4b8ef6e38c2e8417126fae90ecd133b636834cc96c",
+    "tests/test_deploy_rtc_prediction_admission.py": "1162aaeda088c40fea0d45fe83d95b21c3cdd55a399e41cf4d49615e2e17b8d6"
+  },
+  "out_of_scope_capture_sha256": {
+    "robot_motion/deploy/runtime.py": "de9ed0b327e68c410bbcd921306532597110b3dc0a64721dc978786ac3fb8b2d",
+    "teleop_runtime/deploy/run_policy.py": "5b0a8d2c41c4e341effa4394176c735e73892d4f45eeb473ad17615617429354",
+    "teleop_runtime/deploy/replay.py": "984ab78db8717f42e9d0c843c282bf73546ac24e71ec2eb77ced3e5f1008bb1a",
+    "teleop_runtime/position_control/deploy_executor.py": "69eb32a1b16644d296a50ef9918cef7c981a530248ee16ce2488abb7e5af0c26"
+  },
+  "verification": [
+    {
+      "command": "PYTHONPATH=. uv run pytest -q tests/test_policy_chunk_plan.py tests/test_mujoco_rtc_virtual_policy.py tests/test_deploy_rtc_policy_worker.py tests/test_deploy_rtc_prediction_admission.py tests/test_deploy_rtc_producer_state.py",
+      "result": "53 passed in 0.77s"
+    },
+    {
+      "command": "PYTHONPATH=. uv run pytest -q tests/test_robot_motion_deploy_contracts.py tests/test_deploy_canonical_action.py tests/test_deploy_action_emission.py tests/test_openpi_common_deploy.py tests/test_openpi05_deployment.py tests/test_deploy_policy_qpos_init.py tests/test_position_deploy_executor.py tests/test_mujoco_deploy_runtime.py tests/test_mujoco_async_topology.py",
+      "result": "150 passed, 1 skipped in 3.54s"
+    },
+    {
+      "command": "git diff --check -- <rtc_3b5_scoped_paths>",
+      "result": "passed"
+    }
+  ],
+  "claims": [
+    "pure async producer snapshot owns active request, worker session, and timed plan transition",
+    "matching completion settles only its active request",
+    "duplicate, old-request, and old-session completion cannot clear a newer request",
+    "lifecycle invalidation precedes result admission and advances producer epoch",
+    "RTC-3c profile is default-off and forbids position lookahead",
+    "missed-tick pop keeps latest still-valid due keyframe and records skipped target/lateness"
+  ],
+  "non_claims": [
+    "not formal ControlTrace evidence",
+    "not RTC-3c frontend wiring",
+    "not OpenPI transport or model guidance evidence",
+    "not worker execution-drain evidence",
+    "not real shadow readiness",
+    "not motion authorization",
+    "not full-suite green evidence"
+  ],
+  "known_mainline_ledger_not_rerun": {
+    "result": "2513 passed, 6 skipped, 6 failed, 3 warnings, 7 subtests passed",
+    "failure_scope": "parallel RM65 MuJoCo actuation profile v1-to-v2 config/test/real2sim hash drift",
+    "rtc_attribution": "not attributed to RTC-3b.5"
+  }
+}

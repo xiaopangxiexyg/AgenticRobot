@@ -4,17 +4,19 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from sim.contracts.scene import SceneSpec
 
 from .config import CameraMount
+from .modeling.actuators import add_position_actuators
 from .modeling.collision import (
     CollisionFilter,
     excluded_body_pairs,
     validate_excluded_bodies,
 )
 from .modeling.geometry import MeshAssetRegistry, safe_name
+from .modeling.gripper_actuators import add_gripper_position_actuators
 from .modeling.objects import add_free_body_objects
 from .modeling.world import add_ground, contact_attributes
 from .transforms import format_float_list, pose_to_pos_quat_text
@@ -26,6 +28,10 @@ from .urdf import (
     URDFVisual,
     parse_urdf,
 )
+
+if TYPE_CHECKING:
+    from .actuation.gripper_profile import GripperActuationProfile
+    from sim.rm65.actuation import PositionActuationProfile
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,8 @@ def convert_urdf_to_mjcf_xml(
     gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
     debug_proxy_visuals: bool = False,
     scene_spec: SceneSpec | None = None,
+    position_actuation_profile: "PositionActuationProfile | None" = None,
+    gripper_actuation_profile: "GripperActuationProfile | None" = None,
 ) -> str:
     mounts_by_link: dict[str, list[CameraMount]] = {}
     for mount in camera_mounts:
@@ -215,14 +223,17 @@ def convert_urdf_to_mjcf_xml(
             "boundinertia": "1e-9",
         },
     )
-    ET.SubElement(
-        mujoco,
-        "option",
-        {
-            "timestep": f"{float(timestep):.12g}",
-            "gravity": format_float_list(resolved_gravity),
-        },
-    )
+    option_attributes = {
+        "timestep": f"{float(timestep):.12g}",
+        "gravity": format_float_list(resolved_gravity),
+    }
+    if position_actuation_profile is not None or gripper_actuation_profile is not None:
+        # Stiff position servos are numerically unstable under explicit Euler
+        # at the 1 kHz task timestep. MuJoCo's implicit-fast integrator treats
+        # joint damping and actuator velocity feedback implicitly while keeping
+        # the same physical timestep and contact model.
+        option_attributes["integrator"] = "implicitfast"
+    ET.SubElement(mujoco, "option", option_attributes)
     visual = ET.SubElement(mujoco, "visual")
     ET.SubElement(visual, "headlight", {"diffuse": "0.7 0.7 0.7", "ambient": "0.25 0.25 0.25"})
     ET.SubElement(visual, "map", {"znear": "0.01", "zfar": "10"})
@@ -295,6 +306,11 @@ def convert_urdf_to_mjcf_xml(
             for first, second in pairs:
                 ET.SubElement(contact, "exclude", {"body1": first, "body2": second})
 
+    if position_actuation_profile is not None:
+        add_position_actuators(mujoco, position_actuation_profile)
+    if gripper_actuation_profile is not None:
+        add_gripper_position_actuators(mujoco, gripper_actuation_profile)
+
     ET.indent(mujoco, space="  ")
     return ET.tostring(mujoco, encoding="unicode")
 
@@ -308,6 +324,8 @@ def write_mjcf(
     gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
     debug_proxy_visuals: bool = False,
     scene_spec: SceneSpec | None = None,
+    position_actuation_profile: "PositionActuationProfile | None" = None,
+    gripper_actuation_profile: "GripperActuationProfile | None" = None,
 ) -> MJCFConversion:
     model = parse_urdf(urdf_path)
     mounts = tuple(camera_mounts)
@@ -318,6 +336,8 @@ def write_mjcf(
         gravity=gravity,
         debug_proxy_visuals=debug_proxy_visuals,
         scene_spec=scene_spec,
+        position_actuation_profile=position_actuation_profile,
+        gripper_actuation_profile=gripper_actuation_profile,
     )
     if output_path is None:
         handle = tempfile.NamedTemporaryFile(

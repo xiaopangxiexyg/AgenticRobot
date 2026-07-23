@@ -305,6 +305,43 @@ def resolve_assignment(
     return (resolved if not errors else None), errors
 
 
+def resolve_assignment_with_unique_completion(
+    assignment: Mapping[str, Any],
+    sensors: Iterable[SensorCandidate],
+) -> tuple[
+    dict[str, SensorCandidate] | None,
+    tuple[str, SensorCandidate] | None,
+    list[str],
+]:
+    """Resolve saved sides and fill exactly one unmatched side when unambiguous."""
+
+    normalized = _normalize_assignment(assignment)
+    available = list(sensors)
+    resolved: dict[str, SensorCandidate] = {}
+    unresolved: list[str] = []
+    errors: list[str] = []
+    for side in SIDES:
+        matches = [
+            sensor
+            for sensor in available
+            if _candidate_matches(normalized["sides"][side], sensor)
+        ]
+        if len(matches) == 1:
+            resolved[side] = matches[0]
+            available.remove(matches[0])
+        else:
+            unresolved.append(side)
+            errors.append(f"Could not uniquely resolve the configured {side} sensor.")
+    if not unresolved:
+        return resolved, None, []
+    if len(unresolved) == 1 and len(available) == 1:
+        inferred_side = unresolved[0]
+        inferred_sensor = available[0]
+        resolved[inferred_side] = inferred_sensor
+        return resolved, (inferred_side, inferred_sensor), errors
+    return None, None, errors
+
+
 def build_assignment(mapping: Mapping[str, SensorCandidate]) -> dict[str, Any]:
     if set(mapping) != set(SIDES) or mapping["left"] == mapping["right"]:
         raise AngleTriggerError("Assignment needs two different left and right sensors.")
@@ -532,6 +569,92 @@ def _load_optional(path: Path, normalizer: Any) -> tuple[dict[str, Any] | None, 
         return normalizer(_read_json(path)), None
     except AngleTriggerError as exc:
         return None, str(exc)
+
+
+def save_assignment_config(
+    mapping: Mapping[str, SensorCandidate],
+    *,
+    config_root: Path | None = None,
+) -> Path:
+    path = assignment_path((config_root or default_config_root()).expanduser().resolve())
+    _write_json(path, build_assignment(mapping))
+    return path
+
+
+def save_angle_calibration_config(
+    profiles: Mapping[str, Mapping[str, float]],
+    *,
+    config_root: Path | None = None,
+) -> Path:
+    path = angle_calibration_path((config_root or default_config_root()).expanduser().resolve())
+    _write_json(path, build_angle_calibration(profiles))
+    return path
+
+
+def load_assignment_config(*, config_root: Path | None = None) -> dict[str, Any]:
+    root = (config_root or default_config_root()).expanduser().resolve()
+    assignment, error = _load_optional(assignment_path(root), _normalize_assignment)
+    if assignment is None:
+        raise AngleTriggerError(
+            "Angle-trigger side assignment is unavailable: "
+            + str(error or "unknown assignment error")
+        )
+    return assignment
+
+
+def load_angle_calibration_config(*, config_root: Path | None = None) -> dict[str, Any]:
+    root = (config_root or default_config_root()).expanduser().resolve()
+    calibration, error = _load_optional(
+        angle_calibration_path(root), _normalize_angle_calibration
+    )
+    if calibration is None:
+        raise AngleTriggerError(
+            "Angle-trigger endpoint calibration is unavailable: "
+            + str(error or "unknown calibration error")
+        )
+    return calibration
+
+
+def load_configured_reader(
+    *,
+    config_root: Path | None = None,
+    baudrate: int = DEFAULT_BAUDRATE,
+) -> AngleTriggerReader:
+    """Load a ready reader without falling back to terminal interaction.
+
+    GUI runtimes use this entrypoint so a missing, invalid, or stale binding can
+    be surfaced as a recoverable calibration state instead of calling input().
+    """
+
+    root = (config_root or default_config_root()).expanduser().resolve()
+    sensors = discover_sensors(baudrate=baudrate)
+    if len(sensors) != 2:
+        raise AngleTriggerError(
+            f"Exactly two angle sensors are required; found {len(sensors)}."
+        )
+    assignment, assignment_error = _load_optional(
+        assignment_path(root), _normalize_assignment
+    )
+    if assignment is None:
+        raise AngleTriggerError(
+            "Angle-trigger side assignment is unavailable: "
+            + str(assignment_error or "unknown assignment error")
+        )
+    mapping, errors = resolve_assignment(assignment, sensors)
+    if mapping is None:
+        raise AngleTriggerError(
+            "Angle-trigger side assignment does not match connected sensors: "
+            + "; ".join(errors)
+        )
+    calibration, calibration_error = _load_optional(
+        angle_calibration_path(root), _normalize_angle_calibration
+    )
+    if calibration is None:
+        raise AngleTriggerError(
+            "Angle-trigger endpoint calibration is unavailable: "
+            + str(calibration_error or "unknown calibration error")
+        )
+    return AngleTriggerReader(mapping, calibration, baudrate=baudrate)
 
 
 def prepare_reader(

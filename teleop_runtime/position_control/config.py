@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from robot_motion.position_control import (
     POSITION_15_60_120_PROFILE,
@@ -337,6 +337,27 @@ def resolve_real_arm_execution_config(
         mode = raw_mode
     if mode not in {"impedance", "position"}:
         raise ValueError(f"Unsupported arm control mode: {mode!r}.")
+    position_profile_metadata = getattr(
+        args,
+        "position_control_profile_metadata",
+        None,
+    )
+    position_source_shaping_applied = bool(
+        isinstance(position_profile_metadata, Mapping)
+        and position_profile_metadata.get("source_shaping_applied", False)
+    )
+    position_source_shaping_metadata = (
+        position_profile_metadata.get("source_shaping")
+        if isinstance(position_profile_metadata, Mapping)
+        else None
+    )
+    profile_post_ik_alpha: float | None = None
+    if isinstance(position_source_shaping_metadata, Mapping):
+        profile_post_ik_alpha_value = position_source_shaping_metadata.get(
+            "post_ik_qpos_smoothing_alpha"
+        )
+        if profile_post_ik_alpha_value is not None:
+            profile_post_ik_alpha = float(profile_post_ik_alpha_value)
     default_impedance_outer_control_hz = (
         DEFAULT_TELEOP_SAMPLE_HZ
         if impedance_default_outer_control_hz is None
@@ -460,7 +481,10 @@ def resolve_real_arm_execution_config(
         if (
             mode == "position"
             and position_background_streaming_enabled
-            and post_ik_alpha_explicit
+            and (
+                post_ik_alpha_explicit
+                or position_source_shaping_applied
+            )
             and raw_post_ik_alpha is not None
         )
         else 0.9
@@ -502,6 +526,11 @@ def resolve_real_arm_execution_config(
         if expected_position_profile.name == POSITION_15_60_120HZ_PROFILE_NAME
         else 0.1
     )
+    expected_position_post_ik_alpha = (
+        profile_post_ik_alpha
+        if position_source_shaping_applied and profile_post_ik_alpha is not None
+        else 0.9
+    )
     expected = (
         {
             "sample_hz": DEFAULT_TELEOP_SAMPLE_HZ,
@@ -526,7 +555,7 @@ def resolve_real_arm_execution_config(
             "arm_canfd_follow": True,
             "position_background_streaming_enabled": True,
             "position_background_streaming_hz": expected_position_profile.rates.command_hz,
-            "position_post_ik_qpos_smoothing_alpha": 0.9,
+            "position_post_ik_qpos_smoothing_alpha": expected_position_post_ik_alpha,
             "arm_follow_qpos_alpha": expected_position_follow_alpha,
             "arm_canfd_trajectory_mode": 0,
             "arm_canfd_radio": 0,

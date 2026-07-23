@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -141,6 +142,41 @@ class HandEyeEyeInHandTest(unittest.TestCase):
 
 
 class HandEyeRealSenseSettingsTest(unittest.TestCase):
+    def test_startup_no_frames_resets_only_selected_serial_and_retries(self) -> None:
+        selected = _FakeHardwareDevice("LEFT123")
+        other = _FakeHardwareDevice("RIGHT456")
+        fake_rs = _FakeRealSenseStartup(
+            devices=[other, selected],
+            warmup_errors_by_pipeline=[
+                [
+                    RuntimeError("Frame didn't arrive within 1000"),
+                    RuntimeError("Frame didn't arrive within 1000"),
+                ],
+                [],
+            ],
+        )
+        config = RealSenseConfig(
+            serial="LEFT123",
+            resolution=(640, 480),
+            fps=15,
+            enable_depth=False,
+            startup_warmup_frames=2,
+            startup_hardware_reset_on_failure=True,
+            startup_hardware_reset_retry_attempts=1,
+            startup_hardware_reset_sleep_sec=0.0,
+        )
+
+        with patch("utils.hand_eye.camera._require_pyrealsense2", return_value=fake_rs):
+            camera = RealSenseCamera(config).start()
+
+        self.assertEqual(selected.hardware_reset_calls, 1)
+        self.assertEqual(other.hardware_reset_calls, 0)
+        self.assertEqual(len(fake_rs.pipelines), 2)
+        self.assertEqual(fake_rs.pipelines[0].stop_calls, 1)
+        self.assertEqual(fake_rs.pipelines[1].wait_calls, [1000, 1000])
+        self.assertEqual(camera.settings_report["startup.hardware_reset_recovery_count"], 1)
+        camera.stop()
+
     def test_fixed_realsense_options_restore_previous_values_on_stop(self) -> None:
         sensor = _FakeSensor(
             {
@@ -296,6 +332,105 @@ class _FakePipeline:
 
     def stop(self) -> None:
         self.stopped = True
+
+
+class _FakeHardwareDevice:
+    def __init__(self, serial: str) -> None:
+        self.serial = serial
+        self.hardware_reset_calls = 0
+        self.sensors = []
+
+    def supports(self, field: object) -> bool:
+        return field == "serial_number"
+
+    def get_info(self, field: object) -> str:
+        if field != "serial_number":
+            raise KeyError(field)
+        return self.serial
+
+    def hardware_reset(self) -> None:
+        self.hardware_reset_calls += 1
+
+
+class _FakeStartupProfile:
+    def __init__(self, device: _FakeHardwareDevice) -> None:
+        self._device = device
+
+    def get_device(self) -> _FakeHardwareDevice:
+        return self._device
+
+
+class _FakeStartupConfig:
+    def __init__(self) -> None:
+        self.serial: str | None = None
+
+    def enable_device(self, serial: str) -> None:
+        self.serial = serial
+
+    def enable_stream(self, *args: object) -> None:
+        return None
+
+
+class _FakeStartupPipeline:
+    def __init__(
+        self,
+        owner: "_FakeRealSenseStartup",
+        warmup_errors: list[RuntimeError],
+    ) -> None:
+        self.owner = owner
+        self.warmup_errors = list(warmup_errors)
+        self.stop_calls = 0
+        self.wait_calls: list[int] = []
+
+    def start(self, config: _FakeStartupConfig) -> _FakeStartupProfile:
+        serial = config.serial
+        device = next(device for device in self.owner.devices if device.serial == serial)
+        return _FakeStartupProfile(device)
+
+    def wait_for_frames(self, timeout_ms: int) -> object:
+        self.wait_calls.append(timeout_ms)
+        if self.warmup_errors:
+            raise self.warmup_errors.pop(0)
+        return object()
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class _FakeRealSenseStartup:
+    class stream:
+        color = "color"
+        depth = "depth"
+
+    class format:
+        bgr8 = "bgr8"
+        yuyv = "yuyv"
+        z16 = "z16"
+
+    class camera_info:
+        serial_number = "serial_number"
+
+    def __init__(
+        self,
+        *,
+        devices: list[_FakeHardwareDevice],
+        warmup_errors_by_pipeline: list[list[RuntimeError]],
+    ) -> None:
+        self.devices = list(devices)
+        self.warmup_errors_by_pipeline = list(warmup_errors_by_pipeline)
+        self.pipelines: list[_FakeStartupPipeline] = []
+
+    def pipeline(self) -> _FakeStartupPipeline:
+        errors = self.warmup_errors_by_pipeline[len(self.pipelines)]
+        pipeline = _FakeStartupPipeline(self, errors)
+        self.pipelines.append(pipeline)
+        return pipeline
+
+    def config(self) -> _FakeStartupConfig:
+        return _FakeStartupConfig()
+
+    def context(self):
+        return type("Context", (), {"devices": self.devices})()
 
 
 if __name__ == "__main__":

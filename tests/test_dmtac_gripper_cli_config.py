@@ -40,6 +40,64 @@ def _assignment() -> dict:
 
 
 class DMTacGripperCliConfigTest(unittest.TestCase):
+    def test_parser_exposes_canonical_names_and_keeps_legacy_aliases(self) -> None:
+        parser = cli.build_parser()
+        canonical = parser.parse_args(
+            [
+                "verify-gripper",
+                "--gripper-id",
+                "7",
+                "--gripper-baudrate",
+                "57600",
+                "--gripper-timeout",
+                "0.2",
+                "--tactile-max-fps",
+                "60",
+            ]
+        )
+        legacy = parser.parse_args(
+            [
+                "verify-gripper",
+                "--id",
+                "7",
+                "--baudrate",
+                "57600",
+                "--timeout",
+                "0.2",
+                "--max_fps",
+                "60",
+            ]
+        )
+
+        for name in ("gripper_id", "baudrate", "timeout", "max_fps"):
+            self.assertEqual(getattr(canonical, name), getattr(legacy, name))
+
+    def test_configure_usb_modes_are_explicit_and_preserve_other_slots(self) -> None:
+        parser = cli.build_parser()
+        grippers_only = parser.parse_args(["configure-usb", "--grippers-only"])
+        cli._prepare_configure_usb_mode(grippers_only)
+        self.assertEqual(grippers_only.merge_config, "latest")
+        self.assertTrue(grippers_only.auto_grippers)
+        self.assertFalse(grippers_only.assign_tactile_gui)
+
+        tactile_only = parser.parse_args(["configure-usb", "--tactile-only"])
+        cli._prepare_configure_usb_mode(tactile_only)
+        self.assertEqual(tactile_only.merge_config, "latest")
+        self.assertFalse(tactile_only.auto_grippers)
+        self.assertTrue(tactile_only.assign_tactile_gui)
+        self.assertEqual(grippers_only.max_reachable_grippers, 2)
+
+        exhaustive = parser.parse_args(
+            ["configure-usb", "--scan-only", "--max-reachable-grippers", "0"]
+        )
+        self.assertEqual(exhaustive.max_reachable_grippers, 0)
+
+    def test_scan_only_rejects_side_effecting_options(self) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args(["configure-usb", "--scan-only", "--save"])
+        with self.assertRaisesRegex(ValueError, "--scan-only cannot be combined"):
+            cli._prepare_configure_usb_mode(args)
+
     def test_config_resolution_uses_saved_port_without_usb_scan_by_default(self) -> None:
         args = SimpleNamespace(
             config="latest",

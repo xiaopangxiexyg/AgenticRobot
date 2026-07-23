@@ -20,6 +20,8 @@ from teleop_runtime.gui import calibration_web_ui
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.sources.pose import VivePoseSource
 from teleop_runtime.tactile_visualizer import DMTacDistributedForceVisualizer
+from teleop_runtime.tactile_visualizer import dmtac_visualization_snapshot_from_backends
+from dataset_contracts.tactile_calibration import save_tactile_calibration
 
 
 class _FakeTerminal:
@@ -267,6 +269,132 @@ def _args(**overrides: object) -> SimpleNamespace:
 
 
 class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
+    def test_gui_keeps_only_tracker_swap_from_legacy_view_and_pose_tuning_controls(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn("Tracker 输入", html)
+        self.assertIn('data-event="w">交换左右 Tracker</button>', html)
+        self.assertNotIn("左右 / 视图", html)
+        self.assertNotIn("姿态微调", html)
+        for event in ("1", "2", "t", "v", "f", "x", "j", "l", "i", "k", "u", "o"):
+            self.assertNotIn(f'data-event="{event}"', html)
+
+    def test_rendered_page_keeps_modern_javascript_syntax_intact(self) -> None:
+        page = calibration_web_ui._render_initial_html(
+            calibration_web_ui.CalibrationWebUiState().__dict__
+        )
+
+        self.assertNotIn('.join("\n")', page)
+        self.assertIn('.join("\\n")', page)
+        self.assertIn(
+            'buttons[i].textContent = state.camera_visualization_active',
+            page,
+        )
+        self.assertIn(
+            'buttons[i].textContent = state.tactile_visualization_active',
+            page,
+        )
+        self.assertIn(
+            'initSection.hidden = !Boolean(state.init_arm_available)',
+            page,
+        )
+
+    def test_left_status_pills_show_foot_pad_online_count_or_unavailable(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn('state.foot_pad_requested || state.foot_pad_available', html)
+        self.assertIn('online ? `${count} 个已连接` : "未连接 / 未就绪"', html)
+        self.assertIn('online ? "ok" : "warn"', html)
+        self.assertIn(".pill.ok", html)
+        self.assertIn(".pill.warn", html)
+
+    def test_foot_pad_topology_does_not_hide_fix_or_init_gui_controls(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn("captureButton.hidden = false;", html)
+        self.assertIn("initArmToggleButtonEl.hidden = false;", html)
+        self.assertIn(
+            "fixArmToggleButtonEl.parentElement.hidden = false;",
+            html,
+        )
+        self.assertIn("initArmMoveToQposButtonEl.hidden = annotationOnly;", html)
+        self.assertIn("initArmMoveBothToQposButtonEl.hidden = annotationOnly;", html)
+        self.assertNotIn(
+            "initArmMoveToQposButtonEl.hidden = annotationOnly || twoPedal;",
+            html,
+        )
+        self.assertNotIn(
+            "initArmMoveBothToQposButtonEl.hidden = annotationOnly || twoPedal;",
+            html,
+        )
+
+    def test_gripper_force_copy_explains_temporary_normalized_command(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn("临时夹爪驱动力（归一化 0–1）", html)
+        self.assertIn("不是牛顿值", html)
+        self.assertIn("开始数采前会恢复任务配置", html)
+        self.assertIn("保存为新数据集永久力度", html)
+        self.assertIn("gripper_force_persist", html)
+
+    def test_pre_home_wait_services_visualization_callbacks_before_quit(self) -> None:
+        class Clutch:
+            enabled = True
+            should_quit = False
+
+            def __init__(self) -> None:
+                self.startup_enabled: list[bool] = []
+                self.poll_count = 0
+
+            def set_startup_qpos_maintenance_enabled(self, enabled):
+                self.startup_enabled.append(bool(enabled))
+
+            def poll(self):
+                self.poll_count += 1
+                self.should_quit = self.poll_count >= 2
+
+            @staticmethod
+            def consume_calibration_request():
+                return False
+
+            @staticmethod
+            def publish_raw_tracker_pose_state(**_kwargs):
+                return None
+
+        clutch = Clutch()
+        request_times: list[float] = []
+        update_times: list[float] = []
+        runtime_status_updates: list[bool] = []
+        components = SimpleNamespace(
+            active_sides=(),
+            session=SimpleNamespace(poll_sources=lambda now: ({}, [])),
+        )
+        with patch.object(real_teleop, "_handle_ik_debug_log_toggle_request"), patch.object(
+            real_teleop,
+            "_advance_startup_gui_qpos_maintenance",
+        ), patch.object(real_teleop, "_sync_preview_from_real_state_real"), patch.object(
+            real_teleop.time,
+            "sleep",
+        ):
+            result = real_teleop._wait_for_real_teleop_start_request(
+                components,
+                clutch,
+                arm_mode="real",
+                args=_args(),
+                control_ui=None,
+                ik_debug_log_recorder=SimpleNamespace(),
+                ik_debug_profile_base_enabled=False,
+                visualization_request_handler=request_times.append,
+                visualization_update_handler=update_times.append,
+                runtime_status_update_handler=lambda: runtime_status_updates.append(True),
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(request_times), 2)
+        self.assertEqual(len(update_times), 1)
+        self.assertEqual(len(runtime_status_updates), 2)
+        self.assertEqual(clutch.startup_enabled, [True, False])
+
     def test_preview_apply_does_not_mutate_recorded_active_command(self) -> None:
         class _MutatingPreviewBackend:
             def __init__(self) -> None:
@@ -391,6 +519,106 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         self.assertTrue(args.init_arm_available)
         self.assertEqual(args.init_arm_profile, str(init_profile))
+        self.assertEqual(args.init_arm_left_qpos_speed_scale, 5.0)
+        self.assertEqual(args.init_arm_right_qpos_speed_scale, 5.0)
+
+    def test_parse_args_two_pedals_do_not_disable_requested_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            calibration_profile = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
+            calibration_profile.write_text("{}", encoding="utf-8")
+            missing_init_profile = profile_dir / "missing-init-qpos.json"
+            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+                real_teleop, "configured_foot_pad_count", return_value=2
+            ), patch.object(
+                sys,
+                "argv",
+                [
+                    "prog",
+                    "--active-sides",
+                    "both",
+                    "--left-arm-ip",
+                    "192.0.2.10",
+                    "--right-arm-ip",
+                    "192.0.2.11",
+                    "--no-arm-ip-save-latest",
+                    "--no-camera",
+                    "--no-video",
+                    "--headless",
+                    "--no-gui",
+                    "--init-arm-available",
+                    "--init-arm-profile",
+                    str(missing_init_profile),
+                ],
+            ):
+                args = real_teleop.parse_args()
+
+        self.assertTrue(args.init_arm_available)
+        self.assertTrue(args.init_arm_requested)
+        self.assertEqual(args.init_arm_disabled_reason, "")
+        self.assertEqual(args.special_arm_control_mode, "foot-pad")
+
+    def test_missing_saved_two_pedal_device_restores_manual_init_arm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            init_profile = Path(tmp_dir) / "init_arm.json"
+            init_profile.write_text("{}", encoding="utf-8")
+            args = SimpleNamespace(
+                init_arm_available=False,
+                init_arm_requested=True,
+                init_arm_disabled_reason="two_pedal_layout",
+                init_arm_profile=str(init_profile),
+            )
+
+            restored, message = real_teleop._restore_init_arm_after_foot_pad_fallback(
+                args,
+                live_foot_pad_count=None,
+            )
+
+        self.assertTrue(restored)
+        self.assertTrue(args.init_arm_available)
+        self.assertEqual(args.init_arm_disabled_reason, "")
+        self.assertIn("已恢复", message)
+
+    def test_offline_foot_pad_restores_requested_init_from_stale_disabled_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            init_profile = Path(tmp_dir) / "init_arm.json"
+            init_profile.write_text("{}", encoding="utf-8")
+            args = SimpleNamespace(
+                init_arm_available=False,
+                init_arm_requested=True,
+                init_arm_disabled_reason="",
+                init_arm_profile=str(init_profile),
+            )
+
+            restored, message = real_teleop._restore_init_arm_after_foot_pad_fallback(
+                args,
+                live_foot_pad_count=None,
+            )
+
+        self.assertTrue(restored)
+        self.assertTrue(args.init_arm_available)
+        self.assertEqual(args.init_arm_disabled_reason, "")
+        self.assertIn("已恢复", message)
+
+    def test_live_two_pedal_device_does_not_block_requested_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            init_profile = Path(tmp_dir) / "init_arm.json"
+            init_profile.write_text("{}", encoding="utf-8")
+            args = SimpleNamespace(
+                init_arm_available=False,
+                init_arm_requested=True,
+                init_arm_disabled_reason="two_pedal_layout",
+                init_arm_profile=str(init_profile),
+            )
+
+            restored, message = real_teleop._restore_init_arm_after_foot_pad_fallback(
+                args,
+                live_foot_pad_count=2,
+            )
+
+        self.assertTrue(restored)
+        self.assertTrue(args.init_arm_available)
+        self.assertIn("已恢复", message)
 
     def test_parse_args_rejects_special_arm_modes_for_single_arm_before_device_setup(self) -> None:
         for mode_flag in ("--fix-arm", "--init-arm-available"):
@@ -1190,6 +1418,63 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("record_pose_snapshot", active_controls)
         self.assertFalse(running_publish["pose_snapshot_available"])
 
+    def test_device_retry_is_restored_in_hold_and_survives_status_refresh(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+
+        control.publish_teleop_running()
+        running_publish = next(
+            published
+            for published in reversed(ui.published)
+            if published.get("stage") == "RM65 真机遥操运行中"
+        )
+        self.assertNotIn("device_retry", running_publish["active_controls"])
+
+        control.request_hold()
+        self.assertIn("device_retry", ui.published[-1]["active_controls"])
+
+        control.set_visualization_state(camera_active=True)
+        self.assertIn("device_retry", ui.published[-1]["active_controls"])
+
+    def test_visualization_refresh_cannot_reenable_controls_during_recording(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+        control.set_episode_recording_state(active=True)
+
+        control.set_visualization_state(camera_active=True)
+
+        active_controls = set(ui.published[-1]["active_controls"])
+        self.assertIn("episode_stop", active_controls)
+        self.assertNotIn("episode_start", active_controls)
+        self.assertNotIn("device_retry", active_controls)
+        self.assertNotIn("movement_multiple_set", active_controls)
+
+    def test_rejected_episode_start_restores_one_shot_controls(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control._publish_episode_start_rejection("test rejection")
+
+        self.assertIn("episode_start", ui.published[-1]["active_controls"])
+        self.assertIn("test rejection", ui.published[-1]["control_hint"])
+
     def test_fix_arm_running_gui_exposes_pose_snapshot_control(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             ui = _FakeUi()
@@ -1471,6 +1756,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             args=_args(),
             components=_components(),
         )
+        control._teleop_started = True
 
         control.poll()
 
@@ -1564,6 +1850,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("movement_multiple_up", active_controls)
         self.assertIn("movement_multiple_reset", active_controls)
         self.assertIn("movement_multiple_set", active_controls)
+        self.assertIn("device_retry", active_controls)
         self.assertEqual(ready_publish["movement_multiple"], 1.0)
         self.assertEqual(ready_publish["capture_stage"], "runtime_home")
         self.assertEqual(ready_publish["capture_phase"], "ready")
@@ -1576,6 +1863,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 "episode_stop",
                 "toggle_camera_vis",
                 "toggle_tactile_vis",
+                "enable_tactile_solving",
             ]
         )
         control = real_teleop.RealTeleopControlInput(
@@ -1584,6 +1872,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             args=_args(),
             components=_components(),
         )
+        control._teleop_started = True
 
         control.poll()
 
@@ -1591,6 +1880,36 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(control.consume_episode_stop_request())
         self.assertTrue(control.consume_camera_visualization_toggle_request())
         self.assertTrue(control.consume_tactile_visualization_toggle_request())
+        self.assertTrue(control.consume_tactile_solving_enable_request())
+
+    def test_gui_tactile_solving_control_is_only_available_before_teleop_or_in_hold(self) -> None:
+        args = _args(
+            tactile_solving_available=True,
+            tactile_solving_active=False,
+            tactile_visualization_available=False,
+        )
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(), ui=ui, args=args, components=_components()
+        )
+
+        control.start()
+        ready = next(
+            item for item in reversed(ui.published) if "active_controls" in item
+        )
+        self.assertIn("enable_tactile_solving", ready["active_controls"])
+
+        control.publish_teleop_running()
+        running = next(
+            item for item in reversed(ui.published) if "active_controls" in item
+        )
+        self.assertNotIn("enable_tactile_solving", running["active_controls"])
+
+        control.request_hold(reason="unit_test")
+        hold = next(
+            item for item in reversed(ui.published) if "active_controls" in item
+        )
+        self.assertIn("enable_tactile_solving", hold["active_controls"])
 
     def test_gui_movement_multiple_event_updates_all_arm_retargeters(self) -> None:
         ui = _FakeUi(["movement_multiple_set:2.5"])
@@ -1660,11 +1979,131 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_web_ui_accepts_gripper_force_set_payload_when_control_active(self) -> None:
         ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
-        ui.publish(active_controls=["gripper_force_set"])
+        ui.publish(active_controls=["gripper_force_set", "gripper_force_persist"])
 
         event = 'gripper_force_set:{"left":0.31,"right":0.64}'
         self.assertTrue(ui.push_event(event))
         self.assertEqual(ui.consume_events(), [event])
+        persist_event = 'gripper_force_persist:{"left":0.31,"right":0.64}'
+        self.assertTrue(ui.push_event(persist_event))
+        self.assertEqual(ui.consume_events(), [persist_event])
+
+    def test_web_ui_accepts_init_qpos_speed_payload_when_control_active(self) -> None:
+        ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
+        ui.publish(active_controls=["init_arm_qpos_speed_set"])
+
+        event = 'init_arm_qpos_speed_set:{"left":4.0,"right":6.0}'
+        self.assertTrue(ui.push_event(event))
+        self.assertEqual(ui.consume_events(), [event])
+
+    def test_gui_init_qpos_speed_updates_both_sides_atomically(self) -> None:
+        ui = _FakeUi(['init_arm_qpos_speed_set:{"left":4.0,"right":6.0}'])
+        args = _args()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=args,
+            components=_components(),
+        )
+
+        control.poll()
+
+        self.assertEqual(args.init_arm_left_qpos_speed_scale, 4.0)
+        self.assertEqual(args.init_arm_right_qpos_speed_scale, 6.0)
+        state = next(
+            item
+            for item in reversed(ui.published)
+            if "init_arm_qpos_speed_scale_by_side" in item
+        )
+        self.assertEqual(
+            state["init_arm_qpos_speed_scale_by_side"],
+            {"left": 4.0, "right": 6.0},
+        )
+        self.assertTrue(any("统一使用该设置" in message for _, message in ui.messages))
+
+    def test_gui_init_qpos_speed_rejects_partial_invalid_update(self) -> None:
+        ui = _FakeUi(['init_arm_qpos_speed_set:{"left":4.0,"right":20.0}'])
+        args = _args()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=args,
+            components=_components(),
+        )
+
+        control.poll()
+
+        self.assertFalse(hasattr(args, "init_arm_left_qpos_speed_scale"))
+        self.assertFalse(hasattr(args, "init_arm_right_qpos_speed_scale"))
+        self.assertEqual(
+            control._init_arm_qpos_speed_scale_by_side,
+            {"left": 5.0, "right": 5.0},
+        )
+        self.assertTrue(any("倍率无效" in message for _, message in ui.messages))
+
+    def test_init_qpos_emergency_stop_is_operation_stop_not_process_quit(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(["init_qpos_emergency_stop"]),
+            args=_args(),
+            components=_components(),
+        )
+
+        control.poll()
+
+        assert control.should_quit is False
+        assert control.consume_init_qpos_emergency_stop_request() is True
+        assert any("不退出遥操程序" in message for _, message in control.ui.messages)
+
+    def test_init_qpos_emergency_stop_holds_without_latching_arm_backend(self) -> None:
+        class _CommandBackend:
+            def __init__(self) -> None:
+                self.emergency_stop_calls = 0
+
+            def emergency_stop(self) -> None:
+                self.emergency_stop_calls += 1
+
+        class _Controller:
+            qpos_active = True
+            qpos_operation_id = "op-1"
+
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def cancel_active(self, **_kwargs):
+                self.cancelled = True
+                return SimpleNamespace(ok=True, message="cancelled")
+
+        class _Session:
+            def __init__(self) -> None:
+                self.hold_messages: list[str] = []
+
+            def hold_hardware(self, message: str) -> None:
+                self.hold_messages.append(message)
+
+        controller = _Controller()
+        session = _Session()
+        left_backend = _CommandBackend()
+        right_backend = _CommandBackend()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            init_arm_controller=controller,
+            left_command_backend=left_backend,
+            right_command_backend=right_backend,
+            session=session,
+        )
+        control = SimpleNamespace(
+            _teleop_started=False,
+            _cancel_init_arm_qpos_sequence=lambda **_kwargs: None,
+            _publish_init_arm_state=lambda **_kwargs: None,
+        )
+
+        real_teleop._handle_init_qpos_emergency_stop(components, control, now=1.0)
+
+        assert controller.cancelled is True
+        assert session.hold_messages
+        assert left_backend.emergency_stop_calls == 0
+        assert right_backend.emergency_stop_calls == 0
 
     def test_gui_gripper_force_set_updates_active_sides_and_rejects_collection(self) -> None:
         components = _components()
@@ -1707,6 +2146,33 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertAlmostEqual(components.left_hand_backend.config.torque, 0.31)
         self.assertAlmostEqual(components.right_hand_backend.config.torque, 0.64)
         self.assertTrue(any("数采录制、暂停、倒计时或保存中" in message for _, message in ui.messages))
+
+    def test_gui_gripper_force_persist_binds_new_dataset_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            components = _components()
+            components.active_sides = ("right",)
+            components.right_hand_backend = DMTacGripperBackend(
+                DMTacGripperBackendConfig(
+                    side="right",
+                    connect_hardware=False,
+                    connect_tactile=False,
+                )
+            )
+            args = _args(dataset_root=str(Path(tmp_dir) / "new_dataset"))
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=_FakeUi(),
+                args=args,
+                components=components,
+            )
+
+            control._persist_gripper_force_from_gui('{"right":0.73}')
+
+            contract = real_teleop.read_gripper_force_contract(args.dataset_root)
+            assert contract is not None
+            assert contract.force_by_side_dict == {"right": 0.73}
+            assert args._gripper_force_dataset_contract == contract.to_dict()
+            assert components.right_hand_backend.config.torque == 0.73
 
     def test_manual_gripper_force_is_restored_to_task_policy_before_collection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1853,13 +2319,46 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
         )
 
+    def test_http_episode_start_preserves_dataset_capture_contract_selection(self) -> None:
+        encoded = calibration_web_ui._encode_http_event_payload(
+            {
+                "event": "episode_start",
+                "dataset_base_root": "/tmp/datasets",
+                "ignored_camera_keys": ["right_wrist"],
+                "ignored_tactile_keys": ["left"],
+            }
+        )
+        event, raw_payload = encoded.split(":", 1)
+        payload = json.loads(raw_payload)
+
+        self.assertEqual(event, "episode_start")
+        self.assertEqual(payload["ignored_camera_keys"], ["right_wrist"])
+        self.assertEqual(payload["ignored_tactile_keys"], ["left"])
+
     def test_web_ui_accepts_init_arm_toggle_and_side_when_control_active(self) -> None:
         ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
-        ui.publish(active_controls=["init_arm_toggle", "init_arm_select"])
+        ui.publish(
+            active_controls=[
+                "init_arm_toggle",
+                "init_arm_select",
+                "init_arm_move_to_qpos",
+                "init_arm_move_both_to_qpos",
+            ]
+        )
 
         self.assertTrue(ui.push_event("init_arm_toggle"))
         self.assertTrue(ui.push_event("init_arm_select:right"))
-        self.assertEqual(ui.consume_events(), ["init_arm_toggle", "init_arm_select:right"])
+        self.assertTrue(ui.push_event("init_arm_move_to_qpos"))
+        self.assertTrue(ui.push_event("init_arm_move_both_to_qpos"))
+        self.assertEqual(
+            ui.consume_events(),
+            [
+                "init_arm_toggle",
+                "init_arm_select:right",
+                "init_arm_move_to_qpos",
+                "init_arm_move_both_to_qpos",
+            ],
+        )
         self.assertTrue(
             any(
                 item.get("tag") == "WebGUIEvent"
@@ -1867,6 +2366,795 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 for item in ui.snapshot()["messages"]
             )
         )
+
+    def test_web_ui_publishes_exact_qpos_progress_fields(self) -> None:
+        ui = calibration_web_ui.CalibrationWebUi(open_browser=False)
+
+        ui.publish(
+            init_arm_qpos_active=True,
+            init_arm_qpos_phase="qpos_executing",
+            init_arm_qpos_step_index=12,
+            init_arm_qpos_step_count=40,
+            init_arm_qpos_max_error_deg=0.25,
+            init_arm_sequence_active=True,
+            init_arm_sequence_side="left",
+            init_arm_sequence_phase="left_qpos",
+            init_arm_sequence_status="running left",
+            fix_arm_fixed_sides=["left", "right"],
+            fix_hold_active=True,
+        )
+
+        snapshot = ui.snapshot()
+        self.assertTrue(snapshot["init_arm_qpos_active"])
+        self.assertEqual(snapshot["init_arm_qpos_phase"], "qpos_executing")
+        self.assertEqual(snapshot["init_arm_qpos_step_index"], 12)
+        self.assertEqual(snapshot["init_arm_qpos_step_count"], 40)
+        self.assertEqual(snapshot["init_arm_qpos_max_error_deg"], 0.25)
+        self.assertTrue(snapshot["init_arm_sequence_active"])
+        self.assertEqual(snapshot["init_arm_sequence_side"], "left")
+        self.assertEqual(snapshot["init_arm_sequence_phase"], "left_qpos")
+        self.assertEqual(snapshot["init_arm_sequence_status"], "running left")
+        self.assertEqual(snapshot["fix_arm_fixed_sides"], ["left", "right"])
+        self.assertTrue(snapshot["fix_hold_active"])
+
+    def test_fix_hold_disables_gripper_and_blocks_new_episode_start(self) -> None:
+        ui = _FakeUi(["episode_start"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control._teleop_started = True
+        control._gripper_control_enabled = True
+
+        control.set_fix_hold_active(True, message="both sides fixed-like")
+        control.poll()
+
+        self.assertTrue(control.fix_hold_active())
+        self.assertFalse(control.gripper_control_enabled())
+        self.assertFalse(control.consume_episode_start_request())
+        self.assertTrue(any("Fix-Hold" in message for _tag, message in ui.messages))
+
+        control.set_fix_hold_active(False, message="one side released")
+        self.assertFalse(control.fix_hold_active())
+        self.assertTrue(control._gripper_control_enabled)
+
+    def test_terminal_episode_start_cannot_bypass_fix_hold_admission(self) -> None:
+        class StartTerminal(_FakeTerminal):
+            def __init__(self) -> None:
+                self.requested = True
+
+            def consume_episode_start_request(self) -> bool:
+                requested = self.requested
+                self.requested = False
+                return requested
+
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=StartTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control._teleop_started = True
+        control.set_fix_hold_active(True, message="both sides fixed-like")
+
+        self.assertFalse(control.consume_episode_start_request())
+        self.assertTrue(any("Fix-Hold" in message for _tag, message in ui.messages))
+
+    def test_gui_exact_qpos_event_uses_dedicated_planner_not_legacy_g_flow(self) -> None:
+        ui = _FakeUi(["init_arm_move_to_qpos"])
+        components = _components()
+        controller = SimpleNamespace(
+            selected_side="left",
+            active=False,
+            qpos_active=False,
+            status_payload=lambda: {
+                "init_arm_available": True,
+                "init_arm_selected_side": "left",
+                "init_arm_active_side": "",
+                "init_arm_active": False,
+                "init_arm_recalibrating": False,
+                "init_arm_status": "ready",
+            },
+        )
+        components.init_arm_controller = controller
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+        transition = SimpleNamespace(ok=True, side="left", message="planning")
+
+        with patch.object(real_teleop, "_start_gui_qpos_init", return_value=transition) as start:
+            control.poll()
+
+        start.assert_called_once()
+        self.assertTrue(any("后台路径规划" in message for _tag, message in ui.messages))
+
+    def test_gui_exact_qpos_event_is_admitted_before_home_only_with_startup_executor(self) -> None:
+        components = _components()
+        components.collision_guard_requested = True
+        components.dual_arm_retargeter = object()
+        components.active_sides = ("left", "right")
+        components.init_arm_controller = SimpleNamespace(
+            selected_side="left",
+            active=False,
+            qpos_active=False,
+            status_payload=lambda: {"init_arm_available": True},
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        transition = SimpleNamespace(ok=True, side="left", message="planning")
+
+        with patch.object(real_teleop, "_start_gui_qpos_init", return_value=transition) as start:
+            self.assertFalse(control._handle_init_arm_move_to_qpos_event(now=1.0))
+            control.set_startup_qpos_maintenance_enabled(True)
+            self.assertTrue(control._handle_init_arm_move_to_qpos_event(now=2.0))
+
+        start.assert_called_once()
+        self.assertFalse(control._teleop_started)
+        self.assertFalse(control._episode_recording_ui_active)
+
+    def test_gui_exact_qpos_event_is_admitted_from_regular_hold(self) -> None:
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            selected_side="left",
+            active=False,
+            qpos_active=False,
+            status_payload=lambda: {"init_arm_available": True},
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        transition = SimpleNamespace(ok=True, side="left", message="planning")
+
+        with patch.object(
+            real_teleop,
+            "_start_gui_qpos_init",
+            return_value=transition,
+        ) as start:
+            self.assertTrue(control._handle_init_arm_move_to_qpos_event(now=2.0))
+
+        start.assert_called_once()
+        self.assertTrue(control.hold_active())
+
+    def test_startup_qpos_maintenance_dispatches_without_building_teleop_action(self) -> None:
+        class Controller:
+            qpos_active = True
+
+            @staticmethod
+            def qpos_seed_qpos_by_side():
+                return {"left": np.zeros(6), "right": np.ones(6)}
+
+            @staticmethod
+            def consume_qpos_terminal_event():
+                return None
+
+        dispatched: list[TeleopCommand] = []
+        filter_calls: list[tuple[object, float]] = []
+
+        def command_filter(command, observation, now):
+            filter_calls.append((observation, now))
+            command.metadata["shared_filter_applied"] = True
+            return command
+
+        session = SimpleNamespace(
+            command_filter=command_filter,
+            evaluate_command_guard=lambda command, observation, now: None,
+            dispatch_command=lambda command: dispatched.append(command),
+        )
+        components = SimpleNamespace(
+            init_arm_controller=Controller(),
+            session=session,
+        )
+        clutch = SimpleNamespace()
+
+        self.assertTrue(
+            real_teleop._advance_startup_gui_qpos_maintenance(
+                args=_args(arm_control_mode="position"),
+                components=components,
+                clutch_input=clutch,
+                now=3.0,
+            )
+        )
+
+        self.assertEqual(filter_calls, [(None, 3.0)])
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(set(dispatched[0].commands), {"left_arm", "right_arm"})
+        self.assertTrue(dispatched[0].metadata["startup_qpos_maintenance"])
+        self.assertFalse(dispatched[0].metadata["dataset_recording_eligible"])
+
+    def test_startup_qpos_completion_releases_init_without_home_or_collection(self) -> None:
+        class Controller:
+            active = True
+            qpos_operation_id = "startup-operation"
+
+            def __init__(self) -> None:
+                self.cancel_reasons: list[str] = []
+
+            def cancel_active(self, *, now, reason):
+                del now
+                self.cancel_reasons.append(reason)
+                self.active = False
+                return SimpleNamespace(ok=True, message="released")
+
+        controller = Controller()
+        hold_reasons: list[str] = []
+        published: list[str] = []
+        components = SimpleNamespace(
+            init_arm_controller=controller,
+            left_command_backend=None,
+            right_command_backend=None,
+            session=SimpleNamespace(
+                hold_hardware=lambda reason: hold_reasons.append(reason),
+            ),
+        )
+        clutch = SimpleNamespace(
+            _init_qpos_sequence_active=False,
+            handle_init_arm_qpos_terminal=lambda terminal, now: None,
+            _cancel_init_arm_qpos_sequence=lambda reason: None,
+            _publish_init_arm_state=lambda **kwargs: published.append(kwargs["message"]),
+        )
+
+        real_teleop._finish_startup_gui_qpos_terminal(
+            components=components,
+            clutch_input=clutch,
+            terminal={"status": "completed", "side": "left", "message": "arrived"},
+            now=4.0,
+        )
+
+        self.assertEqual(
+            controller.cancel_reasons,
+            ["startup_qpos_completed_without_home_capture"],
+        )
+        self.assertEqual(hold_reasons, [])
+        self.assertIn("未采集 tracker Home", published[-1])
+
+    def test_gui_dual_exact_qpos_runs_left_then_right_without_home_then_holds(self) -> None:
+        class InitController:
+            def __init__(self) -> None:
+                self.selected_side = "right"
+                self.active_side = ""
+                self.active = False
+                self.qpos_active = False
+                self.recapturing = False
+                self.qpos_operation_id = ""
+                self.selected_history: list[str] = []
+                self.cancel_history: list[str] = []
+
+            def select_side(self, side: str):
+                if self.active:
+                    return SimpleNamespace(ok=False, side=self.active_side, message="active")
+                self.selected_side = side
+                self.selected_history.append(side)
+                return SimpleNamespace(ok=True, side=side, message="selected")
+
+            def cancel_active(self, **_kwargs):
+                side = self.active_side
+                self.cancel_history.append(side)
+                self.active = False
+                self.active_side = ""
+                self.qpos_active = False
+                self.qpos_operation_id = ""
+                return SimpleNamespace(ok=True, side=side, message="released")
+
+            def status_payload(self):
+                return {
+                    "init_arm_available": True,
+                    "init_arm_selected_side": self.selected_side,
+                    "init_arm_active_side": self.active_side,
+                    "init_arm_active": self.active,
+                    "init_arm_recalibrating": self.recapturing,
+                    "init_arm_status": "ready",
+                }
+
+        ui = _FakeUi()
+        components = _components()
+        controller = InitController()
+        components.init_arm_controller = controller
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+
+        started_sides: list[str] = []
+
+        def start_selected(_args, _components, *, now):
+            del now
+            side = controller.selected_side
+            started_sides.append(side)
+            controller.active = True
+            controller.active_side = side
+            controller.qpos_active = True
+            controller.qpos_operation_id = "operation-" + side
+            return SimpleNamespace(ok=True, side=side, message="planning")
+
+        with patch.object(real_teleop, "_start_gui_qpos_init", side_effect=start_selected):
+            self.assertTrue(control._handle_init_arm_move_both_to_qpos_event(now=1.0))
+            self.assertEqual(started_sides, ["left"])
+
+            control.handle_init_arm_qpos_terminal(
+                {"status": "completed", "side": "left", "message": "arrived"},
+                now=2.0,
+            )
+            self.assertEqual(controller.cancel_history, ["left"])
+            self.assertEqual(started_sides, ["left", "right"])
+            self.assertFalse(controller.recapturing)
+
+            control.handle_init_arm_qpos_terminal(
+                {"status": "completed", "side": "right", "message": "arrived"},
+                now=3.0,
+            )
+
+        self.assertFalse(control._init_qpos_sequence_active)
+        self.assertEqual(control._init_qpos_sequence_phase, "completed_hold_requested")
+        self.assertEqual(controller.selected_side, "right")
+        self.assertTrue(control.hold_active())
+        self.assertTrue(control.consume_hold_request())
+        self.assertIn("未自动重采 tracker Home", control._init_qpos_sequence_status)
+
+    def test_gui_dual_exact_qpos_terminal_failure_aborts_before_right_and_holds(self) -> None:
+        ui = _FakeUi()
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            active=True,
+            active_side="left",
+            selected_side="left",
+            qpos_active=True,
+            status_payload=lambda: {"init_arm_available": True},
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+        control._init_qpos_sequence_active = True
+        control._init_qpos_sequence_side = "left"
+        control._init_qpos_sequence_phase = "left_qpos"
+
+        with patch.object(control, "_start_init_arm_sequence_side") as start_next:
+            control.handle_init_arm_qpos_terminal(
+                {
+                    "status": "failed",
+                    "side": "left",
+                    "message": "measured qpos did not arrive",
+                },
+                now=3.0,
+            )
+
+        start_next.assert_not_called()
+        self.assertTrue(control.hold_active())
+        self.assertFalse(control._init_qpos_sequence_active)
+        self.assertIn("measured qpos did not arrive", control._init_qpos_sequence_status)
+
+    def test_gui_exact_qpos_event_is_allowed_while_episode_is_active(self) -> None:
+        ui = _FakeUi(["init_arm_move_to_qpos"])
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            selected_side="left",
+            active=False,
+            qpos_active=False,
+            status_payload=lambda: {"init_arm_available": True},
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+        control._episode_recording_ui_active = True
+
+        transition = SimpleNamespace(ok=True, side="left", message="planning")
+        with patch.object(
+            real_teleop,
+            "_start_gui_qpos_init",
+            return_value=transition,
+        ) as start:
+            control.poll()
+
+        start.assert_called_once()
+        self.assertTrue(any("后台路径规划" in message for _tag, message in ui.messages))
+
+    def test_gui_exact_qpos_snapshot_requires_fresh_successful_dual_feedback(self) -> None:
+        now = time.time()
+
+        class StateBackend:
+            def __init__(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float)
+
+            def refresh_state_from_hardware(self):
+                return {
+                    "hardware_read_success": True,
+                    "hardware_measurement_valid": True,
+                    "hardware_arm_err": 0,
+                    "hardware_sys_err": 0,
+                    "hardware_measurement_timestamp": now,
+                    "hardware_qpos": self.qpos.copy(),
+                }
+
+        class PreviewBackend:
+            @staticmethod
+            def normalize_local_qpos_observation(qpos, *, label):
+                del label
+                return np.asarray(qpos, dtype=float).copy(), {"status": "exact"}
+
+        preview = PreviewBackend()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=StateBackend(np.zeros(6)),
+            right_state_backend=StateBackend(np.ones(6)),
+            left_preview_backend=preview,
+            right_preview_backend=preview,
+            arm_state_read_executor=None,
+        )
+
+        snapshot = real_teleop._fresh_gui_init_qpos_by_side(components)
+
+        np.testing.assert_allclose(snapshot["left"], np.zeros(6))
+        np.testing.assert_allclose(snapshot["right"], np.ones(6))
+
+    def test_gui_exact_qpos_snapshot_bounds_tiny_feedback_overshoot_before_seed(self) -> None:
+        now = time.time()
+
+        class StateBackend:
+            def __init__(self, qpos):
+                self.qpos = np.asarray(qpos, dtype=float)
+
+            def refresh_state_from_hardware(self):
+                return {
+                    "hardware_read_success": True,
+                    "hardware_measurement_valid": True,
+                    "hardware_arm_err": 0,
+                    "hardware_sys_err": 0,
+                    "hardware_measurement_timestamp": now,
+                    "hardware_qpos": self.qpos.copy(),
+                }
+
+        right_qpos = np.zeros(6)
+        right_qpos[2] = 2.355008
+        left_preview = real_teleop.RM65ArmBackend(
+            real_teleop.RM65ArmBackendConfig(
+                arm_ip="192.0.2.1",
+                side="left",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+            )
+        )
+        right_preview = real_teleop.RM65ArmBackend(
+            real_teleop.RM65ArmBackendConfig(
+                arm_ip="192.0.2.2",
+                side="right",
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                singularity_protection_enabled=False,
+            )
+        )
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=StateBackend(np.zeros(6)),
+            right_state_backend=StateBackend(right_qpos),
+            left_preview_backend=left_preview,
+            right_preview_backend=right_preview,
+            arm_state_read_executor=None,
+        )
+
+        snapshot = real_teleop._fresh_gui_init_qpos_by_side(components)
+
+        self.assertAlmostEqual(snapshot["right"][2], 2.355, places=9)
+        right_preview._validate_final_joint_target(
+            snapshot["right"],
+            label="GUI Init qpos seed",
+        )
+        with self.assertRaisesRegex(ValueError, "absolute limits"):
+            right_preview._validate_final_joint_target(
+                right_qpos,
+                label="raw hardware feedback",
+            )
+
+    def test_gui_exact_qpos_snapshot_requires_command_safe_preview_normalizer(self) -> None:
+        now = time.time()
+        state = {
+            "hardware_read_success": True,
+            "hardware_measurement_valid": True,
+            "hardware_arm_err": 0,
+            "hardware_sys_err": 0,
+            "hardware_measurement_timestamp": now,
+            "hardware_qpos": np.zeros(6),
+        }
+        backend = SimpleNamespace(
+            refresh_state_from_hardware=lambda: dict(state)
+        )
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=backend,
+            right_state_backend=backend,
+            left_preview_backend=None,
+            right_preview_backend=None,
+            arm_state_read_executor=None,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "command-safe observation normalization",
+        ):
+            real_teleop._fresh_gui_init_qpos_by_side(components)
+
+    def test_gui_exact_qpos_snapshot_rejects_stale_feedback(self) -> None:
+        stale_state = {
+            "hardware_read_success": True,
+            "hardware_measurement_valid": True,
+            "hardware_arm_err": 0,
+            "hardware_sys_err": 0,
+            "hardware_measurement_timestamp": time.time() - 2.0,
+            "hardware_qpos": np.zeros(6),
+        }
+        backend = SimpleNamespace(
+            refresh_state_from_hardware=lambda: dict(stale_state)
+        )
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            left_state_backend=backend,
+            right_state_backend=backend,
+            arm_state_read_executor=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "feedback is stale"):
+            real_teleop._fresh_gui_init_qpos_by_side(components, max_age_sec=0.5)
+
+    def test_impedance_exact_qpos_admission_arms_both_backends(self) -> None:
+        class FakeController:
+            selected_side = "left"
+            qpos_operation_id = "operation-impedance"
+
+            def __init__(self) -> None:
+                target = SimpleNamespace(arm_qpos=np.ones(6))
+                self.targets_by_side = {"left": target, "right": target}
+
+            def start_qpos_planning(self, **_kwargs):
+                return real_teleop.InitArmTransition(
+                    ok=True,
+                    message="planning",
+                    side="left",
+                    mode="qpos_planning",
+                )
+
+        class FakeImpedanceBackend:
+            def __init__(self) -> None:
+                self.begin_calls: list[str] = []
+
+            def begin_exact_qpos_transit(self, operation_id: str) -> None:
+                self.begin_calls.append(operation_id)
+
+        left = FakeImpedanceBackend()
+        right = FakeImpedanceBackend()
+        components = SimpleNamespace(
+            init_arm_controller=FakeController(),
+            fix_arm_controller=None,
+            collision_guard_requested=True,
+            dual_arm_retargeter=object(),
+            left_command_backend=left,
+            right_command_backend=right,
+        )
+        qpos = {"left": np.zeros(6), "right": np.zeros(6)}
+
+        with patch.object(
+            real_teleop,
+            "RM65ImpedanceArmBackend",
+            FakeImpedanceBackend,
+        ), patch.object(
+            real_teleop,
+            "_fresh_gui_init_qpos_by_side",
+            return_value=qpos,
+        ):
+            transition = real_teleop._start_gui_qpos_init(
+                _args(arm_control_mode="impedance"),
+                components,
+                now=1.0,
+            )
+
+        self.assertTrue(transition.ok)
+        self.assertEqual(left.begin_calls, ["operation-impedance"])
+        self.assertEqual(right.begin_calls, ["operation-impedance"])
+
+    def test_impedance_exact_qpos_rejects_before_force_control_initialization(self) -> None:
+        class FakeController:
+            selected_side = "left"
+
+            def __init__(self) -> None:
+                target = SimpleNamespace(arm_qpos=np.ones(6))
+                self.targets_by_side = {"left": target, "right": target}
+                self.plan_calls = 0
+
+            def start_qpos_planning(self, **_kwargs):
+                self.plan_calls += 1
+                return real_teleop.InitArmTransition(ok=True, message="planning", side="left")
+
+        class FakeImpedanceBackend:
+            config = SimpleNamespace(connect_hardware=True)
+
+            def get_state(self):
+                return {
+                    "impedance_enabled": False,
+                    "impedance_loop_state": "not_started",
+                    "last_impedance_record": None,
+                }
+
+        controller = FakeController()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            init_arm_controller=controller,
+            fix_arm_controller=None,
+            collision_guard_requested=True,
+            dual_arm_retargeter=object(),
+            left_command_backend=FakeImpedanceBackend(),
+            right_command_backend=FakeImpedanceBackend(),
+        )
+
+        with patch.object(
+            real_teleop,
+            "RM65ImpedanceArmBackend",
+            FakeImpedanceBackend,
+        ):
+            transition = real_teleop._start_gui_qpos_init(
+                _args(arm_control_mode="impedance"),
+                components,
+                now=1.0,
+            )
+
+        self.assertFalse(transition.ok)
+        self.assertIn("力控尚未初始化", transition.message)
+        self.assertIn("开始遥操", transition.message)
+        self.assertEqual(controller.plan_calls, 0)
+
+    def test_exact_qpos_plan_scales_selected_side_from_shared_slow_baseline(self) -> None:
+        class FakeController:
+            selected_side = "right"
+
+            def __init__(self) -> None:
+                target = SimpleNamespace(arm_qpos=np.ones(6))
+                self.targets_by_side = {"left": target, "right": target}
+                self.plan_builder = None
+
+            def start_qpos_planning(self, **kwargs):
+                self.plan_builder = kwargs["plan_builder"]
+                return real_teleop.InitArmTransition(
+                    ok=True,
+                    message="planning",
+                    side=self.selected_side,
+                )
+
+        controller = FakeController()
+        components = SimpleNamespace(
+            active_sides=("left", "right"),
+            init_arm_controller=controller,
+            fix_arm_controller=None,
+            collision_guard_requested=True,
+            dual_arm_retargeter=object(),
+        )
+        qpos = {"left": np.zeros(6), "right": np.zeros(6)}
+        args = _args(
+            arm_control_mode="position",
+            init_arm_left_qpos_speed_scale=2.0,
+            init_arm_right_qpos_speed_scale=6.0,
+        )
+        fake_profile = SimpleNamespace(
+            max_velocity_deg_s=(6.0, 6.0, 7.0, 8.0, 10.0, 10.0)
+        )
+
+        with patch.object(
+            real_teleop,
+            "_fresh_gui_init_qpos_by_side",
+            return_value=qpos,
+        ), patch.object(
+            real_teleop,
+            "load_joint_velocity_limit_profiles",
+            return_value={"rm65_init_slow": fake_profile},
+        ):
+            transition = real_teleop._start_gui_qpos_init(
+                args,
+                components,
+                now=1.0,
+            )
+
+        self.assertTrue(transition.ok)
+        self.assertIsNotNone(controller.plan_builder)
+        with patch(
+            "teleop_runtime.replay.arm_init.qpos_execute.build_rm65_qpos_init_plan",
+            return_value=object(),
+        ) as build_plan:
+            controller.plan_builder()
+
+        expected = np.deg2rad(np.asarray(fake_profile.max_velocity_deg_s) * 6.0)
+        np.testing.assert_allclose(
+            build_plan.call_args.kwargs["qpos_init_max_angvel_rad_s"],
+            expected,
+        )
+        self.assertEqual(
+            build_plan.call_args.kwargs["joint_velocity_profile"],
+            "rm65_init_slow",
+        )
+
+    def test_impedance_exact_qpos_admission_rolls_back_first_arm(self) -> None:
+        class FakeController:
+            selected_side = "left"
+            qpos_operation_id = "operation-rollback"
+
+            def __init__(self) -> None:
+                target = SimpleNamespace(arm_qpos=np.ones(6))
+                self.targets_by_side = {"left": target, "right": target}
+                self.cancel_calls: list[dict[str, object]] = []
+
+            def start_qpos_planning(self, **_kwargs):
+                return real_teleop.InitArmTransition(ok=True, message="planning", side="left")
+
+            def cancel_active(self, **kwargs):
+                self.cancel_calls.append(dict(kwargs))
+
+        class FakeImpedanceBackend:
+            def __init__(self, *, fail: bool = False) -> None:
+                self.fail = fail
+                self.begin_calls: list[str] = []
+                self.end_calls: list[str] = []
+
+            def begin_exact_qpos_transit(self, operation_id: str) -> None:
+                self.begin_calls.append(operation_id)
+                if self.fail:
+                    raise RuntimeError("force preflight rejected")
+
+            def end_exact_qpos_transit(self, operation_id: str) -> None:
+                self.end_calls.append(operation_id)
+
+        controller = FakeController()
+        left = FakeImpedanceBackend()
+        right = FakeImpedanceBackend(fail=True)
+        components = SimpleNamespace(
+            init_arm_controller=controller,
+            fix_arm_controller=None,
+            collision_guard_requested=True,
+            dual_arm_retargeter=object(),
+            left_command_backend=left,
+            right_command_backend=right,
+        )
+        qpos = {"left": np.zeros(6), "right": np.zeros(6)}
+
+        with patch.object(
+            real_teleop,
+            "RM65ImpedanceArmBackend",
+            FakeImpedanceBackend,
+        ), patch.object(
+            real_teleop,
+            "_fresh_gui_init_qpos_by_side",
+            return_value=qpos,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "force preflight rejected"):
+                real_teleop._start_gui_qpos_init(
+                    _args(arm_control_mode="impedance"),
+                    components,
+                    now=2.0,
+                )
+
+        self.assertEqual(left.end_calls, ["operation-rollback"])
+        self.assertEqual(len(controller.cancel_calls), 1)
 
     def test_gui_episode_start_payload_updates_task_path_and_gripper_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1948,6 +3236,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 args=args,
                 components=components,
             )
+            control._teleop_started = True
 
             with patch.object(real_teleop, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
@@ -1970,6 +3259,86 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             item for item in reversed(ui.published) if item.get("collection_task_id") == "stack_blocks"
         )
         self.assertEqual(task_publish["collection_task_name_zh"], "叠方块")
+
+    def test_gui_episode_start_contract_failure_rolls_back_and_does_not_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_root = Path(tmp_dir) / "datasets"
+            args = _args(dataset_root=str(base_root))
+            args.ignore_camera = []
+            args.ignore_tactile = []
+            args.configured_camera_keys = ("left_wrist", "right_wrist")
+            real_teleop._apply_formal_dataset_layout(args)
+            original = {
+                "dataset_root": args.dataset_root,
+                "ignore_camera": list(args.ignore_camera),
+                "ignore_tactile": list(args.ignore_tactile),
+            }
+            ui = _FakeUi(
+                [
+                    "episode_start:"
+                    + json.dumps(
+                        {
+                            "dataset_base_root": str(base_root),
+                            "task_key": "soft_pick",
+                            "task_english_name": "Soft Pick",
+                            "ignored_camera_keys": ["right_wrist"],
+                            "ignored_tactile_keys": ["left"],
+                        }
+                    )
+                ]
+            )
+            control = real_teleop.RealTeleopControlInput(
+                terminal=_FakeTerminal(),
+                ui=ui,
+                args=args,
+                components=_components(),
+            )
+            control._teleop_started = True
+
+            with patch.object(
+                real_teleop,
+                "bind_capture_modality_contract",
+                side_effect=RuntimeError("contract mismatch"),
+            ):
+                control.poll()
+
+            self.assertFalse(control.consume_episode_start_request())
+            self.assertEqual(args.dataset_root, original["dataset_root"])
+            self.assertEqual(args.ignore_camera, original["ignore_camera"])
+            self.assertEqual(args.ignore_tactile, original["ignore_tactile"])
+            self.assertTrue(
+                any(
+                    "已恢复原配置" in message
+                    for _title, message in ui.messages
+                )
+            )
+
+    def test_gui_episode_start_rejects_unknown_camera_ignore_key(self) -> None:
+        args = _args()
+        args.configured_camera_keys = ("left_wrist", "right_wrist")
+        ui = _FakeUi(
+            [
+                "episode_start:"
+                + json.dumps(
+                    {
+                        "ignored_camera_keys": ["front"],
+                        "ignored_tactile_keys": [],
+                    }
+                )
+            ]
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=args,
+            components=_components(),
+        )
+        control._teleop_started = True
+
+        control.poll()
+
+        self.assertFalse(control.consume_episode_start_request())
+        self.assertEqual(getattr(args, "ignore_camera", []), [])
 
     def test_gui_task_select_payload_updates_policy_without_starting_episode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2013,6 +3382,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 args=args,
                 components=_components(),
             )
+            control._teleop_started = True
 
             with patch.object(real_teleop, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
@@ -2073,6 +3443,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 args=args,
                 components=_components(),
             )
+            control._teleop_started = True
 
             with patch.object(real_teleop, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-04"
@@ -2272,6 +3643,16 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("clearInterval(legacyTimer)", legacy_script)
         self.assertIn("showRefreshWarning(error);", html)
         self.assertIn("window.__calibrationWebUiModernRefreshOk = false;", html)
+        self.assertIn(
+            "if (window.__calibrationWebUiModernRefreshOk) return;\n"
+            "        var eventName = this.getAttribute(\"data-event\");",
+            html,
+        )
+        self.assertIn(
+            "button.addEventListener(\"click\", async () => {\n"
+            "    if (!window.__calibrationWebUiModernRefreshOk) return;",
+            html,
+        )
         self.assertNotIn("showShutdown(\"无法继续连接标定服务", html)
 
     def test_gui_modern_ik_log_button_has_pending_feedback(self) -> None:
@@ -2281,6 +3662,40 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("updateIkDebugLogButton(state)", html)
         self.assertIn("IK 记录切换中...", html)
         self.assertIn('ikDebugLogButtonEl.disabled = !activeControls.has("d") || ikDebugLogTogglePending', html)
+
+    def test_umi_keeps_idle_dataset_directory_picker_enabled(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn(
+            "const pathLocked = Boolean(recording || preparing || finalizing);",
+            html,
+        )
+        self.assertIn("datasetBaseRootInputEl.disabled = pathLocked;", html)
+        self.assertIn("datasetChooseRootButtonEl.disabled = pathLocked;", html)
+        self.assertIn("const locked = Boolean(pathLocked || runtimeConfigured);", html)
+        self.assertIn("let datasetBaseRootOverride = null;", html)
+        self.assertIn("datasetBaseRootOverride = String(result.path);", html)
+
+    def test_episode_delete_controls_are_greyed_while_episode_is_busy(self) -> None:
+        html = calibration_web_ui._HTML_PAGE
+
+        self.assertIn(
+            'id="episodeDeleteIndexInput" type="number" min="0" step="1" '
+            'inputmode="numeric" placeholder="例如 3" disabled',
+            html,
+        )
+        self.assertIn(
+            'id="episodeDeleteButton" class="secondary" '
+            'data-event="episode_delete" disabled',
+            html,
+        )
+        self.assertIn('activeControls.has("episode_delete")', html)
+        self.assertIn("!state.episode_recording", html)
+        self.assertIn("episodeStatus !== \"delete_queued\"", html)
+        self.assertIn(
+            "episodeDeleteIndexInputEl.disabled = !episodeDeleteAllowed;",
+            html,
+        )
 
     def test_gui_initial_html_is_rendered_from_backend_snapshot(self) -> None:
         html = calibration_web_ui._render_initial_html(
@@ -2476,14 +3891,30 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_dmtac_tactile_visualizer_builder_uses_force_window(self) -> None:
         vis = real_teleop._build_tactile_visualizer(
-            _args(visualize_tactile=True),
+            _args(visualize_tactile=True, skip_renderer=True),
             ("right",),
         )
 
         self.assertIsInstance(vis, DMTacDistributedForceVisualizer)
+        self.assertEqual(vis.config.fixed_ref, 1.0)
         vis.close()
 
-    def test_dmtac_tactile_visualization_requires_distributed_force_backend(self) -> None:
+    def test_dmtac_tactile_visualizer_builder_uses_configured_common_scale(self) -> None:
+        vis = real_teleop._build_tactile_visualizer(
+            _args(
+                visualize_tactile=True,
+                skip_renderer=True,
+                dmtac_tactile_vis_fixed_ref=2.5,
+            ),
+            ("left", "right"),
+        )
+
+        self.assertIsInstance(vis, DMTacDistributedForceVisualizer)
+        self.assertEqual(vis.config.fixed_ref, 2.5)
+        self.assertEqual(vis._robust_ref(np.asarray([0.001, 50.0]), vis.config.fixed_ref), 2.5)
+        vis.close()
+
+    def test_dmtac_tactile_visualization_requires_calibrated_force_backend(self) -> None:
         backend = DMTacGripperBackend(
             DMTacGripperBackendConfig(
                 side="right",
@@ -2502,11 +3933,68 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 connect_hardware=False,
                 connect_tactile=True,
                 tactile_fields=("distributed_force",),
+                tactile_calibration_policy="required",
             )
         )
         components.right_hand_backend = backend
 
         self.assertTrue(real_teleop._tactile_visualization_available(_args(), components))
+
+    def test_dmtac_visualization_filters_non_force_fields_without_copying(self) -> None:
+        raw = np.zeros((480, 640), dtype=np.uint8)
+        force = np.ones((8, 10, 3), dtype=np.float32)
+
+        class _Backend:
+            @staticmethod
+            def get_state(**kwargs: object) -> dict[str, object]:
+                self.assertFalse(kwargs.get("copy_tactile_arrays", True))
+                return {
+                    "tactile_dict": {"sensor:raw": raw, "sensor:distributed_force": force},
+                    "tactile_field_by_key": {
+                        "sensor:raw": "raw",
+                        "sensor:distributed_force": "distributed_force",
+                    },
+                    "tactile_fields": ("raw", "distributed_force"),
+                    "tactile_timestamp": 10.0,
+                    "tactile_read_hz": 15.0,
+                    "tactile_process_read": True,
+                    "tactile_worker_alive": True,
+                    "telemetry_error": None,
+                }
+
+        snapshot, health = dmtac_visualization_snapshot_from_backends(
+            ("right",), lambda _side: _Backend(), now=10.01
+        )
+
+        self.assertEqual(set(snapshot["right"] or {}), {"sensor:distributed_force"})
+        self.assertEqual(health["right"]["status"], "ok")
+
+    def test_dmtac_gui_solving_requires_and_applies_fixed_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_tactile_calibration(
+                tmp_dir,
+                "SENSOR_TEST",
+                np.zeros((480, 640), dtype=np.uint8),
+            )
+            backend = DMTacGripperBackend(
+                DMTacGripperBackendConfig(
+                    side="right",
+                    connect_hardware=False,
+                    connect_tactile=True,
+                    tactile_ids=("SENSOR_TEST",),
+                    tactile_fields=("raw",),
+                    tactile_calibration_dir=tmp_dir,
+                )
+            )
+            with patch.object(backend, "_stop_tactile_worker_for_reconfigure") as stop:
+                with patch.object(backend, "_start_tactile_worker") as start:
+                    self.assertTrue(backend.enable_tactile_solving())
+
+        stop.assert_called_once()
+        start.assert_called_once()
+        self.assertEqual(backend.config.tactile_fields, ("raw", "distributed_force"))
+        self.assertEqual(backend.config.tactile_compute_profile, "dist-only")
+        self.assertEqual(backend.config.tactile_calibration_policy, "required")
 
     def test_session_record_root_sets_timestamped_episode_root_without_session_recorder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2566,6 +4054,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             self.assertFalse(metadata["session_record_enabled"])
             self.assertTrue(metadata["debug_episode_recording_enabled"])
             self.assertEqual(metadata["start_reason"], "manual_key_start")
+            self.assertNotIn("capture_modality_contract", metadata)
 
     def test_formal_dataset_metadata_does_not_claim_unused_debug_episode_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3045,6 +4534,14 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(paused)
         self.assertTrue(recorder.is_paused)
         self.assertFalse(recorder.can_record_samples)
+        self.assertFalse(
+            recorder.pause_episode(
+                reason="fix_hold:both_sides_fixed_like",
+                now=time.time(),
+                step_index=43,
+                last_state="RUNNING",
+            )
+        )
         self.assertIsNone(recorder.record_step(SimpleNamespace()))
         self.assertEqual(recorder.frame_count, 4)
         paused_status = recorder.collection_frequency_status()
@@ -3060,10 +4557,19 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(resumed)
         self.assertFalse(recorder.is_paused)
         self.assertTrue(recorder.can_record_samples)
+        self.assertEqual(recorder.continuity_segment_index, 1)
+        self.assertEqual(
+            recorder.pause_summary()["collection_continuity_segment_count"],
+            2,
+        )
         self.assertEqual(len(recorder.pause_summary()["recording_pause_segments"]), 1)
         self.assertEqual(
             recorder.pause_summary()["recording_pause_segments"][0]["start_frame_index"],
             4,
+        )
+        self.assertEqual(
+            recorder.pause_summary()["recording_pause_segments"][0]["reasons"],
+            ["hold_requested", "fix_hold:both_sides_fixed_like"],
         )
 
         class _Observer:
@@ -3288,8 +4794,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("g", active_controls)
         self.assertIn("init_arm_toggle", active_controls)
         self.assertIn("init_arm_select", active_controls)
-        self.assertIn("toggle_camera_vis", active_controls)
-        self.assertIn("toggle_tactile_vis", active_controls)
+        self.assertNotIn("toggle_camera_vis", active_controls)
+        self.assertNotIn("toggle_tactile_vis", active_controls)
         self.assertNotIn("episode_start", active_controls)
         self.assertNotIn("round_trip_toggle", active_controls)
         self.assertNotIn("record_pose_snapshot", active_controls)
@@ -3503,6 +5009,27 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn('id="shortcutGLabel"', calibration_web_ui._HTML_PAGE)
         self.assertIn('data-event="fix_arm_toggle"', calibration_web_ui._HTML_PAGE)
         self.assertIn('data-event="init_arm_toggle"', calibration_web_ui._HTML_PAGE)
+        self.assertIn(
+            'data-event="init_arm_move_to_qpos"',
+            calibration_web_ui._HTML_PAGE,
+        )
+        self.assertIn(
+            'data-event="init_arm_move_both_to_qpos"',
+            calibration_web_ui._HTML_PAGE,
+        )
+        self.assertIn("机械臂回到初始化位姿", calibration_web_ui._HTML_PAGE)
+        self.assertIn("精确归位所选臂：左臂", calibration_web_ui._HTML_PAGE)
+        self.assertIn("双臂顺序精确归位：左臂 → 右臂", calibration_web_ui._HTML_PAGE)
+        self.assertIn("过程中不会修改 tracker Home", html_and_fallback)
+        self.assertIn("启动前执行时到位后停留在启动前 Hold", html_and_fallback)
+        self.assertLess(
+            calibration_web_ui._HTML_PAGE.index('id="initArmSection"'),
+            calibration_web_ui._HTML_PAGE.index('id="footPadTestControls"'),
+        )
+        self.assertGreater(
+            calibration_web_ui._HTML_PAGE.index('id="datasetModalityIgnoreOptions"'),
+            calibration_web_ui._HTML_PAGE.index('id="poseSnapshotSection"'),
+        )
         self.assertIn("固定 ", calibration_web_ui._HTML_PAGE)
         self.assertIn("归位", calibration_web_ui._HTML_PAGE)
         self.assertNotIn("固定/急停", html_and_fallback)

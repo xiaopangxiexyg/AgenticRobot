@@ -64,8 +64,19 @@ class CameraPreviewer:
         if name in self._window_names:
             return
         cv2 = self._require_cv2()
-        flag = cv2.WINDOW_NORMAL if self.config.resizable_window else cv2.WINDOW_AUTOSIZE
+        flag = cv2.WINDOW_AUTOSIZE
+        if self.config.resizable_window:
+            flag = cv2.WINDOW_NORMAL | int(getattr(cv2, "WINDOW_FREERATIO", 0))
         cv2.namedWindow(name, flag)
+        if self.config.resizable_window:
+            set_property = getattr(cv2, "setWindowProperty", None)
+            aspect_property = getattr(cv2, "WND_PROP_ASPECT_RATIO", None)
+            free_ratio = getattr(cv2, "WINDOW_FREERATIO", None)
+            if callable(set_property) and aspect_property is not None and free_ratio is not None:
+                try:
+                    set_property(name, aspect_property, free_ratio)
+                except Exception:
+                    pass
         self._window_names.add(name)
 
     def _display_image(self, frame: Any) -> np.ndarray:
@@ -103,6 +114,46 @@ class CameraPreviewer:
             return {"last_error": f"device_info_failed:{type(exc).__name__}:{exc}"}
 
     @staticmethod
+    def _is_stale(status: Mapping[str, Any]) -> bool:
+        try:
+            age = float(status.get("last_frame_age_sec"))
+            stale_after = float(status.get("stale_after_sec"))
+        except (TypeError, ValueError):
+            age = stale_after = -1.0
+        if age >= 0.0 and stale_after > 0.0 and age >= stale_after:
+            return True
+        error = str(status.get("last_error") or "").lower()
+        return bool(error and ("stale" in error or "disconnect" in error or "restart" in error))
+
+    @staticmethod
+    def _latest_preview_frame(source: Any) -> Any | None:
+        """Use the immutable frame buffer so preview does not copy depth."""
+
+        frame_buffer = getattr(source, "frame_buffer", None)
+        if callable(frame_buffer):
+            try:
+                get_latest = getattr(frame_buffer(), "get_latest", None)
+                if callable(get_latest):
+                    return get_latest()
+            except Exception:  # noqa: BLE001 - fall back to compatibility API.
+                pass
+        return source.get_latest_frame()
+
+    def _closed_window_keys(self) -> list[str]:
+        cv2 = self._require_cv2()
+        get_property = getattr(cv2, "getWindowProperty", None)
+        visible_property = getattr(cv2, "WND_PROP_VISIBLE", None)
+        if not callable(get_property) or visible_property is None:
+            return []
+        for name in tuple(self._window_names):
+            try:
+                if float(get_property(name, visible_property)) < 1.0:
+                    return ["q"]
+            except Exception:  # noqa: BLE001 - unsupported by some HighGUI builds.
+                continue
+        return []
+
+    @staticmethod
     def _short_text(value: object, *, max_chars: int = 120) -> str:
         text = str(value)
         if len(text) <= max_chars:
@@ -118,7 +169,7 @@ class CameraPreviewer:
     ) -> np.ndarray:
         cv2 = self._require_cv2()
         width, height = self._camera_dimensions(source)
-        image = np.zeros((height, width, 3), dtype=np.uint8)
+        image = np.full((height, width, 3), (36, 30, 20), dtype=np.uint8)
         status = self._camera_status(source)
         lines = [
             f"{self.config.window_prefix}:{camera_key}",
@@ -141,7 +192,7 @@ class CameraPreviewer:
                 (24, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 scale,
-                (230, 230, 230),
+                (80, 210, 255),
                 max(1, int(round(scale * 2))),
                 cv2.LINE_AA,
             )
@@ -157,9 +208,9 @@ class CameraPreviewer:
             extra_status = None
             status = self._camera_status(source)
             last_error = status.get("last_error")
-            stale = bool(last_error) and str(last_error).startswith("frame_timeout_stale")
+            stale = self._is_stale(status)
             try:
-                frame = source.get_latest_frame()
+                frame = self._latest_preview_frame(source)
             except Exception as exc:  # noqa: BLE001
                 extra_status = f"get_latest_frame_failed:{type(exc).__name__}:{exc}"
             if stale:
@@ -177,6 +228,9 @@ class CameraPreviewer:
             self._require_cv2().imshow(name, image)
             any_window = True
         if any_window:
+            closed_keys = self._closed_window_keys()
+            if closed_keys:
+                return closed_keys
             key_code = self._require_cv2().waitKey(1)
             if key_code >= 0:
                 key = key_code & 0xFF
@@ -215,6 +269,9 @@ class CameraPreviewer:
             self._require_cv2().imshow(name, image)
             any_window = True
         if any_window:
+            closed_keys = self._closed_window_keys()
+            if closed_keys:
+                return closed_keys
             key_code = self._require_cv2().waitKey(1)
             if key_code >= 0:
                 key = key_code & 0xFF

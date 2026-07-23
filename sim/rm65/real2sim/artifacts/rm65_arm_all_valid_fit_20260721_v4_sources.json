@@ -1,0 +1,206 @@
+{
+  "schema": "dexteleop.sim.rm65_actuator_fit_sources.v1",
+  "profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+  "fit_policy": {
+    "clean_weight": 1,
+    "guardian_restored_weight": 0.5,
+    "command_signal": "sdk_accepted_qcmd_120hz",
+    "measurement_signal": "udp_measured_qpos_approximately_200hz",
+    "guardian_rationale": "Numerically valid zero-error overlap, downweighted because the UDP file lacks an in-band stop row.",
+    "iteration_policy": "Four clean evening captures were first frozen as failed v3 held-out evidence because their maximum effective-delay mismatch exceeded 5 ms, then explicitly converted to v4 fit data. The non-overlapping 220204/220211 pair and orphan 223212 UDP trace are excluded. V4 requires a new untouched held-out capture.",
+    "command_profile_compatibility": "The four new command manifests add only prefer_non_shoulder_singular_branch upstream of SDK-accepted qcmd. Because fitting starts at accepted qcmd and transport settings are unchanged, they remain actuator-response compatible."
+  },
+  "sessions": [
+    {
+      "id": "155023/155029",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_155029_348429_vive_rm65_actuator_trace",
+      "command_trace_sha256": "112dcd65e0607c06a0a5ecd72de53b22c73e0ab8b94c25c749fd6021de118e9a",
+      "command_manifest_sha256": "0e52b53a1f69d32b7748954a175ad8364ed03e1c8eff00eb2ad12258d4b31e0b",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_155023_820044.jsonl",
+      "feedback_trace_sha256": "9f2ae6f2bd69202c0e1d285666766f3ab9c95615efb4de926ee0c39fa2b9bf3d",
+      "recovery_journal_sha256": "87dfb416d1b583cbbeb1e264f57dc454dd7fef0d9ace41f93cd9d38b7789bf17"
+    },
+    {
+      "id": "164941/164947",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_164947_845670_vive_rm65_actuator_trace",
+      "command_trace_sha256": "1d56fa9512b58c3dd33b214378ac0103fd0e10447c1d6fa3ba7400dc43f72e83",
+      "command_manifest_sha256": "e34c9a22c4f104f271c6cc1ff4a12e915cee6fbcd245eb1e73642d3b5be1c4ba",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_164941_498524.jsonl",
+      "feedback_trace_sha256": "e85e315dc2699cda56d3ba6bc86cf2e3e7b451e70f18484edf2fb88d3c49efba",
+      "recovery_journal_sha256": "4ea17d8a713ac8b9f9fe03e10c7aa3534994ad02e476f9de42701bba1c0c31a8"
+    },
+    {
+      "id": "170948/171013",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_171013_962138_vive_rm65_actuator_trace",
+      "command_trace_sha256": "68ad5010557ab1a2f010ec3cd9f3739d8a6dd80728d4a490e849a61a06711c54",
+      "command_manifest_sha256": "2d3cc593e34e006fc6e2fccc68db1fc02182521c37b8b2aa6727dfef2d67d07d",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_170948_339800.jsonl",
+      "feedback_trace_sha256": "4878fa7258e52e3ab4f1e1b00292b53e10974e2637bf120aa789679ba281d090",
+      "recovery_journal_sha256": "8e85d93b6a29baf7edccc9897a69f57eb60074a35f09496d0d392924c9af67ce"
+    },
+    {
+      "id": "171252/171259",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_171259_038735_vive_rm65_actuator_trace",
+      "command_trace_sha256": "8b9d56f217dbcd8120c3dd0cfb8b52cc7007e0f1db8437165dff38daccb989e3",
+      "command_manifest_sha256": "dcb19572de1417c5e766dde1ef6e17f4d46cab19b2b15c3da7c7536e2c38aa5d",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_171252_700872.jsonl",
+      "feedback_trace_sha256": "56b5e24e60ef21f9b3510f4338ba59cda7643e75a4083015038800e526baa796",
+      "recovery_journal_sha256": "c8e9fe71095ba1baa73200c58e3b2b4a22cb4f12f15f32ef8dd135a050cc6e94"
+    },
+    {
+      "id": "171731/172022",
+      "quality": "guardian_restored",
+      "weight": 0.5,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_172022_876639_vive_rm65_actuator_trace",
+      "command_trace_sha256": "4e8c83878df5fdfed95baffd65c78f24fa3882d39a785d30e8baa4a08a0a4a36",
+      "command_manifest_sha256": "cf8e5af831803f150c138b4792fc3a73e5a3392b792b1cfc5825fd23189dd923",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_171731_378683.jsonl",
+      "feedback_trace_sha256": "fdd10413831be706918d1d4076f9c7bc267abd2ad984e818160cdc0603ea45fa",
+      "recovery_journal_sha256": "e4aaa9f7602c0590c37a979bef5809c0988392d5c4ae0effae428abe56536bf2"
+    },
+    {
+      "id": "172343/172455",
+      "quality": "guardian_restored",
+      "weight": 0.5,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_172455_338491_vive_rm65_actuator_trace",
+      "command_trace_sha256": "08d55e34e285c02dbebe8b3852ff296c5361f097a21c2d470f8ab45d33466261",
+      "command_manifest_sha256": "c356e5f4ad7ac3257b62fae053eb20fae526683adbad0a082ff41f62056a4f1e",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_172343_122294.jsonl",
+      "feedback_trace_sha256": "4e1338978aa15db2ba68ca9d77c0d5f95c34e6fc8f61d77d66d684050cd44e2c",
+      "recovery_journal_sha256": "2ee8d841b6b63434dad5e19d4988e3c2df72255248dcd74807841ce75d2600aa"
+    },
+    {
+      "id": "172739/172746",
+      "quality": "guardian_restored",
+      "weight": 0.5,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_172746_614095_vive_rm65_actuator_trace",
+      "command_trace_sha256": "c16d1be9c389036fc18abf714365eff4abb60df55a0a555f92c9e660c3597fa4",
+      "command_manifest_sha256": "afb6813e431005c3b0e6952c81113112f07e6ecf5a6f928c6e818732a0f5d716",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_172739_435602.jsonl",
+      "feedback_trace_sha256": "1f0e6a91e2607702d2c2ef43ae1fe7521ec72ce2c9fc99b1556e30e8b227f84b",
+      "recovery_journal_sha256": "d8235a2243fb7a819b46a8f63c34c493e39a24a635a1614567fa5bddebaeec8a"
+    },
+    {
+      "id": "173045/173052",
+      "quality": "guardian_restored",
+      "weight": 0.5,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_173052_128912_vive_rm65_actuator_trace",
+      "command_trace_sha256": "6012d9bb16fcbe96542cc2c763516c9c18f5bf5a792d313764d4b6d9f8bf3002",
+      "command_manifest_sha256": "3cfcd44192904c3fd7cc2c294ce12eb96d8a7e01f2367abd0fb4b7e21e490162",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_173045_474937.jsonl",
+      "feedback_trace_sha256": "0e542fa8a40e23044ec2475d043d0320cccb9ee10597fe054e26260ac718ff9e",
+      "recovery_journal_sha256": "7f722197f3f8dfa663248b0ff589acefa531a0108d7e075d80da239680bd2136"
+    },
+    {
+      "id": "191842/191916",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_191916_445493_vive_rm65_actuator_trace",
+      "command_trace_sha256": "fcee05320551382a75183a96c71e0174fd8b1b63cb59d870edc0fd09c3b7463e",
+      "command_manifest_sha256": "97f35555c7c55152f7904d3b2ddf86b58d8187f5227a4c3da46c1bf4523319ee",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_191842_086968.jsonl",
+      "feedback_trace_sha256": "50b340e01560c00ff4e32c43689412892430ed9a7ace79cf72ae36acedcb9d74",
+      "recovery_journal_sha256": "62a3dca775da91a5570a763315c61e2137098645a8102b14a6fe9a511352479a"
+    },
+    {
+      "id": "193628/193634",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_193634_917057_vive_rm65_actuator_trace",
+      "command_trace_sha256": "4f27242d2587727061ad8847c78bdc14e0a8f2d017e0e7b5fa7a3fe7ad9775e6",
+      "command_manifest_sha256": "527a17385d569de4fcad149de3feb81fa2296b7379d98518a0424260184162c8",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_193628_339772.jsonl",
+      "feedback_trace_sha256": "c12f9225f87393ca7337872c2f30bdcf67466058da738578151663c58b570232",
+      "recovery_journal_sha256": "1b9f9729932b8c5b6d044623245e97bd349ecd5492b9778811b76fa81b657f1c"
+    },
+    {
+      "id": "221544/221548",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_221548_318672_vive_rm65_actuator_trace",
+      "command_trace_sha256": "cfb19ce4166a95f071e699126777333db8ee83d624c4133f54b727a0eeee4946",
+      "command_manifest_sha256": "7911430ef86966e4c5d5971e77357bb2260f9811fa9a0971d60c9a6236d3f31c",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_221544_231904.jsonl",
+      "feedback_trace_sha256": "75ebe9ccd0cc6988263b5a72c47d4bc5a9b7c3815df898e5d148b44ecabc29ff",
+      "recovery_journal_sha256": "dd6a9acd1154496621bd416cfac10f7d8b7482e8289b982aada8ccb905c4bada",
+      "common_overlap_sec": 36.442334277002374,
+      "command_source_profile_sha256": "0d7a66133ba250f44c8234e35c3a2e9c5713dacf83c280e0074ce4c45e347a26"
+    },
+    {
+      "id": "222640/222650",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_222650_557730_vive_rm65_actuator_trace",
+      "command_trace_sha256": "aa09bb0cdc5ceed7a4cffdf453146a5551e0acf1e413c74a99d4d3208e9c252a",
+      "command_manifest_sha256": "1cc24f6d5de094c816f6c1efb51cf8a131ebe68c115757de1b53439078168c0c",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_222640_266557.jsonl",
+      "feedback_trace_sha256": "66c75f63a0a0ddbc51ca8df96fe9a6dd9b4e537d2e3b36e4b2d17509c296cb3d",
+      "recovery_journal_sha256": "8eba3e907dc07e957549c9a087cfc1e9bf4c2832554d969c09da272083141f31",
+      "common_overlap_sec": 95.87501628699829,
+      "command_source_profile_sha256": "0d7a66133ba250f44c8234e35c3a2e9c5713dacf83c280e0074ce4c45e347a26"
+    },
+    {
+      "id": "224159/224204",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_224204_306028_vive_rm65_actuator_trace",
+      "command_trace_sha256": "1a131c84557058d11c7195112eb32bf488976db3901fc2ed79ccf5d15b603c5b",
+      "command_manifest_sha256": "45e68b610892f8b2db4217e1fa36f8772bbee6d8df38a49135cac910bb1e578f",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_224159_754956.jsonl",
+      "feedback_trace_sha256": "5f15164bf9295ffbecc7b92777dc613dcb502edaf9c96a6bb9a1d12ee150f35c",
+      "recovery_journal_sha256": "203013d32fa7876689e04fd70d1312ba043749ba6b13b60aab7d7ab5a4ebe3b5",
+      "common_overlap_sec": 62.349926572002005,
+      "command_source_profile_sha256": "0d7a66133ba250f44c8234e35c3a2e9c5713dacf83c280e0074ce4c45e347a26"
+    },
+    {
+      "id": "224526/224530",
+      "quality": "clean",
+      "weight": 1,
+      "command_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_identification/20260721_224530_254745_vive_rm65_actuator_trace",
+      "command_trace_sha256": "1c670e16c1b8b00e5df339c0d4533dec20c43ce259e6f0420477a8073865fb0a",
+      "command_manifest_sha256": "74fb8a60b03169d880d2a0671a027352879e86761b718e74c30688bd53fc8315",
+      "feedback_locator": "/home/user/zc/DexTeleop/teleop_records/actuator_feedback/rm65_udp_actuator_trace_20260721_224526_602620.jsonl",
+      "feedback_trace_sha256": "3284c69b6e9ab59613cd6c1cf2c49a14771c74bf573009a76b4377b5a6b8d7ac",
+      "recovery_journal_sha256": "c26f51a3983124abf4c84cac6573fbc68b569165f774454adb04a84bfa7d9973",
+      "common_overlap_sec": 42.699805043987,
+      "command_source_profile_sha256": "0d7a66133ba250f44c8234e35c3a2e9c5713dacf83c280e0074ce4c45e347a26"
+    }
+  ],
+  "excluded_records": [
+    {
+      "id": "163434",
+      "reason": "No overlapping UDP feedback pair."
+    },
+    {
+      "id": "171555",
+      "reason": "Orphan UDP trace without an overlapping command trace."
+    },
+    {
+      "id": "172353",
+      "reason": "Short command record without a valid paired fit interval."
+    },
+    {
+      "id": "220204/220211",
+      "reason": "Individually clean traces but no common time window: accepted qcmd begins after UDP feedback ended on both sides.",
+      "command_trace_sha256": "4df82019824f826b3c3cb14412692366729c45e01de64db1545be36e88998d46",
+      "command_manifest_sha256": "48545874f2edadbf27dfbdbfada38436cb4d232366bfa1ceb02da3c73816baeb",
+      "feedback_trace_sha256": "0a07c236a1d82b91188cd5cb0f0b30bcf7ddaa0420f9c3d9230e5332b23d7369",
+      "recovery_journal_sha256": "c3dbf69770a5b8455a6796371a74746196c0a3de3e565647d5c494c1e9ee347d"
+    },
+    {
+      "id": "223212",
+      "reason": "Orphan UDP trace without an overlapping command trace; detached guardian restored configuration and the trace has no in-band stop row.",
+      "feedback_trace_sha256": "b8e4d1dff552e2a85084cdce750a3dfb6bf157422b52647f6f3b8646a2e75479",
+      "recovery_journal_sha256": "d037d4afaa56a6d4c47d6c59aeb7240ba453133643181fad7eb4dad85fb78022"
+    }
+  ]
+}
+

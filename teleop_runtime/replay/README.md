@@ -1,5 +1,8 @@
 # DexTeleop Replay
 
+> 本页维护 replay 的完整模块参数。当前离线/真机运行入口统一从
+> [`docs/real/README.md`](../../docs/real/README.md#2-replay) 复制。
+
 `teleop_runtime.replay` 用于查看已有数据集，并可在通过检查后把数据集轨迹复现到 RM65 真机。它只做 replay，不创建新 episode，也不写采集数据。
 
 ## 启动 GUI
@@ -54,7 +57,8 @@ data/chunk-*/episode_*.parquet
 ## 真机轨迹 Replay
 
 当前真机 replay 面向 `teleop_runtime.debug.run_vive_rm65_real_teleop`
-采集的数据集。默认语义是：
+采集的数据集。主链路始终是数据集 canonical TCP action replay；qpos 只用于
+`Move Start` 安全初始化或显式低层 debug，不作为轨迹 replay 默认来源。默认语义是：
 
 - `Move Start`: 只使用首帧 qpos 做安全初始化。优先用
   `action.replay.<side>_arm_joint_target`；没有该字段时退回
@@ -66,14 +70,14 @@ data/chunk-*/episode_*.parquet
   `[x, y, z, qx, qy, qz, qw]` pose。先对 15 Hz 离散关键帧执行
   finite/quaternion/workspace/位姿步长安全限制；优先按 parquet 的完整、严格递增真实
   timestamp 重采样，缺失或非法时整段显式退回 nominal action grid，再生成
-  可配置的pose reference（默认75 Hz；xyz linear + shortest-path quaternion SLERP，不是时序平滑）。
-  默认必须同时激活左右臂，每个 75 Hz tool pose 由共享双臂 collision-aware IK
+  可配置的pose reference（默认60 Hz；xyz linear + shortest-path quaternion SLERP，不是时序平滑）。
+  默认必须同时激活左右臂，每个 60 Hz tool pose 由共享双臂 collision-aware IK
   转成 qpos，再执行绝对关节限位、每 reference 步长/速度限制，并对限位后 qpos
-  重新计算碰撞距离。只有通过的 75 Hz qpos 才会交给通用 75→150 qcmd 链路，
+  重新计算碰撞距离。只有通过的 60 Hz qpos 才会交给通用 60→120 qcmd 链路，
   真机 backend 不再对该链路独立解逐臂 Cartesian IK。
 
-当前安全边界：每个最终限位后的 75 Hz qpos endpoint 会执行双臂碰撞检查；
-但相邻 75 Hz endpoint 之间的 150 Hz 关节插值整段尚未做连续碰撞认证。
+当前安全边界：每个最终限位后的 60 Hz qpos endpoint 会执行双臂碰撞检查；
+但相邻 60 Hz endpoint 之间的 120 Hz 关节插值整段尚未做连续碰撞认证。
 调试 metadata 因此始终明确记录 `endpoint_collision_checked=true`、
 `segment_collision_certified=false`；不能将该链路描述为连续轨迹已认证。
 
@@ -81,7 +85,7 @@ data/chunk-*/episode_*.parquet
 0.25 s、左右测量时间差不超过 0.05 s，并要求 read/measured sequence、timestamp、qpos
 一致。硬件读取失败时不会退回 cached `current_qpos`/`last_target_qpos`。coupled planner
 通过后的 qpos 会标记为 prelimited，backend 若再次单臂改写或触发 singularity hold，replay
-会在同 tick hand 下发前 fault/hold。arm queue 前后及每次 hand I/O 前也会检查两侧 150 Hz
+会在同 tick hand 下发前 fault/hold。arm queue 前后及每次 hand I/O 前也会检查两侧 120 Hz
 stream readiness/fault/stale 状态。
 
 仅在默认的 coupled position replay 中，若 RM65 位控 backend 的 SDK 判定某侧目标或当前
@@ -111,17 +115,36 @@ python -m teleop_runtime.replay \
   --left-tool-profile hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json \
   --right-tool-profile hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json \
   --end-effectors-enabled \
-  --hand-backend dmtac_gripper \
-  --left-gripper-port /dev/ttyUSB_LEFT \
-  --right-gripper-port /dev/ttyUSB_RIGHT \
+  --hand-backend dmtac-gripper \
+  --dmtac-config latest \
+  --require-dmtac-config \
   --host 127.0.0.1 \
   --port 8765 \
   --no-open-browser
 ```
 
+Replay Web GUI 与正式 GUI、collection、deploy 共用
+`teleop_runtime/configs/hardware/dmtac/latest.json`。默认会从 assignment 读取 active
+side 的 gripper 稳定串口、Modbus ID、波特率和 timeout，但不会连接 tactile。
+`--left-gripper-port` / `--right-gripper-port` 仍可逐侧覆盖；对应的 ID、baudrate 和
+timeout 使用 `--SIDE-gripper-id`、`--SIDE-gripper-baudrate`、
+`--SIDE-gripper-timeout`。完全手工配置时使用 `--no-dmtac-use-config`。可用
+`--no-dmtac-validate-usb` 跳过当前 USB 探测，但这不会修复错误的左右 assignment。
+
+### UMI replay 坐标系
+
+v2.3 UMI 数据的 arm pose 先依据数据集中的 `pose_frame_contract` 统一为
+canonical `desk`，真机执行边界再使用已检入的 RM65 workspace-near-boundary runtime contract
+分别转换到左右 controller base。preflight、position/collision planner 与 impedance
+replay 使用同一条转换链；缺失或不完整的 canonical frame contract 会直接阻止回放。
+
+UMI 标定协议把标定板坐标系直接定义为 canonical `desk`。因此标定时标定板必须与
+RM65 URDF 的 `workspace_near_boundary_frame` 在物理上同原点、同轴；板的位置或朝向改变后必须
+重新标定，不能只复用旧的 `T_vive_world_to_desk`。
+
 `Move Start` 仍然只做机械臂首帧 qpos 初始化，不移动末端。`Start` 阶段
 会从数据集 `action` 中读取 active side 的 hand slot。手/夹爪仍在各自 15 Hz
-source timestamp 离散下发；机械臂独立按 75 Hz reference 下发，因而不会提前
+source timestamp 离散下发；机械臂独立按 60 Hz reference 下发，因而不会提前
 发送下一帧 hand keyframe，也不会制造中间 hand action。
 
 若临时 tracker hold/FROZEN 帧没有新的 hand command，正式数据集的 26D `action`
@@ -139,7 +162,7 @@ gripper 当前使用 `dmtac_gripper` spec，将 6-slot 兼容 hand target 映射
 1 维 gripper target；如果缺少 spec，resolver 会退回 q6 手部默认语义，
 这通常不适合夹爪部署，需要先补齐数据集 metadata 或做后处理转换。
 
-当前通用 replay 动作构造、轨迹 contract 与 15→75→150 schedule 已集中在
+当前通用 replay 动作构造、轨迹 contract 与 15→60→120 schedule 已集中在
 `robot_motion/replay` 和 `robot_motion/position_control`。`teleop_runtime/replay`
 只保留真机 backend、GUI、preflight 与安全执行壳；MuJoCo replay 复用同一
 时间戳 resampling/schedule。
@@ -147,8 +170,8 @@ gripper 当前使用 `dmtac_gripper` spec，将 6-slot 兼容 hand target 映射
 position 频率和 15 Hz keyframe 安全可在启动时配置：
 
 ```text
---position-reference-hz 75
---arm-control-hz 150
+--position-reference-hz 60
+--arm-control-hz 120
 --position-workspace-min -0.60 -0.80 0.00
 --position-workspace-max  0.60  0.80 0.90
 --position-max-xyz-step-m 0.10
@@ -158,14 +181,21 @@ position 频率和 15 Hz keyframe 安全可在启动时配置：
 --position-collision-scene-profile dual_arm_hand_proxy_open
 --position-collision-min-distance-m 0.03
 --position-collision-distance-epsilon-m 0.0001
---position-collision-max-joint-velocity-rad-s 0.35,0.35,0.35,0.5,0.5,0.5
+--position-collision-max-joint-velocity-rad-s 2.967059728,2.967059728,3.316125579,3.665191429,4.188790205,4.188790205
 --no-position-collision-debug
 ```
 
-`--position-collision-max-joint-step-rad` 可选传 1 个或 6 个值；留空时仅使用
-`max_joint_velocity / reference_hz` 生成每个 75 Hz reference 的安全步长上限。
+位控 replay 默认使用正式 `rm65_bimanual_position_v1`：自适应 IK `min=2/max=4`、
+orientation cost `0.35`、damping `0.03`、5 ms iteration reserve，并使用
+`rm65_bimanual_position_v1_qref` 的逐关节速度上限。数据集主 action 已经是 accepted
+qref 的 FK pose；replay 不重复采集前 inactive/tracker/post-IK qref 平滑，只执行主
+action 之后的插值、IK、安全限位和下发。命令行仍可显式覆盖逐关节速度值用于 debug，
+也可用 `--position-control-profile legacy` 回退。
 
-`--position-collision-debug` 会在每个 75 Hz command metadata 中附加 raw IK qpos、
+`--position-collision-max-joint-step-rad` 可选传 1 个或 6 个值；留空时仅使用
+`max_joint_velocity / reference_hz` 生成每个 60 Hz reference 的安全步长上限。
+
+`--position-collision-debug` 会在每个 60 Hz command metadata 中附加 raw IK qpos、
 限位后 qpos、target/realized endpoint pose、碰撞尝试和耗时明细；关闭时仍保留
 status、距离、限位原因、endpoint/segment 认证边界等摘要。controller 同时维护一个
 512 条的有界事件环和 tracking/limited/backoff/hold/drop 计数；`/api/state` 返回 last 与

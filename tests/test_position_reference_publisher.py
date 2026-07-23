@@ -6,6 +6,7 @@ from robot_motion.position_control import (
     POSITION_TRANSPORT_TARGET_SEQUENCE_KEY,
     POSITION_TRANSPORT_TARGET_SEQUENCES_KEY,
     PositionReferenceAuditEvent,
+    position_qref_fingerprint,
 )
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.position_control import (
@@ -233,6 +234,47 @@ def test_publisher_observer_links_reference_to_backend_transport_targets() -> No
     assert observed[0].epoch == 12
     assert observed[0].reference_sequence == 0
     assert observed[0].transport_target_sequences == {"left": 41, "right": 92}
+
+
+def test_publisher_binds_candidate_certificate_to_qref_sequence_and_transport() -> None:
+    result = _result()
+    for side, target_sequence in (("left", 41), ("right", 92)):
+        command = result.command.commands[f"{side}_arm"]
+        qref = np.asarray(command.value, dtype=float)
+        command.metadata[POSITION_TRANSPORT_TARGET_SEQUENCE_KEY] = target_sequence
+        command.metadata["ik_candidate_selection"] = {
+            "candidate_certificate": {
+                "sequence": 17,
+                "qref_fingerprint_by_side": {
+                    side: position_qref_fingerprint(qref),
+                },
+            }
+        }
+    publisher = PositionReferencePublisher(
+        config=PositionReferencePublisherConfig(active_sides=("left", "right")),
+        fk_by_side={"left": _fk, "right": _fk},
+        wall_clock=_Clock((10.1, 10.2)),
+        monotonic_clock=_Clock((1.0, 1.1)),
+        epoch=12,
+    )
+
+    frame = publisher.publish_step(result)
+
+    assert frame is not None
+    for side, target_sequence in (("left", 41), ("right", 92)):
+        reference = frame.references[side]
+        assert reference.frame_metadata["candidate_certificate_qref_match"] is True
+        binding = result.command.commands[f"{side}_arm"].metadata[
+            "position_reference_candidate_binding"
+        ]
+        assert binding == {
+            "epoch": 12,
+            "sequence": 0,
+            "transport_target_sequence": target_sequence,
+            "qref_fingerprint": reference.frame_metadata["qref_fingerprint"],
+            "candidate_certificate_sequence": 17,
+            "candidate_certificate_qref_match": True,
+        }
 
 
 def test_publisher_audit_observer_failure_is_isolated_from_reference_publish() -> None:

@@ -1,0 +1,132 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_3c_virtual_shadow_frontend_local_2026_07_22",
+  "scope": "non_formal_local_only",
+  "captured_at": "2026-07-22T00:25:04+08:00",
+  "repository": {
+    "commit": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "full_suite_rerun": false
+  },
+  "runtime_environment": {
+    "python": "3.10.20",
+    "hardware_accessed": false,
+    "production_entrypoint_called": false,
+    "production_entrypoint_help_only": true
+  },
+  "rtc_profile": {
+    "profile_id": "rtc_3c_virtual_shadow_15_30_60_120_v1",
+    "semantic_content_hash": "e6145d5d50023de025e1d8ce4f1f843729348dce644da7fbf6ff7d15b21a4022",
+    "rtc_mode": "async_aligned_chunk_v1",
+    "policy_restriction": "builtin_hold_virtual_only",
+    "position_lookahead_enabled": false,
+    "send_actions": false,
+    "observation_hz": 15.0,
+    "decision_hz": 30.0,
+    "action_hz": 30.0,
+    "position_sample_hz": 15.0,
+    "position_reference_hz": 60.0,
+    "position_command_hz": 120.0
+  },
+  "frontend_contract": {
+    "request_mailbox_capacity": 1,
+    "single_in_flight": true,
+    "result_mailbox_bounded": true,
+    "legacy_action_deque_used": false,
+    "formal_emission_schema_reused": "PolicyActionEmission",
+    "position_lookahead_action": null,
+    "commit_through_policy": "after_formal_emission_current_popped_target_only",
+    "future_target_commit_rejection": "not_representable_by_valid_due_pop_receipt_with_defensive_target_not_popped_check",
+    "lifecycle_order": "invalidate_epoch_and_plan_before_worker_stop",
+    "rearm_policy": "explicit_after_old_worker_session_drained"
+  },
+  "scoped_source_sha256": {
+    "robot_motion/deploy/async_producer.py": "52cfffbe769a2276a0d65c156d7d672588704768026c6570edebb5b7ec7fd03a",
+    "robot_motion/deploy/chunk_plan.py": "64e5b705509e3645367bfb253bdc400ed4aec0b49aef8e5e4dd849a3ac54eb0a",
+    "robot_motion/deploy/runtime.py": "158b8d777578cff5e965595c573f2d7b5d6b845fa18c58d81c392b0f7f713101",
+    "robot_motion/deploy/__init__.py": "07dcfb51decf8cecdf3823fe2973752adc757f7cb41915fde71eb65e1cf53ba0",
+    "teleop_runtime/deploy/policy_worker.py": "63227e760ea4657945b4c4829360f9bc725fd54e4d30d203e96fc8fcd9f9fff2",
+    "teleop_runtime/deploy/rtc_frontend.py": "fba0d70c7b01ca96032fdc6605542711107a2121b591c89c6514640954358847",
+    "teleop_runtime/deploy/run_policy.py": "f52a842a4fb00a73ab2015a2745f19f0a8645c294a2f3e711b14605d3d264c35",
+    "teleop_runtime/deploy/__init__.py": "cae2532d0fafa0305158336f57b9b8b35db199f49d921191727c7557392e7c1b",
+    "tests/test_policy_chunk_plan.py": "0f539431d27c5a34b3e05af030afe7e4254fafb580265e0803212d513e42c169",
+    "tests/test_mujoco_rtc_virtual_policy.py": "7e2939873e6a9c8c50569c4b8ef6e38c2e8417126fae90ecd133b636834cc96c",
+    "tests/test_deploy_rtc_policy_worker.py": "c8b48661d99623c979c65cbbb4fbec6abccaabb2a792098ea9340734878be181",
+    "tests/test_deploy_rtc_prediction_admission.py": "1162aaeda088c40fea0d45fe83d95b21c3cdd55a399e41cf4d49615e2e17b8d6",
+    "tests/test_deploy_rtc_producer_state.py": "7b4dbe76bda2007397aa28f14fd85730a4f4484db190337c4f590f803156a4a5",
+    "tests/test_deploy_rtc_frontend_shadow.py": "efd8e2e2219c7182af8de55032059c60e1bfe6cc90572860590533ce3b8a99db",
+    "tests/test_deploy_action_emission.py": "f73bfea259edb11528291a4aa0b95094a8b2f935777350c4868cc4d2b4801d35"
+  },
+  "documentation_sha256": {
+    "todos/dexteleop_rtc_landing_plan.md": "15202ec41f2ed94caba8147adcaae6ad6840644ef258fa18ac1611cf8bb1d528",
+    "todos/dexteleop_rtc_visual_guide.md": "20c1268f36e11d0e20f3d8b33690ee899bea81a7bee871332b610e5943d5cd91",
+    "todos/dexteleop_architecture_planning.md": "01c24caf863cb36e5466836f36d9f363d95ef359144ee1e3bbe313559c4c15dc",
+    "todos/dexteleop_architecture_visual_guide.md": "905bd1826dd226e8bf619bd52a0f9c9ddce982799e72afc1d57c93c69cb6e071",
+    "teleop_runtime/deploy/README.md": "1bf7a0758c13dc8207d808a78d224ce60f72b37874b9932dbbba230350b06998"
+  },
+  "out_of_scope_capture_sha256": {
+    "teleop_runtime/deploy/replay.py": "984ab78db8717f42e9d0c843c282bf73546ac24e71ec2eb77ced3e5f1008bb1a",
+    "teleop_runtime/position_control/deploy_executor.py": "69eb32a1b16644d296a50ef9918cef7c981a530248ee16ce2488abb7e5af0c26",
+    "sim/mujoco/deploy/rtc_policy.py": "b2f5e9a8e1d836cd5db87f1903c75f3bc7fbbe5672318c10acd4cf08819df7f8"
+  },
+  "verification": [
+    {
+      "command": "PYTHONPATH=. uv run pytest -q tests/test_policy_chunk_plan.py tests/test_mujoco_rtc_virtual_policy.py tests/test_deploy_rtc_policy_worker.py tests/test_deploy_rtc_prediction_admission.py tests/test_deploy_rtc_producer_state.py tests/test_deploy_rtc_frontend_shadow.py",
+      "result": "60 passed in 2.07s"
+    },
+    {
+      "command": "PYTHONPATH=. uv run pytest -q tests/test_robot_motion_deploy_contracts.py tests/test_deploy_canonical_action.py tests/test_deploy_action_emission.py tests/test_openpi_common_deploy.py tests/test_openpi05_deployment.py tests/test_deploy_policy_qpos_init.py tests/test_position_deploy_executor.py tests/test_mujoco_deploy_runtime.py tests/test_mujoco_async_topology.py",
+      "result": "152 passed, 1 skipped in 3.55s"
+    },
+    {
+      "command": "python -m py_compile <rtc_3c_scoped_python_paths>",
+      "result": "passed"
+    },
+    {
+      "command": "python -m teleop_runtime.deploy --help",
+      "result": "passed; rtc profile exposed; no runtime resources initialized"
+    },
+    {
+      "command": "git diff --check plus trailing-whitespace scan <rtc_3c_scoped_paths>",
+      "result": "passed"
+    }
+  ],
+  "virtual_fixture_assertions": {
+    "long_run_decision_ticks": 240,
+    "minimum_unique_formal_emissions": 20,
+    "duplicate_emission_identity_count": 0,
+    "legacy_queue_mutation_count": 0,
+    "position_lookahead_count": 0,
+    "request_spacing_minimum_decision_ticks": 2,
+    "control_step_p99_budget_sec": 0.03333333333333333,
+    "blocking_worker_control_step_max_budget_sec": 0.02,
+    "ttl_underrun_fault_hold_late_completion_rearm_covered": true
+  },
+  "claims": [
+    "the worker does not block the virtual 30 Hz control-step fixture",
+    "request/result/session/epoch/timed-plan admission has one control-thread producer truth",
+    "each selected keyframe creates at most one formal PolicyActionEmission",
+    "producer commit-through advances only after that current popped keyframe has a formal emission",
+    "un-popped future successors remain mutable and are never passively staged as RTC position lookahead",
+    "TTL, underrun, HOLD, FAULT, late completion and explicit rearm are covered by local fixtures",
+    "RTC CLI is default-off and rejects send_actions, non-builtin policy, replay and append inputs",
+    "sync_queue_v1 compatibility tests remain green"
+  ],
+  "non_claims": [
+    "not formal ControlTrace evidence",
+    "not an executed full deploy application RTC session",
+    "not proof that application camera/backend resource initialization is hardware-free",
+    "not OpenPI transport, capability handshake or model guidance evidence",
+    "not typed preview or RTC lookahead readiness",
+    "not M1C or real worker execution-drain evidence",
+    "not real observation or transport shadow readiness",
+    "not motion authorization",
+    "not full-suite green evidence"
+  ],
+  "known_mainline_ledger_not_rerun": {
+    "result": "2513 passed, 6 skipped, 6 failed, 3 warnings, 7 subtests passed",
+    "failure_scope": "parallel RM65 MuJoCo actuation profile v1-to-v2 config/test/real2sim hash drift",
+    "rtc_attribution": "not attributed to RTC-3c",
+    "head_observed_unchanged_during_batch": true
+  }
+}

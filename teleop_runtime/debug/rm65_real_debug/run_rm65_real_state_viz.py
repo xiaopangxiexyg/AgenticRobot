@@ -205,8 +205,26 @@ def parse_args() -> argparse.Namespace:
             "Press 's' during the run to save the current state."
         ),
     )
+    parser.add_argument(
+        "--save-once",
+        action="store_true",
+        help=(
+            "Refresh both arm states, save --save-initial-alignment once, and exit. "
+            "This remains strictly read-only with respect to robot hardware."
+        ),
+    )
+    parser.add_argument(
+        "--no-motion",
+        action="store_true",
+        help=(
+            "Explicitly declare the entrypoint's enforced read-only/no-motion contract. "
+            "The tool never sends robot or hand commands regardless of this flag."
+        ),
+    )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0, help="Stop after N steps, 0 means infinite.")
     args = parser.parse_args()
+    if args.save_once and not args.save_initial_alignment:
+        parser.error("--save-once requires --save-initial-alignment PATH_OR_DIR.")
     args.requested_tcp_mode = str(getattr(args, "tcp_mode", TOOL_TCP_FRAME))
     args.tcp_mode = TOOL_TCP_FRAME
     return args
@@ -229,6 +247,11 @@ def _build_backend(
             arm_urdf_path=arm_urdf_path,
             connect_hardware=connect_hardware,
             initial_qpos=initial_qpos,
+            # This entrypoint is a strict read-only preflight.  The shared
+            # backend normally publishes configured singularity thresholds
+            # during start(); that SDK write is appropriate for a control
+            # runtime but must never occur here.
+            configure_singularity_thresholds=False,
         )
     )
 
@@ -429,6 +452,8 @@ def _log_side_status(
     qpos = state.get("current_qpos")
     result_code = state.get("hardware_result_code")
     result_text = state.get("hardware_result_text")
+    arm_err = state.get("hardware_arm_err")
+    sys_err = state.get("hardware_sys_err")
     qpos_summary = None
     if qpos is not None:
         qpos_summary = tuple(np.round(np.asarray(qpos, dtype=float), 3).tolist())
@@ -436,6 +461,8 @@ def _log_side_status(
     snapshot = (
         result_code,
         result_text,
+        arm_err,
+        sys_err,
         qpos is None,
         tcp_pose_desk is None,
     )
@@ -443,6 +470,7 @@ def _log_side_status(
         message = f"{side} result={result_code}"
         if result_text not in (None, "", str(result_code)):
             message += f" ({result_text})"
+        message += f" arm_err={arm_err} sys_err={sys_err}"
         if qpos_summary is not None:
             message += f" q={list(qpos_summary)}"
         if tcp_summary is not None:
@@ -672,6 +700,11 @@ def main() -> None:
                 right_state = components.right_backend.refresh_state_from_hardware()
             else:
                 right_state = components.right_backend.get_state() if components.right_backend is not None else {}
+
+            if args.save_once:
+                output_path = _save_initial_alignment(components, args)
+                log_event("RM65Real", f"saved initial alignment -> {output_path}", now=loop_start)
+                return
 
             left_tcp = _tcp_pose_desk(components.left_backend, components.calibration, "left", args.tcp_mode)
             right_tcp = _tcp_pose_desk(components.right_backend, components.calibration, "right", args.tcp_mode)

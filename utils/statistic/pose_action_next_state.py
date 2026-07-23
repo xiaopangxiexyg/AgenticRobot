@@ -11,17 +11,17 @@ import numpy as np
 
 
 SIDE_ORDER: tuple[str, ...] = ("left", "right")
-ACTION_ARM_POSE_SLICES: dict[str, slice] = {
+PACKED_ARM_POSE_SLICES: dict[str, slice] = {
     "left": slice(0, 7),
     "right": slice(7, 14),
 }
-STATE_ARM_POSE_SLICES: dict[str, slice] = {
+LEGACY_V21_STATE_ARM_POSE_SLICES: dict[str, slice] = {
     "left": slice(6, 13),
     "right": slice(25, 32),
 }
 POSE_DIM = 7
-ACTION_DIM = 26
-STATE_DIM = 38
+PACKED_ARM_POSE_DIM = 14
+LEGACY_V21_STATE_DIM = 38
 
 RELATION_SAME_STATE = "same_state"
 RELATION_NEXT_STATE = "next_state"
@@ -268,6 +268,33 @@ def vector_or_none(value: Any, *, length: int) -> np.ndarray | None:
     return vector
 
 
+def vector_with_minimum_length_or_none(value: Any, *, minimum_length: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        vector = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if vector.size < int(minimum_length):
+        return None
+    return vector
+
+
+def packed_arm_pose_from_row(
+    row: Mapping[str, Any],
+    *,
+    key: str,
+    side: str,
+) -> np.ndarray | None:
+    vector = vector_with_minimum_length_or_none(
+        row.get(key),
+        minimum_length=PACKED_ARM_POSE_DIM,
+    )
+    if vector is None:
+        return None
+    return vector[PACKED_ARM_POSE_SLICES[side]]
+
+
 def pose_from_row(row: Mapping[str, Any], *, side: str, source: str) -> np.ndarray | None:
     if source == "action":
         aliases = (
@@ -280,10 +307,10 @@ def pose_from_row(row: Mapping[str, Any], *, side: str, source: str) -> np.ndarr
             pose = vector_or_none(row.get(key), length=POSE_DIM)
             if pose is not None:
                 return pose
-        action = vector_or_none(row.get("action"), length=ACTION_DIM)
-        if action is not None:
-            return action[ACTION_ARM_POSE_SLICES[side]]
-        return None
+        combined_pose = packed_arm_pose_from_row(row, key="action.arm.pose", side=side)
+        if combined_pose is not None:
+            return combined_pose
+        return packed_arm_pose_from_row(row, key="action", side=side)
 
     if source == "state":
         aliases = (
@@ -292,21 +319,35 @@ def pose_from_row(row: Mapping[str, Any], *, side: str, source: str) -> np.ndarr
             f"observation.{side}_arm_pose",
             f"observation.{side}.pose",
             f"observation.arm.{side}.current_tcp_pose",
+            f"observation.arm.{side}.actual_tcp_pose",
         )
         for key in aliases:
             pose = vector_or_none(row.get(key), length=POSE_DIM)
             if pose is not None:
                 return pose
-        state = vector_or_none(row.get("observation.state"), length=STATE_DIM)
-        if state is not None:
-            return state[STATE_ARM_POSE_SLICES[side]]
-        return None
+        combined_pose = packed_arm_pose_from_row(
+            row,
+            key="observation.arm.pose",
+            side=side,
+        )
+        if combined_pose is not None:
+            return combined_pose
+        state = vector_with_minimum_length_or_none(
+            row.get("observation.state"),
+            minimum_length=PACKED_ARM_POSE_DIM,
+        )
+        if state is None:
+            return None
+        if state.shape == (LEGACY_V21_STATE_DIM,):
+            return state[LEGACY_V21_STATE_ARM_POSE_SLICES[side]]
+        return state[PACKED_ARM_POSE_SLICES[side]]
 
     if source == "last_action":
-        last_action = vector_or_none(row.get("observation.last_action"), length=ACTION_DIM)
-        if last_action is not None:
-            return last_action[ACTION_ARM_POSE_SLICES[side]]
-        return None
+        return packed_arm_pose_from_row(
+            row,
+            key="observation.last_action",
+            side=side,
+        )
 
     raise ValueError(f"Unsupported pose source: {source!r}")
 
@@ -341,12 +382,16 @@ def needed_columns(available: set[str]) -> list[str]:
         "action",
         "observation.state",
         "observation.last_action",
+        "action.arm.pose",
         "action.left_arm.pose",
         "action.right_arm.pose",
+        "observation.arm.pose",
         "observation.left_arm.pose",
         "observation.right_arm.pose",
         "observation.arm.left.current_tcp_pose",
         "observation.arm.right.current_tcp_pose",
+        "observation.arm.left.actual_tcp_pose",
+        "observation.arm.right.actual_tcp_pose",
         "teleop.pose_quality.status",
         "teleop.pose_quality.bad",
         "teleop.arm_mode.left.label",
@@ -525,6 +570,9 @@ def analyze_dataset(
         "dataset_root": str(dataset_root),
         "info_frame_count": info.get("frame_count"),
         "info_episode_count": info.get("episode_count"),
+        "dataset_schema": info.get("dexteleop_dataset_schema"),
+        "pose_storage_frame": info.get("pose_storage_frame"),
+        "policy_io_layout_hash": info.get("policy_io_layout_hash"),
         "scanned_episode_count": int(len(records)),
         "scanned_row_count": int(total_rows),
         "thresholds": {

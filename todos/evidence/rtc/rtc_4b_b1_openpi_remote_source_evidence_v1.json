@@ -1,0 +1,63 @@
+{
+  "schema": "dexteleop_rtc_scoped_evidence_v1",
+  "evidence_id": "rtc_4b_b1_openpi_remote_source_evidence_v1",
+  "captured_at": "2026-07-22T14:25:31+08:00",
+  "scope": "remote_source_additive_no_model_no_server_no_device",
+  "formal": false,
+  "dexteleop_head": "35c50a73b8baa87958373c4211de78b96b5a86ef",
+  "openpi_head": "650c5b0283a49c42784fb5055a0507da2c6d347d",
+  "openpi_head_reproduces_worktree": false,
+  "remote_root": "/home/user/zc/openpi",
+  "modified_files": {
+    "src/openpi/models/pi0.py": {
+      "before_sha256": "61783977b03ebfd8cf7ae28641abfa12dc6993d5faa0dc48fb2d047d8785360d",
+      "after_sha256": "f82e73d8444b808c9535e834c52829c08cdbe233faa552d335f68f9da7b85ce2"
+    },
+    "src/openpi/models/pi0_test.py": {
+      "before_sha256": "5082873014a7fc45fb8414f517909e1c24cdafea980a1fb612e0aea6058ed0fe",
+      "after_sha256": "5cb2ffd519161438d7c4730b99fb2be1bd203e918e17b29e907761db43056bb9"
+    },
+    "src/openpi/policies/policy.py": {
+      "before_sha256": "a2ac5236e23b11d0f5a840d4a8fef148d89dba921d5452ec5dfcd5a6ffa46f20",
+      "after_sha256": "76c4e8369c95df428f01eaf9bf0f674e509ebd4ad520d7d5c1f1565f7890dba6"
+    },
+    "src/openpi/policies/policy_test.py": {
+      "before_sha256": "9dbb20963600367a7e7abfc97d1e326916777c57a87b39b1bc4070ba64676683",
+      "after_sha256": "114b79ca40349c87b56623561f8a29d368f4886d0c7b49b649a637e947c4956a"
+    }
+  },
+  "unchanged_files": {
+    "src/openpi/policies/policy_config.py": "f1b649619fd86fcc3461bf2fca20cfb25c055c52d3c840beb3e5c1b133f5a1cb",
+    "scripts/serve_dexteleop_policy.py": "341d716a20b654d9e1539482e6722d261465eabb77a45913145ea0e14534fa44",
+    "src/openpi/serving/websocket_policy_server.py": "39731c7e561343478df7793a57537bf4b0cbff3793b86b72d7e5b197fe76fcd9"
+  },
+  "verification": [
+    {
+      "command": "python -m pytest src/openpi/models/pi0_test.py src/openpi/policies/policy_test.py -m 'not manual' -q",
+      "result": "16 passed, 2 deselected, 16 warnings in 4.54s"
+    },
+    {
+      "command": "python -m pytest src/openpi/policies/dexteleop_v22_policy_test.py -q",
+      "result": "10 passed, 3 skipped in 3.17s"
+    },
+    {
+      "command": "python -m ruff check src/openpi/models/pi0.py src/openpi/models/pi0_test.py src/openpi/policies/policy.py src/openpi/policies/policy_test.py",
+      "result": "All checks passed"
+    }
+  ],
+  "guarantees": [
+    "sample_actions is unchanged",
+    "Policy.infer is unchanged",
+    "RTC continuation is default-off",
+    "infer_rtc has no server or production caller",
+    "no checkpoint, model server, websocket, GPU inference, camera, robot, teleop, or replay was started"
+  ],
+  "not_proven": [
+    "full Pi0 checkpoint inference",
+    "JIT latency or memory",
+    "RTC wire capability or conditioning receipt",
+    "OpenPI websocket continuation",
+    "DexTeleop RTC-3c or RTC-4b-T integration",
+    "sim or real authority"
+  ]
+}

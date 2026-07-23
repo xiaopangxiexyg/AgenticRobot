@@ -17,7 +17,7 @@ from sim.contracts import SimulationContract
 
 
 MODEL_CACHE_ENV = "SIM_MUJOCO_CACHE_DIR"
-ARTIFACT_KEY_VERSION = "dexteleop.sim.mujoco.model_artifact.v1"
+ARTIFACT_KEY_VERSION = "dexteleop.sim.mujoco.model_artifact.v2"
 
 
 def _sha256(path: Path) -> str:
@@ -79,7 +79,13 @@ class ModelArtifactCache:
             else repo_path(".cache", "mujoco")
         )
 
-    def _fingerprint(self, contract: SimulationContract) -> tuple[str, dict[str, object]]:
+    def _fingerprint(
+        self,
+        contract: SimulationContract,
+        *,
+        position_actuation_profile=None,
+        gripper_actuation_profile=None,
+    ) -> tuple[str, dict[str, object]]:
         import mujoco
 
         dependency_hashes = {
@@ -88,6 +94,16 @@ class ModelArtifactCache:
         payload: dict[str, object] = {
             "artifact_key_version": ARTIFACT_KEY_VERSION,
             "contract": contract.to_dict(),
+            "position_actuation_profile": (
+                None
+                if position_actuation_profile is None
+                else position_actuation_profile.to_metadata()
+            ),
+            "gripper_actuation_profile": (
+                None
+                if gripper_actuation_profile is None
+                else gripper_actuation_profile.to_metadata()
+            ),
             "dependencies": dependency_hashes,
             "mujoco_python_version": mujoco.__version__,
             "mujoco_native_version": mujoco.mj_versionString(),
@@ -97,14 +113,24 @@ class ModelArtifactCache:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest(), payload
 
-    def load_scene(self, contract: SimulationContract):
+    def load_scene(
+        self,
+        contract: SimulationContract,
+        *,
+        position_actuation_profile=None,
+        gripper_actuation_profile=None,
+    ):
         """Return ``(scene, artifact)`` after validating or building the cache."""
 
         import mujoco
 
         from ..scene import MujocoScene
 
-        key, fingerprint = self._fingerprint(contract)
+        key, fingerprint = self._fingerprint(
+            contract,
+            position_actuation_profile=position_actuation_profile,
+            gripper_actuation_profile=gripper_actuation_profile,
+        )
         directory = self.root / key
         directory.mkdir(parents=True, exist_ok=True)
         mjb_path = directory / "model.mjb"
@@ -129,7 +155,12 @@ class ModelArtifactCache:
                         key, directory, mjb_path, mjcf_path, manifest_path, True
                     )
 
-            scene = MujocoScene.from_contract(contract, mjcf_path=mjcf_path)
+            scene = MujocoScene.from_contract(
+                contract,
+                mjcf_path=mjcf_path,
+                position_actuation_profile=position_actuation_profile,
+                gripper_actuation_profile=gripper_actuation_profile,
+            )
             with tempfile.NamedTemporaryFile(
                 dir=directory,
                 prefix="model.",

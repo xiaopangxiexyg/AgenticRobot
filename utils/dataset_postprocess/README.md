@@ -1,5 +1,8 @@
 # Dataset Postprocess
 
+> 本页维护各后处理子命令的完整参数。当前跨工具运行顺序统一从
+> [`docs/data/README.md`](../../docs/data/README.md) 开始。
+
 DexTeleop dataset 后处理工具集合。默认以 dry-run / 写新目录为主，不原地修改原始数据集。
 唯一受支持的包路径是 `utils.dataset_postprocess`。原顶层
 `dataset_postprocess` 包已移除；脚本、测试和外部调用应统一使用新路径。
@@ -14,8 +17,8 @@ conda activate dexteleop310
 
 ## 推荐汇总 Pipeline
 
-大批量数据建议按下面顺序处理。所有会改 dataset 结构的步骤都写到新目录，
-默认不会原地覆盖原始数据。
+大批量数据建议按下面顺序处理。结构变换步骤写到新目录；末尾的 tactile compact
+是唯一默认的原地步骤，但只有显式 `--apply` 才会执行。
 
 ```text
 raw dataset
@@ -25,8 +28,20 @@ raw dataset
   -> wrist table keep-mask
   -> wrist depth mask postprocess
   -> final wrist keep-mask = postprocessed depth OR table keep-mask
+  -> DM_force_calculate（需要 dense force 时，必须在 raw 降分辨率前完成）
+  -> tactile compact v1（最后一步，default, offline and in-place）
   -> dataset_interface training-time masked augmentation
 ```
+
+默认后处理入口会启用 canonical tactile compact v1；不加 `--apply` 时仍然只生成计划：
+
+```bash
+python -m utils.dataset_postprocess postprocess DATASET_ROOT
+python -m utils.dataset_postprocess postprocess DATASET_ROOT --apply
+```
+
+只有明确不需要 compact 时才使用 `--no-tactile-compact`。compact 不在采集 writer/finalize
+线程中运行；检测到正式采集进程时，`--apply` 会拒绝执行。默认磁盘余量为 20 GiB。
 
 默认 mask 行为：
 
@@ -45,6 +60,127 @@ final keep-mask 会按输入保留这部分像素。
 `trim-nan-tails`、`causal-align` 会复制 `meta/` 和 `data/`，视频/触觉/depth
 等大文件 hardlink；`clean-stutters` 会重写 `data/`；`delete-episodes` 和
 `split-episodes` 会优先 hardlink 保留的 artifact。输出目录不能放在源 dataset 内部。
+
+## Canonical tactile compact v1
+
+正式后处理统一使用两个固定 profile，禁止为不同数据集临时组合 shape、位深和 codec：
+
+- `dmtac_raw_120x160_q6_delta_zstd_v1`：保持每个 tactile frame、时间戳和采样频率不变；
+  原始 `uint8[480,640]` 做确定性的 4x4 整数 area mean，随后做 6-bit 中点重建，逻辑输出
+  是 `uint8[120,160]`；每个 chunk 独立做可逆帧差和 Zstd。
+- `dmtac_force_qint16_zstd_v1`：`distributed_force` 的逻辑输出仍是
+  `float32[288,384,3]`，存储为每 chunk/每通道带 scale 的对称 int16，再做 Zstd。
+
+两者都设置 `frequency_preserved=true`。Parquet 的
+`tactile_raw_shape_per_sensor` 和旧 `tactile_shapes_json` 是采集源审计信息，可以继续记录
+`480x640`；实际训练/回放数组的 shape、dtype、量化和 source provenance 以 manifest stream
+spec 为准。manifest 的逐 tactile-frame `shapes/dtypes` 会更新为 compact 后的逻辑值，并把
+原值保存在 `source_shapes/source_dtypes`。
+
+`DM_force_calculate` 只能消费 full-resolution raw，所以需要 dense force 时必须先完成 force
+解算，再运行 compact。compact 同时扫描 `tactile/` 和 `tactile_force/`，并在全部完成后写入
+`meta/tactile_compaction.json` 和 `meta/info.json.tactile_storage_profile`。
+
+命令默认只读并给出完整计划；任何未知 dtype/shape/encoding 都会令计划 `ready=false`，apply
+会 fail closed：
+
+```bash
+python -m utils.dataset_postprocess tactile-compact datasets/umi_dual_wrist
+```
+
+先限制为一个 manifest 做灰度发布。工具逐 chunk 压缩并立即解压校验，所有 stream staging
+成功后才原子提交 manifest，提交后才删除旧流；`--min-free-gb` 是转换期间必须保留的磁盘余量：
+
+```bash
+python -m utils.dataset_postprocess tactile-compact datasets/umi_dual_wrist \
+  --level 1 --chunk-frames 32 --min-free-gb 20 --max-manifests 1 \
+  --apply --delete-originals
+```
+
+检测到正式 collection/GUI 采集进程时，`--apply` 会直接拒绝执行。工具不会改视频、
+wrist-depth 或触觉频率。批量前后必须用 `dataset_contracts.ChunkedTactileStream` 回读每个
+stream 的首/中/末帧，并核对 manifest frame_count 与索引不变。
+
+旧的 `tactile-recompress-zstd` 只提供 full-resolution 无损兼容迁移，不属于默认 pipeline，
+不得与 compact v1 混合作为正式数据发布格式。
+
+## Stable/source 与 sorted 数据的 hardlink 去重
+
+对已经生成的 sorted dataset，可把内容完全相同的不可变大 artifact 改为指向 stable/source
+文件的 hardlink。默认范围严格限制在路径组件 `videos/`、`tactile/`、`wrist_depth/`，不会处理
+`meta/` 或 `data/`。计划阶段先按大小筛选，再对两边完整文件做 SHA-256；文件名和大小相同
+不能代替内容校验：
+
+```bash
+python -m utils.dataset_postprocess hardlink-dedupe \
+  datasets/sorted_v22 \
+  --reference-root /path/to/DexTeleop_StableCollect_0705/datasets
+```
+
+计划中的 `estimated_reclaimable_bytes` 才是预计实际释放空间。确认采集已经结束并审阅计划后：
+
+```bash
+python -m utils.dataset_postprocess hardlink-dedupe \
+  datasets/sorted_v22 \
+  --reference-root /path/to/DexTeleop_StableCollect_0705/datasets \
+  --apply --confirm-replace-targets
+```
+
+执行只原子替换 target 目录项，不删除或改写 reference。替换前会再次核对两边 inode、大小和
+mtime 是否仍与完整哈希计划一致；任一文件变化即停止。完整哈希扫描和执行在正式采集进程
+存在时都会拒绝。hardlink 之后两条路径共享同一 inode：删除任一路径不会删除另一链接，
+但禁止对 artifact 做原地写入；需要修改时必须写临时文件后原子替换。
+
+## 旧 UMI workspace-near-boundary 坐标修正（默认关闭）
+
+该工具仅用于标定板位于旧桌面中心的历史 UMI v2.3 数据。新 frame 与旧 frame 方向相同，
+但新原点在旧 frame 的 `X=-0.15 m`，所以历史 desk pose 转换到新坐标表达时执行
+`x_new=x_old+0.15 m`。它不属于默认 `postprocess` pipeline，也不会被任何采集、训练、
+回放或普通后处理命令隐式启用。
+
+只调用子命令会完整扫描 metadata、episode 和 Parquet，但保持只读：
+
+```bash
+python -m utils.dataset_postprocess umi-workspace-near-boundary-shift DATASET_ROOT
+```
+
+只有确认目标确实是旧 table-center UMI 数据后，显式使用以下专用开关才会先备份
+`data/`、`meta/`，再原地迁移：
+
+```bash
+python -m utils.dataset_postprocess umi-workspace-near-boundary-shift DATASET_ROOT \
+  --apply-workspace-near-boundary-shift
+```
+
+工具会写入不可重复的 migration marker；已迁移数据、非 UMI 数据、非 v2.3 数据、
+非 `desk_absolute` 数据、hash 不一致数据或正式采集进程运行期间都会拒绝执行。
+
+## 历史 UMI 机械臂 action 时序修正（默认关闭）
+
+旧 UMI 数据把同一采样时刻的 tracker pose 同时写入 `observation.state` 和机械臂
+`action`，会形成恒等映射。专用迁移将机械臂部分改为
+`action_arm[t] = observation_arm[t+1]`；夹爪 action 仍保留时刻 `t` 的 AngleTrigger
+真实命令，不使用下一帧夹爪值。每个 episode 删除无法构造下一时刻 action 的末行，
+并同步裁掉末尾双腕视频和对应触觉帧。`observation.last_action` 会按迁移后的 action
+重建；首行使用当前机械臂 pose 和当前夹爪命令作因果初始化。
+
+默认命令只执行完整只读预检：
+
+```bash
+python -m utils.dataset_postprocess umi-arm-action-next-observation DATASET_ROOT
+```
+
+只有明确确认目标是上述旧 UMI 数据后，才可使用专用开关。apply 会先创建同盘硬链接
+快照，在 staging 中生成全部替换文件，验证完成后再切换目录：
+
+```bash
+python -m utils.dataset_postprocess umi-arm-action-next-observation DATASET_ROOT \
+  --apply-umi-arm-alignment
+```
+
+该步骤不会被默认 `postprocess` 或其他转换隐式调用；已经带 alignment marker 的数据、
+机械臂 action/state 不再完全耦合的数据、媒体计数不一致的数据，以及正式采集进程运行
+期间都会被拒绝。
 
 ## v2.1 固定 q6 到 DexTeleop v2.2
 
@@ -65,6 +201,32 @@ python -m utils.dataset_postprocess v21-to-v22 datasets/legacy_task \
 转换永不覆盖源目录或已存在的输出目录。输出的
 `meta/v21_to_v22_conversion.json` 记录 source info SHA-256、conversion id、layout hash 和
 全部 Parquet 相对路径；原 q6 列保留用于追溯，新的模型字段按 v2.2 layout 生成。
+
+## RM65 v2.2 base-frame 到 canonical desk 兼容版 v2.3
+
+该转换只接受左右臂 reference frame 分别为 `left_arm_base/right_arm_base` 的显式
+DexTeleop v2.2 数据，并使用 checked-in RM65 workspace-near-boundary station profile。
+默认会完整扫描 Parquet、统计非有限 action/last_action，但不会写盘：
+
+```bash
+python -m utils.dataset_postprocess v22-to-v23-desk SOURCE_DATASET \
+  --output-root OUTPUT_DATASET
+```
+
+确认计划后使用专用开关创建 copy-on-write derivative：
+
+```bash
+python -m utils.dataset_postprocess v22-to-v23-desk SOURCE_DATASET \
+  --output-root OUTPUT_DATASET \
+  --apply-v22-desk-conversion
+```
+
+转换后 absolute action/state/last_action 和 measured TCP anchor 存储在 canonical desk；
+历史 `*_pose_base`、旧 `teleop.action_source.*_pose_desk` 审计列保持原值。非有限 action
+和 episode 首帧 NaN last_action 不会被填充，行中会增加 `training.action_finite` 和
+`training.relative_last_action_finite`。产物明确标记为
+`v22_canonical_desk_migration`、`native_v23_causal_snapshot=false`，不能当作通过严格
+native-v2.3 因果快照验收的数据。
 
 检测 `FAULT/ESTOP + action 全 NaN` 的 episode 尾段：
 

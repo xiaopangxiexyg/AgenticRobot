@@ -21,6 +21,10 @@ from .constrained_transition import (
     evaluate_transition_state,
     plan_constrained_qpos_transition,
 )
+from .sampling_transition import (
+    ArmSamplingTransitionConfig,
+    plan_sampling_constrained_qpos_transition,
+)
 
 __all__ = [
     "ArmConstrainedTransitionConfig",
@@ -29,6 +33,7 @@ __all__ = [
     "ArmQposTransitionPlan",
     "ArmQposTransitionStep",
     "ArmRuntimeSignals",
+    "ArmSamplingTransitionConfig",
     "ArmTransitionModel",
     "ArmTransitionPlanStep",
     "ArmTransitionRiskAssessment",
@@ -37,6 +42,7 @@ __all__ = [
     "evaluate_transition_state",
     "load_qpos_by_side_file",
     "plan_constrained_qpos_transition",
+    "plan_sampling_constrained_qpos_transition",
     "plan_slow_qpos_transition",
     "qpos_transition_plan_to_dict",
     "validate_qpos_mapping",

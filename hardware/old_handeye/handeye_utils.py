@@ -7,6 +7,7 @@ import cv2.aruco as aruco
 import transforms3d as tfs
 import open3d as o3d
 from scipy.spatial.transform import Rotation # 用于做旋转的平均
+from hardware.realsense.color import color_format_value, color_image_to_bgr
 
 #################### Realsense & Detection #############
 
@@ -30,7 +31,13 @@ def get_rs_pipeline(cam_id, resolution=(1280,720), fps=6, with_pinhole_intrinsic
     print(cam_id)
     config.enable_device(CAMERA_IDS[cam_id])
     config.enable_stream(rs.stream.depth, resolution[0], resolution[1], rs.format.z16, fps)
-    config.enable_stream(rs.stream.color, resolution[0], resolution[1], rs.format.bgr8, fps)
+    config.enable_stream(
+        rs.stream.color,
+        resolution[0],
+        resolution[1],
+        color_format_value(rs, "yuyv"),
+        fps,
+    )
     profile = pipeline.start(config)
     align_to = rs.stream.color
     align = rs.align(align_to)
@@ -59,7 +66,7 @@ def get_aligned_images(pipeline, align):
     pos = np.where(depth_image_8bit == 0)
     depth_image_8bit[pos] = 255
     # rgb图
-    color_image = np.asanyarray(color_frame.get_data())
+    color_image = color_image_to_bgr(np.asanyarray(color_frame.get_data()), "yuyv")
     # return: rgb图，深度图，相机内参，相机畸变系数(intr.coeffs)
     return color_image, depth_image, intr_matrix, np.array(intr.coeffs)
 

@@ -25,6 +25,7 @@ from ..defaults import (
     DEFAULT_RM65_ARM_CONTROL_HZ,
     DEFAULT_RM65_POSITION_ARM_CONTROL_HZ,
     DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
+    DEFAULT_TELEOP_SAMPLE_HZ,
 )
 from ..interfaces import EffectorBackend
 
@@ -164,7 +165,7 @@ def normalize_end_effector_backend(value: Any) -> str:
 
 @dataclass
 class ReplayHardwareConfig:
-    active_sides: tuple[str, ...] = ("right",)
+    active_sides: tuple[str, ...] = ("left", "right")
     arm_ip_by_side: dict[str, str] = field(default_factory=dict)
     tool_profile_by_side: dict[str, str] = field(default_factory=dict)
     end_effectors_enabled: bool = False
@@ -173,6 +174,8 @@ class ReplayHardwareConfig:
     hand_port_by_side: dict[str, int] = field(default_factory=dict)
     gripper_port_by_side: dict[str, str] = field(default_factory=dict)
     gripper_id_by_side: dict[str, int] = field(default_factory=dict)
+    gripper_baudrate_by_side: dict[str, int] = field(default_factory=dict)
+    gripper_timeout_by_side: dict[str, float] = field(default_factory=dict)
     gripper_speed: float = 1.0
     gripper_torque: float = 1.0
     gripper_max_action: float = 1.0
@@ -217,6 +220,16 @@ class ReplayHardwareConfig:
             for side, value in self.gripper_id_by_side.items()
             if int(value) > 0
         }
+        self.gripper_baudrate_by_side = {
+            str(side): int(value)
+            for side, value in self.gripper_baudrate_by_side.items()
+            if int(value) > 0
+        }
+        self.gripper_timeout_by_side = {
+            str(side): float(value)
+            for side, value in self.gripper_timeout_by_side.items()
+            if float(value) > 0.0
+        }
         self.gripper_speed = float(np.clip(float(self.gripper_speed), 0.0, 1.0))
         self.gripper_torque = float(np.clip(float(self.gripper_torque), 0.0, 1.0))
         self.gripper_max_action = float(np.clip(float(self.gripper_max_action), 0.0, 1.0))
@@ -256,7 +269,7 @@ class ReplayHardwareConfig:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ReplayHardwareConfig":
-        active = payload.get("active_sides") or payload.get("activeSides") or "right"
+        active = payload.get("active_sides") or payload.get("activeSides") or "both"
         nested_ips = payload.get("arm_ip_by_side") or payload.get("armIpBySide") or {}
         nested_profiles = payload.get("tool_profile_by_side") or payload.get("toolProfileBySide") or {}
         if not isinstance(nested_ips, Mapping):
@@ -272,6 +285,16 @@ class ReplayHardwareConfig:
         nested_hand_ports = payload.get("hand_port_by_side") or payload.get("handPortBySide") or {}
         nested_gripper_ports = payload.get("gripper_port_by_side") or payload.get("gripperPortBySide") or {}
         nested_gripper_ids = payload.get("gripper_id_by_side") or payload.get("gripperIdBySide") or {}
+        nested_gripper_baudrates = (
+            payload.get("gripper_baudrate_by_side")
+            or payload.get("gripperBaudrateBySide")
+            or {}
+        )
+        nested_gripper_timeouts = (
+            payload.get("gripper_timeout_by_side")
+            or payload.get("gripperTimeoutBySide")
+            or {}
+        )
         if not isinstance(nested_end_effector_backends, Mapping):
             nested_end_effector_backends = {}
         if not isinstance(nested_hand_ips, Mapping):
@@ -282,6 +305,10 @@ class ReplayHardwareConfig:
             nested_gripper_ports = {}
         if not isinstance(nested_gripper_ids, Mapping):
             nested_gripper_ids = {}
+        if not isinstance(nested_gripper_baudrates, Mapping):
+            nested_gripper_baudrates = {}
+        if not isinstance(nested_gripper_timeouts, Mapping):
+            nested_gripper_timeouts = {}
         default_backend = payload.get("end_effector_backend") or payload.get("endEffectorBackend") or "none"
         arm_ip_by_side = {
             "left": str(payload.get("left_arm_ip") or payload.get("leftArmIp") or nested_ips.get("left") or ""),
@@ -351,6 +378,23 @@ class ReplayHardwareConfig:
             )
             if value not in (None, ""):
                 gripper_id_by_side[side] = int(value)
+        gripper_baudrate_by_side: dict[str, int] = {}
+        gripper_timeout_by_side: dict[str, float] = {}
+        for side in ALL_SIDES:
+            baudrate = (
+                payload.get(f"{side}_gripper_baudrate")
+                or payload.get(f"{side}GripperBaudrate")
+                or nested_gripper_baudrates.get(side)
+            )
+            timeout = (
+                payload.get(f"{side}_gripper_timeout")
+                or payload.get(f"{side}GripperTimeout")
+                or nested_gripper_timeouts.get(side)
+            )
+            if baudrate not in (None, ""):
+                gripper_baudrate_by_side[side] = int(baudrate)
+            if timeout not in (None, ""):
+                gripper_timeout_by_side[side] = float(timeout)
         arm_control_hz_value = payload.get("arm_control_hz") if "arm_control_hz" in payload else payload.get("armControlHz")
         arm_canfd_follow_value = (
             payload.get("arm_canfd_follow")
@@ -377,6 +421,8 @@ class ReplayHardwareConfig:
             hand_port_by_side=hand_port_by_side,
             gripper_port_by_side=gripper_port_by_side,
             gripper_id_by_side=gripper_id_by_side,
+            gripper_baudrate_by_side=gripper_baudrate_by_side,
+            gripper_timeout_by_side=gripper_timeout_by_side,
             gripper_speed=float(payload.get("gripper_speed") or payload.get("gripperSpeed") or 1.0),
             gripper_torque=float(
                 payload.get("gripper_torque")
@@ -467,6 +513,8 @@ class ReplayHardwareConfig:
             "hand_port_by_side": dict(self.hand_port_by_side),
             "gripper_port_by_side": dict(self.gripper_port_by_side),
             "gripper_id_by_side": dict(self.gripper_id_by_side),
+            "gripper_baudrate_by_side": dict(self.gripper_baudrate_by_side),
+            "gripper_timeout_by_side": dict(self.gripper_timeout_by_side),
             "gripper_speed": float(self.gripper_speed),
             "gripper_torque": float(self.gripper_torque),
             "gripper_max_action": float(self.gripper_max_action),
@@ -545,6 +593,7 @@ class ReplayHardwareRig:
                         strict_tool_profile=bool(self.config.strict_tool_profile),
                         force_tare_sec=float(self.config.force_tare_sec),
                         control_dt=arm_control_dt,
+                        action_hz=float(DEFAULT_TELEOP_SAMPLE_HZ),
                         max_angvel=tuple(float(value) for value in self.config.arm_max_angvel),
                         actual_send_dt_alpha=1.0,
                         actual_send_dt_min_scale=1.0,
@@ -638,6 +687,12 @@ class ReplayHardwareRig:
                     side=str(side),
                     gripper_port=port or "/dev/null",
                     gripper_id=int(self.config.gripper_id_by_side.get(str(side), 1)),
+                    gripper_baudrate=int(
+                        self.config.gripper_baudrate_by_side.get(str(side), 115200)
+                    ),
+                    gripper_timeout=float(
+                        self.config.gripper_timeout_by_side.get(str(side), 0.10)
+                    ),
                     connect_hardware=bool(self.config.connect_hardware),
                     connect_tactile=False,
                     enable_telemetry=False,
@@ -1041,14 +1096,15 @@ class ReplayHardwareRig:
             background = state.get("background_streaming")
             background_map = dict(background) if isinstance(background, Mapping) else {}
             if bool(background_map.get("enabled", False)):
+                stream_hz = float(self.config.arm_control_hz)
                 fault = background_map.get("fault")
                 if fault:
                     raise RuntimeError(
-                        f"{stage}: {side} 150 Hz position stream fault is latched: {fault}."
+                        f"{stage}: {side} {stream_hz:g} Hz position stream fault is latched: {fault}."
                     )
                 if not bool(background_map.get("healthy", False)):
                     raise RuntimeError(
-                        f"{stage}: {side} 150 Hz position stream is unhealthy: "
+                        f"{stage}: {side} {stream_hz:g} Hz position stream is unhealthy: "
                         f"{background_map.get('health_reasons')}."
                     )
             singularity = state.get("singularity_metadata")
@@ -1175,6 +1231,6 @@ def _raise_if_backend_rewrote_joint_target(
     if not np.allclose(final_qpos, requested_qpos, atol=1e-10, rtol=0.0):
         max_delta = float(np.max(np.abs(final_qpos - requested_qpos)))
         raise RuntimeError(
-            f"{effector_name} rewrote a coupled collision qpos before the 150 Hz stream: "
+            f"{effector_name} rewrote a coupled collision qpos before the high-rate position stream: "
             f"max_delta_rad={max_delta:.9g}."
         )

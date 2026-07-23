@@ -11,6 +11,7 @@ datasets/<dataset_name>/
     tasks.jsonl
     episodes.jsonl
     episodes_stats.jsonl
+    modality_validity.json
     devices/
       realsense.json
   data/
@@ -34,9 +35,29 @@ datasets/<dataset_name>/
           episode_000000/
             manifest.json
             stream.bitpack.bin
+  streams/
+    <stream_id>/
+      chunk-000/
+        episode_000000/
+          samples.cjsonl
+          payloads/<payload_hash>.cjson
+  meta/v24/native_stream/
+    contracts/<stream_id>.cjson
+    episodes/<episode_uuid>/manifest.cjson
 ```
 
 `chunk-000` 按 `meta/info.json` 中的 `chunk_size` 分组。当前数据通常少于一个 chunk，但 reader 不应假设永远只有 `chunk-000`。
+
+`streams/` 是可选的 v2.4 native-stream capability，不替代现有主 parquet、video、tactile 或 wrist-depth
+布局。每个 stream 必须先绑定不可变 `NativeStreamContract`，明确 producer、value schema、shape/dtype、units/frame、
+measured/available clock、rate/retention/validity 和 access role。sample index只保存stable sample ID、sequence、时间、
+valid/stale/gap、payload object ID与hash；payload按content hash去重。episode manifest封存所有stream index hash、
+sample/drop/gap统计，封存后不可追加。inline stream已能与同UUID/index的ControlTrace seal及capture commit绑定。
+由既有video/tactile writer最终落盘的external payload另使用两阶段契约：capture-time intent先冻结sample identity，
+legacy finalize完成后再提交dataset-relative artifact locator、logical payload hash、artifact hash/size及durability receipt；
+receipt完整并经本地复核后native manifest才seal。reader对external sample返回verified locator，不把容器或压缩块伪装成
+已解码array。当前两阶段路径只有fake video/tactile artifact验证，production specialized writer尚未生成receipt，
+shared-memory sample identity和GUI/真机profile也未接通；因此仅存在stream文件仍不能单独证明完整v2.4 capture。
 
 训练用的 wrist final keep-mask 通常是离线后处理派生产物，不要求写回原始
 dataset 目录。默认位置为：
@@ -74,6 +95,12 @@ utils/dataset_postprocess/wrist_cam_adjust/outputs/final_keep_mask/
 
 `meta/tasks.jsonl` 记录任务 id 与描述。
 
+`meta/modality_validity.json.capture` 是采集阶段的数据集级模态契约。它声明整个数据集明确
+忽视的 camera key 和 tactile side；该规则不写成 episode 属性，也不允许同一数据集中的
+episode 使用不同规则。只有全新/空白数据集可以首次选择或改写规则；已有数据的目标数据集
+只允许使用与现有声明完全一致的规则。没有声明的历史非空数据集按“没有忽视项”解释。训练端
+应先读取该声明选择数据集，再决定模型输入模态；详见 `dataset_interface/README.md`。
+
 `meta/episodes.jsonl` 每行对应一个 episode，核心字段：
 
 - `episode_index`: 从 0 开始的 episode 编号。后处理抽取/删除后可保留原始编号，因此不保证连续。
@@ -104,9 +131,19 @@ hold gap。`summary` 可包含以下暂停元信息：
 - `recording_pause_schema`: 当前为 `dexteleop_recording_pause_v1`。
 - `recording_pause_segments`: 每次 pause/resume 的起止时间、持续时间、原因、
   起止 `frame_index` 和 `step_index`。
+- `recording_pause_reasons`: 当前未结束 pause 窗口内按因果顺序去重的
+  全部原因；已结束窗口的同等信息位于
+  `recording_pause_segments[*].reasons`。`reason` 仍保留第一个触发原因以兼容旧 reader。
 - `recording_paused_duration_sec`: episode 内累计暂停时长。
+- `collection_continuity_segment_count`: episode 内不跨暂停边界的连续片段数。
 - `recording_active_duration_sec`: 排除暂停后的有效写入时长，用于采集频率统计。
 - `recording_wall_duration_sec`: episode 打开到停止的真实墙钟时长。
+
+每条 Parquet row 的 `collection.continuity_segment_index` 从 `0` 开始，每次
+pause/resume 完成后加 `1`。resume 同时清空 `last_action` 和 init audit 时序
+缓存；`dataset_interface.pose_policy_window_from_rows` 必须拒绝跨 segment
+组窗，避免模型把暂停前后的两段动作误认为连续轨迹。旧数据缺失该列时
+按 segment `0` 兼容。
 
 `meta/episodes_stats.jsonl` 是每个 episode 的统计摘要，常用字段包括 `frame_count`, `average_dt_sec`, `average_hz`, `mean_control_hz`, `fault_count`。
 如果数据包含 pose/碰撞质量标注，还会包含 `pose_quality_*`,
@@ -213,7 +250,16 @@ arm pose slot。
   `action.gripper.<side>.target` 作为每侧 1 维夹爪目标。其余 5 个 hand slot
   是无效 padding，可能为 `NaN`，不应仅因此判定整帧 action 损坏。
 - `observation.arm.<side>.*`: 当前/实际关节、TCP、硬件回读和时序信息。
+- `action.<side>_arm.pose`: 26 维根 `action` 中该侧 7D pose 的显式副本；v2.3 writer
+  会验证二者一致，并按 storage contract 一起转换。
+- `action.reference.<side>_arm.pose_ref`: RM65 `q_ref` 经 FK 得到的 controller/raw-base
+  审计 target，不是模型 action 副本，也不参与 raw→desk 转换。v2.3 必须同时写
+  `pose_ref_frame=<source.raw_absolute_frame_by_side[side]>`。
 - `observation.hand.<side>.*`: 手/夹爪 telemetry、触觉索引、触觉采样状态。
+  对 DMTAC，位置新鲜度只以 `joint_timestamp`（同时暴露为
+  `gripper_measurement_timestamp`）判定；`telemetry_timestamp` 只是后台循环健康时间，
+  跳过寄存器读取时不得刷新位置年龄。诊断列包含 `joint_age_sec`、命令开始/完成时间、
+  读写耗时、串口锁等待和跳过原因。
 - `observation.images.<camera_key>.*`: 视频帧索引、源时间戳、接收时间戳、
   本机历史可用时间戳和视频路径。
 - `teleop.action_source.<side>_wrist_pose_desk`: 历史命名的 Vive 遥操目标 pose；它实际位于
@@ -242,9 +288,20 @@ arm pose slot。
 `telemetry_snapshot_*` 与 `tactile_snapshot_*` 列。arm 和 wrist-camera actual pose
 使用同一套 arm snapshot 选择结果。
 
+手部的 `*_snapshot_source_age_sec` 与 `*_snapshot_available_age_sec` 分别记录测量年龄和
+本机可见年龄；兼容列 `*_snapshot_age_sec` 取两者较大值。这样后台重复轮询同一份缓存
+状态不会仅因重新发布而被误判为新测量。
+
 VIVE 已完成的 clock-sync 将 sender monotonic capture time 映射到本机 wall-clock，写入
 `source_timestamp`；本机 UDP 接收/发布时间仍写入 `available_timestamp`，因此“物理上早但
 网络上晚”的包同样不会进入该 T0。未校准旧 sender 保留显式 receiver-wall fallback 标记。
+
+直连 RM65、手部 telemetry 和 tactile 的 source/available clock 都是
+`local_wall_time`。RealSense 不把相机固件 timestamp 当作跨设备时间：其
+`source_timestamp` 是本机接收该帧的 wall time，标记 `source_clock=receiver_wall_time`；
+SDK 的 `camera_timestamp_sec`、`sensor_timestamp_ms`、`timestamp_domain` 和
+`sensor_frame_number` 只作设备审计。dataset/episode/row 分别固定保存 causal contract
+schema 与 canonical hash，追加或验收时不允许混用不同定义。
 
 读取时建议只依赖需要的列；调试/采集列可能随版本增加。
 历史 parquet 可能没有 `teleop.pose_quality.*`，兼容读取时不应把缺失解释为坏样本。
@@ -276,6 +333,15 @@ absolute 或 relative，而不会产生两份相互漂移的标签。
 - 训练/回放 reader 必须先把 storage frame 转换到 desk，再做 relative 解算；
   仅允许有限、合法的 SE(3) pose，不能用 command target 代替实际 TCP anchor。
 
+当前双 RM65 station 的默认 canonical `desk` 是已标定 URDF 中的
+`workspace_near_boundary_frame`：原点在桌面表面上左右居中，并且沿“桌面中心到
+操作者/机械臂”的方向位于有效操作空间最靠近操作者/机械臂一侧的边界。该点在 URDF
+world 下仍为 `(-0.472, 0, 0.010)`；`+X` 是操作者面向桌面的方向，`+Y` 是从该原点
+朝向操作者左侧的方向，`+Z` 是垂直桌面向上的方向。
+左右 controller base 到该 frame 的变换分别由 URDF fixed joint 计算为
+`inv(T_world_desk) @ T_world_base[side]`；不得用历史 Vive retarget 原点或简单 identity
+替代。该默认只适用于此双臂 station，单臂/其他安装必须使用独立 source profile。
+
 这里的 canonical `desk` 与 Vive 遥操标定历史上称为 `desk` 的中间坐标系不是同一概念。
 后者统一称为 `vive_retarget_frame`，旧配置键 `desk_frame`、`T_O_D`、`T_D_B` 仅作为兼容
 别名；对应的新名称为 `vive_retarget_frame`、`T_O_VR`、`T_VR_B`，不得直接拿它充当
@@ -290,7 +356,7 @@ TCP 定义计算并按 pose contract 变换的标准 pose，因此两者允许�
 的深拷贝，不修改 `CollectorSample`、`TeleopCommand` 或 backend state。配置
 `raw_absolute` 时 pose 数值不变；配置 `desk_absolute` 时转换以下标准 arm pose 副本：
 
-- `action`、`action.arm.pose`；
+- `action`、`action.arm.pose`、`action.<side>_arm.pose`；
 - `observation.state`、`observation.arm.pose`、`observation.last_action`；
 - `observation.<side>_arm.pose`；
 - `observation.arm.<side>.current_tcp_pose/commanded_tcp_pose/actual_tcp_pose`。
@@ -308,7 +374,8 @@ fail-closed，不允许用 commanded/cached pose 补写。启用 `pose_frame_con
 `hardware_qpos_fk` 且保存有限的 measured hardware qpos；未来 sim/其他硬件 source 可声明
 自己的 measured pose source，但同样不得使用 commanded pose。writer 同时核对每侧
 `observation.<side>_arm.pose` 与该 measured `actual_tcp_pose` 一致，防止训练 state 悄然退回
-commanded pose。
+commanded pose；也核对 packed `observation.state`、`observation.arm.pose` 以及所有 action
+副本，避免同一帧内部出现不同坐标系或不同数值。
 
 这组字段构成 v2.3 的 dataset contract，而不是某个模型的私有约定。转换结果应在
 部署边界重新由固定的 measured TCP anchor 解回绝对 pose，并在 canonical safety/IK
@@ -350,8 +417,35 @@ artifact 还必须用 `pose_training_data_contract` 区分 `native_v23_dataset` 
 - `manifest.json` 描述 `format`, `frame_count`, `sensor_keys`, 每个 sensor 的 binary stream 路径、dtype、shape。
 - 新采集默认对外置触觉流不压缩，按 C-order 写入裸 `.bin`；也可以用 `--tactile-compression zstd|lz4|none` 选择无损 chunk 压缩。选择 `none` 时保持旧式裸流格式。
 - 压缩流在每个 stream spec 中记录 `encoding`, `compression`, `chunk_frame_count`, `chunks`。`chunks` 包含 `frame_start`, `frame_count`, `offset`, `compressed_bytes`, `raw_bytes`，用于随机读取单个 chunk。旧裸流可没有这些字段，reader 应按 `raw_c_order`/`none` 兼容。
+- 正式后处理的 canonical 触觉格式为 `dexteleop_tactile_compaction_v1`。raw profile 固定为
+  `dmtac_raw_120x160_q6_delta_zstd_v1`：不改变触觉帧数、时间戳或采样频率，把
+  `uint8[480,640]` 确定性降为 `uint8[120,160]`，6-bit 中点重建后使用独立 chunk 的
+  `chunked_delta_zstd`。force profile 固定为 `dmtac_force_qint16_zstd_v1`：逻辑值仍为
+  `float32[288,384,3]`，物理存储为 chunk/channel scale 对应的 int16 Zstd。
+- compact stream 的 `shape/dtype` 是 reader 返回的逻辑数组契约；`storage_dtype` 是物理值类型；
+  `tactile_compaction.source` 保存迁移前路径、shape、dtype、encoding 和 logical SHA-256。
+  chunked force 的 scale 保存在各 chunk 的 `quantization` 中。所有读取端必须通过
+  `dataset_contracts.ChunkedTactileStream` 解码，禁止直接按文件后缀推测格式。
+- Parquet 的 `tactile_raw_shape_per_sensor` 与历史 `tactile_shapes_json` 作为采集源审计字段保留；
+  compact 后实际数组 shape 以 manifest stream 为准。manifest frame record 的 `shapes/dtypes`
+  更新为逻辑输出，并用 `source_shapes/source_dtypes` 保存采集源值。
 - parquet 中 `observation.hand.<side>.tactile_frame_index` 指向 manifest 中的触觉帧。
+- 同一个不可变 `tactile_snapshot_sequence` 被多个 dataset row 选中时只写一次大数组；
+  这些 row 可以合法共享同一个 `tactile_frame_index`，manifest 保留 snapshot sequence 和
+  source/available clock 以供审计。
 - 触觉可能相对视觉/action 有延迟，reader 应使用 manifest 与 parquet 中的 timestamp/索引做一致性检查。
+
+## v2.3 finalized dataset acceptance
+
+正式采集结束后运行只读验收：
+
+```bash
+python -m utils.dataset_postprocess validate-v23 /path/to/dataset
+```
+
+退出码 `0` 表示 metadata/hash、pose frame binding、measured TCP/state/action 副本、所有
+`<=T0` causal cut、episode/parquet 计数和外置 artifact 引用均通过；退出码 `1` 表示至少一项
+失败。该命令不会 padding、转换或改写数据，旧 v2.2 数据也不会被冒充成 native v2.3。
 
 腕部深度 mask：
 
@@ -406,8 +500,9 @@ artifact 还必须用 `pose_training_data_contract` 区分 `native_v23_dataset` 
 - `teleop.arm_mode.<side>.label`: 字符串枚举。
 - `teleop.arm_mode.<side>.is_special`: `0/1`，`fixed_hold` 和 `init_pose` 为特殊状态。
 - `teleop.arm_mode.<side>.source`: 标签来源，例如 `normal`, `fix_arm`, `init_arm`,
-  `recording_pause`, `session_state`, `inactive_side`。
-- `teleop.arm_mode.<side>.tags`: 可扩展标签列表。当前可能包含 `fix_arm`, `init_arm`。
+  `command_hold`, `recording_pause`, `session_state`, `inactive_side`。
+- `teleop.arm_mode.<side>.tags`: 可扩展标签列表。当前可能包含 `fix_arm`, `init_arm`,
+  `home_recapture`。
 - `teleop.arm_mode_json`: 完整 JSON，包含每侧 `mode/id/source/tags/detail`。
 
 另有仅供审计的列：
@@ -426,14 +521,44 @@ loss 或部署 observation。模型对 init 只有 `init_pose` 一个标签。
 - `teleop = 1`: 正常遥操。
 - `fixed_hold = 2`: fix-arm 固定侧保持上一帧下发目标动作。该标签不是硬件急停。
 - `init_pose = 3`: init-arm 侧正在前往或保持 init pose；模型侧不区分移动和静止。
-- `stopped = 4`: 非 RUNNING session 或已写入的停止路径。
+- `stopped = 4`: 非 RUNNING session、已写入的停止路径，或精确 qpos Init 被第二次
+  同侧踏板暂停后等待 tracker Home 重采的冻结帧。
 
 判定优先级：
 
 1. 如果本帧处于 recording pause 或非 `RUNNING` session，左右活动臂标为 `stopped`。
-2. 否则该侧处于 init-arm active/recapturing，标为 `init_pose`。
-3. 否则该侧处于 fix-arm fixed/recapturing，标为 `fixed_hold`。
-4. 否则活动侧标为 `teleop`，非活动侧标为 `unknown`。
+2. 否则如果 command 明确声明精确 qpos Init 的目标臂因 Home 重采而冻结，
+   仅目标臂标为 `stopped`；该侧不再带 `init_arm` 标签，非目标臂保持
+   `teleop` 或其自身独立状态。
+3. 否则该侧处于 init-arm active（包括旧 pose Init 的 recapturing），标为 `init_pose`。
+4. 否则该侧处于 fix-arm fixed/recapturing，标为 `fixed_hold`。
+5. 否则活动侧标为 `teleop`，非活动侧标为 `unknown`。
+
+四踏板精确 qpos Init 允许在已开始的正式 episode 内触发，以便这些逐帧标签实际进入
+Parquet；episode 开始倒计时、后台保存以及另一个精确 qpos operation 活动期间仍拒绝新请求。
+第二次踩同侧 Init 踏板是标签边界：后续 Home 重采帧从 `init_pose` 切换为 `stopped`，
+Home 完成后的下一条普通遥操 command 才恢复为 `teleop`。
+
+单侧精确 Init 成功后保持 `init_pose`/Init-fixed，非目标臂继续遥操，
+不会自动触发全局 Hold。只有左右两侧均被 `fixed_hold` 或 Init-fixed
+覆盖时，运行时进入可自动解除的 Fix-Hold 并暂停当前 episode；任一侧
+Home 重采完成后经 warmup 继续同一 episode。Fix-Hold 期间按普通 Hold
+会升级为常规 Hold，清除特殊状态并要求双臂 Home。Fix-Hold 暂停期间不写
+Parquet row，因此不会产生“双臂静止”的无效训练窗。
+
+GUI 的“双臂顺序精确归位”是独立的维护流程：只按左臂→右臂顺序
+执行 qpos 路径，中间和完成时都不重采 tracker Home。左臂实测到位后
+释放该侧 exact-qpos 控制权再启动右臂；右臂到位后立即进入常规
+Hold。任一步失败也进入常规 Hold，不再执行后续臂动作。因为常规 Hold
+会暂停已打开的 episode，该流程不会在旧 Home 与归位后机器人位姿之间
+自动建立新的遥操映射。操作员必须在 Hold 中显式重采 runtime Home 才能恢复。
+
+Fix/Init 的单侧 Home 重采只接受有效、时龄不超过 `0.5 s` 且 source
+timestamp 严格递增的 tracker 帧。tracker 需连续静止至少 `0.25 s`，位移/
+旋转速度上限分别为 `0.015 m/s` 和 `2.5 deg/s`；采样窗中姿态离散超过
+`3 mm` 或 `0.75 deg` 时清空窗口重新计时。这些约束防止重复旧帧或运动中
+tracker 被写入 Home。如果部分 Home anchor 已应用后后续步骤失败，运行时
+fail closed 进入常规 Hold。
 
 正式数采中触发 hold 时，当前 episode 保持打开但暂停写样本；同时 fix/init
 特殊状态会停止。`task_hold` 只用于运行时/episode 审计，不生成数据集标签。再次

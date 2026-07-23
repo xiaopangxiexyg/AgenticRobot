@@ -1060,7 +1060,10 @@ class PolicyIOLayout:
                 assert component.side is not None
                 channel = self._channel_for(role=role, side=component.side)
                 value = sources.get(component.side)
-                packed = self._channel_value(channel, value, strict=strict)
+                try:
+                    packed = self._channel_value(channel, value, strict=strict)
+                except DatasetLayoutError as exc:
+                    raise DatasetLayoutError(f"{component.name}: {exc}") from exc
                 vector[component.offset : component.stop] = packed
         return PackedPolicyIO(continuous=continuous, discrete=discrete)
 

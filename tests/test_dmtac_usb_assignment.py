@@ -364,6 +364,79 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertEqual(events[0]["probe_count"], 1)
         self.assertEqual(events[1]["port"], "/dev/ttyUSB0")
 
+    def test_gripper_probe_stops_after_two_reachable_devices(self) -> None:
+        calls: list[str] = []
+        events: list[dict[str, object]] = []
+
+        def fake_ports():
+            return [
+                {
+                    "device": f"/dev/ttyUSB{index}",
+                    "description": "USB Serial",
+                    "hwid": "USB VID:PID=1A86:7523",
+                    "manufacturer": None,
+                    "product": "USB Serial",
+                }
+                for index in range(4)
+            ]
+
+        def fake_probe(port: str, **kwargs):
+            calls.append(port)
+            return {"reachable": True, "error": None}
+
+        with (
+            patch.object(usb_assignment, "list_serial_devices", fake_ports),
+            patch.object(usb_assignment, "_probe_gripper", fake_probe),
+            patch.object(usb_assignment, "discover_devices", lambda: []),
+            patch.object(usb_assignment, "discover_device_candidates", lambda: []),
+        ):
+            scan = scan_usb_devices(
+                progress_callback=lambda payload: events.append(dict(payload))
+            )
+
+        self.assertEqual(calls, ["/dev/ttyUSB0", "/dev/ttyUSB1"])
+        self.assertEqual(scan["gripper_probe_limit"], 2)
+        self.assertEqual(scan["gripper_probe_attempted_count"], 2)
+        self.assertEqual(scan["gripper_probe_reachable_count"], 2)
+        self.assertTrue(scan["gripper_probe_stopped_early"])
+        self.assertFalse(scan["grippers"][2]["probe_attempted"])
+        self.assertEqual(
+            scan["grippers"][2]["probe_skipped_reason"],
+            "reachable_gripper_limit",
+        )
+        self.assertEqual(events[-1]["event"], "gripper_probe_early_stop")
+
+    def test_gripper_probe_limit_counts_only_reachable_devices(self) -> None:
+        calls: list[str] = []
+
+        def fake_ports():
+            return [
+                {
+                    "device": f"/dev/ttyUSB{index}",
+                    "description": "USB Serial",
+                    "hwid": "USB VID:PID=1A86:7523",
+                    "manufacturer": None,
+                    "product": "USB Serial",
+                }
+                for index in range(4)
+            ]
+
+        def fake_probe(port: str, **kwargs):
+            calls.append(port)
+            return {"reachable": port != "/dev/ttyUSB0", "error": None}
+
+        with (
+            patch.object(usb_assignment, "list_serial_devices", fake_ports),
+            patch.object(usb_assignment, "_probe_gripper", fake_probe),
+            patch.object(usb_assignment, "discover_devices", lambda: []),
+            patch.object(usb_assignment, "discover_device_candidates", lambda: []),
+        ):
+            scan = scan_usb_devices()
+
+        self.assertEqual(calls, ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2"])
+        self.assertEqual(scan["gripper_probe_reachable_count"], 2)
+        self.assertFalse(scan["grippers"][3]["probe_attempted"])
+
     def test_gripper_assignment_uses_detected_modbus_id(self) -> None:
         scan = _scan()
         scan["grippers"][0]["probe"] = {
@@ -517,7 +590,7 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertIn("[0] L_IN", text)
         self.assertNotIn("{'device_index'", text)
 
-    def test_gripper_assignment_prefers_stable_serial_alias_and_remaps(self) -> None:
+    def test_gripper_assignment_prefers_tty_endpoint_and_remaps(self) -> None:
         scan = _scan()
         scan["grippers"][0]["port"] = "/dev/ttyUSB0"
         scan["grippers"][0]["preferred_port"] = "/dev/serial/by-id/left-gripper"
@@ -526,7 +599,7 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
 
         self.assertEqual(
             assignment["assignments"]["left"]["gripper"]["port"],
-            "/dev/serial/by-id/left-gripper",
+            "/dev/ttyUSB0",
         )
 
         current = _scan()
@@ -538,10 +611,10 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertFalse(comparison["missing"])
         self.assertEqual(
             comparison["effective_assignment"]["assignments"]["left"]["gripper"]["port"],
-            "/dev/serial/by-id/left-gripper",
+            "/dev/ttyUSB7",
         )
 
-    def test_gripper_preferred_port_skips_nonunique_ch340_by_id(self) -> None:
+    def test_gripper_preferred_port_uses_tty_before_ch340_aliases(self) -> None:
         preferred = usb_assignment._preferred_port_from_aliases(
             [
                 "/dev/ttyUSB0",
@@ -558,7 +631,73 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
 
         self.assertEqual(
             preferred,
-            "/dev/serial/by-path/pci-0000:00:14.0-usb-0:6.4:1.0-port0",
+            "/dev/ttyUSB0",
+        )
+
+    def test_legacy_by_path_assignment_normalizes_to_recorded_tty(self) -> None:
+        scan = _scan()
+        scan["grippers"][0].update(
+            {
+                "port": "/dev/ttyUSB0",
+                "device": "/dev/ttyUSB0",
+                "preferred_port": "/dev/serial/by-path/old-left",
+                "port_aliases": ["/dev/ttyUSB0", "/dev/serial/by-path/old-left"],
+                "location": "old-left",
+            }
+        )
+        assignment = build_assignment_from_tokens(scan, left_gripper="0")
+        assignment["assignments"]["left"]["gripper"]["port"] = (
+            "/dev/serial/by-path/old-left"
+        )
+
+        normalized = usb_assignment.normalize_assignment(assignment)
+
+        self.assertEqual(
+            normalized["assignments"]["left"]["gripper"]["port"],
+            "/dev/ttyUSB0",
+        )
+
+    def test_power_cycle_path_change_keeps_tty_side_binding(self) -> None:
+        scan = _scan()
+        scan["grippers"][0].update(
+            {
+                "port": "/dev/ttyUSB0",
+                "device": "/dev/ttyUSB0",
+                "preferred_port": "/dev/serial/by-path/before-power-cycle",
+                "port_aliases": [
+                    "/dev/ttyUSB0",
+                    "/dev/serial/by-path/before-power-cycle",
+                ],
+                "hwid": "USB VID:PID=1A86:7523 LOCATION=before-power-cycle",
+                "location": "before-power-cycle",
+            }
+        )
+        assignment = build_assignment_from_tokens(scan, left_gripper="0")
+
+        current = _scan()
+        current["grippers"][0].update(
+            {
+                "port": "/dev/ttyUSB0",
+                "device": "/dev/ttyUSB0",
+                "preferred_port": "/dev/serial/by-path/after-power-cycle",
+                "port_aliases": [
+                    "/dev/ttyUSB0",
+                    "/dev/serial/by-path/after-power-cycle",
+                ],
+                "hwid": "USB VID:PID=1A86:7523 LOCATION=after-power-cycle",
+                "location": "after-power-cycle",
+            }
+        )
+        current["grippers"] = current["grippers"][:1]
+        current["tactile"] = []
+
+        comparison = compare_assignment_to_scan(assignment, current)
+
+        self.assertFalse(comparison["missing"])
+        self.assertFalse(comparison["extra"])
+        self.assertEqual(
+            comparison["effective_assignment"]["assignments"]["left"]["gripper"]["port"],
+            "/dev/ttyUSB0",
         )
 
     def test_compare_ignores_nonunique_ch340_by_id_collision(self) -> None:
@@ -828,8 +967,11 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertFalse(cfg.should_read_force())
 
     def test_tactile_default_fields_read_raw_without_force_pipeline(self) -> None:
-        cfg = tactile_device_config("L_IN", TactileConfig())
+        tactile = TactileConfig()
+        cfg = tactile_device_config("L_IN", tactile)
 
+        self.assertFalse(tactile.denoise_distributed_force)
+        self.assertFalse(tactile.denoise_config.enabled)
         self.assertTrue(cfg.enable_raw)
         self.assertTrue(cfg.should_read_raw())
         self.assertFalse(cfg.enable_force)

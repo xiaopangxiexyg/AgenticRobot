@@ -6,6 +6,12 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from hardware.realsense.color import (
+    color_format_value as _color_format_value,
+    color_image_to_bgr as _color_image_to_bgr,
+    normalize_color_format as _normalize_color_format,
+)
+
 from .transforms import make_transform
 
 
@@ -59,9 +65,14 @@ class RealSenseConfig:
     camera_index: int | None = None
     resolution: tuple[int, int] = (1280, 720)
     fps: int = 15
+    # Request native YUYV transport; CameraFrame.color_bgr remains BGR.
+    color_format: str = "yuyv"
     enable_depth: bool = True
     # Only used after the explicitly requested profile fails to start.
     auto_select_supported_profile: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "color_format", _normalize_color_format(self.color_format))
 
 
 class RealSenseCamera:
@@ -71,6 +82,7 @@ class RealSenseCamera:
         self._pipeline = None
         self._align = None
         self._profile = None
+        self._active_color_format = self.config.color_format
         self.serial: str | None = None
         self.depth_scale_m: float | None = None
         # Saved by the command-line tool with new calibration samples/results.
@@ -104,12 +116,13 @@ class RealSenseCamera:
         rs = self._rs
         pipeline = rs.pipeline()
         config = rs.config()
+        color_format = _color_format_value(rs, self.config.color_format)
         if serial:
             config.enable_device(str(serial))
         width, height = self.config.resolution
         if self.config.enable_depth:
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, int(self.config.fps))
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, int(self.config.fps))
+        config.enable_stream(rs.stream.color, width, height, color_format, int(self.config.fps))
         try:
             profile = pipeline.start(config)
             selected_profiles = {
@@ -117,6 +130,7 @@ class RealSenseCamera:
                     width,
                     height,
                     int(self.config.fps),
+                    color_format=self.config.color_format,
                     enable_depth=self.config.enable_depth,
                 ),
                 "fallback_used": False,
@@ -124,7 +138,9 @@ class RealSenseCamera:
         except Exception as exc:
             if not self.config.auto_select_supported_profile:
                 raise RuntimeError(self._profile_error_message(exc, serial)) from exc
-            fallback_config, selected_profiles = self._fallback_stream_config(serial)
+            fallback_config, selected_profiles, active_color_format = self._fallback_stream_config(
+                serial
+            )
             try:
                 profile = pipeline.start(fallback_config)
             except Exception as fallback_exc:
@@ -132,7 +148,13 @@ class RealSenseCamera:
         self._pipeline = pipeline
         self._profile = profile
         self._align = rs.align(rs.stream.color) if self.config.enable_depth else None
+        self._active_color_format = (
+            self.config.color_format
+            if not selected_profiles.get("fallback_used")
+            else active_color_format
+        )
         self.settings_report = selected_profiles
+        self.settings_report["color.format"] = self._active_color_format
         if self.serial is None:
             try:
                 device = profile.get_device()
@@ -149,7 +171,7 @@ class RealSenseCamera:
     def _fallback_stream_config(
         self,
         serial: str | None,
-    ) -> tuple[Any, dict[str, Any]]:
+    ) -> tuple[Any, dict[str, Any], str]:
         """Build a compatible profile only after the requested one was rejected.
 
         The fixed-camera calibration always needs matched color/depth streams:
@@ -168,6 +190,15 @@ class RealSenseCamera:
                 requested_width=width,
                 requested_height=height,
                 requested_fps=fps,
+                preferred_color_formats=(
+                    self.config.color_format,
+                    "yuyv",
+                    "bgr8",
+                    "rgb8",
+                    "rgba8",
+                    "bgra8",
+                    "y8",
+                ),
             )
             if pair is None:
                 raise RuntimeError(
@@ -178,7 +209,15 @@ class RealSenseCamera:
             color_profile = _choose_video_profile(
                 profiles,
                 stream="color",
-                preferred_formats=("bgr8",),
+                preferred_formats=(
+                    self.config.color_format,
+                    "yuyv",
+                    "bgr8",
+                    "rgb8",
+                    "rgba8",
+                    "bgra8",
+                    "y8",
+                ),
                 requested_width=width,
                 requested_height=height,
                 requested_fps=fps,
@@ -201,6 +240,7 @@ class RealSenseCamera:
                 width,
                 height,
                 fps,
+                color_format=self.config.color_format,
                 enable_depth=self.config.enable_depth,
             ),
             "fallback_used": True,
@@ -215,7 +255,7 @@ class RealSenseCamera:
                 depth_profile.fps,
             )
             report["fallback_depth_profile"] = depth_profile.describe()
-        return config, report
+        return config, report, color_profile.format_name
 
     def _profile_error_message(self, exc: object, serial: str | None) -> str:
         width, height = self.config.resolution
@@ -223,7 +263,8 @@ class RealSenseCamera:
             "RealSense could not start the requested stream profile.",
             (
                 f"requested camera={serial or 'auto'} "
-                f"color={width}x{height}@{int(self.config.fps)} bgr8 "
+                f"color={width}x{height}@{int(self.config.fps)} "
+                f"{self.config.color_format} "
                 f"depth={bool(self.config.enable_depth)}"
             ),
             f"error: {exc}",
@@ -260,7 +301,10 @@ class RealSenseCamera:
             [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
-        color_image = np.asanyarray(color_frame.get_data())
+        color_image = _color_image_to_bgr(
+            np.asanyarray(color_frame.get_data()),
+            self._active_color_format,
+        )
         depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
         timestamp_ms = float(color_frame.get_timestamp() or 0.0)
         timestamp_sec = timestamp_ms / 1000.0 if timestamp_ms > 0.0 else time.time()
@@ -280,6 +324,7 @@ class RealSenseCamera:
         self._pipeline = None
         self._align = None
         self._profile = None
+        self._active_color_format = self.config.color_format
 
     def __enter__(self) -> "RealSenseCamera":
         return self.start()
@@ -612,11 +657,16 @@ def _choose_compatible_video_profile_pair(
     requested_width: int,
     requested_height: int,
     requested_fps: int,
+    preferred_color_formats: Sequence[str] = ("yuyv", "bgr8"),
 ) -> tuple[VideoStreamProfileInfo, VideoStreamProfileInfo] | None:
+    format_rank = {
+        str(name).strip().lower(): index
+        for index, name in enumerate(preferred_color_formats)
+    }
     colors = [
         item
         for item in profiles
-        if item.stream == "color" and item.format_name == "bgr8"
+        if item.stream == "color" and item.format_name in format_rank
     ]
     depths = [
         item
@@ -637,7 +687,7 @@ def _choose_compatible_video_profile_pair(
 
     def score(
         pair: tuple[VideoStreamProfileInfo, VideoStreamProfileInfo],
-    ) -> tuple[int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int]:
         color, _ = pair
         exact_resolution = (
             0
@@ -655,6 +705,7 @@ def _choose_compatible_video_profile_pair(
             area_penalty,
             width_penalty,
             height_penalty,
+            format_rank.get(color.format_name, len(format_rank)),
         )
 
     return min(pairs, key=score)
@@ -680,7 +731,11 @@ def _choose_video_profile(
 
     requested_area = int(requested_width) * int(requested_height)
 
-    def score(item: VideoStreamProfileInfo) -> tuple[int, int, int, int, int]:
+    format_rank = {
+        str(name).strip().lower(): index for index, name in enumerate(preferred_formats)
+    }
+
+    def score(item: VideoStreamProfileInfo) -> tuple[int, int, int, int, int, int]:
         exact_resolution = (
             0
             if (item.width, item.height)
@@ -697,6 +752,7 @@ def _choose_video_profile(
             area_penalty,
             width_penalty,
             height_penalty,
+            format_rank.get(item.format_name, len(format_rank)),
         )
 
     return min(candidates, key=score)
@@ -744,9 +800,10 @@ def _requested_profile_text(
     height: int,
     fps: int,
     *,
+    color_format: str = "yuyv",
     enable_depth: bool,
 ) -> str:
-    streams = [f"color {int(width)}x{int(height)}@{int(fps)} bgr8"]
+    streams = [f"color {int(width)}x{int(height)}@{int(fps)} {color_format}"]
     if enable_depth:
         streams.append(f"depth {int(width)}x{int(height)}@{int(fps)} z16")
     return ", ".join(streams)

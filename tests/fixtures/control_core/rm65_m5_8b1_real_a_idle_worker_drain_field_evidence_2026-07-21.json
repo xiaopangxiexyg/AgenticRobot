@@ -1,0 +1,149 @@
+{
+  "evidence_schema": "rm65_m5_8b1_real_a_idle_worker_drain_field_evidence_v1",
+  "evidence_scope": "scoped_idle_worker_drain_stop_field_evidence",
+  "lineage_completeness": "runtime_diagnostic_profile_complete_v1",
+  "source": "remote_evidence_json",
+  "source_sha256": "32e4850e9cd0aafdd748226929fd0079c139125ef314378869fb44b18f3d6b32",
+  "source_path": "/home/user/zc/DexTeleop/teleop_records/preflight_evidence/m5_8b1_real_a/rm65-idle-worker-preflight-2ad90539-313d-4a4c-b72a-271115123a54/evidence.json",
+  "payload": {
+    "status": "idle_worker_drain_stop_only_completed",
+    "profile_id": "m5_8b1_real_a_idle_worker_drain_stop_only_v1",
+    "runtime_session_id": "rm65-idle-worker-preflight-2ad90539-313d-4a4c-b72a-271115123a54",
+    "manifest_id": "m6_candidate_policy_arm_qpos_v1",
+    "manifest_hash": "964ea0f52b877eeead80145f4b50a2c7c22051f5615773faef1d504805b46bc4",
+    "inventory_hash": "62c603cfabe0552648c7075108a7171baeecd4f1daaf13f37e461decd5c1de53",
+    "worker_drain_plan_hash": "547e54b18928fe2890edaab34a88052b0c323502a89f8ac3066b105c2dab4e90",
+    "canonical_defaults_modified": false,
+    "motion_authorized": false,
+    "lifecycle_authorized": false,
+    "binding": {
+      "context_mode": "hardware_idle_drain_stop_only_preflight",
+      "production_binding_enabled": true,
+      "authority_epoch": 0,
+      "execution_epoch": 1,
+      "motion_authorized": false,
+      "lifecycle_authorized": false,
+      "attempted_stop_sides": ["left", "right"],
+      "stop_receipt_count": 2,
+      "completed_drain_cancellation_id": "dexfact:v1:execution_cancellation:rm65-idle-worker-preflight-2ad90539-313d-4a4c-b72a-271115123a54:rm65-arms:execution-epoch-registry:0:0",
+      "completed_drain_aggregate_id": "worker-epoch-drain-aggregate:11d435aeb48d7a9647fbcd7692e267fae2558740b8553b949ab06c1fecf1f40b"
+    },
+    "drain_aggregate": {
+      "status": "complete",
+      "complete": true,
+      "required_participant_ids": [
+        "position-deploy-reference-worker",
+        "rm65-left-background-stream-worker",
+        "rm65-right-background-stream-worker"
+      ],
+      "accepted_participant_ids": [
+        "position-deploy-reference-worker",
+        "rm65-left-background-stream-worker",
+        "rm65-right-background-stream-worker"
+      ],
+      "missing_participant_ids": [],
+      "rejected_participant_ids": [],
+      "semantic_content_hash": "11d435aeb48d7a9647fbcd7692e267fae2558740b8553b949ab06c1fecf1f40b"
+    },
+    "drain_receipts": [
+      {
+        "participant_id": "position-deploy-reference-worker",
+        "accepted": true,
+        "status": "drained",
+        "observed_execution_epoch": 1,
+        "invalidated_execution_epoch": 0,
+        "discarded_work_ids": [],
+        "in_flight_old_epoch_count": 0,
+        "no_future_old_epoch_calls": true,
+        "semantic_content_hash": "d16e5f79b95862a9b4f310b5533df899265fc5b4ac3a734fee61ffae00131ca1"
+      },
+      {
+        "participant_id": "rm65-left-background-stream-worker",
+        "accepted": true,
+        "status": "drained",
+        "observed_execution_epoch": 1,
+        "invalidated_execution_epoch": 0,
+        "discarded_work_ids": [],
+        "in_flight_old_epoch_count": 0,
+        "no_future_old_epoch_calls": true,
+        "semantic_content_hash": "ea72fcca37d7c774963517c0d7f70db4ef61def9692b22807d8c300ceaa44f74"
+      },
+      {
+        "participant_id": "rm65-right-background-stream-worker",
+        "accepted": true,
+        "status": "drained",
+        "observed_execution_epoch": 1,
+        "invalidated_execution_epoch": 0,
+        "discarded_work_ids": [],
+        "in_flight_old_epoch_count": 0,
+        "no_future_old_epoch_calls": true,
+        "semantic_content_hash": "83f7443c4706a7a91cc4c2a98aa33d05d43a83994d4c997127c45501333fb5c8"
+      }
+    ],
+    "cancellation_acknowledgement": {
+      "accepted": true,
+      "acknowledgement_level": "software_queue",
+      "status": "all_required_workers_drained",
+      "semantic_content_hash": "f1325edd0f18f70b8e2451c1035919bbb0d0b53d2d1e0e95d3d99593e181160f"
+    },
+    "sides": {
+      "left": {
+        "idle_worker_before_drain": {
+          "tick_sequence": 103,
+          "send_count": 0,
+          "target_active": false
+        },
+        "stationary_drift_rad": 0.000034953989307418,
+        "post_stop_delta_rad": 0.00001757686319470153,
+        "slow_stop_latency_sec": 0.006477221992099658,
+        "send_result_code": 0,
+        "send_result_text": "hold:Arm_Slow_Stop:0"
+      },
+      "right": {
+        "idle_worker_before_drain": {
+          "tick_sequence": 93,
+          "send_count": 0,
+          "target_active": false
+        },
+        "stationary_drift_rad": 0.00003488741028001563,
+        "post_stop_delta_rad": 0.000017460349896802896,
+        "slow_stop_latency_sec": 0.00642018299549818,
+        "send_result_code": 0,
+        "send_result_text": "hold:Arm_Slow_Stop:0"
+      }
+    },
+    "stop_receipts": [
+      {
+        "side": "left",
+        "dispatch_accepted": true,
+        "dispatch_status": "accepted",
+        "sdk_result_repr": "0",
+        "permit_id": "dexfact:v1:safety_dispatch_permit:rm65-idle-worker-preflight-2ad90539-313d-4a4c-b72a-271115123a54:rm65-arms:dispatch-owner-registry:0:1",
+        "validation_receipt_id": "rm65-idle-worker-stop-validation:a98c3be24a4961c8afdf269731a9d05a7c8128173eba5a534078ce70d9a0cdfd"
+      },
+      {
+        "side": "right",
+        "dispatch_accepted": true,
+        "dispatch_status": "accepted",
+        "sdk_result_repr": "0",
+        "permit_id": "dexfact:v1:safety_dispatch_permit:rm65-idle-worker-preflight-2ad90539-313d-4a4c-b72a-271115123a54:rm65-arms:dispatch-owner-registry:0:2",
+        "validation_receipt_id": "rm65-idle-worker-stop-validation:aef11626ede46431c3274a752ae06e595731a195a2dd36921c6bb0270cb58092"
+      }
+    ],
+    "trace": {
+      "issued_sequence": 10,
+      "durable_high_watermark": 10,
+      "in_memory_complete": true,
+      "durable_complete": true,
+      "capture_commit_eligible": false,
+      "required_event_types": [
+        "execution_cancellation",
+        "execution_cancellation_ack",
+        "execution_worker_drain",
+        "execution_worker_drain_aggregate",
+        "hardware_preflight_authorization",
+        "runtime_trace_terminal"
+      ]
+    }
+  }
+}

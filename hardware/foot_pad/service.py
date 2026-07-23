@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 SCHEMA_VERSION = "foot_pad_assignment.v1"
 LATEST_CONFIG_NAME = "latest.json"
 MAX_PEDALS = 4
+DEFAULT_PEDAL_COUNT = 4
 # Linux input-event key codes for F13 through F16.  They remain available for
 # configuration validation without importing the optional evdev dependency.
 SPECIAL_KEYS: tuple[tuple[str, int], ...] = (
@@ -101,6 +102,23 @@ def _udev_properties(event_path: str) -> dict[str, str]:
     return properties
 
 
+def _input_permission_hint() -> str:
+    event_nodes = sorted(Path("/dev/input").glob("event*"))
+    uinput = Path("/dev/uinput")
+    event_unreadable = bool(event_nodes) and not any(
+        os.access(path, os.R_OK) for path in event_nodes
+    )
+    uinput_unwritable = uinput.exists() and not os.access(uinput, os.W_OK)
+    if not (event_unreadable or uinput_unwritable):
+        return ""
+    python = sys.executable or "python"
+    return (
+        "physical input/uinput nodes exist but are not accessible to this user; "
+        "run: "
+        f"sudo -E {python} -m teleop_runtime.configure_devices --fix-permissions"
+    )
+
+
 def discover_key_devices() -> list[CandidateDevice]:
     """Return event devices capable of emitting key events.
 
@@ -111,7 +129,12 @@ def discover_key_devices() -> list[CandidateDevice]:
 
     evdev = _require_evdev()
     candidates: list[CandidateDevice] = []
-    for event_path in sorted(evdev.list_devices()):
+    event_paths = sorted(evdev.list_devices())
+    if not event_paths:
+        permission_hint = _input_permission_hint()
+        if permission_hint:
+            raise FootPadError(permission_hint)
+    for event_path in event_paths:
         try:
             device = evdev.InputDevice(event_path)
             capabilities = device.capabilities(absinfo=False)
@@ -375,13 +398,19 @@ def _forward_events(config: Mapping[str, Any], devices: Mapping[str, Any], ui: A
         pedal["source"]["id_path"]: (pedal["source"]["key_code"], pedal["output"]["key_code"])
         for pedal in config["pedals"]
     }
-    device_to_path = {device: id_path for id_path, device in devices.items()}
+    # evdev.InputDevice implements equality but is intentionally unhashable.
+    # Use the file descriptor as the select/index key instead of the device
+    # object, while retaining the object needed to drain events.
+    fd_to_device = {
+        int(device.fileno()): (id_path, device)
+        for id_path, device in devices.items()
+    }
     pressed_keys: set[int] = set()
     try:
         while True:
-            ready, _, _ = select.select(list(device_to_path), [], [])
-            for device in ready:
-                id_path = device_to_path[device]
+            ready, _, _ = select.select(list(fd_to_device), [], [])
+            for fd in ready:
+                id_path, device = fd_to_device[int(fd)]
                 source_key, output_key = source_to_output[id_path]
                 for event in device.read():
                     if event.type != evdev.ecodes.EV_KEY or event.code != source_key or event.value not in (0, 1, 2):
@@ -409,8 +438,13 @@ def run_daemon(config: Mapping[str, Any]) -> None:
             time.sleep(1.0)
             continue
         devices = _open_devices(_configured_candidates(config, candidates), evdev)
+        # Advertise exactly the configured topology.  Teleop uses the live
+        # virtual keyboard capabilities to distinguish two-pad (F13/F14 fix)
+        # from four-pad (F13--F16 fix/init) operation, so exposing all four
+        # keys for a two-pad config would incorrectly re-enable Init-arm.
+        count = int(config["count"])
         ui = evdev.UInput(
-            {evdev.ecodes.EV_KEY: [key_code for _, key_code in SPECIAL_KEYS]},
+            {evdev.ecodes.EV_KEY: [key_code for _, key_code in SPECIAL_KEYS[:count]]},
             name="DexTeleop foot pads",
         )
         grabbed: list[Any] = []
@@ -440,7 +474,11 @@ def _prompt_count() -> int:
     if not sys.stdin.isatty():
         raise FootPadError("No valid config exists; pass --count N to calibrate non-interactively.")
     while True:
-        answer = input(f"How many foot pads should be used (1-{MAX_PEDALS})? ").strip()
+        answer = input(
+            f"How many foot pads should be used (1-{MAX_PEDALS}, default {DEFAULT_PEDAL_COUNT})? "
+        ).strip()
+        if not answer:
+            return DEFAULT_PEDAL_COUNT
         try:
             count = int(answer)
         except ValueError:
@@ -455,7 +493,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Calibrate USB foot pads and forward them as virtual F13-F16 keys."
     )
-    parser.add_argument("--count", type=int, choices=range(1, MAX_PEDALS + 1), help="Number of foot pads to use.")
+    parser.add_argument(
+        "--count",
+        type=int,
+        choices=range(1, MAX_PEDALS + 1),
+        help=f"Number of foot pads to use (interactive calibration defaults to {DEFAULT_PEDAL_COUNT}).",
+    )
     parser.add_argument("--recalibrate", action="store_true", help="Ignore the stored mapping and calibrate again.")
     parser.add_argument("--config", type=Path, help="Config file path (default: project hardware config).")
     parser.add_argument("--check", action="store_true", help="Validate the stored config and exit.")

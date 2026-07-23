@@ -19,6 +19,9 @@ is experimental.
 
 ## Directory ownership
 
+- `control_station/`: top-level application/control plane for composing human,
+  replay, policy, dataset, sim, and real-target modules. It may depend on the
+  active lower-level packages, but none of those packages may import it.
 - `robot_motion/`: shared motion semantics, Rig, Safety, Planner, position
   control, and runtime contracts; no vendor-device initialization or training.
 - `hardware/`: vendor SDKs and device backends; no dataset schema or learner.
@@ -34,7 +37,8 @@ is experimental.
 - `tests/` and `todos/`: verification and planning; neither is runtime code.
 
 Shared code should depend toward `robot_motion` and pure data contracts. `sim`
-must not reverse-depend on `teleop_runtime`.
+must not reverse-depend on `teleop_runtime`. `control_station` is an application
+leaf: dependencies point into it from no lower-level package.
 
 ## Safety and change protocol
 

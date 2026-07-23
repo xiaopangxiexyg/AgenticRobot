@@ -287,9 +287,11 @@ def test_rm65_arm_endpoint_fk_matches_mujoco_for_both_sides() -> None:
     from sim.mujoco.scene import MujocoScene
 
     scene = MujocoScene.from_contract(contract)
+    from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+
     qpos_by_side = {
-        "left": np.asarray([1.57, -0.47, 1.94, 0.0, 0.7, -1.57]),
-        "right": np.asarray([-1.57, -0.47, 1.94, 3.1, -0.7, -1.57]),
+        "left": DEFAULT_LEFT_ARM_QPOS.copy(),
+        "right": DEFAULT_RIGHT_ARM_QPOS.copy(),
     }
     scene.set_qpos_by_side(qpos_by_side)
     canonical_fk = build_rm65_single_arm_ik_solver(

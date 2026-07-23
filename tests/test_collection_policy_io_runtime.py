@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
-from types import SimpleNamespace
 
 from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from teleop_runtime.backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
 from teleop_runtime.collection.policy_io_runtime import resolve_collection_policy_io_layout
 from teleop_runtime.collection.sample_assembler import CollectorSample
-from teleop_runtime.collection.schema_v22 import collector_sample_to_v22_row
+from teleop_runtime.collection.schema_v22 import (
+    LAST_ACTION_INITIALIZATION_METADATA_KEY,
+    STRICT_LAST_ACTION_INITIALIZATION_METADATA,
+    collector_sample_to_v22_row,
+)
+from teleop_runtime.collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from teleop_runtime.retargeters import (
     JointsToDexHandRetargeter,
     JointsToDexHandRetargeterConfig,
@@ -146,6 +153,90 @@ def test_strict_bimanual_dmtac_row_uses_measured_scalar_not_q6_fallback() -> Non
 
     np.testing.assert_allclose(row["action"][-2:], [0.25, 0.75])
     np.testing.assert_allclose(row["observation.state"][-2:], [0.20, 0.80])
+
+
+def test_strict_temporal_reset_seeds_causal_last_action_without_future_arm_target() -> None:
+    left_backend, left_retargeter = _dmtac_pair("left")
+    right_backend, right_retargeter = _dmtac_pair("right")
+    layout = resolve_collection_policy_io_layout(
+        "auto",
+        active_sides=("left", "right"),
+        hand_backends_by_side={"left": left_backend, "right": right_backend},
+        hand_retargeters_by_side={"left": left_retargeter, "right": right_retargeter},
+    ).layout
+    assert layout is not None
+
+    source = _strict_bimanual_dmtac_sample()
+    action = source.action.copy()
+    action[:7] = _pose(0.9)
+    action[7:14] = _pose(0.8)
+    sample = replace(
+        source,
+        action=action,
+        observation_last_action=np.full((26,), np.nan, dtype=np.float32),
+    )
+
+    row, _ = collector_sample_to_v22_row(sample, layout=layout, strict=True)
+
+    np.testing.assert_allclose(row["action"][:7], _pose(0.9))
+    np.testing.assert_allclose(row["action"][7:14], _pose(0.8))
+    np.testing.assert_allclose(row["observation.last_action"][:7], _pose(0.1))
+    np.testing.assert_allclose(row["observation.last_action"][7:14], _pose(0.2))
+    np.testing.assert_allclose(row["observation.last_action"][-2:], [0.25, 0.75])
+
+
+def test_strict_partial_invalid_last_action_remains_fail_closed() -> None:
+    left_backend, left_retargeter = _dmtac_pair("left")
+    right_backend, right_retargeter = _dmtac_pair("right")
+    layout = resolve_collection_policy_io_layout(
+        "auto",
+        active_sides=("left", "right"),
+        hand_backends_by_side={"left": left_backend, "right": right_backend},
+        hand_retargeters_by_side={"left": left_retargeter, "right": right_retargeter},
+    ).layout
+    assert layout is not None
+
+    source = _strict_bimanual_dmtac_sample()
+    partial = source.observation_last_action.copy()
+    partial[14] = np.nan
+    sample = replace(source, observation_last_action=partial)
+
+    with pytest.raises(
+        ValueError,
+        match=r"observation\.last_action: left\.end_effector\.target: .*non-finite",
+    ):
+        collector_sample_to_v22_row(sample, layout=layout, strict=True)
+
+
+def test_strict_standard_writer_declares_last_action_initialization_contract(
+    tmp_path,
+) -> None:
+    left_backend, left_retargeter = _dmtac_pair("left")
+    right_backend, right_retargeter = _dmtac_pair("right")
+    layout = resolve_collection_policy_io_layout(
+        "auto",
+        active_sides=("left", "right"),
+        hand_backends_by_side={"left": left_backend, "right": right_backend},
+        hand_retargeters_by_side={"left": left_retargeter, "right": right_retargeter},
+    ).layout
+    assert layout is not None
+
+    config = LeRobotV21WriterConfig(
+        root_dir=tmp_path,
+        policy_io_layout=layout,
+        strict_v22_policy_io=True,
+        write_parquet=False,
+        write_video=False,
+    )
+
+    assert config.dataset_metadata[LAST_ACTION_INITIALIZATION_METADATA_KEY] == (
+        STRICT_LAST_ACTION_INITIALIZATION_METADATA
+    )
+    LeRobotV21Writer(config)
+    info = json.loads((tmp_path / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert info[LAST_ACTION_INITIALIZATION_METADATA_KEY] == (
+        STRICT_LAST_ACTION_INITIALIZATION_METADATA
+    )
 
 
 def test_strict_v22_rejects_missing_or_stale_measured_gripper_state() -> None:

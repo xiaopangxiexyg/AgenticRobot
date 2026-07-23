@@ -7,9 +7,12 @@ start devices, dispatch commands, or alter the control decision.
 from __future__ import annotations
 
 import argparse
+import queue
+import sys
+import threading
 import time
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, TextIO
 
 from robot_motion.position_control import PositionAuditFanout, PositionTimingAuditEvent
 
@@ -23,6 +26,78 @@ class RealDebugTimingState:
     report_interval_sec: float = 1.0
     last_report_at: float = 0.0
     suppressed_reports: int = 0
+    console_writer: AsyncDebugTimingConsole | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+class AsyncDebugTimingConsole:
+    """Best-effort console sink that never waits in the control loop."""
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        max_queue_size: int = 8,
+    ) -> None:
+        self._stream = sys.stdout if stream is None else stream
+        self._queue: queue.Queue[str | None] = queue.Queue(
+            maxsize=max(1, int(max_queue_size))
+        )
+        self._closed = False
+        self._drop_count = 0
+        self._thread = threading.Thread(
+            target=self._writer_loop,
+            daemon=True,
+            name="debug_timing_console_writer",
+        )
+        self._thread.start()
+
+    @property
+    def drop_count(self) -> int:
+        return int(self._drop_count)
+
+    def submit(self, message: str) -> bool:
+        if self._closed:
+            return False
+        try:
+            self._queue.put_nowait(str(message))
+        except queue.Full:
+            self._drop_count += 1
+            return False
+        return True
+
+    def _writer_loop(self) -> None:
+        while True:
+            message = self._queue.get()
+            if message is None:
+                return
+            try:
+                self._stream.write(message + "\n")
+                self._stream.flush()
+            except Exception:
+                # Diagnostics must never stop teleoperation.  A broken output
+                # stream is treated like a dropped best-effort report.
+                self._drop_count += 1
+
+    def close(self, *, join_timeout_sec: float = 1.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._queue.put(None, timeout=0.1)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                return
+        self._thread.join(timeout=max(0.0, float(join_timeout_sec)))
 
 
 @dataclass(frozen=True)
@@ -114,6 +189,19 @@ def debug_timing_metadata(args: argparse.Namespace) -> dict[str, object]:
         "debug_action_sample_hz": float(
             getattr(args, "debug_action_sample_hz", 0.0)
         ),
+        "actuator_trace": bool(getattr(args, "actuator_trace", False)),
+        "actuator_trace_root": str(getattr(args, "actuator_trace_root", "")),
+        "actuator_trace_max_duration_sec": float(
+            getattr(args, "actuator_trace_max_duration_sec", 0.0)
+        ),
+        "actuator_singularity_trace": bool(
+            getattr(args, "actuator_singularity_trace", True)
+        ),
+        "actuator_trace_hot_path_policy": (
+            "fixed_numeric_preallocated_memory; no queue/json/fk/disk_write"
+            if bool(getattr(args, "actuator_trace", False))
+            else None
+        ),
         "control_debug": (
             {
                 **control_debug.to_metadata(),
@@ -186,6 +274,7 @@ def record_position_loop_timings(
 
 
 __all__ = [
+    "AsyncDebugTimingConsole",
     "DebugTimingModules",
     "RealDebugTimingState",
     "debug_timing_metadata",

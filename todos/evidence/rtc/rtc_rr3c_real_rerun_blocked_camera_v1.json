@@ -1,0 +1,85 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr3c_real_rerun_blocked_camera_2026_07_23",
+  "captured_at": "2026-07-23T23:21:00+08:00",
+  "scope": "real_observation_openpi_raw_rtc_no_action_rerun_before_control_loop",
+  "gate_result": "blocked_before_rtc_loop_by_left_wrist_camera_profile",
+  "repository": {
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "teleop_or_replay_modified": false,
+    "sim_observation_modified": false,
+    "openpi_checkout_modified": false
+  },
+  "deployment_repairs_verified_before_rerun": {
+    "openpi_server_launcher_preserves_dexteleop_pythonpath": true,
+    "rtc_real_shadow_headless_auto_start": true,
+    "rtc_real_shadow_manual_ready_confirmation_disabled": true,
+    "rtc_real_shadow_dmtac_tactile_disabled": true,
+    "ordinary_production_profile_changed": false
+  },
+  "boundary": {
+    "rtc_profile": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "rtc_real_shadow": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "arm_observation_only": true,
+    "gripper_observation_only": true,
+    "gripper_send_commands": false,
+    "tactile_enabled": false,
+    "action_send_authority": false
+  },
+  "attempts": {
+    "pre_profile_repair": {
+      "result": "bounded_remote_timeout_before_loop",
+      "cause": "shadow inherited manual ready confirmation and current mainline tactile auto-configuration",
+      "rtc_frontend_close_state": "DRAINED",
+      "worker_thread_exited": true
+    },
+    "post_profile_repair_first": {
+      "result": "camera_start_failed_before_loop",
+      "camera_key": "left_wrist",
+      "camera_serial": "261122273924",
+      "requested_profile": "640x480@15 yuyv",
+      "rtc_frontend_close_state": "DRAINED",
+      "worker_thread_exited": true
+    },
+    "post_profile_repair_retry": {
+      "result": "same_camera_start_failure_repeated",
+      "camera_key": "left_wrist",
+      "camera_serial": "261122273924",
+      "requested_profile": "640x480@15 yuyv",
+      "rtc_frontend_close_state": "DRAINED",
+      "worker_thread_exited": true
+    }
+  },
+  "interpretation": {
+    "rtc_frontend_step_count": 0,
+    "rtc_transport_exchange_count": 0,
+    "formal_emission_count": 0,
+    "dispatch_count": 0,
+    "control_budget_conclusion_available": false,
+    "camera_config_last_modified_before_prior_successful_gate": true,
+    "camera_device_reenumerated_after_prior_successful_gate": true,
+    "owner": "real camera/device profile outside RTC"
+  },
+  "raw_log_attestation": {
+    "pre_profile_repair_client_log_sha256": "64fe0c333553b3ed6d968493c210a884102c6640546a360effd03f2f0901cbc1",
+    "first_camera_failure_client_log_sha256": "5b61eca8217c4b49b18f9d020fb40a95242aaee8742c6bca256c6c3b4dbe1005",
+    "retry_camera_failure_client_log_sha256": "5ea0326c250ec1f2909a5b72d5c2ddc313dd2d6392246b4ce2c9b0ded3d33e98",
+    "first_camera_failure_debug_sha256": "0bcf8a7c7c2634799baa420b769076f0df883d24644674a0b557633ec0c86590",
+    "retry_camera_failure_debug_sha256": "c64a6387f9836c9ee8e5bc035b174c770f7fdf0d573845abcd7420e61ebbf413"
+  },
+  "cleanup": {
+    "client_processes_remaining": false,
+    "server_processes_remaining": false,
+    "worker_sessions_drained": true
+  },
+  "next_gate": {
+    "action_send_authorized": false,
+    "required": [
+      "camera owner verifies a valid current profile for left_wrist serial 261122273924",
+      "repeat the same real no-action gate without changing RTC or sim observation semantics",
+      "require zero 30 Hz control-budget exceedances before any action-send discussion"
+    ]
+  }
+}

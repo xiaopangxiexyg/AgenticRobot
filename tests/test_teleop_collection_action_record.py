@@ -77,15 +77,24 @@ class _FakeRefreshArmBackend:
         self.qpos = np.asarray(qpos, dtype=np.float32)
         self.tcp_pose = np.asarray(tcp_pose, dtype=np.float32)
         self.timestamp = float(timestamp)
-        self.calls: list[tuple[int | None, float | None]] = []
+        self.calls: list[tuple[int | None, float | None, bool, bool]] = []
 
     def refresh_state_from_hardware(
         self,
         *,
         hardware_read_retries: int | None = None,
         hardware_read_retry_delay_sec: float | None = None,
+        include_derived_pose: bool = True,
+        include_timing_percentiles: bool = True,
     ) -> dict:
-        self.calls.append((hardware_read_retries, hardware_read_retry_delay_sec))
+        self.calls.append(
+            (
+                hardware_read_retries,
+                hardware_read_retry_delay_sec,
+                include_derived_pose,
+                include_timing_percentiles,
+            )
+        )
         return {
             "hardware_qpos": self.qpos.copy(),
             "current_tcp_pose": self.tcp_pose.copy(),
@@ -776,7 +785,7 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
         poller._poll_once("left", backend)
         latest = poller.latest_by_side(sample_timestamp=timestamp + 0.02)["left"]
 
-        self.assertEqual(backend.calls, [(0, 0.0)])
+        self.assertEqual(backend.calls, [(0, 0.0, False, False)])
         np.testing.assert_allclose(latest["actual_qpos"], qpos, atol=1e-6)
         np.testing.assert_allclose(
             latest["wrist_camera_pose_base"],

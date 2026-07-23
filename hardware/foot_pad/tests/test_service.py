@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from hardware.foot_pad.service import (
     CalibrationHit,
@@ -63,6 +65,52 @@ class FootPadConfigTests(unittest.TestCase):
 
         with self.assertRaises(FootPadError):
             normalize_config(config)
+
+    def test_forward_events_handles_unhashable_input_device(self) -> None:
+        from hardware.foot_pad import service
+
+        class UnhashableDevice:
+            def __init__(self) -> None:
+                self.events = [SimpleNamespace(type=1, code=30, value=1)]
+
+            def __eq__(self, other: object) -> bool:
+                return self is other
+
+            def fileno(self) -> int:
+                return 123
+
+            def read(self) -> list[SimpleNamespace]:
+                events, self.events = self.events, []
+                return events
+
+        class FakeUi:
+            def __init__(self) -> None:
+                self.writes: list[tuple[int, int, int]] = []
+                self.sync_count = 0
+
+            def write(self, event_type: int, code: int, value: int) -> None:
+                self.writes.append((event_type, code, value))
+
+            def syn(self) -> None:
+                self.sync_count += 1
+
+        device = UnhashableDevice()
+        self.assertIsNone(device.__hash__)
+        first = candidate("pci-usb-0:6.1:1.1", {30})
+        config = build_config([CalibrationHit(first, 30, "KEY_A")])
+        ui = FakeUi()
+        fake_evdev = SimpleNamespace(ecodes=SimpleNamespace(EV_KEY=1))
+
+        with patch.object(
+            service.select,
+            "select",
+            side_effect=[([123], [], []), KeyboardInterrupt],
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                service._forward_events(config, {first.id_path: device}, ui, fake_evdev)
+
+        self.assertEqual(ui.writes, [(1, SPECIAL_KEYS[0][1], 1), (1, SPECIAL_KEYS[0][1], 0)])
+        self.assertEqual(ui.sync_count, 2)
 
 
 if __name__ == "__main__":

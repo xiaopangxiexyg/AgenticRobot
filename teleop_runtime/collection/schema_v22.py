@@ -16,6 +16,7 @@ import numpy as np
 from dataset_contracts.v22 import (
     ARM_ACTION_DIM,
     DEXTELEOP_DATASET_SCHEMA_V22,
+    DatasetLayoutError,
     EndEffectorChannelSpec,
     PolicyIOLayout,
     SIDES,
@@ -33,6 +34,19 @@ from robot_motion.deploy.schema import (
 
 from .sample_assembler import CollectorSample
 from .schema_v21 import collector_sample_to_row
+
+
+LAST_ACTION_INITIALIZATION_METADATA_KEY = "last_action_initialization"
+STRICT_LAST_ACTION_INITIALIZATION_METADATA = {
+    "schema": "dexteleop_last_action_initialization_v1",
+    "scope": "episode_and_continuity_segment_start",
+    "reset_sentinel": "legacy_observation_last_action_all_non_finite",
+    "steady_state": "action[t-1]",
+    "arm_at_reset": "observation.arm.pose[t]",
+    "end_effector_at_reset": "action.end_effector.target[t]",
+    "partial_non_finite_policy": "reject",
+    "future_arm_action_used_at_reset": False,
+}
 
 
 def _vector_or_none(value: Any, *, length: int | None = None) -> np.ndarray | None:
@@ -54,6 +68,29 @@ def _legacy_action(sample: CollectorSample, *, last: bool = False) -> np.ndarray
 
 def _legacy_state(sample: CollectorSample) -> np.ndarray | None:
     return _vector_or_none(sample.observation_state, length=OBSERVATION_STATE_DIM)
+
+
+def _last_action_is_temporal_reset_sentinel(sample: CollectorSample) -> bool:
+    """Return whether the legacy assembler explicitly reset temporal history.
+
+    ``SampleAssembler`` represents an episode/continuity-boundary reset with an
+    entirely non-finite legacy last-action vector.  A partially invalid vector
+    is data corruption and must not receive the causal initialization below.
+    """
+
+    last_action = _legacy_action(sample, last=True)
+    return bool(
+        last_action is not None
+        and last_action.size > 0
+        and not np.any(np.isfinite(last_action))
+    )
+
+
+def _pack_with_context(label: str, packer: Any, **kwargs: Any):
+    try:
+        return packer(**kwargs)
+    except DatasetLayoutError as exc:
+        raise DatasetLayoutError(f"{label}: {exc}") from exc
 
 
 def _select_numeric_channel(
@@ -272,7 +309,9 @@ def collector_sample_to_v22_row(
         tactile_storage_refs=tactile_storage_refs,
         inline_tactile=inline_tactile,
     )
-    action = layout.pack_action(
+    action = _pack_with_context(
+        "action",
+        layout.pack_action,
         arm_pose_by_side=_arm_poses_from_action(sample),
         end_effector_by_side=_eef_values_from_sample(
             sample,
@@ -282,7 +321,9 @@ def collector_sample_to_v22_row(
         ),
         strict=bool(strict),
     )
-    state = layout.pack_observation_state(
+    state = _pack_with_context(
+        "observation.state",
+        layout.pack_observation_state,
         arm_pose_by_side=_arm_poses_from_state(sample),
         end_effector_by_side=_eef_values_from_sample(
             sample,
@@ -292,15 +333,27 @@ def collector_sample_to_v22_row(
         ),
         strict=bool(strict),
     )
-    last_action = layout.pack_action(
-        arm_pose_by_side=_arm_poses_from_action(sample, last_action=True),
-        end_effector_by_side=_eef_values_from_sample(
-            sample,
-            layout,
-            role="action",
-            last_action=True,
-            strict=bool(strict),
-        ),
+    temporal_reset = bool(strict) and _last_action_is_temporal_reset_sentinel(sample)
+    last_action_arm_poses = (
+        _arm_poses_from_state(sample)
+        if temporal_reset
+        else _arm_poses_from_action(sample, last_action=True)
+    )
+    last_action_end_effectors = _eef_values_from_sample(
+        sample,
+        layout,
+        role="action",
+        # At an explicit temporal reset there is no previous command.  Seed
+        # only the end-effector part from the final command accepted at T0;
+        # the arm part above comes from measured state, never action[t].
+        last_action=not temporal_reset,
+        strict=bool(strict),
+    )
+    last_action = _pack_with_context(
+        "observation.last_action",
+        layout.pack_action,
+        arm_pose_by_side=last_action_arm_poses,
+        end_effector_by_side=last_action_end_effectors,
         strict=bool(strict),
     )
     arm_qpos = layout.pack_arm_qpos_audit(_arm_qpos_from_state(sample))

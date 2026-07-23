@@ -476,6 +476,103 @@ def _parquet_declares_v22_policy_io(path: Path) -> bool:
     return "policy_io_layout_hash" in names and "action" in names
 
 
+def load_contract_replay_actions_from_parquet(
+    parquet_path: str | Path,
+    *,
+    resolved_metadata: Mapping[str, Any],
+    action_column: str = "action",
+    start_index: int = 0,
+    end_index: int | None = None,
+    policy_io_layout: PolicyIOLayout | Mapping[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any], PoseFrameContract | None, bool]:
+    """Load replay actions using the dataset's serialized action contract.
+
+    Legacy datasets store canonical 26D actions directly.  v2.2/v2.3 datasets
+    instead store a layout-bound compact action (16D for dual-wrist DMTAC), so
+    every replay entrypoint must bridge it before constructing a canonical
+    ``ReplayTrajectoryGroup``.
+    """
+
+    path = Path(parquet_path).expanduser().resolve()
+    dataset_info = resolved_metadata.get("dataset_info")
+    dataset_info = dataset_info if isinstance(dataset_info, Mapping) else {}
+    explicit_layout = policy_io_layout
+    if isinstance(explicit_layout, Mapping):
+        explicit_layout = PolicyIOLayout.from_dict(explicit_layout)
+    elif explicit_layout is not None and not isinstance(explicit_layout, PolicyIOLayout):
+        raise TypeError("policy_io_layout must be a PolicyIOLayout, mapping, or None.")
+
+    dataset_schema = str(dataset_info.get("dexteleop_dataset_schema") or "")
+    metadata_is_v22 = dataset_schema == DEXTELEOP_DATASET_SCHEMA_V22
+    metadata_is_v23 = dataset_schema == DEXTELEOP_DATASET_SCHEMA_V23
+    row_contract_is_v22 = path.is_file() and _parquet_declares_v22_policy_io(path)
+    is_typed = metadata_is_v22 or metadata_is_v23 or row_contract_is_v22
+    if not is_typed:
+        if explicit_layout is not None:
+            raise ValueError(
+                "A v2.2 replay layout was supplied for a non-v2.2 dataset; convert the dataset first."
+            )
+        actions = load_replay_actions_from_parquet(
+            path,
+            action_column=action_column,
+            start_index=int(start_index),
+            end_index=end_index,
+        )
+        return actions, {}, None, False
+
+    resolved_pose_contract: PoseFrameContract | None = None
+    if metadata_is_v23:
+        v23_contract = resolve_v23_dataset_contract(dataset_info)
+        layout = v23_contract.policy_io_layout
+        resolved_pose_contract = v23_contract.pose_frames
+        if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
+            raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
+    elif metadata_is_v22:
+        layout = policy_io_layout_from_metadata(dataset_info, allow_legacy_v21=False)
+        if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
+            raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
+    elif explicit_layout is not None:
+        layout = explicit_layout
+    else:
+        raise ValueError(
+            "Direct parquet declares v2.2 policy I/O but its layout cannot be reconstructed. "
+            "Pass the enclosing dataset root or an explicit policy_io_layout."
+        )
+
+    actions, action_metadata = load_v22_replay_actions_from_parquet(
+        path,
+        layout=layout,
+        start_index=int(start_index),
+        end_index=end_index,
+    )
+    if resolved_pose_contract is not None:
+        for side in resolved_pose_contract.source.active_sides:
+            pose_slice = ACTION_ARM_POSE_SLICES[side]
+            try:
+                actions[:, pose_slice] = np.stack(
+                    [
+                        resolved_pose_contract.storage_pose_vector_to_canonical_desk(
+                            row[pose_slice], side=side
+                        )
+                        for row in actions
+                    ],
+                    axis=0,
+                )
+            except (PoseFrameContractError, ValueError) as exc:
+                raise ValueError(
+                    f"v2.3 replay action for {side!r} cannot be converted to canonical desk: {exc}"
+                ) from exc
+        action_metadata.update(
+            {
+                "pose_frame_contract": resolved_pose_contract.to_dict(),
+                "pose_storage_frame": resolved_pose_contract.pose_storage_frame,
+                "pose_source_id": resolved_pose_contract.source_id,
+                "pose_action_absolute_frame": "canonical_desk",
+            }
+        )
+    return actions, action_metadata, resolved_pose_contract, True
+
+
 def load_replay_frame_times_from_parquet(
     parquet_path: str | Path,
     *,
@@ -1107,6 +1204,7 @@ class DatasetReplayPolicy:
     action_metadata: dict[str, Any] = field(default_factory=dict)
     output_pose_mode: str = "absolute"
     active_sides: tuple[str, ...] = ("left", "right")
+    source_start_index: int = 0
     cursor: int = 0
     completed_passes: int = 0
     finished: bool = False
@@ -1130,6 +1228,7 @@ class DatasetReplayPolicy:
         self.active_sides = tuple(
             dict.fromkeys(str(side).strip().lower() for side in self.active_sides)
         )
+        self.source_start_index = max(0, int(self.source_start_index))
 
     @property
     def frame_count(self) -> int:
@@ -1182,7 +1281,7 @@ class DatasetReplayPolicy:
         self.completed_passes = int(checkpoint.completed_passes)
         self.finished = bool(checkpoint.finished)
 
-    def _next_action_chunk(self) -> np.ndarray:
+    def _next_action_chunk(self) -> tuple[np.ndarray, tuple[int, ...]]:
         if self.cursor >= self.frame_count:
             if self.loop:
                 self.cursor = 0
@@ -1190,18 +1289,30 @@ class DatasetReplayPolicy:
                 self.finished = False
             else:
                 self.finished = True
-                return self.actions[-1:].copy()
+                local_index = self.frame_count - 1
+                return self.actions[-1:].copy(), (local_index,)
+        start = int(self.cursor)
         end = min(self.frame_count, self.cursor + self.chunk_size)
         chunk = self.actions[self.cursor : end].copy()
         self.cursor = end
         if self.cursor >= self.frame_count:
             self.finished = not self.loop
-        return chunk
+        return chunk, tuple(range(start, end))
 
     def predict(self, observation: DeploymentObservation) -> dict[str, Any]:
+        chunk, local_indices = self._next_action_chunk()
         actions = [
-            NormalizedAction(vector=action, metadata=dict(self.action_metadata))
-            for action in self._next_action_chunk()
+            NormalizedAction(
+                vector=action,
+                metadata={
+                    **dict(self.action_metadata),
+                    "debug_replay_local_action_index": int(local_index),
+                    "debug_replay_source_action_index": int(
+                        self.source_start_index + local_index
+                    ),
+                },
+            )
+            for action, local_index in zip(chunk, local_indices, strict=True)
         ]
         if self.output_pose_mode == "relative":
             try:
@@ -1281,82 +1392,26 @@ def load_dataset_replay_policy(
         parquet_path=parquet_path,
         episode_index=int(episode_index),
     )
-    dataset_info = metadata.get("dataset_info")
-    dataset_info = dataset_info if isinstance(dataset_info, Mapping) else {}
-    explicit_layout = policy_io_layout
-    if isinstance(explicit_layout, Mapping):
-        explicit_layout = PolicyIOLayout.from_dict(explicit_layout)
-    elif explicit_layout is not None and not isinstance(explicit_layout, PolicyIOLayout):
-        raise TypeError("policy_io_layout must be a PolicyIOLayout, mapping, or None.")
-    dataset_schema = str(dataset_info.get("dexteleop_dataset_schema") or "")
-    metadata_is_v22 = dataset_schema == DEXTELEOP_DATASET_SCHEMA_V22
-    metadata_is_v23 = dataset_schema == DEXTELEOP_DATASET_SCHEMA_V23
-    metadata_is_typed = metadata_is_v22 or metadata_is_v23
-    row_contract_is_v22 = path.is_file() and _parquet_declares_v22_policy_io(path)
-    is_typed = metadata_is_typed or row_contract_is_v22
-    resolved_pose_contract: PoseFrameContract | None = None
-    if is_typed:
-        if metadata_is_v23:
-            v23_contract = resolve_v23_dataset_contract(dataset_info)
-            layout = v23_contract.policy_io_layout
-            resolved_pose_contract = v23_contract.pose_frames
-            if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
-                raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
-        elif metadata_is_v22:
-            layout = policy_io_layout_from_metadata(dataset_info, allow_legacy_v21=False)
-            if explicit_layout is not None and explicit_layout.layout_hash != layout.layout_hash:
-                raise ValueError("Explicit replay policy_io_layout does not match dataset metadata.")
-        elif explicit_layout is not None:
-            layout = explicit_layout
-        else:
-            raise ValueError(
-                "Direct parquet declares v2.2 policy I/O but its layout cannot be reconstructed. "
-                "Pass the enclosing --debug-replay-dataset or an explicit policy_io_layout."
-            )
-        actions, v22_action_metadata = load_v22_replay_actions_from_parquet(
+    actions, v22_action_metadata, resolved_pose_contract, is_typed = (
+        load_contract_replay_actions_from_parquet(
             path,
-            layout=layout,
-            start_index=int(start_index),
-            end_index=end_index,
-        )
-        if resolved_pose_contract is not None:
-            for side in resolved_pose_contract.source.active_sides:
-                pose_slice = ACTION_ARM_POSE_SLICES[side]
-                try:
-                    actions[:, pose_slice] = np.stack(
-                        [
-                            resolved_pose_contract.storage_pose_vector_to_canonical_desk(
-                                row[pose_slice], side=side
-                            )
-                            for row in actions
-                        ],
-                        axis=0,
-                    )
-                except (PoseFrameContractError, ValueError) as exc:
-                    raise ValueError(
-                        f"v2.3 replay action for {side!r} cannot be converted to "
-                        f"canonical desk: {exc}"
-                    ) from exc
-            v22_action_metadata.update(
-                {
-                    "pose_frame_contract": resolved_pose_contract.to_dict(),
-                    "pose_storage_frame": resolved_pose_contract.pose_storage_frame,
-                    "pose_source_id": resolved_pose_contract.source_id,
-                    "pose_action_absolute_frame": "canonical_desk",
-                }
-            )
-    else:
-        if explicit_layout is not None:
-            raise ValueError(
-                "A v2.2 replay layout was supplied for a non-v2.2 dataset; convert the dataset first."
-            )
-        actions = load_replay_actions_from_parquet(
-            path,
+            resolved_metadata=metadata,
             action_column=action_column,
             start_index=int(start_index),
             end_index=end_index,
+            policy_io_layout=policy_io_layout,
         )
-        v22_action_metadata = {}
+    )
+    dataset_info = metadata.get("dataset_info")
+    dataset_info = dataset_info if isinstance(dataset_info, Mapping) else {}
+    metadata_is_v23 = (
+        str(dataset_info.get("dexteleop_dataset_schema") or "")
+        == DEXTELEOP_DATASET_SCHEMA_V23
+    )
+    policy_io_layout_hash = (
+        dataset_info.get("policy_io_layout_hash")
+        or v22_action_metadata.get("policy_io_layout_hash")
+    )
     if end_effector_sides is not None:
         v22_action_metadata = _restrict_replay_end_effector_metadata(
             v22_action_metadata,
@@ -1417,6 +1472,7 @@ def load_dataset_replay_policy(
         action_metadata=v22_action_metadata,
         output_pose_mode=str(output_pose_mode),
         active_sides=active,
+        source_start_index=int(start_index),
     )
     return LoadedPolicy(
         policy=policy,
@@ -1427,9 +1483,7 @@ def load_dataset_replay_policy(
             "source_path": str(path),
             "frame_count": int(actions.shape[0]),
             "action_column": str(action_column or "action"),
-            "policy_io_layout_hash": (
-                None if not is_typed else layout.layout_hash
-            ),
+            "policy_io_layout_hash": None if not is_typed else policy_io_layout_hash,
             "explicit_hand_replay_sides": sorted(hand_joint_targets),
             "action_hz": float(action_hz_estimate["hz"]),
             "action_hz_source": str(action_hz_estimate.get("source", "unknown")),

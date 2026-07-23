@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .action.schema import ActionRecord
+from .action.human_proposal import HumanCommandEmission, HumanLegacyCommandObservation
 from .calibration import TeleopCalibration
 from .diagnostics import FaultEvent, FaultSeverity, RateTracker, TeleopRunState, TeleopStateMachine
 from .interfaces import ObservationSource, Retargeter, Rig
@@ -24,6 +25,10 @@ from robot_motion.runtime.lifecycle import (
     LifecycleStartupError,
     collect_lifecycle_failures,
     run_best_effort_cleanup,
+)
+from robot_motion.runtime.observation_cut import (
+    ObservationSampleRef,
+    ObservationSampleTracker,
 )
 
 
@@ -93,6 +98,9 @@ class SessionStepResult:
     control_hz: float
     channels: dict[str, ObservationChannel] = field(default_factory=dict)
     raw_channels: dict[str, ObservationChannel] = field(default_factory=dict)
+    input_sample_refs: dict[str, ObservationSampleRef] = field(
+        default_factory=dict
+    )
     observation: TeleopObservation | None = None
     command: TeleopCommand | None = None
     command_dispatched: bool = False
@@ -128,6 +136,13 @@ class TeleopSession:
             [Sequence[FaultEvent], dict[str, ObservationChannel], float], Sequence[FaultEvent]
         ]
         | None = None,
+        human_command_observer: Callable[[HumanCommandEmission], None] | None = None,
+        human_command_filter_observer: Callable[
+            [HumanCommandEmission, TeleopCommand, float], None
+        ]
+        | None = None,
+        human_execution_observer: Callable[[HumanLegacyCommandObservation], None]
+        | None = None,
     ):
         self.config = config
         self.sources = list(sources or [])
@@ -140,6 +155,9 @@ class TeleopSession:
         self.command_filter = command_filter
         self.command_guard = command_guard
         self.fault_filter = fault_filter
+        self.human_command_observer = human_command_observer
+        self.human_command_filter_observer = human_command_filter_observer
+        self.human_execution_observer = human_execution_observer
         if self.recorder is None and config.record_enabled:
             self.recorder = SessionRecorder(config=RecordingConfig(enabled=True))
         self.state_machine = state_machine if state_machine is not None else TeleopStateMachine()
@@ -159,6 +177,16 @@ class TeleopSession:
         self._home_recalibration_required = False
         self._last_home_recalibration_reason = ""
         self._last_safe_command: TeleopCommand | None = None
+        self._human_command_emission_sequence = 0
+        self.human_command_observer_error_count = 0
+        self.last_human_command_observer_error: Exception | None = None
+        self.human_command_filter_observer_error_count = 0
+        self.last_human_command_filter_observer_error: Exception | None = None
+        self.human_execution_observer_error_count = 0
+        self.last_human_execution_observer_error: Exception | None = None
+        self._current_human_command_emission: HumanCommandEmission | None = None
+        self._input_sample_tracker = ObservationSampleTracker()
+        self._current_input_sample_refs: dict[str, ObservationSampleRef] = {}
 
     @property
     def motion_hold_mode(self) -> str:
@@ -219,6 +247,10 @@ class TeleopSession:
         self.fault(reason if held else f"{reason}; hold_motion failed")
 
     def _step_result(self, **kwargs: Any) -> SessionStepResult:
+        kwargs.setdefault(
+            "input_sample_refs",
+            dict(self._current_input_sample_refs),
+        )
         return SessionStepResult(
             **kwargs,
             motion_hold_mode=self._motion_hold_mode,
@@ -647,10 +679,15 @@ class TeleopSession:
         observation: TeleopObservation,
         phase_recorder: Callable[[str, float], None] | None = None,
     ) -> TeleopCommand:
+        self._current_human_command_emission = None
         commands: list[TeleopCommand] = []
+        contribution_names: list[str] = []
         for index, retargeter in enumerate(self.retargeters):
             started_at = time.perf_counter()
             commands.append(retargeter.retarget(observation, self.calibration))
+            contribution_names.append(
+                str(getattr(retargeter, "name", "") or type(retargeter).__name__)
+            )
             if phase_recorder is not None:
                 retargeter_name = str(getattr(retargeter, "name", "") or type(retargeter).__name__)
                 phase_recorder(
@@ -661,7 +698,75 @@ class TeleopSession:
         if command.timestamp is None:
             command.timestamp = observation.timestamp
         command.metadata.setdefault("tcp_mode", self.config.tcp_mode)
+        if (
+            self.human_command_observer is not None
+            or self.human_execution_observer is not None
+        ):
+            observer_started_at = time.perf_counter()
+            try:
+                emission = HumanCommandEmission.capture(
+                    emission_sequence=self._human_command_emission_sequence,
+                    # Eligibility uses the local monotonic observer clock. The
+                    # source/command timestamp remains separately preserved in
+                    # ``HumanCommandEmission.command_timestamp``.
+                    emitted_at=time.monotonic(),
+                    contributions=tuple(zip(contribution_names, commands, strict=True)),
+                    merged_command=command,
+                    observation_sample_refs=self._current_input_sample_refs,
+                )
+                self._human_command_emission_sequence += 1
+                self._current_human_command_emission = emission
+                if self.human_command_observer is not None:
+                    self.human_command_observer(emission)
+                    self.last_human_command_observer_error = None
+            except Exception as exc:  # noqa: BLE001 - observe-only hook must not affect control.
+                self.human_command_observer_error_count += 1
+                self.last_human_command_observer_error = exc
+            if phase_recorder is not None:
+                phase_recorder(
+                    "session.observe_human_command",
+                    time.perf_counter() - observer_started_at,
+                )
         return command
+
+    def _observe_human_legacy_execution(
+        self,
+        *,
+        command: TeleopCommand,
+        observed_at: float,
+        outcome: str,
+        command_dispatched: bool,
+        guard_fault_code: str | None = None,
+        dispatch_receipts: Mapping[str, object | None] | None = None,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> None:
+        emission = self._current_human_command_emission
+        observer = self.human_execution_observer
+        if emission is None or observer is None:
+            return
+        started_at = time.perf_counter()
+        try:
+            observer(
+                HumanLegacyCommandObservation.capture(
+                    emission=emission,
+                    observed_at=float(observed_at),
+                    outcome=outcome,
+                    command_dispatched=command_dispatched,
+                    run_state=self.state_machine.state.value,
+                    command=command,
+                    guard_fault_code=guard_fault_code,
+                    dispatch_receipts=dispatch_receipts,
+                )
+            )
+            self.last_human_execution_observer_error = None
+        except Exception as exc:  # noqa: BLE001 - observe-only hook must not affect control.
+            self.human_execution_observer_error_count += 1
+            self.last_human_execution_observer_error = exc
+        if phase_recorder is not None:
+            phase_recorder(
+                "session.observe_human_legacy_execution",
+                time.perf_counter() - started_at,
+            )
 
     def dispatch_command(
         self,
@@ -707,6 +812,13 @@ class TeleopSession:
 
         channels, faults = self.poll_sources(current_time)
         raw_channels = {name: channel.copy() for name, channel in channels.items()}
+        self._current_input_sample_refs = dict(
+            self._input_sample_tracker.observe(
+                raw_channels,
+                available_at=time.monotonic(),
+                available_clock_domain_id="teleop_session.monotonic",
+            )
+        )
         mark_phase("session.poll_sources")
         if self.channel_filter is not None:
             channels = dict(self.channel_filter(channels, current_time))
@@ -880,11 +992,37 @@ class TeleopSession:
         if self.command_filter is not None:
             command = self.command_filter(command, observation, current_time)
             mark_phase("session.filter_command")
+        emission = self._current_human_command_emission
+        if emission is not None and self.human_command_filter_observer is not None:
+            observer_started_at = time.perf_counter()
+            try:
+                self.human_command_filter_observer(
+                    emission,
+                    self._copy_command(command),
+                    time.monotonic(),
+                )
+                self.last_human_command_filter_observer_error = None
+            except Exception as exc:  # noqa: BLE001 - observe-only hook.
+                self.human_command_filter_observer_error_count += 1
+                self.last_human_command_filter_observer_error = exc
+            if phase_recorder is not None:
+                phase_recorder(
+                    "session.observe_human_filtered_command",
+                    time.perf_counter() - observer_started_at,
+                )
 
         command_guard_fault = self.evaluate_command_guard(command, observation, current_time)
         if command_guard_fault is not None:
             faults.append(command_guard_fault)
             self.reject_command_for_guard_fault(command_guard_fault)
+            self._observe_human_legacy_execution(
+                command=command,
+                observed_at=time.monotonic(),
+                outcome="guard_rejected",
+                command_dispatched=False,
+                guard_fault_code=command_guard_fault.code,
+                phase_recorder=phase_recorder,
+            )
             mark_phase("session.command_guard_fault")
             return self._step_result(
                 timestamp=current_time,
@@ -902,17 +1040,30 @@ class TeleopSession:
             mark_phase("session.record_command")
 
         command_dispatched = False
+        dispatch_receipts: Mapping[str, object | None] | None = None
         if self.rig is not None and self.state_machine.state in {
             TeleopRunState.ARMED,
             TeleopRunState.RUNNING,
         }:
-            self.dispatch_command(command, phase_recorder=phase_recorder)
+            dispatch_receipts = self.dispatch_command(
+                command,
+                phase_recorder=phase_recorder,
+            )
             command_dispatched = True
             self._last_safe_command = self._copy_command(command)
             mark_phase("session.rig.send_commands")
             if self.state_machine.state != TeleopRunState.RUNNING:
                 self._transition(TeleopRunState.RUNNING, "first command dispatched")
                 mark_phase("session.transition_running")
+
+        self._observe_human_legacy_execution(
+            command=command,
+            observed_at=time.monotonic(),
+            outcome="dispatched" if command_dispatched else "not_dispatched",
+            command_dispatched=command_dispatched,
+            dispatch_receipts=dispatch_receipts,
+            phase_recorder=phase_recorder,
+        )
 
         return self._step_result(
             timestamp=current_time,

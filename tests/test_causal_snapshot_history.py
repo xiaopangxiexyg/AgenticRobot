@@ -3,9 +3,13 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pytest
 
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
-from teleop_runtime.collection.hand_state_polling import HandStateHistoryPoller
+from teleop_runtime.collection.hand_state_polling import (
+    HandStateHistoryPoller,
+    hand_state_tactile_arrays,
+)
 
 
 def test_history_freezes_numpy_payload_and_requires_both_timestamps() -> None:
@@ -80,3 +84,59 @@ def test_hand_poller_freezes_telemetry_and_tactile_separately() -> None:
     assert selected["left"]["causal_snapshot_contract"] == (
         "source_timestamp<=T0_and_available_timestamp<=T0"
     )
+    assert selected["left"]["telemetry_snapshot_source_clock"] == "local_wall_time"
+    assert selected["left"]["telemetry_snapshot_available_clock"] == "local_wall_time"
+    assert selected["left"]["tactile_snapshot_source_clock"] == "local_wall_time"
+    assert selected["left"]["tactile_snapshot_available_clock"] == "local_wall_time"
+    assert selected["left"]["telemetry_snapshot_source_age_sec"] > 1.0
+    assert selected["left"]["telemetry_snapshot_available_age_sec"] < 2.0
+    assert selected["left"]["telemetry_snapshot_age_sec"] == pytest.approx(
+        selected["left"]["telemetry_snapshot_source_age_sec"]
+    )
+    assert selected["left"]["tactile_snapshot_age_sec"] == pytest.approx(
+        selected["left"]["tactile_snapshot_source_age_sec"]
+    )
+
+    selected_again = poller.latest_by_side(time.time() + 1.0)
+    first_array = selected["left"]["tactile_dict"]["sensor"]
+    second_array = selected_again["left"]["tactile_dict"]["sensor"]
+    assert first_array is second_array
+    assert not first_array.flags.writeable
+    with pytest.raises(ValueError):
+        first_array.setflags(write=True)
+
+
+def test_hand_poller_uses_joint_read_timestamp_not_newer_worker_loop_timestamp() -> None:
+    now = time.time()
+    backend = _FakeHandBackend()
+    backend.joint_timestamp = now - 0.4
+    poller = HandStateHistoryPoller(backends_by_side={"left": backend})
+    original_get_state = backend.get_state
+
+    def state_with_new_loop_timestamp(**kwargs):
+        state = original_get_state(**kwargs)
+        state["telemetry_timestamp"] = now
+        return state
+
+    backend.get_state = state_with_new_loop_timestamp
+    poller._poll_once("left", backend)
+    selected = poller.latest_by_side(now + 0.01)["left"]
+
+    assert selected["telemetry_snapshot_source_timestamp"] == pytest.approx(now - 0.4)
+    assert selected["telemetry_snapshot_source_age_sec"] == pytest.approx(0.41)
+    assert selected["joint_age_sec"] == pytest.approx(0.41)
+
+
+def test_tactile_metadata_without_arrays_is_not_writer_ready() -> None:
+    assert hand_state_tactile_arrays(
+        {
+            "tactile_timestamp": time.time(),
+            "tactile_version": 3,
+            "tactile_devices": ["sensor"],
+        }
+    ) == {}
+    arrays = hand_state_tactile_arrays(
+        {"tactile_dict": {"sensor": np.ones((2, 3), dtype=np.float32)}}
+    )
+    assert set(arrays) == {"sensor"}
+    assert arrays["sensor"].shape == (2, 3)

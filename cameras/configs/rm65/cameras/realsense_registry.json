@@ -10,7 +10,7 @@
         "width": 640,
         "height": 480,
         "fps": 15,
-        "format": "bgr8"
+        "format": "yuyv"
       },
       "intrinsics": null,
       "extrinsics": {
@@ -52,16 +52,6 @@
             },
             "placements": [
               {
-                "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf",
-                "frame": "head_camera_frame",
-                "parent_frame": "left_arm_base_link"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf",
-                "frame": "head_camera_frame",
-                "parent_frame": "left_arm_base_link"
-              },
-              {
                 "urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
                 "frame": "head_camera_frame",
                 "parent_frame": "left_arm_base_link"
@@ -82,31 +72,13 @@
         "width": 640,
         "height": 480,
         "fps": 15,
-        "format": "bgr8"
+        "format": "yuyv"
       },
       "intrinsics": null,
       "extrinsics": {
         "frames": {
           "left_camera_rgb": {
             "placements": [
-              {
-                "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf",
-                "frame": "left_camera_rgb"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf",
-                "frame": "left_camera_rgb"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf",
-                "frame": "left_camera_rgb",
-                "parent_frame": "left_arm_link6"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf",
-                "frame": "left_camera_rgb",
-                "parent_frame": "left_arm_link6"
-              },
               {
                 "urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
                 "frame": "left_camera_rgb",
@@ -140,31 +112,13 @@
         "width": 640,
         "height": 480,
         "fps": 15,
-        "format": "bgr8"
+        "format": "yuyv"
       },
       "intrinsics": null,
       "extrinsics": {
         "frames": {
           "right_camera_rgb": {
             "placements": [
-              {
-                "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1.urdf",
-                "frame": "right_camera_rgb"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v1/rm65_dual_arm_gripper_v1_head_camera.urdf",
-                "frame": "right_camera_rgb"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2.urdf",
-                "frame": "right_camera_rgb",
-                "parent_frame": "right_arm_link6"
-              },
-              {
-                "urdf": "assets/rm65_inspire_gripper_v2/rm65_dual_arm_wrist_cameras_v2_head_camera.urdf",
-                "frame": "right_camera_rgb",
-                "parent_frame": "right_arm_link6"
-              },
               {
                 "urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
                 "frame": "right_camera_rgb",

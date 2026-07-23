@@ -1,5 +1,8 @@
 # Statistic Utilities
 
+> 本页维护统计脚本的局部示例。当前数据处理、分析和验收入口统一从
+> [`docs/data/README.md`](../../docs/data/README.md) 开始。
+
 ## Pose Action vs Next State
 
 Run:
@@ -10,7 +13,8 @@ Run:
   --output-dir utils/statistic/pose_action_next_state_reports
 ```
 
-The tool scans LeRobot-style DexTeleop datasets and writes:
+The tool scans LeRobot-style DexTeleop datasets, including v2.2/v2.3 datasets
+and UMI datasets converted to v2.3, and writes:
 
 - `pose_action_next_state_summary.json`: machine-readable full summary.
 - `pose_action_next_state_summary.md`: compact human-readable table.
@@ -22,6 +26,11 @@ Metrics:
 - `last_action`: checks `observation.last_action_t` against `action_{t-1}`.
 
 Pose vectors are `[x, y, z, qx, qy, qz, qw]`; quaternion sign is treated as equivalent.
+For v2.2/v2.3 packed vectors, the first 14 values are the left and right arm
+pose7 values. End-effector dimensions after those values are ignored by the
+pose comparison. Explicit per-side pose columns take priority when present.
+The historical 38D v2.1 state layout remains supported as a compatibility
+fallback.
 
 ## Pose Action Lag Scan
 

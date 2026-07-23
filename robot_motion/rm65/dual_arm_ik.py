@@ -112,6 +112,29 @@ class MultiTaskIKSolver:
             q_array[slightly_above] = upper[slightly_above]
         return q_array
 
+    def _clamp_integrated_configuration_to_limits(self, q: np.ndarray) -> np.ndarray:
+        """Clamp solver-generated integration output before Pink updates state.
+
+        Pink validates limits inside ``Configuration.update``.  QP integration
+        can overshoot an active bound by a few milliradians, which previously
+        installed an invalid configuration long enough to emit repeated limit
+        warnings (and exposed native geometry code to out-of-range state).
+        External feedback keeps the narrower soft-clamp policy in
+        :meth:`set_configuration_q`; solver-owned integration is always bounded.
+        """
+
+        q_array = np.asarray(q, dtype=float).reshape(-1).copy()
+        lower = np.asarray(self.robot.model.lowerPositionLimit, dtype=float).reshape(-1)
+        upper = np.asarray(self.robot.model.upperPositionLimit, dtype=float).reshape(-1)
+        if q_array.shape != lower.shape or q_array.shape != upper.shape:
+            raise ValueError(
+                "Integrated configuration shape does not match robot joint limits: "
+                f"q={q_array.shape} lower={lower.shape} upper={upper.shape}."
+            )
+        limited = np.isfinite(lower) & np.isfinite(upper) & (upper > lower + 1e-9)
+        q_array[limited] = np.clip(q_array[limited], lower[limited], upper[limited])
+        return q_array
+
     def _initialize_robot(
         self,
         urdf_path: str,
@@ -339,11 +362,15 @@ class MultiTaskIKSolver:
             )
         qp_elapsed = time.perf_counter() - qp_start if self.debug_profile else 0.0
         integrate_start = time.perf_counter() if self.debug_profile else 0.0
-        self.configuration.integrate_inplace(velocity, self.dt)
+        integrated_q = self.pin.integrate(
+            self.robot.model,
+            self.configuration.q,
+            velocity * self.dt,
+        )
+        integrated_q = self._clamp_integrated_configuration_to_limits(integrated_q)
+        self.configuration.update(integrated_q)
         integrate_elapsed = time.perf_counter() - integrate_start if self.debug_profile else 0.0
-        set_start = time.perf_counter() if self.debug_profile else 0.0
-        self.set_configuration_q(self.configuration.q)
-        set_elapsed = time.perf_counter() - set_start if self.debug_profile else 0.0
+        set_elapsed = 0.0
         if self.debug_profile:
             self.last_solve_profile = {
                 "solver": self.solver,

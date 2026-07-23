@@ -36,6 +36,7 @@ def test_writer_v21_does_not_depend_on_or_reorder_shadowed_utils() -> None:
 
         assert sys.path == path_before
         assert "utils" not in sys.modules
+        assert "teleop_runtime.action.replay_proposal" not in sys.modules
         assert writer_v21.DepthRangeMaskConfig.__module__ == "dataset_contracts.wrist_depth"
         """
     )
@@ -57,7 +58,23 @@ def test_writer_v21_leaves_already_loaded_top_level_utils_untouched() -> None:
         from teleop_runtime.collection import writer_v21
 
         assert sys.modules["utils"] is poisoned
+        assert "teleop_runtime.action.replay_proposal" not in sys.modules
         assert writer_v21.DepthRangeMaskConfig.__module__ == "dataset_contracts.wrist_depth"
+        """
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_replay_proposal_public_exports_are_loaded_lazily() -> None:
+    result = _run_import_check(
+        """
+        import sys
+        import teleop_runtime.action as action
+
+        assert "teleop_runtime.action.replay_proposal" not in sys.modules
+        assert action.DatasetReplayProposalShadowConfig is not None
+        assert "teleop_runtime.action.replay_proposal" in sys.modules
         """
     )
 

@@ -1,8 +1,8 @@
 {
   "schema": "dexteleop_pose_source_contract_v1",
-  "source_id": "rm65_real_dual_arm_table_center_v1",
+  "source_id": "rm65_real_dual_arm_workspace_near_boundary_v1",
   "source_family": "real_robot",
-  "source_description": "Dual RM65 station with canonical desk at the v3 tabletop center frame.",
+  "source_description": "Dual RM65 station whose canonical desk is the v3 valid-workspace near-boundary frame.",
   "topology": "dual_arm",
   "active_sides": [
     "left",
@@ -20,14 +20,14 @@
   ],
   "raw_to_canonical_desk_transform_by_side": {
     "left": [
-      [0.0, 1.0, 0.0, 0.412],
-      [-1.0, 0.0, 0.0, -0.2625],
+      [0.0, -1.0, 0.0, -0.472],
+      [1.0, 0.0, 0.0, 0.2625],
       [0.0, 0.0, 1.0, -0.01],
       [0.0, 0.0, 0.0, 1.0]
     ],
     "right": [
-      [0.0, -1.0, 0.0, 0.412],
-      [1.0, 0.0, 0.0, 0.2625],
+      [0.0, 1.0, 0.0, -0.472],
+      [-1.0, 0.0, 0.0, -0.2625],
       [0.0, 0.0, 1.0, -0.01],
       [0.0, 0.0, 0.0, 1.0]
     ]
@@ -36,11 +36,18 @@
   "profile_version": "1",
   "metadata": {
     "station_profile": "rm65_dual_arm_table_v3",
-    "canonical_frame_urdf_link": "table_center_frame",
+    "canonical_frame_urdf_link": "workspace_near_boundary_frame",
     "reference_urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
-    "canonical_frame_world_xyz_m": [-0.412, 0.0, 0.01],
-    "canonical_frame_world_rpy_rad": [0.0, 0.0, 0.0],
-    "extrinsics_basis": "annotated_station_urdf",
-    "hardware_measurement_status": "not_measured"
+    "canonical_frame_world_xyz_m": [-0.472, 0.0, 0.01],
+    "canonical_frame_world_rpy_rad": [0.0, 0.0, 3.141592653589793],
+    "canonical_frame_definition": "Left-right centered on the tabletop surface and located at the operator/robot-near boundary of the valid tabletop workspace along the tabletop-center-to-operator/robot direction.",
+    "canonical_frame_axes": {
+      "x": "operator-facing direction toward the tabletop",
+      "y": "from the workspace-near-boundary origin toward the operator's left",
+      "z": "vertically upward from the tabletop"
+    },
+    "extrinsics_basis": "calibrated_station_urdf",
+    "calibration_status": "authoritative_calibrated_urdf",
+    "hardware_measurement_status": "encoded_in_calibrated_station_urdf"
   }
 }

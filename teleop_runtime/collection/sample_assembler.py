@@ -33,6 +33,9 @@ from .video_frame import NearestFrameBuffer, VideoFrame
 _COMPACT_COMMAND_METADATA_KEYS = frozenset(
     {
         "arm_action_spec",
+        "arm_mode_stop_reason",
+        "arm_mode_stopped",
+        "arm_mode_stopped_sides",
         "arm_controlled_frame",
         "arm_reference_frame",
         "controlled_frame",
@@ -50,7 +53,16 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
         "init_arm_active",
         "init_arm_active_side",
         "init_arm_mode",
+        "init_arm_label_active",
+        "init_arm_qpos_active",
+        "init_arm_qpos_operation_id",
+        "init_arm_qpos_phase",
+        "init_arm_qpos_selected_side",
+        "init_arm_qpos_step_count",
+        "init_arm_qpos_step_index",
         "init_arm_side",
+        "init_arm_target_pose_base",
+        "init_arm_target_qpos",
         "output_dim",
         "source_command_type",
         "source_dim",
@@ -1542,6 +1554,18 @@ class CollectorSampleBuilder:
         self._last_tactile_snapshot_key_by_side.clear()
         self._init_arm_audit_tracker.reset()
 
+    def set_dataset_position(self, *, episode_index: int, sample_index: int) -> None:
+        """Reset cached writer cursors after idle out-of-band dataset changes."""
+
+        self.set_episode(int(episode_index))
+        self._sample_index = int(sample_index)
+
+    def reset_temporal_history(self) -> None:
+        """Start a new model-continuity segment inside the current episode."""
+
+        self.assembler.reset_last_action()
+        self._init_arm_audit_tracker.reset()
+
     def _snapshot_arm_state_metadata(
         self,
         components: CollectorComponents,
@@ -1687,6 +1711,12 @@ class CollectorSampleBuilder:
             provided = self.hand_state_provider(components, float(sample_timestamp))
             if not isinstance(provided, Mapping):
                 return {}
+            if self.hand_state_provider_returns_isolated:
+                return {
+                    str(side): dict(state)
+                    for side, state in provided.items()
+                    if isinstance(state, Mapping)
+                }
             return {
                 str(side): _copy_value(state)
                 for side, state in provided.items()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 from portable_dm_tac import (
@@ -13,6 +14,12 @@ from portable_dm_tac import (
 )
 
 from .gripper_driver import GripperState, InspireGripper
+from .tactile_calibration import (
+    default_calibration_dir,
+    load_tactile_calibration,
+    normalize_calibration_policy,
+    save_tactile_calibration,
+)
 from .tactile_filter import DistributedForceDenoiser, TactileDenoiseConfig
 
 
@@ -86,8 +93,11 @@ class TactileConfig:
     pc_host: str = "0.0.0.0"
     pc_port: int = 60001
     parallel_read: bool = True
-    denoise_distributed_force: bool = True
+    denoise_distributed_force: bool = False
     denoise_config: TactileDenoiseConfig = field(default_factory=TactileDenoiseConfig)
+    calibration_policy: str = "auto"
+    calibration_dir: str | Path | None = None
+    persist_reset_calibration: bool = True
 
 
 @dataclass
@@ -215,11 +225,15 @@ class DMTacGripperDevice:
         *,
         connect_gripper: bool = True,
         connect_tactile: bool = True,
+        apply_tactile_calibration_on_connect: bool = True,
     ) -> None:
         self.gripper_config = gripper or GripperConfig()
         self.tactile_config = tactile or TactileConfig()
         self.connect_gripper = bool(connect_gripper)
         self.connect_tactile = bool(connect_tactile)
+        self.apply_tactile_calibration_on_connect = bool(
+            apply_tactile_calibration_on_connect
+        )
         self.gripper: Optional[InspireGripper] = None
         self.tactile: Optional[DMTacMultiDevice] = None
         self._distributed_force_denoiser = DistributedForceDenoiser(self.tactile_config.denoise_config)
@@ -250,6 +264,8 @@ class DMTacGripperDevice:
                 )
             configs = [tactile_device_config(dev_id, self.tactile_config) for dev_id in dev_ids]
             self.tactile = DMTacMultiDevice(configs).connect()
+            if self.apply_tactile_calibration_on_connect:
+                self.apply_fixed_tactile_calibration()
             self.reset_tactile_filter()
 
         return self
@@ -334,8 +350,45 @@ class DMTacGripperDevice:
     def wait_tactile_ready(self, timeout_s: float = 10.0) -> Dict[DeviceId, bool]:
         return self.require_tactile().wait_until_ready(timeout_s=timeout_s)
 
+    def apply_fixed_tactile_calibration(self) -> Dict[str, Dict[str, Any]]:
+        tactile = self.require_tactile()
+        policy = normalize_calibration_policy(self.tactile_config.calibration_policy)
+        if policy == "off":
+            return {}
+        root = Path(self.tactile_config.calibration_dir or default_calibration_dir())
+        applied: Dict[str, Dict[str, Any]] = {}
+        for device in tactile.devices:
+            calibration = load_tactile_calibration(
+                root,
+                device.dev_id,
+                required=(policy == "required"),
+            )
+            if calibration is None:
+                continue
+            device.set_base_frame(calibration.frame)
+            applied[str(device.dev_id)] = calibration.descriptor()
+        return applied
+
+    def persist_current_tactile_calibration(self) -> Dict[str, Dict[str, Any]]:
+        tactile = self.require_tactile()
+        if not hasattr(tactile, "get_base_frames"):
+            return {}
+        root = Path(self.tactile_config.calibration_dir or default_calibration_dir())
+        saved: Dict[str, Dict[str, Any]] = {}
+        for sensor_key, frame in tactile.get_base_frames().items():
+            calibration = save_tactile_calibration(
+                root,
+                sensor_key,
+                frame,
+                source={"kind": "live_sdk_reset"},
+            )
+            saved[str(sensor_key)] = calibration.descriptor()
+        return saved
+
     def reset_tactile(self) -> None:
         self.require_tactile().reset_all()
+        if self.tactile_config.persist_reset_calibration:
+            self.persist_current_tactile_calibration()
         self.reset_tactile_filter()
 
     def reset_tactile_filter(self) -> None:

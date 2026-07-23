@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.deploy.actions import (
     FilteredNormalizedAction,
     NormalizedAction,
@@ -41,9 +42,25 @@ from robot_motion.rm65 import (
     RM65PositionPlannerProtocol,
 )
 from robot_motion.runtime import TeleopCommand
+from robot_motion.runtime import (
+    ExecutionCancellation,
+    ExecutionCancellationParticipantSpec,
+    ExecutionEpochGuard,
+    ExecutionWorkItem,
+    WorkerEpochDrainReceipt,
+)
 from robot_motion.safety_constraints import (
     constrain_joint_vector,
     workspace_distance_l2,
+)
+
+from .reference_observation import (
+    LegacyPositionReferenceObserver,
+    LegacyReferenceDerivation,
+    LegacyReferenceGenerationInvalidation,
+    LegacyReferenceResolutionFailureDerivation,
+    LegacyReferenceResolutionDerivation,
+    LegacyReferenceSourceFact,
 )
 
 
@@ -184,6 +201,8 @@ class _Submission:
     lookahead_observation: DeploymentObservation | None = None
     lookahead_policy_name: str | None = None
     lookahead_discrete_command: TeleopCommand | None = None
+    execution_work_item: ExecutionWorkItem | None = None
+    lookahead_execution_work_item: ExecutionWorkItem | None = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +212,7 @@ class _ReferenceTemplate:
     policy_name: str
     source_timestamp: float
     discrete_command: TeleopCommand | None = None
+    execution_work_item: ExecutionWorkItem | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +277,19 @@ def _copy_filtered_action(filtered: FilteredNormalizedAction) -> FilteredNormali
     )
 
 
+def _same_execution_scope(
+    left: ExecutionWorkItem,
+    right: ExecutionWorkItem,
+) -> bool:
+    return bool(
+        left.control_domain_id == right.control_domain_id
+        and left.authority_epoch == right.authority_epoch
+        and left.execution_epoch == right.execution_epoch
+        and dict(left.segment_generation_by_group)
+        == dict(right.segment_generation_by_group)
+    )
+
+
 def _copy_teleop_command(command: TeleopCommand) -> TeleopCommand:
     return TeleopCommand(
         commands={
@@ -265,6 +298,7 @@ def _copy_teleop_command(command: TeleopCommand) -> TeleopCommand:
         },
         timestamp=command.timestamp,
         metadata=dict(command.metadata),
+        execution_work_item=command.execution_work_item,
     )
 
 
@@ -323,6 +357,9 @@ class PositionDeployExecutor:
         discrete_dispatch_callback: Callable[[TeleopCommand], object] | None = None,
         hold_callback: Callable[[], None] | None = None,
         collision_planner_factory: Callable[[], RM65PositionPlannerProtocol] | None = None,
+        reference_observer: LegacyPositionReferenceObserver | None = None,
+        execution_epoch_guard: ExecutionEpochGuard | None = None,
+        worker_drain_participant: ExecutionCancellationParticipantSpec | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -350,6 +387,29 @@ class PositionDeployExecutor:
             collision_planner_factory
         ):
             raise TypeError("collision_planner_factory must be callable or None")
+        if reference_observer is not None and not callable(
+            getattr(reference_observer, "submit_nowait", None)
+        ):
+            raise TypeError("reference_observer must provide submit_nowait() or be None")
+        if (execution_epoch_guard is None) != (worker_drain_participant is None):
+            raise ValueError(
+                "execution_epoch_guard and worker_drain_participant must be configured together"
+            )
+        if execution_epoch_guard is not None and not isinstance(
+            execution_epoch_guard,
+            ExecutionEpochGuard,
+        ):
+            raise TypeError("execution_epoch_guard must be an ExecutionEpochGuard")
+        if worker_drain_participant is not None:
+            if not isinstance(
+                worker_drain_participant,
+                ExecutionCancellationParticipantSpec,
+            ):
+                raise TypeError(
+                    "worker_drain_participant must be an ExecutionCancellationParticipantSpec"
+                )
+            if worker_drain_participant.worker_kind != "reference_worker":
+                raise ValueError("position deploy drain participant must be a reference_worker")
         if config.collision_required and collision_planner_factory is None:
             raise ValueError(
                 "collision_required position deploy needs a collision_planner_factory"
@@ -373,6 +433,9 @@ class PositionDeployExecutor:
         self.discrete_dispatch_callback = discrete_dispatch_callback
         self.hold_callback = hold_callback
         self._collision_planner_factory = collision_planner_factory
+        self._reference_observer = reference_observer
+        self._execution_epoch_guard = execution_epoch_guard
+        self._worker_drain_participant = worker_drain_participant
         self._collision_planner: RM65PositionPlannerProtocol | None = None
         self._collision_planner_initialized = False
         self._clock = clock
@@ -387,6 +450,9 @@ class PositionDeployExecutor:
         self._qpos_resampler = CausalMotionResampler(max_samples=max_samples)
         self._max_templates = max_samples * 2
         self._templates: OrderedDict[int, _ReferenceTemplate] = OrderedDict()
+        self._legacy_reference_source_facts: dict[
+            tuple[str, int], LegacyReferenceSourceFact
+        ] = {}
 
         self._lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
@@ -414,6 +480,7 @@ class PositionDeployExecutor:
         self._staged_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
         self._staged_lookahead_qpos_by_side: Mapping[str, np.ndarray] | None = None
         self._staged_lookahead_discrete_command: TeleopCommand | None = None
+        self._staged_lookahead_execution_work_item: ExecutionWorkItem | None = None
         self._terminal_pose_by_side: Mapping[str, np.ndarray] | None = None
         self._terminal_qpos_by_side: Mapping[str, np.ndarray] | None = None
         self._terminal_timestamp: float | None = None
@@ -462,6 +529,13 @@ class PositionDeployExecutor:
         self._collision_hold_count = 0
         self._last_collision_metadata: dict[str, Any] | None = None
         self._last_collision_reset_metadata: dict[str, Any] | None = None
+        self._reference_observer_error_count = 0
+        self._last_reference_observer_error: str | None = None
+        self._execution_epoch_rejected_count = 0
+        self._inflight_execution_work_item: ExecutionWorkItem | None = None
+        self._last_completed_execution_work_item: ExecutionWorkItem | None = None
+        self._last_old_epoch_invocation_started_at: float | None = None
+        self._last_old_epoch_invocation_completed_at: float | None = None
 
     @property
     def dry_run(self) -> bool:
@@ -537,6 +611,8 @@ class PositionDeployExecutor:
         lookahead_filtered: FilteredNormalizedAction | None = None,
         lookahead_observation: DeploymentObservation | None = None,
         lookahead_discrete_command: TeleopCommand | None = None,
+        execution_work_item: ExecutionWorkItem | None = None,
+        lookahead_execution_work_item: ExecutionWorkItem | None = None,
     ) -> int:
         """Enqueue one safe keyframe without applying its safety filter again.
 
@@ -583,6 +659,44 @@ class PositionDeployExecutor:
             raise ValueError(
                 "lookahead_discrete_command requires lookahead_filtered"
             )
+        guard_enabled = self._execution_epoch_guard is not None
+        if guard_enabled and execution_work_item is None:
+            raise ValueError(
+                "epoch-mediated position deploy requires an execution_work_item"
+            )
+        if execution_work_item is not None:
+            if not isinstance(execution_work_item, ExecutionWorkItem):
+                raise TypeError("execution_work_item must be an ExecutionWorkItem or None")
+            if execution_work_item.work_kind != "reference_segment":
+                raise ValueError(
+                    "position keyframe execution_work_item must use reference_segment"
+                )
+        if lookahead_filtered is not None and guard_enabled:
+            if lookahead_execution_work_item is None:
+                raise ValueError(
+                    "epoch-mediated lookahead requires lookahead_execution_work_item"
+                )
+        elif lookahead_execution_work_item is not None:
+            raise ValueError(
+                "lookahead_execution_work_item requires lookahead_filtered and an epoch guard"
+            )
+        if lookahead_execution_work_item is not None:
+            if not isinstance(lookahead_execution_work_item, ExecutionWorkItem):
+                raise TypeError(
+                    "lookahead_execution_work_item must be an ExecutionWorkItem"
+                )
+            if lookahead_execution_work_item.work_kind != "reference_segment":
+                raise ValueError(
+                    "lookahead execution work must use reference_segment"
+                )
+            assert execution_work_item is not None
+            if not _same_execution_scope(
+                execution_work_item,
+                lookahead_execution_work_item,
+            ):
+                raise ValueError(
+                    "current and lookahead execution work must share control epoch/generation"
+                )
         for command_name, candidate_command in (
             ("discrete_command", discrete_command),
             ("lookahead_discrete_command", lookahead_discrete_command),
@@ -852,6 +966,8 @@ class PositionDeployExecutor:
                     if lookahead_discrete_command is None
                     else _copy_teleop_command(lookahead_discrete_command)
                 ),
+                execution_work_item=execution_work_item,
+                lookahead_execution_work_item=lookahead_execution_work_item,
             )
             try:
                 self._queue.put_nowait(submission)
@@ -882,6 +998,9 @@ class PositionDeployExecutor:
                     None
                     if lookahead_discrete_command is None
                     else _copy_teleop_command(lookahead_discrete_command)
+                )
+                self._staged_lookahead_execution_work_item = (
+                    lookahead_execution_work_item
                 )
                 self._terminal_pose_by_side = (
                     dict(lookahead_pose_by_side)
@@ -946,7 +1065,13 @@ class PositionDeployExecutor:
                     or not self._discrete_queue.empty()
                     or self._hold_retry_required
                 )
+                invalidated_generation = self._generation
                 self._generation += 1
+                self._notify_reference_generation_invalidation_locked(
+                    legacy_worker_generation=invalidated_generation,
+                    reason="stream_clear",
+                    terminal_status="canceled",
+                )
                 self._clear_count += 1
                 self._reset_stream_locked()
                 self._append_debug_event_locked(
@@ -966,6 +1091,96 @@ class PositionDeployExecutor:
 
     def pause(self) -> None:
         self.clear()
+
+    def drain_execution_cancellation(
+        self,
+        cancellation: ExecutionCancellation,
+    ) -> WorkerEpochDrainReceipt:
+        """Invalidate all old-epoch reference work without touching hardware.
+
+        This method is available only when the default-off M1C binding was
+        explicitly configured.  Taking ``_dispatch_lock`` waits for any
+        callback that already crossed the final reference-worker check; the
+        generation change then prevents queue work already copied by the
+        worker from becoming dispatchable.
+        """
+
+        if not isinstance(cancellation, ExecutionCancellation):
+            raise TypeError("cancellation must be an ExecutionCancellation")
+        guard = self._execution_epoch_guard
+        participant = self._worker_drain_participant
+        if guard is None or participant is None:
+            raise RuntimeError("position deploy execution drain is not configured")
+        snapshot = guard.registry.snapshot()
+        if (
+            cancellation.control_domain_id != snapshot.control_domain_id
+            or cancellation.execution_epoch != snapshot.execution_epoch
+        ):
+            raise RuntimeError(
+                "position deploy drain requires the cancellation epoch to be current"
+            )
+
+        discarded: set[str] = set()
+        with self._dispatch_lock:
+            with self._lock:
+                if self._inflight_execution_work_item is not None:
+                    raise RuntimeError(
+                        "reference callback remained in flight while holding dispatch lock"
+                    )
+                with self._queue.mutex:
+                    queued = tuple(self._queue.queue)
+                for submission in queued:
+                    for item in (
+                        submission.execution_work_item,
+                        submission.lookahead_execution_work_item,
+                    ):
+                        if (
+                            item is not None
+                            and item.execution_epoch
+                            == cancellation.previous_execution_epoch
+                        ):
+                            discarded.add(item.work_item_id)
+                for template in self._templates.values():
+                    item = template.execution_work_item
+                    if (
+                        item is not None
+                        and item.execution_epoch
+                        == cancellation.previous_execution_epoch
+                    ):
+                        discarded.add(item.work_item_id)
+                invalidated_generation = self._generation
+                self._generation += 1
+                self._notify_reference_generation_invalidation_locked(
+                    legacy_worker_generation=invalidated_generation,
+                    reason=f"execution_cancellation:{cancellation.reason}",
+                    terminal_status="canceled",
+                )
+                self._reset_stream_locked()
+                completed_item = self._last_completed_execution_work_item
+                started_at = (
+                    self._last_old_epoch_invocation_started_at
+                    if completed_item is not None
+                    and completed_item.execution_epoch
+                    == cancellation.previous_execution_epoch
+                    else None
+                )
+                completed_at = (
+                    self._last_old_epoch_invocation_completed_at
+                    if started_at is not None
+                    else None
+                )
+        acknowledged_at = max(float(self._clock()), cancellation.effective_at)
+        return WorkerEpochDrainReceipt.evaluate(
+            cancellation=cancellation,
+            participant=participant,
+            observed_execution_epoch=snapshot.execution_epoch,
+            discarded_work_ids=tuple(sorted(discarded)),
+            last_old_epoch_invocation_started_at=started_at,
+            last_old_epoch_invocation_completed_at=completed_at,
+            in_flight_old_epoch_count=0,
+            no_future_old_epoch_calls=True,
+            acknowledged_at=acknowledged_at,
+        )
 
     def latch_safety_fault(
         self,
@@ -1034,7 +1249,13 @@ class PositionDeployExecutor:
                 self._fault_pending = False
                 self._fault_pending_stage = None
                 self._fault_pending_error = None
+                invalidated_generation = self._generation
                 self._generation += 1
+                self._notify_reference_generation_invalidation_locked(
+                    legacy_worker_generation=invalidated_generation,
+                    reason="manual_safety_rearm",
+                    terminal_status="canceled",
+                )
                 self._reset_stream_locked()
                 self._append_debug_event_locked(
                     "manual_safety_rearmed",
@@ -1218,6 +1439,22 @@ class PositionDeployExecutor:
                 "debug_event_queue_depth": int(len(self._debug_events)),
                 "debug_event_drop_count": int(self._debug_event_drop_count),
                 "debug_events_enabled": bool(self.config.debug_events_enabled),
+                "reference_observer_attached": self._reference_observer is not None,
+                "reference_observer_error_count": int(
+                    self._reference_observer_error_count
+                ),
+                "last_reference_observer_error": self._last_reference_observer_error,
+                "execution_epoch_binding_enabled": (
+                    self._execution_epoch_guard is not None
+                ),
+                "execution_epoch_rejected_count": int(
+                    self._execution_epoch_rejected_count
+                ),
+                "inflight_execution_work_item_id": (
+                    None
+                    if self._inflight_execution_work_item is None
+                    else self._inflight_execution_work_item.work_item_id
+                ),
                 "collision_required": bool(self.config.collision_required),
                 "collision_reset_measurement_max_age_sec": float(
                     self.config.collision_reset_measurement_max_age_sec
@@ -1328,7 +1565,13 @@ class PositionDeployExecutor:
                             or not self._discrete_queue.empty()
                             or self._hold_retry_required
                         )
+                        invalidated_generation = self._generation
                         self._generation += 1
+                        self._notify_reference_generation_invalidation_locked(
+                            legacy_worker_generation=invalidated_generation,
+                            reason="executor_close",
+                            terminal_status="canceled",
+                        )
                         self._reset_stream_locked()
                         self._append_debug_event_locked(
                             "executor_closing",
@@ -2024,6 +2267,24 @@ class PositionDeployExecutor:
                 self._queue.task_done()
 
     def _accept_submission(self, submission: _Submission) -> None:
+        guard = self._execution_epoch_guard
+        if guard is not None:
+            item = submission.execution_work_item
+            if item is None:
+                raise RuntimeError("epoch-mediated submission lost its execution work item")
+            check = guard.check_at_dequeue(item)
+            if not check.accepted:
+                with self._lock:
+                    self._execution_epoch_rejected_count += 1
+                    self._append_debug_event_locked(
+                        "execution_work_rejected",
+                        {
+                            "work_item_id": item.work_item_id,
+                            "checkpoint": check.checkpoint,
+                            "status": check.status,
+                        },
+                    )
+                return
         if submission.collision_reset_qpos_by_side is not None:
             self.prepare_collision_planner()
         with self._lock:
@@ -2066,6 +2327,7 @@ class PositionDeployExecutor:
                     else float(submission.logical_timestamp)
                 ),
                 discrete_command=submission.discrete_command,
+                execution_work_item=submission.execution_work_item,
             )
             logical_timestamp = (
                 submission.timestamp
@@ -2075,6 +2337,13 @@ class PositionDeployExecutor:
             if submission.anchor_source_index is not None:
                 assert submission.anchor_timestamp is not None
                 if submission.pose_by_side:
+                    self._store_legacy_reference_source_fact_locked(
+                        modality="pose",
+                        source_index=submission.anchor_source_index,
+                        source_timestamp=submission.anchor_timestamp,
+                        source_stage="current_observation_anchor",
+                        target_by_side=dict(submission.anchor_pose_by_side or {}),
+                    )
                     self._pose_resampler.push(
                         TimestampedMotionTarget(
                             timestamp=submission.anchor_timestamp,
@@ -2089,6 +2358,13 @@ class PositionDeployExecutor:
                         )
                     )
                 if submission.qpos_by_side:
+                    self._store_legacy_reference_source_fact_locked(
+                        modality="qpos",
+                        source_index=submission.anchor_source_index,
+                        source_timestamp=submission.anchor_timestamp,
+                        source_stage="current_observation_anchor",
+                        target_by_side=dict(submission.anchor_qpos_by_side or {}),
+                    )
                     self._qpos_resampler.push(
                         TimestampedMotionTarget(
                             timestamp=submission.anchor_timestamp,
@@ -2112,6 +2388,15 @@ class PositionDeployExecutor:
                 )
 
             if submission.pose_by_side and not submission.current_already_staged:
+                self._store_legacy_reference_source_fact_locked(
+                    modality="pose",
+                    source_index=submission.source_index,
+                    source_timestamp=logical_timestamp,
+                    source_stage=(
+                        f"safe_{_rate_label(self.config.sample_hz)}hz_keyframe"
+                    ),
+                    target_by_side=submission.pose_by_side,
+                )
                 self._pose_resampler.push(
                     TimestampedMotionTarget(
                         timestamp=logical_timestamp,
@@ -2128,6 +2413,15 @@ class PositionDeployExecutor:
                     )
                 )
             if submission.qpos_by_side and not submission.current_already_staged:
+                self._store_legacy_reference_source_fact_locked(
+                    modality="qpos",
+                    source_index=submission.source_index,
+                    source_timestamp=logical_timestamp,
+                    source_stage=(
+                        f"safe_{_rate_label(self.config.sample_hz)}hz_keyframe"
+                    ),
+                    target_by_side=submission.qpos_by_side,
+                )
                 self._qpos_resampler.push(
                     TimestampedMotionTarget(
                         timestamp=logical_timestamp,
@@ -2152,6 +2446,16 @@ class PositionDeployExecutor:
                 ):
                     raise RuntimeError("incomplete chunk lookahead submission")
                 if submission.lookahead_pose_by_side:
+                    self._store_legacy_reference_source_fact_locked(
+                        modality="pose",
+                        source_index=int(submission.lookahead_source_index),
+                        source_timestamp=float(submission.lookahead_timestamp),
+                        source_stage=(
+                            f"safe_{_rate_label(self.config.sample_hz)}hz_"
+                            "chunk_lookahead"
+                        ),
+                        target_by_side=submission.lookahead_pose_by_side,
+                    )
                     self._pose_resampler.push(
                         TimestampedMotionTarget(
                             timestamp=float(submission.lookahead_timestamp),
@@ -2167,6 +2471,16 @@ class PositionDeployExecutor:
                         )
                     )
                 if submission.lookahead_qpos_by_side:
+                    self._store_legacy_reference_source_fact_locked(
+                        modality="qpos",
+                        source_index=int(submission.lookahead_source_index),
+                        source_timestamp=float(submission.lookahead_timestamp),
+                        source_stage=(
+                            f"safe_{_rate_label(self.config.sample_hz)}hz_"
+                            "chunk_lookahead"
+                        ),
+                        target_by_side=submission.lookahead_qpos_by_side,
+                    )
                     self._qpos_resampler.push(
                         TimestampedMotionTarget(
                             timestamp=float(submission.lookahead_timestamp),
@@ -2192,6 +2506,9 @@ class PositionDeployExecutor:
                         ),
                         source_timestamp=float(submission.lookahead_timestamp),
                         discrete_command=submission.lookahead_discrete_command,
+                        execution_work_item=(
+                            submission.lookahead_execution_work_item
+                        ),
                     ),
                 )
             self._last_source_timestamp = submission.timestamp
@@ -2239,11 +2556,376 @@ class PositionDeployExecutor:
         applied["measurement_age_at_apply_sec_by_side"] = apply_ages
         return applied
 
+    def _execution_work_for_reference_locked(
+        self,
+        *,
+        parent_indices: tuple[int, ...],
+        reference_sequence: int,
+    ) -> ExecutionWorkItem | None:
+        if self._execution_epoch_guard is None:
+            return None
+        parent_items: list[ExecutionWorkItem] = []
+        for source_index in parent_indices:
+            template = self._templates.get(int(source_index))
+            item = None if template is None else template.execution_work_item
+            if item is None:
+                raise RuntimeError(
+                    "epoch-mediated reference has a parent without execution lineage"
+                )
+            parent_items.append(item)
+        first = parent_items[0]
+        if any(not _same_execution_scope(first, item) for item in parent_items[1:]):
+            raise RuntimeError(
+                "reference parents cross authority/execution epoch or group generation"
+            )
+        parent_ids = tuple(item.work_item_id for item in parent_items)
+        payload = {
+            "parent_work_item_ids": parent_ids,
+            "reference_sequence": int(reference_sequence),
+            "control_domain_id": first.control_domain_id,
+            "authority_epoch": first.authority_epoch,
+            "execution_epoch": first.execution_epoch,
+            "segment_generation_by_group": dict(
+                first.segment_generation_by_group
+            ),
+        }
+        semantic_hash = canonical_content_hash(
+            payload,
+            domain="dexteleop.position_reference_execution_work.v1",
+        )
+        source_decision_ids = {
+            item.source_decision_id
+            for item in parent_items
+            if item.source_decision_id is not None
+        }
+        return ExecutionWorkItem(
+            work_item_id=f"position-reference-work:{semantic_hash}",
+            work_kind="position_command",
+            control_domain_id=first.control_domain_id,
+            authority_epoch=first.authority_epoch,
+            execution_epoch=first.execution_epoch,
+            segment_generation_by_group=dict(
+                first.segment_generation_by_group
+            ),
+            source_decision_id=(
+                next(iter(source_decision_ids))
+                if len(source_decision_ids) == 1
+                else None
+            ),
+            source_reference_segment_id=f"position-reference-lineage:{semantic_hash}",
+        )
+
     def _store_template_locked(self, source_index: int, template: _ReferenceTemplate) -> None:
         self._templates[int(source_index)] = template
         self._templates.move_to_end(int(source_index))
         while len(self._templates) > self._max_templates:
-            self._templates.popitem(last=False)
+            expired_index, _ = self._templates.popitem(last=False)
+            self._legacy_reference_source_facts.pop(("pose", expired_index), None)
+            self._legacy_reference_source_facts.pop(("qpos", expired_index), None)
+
+    def _store_legacy_reference_source_fact_locked(
+        self,
+        *,
+        modality: str,
+        source_index: int,
+        source_timestamp: float,
+        source_stage: str,
+        target_by_side: Mapping[str, np.ndarray],
+    ) -> None:
+        """Retain the actual resampler source provenance without re-labelling it."""
+
+        if self._reference_observer is None or not target_by_side:
+            return
+        key = (str(modality), int(source_index))
+        # A same-chunk lookahead later becomes the current keyframe without a
+        # second resampler push. Preserve the stage under which it actually
+        # entered the worker instead of overwriting provenance at queue drain.
+        if key in self._legacy_reference_source_facts:
+            return
+        target_hash = canonical_content_hash(
+            {str(side): np.asarray(value) for side, value in target_by_side.items()},
+            domain=f"dexteleop.legacy_position_source_target.{modality}.v1",
+        )
+        self._legacy_reference_source_facts[key] = LegacyReferenceSourceFact(
+            source_index=int(source_index),
+            source_timestamp=float(source_timestamp),
+            source_stage=str(source_stage),
+            target_payload_hash=target_hash,
+        )
+
+    def _notify_reference_observer(
+        self,
+        *,
+        generation: int,
+        scheduled_timestamp: float,
+        actual_emit: float,
+        pose_ref: ResampledMotionReference | None,
+        qpos_ref: ResampledMotionReference | None,
+    ) -> tuple[LegacyReferenceDerivation, ...]:
+        """Submit pre-resolver facts; observer failures never affect execution."""
+
+        observer = self._reference_observer
+        if observer is None:
+            return ()
+        derivations: list[LegacyReferenceDerivation] = []
+        try:
+            for modality, reference, interpolation_contract in (
+                (
+                    "pose",
+                    pose_ref,
+                    "xyz_linear+quaternion_shortest_path_slerp",
+                ),
+                ("qpos", qpos_ref, "linear_qpos_interpolation"),
+            ):
+                if reference is None:
+                    continue
+                with self._lock:
+                    start = self._legacy_reference_source_facts.get(
+                        (modality, int(reference.left_source_index))
+                    )
+                    end = self._legacy_reference_source_facts.get(
+                        (modality, int(reference.right_source_index))
+                    )
+                if start is None or end is None:
+                    raise RuntimeError(
+                        "missing legacy source provenance for observed reference "
+                        f"{modality}:{reference.left_source_index}->"
+                        f"{reference.right_source_index}"
+                    )
+                derivation = LegacyReferenceDerivation(
+                    legacy_worker_generation=int(generation),
+                    modality=modality,
+                    scheduled_for=float(scheduled_timestamp),
+                    emitted_at=float(actual_emit),
+                    reference=reference,
+                    start_source_fact=start,
+                    end_source_fact=end,
+                    interpolation_contract_hash=canonical_content_hash(
+                        {
+                            "modality": modality,
+                            "algorithm": interpolation_contract,
+                            "sample_hz": float(self.config.sample_hz),
+                            "reference_hz": float(self.config.reference_hz),
+                            "causal_delay_periods": (
+                                0 if self.config.chunk_lookahead_enabled else 1
+                            ),
+                        },
+                        domain=(
+                            "dexteleop.legacy_position_interpolation_contract.v1"
+                        ),
+                    ),
+                )
+                derivations.append(derivation)
+                observer.submit_nowait(derivation)
+        except Exception as exc:  # noqa: BLE001 - passive diagnostics only.
+            with self._lock:
+                self._reference_observer_error_count += 1
+                self._last_reference_observer_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return tuple(derivations)
+
+    @staticmethod
+    def _legacy_command_intent_hash(command: TeleopCommand) -> str:
+        payload = {
+            "commands": {
+                str(name): {
+                    "effector_name": item.effector_name,
+                    "side": item.side,
+                    "command_type": item.command_type,
+                    "frame_name": item.frame_name,
+                    "value": np.asarray(item.value),
+                }
+                for name, item in sorted(command.commands.items())
+            }
+        }
+        return canonical_content_hash(
+            payload,
+            domain="dexteleop.legacy_position_command_intent.v1",
+        )
+
+    def _notify_reference_resolution_observer(
+        self,
+        *,
+        derivations: tuple[LegacyReferenceDerivation, ...],
+        actual_emit: float,
+        command: TeleopCommand,
+        collision_qpos_by_side: Mapping[str, np.ndarray] | None,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        observer = self._reference_observer
+        submit = (
+            None
+            if observer is None
+            else getattr(observer, "submit_resolution_nowait", None)
+        )
+        if not callable(submit) or not derivations:
+            return
+        try:
+            command_hash = self._legacy_command_intent_hash(command)
+            resolver_hash = canonical_content_hash(
+                {
+                    "resolver": "CanonicalDeployActionPipeline.resolve_filtered",
+                    "active_sides": tuple(self.canonical_pipeline.active_sides),
+                    "command_intent_hash": command_hash,
+                },
+                domain="dexteleop.legacy_position_resolver_evidence.v1",
+            )
+            if collision_qpos_by_side is None:
+                planner_status = "not_applicable"
+                planner_input_hash = None
+                planner_output_hash = None
+                planner_evidence_hash = None
+                measurement_status = "not_applicable"
+            else:
+                pose_derivation = next(
+                    (
+                        item
+                        for item in derivations
+                        if item.modality == "pose"
+                    ),
+                    None,
+                )
+                if pose_derivation is None:
+                    raise RuntimeError(
+                        "collision planner outcome is missing its pose reference"
+                    )
+                planner_status = "legacy_collision_planner_accepted"
+                planner_input_hash = canonical_content_hash(
+                    {
+                        str(side): np.asarray(value)
+                        for side, value in pose_derivation.reference.pose_by_side.items()
+                    },
+                    domain="dexteleop.legacy_collision_planner_input.v1",
+                )
+                planner_output_hash = canonical_content_hash(
+                    {
+                        str(side): np.asarray(value)
+                        for side, value in collision_qpos_by_side.items()
+                    },
+                    domain="dexteleop.legacy_collision_planner_output.v1",
+                )
+                planner_evidence_hash = canonical_content_hash(
+                    {
+                        "input_hash": planner_input_hash,
+                        "output_hash": planner_output_hash,
+                        "endpoint_collision_checked": bool(
+                            metadata.get("position_endpoint_collision_checked", False)
+                        ),
+                        "endpoint_collision_passed": bool(
+                            metadata.get("position_endpoint_collision_passed", False)
+                        ),
+                        "collision_status": metadata.get(
+                            "position_collision_status"
+                        ),
+                    },
+                    domain="dexteleop.legacy_collision_planner_evidence.v1",
+                )
+                measurement_status = "legacy_planner_state_not_typed"
+            for derivation in derivations:
+                submit(
+                    LegacyReferenceResolutionDerivation(
+                        reference_derivation=derivation,
+                        resolved_at=float(actual_emit),
+                        resolver_evidence_hash=resolver_hash,
+                        planner_evidence_status=planner_status,
+                        planner_input_hash=planner_input_hash,
+                        planner_output_hash=planner_output_hash,
+                        planner_evidence_hash=planner_evidence_hash,
+                        measured_state_evidence_status=measurement_status,
+                        measured_state_evidence_ids=(),
+                        command_intent_hash=command_hash,
+                        local_pre_backend_generation_check_passed=True,
+                        local_pre_backend_check_observed_at=float(actual_emit),
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - passive diagnostics only.
+            with self._lock:
+                self._reference_observer_error_count += 1
+                self._last_reference_observer_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    def _notify_reference_resolution_failure_observer(
+        self,
+        *,
+        derivations: tuple[LegacyReferenceDerivation, ...],
+        actual_emit: float,
+        failure_stage: str,
+        error: BaseException,
+    ) -> None:
+        """Observe an existing explicit failure branch without changing it."""
+
+        observer = self._reference_observer
+        submit = (
+            None
+            if observer is None
+            else getattr(observer, "submit_resolution_failure_nowait", None)
+        )
+        if not callable(submit) or not derivations:
+            return
+        try:
+            evidence_hash = canonical_content_hash(
+                {
+                    "failure_stage": str(failure_stage),
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                    "legacy_worker_generation": tuple(
+                        item.legacy_worker_generation for item in derivations
+                    ),
+                    "source_reference_sequences": tuple(
+                        item.reference.sequence for item in derivations
+                    ),
+                },
+                domain="dexteleop.legacy_position_resolution_failure_evidence.v1",
+            )
+            for derivation in derivations:
+                submit(
+                    LegacyReferenceResolutionFailureDerivation(
+                        reference_derivation=derivation,
+                        failed_at=float(actual_emit),
+                        failure_stage=str(failure_stage),
+                        error_type=type(error).__name__,
+                        error_message=str(error),
+                        failure_evidence_hash=evidence_hash,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - passive diagnostics only.
+            with self._lock:
+                self._reference_observer_error_count += 1
+                self._last_reference_observer_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    def _notify_reference_generation_invalidation_locked(
+        self,
+        *,
+        legacy_worker_generation: int,
+        reason: str,
+        terminal_status: str,
+    ) -> None:
+        """Observe the real local generation transition without claiming stop ack."""
+
+        observer = self._reference_observer
+        submit = (
+            None
+            if observer is None
+            else getattr(observer, "submit_generation_invalidation_nowait", None)
+        )
+        if not callable(submit):
+            return
+        try:
+            submit(
+                LegacyReferenceGenerationInvalidation(
+                    legacy_worker_generation=int(legacy_worker_generation),
+                    invalidated_at=float(time.monotonic()),
+                    reason=str(reason),
+                    terminal_status=str(terminal_status),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - passive diagnostics only.
+            self._reference_observer_error_count += 1
+            self._last_reference_observer_error = f"{type(exc).__name__}: {exc}"
 
     def _emit_reference(self, *, scheduled_timestamp: float) -> None:
         with self._dispatch_lock:
@@ -2288,6 +2970,10 @@ class PositionDeployExecutor:
                         f"missing reference template for source index {template_index}"
                     )
                 reference_sequence = self._reference_count
+                execution_work_item = self._execution_work_for_reference_locked(
+                    parent_indices=parent_indices,
+                    reference_sequence=reference_sequence,
+                )
 
             metadata = self._reference_metadata(
                 reference_sequence=reference_sequence,
@@ -2298,6 +2984,13 @@ class PositionDeployExecutor:
                 pose_ref=pose_ref,
                 qpos_ref=qpos_ref,
                 parent_indices=parent_indices,
+            )
+            reference_derivations = self._notify_reference_observer(
+                generation=generation,
+                scheduled_timestamp=scheduled_timestamp,
+                actual_emit=actual_emit,
+                pose_ref=pose_ref,
+                qpos_ref=qpos_ref,
             )
             collision_qpos_by_side: Mapping[str, np.ndarray] | None = None
             if self.config.collision_required:
@@ -2312,16 +3005,25 @@ class PositionDeployExecutor:
                     raise RuntimeError(
                         "collision planner is not reset from complete dual-arm qpos"
                     )
-                collision_result = planner.plan_pose_reference(
-                    pose_ref.pose_by_side,
-                    target_reference_frame="arm_base",
-                    target_controlled_frame="tool_tcp",
-                    source_timestamp=float(query),
-                    source=(
-                        f"deploy_pose_reference_{_rate_label(self.config.reference_hz)}hz"
-                    ),
-                    metadata=metadata,
-                )
+                try:
+                    collision_result = planner.plan_pose_reference(
+                        pose_ref.pose_by_side,
+                        target_reference_frame="arm_base",
+                        target_controlled_frame="tool_tcp",
+                        source_timestamp=float(query),
+                        source=(
+                            f"deploy_pose_reference_{_rate_label(self.config.reference_hz)}hz"
+                        ),
+                        metadata=metadata,
+                    )
+                except Exception as exc:
+                    self._notify_reference_resolution_failure_observer(
+                        derivations=reference_derivations,
+                        actual_emit=actual_emit,
+                        failure_stage="planner",
+                        error=exc,
+                    )
+                    raise
                 collision_metadata = self._collision_result_metadata(collision_result)
                 metadata.update(collision_metadata)
                 with self._lock:
@@ -2349,12 +3051,19 @@ class PositionDeployExecutor:
                             (),
                         )
                     )
-                    raise RuntimeError(
+                    planner_error = RuntimeError(
                         "High-rate collision-aware IK failed closed before arm/hand dispatch: "
                         f"endpoint_checked={endpoint_checked}, "
                         f"endpoint_passed={endpoint_passed}, reasons="
                         + (", ".join(reasons) if reasons else "unknown planner failure")
                     )
+                    self._notify_reference_resolution_failure_observer(
+                        derivations=reference_derivations,
+                        actual_emit=actual_emit,
+                        failure_stage="planner",
+                        error=planner_error,
+                    )
+                    raise planner_error
                 collision_qpos_by_side = {
                     side: np.asarray(collision_result.q_ref_by_side[side], dtype=float).copy()
                     for side in self.canonical_pipeline.active_sides
@@ -2367,13 +3076,35 @@ class PositionDeployExecutor:
                 metadata=metadata,
             )
             reference_observation = replace(template.observation, timestamp=wall_emit)
-            result = self.canonical_pipeline.resolve_filtered(
-                reference_filtered,
-                reference_observation,
-                policy_name=template.policy_name,
-            )
-            command = self._validated_command(result)
+            try:
+                result = self.canonical_pipeline.resolve_filtered(
+                    reference_filtered,
+                    reference_observation,
+                    policy_name=template.policy_name,
+                )
+            except Exception as exc:
+                self._notify_reference_resolution_failure_observer(
+                    derivations=reference_derivations,
+                    actual_emit=actual_emit,
+                    failure_stage="resolver",
+                    error=exc,
+                )
+                raise
+            try:
+                command = self._validated_command(result)
+            except Exception as exc:
+                self._notify_reference_resolution_failure_observer(
+                    derivations=reference_derivations,
+                    actual_emit=actual_emit,
+                    failure_stage="command_construction",
+                    error=exc,
+                )
+                raise
             self._annotate_command(command, metadata)
+            if execution_work_item is not None:
+                command.execution_work_item = execution_work_item
+                for effector_command in command.commands.values():
+                    effector_command.execution_work_item = execution_work_item
 
             arm_dispatch_attempted = self.dispatch_callback is not None
             expected_joint_qpos_by_effector = {
@@ -2398,10 +3129,49 @@ class PositionDeployExecutor:
                 ) = self._take_due_discrete_command_locked(query)
                 if arm_dispatch_attempted:
                     self._arm_dispatch_attempt_count += 1
+            self._notify_reference_resolution_observer(
+                derivations=reference_derivations,
+                actual_emit=actual_emit,
+                command=command,
+                collision_qpos_by_side=collision_qpos_by_side,
+                metadata=metadata,
+            )
             if arm_dispatch_attempted:
                 dispatch_result: object = None
                 try:
-                    dispatch_result = self.dispatch_callback(command)
+                    guard = self._execution_epoch_guard
+                    if guard is not None:
+                        assert execution_work_item is not None
+                        check = guard.check_before_backend_call(execution_work_item)
+                        if not check.accepted:
+                            with self._lock:
+                                self._execution_epoch_rejected_count += 1
+                                self._append_debug_event_locked(
+                                    "execution_work_rejected",
+                                    {
+                                        "work_item_id": execution_work_item.work_item_id,
+                                        "checkpoint": check.checkpoint,
+                                        "status": check.status,
+                                    },
+                                )
+                            return
+                        with self._lock:
+                            self._inflight_execution_work_item = execution_work_item
+                            self._last_old_epoch_invocation_started_at = float(
+                                self._clock()
+                            )
+                    try:
+                        dispatch_result = self.dispatch_callback(command)
+                    finally:
+                        if guard is not None:
+                            with self._lock:
+                                self._last_old_epoch_invocation_completed_at = float(
+                                    self._clock()
+                                )
+                                self._last_completed_execution_work_item = (
+                                    execution_work_item
+                                )
+                                self._inflight_execution_work_item = None
                     if dispatch_result is False:
                         raise RuntimeError("arm dispatch callback rejected the reference")
                     if self.config.collision_required:
@@ -2739,6 +3509,13 @@ class PositionDeployExecutor:
             f"->causal_{_rate_label(self.config.reference_hz)}"
             f"->{_rate_label(self.config.command_hz)}"
         )
+        pose_action_interval_velocity = (
+            {}
+            if pose_ref is None
+            else dict(
+                pose_ref.metadata.get("pose_action_interval_velocity", {}) or {}
+            )
+        )
         return {
             "position_execution_contract": chain,
             # Keep the historical metadata key for consumers, but report the
@@ -2777,6 +3554,12 @@ class PositionDeployExecutor:
             "position_pose_interpolation": (
                 "xyz_linear+quaternion_shortest_path_slerp"
                 if pose_ref is not None
+                else None
+            ),
+            "pose_action_interval_velocity": pose_action_interval_velocity,
+            "position_pose_speed_source": (
+                "adjacent_pose_action_interval"
+                if bool(pose_action_interval_velocity.get("quality_valid", False))
                 else None
             ),
             "position_qpos_interpolation": "linear" if qpos_ref is not None else None,
@@ -3137,7 +3920,13 @@ class PositionDeployExecutor:
                     or not self._discrete_queue.empty()
                     or self._hold_retry_required
                 )
+                invalidated_generation = self._generation
                 self._generation += 1
+                self._notify_reference_generation_invalidation_locked(
+                    legacy_worker_generation=invalidated_generation,
+                    reason=f"fault:{stage}",
+                    terminal_status="faulted",
+                )
                 self._reset_stream_locked()
                 self._append_debug_event_locked(
                     "executor_fault",
@@ -3232,6 +4021,7 @@ class PositionDeployExecutor:
         self._staged_lookahead_pose_by_side = None
         self._staged_lookahead_qpos_by_side = None
         self._staged_lookahead_discrete_command = None
+        self._staged_lookahead_execution_work_item = None
         self._terminal_pose_by_side = None
         self._terminal_qpos_by_side = None
         self._terminal_timestamp = None
@@ -3239,6 +4029,7 @@ class PositionDeployExecutor:
         self._pose_resampler.clear()
         self._qpos_resampler.clear()
         self._templates.clear()
+        self._legacy_reference_source_facts.clear()
         self._drain_discrete_queue_locked()
         while True:
             try:

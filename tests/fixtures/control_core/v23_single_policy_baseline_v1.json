@@ -1,0 +1,174 @@
+{
+  "canonical": {
+    "active_effectors": ["right_arm"],
+    "command_effectors": ["right_arm"],
+    "command_policy_name": "control_core_baseline_policy",
+    "command_source": "deploy_canonical_robot_action",
+    "faults": [],
+    "filtered_action": [
+      null, null, null, null, null, null, null,
+      0.11999999731779099, 0.20999999344348907, 0.3100000023841858,
+      0.0, 0.0, 0.0, 1.0,
+      null, null, null, null, null, null, null, null, null, null, null, null
+    ],
+    "right_arm_pose": [
+      0.11999999731779099, 0.20999999344348907, 0.3100000023841858,
+      0.0, 0.0, 0.0, 1.0
+    ],
+    "right_command_type": "cartesian_pose",
+    "right_target_xyzquat": [
+      0.11999999731779099, 0.20999999344348907, 0.3100000023841858,
+      0.0, 0.0, 0.0, 1.0
+    ],
+    "robot_action_source": "deploy_policy:control_core_baseline_policy",
+    "robot_action_space": "bimanual_ee_pose_v1"
+  },
+  "deploy_profiles": {
+    "non_position_impedance": {
+      "action_hz": 15.0,
+      "action_hz_source": "cli.hz",
+      "active_sides": ["right"],
+      "arm_canfd_follow": false,
+      "arm_control_hz": 40.0,
+      "arm_control_mode": "impedance",
+      "position_chunk_lookahead": true,
+      "position_executor_enabled": false,
+      "position_reference_hz": 60.0
+    },
+    "position_default": {
+      "action_hz": 15.0,
+      "action_hz_source": "cli.hz",
+      "active_sides": ["right"],
+      "arm_canfd_follow": true,
+      "arm_control_hz": 120.0,
+      "arm_control_mode": "position",
+      "position_chunk_lookahead": true,
+      "position_executor_enabled": true,
+      "position_reference_hz": 60.0
+    }
+  },
+  "dispatch": {
+    "effectors": ["right_arm"],
+    "intent_count": 1,
+    "mode": "dry_run"
+  },
+  "fixture_id": "v23_single_policy_relative_right_arm_v1",
+  "last_action_contract": {
+    "deploy_update_stage": "accepted_canonical_safe_action",
+    "initial_stage": "unavailable_nan_vector"
+  },
+  "observation": {
+    "active_sides": ["right"],
+    "faults": [],
+    "last_action": [
+      null, null, null, null, null, null, null, null, null, null, null, null,
+      null, null, null, null, null, null, null, null, null, null, null, null,
+      null, null
+    ],
+    "legacy_model_input_keys": [
+      "active_sides",
+      "arms_enabled",
+      "end_effector_sides",
+      "faults",
+      "hands_enabled",
+      "image",
+      "image_ages_sec",
+      "image_timestamps",
+      "images",
+      "last_action",
+      "metadata",
+      "state",
+      "state_dict",
+      "state_valid",
+      "step_index",
+      "tactile",
+      "tactile_by_side",
+      "tactile_valid_by_side",
+      "timestamp"
+    ],
+    "legacy_private_faults": [
+      "injected_control_fault_must_not_enter_strict_view"
+    ],
+    "legacy_private_metadata_keys": [
+      "backend_health",
+      "dispatch_receipt",
+      "reward",
+      "selected_owner",
+      "writer_health"
+    ],
+    "right_arm_pose": [
+      0.10000000149011612, 0.20000000298023224, 0.30000001192092896,
+      0.0, 0.0, 0.0, 1.0
+    ],
+    "step_index": 7,
+    "timestamp": 12.5
+  },
+  "policy": {
+    "chunk_ids": [0, 0],
+    "chunk_indices": [0, 1],
+    "chunk_sizes": [2, 2],
+    "decoded_absolute_actions": [
+      [
+        null, null, null, null, null, null, null,
+        0.11999999731779099, 0.20999999344348907, 0.3100000023841858,
+        0.0, 0.0, 0.0, 1.0,
+        null, null, null, null, null, null, null, null, null, null, null, null
+      ],
+      [
+        null, null, null, null, null, null, null,
+        0.12999999523162842, 0.2199999988079071, 0.3199999928474426,
+        0.0, 0.0, 0.0, 1.0,
+        null, null, null, null, null, null, null, null, null, null, null, null
+      ]
+    ],
+    "pose_anchor_policy": "current_actual_tcp_fixed_for_chunk",
+    "pose_anchor_sides": ["right"],
+    "pose_mode": "relative",
+    "prediction_accepted": true,
+    "queue_len_after": 2,
+    "queue_len_before": 0,
+    "relative_actions": [
+      [
+        null, null, null, null, null, null, null,
+        0.019999995827674866, 0.009999990463256836, 0.009999990463256836,
+        0.0, 0.0, 0.0, 1.0,
+        null, null, null, null, null, null, null, null, null, null, null, null
+      ],
+      [
+        null, null, null, null, null, null, null,
+        0.0299999937415123, 0.019999995827674866, 0.019999980926513672,
+        0.0, 0.0, 0.0, 1.0,
+        null, null, null, null, null, null, null, null, null, null, null, null
+      ]
+    ]
+  },
+  "position_keyframe": {
+    "command_hz": 120.0,
+    "dry_run": true,
+    "event_names": ["keyframe_submitted"],
+    "queue_depth": 1,
+    "reference_hz": 60.0,
+    "sample_hz": 15.0,
+    "source_index": 1,
+    "submitted_count": 1
+  },
+  "runtime_semantics": {
+    "collection_last_action_stage": "previous_session_command_derived_action",
+    "deploy_last_action_stage": "accepted_canonical_safe_action",
+    "dispatch_seam": "TeleopSession.dispatch_command->Rig.send_commands",
+    "teleop_session_order": [
+      "channel_fault_freeze",
+      "command_filter",
+      "command_guard",
+      "record_command",
+      "dispatch_command"
+    ]
+  },
+  "schema": "dexteleop_control_core_baseline_v1",
+  "v23_contracts": {
+    "action_layout_version": "deploy_action_vector.ee_pose_q6.v1",
+    "action_space": "bimanual_ee_pose_v1",
+    "causal_snapshot_hash": "sha256:f5ff39f205ec1714f3730b9bc0efabb9b591428bdd00e9ae9c59ed0e1add41ad",
+    "causal_snapshot_schema": "dexteleop_causal_snapshot_v1"
+  }
+}

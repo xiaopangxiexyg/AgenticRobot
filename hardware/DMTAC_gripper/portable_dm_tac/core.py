@@ -53,6 +53,7 @@ _SDK_OUTPUT_SUPPRESS_ENV = "DMTAC_SUPPRESS_SDK_OUTPUT"
 _SDK_PREFLIGHT_VIDEO_ENV = "DMTAC_PREFLIGHT_VIDEO_OPEN"
 _SDK_RESOLVE_SERIAL_ENV = "DMTAC_RESOLVE_SERIAL_TO_INDEX"
 _SDK_OUTPUT_LOCK = threading.RLock()
+_SDK_IMPORT_PATH_LOCK = threading.RLock()
 _SDK_NOISE_CONFIGURED = False
 _SDK_DISCOVERY_CACHE: tuple[float, List[Any]] | None = None
 _SDK_DISCOVERY_CACHE_TTL_S = 2.0
@@ -189,6 +190,41 @@ def _install_dmrobotics_thread_excepthook() -> None:
         _THREAD_EXCEPTHOOK_INSTALLED = True
 
 
+def _is_dmrobotics_package_path(value: object) -> bool:
+    """Return whether *value* exposes the SDK package as top-level modules."""
+
+    if not isinstance(value, (str, os.PathLike)) or not str(value):
+        return False
+    try:
+        path = Path(value).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        path.name == "dmrobotics"
+        and (path / "__init__.py").is_file()
+        and (path / "utils.py").is_file()
+    )
+
+
+@contextlib.contextmanager
+def _isolate_dmrobotics_import_path():
+    """Contain the vendor SDK's top-level ``sys.path`` side effect.
+
+    dmrobotics 1.2.10 inserts its package directory itself at ``sys.path[0]``.
+    A later multiprocessing ``spawn`` then resolves the repository's ``utils``
+    package as ``dmrobotics/utils.py``.  Keep the SDK root fallback available,
+    but never leave the package directory exposed as a top-level import root.
+    """
+
+    with _SDK_IMPORT_PATH_LOCK:
+        try:
+            yield
+        finally:
+            sys.path[:] = [
+                value for value in sys.path if not _is_dmrobotics_package_path(value)
+            ]
+
+
 def add_local_sdk_path() -> bool:
     """Fallback to the sibling dmrobotics source tree if the package is not installed."""
     package_root = Path(__file__).resolve().parents[1]
@@ -223,23 +259,24 @@ def _import_dmrobotics():
     _install_dmrobotics_thread_excepthook()
     _configure_sdk_noise_filters()
     patch_libudev_for_conda()
-    try:
-        with _suppress_noisy_sdk_output():
-            import dmrobotics  # type: ignore
-    except ImportError as exc:
-        if not add_local_sdk_path():
-            raise RuntimeError(
-                "Cannot import dmrobotics. Install dmrobotics in the active Python "
-                "environment, or keep portable_DMTAC_gripper next to a local dmrobotics directory."
-            ) from exc
+    with _isolate_dmrobotics_import_path():
         try:
             with _suppress_noisy_sdk_output():
                 import dmrobotics  # type: ignore
-        except ImportError as fallback_exc:
-            raise RuntimeError(
-                "Cannot import dmrobotics after checking the installed package and "
-                "the sibling local dmrobotics directory."
-            ) from fallback_exc
+        except ImportError as exc:
+            if not add_local_sdk_path():
+                raise RuntimeError(
+                    "Cannot import dmrobotics. Install dmrobotics in the active Python "
+                    "environment, or keep portable_DMTAC_gripper next to a local dmrobotics directory."
+                ) from exc
+            try:
+                with _suppress_noisy_sdk_output():
+                    import dmrobotics  # type: ignore
+            except ImportError as fallback_exc:
+                raise RuntimeError(
+                    "Cannot import dmrobotics after checking the installed package and "
+                    "the sibling local dmrobotics directory."
+                ) from fallback_exc
     return dmrobotics
 
 
@@ -257,17 +294,18 @@ def discover_devices() -> List[Any]:
     """Return the SDK's detected compliant device records."""
     _configure_sdk_noise_filters()
     patch_libudev_for_conda()
-    try:
-        with _suppress_noisy_sdk_output():
-            from dmrobotics.src.CameraDeviceManager import CameraDeviceManager  # type: ignore
-    except ImportError as exc:
-        _import_dmrobotics()
-        with _suppress_noisy_sdk_output():
-            from dmrobotics.src.CameraDeviceManager import CameraDeviceManager  # type: ignore  # noqa: F401
+    with _isolate_dmrobotics_import_path():
+        try:
+            with _suppress_noisy_sdk_output():
+                from dmrobotics.src.CameraDeviceManager import CameraDeviceManager  # type: ignore
+        except ImportError:
+            _import_dmrobotics()
+            with _suppress_noisy_sdk_output():
+                from dmrobotics.src.CameraDeviceManager import CameraDeviceManager  # type: ignore  # noqa: F401
 
-    with _suppress_noisy_sdk_output():
-        mgr = CameraDeviceManager()
-        devices = mgr.find_devices()
+        with _suppress_noisy_sdk_output():
+            mgr = CameraDeviceManager()
+            devices = mgr.find_devices()
     if devices is None:
         return []
     if isinstance(devices, list):
@@ -686,6 +724,30 @@ class DMTacDevice:
             self.sensor.reset()
             self._last_fid = -1
 
+    def set_base_frame(self, raw: Any) -> None:
+        frame = np.asarray(raw)
+        if frame.shape != (480, 640) or frame.dtype != np.uint8:
+            raise ValueError(
+                f"DM-Tac base frame must be uint8 (480, 640), got {frame.dtype} {frame.shape}"
+            )
+        with self._io_lock:
+            self.ensure_connected()
+            from dmrobotics.src.dmSDK import DMTacImage  # type: ignore  # noqa: PLC0415
+
+            image = DMTacImage(img=np.ascontiguousarray(frame), serial=str(self.dev_id))
+            self.sensor.setBaseFrame(image)
+
+    def get_base_frame_array(self) -> np.ndarray:
+        with self._io_lock:
+            self.ensure_connected()
+            image = self.sensor.getBaseFrame()
+            frame = np.asarray(getattr(image, "img", None))
+            if frame.shape != (480, 640) or frame.dtype != np.uint8:
+                raise ValueError(
+                    f"SDK returned invalid base frame for {self.dev_id!r}: {frame.dtype} {frame.shape}"
+                )
+            return np.ascontiguousarray(frame)
+
     def set_max_fps(self, max_fps: int) -> Any:
         with self._io_lock:
             self.ensure_connected()
@@ -913,6 +975,16 @@ class DMTacMultiDevice:
         with self._io_lock:
             for device in self.devices:
                 device.reset()
+
+    def set_base_frames(self, frames: Mapping[DeviceId, Any]) -> None:
+        with self._io_lock:
+            for device in self.devices:
+                if device.dev_id in frames:
+                    device.set_base_frame(frames[device.dev_id])
+
+    def get_base_frames(self) -> Dict[DeviceId, np.ndarray]:
+        with self._io_lock:
+            return {device.dev_id: device.get_base_frame_array() for device in self.devices}
 
 
 def format_frame_summary(frame: Optional[TacFrame]) -> str:

@@ -137,6 +137,54 @@ def test_decode_udp_payload_keeps_raw_and_promotes_joint_fields() -> None:
     assert decoded["payload_base64"]
 
 
+def test_decode_udp_payload_compact_omits_redundant_raw_json() -> None:
+    payload = json.dumps(
+        {
+            "joint_status": {
+                "joint_position": [1, 2, 3, 4, 5, 6],
+                "joint_speed": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                "joint_current": [10, 20, 30, 40, 50, 60],
+            }
+        }
+    ).encode()
+
+    decoded = trace.decode_udp_payload(payload, compact=True)
+
+    assert decoded["payload_format"] == "json"
+    assert decoded["joint_position_deg"] == [1, 2, 3, 4, 5, 6]
+    assert decoded["joint_speed_deg_s"] == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    assert decoded["joint_current_ma"] == [10, 20, 30, 40, 50, 60]
+    assert "payload_base64" not in decoded
+    assert "payload_json" not in decoded
+
+
+def test_decode_udp_payload_compact_retains_schema_sample_and_binary_error() -> None:
+    payload = json.dumps(
+        {"joint_status": {"joint_position": [1, 2, 3, 4, 5, 6]}}
+    ).encode()
+
+    sample = trace.decode_udp_payload(payload, compact=True, retain_raw=True)
+    invalid = trace.decode_udp_payload(b"\xffinvalid", compact=True)
+
+    assert sample["schema_sample"] is True
+    assert sample["payload_base64"]
+    assert sample["payload_json"]
+    assert invalid["payload_format"] == "binary"
+    assert invalid["payload_base64"]
+
+
+def test_capture_parser_exposes_backward_compatible_full_and_compact_format() -> None:
+    parser = trace.build_parser()
+
+    default_args = parser.parse_args(["capture", "--duration-sec", "30"])
+    compact_args = parser.parse_args(
+        ["capture", "--duration-sec", "30", "--format", "compact"]
+    )
+
+    assert default_args.trace_format == "full"
+    assert compact_args.trace_format == "compact"
+
+
 def test_restore_journal_restores_right_then_left_and_marks_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

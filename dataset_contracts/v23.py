@@ -19,7 +19,11 @@ from .pose_frames import (
     normalize_pose_storage_frame,
     pose_frame_contract_from_metadata,
 )
-from .v22 import PolicyIOLayout, policy_io_layout_from_metadata
+from .v22 import (
+    DEXTELEOP_DATASET_SCHEMA_V22,
+    PolicyIOLayout,
+    policy_io_layout_from_metadata,
+)
 
 
 DEXTELEOP_DATASET_SCHEMA_V23 = "dexteleop_dataset_v2.3"
@@ -27,6 +31,9 @@ V23_POSE_ACTION_MODE_METADATA_KEY = "arm_pose_action_mode"
 V23_POSE_STORAGE_FRAME_METADATA_KEY = "pose_storage_frame"
 V23_SOURCE_SCHEMA_METADATA_KEY = "v23_compatibility_source_schema"
 V23_RELATIVE_ACTION_SUPPORTED_METADATA_KEY = "relative_action_supported"
+V23_COMPATIBILITY_KIND_METADATA_KEY = "v23_compatibility_kind"
+V23_COMPATIBILITY_V22_CANONICAL_DESK = "v22_canonical_desk_migration"
+V23_NATIVE_CAUSAL_SNAPSHOT_METADATA_KEY = "native_v23_causal_snapshot"
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,17 @@ def resolve_v23_dataset_contract(
     info = dict(metadata)
     source_schema = str(info.get("dexteleop_dataset_schema") or "legacy_unversioned")
     is_v23 = source_schema == DEXTELEOP_DATASET_SCHEMA_V23
+    compatibility_kind = str(
+        info.get(V23_COMPATIBILITY_KIND_METADATA_KEY) or ""
+    ).strip()
+    if compatibility_kind and compatibility_kind != V23_COMPATIBILITY_V22_CANONICAL_DESK:
+        raise PoseFrameContractError(
+            f"Unsupported v2.3 compatibility kind {compatibility_kind!r}."
+        )
+    if compatibility_kind and not is_v23:
+        raise PoseFrameContractError(
+            "A v2.3 compatibility kind requires dexteleop_dataset_v2.3 storage."
+        )
     if is_v23 and require_explicit_v23_pose_contract:
         if not isinstance(info.get(POSE_FRAME_CONTRACT_METADATA_KEY), Mapping):
             raise PoseFrameContractError(
@@ -107,11 +125,25 @@ def resolve_v23_dataset_contract(
             )
     if is_v23 and frames.pose_storage_frame not in {"raw_absolute", POSE_STORAGE_FRAME_DESK}:
         raise PoseFrameContractError("v2.3 pose_storage_frame is invalid.")
+    if compatibility_kind:
+        if str(info.get(V23_SOURCE_SCHEMA_METADATA_KEY)) != DEXTELEOP_DATASET_SCHEMA_V22:
+            raise PoseFrameContractError(
+                "v22 canonical-desk compatibility must declare its v2.2 source schema."
+            )
+        if info.get(V23_NATIVE_CAUSAL_SNAPSHOT_METADATA_KEY) is not False:
+            raise PoseFrameContractError(
+                "v22 canonical-desk compatibility must explicitly declare "
+                "native_v23_causal_snapshot=false."
+            )
+        if frames.pose_storage_frame != POSE_STORAGE_FRAME_DESK:
+            raise PoseFrameContractError(
+                "v22 canonical-desk compatibility requires desk_absolute storage."
+            )
     return V23DatasetContract(
         policy_io_layout=layout,
         pose_frames=frames,
         source_schema=source_schema,
-        compatibility_mode=not is_v23,
+        compatibility_mode=not is_v23 or bool(compatibility_kind),
     )
 
 
@@ -152,6 +184,9 @@ __all__ = [
     "V23_POSE_ACTION_MODE_METADATA_KEY",
     "V23_POSE_STORAGE_FRAME_METADATA_KEY",
     "V23_RELATIVE_ACTION_SUPPORTED_METADATA_KEY",
+    "V23_COMPATIBILITY_KIND_METADATA_KEY",
+    "V23_COMPATIBILITY_V22_CANONICAL_DESK",
+    "V23_NATIVE_CAUSAL_SNAPSHOT_METADATA_KEY",
     "V23_SOURCE_SCHEMA_METADATA_KEY",
     "resolve_v23_dataset_contract",
     "v22_to_v23_compatibility_metadata",

@@ -12,6 +12,7 @@ from typing import Any, Mapping, MutableMapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.causal_snapshot import DEFAULT_CAUSAL_SNAPSHOT_CONTRACT
 from dataset_contracts.pose_frames import (
     POSE_STORAGE_FRAME_DESK,
     PoseFrameContract,
@@ -29,10 +30,15 @@ _PACKED_ARM_POSE_FIELDS = (
 )
 
 _SIDE_POSE_FIELD_TEMPLATES = (
+    "action.{side}_arm.pose",
     "observation.{side}_arm.pose",
     "observation.arm.{side}.current_tcp_pose",
     "observation.arm.{side}.commanded_tcp_pose",
     "observation.arm.{side}.actual_tcp_pose",
+)
+
+_RAW_AUDIT_POSE_FIELD_TEMPLATES = (
+    "action.reference.{side}_arm.pose_ref",
 )
 
 
@@ -55,9 +61,55 @@ def _is_false(value: Any) -> bool:
 def _same_pose7(left: np.ndarray, right: np.ndarray) -> bool:
     if not np.allclose(left[:3], right[:3], atol=1e-6, rtol=0.0):
         return False
-    left_quat = left[3:] / np.linalg.norm(left[3:])
-    right_quat = right[3:] / np.linalg.norm(right[3:])
+    left_norm = float(np.linalg.norm(left[3:]))
+    right_norm = float(np.linalg.norm(right[3:]))
+    if left_norm <= 1e-12 or right_norm <= 1e-12:
+        return False
+    left_quat = left[3:] / left_norm
+    right_quat = right[3:] / right_norm
     return bool(abs(float(np.dot(left_quat, right_quat))) >= 1.0 - 1e-6)
+
+
+def _packed_pose7_or_none(
+    row: Mapping[str, Any],
+    *,
+    key: str,
+    side: str,
+) -> np.ndarray | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        packed = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if packed.size < 14:
+        return None
+    start = 0 if side == "left" else 7
+    pose = packed[start : start + 7]
+    return pose.copy() if np.all(np.isfinite(pose)) else None
+
+
+def _require_matching_pose_copy(
+    failures: list[str],
+    *,
+    row: Mapping[str, Any],
+    key: str,
+    side: str,
+    expected: np.ndarray,
+    packed: bool,
+    failure_name: str,
+) -> None:
+    try:
+        candidate = (
+            _packed_pose7_or_none(row, key=key, side=side)
+            if packed
+            else _pose7_or_none(row.get(key), name=f"row.{key}")
+        )
+    except PoseFrameContractError:
+        candidate = None
+    if candidate is None or not _same_pose7(candidate, expected):
+        failures.append(f"{side}:{failure_name}")
 
 
 def validate_v23_collection_row_actual_tcp(
@@ -97,24 +149,56 @@ def validate_v23_collection_row_actual_tcp(
             failures.append(f"{side}:missing_or_nonfinite_actual_tcp_pose")
             continue
 
-        state_pose_key = f"observation.{side}_arm.pose"
-        try:
-            state_pose = _pose7_or_none(
-                row.get(state_pose_key),
-                name=f"row.{state_pose_key}",
-            )
-        except PoseFrameContractError:
-            state_pose = None
-        state_quaternion_norm = (
-            None if state_pose is None else float(np.linalg.norm(state_pose[3:]))
+        _require_matching_pose_copy(
+            failures,
+            row=row,
+            key=f"observation.{side}_arm.pose",
+            side=side,
+            expected=pose,
+            packed=False,
+            failure_name="observation_state_pose_is_not_actual_tcp",
         )
-        if (
-            state_pose is None
-            or state_quaternion_norm is None
-            or state_quaternion_norm <= 1e-12
-            or not _same_pose7(state_pose, pose)
-        ):
-            failures.append(f"{side}:observation_state_pose_is_not_actual_tcp")
+        _require_matching_pose_copy(
+            failures,
+            row=row,
+            key="observation.state",
+            side=side,
+            expected=pose,
+            packed=True,
+            failure_name="packed_observation_state_pose_is_not_actual_tcp",
+        )
+        _require_matching_pose_copy(
+            failures,
+            row=row,
+            key="observation.arm.pose",
+            side=side,
+            expected=pose,
+            packed=True,
+            failure_name="observation_arm_pose_copy_is_not_actual_tcp",
+        )
+
+        action_pose = _packed_pose7_or_none(row, key="action", side=side)
+        if action_pose is None:
+            failures.append(f"{side}:missing_packed_action_pose")
+        else:
+            _require_matching_pose_copy(
+                failures,
+                row=row,
+                key="action.arm.pose",
+                side=side,
+                expected=action_pose,
+                packed=True,
+                failure_name="action_arm_pose_copy_disagrees",
+            )
+            _require_matching_pose_copy(
+                failures,
+                row=row,
+                key=f"action.{side}_arm.pose",
+                side=side,
+                expected=action_pose,
+                packed=False,
+                failure_name="action_side_pose_copy_disagrees",
+            )
 
         pose_source = str(row.get(f"{prefix}actual_tcp_pose_source") or "").strip()
         if rm65_source:
@@ -284,9 +368,24 @@ def bind_collection_row_pose_storage(
                     name=f"row.{key}",
                 )
 
+    # q_ref FK is a controller/raw-frame audit value, not a model action copy.
+    # Preserve its numeric value and make its per-side source frame explicit.
+    for side in contract.source.active_sides:
+        for template in _RAW_AUDIT_POSE_FIELD_TEMPLATES:
+            key = template.format(side=side)
+            if key in output and output[key] is not None:
+                output[f"{key}_frame"] = contract.source.raw_frame(side)
+
     output["dexteleop.dataset_schema"] = DEXTELEOP_DATASET_SCHEMA_V23
     output["dexteleop.pose_storage_frame"] = contract.pose_storage_frame
     output["dexteleop.pose_source_id"] = contract.source_id
+    output["dexteleop.pose_frame_contract_hash"] = contract.contract_hash
+    output["dexteleop.causal_snapshot_contract"] = (
+        DEFAULT_CAUSAL_SNAPSHOT_CONTRACT.schema
+    )
+    output["dexteleop.causal_snapshot_contract_hash"] = (
+        DEFAULT_CAUSAL_SNAPSHOT_CONTRACT.contract_hash
+    )
     return output
 
 

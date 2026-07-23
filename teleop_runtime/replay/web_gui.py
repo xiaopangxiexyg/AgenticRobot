@@ -11,6 +11,17 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
+from teleop_runtime.action.replay_shadow_frontend import ReplayGuiShadowProfile
+from robot_motion.rm65 import (
+    RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_POSITION_CONTROL_PROFILE_CHOICES,
+)
+
+from ..configs.dmtac_hardware import (
+    add_dmtac_assignment_arguments,
+    dmtac_backend_configs_from_assignment,
+    load_dmtac_hardware_assignment,
+)
 from ..http_security import (
     CONTROL_TOKEN_HEADER,
     DEFAULT_MAX_CONTROL_BODY_BYTES,
@@ -24,9 +35,11 @@ from .arm_init.qpos_execute import normalize_qpos_init_max_angvel
 from .executor import ReplayExecutionSettings
 from .hardware import (
     DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
+    END_EFFECTOR_BACKEND_DMTAC_GRIPPER,
     RM65_ARM_CONTROL_MODE_POSITION,
     RM65_ARM_CONTROL_MODES,
     ReplayHardwareConfig,
+    normalize_end_effector_backend,
 )
 from .session import ReplayGuiSession
 
@@ -843,7 +856,7 @@ INDEX_HTML = r"""<!doctype html>
       const settings = execution.settings || {};
       const ips = config.arm_ip_by_side || {};
       const profiles = config.tool_profile_by_side || {};
-      fieldValue(els.activeSides, activeSidesValue(config.active_sides || execution.active_sides || ["right"]));
+      fieldValue(els.activeSides, activeSidesValue(config.active_sides || execution.active_sides || ["left", "right"]));
       fieldValue(els.leftArmIp, ips.left || "");
       fieldValue(els.rightArmIp, ips.right || "");
       fieldValue(els.leftToolProfile, profiles.left || "");
@@ -1155,6 +1168,89 @@ def _parse_unit_interval_float(text: str) -> float:
     return value
 
 
+def _resolve_replay_dmtac_fields(
+    args: argparse.Namespace,
+    *,
+    active_sides: Sequence[str],
+    end_effector_backend_by_side: Mapping[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Resolve replay DMTAC serial settings with the shared assignment precedence."""
+    dmtac_sides = tuple(
+        str(side)
+        for side in active_sides
+        if normalize_end_effector_backend(
+            end_effector_backend_by_side.get(str(side))
+        )
+        == END_EFFECTOR_BACKEND_DMTAC_GRIPPER
+    )
+    fields: dict[str, dict[str, Any]] = {
+        "port": {},
+        "id": {},
+        "baudrate": {},
+        "timeout": {},
+    }
+    if not bool(args.end_effectors_enabled) or not dmtac_sides:
+        return fields
+
+    if bool(getattr(args, "dmtac_default_config", True)):
+        try:
+            assignment = load_dmtac_hardware_assignment(
+                str(getattr(args, "dmtac_config", "latest") or "latest"),
+                validate_current_usb=bool(
+                    getattr(args, "dmtac_validate_current_usb", True)
+                ),
+                allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
+                assume_yes_for_extra=bool(
+                    getattr(args, "dmtac_assume_yes_for_extra", True)
+                ),
+            )
+            configs = dmtac_backend_configs_from_assignment(
+                assignment,
+                active_sides=dmtac_sides,
+                speed=float(args.gripper_speed),
+                torque=float(args.gripper_torque),
+                max_action=float(args.gripper_max_action),
+            )
+            for side, config in configs.items():
+                if not bool(config.connect_hardware):
+                    continue
+                fields["port"][side] = str(config.gripper_port)
+                fields["id"][side] = int(config.gripper_id)
+                fields["baudrate"][side] = int(config.gripper_baudrate)
+                fields["timeout"][side] = float(config.gripper_timeout)
+        except Exception as exc:  # noqa: BLE001
+            if bool(getattr(args, "dmtac_config_required", False)):
+                raise RuntimeError(
+                    "Failed to load DMTAC hardware assignment "
+                    f"{getattr(args, 'dmtac_config', 'latest')!r}: {exc}"
+                ) from exc
+            print(
+                f"[ReplayGUI] WARNING: could not load DMTAC hardware assignment: {exc}",
+                flush=True,
+            )
+
+    for side in dmtac_sides:
+        port = str(getattr(args, f"{side}_gripper_port", "") or "").strip()
+        if not port:
+            continue
+        fields["port"][side] = port
+        fields["id"][side] = int(getattr(args, f"{side}_gripper_id", 1) or 1)
+        fields["baudrate"][side] = int(
+            getattr(args, f"{side}_gripper_baudrate", 115200) or 115200
+        )
+        fields["timeout"][side] = float(
+            getattr(args, f"{side}_gripper_timeout", 0.10) or 0.10
+        )
+
+    missing = [side for side in dmtac_sides if side not in fields["port"]]
+    if missing and bool(getattr(args, "dmtac_config_required", False)):
+        raise RuntimeError(
+            "DMTAC hardware assignment does not define replay grippers for active "
+            f"sides: {missing}"
+        )
+    return fields
+
+
 def _should_log_http_message(access_log: bool, args: tuple[Any, ...]) -> bool:
     if access_log:
         return True
@@ -1424,6 +1520,8 @@ def run_server(
     unsafe_allow_remote_web: bool = False,
     allowed_web_hosts: Sequence[str] = (),
     access_log: bool = False,
+    replay_action_shadow: bool = False,
+    replay_action_shadow_profile: ReplayGuiShadowProfile | None = None,
 ) -> ThreadingHTTPServer:
     local_hardware_output_armed = bool(hardware_output_armed or send_actions)
     session = ReplayGuiSession(
@@ -1431,6 +1529,8 @@ def run_server(
         execution_settings=execution_settings,
         send_actions=bool(send_actions),
         end_effectors_enabled=bool(end_effectors_enabled),
+        replay_action_shadow=bool(replay_action_shadow),
+        replay_action_shadow_profile=replay_action_shadow_profile,
     )
     if dataset_root is not None and str(dataset_root):
         session.load_dataset(dataset_root, episode=episode)
@@ -1511,10 +1611,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log every HTTP request. By default only 4xx/5xx replay GUI requests are logged.",
     )
     parser.add_argument(
+        "--replay-action-shadow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the default-off passive replay ActionProposal/Arbiter shadow. "
+            "It consumes the existing source-frame tap and never owns dispatch."
+        ),
+    )
+    parser.add_argument(
+        "--replay-action-shadow-trace-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional debug WAL root for passive replay shadow RuntimeTraceSession "
+            "records; this is not a formal dataset episode."
+        ),
+    )
+    parser.add_argument(
+        "--replay-action-shadow-queue-size",
+        type=int,
+        default=4096,
+        help="Bounded nonblocking passive replay emission queue capacity.",
+    )
+    parser.add_argument(
+        "--replay-action-shadow-trace-capacity",
+        type=int,
+        default=65536,
+        help="Maximum in-memory passive replay ControlTrace facts.",
+    )
+    parser.add_argument(
+        "--replay-action-shadow-wal-max-bytes",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="Maximum debug WAL size when a shadow trace root is configured.",
+    )
+    parser.add_argument(
         "--active-sides",
         choices=("left", "right", "both"),
-        default="right",
-        help="Arm side(s) used for hardware trajectory replay.",
+        default="both",
+        help=(
+            "Arm side(s) used for hardware trajectory replay. Defaults to both because "
+            "position collision planning is a coupled dual-arm safety contract."
+        ),
     )
     parser.add_argument("--left-arm-ip", default="", help="RM65 left arm IP for hardware replay.")
     parser.add_argument("--right-arm-ip", default="", help="RM65 right arm IP for hardware replay.")
@@ -1524,19 +1663,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--arm-control-mode",
         choices=RM65_ARM_CONTROL_MODES,
         default=RM65_ARM_CONTROL_MODE_POSITION,
-        help="RM65 replay execution mode. Position defaults to CANFD follow at 150Hz; impedance defaults to 40Hz.",
+        help="RM65 replay execution mode. Position defaults to CANFD follow at 120Hz; impedance defaults to 40Hz.",
     )
     parser.add_argument(
         "--arm-control-hz",
         type=float,
         default=None,
-        help="RM65 replay command/update rate. Defaults to 150Hz for position and 40Hz for impedance.",
+        help="RM65 replay command/update rate. Defaults to 120Hz for position and 40Hz for impedance.",
     )
     parser.add_argument(
         "--position-reference-hz",
         type=float,
         default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
         help="Position replay pose-reference/IK rate between source actions and the command stream.",
+    )
+    parser.add_argument(
+        "--position-control-profile",
+        choices=RM65_POSITION_CONTROL_PROFILE_CHOICES,
+        default=RM65_BIMANUAL_POSITION_V1_NAME,
+        help=(
+            "Position action-execution profile. Formal replay does not repeat "
+            "collection-side source/qref shaping; legacy preserves the previous adapter."
+        ),
     )
     parser.add_argument(
         "--position-workspace-min",
@@ -1600,8 +1748,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--position-collision-max-joint-velocity-rad-s",
-        default="0.35,0.35,0.35,0.5,0.5,0.5",
-        help="One or six per-joint safety velocity limits used at the high-rate IK stage.",
+        default=",".join(
+            str(value)
+            for value in ReplayExecutionSettings().position_collision_max_joint_velocity_rad_s
+        ),
+        help=(
+            "One or six per-joint safety velocity limits used at the high-rate IK stage. "
+            "Defaults to the rm65_position_2x profile."
+        ),
     )
     parser.add_argument(
         "--position-collision-max-joint-step-rad",
@@ -1682,7 +1836,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hand-backend",
-        choices=("none", "inspire_tac", "dmtac_gripper"),
+        choices=(
+            "none",
+            "inspire_tac",
+            "inspire-tac",
+            "dmtac_gripper",
+            "dmtac-gripper",
+        ),
         default="none",
         help="Default active-side end-effector backend for hardware replay.",
     )
@@ -1692,10 +1852,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--right-hand-ip", default="", help="Right Inspire hand IP for end-effector replay.")
     parser.add_argument("--left-hand-port", type=int, default=6000, help="Left Inspire hand port.")
     parser.add_argument("--right-hand-port", type=int, default=6000, help="Right Inspire hand port.")
-    parser.add_argument("--left-gripper-port", default="", help="Left DMTAC gripper serial port.")
-    parser.add_argument("--right-gripper-port", default="", help="Right DMTAC gripper serial port.")
-    parser.add_argument("--left-gripper-id", type=int, default=1, help="Left DMTAC gripper Modbus id.")
-    parser.add_argument("--right-gripper-id", type=int, default=1, help="Right DMTAC gripper Modbus id.")
+    add_dmtac_assignment_arguments(parser, assignment_includes_tactile=False)
     parser.add_argument("--gripper-speed", type=float, default=1.0, help="DMTAC gripper speed for replay.")
     parser.add_argument("--gripper-torque", type=float, default=1.0, help="DMTAC gripper torque/force for replay.")
     parser.add_argument("--gripper-max-action", type=float, default=1.0, help="DMTAC max normalized close command.")
@@ -1705,6 +1862,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     active_sides = ("left", "right") if args.active_sides == "both" else (str(args.active_sides),)
+    end_effector_backend_by_side = {
+        "left": str(args.left_hand_backend or args.hand_backend or "none"),
+        "right": str(args.right_hand_backend or args.hand_backend or "none"),
+    }
+    dmtac_fields = _resolve_replay_dmtac_fields(
+        args,
+        active_sides=active_sides,
+        end_effector_backend_by_side=end_effector_backend_by_side,
+    )
     hardware_config = ReplayHardwareConfig(
         active_sides=active_sides,
         arm_ip_by_side={
@@ -1716,10 +1882,7 @@ def main(argv: list[str] | None = None) -> None:
             "right": str(args.right_tool_profile or ""),
         },
         end_effectors_enabled=bool(args.end_effectors_enabled),
-        end_effector_backend_by_side={
-            "left": str(args.left_hand_backend or args.hand_backend or "none"),
-            "right": str(args.right_hand_backend or args.hand_backend or "none"),
-        },
+        end_effector_backend_by_side=end_effector_backend_by_side,
         hand_ip_by_side={
             "left": str(args.left_hand_ip or ""),
             "right": str(args.right_hand_ip or ""),
@@ -1728,14 +1891,10 @@ def main(argv: list[str] | None = None) -> None:
             "left": int(args.left_hand_port),
             "right": int(args.right_hand_port),
         },
-        gripper_port_by_side={
-            "left": str(args.left_gripper_port or ""),
-            "right": str(args.right_gripper_port or ""),
-        },
-        gripper_id_by_side={
-            "left": int(args.left_gripper_id),
-            "right": int(args.right_gripper_id),
-        },
+        gripper_port_by_side=dict(dmtac_fields["port"]),
+        gripper_id_by_side=dict(dmtac_fields["id"]),
+        gripper_baudrate_by_side=dict(dmtac_fields["baudrate"]),
+        gripper_timeout_by_side=dict(dmtac_fields["timeout"]),
         gripper_speed=float(args.gripper_speed),
         gripper_torque=float(args.gripper_torque),
         gripper_max_action=float(args.gripper_max_action),
@@ -1760,6 +1919,7 @@ def main(argv: list[str] | None = None) -> None:
         position_max_xyz_step_m=float(args.position_max_xyz_step_m),
         position_max_rot_step_deg=float(args.position_max_rot_step_deg),
         position_max_joint_step_rad=float(args.position_max_joint_step_rad),
+        position_control_profile_name=str(args.position_control_profile),
         position_collision_required=bool(args.position_collision_required),
         position_collision_scene_profile=str(args.position_collision_scene_profile),
         position_collision_min_distance_m=float(
@@ -1795,6 +1955,17 @@ def main(argv: list[str] | None = None) -> None:
         unsafe_allow_remote_web=bool(args.unsafe_allow_remote_web),
         allowed_web_hosts=tuple(args.web_allowed_host),
         access_log=bool(args.access_log),
+        replay_action_shadow=bool(args.replay_action_shadow),
+        replay_action_shadow_profile=(
+            ReplayGuiShadowProfile(
+                queue_capacity=int(args.replay_action_shadow_queue_size),
+                trace_capacity=int(args.replay_action_shadow_trace_capacity),
+                trace_root=args.replay_action_shadow_trace_root,
+                wal_max_bytes=int(args.replay_action_shadow_wal_max_bytes),
+            )
+            if args.replay_action_shadow
+            else None
+        ),
     )
 
 

@@ -29,16 +29,18 @@ from cameras.configs import (
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )
 from project_paths import calibration_profiles_dir, default_dataset_root
+from robot_motion.pose_frame_profiles import default_rm65_workspace_near_boundary_collection_pose_frame_contract
 from robot_motion.rm65.assets import require_asset_path
 
 from ..backends.arms import RM65ArmBackend, RM65ArmBackendConfig
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
+    DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
     DMTAC_TACTILE_FIELDS,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
     GRIPPER_ACTION_MAX,
-    dmtac_tactile_requires_calibration,
     normalize_dmtac_tactile_fields,
 )
 from ..backends.hands import (
@@ -51,8 +53,11 @@ from ..calibration import TeleopCalibration
 from ..cameras import build_camera_registry_snapshot, load_camera_registry
 from ..configs import build_annotated_dual_rm65_calibration
 from ..configs.dmtac_hardware import (
+    add_dmtac_assignment_arguments,
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
+    manual_dmtac_backend_config_for_side,
+    require_dmtac_sides_resolved,
 )
 from ..configs.q6_hardware import load_latest_q6_ports
 from ..defaults import (
@@ -206,7 +211,8 @@ GRIPPER_POLICY_DEFAULTS = {
     "send_threshold": 0.002,
     "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
     "continuous_grasp": True,
-    "telemetry_hz": 10.0,
+    "telemetry_hz": DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
+    "telemetry_command_grace_s": DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
 }
 
 
@@ -591,6 +597,7 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "telemetry_command_grace_s": ("telemetry_command_grace_s",),
         "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
         "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
@@ -613,6 +620,9 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": getattr(args, "gripper_command_hz", None),
         "continuous_grasp": getattr(args, "gripper_continuous_grasp", None),
         "telemetry_hz": getattr(args, "gripper_telemetry_hz", None),
+        "telemetry_command_grace_s": getattr(
+            args, "gripper_telemetry_command_grace_s", None
+        ),
     }
     for key, value in cli_overrides.items():
         if value is not None:
@@ -632,6 +642,9 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    policy["telemetry_command_grace_s"] = float(
+        policy["telemetry_command_grace_s"]
+    )
     if policy.get("tactile_fields") is not None:
         policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
     if policy.get("tactile_compute_profile") is not None:
@@ -650,6 +663,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("gripper command_hz must be > 0.")
     if float(policy["telemetry_hz"]) <= 0.0:
         raise ValueError("gripper telemetry_hz must be > 0.")
+    if float(policy["telemetry_command_grace_s"]) < 0.0:
+        raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
     setattr(args, "_resolved_gripper_policy", dict(policy))
     return dict(policy)
 
@@ -659,33 +674,6 @@ def _dmtac_tactile_enabled(args: argparse.Namespace) -> bool:
     if explicit is not None:
         return bool(explicit)
     return bool(getattr(args, "with_tactile", True))
-
-
-def _manual_dmtac_config_for_side(
-    args: argparse.Namespace,
-    side: str,
-    policy: Mapping[str, Any],
-) -> DMTacGripperBackendConfig | None:
-    port = str(getattr(args, f"{side}_gripper_port", "") or "").strip()
-    if not port:
-        return None
-    return DMTacGripperBackendConfig(
-        side=side,
-        effector_name=f"{side}_hand",
-        gripper_port=port,
-        gripper_id=int(getattr(args, f"{side}_gripper_id", 1) or 1),
-        command_dim=int(policy["output_dim"]),
-        speed=float(policy["speed"]),
-        torque=float(policy["torque"]),
-        max_action=float(policy["max_action"]),
-        send_threshold=float(policy["send_threshold"]),
-        command_hz=float(policy["command_hz"]),
-        continuous_grasp=bool(policy["continuous_grasp"]),
-        enable_telemetry=True,
-        telemetry_hz=float(policy["telemetry_hz"]),
-        connect_tactile=False,
-        tactile_ids=(),
-    )
 
 
 def _apply_gripper_policy_to_dmtac_config(
@@ -702,6 +690,12 @@ def _apply_gripper_policy_to_dmtac_config(
     config.command_hz = float(policy["command_hz"])
     config.continuous_grasp = bool(policy["continuous_grasp"])
     config.telemetry_hz = float(policy["telemetry_hz"])
+    config.gripper_telemetry_command_grace_s = float(
+        policy.get(
+            "telemetry_command_grace_s",
+            DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
+        )
+    )
     tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
     if tactile_timeout_ms is not None:
         config.tactile_timeout_ms = int(tactile_timeout_ms)
@@ -734,9 +728,7 @@ def _apply_gripper_policy_to_dmtac_config(
     elif policy.get("tactile_compute_profile"):
         config.tactile_compute_profile = str(policy["tactile_compute_profile"])
     tactile_calibrate = getattr(args, "dmtac_tactile_calibrate", None)
-    if tactile_calibrate is None:
-        config.tactile_reset_on_start = dmtac_tactile_requires_calibration(config.tactile_fields)
-    else:
+    if tactile_calibrate is not None:
         config.tactile_reset_on_start = bool(tactile_calibrate)
     tactile_max_fps = getattr(args, "dmtac_tactile_max_fps", None)
     if tactile_max_fps is not None:
@@ -809,7 +801,7 @@ def _dmtac_backend_configs(
             _log("DMTAC", f"WARNING: could not load DMTAC hardware assignment: {exc}")
 
     for side in dmtac_sides:
-        manual = _manual_dmtac_config_for_side(args, side, policy)
+        manual = manual_dmtac_backend_config_for_side(args, side, policy)
         if manual is not None:
             configs[side] = manual
 
@@ -818,6 +810,12 @@ def _dmtac_backend_configs(
         for side, config in configs.items()
         if side in active_sides and (config.connect_hardware or config.connect_tactile)
     }
+    if bool(getattr(args, "dmtac_config_required", False)):
+        require_dmtac_sides_resolved(
+            dmtac_sides,
+            resolved,
+            config=str(getattr(args, "dmtac_config", "latest") or "latest"),
+        )
     setattr(args, "_dmtac_backend_configs", dict(resolved))
     setattr(args, "dmtac_config_loaded_sides", sorted(resolved))
     return dict(resolved)
@@ -1102,47 +1100,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail if --q6-config cannot be loaded while an active side is missing a hand port.",
     )
-    parser.add_argument("--left-gripper-port", type=str, default="", help="Optional left 1D gripper serial port.")
-    parser.add_argument("--right-gripper-port", type=str, default="", help="Optional right 1D gripper serial port.")
-    parser.add_argument("--left-gripper-id", type=int, default=1, help="Left gripper Modbus id.")
-    parser.add_argument("--right-gripper-id", type=int, default=1, help="Right gripper Modbus id.")
-    parser.add_argument(
-        "--dmtac-config",
-        type=str,
-        default="latest",
-        help="DMTAC gripper/tactile assignment config used when --hand-backend dmtac-gripper.",
-    )
-    parser.add_argument(
-        "--no-dmtac-default-config",
-        dest="dmtac_default_config",
-        action="store_false",
-        default=True,
-        help="Do not auto-load DMTAC gripper/tactile ports from latest assignment.",
-    )
-    parser.add_argument(
-        "--dmtac-config-required",
-        action="store_true",
-        help="Fail if --dmtac-config cannot be loaded for --hand-backend dmtac-gripper.",
-    )
-    parser.add_argument(
-        "--dmtac-allow-missing",
-        action="store_true",
-        help="Allow configured DMTAC gripper/tactile devices to be missing during USB validation.",
-    )
-    parser.add_argument(
-        "--dmtac-no-validate-current-usb",
-        dest="dmtac_validate_current_usb",
-        action="store_false",
-        default=True,
-        help="Load DMTAC assignment without probing current USB devices.",
-    )
-    parser.add_argument(
-        "--dmtac-confirm-extra",
-        dest="dmtac_assume_yes_for_extra",
-        action="store_false",
-        default=True,
-        help="Ask before continuing when extra unassigned DMTAC devices are detected.",
-    )
+    add_dmtac_assignment_arguments(parser, assignment_includes_tactile=True)
     parser.add_argument(
         "--dmtac-tactile-backend",
         type=str,
@@ -1268,15 +1226,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=None,
         help=(
-            "Capture a DM-Tac no-contact base frame before reads. This is enabled automatically "
-            "when requesting solved tactile fields and disabled for raw-image-only collection."
+            "Explicitly capture a DM-Tac no-contact base frame before reads. "
+            "Disabled by default for raw images and solved tactile fields."
         ),
     )
     parser.add_argument(
         "--dmtac-tactile-no-calibrate",
         dest="dmtac_tactile_calibrate",
         action="store_false",
-        help="Do not capture a DM-Tac base frame at startup, even for solved tactile fields.",
+        help="Do not capture a DM-Tac base frame at startup (the default).",
     )
     parser.add_argument(
         "--dmtac-tactile-denoise",
@@ -1359,6 +1317,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-no-continuous", dest="gripper_continuous_grasp", action="store_false")
     parser.add_argument("--gripper-command-hz", type=_positive_float, default=None)
     parser.add_argument("--gripper-telemetry-hz", type=_positive_float, default=None)
+    parser.add_argument(
+        "--gripper-telemetry-command-grace-s", type=float, default=None
+    )
     parser.add_argument("--hand-reader-baudrate", type=int, default=115200, help="Hand q6 baudrate.")
     parser.add_argument(
         "--hand-reader-timeout",
@@ -1456,7 +1417,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
         help=(
             "Teleop IK/safety/qpos-reference rate for position control. This clock is "
-            "independent of --hz and defaults to 75 Hz."
+            "independent of --hz and defaults to 60 Hz."
         ),
     )
     parser.add_argument(
@@ -1472,7 +1433,7 @@ def parse_args() -> argparse.Namespace:
         "--arm-control-hz",
         type=_positive_float,
         default=DEFAULT_RM65_POSITION_ARM_CONTROL_HZ,
-        help="RM65 position command streaming rate beneath each qpos reference. Defaults to 150 Hz.",
+        help="RM65 position command streaming rate beneath each qpos reference. Defaults to 120 Hz.",
     )
     parser.add_argument(
         "--dual-arm-ik-hz",
@@ -1654,15 +1615,25 @@ def parse_args() -> argparse.Namespace:
             "collection keeps LeRobot-v2.1-style storage but writes typed v2.2 fields."
         ),
     )
-    parser.add_argument(
+    pose_frame_group = parser.add_mutually_exclusive_group()
+    pose_frame_group.add_argument(
         "--pose-frame-contract",
         type=load_pose_frame_contract,
         default=None,
         metavar="JSON",
         help=(
-            "Optional explicit v2.3 pose-frame contract JSON. Requires "
+            "Explicit v2.3 pose-frame contract JSON. Requires "
             "--policy-io-layout auto or a layout JSON. raw_absolute preserves pose values; "
-            "desk_absolute converts only the detached writer row."
+            "desk_absolute converts only the detached writer row. Dual-RM65 collection "
+            "defaults to the calibrated URDF workspace-near-boundary desk contract."
+        ),
+    )
+    pose_frame_group.add_argument(
+        "--no-pose-frame-contract",
+        action="store_true",
+        help=(
+            "Disable the default dual-RM65 v2.3 desk contract and retain the legacy "
+            "v2.2/raw collection path."
         ),
     )
     parser.add_argument(
@@ -2017,6 +1988,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args(_normalize_qpos_option_argv(sys.argv[1:]))
     if args.nominal_fps is None:
         args.nominal_fps = float(args.hz)
+    args.pose_frame_contract_source = (
+        "explicit" if args.pose_frame_contract is not None else "disabled"
+    )
+    if args.pose_frame_contract is None and not bool(args.no_pose_frame_contract):
+        default_contract = default_rm65_workspace_near_boundary_collection_pose_frame_contract(args.active_sides)
+        if default_contract is not None:
+            args.pose_frame_contract = default_contract
+            args.pose_frame_contract_source = "default_rm65_dual_arm_workspace_near_boundary_v1"
+            if not str(args.policy_io_layout).strip():
+                args.policy_io_layout = "auto"
     if args.pose_frame_contract is not None and not str(args.policy_io_layout).strip():
         parser.error(
             "--pose-frame-contract requires --policy-io-layout auto or an explicit layout JSON."
@@ -5517,6 +5498,18 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
         hand_retargeters_by_side={
             side: hand_retargeters.get(side) for side in active_sides
         },
+        arm_reference_frame_by_side=(
+            None
+            if args.pose_frame_contract is None
+            else {
+                side: (
+                    args.pose_frame_contract.canonical_absolute_frame
+                    if args.pose_frame_contract.pose_storage_frame == "desk_absolute"
+                    else args.pose_frame_contract.source.raw_frame(side)
+                )
+                for side in active_sides
+            }
+        ),
     )
     writer = LeRobotV21Writer(
         LeRobotV21WriterConfig(
@@ -5575,6 +5568,7 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
                 sample_timestamp=float(sample_timestamp)
             )
         ),
+        hand_state_provider_returns_isolated=hand_state_poller is not None,
         position_reference_provider=position_reference_publisher.reference_for_sample,
     )
     writer_pool = AsyncWriterPool(

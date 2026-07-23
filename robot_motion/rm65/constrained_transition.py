@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -18,6 +18,10 @@ from robot_motion.arm_init.constrained_transition import (
     evaluate_transition_state,
     plan_constrained_qpos_transition,
 )
+from robot_motion.arm_init.sampling_transition import (
+    ArmSamplingTransitionConfig,
+    plan_sampling_constrained_qpos_transition,
+)
 from robot_motion.pose import as_strict_pose_matrix
 
 from .constants import ARM_DOF, LEFT, RIGHT, SIDES
@@ -33,12 +37,14 @@ RM65ConstrainedTransitionConfig = ArmConstrainedTransitionConfig
 RM65TransitionPlanStep = ArmTransitionPlanStep
 RM65ConstrainedTransitionPlan = ArmConstrainedTransitionPlan
 RM65DualArmTransitionModel = ArmTransitionModel
+RM65SamplingTransitionConfig = ArmSamplingTransitionConfig
 
 
 @dataclass
 class RM65DualArmCollisionIKTransitionModel:
     bundle: RM65DualArmCollisionIKBundle
     reference_full_q: np.ndarray | None = None
+    last_collision_details: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_config(
@@ -70,8 +76,13 @@ class RM65DualArmCollisionIKTransitionModel:
             return None
         value = method(self._full_q(_as_dual_qpos(qpos_by_side)))
         if value is None:
+            self.last_collision_details = {"min_distance_m": None}
             return None
+        self.last_collision_details = self._closest_collision_details(float(value))
         return float(value)
+
+    def collision_distance_details(self) -> Mapping[str, Any]:
+        return dict(self.last_collision_details)
 
     def singularity_margin_by_side(self, qpos_by_side: Mapping[str, np.ndarray]) -> Mapping[str, Any]:
         del qpos_by_side
@@ -89,6 +100,35 @@ class RM65DualArmCollisionIKTransitionModel:
         )
         self.reference_full_q = full_q.copy()
         return full_q
+
+    def _closest_collision_details(self, min_distance: float) -> dict[str, Any]:
+        try:
+            robot = self.bundle.solver.robot
+            pairs = robot.collision_model.collisionPairs
+            results = robot.collision_data.distanceResults
+            geometries = robot.collision_model.geometryObjects
+
+            def distance_at(index: int) -> float:
+                raw = getattr(results[index], "min_distance", None)
+                if raw is None:
+                    raw = getattr(results[index], "minimum_distance", float("inf"))
+                return float(raw)
+
+            best_index = min(
+                range(min(len(pairs), len(results))),
+                key=distance_at,
+            )
+            pair = pairs[best_index]
+            return {
+                "min_distance_m": float(min_distance),
+                "pair_index": int(best_index),
+                "geometry_pair": (
+                    str(geometries[pair.first].name),
+                    str(geometries[pair.second].name),
+                ),
+            }
+        except Exception:
+            return {"min_distance_m": float(min_distance)}
 
 
 def evaluate_dual_arm_transition_state(
@@ -129,6 +169,24 @@ def plan_dual_arm_constrained_qpos_transition(
         sides=SIDES,
         model=model,
         config=config,
+    )
+
+
+def plan_dual_arm_sampling_qpos_transition(
+    *,
+    start_qpos_by_side: Mapping[str, Any],
+    target_qpos_by_side: Mapping[str, Any],
+    model: RM65DualArmTransitionModel,
+    config: RM65ConstrainedTransitionConfig | None = None,
+    search_config: RM65SamplingTransitionConfig | None = None,
+) -> RM65ConstrainedTransitionPlan:
+    return plan_sampling_constrained_qpos_transition(
+        start_qpos_by_side=_as_dual_qpos(start_qpos_by_side),
+        target_qpos_by_side=_as_dual_qpos(target_qpos_by_side),
+        sides=SIDES,
+        model=model,
+        transition_config=config,
+        search_config=search_config,
     )
 
 
@@ -182,10 +240,12 @@ __all__ = [
     "RM65DualArmCollisionIKTransitionModel",
     "RM65DualArmTransitionModel",
     "RM65RuntimeSignals",
+    "RM65SamplingTransitionConfig",
     "RM65TransitionPlanStep",
     "RM65TransitionRiskAssessment",
     "RM65TransitionRiskEvent",
     "RM65TransitionRiskLevel",
     "evaluate_dual_arm_transition_state",
     "plan_dual_arm_constrained_qpos_transition",
+    "plan_dual_arm_sampling_qpos_transition",
 ]

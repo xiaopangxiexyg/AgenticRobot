@@ -12,20 +12,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import select
 import sys
+import threading
 import termios
 import time
 import tty
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.layout import episode_id_from_index
 from dataset_contracts.policy_artifact import policy_artifact_from_metadata
 from dataset_contracts.pose_frames import load_pose_frame_contract
+from dataset_contracts.pose_training import POSE_TRAINING_ORIGIN_NATIVE_V23
 from dataset_contracts.v22 import DEXTELEOP_DATASET_SCHEMA_V22, policy_io_layout_from_metadata
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from deployments.client import load_policy_artifact
@@ -38,7 +44,18 @@ from robot_motion.deploy.actions import (
     NormalizedAction,
 )
 from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
-from robot_motion.deploy.observation import build_deployment_observation
+from robot_motion.deploy.async_producer import (
+    POLICY_ASYNC_PRODUCER_ELIGIBLE,
+    RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+    RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+    RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
+    RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
+)
+from robot_motion.deploy.observation import (
+    DEFAULT_HAND_STATE_MAX_AGE_SEC,
+    build_deployment_observation,
+)
+from robot_motion.deploy.observation_view import default_deploy_policy_observation_contract
 from robot_motion.deploy.pose_adapter import convert_policy_absolute_vector_to_runtime_raw
 from robot_motion.deploy.runtime import (
     PolicyDeployRuntime,
@@ -50,6 +67,7 @@ from robot_motion.deploy.schema import (
     ACTION_DIM,
     ACTION_HAND_SLICES,
     ALL_SIDES,
+    DEPLOY_ACTION_VECTOR_ACTION_SPACE,
     pose_matrix_to_xyzquat,
     to_serializable,
 )
@@ -66,10 +84,16 @@ from robot_motion.rm65 import (
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
+    IKObjectiveWeights,
+    LEGACY_POSITION_CONTROL_PROFILE_NAME,
+    RM65_BIMANUAL_POSITION_V1,
+    RM65_BIMANUAL_POSITION_V1_NAME,
+    RM65_POSITION_CONTROL_PROFILE_CHOICES,
     RM65_POSITION_TRACKING_FOLLOW_ALPHA,
     RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
+    load_ik_tuning_config,
 )
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -78,6 +102,7 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
     POSITION_COMMAND_PLANNER_CHOICES,
 )
+from robot_motion.pose_frame_profiles import default_rm65_workspace_near_boundary_runtime_pose_frame_contract
 from robot_motion.runtime import TeleopCommand
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
 from robot_motion.runtime_gate import IKActionChunkGate
@@ -89,8 +114,19 @@ from ..backends.arms import (
     RM65ImpedanceArmBackend,
     RM65ImpedanceArmBackendConfig,
 )
+from ..action.replay_proposal import (
+    DatasetReplayProposalShadowAdapter,
+    DatasetReplayProposalShadowConfig,
+    replay_adapter_debug_payload,
+)
+from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
+from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
+from .rtc_step_fanout import RtcFrontendStepFanout
+from deployments.client.rtc_frontend import build_rtc_model_shadow_frontend
 from ..backends.grippers import (
     DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
+    DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
+    DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
     DMTAC_TACTILE_FIELDS,
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
@@ -108,8 +144,11 @@ from ..collection.hand_state_polling import (
     HandStateHistoryPollerConfig,
 )
 from ..configs.dmtac_hardware import (
+    add_dmtac_assignment_arguments,
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
+    manual_dmtac_backend_config_for_side,
+    require_dmtac_sides_resolved,
 )
 from ..defaults import (
     DEFAULT_RM65_ARM_CONTROL_HZ,
@@ -126,6 +165,7 @@ from ..position_control import (
     PositionDeployExecutor,
     PositionDeployExecutorConfig,
     PositionDeployExecutorFault,
+    apply_rm65_position_profile_defaults,
     build_position_collision_planner_from_started_backends,
     resolve_real_arm_execution_config,
 )
@@ -143,14 +183,29 @@ from .dispatch import (
     dispatch_teleop_command,
     require_arm_backends_ready_for_position_dispatch,
 )
+from .arbiter_shadow import (
+    ARBITER_SHADOW_MODE_SHADOW,
+    ARBITER_SHADOW_MODES_M3,
+    PassivePolicyArbiterShadow,
+    PolicyArbiterShadowConfig,
+)
 from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
 from deployments.client.policy import load_policy
+from deployments.client.rtc_executor import (
+    rtc_client_inference_bundle_debug_payload,
+)
 from .policy_qpos_init import (
     DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
     load_deploy_policy_qpos_init_plan,
 )
-from .replay import infer_replay_action_hz, load_dataset_replay_policy, resolve_replay_parquet_path
+from .replay import (
+    DatasetReplayPolicy,
+    infer_replay_action_hz,
+    load_dataset_replay_policy,
+    resolve_replay_parquet_path,
+)
+from .safety_shadow import evaluate_policy_legacy_aligned_safety
 from .startup_init import StartupInitializer, resolve_startup_init_action
 
 
@@ -168,7 +223,8 @@ GRIPPER_POLICY_DEFAULTS = {
     "send_threshold": 0.002,
     "command_hz": DEFAULT_DMTAC_GRIPPER_COMMAND_HZ,
     "continuous_grasp": True,
-    "telemetry_hz": 10.0,
+    "telemetry_hz": DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ,
+    "telemetry_command_grace_s": DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
 }
 DEPLOY_RM65_ARM_MAX_ANGVEL = (0.7, 0.7, 0.9, 1.5, 1.5, 2.0)
 DEPLOY_ARM_STEP_DT_ALPHA = 0.25
@@ -595,6 +651,8 @@ def _debug_backend_limits(
                 else float(getattr(config, "background_streaming_hz"))
             ),
             "canfd_follow": getattr(config, "canfd_follow", None),
+            "observation_only": bool(getattr(config, "observation_only", False)),
+            "send_commands": getattr(config, "send_commands", None),
             "error": error,
         }
     return limits
@@ -612,6 +670,7 @@ class DeploymentDebugLogger:
         self.active_sides = tuple(active_sides)
         self.path: Path | None = None
         self._handle: Any = None
+        self._lock = threading.RLock()
         self._write_failed = False
         if not self.enabled:
             return
@@ -627,35 +686,37 @@ class DeploymentDebugLogger:
         print(f"[DeployDebug] writing action/pose debug JSONL to {self.path}", flush=True)
 
     def close(self) -> None:
-        if self._handle is None:
-            return
-        self._handle.flush()
-        self._handle.close()
-        self._handle = None
+        with self._lock:
+            if self._handle is None:
+                return
+            self._handle.flush()
+            self._handle.close()
+            self._handle = None
 
     def log_event(self, event: str, payload: Mapping[str, Any]) -> None:
-        if not self.enabled or self._handle is None:
-            return
-        record = {
-            "event": str(event),
-            "wall_time": time.time(),
-            **dict(payload),
-        }
-        try:
-            self._handle.write(
-                json.dumps(
-                    to_serializable(record),
-                    ensure_ascii=True,
-                    separators=(",", ":"),
+        with self._lock:
+            if not self.enabled or self._handle is None:
+                return
+            record = {
+                "event": str(event),
+                "wall_time": time.time(),
+                **dict(payload),
+            }
+            try:
+                self._handle.write(
+                    json.dumps(
+                        to_serializable(record),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            self._handle.flush()
-        except Exception as exc:  # noqa: BLE001
-            if not self._write_failed:
-                print(f"[DeployDebug] disabled after write failure: {type(exc).__name__}: {exc}", flush=True)
-            self._write_failed = True
-            self.enabled = False
+                self._handle.flush()
+            except Exception as exc:  # noqa: BLE001
+                if not self._write_failed:
+                    print(f"[DeployDebug] disabled after write failure: {type(exc).__name__}: {exc}", flush=True)
+                self._write_failed = True
+                self.enabled = False
 
     def log_startup(
         self,
@@ -1228,6 +1289,7 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": ("command_hz", "max_command_hz"),
         "continuous_grasp": ("continuous_grasp", "continuous"),
         "telemetry_hz": ("telemetry_hz",),
+        "telemetry_command_grace_s": ("telemetry_command_grace_s",),
         "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
         "tactile_compute_profile": ("tactile_compute_profile", "dmtac_tactile_compute_profile"),
     }
@@ -1245,6 +1307,9 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         "command_hz": getattr(args, "gripper_command_hz", None),
         "continuous_grasp": getattr(args, "gripper_continuous_grasp", None),
         "telemetry_hz": getattr(args, "gripper_telemetry_hz", None),
+        "telemetry_command_grace_s": getattr(
+            args, "gripper_telemetry_command_grace_s", None
+        ),
     }
     for key, value in cli_overrides.items():
         if value is not None:
@@ -1258,6 +1323,9 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
     policy["command_hz"] = float(policy["command_hz"])
     policy["continuous_grasp"] = bool(policy["continuous_grasp"])
     policy["telemetry_hz"] = float(policy["telemetry_hz"])
+    policy["telemetry_command_grace_s"] = float(
+        policy["telemetry_command_grace_s"]
+    )
     if policy.get("tactile_fields") is not None:
         policy["tactile_fields"] = normalize_dmtac_tactile_fields(policy["tactile_fields"])
     if policy.get("tactile_compute_profile") is not None:
@@ -1270,6 +1338,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("gripper command_hz must be > 0.")
     if float(policy["telemetry_hz"]) <= 0.0:
         raise ValueError("gripper telemetry_hz must be > 0.")
+    if float(policy["telemetry_command_grace_s"]) < 0.0:
+        raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
     setattr(args, "_resolved_gripper_policy", dict(policy))
     return dict(policy)
 
@@ -1279,33 +1349,6 @@ def _dmtac_tactile_enabled(args: argparse.Namespace) -> bool:
     if explicit is not None:
         return bool(explicit)
     return True
-
-
-def _manual_dmtac_config_for_side(
-    args: argparse.Namespace,
-    side: str,
-    policy: Mapping[str, Any],
-) -> DMTacGripperBackendConfig | None:
-    port = str(getattr(args, f"{side}_gripper_port", "") or "").strip()
-    if not port:
-        return None
-    return DMTacGripperBackendConfig(
-        side=side,
-        effector_name=f"{side}_hand",
-        gripper_port=port,
-        gripper_id=int(getattr(args, f"{side}_gripper_id", 1) or 1),
-        command_dim=int(policy["output_dim"]),
-        speed=float(policy["speed"]),
-        torque=float(policy["torque"]),
-        max_action=float(policy["max_action"]),
-        send_threshold=float(policy["send_threshold"]),
-        command_hz=float(policy["command_hz"]),
-        continuous_grasp=bool(policy["continuous_grasp"]),
-        enable_telemetry=True,
-        telemetry_hz=float(policy["telemetry_hz"]),
-        connect_tactile=False,
-        tactile_ids=(),
-    )
 
 
 def _apply_gripper_policy_to_dmtac_config(
@@ -1322,6 +1365,12 @@ def _apply_gripper_policy_to_dmtac_config(
     config.command_hz = float(policy["command_hz"])
     config.continuous_grasp = bool(policy["continuous_grasp"])
     config.telemetry_hz = float(policy["telemetry_hz"])
+    config.gripper_telemetry_command_grace_s = float(
+        policy.get(
+            "telemetry_command_grace_s",
+            DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
+        )
+    )
     tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
     if tactile_timeout_ms is not None:
         config.tactile_timeout_ms = int(tactile_timeout_ms)
@@ -1343,6 +1392,16 @@ def _apply_gripper_policy_to_dmtac_config(
     if not _dmtac_tactile_enabled(args):
         config.connect_tactile = False
         config.tactile_ids = ()
+    if bool(getattr(args, "rtc_real_shadow", False)):
+        # Live raw-RTC shadow may read gripper/tactile observations, but its
+        # startup must not clear faults, write speed/torque, open the gripper,
+        # reset tactile calibration, or accept a command through a bypass API.
+        config.observation_only = True
+        config.send_commands = False
+        config.clear_fault_on_start = False
+        config.open_on_start = False
+        config.tactile_reset_on_start = False
+        config.tactile_warmup_frames = 0
     config.enable_telemetry = bool(config.connect_hardware or config.connect_tactile)
     return config
 
@@ -1391,7 +1450,7 @@ def _dmtac_backend_configs(
             print(f"[DMTAC] WARNING: could not load DMTAC hardware assignment: {exc}", flush=True)
 
     for side in dmtac_sides:
-        manual = _manual_dmtac_config_for_side(args, side, policy)
+        manual = manual_dmtac_backend_config_for_side(args, side, policy)
         if manual is not None:
             configs[side] = manual
 
@@ -1400,6 +1459,12 @@ def _dmtac_backend_configs(
         for side, config in configs.items()
         if side in active_sides and (config.connect_hardware or config.connect_tactile)
     }
+    if bool(getattr(args, "dmtac_config_required", False)):
+        require_dmtac_sides_resolved(
+            dmtac_sides,
+            resolved,
+            config=str(getattr(args, "dmtac_config", "latest") or "latest"),
+        )
     setattr(args, "_dmtac_backend_configs", dict(resolved))
     setattr(args, "dmtac_config_loaded_sides", sorted(resolved))
     return dict(resolved)
@@ -1416,6 +1481,50 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Policy loader spec: hold, package.module:Policy, or /path/policy.py:Policy.",
     )
     parser.add_argument("--policy-kwargs-json", type=str, default="{}")
+    parser.add_argument(
+        "--rtc-profile",
+        choices=(
+            "off",
+            RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
+            RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        ),
+        default="off",
+        help=(
+            "Experimental default-off RTC frontend profile. RTC-3c remains the builtin-hold "
+            "virtual shadow; raw_rtc_final_chunk enables an explicit model adapter with "
+            "the existing final-chunk model/server contract. Both force 30 Hz action/decision, "
+            "15 Hz observation requests, disable position chunk lookahead, and forbid motion output."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-real-shadow",
+        action="store_true",
+        help=(
+            "Opt into the explicit live observation/transport no-action shadow. "
+            "Requires the raw final-chunk RTC profile; hardware backends are "
+            "configured for observation-only startup (no command, force, tool-frame, "
+            "singularity, or background-stream writes). Default is off."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-request-validity-steps",
+        type=_positive_int,
+        default=10,
+        help=(
+            "RTC request/plan validity in action-keyframe steps. The default 10 "
+            "preserves the existing fail-closed profile; explicit model deployments "
+            "may bind a larger tested window without changing model/server payloads."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-worker-stop-timeout-sec",
+        type=_non_negative_float,
+        default=0.0,
+        help=(
+            "Bounded wait for an in-flight RTC worker during frontend close. "
+            "0 preserves the existing non-waiting close behavior."
+        ),
+    )
     parser.add_argument(
         "--policy-artifact-json",
         type=Path,
@@ -1435,13 +1544,34 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--policy-observation-firewall-mode",
+        choices=("strict", "dual-validate"),
+        default="strict",
+        help=(
+            "Model-input firewall mode. strict (default) makes the typed actor view the "
+            "only prediction source; dual-validate is a dry-run compatibility check and "
+            "is forbidden with --send-actions."
+        ),
+    )
+    parser.add_argument(
+        "--action-arbiter-mode",
+        choices=ARBITER_SHADOW_MODES_M3,
+        default="off",
+        help=(
+            "M3 passive ActionArbiter mode. off preserves the legacy path; shadow "
+            "evaluates the same popped PolicyActionEmission without dispatch authority "
+            "and is currently restricted to dry-run/replay."
+        ),
+    )
+    parser.add_argument(
         "--runtime-pose-frame-contract",
         type=load_pose_frame_contract,
         default=None,
         metavar="JSON",
         help=(
             "Current robot runtime raw_absolute->canonical-desk pose contract. "
-            "Native-v2.3-trained pose policies require this explicitly. Policies "
+            "Native-v2.3-trained pose policies default to the calibrated dual-RM65 "
+            "URDF workspace-near-boundary profile; use this option for another station. Policies "
             "declared as v2.2 raw identity compatibility may only use the matching "
             "same-source identity binding; omitting it selects that audited identity "
             "profile."
@@ -1491,6 +1621,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "RM65 deployment execution mode. position uses Movej_CANFD passthrough by default; "
             "impedance uses the force-admittance backend at 40Hz without CANFD follow by default."
+        ),
+    )
+    parser.add_argument(
+        "--position-control-profile",
+        choices=RM65_POSITION_CONTROL_PROFILE_CHOICES,
+        default=RM65_BIMANUAL_POSITION_V1_NAME,
+        help=(
+            "Versioned position action-execution profile. Policy/dataset main actions "
+            "are already source-shaped, so the formal deploy path does not repeat "
+            "collection-side inactive, tracker, or post-IK qref smoothing."
         ),
     )
     parser.add_argument(
@@ -1561,9 +1701,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--position-ik-solve-max-iterations",
         type=_positive_int,
-        default=2,
+        default=4,
         help=(
-            "Position-only coupled IK iteration upper bound (default 2). "
+            "Position-only coupled IK iteration upper bound (formal default 4). "
             "The impedance path does not consume this option."
         ),
     )
@@ -1582,9 +1722,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Position-only Pink QP damping (default 0.03).",
     )
     parser.add_argument(
+        "--position-ik-orientation-weight",
+        type=_non_negative_float,
+        default=0.35,
+        help="Position-only IK orientation objective weight; position weight is 1.0.",
+    )
+    parser.add_argument(
         "--position-ik-adaptive-iterations",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "After the minimum iterations, continue only while the shared "
             "planner's frame budget has room."
@@ -1665,6 +1811,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--min-action-queue", type=_non_negative_int, default=0)
+    parser.add_argument(
+        "--action-chunk-execution-steps",
+        type=_positive_int,
+        default=None,
+        metavar="X",
+        help=(
+            "Execute only the first X actions from every received policy chunk, "
+            "then request/consume the next chunk. Omit to keep the complete chunk."
+        ),
+    )
     parser.add_argument(
         "--action-queue-policy",
         choices=["auto", "replace", "append"],
@@ -2098,47 +2254,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "Current deploy clips hand q6 to [0, 1] but does not rate-limit it."
         ),
     )
-    parser.add_argument("--left-gripper-port", type=str, default="", help="Optional left 1D gripper serial port.")
-    parser.add_argument("--right-gripper-port", type=str, default="", help="Optional right 1D gripper serial port.")
-    parser.add_argument("--left-gripper-id", type=int, default=1, help="Left gripper Modbus id.")
-    parser.add_argument("--right-gripper-id", type=int, default=1, help="Right gripper Modbus id.")
-    parser.add_argument(
-        "--dmtac-config",
-        type=str,
-        default="latest",
-        help="DMTAC gripper/tactile assignment config used when --hand-backend dmtac-gripper.",
-    )
-    parser.add_argument(
-        "--no-dmtac-default-config",
-        dest="dmtac_default_config",
-        action="store_false",
-        default=True,
-        help="Do not auto-load DMTAC gripper/tactile ports from latest assignment.",
-    )
-    parser.add_argument(
-        "--dmtac-config-required",
-        action="store_true",
-        help="Fail if --dmtac-config cannot be loaded for --hand-backend dmtac-gripper.",
-    )
-    parser.add_argument(
-        "--dmtac-allow-missing",
-        action="store_true",
-        help="Allow configured DMTAC gripper/tactile devices to be missing during USB validation.",
-    )
-    parser.add_argument(
-        "--dmtac-no-validate-current-usb",
-        dest="dmtac_validate_current_usb",
-        action="store_false",
-        default=True,
-        help="Load DMTAC assignment without probing current USB devices.",
-    )
-    parser.add_argument(
-        "--dmtac-confirm-extra",
-        dest="dmtac_assume_yes_for_extra",
-        action="store_false",
-        default=True,
-        help="Ask before continuing when extra unassigned DMTAC devices are detected.",
-    )
+    add_dmtac_assignment_arguments(parser, assignment_includes_tactile=True)
     parser.add_argument("--dmtac-tactile-backend", type=str, default="cpu")
     parser.add_argument("--dmtac-tactile-timeout-ms", type=_positive_int, default=None)
     parser.add_argument("--dmtac-tactile-wait-for-new", action="store_true", default=None)
@@ -2190,6 +2306,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gripper-no-continuous", dest="gripper_continuous_grasp", action="store_false")
     parser.add_argument("--gripper-command-hz", type=_positive_float, default=None)
     parser.add_argument("--gripper-telemetry-hz", type=_positive_float, default=None)
+    parser.add_argument(
+        "--gripper-telemetry-command-grace-s", type=float, default=None
+    )
 
     parser.add_argument("--camera-mode", choices=["none", "single", "multi"], default="none")
     parser.add_argument("--camera-config", type=Path, default=DEFAULT_CAMERA_CONFIG_PATH)
@@ -2233,6 +2352,32 @@ def _hands_enabled(args: argparse.Namespace) -> bool:
     )
 
 
+def _position_deploy_ik_tuning(args: argparse.Namespace):
+    """Bind the formal action-to-qref objective without source-side shaping."""
+
+    if (
+        str(getattr(args, "position_control_profile_resolved", ""))
+        == LEGACY_POSITION_CONTROL_PROFILE_NAME
+    ):
+        return None
+    tuning = load_ik_tuning_config()
+    mode_name = RM65_BIMANUAL_POSITION_V1_NAME
+    position_weight = RM65_BIMANUAL_POSITION_V1.ik_execution.position_weight
+    orientation_weight = float(args.position_ik_orientation_weight)
+    objective_modes = dict(tuning.objective_modes)
+    objective_modes[mode_name] = IKObjectiveWeights(
+        single_arm_position_weight=position_weight,
+        single_arm_orientation_weight=orientation_weight,
+        dual_arm_position_cost=position_weight,
+        dual_arm_orientation_cost=orientation_weight,
+    )
+    return replace(
+        tuning,
+        ik_objective_mode=mode_name,
+        objective_modes=objective_modes,
+    )
+
+
 def validate_args(
     args: argparse.Namespace,
     *,
@@ -2240,7 +2385,138 @@ def validate_args(
 ) -> tuple[str, ...]:
     active_sides = _parse_active_sides(args.active_sides)
     args.active_sides = active_sides
-    raw_tokens = tuple(str(value) for value in raw_argv)
+    observation_firewall_mode = str(
+        getattr(args, "policy_observation_firewall_mode", "strict")
+    ).strip().lower()
+    rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
+    rtc_profile_enabled = rtc_profile_id != "off"
+    rtc_real_shadow = bool(getattr(args, "rtc_real_shadow", False))
+    if rtc_real_shadow and rtc_profile_id != RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+        raise ValueError(
+            "--rtc-real-shadow requires the explicit raw final-chunk RTC profile; "
+            "it is not available for RTC-3c virtual policy or sync deployment."
+        )
+    if rtc_profile_enabled:
+        if rtc_profile_id not in {
+            RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
+            RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        }:
+            raise ValueError(f"Unsupported RTC profile: {rtc_profile_id!r}.")
+        if bool(args.send_actions):
+            raise ValueError("RTC shadow profile forbids --send-actions.")
+        if args.debug_replay_dataset or args.debug_replay_parquet:
+            raise ValueError("RTC profiles do not modify or consume debug replay.")
+        if args.action_hz_dataset or args.action_hz_parquet:
+            raise ValueError("RTC profiles do not consume replay/reference rate inputs.")
+        if bool(args.append_action_chunks) or str(args.action_queue_policy) == "append":
+            raise ValueError("RTC profiles use timed mutable-future merge, not queue append.")
+        if rtc_profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1:
+            if str(args.policy_spec or "hold").strip().lower() not in {
+                "",
+                "hold",
+                "builtin:hold",
+            }:
+                raise ValueError("RTC-3c is restricted to the builtin hold virtual policy.")
+            if args.policy_artifact_json is not None:
+                raise ValueError("RTC-3c virtual shadow does not bind a model artifact yet.")
+            if parse_policy_kwargs(args.policy_kwargs_json):
+                raise ValueError("RTC-3c builtin hold policy accepts no policy kwargs.")
+        elif args.policy_artifact_json is None:
+            raise ValueError(
+                "raw-RTC final-chunk requires an explicit --policy-artifact-json "
+                "sidecar; model identity must not be inferred from a model name."
+            )
+        if (
+            rtc_profile_id == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
+            and not rtc_real_shadow
+            and (
+                bool(args.left_arm_ip)
+                or bool(args.right_arm_ip)
+                or bool(args.left_hand_ip)
+                or bool(args.right_hand_ip)
+                or (
+                    bool(getattr(args, "hands_enabled", False))
+                    and any(
+                        _hand_backend_mode_for_side(args, side)
+                        == HAND_BACKEND_DMTAC_GRIPPER
+                        for side in ALL_SIDES
+                    )
+                )
+            )
+        ):
+            raise ValueError(
+                "raw-RTC with live hardware endpoints requires explicit "
+                "--rtc-real-shadow; otherwise use synthetic/local inputs."
+            )
+        if float(args.action_hz) not in {
+            0.0,
+            RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz,
+        }:
+            raise ValueError("RTC shadow action rate is fixed at 30 Hz.")
+        if args.policy_hz is not None and not math.isclose(
+            float(args.policy_hz),
+            RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.decision_hz,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("RTC shadow decision rate is fixed at 30 Hz.")
+        args.position_chunk_lookahead = False
+        args.action_hz = RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz
+        args.policy_hz = RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.decision_hz
+    elif (
+        int(getattr(args, "rtc_request_validity_steps", 10)) != 10
+        or float(getattr(args, "rtc_worker_stop_timeout_sec", 0.0)) != 0.0
+    ):
+        raise ValueError(
+            "RTC validity/worker-stop overrides require an explicit --rtc-profile."
+        )
+    if rtc_real_shadow:
+        # A live observation shadow has no init/qpos authority.  Keeping a
+        # dataset-frame init controller alive would either block the model on a
+        # target it cannot execute or accidentally reintroduce a dispatch path
+        # if a future caller forgets to pass send_actions=False.
+        if args.deploy_fixed_init_dataset or args.deploy_fixed_init_parquet:
+            raise ValueError(
+                "--rtc-real-shadow does not accept deploy-fixed-init dataset inputs."
+            )
+        if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
+            raise ValueError(
+                "--rtc-real-shadow does not accept policy-qpos-init dataset inputs."
+            )
+        if bool(args.send_actions):
+            raise ValueError("--rtc-real-shadow forbids --send-actions.")
+    if bool(args.send_actions) and observation_firewall_mode != "strict":
+        raise ValueError(
+            "--send-actions requires --policy-observation-firewall-mode strict."
+        )
+    if (
+        bool(args.send_actions)
+        and str(getattr(args, "action_arbiter_mode", "off"))
+        == ARBITER_SHADOW_MODE_SHADOW
+    ):
+        raise ValueError(
+            "M3 --action-arbiter-mode shadow is dry-run/replay only; "
+            "formal real shadow requires the M4B durable trace gate."
+        )
+    raw_tokens_list = [str(value) for value in raw_argv]
+    if not any(
+        token in ("--arm-canfd-follow", "--no-arm-canfd-follow")
+        for token in raw_tokens_list
+    ) and getattr(args, "arm_canfd_follow", None) is False:
+        raw_tokens_list.append("--no-arm-canfd-follow")
+    if not any(
+        token == "--position-ik-solve-min-iterations"
+        or token.startswith("--position-ik-solve-min-iterations=")
+        for token in raw_tokens_list
+    ) and int(args.position_ik_solve_min_iterations) != 2:
+        raw_tokens_list.append("--position-ik-solve-min-iterations")
+    if not any(
+        token == "--position-ik-solve-max-iterations"
+        or token.startswith("--position-ik-solve-max-iterations=")
+        for token in raw_tokens_list
+    ) and int(args.position_ik_solve_max_iterations) != 4:
+        raw_tokens_list.append("--position-ik-solve-max-iterations")
+    raw_tokens = tuple(raw_tokens_list)
     requested_profile = getattr(args, "arm_execution_profile", None)
     position_requested = bool(
         requested_profile != "impedance_40hz"
@@ -2255,6 +2531,50 @@ def validate_args(
         # current position teleop. Explicit rate flags remain profile
         # overrides through resolve_real_arm_execution_config().
         args.arm_execution_profile = POSITION_15_60_120HZ_PROFILE_NAME
+    explicit_compatibility_arm_profile = (
+        any(
+            token == "--arm-execution-profile"
+            or token.startswith("--arm-execution-profile=")
+            for token in raw_tokens
+        )
+        and requested_profile not in (None, "", POSITION_15_60_120HZ_PROFILE_NAME)
+    )
+    if explicit_compatibility_arm_profile:
+        args.position_control_profile_resolved = LEGACY_POSITION_CONTROL_PROFILE_NAME
+        args.position_control_profile_metadata = {
+            "name": LEGACY_POSITION_CONTROL_PROFILE_NAME,
+            "compatibility_mode": True,
+            "reason": f"explicit_arm_execution_profile:{requested_profile}",
+        }
+    else:
+        if (
+            str(args.position_control_profile)
+            == LEGACY_POSITION_CONTROL_PROFILE_NAME
+        ):
+            if not any(
+                token == "--position-ik-solve-max-iterations"
+                or token.startswith("--position-ik-solve-max-iterations=")
+                for token in raw_tokens
+            ):
+                args.position_ik_solve_max_iterations = 2
+            if not any(
+                token in (
+                    "--position-ik-adaptive-iterations",
+                    "--no-position-ik-adaptive-iterations",
+                )
+                for token in raw_tokens
+            ):
+                args.position_ik_adaptive_iterations = False
+        apply_rm65_position_profile_defaults(
+            args,
+            raw_argv=raw_tokens,
+            mode=(
+                "impedance"
+                if requested_profile == "impedance_40hz"
+                else str(args.arm_control_mode)
+            ),
+            include_source_shaping=False,
+        )
     current_position_profile = bool(
         args.arm_execution_profile == POSITION_15_60_120HZ_PROFILE_NAME
     )
@@ -2279,6 +2599,23 @@ def validate_args(
     args.arm_control_hz = execution_config.arm_control_hz
     args.position_reference_hz = execution_config.position_reference_hz
     args.arm_follow_qpos_alpha = execution_config.arm_follow_qpos_alpha
+    if rtc_profile_enabled and args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION:
+        rates = RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.position_rates
+        if not math.isclose(
+            float(args.position_reference_hz),
+            rates.reference_hz,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ) or not math.isclose(
+            float(args.arm_control_hz),
+            rates.command_hz,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "RTC-3c position cadence is fixed at 60 Hz reference / "
+                "120 Hz command."
+            )
     if (
         args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION
         and float(args.arm_control_hz) < float(args.position_reference_hz)
@@ -2369,8 +2706,11 @@ def validate_args(
         and bool(args.send_actions)
         and bool(args.arms_enabled)
         and not any(
-            label in execution_config.explicit_overrides
-            for label in ("arm_execution_profile", "arm_control_mode")
+            token == "--arm-execution-profile"
+            or token.startswith("--arm-execution-profile=")
+            or token == "--arm-control-mode"
+            or token.startswith("--arm-control-mode=")
+            for token in raw_tokens
         )
     ):
         raise ValueError(
@@ -2451,6 +2791,18 @@ def validate_args(
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
     return active_sides
+
+
+def _runtime_action_keyframe_period_sec(args: argparse.Namespace) -> float:
+    """Bind RTC runtime timing without changing the legacy sync default."""
+
+    profile_id = str(getattr(args, "rtc_profile", "off")).strip()
+    if profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1:
+        return 1.0 / RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz
+    if profile_id == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+        return 1.0 / RAW_RTC_FINAL_CHUNK_PROFILE_V1.action_hz
+    # Preserve the historical PolicyDeployRuntimeConfig default for sync_queue_v1.
+    return 1.0 / 15.0
 
 
 def _action_hz_reference(args: argparse.Namespace) -> tuple[Path | None, Path | None, int, int, int | None]:
@@ -2785,6 +3137,18 @@ def build_arm_backends(
         action_hz=action_hz,
     )
     arm_control_mode = normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
+    worker_binding = getattr(args, "_rm65_legacy_worker_binding", None)
+    if worker_binding is not None:
+        if not isinstance(worker_binding, RM65LegacyWorkerExecutionBinding):
+            raise TypeError("_rm65_legacy_worker_binding has an unsupported type")
+        if tuple(active_sides) != ("left", "right"):
+            raise ValueError(
+                "RM65 arms-only worker binding requires coupled left/right sides"
+            )
+        if arm_control_mode != RM65_ARM_CONTROL_MODE_POSITION:
+            raise ValueError(
+                "RM65 arms-only worker binding excludes impedance control"
+            )
     command_input_hz = (
         effective_position_reference_hz(args)
         if arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION
@@ -2796,6 +3160,13 @@ def build_arm_backends(
         action_hz=command_input_hz,
     )
     arm_canfd_follow = effective_arm_canfd_follow(args)
+    observation_only = bool(getattr(args, "rtc_real_shadow", False))
+    if observation_only and bool(getattr(args, "send_actions", False)):
+        raise ValueError("rtc real shadow backend construction requires send_actions=False")
+    if observation_only:
+        # A read-only shadow must not accidentally inherit a force/CANFD
+        # execution setting from the checked-in lab profile.
+        arm_canfd_follow = False
     backends: dict[str, EffectorBackend] = {}
     for side in active_sides:
         arm_ip = str(getattr(args, f"{side}_arm_ip") or "")
@@ -2805,6 +3176,7 @@ def build_arm_backends(
                     arm_ip=arm_ip or "0.0.0.0",
                     side=side,
                     connect_hardware=bool(arm_ip),
+                    observation_only=observation_only,
                     tool_profile=getattr(args, f"{side}_tool_profile", "") or None,
                     strict_tool_profile=bool(getattr(args, "strict_tool_profile", True)),
                     impedance_mode="pose",
@@ -2853,12 +3225,21 @@ def build_arm_backends(
                 )
             )
             continue
+        binding_kwargs = (
+            {}
+            if worker_binding is None
+            else worker_binding.arm_backend_kwargs(
+                side,
+                connect_hardware=bool(arm_ip),
+            )
+        )
         backends[side] = RM65ArmBackend(
             RM65ArmBackendConfig(
                 arm_ip=arm_ip or "0.0.0.0",
                 side=side,
                 arm_urdf_path=arm_urdf_path,
                 connect_hardware=bool(arm_ip),
+                observation_only=observation_only,
                 control_dt=backend_control_dt,
                 max_angvel=tuple(float(value) for value in args.arm_max_angvel),
                 singularity_qpos_init_slowdown=float(args.singularity_qpos_init_slowdown),
@@ -2894,7 +3275,8 @@ def build_arm_backends(
                 canfd_follow=bool(arm_canfd_follow),
                 canfd_trajectory_mode=int(getattr(args, "arm_canfd_trajectory_mode", 0)),
                 canfd_radio=int(getattr(args, "arm_canfd_radio", 0)),
-            )
+            ),
+            **binding_kwargs,
         )
     return backends
 
@@ -2911,6 +3293,7 @@ def build_hand_backends(args: argparse.Namespace, active_sides: tuple[str, ...])
     }
 
     tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
+    observation_only = bool(getattr(args, "rtc_real_shadow", False))
     for side in active_sides:
         if _hand_backend_mode_for_side(args, side) != HAND_BACKEND_INSPIRE:
             continue
@@ -2922,6 +3305,7 @@ def build_hand_backends(args: argparse.Namespace, active_sides: tuple[str, ...])
                 side=side,
                 effector_name=f"{side}_hand",
                 connect_hardware=bool(hand_ip),
+                observation_only=observation_only,
                 max_fingertip_force=int(args.max_fingertip_force),
                 send_threshold=float(args.hand_send_threshold),
                 enable_telemetry=bool(hand_ip),
@@ -3144,6 +3528,45 @@ def _resolve_action_queue_policy(args: argparse.Namespace, *, debug_replay: bool
     )
 
 
+def _resolve_runtime_pose_frame_contract(
+    configured_contract: Any | None,
+    *,
+    policy_artifact: Any | None,
+    policy_metadata: Mapping[str, Any],
+) -> tuple[Any | None, str]:
+    """Resolve the RM65 workspace-near-boundary default without changing v2.2 semantics."""
+
+    if configured_contract is not None:
+        return configured_contract, "explicit"
+
+    pose_training_data = (
+        None if policy_artifact is None else policy_artifact.pose_training_data
+    )
+    if (
+        pose_training_data is not None
+        and pose_training_data.origin == POSE_TRAINING_ORIGIN_NATIVE_V23
+    ):
+        return (
+            default_rm65_workspace_near_boundary_runtime_pose_frame_contract(),
+            "default_rm65_dual_arm_workspace_near_boundary_v1",
+        )
+    if policy_artifact is not None:
+        # In particular, v2.2 raw-identity compatibility must stay identity.
+        return None, "v22_identity_compatibility"
+
+    dataset_info = policy_metadata.get("dataset_info")
+    if (
+        isinstance(dataset_info, Mapping)
+        and str(dataset_info.get("dexteleop_dataset_schema") or "")
+        == DEXTELEOP_DATASET_SCHEMA_V23
+    ):
+        return (
+            default_rm65_workspace_near_boundary_runtime_pose_frame_contract(),
+            "default_rm65_dual_arm_workspace_near_boundary_v1",
+        )
+    return None, "not_applicable"
+
+
 def _send_legacy_deployment_action_commands(
     commands: Mapping[str, Any],
     *,
@@ -3225,6 +3648,19 @@ def _policy_status_text(policy: Any) -> str:
     return ""
 
 
+def _debug_replay_execution_exhausted(policy: Any, *, queued_actions: int) -> bool:
+    """Stop non-loop replay after its already-decoded final chunk is consumed."""
+
+    wrapped_policy = getattr(policy, "policy", policy)
+    if not isinstance(wrapped_policy, DatasetReplayPolicy):
+        return False
+    return (
+        not bool(wrapped_policy.loop)
+        and bool(wrapped_policy.finished)
+        and int(queued_actions) <= 0
+    )
+
+
 def _skip_startup_replay_frames(policy: Any, count: int = 1) -> int:
     wrapped_policy = getattr(policy, "policy", policy)
     skip = getattr(wrapped_policy, "skip_startup_frames", None)
@@ -3271,7 +3707,61 @@ def _bind_policy_pose_mode_from_artifact(
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def _policy_observation_contract(
+    *,
+    policy: Any,
+    policy_artifact: Any,
+    deploy_layout: Any,
+    pose_mode: str,
+) -> Any:
+    """Bind the strict actor view to this artifact/layout and its adapter needs."""
+
+    effective_layout = deploy_layout
+    if effective_layout is None:
+        wrapped_policy = getattr(policy, "policy", None)
+        policy_config = getattr(wrapped_policy, "config", None)
+        effective_layout = getattr(policy_config, "policy_io_layout", None)
+    hand_state_keys: set[str] = set()
+    if effective_layout is not None:
+        for side in ALL_SIDES:
+            spec = effective_layout.end_effector(side)
+            if spec.present:
+                hand_state_keys.add(str(spec.state_source_field))
+            channel = effective_layout.channel("state", side)
+            for token in channel.tokens:
+                if token.source_metadata_key:
+                    hand_state_keys.add(str(token.source_metadata_key))
+
+    if policy_artifact is not None:
+        artifact_hash = canonical_content_hash(
+            policy_artifact.to_dict(),
+            domain="dexteleop.policy_observation_artifact_binding.v1",
+        )
+        binding_id = f"artifact={artifact_hash}"
+    elif effective_layout is not None:
+        binding_id = (
+            f"layout={effective_layout.layout_hash};model=unversioned"
+        )
+    else:
+        binding_id = f"policy={getattr(policy, 'name', 'unknown')}"
+    return default_deploy_policy_observation_contract(
+        binding_id=binding_id,
+        last_action_pose_mode=str(pose_mode),
+        compatibility_hand_state_keys=tuple(sorted(hand_state_keys)),
+    )
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    rtc_step_fanout: RtcFrontendStepFanout | None = None,
+    rtc_model_adapter_factory: Callable[..., Any] | None = None,
+) -> int:
+    if rtc_step_fanout is not None and not isinstance(
+        rtc_step_fanout,
+        RtcFrontendStepFanout,
+    ):
+        raise TypeError("rtc_step_fanout must be an RtcFrontendStepFanout or None.")
     parser = argparse.ArgumentParser(
         description="Deploy a policy on teleop_runtime RM65 arms, optional InspireTac hands, and RealSense."
     )
@@ -3317,6 +3807,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.hands_enabled is None:
             args.hands_enabled = bool(layout_sides)
     active_sides = validate_args(args, raw_argv=raw_argv)
+    if rtc_step_fanout is not None and str(args.rtc_profile) != (
+        RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
+    ):
+        raise ValueError("rtc_step_fanout requires the explicit RTC-3c profile.")
+    if rtc_model_adapter_factory is not None and not callable(
+        rtc_model_adapter_factory
+    ):
+        raise TypeError("rtc_model_adapter_factory must be callable or None.")
     selected_camera_keys = resolve_policy_camera_input_keys(
         args,
         policy_artifact,
@@ -3368,15 +3866,29 @@ def main(argv: list[str] | None = None) -> int:
             )
             for side in end_effector_sides
         }
+    (
+        runtime_pose_frame_contract,
+        runtime_pose_frame_contract_source,
+    ) = _resolve_runtime_pose_frame_contract(
+        args.runtime_pose_frame_contract,
+        policy_artifact=policy_artifact,
+        policy_metadata=getattr(policy, "metadata", {}),
+    )
     deploy_session_contract = resolve_deploy_session_contract(
         active_sides=active_sides,
         model_metadata=getattr(policy, "metadata", {}),
         policy_artifact=policy_artifact,
         policy_io_layout=deploy_layout,
-        runtime_pose_frame_contract=args.runtime_pose_frame_contract,
+        runtime_pose_frame_contract=runtime_pose_frame_contract,
         runtime_end_effectors=runtime_capabilities,
         hardware_output=bool(args.send_actions),
         allow_missing_end_effectors=bool(args.allow_missing_v22_end_effectors),
+    )
+    policy_observation_contract = _policy_observation_contract(
+        policy=policy,
+        policy_artifact=policy_artifact,
+        deploy_layout=deploy_layout,
+        pose_mode=str(args.policy_action_pose_mode),
     )
     policy_deploy_runtime = PolicyDeployRuntime(
         PolicyDeployRuntimeConfig(
@@ -3386,9 +3898,34 @@ def main(argv: list[str] | None = None) -> int:
             policy_action_pose_mode=str(args.policy_action_pose_mode),
             policy_absolute_frame=str(deploy_session_contract.policy_absolute_frame),
             runtime_pose_frame_contract=deploy_session_contract.runtime_pose_frame_contract,
+            policy_observation_contract=policy_observation_contract,
+            observation_firewall_mode=str(
+                args.policy_observation_firewall_mode
+            ).replace("-", "_"),
+            action_chunk_execution_steps=(
+                None
+                if getattr(args, "action_chunk_execution_steps", None) is None
+                else int(args.action_chunk_execution_steps)
+            ),
+            action_keyframe_period_sec=_runtime_action_keyframe_period_sec(args),
         )
     )
     policy.metadata["resolved_deploy_session_contract"] = deploy_session_contract.to_dict()
+    policy.metadata["policy_observation_firewall"] = (
+        policy_deploy_runtime.observation_firewall_manifest()
+    )
+    policy.metadata["runtime_pose_frame_contract_source"] = (
+        runtime_pose_frame_contract_source
+    )
+    policy.metadata["action_chunk_execution_steps"] = (
+        policy_deploy_runtime.config.action_chunk_execution_steps
+    )
+    if runtime_pose_frame_contract_source == "default_rm65_dual_arm_workspace_near_boundary_v1":
+        print(
+            "[Deploy] runtime pose frame default: dual RM65 calibrated URDF "
+            "workspace_near_boundary_frame.",
+            flush=True,
+        )
     if deploy_session_contract.policy_contract_mode == POLICY_CONTRACT_V22_NATIVE:
         raise RuntimeError(
             "v22_native typed RobotAction transport is available, but this run_policy loop "
@@ -3434,6 +3971,95 @@ def main(argv: list[str] | None = None) -> int:
         action_hz=float(effective_action_hz),
         action_hz_source=str(action_hz_info.get("source", "")),
     )
+
+    policy_arbiter_shadow: PassivePolicyArbiterShadow | None = None
+    replay_proposal_shadow_adapter: DatasetReplayProposalShadowAdapter | None = None
+    if str(args.action_arbiter_mode) == ARBITER_SHADOW_MODE_SHADOW:
+        shadow_effectors = tuple(
+            [
+                f"{side}_arm"
+                for side in active_sides
+                if bool(args.arms_enabled)
+            ]
+            + [
+                f"{side}_hand"
+                for side in end_effector_sides
+                if hands_enabled
+            ]
+        )
+        runtime_session_id = f"deploy-shadow-{uuid.uuid4()}"
+        policy_arbiter_shadow = PassivePolicyArbiterShadow(
+            PolicyArbiterShadowConfig(
+                runtime_session_id=runtime_session_id,
+                control_domain_id="deploy-control-0",
+                embodiment_instance_id="rm65-bimanual-0",
+                producer_id=(
+                    f"replay:{policy.name}"
+                    if debug_replay
+                    else f"policy:{policy.name}"
+                ),
+                active_effectors=shadow_effectors,
+                action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+                # Event-limited: ordinary 15/30/40 Hz emissions are evaluated
+                # immediately, while >60 Hz producers are coalesced by the
+                # shared production decision-rate ceiling.
+                decision_hz=60.0,
+                policy_node_id="single_policy",
+                clock_domain_id="local_monotonic",
+                boot_id=runtime_session_id,
+            )
+        )
+        print(
+            "[ArbiterShadow] passive non-authoritative evaluation enabled "
+            "with a 60 Hz event-limited gate; legacy execution remains owner.",
+            flush=True,
+        )
+        if debug_replay:
+            dataset_info = policy.metadata.get("dataset_info")
+            dataset_info = dataset_info if isinstance(dataset_info, Mapping) else {}
+            try:
+                replay_proposal_shadow_adapter = DatasetReplayProposalShadowAdapter(
+                    DatasetReplayProposalShadowConfig(
+                        runtime_session_id=runtime_session_id,
+                        control_domain_id="deploy-control-0",
+                        embodiment_instance_id="rm65-bimanual-0",
+                        producer_id=policy_arbiter_shadow.config.producer_id,
+                        producer_epoch=policy_arbiter_shadow.config.producer_epoch,
+                        component_schema_hash=(
+                            policy_arbiter_shadow.component_catalog.semantic_content_hash
+                        ),
+                        component_coverage=shadow_effectors,
+                        source_path=str(policy.metadata.get("source_path") or ""),
+                        episode_id=str(
+                            policy.metadata.get("episode_id")
+                            or episode_id_from_index(int(args.debug_replay_episode))
+                        ),
+                        action_field=str(args.debug_replay_action_column),
+                        source_action_space=DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+                        source_hz=float(policy.metadata["action_hz"]),
+                        source_start_index=int(args.debug_replay_start_index),
+                        dataset_metadata=dataset_info,
+                        target_frame_contract_hash=(
+                            None
+                            if deploy_session_contract.runtime_pose_frame_contract is None
+                            else deploy_session_contract.runtime_pose_frame_contract.contract_hash
+                        ),
+                    )
+                )
+                print(
+                    "[ReplayProposalShadow] typed passive replay adapter enabled; "
+                    "DatasetReplayPolicy remains the only cursor/queue owner.",
+                    flush=True,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                # Legacy execution stays unchanged, but an untyped replay must
+                # never be mislabeled as a policy proposal in the new facts.
+                print(
+                    "[ReplayProposalShadow][WARN] typed replay shadow disabled: "
+                    f"{exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     backend_control_hz = float(args.arm_control_hz)
     arm_backends = build_arm_backends(
@@ -3506,6 +4132,106 @@ def main(argv: list[str] | None = None) -> int:
         arms_enabled=bool(args.arms_enabled),
         hands_enabled=bool(hands_enabled),
     )
+    rtc_frontend: RtcPolicyShadowFrontend | None = None
+    if str(args.rtc_profile) == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1:
+        rtc_session_id = f"deploy-rtc-shadow-{uuid.uuid4()}"
+        runtime_frame_hash = getattr(
+            deploy_session_contract.runtime_pose_frame_contract,
+            "contract_hash",
+            None,
+        )
+        if runtime_frame_hash is None:
+            runtime_frame_hash = canonical_content_hash(
+                {
+                    "policy_absolute_frame": (
+                        deploy_session_contract.policy_absolute_frame
+                    ),
+                    "runtime_pose_frame_contract": None,
+                },
+                domain="dexteleop.rtc_3c.runtime_frame_binding.v1",
+            )
+        rtc_frontend = RtcPolicyShadowFrontend(
+            config=RtcPolicyShadowConfig(
+                runtime_session_id=rtc_session_id,
+                control_domain_id="deploy-control-0",
+                producer_id=f"policy:{policy.name}:rtc-shadow",
+                policy_node_id=policy_deploy_runtime.config.policy_node_id,
+                artifact_hash=canonical_content_hash(
+                    {
+                        "policy_name": policy.name,
+                        "policy_metadata": policy.metadata,
+                    },
+                    domain="dexteleop.rtc_3c.virtual_policy_artifact.v1",
+                ),
+                action_codec_hash=canonical_content_hash(
+                    {
+                        "action_space": DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+                        "pose_mode": str(args.policy_action_pose_mode),
+                    },
+                    domain="dexteleop.rtc_3c.action_codec.v1",
+                ),
+                frame_contract_hash=str(runtime_frame_hash),
+                layout_hash=(
+                    deploy_layout.layout_hash
+                    if deploy_layout is not None
+                    else canonical_content_hash(
+                        {
+                            "active_sides": active_sides,
+                            "end_effector_sides": end_effector_sides,
+                            "arms_enabled": bool(args.arms_enabled),
+                            "hands_enabled": hands_enabled,
+                        },
+                        domain="dexteleop.rtc_3c.deploy_layout.v1",
+                    )
+                ),
+                normalization_hash=canonical_content_hash(
+                    {"normalization": "runtime_absolute_none_v1"},
+                    domain="dexteleop.rtc_3c.normalization.v1",
+                ),
+                request_validity_steps=int(args.rtc_request_validity_steps),
+                worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
+            ),
+            deploy_runtime=policy_deploy_runtime,
+            policy=policy,
+            preparer=canonical_action_pipeline,
+            created_at=time.monotonic(),
+        )
+        if rtc_step_fanout is not None:
+            rtc_step_fanout.bind_frontend(rtc_frontend)
+    elif str(args.rtc_profile) == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+        if rtc_model_adapter_factory is None:
+            raise ValueError(
+                "raw-RTC final-chunk requires a model-package adapter factory; "
+                "the generic deploy runtime will not infer one from policy names."
+            )
+        model_adapter = rtc_model_adapter_factory(
+            policy=policy,
+            policy_artifact=policy_artifact,
+            deploy_session_contract=deploy_session_contract,
+            deploy_runtime=policy_deploy_runtime,
+            args=args,
+            active_sides=active_sides,
+        )
+        rtc_frontend = build_rtc_model_shadow_frontend(
+            model_adapter,
+            runtime_session_id=f"deploy-raw-rtc-{uuid.uuid4()}",
+            control_domain_id="deploy-control-0",
+            producer_id=f"policy:{policy.name}:raw-rtc",
+            policy_node_id=policy_deploy_runtime.config.policy_node_id,
+            deploy_runtime=policy_deploy_runtime,
+            policy_name=policy.name,
+            preparer=canonical_action_pipeline,
+            created_at=time.monotonic(),
+            profile=RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+            request_validity_steps=int(args.rtc_request_validity_steps),
+            worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
+            observe_bundle=(
+                lambda bundle: debug_logger.log_event(
+                    "rtc_transport_exchange",
+                    rtc_client_inference_bundle_debug_payload(bundle),
+                )
+            ),
+        )
     ik_action_gate = IKActionChunkGate(stable_frames_required=int(args.ik_recovery_stable_frames))
     startup_initializer = StartupInitializer(
         duration_s=float(args.init_time_s),
@@ -3640,6 +4366,12 @@ def main(argv: list[str] | None = None) -> int:
                 hand_backends=hand_backends,
             )
 
+        position_worker_binding = getattr(args, "_rm65_legacy_worker_binding", None)
+        if position_worker_binding is not None and not isinstance(
+            position_worker_binding,
+            RM65LegacyWorkerExecutionBinding,
+        ):
+            raise TypeError("_rm65_legacy_worker_binding has an unsupported type")
         position_deploy_executor = PositionDeployExecutor(
             config=PositionDeployExecutorConfig(
                 sample_hz=float(effective_action_hz),
@@ -3708,10 +4440,16 @@ def main(argv: list[str] | None = None) -> int:
                             args.position_ik_iteration_reserve_ms
                         ),
                         debug_profile=bool(args.position_collision_debug_profile),
+                        ik_tuning=_position_deploy_ik_tuning(args),
                     )
                 )
                 if position_collision_required
                 else None
+            ),
+            **(
+                {}
+                if position_worker_binding is None
+                else position_worker_binding.position_executor_kwargs()
             ),
         )
 
@@ -3881,6 +4619,52 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    def hold_rtc_if_eligible(*, now: float, reason: str) -> None:
+        if (
+            rtc_frontend is not None
+            and rtc_frontend.state.lifecycle_state
+            == POLICY_ASYNC_PRODUCER_ELIGIBLE
+        ):
+            transition = rtc_frontend.hold(now=now, reason=reason)
+            debug_logger.log_event(
+                "rtc_lifecycle_transition",
+                {
+                    "target": "HOLD",
+                    "reason": reason,
+                    "producer_transition_hash": (
+                        transition.producer_transition.receipt.semantic_content_hash
+                    ),
+                    "worker_stop_hash": (
+                        transition.worker_stop_receipt.semantic_content_hash
+                    ),
+                },
+            )
+
+    def rearm_rtc_if_needed(*, now: float, reason: str) -> bool:
+        if rtc_frontend is None:
+            return True
+        if (
+            rtc_frontend.state.lifecycle_state
+            == POLICY_ASYNC_PRODUCER_ELIGIBLE
+        ):
+            return True
+        try:
+            transition = rtc_frontend.rearm(now=now, reason=reason)
+        except RuntimeError as exc:
+            print(f"[RTC-3c] rearm deferred: {exc}", flush=True)
+            return False
+        debug_logger.log_event(
+            "rtc_lifecycle_transition",
+            {
+                "target": "ELIGIBLE",
+                "reason": reason,
+                "producer_transition_hash": (
+                    transition.receipt.semantic_content_hash
+                ),
+            },
+        )
+        return True
+
     try:
         print(
             "[Deploy] policy="
@@ -3894,7 +4678,8 @@ def main(argv: list[str] | None = None) -> int:
             f"hz={float(effective_action_hz):.2f} "
             f"policy_hz={float(effective_policy_hz):.2f} "
             f"backend_hz={backend_control_hz:.2f} "
-            f"queue_policy={action_queue_policy}"
+            f"queue_policy={action_queue_policy} "
+            f"rtc_profile={args.rtc_profile}"
         )
         if action_hz_info.get("source") != "cli.hz":
             print(
@@ -4022,6 +4807,26 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[Camera] preview disabled: {camera_previewer.disabled_reason}")
         for camera_source in camera_sources.values():
             camera_source.start()
+        if rtc_frontend is not None:
+            rtc_frontend.start()
+            if str(args.rtc_profile) == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
+                print(
+                    "[raw-RTC] OpenPI/model final-chunk shadow active: "
+                    "send_actions=false, position_lookahead=false, "
+                    "timed-plan admission enabled."
+                    + (
+                        " live observation-only hardware guard enabled."
+                        if bool(getattr(args, "rtc_real_shadow", False))
+                        else ""
+                    ),
+                    flush=True,
+                )
+            else:
+                print(
+                    "[RTC-3c] virtual-policy shadow active: send_actions=false, "
+                    "position_lookahead=false, timed-plan admission enabled.",
+                    flush=True,
+                )
         print_controls(
             send_actions=send_actions,
             auto_start=bool(args.auto_start),
@@ -4043,6 +4848,7 @@ def main(argv: list[str] | None = None) -> int:
         with NonBlockingKeyboard() as keyboard:
             while True:
                 loop_started_at = time.time()
+                control_loop_started_at = time.monotonic()
                 position_safety_fault_latched = False
                 if position_deploy_executor is not None:
                     flush_position_executor_debug_events()
@@ -4080,6 +4886,12 @@ def main(argv: list[str] | None = None) -> int:
                     if position_deploy_executor is not None:
                         position_deploy_executor.clear()
                         last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
+                    if not rearm_rtc_if_needed(
+                        now=control_loop_started_at,
+                        reason="operator_g",
+                    ):
+                        policy_active = False
+                        continue
                     policy.reset()
                     policy_deploy_runtime.clear_action_queue()
                     startup_initializer.reset()
@@ -4106,6 +4918,12 @@ def main(argv: list[str] | None = None) -> int:
                     elif policy_qpos_init_controller is not None and policy_qpos_init_controller.blocks_policy:
                         print("[Deploy] ready confirm ignored: complete policy qpos init first (press g).")
                     else:
+                        if not rearm_rtc_if_needed(
+                            now=control_loop_started_at,
+                            reason="operator_ready_confirm",
+                        ):
+                            policy_active = False
+                            continue
                         if not policy_active:
                             policy_active = True
                         enable_deferred_impedance_force_control(trigger="A_policy_or_ready_confirm")
@@ -4117,6 +4935,10 @@ def main(argv: list[str] | None = None) -> int:
                             policy_deploy_runtime.reset_prediction_schedule()
                             print("[Deploy] ready confirmed; policy inference/execution may start.")
                 elif key == "h":
+                    hold_rtc_if_eligible(
+                        now=control_loop_started_at,
+                        reason="operator_hold",
+                    )
                     if position_deploy_executor is not None:
                         position_deploy_executor.clear()
                         last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
@@ -4153,6 +4975,10 @@ def main(argv: list[str] | None = None) -> int:
                 ik_gate_event = ik_action_gate.update(arm_states)
                 if ik_action_gate.blocks_action_output:
                     policy_deploy_runtime.clear_action_queue()
+                    hold_rtc_if_eligible(
+                        now=control_loop_started_at,
+                        reason="ik_action_gate_blocked",
+                    )
                 if ik_gate_event:
                     policy_deploy_runtime.reset_prediction_schedule()
                     print(f"[Deploy] {ik_gate_event}; action queue cleared")
@@ -4174,6 +5000,7 @@ def main(argv: list[str] | None = None) -> int:
                     last_action=last_action,
                     timestamp=loop_started_at,
                     require_images=bool(args.require_camera_frame),
+                    hand_state_max_age_sec=DEFAULT_HAND_STATE_MAX_AGE_SEC,
                     metadata={
                         "control_hz": control_hz,
                         "causal_snapshot_contract": (
@@ -4199,6 +5026,10 @@ def main(argv: list[str] | None = None) -> int:
                 if position_safety_fault_latched:
                     policy_active = False
                     policy_deploy_runtime.clear_action_queue()
+                    hold_rtc_if_eligible(
+                        now=control_loop_started_at,
+                        reason="position_safety_fault_latched",
+                    )
                     faults.append("position_safety_fault_manual_rearm_required")
                     if rearm_requested and position_deploy_executor is not None:
                         try:
@@ -4272,6 +5103,11 @@ def main(argv: list[str] | None = None) -> int:
                 if policy_active:
                     position_action_submitted_this_loop = False
                     can_run_policy = not (bool(args.require_ready_observation) and faults)
+                    if _debug_replay_execution_exhausted(
+                        policy,
+                        queued_actions=policy_deploy_runtime.action_queue_length(),
+                    ):
+                        can_run_policy = False
                     if fixed_completed_this_step:
                         can_run_policy = False
                     if policy_qpos_completed_this_step:
@@ -4335,17 +5171,24 @@ def main(argv: list[str] | None = None) -> int:
                         can_run_policy = False
                     if can_run_policy and wait_for_ready_confirm and not ready_confirmed:
                         can_run_policy = False
-                    if can_run_policy and policy_deploy_runtime.should_predict(
-                        now=loop_started_at,
-                        policy_interval_s=1.0 / float(effective_policy_hz),
-                        min_action_queue=int(args.min_action_queue),
+                    if (
+                        rtc_frontend is None
+                        and can_run_policy
+                        and policy_deploy_runtime.should_predict(
+                            now=control_loop_started_at,
+                            policy_interval_s=1.0 / float(effective_policy_hz),
+                            min_action_queue=int(args.min_action_queue),
+                        )
                     ):
                         prediction = policy_deploy_runtime.predict_and_queue(
                             policy,
                             observation,
-                            now=loop_started_at,
+                            now=control_loop_started_at,
                             queue_policy=action_queue_policy,
                             discard_policy_output=ik_action_gate.discards_policy_output,
+                            action_keyframe_period_sec=(
+                                1.0 / float(effective_action_hz)
+                            ),
                         )
                         queue_len_before_update = prediction.queue_len_before
                         if prediction.accepted:
@@ -4427,20 +5270,192 @@ def main(argv: list[str] | None = None) -> int:
                     # impedance backend already keeps its last safe command;
                     # synthesising the current measured TCP here would
                     # re-anchor the Cartesian reference on every gap.
-                    action_step = policy_deploy_runtime.prepare_next_action(
-                        observation,
-                        preparer=canonical_action_pipeline,
-                        policy_name=policy.name,
-                        allow_output=(
-                            can_run_policy and not ik_action_gate.blocks_action_output
-                        ),
+                    allow_policy_output = (
+                        can_run_policy and not ik_action_gate.blocks_action_output
                     )
+                    if policy_arbiter_shadow is not None:
+                        shadow_gate_status = (
+                            "fault"
+                            if position_safety_fault_latched
+                            else "ready"
+                            if allow_policy_output
+                            else "hold"
+                        )
+                        policy_arbiter_shadow.update_execution_gate(
+                            shadow_gate_status,
+                            reason=(
+                                "legacy_output_eligible"
+                                if shadow_gate_status == "ready"
+                                else "legacy_safety_fault_latched"
+                                if shadow_gate_status == "fault"
+                                else "legacy_output_not_eligible"
+                            ),
+                            produced_at=control_loop_started_at,
+                        )
+                    if rtc_frontend is None:
+                        action_step = policy_deploy_runtime.prepare_next_action(
+                            observation,
+                            preparer=canonical_action_pipeline,
+                            policy_name=policy.name,
+                            allow_output=allow_policy_output,
+                        )
+                    else:
+                        rtc_step = rtc_frontend.step(
+                            observation,
+                            now=control_loop_started_at,
+                            allow_output=allow_policy_output,
+                        )
+                        if rtc_step_fanout is not None:
+                            rtc_step_fanout.put_nowait(rtc_step)
+                        action_step = rtc_step.action_preparation
+                        debug_logger.log_event(
+                            "rtc_frontend_step",
+                            rtc_step.to_debug_payload(),
+                        )
+                        if (
+                            rtc_step.result_transition is not None
+                            and not rtc_step.result_transition.receipt.accepted
+                        ):
+                            faults.extend(
+                                "rtc_result_rejected:"
+                                f"{reason}"
+                                for reason in (
+                                    rtc_step.result_transition.receipt.reasons
+                                )
+                            )
+                        elif (
+                            rtc_step.result_transition is not None
+                            and rtc_step.result_transition.receipt.accepted
+                        ):
+                            ik_action_gate.mark_policy_output_accepted()
+                        if rtc_step.budget_exceeded:
+                            faults.append("rtc_control_budget_exceeded")
+                        if (
+                            rtc_step.state.lifecycle_state
+                            != POLICY_ASYNC_PRODUCER_ELIGIBLE
+                        ):
+                            policy_active = False
+                    arbiter_shadow_step = None
+                    if policy_arbiter_shadow is not None:
+                        if action_step.emission is not None:
+                            if debug_replay:
+                                if (
+                                    replay_proposal_shadow_adapter is not None
+                                    and action_step.raw_action is not None
+                                ):
+                                    try:
+                                        replay_adapter_result = (
+                                            replay_proposal_shadow_adapter.adapt_emission(
+                                                action_step.emission,
+                                                raw_action_metadata=(
+                                                    action_step.raw_action.metadata
+                                                ),
+                                            )
+                                        )
+                                        debug_logger.log_event(
+                                            "replay_proposal_adapter",
+                                            replay_adapter_debug_payload(
+                                                replay_adapter_result
+                                            ),
+                                        )
+                                        if replay_adapter_result.proposal_draft is not None:
+                                            arbiter_shadow_step = (
+                                                policy_arbiter_shadow.evaluate_proposal_draft(
+                                                    replay_adapter_result.proposal_draft,
+                                                    source_event_id=(
+                                                        replay_adapter_result
+                                                        .source_adapter_receipt
+                                                        .representation_trace_id
+                                                    ),
+                                                    emission=action_step.emission,
+                                                )
+                                            )
+                                        else:
+                                            arbiter_shadow_step = policy_arbiter_shadow.status(
+                                                "replay_adapter_rejected",
+                                                reason="replay_source_or_binding_invalid",
+                                                emission_id=action_step.emission.emission_id,
+                                                emission=action_step.emission,
+                                                occurred_at=control_loop_started_at,
+                                            )
+                                    except (KeyError, TypeError, ValueError) as exc:
+                                        arbiter_shadow_step = policy_arbiter_shadow.status(
+                                            "replay_adapter_error",
+                                            reason=type(exc).__name__,
+                                            emission_id=action_step.emission.emission_id,
+                                            emission=action_step.emission,
+                                            occurred_at=control_loop_started_at,
+                                        )
+                                else:
+                                    arbiter_shadow_step = policy_arbiter_shadow.status(
+                                        "replay_adapter_unavailable",
+                                        reason="typed_replay_contract_unavailable",
+                                        emission_id=action_step.emission.emission_id,
+                                        emission=action_step.emission,
+                                        occurred_at=control_loop_started_at,
+                                    )
+                            else:
+                                arbiter_shadow_step = (
+                                    policy_arbiter_shadow.evaluate_emission(
+                                        action_step.emission
+                                    )
+                                )
+                        elif action_step.emission_error is not None:
+                            arbiter_shadow_step = policy_arbiter_shadow.status(
+                                "emission_error",
+                                reason=type(action_step.emission_error).__name__,
+                                occurred_at=control_loop_started_at,
+                            )
+                        if arbiter_shadow_step is not None:
+                            debug_logger.log_event(
+                                "arbitration_shadow_step",
+                                arbiter_shadow_step.to_debug_payload(),
+                            )
                     queue_len_before_pop = action_step.queue_len_before
                     raw_action = action_step.raw_action
                     raw_lookahead_action = action_step.raw_lookahead_action
                     queue_len_after_pop = action_step.queue_len_after
                     if raw_action is not None:
                         canonical_action = action_step.prepared_action
+                        if (
+                            not debug_replay
+                            and action_step.emission is not None
+                            and arbiter_shadow_step is not None
+                            and arbiter_shadow_step.evaluation is not None
+                        ):
+                            try:
+                                policy_safety_comparison = (
+                                    evaluate_policy_legacy_aligned_safety(
+                                        emission=action_step.emission,
+                                        arbitration_evaluation_id=(
+                                            arbiter_shadow_step.evaluation.evaluation_id
+                                        ),
+                                        observation=observation,
+                                        legacy_result=canonical_action,
+                                        safety_filter=(
+                                            canonical_action_pipeline.safety_filter
+                                        ),
+                                    )
+                                )
+                                debug_logger.log_event(
+                                    "policy_safety_shadow_comparison",
+                                    policy_safety_comparison.to_debug_payload(),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                # This is a passive observer.  Its failure must
+                                # not alter the legacy fault list, last_action,
+                                # queue state, or execution result.
+                                debug_logger.log_event(
+                                    "policy_safety_shadow_error",
+                                    {
+                                        "non_authoritative": True,
+                                        "emission_id": action_step.emission.emission_id,
+                                        "arbitration_evaluation_id": (
+                                            arbiter_shadow_step.evaluation.evaluation_id
+                                        ),
+                                        "error_type": type(exc).__name__,
+                                    },
+                                )
                         lookahead_canonical_action = None
                         lookahead_observation = None
                         if (
@@ -4473,6 +5488,31 @@ def main(argv: list[str] | None = None) -> int:
                             observation,
                             policy_name=policy.name,
                         )
+                        if (
+                            rtc_frontend is not None
+                            and canonical_action.faults
+                            and rtc_frontend.state.lifecycle_state
+                            == POLICY_ASYNC_PRODUCER_ELIGIBLE
+                        ):
+                            rtc_fault = rtc_frontend.fault(
+                                now=control_loop_started_at,
+                                reason="canonical_safety_fault",
+                            )
+                            debug_logger.log_event(
+                                "rtc_lifecycle_transition",
+                                {
+                                    "target": "FAULT",
+                                    "reason": "canonical_safety_fault",
+                                    "producer_transition_hash": (
+                                        rtc_fault.producer_transition.receipt
+                                        .semantic_content_hash
+                                    ),
+                                    "worker_stop_hash": (
+                                        rtc_fault.worker_stop_receipt.semantic_content_hash
+                                    ),
+                                },
+                            )
+                            policy_active = False
                         dispatch_error: BaseException | None = None
                         execution: _PreparedActionExecution | None = None
                         post_arm_states: dict[str, dict[str, Any]] | None = None
@@ -4504,6 +5544,23 @@ def main(argv: list[str] | None = None) -> int:
                                 post_arm_states = _debug_backend_arm_states(arm_backends)
                         except Exception as exc:  # noqa: BLE001
                             dispatch_error = exc
+                            if (
+                                policy_arbiter_shadow is not None
+                                and action_step.emission is not None
+                            ):
+                                legacy_shadow_event = (
+                                    policy_arbiter_shadow.observe_legacy_execution(
+                                        emission=action_step.emission,
+                                        shadow_step=arbiter_shadow_step,
+                                        canonical_action=canonical_action,
+                                        execution=execution,
+                                        dispatch_error=dispatch_error,
+                                    )
+                                )
+                                debug_logger.log_event(
+                                    "legacy_execution_observation",
+                                    legacy_shadow_event.to_debug_payload(),
+                                )
                             if debug_logger.enabled:
                                 post_arm_states = _debug_backend_arm_states(arm_backends)
                                 debug_logger.log_action_step(
@@ -4523,6 +5580,23 @@ def main(argv: list[str] | None = None) -> int:
                                     execution=execution,
                                 )
                             raise
+                        if (
+                            policy_arbiter_shadow is not None
+                            and action_step.emission is not None
+                        ):
+                            legacy_shadow_event = (
+                                policy_arbiter_shadow.observe_legacy_execution(
+                                    emission=action_step.emission,
+                                    shadow_step=arbiter_shadow_step,
+                                    canonical_action=canonical_action,
+                                    execution=execution,
+                                    dispatch_error=dispatch_error,
+                                )
+                            )
+                            debug_logger.log_event(
+                                "legacy_execution_observation",
+                                legacy_shadow_event.to_debug_payload(),
+                            )
                         debug_logger.log_action_step(
                             timestamp=loop_started_at,
                             step_index=step_index,
@@ -4561,6 +5635,11 @@ def main(argv: list[str] | None = None) -> int:
 
                 if loop_started_at - last_status_at >= float(args.status_sec):
                     policy_status = _policy_status_text(policy)
+                    pending_action_count = (
+                        policy_deploy_runtime.action_queue_length()
+                        if rtc_frontend is None
+                        else len(rtc_frontend.state.plan.keyframes)
+                    )
                     position_executor_status = ""
                     if position_deploy_executor is not None:
                         position_snapshot = position_deploy_executor.snapshot()
@@ -4634,6 +5713,16 @@ def main(argv: list[str] | None = None) -> int:
                             policy_status,
                             ik_action_gate.status_text(),
                             position_executor_status,
+                            (
+                                "rtc="
+                                f"{rtc_frontend.state.lifecycle_state.lower()} "
+                                "rtc_worker="
+                                f"{rtc_frontend.state.worker_session_state.lower()} "
+                                "rtc_emissions="
+                                f"{rtc_frontend.selected_emission_count}"
+                                if rtc_frontend is not None
+                                else ""
+                            ),
                         )
                         if text
                     ]
@@ -4643,7 +5732,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"step={step_index} hz={control_hz:.2f} "
                         f"policy={'active' if policy_active else 'paused'} "
                         f"send={'on' if send_actions else 'dry-run'} "
-                        f"queue={policy_deploy_runtime.action_queue_length()} "
+                        f"queue={pending_action_count} "
                         f"state_valid={int(np.sum(observation.state_valid))}/{observation.state_valid.size} "
                         f"{camera_status_text(camera_sources, camera_previewer)}"
                         f"{suffix}"
@@ -4682,6 +5771,21 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(f"[DeployCleanup] {error}", file=sys.stderr)
 
+        if rtc_frontend is not None:
+            try:
+                rtc_stop = rtc_frontend.close(now=time.monotonic())
+                debug_logger.log_event(
+                    "rtc_frontend_close",
+                    {
+                        "worker_stop_hash": rtc_stop.semantic_content_hash,
+                        "worker_session_state": rtc_stop.session_state,
+                        "thread_exited": rtc_stop.thread_exited,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - continue all cleanup.
+                error = f"rtc_frontend: {type(exc).__name__}: {exc}"
+                cleanup_errors.append(error)
+                print(f"[DeployCleanup] {error}", file=sys.stderr)
         if position_deploy_executor is not None:
             try:
                 position_deploy_executor.close()
@@ -4708,6 +5812,10 @@ def main(argv: list[str] | None = None) -> int:
                     },
                 )
             flush_position_executor_debug_events()
+            debug_logger.log_event(
+                "position_executor_final_snapshot",
+                position_deploy_executor.snapshot(),
+            )
         if fixed_init_controller is not None:
             try:
                 fixed_init_controller.restore_speed(arm_backends)

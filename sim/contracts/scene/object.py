@@ -26,7 +26,7 @@ class FreeBodyObjectSpec:
     name: str
     shape: str = "box"
     size_m: tuple[float, float, float] = (0.03, 0.03, 0.03)
-    initial_position_m: tuple[float, float, float] = (-0.412, 0.0, 0.026)
+    initial_position_m: tuple[float, float, float] = (-0.472, 0.0, 0.026)
     initial_quaternion_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
     mass_kg: float = 0.05
     inertia_diagonal_kg_m2: tuple[float, float, float] | None = None
@@ -86,7 +86,7 @@ class FreeBodyObjectSpec:
             shape=str(payload.get("shape", "box")),
             size_m=tuple(payload.get("size_m", (0.03, 0.03, 0.03))),
             initial_position_m=tuple(
-                payload.get("initial_position_m", (-0.412, 0.0, 0.026))
+                payload.get("initial_position_m", (-0.472, 0.0, 0.026))
             ),
             initial_quaternion_wxyz=tuple(
                 payload.get("initial_quaternion_wxyz", (1.0, 0.0, 0.0, 0.0))

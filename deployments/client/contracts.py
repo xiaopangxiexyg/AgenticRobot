@@ -45,6 +45,10 @@ class DeployPolicyContract:
     require_active_sides_match: bool = True
     required_camera_slots: tuple[str, ...] = ()
     hand_layout: str | None = "q6_slot0_gripper"
+    # Optional explicit binding for the numeric normalization contract.  It is
+    # deliberately opt-in so legacy servers keep their historical metadata
+    # compatibility until they publish a contract hash.
+    normalization_hash: str | None = None
     metadata_required: bool = True
     extra: Mapping[str, Any] = field(default_factory=dict)
 
@@ -80,6 +84,7 @@ class DeployPolicyContract:
         object.__setattr__(self, "active_sides", _normalize_sides(self.active_sides))
         object.__setattr__(self, "required_camera_slots", tuple(str(v) for v in self.required_camera_slots))
         object.__setattr__(self, "hand_layout", _optional_str(self.hand_layout))
+        object.__setattr__(self, "normalization_hash", _optional_str(self.normalization_hash))
         object.__setattr__(self, "extra", dict(self.extra))
 
 
@@ -191,6 +196,25 @@ def validate_server_metadata(
             "input_state_mode_mismatch:"
             f"expected={contract.state_input_mode!r}, actual={server_state_input_mode!r}"
         )
+    server_normalization_hash = _optional_str(
+        _first_present(
+            payload,
+            (
+                "normalization_hash",
+                "dataset_adapter.normalization_hash",
+                "model.normalization_hash",
+                "deployment.normalization_hash",
+            ),
+        )
+    )
+    if contract.normalization_hash is not None:
+        if server_normalization_hash is None:
+            errors.append("normalization_hash_missing")
+        elif server_normalization_hash != contract.normalization_hash:
+            errors.append(
+                "normalization_hash_mismatch:"
+                f"expected={contract.normalization_hash!r}, actual={server_normalization_hash!r}"
+            )
     state_discrete_key = _optional_str(
         _first_present(
             payload,
@@ -290,6 +314,7 @@ def validate_server_metadata(
         "state_key": state_key,
         "state_dim": state_dim,
         "state_input_mode": server_state_input_mode,
+        "normalization_hash": server_normalization_hash,
         "state_discrete_key": state_discrete_key,
         "state_discrete_dim": state_discrete_dim,
         "action_dim": action_dim,

@@ -75,6 +75,39 @@ class ArmModeLabelTests(unittest.TestCase):
         self.assertEqual(payload["sides"]["right"]["mode"], "init_pose")
         self.assertEqual(payload["sides"]["right"]["source"], "init_arm")
 
+    def test_qpos_home_recapture_ends_init_and_marks_target_arm_stopped(self) -> None:
+        command = _command()
+        command.metadata.update(
+            {
+                "init_arm_active_side": "left",
+                "init_arm_mode": "qpos_recapturing",
+                "init_arm_qpos_active": True,
+                "init_arm_label_active": False,
+                "arm_mode_stopped_sides": ["left"],
+                "arm_mode_stop_reason": "init_arm_home_recapture",
+            }
+        )
+        command.commands["left_arm"].metadata.update(
+            {
+                "arm_mode_stopped": True,
+                "arm_mode_stop_reason": "init_arm_home_recapture",
+            }
+        )
+
+        payload = build_arm_mode_metadata(
+            command=command,
+            session_state="RUNNING",
+            active_sides=("left", "right"),
+        )
+
+        self.assertEqual(payload["sides"]["left"]["mode"], "stopped")
+        self.assertEqual(payload["sides"]["right"]["mode"], "teleop")
+        self.assertEqual(payload["active_special_tasks"], [])
+        self.assertEqual(
+            payload["sides"]["left"]["detail"]["stop_reason"],
+            "init_arm_home_recapture",
+        )
+
     def test_init_audit_uses_actual_feedback_but_model_mode_stays_single_label(self) -> None:
         command = _command()
         target = _pose()
@@ -246,7 +279,10 @@ class ArmModeLabelTests(unittest.TestCase):
             observation_last_action=np.zeros(26, dtype=np.float32),
             arm_state_source="unit",
             active_sides=("left", "right"),
-            metadata={"arm_mode": payload},
+            metadata={
+                "arm_mode": payload,
+                "collection_continuity_segment_index": 3,
+            },
         )
 
         row, _camera_expectations = collector_sample_to_row(sample)
@@ -260,6 +296,7 @@ class ArmModeLabelTests(unittest.TestCase):
         self.assertEqual(decoded["schema"], "dexteleop_arm_mode_v2")
         self.assertEqual(row["teleop.arm_mode.left.init_phase"], "not_active")
         self.assertEqual(row["teleop.arm_mode.left.init_phase_valid"], 0)
+        self.assertEqual(row["collection.continuity_segment_index"], 3)
 
     def test_schema_keeps_missing_legacy_arm_mode_compatible(self) -> None:
         sample = CollectorSample(

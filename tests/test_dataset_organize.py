@@ -71,6 +71,14 @@ def _make_source(root: Path) -> None:
         "duration_sec": 2.0,
         "parquet_path": "data/chunk-000/episode_000005.parquet",
         "video_paths": {"front": "videos/observation.images.front/chunk-000/episode_000005.mp4"},
+        "summary": {
+            "video_frame_stats": {
+                "front": {
+                    "path": "videos/observation.images.front/chunk-000/episode_000005.mp4",
+                    "written": 2,
+                }
+            }
+        },
         "metadata": {
             "hand_action_specs_by_side": {"left": {"hand_model": "inspire_tac"}},
             "gripper_policy": {"output_dim": 1},
@@ -118,6 +126,9 @@ def test_build_reindexes_and_migrates_legacy_dmtac_slot(tmp_path: Path) -> None:
     assert output_record["episode_id"] == "episode_000000"
     assert output_record["parquet_path"] == "data/chunk-000/episode_000000.parquet"
     assert output_record["video_paths"]["front"].endswith("episode_000000.mp4")
+    assert output_record["summary"]["video_frame_stats"]["front"]["path"].endswith(
+        "episode_000000.mp4"
+    )
     source_video = source / "videos/observation.images.front/chunk-000/episode_000005.mp4"
     output_video = output / "videos/observation.images.front/chunk-000/episode_000000.mp4"
     assert source_video.stat().st_ino == output_video.stat().st_ino
@@ -147,6 +158,24 @@ def test_reindex_path_accepts_an_already_zero_episode_name() -> None:
         output_episode_index=0,
         chunk_size=1000,
     ) == Path("data/chunk-000/episode_000000.parquet")
+
+
+def test_rewrite_paths_does_not_treat_episode_event_names_as_paths() -> None:
+    from utils.dataset_postprocess.organize_episodes import _rewrite_paths_in_value
+
+    payload = {
+        "event": "episode_start",
+        "path": "data/chunk-000/episode_000005.parquet",
+    }
+
+    assert _rewrite_paths_in_value(
+        payload,
+        output_episode_index=2,
+        chunk_size=1000,
+    ) == {
+        "event": "episode_start",
+        "path": "data/chunk-000/episode_000002.parquet",
+    }
 
 
 def test_minimum_duration_filter_is_inclusive_at_the_threshold() -> None:
@@ -182,4 +211,3 @@ def test_plan_can_select_one_named_output(tmp_path: Path) -> None:
     )
     plan = plan_dataset_build(manifest_path, dataset_names=["second"])
     assert [item.name for item in plan] == ["second"]
-

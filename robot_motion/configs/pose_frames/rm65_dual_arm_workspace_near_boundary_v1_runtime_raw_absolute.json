@@ -1,0 +1,59 @@
+{
+  "schema": "dexteleop_pose_frame_contract_v1",
+  "pose_storage_frame": "raw_absolute",
+  "canonical_absolute_frame": "desk",
+  "source": {
+    "schema": "dexteleop_pose_source_contract_v1",
+    "source_id": "rm65_real_dual_arm_workspace_near_boundary_v1",
+    "source_family": "real_robot",
+    "source_description": "Dual RM65 station whose canonical desk is the v3 valid-workspace near-boundary frame.",
+    "topology": "dual_arm",
+    "active_sides": ["left", "right"],
+    "raw_absolute_frame_by_side": {
+      "left": "left_rm65_base",
+      "right": "right_rm65_base"
+    },
+    "raw_to_canonical_desk_transform": [
+      [1.0, 0.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0, 0.0],
+      [0.0, 0.0, 1.0, 0.0],
+      [0.0, 0.0, 0.0, 1.0]
+    ],
+    "raw_to_canonical_desk_transform_by_side": {
+      "left": [
+        [0.0, -1.0, 0.0, -0.472],
+        [1.0, 0.0, 0.0, 0.2625],
+        [0.0, 0.0, 1.0, -0.01],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "right": [
+        [0.0, 1.0, 0.0, -0.472],
+        [-1.0, 0.0, 0.0, -0.2625],
+        [0.0, 0.0, 1.0, -0.01],
+        [0.0, 0.0, 0.0, 1.0]
+      ]
+    },
+    "canonical_desk_frame": "desk",
+    "profile_version": "1",
+    "metadata": {
+      "station_profile": "rm65_dual_arm_table_v3",
+      "canonical_frame_urdf_link": "workspace_near_boundary_frame",
+      "reference_urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
+      "canonical_frame_world_xyz_m": [-0.472, 0.0, 0.01],
+      "canonical_frame_world_rpy_rad": [0.0, 0.0, 3.141592653589793],
+      "canonical_frame_definition": "Left-right centered on the tabletop surface and located at the operator/robot-near boundary of the valid tabletop workspace along the tabletop-center-to-operator/robot direction.",
+      "canonical_frame_axes": {
+        "x": "operator-facing direction toward the tabletop",
+        "y": "from the workspace-near-boundary origin toward the operator's left",
+        "z": "vertically upward from the tabletop"
+      },
+      "extrinsics_basis": "calibrated_station_urdf",
+      "calibration_status": "authoritative_calibrated_urdf",
+      "hardware_measurement_status": "encoded_in_calibrated_station_urdf"
+    }
+  },
+  "metadata": {
+    "binding_role": "deployment_runtime_raw_input",
+    "canonical_frame_urdf_link": "workspace_near_boundary_frame"
+  }
+}

@@ -12,7 +12,8 @@
     "send_threshold": 0.002,
     "command_hz": 40.0,
     "continuous_grasp": true,
-    "telemetry_hz": 10.0
+    "telemetry_hz": 20.0,
+    "telemetry_command_grace_s": 0.02
   },
   "tasks": {
     "soft_grasp": {

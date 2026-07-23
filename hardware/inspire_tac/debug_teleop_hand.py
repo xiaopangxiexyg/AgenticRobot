@@ -6,18 +6,19 @@ import numpy as np
 import pyrealsense2 as rs
 import multiprocessing
 from inspire_tac_modbus import InspireTacModbus, TactileVisualizer
+from hardware.realsense.color import color_format_value, color_image_to_bgr
 
 
 def produce_frame(queue: multiprocessing.Queue):
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, 640, 480, color_format_value(rs, "yuyv"), 30)
     pipeline.start(config)
     while True:#cap.isOpened():
         #success, image = cap.read()
         frames = pipeline.wait_for_frames()
         color_frame = frames.get_color_frame()
-        image = np.asanyarray(color_frame.get_data())
+        image = color_image_to_bgr(np.asanyarray(color_frame.get_data()), "yuyv")
         #if not success:
         #    continue
         frame = image

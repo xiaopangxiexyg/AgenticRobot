@@ -80,6 +80,8 @@ def test_mujoco_position_rig_runs_atomic_60_to_120_to_1000_pipeline() -> None:
         scene,
         MujocoPositionExecutionConfig(
             timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
             realtime_worker=False,
             follow_qpos_alpha=1.0,
         ),
@@ -110,6 +112,8 @@ def test_mujoco_position_rig_mailbox_keeps_only_latest_qref() -> None:
         scene,
         MujocoPositionExecutionConfig(
             timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
             realtime_worker=False,
             follow_qpos_alpha=1.0,
         ),
@@ -131,7 +135,12 @@ def test_mujoco_position_rig_rejects_partial_bimanual_reference() -> None:
     scene = _FakeScene()
     rig = MujocoPositionExecutionRig(
         scene,
-        MujocoPositionExecutionConfig(timing=_timing(), realtime_worker=False),
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
     )
     rig.start()
     partial = TeleopCommand()

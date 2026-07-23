@@ -54,12 +54,42 @@ def _print_json(data) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 
+def _add_hidden_alias(
+    parser: argparse.ArgumentParser,
+    option: str,
+    *,
+    dest: str,
+    action: str | None = None,
+    value_type=None,
+    nargs=None,
+) -> None:
+    kwargs = {"dest": dest, "help": argparse.SUPPRESS}
+    if action is not None:
+        kwargs["action"] = action
+    if value_type is not None:
+        kwargs["type"] = value_type
+    if nargs is not None:
+        kwargs["nargs"] = nargs
+    parser.add_argument(option, **kwargs)
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--port", default="/dev/ttyUSB0")
-    parser.add_argument("--id", type=int, default=1, dest="gripper_id")
-    parser.add_argument("--baudrate", type=int, default=115200)
-    parser.add_argument("--timeout", type=float, default=0.10)
-    parser.add_argument("--max_open_mm", type=float, default=70.0)
+    transport = parser.add_argument_group("gripper transport")
+    transport.add_argument("--port", default="/dev/ttyUSB0", help="Gripper serial port.")
+    transport.add_argument("--gripper-id", type=int, default=1, help="Gripper Modbus id.")
+    _add_hidden_alias(transport, "--id", dest="gripper_id", value_type=int)
+    transport.add_argument("--gripper-baudrate", dest="baudrate", type=int, default=115200)
+    _add_hidden_alias(transport, "--baudrate", dest="baudrate", value_type=int)
+    transport.add_argument(
+        "--gripper-timeout",
+        dest="timeout",
+        type=float,
+        default=0.10,
+        help="Gripper serial timeout in seconds.",
+    )
+    _add_hidden_alias(transport, "--timeout", dest="timeout", value_type=float)
+    transport.add_argument("--max-open-mm", dest="max_open_mm", type=float, default=70.0)
+    _add_hidden_alias(transport, "--max_open_mm", dest="max_open_mm", value_type=float)
     parser.add_argument(
         "--no-gripper-reconnect",
         action="store_true",
@@ -74,18 +104,34 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         help="Use Modbus 0x10 to write position/speed/torque together. Disabled by default for stability.",
     )
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--tactile_ids", nargs="*", default=None)
-    parser.add_argument("--backend", default="cpu", choices=["cpu", "cuda", "Flux", "flux"])
-    parser.add_argument("--mode", default="standard", choices=["standard", "high"])
-    parser.add_argument("--max_fps", type=int, default=120)
-    parser.add_argument("--tactile_fields", nargs="*", default=["raw"])
+    tactile = parser.add_argument_group("DM-Tac tactile")
+    tactile.add_argument("--tactile-ids", nargs="*", default=None)
+    _add_hidden_alias(tactile, "--tactile_ids", dest="tactile_ids", nargs="*")
+    tactile.add_argument(
+        "--tactile-backend",
+        dest="backend",
+        default="cpu",
+        choices=["cpu", "cuda", "Flux", "flux"],
+    )
+    _add_hidden_alias(tactile, "--backend", dest="backend")
+    tactile.add_argument(
+        "--tactile-mode",
+        dest="mode",
+        default="standard",
+        choices=["standard", "high"],
+    )
+    _add_hidden_alias(tactile, "--mode", dest="mode")
+    tactile.add_argument("--tactile-max-fps", dest="max_fps", type=int, default=120)
+    _add_hidden_alias(tactile, "--max_fps", dest="max_fps", value_type=int)
+    tactile.add_argument("--tactile-fields", nargs="*", default=["raw"])
+    _add_hidden_alias(tactile, "--tactile_fields", dest="tactile_fields", nargs="*")
     parser.add_argument(
         "--tactile-compute-profile",
         choices=TACTILE_COMPUTE_PROFILES,
         default="dist-only",
         help=(
             "SDK compute channels to enable for tactile reads. Default fields are raw images; "
-            "use tactile_fields distributed_force for real-time force output."
+            "use --tactile-fields distributed_force for real-time force output."
         ),
     )
     parser.add_argument(
@@ -314,6 +360,9 @@ def _is_gripper_attention_item(item) -> bool:
 def _format_probe_error(item) -> str:
     probe = item.get("probe") or {}
     parts = []
+    skipped_reason = str(item.get("probe_skipped_reason") or "").strip()
+    if skipped_reason:
+        parts.append(f"skipped={skipped_reason}")
     attempted_count = probe.get("attempted_setting_count") or probe.get("attempted_gripper_id_count")
     if isinstance(attempted_count, int) and attempted_count > 1:
         parts.append(f"probes_tried={attempted_count}")
@@ -343,6 +392,13 @@ def _print_scan_summary(scan: dict) -> None:
     reachable = [item for item in all_grippers if _is_reachable_gripper_item(item)]
     attention = [item for item in all_grippers if _is_gripper_attention_item(item)]
     hidden_count = sum(1 for item in all_grippers if _is_noise_serial_item(item))
+
+    if bool(scan.get("gripper_probe_stopped_early")):
+        print(
+            "Gripper probe stopped early after finding "
+            f"{int(scan.get('gripper_probe_reachable_count') or 0)} reachable devices; "
+            "use --max-reachable-grippers 0 for an exhaustive scan."
+        )
 
     print("Reachable grippers:")
     if reachable:
@@ -656,7 +712,58 @@ def _apply_configure_gripper_settings(assignment: dict, args) -> dict:
     return assignment
 
 
+def _prepare_configure_usb_mode(args) -> None:
+    tactile_tokens = (
+        "left_inner",
+        "left_outer",
+        "right_inner",
+        "right_outer",
+    )
+    if bool(args.scan_only):
+        side_effects = []
+        for name in (
+            "save",
+            "interactive",
+            "assign_tactile_gui",
+            "left_gripper",
+            "right_gripper",
+            *tactile_tokens,
+        ):
+            if bool(getattr(args, name, False)):
+                side_effects.append(name)
+        if args.test_gripper or args.visualize_tactile or str(args.merge_config or ""):
+            side_effects.append("motion/visualization/merge option")
+        if side_effects:
+            raise ValueError(
+                "--scan-only cannot be combined with assignment, motion, visualization, merge, "
+                f"or save options: {sorted(set(side_effects))}"
+            )
+        return
+
+    if bool(args.grippers_only):
+        invalid = [name for name in tactile_tokens if getattr(args, name)]
+        if args.assign_tactile_gui or args.visualize_tactile or args.interactive:
+            invalid.append("tactile/manual-all-slots option")
+        if invalid:
+            raise ValueError(f"--grippers-only received tactile assignment options: {invalid}")
+        if not str(args.merge_config or "").strip():
+            args.merge_config = "latest"
+
+    if bool(args.tactile_only):
+        invalid = []
+        if args.left_gripper or args.right_gripper or args.test_gripper or args.interactive:
+            invalid.append("gripper/manual-all-slots option")
+        if invalid:
+            raise ValueError(f"--tactile-only received gripper assignment options: {invalid}")
+        args.auto_grippers = False
+        if not any(getattr(args, name) for name in tactile_tokens):
+            args.assign_tactile_gui = True
+        if not str(args.merge_config or "").strip():
+            args.merge_config = "latest"
+
+
 def _run_configure_usb(args) -> None:
+    _prepare_configure_usb_mode(args)
     if (
         not bool(getattr(args, "json", False))
         and not bool(args.no_probe_grippers)
@@ -666,7 +773,8 @@ def _run_configure_usb(args) -> None:
         if bool(args.no_scan_baudrates):
             baudrates = (int(args.baudrate),)
         print(
-            "Scanning likely gripper USB ports; if --id is not correct, Modbus ids 1..247 are tried "
+            "Scanning likely gripper USB ports; if --gripper-id is not correct, "
+            "Modbus ids 1..247 are tried "
             f"at baudrates {','.join(str(value) for value in baudrates)}."
         )
     scan = scan_usb_devices(
@@ -678,6 +786,7 @@ def _run_configure_usb(args) -> None:
         timeout=args.timeout,
         scan_gripper_ids=bool(args.scan_gripper_ids),
         scan_baudrates=() if bool(args.no_scan_baudrates) else tuple(args.scan_baudrates or (args.baudrate,)),
+        max_reachable_grippers=int(args.max_reachable_grippers),
     )
     if args.json and args.scan_only:
         _print_json(scan)
@@ -825,7 +934,7 @@ def _run_configure_usb(args) -> None:
                 "No reachable grippers found, so nothing was assigned. "
                 "Check power/wiring/permissions/baudrate. "
                 "The gripper-like USB candidates above show probe errors and the number of Modbus ids tried. "
-                "Use --id <N> to force a known id, or --interactive to assign manually."
+                "Use --gripper-id <N> to force a known id, or --manual-all-slots to assign manually."
             )
     if args.interactive and bool(args.assign_tactile_gui):
         print("Enter gripper scan index/port, or blank/none to skip. Tactile slots come from GUI.")
@@ -880,16 +989,44 @@ def _run_configure_usb(args) -> None:
         _fast_exit(0)
 
 
-def main(argv=None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Inspire gripper + DM-Tac tactile CLI")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    sub.add_parser("list-ports")
-    sub.add_parser("list-tactile")
+    sub.add_parser("list-ports", help="List serial devices without sending motion commands.")
+    sub.add_parser("list-tactile", help="List DM-Tac devices visible to the SDK.")
 
-    p = sub.add_parser("configure-usb")
-    p.add_argument("--scan-only", action="store_true")
-    p.add_argument("--interactive", action="store_true")
+    p = sub.add_parser(
+        "configure-usb",
+        help="Scan and build the shared left/right gripper/tactile assignment.",
+        description=(
+            "Scan DMTAC hardware and build an assignment. Use exactly one mode: "
+            "--scan-only, --grippers-only, --tactile-only, or the default full assignment."
+        ),
+    )
+    configure_mode = p.add_mutually_exclusive_group()
+    configure_mode.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Only print the scan result; assignment, motion-test, GUI, and save options are rejected.",
+    )
+    configure_mode.add_argument(
+        "--grippers-only",
+        action="store_true",
+        help="Assign only left/right grippers and preserve tactile slots from --merge-config (latest by default).",
+    )
+    configure_mode.add_argument(
+        "--tactile-only",
+        action="store_true",
+        help="Assign only tactile slots and preserve grippers from --merge-config (latest by default).",
+    )
+    p.add_argument(
+        "--manual-all-slots",
+        dest="interactive",
+        action="store_true",
+        help="Prompt for both grippers and all four tactile slots using terminal tokens.",
+    )
+    _add_hidden_alias(p, "--interactive", dest="interactive", action="store_true")
     p.add_argument("--save", action="store_true")
     p.add_argument("--output-dir", default="")
     p.add_argument("--json", action="store_true")
@@ -931,7 +1068,14 @@ def main(argv=None) -> None:
     p.add_argument("--left-outer", default=None)
     p.add_argument("--right-inner", default=None)
     p.add_argument("--right-outer", default=None)
-    p.add_argument("--test-gripper", nargs="*", default=())
+    p.add_argument(
+        "--motion-test-gripper",
+        dest="test_gripper",
+        nargs="*",
+        default=(),
+        help="Run an explicit test motion on selected scan tokens before assignment.",
+    )
+    _add_hidden_alias(p, "--test-gripper", dest="test_gripper", nargs="*")
     p.add_argument("--visualize-tactile", nargs="*", default=())
     p.add_argument(
         "--assign-tactile-gui",
@@ -1040,6 +1184,15 @@ def main(argv=None) -> None:
     p.add_argument("--no-probe-grippers", action="store_true")
     p.add_argument("--probe-all-serial", action="store_true")
     p.add_argument(
+        "--max-reachable-grippers",
+        type=int,
+        default=2,
+        help=(
+            "Stop expensive serial probing after this many reachable grippers "
+            "are found (default: 2; use 0 to probe every candidate)."
+        ),
+    )
+    p.add_argument(
         "--probe-system-ttys",
         action="store_true",
         help="Also probe /dev/ttyS* system serial ports. Off by default because they are usually noisy and permission denied.",
@@ -1049,26 +1202,41 @@ def main(argv=None) -> None:
         dest="scan_gripper_ids",
         action="store_false",
         default=True,
-        help="Only probe --id instead of automatically scanning Modbus ids 1..247 on likely gripper ports.",
+        help=(
+            "Only probe --gripper-id instead of automatically scanning Modbus ids "
+            "1..247 on likely gripper ports."
+        ),
     )
-    p.add_argument("--id", type=int, default=1, dest="gripper_id")
-    p.add_argument("--baudrate", type=int, default=115200)
+    p.add_argument("--gripper-id", type=int, default=1)
+    _add_hidden_alias(p, "--id", dest="gripper_id", value_type=int)
+    p.add_argument("--gripper-baudrate", dest="baudrate", type=int, default=115200)
+    _add_hidden_alias(p, "--baudrate", dest="baudrate", value_type=int)
     p.add_argument(
         "--scan-baudrates",
         nargs="*",
         type=int,
         default=[115200, 57600, 19200],
-        help="Baudrates to try while auto-probing likely gripper ports. --baudrate is tried first.",
+        help=(
+            "Baudrates to try while auto-probing likely gripper ports. "
+            "--gripper-baudrate is tried first."
+        ),
     )
     p.add_argument(
         "--no-scan-baudrates",
         action="store_true",
-        help="Only probe --baudrate instead of also trying --scan-baudrates.",
+        help=(
+            "Only probe --gripper-baudrate instead of also trying "
+            "--scan-baudrates."
+        ),
     )
-    p.add_argument("--timeout", type=float, default=0.03)
-    p.add_argument("--motion-amplitude", type=float, default=0.3)
-    p.add_argument("--motion-speed", type=float, default=0.1)
-    p.add_argument("--motion-torque", type=float, default=0.1)
+    p.add_argument("--gripper-timeout", dest="timeout", type=float, default=0.03)
+    _add_hidden_alias(p, "--timeout", dest="timeout", value_type=float)
+    p.add_argument("--motion-test-amplitude", dest="motion_amplitude", type=float, default=0.3)
+    _add_hidden_alias(p, "--motion-amplitude", dest="motion_amplitude", value_type=float)
+    p.add_argument("--motion-test-speed", dest="motion_speed", type=float, default=0.1)
+    _add_hidden_alias(p, "--motion-speed", dest="motion_speed", value_type=float)
+    p.add_argument("--motion-test-torque", dest="motion_torque", type=float, default=0.1)
+    _add_hidden_alias(p, "--motion-torque", dest="motion_torque", value_type=float)
     p.add_argument(
         "--gripper-jog-amplitude",
         type=float,
@@ -1077,9 +1245,12 @@ def main(argv=None) -> None:
     )
     p.add_argument("--gripper-jog-speed", type=float, default=0.3)
     p.add_argument("--gripper-jog-torque", type=float, default=0.3)
-    p.add_argument("--backend", default="cpu", choices=["cpu", "cuda", "Flux", "flux"])
-    p.add_argument("--mode", default="standard", choices=["standard", "high"])
-    p.add_argument("--max_fps", type=int, default=120)
+    p.add_argument("--tactile-backend", dest="backend", default="cpu", choices=["cpu", "cuda", "Flux", "flux"])
+    _add_hidden_alias(p, "--backend", dest="backend")
+    p.add_argument("--tactile-mode", dest="mode", default="standard", choices=["standard", "high"])
+    _add_hidden_alias(p, "--mode", dest="mode")
+    p.add_argument("--tactile-max-fps", dest="max_fps", type=int, default=120)
+    _add_hidden_alias(p, "--max_fps", dest="max_fps", value_type=int)
     p.add_argument(
         "--tactile-gui-compute-profile",
         choices=TACTILE_COMPUTE_PROFILES,
@@ -1089,97 +1260,153 @@ def main(argv=None) -> None:
             "does not return force in dist-only mode."
         ),
     )
-    p.add_argument("--timeout_ms", type=int, default=100)
+    p.add_argument("--tactile-timeout-ms", dest="timeout_ms", type=int, default=100)
+    _add_hidden_alias(p, "--timeout_ms", dest="timeout_ms", value_type=int)
     p.add_argument("--visualize-count", type=int, default=0)
-    p.add_argument("--max_hz", type=float, default=0.0)
-    p.add_argument("--reset_tactile", action="store_true")
-    p.add_argument("--warmup_frames", type=int, default=0)
+    p.add_argument("--visualize-max-hz", dest="max_hz", type=float, default=0.0)
+    _add_hidden_alias(p, "--max_hz", dest="max_hz", value_type=float)
+    p.add_argument("--reset-tactile", dest="reset_tactile", action="store_true")
+    _add_hidden_alias(p, "--reset_tactile", dest="reset_tactile", action="store_true")
+    p.add_argument("--warmup-frames", dest="warmup_frames", type=int, default=0)
+    _add_hidden_alias(p, "--warmup_frames", dest="warmup_frames", value_type=int)
 
-    p = sub.add_parser("verify-gripper")
+    p = sub.add_parser("verify-gripper", help="Read one gripper state without commanding motion.")
     _add_common(p)
 
-    p = sub.add_parser("verify-tactile")
-    _add_common(p)
-    p.add_argument("--count", type=int, default=10)
-    p.add_argument("--timeout_ms", type=int, default=500)
-
-    p = sub.add_parser("read")
+    p = sub.add_parser("verify-tactile", help="Read frame ids from configured tactile sensors.")
     _add_common(p)
     p.add_argument("--count", type=int, default=10)
-    p.add_argument("--period_s", type=float, default=0.0)
-    p.add_argument("--timeout_ms", type=int, default=100)
-    p.add_argument("--no_gripper", action="store_true")
-    p.add_argument("--no_tactile", action="store_true")
+    p.add_argument("--tactile-timeout-ms", dest="timeout_ms", type=int, default=500)
+    _add_hidden_alias(p, "--timeout_ms", dest="timeout_ms", value_type=int)
 
-    p = sub.add_parser("visualize-force")
+    p = sub.add_parser("read", help="Read a combined gripper/tactile snapshot stream.")
+    _add_common(p)
+    p.add_argument("--count", type=int, default=10)
+    p.add_argument("--period-sec", dest="period_s", type=float, default=0.0)
+    _add_hidden_alias(p, "--period_s", dest="period_s", value_type=float)
+    p.add_argument("--tactile-timeout-ms", dest="timeout_ms", type=int, default=100)
+    _add_hidden_alias(p, "--timeout_ms", dest="timeout_ms", value_type=int)
+    p.add_argument("--no-gripper", dest="no_gripper", action="store_true")
+    _add_hidden_alias(p, "--no_gripper", dest="no_gripper", action="store_true")
+    p.add_argument("--no-tactile", dest="no_tactile", action="store_true")
+    _add_hidden_alias(p, "--no_tactile", dest="no_tactile", action="store_true")
+
+    p = sub.add_parser("visualize-force", help="Visualize live distributed-force fields.")
     _add_common(p)
     p.add_argument("--count", type=int, default=0, help="0 means run until q/ESC")
-    p.add_argument("--timeout_ms", type=int, default=100)
-    p.add_argument("--max_hz", type=float, default=0.0, help="0 means no extra sleep")
+    p.add_argument("--tactile-timeout-ms", dest="timeout_ms", type=int, default=100)
+    _add_hidden_alias(p, "--timeout_ms", dest="timeout_ms", value_type=int)
+    p.add_argument("--max-hz", dest="max_hz", type=float, default=0.0, help="0 means no extra sleep")
+    _add_hidden_alias(p, "--max_hz", dest="max_hz", value_type=float)
     p.add_argument("--stride", type=int, default=12)
     p.add_argument("--scale", type=int, default=2)
-    p.add_argument("--arrow_scale", type=float, default=18.0)
-    p.add_argument("--min_arrow_norm", type=float, default=0.015)
-    p.add_argument("--deadband_abs", type=float, default=5e-5)
-    p.add_argument("--temporal_alpha", type=float, default=0.85)
-    p.add_argument("--spatial_blur_ksize", type=int, default=5)
-    p.add_argument("--arrow_pool", type=int, default=16)
-    p.add_argument("--viz_mode", default="delta", choices=["delta", "absolute", "frame_delta"])
-    p.add_argument("--baseline_frames", type=int, default=8)
-    p.add_argument("--fixed_ref", type=float, default=None)
-    p.add_argument("--norm_percentile", type=float, default=99.0)
-    p.add_argument("--reset_tactile", action="store_true")
-    p.add_argument("--warmup_frames", type=int, default=0)
+    p.add_argument("--arrow-scale", dest="arrow_scale", type=float, default=18.0)
+    p.add_argument("--min-arrow-norm", dest="min_arrow_norm", type=float, default=0.015)
+    p.add_argument("--deadband-abs", dest="deadband_abs", type=float, default=5e-5)
+    p.add_argument("--temporal-alpha", dest="temporal_alpha", type=float, default=0.85)
+    p.add_argument("--spatial-blur-ksize", dest="spatial_blur_ksize", type=int, default=5)
+    p.add_argument("--arrow-pool", dest="arrow_pool", type=int, default=16)
+    p.add_argument(
+        "--viz-mode",
+        dest="viz_mode",
+        default="absolute",
+        choices=["delta", "absolute", "frame_delta"],
+        help="Display raw SDK force by default; delta modes explicitly enable preprocessing.",
+    )
+    p.add_argument("--baseline-frames", dest="baseline_frames", type=int, default=8)
+    p.add_argument("--fixed-ref", dest="fixed_ref", type=float, default=None)
+    p.add_argument("--norm-percentile", dest="norm_percentile", type=float, default=99.0)
+    p.add_argument("--reset-tactile", dest="reset_tactile", action="store_true")
+    p.add_argument("--warmup-frames", dest="warmup_frames", type=int, default=0)
+    for legacy, dest, value_type in (
+        ("--arrow_scale", "arrow_scale", float),
+        ("--min_arrow_norm", "min_arrow_norm", float),
+        ("--deadband_abs", "deadband_abs", float),
+        ("--temporal_alpha", "temporal_alpha", float),
+        ("--spatial_blur_ksize", "spatial_blur_ksize", int),
+        ("--arrow_pool", "arrow_pool", int),
+        ("--baseline_frames", "baseline_frames", int),
+        ("--fixed_ref", "fixed_ref", float),
+        ("--norm_percentile", "norm_percentile", float),
+        ("--warmup_frames", "warmup_frames", int),
+    ):
+        _add_hidden_alias(p, legacy, dest=dest, value_type=value_type)
+    _add_hidden_alias(p, "--viz_mode", dest="viz_mode")
+    _add_hidden_alias(p, "--reset_tactile", dest="reset_tactile", action="store_true")
     p.add_argument("--window", default="DM-Tac distributed_force XY")
 
-    p = sub.add_parser("probe-force")
+    p = sub.add_parser("probe-force", help="Print live distributed-force diagnostics.")
     _add_common(p)
     p.add_argument("--count", type=int, default=30)
-    p.add_argument("--timeout_ms", type=int, default=100)
-    p.add_argument("--period_s", type=float, default=0.0)
-    p.add_argument("--reset_tactile", action="store_true")
-    p.add_argument("--warmup_frames", type=int, default=0)
-    p.add_argument("--no_denoise", action="store_true")
-    p.add_argument("--denoise_mode", default="delta", choices=["delta", "absolute", "frame_delta"])
-    p.add_argument("--baseline_frames", type=int, default=20)
-    p.add_argument("--deadband_abs", type=float, default=5e-5)
-    p.add_argument("--temporal_alpha", type=float, default=0.85)
-    p.add_argument("--spatial_blur_ksize", type=int, default=5)
+    p.add_argument("--tactile-timeout-ms", dest="timeout_ms", type=int, default=100)
+    _add_hidden_alias(p, "--timeout_ms", dest="timeout_ms", value_type=int)
+    p.add_argument("--period-sec", dest="period_s", type=float, default=0.0)
+    p.add_argument("--reset-tactile", dest="reset_tactile", action="store_true")
+    p.add_argument("--warmup-frames", dest="warmup_frames", type=int, default=0)
+    p.add_argument(
+        "--denoise",
+        dest="denoise",
+        action="store_true",
+        default=False,
+        help="Explicitly enable distributed-force denoise/baseline processing.",
+    )
+    p.add_argument("--no-denoise", dest="denoise", action="store_false", help=argparse.SUPPRESS)
+    p.add_argument("--denoise-mode", dest="denoise_mode", default="delta", choices=["delta", "absolute", "frame_delta"])
+    p.add_argument("--baseline-frames", dest="baseline_frames", type=int, default=20)
+    p.add_argument("--deadband-abs", dest="deadband_abs", type=float, default=5e-5)
+    p.add_argument("--temporal-alpha", dest="temporal_alpha", type=float, default=0.85)
+    p.add_argument("--spatial-blur-ksize", dest="spatial_blur_ksize", type=int, default=5)
+    for legacy, dest, action, value_type in (
+        ("--period_s", "period_s", None, float),
+        ("--reset_tactile", "reset_tactile", "store_true", None),
+        ("--warmup_frames", "warmup_frames", None, int),
+        ("--no_denoise", "denoise", "store_false", None),
+        ("--denoise_mode", "denoise_mode", None, None),
+        ("--baseline_frames", "baseline_frames", None, int),
+        ("--deadband_abs", "deadband_abs", None, float),
+        ("--temporal_alpha", "temporal_alpha", None, float),
+        ("--spatial_blur_ksize", "spatial_blur_ksize", None, int),
+    ):
+        _add_hidden_alias(p, legacy, dest=dest, action=action, value_type=value_type)
 
-    p = sub.add_parser("reset-tactile")
+    p = sub.add_parser("reset-tactile", help="Reset tactile baselines; requires unloaded sensors.")
     _add_common(p)
 
-    p = sub.add_parser("set-speed")
+    p = sub.add_parser("set-speed", help="Set the gripper speed parameter.")
     _add_common(p)
     p.add_argument("speed", type=float)
 
-    p = sub.add_parser("set-torque")
+    p = sub.add_parser("set-torque", help="Set the gripper torque/force parameter.")
     _add_common(p)
     p.add_argument("torque", type=float)
 
-    p = sub.add_parser("open")
+    p = sub.add_parser("open", help="Command the gripper to the open endpoint.")
     _add_common(p)
     p.add_argument("--wait", action="store_true")
 
-    p = sub.add_parser("close")
+    p = sub.add_parser("close", help="Command the gripper to the closed endpoint.")
     _add_common(p)
     p.add_argument("--speed", type=float, default=None)
     p.add_argument("--torque", type=float, default=None)
     p.add_argument("--continuous", action="store_true")
     p.add_argument("--wait", action="store_true")
 
-    p = sub.add_parser("move")
+    p = sub.add_parser("move", help="Command one normalized gripper position.")
     _add_common(p)
-    p.add_argument("joint_pos", type=float)
+    p.add_argument("position", type=float, help="Normalized close position in [0, 1].")
     p.add_argument("--speed", type=float, default=None)
     p.add_argument("--torque", type=float, default=None)
     p.add_argument("--continuous", action="store_true")
     p.add_argument("--wait", action="store_true")
 
-    p = sub.add_parser("stop")
+    p = sub.add_parser("stop", help="Send the gripper stop command.")
     _add_common(p)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
 
     if args.command == "list-ports":
         _print_json(list_serial_devices())
@@ -1276,9 +1503,9 @@ def main(argv=None) -> None:
         from .force_visualizer import probe_distributed_force
 
         tactile_config = _tactile_config(args)
-        tactile_config.denoise_distributed_force = not args.no_denoise
+        tactile_config.denoise_distributed_force = bool(args.denoise)
         tactile_config.denoise_config = TactileDenoiseConfig(
-            enabled=not args.no_denoise,
+            enabled=bool(args.denoise),
             mode=args.denoise_mode,
             baseline_frames=args.baseline_frames,
             deadband_abs=args.deadband_abs,
@@ -1335,7 +1562,7 @@ def main(argv=None) -> None:
                 _print_gripper_state(state, args.json)
         elif args.command == "move":
             state = dev.move(
-                args.joint_pos,
+                args.position,
                 speed=args.speed,
                 torque=args.torque,
                 continuous=args.continuous,

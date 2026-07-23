@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -42,7 +42,7 @@ from robot_motion.replay.trajectory import (
 
 from ..deploy.replay import (
     infer_replay_action_hz,
-    load_replay_actions_from_parquet,
+    load_contract_replay_actions_from_parquet,
     load_replay_arm_joint_targets_from_parquet,
     load_replay_arm_observation_qpos_from_parquet,
     load_replay_frame_times_from_parquet,
@@ -102,11 +102,14 @@ def build_replay_group_for_episode(
         parquet_path=str(args.replay_parquet).strip() or None,
         episode_index=int(episode_index),
     )
-    all_actions = load_replay_actions_from_parquet(
-        source_path,
-        action_column=str(args.replay_action_column or "action"),
-        start_index=0,
-        end_index=None,
+    all_actions, action_metadata, _pose_contract, is_typed = (
+        load_contract_replay_actions_from_parquet(
+            source_path,
+            resolved_metadata=resolved_metadata,
+            action_column=str(args.replay_action_column or "action"),
+            start_index=0,
+            end_index=None,
+        )
     )
     total_frames = int(all_actions.shape[0])
     start_index = int(group_spec.start_index)
@@ -145,11 +148,15 @@ def build_replay_group_for_episode(
         end_index=end_index,
         required=bool(require_arm_joint_targets),
     )
-    hand_joint_targets = load_replay_hand_joint_targets_from_parquet(
-        source_path,
-        active_sides=args.active_sides,
-        start_index=start_index,
-        end_index=end_index,
+    hand_joint_targets = (
+        {}
+        if is_typed
+        else load_replay_hand_joint_targets_from_parquet(
+            source_path,
+            active_sides=args.active_sides,
+            start_index=start_index,
+            end_index=end_index,
+        )
     )
     arm_observation_current_qpos = load_replay_arm_observation_qpos_from_parquet(
         source_path,
@@ -166,6 +173,17 @@ def build_replay_group_for_episode(
         end_index=end_index,
     )
     source_episode_index = int(resolved_metadata.get("episode_index", int(episode_index)))
+    replay_source_metadata = dict(resolved_metadata)
+    replay_dataset_info = replay_source_metadata.get("dataset_info")
+    replay_dataset_info = (
+        dict(replay_dataset_info) if isinstance(replay_dataset_info, Mapping) else {}
+    )
+    for key in ("hand_action_specs_by_side", "hand_active_mask_by_side"):
+        bridged_value = action_metadata.get(key)
+        if key not in replay_dataset_info and isinstance(bridged_value, Mapping):
+            replay_dataset_info[key] = dict(bridged_value)
+    if replay_dataset_info:
+        replay_source_metadata["dataset_info"] = replay_dataset_info
     return ReplayTrajectoryGroup(
         key=group_spec.key,
         label=f"episodes_{group_spec.episode_range}",
@@ -184,8 +202,10 @@ def build_replay_group_for_episode(
         metadata={
             "action_hz_estimate": dict(action_hz_info),
             "frame_timing": dict(frame_timing_info),
-            "source_metadata": dict(resolved_metadata),
+            "source_metadata": replay_source_metadata,
             "action_column": str(args.replay_action_column or "action"),
+            "action_metadata": dict(action_metadata),
+            "typed_action_contract": bool(is_typed),
             "balanced_replay": bool(str(args.replay_dataset).strip())
             and bool(getattr(args, "replay_all_episodes", True)),
             "balanced_episode_count": int(balanced_episode_count),
@@ -258,18 +278,19 @@ def build_replay_init_plan_from_args(args: Any) -> ReplayInitEpisodePlan | None:
     if not episode_token:
         raise ValueError("replay init episode spec must start with an episode index.")
     episode_index = int(episode_token)
-    init_episode_path, _ = resolve_replay_parquet_path(
+    init_episode_path, init_resolved_metadata = resolve_replay_parquet_path(
         dataset_root=source_dataset_root or None,
         parquet_path=source_parquet_path or None,
         episode_index=episode_index,
     )
     total_frames = int(
-        load_replay_actions_from_parquet(
+        load_contract_replay_actions_from_parquet(
             init_episode_path,
+            resolved_metadata=init_resolved_metadata,
             action_column=str(args.replay_action_column or "action"),
             start_index=0,
             end_index=None,
-        ).shape[0]
+        )[0].shape[0]
     )
     parsed = parse_replay_init_episode_spec(
         spec_text,

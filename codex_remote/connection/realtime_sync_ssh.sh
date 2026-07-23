@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SETUP_SCRIPT="$SCRIPT_DIR/setup_ssh_passwordless.sh"
 DEFAULT_KEY_FILE="$HOME/.ssh/id_ed25519"
+DEFAULT_EXCLUDE_FILE_NAME=".realtime_sync_ssh.exclude"
 
 REMOTE_HOST=""
 REMOTE_USER=""
@@ -13,6 +14,7 @@ LOCAL_DIR=""
 REMOTE_DIR=""
 DELETE=false
 EXCLUDES=(".codex/")
+EXCLUDE_FILES=()
 
 usage() {
   cat <<'EOF'
@@ -31,10 +33,14 @@ Options:
       --delete           Delete remote-only files and make remote mirror local exactly.
       --no-delete        Keep remote-only files. This is the default.
       --exclude PATTERN  Exclude an rsync pattern. Can be repeated. Default excludes: .codex/
+      --exclude-from FILE
+                          Load exclude patterns from FILE. Can be repeated.
+                          Blank lines and lines starting with # are ignored.
   -h, --help             Show this help.
 
 This is a one-way live mirror: local directory -> remote directory.
 If passwordless SSH is not ready, this script runs setup_ssh_passwordless.sh.
+If LOCAL/.realtime_sync_ssh.exclude exists, it is loaded automatically.
 EOF
 }
 
@@ -99,6 +105,38 @@ ensure_trailing_slash() {
   else
     printf '%s/\n' "${1%/}"
   fi
+}
+
+load_exclude_file() {
+  local file="$1"
+  local line pattern count=0
+
+  file="$(expand_path "$file")"
+  [[ -f "$file" ]] || die "exclude file does not exist: $file"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    pattern="${line%$'\r'}"
+    [[ "$pattern" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$pattern" =~ ^[[:space:]]*# ]] && continue
+    EXCLUDES+=("$pattern")
+    ((count += 1))
+  done < "$file"
+  info "Loaded $count exclude pattern(s) from: $file"
+}
+
+load_exclude_files() {
+  local default_file="$LOCAL_DIR/$DEFAULT_EXCLUDE_FILE_NAME"
+  local file pattern
+
+  if [[ -f "$default_file" ]]; then
+    load_exclude_file "$default_file"
+  fi
+  for file in "${EXCLUDE_FILES[@]}"; do
+    load_exclude_file "$file"
+  done
+  info "Active exclude patterns:"
+  for pattern in "${EXCLUDES[@]}"; do
+    printf '  - %s\n' "$pattern"
+  done
 }
 
 remote_target() {
@@ -539,6 +577,11 @@ main() {
         EXCLUDES+=("$2")
         shift 2
         ;;
+      --exclude-from)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        EXCLUDE_FILES+=("$2")
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -558,6 +601,7 @@ main() {
 
   prompt_connection_values
   prompt_sync_dirs
+  load_exclude_files
   ensure_inotify_limits
   ensure_passwordless_login
   prepare_remote_target_dir

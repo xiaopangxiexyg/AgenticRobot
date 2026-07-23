@@ -16,26 +16,24 @@ from robot_motion.rm65.dual_arm_target_solver import (
     BimanualIKSideResult,
     BimanualPoseTarget,
     BimanualPoseTargetSource,
-    DualArmCollisionAwareTargetSolver,
-    DualArmCollisionAwareTargetSolverConfig,
+    DualArmCollisionAwareRetargeter as _SharedDualArmCollisionAwareRetargeter,
+    DualArmCollisionAwareRetargeterConfig,
     DualArmQposCollisionCheck,
     DualArmTargetContext,
     _DualArmCandidate,
     _DualArmEvaluatedCandidate,
 )
 
-from ..interfaces import Retargeter
 from ..registry import register_retargeter
 from .pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 
 
-DualArmCollisionAwareRetargeterConfig = DualArmCollisionAwareTargetSolverConfig
 build_rm65_dual_arm_collision_ik_solver = _core.build_rm65_dual_arm_collision_ik_solver
 build_rm65_dual_arm_scene_profile = _core.build_rm65_dual_arm_scene_profile
 
 
 @register_retargeter("dual_arm_collision_aware")
-class DualArmCollisionAwareRetargeter(DualArmCollisionAwareTargetSolver, Retargeter):
+class DualArmCollisionAwareRetargeter(_SharedDualArmCollisionAwareRetargeter):
     """Backward-compatible operator adapter around the shared motion core."""
 
     def __init__(

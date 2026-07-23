@@ -24,9 +24,11 @@ from .audit import (
 )
 from .contracts import (
     POSITION_CONTROL_PIPELINE_VERSION,
+    POSITION_QREF_FINGERPRINT_SCHEMA,
     PositionCommandTick,
     PositionReferenceFrame,
     PositionSideReference,
+    position_qref_fingerprint,
 )
 from .config import (
     POSITION_15_60_120_PROFILE,
@@ -49,6 +51,11 @@ from .interpolation import (
     interpolate_joint_command_segment,
     reference_age_and_stale,
 )
+from .pose_action_motion import (
+    POSE_ACTION_MOTION_INTENT_SCHEMA,
+    PoseActionMotionIntentConfig,
+    PoseActionMotionIntentStateMachine,
+)
 from .execution_policy import (
     PositionTrajectoryPolicy,
     classify_position_trajectory_policy,
@@ -56,6 +63,7 @@ from .execution_policy import (
 )
 from .resampling import (
     CausalMotionResampler,
+    POSE_ACTION_INTERVAL_VELOCITY_SCHEMA,
     ResampledMotionReference,
     TimestampedMotionTarget,
     build_uniform_time_grid,
@@ -83,10 +91,12 @@ from .trajectory import (
     POSITION_COMMAND_PLANNER_LINEAR,
     normalize_position_command_planner,
 )
+from .capability import CANCELLATION_ACK_LEVELS, ExecutionCapabilityProfile
 
 __all__ = [
     "AccelerationLimitedJointTrajectoryPlanner",
     "CausalMotionResampler",
+    "POSE_ACTION_INTERVAL_VELOCITY_SCHEMA",
     "DEFAULT_POSITION_COMMAND_HZ",
     "DEFAULT_POSITION_DEGRADED_SPEED_SCALE",
     "DEFAULT_POSITION_PROFILE",
@@ -97,11 +107,15 @@ __all__ = [
     "DEFAULT_POSITION_VELOCITY_RAMP_SEC",
     "DEFAULT_REFERENCE_STALE_AFTER_SEC",
     "JointCommandInterpolator",
+    "ExecutionCapabilityProfile",
+    "CANCELLATION_ACK_LEVELS",
     "JointTrajectoryLimits",
     "JointTrajectoryProposal",
     "OutOfOrderReferenceError",
     "POSITION_AUDIT_SCHEMA_VERSION",
+    "POSE_ACTION_MOTION_INTENT_SCHEMA",
     "POSITION_CONTROL_PIPELINE_VERSION",
+    "POSITION_QREF_FINGERPRINT_SCHEMA",
     "POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED",
     "POSITION_COMMAND_PLANNER_CHOICES",
     "POSITION_COMMAND_PLANNER_LINEAR",
@@ -126,6 +140,8 @@ __all__ = [
     "PositionCommandTick",
     "PositionControlProfile",
     "PositionControlRates",
+    "PoseActionMotionIntentConfig",
+    "PoseActionMotionIntentStateMachine",
     "PositionKeyframeSafetyConfig",
     "PositionKeyframeSafetyResult",
     "PositionReferenceAuditEvent",
@@ -149,6 +165,7 @@ __all__ = [
     "normalize_position_command_planner",
     "position_audit_event_to_dict",
     "position_reference_audit_event",
+    "position_qref_fingerprint",
     "reference_age_and_stale",
     "resample_motion_targets",
     "resolve_periodic_tick",

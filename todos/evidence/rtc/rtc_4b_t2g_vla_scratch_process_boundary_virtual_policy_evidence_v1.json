@@ -1,0 +1,100 @@
+{
+  "schema": "dexteleop_rtc_scoped_evidence_v1",
+  "evidence_id": "rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_2026_07_23",
+  "captured_at": "2026-07-23T12:48:42+08:00",
+  "scope": "independent server/client process probes; native ZMQ wire; one deterministic virtual model instance; no checkpoint or action",
+  "external_baseline": {
+    "path": "/home/zc/HandMotion/vla-scratch",
+    "revision": "fa3cb37a6f3ba620bd2c167a97035b5431f31d19",
+    "status_before": "clean",
+    "status_after": "clean",
+    "modified_by_gate": false
+  },
+  "process_topology": {
+    "server": "vla-scratch native ServePolicy wrapper in a child process",
+    "model_instance": "one deterministic VirtualFullDexTeleopPolicy implementing BasePolicy, created inside that server process",
+    "client": "unchanged vla-scratch native ZmqPolicyClient in the parent process (native vla-scratch and dexteleop310 runtime probes)",
+    "dexteleop_client_runtime_probe": "the same unchanged client surface also ran from dexteleop310 with the optional pyzmq extra; the server remained in the native vla-scratch environment",
+    "policy_instance_count": 1,
+    "additional_model_on_client": false,
+    "shared_python_imports": false,
+    "shared_contract": "serialized existing processed observation and action_chunk.actions wire keys",
+    "transport": "localhost ZMQ",
+    "dexteleop_adapter_coverage": "separate local RTC adapter tests; this probe intentionally does not import DexTeleop into the baseline process"
+  },
+  "payload": {
+    "camera_source_order": [
+      "front",
+      "left_wrist",
+      "right_wrist"
+    ],
+    "images_shape": [
+      3,
+      3,
+      6,
+      8
+    ],
+    "image_masks_shape": [
+      3,
+      1
+    ],
+    "state_shape": [
+      1,
+      26
+    ],
+    "result_action_chunk_shape": [
+      4,
+      26
+    ],
+    "result_dtype": "float32",
+    "result_finite": true
+  },
+  "verification": [
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/zc/HandMotion/vla-scratch /home/zc/HandMotion/vla-scratch/.venv/bin/python /tmp/dexteleop_vla_scratch_process_boundary_probe.py",
+      "result": "passed; native server/client exchanged full 3-camera/1x26-state payload and 4x26 final chunk"
+    },
+    {
+      "command": "git -C /home/zc/HandMotion/vla-scratch status --short",
+      "result": "clean"
+    },
+    {
+      "command": "python -m pytest -q tests/test_vla_scratch_dexteleop_dataset_view.py tests/test_vla_scratch_rtc_adapter.py tests/test_rtc_final_chunk_backend.py",
+      "result": "16 passed; DexTeleop-side sample/adapter seam remains green"
+    },
+    {
+      "command": "PYTHONNOUSERSITE=1 PYTHONPATH=/home/zc/HandMotion/vla-scratch /home/zc/anaconda3/envs/dexteleop310/bin/python /tmp/dexteleop_vla_scratch_process_boundary_probe.py",
+      "result": "passed; dexteleop310 client process imported pyzmq and exchanged the unchanged 3-camera/1x26-state payload with the native vla-scratch server, returning a 4x26 finite chunk"
+    }
+  ],
+  "scoped_source_sha256": {
+    "tmp_virtual_policy_server.py": "b1665de7f92eb409aa75569e44ea1459e9256365af3684d0bd805c10c28a5ecc",
+    "tmp_process_boundary_probe.py": "d63929c16b5a118110fa2a9173d7a3a1b7860c1ad2dfdbbcf6153a523dcf74de",
+    "vla_scratch/vla_scratch/utils/serving/zmq_policy_client.py": "5dea25df869dde788a2d1b28799e14a2d73d2bdccea0ae311fe3ff73223a3b11",
+    "vla_scratch/vla_scratch/utils/serving/zmq_policy_server.py": "be8adbd2ec4c5cc78dfc29a57d040be9eb7033cc0ef9ce00575b607a96be980",
+    "vla_scratch/scripts/serve_policy.py": "c61cf25f5fa7e28c7e89980981f087b0a3d85113d171ba836973e98058a657fd"
+  },
+  "claims": [
+    "server-client inference does not require DexTeleop and vla-scratch to share Python imports or virtual-environment dependencies",
+    "the process topology contains one model instance; ServePolicy is a server wrapper and ZmqPolicyClient is transport, not a second policy",
+    "the unchanged native vla-scratch ServePolicy surface can return a full canonical-shaped final chunk through its existing ZMQ server",
+    "three ordered cameras and a 1x26 state cross the native wire and yield a finite 4x26 chunk",
+    "the external baseline remains unmodified"
+  ],
+  "non_claims": [
+    "the virtual policy is not a trained checkpoint",
+    "no normalization statistics or model artifact compatibility was attested",
+    "this is not direct DexTeleop production startup or a real observation shadow",
+    "no worker/timed-plan admission, safety, target, dispatch, or motion authority was used",
+    "no true prefix-conditioned RTC continuation was tested"
+  ],
+  "next_gate": {
+    "id": "vla_scratch_loaded_model_synthetic_no_action",
+    "requires": [
+      "a loaded model artifact matching the 26D canonical sample binding",
+      "normalization and decoder/codec identity",
+      "server metadata attestation or an explicit external sidecar"
+    ],
+    "environment_dependency_requirement": "none beyond the chosen server/client transport processes"
+  }
+}

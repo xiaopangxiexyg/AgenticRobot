@@ -76,6 +76,7 @@ def build_position_collision_planner_from_started_backends(
     solve_adaptive_iterations_enabled: bool = False,
     solve_iteration_reserve_ms: float = 5.0,
     debug_profile: bool = False,
+    ik_tuning: Any | None = None,
 ) -> RM65PositionPlannerProtocol:
     """Build the common pose-to-qpos planner at the real-runtime boundary."""
 
@@ -109,6 +110,7 @@ def build_position_collision_planner_from_started_backends(
             ),
             solve_iteration_reserve_ms=float(solve_iteration_reserve_ms),
             debug_profile=bool(debug_profile),
+            ik_tuning=ik_tuning,
         ),
         endpoint_to_tool_by_side=endpoint_to_tool_transforms_from_started_backends(
             arm_backends

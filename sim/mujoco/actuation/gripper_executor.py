@@ -1,0 +1,251 @@
+"""Physics-rate DM-Tac gripper transport and servo approximation."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Mapping
+
+import numpy as np
+
+from sim.rm65.actuation import DmtacPositionActuator
+
+from .gripper_profile import GripperActuationProfile
+
+
+@dataclass(frozen=True)
+class GripperControlTick:
+    physics_time_sec: float
+    accepted_by_gripper: Mapping[str, bool]
+    accepted_close_by_gripper: Mapping[str, float]
+    servo_goal_close_by_gripper: Mapping[str, float]
+    actuator_target_close_by_gripper: Mapping[str, float]
+    actuator_target_rate_by_gripper: Mapping[str, float]
+    measured_close_by_gripper: Mapping[str, float]
+
+
+class MujocoDmtacGripperExecutor:
+    """Bind the reusable 20 Hz RM65 gripper core to MuJoCo finger servos.
+
+    This component never advances MuJoCo and never writes qpos/qvel. The parent
+    MuJoCo rig remains the sole ``MjData`` owner and calls
+    :meth:`before_physics_step` immediately before its single ``mj_step``.
+    """
+
+    execution_mode = "dmtac_fitted_position_servo_v2"
+
+    def __init__(self, scene, profile: GripperActuationProfile) -> None:
+        self.scene = scene
+        self.profile = profile
+        missing = set(profile.joint_names_by_gripper) - set(scene.gripper_specs)
+        if missing:
+            raise KeyError(f"scene is missing configured grippers: {sorted(missing)}")
+        self._actuator_ids: dict[str, np.ndarray] = {}
+        for gripper_name, joint_names in profile.joint_names_by_gripper.items():
+            spec = scene.gripper_specs[gripper_name]
+            if tuple(spec.joint_names) != tuple(joint_names):
+                raise ValueError(
+                    f"{gripper_name} scene/profile joint mismatch: "
+                    f"scene={tuple(spec.joint_names)} profile={tuple(joint_names)}"
+                )
+            ids: list[int] = []
+            for index in range(len(joint_names)):
+                actuator_name = profile.actuator_name(gripper_name, index)
+                actuator_id = scene.mujoco.mj_name2id(
+                    scene.model,
+                    scene.mujoco.mjtObj.mjOBJ_ACTUATOR,
+                    actuator_name,
+                )
+                if actuator_id < 0:
+                    raise KeyError(
+                        f"scene has no gripper actuator {actuator_name!r}; compile "
+                        "with the same GripperActuationProfile."
+                    )
+                ids.append(int(actuator_id))
+            self._actuator_ids[gripper_name] = np.asarray(ids, dtype=np.int32)
+        self._gripper_by_side = {
+            side: name for name, side in profile.side_by_gripper.items()
+        }
+        self._position_actuator = DmtacPositionActuator(
+            profile.normalized_position_profile()
+        )
+        self._accepted_close_by_gripper: dict[str, float] = {}
+        self._servo_goal_close_by_gripper: dict[str, float] = {}
+        self._actuator_target_close_by_gripper: dict[str, float] = {}
+        self._actuator_target_rate_by_gripper: dict[str, float] = {}
+        self._last_status_by_gripper: dict[str, str] = {}
+        self._reset = False
+
+    @property
+    def execution_metadata(self) -> dict[str, object]:
+        return {
+            "execution_mode": self.execution_mode,
+            "command_hz": self.profile.command_hz,
+            "command_hold": "hold_last_target",
+            "profile": self.profile.to_metadata(),
+        }
+
+    def reset(self, initial_close_by_gripper: Mapping[str, float]) -> None:
+        expected = set(self.profile.joint_names_by_gripper)
+        if set(initial_close_by_gripper) != expected:
+            raise ValueError(
+                "initial gripper close mapping must exactly match profile: "
+                f"expected={sorted(expected)} got={sorted(initial_close_by_gripper)}"
+            )
+        initial = {
+            name: self._validate_close(value, name=name)
+            for name, value in initial_close_by_gripper.items()
+        }
+        self._position_actuator.reset(
+            {
+                self.profile.side_by_gripper[name]: value
+                for name, value in initial.items()
+            }
+        )
+        self._accepted_close_by_gripper = dict(initial)
+        self._servo_goal_close_by_gripper = dict(initial)
+        self._actuator_target_close_by_gripper = dict(initial)
+        self._actuator_target_rate_by_gripper = {name: 0.0 for name in expected}
+        self._last_status_by_gripper = {name: "reset" for name in expected}
+        self._reset = True
+        self._write_ctrl()
+
+    def queue_close_targets(self, close_by_gripper: Mapping[str, float]) -> int:
+        if not self._reset:
+            raise RuntimeError("reset(initial_close_by_gripper) is required first.")
+        unknown = set(close_by_gripper) - set(self.profile.joint_names_by_gripper)
+        if unknown:
+            raise KeyError(f"unknown gripper target(s): {sorted(unknown)}")
+        targets = {
+            self.profile.side_by_gripper[name]: self._validate_close(value, name=name)
+            for name, value in close_by_gripper.items()
+        }
+        sequence = self._position_actuator.queue_targets(targets)
+        for name in close_by_gripper:
+            self._last_status_by_gripper[name] = "queued"
+        return sequence
+
+    def hold_targets(self) -> None:
+        """Discard queued transport work and freeze the current actuator target."""
+
+        self._position_actuator.hold_targets()
+        snapshot = self._position_actuator.snapshot()
+        self._accepted_close_by_gripper = self._map_by_gripper(
+            snapshot["accepted_target_by_side"]
+        )
+        self._servo_goal_close_by_gripper = self._map_by_gripper(
+            snapshot["servo_goal_by_side"]
+        )
+        self._actuator_target_close_by_gripper = self._map_by_gripper(
+            snapshot["actuator_position_by_side"]
+        )
+        self._actuator_target_rate_by_gripper = self._map_by_gripper(
+            snapshot["actuator_rate_by_side"]
+        )
+        for name in self._last_status_by_gripper:
+            self._last_status_by_gripper[name] = "held"
+        self._write_ctrl()
+
+    def before_physics_step(
+        self,
+        *,
+        physics_time_sec: float,
+        timestep_sec: float,
+    ) -> GripperControlTick:
+        if not self._reset:
+            raise RuntimeError("reset(initial_close_by_gripper) is required first.")
+        now = float(physics_time_sec)
+        dt = float(timestep_sec)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("physics_time_sec must be finite and non-negative.")
+        if not math.isfinite(dt) or dt <= 0.0:
+            raise ValueError("timestep_sec must be finite and positive.")
+        core_tick = self._position_actuator.step(
+            physics_time_sec=now,
+            timestep_sec=dt,
+        )
+        accepted = self._map_by_gripper(core_tick.accepted_by_side)
+        self._accepted_close_by_gripper = self._map_by_gripper(
+            core_tick.accepted_target_by_side
+        )
+        self._servo_goal_close_by_gripper = self._map_by_gripper(
+            core_tick.servo_goal_by_side
+        )
+        self._actuator_target_close_by_gripper = self._map_by_gripper(
+            core_tick.actuator_position_by_side
+        )
+        self._actuator_target_rate_by_gripper = self._map_by_gripper(
+            core_tick.actuator_rate_by_side
+        )
+        for name, was_accepted in accepted.items():
+            if was_accepted:
+                self._last_status_by_gripper[name] = "accepted_delayed"
+        self._write_ctrl()
+        return GripperControlTick(
+            physics_time_sec=now,
+            accepted_by_gripper=accepted,
+            accepted_close_by_gripper=dict(self._accepted_close_by_gripper),
+            servo_goal_close_by_gripper=dict(self._servo_goal_close_by_gripper),
+            actuator_target_close_by_gripper=dict(
+                self._actuator_target_close_by_gripper
+            ),
+            actuator_target_rate_by_gripper=dict(
+                self._actuator_target_rate_by_gripper
+            ),
+            measured_close_by_gripper=self.measured_close_by_gripper(),
+        )
+
+    def accepted_close(self, gripper_name: str) -> float:
+        return float(self._accepted_close_by_gripper[str(gripper_name)])
+
+    def measured_close_by_gripper(self) -> dict[str, float]:
+        return {
+            name: float(self.scene.get_gripper_close(name))
+            for name in self.profile.joint_names_by_gripper
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        core = self._position_actuator.snapshot()
+        return {
+            **self.execution_metadata,
+            "pending_close_by_gripper": self._map_by_gripper(
+                {
+                    side: values["target"]
+                    for side, values in core["pending"].items()
+                }
+            ),
+            "accepted_close_by_gripper": dict(self._accepted_close_by_gripper),
+            "servo_goal_close_by_gripper": dict(self._servo_goal_close_by_gripper),
+            "actuator_target_close_by_gripper": dict(
+                self._actuator_target_close_by_gripper
+            ),
+            "actuator_target_rate_by_gripper": dict(
+                self._actuator_target_rate_by_gripper
+            ),
+            "measured_close_by_gripper": self.measured_close_by_gripper(),
+            "pending_delayed_targets": core["pending_delayed_targets"],
+            "last_status_by_gripper": dict(self._last_status_by_gripper),
+        }
+
+    def _map_by_gripper(self, values_by_side: Mapping[str, object]) -> dict:
+        return {
+            self._gripper_by_side[side]: value
+            for side, value in values_by_side.items()
+        }
+
+    @staticmethod
+    def _validate_close(value: float, *, name: str) -> float:
+        close = float(value)
+        if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+            raise ValueError(f"{name} close target must be finite and in [0, 1].")
+        return close
+
+    def _write_ctrl(self) -> None:
+        for name, actuator_ids in self._actuator_ids.items():
+            self.scene.data.ctrl[actuator_ids] = self.profile.qpos_from_close(
+                name,
+                self._actuator_target_close_by_gripper[name],
+            )
+
+
+__all__ = ["GripperControlTick", "MujocoDmtacGripperExecutor"]

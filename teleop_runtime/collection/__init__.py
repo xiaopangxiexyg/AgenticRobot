@@ -17,6 +17,10 @@ from .observers import (
 from .preview_rate import PreviewRateLimiter
 from .runtime import CollectionRuntime, CollectionRuntimeConfig
 from .writer_runtime import CollectionWriterRuntime
+from .stream_sink import (
+    NativeStreamAppendReceipt,
+    NativeStreamEpisodeWriter,
+)
 from .sample_assembler import (
     ArmStateMetadataProvider,
     CameraFrameMatch,
@@ -43,6 +47,8 @@ from .writer_v21 import (
     ROW_JOB_KIND,
     VIDEO_FRAME_JOB_KIND,
     WRIST_DEPTH_FRAME_JOB_KIND,
+    LegacyEpisodeArtifactReport,
+    LegacyFinalizedVideoArtifact,
     LeRobotV21Writer,
     LeRobotV21WriterConfig,
 )
@@ -60,6 +66,8 @@ __all__ = [
     "CollectionWriterObserver",
     "CollectionWriterObserverConfig",
     "CollectionWriterRuntime",
+    "NativeStreamAppendReceipt",
+    "NativeStreamEpisodeWriter",
     "CollectorSample",
     "CollectorSampleBuilder",
     "CollectorSampleBuilderConfig",
@@ -69,6 +77,8 @@ __all__ = [
     "EpisodeStatsAccumulator",
     "EndToEndLatencyBreakdown",
     "FINALIZE_EPISODE_JOB_KIND",
+    "LegacyEpisodeArtifactReport",
+    "LegacyFinalizedVideoArtifact",
     "LeRobotV21Writer",
     "LeRobotV21WriterConfig",
     "HandStateProvider",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from teleop_runtime.special_tasks.fix_arm import (
     build_fix_arm_pose_snapshot_payload,
     advance_fix_arm_home_capture,
 )
+from teleop_runtime.special_tasks.fix_hold import SpecialArmFixHoldCoordinator
 
 
 def _command(
@@ -101,6 +103,80 @@ def _channels(
 
 
 class FixArmCommandControllerTests(unittest.TestCase):
+    def test_both_sides_can_be_fixed_and_releasing_one_keeps_the_other_fixed(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(controller.select_side("right").ok)
+        self.assertTrue(controller.freeze_selected(now=1.2).ok)
+        self.assertEqual(controller.fixed_sides, ("left", "right"))
+
+        filtered = controller.filter_command(
+            _command(left_arm=10.0, right_arm=20.0, left_hand=30.0, right_hand=40.0),
+            None,
+            1.3,
+        )
+        np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
+        np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 2.0))
+
+        self.assertTrue(controller.select_side("left").ok)
+        self.assertTrue(
+            controller.start_recalibration(now=1.4, timeout_sec=5.0, min_samples=1).ok
+        )
+        self.assertTrue(controller.complete_recalibration(now=1.5).ok)
+        self.assertEqual(controller.fixed_sides, ("right",))
+
+    def test_fix_hold_requires_both_fixed_like_sides_and_auto_releases(self) -> None:
+        coordinator = SpecialArmFixHoldCoordinator()
+        fix = SimpleNamespace(fixed=True, fixed_sides=("left",), fixed_side="left")
+        init = SimpleNamespace(fixed=False, fixed_sides=(), active_side="")
+        transition = coordinator.update(fix_controller=fix, init_controller=init)
+        self.assertFalse(transition.active)
+
+        init.fixed = True
+        init.fixed_sides = ("right",)
+        init.active_side = "right"
+        transition = coordinator.update(fix_controller=fix, init_controller=init)
+        self.assertTrue(transition.entered)
+        self.assertEqual(transition.source_by_side, {"left": "fix_arm", "right": "init_fixed"})
+
+        # Starting target-side Home recapture is still a pending release; the
+        # episode must remain paused until recapture completes.
+        init.fix_hold_sides = ("right",)
+        init.fixed = False
+        init.fixed_sides = ()
+        transition = coordinator.update(fix_controller=fix, init_controller=init)
+        self.assertTrue(transition.active)
+        self.assertFalse(transition.exited)
+
+        fix.fixed = False
+        fix.fixed_sides = ()
+        init.fix_hold_sides = ()
+        transition = coordinator.update(fix_controller=fix, init_controller=init)
+        self.assertTrue(transition.exited)
+        self.assertFalse(transition.active)
+
+    def test_regular_hold_escalation_is_not_an_auto_release(self) -> None:
+        coordinator = SpecialArmFixHoldCoordinator()
+        both = SimpleNamespace(
+            fixed=True,
+            fixed_sides=("left", "right"),
+            fixed_side="left",
+        )
+        coordinator.update(fix_controller=both, init_controller=None)
+        transition = coordinator.escalate_to_regular_hold()
+        self.assertEqual(transition.reason, "escalated_to_regular_hold")
+        self.assertEqual(transition.locked_sides, ("left", "right"))
+        self.assertFalse(coordinator.active)
+
     def test_freeze_reuses_fixed_side_input_channels_and_leaves_other_side_live(self) -> None:
         controller = _controller("left")
         controller.filter_channels(
@@ -402,7 +478,7 @@ class FixArmRuntimeHomeTests(unittest.TestCase):
         self.assertTrue(progress.active)
         self.assertFalse(progress.completed)
 
-        progress = advance_fix_arm_home_capture(
+        repeated = advance_fix_arm_home_capture(
             controller=controller,
             channels={"left_wrist_pose": channel},
             calibration=calibration,
@@ -413,6 +489,31 @@ class FixArmRuntimeHomeTests(unittest.TestCase):
             side_retargeter=lambda side: retargeter,
             tcp_mode="tool_tcp",
         )
+        self.assertEqual(repeated.sample_count, 0)
+        self.assertTrue(repeated.waiting_for_stability)
+        self.assertIn("fresh", repeated.stability_reason)
+
+        for timestamp in (1.6, 1.7):
+            channel = ObservationChannel(
+                channel_name="left_wrist_pose",
+                capability="pose6d",
+                side="left",
+                value=channel_pose,
+                frame_name="desk",
+                timestamp=timestamp,
+                source_name="test",
+            )
+            progress = advance_fix_arm_home_capture(
+                controller=controller,
+                channels={"left_wrist_pose": channel},
+                calibration=calibration,
+                now=timestamp,
+                pose_from_channel=lambda item, _calibration: np.asarray(item.value, dtype=float),
+                mean_pose=lambda samples: samples[0],
+                resolve_robot_home=lambda side: (robot_home.copy(), np.arange(6), "test_home"),
+                side_retargeter=lambda side: retargeter,
+                tcp_mode="tool_tcp",
+            )
 
         self.assertTrue(progress.completed)
         self.assertFalse(controller.fixed)

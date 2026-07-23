@@ -21,8 +21,12 @@ DEFAULT_DMTAC_GRIPPER_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 DEFAULT_DMTAC_GRIPPER_SPEED = 1.0
 DEFAULT_DMTAC_GRIPPER_TORQUE = 0.2
 DEFAULT_DMTAC_GRIPPER_COMMAND_HZ = 20.0
+DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ = 20.0
 GRIPPER_ACTION_MAX = 1.0
-DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S = 0.15
+# A state-register read takes about 10 ms on the validated 115200-baud setup.
+# Keep a short write-to-read guard, but do not hide the physical response for
+# multiple collection frames after every accepted command.
+DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S = 0.02
 DMTAC_DISTRIBUTED_FORCE_SHAPE = (288, 384, 3)
 DMTAC_RAW_IMAGE_SHAPE = (480, 640)
 DMTAC_TACTILE_FIELDS = (
@@ -47,8 +51,8 @@ DMTAC_TACTILE_ARRAY_FIELDS = (
     "distributed_force",
 )
 DMTAC_DEFAULT_TACTILE_FIELDS = ("raw",)
-# These fields are interpreted relative to a no-contact base frame.  Raw and
-# infer images are camera outputs and remain meaningful without an SDK reset.
+# These solved fields can optionally be interpreted relative to an explicitly
+# captured no-contact base frame. Requesting one never authorizes an SDK reset.
 DMTAC_TACTILE_CALIBRATED_FIELDS = frozenset(
     {
         "deformation2d",
@@ -174,7 +178,7 @@ normalize_dmtac_tactile_fields = _normalize_dmtac_tactile_fields
 
 
 def dmtac_tactile_requires_calibration(fields: Any) -> bool:
-    """Whether requested tactile outputs require a fresh no-contact base frame."""
+    """Whether requested outputs support an optional no-contact calibration."""
 
     return bool(DMTAC_TACTILE_CALIBRATED_FIELDS.intersection(_normalize_dmtac_tactile_fields(fields)))
 
@@ -333,6 +337,8 @@ def _dmtac_tactile_worker_main(
                 config_payload.get("tactile_fields", DMTAC_DEFAULT_TACTILE_FIELDS)
             ),
             compute_profile=str(config_payload.get("tactile_compute_profile", "dist-only")),
+            calibration_policy=str(config_payload.get("tactile_calibration_policy", "auto")),
+            calibration_dir=config_payload.get("tactile_calibration_dir"),
             parallel_read=bool(config_payload.get("tactile_parallel_read", False)),
             denoise_distributed_force=bool(config_payload.get("tactile_denoise", False)),
             denoise_config=TactileDenoiseConfig(
@@ -349,6 +355,9 @@ def _dmtac_tactile_worker_main(
             tactile=tactile,
             connect_gripper=False,
             connect_tactile=True,
+            apply_tactile_calibration_on_connect=bool(
+                config_payload.get("apply_tactile_calibration_on_connect", True)
+            ),
         ).connect()
         try:
             if bool(config_payload.get("tactile_reset_on_start", False)):
@@ -449,6 +458,8 @@ class DMTacGripperBackendConfig:
     gripper_timeout: float = 0.10
     max_open_mm: float = 70.0
     connect_hardware: bool = True
+    # Deployment-only live observation shadow.  It permits telemetry/tactile
+    # reads but suppresses all startup and command-side gripper writes.
     command_dim: int = 0
     send_commands: bool = True
     send_threshold: float = 0.002
@@ -462,7 +473,7 @@ class DMTacGripperBackendConfig:
     reconnect_on_error: bool = True
     reconnect_cooldown_sec: float = 1.0
     enable_telemetry: bool = True
-    telemetry_hz: float = 10.0
+    telemetry_hz: float = DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ
     gripper_telemetry_command_grace_s: float = DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S
     connect_tactile: bool = True
     tactile_ids: tuple[str | int, ...] = ()
@@ -471,6 +482,8 @@ class DMTacGripperBackendConfig:
     tactile_max_fps: int = 30
     tactile_fields: tuple[str, ...] = DMTAC_DEFAULT_TACTILE_FIELDS
     tactile_compute_profile: str = "dist-only"
+    tactile_calibration_policy: str = "auto"
+    tactile_calibration_dir: str | Path | None = None
     tactile_timeout_ms: int = 100
     tactile_wait_for_new: bool = False
     tactile_read_hz: float = 1.0
@@ -478,10 +491,13 @@ class DMTacGripperBackendConfig:
     tactile_process_nice: int = 12
     tactile_process_cpu_affinity: tuple[int, ...] = ()
     tactile_process_queue_size: int = DMTAC_TACTILE_PROCESS_QUEUE_SIZE
+    tactile_worker_restart_on_error: bool = True
+    tactile_worker_restart_initial_backoff_sec: float = 0.5
+    tactile_worker_restart_max_backoff_sec: float = 5.0
     tactile_parallel_read: bool = False
     tactile_global_read_lock: bool = True
     tactile_require_ready: bool = True
-    tactile_reset_on_start: bool | None = None
+    tactile_reset_on_start: bool | None = False
     tactile_ready_timeout_s: float = 10.0
     tactile_warmup_frames: int = 0
     tactile_denoise: bool = False
@@ -493,6 +509,9 @@ class DMTacGripperBackendConfig:
     tactile_spatial_blur_ksize: int = 5
     dmtac_root: str | Path | None = None
     debug: bool = False
+    # Kept after the existing public fields so legacy positional construction
+    # keeps its old meaning.
+    observation_only: bool = False
 
     def __post_init__(self) -> None:
         if self.effector_name is None:
@@ -522,14 +541,20 @@ class DMTacGripperBackendConfig:
         if int(self.tactile_max_fps) <= 0:
             raise ValueError("tactile_max_fps must be positive.")
         self.tactile_fields = normalize_dmtac_tactile_fields(self.tactile_fields)
-        if self.tactile_reset_on_start is None:
-            self.tactile_reset_on_start = dmtac_tactile_requires_calibration(self.tactile_fields)
-        else:
-            self.tactile_reset_on_start = bool(self.tactile_reset_on_start)
+        # A solved tactile field does not imply permission to capture a new
+        # no-contact base.  Resetting changes the SDK inference state and must
+        # therefore be an explicit opt-in, independent of the requested fields.
+        self.tactile_reset_on_start = bool(self.tactile_reset_on_start)
         profile = str(self.tactile_compute_profile).strip().lower().replace("_", "-")
         if profile not in {"dist-only", "legacy", "requested", "shear-depth"}:
             raise ValueError("tactile_compute_profile must be dist-only, legacy, requested, or shear-depth.")
         self.tactile_compute_profile = profile
+        calibration_policy = str(self.tactile_calibration_policy or "auto").strip().lower()
+        if calibration_policy not in {"auto", "required", "off"}:
+            raise ValueError("tactile_calibration_policy must be auto, required, or off.")
+        self.tactile_calibration_policy = calibration_policy
+        if self.tactile_calibration_dir is not None:
+            self.tactile_calibration_dir = Path(self.tactile_calibration_dir)
         if int(self.tactile_timeout_ms) <= 0:
             raise ValueError("tactile_timeout_ms must be positive.")
         if float(self.tactile_read_hz) < 0.0:
@@ -538,6 +563,14 @@ class DMTacGripperBackendConfig:
             raise ValueError("tactile_process_nice must be in [0, 19].")
         if int(self.tactile_process_queue_size) <= 0:
             raise ValueError("tactile_process_queue_size must be positive.")
+        if float(self.tactile_worker_restart_initial_backoff_sec) < 0.0:
+            raise ValueError("tactile_worker_restart_initial_backoff_sec must be non-negative.")
+        if float(self.tactile_worker_restart_max_backoff_sec) < float(
+            self.tactile_worker_restart_initial_backoff_sec
+        ):
+            raise ValueError(
+                "tactile_worker_restart_max_backoff_sec must be >= initial backoff."
+            )
         cpus = tuple(int(cpu) for cpu in self.tactile_process_cpu_affinity)
         if any(cpu < 0 for cpu in cpus):
             raise ValueError("tactile_process_cpu_affinity CPU indices must be non-negative.")
@@ -581,6 +614,7 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_command: EffectorCommand | None = None
         self._last_sent_command: np.ndarray | None = None
         self._last_sent_command_timestamp: float | None = None
+        self._last_sent_command_completed_timestamp: float | None = None
         self._latest_joint_pos: np.ndarray | None = None
         self._latest_measured_joint_pos: np.ndarray | None = None
         self._latest_joint_timestamp: float | None = None
@@ -597,6 +631,7 @@ class DMTacGripperBackend(EffectorBackend):
         self._latest_gripper_read_elapsed_s: float | None = None
         self._latest_gripper_read_skipped = False
         self._latest_gripper_read_skip_reason: str | None = None
+        self._latest_gripper_read_forced = False
         self._latest_tactile_read_elapsed_s: float | None = None
         self._latest_tactile_gate_wait_s: float | None = None
         self._latest_tactile_read_skipped = False
@@ -612,6 +647,14 @@ class DMTacGripperBackend(EffectorBackend):
         self._tactile_worker_stop_event: Any | None = None
         self._tactile_worker_receiver_stop: threading.Event | None = None
         self._tactile_worker_receiver_thread: threading.Thread | None = None
+        self._tactile_worker_restart_pending = False
+        self._tactile_worker_failure_count = 0
+        self._tactile_worker_restart_count = 0
+        self._tactile_worker_last_restart_attempt_at: float | None = None
+        self._tactile_worker_last_exit_code: int | None = None
+        self._tactile_worker_observed_process: Any | None = None
+        self._tactile_worker_supervisor_lock = threading.Lock()
+        self._closing = False
         self._applied_speed: float | None = None
         self._applied_torque: float | None = None
         self._applied_continuous_grasp: bool | None = None
@@ -659,6 +702,8 @@ class DMTacGripperBackend(EffectorBackend):
             max_fps=int(self.config.tactile_max_fps),
             fields=normalize_dmtac_tactile_fields(self.config.tactile_fields),
             compute_profile=str(self.config.tactile_compute_profile),
+            calibration_policy=str(self.config.tactile_calibration_policy),
+            calibration_dir=self.config.tactile_calibration_dir,
             parallel_read=bool(self.config.tactile_parallel_read),
             denoise_distributed_force=bool(self.config.tactile_denoise),
             denoise_config=TactileDenoiseConfig(
@@ -677,6 +722,9 @@ class DMTacGripperBackend(EffectorBackend):
             connect_tactile=bool(
                 self.config.connect_tactile
                 and not self.config.tactile_process_read
+            ),
+            apply_tactile_calibration_on_connect=not bool(
+                self.config.observation_only
             ),
         ).connect()
 
@@ -700,7 +748,8 @@ class DMTacGripperBackend(EffectorBackend):
 
     def _apply_gripper_start_config_locked(self, *, open_on_start: bool) -> None:
         if (
-            not self.config.connect_hardware
+            self.config.observation_only
+            or not self.config.connect_hardware
             or self.device is None
             or getattr(self.device, "gripper", None) is None
         ):
@@ -789,6 +838,12 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_max_fps": int(self.config.tactile_max_fps),
             "tactile_fields": list(self.config.tactile_fields),
             "tactile_compute_profile": str(self.config.tactile_compute_profile),
+            "tactile_calibration_policy": str(self.config.tactile_calibration_policy),
+            "tactile_calibration_dir": (
+                None
+                if self.config.tactile_calibration_dir is None
+                else str(self.config.tactile_calibration_dir)
+            ),
             "tactile_timeout_ms": int(self.config.tactile_timeout_ms),
             "tactile_wait_for_new": bool(self.config.tactile_wait_for_new),
             "tactile_read_hz": float(self.config.tactile_read_hz),
@@ -799,6 +854,9 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_global_read_lock": bool(self.config.tactile_global_read_lock),
             "tactile_require_ready": bool(self.config.tactile_require_ready),
             "tactile_reset_on_start": bool(self.config.tactile_reset_on_start),
+            "apply_tactile_calibration_on_connect": not bool(
+                self.config.observation_only
+            ),
             "tactile_ready_timeout_s": float(self.config.tactile_ready_timeout_s),
             "tactile_warmup_frames": int(self.config.tactile_warmup_frames),
             "tactile_denoise": bool(self.config.tactile_denoise),
@@ -829,7 +887,123 @@ class DMTacGripperBackend(EffectorBackend):
             daemon=True,
         )
         self._tactile_worker_process.start()
+        self._tactile_worker_restart_pending = False
         self._start_tactile_worker_receiver()
+
+    def _stop_tactile_worker_for_reconfigure(self) -> None:
+        """Stop only tactile acquisition while leaving gripper control untouched."""
+
+        stop_event = self._tactile_worker_stop_event
+        receiver_stop = self._tactile_worker_receiver_stop
+        receiver = self._tactile_worker_receiver_thread
+        process = self._tactile_worker_process
+        queue_out = self._tactile_worker_queue
+        if stop_event is not None:
+            stop_event.set()
+        if receiver_stop is not None:
+            receiver_stop.set()
+        if receiver is not None and receiver is not threading.current_thread():
+            receiver.join(timeout=1.0)
+        if process is not None:
+            process.join(timeout=DMTAC_TACTILE_PROCESS_STOP_TIMEOUT_S)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+        if queue_out is not None:
+            try:
+                queue_out.close()
+                queue_out.cancel_join_thread()
+            except (AttributeError, OSError, ValueError):
+                pass
+        self._tactile_worker_process = None
+        self._tactile_worker_queue = None
+        self._tactile_worker_stop_event = None
+        self._tactile_worker_receiver_stop = None
+        self._tactile_worker_receiver_thread = None
+        self._tactile_worker_observed_process = None
+        self._tactile_worker_restart_pending = False
+        with self._state_lock:
+            self._latest_tactile = None
+            self._latest_tactile_timestamp = None
+            self._latest_tactile_dict = None
+            self._latest_tactile_devices = []
+            self._latest_tactile_field_by_key = {}
+            self._tactile_ready = {}
+
+    def enable_tactile_solving(self) -> bool:
+        """Enable calibrated distributed-force solving with a worker-only restart.
+
+        This operation is intentionally one-way for a runtime session. Keeping
+        the solved field enabled after the first episode prevents the dataset
+        field contract from changing when a preview window is merely closed.
+        """
+
+        if not self.config.connect_tactile:
+            raise RuntimeError("DMTAC tactile acquisition is not configured for this side.")
+        if not self.config.tactile_process_read:
+            raise RuntimeError(
+                "GUI tactile solving requires the isolated tactile worker process."
+            )
+        self._ensure_import_path()
+        from portable_dmtac_gripper import (
+            default_calibration_dir,
+            load_tactile_calibration,
+        )
+
+        calibration_root = Path(
+            self.config.tactile_calibration_dir or default_calibration_dir()
+        )
+        sensor_ids = tuple(self.config.tactile_ids)
+        if not sensor_ids:
+            raise RuntimeError(
+                "Calibrated GUI solving requires explicit DMTAC sensor ids from the hardware assignment."
+            )
+        for sensor_id in sensor_ids:
+            load_tactile_calibration(calibration_root, sensor_id, required=True)
+
+        fields = tuple(self.config.tactile_fields)
+        already_enabled = (
+            "distributed_force" in fields
+            and str(self.config.tactile_calibration_policy) == "required"
+        )
+        if already_enabled:
+            return False
+
+        old_fields = fields
+        old_profile = str(self.config.tactile_compute_profile)
+        old_policy = str(self.config.tactile_calibration_policy)
+        old_dir = self.config.tactile_calibration_dir
+        new_fields = tuple(dict.fromkeys((*fields, "distributed_force")))
+        with self._tactile_worker_supervisor_lock:
+            was_closing = self._closing
+            self._closing = True
+            try:
+                self._stop_tactile_worker_for_reconfigure()
+                self.config.tactile_fields = new_fields
+                self.config.tactile_compute_profile = "dist-only"
+                self.config.tactile_calibration_policy = "required"
+                self.config.tactile_calibration_dir = calibration_root
+                self._closing = was_closing
+                self._start_tactile_worker()
+            except Exception:
+                self.config.tactile_fields = old_fields
+                self.config.tactile_compute_profile = old_profile
+                self.config.tactile_calibration_policy = old_policy
+                self.config.tactile_calibration_dir = old_dir
+                self._closing = was_closing
+                if not was_closing and self._tactile_worker_process is None:
+                    try:
+                        self._start_tactile_worker()
+                    except Exception as restore_exc:  # noqa: BLE001
+                        self._telemetry_error = (
+                            "tactile_solving_restore_failed:"
+                            f"{type(restore_exc).__name__}:{restore_exc}"
+                        )
+                raise
+            finally:
+                self._closing = was_closing
+        self._telemetry_error = None
+        return True
 
     def _tactile_worker_receiver_active(self) -> bool:
         thread = self._tactile_worker_receiver_thread
@@ -856,6 +1030,9 @@ class DMTacGripperBackend(EffectorBackend):
                 payload = queue_in.get(timeout=0.05)
             except queue.Empty:
                 self._check_tactile_worker_process()
+                process = self._tactile_worker_process
+                if process is not None and not process.is_alive():
+                    break
                 continue
             except (EOFError, OSError):
                 break
@@ -868,10 +1045,12 @@ class DMTacGripperBackend(EffectorBackend):
             return
         if self.device is not None:
             return
+        self._closing = False
         try:
             with self._lock:
                 self.device = self._create_device()
-                self._apply_gripper_start_config_locked(open_on_start=True)
+                if not self.config.observation_only:
+                    self._apply_gripper_start_config_locked(open_on_start=True)
                 if (
                     self.config.connect_tactile
                     and self.config.tactile_process_read
@@ -921,12 +1100,20 @@ class DMTacGripperBackend(EffectorBackend):
                 f"{self.name} supports command_type='joint_vector' or 'gripper_scalar', "
                 f"got '{command.command_type}'."
             )
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; refusing gripper command dispatch."
+            )
         sent = self._send_joint_pos(command.value, bypass_send_commands=False, force=False)
         if sent:
             self._last_command = command.copy()
         return sent
 
     def send_fixed_joint_pos(self, joint_pos: object) -> bool:
+        if self.config.observation_only:
+            raise RuntimeError(
+                f"{self.name} is observation-only; refusing fixed gripper command dispatch."
+            )
         return self._send_joint_pos(joint_pos, bypass_send_commands=True, force=True)
 
     def set_torque(self, torque: float) -> float:
@@ -942,6 +1129,8 @@ class DMTacGripperBackend(EffectorBackend):
         value = float(torque)
         if not np.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError("gripper torque must be a finite value in [0, 1].")
+        if self.config.observation_only:
+            return value
         with self._lock:
             previous_torque = float(self.config.torque)
             previous_applied_torque = self._applied_torque
@@ -1096,6 +1285,7 @@ class DMTacGripperBackend(EffectorBackend):
         self._latest_joint_pos = target.copy()
         self._last_sent_command = target.copy()
         self._last_sent_command_timestamp = command_time
+        self._last_sent_command_completed_timestamp = time.time()
         return finish("sent", sent=True)
 
     def _move_gripper_locked(self, target_scalar: float) -> None:
@@ -1139,11 +1329,29 @@ class DMTacGripperBackend(EffectorBackend):
         return speed_arg, torque_arg, continuous_arg
 
     def _skip_gripper_telemetry_after_recent_command(self, now: float) -> bool:
-        last_sent = self._last_sent_command_timestamp
+        if self._gripper_telemetry_force_read_due(now):
+            return False
+        last_sent = self._last_sent_command_completed_timestamp
         if last_sent is None:
             return False
         grace_s = float(self.config.gripper_telemetry_command_grace_s)
         return bool(grace_s > 0.0 and float(now) - float(last_sent) < grace_s)
+
+    def _gripper_telemetry_max_deferral_s(self) -> float:
+        period_s = 1.0 / float(self.config.telemetry_hz)
+        grace_s = float(self.config.gripper_telemetry_command_grace_s)
+        # A continuously changing command stream must not starve measured
+        # position feedback.  Permit one skipped telemetry period, then force
+        # a serialized register read even if it lands inside the write guard.
+        return max(2.0 * period_s, grace_s + period_s)
+
+    def _gripper_telemetry_force_read_due(self, now: float) -> bool:
+        measured_at = self._latest_joint_timestamp
+        if measured_at is None:
+            return True
+        age_s = float(now) - float(measured_at)
+        max_deferral_s = self._gripper_telemetry_max_deferral_s()
+        return bool(age_s >= max_deferral_s or age_s < -max_deferral_s)
 
     def _apply_tactile_worker_payload(self, payload: dict[str, Any]) -> bool:
         payload_type = str(payload.get("type") or "")
@@ -1158,6 +1366,11 @@ class DMTacGripperBackend(EffectorBackend):
             return False
         if payload_type == "error":
             self._telemetry_error = f"tactile_worker_failed: {payload.get('error')}"
+            with self._state_lock:
+                self._latest_tactile = None
+                self._latest_tactile_timestamp = None
+                self._latest_tactile_dict = None
+                self._latest_tactile_devices = []
             return False
         if payload_type != "frame":
             return False
@@ -1224,8 +1437,84 @@ class DMTacGripperBackend(EffectorBackend):
         process = self._tactile_worker_process
         if process is not None and not process.is_alive():
             exit_code = getattr(process, "exitcode", None)
-            if exit_code not in {0, None}:
+            if process is not self._tactile_worker_observed_process:
+                self._tactile_worker_observed_process = process
+                self._tactile_worker_failure_count += 1
+                self._tactile_worker_last_exit_code = exit_code
+            if not self._closing:
                 self._telemetry_error = f"tactile_worker_exited:{exit_code}"
+                self._tactile_worker_restart_pending = bool(
+                    self.config.tactile_worker_restart_on_error
+                )
+            with self._state_lock:
+                self._latest_tactile = None
+                self._latest_tactile_timestamp = None
+                self._latest_tactile_dict = None
+                self._latest_tactile_devices = []
+
+    def _maybe_restart_tactile_worker(self) -> bool:
+        if not self._tactile_worker_supervisor_lock.acquire(blocking=False):
+            return False
+        try:
+            return self._maybe_restart_tactile_worker_locked()
+        finally:
+            self._tactile_worker_supervisor_lock.release()
+
+    def _maybe_restart_tactile_worker_locked(self) -> bool:
+        if (
+            self._closing
+            or not self.config.connect_tactile
+            or not self.config.tactile_process_read
+            or not self.config.tactile_worker_restart_on_error
+        ):
+            return False
+        self._check_tactile_worker_process()
+        process = self._tactile_worker_process
+        if process is not None and process.is_alive():
+            return False
+        if not self._tactile_worker_restart_pending:
+            return False
+        exponent = max(0, min(8, self._tactile_worker_failure_count - 1))
+        backoff = min(
+            float(self.config.tactile_worker_restart_max_backoff_sec),
+            float(self.config.tactile_worker_restart_initial_backoff_sec) * (2**exponent),
+        )
+        now = time.time()
+        if (
+            self._tactile_worker_last_restart_attempt_at is not None
+            and now - self._tactile_worker_last_restart_attempt_at < backoff
+        ):
+            return False
+        self._tactile_worker_last_restart_attempt_at = now
+        receiver_stop = self._tactile_worker_receiver_stop
+        if receiver_stop is not None:
+            receiver_stop.set()
+        receiver = self._tactile_worker_receiver_thread
+        if receiver is not None and receiver is not threading.current_thread():
+            receiver.join(timeout=0.5)
+        if process is not None:
+            process.join(timeout=0.1)
+        queue_out = self._tactile_worker_queue
+        if queue_out is not None:
+            try:
+                queue_out.close()
+                queue_out.cancel_join_thread()
+            except (AttributeError, OSError, ValueError):
+                pass
+        self._tactile_worker_process = None
+        self._tactile_worker_queue = None
+        self._tactile_worker_stop_event = None
+        self._tactile_worker_receiver_stop = None
+        self._tactile_worker_receiver_thread = None
+        try:
+            self._start_tactile_worker()
+        except Exception as exc:  # noqa: BLE001
+            self._tactile_worker_restart_pending = True
+            self._telemetry_error = f"tactile_worker_restart_failed:{type(exc).__name__}:{exc}"
+            return False
+        self._tactile_worker_restart_count += 1
+        self._telemetry_error = None
+        return True
 
     def _drain_tactile_worker_queue(self) -> bool:
         if self._tactile_worker_queue is None:
@@ -1261,6 +1550,7 @@ class DMTacGripperBackend(EffectorBackend):
                 self._stop_event.wait(remaining)
 
     def _read_telemetry_once(self) -> None:
+        self._maybe_restart_tactile_worker()
         device = self.device
         if device is None:
             if self.config.connect_hardware:
@@ -1281,6 +1571,7 @@ class DMTacGripperBackend(EffectorBackend):
         gripper_read_elapsed_s = None
         gripper_read_skipped = False
         gripper_read_skip_reason = None
+        gripper_read_forced = False
         tactile_read_elapsed_s = None
         tactile_gate_wait_s = None
         tactile_read_attempted = False
@@ -1289,11 +1580,12 @@ class DMTacGripperBackend(EffectorBackend):
             self.config.connect_tactile and self.config.tactile_process_read
         )
         if self.config.connect_hardware and device.gripper is not None:
+            gripper_read_forced = self._gripper_telemetry_force_read_due(read_started_at)
             if self._skip_gripper_telemetry_after_recent_command(read_started_at):
                 gripper_read_skipped = True
                 gripper_read_skip_reason = "recent_command"
             else:
-                acquired_gripper_lock = self._lock.acquire(blocking=False)
+                acquired_gripper_lock = self._lock.acquire(blocking=gripper_read_forced)
                 if not acquired_gripper_lock:
                     gripper_read_skipped = True
                     gripper_read_skip_reason = "io_busy"
@@ -1395,6 +1687,7 @@ class DMTacGripperBackend(EffectorBackend):
         self._latest_gripper_read_elapsed_s = gripper_read_elapsed_s
         self._latest_gripper_read_skipped = bool(gripper_read_skipped)
         self._latest_gripper_read_skip_reason = gripper_read_skip_reason
+        self._latest_gripper_read_forced = bool(gripper_read_forced)
         if not tactile_worker_active:
             with self._state_lock:
                 self._latest_tactile_read_elapsed_s = tactile_read_elapsed_s
@@ -1535,12 +1828,16 @@ class DMTacGripperBackend(EffectorBackend):
             if commanded_joint_pos is None
             else commanded_joint_pos.copy(),
             "last_sent_command_timestamp": self._last_sent_command_timestamp,
+            "last_sent_command_completed_timestamp": (
+                self._last_sent_command_completed_timestamp
+            ),
             "commanded_joint_pos": None
             if commanded_joint_pos is None
             else commanded_joint_pos.copy(),
             "joint_pos": None if joint_pos is None else joint_pos.copy(),
             "measured_joint_pos": None if measured_joint_pos is None else measured_joint_pos.copy(),
             "joint_timestamp": self._latest_joint_timestamp,
+            "gripper_measurement_timestamp": self._latest_joint_timestamp,
             "gripper_commanded_scalar": commanded_scalar,
             "gripper_measured_scalar": measured_scalar,
             "gripper_state_scalar": None if joint_pos is None else float(joint_pos[scalar_index]),
@@ -1562,6 +1859,10 @@ class DMTacGripperBackend(EffectorBackend):
             "gripper_read_elapsed_s": self._latest_gripper_read_elapsed_s,
             "gripper_read_skipped": bool(self._latest_gripper_read_skipped),
             "gripper_read_skip_reason": self._latest_gripper_read_skip_reason,
+            "gripper_read_forced": bool(self._latest_gripper_read_forced),
+            "gripper_telemetry_max_deferral_s": (
+                self._gripper_telemetry_max_deferral_s()
+            ),
             "gripper_send_attempt_timestamp": self._last_send_attempt_timestamp,
             "gripper_send_elapsed_s": self._last_send_elapsed_s,
             "gripper_send_lock_wait_s": self._last_send_lock_wait_s,
@@ -1583,10 +1884,27 @@ class DMTacGripperBackend(EffectorBackend):
                 and self._tactile_worker_process.is_alive()
             ),
             "tactile_worker_receiver_alive": self._tactile_worker_receiver_active(),
+            "tactile_worker_restart_on_error": bool(
+                self.config.tactile_worker_restart_on_error
+            ),
+            "tactile_worker_restart_pending": bool(self._tactile_worker_restart_pending),
+            "tactile_worker_restart_count": int(self._tactile_worker_restart_count),
+            "tactile_worker_failure_count": int(self._tactile_worker_failure_count),
+            "tactile_worker_last_exit_code": self._tactile_worker_last_exit_code,
+            "tactile_worker_last_restart_attempt_timestamp": (
+                self._tactile_worker_last_restart_attempt_at
+            ),
             "tactile_parallel_read": bool(self.config.tactile_parallel_read),
             "tactile_global_read_lock": bool(self.config.tactile_global_read_lock),
             "tactile_fields": tuple(self.config.tactile_fields),
             "tactile_compute_profile": str(self.config.tactile_compute_profile),
+            "tactile_calibration_policy": str(self.config.tactile_calibration_policy),
+            "tactile_calibration_dir": (
+                None
+                if self.config.tactile_calibration_dir is None
+                else str(self.config.tactile_calibration_dir)
+            ),
+            "tactile_solving_enabled": "distributed_force" in self.config.tactile_fields,
             "tactile_max_fps": int(self.config.tactile_max_fps),
             "tactile_reset_on_start": bool(self.config.tactile_reset_on_start),
             "tactile_warmup_frames": int(self.config.tactile_warmup_frames),
@@ -1595,6 +1913,7 @@ class DMTacGripperBackend(EffectorBackend):
             "telemetry_error": telemetry_error,
             "connect_hardware": bool(self.config.connect_hardware),
             "connect_tactile": bool(self.config.connect_tactile),
+            "observation_only": bool(self.config.observation_only),
             "send_commands": bool(self.config.send_commands),
             "is_connected": self.device is not None,
             "gripper_is_connected": self.device is not None
@@ -1620,6 +1939,7 @@ class DMTacGripperBackend(EffectorBackend):
         }
 
     def close(self) -> None:
+        self._closing = True
         if self._stop_event is not None:
             self._stop_event.set()
         if self._telemetry_thread is not None:

@@ -68,6 +68,7 @@ from .sources.pose import VivePoseSource, ViveTrackerConfig
 from .configs import (
     ANNOTATED_DUAL_RM65_BASE_DISTANCE_M,
     build_annotated_dual_rm65_calibration,
+    build_bimanual_passive_session,
     build_bimanual_session,
     default_vive_tracker_configs,
     dmtac_backend_configs_from_assignment,
@@ -130,6 +131,7 @@ __all__ = [
     "ViveTrackerConfig",
     "backend_registry",
     "build_annotated_dual_rm65_calibration",
+    "build_bimanual_passive_session",
     "build_bimanual_session",
     "compare_start_qpos_pair",
     "default_vive_tracker_configs",

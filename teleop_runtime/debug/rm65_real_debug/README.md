@@ -8,7 +8,7 @@
 
 1. 连接左/右 RM65
 2. 可选连接左/右 InspireTac
-3. 只调用 `Get_Current_Arm_State` 和手部只读遥测
+3. 只调用 `Get_Current_Arm_State`、`Get_Current_Tool_Frame` 和手部只读遥测
 4. 用当前 `desk -> base` 标定和 URDF 正向运动学计算真实 TCP
 5. 在 SAPIEN 中显示双臂、双手、desk 坐标系、arm base 坐标系和当前 TCP 坐标系
 
@@ -25,22 +25,67 @@
 - 它不会调用 `Movej_CANFD`
 - 不会发送任何动态轨迹
 - 不会改动真机姿态
+- 显式禁用共享 backend 启动期的 `Algo_Kin_Set_Singularity_Thresholds` 写入
 
-唯一的真机读操作是：
+机械臂侧允许的真机读操作是：
 
 - `Get_Current_Arm_State`
+- `Get_Current_Tool_Frame`
 - `InspireTac.read_joint_pos()`
+
+状态行会同时显示同一次 `Get_Current_Arm_State` 已返回的 `arm_err` 和
+`sys_err`；这不会增加 SDK 调用，也不等价于使能、急停回路或运动就绪验收。
+
+## M5.8-b0 stop-only preflight
+
+`run_rm65_stop_only_preflight` 不是只读工具。它只用于已经单独授权的
+M5.8-b0 窄验收，并向每侧各发送一次 `Arm_Slow_Stop`。入口具有以下代码级限制：
+
+- 必须同时提供 execute、arms-stationary 和 ESTOP-ready 三个确认参数；
+- 启动前读取两次 fresh qpos，检查 error code、URDF 限位和静止漂移；
+- motion adapter 为 deny-all，不提供 `Movej_CANFD`/force-position permit；
+- lifecycle 和其他 safety seam 均不能从 stop-only provider 获得 permit；
+- 每侧在本次 authorization 下最多尝试一次，失败后不会自动重试；
+- 不允许从 `Arm_Slow_Stop` 回退到 `Arm_Stop`。
+
+该入口只产生 stop-only 现场证据，不表示完整 M5.8-b、worker drain、measured-stop
+acknowledgement 或 M6 authority 已通过。
+
+## M5.8-b1-real-A idle-worker drain/stop-only preflight
+
+`run_rm65_idle_worker_drain_preflight` 是另一个独立、需要现场授权的状态改变入口。它会启动真实 RM65
+background worker，但不会给 worker 提供任何 target；确认 worker 已运行且 `send_count=0` 后，推进一次
+execution epoch，依次 drain position-reference、left sender、right sender，最后向每侧最多发送一次
+`Arm_Slow_Stop`。
+
+这个入口采用专用 profile `m5_8b1_real_a_idle_worker_drain_stop_only_v1`，其保守配置与正式操作严格隔离：
+
+- 不修改 `m6_candidate_policy_arm_qpos_v1`、canonical deploy 参数或 backend 默认值；
+- 不提供 motion、home、enable、rearm、force-position 或 lifecycle authority；
+- authorization、owner token、epoch registry 和 worker 只在本次进程内有效；
+- 证据只写入 `teleop_records/preflight_evidence/m5_8b1_real_a/<runtime_session_id>/` 的诊断 WAL 与
+  `evidence.json`，明确不能 seal/commit 为公开 v2.4 capture；
+- 后续真实运动必须重新构造对应 execution profile 和 authorization，不能继承本入口的 deny-motion、
+  无target或一次性stop设置。
+
+该批次只验证真实 idle worker 的 epoch/drain barrier 和 drain 后的 final Slow-Stop，不证明带target streaming、
+motion permit、physical measured-stop、owner切换或M6 authority。
+
+2026-07-21 的 scoped 现场批次已完成：两侧worker在无target条件下分别运行103/93 tick且`send_count=0`，
+三个required participant完成execution epoch 0→1 drain；两次Slow-Stop均accepted且SDK返回0，诊断trace为
+10/10 durable并保持`capture_commit_eligible=false`。因为没有target或in-flight旧调用，这份证据只关闭
+idle-worker profile；带target streaming与production mediation仍需独立授权和验收。
 
 ## 入口
 
 主脚本：
 
-- [run_rm65_real_state_viz.py](/home/user/zc/dex_inspire_teleop/teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py)
+- `teleop_runtime/debug/rm65_real_debug/run_rm65_real_state_viz.py`
 
 推荐启动方式：
 
 ```bash
-conda activate grasp_py310_copy
+conda activate /home/user/miniconda3/envs/dexteleop310
 
 python -m teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz \
   --left-arm-ip 192.168.101.21 \
@@ -168,6 +213,9 @@ SAPIEN 中当前会显示：
 - 如果连接了 InspireTac，还会额外输出 `left_hand q6=[...]` / `right_hand q6=[...]`
 
 ## 保存初始对齐状态
+
+需要从环境准备、只读检查、按 `s` 保存到遥操作复用的完整步骤时，参见
+[`INITIAL_ALIGNMENT_WORKFLOW.md`](./INITIAL_ALIGNMENT_WORKFLOW.md)。
 
 运行时按：
 

@@ -15,7 +15,7 @@ Use the RM65 qpos plan command for offline/dry-run initialization planning:
 ```bash
 PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
   --current-qpos current_qpos.json \
-  --qpos-target robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json \
+  --qpos-target robot_motion/rm65/arm_init/qpos_targets/measured_init_pose.json \
   --arm both \
   --output /tmp/rm65_qpos_init_plan.json \
   --include-steps
@@ -29,7 +29,7 @@ Precheck live state and write the plan report without motion:
 
 ```bash
 PYTHONPATH=. python -m teleop_runtime.replay.arm_init.qpos_execute \
-  --qpos-target robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json \
+  --qpos-target robot_motion/rm65/arm_init/qpos_targets/measured_init_pose.json \
   --arm both \
   --left-ip 192.168.101.21 \
   --right-ip 192.168.1.20 \
@@ -41,7 +41,7 @@ Execute on real hardware:
 
 ```bash
 PYTHONPATH=. python -m teleop_runtime.replay.arm_init.qpos_execute \
-  --qpos-target robot_motion/rm65/arm_init/qpos_targets/bench_init_pose.json \
+  --qpos-target robot_motion/rm65/arm_init/qpos_targets/measured_init_pose.json \
   --arm both \
   --left-ip 192.168.101.21 \
   --right-ip 192.168.1.20 \

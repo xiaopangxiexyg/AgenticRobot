@@ -5,6 +5,206 @@ import pytest
 
 
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
+DEFAULT_PHYSICAL_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json"
+)
+PRIVILEGED_EXPERT_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_v1.json"
+)
+NORMAL_RGB_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v1.json"
+)
+PRIVILEGED_EXPERT_RGB_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_rgb_v1.json"
+)
+NORMAL_RGB_48_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json"
+)
+NORMAL_RGB_MOTION_TRACKING_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v3.json"
+)
+NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json"
+)
+PRIVILEGED_EXPERT_RGB_48_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_rgb_v2.json"
+)
+
+
+def test_temp_training_defaults_to_fully_actuated_task() -> None:
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    args = build_arg_parser().parse_args([])
+    assert args.task_config == DEFAULT_PHYSICAL_TASK_CONFIG
+    assert args.log_interval_updates == 1
+    assert args.print_full_metrics is False
+
+
+def test_normal_rgb_v4_is_the_no_episode_clock_real_observation_profile() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_observation_contract
+
+    config = CubeLiftTaskConfig.load(NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_TASK_CONFIG)
+    contract = build_observation_contract(config)
+    assert config.policy_class == "normal"
+    assert config.proprio_observation_dim == 28
+    assert config.observation_dim == 28 + 3 * 48 * 48
+    assert config.wrist_rgb_shape == (3, 48, 48)
+    assert "episode_progress" not in contract.field_names
+    assert config.observation_layout.endswith("right_wrist_rgb_chw_3x48x48.v4")
+
+
+def test_temp_training_progress_line_shows_progress_and_key_metrics() -> None:
+    from sim.mujoco_temp_pipeline.train import format_training_progress
+
+    line = format_training_progress(
+        {
+            "update": 10,
+            "global_step": 10240,
+            "wall_time_seconds": 50.0,
+            "transitions_per_second": 204.8,
+            "completed_episodes": 71,
+            "successful_episodes": 2,
+            "success_rate": 2.0 / 71.0,
+            "raw_reward_mean": -0.0022,
+            "shaped_reward_mean": 0.0365,
+            "recent_episode_raw_return_mean": -0.304,
+            "reward_distance_m_mean": 0.334,
+            "reward_gripper_close_mean": 0.39,
+            "reward_lift_fraction_mean": 0.0,
+            "safety_projection_rate": 0.13,
+            "safety_rejection_rate": 0.02,
+            "clearance_violation_count": 0,
+            "hard_penetration_count": 0,
+            "arm_tracking_error_rad_mean": 0.0179,
+            "gripper_tracking_error_mean": 0.09,
+            "policy_loss": -0.004,
+            "value_loss": 0.33,
+            "approx_kl": 0.0006,
+        },
+        total_timesteps=2_000_000,
+        next_checkpoint=50_000,
+    )
+
+    assert "steps=10,240/2,000,000 (  0.5%)" in line
+    assert "eta=" in line
+    assert "succ=2( 2.8%)" in line
+    assert "reach=0.334m" in line
+    assert "proj=13.0%" in line
+    assert "clr=0 pen=0" in line
+    assert "armerr=0.0179rad" in line
+    assert "griperr=0.090" in line
+    assert "kl=6.00e-04" in line
+    assert "ckpt=next=50,000" in line
+    assert len(line) < 700
+
+
+def test_temp_training_can_restore_full_json_terminal_output() -> None:
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    args = build_arg_parser().parse_args(
+        ["--log-interval-updates", "10", "--print-full-metrics"]
+    )
+    assert args.log_interval_updates == 10
+    assert args.print_full_metrics is True
+
+
+def test_temp_training_rgb_health_guard_is_explicit() -> None:
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    args = build_arg_parser().parse_args(["--require-rgb-health"])
+    assert args.require_rgb_health is True
+
+
+def test_normal_and_expert_configs_share_identified_actuators() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    normal = CubeLiftTaskConfig.load(DEFAULT_PHYSICAL_TASK_CONFIG)
+    expert = CubeLiftTaskConfig.load(PRIVILEGED_EXPERT_TASK_CONFIG)
+    assert normal.policy_class == "normal"
+    assert normal.observation_mode == "proprioceptive_real_motion_tracking_no_episode_clock_wrist_rgb"
+    assert normal.observation_dim == 28 + 3 * 48 * 48
+    assert normal.grasp_mode == "physical_contact"
+    assert expert.policy_class == "privileged_expert"
+    assert expert.observation_mode == "state_privileged"
+    assert expert.observation_dim == 31
+    assert expert.grasp_mode == "contact_latch_debug"
+    assert normal.position_actuation_profile_name == expert.position_actuation_profile_name
+    assert normal.position_actuation_profile_sha256 == expert.position_actuation_profile_sha256
+    assert normal.gripper_actuation_profile_name == expert.gripper_actuation_profile_name
+    assert normal.gripper_actuation_profile_sha256 == expert.gripper_actuation_profile_sha256
+
+
+def test_rgb_policy_configs_append_only_active_wrist_camera() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    normal = CubeLiftTaskConfig.load(NORMAL_RGB_TASK_CONFIG)
+    expert = CubeLiftTaskConfig.load(PRIVILEGED_EXPERT_RGB_TASK_CONFIG)
+    assert normal.wrist_rgb_enabled is True
+    assert normal.wrist_rgb_camera_name == "right_wrist"
+    assert normal.wrist_rgb_shape == (3, 32, 32)
+    assert normal.observation_dim == 15 + 3 * 32 * 32
+    assert expert.observation_dim == 31 + 3 * 32 * 32
+    assert normal.action_layout == expert.action_layout
+    assert normal.position_actuation_profile_sha256 == expert.position_actuation_profile_sha256
+    assert normal.gripper_actuation_profile_sha256 == expert.gripper_actuation_profile_sha256
+
+
+def test_current_rgb_policy_configs_use_versioned_48_by_48_input() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    normal = CubeLiftTaskConfig.load(NORMAL_RGB_48_TASK_CONFIG)
+    expert = CubeLiftTaskConfig.load(PRIVILEGED_EXPERT_RGB_48_TASK_CONFIG)
+    assert normal.wrist_rgb_shape == (3, 48, 48)
+    assert expert.wrist_rgb_shape == (3, 48, 48)
+    assert normal.observation_dim == 15 + 3 * 48 * 48
+    assert expert.observation_dim == 31 + 3 * 48 * 48
+    assert normal.observation_layout.endswith("right_wrist_rgb_chw_3x48x48.v2")
+    assert expert.observation_layout.endswith("right_wrist_rgb_chw_3x48x48.v2")
+
+
+def test_normal_rgb_v3_uses_real_observable_motion_tracking_contract() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    config = CubeLiftTaskConfig.load(NORMAL_RGB_MOTION_TRACKING_TASK_CONFIG)
+    assert config.policy_class == "normal"
+    assert config.normal_proprio_profile == (
+        "qpos_close_motion_tracking_action_progress.v1"
+    )
+    assert config.proprio_observation_dim == 29
+    assert config.observation_dim == 29 + 3 * 48 * 48
+    assert config.wrist_rgb_spatial_pool_size == 3
+    assert config.observation_layout.endswith(
+        "right_wrist_rgb_chw_3x48x48.v3"
+    )
+    assert config.reward_shaping["staged_grasp"] is True
+
+
+def test_motion_tracking_observation_spec_has_no_privileged_cube_fields() -> None:
+    from sim.mujoco.tasks.cube_lift.spec import CubeLiftObservationSpec
+
+    spec = CubeLiftObservationSpec(
+        layout_version=(
+            "right_qpos6_right_close1_right_qpos_delta6_right_close_delta1_"
+            "right_target_error6_right_gripper_target_error1_last_action7_progress1_"
+            "right_wrist_rgb_chw_3x48x48.v3"
+        )
+    )
+    assert spec.proprio_dim == 29
+    assert "cube_to_right_grasp_x_m" not in spec.field_names
+    assert spec.wrist_rgb_shape == (3, 48, 48)
+    assert spec.dim == 29 + 3 * 48 * 48
+
+
+def test_normal_config_rejects_debug_grasp_latch() -> None:
+    import json
+
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+
+    payload = json.loads(DEFAULT_PHYSICAL_TASK_CONFIG.read_text())
+    payload["grasp_mode"] = "contact_latch_debug"
+    with pytest.raises(ValueError, match="cannot use the debug grasp latch"):
+        CubeLiftTaskConfig.from_dict(payload)
 
 
 def test_temp_reward_shaping_preserves_raw_reward_when_disabled() -> None:
@@ -197,6 +397,32 @@ def test_temp_dense_reward_has_explicit_success_bonus() -> None:
     assert shaped[1] - shaped[0] == pytest.approx(10.0)
 
 
+def test_staged_reward_opens_close_gate_before_strict_lift_gate() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((1, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[0, 20] = 0.12
+    current[0, 20] = 0.08
+    current[0, 6] = 0.5
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(1, dtype=np.float32),
+        RewardShapingConfig(
+            staged_grasp=True,
+            grasp_acquire_gate=0.0,
+            grasp_acquire_bonus=1.0,
+        ),
+    )
+    assert terms["close_gate"][0] > terms["grasp_gate"][0]
+    assert terms["reach_phase_weight"][0] < 1.0
+    assert terms["grasp_acquire_term"][0] == pytest.approx(1.0)
+    assert terms["gripper_progress_term"][0] > 0.0
+    assert shaped[0] > terms["gripper_term"][0]
+
+
 def test_temp_reward_shaping_penalizes_collision_projection() -> None:
     from sim.mujoco_temp_pipeline.config import RewardShapingConfig
     from sim.mujoco_temp_pipeline.reward import shape_rewards
@@ -302,6 +528,47 @@ def test_temp_policy_actions_and_log_probs_are_finite() -> None:
     torch.testing.assert_close(log_prob, evaluated_log_prob)
     torch.testing.assert_close(value, evaluated_value)
     assert torch.isfinite(entropy).all()
+
+
+def test_temp_rgb_policy_uses_cnn_and_keeps_action_contract() -> None:
+    torch = pytest.importorskip("torch")
+    from sim.mujoco_temp_pipeline.policy import ActorCritic
+
+    policy = ActorCritic(
+        observation_dim=15 + 3 * 32 * 32,
+        action_dim=7,
+        hidden_dim=32,
+        proprio_dim=15,
+        image_shape=(3, 32, 32),
+    )
+    observation = torch.zeros((4, 15 + 3 * 32 * 32))
+    action, log_prob, value = policy.act(observation, deterministic=True)
+    assert action.shape == (4, 7)
+    assert log_prob.shape == (4,)
+    assert value.shape == (4,)
+    assert policy.image_shape == (3, 32, 32)
+
+
+def test_temp_rgb_v3_policy_preserves_spatial_features() -> None:
+    torch = pytest.importorskip("torch")
+    from sim.mujoco_temp_pipeline.policy import ActorCritic
+
+    observation_dim = 29 + 3 * 48 * 48
+    policy = ActorCritic(
+        observation_dim=observation_dim,
+        action_dim=7,
+        hidden_dim=32,
+        proprio_dim=29,
+        image_shape=(3, 48, 48),
+        image_pool_size=3,
+    )
+    observation = torch.zeros((2, observation_dim))
+    action, log_prob, value = policy.act(observation, deterministic=True)
+    assert action.shape == (2, 7)
+    assert log_prob.shape == (2,)
+    assert value.shape == (2,)
+    assert policy.image_pool_size == 3
+    assert policy.image_encoder[-2].in_features == 64 * 3 * 3
 
 
 def test_temp_run_recorder_writes_machine_and_human_readable_outputs(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 import time
@@ -12,15 +13,33 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.tactile_calibration import (
+    load_tactile_calibration,
+    normalize_calibration_policy,
+    save_tactile_calibration,
+)
 from utils.dataset_postprocess.io import read_json, read_jsonl, write_json
 
 
 DM_FORCE_FORMAT = "dexteleop_dmtac_distributed_force_v1"
+DM_FORCE_PROCESSOR_REVISION = "sdk_offline_force_fixed_calibration_zstd_v4"
 TACTILE_STREAM_FORMAT = "binary_stream_v1"
 RAW_DTYPE = "uint8"
 RAW_SHAPE = (480, 640)
 FORCE_DTYPE = "float32"
 FORCE_SHAPE = (288, 384, 3)
+DEFAULT_FORCE_COMPRESSION = "zstd"
+DEFAULT_FORCE_COMPRESSION_LEVEL = 3
+DEFAULT_FORCE_CHUNK_FRAMES = 16
+
+
+def default_calibration_dir() -> Path:
+    """Return the legacy DM-Tac calibration location without importing hardware."""
+
+    return (
+        Path(__file__).resolve().parents[3]
+        / "hardware/DMTAC_gripper/configs/tactile_calibration"
+    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -68,6 +87,37 @@ def _safe_path_token(value: Any) -> str:
 
 def _timestamp_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(_jsonable(payload), handle, ensure_ascii=True, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _manifest_stream_paths(root: Path, manifest: Mapping[str, Any]) -> set[Path]:
+    streams = manifest.get("streams")
+    if not isinstance(streams, Mapping):
+        return set()
+    paths: set[Path] = set()
+    for spec in streams.values():
+        if not isinstance(spec, Mapping) or not spec.get("path"):
+            continue
+        candidate = _resolve_dataset_path(root, spec.get("path")).resolve()
+        try:
+            candidate.relative_to((root / "tactile_force").resolve())
+        except ValueError:
+            continue
+        paths.add(candidate)
+    return paths
 
 
 @dataclass(frozen=True)
@@ -126,7 +176,13 @@ class ForceProcessConfig:
     remote_addr: str = "192.168.127.10:50051"
     pc_host: str = "0.0.0.0"
     pc_port: int = 60000
-    base_frame_index: int = 0
+    base_frame_index: int | None = None
+    calibration_policy: str = "auto"
+    calibration_dir: Path | None = None
+    save_calibration: bool = False
+    compression: str = DEFAULT_FORCE_COMPRESSION
+    compression_level: int = DEFAULT_FORCE_COMPRESSION_LEVEL
+    chunk_frames: int = DEFAULT_FORCE_CHUNK_FRAMES
     max_frames: int = 0
     sdk_root: Path | None = None
     overwrite: bool = False
@@ -141,6 +197,20 @@ class ForceProcessConfig:
         unknown_sides = [side for side in sides if side not in {"left", "right"}]
         if unknown_sides:
             raise ValueError(f"unsupported side(s): {unknown_sides}")
+        calibration_policy = normalize_calibration_policy(self.calibration_policy)
+        if self.save_calibration and self.base_frame_index is None:
+            raise ValueError("save_calibration requires an explicit base_frame_index")
+        if self.save_calibration and len(self.episodes) != 1:
+            raise ValueError("save_calibration requires exactly one episode")
+        compression = str(self.compression or DEFAULT_FORCE_COMPRESSION).strip().lower()
+        if compression not in {"zstd", "none"}:
+            raise ValueError("compression must be zstd or none")
+        compression_level = int(self.compression_level)
+        if not 1 <= compression_level <= 19:
+            raise ValueError("compression_level must be in [1, 19]")
+        chunk_frames = int(self.chunk_frames)
+        if chunk_frames <= 0:
+            raise ValueError("chunk_frames must be positive")
         return ForceProcessConfig(
             dataset_root=dataset_root,
             output_root=output_root,
@@ -154,7 +224,15 @@ class ForceProcessConfig:
             remote_addr=str(self.remote_addr),
             pc_host=str(self.pc_host),
             pc_port=int(self.pc_port),
-            base_frame_index=int(self.base_frame_index),
+            base_frame_index=(
+                None if self.base_frame_index is None else int(self.base_frame_index)
+            ),
+            calibration_policy=calibration_policy,
+            calibration_dir=Path(self.calibration_dir or default_calibration_dir()).expanduser().resolve(),
+            save_calibration=bool(self.save_calibration),
+            compression=compression,
+            compression_level=compression_level,
+            chunk_frames=chunk_frames,
             max_frames=max(0, int(self.max_frames)),
             sdk_root=None if self.sdk_root is None else Path(self.sdk_root).expanduser().resolve(),
             overwrite=bool(self.overwrite),
@@ -171,7 +249,15 @@ class ForceProcessConfig:
             "remote_addr": self.remote_addr,
             "pc_host": self.pc_host,
             "pc_port": int(self.pc_port),
-            "base_frame_index": int(self.base_frame_index),
+            "base_frame_index": (
+                None if self.base_frame_index is None else int(self.base_frame_index)
+            ),
+            "calibration_policy": self.calibration_policy,
+            "calibration_dir": str(self.calibration_dir or default_calibration_dir()),
+            "save_calibration": bool(self.save_calibration),
+            "compression": self.compression,
+            "compression_level": int(self.compression_level),
+            "chunk_frames": int(self.chunk_frames),
             "max_frames": int(self.max_frames),
             "sdk_root": None if self.sdk_root is None else str(self.sdk_root),
             "overwrite": bool(self.overwrite),
@@ -186,6 +272,8 @@ class StreamProcessResult:
     elapsed_sec: float = 0.0
     output_bytes: int = 0
     error: str | None = None
+    calibration: dict[str, Any] = field(default_factory=dict)
+    stream_spec: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +283,8 @@ class StreamProcessResult:
             "elapsed_sec": float(self.elapsed_sec),
             "output_bytes": int(self.output_bytes),
             "error": self.error,
+            "calibration": _jsonable(self.calibration),
+            "stream_spec": _jsonable(self.stream_spec),
         }
 
 
@@ -312,7 +402,8 @@ def discover_raw_tactile_tasks(config: ForceProcessConfig) -> list[RawTactileStr
             if frame_count <= 0:
                 continue
             safe_sensor = _safe_path_token(sensor)
-            output_stream_path = cfg.output_root / output_relative_dir / f"{safe_sensor}.float32.bin"
+            suffix = ".float32.bin.zst" if cfg.compression == "zstd" else ".float32.bin"
+            output_stream_path = cfg.output_root / output_relative_dir / f"{safe_sensor}{suffix}"
             tasks.append(
                 RawTactileStreamTask(
                     dataset_root=cfg.dataset_root,
@@ -421,17 +512,57 @@ class DMForceCalculator:
             getdistforce=True,
         )
         errors: list[str] = []
+        # Newer SDK builds may return distributed_force directly from the
+        # offline process call. Prefer that result over a live getter, whose
+        # disconnected placeholder is a correctly-shaped all-zero array.
+        try:
+            return _validate_distributed_force(_extract_distributed_force(process_result))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"process: {exc!r}")
+
+        # DM-Tac SDK 1.2.10 computes non-zero offline depth, shear, and global
+        # force, but leaves the corresponding DMV1 getter state untouched.
+        # getDistributeForce() is the SDK-owned composition step, so mirror the
+        # process outputs into that state before calling it. This does not set
+        # or synthesize a tactile base frame.
+        try:
+            self._sync_offline_force_state(process_result)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"offline state sync: {exc!r}")
         try:
             getter_result = self.sensor.getDistributeForce()
         except Exception as exc:  # noqa: BLE001
             getter_result = None
             errors.append(f"getDistributeForce call: {exc!r}")
-        for source_name, result in (("getDistributeForce", getter_result), ("process", process_result)):
-            try:
-                return _validate_distributed_force(_extract_distributed_force(result))
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{source_name}: {exc!r}")
+        try:
+            return _validate_distributed_force(_extract_distributed_force(getter_result))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"getDistributeForce: {exc!r}")
         raise ValueError("failed to obtain distributed_force; " + "; ".join(errors))
+
+    def _sync_offline_force_state(self, process_result: Any) -> None:
+        if not isinstance(process_result, tuple | list) or len(process_result) < 5:
+            raise ValueError("offline process result does not contain depth/shear/force")
+        depth = np.asarray(process_result[2], dtype=np.float32)
+        shear = np.asarray(process_result[3], dtype=np.float32)
+        force = np.asarray(process_result[4], dtype=np.float32)
+        if depth.shape != FORCE_SHAPE[:2]:
+            raise ValueError(f"offline depth shape {depth.shape!r}")
+        if shear.shape != (*FORCE_SHAPE[:2], 2):
+            raise ValueError(f"offline shear shape {shear.shape!r}")
+        if force.size < 3:
+            raise ValueError(f"offline force shape {force.shape!r}")
+        hardware = getattr(self.sensor, "hardware", None)
+        required = ("_DMV1__s", "_DMV1__d", "_DMV1__n")
+        missing = [name for name in required if hardware is None or not hasattr(hardware, name)]
+        if missing:
+            raise RuntimeError(
+                "SDK does not expose the DM-Tac 1.2.10 offline force state: "
+                + ", ".join(missing)
+            )
+        setattr(hardware, "_DMV1__s", np.ascontiguousarray(shear))
+        setattr(hardware, "_DMV1__d", np.ascontiguousarray(depth))
+        setattr(hardware, "_DMV1__n", np.ascontiguousarray(force.reshape(-1)))
 
 
 def _validate_distributed_force(distforce: Any) -> np.ndarray:
@@ -524,6 +655,214 @@ def _frame_records_for_tasks(tasks: Sequence[RawTactileStreamTask], frame_count:
     return records
 
 
+def _base_frame_descriptor(
+    task: RawTactileStreamTask,
+    worker_config: Mapping[str, Any],
+    read_source_frame: Callable[[int], np.ndarray],
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    policy = normalize_calibration_policy(str(worker_config.get("calibration_policy") or "auto"))
+    calibration_dir = Path(
+        worker_config.get("calibration_dir") or default_calibration_dir()
+    ).expanduser().resolve()
+    base_frame_value = worker_config.get("base_frame_index")
+    if base_frame_value is not None:
+        index = int(base_frame_value)
+        if not 0 <= index < int(task.frame_count):
+            raise ValueError(f"base_frame_index {index} out of range for {task.frame_count} frames")
+        frame = np.ascontiguousarray(read_source_frame(index), dtype=np.uint8)
+        source = {
+            "kind": "dataset_raw_frame",
+            "dataset_root": str(task.dataset_root),
+            "source_manifest_path": str(task.source_manifest_path),
+            "episode_index": int(task.episode_index),
+            "frame_index": index,
+        }
+        if bool(worker_config.get("save_calibration", False)):
+            saved = save_tactile_calibration(
+                calibration_dir,
+                task.sensor_key,
+                frame,
+                source=source,
+            )
+            descriptor = saved.descriptor()
+            descriptor["status"] = "captured_and_saved"
+        else:
+            descriptor = {
+                "status": "explicit_episode_frame",
+                "sensor_key": task.sensor_key,
+                "sha256": hashlib.sha256(memoryview(frame)).hexdigest(),
+                "source": source,
+            }
+        return frame, descriptor
+    if policy == "off":
+        return None, {"status": "off", "sensor_key": task.sensor_key}
+    calibration = load_tactile_calibration(
+        calibration_dir,
+        task.sensor_key,
+        required=(policy == "required"),
+    )
+    if calibration is None:
+        return None, {
+            "status": "missing_raw_solution",
+            "sensor_key": task.sensor_key,
+            "calibration_dir": str(calibration_dir),
+        }
+    descriptor = calibration.descriptor()
+    descriptor["status"] = "loaded_fixed"
+    return calibration.frame, descriptor
+
+
+def _existing_stream_spec(task: RawTactileStreamTask) -> Mapping[str, Any] | None:
+    if not task.output_manifest_path.is_file():
+        return None
+    try:
+        manifest = read_json(task.output_manifest_path)
+        streams = manifest.get("streams")
+        if not isinstance(streams, Mapping):
+            return None
+        spec = streams.get(task.sensor_key)
+        if not isinstance(spec, Mapping):
+            return None
+        return spec
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _force_output_settings(worker_config: Mapping[str, Any]) -> tuple[str, int, int]:
+    compression = str(worker_config.get("compression") or DEFAULT_FORCE_COMPRESSION).strip().lower()
+    level = int(worker_config.get("compression_level") or DEFAULT_FORCE_COMPRESSION_LEVEL)
+    chunk_frames = int(worker_config.get("chunk_frames") or DEFAULT_FORCE_CHUNK_FRAMES)
+    if compression not in {"zstd", "none"}:
+        raise ValueError("compression must be zstd or none")
+    if not 1 <= level <= 19:
+        raise ValueError("compression_level must be in [1, 19]")
+    if chunk_frames <= 0:
+        raise ValueError("chunk_frames must be positive")
+    return compression, level, chunk_frames
+
+
+def _existing_force_stream_matches(
+    task: RawTactileStreamTask,
+    spec: Mapping[str, Any] | None,
+    *,
+    frame_count: int,
+    calibration: Mapping[str, Any],
+    compression: str,
+    compression_level: int,
+    chunk_frames: int,
+) -> bool:
+    if not isinstance(spec, Mapping):
+        return False
+    if int(spec.get("frame_count") or 0) != int(frame_count):
+        return False
+    if dict(spec.get("calibration") or {}) != dict(calibration):
+        return False
+    actual_compression = str(spec.get("compression") or "none").strip().lower()
+    if actual_compression != compression:
+        return False
+    expected_raw_bytes = int(frame_count) * int(np.prod(FORCE_SHAPE)) * np.dtype(FORCE_DTYPE).itemsize
+    if compression == "none":
+        return task.output_stream_path.stat().st_size == expected_raw_bytes
+    if int(spec.get("compression_level") or 0) != int(compression_level):
+        return False
+    if int(spec.get("chunk_frame_count") or 0) != int(chunk_frames):
+        return False
+    chunks = spec.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return False
+    if sum(int(item.get("raw_bytes") or 0) for item in chunks if isinstance(item, Mapping)) != expected_raw_bytes:
+        return False
+    return sum(
+        int(item.get("compressed_bytes") or 0)
+        for item in chunks
+        if isinstance(item, Mapping)
+    ) == task.output_stream_path.stat().st_size
+
+
+class _ForceStreamWriter:
+    def __init__(
+        self,
+        handle: Any,
+        *,
+        compression: str,
+        compression_level: int,
+        chunk_frames: int,
+    ) -> None:
+        self.handle = handle
+        self.compression = compression
+        self.compression_level = int(compression_level)
+        self.chunk_frames = int(chunk_frames)
+        self.frames: list[np.ndarray] = []
+        self.frame_start = 0
+        self.chunks: list[dict[str, int]] = []
+        self.raw_sha256 = hashlib.sha256()
+        self._compressor: Any | None = None
+        self._decompressor: Any | None = None
+        if compression == "zstd":
+            try:
+                import zstandard
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "Default DM-Tac force compression requires the zstandard Python package. "
+                    "Install the project environment or pass --compression none."
+                ) from exc
+            self._compressor = zstandard.ZstdCompressor(level=self.compression_level)
+            self._decompressor = zstandard.ZstdDecompressor()
+
+    def write(self, force: np.ndarray) -> None:
+        array = _validate_distributed_force(force)
+        if self.compression == "none":
+            raw = array.tobytes(order="C")
+            self.raw_sha256.update(raw)
+            self.handle.write(raw)
+            return
+        self.frames.append(array.copy())
+        if len(self.frames) >= self.chunk_frames:
+            self._flush_chunk()
+
+    def finish(self) -> dict[str, Any]:
+        if self.frames:
+            self._flush_chunk()
+        spec: dict[str, Any] = {
+            "encoding": "raw_c_order",
+            "compression": "none",
+            "raw_sha256": self.raw_sha256.hexdigest(),
+        }
+        if self.compression == "zstd":
+            spec.update(
+                {
+                    "encoding": "chunked_zstd",
+                    "compression": "zstd",
+                    "compression_level": self.compression_level,
+                    "chunk_frame_count": self.chunk_frames,
+                    "chunks": list(self.chunks),
+                }
+            )
+        return spec
+
+    def _flush_chunk(self) -> None:
+        raw = np.stack(self.frames).astype(np.float32, copy=False).tobytes(order="C")
+        self.raw_sha256.update(raw)
+        assert self._compressor is not None and self._decompressor is not None
+        compressed = self._compressor.compress(raw)
+        restored = self._decompressor.decompress(compressed, max_output_size=len(raw))
+        if restored != raw:
+            raise ValueError(f"Zstd round-trip mismatch at force frame {self.frame_start}")
+        offset = int(self.handle.tell())
+        self.handle.write(compressed)
+        self.chunks.append(
+            {
+                "frame_start": self.frame_start,
+                "frame_count": len(self.frames),
+                "offset": offset,
+                "compressed_bytes": len(compressed),
+                "raw_bytes": len(raw),
+            }
+        )
+        self.frame_start += len(self.frames)
+        self.frames.clear()
+
+
 def process_raw_tactile_stream(
     task: RawTactileStreamTask,
     worker_config: Mapping[str, Any],
@@ -534,18 +873,52 @@ def process_raw_tactile_stream(
     max_frames = int(worker_config.get("max_frames") or 0)
     target_count = int(task.frame_count if max_frames <= 0 else min(task.frame_count, max_frames))
     task_payload = task.to_dict()
-    if task.output_stream_path.exists() and not bool(worker_config.get("overwrite", False)):
-        size = task.output_stream_path.stat().st_size
-        return StreamProcessResult(
-            task=task_payload,
-            status="skipped_exists",
-            frame_count=target_count,
-            output_bytes=size,
-            elapsed_sec=time.perf_counter() - started,
-        )
     if target_count <= 0:
         return StreamProcessResult(task=task_payload, status="skipped_empty")
-    read_source_frame = _raw_tactile_frame_reader(task)
+    try:
+        read_source_frame = _raw_tactile_frame_reader(task)
+        base_frame, calibration = _base_frame_descriptor(task, worker_config, read_source_frame)
+        compression, compression_level, chunk_frames = _force_output_settings(worker_config)
+    except Exception as exc:  # noqa: BLE001
+        return StreamProcessResult(
+            task=task_payload,
+            status="failed",
+            elapsed_sec=time.perf_counter() - started,
+            error=repr(exc),
+        )
+    if task.output_stream_path.exists() and not bool(worker_config.get("overwrite", False)):
+        size = task.output_stream_path.stat().st_size
+        manifest_revision = None
+        if task.output_manifest_path.is_file():
+            try:
+                manifest_payload = read_json(task.output_manifest_path)
+                processing = manifest_payload.get("processing")
+                if isinstance(processing, Mapping):
+                    manifest_revision = processing.get("processor_revision")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                manifest_revision = None
+        existing_spec = _existing_stream_spec(task)
+        if (
+            manifest_revision == DM_FORCE_PROCESSOR_REVISION
+            and _existing_force_stream_matches(
+                task,
+                existing_spec,
+                frame_count=target_count,
+                calibration=calibration,
+                compression=compression,
+                compression_level=compression_level,
+                chunk_frames=chunk_frames,
+            )
+        ):
+            return StreamProcessResult(
+                task=task_payload,
+                status="skipped_exists",
+                frame_count=target_count,
+                output_bytes=size,
+                elapsed_sec=time.perf_counter() - started,
+                calibration=calibration,
+                stream_spec=dict(existing_spec or {}),
+            )
     task.output_stream_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = task.output_stream_path.with_suffix(task.output_stream_path.suffix + ".tmp")
     if tmp_path.exists():
@@ -561,16 +934,29 @@ def process_raw_tactile_stream(
         sdk_root=worker_config.get("sdk_root"),
     )
     try:
-        base_frame_index = int(worker_config.get("base_frame_index", 0))
-        if not 0 <= base_frame_index < int(task.frame_count):
-            raise ValueError(
-                f"base_frame_index {base_frame_index} out of range for {task.frame_count} frames"
-            )
-        calculator.set_base_frame(read_source_frame(base_frame_index))
+        if base_frame is not None:
+            calculator.set_base_frame(base_frame)
+        nonzero_force_frames = 0
         with tmp_path.open("wb") as handle:
+            writer = _ForceStreamWriter(
+                handle,
+                compression=compression,
+                compression_level=compression_level,
+                chunk_frames=chunk_frames,
+            )
             for index in range(target_count):
                 force = calculator.distributed_force(read_source_frame(index))
-                handle.write(force.tobytes(order="C"))
+                if np.any(force != 0.0):
+                    nonzero_force_frames += 1
+                writer.write(force)
+            stream_spec = writer.finish()
+            handle.flush()
+            os.fsync(handle.fileno())
+        if nonzero_force_frames == 0:
+            raise ValueError(
+                "SDK returned all-zero distributed_force for every frame; refusing to publish "
+                "a disconnected getter placeholder as a processed stream"
+            )
         tmp_path.replace(task.output_stream_path)
     except Exception as exc:  # noqa: BLE001
         try:
@@ -583,6 +969,7 @@ def process_raw_tactile_stream(
             frame_count=0,
             elapsed_sec=time.perf_counter() - started,
             error=repr(exc),
+            calibration=calibration,
         )
     finally:
         calculator.close()
@@ -592,6 +979,8 @@ def process_raw_tactile_stream(
         frame_count=target_count,
         output_bytes=task.output_stream_path.stat().st_size,
         elapsed_sec=time.perf_counter() - started,
+        calibration=calibration,
+        stream_spec=stream_spec,
     )
 
 
@@ -617,6 +1006,8 @@ def _merge_stream_results_into_manifests(
             continue
         tasks_by_manifest.setdefault(task.output_manifest_path, []).append(task)
     for manifest_path, manifest_tasks in sorted(tasks_by_manifest.items(), key=lambda item: str(item[0])):
+        previous_manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+        previous_stream_paths = _manifest_stream_paths(config.output_root, previous_manifest)
         side = manifest_tasks[0].side
         episode_index = manifest_tasks[0].episode_index
         relative_dir = str(manifest_path.parent.relative_to(config.output_root))
@@ -627,7 +1018,8 @@ def _merge_stream_results_into_manifests(
             result = processed_by_key[(task.output_manifest_path.resolve(), task.sensor_key)]
             written_frames = int(result.frame_count)
             frame_count = max(frame_count, written_frames)
-            streams[task.sensor_key] = {
+            stream_spec = dict(result.stream_spec)
+            stream_spec.update({
                 "path": str(task.output_stream_path.relative_to(config.output_root)),
                 "dtype": FORCE_DTYPE,
                 "shape": list(FORCE_SHAPE),
@@ -636,7 +1028,9 @@ def _merge_stream_results_into_manifests(
                 "source_dtype": task.source_dtype,
                 "source_shape": list(task.source_shape),
                 "source_compression": task.to_dict().get("source_compression", "none"),
-            }
+                "calibration": dict(result.calibration),
+            })
+            streams[task.sensor_key] = stream_spec
         payload = {
             "format": TACTILE_STREAM_FORMAT,
             "force_format": DM_FORCE_FORMAT,
@@ -652,12 +1046,24 @@ def _merge_stream_results_into_manifests(
                 "source_manifest_path": str(first_task.source_manifest_path.relative_to(config.dataset_root)),
                 "backend": config.backend,
                 "mode": config.mode,
-                "base_frame_index": int(config.base_frame_index),
+                "processor_revision": DM_FORCE_PROCESSOR_REVISION,
+                "base_frame_index": (
+                    None if config.base_frame_index is None else int(config.base_frame_index)
+                ),
+                "calibration_policy": config.calibration_policy,
+                "calibration_dir": str(config.calibration_dir or default_calibration_dir()),
+                "save_calibration": bool(config.save_calibration),
+                "compression": config.compression,
+                "compression_level": int(config.compression_level),
+                "chunk_frame_count": int(config.chunk_frames),
                 "max_frames": int(config.max_frames),
                 "sdk_root": None if config.sdk_root is None else str(config.sdk_root),
             },
         }
-        write_json(manifest_path, _jsonable(payload))
+        _atomic_write_json(manifest_path, payload)
+        active_stream_paths = _manifest_stream_paths(config.output_root, payload)
+        for obsolete_path in sorted(previous_stream_paths - active_stream_paths):
+            obsolete_path.unlink(missing_ok=True)
         manifests.append(manifest_path)
     return manifests
 

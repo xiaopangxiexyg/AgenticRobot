@@ -85,6 +85,7 @@ python -m utils.hand_eye \
 
 默认就是高精度采集配置：
 
+- color transport 默认请求 RealSense 原生 `yuyv`；`CameraFrame.color_bgr` 和标定检测接口仍保持三通道 BGR，避免直接请求 `bgr8` 在多相机 UVC 链路上出现无帧超时。
 - color auto exposure 关闭，默认 `--color-exposure-us 8000`、`--color-gain 16`。
 - color auto white balance 关闭，默认 `--color-white-balance 4600`。
 - 程序会在写入这些固定 RealSense option 前保存原值，并在正常退出时默认恢复：

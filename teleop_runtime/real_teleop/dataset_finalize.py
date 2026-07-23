@@ -30,6 +30,9 @@ class RealDatasetFinalizeTask:
     error: str = ""
     completed_at: float | None = None
     stage_timings_ms: dict[str, float] = field(default_factory=dict)
+    control_trace_release: Any | None = field(default=None, repr=False)
+    control_trace_finalize_report: Any | None = field(default=None, repr=False)
+    control_trace_error: str = ""
     _state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -57,4 +60,3 @@ class RealDatasetFinalizeTask:
             self.completed_at = time.time()
 
 __all__ = ["RealDatasetFinalizeTask"]
-

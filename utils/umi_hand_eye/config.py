@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .tcp_extrinsic import DEFAULT_TCP_PROFILE, DEFAULT_URDF
+
 
 CONFIG_SCHEMA = "dexteleop.umi_hand_eye.config.v1"
 
@@ -15,12 +17,19 @@ class UmiSideConfig:
     tracker_name: str
     tracker_role: str
     channel_name: str
+    tcp_profile: str = DEFAULT_TCP_PROFILE
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any], *, side: str) -> "UmiSideConfig":
         values = {
             name: str(payload.get(name, "")).strip()
-            for name in ("camera_serial", "tracker_name", "tracker_role", "channel_name")
+            for name in (
+                "camera_serial",
+                "tracker_name",
+                "tracker_role",
+                "channel_name",
+                "tcp_profile",
+            )
         }
         missing = [name for name, value in values.items() if not value]
         if missing:
@@ -33,19 +42,21 @@ class UmiSideConfig:
             "tracker_name": self.tracker_name,
             "tracker_role": self.tracker_role,
             "channel_name": self.channel_name,
+            "tcp_profile": self.tcp_profile,
         }
 
 
 @dataclass(frozen=True)
 class UmiHandEyeConfig:
     sides: Mapping[str, UmiSideConfig]
-    validity_seconds: float = 3600.0
+    validity_seconds: float = 10800.0
     vive_host: str = "0.0.0.0"
     vive_port: int = 9999
     vive_clock_sync_port: int = 10001
     camera_resolution: tuple[int, int] = (640, 480)
     camera_fps: int = 15
     target: Mapping[str, Any] = field(default_factory=dict)
+    urdf_path: Path = DEFAULT_URDF
     schema: str = CONFIG_SCHEMA
 
     def __post_init__(self) -> None:
@@ -64,6 +75,9 @@ class UmiHandEyeConfig:
         object.__setattr__(self, "sides", normalized)
         object.__setattr__(self, "camera_resolution", resolution)
         object.__setattr__(self, "target", dict(self.target))
+        object.__setattr__(self, "urdf_path", Path(self.urdf_path).expanduser().resolve())
+        if not self.urdf_path.is_file():
+            raise FileNotFoundError(f"UMI geometry URDF does not exist: {self.urdf_path}")
 
     def side(self, side: str) -> UmiSideConfig:
         normalized = str(side).strip().lower()
@@ -73,7 +87,12 @@ class UmiHandEyeConfig:
             raise ValueError(f"side must be left or right, got {side!r}") from exc
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "UmiHandEyeConfig":
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        base_dir: Path | None = None,
+    ) -> "UmiHandEyeConfig":
         schema = str(payload.get("schema", CONFIG_SCHEMA))
         raw_sides = payload.get("sides")
         if not isinstance(raw_sides, Mapping):
@@ -82,15 +101,19 @@ class UmiHandEyeConfig:
             str(side): UmiSideConfig.from_dict(value, side=str(side))
             for side, value in raw_sides.items()
         }
+        urdf_value = Path(str(payload.get("urdf_path", DEFAULT_URDF))).expanduser()
+        if not urdf_value.is_absolute() and base_dir is not None:
+            urdf_value = base_dir / urdf_value
         return cls(
             sides=sides,
-            validity_seconds=float(payload.get("validity_seconds", 3600.0)),
+            validity_seconds=float(payload.get("validity_seconds", 10800.0)),
             vive_host=str(payload.get("vive_host", "0.0.0.0")),
             vive_port=int(payload.get("vive_port", 9999)),
             vive_clock_sync_port=int(payload.get("vive_clock_sync_port", 10001)),
             camera_resolution=tuple(payload.get("camera_resolution", (640, 480))),
             camera_fps=int(payload.get("camera_fps", 15)),
             target=dict(payload.get("target") or {}),
+            urdf_path=urdf_value,
             schema=schema,
         )
 
@@ -105,11 +128,13 @@ class UmiHandEyeConfig:
             "camera_fps": int(self.camera_fps),
             "sides": {side: config.to_dict() for side, config in self.sides.items()},
             "target": dict(self.target),
+            "urdf_path": str(self.urdf_path),
         }
 
 
 def load_config(path: str | Path) -> UmiHandEyeConfig:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    source = Path(path).expanduser().resolve()
+    payload = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError("UMI config root must be an object")
-    return UmiHandEyeConfig.from_dict(payload)
+    return UmiHandEyeConfig.from_dict(payload, base_dir=source.parent)

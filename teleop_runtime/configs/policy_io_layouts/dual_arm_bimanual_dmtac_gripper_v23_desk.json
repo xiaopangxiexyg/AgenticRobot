@@ -1,0 +1,51 @@
+{
+  "schema": "dexteleop_policy_io_layout_v2.2",
+  "name": "dual_arm_bimanual_dmtac_gripper_v23_desk",
+  "arm": {
+    "pose_representation": "xyz_quat_xyzw",
+    "controlled_frame_by_side": {"left": "tool_tcp", "right": "tool_tcp"},
+    "reference_frame_by_side": {"left": "desk", "right": "desk"}
+  },
+  "end_effectors": {
+    "left": {
+      "side": "left",
+      "adapter": "dmtac_gripper_v1",
+      "target": {
+        "value_type": "continuous", "dim": 1, "names": ["gripper_close"],
+        "source_indices": [0], "legacy_q6_slot_indices": [0], "tokens": [],
+        "units": "normalized_0_1", "normalization": {"minimum": 0.0, "maximum": 1.0}
+      },
+      "state": null,
+      "state_source_field": "gripper_measured_scalar",
+      "metadata": {
+        "collection_action_source": "final_hand_command.slot_0",
+        "collection_state_source": "gripper_measured_scalar",
+        "collection_state_timestamp_field": "joint_timestamp",
+        "collection_state_requires_measured_feedback": true,
+        "collection_state_max_age_sec": 0.5
+      }
+    },
+    "right": {
+      "side": "right",
+      "adapter": "dmtac_gripper_v1",
+      "target": {
+        "value_type": "continuous", "dim": 1, "names": ["gripper_close"],
+        "source_indices": [0], "legacy_q6_slot_indices": [0], "tokens": [],
+        "units": "normalized_0_1", "normalization": {"minimum": 0.0, "maximum": 1.0}
+      },
+      "state": null,
+      "state_source_field": "gripper_measured_scalar",
+      "metadata": {
+        "collection_action_source": "final_hand_command.slot_0",
+        "collection_state_source": "gripper_measured_scalar",
+        "collection_state_timestamp_field": "joint_timestamp",
+        "collection_state_requires_measured_feedback": true,
+        "collection_state_max_age_sec": 0.5
+      }
+    }
+  },
+  "metadata": {
+    "description": "Native v2.3 dual-RM65 DM-Tac layout; stored arm state/actions are canonical desk absolute poses.",
+    "pose_storage_frame": "desk_absolute"
+  }
+}

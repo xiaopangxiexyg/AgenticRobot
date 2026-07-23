@@ -47,6 +47,9 @@ class UmiSample:
     gripper_commands: Mapping[str, float]
     hand_states: Mapping[str, Mapping[str, Any]]
     operator_labels: OperatorLabelSnapshot
+    arm_action_poses: Mapping[str, UmiPoseMeasurement] | None = None
+    arm_action_source_frame_index: int | None = None
+    arm_action_source_timestamp: float | None = None
     camera_frames: Mapping[str, Any] = field(default_factory=dict)
     channels: Mapping[str, Any] = field(default_factory=dict)
     faults: tuple[Any, ...] = ()
@@ -57,6 +60,26 @@ class UmiSample:
             raise ValueError("UMI samples require left and right poses")
         if set(self.gripper_commands) != {"left", "right"}:
             raise ValueError("UMI samples require left and right gripper commands")
+        if self.arm_action_poses is None and (
+            self.arm_action_source_frame_index is not None
+            or self.arm_action_source_timestamp is not None
+        ):
+            raise ValueError("UMI arm action alignment fields must be provided together")
+        if self.arm_action_poses is not None:
+            if set(self.arm_action_poses) != {"left", "right"}:
+                raise ValueError("UMI arm action poses require left and right poses")
+            if self.arm_action_source_frame_index is None:
+                raise ValueError("UMI aligned arm actions require a source frame index")
+            if int(self.arm_action_source_frame_index) != int(self.frame_index) + 1:
+                raise ValueError(
+                    "UMI arm action source must be the next accepted observation frame"
+                )
+            if self.arm_action_source_timestamp is None or not np.isfinite(
+                float(self.arm_action_source_timestamp)
+            ):
+                raise ValueError("UMI aligned arm actions require a finite source timestamp")
+            if float(self.arm_action_source_timestamp) <= float(self.timestamp):
+                raise ValueError("UMI arm action source timestamp must follow the row timestamp")
         for side, value in self.gripper_commands.items():
             scalar = float(value)
             if not np.isfinite(scalar) or not 0.0 <= scalar <= 1.0:

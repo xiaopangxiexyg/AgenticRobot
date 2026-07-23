@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Any
+from typing import Any, Protocol
 
 from robot_motion.runtime.lifecycle import run_best_effort_cleanup
 
-from hardware.angle_trigger.angle_trigger import prepare_reader
+from hardware.angle_trigger.angle_trigger import load_configured_reader
 from ...backends.grippers.dmtac import DMTacGripperBackend
 from ...configs.dmtac_hardware import (
     dmtac_backend_configs_from_assignment,
@@ -24,11 +24,51 @@ from ...sources.camera.realsense_rgb import (
     RealSenseRGBSource,
 )
 from ...sources.hand.angle_trigger import AngleTriggerSource
-from ...real_teleop.foot_pad_controls import FootPadSpecialArmInput
+from ...real_teleop.foot_pad_controls import (
+    FootPadSpecialArmInput,
+    FootPadUnavailableError,
+)
 from ...sources.pose.vive import VivePoseSource, ViveTrackerConfig
 from ..hand_state_polling import HandStateHistoryPoller
 from ..sample_assembler import CameraFrameMatch
 from .config import UmiCollectionConfig
+
+
+class UmiStartupProgress(Protocol):
+    def begin(
+        self,
+        key: str,
+        *,
+        label: str,
+        message: str,
+        requirement: str = "feature_dependent",
+    ) -> None: ...
+
+    def succeed(self, key: str, *, message: str = "连接完成") -> None: ...
+
+    def fail(self, key: str, error: str, *, message: str = "连接失败") -> None: ...
+
+
+def _umi_startup_label(name: str) -> str:
+    if name == "dmtac.rig":
+        return "DMTac 双夹爪"
+    if name == "dmtac.state_poller":
+        return "DMTac 状态采样"
+    if name == "vive":
+        return "VIVE tracker"
+    if name == "angle_trigger":
+        return "AngleTrigger"
+    if name.startswith("camera."):
+        return f"腕部相机 {name.split('.', 1)[1]}"
+    return name
+
+
+def _umi_startup_requirement(name: str) -> str:
+    return (
+        "collection_core"
+        if name in {"dmtac.rig", "dmtac.state_poller", "vive", "angle_trigger"}
+        else "collection"
+    )
 
 
 @dataclass
@@ -41,25 +81,127 @@ class UmiComponents:
     retargeters: dict[str, ScalarToGripperRetargeter]
     hand_state_poller: HandStateHistoryPoller
     foot_pad: FootPadSpecialArmInput | None = None
+    foot_pad_error: str = ""
+    strict_startup: bool = False
+    startup_errors: dict[str, str] = field(default_factory=dict)
     _started: bool = False
 
-    def start(self) -> None:
+    def _require_dmtac_ready(self) -> None:
+        unavailable = []
+        for side, backend in sorted(self.grippers.items()):
+            if backend.is_ready():
+                continue
+            try:
+                state = backend.get_state(include_tactile_arrays=False)
+            except TypeError:
+                state = backend.get_state()
+            detail = str(state.get("telemetry_error") or "backend is not ready")
+            unavailable.append(f"{side}={detail}")
+        if unavailable:
+            raise RuntimeError("DMTAC startup incomplete: " + "; ".join(unavailable))
+
+    def start(self, *, startup_progress: UmiStartupProgress | None = None) -> None:
         if self._started:
             return
+        if not self.strict_startup:
+            self.startup_errors.clear()
+            for name, component in (
+                ("dmtac.rig", self.rig),
+                ("dmtac.state_poller", self.hand_state_poller),
+                ("vive", self.vive),
+                *((f"camera.{key}", camera) for key, camera in self.cameras.items()),
+                ("angle_trigger", self.angle_trigger),
+            ):
+                if startup_progress is not None:
+                    startup_progress.begin(
+                        name,
+                        label=_umi_startup_label(name),
+                        message="正在调用设备 start()",
+                        requirement=_umi_startup_requirement(name),
+                    )
+                try:
+                    component.start()
+                    if name == "dmtac.rig":
+                        self._require_dmtac_ready()
+                except Exception as exc:  # noqa: BLE001 - report each independent device.
+                    detail = f"{type(exc).__name__}: {exc}"
+                    self.startup_errors[str(name)] = detail
+                    if startup_progress is not None:
+                        startup_progress.fail(name, detail)
+                else:
+                    if startup_progress is not None:
+                        startup_progress.succeed(name)
+            self._started = True
+            return
         started: list[tuple[str, Any]] = []
+        current_name = "dmtac.rig"
         try:
+            if startup_progress is not None:
+                startup_progress.begin(
+                    "dmtac.rig",
+                    label=_umi_startup_label("dmtac.rig"),
+                    message="正在启动双夹爪 Rig",
+                    requirement=_umi_startup_requirement("dmtac.rig"),
+                )
             self.rig.start()
+            self._require_dmtac_ready()
             started.append(("rig", self.rig))
+            if startup_progress is not None:
+                startup_progress.succeed("dmtac.rig")
+                current_name = "dmtac.state_poller"
+                startup_progress.begin(
+                    "dmtac.state_poller",
+                    label=_umi_startup_label("dmtac.state_poller"),
+                    message="正在启动状态采样",
+                    requirement=_umi_startup_requirement("dmtac.state_poller"),
+                )
             self.hand_state_poller.start()
             started.append(("hand_state_poller", self.hand_state_poller))
+            if startup_progress is not None:
+                startup_progress.succeed("dmtac.state_poller")
+                current_name = "vive"
+                startup_progress.begin(
+                    "vive",
+                    label=_umi_startup_label("vive"),
+                    message="正在启动 tracker 接收",
+                    requirement=_umi_startup_requirement("vive"),
+                )
             self.vive.start()
             started.append(("vive", self.vive))
+            if startup_progress is not None:
+                startup_progress.succeed("vive")
             for key, camera in self.cameras.items():
+                name = f"camera.{key}"
+                current_name = name
+                if startup_progress is not None:
+                    startup_progress.begin(
+                        name,
+                        label=_umi_startup_label(name),
+                        message="正在启动视频流",
+                        requirement=_umi_startup_requirement(name),
+                    )
                 camera.start()
                 started.append((f"camera[{key}]", camera))
+                if startup_progress is not None:
+                    startup_progress.succeed(name, message="视频流已启动")
+            current_name = "angle_trigger"
+            if startup_progress is not None:
+                startup_progress.begin(
+                    "angle_trigger",
+                    label=_umi_startup_label("angle_trigger"),
+                    message="正在启动串口输入",
+                    requirement=_umi_startup_requirement("angle_trigger"),
+                )
             self.angle_trigger.start()
             started.append(("angle_trigger", self.angle_trigger))
-        except BaseException:
+            if startup_progress is not None:
+                startup_progress.succeed("angle_trigger")
+        except BaseException as exc:
+            if startup_progress is not None:
+                startup_progress.fail(
+                    current_name,
+                    f"{type(exc).__name__}: {exc}",
+                )
             run_best_effort_cleanup(
                 "umi_components.start.rollback",
                 ((name, component.close) for name, component in reversed(started)),
@@ -103,7 +245,25 @@ class UmiComponents:
         }
 
 
-def build_umi_components(config: UmiCollectionConfig) -> UmiComponents:
+def _configure_dmtac_backend_configs(
+    config: UmiCollectionConfig,
+    backend_configs: dict[str, Any],
+) -> None:
+    for backend_config in backend_configs.values():
+        backend_config.send_commands = bool(config.send_gripper_commands)
+        backend_config.tactile_read_hz = float(config.dmtac_tactile_read_hz)
+        backend_config.command_hz = float(config.dmtac_gripper_command_hz)
+        backend_config.telemetry_hz = float(config.dmtac_gripper_telemetry_hz)
+        backend_config.gripper_telemetry_command_grace_s = float(
+            config.dmtac_gripper_telemetry_command_grace_s
+        )
+
+
+def build_umi_components(
+    config: UmiCollectionConfig,
+    *,
+    dmtac_assignment: dict[str, Any] | None = None,
+) -> UmiComponents:
     tracker_configs = [
         ViveTrackerConfig(
             name=config.side(side).tracker_name,
@@ -138,16 +298,20 @@ def build_umi_components(config: UmiCollectionConfig) -> UmiComponents:
         )
         for side in ("left", "right")
     }
-    angle_reader = prepare_reader(config_root=config.angle_trigger_config_root)
+    angle_reader = load_configured_reader(config_root=config.angle_trigger_config_root)
     angle_trigger = AngleTriggerSource(
         angle_reader,
         rate_hz=config.angle_trigger_rate_hz,
         config_root=config.angle_trigger_config_root,
     )
 
-    assignment = load_dmtac_hardware_assignment(
-        config.dmtac_assignment,
-        validate_current_usb=True,
+    assignment = (
+        dmtac_assignment
+        if dmtac_assignment is not None
+        else load_dmtac_hardware_assignment(
+            config.dmtac_assignment,
+            validate_current_usb=True,
+        )
     )
     backend_configs = dmtac_backend_configs_from_assignment(
         assignment,
@@ -156,8 +320,7 @@ def build_umi_components(config: UmiCollectionConfig) -> UmiComponents:
     missing = sorted({"left", "right"} - set(backend_configs))
     if missing:
         raise RuntimeError(f"DMTac assignment is missing UMI side(s): {missing}")
-    for backend_config in backend_configs.values():
-        backend_config.send_commands = bool(config.send_gripper_commands)
+    _configure_dmtac_backend_configs(config, backend_configs)
     grippers = {
         side: DMTacGripperBackend(backend_configs[side])
         for side in ("left", "right")
@@ -180,7 +343,16 @@ def build_umi_components(config: UmiCollectionConfig) -> UmiComponents:
         for side in ("left", "right")
     }
     poller = HandStateHistoryPoller(backends_by_side=grippers)
-    foot_pad = FootPadSpecialArmInput.open_online() if config.foot_pad_enabled else None
+    foot_pad = None
+    foot_pad_error = ""
+    if config.foot_pad_enabled:
+        try:
+            foot_pad = FootPadSpecialArmInput.open_online()
+        except (FootPadUnavailableError, OSError, RuntimeError, ValueError) as exc:
+            # UMI remains usable with the legacy GUI label controls when the
+            # optional virtual keyboard is absent.  The adapter will only be
+            # created when a valid 2/4-pedal device is actually online.
+            foot_pad_error = str(exc)
     return UmiComponents(
         vive=vive,
         cameras=cameras,
@@ -190,6 +362,8 @@ def build_umi_components(config: UmiCollectionConfig) -> UmiComponents:
         retargeters=retargeters,
         hand_state_poller=poller,
         foot_pad=foot_pad,
+        foot_pad_error=foot_pad_error,
+        strict_startup=config.hardware_admission_mode == "strict",
     )
 
 

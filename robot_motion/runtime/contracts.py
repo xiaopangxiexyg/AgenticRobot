@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .cancellation import ExecutionWorkItem
 
 
 def copy_runtime_value(value: Any) -> Any:
@@ -69,6 +72,10 @@ class EffectorCommand:
     value: Any
     frame_name: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Typed execution lineage is deliberately separate from free-form
+    # metadata.  Legacy callers leave it unset; an epoch-mediated execution
+    # profile must bind it before work can enter an asynchronous backend.
+    execution_work_item: "ExecutionWorkItem | None" = None
 
     def copy(self) -> "EffectorCommand":
         return EffectorCommand(
@@ -78,6 +85,7 @@ class EffectorCommand:
             value=copy_runtime_value(self.value),
             frame_name=self.frame_name,
             metadata=dict(self.metadata),
+            execution_work_item=self.execution_work_item,
         )
 
 
@@ -86,6 +94,7 @@ class TeleopCommand:
     commands: dict[str, EffectorCommand] = field(default_factory=dict)
     timestamp: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    execution_work_item: "ExecutionWorkItem | None" = None
 
     def add_command(self, command: EffectorCommand) -> None:
         self.commands[command.effector_name] = command
@@ -107,6 +116,15 @@ def merge_teleop_commands(
     for command in iterable:
         if command is None:
             continue
+        if command.execution_work_item is not None:
+            if (
+                merged.execution_work_item is not None
+                and merged.execution_work_item != command.execution_work_item
+            ):
+                raise ValueError(
+                    "Cannot merge commands from different execution work items."
+                )
+            merged.execution_work_item = command.execution_work_item
         for effector_name, effector_command in command.commands.items():
             merged.commands[effector_name] = effector_command.copy()
         merged.metadata.update(command.metadata)
