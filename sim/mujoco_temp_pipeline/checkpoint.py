@@ -119,6 +119,9 @@ def save_checkpoint(
         "policy": {
             "observation_dim": policy.observation_dim,
             "action_dim": policy.action_dim,
+            "environment_action_dim": policy.environment_action_dim,
+            "active_action_indices": list(policy.active_action_indices),
+            "trainable_log_std": policy.trainable_log_std,
             "hidden_dim": policy.hidden_dim,
             "proprio_dim": policy.proprio_dim,
             "image_shape": (
@@ -181,6 +184,22 @@ def build_policy_from_checkpoint(
             else tuple(int(value) for value in policy_data["image_shape"])
         ),
         image_pool_size=int(policy_data.get("image_pool_size", 1)),
+        environment_action_dim=int(
+            policy_data.get(
+                "environment_action_dim",
+                policy_data["action_dim"],
+            )
+        ),
+        active_action_indices=tuple(
+            int(value)
+            for value in policy_data.get(
+                "active_action_indices",
+                range(int(policy_data["action_dim"])),
+            )
+        ),
+        trainable_log_std=bool(
+            policy_data.get("trainable_log_std", True)
+        ),
     ).to(resolved_device)
     policy.load_state_dict(_require_mapping(policy_data, "state_dict"))
     policy.eval()

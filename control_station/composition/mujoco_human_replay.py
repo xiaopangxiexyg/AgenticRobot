@@ -32,23 +32,46 @@ from dataset_contracts.replay import (
     REPLAY_BINDING_USE_EXECUTION_CANDIDATE,
     REPLAY_BINDING_VERIFIED_COMPATIBLE,
 )
-from robot_motion.action import (
-    BIMANUAL_EE_POSE_V1,
-    BIMANUAL_QPOS_V1,
+from control_composition.composition import (
     CompositionInputAdmissionReceipt,
     CompositionInputDraft,
     CompositionSpec,
-    ControlExecutionManifest,
     DiscreteOwnerPoseMixingStrategy,
-    ExecutionProfileExclusion,
     PoseMixingContext,
     PoseMixingDecision,
     PoseMixingStrategy,
-    build_control_execution_manifest,
     build_pose_mixing_input_snapshot,
+)
+from control_composition.runtime import CompositeProposalSubmission
+from control_composition.lifecycle import (
+    AuthorityReleaseReceipt,
+    ExecutionHoldReceipt,
+    ExecutionReadyReceipt,
+    HumanAuthorityTakeoverReceipt,
+    HumanReadinessReceipt,
+    HumanTakeoverOperationEvidence,
+    HumanTakeoverOperationSpec,
+    HumanTakeoverRequest,
+    HumanTakeoverState,
+    MixedControlBoundaryPolicy,
+    SourceInvalidationReceipt,
+    apply_authority_release,
+    apply_execution_hold,
+    apply_execution_ready,
+    apply_human_authority_takeover,
+    apply_human_readiness,
+    apply_source_invalidation,
+    begin_human_takeover,
+    fail_human_takeover,
+)
+from robot_motion.action import (
+    BIMANUAL_EE_POSE_V1,
+    BIMANUAL_QPOS_V1,
+    ControlExecutionManifest,
+    ExecutionProfileExclusion,
+    build_control_execution_manifest,
     split_effector_name,
 )
-from robot_motion.deploy import CompositeProposalSubmission
 from robot_motion.action.proposal import (
     ProposalAdmissionReceipt,
     robot_action_semantic_payload,
@@ -74,27 +97,6 @@ from ..contracts import (
     SourceSlotSpec,
     StationIntent,
     StationOperationResultDraft,
-)
-from ..handoff import (
-    AuthorityReleaseReceipt,
-    ExecutionHoldReceipt,
-    ExecutionReadyReceipt,
-    HumanAuthorityTakeoverReceipt,
-    HumanReadinessReceipt,
-    HumanTakeoverOperationEvidence,
-    HumanTakeoverOperationSpec,
-    HumanTakeoverRequest,
-    HumanTakeoverState,
-    MixedControlBoundaryPolicy,
-    SourceInvalidationReceipt,
-    apply_authority_release,
-    apply_execution_hold,
-    apply_execution_ready,
-    apply_human_authority_takeover,
-    apply_human_readiness,
-    apply_source_invalidation,
-    begin_human_takeover,
-    fail_human_takeover,
 )
 from ..adapters import StationOperationAdapter
 from ..publication_barrier import (
@@ -1537,7 +1539,8 @@ class MujocoHumanReplayHandoffComposition:
         effective_from: float,
         effective_until: float,
         observation_cut_id: str | None,
-        lineage_context_ids: tuple[str, ...],
+        source_fact_ids: tuple[str, ...],
+        source_fact_hashes: tuple[str, ...],
         parent_fact_id: str,
         parent_fact_hash: str,
     ) -> CompositionInputAdmissionReceipt:
@@ -1557,9 +1560,11 @@ class MujocoHumanReplayHandoffComposition:
                 effective_from=effective_from,
                 effective_until=effective_until,
                 effective_clock_domain_id=self.runtime.config.clock_domain_id,
-                context_ids=lineage_context_ids,
+                context_ids=(),
                 observation_cut_id=observation_cut_id,
                 policy_output_id=None,
+                source_fact_ids=source_fact_ids,
+                source_fact_hashes=source_fact_hashes,
                 authority_candidate=False,
                 audit_metadata={
                     "non_authoritative": True,
@@ -1615,19 +1620,22 @@ class MujocoHumanReplayHandoffComposition:
                 effective_until = (
                     effective_from + self.runtime.config.proposal_horizon_sec
                 )
-                self.runtime.core.record_external_facts(
-                    project_human_proposal_adapter_result(
-                        emission,
-                        adaptation,
-                        runtime_session_id=self.runtime.config.runtime_session_id,
-                        control_domain_id=self.runtime.config.control_domain_id,
-                        embodiment_instance_id=(
-                            self.runtime.config.embodiment_instance_id
-                        ),
-                        occurred_at=effective_from,
-                        clock_domain_id=self.runtime.config.clock_domain_id,
-                    )
+                source_facts = project_human_proposal_adapter_result(
+                    emission,
+                    adaptation,
+                    runtime_session_id=self.runtime.config.runtime_session_id,
+                    control_domain_id=self.runtime.config.control_domain_id,
+                    embodiment_instance_id=(
+                        self.runtime.config.embodiment_instance_id
+                    ),
+                    occurred_at=effective_from,
+                    clock_domain_id=self.runtime.config.clock_domain_id,
                 )
+                self.runtime.core.record_external_facts(source_facts)
+                source_fact_hash_by_id = {
+                    fact.fact_id: fact.semantic_content_hash
+                    for fact in source_facts
+                }
                 if action is None or not adaptation.source_validation.accepted:
                     self._pose_fusion_shadow_error_by_role[
                         CS6B1G_HUMAN_POSE_INPUT_ROLE_V1
@@ -1665,9 +1673,17 @@ class MujocoHumanReplayHandoffComposition:
                     effective_from=effective_from,
                     effective_until=effective_until,
                     observation_cut_id=None,
-                    lineage_context_ids=(
+                    source_fact_ids=(
                         adapter_receipt.source_emission_id,
                         adapter_receipt.representation_trace_id,
+                    ),
+                    source_fact_hashes=(
+                        source_fact_hash_by_id[
+                            adapter_receipt.source_emission_id
+                        ],
+                        source_fact_hash_by_id[
+                            adapter_receipt.representation_trace_id
+                        ],
                     ),
                     parent_fact_id=adapter_receipt.source_emission_id,
                     parent_fact_hash=(
@@ -1784,6 +1800,10 @@ class MujocoHumanReplayHandoffComposition:
                             CS6B1G_REPLAY_POSE_INPUT_ROLE_V1
                         ] = "replay_adapter_produced_no_action"
                     else:
+                        replay_source_facts = {
+                            fact.fact_id: fact.semantic_content_hash
+                            for fact in self.runtime.trace_facts
+                        }
                         self._submit_pose_fusion_shadow_input(
                             role=CS6B1G_REPLAY_POSE_INPUT_ROLE_V1,
                             producer_id=draft.producer_id,
@@ -1797,10 +1817,18 @@ class MujocoHumanReplayHandoffComposition:
                             effective_from=draft.effective_from,
                             effective_until=draft.effective_until,
                             observation_cut_id=draft.observation_cut_id,
-                            lineage_context_ids=(
+                            source_fact_ids=(
                                 emission.emission_id,
                                 submission.adapter_result.source_adapter_receipt
                                 .representation_trace_id,
+                            ),
+                            source_fact_hashes=(
+                                replay_source_facts[emission.emission_id],
+                                replay_source_facts[
+                                    submission.adapter_result
+                                    .source_adapter_receipt
+                                    .representation_trace_id
+                                ],
                             ),
                             parent_fact_id=emission.emission_id,
                             parent_fact_hash=emission.semantic_content_hash,

@@ -8,6 +8,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionInputDraft,
+    CompositionSpec,
+)
+from control_composition.observability import SourceDifferenceSpec
 from dataset_contracts.replay import (
     REPLAY_ACTION_STAGE_SELECTED,
     REPLAY_BINDING_USE_EXECUTION_CANDIDATE,
@@ -30,8 +36,6 @@ from dataset_contracts.completeness import (
 from robot_motion.action import (
     ActionProposalDraft,
     AuthoritativeControlRuntime,
-    CompositionInputDraft,
-    CompositionSpec,
     IMMEDIATE_QREF_SIM_V1,
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
@@ -44,7 +48,6 @@ from robot_motion.runtime import (
     ExecutionCancellationRequest,
     ExecutionEpochRegistry,
 )
-from robot_motion.deploy import PolicyContextDraft
 from robot_motion.replay import (
     ReplayProposalSource,
     ReplayProposalSourceConfig,
@@ -1416,14 +1419,14 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
         policy_node_id="slow-vision",
         trigger_reason="fixed_10hz",
     )
-    context_receipt = runtime.submit_policy_context(
-        PolicyContextDraft(
+    context_receipt = runtime.submit_composition_context(
+        CompositionContextDraft(
             runtime_session_id=runtime.config.runtime_session_id,
             control_domain_id=runtime.config.control_domain_id,
             producer_id="slow-context",
             producer_epoch=runtime.config.producer_epoch,
             sequence=0,
-            policy_node_id="slow-vision",
+            producer_node_id="slow-vision",
             context_channel="motion-plan",
             context_kind="trajectory_plan",
             semantic_payload={"fixture_plan": "bimanual-base-v1"},
@@ -1432,7 +1435,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
             effective_from=clock.value,
             effective_until=clock.value + 0.2,
             effective_clock_domain_id=runtime.config.clock_domain_id,
-            context_contract_hash="synthetic-motion-plan-v1",
+            payload_contract_hash="synthetic-motion-plan-v1",
             observation_cut_id=slow_observation.record.observation_cut_id,
             policy_output_id="slow-output-0",
         )
@@ -1471,7 +1474,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
         policy_node_id="fast-tactile",
         trigger_reason="fixed_40hz",
     )
-    context_snapshot = runtime.capture_policy_context_snapshot(
+    context_snapshot = runtime.capture_composition_context_snapshot(
         target_effective_at=clock.value,
         required_channels=("motion-plan",),
     )
@@ -1520,15 +1523,66 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
     )
     assert shadow.composition_result.output_status == "ready"
     assert shadow.proposal_admission is None
+    assert shadow.source_difference_observation is None
+    assert shadow.source_difference_error is None
+    assert shadow.evaluation_record is not None
+    assert shadow.evaluation_record.composition_spec is spec
+    assert shadow.evaluation_record.input_snapshot is shadow.input_snapshot
+    assert shadow.evaluation_record.composition_result is (
+        shadow.composition_result
+    )
+    assert shadow.evaluation_record.selected_inputs_by_role.keys() == {
+        "base",
+        "residual",
+    }
+    assert {
+        fact.event_type for fact in shadow.trace_facts_emitted
+    } == {
+        "composition_spec",
+        "composition_input_snapshot",
+        "composition_result",
+    }
+    assert shadow.diagnostics == ()
     assert len(runtime.core.proposals) == 0
 
-    submission = runtime.compose_and_submit(
+    invalid_diagnostic = runtime.evaluate_composition_shadow(
         spec=spec,
         target_effective_at=clock.value,
+        source_difference_spec=SourceDifferenceSpec(
+            spec_id="invalid-diagnostic-must-not-block-composition",
+            composition_spec_hash=spec.semantic_content_hash,
+            compared_reference_role_pairs=(("base", "unknown-role"),),
+        ),
+    )
+    assert invalid_diagnostic.composition_result.output_status == "ready"
+    assert invalid_diagnostic.source_difference_observation is None
+    assert invalid_diagnostic.source_difference_error is not None
+    assert "unknown composition role" in (
+        invalid_diagnostic.source_difference_error
+    )
+    assert invalid_diagnostic.evaluation_record is not None
+    assert len(invalid_diagnostic.diagnostics) == 1
+    assert invalid_diagnostic.diagnostics[0].stage == "source_difference"
+    assert invalid_diagnostic.diagnostics[0].recoverable
+    assert "composition_spec" not in {
+        fact.event_type for fact in invalid_diagnostic.trace_facts_emitted
+    }
+    assert sum(
+        fact.event_type == "composition_spec" for fact in runtime.trace_facts
+    ) == 1
+    assert len(runtime.core.proposals) == 0
+
+    submission = runtime.submit_evaluated_composition(
+        shadow,
     )
     assert submission.composition_result.output_status == "ready"
     assert submission.proposal_admission is not None
     assert submission.proposal_admission.accepted
+    assert submission.evaluation_record is shadow.evaluation_record
+    assert len(runtime.core.proposals) == 1
+    duplicate = runtime.submit_evaluated_composition(shadow)
+    assert duplicate.proposal_admission is submission.proposal_admission
+    assert duplicate.evaluation_record is shadow.evaluation_record
     assert len(runtime.core.proposals) == 1
 
     step = runtime.step(now=clock.value, physics_ticks_after_dispatch=1)
@@ -1553,8 +1607,8 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
     )
     event_types = {fact.event_type for fact in runtime.trace_facts}
     assert {
-        "policy_context",
-        "policy_context_snapshot",
+        "composition_context",
+        "composition_context_snapshot",
         "composition_input",
         "composition_input_snapshot",
         "composition_result",
@@ -1630,14 +1684,14 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
                 policy_node_id="slow-vision",
                 trigger_reason="fixed_10hz",
             )
-            context_receipt = runtime.submit_policy_context(
-                PolicyContextDraft(
+            context_receipt = runtime.submit_composition_context(
+                CompositionContextDraft(
                     runtime_session_id=runtime.config.runtime_session_id,
                     control_domain_id=runtime.config.control_domain_id,
                     producer_id="slow-context",
                     producer_epoch=runtime.config.producer_epoch,
                     sequence=index,
-                    policy_node_id="slow-vision",
+                    producer_node_id="slow-vision",
                     context_channel="motion-plan",
                     context_kind="trajectory_plan",
                     semantic_payload={"slow_tick": index},
@@ -1646,7 +1700,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
                     effective_from=clock.value,
                     effective_until=clock.value + 0.101,
                     effective_clock_domain_id=runtime.config.clock_domain_id,
-                    context_contract_hash="synthetic-motion-plan-v1",
+                    payload_contract_hash="synthetic-motion-plan-v1",
                     observation_cut_id=observation.record.observation_cut_id,
                     policy_output_id=f"slow-context-output-{index}",
                 )
@@ -1722,7 +1776,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
             assert current_context_id is not None
             assert current_base_value is not None
             assert current_residual_value is not None
-            context_snapshot = runtime.capture_policy_context_snapshot(
+            context_snapshot = runtime.capture_composition_context_snapshot(
                 target_effective_at=clock.value,
                 required_channels=("motion-plan",),
             )
@@ -1765,7 +1819,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
         for earlier, later in zip(published_at, published_at[1:])
     )
     event_types = [fact.event_type for fact in runtime.trace_facts]
-    assert event_types.count("policy_context") == 3
+    assert event_types.count("composition_context") == 3
     assert event_types.count("composition_input") == 12
     assert event_types.count("composition_result") == 7
     assert event_types.count("action_proposal") == 7

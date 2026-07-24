@@ -20,7 +20,12 @@ from dataset_contracts.pose_frames import (
     PoseFrameContract,
     PoseFrameContractError,
 )
-from dataset_contracts.stats import EpisodeStatsAccumulator
+from dataset_contracts.stats import (
+    FORCE_COLLISION_LABEL_CLEAN,
+    FORCE_COLLISION_LABEL_DETECTED,
+    EpisodeStatsAccumulator,
+    summary_has_force_collision,
+)
 from dataset_contracts.v23 import (
     DEXTELEOP_DATASET_SCHEMA_V23,
     V23_POSE_ACTION_MODE_METADATA_KEY,
@@ -2379,14 +2384,23 @@ class LeRobotV21Writer:
         if wrist_depth_integrity is not None:
             summary_payload["wrist_depth_integrity"] = wrist_depth_integrity
             episode.metadata["wrist_depth_integrity"] = wrist_depth_integrity
+        force_collision_detected = bool(
+            stats.force_collision_detected
+            or summary_has_force_collision(summary_payload)
+        )
+        force_collision_label = (
+            FORCE_COLLISION_LABEL_DETECTED
+            if force_collision_detected
+            else FORCE_COLLISION_LABEL_CLEAN
+        )
         trajectory_quality = {
             "pose_quality_status_counts": dict(stats.pose_quality_status_counts),
             "pose_quality_bad_count": int(stats.pose_quality_bad_count),
             "pose_quality_warning_count": int(stats.pose_quality_warning_count),
             "pose_quality_min_score": stats.pose_quality_min_score,
             "pose_quality_mean_score": stats.pose_quality_mean_score,
-            "force_collision_detected": bool(stats.force_collision_detected),
-            "force_collision_label": stats.force_collision_label,
+            "force_collision_detected": force_collision_detected,
+            "force_collision_label": force_collision_label,
         }
         summary_trajectory_quality = summary_payload.get("trajectory_quality")
         if isinstance(summary_trajectory_quality, dict):
@@ -2394,16 +2408,16 @@ class LeRobotV21Writer:
         else:
             summary_trajectory_quality = dict(trajectory_quality)
         summary_payload["trajectory_quality"] = summary_trajectory_quality
-        summary_payload["force_collision_detected"] = bool(stats.force_collision_detected)
-        summary_payload["force_collision_label"] = stats.force_collision_label
+        summary_payload["force_collision_detected"] = force_collision_detected
+        summary_payload["force_collision_label"] = force_collision_label
         episode_trajectory_quality = episode.metadata.get("trajectory_quality")
         if isinstance(episode_trajectory_quality, dict):
             episode_trajectory_quality.update(trajectory_quality)
         else:
             episode_trajectory_quality = dict(trajectory_quality)
         episode.metadata["trajectory_quality"] = episode_trajectory_quality
-        episode.metadata["force_collision_detected"] = bool(stats.force_collision_detected)
-        episode.metadata["force_collision_label"] = stats.force_collision_label
+        episode.metadata["force_collision_detected"] = force_collision_detected
+        episode.metadata["force_collision_label"] = force_collision_label
         episode_record = {
             "episode_index": int(episode.episode_index),
             "episode_id": episode.episode_id,
@@ -2438,8 +2452,8 @@ class LeRobotV21Writer:
             "pose_quality_warning_count": int(stats.pose_quality_warning_count),
             "pose_quality_min_score": stats.pose_quality_min_score,
             "pose_quality_mean_score": stats.pose_quality_mean_score,
-            "force_collision_detected": bool(stats.force_collision_detected),
-            "force_collision_label": stats.force_collision_label,
+            "force_collision_detected": force_collision_detected,
+            "force_collision_label": force_collision_label,
         }
         _append_jsonl(self.episodes_path, episode_record)
         _append_jsonl(self.episode_stats_path, episode_stats_record)

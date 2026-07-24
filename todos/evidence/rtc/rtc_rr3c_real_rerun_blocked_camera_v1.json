@@ -74,10 +74,67 @@
     "server_processes_remaining": false,
     "worker_sessions_drained": true
   },
+  "followup_camera_startup_orchestration_2026_07_23": {
+    "implementation": {
+      "scope": "deploy_only_default_off",
+      "serial_targeted_startup_hardware_reset": true,
+      "camera_config_insertion_order_preserved": true,
+      "inter_camera_stagger_sec": 0.5,
+      "rtc_real_shadow_enabled": true,
+      "ordinary_openpi_profile_changed": false,
+      "teleop_or_replay_changed": false
+    },
+    "pre_run_read_only_enumeration": {
+      "configured_serials": [
+        "213222079798",
+        "261122273924",
+        "260522278055"
+      ],
+      "currently_enumerated_realsense_serials": [
+        "260623070254",
+        "214423020090",
+        "261523072125"
+      ],
+      "configured_serial_match_count": 0,
+      "authoritative_mapping_source": "cameras/configs/rm65/devices/realsense.json",
+      "authoritative_front_left_right_mapping_known": true,
+      "enumeration_order_remapping_allowed": false,
+      "currently_enumerated_serials_in_gate_scope": false
+    },
+    "gate_result": "stopped_before_hardware_reset_because_all_authoritative_configured_devices_are_absent",
+    "hardware_reset_executed": false,
+    "rtc_client_started": false,
+    "action_dispatch_count": 0
+  },
+  "sdk_enumeration_resolution_2026_07_24": {
+    "status": "supersedes_v4l2_only_absence_interpretation",
+    "authoritative_enumerator": "pyrealsense2_context_query_devices",
+    "devices": [
+      {
+        "camera_key": "front",
+        "serial": "213222079798",
+        "model": "Intel RealSense D435"
+      },
+      {
+        "camera_key": "left_wrist",
+        "serial": "261122273924",
+        "model": "Intel RealSense D405"
+      },
+      {
+        "camera_key": "right_wrist",
+        "serial": "260522278055",
+        "model": "Intel RealSense D405"
+      }
+    ],
+    "configured_serial_match_count": 3,
+    "v4l2_serial_field_is_not_used_for_realsense_assignment": true,
+    "camera_gate_ready": true,
+    "next_evidence": "todos/evidence/rtc/rtc_rr3d_real_rerun_blocked_dmtac_v1.json"
+  },
   "next_gate": {
     "action_send_authorized": false,
     "required": [
-      "camera owner verifies a valid current profile for left_wrist serial 261122273924",
+      "stabilize both configured DMTAC serial devices before camera startup",
       "repeat the same real no-action gate without changing RTC or sim observation semantics",
       "require zero 30 Hz control-budget exceedances before any action-send discussion"
     ]

@@ -212,6 +212,39 @@ def test_cube_lift_success_and_out_of_bounds_termination_predicates() -> None:
         env.close()
 
 
+def test_normal_v2_lift_requires_bilateral_finger_contact() -> None:
+    pytest.importorskip("mujoco")
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json",
+        include_training_reward_state=True,
+    )
+    try:
+        _observation, info = env.reset(seed=5)
+        assert info["left_finger_cube_contact"] is False
+        assert info["right_finger_cube_contact"] is False
+        assert info["bilateral_finger_cube_contact"] is False
+
+        lifted_qpos = env.kernel.scene.freejoint_qpos(
+            env.config.object_freejoint_name
+        )
+        lifted_qpos[2] = (
+            env.kernel._resting_center_z + env.config.lift_delta_m + 0.005
+        )
+        env.kernel.scene.set_freejoint_state(
+            env.config.object_freejoint_name,
+            qpos=lifted_qpos,
+            qvel=np.zeros(6),
+            forward=True,
+        )
+        for _ in range(env.config.success_hold_physics_ticks + 1):
+            assert env.kernel._check_termination(check_success=True) is False
+        assert env.kernel._termination_reason is None
+    finally:
+        env.close()
+
+
 def test_cube_lift_hundred_random_headless_resets_remain_finite() -> None:
     pytest.importorskip("gymnasium")
     rng = np.random.default_rng(20260715)

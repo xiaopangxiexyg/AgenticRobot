@@ -610,8 +610,8 @@ class ReplayHardwareRig:
                             "ik_resolver_local_step_max_position_worsen_m": 0.003,
                             "ik_resolver_local_step_max_orientation_worsen_deg": 0.5,
                             "ik_resolver_local_step_dynamic_worsen_enabled": False,
-                            "direct_joint_hint_max_linear_offset_m": 0.003,
-                            "direct_joint_hint_max_angular_offset_rad": 0.008726646259971648,
+                            "direct_joint_hint_max_linear_offset_m": 0.0,
+                            "direct_joint_hint_max_angular_offset_rad": 0.0,
                         },
                     )
                 )

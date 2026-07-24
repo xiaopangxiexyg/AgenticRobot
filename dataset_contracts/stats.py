@@ -11,8 +11,8 @@ from typing import Any, Mapping
 import numpy as np
 
 
-_FORCE_LIMIT_COLLISION_LABEL = "detected_collision"
-_FORCE_LIMIT_CLEAN_LABEL = "clean"
+FORCE_COLLISION_LABEL_DETECTED = "detected_collision"
+FORCE_COLLISION_LABEL_CLEAN = "clean"
 _FORCE_LIMIT_TEXT_RE = re.compile(
     r"\b(?:force|torque)\s+"
     r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?\s*(?:nm|n)\s*>\s*"
@@ -81,12 +81,30 @@ def _strings_in_payload(value: Any) -> Iterable[str]:
             yield from _strings_in_payload(item)
 
 
-def _has_force_limit_collision_text(*values: Any) -> bool:
+def has_force_limit_collision_text(*values: Any) -> bool:
+    """Return whether payload text contains a controller force-limit trip."""
+
     for value in values:
         for text in _strings_in_payload(value):
             if _FORCE_LIMIT_TEXT_RE.search(text):
                 return True
     return False
+
+
+def summary_has_force_collision(summary: Mapping[str, Any] | None) -> bool:
+    """Return explicit terminal collision evidence carried by an episode summary.
+
+    Terminal safety trips can stop command dispatch before another dataset row
+    is assembled.  The summary is therefore a second, episode-level evidence
+    channel; it may only add a collision and never erase row-level evidence.
+    """
+
+    if not isinstance(summary, Mapping):
+        return False
+    if _truthy(summary.get("force_collision_detected")):
+        return True
+    event = summary.get("force_collision_event")
+    return isinstance(event, Mapping) and _truthy(event.get("detected"))
 
 
 def _row_has_force_limit_collision(row: Mapping[str, Any]) -> bool:
@@ -102,7 +120,7 @@ def _row_has_force_limit_collision(row: Mapping[str, Any]) -> bool:
                 row.get(f"{prefix}.actual_state_error"),
             ]
         )
-    return _has_force_limit_collision_text(*values)
+    return has_force_limit_collision_text(*values)
 
 
 class EpisodeStatsAccumulator:
@@ -215,9 +233,9 @@ class EpisodeStatsAccumulator:
             pose_quality_mean_score=pose_quality_mean_score,
             force_collision_detected=bool(self._force_collision_detected),
             force_collision_label=(
-                _FORCE_LIMIT_COLLISION_LABEL
+                FORCE_COLLISION_LABEL_DETECTED
                 if self._force_collision_detected
-                else _FORCE_LIMIT_CLEAN_LABEL
+                else FORCE_COLLISION_LABEL_CLEAN
             ),
         )
 

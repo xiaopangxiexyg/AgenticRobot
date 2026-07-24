@@ -321,7 +321,7 @@ class RM65ImpedanceConfig:
     hard_stop_torque_nm: float = 10.0
     # Absolute final per-tick cap. Joint-specific velocity limits may impose a
     # smaller bound, but no configured profile may enlarge this hard ceiling.
-    max_command_joint_step_deg: float = 40.0
+    max_command_joint_step_deg: float = 20.0
     max_command_joint_velocity_deg_s: float = 120.0
     joint_rate_limiter_enabled: bool = True
     joint_velocity_limits_json: str | None = None

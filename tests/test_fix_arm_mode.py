@@ -103,6 +103,355 @@ def _channels(
 
 
 class FixArmCommandControllerTests(unittest.TestCase):
+    def test_two_pedal_switch_replaces_fixed_side_atomically(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertEqual(controller.fixed_sides, ("right",))
+
+        transition = controller.start_two_pedal_transition(
+            fixed_side="left",
+            now=1.2,
+            timeout_sec=1.0,
+            min_samples=1,
+        )
+        self.assertTrue(transition.ok)
+        self.assertEqual(controller.fixed_sides, ("right",))
+
+        self.assertTrue(controller.complete_recalibration(now=1.3).ok)
+        self.assertEqual(controller.fixed_sides, ("left",))
+        self.assertNotEqual(controller.fixed_sides, ("left", "right"))
+
+    def test_two_pedal_switch_to_bimanual_releases_only_after_home(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side=None,
+                now=1.2,
+                timeout_sec=1.0,
+                min_samples=1,
+            ).ok
+        )
+        self.assertEqual(controller.fixed_sides, ("right",))
+        self.assertTrue(controller.complete_recalibration(now=1.3).ok)
+        self.assertEqual(controller.fixed_sides, ())
+
+    def test_two_pedal_transition_reuses_fresh_passive_home_cache(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        pose = np.eye(4)
+        for timestamp in (1.10, 1.20, 1.36):
+            controller.observe_two_pedal_home_cache(
+                "right",
+                pose,
+                source_timestamp=timestamp,
+            )
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side="left",
+                now=1.4,
+                timeout_sec=1.0,
+                min_samples=1,
+            ).ok
+        )
+        self.assertEqual(controller.sample_count, 1)
+
+    def test_single_arm_mode_caches_both_sides_for_immediate_followup_switch(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.05).ok)
+        left_pose = np.eye(4)
+        right_pose = np.eye(4)
+        right_pose[1, 3] = 0.1
+        for timestamp in (1.10, 1.20, 1.36):
+            controller.observe_two_pedal_home_cache(
+                "left",
+                left_pose,
+                source_timestamp=timestamp,
+            )
+            controller.observe_two_pedal_home_cache(
+                "right",
+                right_pose,
+                source_timestamp=timestamp,
+            )
+
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side="left",
+                now=1.4,
+            ).ok
+        )
+        self.assertEqual(controller.sample_count, 1)
+        self.assertTrue(controller.complete_recalibration(now=1.41).ok)
+        self.assertEqual(controller.fixed_sides, ("left",))
+
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side=None,
+                now=1.42,
+            ).ok
+        )
+        self.assertEqual(controller.sample_count, 1)
+        self.assertTrue(controller.complete_recalibration(now=1.43).ok)
+        self.assertEqual(controller.fixed_sides, ())
+
+    def test_high_rate_tracker_quantization_can_form_passive_home_cache(self) -> None:
+        controller = _controller("right")
+        controller.filter_channels(
+            _channels(
+                left_wrist=1.0,
+                right_wrist=2.0,
+                left_hand=3.0,
+                right_hand=4.0,
+            ),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(
+                left_arm=1.0,
+                right_arm=2.0,
+                left_hand=3.0,
+                right_hand=4.0,
+            ),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.01).ok)
+
+        accepted = False
+        for index in range(80):
+            pose = np.eye(4)
+            pose[0, 3] = 0.0001 if index % 2 else 0.0
+            accepted = (
+                controller.observe_two_pedal_home_cache(
+                    "right",
+                    pose,
+                    source_timestamp=1.02 + 0.004 * index,
+                )
+                or accepted
+            )
+
+        self.assertTrue(accepted)
+        transition = controller.start_two_pedal_transition(
+            fixed_side="left",
+            now=1.34,
+        )
+        self.assertTrue(transition.ok)
+        self.assertEqual(controller.sample_count, 1)
+
+    def test_passive_home_cache_reports_raw_tracker_unavailability(self) -> None:
+        controller = _controller("right")
+        controller.note_two_pedal_home_unavailable(
+            "right",
+            reason="tracker_channel_invalid",
+            observed_at=10.0,
+        )
+
+        status = controller.passive_home_cache_status("right", now=10.1)
+
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["reason"], "tracker_channel_invalid")
+
+    def test_two_pedal_transition_uses_actual_fixed_side_after_selection_drift(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(controller.select_side("right").ok)
+
+        transition = controller.start_two_pedal_transition(
+            fixed_side="right",
+            now=1.2,
+        )
+
+        self.assertTrue(transition.ok)
+        self.assertTrue(controller.recapturing)
+        self.assertEqual(controller.fixed_side, "left")
+        self.assertEqual(controller.selected_side, "left")
+        self.assertTrue(controller.complete_recalibration(now=1.3).ok)
+        self.assertEqual(controller.fixed_sides, ("right",))
+
+    def test_new_two_pedal_request_replaces_pending_target(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side="right",
+                now=1.2,
+            ).ok
+        )
+
+        replacement = controller.start_two_pedal_transition(
+            fixed_side=None,
+            now=1.21,
+        )
+
+        self.assertTrue(replacement.ok)
+        self.assertTrue(controller.two_pedal_transition_pending)
+        self.assertIsNone(controller.two_pedal_transition_target_fixed_side)
+        self.assertEqual(controller.recalibration_started_at, 1.21)
+        self.assertEqual(controller.recalibration_timeout_sec, 1.0)
+        self.assertEqual(controller.fixed_sides, ("left",))
+        self.assertTrue(controller.complete_recalibration(now=1.3).ok)
+        self.assertEqual(controller.fixed_sides, ())
+
+    def test_unavailable_new_target_cancels_older_pending_destination(self) -> None:
+        controller = FixArmCommandController(
+            active_sides=("left", "right"),
+            selected_side="left",
+            required_effectors_by_side={
+                "left": ("left_arm",),
+                "right": ("right_arm",),
+            },
+        )
+        controller.filter_channels(
+            {
+                "left_wrist_pose": _channel(
+                    "left_wrist_pose",
+                    "left",
+                    1.0,
+                )
+            },
+            now=1.0,
+        )
+        command = TeleopCommand(timestamp=1.0)
+        command.add_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.ones(6),
+            )
+        )
+        controller.filter_command(command, None, 1.0)
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side=None,
+                now=1.2,
+            ).ok
+        )
+
+        unavailable = controller.start_two_pedal_transition(
+            fixed_side="right",
+            now=1.21,
+        )
+
+        self.assertFalse(unavailable.ok)
+        self.assertFalse(controller.recapturing)
+        self.assertFalse(controller.two_pedal_transition_pending)
+        self.assertEqual(controller.fixed_sides, ("left",))
+
+    def test_pedal_for_current_single_arm_cancels_older_pending_switch(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side="right",
+                now=1.2,
+            ).ok
+        )
+
+        cancelled = controller.start_two_pedal_transition(
+            fixed_side="left",
+            now=1.21,
+        )
+
+        self.assertTrue(cancelled.ok)
+        self.assertFalse(controller.recapturing)
+        self.assertFalse(controller.two_pedal_transition_pending)
+        self.assertEqual(controller.fixed_sides, ("left",))
+
+    def test_two_pedal_continuous_single_arm_to_single_arm_to_bimanual(self) -> None:
+        controller = _controller("left")
+        controller.filter_channels(
+            _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
+            now=1.0,
+        )
+        controller.filter_command(
+            _command(left_arm=1.0, right_arm=2.0, left_hand=3.0, right_hand=4.0),
+            None,
+            1.0,
+        )
+        self.assertTrue(controller.freeze_selected(now=1.1).ok)
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side="right",
+                now=1.2,
+            ).ok
+        )
+        self.assertTrue(controller.complete_recalibration(now=1.3).ok)
+        self.assertEqual(controller.fixed_sides, ("right",))
+
+        self.assertTrue(
+            controller.start_two_pedal_transition(
+                fixed_side=None,
+                now=1.4,
+            ).ok
+        )
+        self.assertTrue(controller.complete_recalibration(now=1.5).ok)
+        self.assertEqual(controller.fixed_sides, ())
+
     def test_both_sides_can_be_fixed_and_releasing_one_keeps_the_other_fixed(self) -> None:
         controller = _controller("left")
         controller.filter_channels(

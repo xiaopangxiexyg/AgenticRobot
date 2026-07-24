@@ -515,7 +515,10 @@ def test_side_effect_prepare_failure_resolves_pending_and_web_rejects_it() -> No
     station, _source, _scene, clock = _build_station(ManualClock())
     event_log = BoundedStationEventLog(clock=clock)
 
-    def fail_prepare(_transition) -> None:
+    prepare_calls: list[str] = []
+
+    def fail_prepare(transition) -> None:
+        prepare_calls.append(transition.intent.intent_kind)
         raise RuntimeError("configured prepare failure")
 
     coordinator = SideEffectStationOperationCoordinator(
@@ -552,6 +555,8 @@ def test_side_effect_prepare_failure_resolves_pending_and_web_rejects_it() -> No
         )
     )
     assert lease.transition.receipt.accepted
+    assert lease.enqueue_receipt.status == "operation_not_requested"
+    assert prepare_calls == []
     target_id = station.station.manifest.execution_binding.binding_id
     failed = coordinator.submit_intent(
         StationIntentDraft(
@@ -567,6 +572,7 @@ def test_side_effect_prepare_failure_resolves_pending_and_web_rejects_it() -> No
     )
     assert failed.transition.receipt.status == "operation_requested"
     assert failed.enqueue_receipt.status == "operation_prepare_failed"
+    assert prepare_calls == ["connect_target"]
     assert coordinator.reserved_work_count == 0
     assert station.station.state.target_state == "configured"
     assert not station.station.state.pending_operation_by_subject

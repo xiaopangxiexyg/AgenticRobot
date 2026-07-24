@@ -237,7 +237,7 @@ def test_realsense_startup_does_not_hardware_reset_unsupported_profile() -> None
         )
     )
 
-    with pytest.raises(RuntimeError, match="matching resolutions"):
+    with pytest.raises(RuntimeError, match="configured profile was preserved"):
         source._start_pipeline(fake_rs)
 
     assert len(fake_rs.pipelines) == 1

@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 from .gripper_profile import (
     GripperActuationProfile,
     GripperContactTuning,
+    cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     temporary_bimanual_dmtac_gripper_profile,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "MujocoActuatedPositionExecutor",
     "MujocoDmtacGripperExecutor",
     "PositionActuationProfile",
+    "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
     "rm65_bimanual_udp_feedback_profile",
     "rm65_bimanual_udp_feedback_profile_v1",

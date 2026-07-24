@@ -4,20 +4,22 @@ from dataclasses import replace
 
 import numpy as np
 
-from robot_motion.deploy.context import (
-    PolicyContextDraft,
-    PolicyContextStore,
-    build_policy_context_snapshot,
-    project_policy_contexts,
+from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionContextStore,
+    build_composition_context_snapshot,
+    project_composition_contexts,
 )
+from control_composition.retention import TimeWindowRetentionSpec
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 from robot_motion.runtime.identity import ClockDomainDescriptor
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
-from teleop_runtime.control_trace.projection import (
-    project_policy_context,
-    project_policy_context_admission,
-    project_policy_context_snapshot,
+from control_composition.trace import (
+    project_composition_context,
+    project_composition_context_admission,
+    project_composition_context_snapshot,
 )
+from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
 
 
 class Clock:
@@ -28,7 +30,7 @@ class Clock:
         return self.value
 
 
-def runtime(*, capacity: int = 16):
+def runtime():
     clock = Clock()
     coordinator = ControlAdmissionCoordinator(
         "robot-0",
@@ -50,11 +52,17 @@ def runtime(*, capacity: int = 16):
         produced_clock_domain_id="slow-policy.monotonic",
         reason="startup",
     )
-    store = PolicyContextStore(
+    store = CompositionContextStore(
         runtime_session_id="session-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        capacity=capacity,
+        retention_spec=TimeWindowRetentionSpec(
+            spec_id="test-context-window-v1",
+            history_window_sec=0.0,
+            max_future_lead_sec=2.0,
+            max_effective_duration_sec=2.0,
+            max_late_arrival_sec=0.0,
+        ),
     )
     return clock, coordinator, epochs, store
 
@@ -67,14 +75,14 @@ def draft(
     effective_until: float = 11.0,
     payload=None,
     audit=None,
-) -> PolicyContextDraft:
-    return PolicyContextDraft(
+) -> CompositionContextDraft:
+    return CompositionContextDraft(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         producer_id="slow-policy",
         producer_epoch=epoch,
         sequence=sequence,
-        policy_node_id="slow-vision-policy",
+        producer_node_id="slow-vision-policy",
         context_channel="motion-plan",
         context_kind="semantic_subgoal",
         semantic_payload=payload or {"target_xyz": np.asarray([0.3, 0.0, 0.4])},
@@ -83,7 +91,7 @@ def draft(
         effective_from=effective_from,
         effective_until=effective_until,
         effective_clock_domain_id="control.monotonic",
-        context_contract_hash="context-contract-hash",
+        payload_contract_hash="context-contract-hash",
         observation_cut_id="observation-cut-4",
         inference_id="inference-4",
         policy_output_id="policy-output-4",
@@ -144,8 +152,8 @@ def test_snapshot_is_target_time_aware_and_restart_invalidates_old_context() -> 
     assert old is not None and new is not None
     clock.value = 10.75
     cut = coordinator.capture_cut(cutoff_at=10.75).cut
-    snapshot = build_policy_context_snapshot(
-        project_policy_contexts(store, cut),
+    snapshot = build_composition_context_snapshot(
+        project_composition_contexts(store, cut),
         producer_epochs=epochs.snapshot(cut),
         target_effective_at=10.75,
         required_channels=("motion-plan",),
@@ -161,8 +169,8 @@ def test_snapshot_is_target_time_aware_and_restart_invalidates_old_context() -> 
     )
     clock.value = 10.9
     restarted_cut = coordinator.capture_cut(cutoff_at=10.9).cut
-    missing = build_policy_context_snapshot(
-        project_policy_contexts(store, restarted_cut),
+    missing = build_composition_context_snapshot(
+        project_composition_contexts(store, restarted_cut),
         producer_epochs=epochs.snapshot(restarted_cut),
         target_effective_at=10.9,
         required_channels=("motion-plan",),
@@ -176,7 +184,7 @@ def test_context_arriving_after_cut_only_changes_next_snapshot() -> None:
     first = store.admit(draft(sequence=0)).context
     assert first is not None
     cut = coordinator.capture_cut(cutoff_at=10.0).cut
-    frozen_projection = project_policy_contexts(store, cut)
+    frozen_projection = project_composition_contexts(store, cut)
     frozen_epochs = epochs.snapshot(cut)
 
     clock.value = 10.01
@@ -184,7 +192,7 @@ def test_context_arriving_after_cut_only_changes_next_snapshot() -> None:
         draft(sequence=1, effective_from=10.0, effective_until=11.0)
     ).context
     assert second is not None
-    before = build_policy_context_snapshot(
+    before = build_composition_context_snapshot(
         frozen_projection,
         producer_epochs=frozen_epochs,
         target_effective_at=10.5,
@@ -193,8 +201,8 @@ def test_context_arriving_after_cut_only_changes_next_snapshot() -> None:
     assert before.selected_context_id_by_channel["motion-plan"] == first.context_id
 
     next_cut = coordinator.capture_cut(cutoff_at=10.02).cut
-    after = build_policy_context_snapshot(
-        project_policy_contexts(store, next_cut),
+    after = build_composition_context_snapshot(
+        project_composition_contexts(store, next_cut),
         producer_epochs=epochs.snapshot(next_cut),
         target_effective_at=10.5,
         required_channels=("motion-plan",),
@@ -216,8 +224,8 @@ def test_context_sequence_rollback_and_stale_interval_fail_closed() -> None:
 
     clock.value = 10.3
     cut = coordinator.capture_cut(cutoff_at=10.3).cut
-    stale = build_policy_context_snapshot(
-        project_policy_contexts(store, cut),
+    stale = build_composition_context_snapshot(
+        project_composition_contexts(store, cut),
         producer_epochs=epochs.snapshot(cut),
         target_effective_at=10.3,
         required_channels=("motion-plan",),
@@ -230,33 +238,89 @@ def test_context_trace_records_are_explicit_and_hash_preserving() -> None:
     receipt = store.admit(draft())
     assert receipt.context is not None
     cut = coordinator.capture_cut(cutoff_at=10.0).cut
-    snapshot = build_policy_context_snapshot(
-        project_policy_contexts(store, cut),
+    snapshot = build_composition_context_snapshot(
+        project_composition_contexts(store, cut),
         producer_epochs=epochs.snapshot(cut),
         target_effective_at=10.5,
         required_channels=("motion-plan",),
     )
-    admission_fact = project_policy_context_admission(
-        receipt,
+    trace_context = AuthoritativeTraceContext(
         runtime_session_id="session-0",
         control_domain_id="robot-0",
         embodiment_instance_id="rm65-pair-0",
+        clock_domain_id="control.monotonic",
+    )
+    admission_fact = project_composition_context_admission(
+        trace_context,
+        receipt,
         occurred_at=10.0,
-        clock_domain_id="control.monotonic",
     )
-    context_fact = project_policy_context(
-        receipt.context, embodiment_instance_id="rm65-pair-0"
+    context_fact = project_composition_context(
+        trace_context,
+        receipt.context,
     )
-    snapshot_fact = project_policy_context_snapshot(
+    snapshot_fact = project_composition_context_snapshot(
+        trace_context,
         snapshot,
-        runtime_session_id="session-0",
-        embodiment_instance_id="rm65-pair-0",
-        clock_domain_id="control.monotonic",
     )
-    assert admission_fact.event_type == "policy_context_admission"
+    assert admission_fact.event_type == "composition_context_admission"
     assert context_fact.payload["context_semantic_content_hash"] == (
         receipt.context.semantic_content_hash
     )
     assert snapshot_fact.payload["selected_context_id_by_channel"] == {
         "motion-plan": receipt.context.context_id
     }
+
+
+def test_atomic_snapshot_advances_time_window_and_prunes_full_payload() -> None:
+    clock, coordinator, epochs, store = runtime()
+    first = store.admit(
+        draft(sequence=0, effective_from=10.0, effective_until=10.2)
+    )
+    assert first.accepted
+    clock.value = 10.15
+    cut = coordinator.capture_cut(cutoff_at=10.15).cut
+    selected = store.capture_snapshot(
+        cut,
+        producer_epochs=epochs.snapshot(cut),
+        target_effective_at=10.15,
+        required_channels=("motion-plan",),
+    )
+    assert selected.selected_context_id_by_channel["motion-plan"] == first.context_id
+    assert len(store) == 1
+
+    clock.value = 10.25
+    later_cut = coordinator.capture_cut(cutoff_at=10.25).cut
+    missing = store.capture_snapshot(
+        later_cut,
+        producer_epochs=epochs.snapshot(later_cut),
+        target_effective_at=10.25,
+        required_channels=("motion-plan",),
+    )
+    assert missing.missing_channels == ("motion-plan",)
+    health = store.retention_snapshot()
+    assert health.closed_target_through == 10.25
+    assert health.retained_record_count == 0
+    assert health.pruned_record_count == 1
+    assert health.producer_epoch_tombstone_count == 1
+
+    duplicate = store.admit(
+        draft(sequence=0, effective_from=10.25, effective_until=10.5)
+    )
+    assert not duplicate.accepted
+    assert duplicate.rejection_code == "duplicate"
+
+
+def test_retention_rejects_unbounded_future_and_duration() -> None:
+    _, _, _, store = runtime()
+    future = store.admit(
+        draft(sequence=0, effective_from=12.1, effective_until=12.2)
+    )
+    assert not future.accepted
+    assert future.rejection_code == "retention_window_violation"
+
+    too_long = store.admit(
+        draft(sequence=0, effective_from=10.0, effective_until=12.1)
+    )
+    assert not too_long.accepted
+    assert too_long.rejection_code == "retention_window_violation"

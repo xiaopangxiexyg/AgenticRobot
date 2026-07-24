@@ -41,6 +41,7 @@ class GuiControlState:
     teleop_started: bool = False
     hold_active: bool = False
     episode_recording_available: bool = False
+    episode_delete_available: bool = True
     episode_recording_active: bool = False
     recording_paused: bool = False
     episode_countdown_active: bool = False
@@ -61,6 +62,7 @@ class GuiControlState:
     foot_pad_available: bool = False
     foot_pad_count: int = 0
     foot_pad_test_active: bool = False
+    foot_pad_test_completed: bool = False
 
 
 def episode_busy(state: GuiControlState) -> bool:
@@ -162,7 +164,11 @@ def episode_controls(state: GuiControlState, events: GuiControlEvents) -> list[s
         return ["episode_stop"] if (
             state.episode_recording_active or state.episode_countdown_active
         ) else []
-    return list(events.episode_events)
+    return [
+        event
+        for event in events.episode_events
+        if event != "episode_delete" or state.episode_delete_available
+    ]
 
 
 def fix_init_allowed_in_controls(state: GuiControlState) -> bool:
@@ -312,7 +318,14 @@ def fix_hold_controls(state: GuiControlState) -> list[str]:
 
 
 def qpos_active_controls(state: GuiControlState) -> list[str]:
-    controls = ["q", "d", "h", "init_qpos_emergency_stop"]
+    controls = ["q", "d"]
+    # request_hold() is a runtime-teleop transition and is intentionally a
+    # no-op before the first Home.  Do not expose a dead Hold button during
+    # startup exact-qpos maintenance; the explicit operation emergency stop
+    # is the authoritative pre-Home stop control.
+    if state.teleop_started:
+        controls.append("h")
+    controls.append("init_qpos_emergency_stop")
     if state.episode_recording_active or state.episode_countdown_active:
         controls.append("episode_stop")
     if state.init_arm_available and manual_init_arm_controls(state):

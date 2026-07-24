@@ -73,7 +73,7 @@ hardware = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
-    "cameras*",
+    "control_composition*",
     "control_station*",
     "dataset_contracts*",
     "dataset_interface*",
@@ -94,6 +94,8 @@ include-package-data = true
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.yaml", "*.yml", "*.xml", "*.urdf", "*.obj", "*.stl"]
 control_station = ["web/static/*.html", "web/static/*.js", "web/static/*.css"]
+robot_motion = ["configs/*.json", "configs/**/*.json"]
+teleop_runtime = ["configs/*.json", "configs/**/*.json"]
 
 
 [tool.dexteleop.environment]

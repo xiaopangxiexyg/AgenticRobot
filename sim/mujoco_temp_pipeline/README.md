@@ -14,19 +14,20 @@ simulated execution path.  The left arm is held at home.  The retained v0
 direct-qpos debug config still exposes six joint deltas for compatibility.
 Two explicit policy classes are available:
 
-- the default `normal` task consumes only real-observable feedback. Historical
-  configs use a 15-D state (measured arm/gripper state, last action and episode
-  progress); `normal_rgb_v3` is the compatibility 29-D extension with a
-  runtime episode clock; the recommended `normal_rgb_v4` removes that clock
-  and uses the 28-D measured motion/tracking state plus the active wrist RGB
-  image.  Both use physical MuJoCo contact without a grasp latch;
+- the default `normal_v2` task consumes a 28-D measured motion/tracking state
+  with no wrist RGB and no runtime episode clock. It uses physical MuJoCo
+  contact, requires bilateral finger contact for lift reward/success, and
+  enables pose-target anti-windup. Historical RGB configs remain available
+  only for checkpoint reproduction while camera training is paused;
 - `privileged_expert` consumes the 31-D simulator state and may use the debug
   contact latch. It is a teacher/debug artifact and is never a real deployment
   checkpoint.
 
-Both classes are required to use the same identified RM65 and bilateral DM-Tac
-actuator profiles. Simulator-only dense-reward features are passed through a
-separate training channel and never enter the normal policy observation.
+Both classes retain the same identified RM65 and bilateral DM-Tac free-motion
+response. Normal v2 selects a separately hashed Cube-Lift contact variant that
+changes only simulator friction after the settled reset; the tuple is not
+hardware force identification. Simulator-only dense-reward features are passed
+through a separate training channel and never enter the normal observation.
 
 ## Environment
 
@@ -62,32 +63,86 @@ python -m sim.mujoco_temp_pipeline.train \
   --num-envs 16 \
   --rollout-steps 128 \
   --total-timesteps 200000 \
-  --run-name cube_lift_normal_rgb_v4 \
+  --run-name cube_lift_normal_v2 \
   --device auto
 ```
 
-The state-only v1 and camera v2 profiles remain available for compatibility.
-The v3 profile is also retained for reproducing earlier checkpoints, but its
-episode clock is not part of the recommended real-observable contract.  The
-long-term normal profile is `rm65_right_cube_lift_rl_normal_rgb_v4.json`: it
-keeps the same pose action, fitted RM65/DM-Tac actuator paths, 48x48 right
-wrist RGB input and 3x3 CNN, while using only measured motion/tracking state.
-The v4 task is the training default; its image/layout hash prevents reuse of
-v3 checkpoints.  For a v4 run:
+The default `rm65_right_cube_lift_rl_normal_v2.json` temporarily removes wrist
+RGB. It retains only measured motion/tracking state, reduces pose/gripper action
+increments, removes the sustained close-hover reward, rewards bilateral physical
+contact, gates lift reward and success on that contact, penalizes failed and
+unsafe terminations without penalizing a full-length time limit, and enables
+pose-target anti-windup. The closed-grasp target is 22 mm above cube center and
+the first physical milestone is a 70 mm bilateral-contact lift. For a full run:
 
 ```bash
-MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.train \
-  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json \
+python -m sim.mujoco_temp_pipeline.train \
+  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
   --num-envs 16 \
   --rollout-steps 128 \
   --total-timesteps 2000000 \
-  --run-name cube_lift_normal_rgb_v4 \
-  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_rgb_v4.pt \
-  --require-rgb-health \
+  --run-name cube_lift_normal_v2 \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2.pt \
   --device auto
 ```
 
-`--require-rgb-health` is an explicit guard. It aborts at reset when the
+Before training, the simulator-only scripted gate should prove that the current
+physics, safety projection, and task threshold admit a physical grasp:
+
+```bash
+python - <<'PY'
+from sim.mujoco.tasks.cube_lift.scripted_grasp_gate import (
+    run_scripted_physical_grasp_gate,
+)
+print(run_scripted_physical_grasp_gate(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json"
+))
+PY
+```
+
+The expected reason is `bilateral_contact_lift_success`; this oracle reads
+privileged cube state and is diagnostics-only. It is not a policy input.
+
+If a home-reset probe still reports zero contact, first train the lift/contact
+stage. Its simulator-only reset controller establishes bilateral physical
+contact, then hands the same 28-D normal observation and 7-D action contract to
+PPO. Bilateral contact is the primary reset condition. The v2 reset follows
+the validated float32 gate trajectory, requires a 0.59 measured-close floor,
+executes one centered stabilization step, and has bounded retries.
+The retained v1 run learned to leave the cube to reduce its dense
+safety-projection penalty, so its checkpoint is not a valid warm-start source.
+
+```bash
+MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.train \
+  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v2.json \
+  --run-name cube_lift_contact_curriculum_v2 \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_contact_curriculum_v2.pt \
+  --total-timesteps 200000 \
+  --num-envs 8 \
+  --rollout-steps 128 \
+  --device auto
+```
+
+Only after deterministic v2 evaluation shows real bilateral lift success,
+warm-start a fresh full home-reset run. `--init-checkpoint` transfers only
+compatible policy weights and observation normalization; optimizer state,
+training counters, and the task hash start fresh:
+
+```bash
+MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.train \
+  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
+  --init-checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_contact_curriculum_v2.pt \
+  --run-name cube_lift_normal_v2_from_contact \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2_from_contact.pt \
+  --total-timesteps 2000000 \
+  --num-envs 8 \
+  --rollout-steps 128 \
+  --device auto
+```
+
+The old `normal_rgb_v4` config and checkpoint remain loadable only when selected
+explicitly. For those compatibility runs, `--require-rgb-health` is an explicit
+guard. It aborts at reset when the
 configured RGB frames are flat, dark, or saturated; without it, the same
 health statistics are recorded for diagnosis. It does not prove that the
 cube is visible, so inspect home, pre-grasp, and contact-pose frames before a
@@ -132,8 +187,9 @@ profile adds an explicit close phase:
 
 - a smooth reach score and reach-progress term guide the grasp frame to a
   pre-grasp point 30 mm above the cube center, rather than into the tabletop;
-- an independent 25 mm closed-grasp target gates closure reward, so closing the
-  gripper never moves and invalidates the 30 mm reach target;
+- an independent closed-grasp target gates closure reward, so closing the
+  gripper never moves and invalidates the 30 mm reach target; the current
+  state-only v2 physical profile uses the separately validated 22 mm target;
 - v3 exposes an earlier close gate (12 cm with a 3 cm smooth width), while the
   strict 5 cm gate remains the lift-confidence signal;
 - v3 rewards closure/progress through the wide gate, grants one acquisition
@@ -174,7 +230,8 @@ the terminal prints one compact progress line per update, including step
 percentage, elapsed time, ETA, throughput, completed episodes and success rate,
 raw/shaped reward, recent return, reach/closure/lift signals, safety
 projection/rejection, clearance/penetration counts, actuator tracking error,
-PPO losses and the next checkpoint. Complete per-update records are still
+joint-limit/time-limit episode counts, PPO losses and the next checkpoint.
+Complete per-update records are still
 written to `metrics.jsonl` and `metrics.csv`. Use `--log-interval-updates N` to
 print every Nth update (checkpoint and final updates are still shown), or
 `--print-full-metrics` to restore the previous full-JSON terminal stream.
@@ -194,9 +251,9 @@ planner's 3 cm clearance default is not injected into this sim instance. If a
 measured state still falls below the sim clearance, it terminates and
 auto-resets as `sim_collision_margin_violation` instead of aborting PPO.
 The report also records mean reach distance, both grasp gates, gripper closure,
-RGB mean/std/health rate, grasp latch state, lift fraction, and every individual
-dense-reward term so a stalled reach/grasp/lift or camera-input stage can be
-identified without viewer replay.
+bilateral finger contact/acquisition, lift fraction, and every individual
+dense-reward term. RGB diagnostics remain present only for explicitly selected
+camera configs.
 
 For example:
 
@@ -220,14 +277,16 @@ For an explicit normal checkpoint:
 
 ```bash
 python -m sim.mujoco_temp_pipeline.evaluate \
-  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v1.pt \
-  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v1.json \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2.pt \
+  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
   --episodes 32 \
   --num-envs 8 \
   --device cpu
 ```
 
-For the RGB policy, the task config must be paired with the RGB checkpoint:
+Historical RGB checkpoints must still be paired with their matching task
+configs. These commands are compatibility examples, not current training
+recommendations:
 
 ```bash
 MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
@@ -238,7 +297,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
   --device auto
 ```
 
-For the v3 input/reward contract:
+For the historical v3 input/reward contract:
 
 ```bash
 MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
@@ -249,8 +308,7 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
   --device auto
 ```
 
-For the recommended v4 contract, pair the checkpoint with the same v4 task
-file:
+For the historical v4 contract, pair the checkpoint with the same v4 task file:
 
 ```bash
 MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
@@ -263,20 +321,13 @@ MUJOCO_GL=egl python -m sim.mujoco_temp_pipeline.evaluate \
 
 ## Viewer replay
 
-Run this only in a graphical session:
+Run this only in a graphical session. The current state-only normal-policy
+viewer command is:
 
 ```bash
 python -m sim.mujoco_temp_pipeline.play \
-  --checkpoint sim/mujoco_temp_pipeline/checkpoints/latest.pt \
-  --episodes 3
-```
-
-The corresponding normal-policy viewer command is:
-
-```bash
-python -m sim.mujoco_temp_pipeline.play \
-  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v1.pt \
-  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v1.json \
+  --checkpoint sim/mujoco_temp_pipeline/checkpoints/cube_lift_normal_v2.pt \
+  --task-config sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json \
   --episodes 3 \
   --device cpu \
   --print-safety-events
@@ -304,7 +355,7 @@ python -m sim.mujoco_temp_pipeline.play \
   --print-safety-events
 ```
 
-The recommended v4 viewer command is:
+The historical v4 viewer command is:
 
 ```bash
 python -m sim.mujoco_temp_pipeline.play \
@@ -316,11 +367,10 @@ python -m sim.mujoco_temp_pipeline.play \
 ```
 
 `play` loads the same policy and observation normalization as headless
-evaluation, renders the configured active-side wrist RGB image at 48x48, drives
-the reference `CubeLiftEnv` at 15 Hz, and displays the result through the
-existing passive MuJoCo viewer. This is still a MuJoCo deployment check; the
-RGB policy is not a real-camera/real-robot deployment contract until the real
-camera transport and observation adapter are implemented and calibrated.
+evaluation, drives the reference `CubeLiftEnv` at 15 Hz, and displays the
+result through the existing passive MuJoCo viewer. Historical RGB task configs
+also render their configured active-side 48x48 camera input. This is still a
+MuJoCo deployment check, not a real-camera or real-robot deployment contract.
 
 ## Legacy checkpoint collision regression
 

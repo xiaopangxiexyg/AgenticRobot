@@ -87,6 +87,7 @@ def test_initial_profiles_classify_every_event_type_once() -> None:
         "deployable_sim_scheduled_qpos_policy_station_v1",
         "deployable_sim_scheduled_pose_to_qpos_station_v1",
         "deployable_sim_scheduled_pose_human_replay_station_v1",
+        "deployable_sim_scheduled_pose_composer_station_v1",
     }
     for profile in TRACE_REQUIREMENT_PROFILES_V1.values():
         classified = (

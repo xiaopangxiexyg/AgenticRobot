@@ -41,6 +41,39 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
 ```
 
+进入 runtime Home 前，系统会用已标定的 VIVE desk 横向轴检查左右 wrist tracker：
+三轴标定中的“身体右侧 → 身体左侧”定义为操作者坐标 `+Y`。检查会先去除配置的
+`virtual_desk_post_yaw_deg`，因此默认 `180°` 场景旋转不会把左右判断颠倒。
+正常情况要求 logical left tracker 的操作者坐标 Y 大于 logical right；若顺序相反，
+或双手横向间距小于 5 cm 无法可靠判断，GUI 会在 Home 真正开始前弹窗并要求二次
+确认。建议取消后点击“交换左右 Tracker”并重试；选择继续不会自动交换机械臂、
+Q6、真手或任何持久配置。
+双侧样本还必须有效且接收时间不超过 0.5 秒；按下开始后会等待首个可判定的新鲜
+结果，并在准备倒计时结束、真正采集 Home 前再复核一次。运行中双臂映射已锁定时，
+弹窗不会提供不可用的“交换”建议，而是要求恢复左右手位置，或安全退出后重新启动。
+左右关系检查只在当前 GUI 进程第一次开始遥操时执行一次：首次通过或经人工二次
+确认后，本进程后续的普通 Home、Q6 重采和双踏板切换不再重复计算左右关系，避免
+把它变成持续运行监控。后续 Home 仍会独立检查 Tracker 新鲜度和稳定性。首次操作
+若来自双踏板 Hold 恢复，则左右检查通过后仍走原有快速 Home，Tracker 等待与稳定
+Home 采样共享 1 秒总时限；超时会取消切换并显示 3 秒红色提醒。人工处理首次左右
+警告弹窗的时间不计入，二次确认后重新开始这 1 秒窗口。普通 Home 与 Q6 Home
+不会被双踏板模式误识别为快速 Home。
+
+双踏板模式下 B 是“双臂遥操 / Hold”状态键，并不始终等同于普通“开始遥操”：
+双臂遥操时按 B 进入 Hold；Hold 时按 B 经过快速 Home 恢复双臂遥操；任一单臂
+Fix 状态按 B 时，当前运动臂和数采保持连续，固定臂继续冻结到后台 Home 就绪后
+再原子释放为双臂遥操，不触发全局 Hold，也不暂停数采。Init 移动、精确 qpos
+或 Init Home 重采期间不会接受 B/踏板 1/2 的模式切换；此时 C 仍始终可用，用于
+先进入常规 Hold，再重新选择单臂/双臂遥操。
+
+### 踏板:
+
+```bash
+sudo -E /home/user/miniconda3/envs/dexteleop310/bin/python -m teleop_runtime.configure_devices --fix-permissions
+
+python -m hardware.foot_pad --count 2
+```
+
 ### 1.3 正式 position 数采（M）
 
 ```bash
@@ -64,9 +97,21 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --collection-task-description "formal rm65 bimanual position v1: accepted-qref FK action, IK 1.0/0.35 min2/max4, 15/60/60/120" \
   --q6-config latest --q6-config-required \
   --dmtac-config latest --require-dmtac-config \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
   --write-parquet --write-video
 ```
+
+`POSITION_FORMAL_V1_ARGS` 会强制启用独立的双臂位控受力急停：通过左右 RM65
+状态连接以 20 Hz 读取 tool-zero 六维力，默认任一侧 `|F| > 15 N` 或
+`|T| > 2 Nm` 即锁存并并行请求左右臂 `Arm_Stop`。启动时必须看到
+`force_limits_armed=true stale_watchdog=deferred_until_camera_ready`，随后在相机启动
+完成且任何归位/遥操动作前看到
+`stale_watchdog=armed_after_fresh_post_camera_samples motion_admission=ready`。
+相机初始化期间真实超力和连续读取错误仍会 fail-closed；只有数据陈旧 watchdog
+延后启用，且启用前强制要求左右各产生一帧新的有效力样本。运行期力读取连续失败、
+数据陈旧或启动后无法取得双侧新鲜样本都会 fail-closed。触发后不能在当前进程
+重新使能，必须检查设备并重启。这里的保护与 impedance 使用的
+`--force-tare-sec` 无关。
 
 ### 1.4 Impedance/力控 15→40 Hz 数采（M）
 
@@ -89,7 +134,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --collection-task-description "full-device bimanual impedance 15Hz capture / 40Hz backend" \
   --q6-config latest --q6-config-required \
   --dmtac-config latest --require-dmtac-config \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
   --write-parquet --write-video
 ```
 
@@ -117,7 +162,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   "${NO_COLLECTION_SENSOR_BASELINE_ARGS[@]}" \
   --q6-config latest --q6-config-required \
   --dmtac-config latest --require-dmtac-config \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
   "${CONSOLE_TIMING_ARGS[@]}" \
   "${NO_DEBUG_DISK_WRITE_ARGS[@]}"
 ```

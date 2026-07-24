@@ -7,6 +7,7 @@ import pytest
 
 from robot_motion.deploy import DeployRobotActionAdapter, build_deployment_observation
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES
+from robot_motion.action import HandActionSpec
 from sim.mujoco.deploy import (
     MujocoPolicyRollout,
     MujocoPolicyRolloutError,
@@ -144,4 +145,44 @@ def test_rollout_rejects_the_whole_chunk_when_one_action_is_invalid():
     assert len(runtime.transitions) == 1
     assert runtime.transitions[0][0] == "fault"
     assert source.last_actions == []
+    rollout.close()
+
+
+def test_rollout_carries_observation_hand_specs_for_legacy_dense_actions():
+    source = _Source()
+    hand_specs = {
+        side: HandActionSpec.dmtac_gripper(side)
+        for side in ("left", "right")
+    }
+    source.observation = build_deployment_observation(
+        active_sides=("left", "right"),
+        arms_enabled=True,
+        hands_enabled=True,
+        step_index=4,
+        arm_states={
+            "left": {"current_qpos": np.zeros(6), "current_tcp_pose": np.eye(4)},
+            "right": {"current_qpos": np.zeros(6), "current_tcp_pose": np.eye(4)},
+        },
+        hand_states={
+            "left": {"joint_pos": np.zeros(6), "joint_timestamp": 10.0},
+            "right": {"joint_pos": np.zeros(6), "joint_timestamp": 10.0},
+        },
+        timestamp=10.0,
+        metadata={
+            "hand_action_specs_by_side": {
+                side: spec.to_metadata() for side, spec in hand_specs.items()
+            }
+        },
+    )
+    runtime = _Runtime()
+    rollout = _rollout(_Policy((_action(0.1),)), source, runtime)
+
+    rollout.start()
+    result = rollout.run_cycle()
+
+    for action in result.actions:
+        specs = action.metadata["hand_action_specs_by_side"]
+        for side in ("left", "right"):
+            assert specs[side]["hand_model"] == "dmtac_gripper"
+            assert specs[side]["active_dof"] == 1
     rollout.close()

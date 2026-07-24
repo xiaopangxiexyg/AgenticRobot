@@ -1,0 +1,95 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_4b_t2h_raw_rtc_final_chunk_composition_local_2026_07_24",
+  "scope": "model_framework_neutral_final_chunk_composition_local_no_action",
+  "captured_at": "2026-07-24T15:45:36+08:00",
+  "repository": {
+    "dexteleop_commit": "a79c180a6ea415c239e3a74c8999b6eb07acadfd",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "external_vla_scratch_modified": false,
+    "dependency_or_lock_change": false
+  },
+  "implementation": {
+    "one_step_factory": "deployments.client.create_final_chunk_rtc_runtime_adapter",
+    "mapping_output_adapter": "deployments.client.MappingFinalChunkOutputAdapter",
+    "identity_source": "one instance-derived FinalChunkRtcBinding",
+    "request_spec_copied_by_framework": false,
+    "continuous_and_discrete_channels_kept_separate": true,
+    "extra_unselected_response_metadata_allowed": true,
+    "default_vla_scratch_backend_type": "deployments.client.FinalChunkRtcBackend",
+    "vla_scratch_named_backend_retained_for_import_compatibility": true,
+    "openpi_custom_session_adapter_changed": false
+  },
+  "fail_closed_coverage": [
+    "prepared model input hash mismatch before model call",
+    "missing or ambiguous mapping response keys",
+    "mapping discrete-key and binding discrete-dimension mismatch",
+    "non-mapping response",
+    "non-string source output identity",
+    "continuous/discrete dtype, rank, shape and finite validation",
+    "non-typed direct final-chunk output",
+    "non-bool optional cancellation result"
+  ],
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_rtc_final_chunk_backend.py tests/test_vla_scratch_rtc_adapter.py tests/test_rtc_generic_deploy_runtime.py tests/test_openpi_rtc_final_chunk_adapter.py tests/test_rtc_absolute_canonicalizer.py",
+      "result": "88 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_rtc_*.py tests/test_openpi_common_deploy.py tests/test_openpi_rtc_final_chunk_adapter.py tests/test_vla_scratch_rtc_adapter.py",
+      "result": "187 passed"
+    },
+    {
+      "command": "python -m py_compile <scoped changed Python files>",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check -- <scoped changed files>",
+      "result": "passed"
+    }
+  ],
+  "boundary": {
+    "production_caller_added": false,
+    "teleop_or_replay_path_changed": false,
+    "control_station_changed": false,
+    "sync_queue_v1_changed": false,
+    "position_lookahead_changed": false,
+    "worker_or_timed_plan_authority_changed": false,
+    "safety_reference_target_or_dispatch_changed": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "model_rtc_claimed": false,
+    "arbitrary_embodiment_or_sim_target_claimed": false
+  },
+  "scoped_source_sha256": {
+    "deployments/client/rtc_final_chunk_adapter.py": "9f59280afd927e4d3600a5dd3308e260411dea7e744c39a16a788d8f6d63aa7d",
+    "deployments/client/rtc_final_chunk.py": "363c4d626d4bdb50f411f502f6ffe1363ee7a4ca1865a2303c39f325d376f396",
+    "deployments/client/__init__.py": "195bba97759601c3c602a32c71b23b44e192954a81669f1e7f88f10ca5ea0845",
+    "deployments/client/README.md": "69c6ce9b9d90a1cbd27851c735ee98bf40a9e85cfea9a884d47d36504c9e3bb2",
+    "deployments/vla_scratch/client/rtc.py": "9063f6e0d78856f27e899ee3a04ed54301d931bddf45adb3a4e3da6e0ee2bd2f",
+    "deployments/vla_scratch/README.md": "0c29a27f2bf8e8d84256f82bdd20003f654bf5406e98e9e528952a21393d9a6e",
+    "tests/test_rtc_final_chunk_backend.py": "9aae41caaae9dbd932725d6cc19639cfb7015fb56b4772616bbcca850f99205e",
+    "tests/test_vla_scratch_rtc_adapter.py": "42c0f055dbea7fa870697aeebdfa525657f5009ce887a2ae7ef8bd708646f66a",
+    "DEPLOY_SCHEMA.md": "b7ddcbb63269ed8df77181430038d6c630f99e1b8d3c7f213cf113f324782162",
+    "todos/dexteleop_rtc_landing_plan.md": "7cbf424e1bae94b045347087e11bac3f6b8bd274739ded1286c273c21c941bdc"
+  },
+  "claims": [
+    "a sessionless final-chunk model framework can compose into raw-RTC without implementing a framework backend subclass or copying request identity",
+    "mapping responses with continuous and optional discrete chunks are validated through one public composition path",
+    "vla-scratch uses the public composition path while the external baseline remains unchanged",
+    "OpenPI and the existing raw-RTC scheduler remain compatible"
+  ],
+  "non_claims": [
+    "custom session, metadata and reconnect lifecycles are not replaced by the sessionless helper",
+    "no arbitrary robot embodiment or simulation target compatibility is proven",
+    "no real observation, target acceptance, dispatch or motion result was produced by this gate",
+    "no prefix-conditioned model-RTC capability is implemented"
+  ],
+  "next_gate": {
+    "id": "raw_rtc_typed_launcher_adapter_context",
+    "goal": "replace model-launcher opaque RTC adapter kwargs with a typed compatibility-preserving factory context",
+    "requires_mainline_interface_audit": true,
+    "requires_action_send": false,
+    "requires_teleop_or_replay_change": false
+  }
+}

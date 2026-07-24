@@ -155,6 +155,14 @@ IMPEDANCE_40HZ_ARGS=(
 POSITION_FORMAL_V1_ARGS=(
   --position-control-profile rm65_bimanual_position_v1
   --arm-control-mode position
+  --position-force-guard
+  --position-force-guard-source tool
+  --position-force-guard-max-force-n 15
+  --position-force-guard-max-torque-nm 2
+  --position-force-guard-hz 20
+  --position-force-guard-consecutive-samples 1
+  --position-force-guard-max-read-errors 3
+  --position-force-guard-stale-sec 0.25
 )
 
 # 历史兼容/调试数组。显式 --arm-execution-profile position 会选择 legacy 回退，

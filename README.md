@@ -32,6 +32,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 
 ## 目录边界
 
+- `control_composition/`：与本体、sim、遥操设备和模型实现解耦的多源控制组合、session/handoff 与差异观测；只产生 proposal candidate 和 lineage，不拥有 authority、安全或执行。
 - `robot_motion/`：共享动作语义、Rig、Safety、Planner、position control 和 runtime contracts。
 - `hardware/`：厂商 SDK 与设备 backend。
 - `sim/`：仿真 backend、task 和 adapter；不得依赖 `teleop_runtime` 或真实硬件。

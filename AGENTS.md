@@ -19,6 +19,12 @@ is experimental.
 
 ## Directory ownership
 
+- `control_composition/`: reusable, backend-neutral multi-source control
+  composition, lifecycle reducers, causal lineage, and non-authoritative
+  difference/feedback. It may depend on `robot_motion` and pure data contracts,
+  but must not import concrete sim, hardware, teleop, deployment, or
+  `control_station` modules. It owns no authority, canonical safety, execution,
+  device/model worker, replay cursor, or episode lifecycle.
 - `control_station/`: top-level application/control plane for composing human,
   replay, policy, dataset, sim, and real-target modules. It may depend on the
   active lower-level packages, but none of those packages may import it.
@@ -36,9 +42,11 @@ is experimental.
 - `legacy/`: confirmed-archived code/docs only; production code must not import it.
 - `tests/` and `todos/`: verification and planning; neither is runtime code.
 
-Shared code should depend toward `robot_motion` and pure data contracts. `sim`
-must not reverse-depend on `teleop_runtime`. `control_station` is an application
-leaf: dependencies point into it from no lower-level package.
+Shared code should depend toward `control_composition`, `robot_motion`, and pure
+data contracts. `control_composition` depends downward on `robot_motion`; the
+reverse dependency is forbidden. `sim` must not reverse-depend on
+`teleop_runtime`. `control_station` is an application leaf: dependencies point
+into it from no lower-level package.
 
 ## Safety and change protocol
 

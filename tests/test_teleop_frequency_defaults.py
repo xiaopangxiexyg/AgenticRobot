@@ -1175,8 +1175,8 @@ def test_deploy_impedance_arm_backend_uses_40hz_no_follow_default() -> None:
     assert overrides["ik_resolver_local_step_max_position_worsen_m"] == 0.003
     assert overrides["ik_resolver_local_step_max_orientation_worsen_deg"] == 0.5
     assert overrides["ik_resolver_local_step_dynamic_worsen_enabled"] is False
-    assert overrides["direct_joint_hint_max_linear_offset_m"] == 0.003
-    assert overrides["direct_joint_hint_max_angular_offset_rad"] == pytest.approx(np.deg2rad(0.5))
+    assert overrides["direct_joint_hint_max_linear_offset_m"] == 0.0
+    assert overrides["direct_joint_hint_max_angular_offset_rad"] == 0.0
 
 
 def test_deploy_named_execution_profiles_use_shared_real_config_resolver() -> None:

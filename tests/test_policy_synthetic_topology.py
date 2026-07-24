@@ -5,6 +5,26 @@ import math
 import numpy as np
 import pytest
 
+from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionContextStore,
+    CompositionInputDraft,
+    CompositionInputStore,
+    CompositionSpec,
+    DeterministicComposer,
+    build_composite_action_proposal_draft,
+    build_composition_context_snapshot,
+    build_composition_input_snapshot,
+    project_composition_contexts,
+    project_composition_inputs,
+)
+from control_composition.retention import TimeWindowRetentionSpec
+from control_composition.policy_node import (
+    PolicyNodeOutput,
+    PolicyNodeRequest,
+    PolicyNodeRuntime,
+    PolicyNodeSpec,
+)
 from robot_motion.action import (
     BIMANUAL_QPOS_V1,
     ActionArbiter,
@@ -12,29 +32,12 @@ from robot_motion.action import (
     ActionComponentSpec,
     AuthorityPolicySpec,
     AuthorityStore,
-    CompositionInputDraft,
-    CompositionInputStore,
-    CompositionSpec,
     DecisionScheduleSpec,
     DecisionScheduler,
-    DeterministicComposer,
     ProposalBuffer,
     RobotAction,
-    build_composite_action_proposal_draft,
-    build_composition_input_snapshot,
-    project_composition_inputs,
 )
 from robot_motion.action.arbitration_input import capture_arbitration_input
-from robot_motion.deploy import (
-    PolicyContextDraft,
-    PolicyContextStore,
-    PolicyNodeOutput,
-    PolicyNodeRequest,
-    PolicyNodeRuntime,
-    PolicyNodeSpec,
-    build_policy_context_snapshot,
-    project_policy_contexts,
-)
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 from robot_motion.runtime.execution_gate import ExecutionGateStore
 from robot_motion.runtime.identity import ClockDomainDescriptor
@@ -59,7 +62,7 @@ class FakeSlowContextNode:
         self.sequence = 0
         self.spec = PolicyNodeSpec(
             node_id="slow-vision",
-            output_kind="policy_context",
+            output_kind="composition_context",
             trigger_mode="fixed",
             nominal_hz=10.0,
             observation_contract_hash="slow-observation-v1",
@@ -72,15 +75,15 @@ class FakeSlowContextNode:
         self.sequence += 1
         return PolicyNodeOutput(
             node_id=self.spec.node_id,
-            output_kind="policy_context",
+            output_kind="composition_context",
             produced_at=request.scheduled_at,
-            policy_context=PolicyContextDraft(
+            composition_context=CompositionContextDraft(
                 runtime_session_id="session-0",
                 control_domain_id="robot-0",
                 producer_id=self.spec.node_id,
                 producer_epoch=1,
                 sequence=sequence,
-                policy_node_id=self.spec.node_id,
+                producer_node_id=self.spec.node_id,
                 context_channel="motion-plan",
                 context_kind="semantic_subgoal",
                 semantic_payload={
@@ -92,7 +95,7 @@ class FakeSlowContextNode:
                 effective_from=request.target_effective_at,
                 effective_until=request.target_effective_at + 0.2,
                 effective_clock_domain_id="control.monotonic",
-                context_contract_hash=self.spec.output_contract_hash,
+                payload_contract_hash=self.spec.output_contract_hash,
                 observation_cut_id=request.observation.record.observation_cut_id,
                 inference_id=f"slow-inference:{sequence}",
                 policy_output_id=f"slow-output:{sequence}",
@@ -233,17 +236,27 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
             produced_clock_domain_id="control.monotonic",
             reason="startup",
         )
-    contexts = PolicyContextStore(
+    contexts = CompositionContextStore(
         runtime_session_id="session-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        capacity=16,
+        retention_spec=TimeWindowRetentionSpec(
+            spec_id="synthetic-context-window-v1",
+            history_window_sec=0.0,
+            max_future_lead_sec=1.0,
+            max_effective_duration_sec=1.0,
+        ),
     )
     composition_inputs = CompositionInputStore(
         runtime_session_id="session-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        capacity=64,
+        retention_spec=TimeWindowRetentionSpec(
+            spec_id="synthetic-input-window-v1",
+            history_window_sec=0.0,
+            max_future_lead_sec=1.0,
+            max_effective_duration_sec=1.0,
+        ),
     )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
@@ -310,7 +323,7 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
                     observation=slow_observation,
                 )
             )
-            context_receipt = contexts.admit(slow_output.policy_context)
+            context_receipt = contexts.admit(slow_output.composition_context)
             assert context_receipt.context is not None
             context = context_receipt.context
             composition_inputs.admit(
@@ -341,8 +354,8 @@ def test_multirate_slow_context_fast_action_and_composite_lineage() -> None:
             base_sequence += 1
 
         cut = coordinator.capture_cut(cutoff_at=at).cut
-        context_snapshot = build_policy_context_snapshot(
-            project_policy_contexts(contexts, cut),
+        context_snapshot = build_composition_context_snapshot(
+            project_composition_contexts(contexts, cut),
             producer_epochs=epochs.snapshot(cut),
             target_effective_at=at,
             required_channels=("motion-plan",),
@@ -451,7 +464,7 @@ def test_policy_node_protocol_rejects_mismatched_output_kind() -> None:
     with pytest.raises(ValueError, match="kind and typed payload"):
         PolicyNodeOutput(
             node_id="bad-node",
-            output_kind="policy_context",
+            output_kind="composition_context",
             produced_at=10.0,
             no_output_reason=None,
         )

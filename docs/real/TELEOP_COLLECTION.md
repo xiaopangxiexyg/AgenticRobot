@@ -98,6 +98,9 @@ Dataset `meta/info.json` 的 runtime metadata 至少应满足：
 - `position_singularity_candidate_certificate=true`；
 - `position_reference_hz=60`、`arm_control_hz=120`；
 - `position_target_velocity_filter_tau_sec=0.03`；
+- `position_force_guard.enabled=true`、`source=tool`；
+- `position_force_guard.max_force_n=15`、`max_torque_nm=2`；
+- `position_force_guard.fail_closed=true`、`latched=true`、`stop_scope=bimanual`；
 - `position_max_command_step_deg=0.675`；
 - `collection_worker_mode=process`、`control_debug.level=off`；
 - `actuator_trace=true`、`actuator_singularity_trace=true`。

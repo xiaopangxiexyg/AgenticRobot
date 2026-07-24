@@ -22,6 +22,7 @@ CONTROL_STATION_SOURCE_KINDS_V1 = (
 CONTROL_STATION_SOURCE_USES_V1 = (
     "record_only",
     "shadow",
+    "contributor",
     "candidate",
     "authority",
 )
@@ -44,6 +45,9 @@ CONTROL_STATION_INTENT_KINDS_V1 = (
     "request_motion_authority",
     "release_motion_authority",
     "request_human_takeover",
+    "start_composition_session",
+    "rearm_composition_session",
+    "stop_composition_session",
     "hold",
     "estop",
     "request_recovery",

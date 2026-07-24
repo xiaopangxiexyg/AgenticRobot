@@ -1,8 +1,8 @@
 # DexTeleop Control Station：多源控制实验台与统一 GUI 落地规划
 
-状态：`CS-2a human + CS-2b-c pose replay + CS-2c sync-policy + CS-2d RTC-policy formal fixtures scoped complete；CS-3a existing deploy RTC passive source scoped complete；CS-6a/6b direct arm-qpos mixed仅保留debug/contract fixture；CS-6b1c passive human ingress complete；CS-6b1d arm-pose mixed sim第一段与replaceable strategy shadow complete；CS-6b1e device-neutral passive pose source已接入replay-authoritative sim；CS-6b1f opt-in pose HIL formal capture complete；CS-6b1g fixed-weight SE(3) generic composition及shared-receiver dual-input sim shadow complete/default-off；CS-6b2a passive component source contract complete；CS-6b2b sample/admission/safety前置 complete；CS-6b2c opt-in multi-group pose+DMTAC formal sim execution complete；CS-6b2d receiver cut + native stream storage/reader sim fixture complete；CS-6b2e native stream episode seal/commit binding complete；CS-6b2f bounded inline process seam complete；CS-6b2g external receipt + post-finalize native seal本地契约 complete；CS-6b2h selected RGB process receipt bridge complete/default-off；native-rate RGBD、高频tactile与顶层profile接线仍pending / no production entrypoint / no real motion authorization`
+状态：`CS-2a human + CS-2b-c pose replay + CS-2c sync-policy + CS-2d RTC-policy formal fixtures scoped complete；CS-3a existing deploy RTC passive source scoped complete；CS-6a/6b direct arm-qpos mixed仅保留debug/contract fixture；CS-6b1c passive human ingress complete；CS-6b1d arm-pose mixed sim第一段与replaceable strategy shadow complete；CS-6b1e device-neutral passive pose source已接入replay-authoritative sim；CS-6b1f opt-in pose HIL formal capture complete；CS-6b1g fixed-weight SE(3) generic composition及shared-receiver dual-input sim shadow complete/default-off；CS-6b1h composer-only formal pose fusion deterministic sim第一段complete/default-off；CS-6b1i generic typed composition session + formal sim capture complete/default-off，typed re-arm/GUI/real/policy/RTC pending；CS-6b2a passive component source contract complete；CS-6b2b sample/admission/safety前置 complete；CS-6b2c opt-in multi-group pose+DMTAC formal sim execution complete；CS-6b2d receiver cut + native stream storage/reader sim fixture complete；CS-6b2e native stream episode seal/commit binding complete；CS-6b2f bounded inline process seam complete；CS-6b2g external receipt + post-finalize native seal本地契约 complete；CS-6b2h selected RGB process receipt bridge complete/default-off；native-rate RGBD、高频tactile与顶层profile接线仍pending / no production entrypoint / no real motion authorization`
 
-更新日期：2026-07-23
+更新日期：2026-07-24
 
 当前实现状态：
 
@@ -40,6 +40,11 @@
   release HOLD失败时Station进入latched `fault`，不能从prior active状态派生回`running`；
 - CS-2a2b又增加测试侧bounded `SideEffectStationOperationCoordinator`：容量在intent admission前预留，release request在
   worker入队前关闭barrier，prepare/adapter异常会生成typed failure并清除pending；它复用同一station result-admission seam；
+  其中`operation_prepare`的正式边界已冻结为：对`operation_requested`在入队前执行；lease acquisition/release、stop_runtime等
+  不拥有pending operation的accepted intent不调用prepare，只有显式lower-safety的`hold`/`estop`例外。pending operation的
+  prepare异常会在同一receiver admission seam生成`operation_prepare_exception:<ExceptionType>` typed failure、解决并清除
+  pending、释放capacity且不入队；非operation safety prepare失败和无法完成result admission的coordinator/lifecycle内部错误
+  继续抛出，避免伪造无pending的operation completion；
   现有CS-1c Web builder以exact type只接受no-I/O coordinator并明确拒绝该side-effect worker；
 - 独立`build_scoped_sim_authority_control_station_server()`现已只为CS-2a2b开放typed lifecycle/candidate/authority API：
   exact side-effect coordinator、exact sim target、loopback bind以及`browser_raw_action_submission/real_motion/
@@ -880,6 +885,42 @@ inference/pop/merge。
   trace hash因新增admission而有意变化，但proposal ID/hash、selected action、replay pop、safety/reference/command/dispatch
   不变。missing/TTL/conflict/exception均只影响shadow。它仍不是正式fusion proposal/authority，也未接policy、RTC、真机或
   production入口；
+- **CS-6b1h（composer-only formal pose fusion，deterministic sim第一段complete）**：
+  独立profile关闭primary-policy与replay proposal authority，human/replay仅作为同一receiver prefix中的non-authoritative
+  contributor；唯一arms proposal producer是pose composer。`CompositionAuthorityGateSpec/Disposition`冻结required-role
+  missing、TTL、epoch invalidation、conflict和composer error均HOLD，禁止parallel source proposal及绕过canonical safety。
+  formal gate先检查exact `CompositionResult`，再以同一result一次性promotion，不能重新capture更晚cut；同decision key/result
+  幂等。ready proposal仍走原Arbiter→canonical safety→pose transform→coupled IK→scheduled MuJoCo dispatch；HOLD后fresh
+  input不会自动READY或预发恢复proposal。ControlTrace新增`composition_authority_disposition`闭合publish/HOLD原因。
+  human/replay contributor另记录`composition_contributor_input`，其source fact ID/hash必须精确解析到既有source/
+  representation事实；无source lineage的旧`composition_input`事件和hash不变。
+  当前没有Station manifest/operation、episode capture profile、policy/RTC contributor或real binding，旧CS-6b1f/1g不变；
+
+  共享数值层已补充两个后端无关增量，但未改变该concrete profile：pose strategy/composer可由manifest声明
+  `left_arm`/`right_arm`非空subset，默认双臂hash、顺序和行为不变；当前CS-6b1i MuJoCo target仍保持双臂能力。
+  同一composition cut现可在显式`SourceDifferenceSpec`下生成并返回non-authoritative source/output pose或qpos差异；
+  spec绑定composition hash及可比较role，通用`PolicyTopologyRuntime`负责计算/trace，CS-6b1h/1i只做default-off透传。
+  diagnostic失败不得影响result/disposition/HOLD；重复decision幂等。pose差异还可映射为bounded、TTL约束的
+  `guidance_haptic_non_force`虚拟cue；当前只有no-I/O adapter与可选ControlTrace，GUI、真实触觉、HOLD clear和真机均pending。
+
+  | formal v1 条件 | disposition |
+  |---|---|
+  | human + replay同cut有效，融合ready | 发布唯一composer proposal |
+  | required contributor TTL过期或producer epoch失效 | HOLD + cancellation |
+  | 所有contributor缺失 | HOLD + cancellation |
+  | frame/quaternion/pose disagreement冲突 | HOLD + cancellation |
+  | evaluation/promotion异常 | HOLD + cancellation |
+  | gate已经HOLD，随后出现fresh input | 保持HOLD；等待外部typed re-arm，不预发proposal |
+- **CS-6b1i（generic composition session + formal sim capture，complete/default-off）**：
+  新增单次使用的`CompositionSessionOperationSpec`及独立`start_composition_session`/`stop_composition_session`
+  operation，不复用human takeover。backend-independent `CompositionSessionController`持有spec registry、epoch、
+  lifecycle、trace observer与publication barrier；MuJoCo wrapper仅持有具体readiness/HOLD/adapter/input/step接线。
+  Station中只有composite source进入candidate/active；human/replay保持preflighted，
+  contributor身份由session spec显式冻结。start result必须为`composition_session_ready`且携带evidence，才打开同一composer
+  publication barrier。HOLD/ESTOP/stop或data-plane composition失败都会先barrier-off、lower HOLD/cancel，再写不可逆
+  `composition_session_transition`；held状态不能由fresh input或重复start恢复。现有`EpisodeTraceRecorderSink`已验证
+  spec→start→contributor input→result/disposition→composer proposal→safety/reference/dispatch→hold/stop的同episode
+  seal/commit。当前不提供typed re-arm、GUI、真机、policy/RTC contributor或production入口；
 - **CS-6b1e（device-neutral passive live pose，scoped complete）**：新增只接既有`ObservationSource`/pose `Retargeter`的
   通用构造层，固定创建`TeleopSession(rig=None, recorder=None)`，拒绝record和hardware-arm eligibility，并在root逐项校验
   source spec 声明的 pose effectors、`cartesian_pose`、exact reference frame、finite homogeneous SE(3)；默认 spec 仍是
@@ -1097,6 +1138,9 @@ CS-6b1e device-neutral passive pose session + replay-only-authority integration 
          typed lower deadman/rebase receipts + real readiness provider                ⛔ real-only blocked
 CS-6b1f opt-in sim pose HIL + external-recorder formal capture                         ✅ scoped; virtual readiness only
 CS-6b1g fixed-weight SE(3) shared-receiver human+replay sim shadow                    ✅ scoped/default-off
+CS-6b1h composer-only formal pose fusion + fail-closed gate                           ✅ deterministic sim/default-off
+CS-6b1i generic typed composition session + formal episode capture                     ✅ deterministic sim/default-off
+         typed re-arm + GUI/real + policy/RTC contributor                              ⏳
 CS-6b2a passive pose/hand-qpos component source + catalog-bound adaptation        ✅ scoped
 CS-6b2  component shadow + trace/lifecycle fixture; production compound gate   ✅ scoped / ⏳
 CS-6b2e native stream same-episode seal/commit binding                          ✅ scoped

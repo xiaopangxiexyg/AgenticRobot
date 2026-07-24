@@ -57,8 +57,8 @@ raw-RTC 的隐含前置条件；两者均不取得 teleop/replay 或真机 dispa
 | RTC-3d pre-motion lookahead gate | ⏳ later | typed preview receipt完成前，RTC profile不得重新启用position lookahead |
 | RTC-4a generic protocol/client seam | ✅ pure/local only | scheduler/continuation分轴、capability/envelope/receipt与两个local backend迁移fixture；无具体模型或transport |
 | RTC-4b-A OpenPI raw-RTC final-chunk adapter | ✅ offline/fake transport | artifact/server/input/output/V22 codec完整绑定；只声明`continuation=none`；adapter本身不创建websocket、worker或frontend |
-| RTC-4b-T3 OpenPI raw-RTC caller | 🟡 code + local/fake frontend + read-only guard | 既有OpenPI launcher仅在显式raw profile创建adapter；`--rtc-real-shadow`才允许live endpoints，并将RM65/DMTAC/hand置为observation-only；`--debug`记录model-neutral `rtc_transport_exchange` latency/hash事实；尚无真实observation/action send evidence；[scoped evidence](evidence/rtc/rtc_4b_t3_openpi_raw_rtc_local_evidence_v1.json) |
-| raw-RTC action representation | 🟡 OpenPI absolute + relative live no-action complete | R-A1/R-R1均在plan前形成chunk-bound typed result；R-R2已用registered relative checkpoint完成same-chunk sync/RTC gold及worker→timed-plan→单emission；真实observation、正式target/safety与motion仍未接 |
+| RTC-4b-T3 OpenPI raw-RTC caller | 🟡 real no-action shadow / authority pending | 既有OpenPI launcher仅在显式raw profile创建adapter；`--rtc-real-shadow`才允许live endpoints，并将RM65/DMTAC/hand置为observation-only；R-R4已验证真实observation→transport→timed-plan/emission→bounded drain，仍无action send authority；[local evidence](evidence/rtc/rtc_4b_t3_openpi_raw_rtc_local_evidence_v1.json) · [R-R4 default](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json) · [R-R4 drain](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json) |
+| raw-RTC action representation | 🟡 OpenPI absolute + relative live no-action complete | R-A1/R-R1均在plan前形成chunk-bound typed result；R-R2完成same-chunk sync/RTC gold，R-R4完成真实observation→worker→timed-plan→drained no-action shadow；正式target/safety与motion仍未接 |
 | RTC-4b-T0 generic worker bridge | ✅ local/fake backend | core迁入`robot_motion.deploy`；通用client executor接bounded worker→timed plan，2/4/8 horizon与blocked backend通过；无target caller |
 | RTC-4b-T1 transport lifecycle | ✅ local/fake transport | typed cancel/close receipt、hook隔离、worker drain事实、pending/failed-close re-arm拒绝与fresh reconnect；无server/network |
 | RTC-4b-T2a transport deadline/localhost | ✅ no-model local websocket | 通用phase deadline/receipt映射、timeout socket退役、cancel竞争、fresh reconnect与metadata continuity；无模型/GPU/action send |
@@ -926,6 +926,15 @@ flowchart TB
   emission；completion-side最大`103.99 ms`并在close留下`ABANDONED_UNDRAINED`。R-R3b用显式50-step validity和2 s
   bounded close复跑：7个warm result接纳256个future keyframe，240个formal emission全部唯一，仍为零dispatch，
   worker完整`DRAINED`；但8/8 completion step超33.3 ms、最大`101.80 ms`，所以尚不证明实时control budget或可动作部署；
+- R-R4以默认raw profile做deploy-only回归：600个30 Hz step内真实双臂、双DM-Tac和三相机进入OpenPI worker，19次
+  request/18次response、10次merge接纳、9个唯一formal emission，1次TTL拒绝和7次`no_eligible_future`；control budget
+  exceedance为0，`send_actions=false`、lookahead disabled、dispatch/action-step均为0。默认`worker_stop_timeout_sec=0`
+  使最后一个in-flight request在close留下`ABANDONED_UNDRAINED`，因此该批只闭合真实输入/transport/admission shadow，
+  不提升drained close或motion readiness；详见[scoped R-R4 evidence](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json)。
+- R-R4 drain-gate复跑显式设置`request_validity_steps=50`、`worker_stop_timeout_sec=2`：900个30 Hz step内8次
+  request/response，7次merge接纳、1次cold TTL拒绝、253个唯一formal emission；control tick最大`16.80 ms`且零超预算，
+  close为`DRAINED/thread_exited=true`，仍无dispatch/action-step。该结果闭合real no-action shadow的transport/admission/
+  drain部分，但canonical safety/IK、target acceptance和motion authority仍是独立gate；详见[drain-gate evidence](evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json)。
 - R-S1只做target-side sim集成，等待sim2real observation contract，不在RTC侧新增MuJoCo→Real observation adapter；
 - R-M1再以loaded-instance capability接可选continuation provider、offline dataset与latency/memory profile；
   不使用checkpoint/config白名单，OpenPI只是候选之一，失败不影响raw-RTC；

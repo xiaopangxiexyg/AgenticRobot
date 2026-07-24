@@ -7,15 +7,17 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.action.composition import CompositionInputDraft
+from .composition import (
+    CompositionContextDraft,
+    CompositionContextSnapshot,
+    CompositionInputDraft,
+)
 from robot_motion.action.proposal import ActionProposalDraft
 from robot_motion.runtime.observation_cut import ObservationBundle
 
-from .context import PolicyContextDraft, PolicyContextSnapshot
-
 
 POLICY_NODE_OUTPUT_KINDS_V1 = frozenset(
-    {"action_proposal", "policy_context", "composition_input", "no_output"}
+    {"action_proposal", "composition_context", "composition_input", "no_output"}
 )
 POLICY_NODE_SPEC_HASH_DOMAIN_V1 = "dexteleop.policy_node_spec.v1"
 
@@ -79,7 +81,7 @@ class PolicyNodeRequest:
     scheduled_at: float
     target_effective_at: float
     observation: ObservationBundle
-    context_snapshot: PolicyContextSnapshot | None = None
+    context_snapshot: CompositionContextSnapshot | None = None
 
     def __post_init__(self) -> None:
         for name in ("request_id", "schedule_tick_id", "trigger_reason"):
@@ -95,7 +97,7 @@ class PolicyNodeOutput:
     node_id: str
     output_kind: str
     produced_at: float
-    policy_context: PolicyContextDraft | None = None
+    composition_context: CompositionContextDraft | None = None
     action_proposal: ActionProposalDraft | None = None
     composition_input: CompositionInputDraft | None = None
     no_output_reason: str | None = None
@@ -108,7 +110,7 @@ class PolicyNodeOutput:
         if not math.isfinite(float(self.produced_at)):
             raise ValueError("produced_at must be finite.")
         payloads = {
-            "policy_context": self.policy_context,
+            "composition_context": self.composition_context,
             "action_proposal": self.action_proposal,
             "composition_input": self.composition_input,
         }

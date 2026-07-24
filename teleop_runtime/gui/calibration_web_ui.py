@@ -661,6 +661,23 @@ button.stop-ready {
   font-size: 12px;
   line-height: 1.45;
 }
+.two-pedal-alert {
+  margin: 0 0 12px;
+  border: 2px solid #f59e0b;
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #3b2500;
+  color: #fff7ed;
+  font-weight: 800;
+  line-height: 1.5;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.18);
+}
+.two-pedal-alert.red {
+  border-color: #ef4444;
+  background: #450a0a;
+  color: #ffffff;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
+}
 .gripper-grid,
 .device-grid {
   display: grid;
@@ -727,6 +744,12 @@ button.stop-ready {
   background: #ffe9e9;
   color: #7c1717;
   box-shadow: 0 0 0 4px rgba(191, 46, 46, 0.14);
+}
+.foot-pad-test-banner.completed {
+  border-color: #27864a;
+  background: #e8f7ed;
+  color: #145f31;
+  box-shadow: 0 0 0 3px rgba(39, 134, 74, 0.12);
 }
 .foot-pad-test-banner.unavailable {
   border-color: #d88916;
@@ -905,9 +928,10 @@ button.stop-ready {
   <section class="panel">
     <header><h2>控制</h2></header>
     <div class="panel-body">
+      <div id="twoPedalAlert" class="two-pedal-alert" hidden></div>
       <div class="shortcut-strip" aria-label="快捷键">
         <div class="shortcut-item"><kbd>A</kbd><span>开始 / 停止数采</span></div>
-        <div class="shortcut-item"><kbd>B</kbd><span>开始遥操 / Hold</span></div>
+        <div class="shortcut-item"><kbd>B</kbd><span>双臂遥操 / Hold</span></div>
         <div class="shortcut-item"><kbd>C</kbd><span id="shortcutCLabel">固定臂不可用</span></div>
         <div class="shortcut-item"><kbd>G</kbd><span id="shortcutGLabel">归位不可用</span></div>
       </div>
@@ -982,8 +1006,8 @@ button.stop-ready {
       <div id="footPadTestControls" hidden>
         <div class="control-title">脚踏板安全测试</div>
         <div class="foot-pad-test-banner">
-          <div class="foot-pad-test-title">先测试，确认后再使用</div>
-        <div class="foot-pad-test-detail">默认 4 踏板：F13/F14 固定左右臂，F15/F16 启动左右臂精确 Init qpos 防碰撞归位；若检测到 2 踏板，则 F13/F14 只提供左右 Fix 快捷输入。踏板是可选的附加输入，不会关闭或隐藏 GUI/键盘的 Fix、Init 与精确归位。测试模式只显示踏板操作，不会执行机械臂动作或写入数采。请逐个踩踏板确认映射，确认无误后点击停止测试。</div>
+          <div class="foot-pad-test-title">可选映射测试（不阻塞控制）</div>
+        <div class="foot-pad-test-detail">双踏板模式：F13/踏板1 进入仅左臂遥操（Fix 右臂），F14/踏板2 进入仅右臂遥操（Fix 左臂），不执行 Init。四踏板模式保持原映射：F13/F14 固定左右臂，F15/F16 启动左右臂精确 Init qpos。测试模式始终检查踏板 1–4，只显示键位，不执行机械臂动作或写入数采。</div>
         </div>
         <div class="button-grid">
           <button id="footPadTestStartButton" class="warn" data-event="foot_pad_test_start">开始测试踏板</button>
@@ -1007,7 +1031,7 @@ button.stop-ready {
         <div id="fixArmStatus" class="numeric-value mono">-</div>
       </div>
       <div id="footPadSpecialArmHint" class="gripper-status mono" hidden>
-        Foot-pad 模式：踏板 1/2 固定左/右臂；踏板 3/4 启动左/右臂精确 Init qpos 防碰撞归位。归位期间再踩同一踏板会立即冻结目标臂，仅重采该侧 Home；成功后目标臂进入 Init-fixed。
+        双踏板模式：踏板1进入仅左臂遥操（Fix右臂），踏板2进入仅右臂遥操（Fix左臂），不执行 Init。四踏板模式：踏板1/2固定左/右臂，踏板3/4启动左/右臂精确 Init qpos。
       </div>
       <div class="control-title">数采</div>
       <div class="form-grid">
@@ -1140,6 +1164,7 @@ button.stop-ready {
   var legacyTimer = null;
   var legacyLatestState = {};
   var legacyActiveControls = {};
+  var legacyTrackerSideConfirmationToken = "";
 
   function byId(id) {
     return document.getElementById(id);
@@ -1430,7 +1455,7 @@ button.stop-ready {
     if (shortcutC) {
       if (footPadMode && state.fix_arm_available) {
         shortcutC.textContent = twoPedal
-          ? "踏板 1/2：固定左右臂"
+          ? "进入双臂 Hold"
           : "踏板 1/2：固定 / 重采左右臂 Home";
       } else if (String(state.ui_mode || "") === "umi_collection" && state.fix_arm_available) {
         var umiFixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -1455,7 +1480,7 @@ button.stop-ready {
           ? "2 踏板仅切换 fixed；init 标注使用 G/GUI"
           : "踏板 3/4：切换左右 init 标注";
       } else if (twoPedal && state.init_arm_available) {
-        shortcutG.textContent = "踏板 1/2 控制 Fix；Init 仍可使用 G/GUI";
+        shortcutG.textContent = "双踏板不执行 Init；Init 仍可使用 G/GUI";
       } else if (footPadMode && state.init_arm_available) {
         shortcutG.textContent = "踏板 3/4 或 G/GUI：Init 左/右臂";
       } else if (String(state.ui_mode || "") === "umi_collection" && state.init_arm_available) {
@@ -1554,26 +1579,27 @@ button.stop-ready {
     var available = Boolean(state.foot_pad_available);
     var requested = Boolean(state.foot_pad_requested);
     var active = Boolean(state.foot_pad_test_active);
+    var completed = Boolean(state.foot_pad_test_completed);
     var twoPedal = Number(state.foot_pad_count || 0) === 2;
     var banner = byId("footPadTestBanner");
     var controls = byId("footPadTestControls");
     if (banner) {
       banner.hidden = !(requested || available);
-      banner.className = "foot-pad-test-banner" + (active ? " active" : (!available ? " unavailable" : ""));
+      banner.className = "foot-pad-test-banner" + (active ? " active" : (!available ? " unavailable" : (completed ? " completed" : "")));
     }
     if (controls) controls.hidden = !available;
-    setText("footPadTestTitle", !available ? "踏板未连接 / 未就绪" : (active ? "脚踏测试模式已开启（仅显示，不执行操作）" : (Number(state.foot_pad_count || 0) + " 个踏板已连接")));
+    setText("footPadTestTitle", !available ? "踏板未连接 / 未就绪" : (active ? "脚踏测试模式已开启（仅显示，不执行操作）" : (completed ? "本次连接的踏板测试已完成" : (Number(state.foot_pad_count || 0) + " 个踏板已连接"))));
     setText(
       "footPadTestDetail",
       !available
         ? (state.foot_pad_status_message || "未找到可用的 2/4 踏板虚拟键盘。")
         : active
-        ? (twoPedal
-          ? "请依次踩踏板 1、2（固定左臂、固定右臂）。测试期间不会固定、归位、移动机械臂，也不会写入数采；Init 始终可通过 G/GUI 操作。确认无误后点击“停止测试踏板”。"
-          : "请依次踩踏板 1、2、3、4。测试期间不会固定、归位、移动机械臂，也不会写入数采。确认无误后点击“停止测试踏板”。")
+        ? "请依次踩踏板 1、2、3、4；即使当前识别为双踏板模式也测试四个位置。测试期间只显示按键，不会固定、归位、移动机械臂或写入数采。确认无误后点击“停止测试踏板”。"
+        : completed
+        ? "测试结果已在本次连接期间保留，不会重复要求测试；只有主动点击“重新测试踏板”或设备断开重连后才会重置。"
         : (twoPedal
-          ? "F13/踏板1 固定左臂；F14/踏板2 固定右臂；归位操作仍使用 G。点击下方按钮开始安全测试。"
-          : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。点击下方按钮开始安全测试。")
+          ? "F13/踏板1 进入仅左臂遥操（Fix 右臂）；F14/踏板2 进入仅右臂遥操（Fix 左臂）；双踏板不执行 Init。映射测试仅用于按需核对，不会阻塞踏板或 A/B/C 控制。"
+          : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。映射测试仅用于按需核对，不会阻塞其他控制。")
     );
     setText("footPadTestLast", "最近检测：" + (state.foot_pad_test_last_event || "-"));
     setText("footPadTestStatus", state.foot_pad_test_status || "-");
@@ -1581,7 +1607,7 @@ button.stop-ready {
     var stop = byId("footPadTestStopButton");
     if (start) {
       start.className = "warn" + (!active ? " active" : "");
-      start.textContent = active ? "测试进行中" : "开始测试踏板";
+      start.textContent = active ? "测试进行中" : (completed ? "重新测试踏板" : "开始测试踏板");
     }
     if (stop) stop.className = "danger" + (active ? " active" : "");
   }
@@ -1725,6 +1751,25 @@ button.stop-ready {
     el.innerHTML = html.join("");
   }
 
+  function maybePromptTrackerSideConfirmation(state) {
+    var check = state.tracker_side_check || {};
+    var token = String(check.confirmation_token || "");
+    if (!check.confirmation_required || !token || token === legacyTrackerSideConfirmationToken) {
+      return;
+    }
+    legacyTrackerSideConfirmationToken = token;
+    var message = String(
+      check.confirmation_message ||
+      check.message ||
+      "Tracker 左右位置检查未通过。是否仍要继续本次 runtime Home？"
+    );
+    postEvent(
+      window.confirm(message)
+        ? "tracker_side_confirm_continue"
+        : "tracker_side_confirm_cancel"
+    );
+  }
+
   function renderState(state) {
     if (!state || window.__calibrationWebUiModernRefreshOk) return;
     legacyLatestState = state || {};
@@ -1733,6 +1778,13 @@ button.stop-ready {
     setText("frameVizMode", state.frame_viz_mode);
     setText("virtualDeskYaw", state.virtual_desk_post_yaw_deg != null ? String(state.virtual_desk_post_yaw_deg) + " deg" : "-");
     setText("controlHint", state.control_hint || "-");
+    var twoPedalAlert = state.two_pedal_alert || {};
+    var twoPedalAlertEl = byId("twoPedalAlert");
+    if (twoPedalAlertEl) {
+      twoPedalAlertEl.hidden = !Boolean(twoPedalAlert.active);
+      twoPedalAlertEl.className = "two-pedal-alert" + (String(twoPedalAlert.level || "") === "red" ? " red" : "");
+      twoPedalAlertEl.textContent = twoPedalAlert.message || "";
+    }
     setText("captureStage", labelStage(state.capture_stage));
     setText("captureSamples", captureSamplesText(state));
     setText("captureValid", captureValidText(state));
@@ -1745,6 +1797,7 @@ button.stop-ready {
     renderEpisodeStateLegacy(state);
     renderIkDebugLogButtonLegacy(state);
     renderMessages(state.messages || []);
+    maybePromptTrackerSideConfirmation(state);
   }
 
   function fetchState() {
@@ -1859,12 +1912,23 @@ button.stop-ready {
     var eventName = "";
     var payload = null;
     if (key === "a") {
-      eventName = (state.episode_recording || String(state.episode_event_status || "") === "preparing") ? "episode_stop" : "episode_start";
+      eventName = (
+        legacyActiveControls["episode_stop"]
+        && (
+          state.episode_recording
+          || String(state.episode_event_status || "") === "preparing"
+          || !legacyActiveControls["episode_start"]
+        )
+      ) ? "episode_stop" : (legacyActiveControls["episode_start"] ? "episode_start" : "");
       if (eventName === "episode_start") payload = collectEpisodeStartPayloadLegacy();
     } else if (key === "b") {
-      eventName = state.teleop_running ? "h" : "p";
+      eventName = legacyActiveControls["two_pedal_b"]
+        ? "two_pedal_b"
+        : (legacyActiveControls["h"] ? "h" : (legacyActiveControls["p"] ? "p" : ""));
     } else if (key === "c") {
-      if (state.fix_arm_available && state.teleop_running && legacyActiveControls["fix_arm_toggle"]) {
+      if (legacyActiveControls["two_pedal_c"]) {
+        eventName = "two_pedal_c";
+      } else if (state.fix_arm_available && state.teleop_running && legacyActiveControls["fix_arm_toggle"]) {
         eventName = "fix_arm_toggle";
       }
     } else if (key === "g") {
@@ -1893,6 +1957,10 @@ button.stop-ready {
       event = event || window.event;
       if (event.repeat || isEditableTargetLegacy(event.target || event.srcElement)) return;
       var key = String(event.key || "").toLowerCase();
+      var code = String(event.code || "").toLowerCase();
+      if (key !== "a" && key !== "b" && key !== "c" && key !== "g") {
+        key = code === "keya" ? "a" : code === "keyb" ? "b" : code === "keyc" ? "c" : code === "keyg" ? "g" : key;
+      }
       if (key !== "a" && key !== "b" && key !== "c" && key !== "g") return;
       if (event.preventDefault) event.preventDefault();
       event.returnValue = false;
@@ -2089,6 +2157,7 @@ let ikDebugLogToggleExpected = null;
 let ikDebugLogToggleRequestedAt = 0;
 let stateRefreshFailureCount = 0;
 let latestState = {};
+let trackerSideConfirmationToken = "";
 let taskTypeOverride = null;
 let roundTripPhaseOverride = null;
 let datasetBaseRootOverride = null;
@@ -2405,12 +2474,23 @@ async function sendGuiShortcut(key) {
   let eventName = "";
   let payload = null;
   if (key === "a") {
-    eventName = (state.episode_recording || shortcutStatus === "preparing") ? "episode_stop" : "episode_start";
+    eventName = (
+      activeControls.has("episode_stop")
+      && (
+        state.episode_recording
+        || shortcutStatus === "preparing"
+        || !activeControls.has("episode_start")
+      )
+    ) ? "episode_stop" : (activeControls.has("episode_start") ? "episode_start" : "");
     if (eventName === "episode_start") payload = collectEpisodeStartPayload();
   } else if (key === "b") {
-    eventName = state.teleop_running ? "h" : "p";
+    eventName = activeControls.has("two_pedal_b")
+      ? "two_pedal_b"
+      : (activeControls.has("h") ? "h" : (activeControls.has("p") ? "p" : ""));
   } else if (key === "c") {
-    if (state.fix_arm_available && state.teleop_running && canSendEvent("fix_arm_toggle")) {
+    if (activeControls.has("two_pedal_c")) {
+      eventName = "two_pedal_c";
+    } else if (state.fix_arm_available && state.teleop_running && canSendEvent("fix_arm_toggle")) {
       eventName = "fix_arm_toggle";
     }
   } else if (key === "g") {
@@ -2732,7 +2812,11 @@ if (initArmSideSelectEl) {
 document.addEventListener("keydown", async (event) => {
   if (event.repeat) return;
   if (isEditableTarget(event.target)) return;
-  const key = event.key.toLowerCase();
+  let key = String(event.key || "").toLowerCase();
+  const code = String(event.code || "").toLowerCase();
+  if (!["a", "b", "c", "g"].includes(key)) {
+    key = code === "keya" ? "a" : code === "keyb" ? "b" : code === "keyc" ? "c" : code === "keyg" ? "g" : key;
+  }
   if (["a", "b", "c", "g"].includes(key)) {
     event.preventDefault();
     try {
@@ -2825,11 +2909,13 @@ function renderFootPadTest(state) {
   const available = Boolean(state.foot_pad_available);
   const requested = Boolean(state.foot_pad_requested);
   const active = Boolean(state.foot_pad_test_active);
+  const completed = Boolean(state.foot_pad_test_completed);
   const twoPedal = Number(state.foot_pad_count || 0) === 2;
   if (footPadTestBannerEl) {
     footPadTestBannerEl.hidden = !(requested || available);
     footPadTestBannerEl.classList.toggle("active", active);
     footPadTestBannerEl.classList.toggle("unavailable", !available);
+    footPadTestBannerEl.classList.toggle("completed", available && completed && !active);
   }
   if (footPadTestControlsEl) footPadTestControlsEl.hidden = !available;
   if (footPadTestTitleEl) {
@@ -2837,18 +2923,20 @@ function renderFootPadTest(state) {
       ? "踏板未连接 / 未就绪"
       : active
       ? "脚踏测试模式已开启（仅显示，不执行操作）"
+      : completed
+      ? "本次连接的踏板测试已完成"
       : `${Number(state.foot_pad_count || 0)} 个踏板已连接`;
   }
   if (footPadTestDetailEl) {
     footPadTestDetailEl.textContent = !available
       ? (state.foot_pad_status_message || "未找到可用的 2/4 踏板虚拟键盘。")
       : active
-      ? (twoPedal
-        ? "请依次踩踏板 1、2（固定左臂、固定右臂）。测试期间不会固定、归位、移动机械臂，也不会写入数采；Init 始终可通过 G/GUI 操作。确认无误后点击“停止测试踏板”。"
-        : "请依次踩踏板 1、2、3、4。测试期间不会固定、归位、移动机械臂，也不会写入数采。确认无误后点击“停止测试踏板”。")
+      ? "请依次踩踏板 1、2、3、4；即使当前识别为双踏板模式也测试四个位置。测试期间只显示按键，不会固定、归位、移动机械臂或写入数采。确认无误后点击“停止测试踏板”。"
+      : completed
+      ? "测试结果已在本次连接期间保留，不会重复要求测试；只有主动点击“重新测试踏板”或设备断开重连后才会重置。"
       : (twoPedal
-        ? "F13/踏板1 固定左臂；F14/踏板2 固定右臂；归位操作仍使用 G。点击下方按钮开始安全测试。"
-        : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。点击下方按钮开始安全测试。");
+        ? "F13/踏板1 进入仅左臂遥操（Fix 右臂）；F14/踏板2 进入仅右臂遥操（Fix 左臂）；双踏板不执行 Init。映射测试仅用于按需核对，不会阻塞踏板或 A/B/C 控制。"
+        : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。映射测试仅用于按需核对，不会阻塞其他控制。");
   }
   if (footPadTestLastEl) {
     footPadTestLastEl.textContent = "最近检测：" + (state.foot_pad_test_last_event || "-");
@@ -2856,7 +2944,7 @@ function renderFootPadTest(state) {
   if (footPadTestStatusEl) footPadTestStatusEl.textContent = state.foot_pad_test_status || "-";
   if (footPadTestStartButtonEl) {
     footPadTestStartButtonEl.classList.toggle("active", !active);
-    footPadTestStartButtonEl.textContent = active ? "测试进行中" : "开始测试踏板";
+    footPadTestStartButtonEl.textContent = active ? "测试进行中" : (completed ? "重新测试踏板" : "开始测试踏板");
   }
   if (footPadTestStopButtonEl) {
     footPadTestStopButtonEl.classList.toggle("active", active);
@@ -2871,7 +2959,9 @@ function updateShortcutHints(state) {
     if (footPadMode && state.fix_arm_available && annotationOnly) {
       shortcutCLabelEl.textContent = "踏板 1/2：切换左右 fixed 标注";
     } else if (footPadMode && state.fix_arm_available) {
-      shortcutCLabelEl.textContent = "踏板 1/2：固定 / 重采左右臂 Home";
+      shortcutCLabelEl.textContent = twoPedal
+        ? "进入双臂 Hold"
+        : "踏板 1/2：固定 / 重采左右臂 Home";
     } else if (state.fix_arm_available && state.teleop_running) {
       const side = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
       const label = side === "right" ? "右臂" : "左臂";
@@ -2894,7 +2984,7 @@ function updateShortcutHints(state) {
         ? "2 踏板仅切换 fixed；init 标注使用 G/GUI"
         : "踏板 3/4：切换左右 init 标注";
     } else if (twoPedal && state.init_arm_available) {
-      shortcutGLabelEl.textContent = "踏板 1/2 控制 Fix；Init 仍可使用 G/GUI";
+      shortcutGLabelEl.textContent = "双踏板不执行 Init；Init 仍可使用 G/GUI";
     } else if (footPadMode && state.init_arm_available) {
       shortcutGLabelEl.textContent = "踏板 3/4 或 G/GUI：Init 左/右臂";
     } else if (state.init_arm_available && state.teleop_running) {
@@ -2975,7 +3065,7 @@ function renderFixArm(state) {
   if (footPadSpecialArmHintEl) {
     footPadSpecialArmHintEl.hidden = !footPadMode;
     footPadSpecialArmHintEl.textContent = twoPedal
-      ? "Foot-pad 附加输入：踏板 1/2 固定左/右臂；Fix/Init 的全部 GUI 与键盘操作始终保留。"
+      ? "双踏板附加输入：踏板1仅左臂遥操（Fix右臂），踏板2仅右臂遥操（Fix左臂）；不触发 Init，也不影响数采。"
       : "Foot-pad 附加输入：踏板 1/2 固定左/右臂，踏板 3/4 启动左/右臂精确 Init qpos；Fix/Init 的全部 GUI 与键盘操作始终保留。";
     if (String(state.ui_mode || "") === "umi_collection") {
       footPadSpecialArmHintEl.textContent = twoPedal
@@ -4214,6 +4304,33 @@ function renderMessages(messages) {
   }
 }
 
+async function maybePromptTrackerSideConfirmation(state) {
+  const check = state.tracker_side_check || {};
+  const token = String(check.confirmation_token || "");
+  if (!check.confirmation_required || !token || token === trackerSideConfirmationToken) {
+    return;
+  }
+  trackerSideConfirmationToken = token;
+  const message = String(
+    check.confirmation_message ||
+    check.message ||
+    "Tracker 左右位置检查未通过。是否仍要继续本次 runtime Home？"
+  );
+  try {
+    await sendEvent(
+      window.confirm(message)
+        ? "tracker_side_confirm_continue"
+        : "tracker_side_confirm_cancel"
+    );
+  } catch (error) {
+    // The backend may resolve the warning while the modal is open (for
+    // example after the operator uncrosses their hands).  A stale confirm
+    // event is not a state.json refresh failure and must not disable the
+    // modern UI or activate the legacy fallback.
+    sendStatusEl.textContent = "Tracker 左右确认状态已变化，请按当前页面状态重新操作。";
+  }
+}
+
 async function refresh() {
   try {
     const response = await fetch("/state.json?ts=" + Date.now(), {cache: "no-store"});
@@ -4245,6 +4362,13 @@ async function refresh() {
     frameVizModeEl.textContent = labelFor(frameVizLabels, state.frame_viz_mode);
     virtualDeskYawEl.textContent = state.virtual_desk_post_yaw_deg !== undefined ? String(state.virtual_desk_post_yaw_deg) + " deg" : "-";
     controlHintEl.textContent = state.control_hint || "-";
+    const twoPedalAlert = state.two_pedal_alert || {};
+    const twoPedalAlertEl = document.getElementById("twoPedalAlert");
+    if (twoPedalAlertEl) {
+      twoPedalAlertEl.hidden = !Boolean(twoPedalAlert.active);
+      twoPedalAlertEl.className = ["two-pedal-alert", String(twoPedalAlert.level || "") === "red" ? "red" : ""].filter(Boolean).join(" ");
+      twoPedalAlertEl.textContent = twoPedalAlert.message || "";
+    }
     captureStageEl.textContent = labelFor(stageLabels, state.capture_stage);
     captureSamplesEl.textContent = formatCapture(state);
     captureValidEl.textContent = formatValid(state);
@@ -4274,6 +4398,7 @@ async function refresh() {
     renderMessages(state.messages || []);
     window.__calibrationWebUiModernRefreshOk = true;
     clearRefreshWarning();
+    await maybePromptTrackerSideConfirmation(state);
     if (state.shutdown) {
       showShutdown(state.shutdown_message || "服务已退出，这个网页已经失效。");
     }
@@ -4297,6 +4422,7 @@ _FALLBACK_SCRIPT = r"""
   window.__calibrationWebUiExternalFallbackLoaded = true;
   var fallbackLatestState = {};
   var fallbackActiveControls = {};
+  var fallbackTrackerSideConfirmationToken = "";
   var fallbackPlusReviewToken = "";
   var fallbackPlusReviewDisposition = "unknown";
   var fallbackPlusReviewReason = "unknown";
@@ -4534,7 +4660,7 @@ _FALLBACK_SCRIPT = r"""
     if (shortcutC) {
       if (footPadMode && state.fix_arm_available) {
         shortcutC.textContent = twoPedal
-          ? "踏板 1/2：固定左右臂"
+          ? "进入双臂 Hold"
           : "踏板 1/2：固定 / 重采左右臂 Home";
       } else if (String(state.ui_mode || "") === "umi_collection" && state.fix_arm_available) {
         var umiFixSide = state.fix_arm_fixed_side || state.fix_arm_selected_side || "left";
@@ -4559,7 +4685,7 @@ _FALLBACK_SCRIPT = r"""
           ? "2 踏板仅切换 fixed；init 标注使用 G/GUI"
           : "踏板 3/4：切换左右 init 标注";
       } else if (twoPedal && state.init_arm_available) {
-        shortcutG.textContent = "踏板 1/2 控制 Fix；Init 仍可使用 G/GUI";
+        shortcutG.textContent = "双踏板不执行 Init；Init 仍可使用 G/GUI";
       } else if (footPadMode && state.init_arm_available) {
         shortcutG.textContent = "踏板 3/4 或 G/GUI：Init 左/右臂";
       } else if (String(state.ui_mode || "") === "umi_collection" && state.init_arm_available) {
@@ -4682,26 +4808,27 @@ _FALLBACK_SCRIPT = r"""
     var available = Boolean(state.foot_pad_available);
     var requested = Boolean(state.foot_pad_requested);
     var active = Boolean(state.foot_pad_test_active);
+    var completed = Boolean(state.foot_pad_test_completed);
     var twoPedal = Number(state.foot_pad_count || 0) === 2;
     var banner = byId("footPadTestBanner");
     var controls = byId("footPadTestControls");
     if (banner) {
       banner.hidden = !(requested || available);
-      banner.className = "foot-pad-test-banner" + (active ? " active" : (!available ? " unavailable" : ""));
+      banner.className = "foot-pad-test-banner" + (active ? " active" : (!available ? " unavailable" : (completed ? " completed" : "")));
     }
     if (controls) controls.hidden = !available;
-    setText("footPadTestTitle", !available ? "踏板未连接 / 未就绪" : (active ? "脚踏测试模式已开启（仅显示，不执行操作）" : (Number(state.foot_pad_count || 0) + " 个踏板已连接")));
+    setText("footPadTestTitle", !available ? "踏板未连接 / 未就绪" : (active ? "脚踏测试模式已开启（仅显示，不执行操作）" : (completed ? "本次连接的踏板测试已完成" : (Number(state.foot_pad_count || 0) + " 个踏板已连接"))));
     setText(
       "footPadTestDetail",
       !available
         ? (state.foot_pad_status_message || "未找到可用的 2/4 踏板虚拟键盘。")
         : active
-        ? (twoPedal
-          ? "请依次踩踏板 1、2（固定左臂、固定右臂）。测试期间不会固定、归位、移动机械臂，也不会写入数采；Init 始终可通过 G/GUI 操作。确认无误后点击“停止测试踏板”。"
-          : "请依次踩踏板 1、2、3、4。测试期间不会固定、归位、移动机械臂，也不会写入数采。确认无误后点击“停止测试踏板”。")
+        ? "请依次踩踏板 1、2、3、4；即使当前识别为双踏板模式也测试四个位置。测试期间只显示按键，不会固定、归位、移动机械臂或写入数采。确认无误后点击“停止测试踏板”。"
+        : completed
+        ? "测试结果已在本次连接期间保留，不会重复要求测试；只有主动点击“重新测试踏板”或设备断开重连后才会重置。"
         : (twoPedal
-          ? "F13/踏板1 固定左臂；F14/踏板2 固定右臂；归位操作仍使用 G。点击下方按钮开始安全测试。"
-          : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。点击下方按钮开始安全测试。")
+          ? "F13/踏板1 进入仅左臂遥操（Fix 右臂）；F14/踏板2 进入仅右臂遥操（Fix 左臂）；双踏板不执行 Init。映射测试仅用于按需核对，不会阻塞踏板或 A/B/C 控制。"
+          : "F13/踏板1 固定左臂；F14/踏板2 固定右臂；F15/踏板3 左臂精确 Init qpos；F16/踏板4 右臂精确 Init qpos。映射测试仅用于按需核对，不会阻塞其他控制。")
     );
     setText("footPadTestLast", "最近检测：" + (state.foot_pad_test_last_event || "-"));
     setText("footPadTestStatus", state.foot_pad_test_status || "-");
@@ -4709,7 +4836,7 @@ _FALLBACK_SCRIPT = r"""
     var stop = byId("footPadTestStopButton");
     if (start) {
       start.className = "warn" + (!active ? " active" : "");
-      start.textContent = active ? "测试进行中" : "开始测试踏板";
+      start.textContent = active ? "测试进行中" : (completed ? "重新测试踏板" : "开始测试踏板");
     }
     if (stop) stop.className = "danger" + (active ? " active" : "");
   }
@@ -4899,6 +5026,25 @@ _FALLBACK_SCRIPT = r"""
     el.innerHTML = html.join("");
   }
 
+  function maybePromptTrackerSideConfirmation(state) {
+    var check = state.tracker_side_check || {};
+    var token = String(check.confirmation_token || "");
+    if (!check.confirmation_required || !token || token === fallbackTrackerSideConfirmationToken) {
+      return;
+    }
+    fallbackTrackerSideConfirmationToken = token;
+    var message = String(
+      check.confirmation_message ||
+      check.message ||
+      "Tracker 左右位置检查未通过。是否仍要继续本次 runtime Home？"
+    );
+    postEvent(
+      window.confirm(message)
+        ? "tracker_side_confirm_continue"
+        : "tracker_side_confirm_cancel"
+    );
+  }
+
   function renderRawPoses(state) {
     var poses = state.raw_tracker_poses || {};
     var left = rawPoseText(poses.left);
@@ -5065,6 +5211,13 @@ _FALLBACK_SCRIPT = r"""
     setText("frameVizMode", state.frame_viz_mode);
     setText("virtualDeskYaw", state.virtual_desk_post_yaw_deg != null ? String(state.virtual_desk_post_yaw_deg) + " deg" : "-");
     setText("controlHint", state.control_hint || "-");
+    var twoPedalAlert = state.two_pedal_alert || {};
+    var twoPedalAlertEl = byId("twoPedalAlert");
+    if (twoPedalAlertEl) {
+      twoPedalAlertEl.hidden = !Boolean(twoPedalAlert.active);
+      twoPedalAlertEl.className = "two-pedal-alert" + (String(twoPedalAlert.level || "") === "red" ? " red" : "");
+      twoPedalAlertEl.textContent = twoPedalAlert.message || "";
+    }
     setText("captureStage", labelStage(state.capture_stage));
     setText("captureSamples", captureSamplesText(state));
     setText("captureValid", captureValidText(state));
@@ -5079,6 +5232,7 @@ _FALLBACK_SCRIPT = r"""
     renderDeviceStatus("cameraCards", state.camera_status, "当前没有 RealSense camera_sources。", "");
     renderDeviceStatus("tactileCameraCards", state.tactile_camera_status, "当前没有 DMTac 视触觉状态。", "");
     renderMessages(state.messages || []);
+    maybePromptTrackerSideConfirmation(state);
     setHealth("外部兼容脚本正在刷新 state.json；主内联脚本未接管，通常是浏览器策略、扩展或嵌入式页面拦截了 inline script。");
   }
 
@@ -5191,12 +5345,23 @@ _FALLBACK_SCRIPT = r"""
     var eventName = "";
     var payload = null;
     if (key === "a") {
-      eventName = (state.episode_recording || String(state.episode_event_status || "") === "preparing") ? "episode_stop" : "episode_start";
+      eventName = (
+        fallbackActiveControls["episode_stop"]
+        && (
+          state.episode_recording
+          || String(state.episode_event_status || "") === "preparing"
+          || !fallbackActiveControls["episode_start"]
+        )
+      ) ? "episode_stop" : (fallbackActiveControls["episode_start"] ? "episode_start" : "");
       if (eventName === "episode_start") payload = collectEpisodeStartPayloadFallback();
     } else if (key === "b") {
-      eventName = state.teleop_running ? "h" : "p";
+      eventName = fallbackActiveControls["two_pedal_b"]
+        ? "two_pedal_b"
+        : (fallbackActiveControls["h"] ? "h" : (fallbackActiveControls["p"] ? "p" : ""));
     } else if (key === "c") {
-      if (state.fix_arm_available && state.teleop_running && fallbackActiveControls["fix_arm_toggle"]) {
+      if (fallbackActiveControls["two_pedal_c"]) {
+        eventName = "two_pedal_c";
+      } else if (state.fix_arm_available && state.teleop_running && fallbackActiveControls["fix_arm_toggle"]) {
         eventName = "fix_arm_toggle";
       }
     } else if (key === "g") {
@@ -5224,6 +5389,10 @@ _FALLBACK_SCRIPT = r"""
       event = event || window.event;
       if (event.repeat || isEditableTargetFallback(event.target || event.srcElement)) return;
       var key = String(event.key || "").toLowerCase();
+      var code = String(event.code || "").toLowerCase();
+      if (key !== "a" && key !== "b" && key !== "c" && key !== "g") {
+        key = code === "keya" ? "a" : code === "keyb" ? "b" : code === "keyc" ? "c" : code === "keyg" ? "g" : key;
+      }
       if (key !== "a" && key !== "b" && key !== "c" && key !== "g") return;
       if (event.preventDefault) event.preventDefault();
       event.returnValue = false;
@@ -5331,7 +5500,7 @@ _FALLBACK_SCRIPT = r"""
 """
 
 
-_PAGE_VERSION = "real_teleop_gui_init_qpos_speed_v3"
+_PAGE_VERSION = "real_teleop_gui_two_pedal_controls_v4"
 
 
 def _html_text(value: Any) -> str:
@@ -5797,6 +5966,7 @@ class CalibrationWebUiState:
     home_ready: bool = False
     teleop_running: bool = False
     raw_tracker_poses: dict[str, Any] = field(default_factory=dict)
+    tracker_side_check: dict[str, Any] = field(default_factory=dict)
     debug_ik_timing: bool = False
     ik_timing: dict[str, Any] = field(default_factory=dict)
     ik_warning: dict[str, Any] = field(default_factory=dict)
@@ -5884,6 +6054,7 @@ class CalibrationWebUiState:
     fix_arm_status: str = ""
     fix_arm_sample_count: int | None = None
     fix_arm_min_samples: int | None = None
+    fix_arm_home_cache: dict[str, Any] = field(default_factory=dict)
     special_arm_control_mode: str = "manual"
     foot_pad_requested: bool = False
     foot_pad_available: bool = False
@@ -5892,6 +6063,8 @@ class CalibrationWebUiState:
     foot_pad_status_label: str = "未启用"
     foot_pad_status_message: str = ""
     foot_pad_test_active: bool = False
+    foot_pad_test_completed: bool = False
+    foot_pad_test_seen_count: int = 0
     foot_pad_test_last_event: str = ""
     foot_pad_test_status: str = ""
     init_arm_available: bool = False
@@ -5927,6 +6100,7 @@ class CalibrationWebUiState:
     init_arm_qpos_speed_scale_max: float = 10.0
     init_arm_qpos_speed_scale_default: float = 5.0
     fix_hold_active: bool = False
+    two_pedal_alert: dict[str, Any] = field(default_factory=dict)
     pose_snapshot_available: bool = False
     pose_snapshot_dir: str = ""
     pose_snapshot_count: int = 0
@@ -6186,6 +6360,7 @@ class CalibrationWebUi:
                 "home_ready": self._state.home_ready,
                 "teleop_running": self._state.teleop_running,
                 "raw_tracker_poses": dict(self._state.raw_tracker_poses),
+                "tracker_side_check": dict(self._state.tracker_side_check),
                 "debug_ik_timing": self._state.debug_ik_timing,
                 "ik_timing": dict(self._state.ik_timing),
                 "ik_warning": dict(self._state.ik_warning),
@@ -6274,6 +6449,7 @@ class CalibrationWebUi:
                 "fix_arm_status": self._state.fix_arm_status,
                 "fix_arm_sample_count": self._state.fix_arm_sample_count,
                 "fix_arm_min_samples": self._state.fix_arm_min_samples,
+                "fix_arm_home_cache": dict(self._state.fix_arm_home_cache),
                 "special_arm_control_mode": self._state.special_arm_control_mode,
                 "foot_pad_requested": self._state.foot_pad_requested,
                 "foot_pad_available": self._state.foot_pad_available,
@@ -6282,6 +6458,8 @@ class CalibrationWebUi:
                 "foot_pad_status_label": self._state.foot_pad_status_label,
                 "foot_pad_status_message": self._state.foot_pad_status_message,
                 "foot_pad_test_active": self._state.foot_pad_test_active,
+                "foot_pad_test_completed": self._state.foot_pad_test_completed,
+                "foot_pad_test_seen_count": self._state.foot_pad_test_seen_count,
                 "foot_pad_test_last_event": self._state.foot_pad_test_last_event,
                 "foot_pad_test_status": self._state.foot_pad_test_status,
                 "init_arm_available": self._state.init_arm_available,
@@ -6311,6 +6489,7 @@ class CalibrationWebUi:
                 "init_arm_sequence_phase": self._state.init_arm_sequence_phase,
                 "init_arm_sequence_status": self._state.init_arm_sequence_status,
                 "fix_hold_active": self._state.fix_hold_active,
+                "two_pedal_alert": dict(self._state.two_pedal_alert),
                 "pose_snapshot_available": self._state.pose_snapshot_available,
                 "pose_snapshot_dir": self._state.pose_snapshot_dir,
                 "pose_snapshot_count": self._state.pose_snapshot_count,

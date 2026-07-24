@@ -30,9 +30,22 @@ from robot_motion.runtime.producer_epoch import (
     ProducerEpochSnapshot,
 )
 
-from .mixing_strategy import fuse_weighted_se3_pose_actions
-from .proposal import ActionProposalDraft, freeze_robot_action, robot_action_semantic_payload
-from .schema import RobotAction, split_effector_name
+from control_composition.retention import (
+    TimeWindowRetentionSpec,
+    TimeWindowStoreSnapshot,
+)
+
+from .pose import (
+    POSE_MIXING_ARM_COMPONENTS_V1,
+    fuse_weighted_se3_pose_actions,
+    normalize_pose_component_dependencies,
+)
+from robot_motion.action.proposal import (
+    ActionProposalDraft,
+    freeze_robot_action,
+    robot_action_semantic_payload,
+)
+from robot_motion.action.schema import RobotAction, split_effector_name
 
 
 COMPOSITION_INPUT_HASH_DOMAIN_V1 = "dexteleop.composition_input.semantic.v1"
@@ -41,6 +54,12 @@ COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V1 = (
 )
 COMPOSITION_SPEC_HASH_DOMAIN_V1 = "dexteleop.composition_spec.v1"
 COMPOSITION_RESULT_HASH_DOMAIN_V1 = "dexteleop.composition_result.v1"
+COMPOSITION_AUTHORITY_GATE_SPEC_HASH_DOMAIN_V1 = (
+    "dexteleop.composition_authority_gate_spec.v1"
+)
+COMPOSITION_AUTHORITY_DISPOSITION_HASH_DOMAIN_V1 = (
+    "dexteleop.composition_authority_disposition.v1"
+)
 COMPOSITION_ALGEBRAS_V1 = frozenset(
     {
         "component_union",
@@ -91,6 +110,8 @@ class CompositionInputDraft:
     context_ids: tuple[str, ...] = ()
     observation_cut_id: str | None = None
     policy_output_id: str | None = None
+    source_fact_ids: tuple[str, ...] = ()
+    source_fact_hashes: tuple[str, ...] = ()
     authority_candidate: bool = False
     audit_metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -116,6 +137,8 @@ class CompositionInputRecord:
     context_ids: tuple[str, ...]
     observation_cut_id: str | None
     policy_output_id: str | None
+    source_fact_ids: tuple[str, ...]
+    source_fact_hashes: tuple[str, ...]
     authority_candidate: bool
     semantic_content_hash: str
     audit_metadata: Mapping[str, Any]
@@ -146,6 +169,9 @@ class CompositionSpec:
     weight_by_role: Mapping[str, float] = field(default_factory=dict)
     max_translation_disagreement_m: float | None = None
     max_rotation_disagreement_rad: float | None = None
+    pose_component_dependencies: tuple[str, ...] = (
+        POSE_MIXING_ARM_COMPONENTS_V1
+    )
 
     def __post_init__(self) -> None:
         _required(self.spec_id, field_name="spec_id")
@@ -191,6 +217,9 @@ class CompositionSpec:
             weights[key] = weight
         translation_limit = self.max_translation_disagreement_m
         rotation_limit = self.max_rotation_disagreement_rad
+        pose_dependencies = normalize_pose_component_dependencies(
+            self.pose_component_dependencies
+        )
         if algebra == "weighted_se3_pose_fusion":
             if set(weights) != set(roles) or not any(
                 weight > 0.0 for weight in weights.values()
@@ -221,7 +250,12 @@ class CompositionSpec:
                 raise ValueError(
                     "weighted_se3_pose_fusion does not use residual limits."
                 )
-        elif weights or translation_limit is not None or rotation_limit is not None:
+        elif (
+            weights
+            or translation_limit is not None
+            or rotation_limit is not None
+            or pose_dependencies != POSE_MIXING_ARM_COMPONENTS_V1
+        ):
             raise ValueError(
                 "Pose fusion parameters require weighted_se3_pose_fusion."
             )
@@ -239,6 +273,11 @@ class CompositionSpec:
             self,
             "max_rotation_disagreement_rad",
             rotation_limit,
+        )
+        object.__setattr__(
+            self,
+            "pose_component_dependencies",
+            pose_dependencies,
         )
 
     @property
@@ -267,9 +306,123 @@ class CompositionSpec:
                     ),
                 }
             )
+            if (
+                self.pose_component_dependencies
+                != POSE_MIXING_ARM_COMPONENTS_V1
+            ):
+                payload["pose_component_dependencies"] = (
+                    self.pose_component_dependencies
+                )
         return canonical_content_hash(
             payload,
             domain=COMPOSITION_SPEC_HASH_DOMAIN_V1,
+        )
+
+
+@dataclass(frozen=True)
+class CompositionAuthorityGateSpec:
+    """Fail-closed promotion policy for one formal composition producer.
+
+    Contributors remain internal inputs.  Only a ready ``CompositionResult``
+    may be promoted, and that promotion belongs to ``composer_producer_id``.
+    Missing required/deadman-like roles, numerical conflicts, and producer
+    errors are execution-gate events rather than implicit weight fallbacks.
+    """
+
+    gate_spec_id: str
+    composition_spec_hash: str
+    composer_producer_id: str
+    missing_behavior_by_role: Mapping[str, str]
+    proposal_ttl_sec: float
+    invalid_result_behavior: str = "hold"
+    composer_error_behavior: str = "hold"
+    all_inputs_missing_behavior: str = "hold"
+    allow_parallel_source_proposals: bool = False
+    canonical_safety_required: bool = True
+
+    def __post_init__(self) -> None:
+        for name in (
+            "gate_spec_id",
+            "composition_spec_hash",
+            "composer_producer_id",
+        ):
+            _required(getattr(self, name), field_name=name)
+        behaviors: dict[str, str] = {}
+        for role, behavior in dict(self.missing_behavior_by_role).items():
+            normalized_role = _required(role, field_name="contributor role")
+            normalized_behavior = _required(
+                behavior,
+                field_name=f"missing behavior for {normalized_role}",
+            )
+            if normalized_behavior not in {"hold", "drop_and_renormalize"}:
+                raise ValueError(
+                    "Contributor missing behavior must be hold or "
+                    "drop_and_renormalize."
+                )
+            behaviors[normalized_role] = normalized_behavior
+        if not behaviors:
+            raise ValueError("missing_behavior_by_role must be non-empty.")
+        proposal_ttl = float(self.proposal_ttl_sec)
+        if not math.isfinite(proposal_ttl) or proposal_ttl <= 0.0:
+            raise ValueError("proposal_ttl_sec must be finite and positive.")
+        for name in (
+            "invalid_result_behavior",
+            "composer_error_behavior",
+            "all_inputs_missing_behavior",
+        ):
+            if getattr(self, name) != "hold":
+                raise ValueError(f"{name} must be hold in formal composition v1.")
+        if self.allow_parallel_source_proposals:
+            raise ValueError(
+                "Formal composition v1 forbids parallel contributor proposals."
+            )
+        if not self.canonical_safety_required:
+            raise ValueError("Formal composition v1 requires canonical safety.")
+        object.__setattr__(
+            self,
+            "missing_behavior_by_role",
+            MappingProxyType(behaviors),
+        )
+        object.__setattr__(self, "proposal_ttl_sec", proposal_ttl)
+
+    def validate_composition_spec(self, spec: CompositionSpec) -> None:
+        if not isinstance(spec, CompositionSpec):
+            raise TypeError("spec must be a CompositionSpec.")
+        if spec.semantic_content_hash != self.composition_spec_hash:
+            raise ValueError("Authority gate is bound to another composition spec.")
+        if set(self.missing_behavior_by_role) != set(spec.input_roles):
+            raise ValueError(
+                "Authority gate must classify every composition input role exactly."
+            )
+        unsafe_required = {
+            role
+            for role in spec.required_roles
+            if self.missing_behavior_by_role[role] != "hold"
+        }
+        if unsafe_required:
+            raise ValueError(
+                "Required formal contributors must HOLD when missing: "
+                f"{sorted(unsafe_required)!r}."
+            )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "gate_spec_id": self.gate_spec_id,
+                "composition_spec_hash": self.composition_spec_hash,
+                "composer_producer_id": self.composer_producer_id,
+                "missing_behavior_by_role": self.missing_behavior_by_role,
+                "proposal_ttl_sec": self.proposal_ttl_sec,
+                "invalid_result_behavior": self.invalid_result_behavior,
+                "composer_error_behavior": self.composer_error_behavior,
+                "all_inputs_missing_behavior": self.all_inputs_missing_behavior,
+                "allow_parallel_source_proposals": (
+                    self.allow_parallel_source_proposals
+                ),
+                "canonical_safety_required": self.canonical_safety_required,
+            },
+            domain=COMPOSITION_AUTHORITY_GATE_SPEC_HASH_DOMAIN_V1,
         )
 
 
@@ -319,6 +472,85 @@ class CompositionResult:
 
 
 @dataclass(frozen=True)
+class CompositionAuthorityDisposition:
+    disposition_id: str
+    gate_spec_hash: str
+    composition_result_id: str
+    composition_result_hash: str
+    action: str
+    reason: str
+    missing_roles: tuple[str, ...]
+    semantic_content_hash: str
+
+
+def decide_composition_authority_disposition(
+    snapshot: CompositionInputSnapshot,
+    result: CompositionResult,
+    *,
+    spec: CompositionSpec,
+    gate_spec: CompositionAuthorityGateSpec,
+) -> CompositionAuthorityDisposition:
+    """Choose proposal promotion or HOLD without reading runtime state."""
+
+    if not isinstance(snapshot, CompositionInputSnapshot):
+        raise TypeError("snapshot must be a CompositionInputSnapshot.")
+    if not isinstance(result, CompositionResult):
+        raise TypeError("result must be a CompositionResult.")
+    gate_spec.validate_composition_spec(spec)
+    if (
+        snapshot.composition_spec_hash != spec.semantic_content_hash
+        or result.composition_spec_hash != spec.semantic_content_hash
+        or result.composition_input_snapshot_id
+        != snapshot.composition_input_snapshot_id
+        or result.composition_input_snapshot_hash
+        != snapshot.semantic_content_hash
+    ):
+        raise ValueError("Composition disposition inputs do not share one snapshot.")
+    missing = tuple(snapshot.missing_roles)
+    if result.output_status == "ready" and result.composed_action is not None:
+        action = "publish_proposal"
+        reason = "ready_composition"
+    elif missing:
+        missing_behaviors = tuple(
+            gate_spec.missing_behavior_by_role[role] for role in missing
+        )
+        if len(missing) == len(spec.input_roles):
+            action = gate_spec.all_inputs_missing_behavior
+            reason = "all_inputs_missing"
+        elif "hold" in missing_behaviors:
+            action = "hold"
+            reason = "required_contributor_missing"
+        else:
+            # A renormalizing numerical spec should have produced a ready
+            # action.  Reaching no-action here is therefore fail-closed.
+            action = "hold"
+            reason = "renormalization_produced_no_action"
+    elif result.output_status == "invalid":
+        action = gate_spec.invalid_result_behavior
+        reason = "composition_invalid"
+    else:
+        action = "hold"
+        reason = "composition_not_publishable"
+    payload = {
+        "gate_spec_hash": gate_spec.semantic_content_hash,
+        "composition_result_id": result.composition_result_id,
+        "composition_result_hash": result.semantic_content_hash,
+        "action": action,
+        "reason": reason,
+        "missing_roles": missing,
+    }
+    digest = canonical_content_hash(
+        payload,
+        domain=COMPOSITION_AUTHORITY_DISPOSITION_HASH_DOMAIN_V1,
+    )
+    return CompositionAuthorityDisposition(
+        disposition_id=f"composition-authority-disposition:{digest}",
+        semantic_content_hash=digest,
+        **payload,
+    )
+
+
+@dataclass(frozen=True)
 class _PreparedInput:
     identity: RuntimeFactIdentity
     draft: CompositionInputDraft
@@ -327,6 +559,8 @@ class _PreparedInput:
     effective_from: float
     effective_until: float
     context_ids: tuple[str, ...]
+    source_fact_ids: tuple[str, ...]
+    source_fact_hashes: tuple[str, ...]
     audit_metadata: Mapping[str, Any]
 
 
@@ -361,6 +595,24 @@ def _prepare(draft: CompositionInputDraft) -> _PreparedInput:
     context_ids = tuple(_required(value, field_name="context_id") for value in draft.context_ids)
     if len(context_ids) != len(set(context_ids)):
         raise CompositionAdmissionError("invalid_field", "context_ids must be unique.")
+    source_fact_ids = tuple(
+        _required(value, field_name="source_fact_id")
+        for value in draft.source_fact_ids
+    )
+    source_fact_hashes = tuple(
+        _required(value, field_name="source_fact_hash")
+        for value in draft.source_fact_hashes
+    )
+    if len(source_fact_ids) != len(source_fact_hashes):
+        raise CompositionAdmissionError(
+            "invalid_field",
+            "source_fact_ids and source_fact_hashes must have equal length.",
+        )
+    if len(source_fact_ids) != len(set(source_fact_ids)):
+        raise CompositionAdmissionError(
+            "invalid_field",
+            "source_fact_ids must be unique.",
+        )
     return _PreparedInput(
         identity=RuntimeFactIdentity(
             runtime_session_id=session,
@@ -376,12 +628,14 @@ def _prepare(draft: CompositionInputDraft) -> _PreparedInput:
         effective_from=effective_from,
         effective_until=effective_until,
         context_ids=context_ids,
+        source_fact_ids=source_fact_ids,
+        source_fact_hashes=source_fact_hashes,
         audit_metadata=deep_freeze(dict(draft.audit_metadata)),
     )
 
 
 def composition_input_semantic_payload(record: CompositionInputRecord) -> dict[str, Any]:
-    return {
+    payload = {
         "composition_input_id": record.composition_input_id,
         "runtime_session_id": record.runtime_session_id,
         "control_domain_id": record.control_domain_id,
@@ -403,6 +657,10 @@ def composition_input_semantic_payload(record: CompositionInputRecord) -> dict[s
         "policy_output_id": record.policy_output_id,
         "authority_candidate": record.authority_candidate,
     }
+    if record.source_fact_ids:
+        payload["source_fact_ids"] = record.source_fact_ids
+        payload["source_fact_hashes"] = record.source_fact_hashes
+    return payload
 
 
 class CompositionInputStore:
@@ -412,22 +670,24 @@ class CompositionInputStore:
         runtime_session_id: str,
         coordinator: ControlAdmissionCoordinator,
         producer_epochs: ProducerEpochRegistry,
-        capacity: int,
+        retention_spec: TimeWindowRetentionSpec,
     ) -> None:
-        if int(capacity) <= 0:
-            raise ValueError("CompositionInputStore capacity must be positive.")
         if producer_epochs.coordinator is not coordinator:
             raise ValueError("Composition store and epochs must share one coordinator.")
+        if not isinstance(retention_spec, TimeWindowRetentionSpec):
+            raise TypeError("retention_spec must be a TimeWindowRetentionSpec.")
         self.runtime_session_id = _required(runtime_session_id, field_name="runtime_session_id")
         if self.runtime_session_id != coordinator.clock_domain.runtime_session_id:
             raise ValueError("Composition store session must match the control clock session.")
         self.coordinator = coordinator
         self.control_domain_id = coordinator.control_domain_id
         self.producer_epochs = producer_epochs
-        self.capacity = int(capacity)
+        self.retention_spec = retention_spec
         self._records: list[CompositionInputRecord] = []
         self._by_id: dict[str, CompositionInputRecord] = {}
         self._last_sequence: dict[tuple[str, int], int] = {}
+        self._closed_target_through: float | None = None
+        self._pruned_record_count = 0
         self._lock = threading.RLock()
 
     def admit(self, draft: CompositionInputDraft) -> CompositionInputAdmissionReceipt:
@@ -446,6 +706,16 @@ class CompositionInputStore:
                 )
 
             def build(available_at: float, admission_sequence: int) -> CompositionInputRecord:
+                try:
+                    self.retention_spec.validate_admitted_interval(
+                        available_at=available_at,
+                        effective_from=prepared.effective_from,
+                        effective_until=prepared.effective_until,
+                    )
+                except ValueError as exc:
+                    raise CompositionAdmissionError(
+                        "retention_window_violation", str(exc)
+                    ) from exc
                 payload = {
                     "composition_input_id": prepared.identity.fact_id,
                     "runtime_session_id": prepared.identity.runtime_session_id,
@@ -466,9 +736,14 @@ class CompositionInputStore:
                     "context_ids": prepared.context_ids,
                     "observation_cut_id": draft.observation_cut_id,
                     "policy_output_id": draft.policy_output_id,
+                    "source_fact_ids": prepared.source_fact_ids,
+                    "source_fact_hashes": prepared.source_fact_hashes,
                     "authority_candidate": False,
                 }
                 semantic_payload = dict(payload)
+                if not prepared.source_fact_ids:
+                    semantic_payload.pop("source_fact_ids")
+                    semantic_payload.pop("source_fact_hashes")
                 semantic_payload["action"] = robot_action_semantic_payload(prepared.action)
                 return CompositionInputRecord(
                     **payload,
@@ -511,11 +786,10 @@ class CompositionInputStore:
             key = (record.producer_id, record.producer_epoch)
             previous = self._last_sequence.get(key)
             if previous is not None and record.sequence <= previous:
+                code = "duplicate" if record.sequence == previous else "sequence_rollback"
                 raise CompositionAdmissionError(
-                    "sequence_rollback", f"Producer sequence must increase beyond {previous}."
+                    code, f"Producer sequence must increase beyond {previous}."
                 )
-            if len(self._records) >= self.capacity:
-                raise CompositionAdmissionError("capacity_exhausted", "CompositionInputStore is full.")
             self._records.append(record)
             self._by_id[record.composition_input_id] = record
             self._last_sequence[key] = record.sequence
@@ -529,6 +803,77 @@ class CompositionInputStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._records)
+
+    def capture_snapshot(
+        self,
+        cut: ControlCut,
+        *,
+        producer_epochs: ProducerEpochSnapshot,
+        spec: CompositionSpec,
+        target_effective_at: float,
+    ) -> CompositionInputSnapshot:
+        """Materialize one same-cut snapshot, then close its target-time window."""
+
+        with self._lock:
+            snapshot = build_composition_input_snapshot(
+                CompositionInputProjection(
+                    control_domain_id=cut.control_domain_id,
+                    cutoff_at=cut.cutoff_at,
+                    cutoff_admission_sequence=cut.cutoff_admission_sequence,
+                    records=tuple(
+                        record
+                        for record in self._records
+                        if admitted_at_or_before(record, cut)
+                    ),
+                ),
+                producer_epochs=producer_epochs,
+                spec=spec,
+                target_effective_at=target_effective_at,
+            )
+            self._advance_closed_target_locked(float(target_effective_at))
+            return snapshot
+
+    def _advance_closed_target_locked(self, target: float) -> None:
+        self._validate_target_locked(target)
+        self._closed_target_through = target
+        prune_before = self.retention_spec.prune_before(
+            closed_target_through=target
+        )
+        retained = [
+            record
+            for record in self._records
+            if record.effective_until > prune_before
+        ]
+        self._pruned_record_count += len(self._records) - len(retained)
+        self._records = retained
+        self._by_id = {
+            record.composition_input_id: record for record in retained
+        }
+
+    def _validate_target_locked(self, target: float) -> None:
+        if not math.isfinite(target):
+            raise ValueError("Composition target time must be finite.")
+        if (
+            self._closed_target_through is not None
+            and target < self._closed_target_through
+        ):
+            raise ValueError(
+                "Composition target time cannot move behind the closed window."
+            )
+
+    def validate_target(self, target_effective_at: float) -> None:
+        with self._lock:
+            self._validate_target_locked(float(target_effective_at))
+
+    def retention_snapshot(self) -> TimeWindowStoreSnapshot:
+        with self._lock:
+            return TimeWindowStoreSnapshot(
+                retention_spec_hash=self.retention_spec.semantic_content_hash,
+                closed_target_through=self._closed_target_through,
+                retained_record_count=len(self._records),
+                pruned_record_count=self._pruned_record_count,
+                producer_epoch_tombstone_count=len(self._last_sequence),
+            )
 
 
 def project_composition_inputs(
@@ -736,6 +1081,7 @@ def _weighted_se3_pose_fusion(
             max_rotation_disagreement_rad=float(
                 spec.max_rotation_disagreement_rad
             ),
+            component_dependencies=spec.pose_component_dependencies,
             source=f"deterministic_composer:{spec.spec_id}",
         )
     )
@@ -935,11 +1281,15 @@ def build_blocked_composition_result(
 
 __all__ = [
     "COMPOSITION_ALGEBRAS_V1",
+    "COMPOSITION_AUTHORITY_DISPOSITION_HASH_DOMAIN_V1",
+    "COMPOSITION_AUTHORITY_GATE_SPEC_HASH_DOMAIN_V1",
     "COMPOSITION_INPUT_HASH_DOMAIN_V1",
     "COMPOSITION_INPUT_SNAPSHOT_HASH_DOMAIN_V1",
     "COMPOSITION_RESULT_HASH_DOMAIN_V1",
     "COMPOSITION_SPEC_HASH_DOMAIN_V1",
     "CompositionAdmissionError",
+    "CompositionAuthorityDisposition",
+    "CompositionAuthorityGateSpec",
     "CompositionInputAdmissionReceipt",
     "CompositionInputDraft",
     "CompositionInputProjection",
@@ -953,5 +1303,6 @@ __all__ = [
     "build_blocked_composition_result",
     "build_composition_input_snapshot",
     "composition_input_semantic_payload",
+    "decide_composition_authority_disposition",
     "project_composition_inputs",
 ]

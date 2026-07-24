@@ -27,17 +27,24 @@ def test_dmtac_impedance_profiles_use_hardened_admittance_and_fast_return(
 
     config = RM65ImpedanceConfig.from_profile(load_profile(profile_name), mode=mode)
 
-    assert config.linear_compliance_m_per_n == pytest.approx(0.0012)
-    assert config.angular_compliance_rad_per_nm == pytest.approx(0.02)
-    assert config.max_linear_offset_m == pytest.approx(0.03)
-    assert config.max_angular_offset_rad == pytest.approx(0.12)
-    assert config.max_linear_return_velocity_m_s == pytest.approx(0.06)
-    assert config.max_angular_return_velocity_rad_s == pytest.approx(0.3)
-    assert config.return_rate_s == pytest.approx(4.0)
+    assert config.linear_compliance_m_per_n == pytest.approx(0.004)
+    assert config.angular_compliance_rad_per_nm == pytest.approx(0.1)
+    expected_linear_offset = 0.08 if "left_" in profile_name else 0.07
+    expected_force_deadband = 0.45 if "left_" in profile_name else 0.35
+    expected_torque_deadband = 0.04 if "left_" in profile_name else 0.03
+    assert config.max_linear_offset_m == pytest.approx(expected_linear_offset)
+    assert config.max_angular_offset_rad == pytest.approx(0.4)
+    assert config.max_linear_return_velocity_m_s == pytest.approx(0.03)
+    assert config.max_angular_return_velocity_rad_s == pytest.approx(0.1)
+    assert config.return_rate_s == pytest.approx(1.0)
 
     thresholds = config.saturation_thresholds()
-    assert thresholds["linear_filtered_force_n_for_max_offset"] == pytest.approx(25.45)
-    assert thresholds["angular_filtered_torque_nm_for_max_offset"] == pytest.approx(6.04)
+    assert thresholds["linear_filtered_force_n_for_max_offset"] == pytest.approx(
+        expected_linear_offset / 0.004 + expected_force_deadband
+    )
+    assert thresholds["angular_filtered_torque_nm_for_max_offset"] == pytest.approx(
+        0.4 / 0.1 + expected_torque_deadband
+    )
 
 
 def test_hardened_profile_return_rate_and_caps_take_effect_in_admittance() -> None:
@@ -46,7 +53,7 @@ def test_hardened_profile_return_rate_and_caps_take_effect_in_admittance() -> No
         mode="pose",
     )
     admittance = config.make_admittance()
-    admittance.offset = [0.03, 0.0, 0.0, 0.12, 0.0, 0.0]
+    admittance.offset = [0.04, 0.0, 0.0, 0.12, 0.0, 0.0]
 
     update = admittance.update(
         [0.0] * 6,
@@ -57,8 +64,8 @@ def test_hardened_profile_return_rate_and_caps_take_effect_in_admittance() -> No
     )
 
     # The faster return is still bounded independently per translation/rotation.
-    assert update["offset"][0] == pytest.approx(0.0285)
-    assert update["offset"][3] == pytest.approx(0.1125)
+    assert update["offset"][0] == pytest.approx(0.03925)
+    assert update["offset"][3] == pytest.approx(0.1175)
     assert update["linear_return_velocity_limit_applied"] is True
     assert update["angular_return_velocity_limit_applied"] is True
 

@@ -35,7 +35,10 @@ from teleop_runtime.control_trace.projection import (
     project_human_proposal_adapter_result,
 )
 
-from ..handoff import HumanTakeoverOperationSpec, HumanTakeoverState
+from control_composition.lifecycle import (
+    HumanTakeoverOperationSpec,
+    HumanTakeoverState,
+)
 
 
 HUMAN_TAKEOVER_READINESS_CANDIDATE_HASH_DOMAIN_V1 = (

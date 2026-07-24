@@ -13,9 +13,12 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from robot_motion.action import CompositionInputDraft, CompositionSpec
+from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionInputDraft,
+    CompositionSpec,
+)
 from robot_motion.action.proposal import freeze_robot_action
-from robot_motion.deploy import PolicyContextDraft
 from robot_motion.runtime.immutable import deep_freeze
 
 from .runtime import MujocoDeployRuntime
@@ -23,7 +26,7 @@ from .runtime import MujocoDeployRuntime
 
 ASYNC_JOB_KINDS_V1 = frozenset(
     {
-        "policy_context",
+        "composition_context",
         "composition_input",
         "compose",
         "decision",
@@ -201,17 +204,17 @@ class DeterministicAsyncTopologyHarness:
         self._known_job_ids.add(normalized_id)
         return AsyncHarnessSubmissionReceipt(True, normalized_id, queue_sequence)
 
-    def schedule_policy_context(
+    def schedule_composition_context(
         self,
         *,
         job_id: str,
-        draft: PolicyContextDraft,
+        draft: CompositionContextDraft,
         submitted_at: float,
         completed_at: float,
         deadline_at: float | None = None,
     ) -> AsyncHarnessSubmissionReceipt:
-        if not isinstance(draft, PolicyContextDraft):
-            raise TypeError("draft must be a PolicyContextDraft.")
+        if not isinstance(draft, CompositionContextDraft):
+            raise TypeError("draft must be a CompositionContextDraft.")
         frozen_draft = replace(
             draft,
             semantic_payload=deep_freeze(draft.semantic_payload),
@@ -221,7 +224,7 @@ class DeterministicAsyncTopologyHarness:
         )
         return self._schedule(
             job_id=job_id,
-            job_kind="policy_context",
+            job_kind="composition_context",
             operation=frozen_draft,
             submitted_at=submitted_at,
             completed_at=completed_at,
@@ -388,8 +391,8 @@ class DeterministicAsyncTopologyHarness:
         error: str | None = None
         try:
             operation = job.operation
-            if job.job_kind == "policy_context":
-                result = self.runtime.submit_policy_context(operation)
+            if job.job_kind == "composition_context":
+                result = self.runtime.submit_composition_context(operation)
                 status = "admitted" if result.accepted else "rejected"
             elif job.job_kind == "composition_input":
                 result = self.runtime.submit_composition_input(operation)

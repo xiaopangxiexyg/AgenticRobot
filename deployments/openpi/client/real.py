@@ -50,7 +50,7 @@ def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
         "--camera-mode",
         "multi",
         "--camera-config",
-        str(_PROJECT_ROOT / "cameras/configs/rm65/devices/realsense.json"),
+        str(_PROJECT_ROOT / "teleop_runtime/configs/devices/realsense.json"),
         "--require-camera-frame",
         "--require-ready-observation",
         "--action-queue-policy",
@@ -66,6 +66,9 @@ def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
                 "--auto-start",
                 "--no-wait-for-ready-confirm",
                 "--dmtac-no-tactile",
+                "--camera-startup-hardware-reset",
+                "--camera-start-stagger-sec",
+                "0.5",
             ]
         )
     else:

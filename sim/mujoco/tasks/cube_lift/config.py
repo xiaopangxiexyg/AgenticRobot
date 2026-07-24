@@ -17,6 +17,7 @@ from robot_motion.position_control import DEFAULT_POSITION_COMMAND_HZ
 from sim.contracts import SimulationContract
 
 from ...actuation import (
+    cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
@@ -32,6 +33,9 @@ PRESCRIBED_GRIPPER_DYNAMICS = "prescribed_qpos_debug"
 MUJOCO_IDENTIFIED_GRIPPER_DYNAMICS = "mujoco_identified_position_actuator"
 RM65_ACTUATION_PROFILE_NAME = "rm65_bimanual_udp_feedback_20260721.v4"
 DMTAC_GRIPPER_ACTUATION_PROFILE_NAME = "dmtac_bimanual_position_20260722.v1"
+CUBE_LIFT_CONTACT_GRIPPER_ACTUATION_PROFILE_NAME = (
+    "dmtac_bimanual_position_cube_lift_contact_20260724.v2"
+)
 NORMAL_POLICY_CLASS = "normal"
 PRIVILEGED_EXPERT_POLICY_CLASS = "privileged_expert"
 LEGACY_DEBUG_POLICY_CLASS = "legacy_debug"
@@ -44,6 +48,9 @@ NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2 = (
 )
 PHYSICAL_CONTACT_GRASP_MODE = "physical_contact"
 CONTACT_LATCH_DEBUG_GRASP_MODE = "contact_latch_debug"
+HEIGHT_ONLY_LIFT_SUCCESS_REASON = "height_only_lift_success"
+BILATERAL_CONTACT_LIFT_SUCCESS_REASON = "bilateral_contact_lift_success"
+SCRIPTED_CONTACT_LOST_REASON = "scripted_contact_lost"
 DEFAULT_LEFT_TOOL_PROFILE_PATH = (
     "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json"
 )
@@ -61,8 +68,33 @@ def rm65_position_actuation_profile_sha256() -> str:
     return _metadata_sha256(rm65_bimanual_udp_feedback_profile().to_metadata())
 
 
-def dmtac_gripper_actuation_profile_sha256() -> str:
-    return _metadata_sha256(identified_bimanual_dmtac_gripper_profile().to_metadata())
+def resolve_dmtac_gripper_actuation_profile(name: str):
+    profiles = {
+        profile.name: profile
+        for profile in (
+            identified_bimanual_dmtac_gripper_profile(),
+            cube_lift_contact_dmtac_gripper_profile(),
+        )
+    }
+    try:
+        return profiles[str(name)]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported DM-Tac gripper profile {name!r}.") from exc
+
+
+def dmtac_gripper_actuation_profile_sha256(
+    name: str = DMTAC_GRIPPER_ACTUATION_PROFILE_NAME,
+) -> str:
+    return _metadata_sha256(
+        resolve_dmtac_gripper_actuation_profile(name).to_metadata()
+    )
+
+
+def is_cube_lift_success_reason(reason: object) -> bool:
+    return reason in {
+        HEIGHT_ONLY_LIFT_SUCCESS_REASON,
+        BILATERAL_CONTACT_LIFT_SUCCESS_REASON,
+    }
 
 
 def _finite_tuple(
@@ -186,6 +218,16 @@ class CubeLiftTaskConfig:
     max_episode_steps: int = 150
     lift_delta_m: float = 0.08
     success_hold_physics_ticks: int = 20
+    success_requires_bilateral_contact: bool = False
+    pose_target_anti_windup: bool = False
+    scripted_contact_reset: bool = False
+    scripted_contact_reset_hold_steps: int = 5
+    scripted_contact_reset_min_measured_close: float = 0.60
+    scripted_contact_reset_max_attempts: int = 1
+    scripted_contact_loss_grace_steps: int = 0
+    scripted_contact_action_scale: tuple[float, ...] = (1.0,) * 7
+    scripted_contact_action_bias: tuple[float, ...] = (0.0,) * 7
+    scripted_contact_nonnegative_lift_action: bool = False
     out_of_bounds_xyz_lower_m: tuple[float, ...] = (-0.922, -0.65, -0.05)
     out_of_bounds_xyz_upper_m: tuple[float, ...] = (-0.022, 0.65, 0.6)
     reward: CubeLiftRewardConfig = field(default_factory=CubeLiftRewardConfig)
@@ -252,15 +294,9 @@ class CubeLiftTaskConfig:
                     raise ValueError(
                         "Fully-actuated CubeLift v2 requires the identified MuJoCo gripper."
                     )
-                if (
-                    self.gripper_actuation_profile_name
-                    != DMTAC_GRIPPER_ACTUATION_PROFILE_NAME
-                ):
-                    raise ValueError(
-                        "Fully-actuated CubeLift requires gripper profile "
-                        f"{DMTAC_GRIPPER_ACTUATION_PROFILE_NAME!r}."
-                    )
-                expected_gripper_hash = dmtac_gripper_actuation_profile_sha256()
+                expected_gripper_hash = dmtac_gripper_actuation_profile_sha256(
+                    str(self.gripper_actuation_profile_name)
+                )
                 if self.gripper_actuation_profile_sha256 != expected_gripper_hash:
                     raise ValueError(
                         "CubeLift gripper actuation profile hash mismatch: "
@@ -504,10 +540,137 @@ class CubeLiftTaskConfig:
         object.__setattr__(self, "settle_physics_ticks", int(self.settle_physics_ticks))
         object.__setattr__(self, "max_episode_steps", int(self.max_episode_steps))
         object.__setattr__(self, "success_hold_physics_ticks", int(self.success_hold_physics_ticks))
+        object.__setattr__(
+            self,
+            "success_requires_bilateral_contact",
+            bool(self.success_requires_bilateral_contact),
+        )
+        object.__setattr__(
+            self,
+            "pose_target_anti_windup",
+            bool(self.pose_target_anti_windup),
+        )
+        object.__setattr__(
+            self,
+            "scripted_contact_reset",
+            bool(self.scripted_contact_reset),
+        )
+        object.__setattr__(
+            self,
+            "scripted_contact_reset_hold_steps",
+            int(self.scripted_contact_reset_hold_steps),
+        )
+        if self.scripted_contact_reset_hold_steps <= 0:
+            raise ValueError("scripted_contact_reset_hold_steps must be positive.")
+        object.__setattr__(
+            self,
+            "scripted_contact_reset_max_attempts",
+            int(self.scripted_contact_reset_max_attempts),
+        )
+        if self.scripted_contact_reset_max_attempts <= 0:
+            raise ValueError("scripted_contact_reset_max_attempts must be positive.")
+        object.__setattr__(
+            self,
+            "scripted_contact_loss_grace_steps",
+            int(self.scripted_contact_loss_grace_steps),
+        )
+        if self.scripted_contact_loss_grace_steps < 0:
+            raise ValueError(
+                "scripted_contact_loss_grace_steps must be non-negative."
+            )
+        scripted_action_scale = _finite_tuple(
+            self.scripted_contact_action_scale,
+            size=7,
+            name="scripted_contact_action_scale",
+        )
+        if any(value < 0.0 or value > 1.0 for value in scripted_action_scale):
+            raise ValueError(
+                "scripted_contact_action_scale values must lie in [0, 1]."
+            )
+        object.__setattr__(
+            self,
+            "scripted_contact_action_scale",
+            scripted_action_scale,
+        )
+        scripted_action_bias = _finite_tuple(
+            self.scripted_contact_action_bias,
+            size=7,
+            name="scripted_contact_action_bias",
+        )
+        if any(
+            abs(bias) + scale > 1.0
+            for bias, scale in zip(
+                scripted_action_bias,
+                scripted_action_scale,
+            )
+        ):
+            raise ValueError(
+                "scripted_contact_action_bias plus action scale must keep "
+                "every constrained action within [-1, 1]."
+            )
+        object.__setattr__(
+            self,
+            "scripted_contact_action_bias",
+            scripted_action_bias,
+        )
+        object.__setattr__(
+            self,
+            "scripted_contact_nonnegative_lift_action",
+            bool(self.scripted_contact_nonnegative_lift_action),
+        )
+        if not self.scripted_contact_reset and (
+            self.scripted_contact_loss_grace_steps > 0
+            or scripted_action_scale != (1.0,) * 7
+            or scripted_action_bias != (0.0,) * 7
+            or self.scripted_contact_nonnegative_lift_action
+        ):
+            raise ValueError(
+                "Scripted-contact curriculum constraints require "
+                "scripted_contact_reset=true."
+            )
+        scripted_min_close = float(
+            self.scripted_contact_reset_min_measured_close
+        )
+        if not 0.0 <= scripted_min_close <= self.right_gripper_max_close:
+            raise ValueError(
+                "scripted_contact_reset_min_measured_close must lie within "
+                "the configured gripper close range."
+            )
+        object.__setattr__(
+            self,
+            "scripted_contact_reset_min_measured_close",
+            scripted_min_close,
+        )
 
     @property
     def action_dim(self) -> int:
         return 7
+
+    @property
+    def policy_active_action_indices(self) -> tuple[int, ...]:
+        """Return policy-controlled indices within the public 7-D action."""
+
+        if not self.scripted_contact_reset:
+            return tuple(range(self.action_dim))
+        active = tuple(
+            index
+            for index, scale in enumerate(self.scripted_contact_action_scale)
+            if scale > 0.0
+        )
+        if not active:
+            raise ValueError(
+                "A scripted-contact curriculum must expose at least one "
+                "policy-controlled action dimension."
+            )
+        return active
+
+    @property
+    def success_termination_reason(self) -> str:
+        return (
+            BILATERAL_CONTACT_LIFT_SUCCESS_REASON
+            if self.success_requires_bilateral_contact
+            else HEIGHT_ONLY_LIFT_SUCCESS_REASON
+        )
 
     @property
     def uses_pose_action(self) -> bool:
@@ -686,6 +849,32 @@ class CubeLiftTaskConfig:
             "pose_control_frame": self.pose_control_frame,
             "right_tcp_delta_m": list(self.right_tcp_delta_m),
             "right_tcp_rotation_delta_rad": list(self.right_tcp_rotation_delta_rad),
+            "pose_target_anti_windup": self.pose_target_anti_windup,
+            "scripted_contact_reset": self.scripted_contact_reset,
+            "scripted_contact_reset_hold_steps": (
+                self.scripted_contact_reset_hold_steps
+            ),
+            "scripted_contact_reset_min_measured_close": (
+                self.scripted_contact_reset_min_measured_close
+            ),
+            "scripted_contact_reset_max_attempts": (
+                self.scripted_contact_reset_max_attempts
+            ),
+            "scripted_contact_loss_grace_steps": (
+                self.scripted_contact_loss_grace_steps
+            ),
+            "scripted_contact_action_scale": list(
+                self.scripted_contact_action_scale
+            ),
+            "scripted_contact_action_bias": list(
+                self.scripted_contact_action_bias
+            ),
+            "scripted_contact_nonnegative_lift_action": (
+                self.scripted_contact_nonnegative_lift_action
+            ),
+            "policy_active_action_indices": list(
+                self.policy_active_action_indices
+            ),
             "left_tool_profile_path": self.left_tool_profile_path,
             "right_tool_profile_path": self.right_tool_profile_path,
             "wrist_rgb_enabled": self.wrist_rgb_enabled,
@@ -700,6 +889,9 @@ class CubeLiftTaskConfig:
             ),
             "observation_layout": self.observation_layout,
             "observation_dim": self.observation_dim,
+            "success_requires_bilateral_contact": (
+                self.success_requires_bilateral_contact
+            ),
             "reward_shaping": dict(self.reward_shaping),
         }
 
@@ -806,6 +998,36 @@ class CubeLiftTaskConfig:
             max_episode_steps=int(payload.get("max_episode_steps", 150)),
             lift_delta_m=float(payload.get("lift_delta_m", 0.08)),
             success_hold_physics_ticks=int(payload.get("success_hold_physics_ticks", 20)),
+            success_requires_bilateral_contact=bool(
+                payload.get("success_requires_bilateral_contact", False)
+            ),
+            pose_target_anti_windup=bool(
+                payload.get("pose_target_anti_windup", False)
+            ),
+            scripted_contact_reset=bool(
+                payload.get("scripted_contact_reset", False)
+            ),
+            scripted_contact_reset_hold_steps=int(
+                payload.get("scripted_contact_reset_hold_steps", 5)
+            ),
+            scripted_contact_reset_min_measured_close=float(
+                payload.get("scripted_contact_reset_min_measured_close", 0.60)
+            ),
+            scripted_contact_reset_max_attempts=int(
+                payload.get("scripted_contact_reset_max_attempts", 1)
+            ),
+            scripted_contact_loss_grace_steps=int(
+                payload.get("scripted_contact_loss_grace_steps", 0)
+            ),
+            scripted_contact_action_scale=tuple(
+                payload.get("scripted_contact_action_scale", (1.0,) * 7)
+            ),
+            scripted_contact_action_bias=tuple(
+                payload.get("scripted_contact_action_bias", (0.0,) * 7)
+            ),
+            scripted_contact_nonnegative_lift_action=bool(
+                payload.get("scripted_contact_nonnegative_lift_action", False)
+            ),
             out_of_bounds_xyz_lower_m=tuple(payload["out_of_bounds_xyz_lower_m"]),
             out_of_bounds_xyz_upper_m=tuple(payload["out_of_bounds_xyz_upper_m"]),
             reward=CubeLiftRewardConfig.from_dict(reward_payload),
@@ -846,7 +1068,9 @@ class CubeLiftTaskConfig:
     def gripper_actuation_profile(self):
         if not self.uses_actuated_gripper:
             return None
-        profile = identified_bimanual_dmtac_gripper_profile()
+        profile = resolve_dmtac_gripper_actuation_profile(
+            str(self.gripper_actuation_profile_name)
+        )
         if profile.name != self.gripper_actuation_profile_name:
             raise RuntimeError("Resolved DM-Tac gripper profile name changed after validation.")
         return profile
@@ -855,6 +1079,7 @@ class CubeLiftTaskConfig:
 __all__ = [
     "ACTUATED_POSITION_EXECUTION_MODE",
     "CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION",
+    "CUBE_LIFT_CONTACT_GRIPPER_ACTUATION_PROFILE_NAME",
     "CUBE_LIFT_FULLY_ACTUATED_TASK_SCHEMA_VERSION",
     "CUBE_LIFT_TASK_SCHEMA_VERSION",
     "CubeLiftRewardConfig",
@@ -870,6 +1095,8 @@ __all__ = [
     "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2",
     "PHYSICAL_CONTACT_GRASP_MODE",
     "PRIVILEGED_EXPERT_POLICY_CLASS",
+    "SCRIPTED_CONTACT_LOST_REASON",
     "rm65_position_actuation_profile_sha256",
     "dmtac_gripper_actuation_profile_sha256",
+    "resolve_dmtac_gripper_actuation_profile",
 ]

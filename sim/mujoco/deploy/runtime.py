@@ -9,6 +9,17 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 from dataset_contracts.control_trace import ControlTraceFact
+from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionInputDraft,
+    CompositionSpec,
+)
+from control_composition.observability import SourceDifferenceSpec
+from control_composition.retention import TimeWindowRetentionSpec
+from control_composition.runtime import (
+    CompositeProposalSubmission,
+    ControlCompositionRuntime,
+)
 from dataset_contracts.replay import (
     REPLAY_EXECUTION_MODE_SIM_AUTHORITY,
     TargetRuntimeActionContract,
@@ -20,8 +31,6 @@ from robot_motion.action import (
     ActionComponentSpec,
     ActionPersistencePolicy,
     ActionProposalDraft,
-    CompositionInputDraft,
-    CompositionSpec,
     CandidateAuthorizationAdmissionReceipt,
     CompoundDispatchManifest,
     AuthorityPolicySpec,
@@ -61,8 +70,6 @@ from robot_motion.position_control import ExecutionCapabilityProfile
 from robot_motion.deploy import (
     ActionChunkExecutionPolicy,
     PolicyActionEmission,
-    PolicyContextDraft,
-    PolicyTopologyRuntime,
     project_policy_action_emission,
 )
 
@@ -136,6 +143,10 @@ class MujocoDeployConfig:
     compound_hand_action_specs_by_side: Mapping[
         str, HandActionSpec | Mapping[str, object]
     ] = field(default_factory=dict)
+    # Default-on preserves every existing runtime.  A formal composition
+    # profile sets this false so raw contributor/policy proposals cannot race
+    # the single composer proposal for actuator authority.
+    enable_primary_policy_authority: bool = True
 
     def __post_init__(self) -> None:
         for name in (
@@ -162,6 +173,21 @@ class MujocoDeployConfig:
         )
         if int(self.producer_epoch) < 0:
             raise ValueError("producer_epoch must be non-negative.")
+        for name in (
+            "enable_primary_policy_authority",
+            "enable_composer_authority",
+            "enable_replay_authority",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool.")
+        if not any(
+            (
+                self.enable_primary_policy_authority,
+                self.enable_composer_authority,
+                self.enable_replay_authority,
+            )
+        ):
+            raise ValueError("At least one MuJoCo proposal authority must be enabled.")
         if self.reference_activation_profile_id not in {
             IMMEDIATE_QREF_SIM_V1,
             SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
@@ -372,6 +398,7 @@ class MujocoDeployRuntime:
         self.clock = clock
         self.pose_resolver = pose_resolver
         self._pose_execution_enabled = pose_resolver is not None
+        self._explicit_shared_safety = shared_safety is not None
         self._compound_hand_specs = dict(
             config.compound_hand_action_specs_by_side
         )
@@ -416,8 +443,6 @@ class MujocoDeployRuntime:
                 raise ValueError(
                     "Pose execution v1 requires scheduled qpos reference segments."
                 )
-            if config.enable_composer_authority:
-                raise ValueError("Pose execution v1 does not enable the qpos composer.")
             transformer = pose_resolver.pose_transformer
             if transformer is not None and (
                 transformer.binding_receipt.target_pose_frame_contract_hash
@@ -577,7 +602,9 @@ class MujocoDeployRuntime:
             schedule=decision_schedule,
             capability=self.execution_capability,
         )
-        priority = {config.producer_id: 10}
+        priority: dict[str, int] = {}
+        if config.enable_primary_policy_authority:
+            priority[config.producer_id] = 10
         if config.enable_replay_authority:
             priority[config.replay_producer_id] = 20
         if config.enable_composer_authority:
@@ -669,7 +696,7 @@ class MujocoDeployRuntime:
                     rig,
                     **receiver_args,
                 )
-        self.policy_topology = PolicyTopologyRuntime(
+        self.policy_topology = ControlCompositionRuntime(
             runtime_session_id=config.runtime_session_id,
             control_domain_id=config.control_domain_id,
             embodiment_instance_id=config.embodiment_instance_id,
@@ -679,6 +706,20 @@ class MujocoDeployRuntime:
             trace_context=self.core.trace_context,
             trace_emitter=self.core.record_external_facts,
             proposal_admitter=self.core.admit_proposal,
+            context_retention_spec=TimeWindowRetentionSpec(
+                spec_id="mujoco-composition-context-latest-v1",
+                history_window_sec=0.0,
+                max_future_lead_sec=1.0,
+                max_effective_duration_sec=1.0,
+                max_late_arrival_sec=0.0,
+            ),
+            composition_input_retention_spec=TimeWindowRetentionSpec(
+                spec_id="mujoco-composition-input-latest-v1",
+                history_window_sec=0.0,
+                max_future_lead_sec=1.0,
+                max_effective_duration_sec=1.0,
+                max_late_arrival_sec=0.0,
+            ),
             clock=clock,
         )
         self._started = False
@@ -691,6 +732,7 @@ class MujocoDeployRuntime:
         self._next_proposal_sequence = 0
         self._next_replay_proposal_sequence = 0
         self._next_composite_proposal_sequence = 0
+        self._composer_producer_epoch = config.producer_epoch
         self.observation_adapter = MujocoPolicyObservationAdapter(
             rig,
             policy_node_id=config.policy_node_id,
@@ -776,6 +818,14 @@ class MujocoDeployRuntime:
     def trace_facts(self) -> tuple[ControlTraceFact, ...]:
         return self.core.trace_facts
 
+    @property
+    def pose_execution_enabled(self) -> bool:
+        return self._pose_execution_enabled
+
+    @property
+    def explicit_shared_safety(self) -> bool:
+        return self._explicit_shared_safety
+
     def start(self) -> None:
         if self._started:
             return
@@ -805,10 +855,10 @@ class MujocoDeployRuntime:
         *,
         producer_epoch: int | None = None,
         reason: str = "mujoco policy topology startup",
-    ) -> None:
+    ):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        self.core.activate_producer(
+        activation = self.core.activate_producer(
             producer_id=producer_id,
             producer_epoch=(
                 self.config.producer_epoch
@@ -817,6 +867,9 @@ class MujocoDeployRuntime:
             ),
             reason=reason,
         )
+        if producer_id == self.config.composer_producer_id:
+            self._composer_producer_epoch = activation.producer_epoch
+        return activation
 
     def submit_policy_action(
         self,
@@ -1028,9 +1081,14 @@ class MujocoDeployRuntime:
                 raise ValueError(
                     "Deployable sim action does not match its explicit execution profile."
                 )
-            if set(action.active_effectors) != {"left_arm", "right_arm"}:
+            expected_effectors = {
+                component.effector_name for component in self.catalog.components
+            }
+            if set(action.active_effectors) != expected_effectors:
                 raise ValueError(
-                    "M5.5a requires one atomic coupled bimanual action."
+                    "Policy action must exactly cover the explicit execution "
+                    f"profile components: expected={sorted(expected_effectors)!r}, "
+                    f"got={sorted(action.active_effectors)!r}."
                 )
         normalized_policy_output_id = str(policy_output_id).strip()
         if not normalized_policy_output_id:
@@ -1298,12 +1356,12 @@ class MujocoDeployRuntime:
         self.core.record_observation_cut(bundle.record)
         return bundle
 
-    def submit_policy_context(self, draft: PolicyContextDraft):
+    def submit_composition_context(self, draft: CompositionContextDraft):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.admit_policy_context(draft)
+        return self.policy_topology.admit_composition_context(draft)
 
-    def capture_policy_context_snapshot(
+    def capture_composition_context_snapshot(
         self,
         *,
         target_effective_at: float,
@@ -1311,7 +1369,7 @@ class MujocoDeployRuntime:
     ):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        return self.policy_topology.capture_policy_context_snapshot(
+        return self.policy_topology.capture_composition_context_snapshot(
             target_effective_at=target_effective_at,
             required_channels=required_channels,
         )
@@ -1329,6 +1387,7 @@ class MujocoDeployRuntime:
         required_context_channels: tuple[str, ...] = (),
         cutoff_at: float | None = None,
         control_cut: ControlCut | None = None,
+        source_difference_spec: SourceDifferenceSpec | None = None,
     ):
         """Evaluate a composition cut without proposal, authority, or dispatch."""
 
@@ -1340,6 +1399,7 @@ class MujocoDeployRuntime:
             required_context_channels=required_context_channels,
             cutoff_at=cutoff_at,
             control_cut=control_cut,
+            source_difference_spec=source_difference_spec,
         )
         if submission.proposal_admission is not None:
             raise RuntimeError("Shadow composition unexpectedly admitted a proposal.")
@@ -1352,6 +1412,7 @@ class MujocoDeployRuntime:
         target_effective_at: float,
         policy_node_id: str = "fast-composer",
         required_context_channels: tuple[str, ...] = (),
+        source_difference_spec: SourceDifferenceSpec | None = None,
     ):
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
@@ -1361,19 +1422,60 @@ class MujocoDeployRuntime:
             spec=spec,
             target_effective_at=target_effective_at,
             producer_id=self.config.composer_producer_id,
-            producer_epoch=self.config.producer_epoch,
+            producer_epoch=self._composer_producer_epoch,
             sequence=self._next_composite_proposal_sequence,
             effective_until=target_effective_at + self.config.proposal_horizon_sec,
             component_coverage=("left_arm", "right_arm"),
             selection_groups=("arms",),
             policy_node_id=policy_node_id,
             required_context_channels=required_context_channels,
+            source_difference_spec=source_difference_spec,
         )
         if (
             submission.proposal_admission is not None
             and submission.proposal_admission.accepted
         ):
             self._next_composite_proposal_sequence += 1
+        return submission
+
+    def submit_evaluated_composition(
+        self,
+        evaluation: CompositeProposalSubmission,
+        *,
+        policy_node_id: str = "formal-composer",
+    ) -> CompositeProposalSubmission:
+        """Promote the exact gated result without capturing a later cut."""
+
+        if not self._started:
+            raise RuntimeError("MujocoDeployRuntime.start() is required.")
+        if not self.config.enable_composer_authority:
+            raise RuntimeError("Composer authority is not enabled for this sim runtime.")
+        submission = self.policy_topology.admit_evaluated_composition(
+            evaluation,
+            runtime_session_id=self.config.runtime_session_id,
+            producer_id=self.config.composer_producer_id,
+            producer_epoch=self._composer_producer_epoch,
+            sequence=self._next_composite_proposal_sequence,
+            effective_until=(
+                evaluation.input_snapshot.target_effective_at
+                + self.config.proposal_horizon_sec
+            ),
+            component_coverage=("left_arm", "right_arm"),
+            selection_groups=("arms",),
+            policy_node_id=policy_node_id,
+        )
+        if (
+            submission.proposal_admission is not None
+            and submission.proposal_admission.accepted
+            and submission.proposal_admission
+            is not evaluation.proposal_admission
+        ):
+            proposal = submission.proposal_admission.proposal
+            if (
+                proposal is not None
+                and proposal.sequence == self._next_composite_proposal_sequence
+            ):
+                self._next_composite_proposal_sequence += 1
         return submission
 
     def step(

@@ -9,7 +9,7 @@ import numpy as np
 
 from .config import CubeLiftTaskConfig
 from .env import DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH
-from .kernel import CubeLiftKernel, InfoMode
+from .kernel import CubeLiftKernel, InfoMode, ScriptedContactResetError
 from .spec import CubeLiftActionSpec, CubeLiftObservationSpec, require_gymnasium
 
 
@@ -67,7 +67,25 @@ class FastCubeLiftEnv(_EnvBase):
         super().reset(seed=seed)
         if options:
             raise ValueError("FastCubeLiftEnv does not support reset options yet.")
-        observation, info = self.kernel.reset(seed=seed)
+        reset_failures: list[str] = []
+        max_attempts = (
+            self.config.scripted_contact_reset_max_attempts
+            if self.config.scripted_contact_reset
+            else 1
+        )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                observation, info = self.kernel.reset(seed=seed)
+                break
+            except ScriptedContactResetError as exc:
+                reset_failures.append(str(exc))
+                if attempt >= max_attempts:
+                    raise
+        info = {
+            **info,
+            "scripted_contact_reset_attempts": attempt,
+            "scripted_contact_reset_failures": tuple(reset_failures),
+        }
         self.last_physics_ticks = self.kernel.last_physics_ticks
         return observation, info
 

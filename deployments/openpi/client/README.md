@@ -48,7 +48,10 @@ must explicitly compose its returned actions with the existing generic
 `DeployRobotActionAdapter` and `MujocoDeployRuntime` profile. For a synchronous
 sim-only composition, `sim.mujoco.deploy.MujocoPolicyRollout` owns that seam;
 it does not change the PPO training path or the `sim.mujoco_temp_pipeline.play`
-Torch-policy entrypoint.
+Torch-policy entrypoint. Arms-only remains the default MuJoCo target; OpenPI
+hand keyframes require the explicit DMTAC compound target profile and shared
+safety callback, otherwise the runtime rejects the chunk rather than dropping
+the gripper commands.
 
 ### Numeric normalization ownership
 
@@ -69,6 +72,18 @@ server-owned case. Its checkpoint asset contains `norm_stats.json` with
 `[-1, 1]` using `(x-q01)/(q99-q01+1e-6)*2-1`; model actions are mapped back to
 raw compact 16D using the inverse formula. Images remain raw RGB `uint8` HWC
 at this boundary (the server later resizes them to 224x224).
+
+The resolution boundary is intentional and must not be mistaken for visual
+sim-real equivalence. The current MuJoCo OpenPI smoke path may render all
+three camera slots at `48x48` so that the transport, policy adapter, action
+codec, and sim execution path can be exercised cheaply. The remote OpenPI
+policy then applies its model transform `resize_with_pad(224, 224)` before the
+vision encoder. This is a valid protocol/control-chain test, but it is not the
+same image distribution as the real RM65 cameras (`640x480`, 4:3): a square
+`48x48` source is upsampled without padding, while a `640x480` source becomes
+`224x168` and receives top/bottom padding. Do not report the smoke result as
+visual sim-real alignment; use a camera-contract-matched source profile for
+that claim.
 Use `make_openpi_quantile_normalization_contract()` when the artifact has an
 exact stats reference and SHA-256. Do not infer this contract from a field such
 as `state_input_mode`. The remote registry now publishes additive normalization
@@ -162,9 +177,13 @@ transport, but never sends actuator commands. The guard also removes the lab
 profile's qpos-init authority and configures RM65/DMTAC/hand backends for
 observation-only startup. The explicit shadow profile is headless: it
 auto-starts policy observation, disables manual ready confirmation, and keeps
-DMTAC tactile disabled unless a separate gate changes that scope. The ordinary
-production profile retains its ready confirmation, qpos-init and configured
-tactile behavior. It is not dataset replay: replay/synthetic tests
+DMTAC tactile disabled unless a separate gate changes that scope. For every
+launch it resets each artifact-selected RealSense by its configured serial,
+waits for that device to reconnect, then starts cameras in camera-config order
+with a 0.5 s stagger. Reset is limited to the selected serial; it does not
+probe or rewrite stream profiles. The ordinary production profile retains its
+ready confirmation, qpos-init, configured tactile behavior, and existing
+camera startup defaults. It is not dataset replay: replay/synthetic tests
 remain the deterministic complement for codec and plan semantics. The result
 is only a real-shadow readiness record, not permission for motion deployment.
 

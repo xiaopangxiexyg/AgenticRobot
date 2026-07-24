@@ -1,0 +1,103 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_tx3a_policy_emission_target_proposal_preparation_local_2026_07_24",
+  "scope": "pure_policy_emission_target_proposal_preparation_no_trace_no_target_no_action",
+  "captured_at": "2026-07-24T18:58:22+08:00",
+  "repository": {
+    "dexteleop_commit": "a79c180a6ea415c239e3a74c8999b6eb07acadfd",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "dependency_or_lock_change": false
+  },
+  "implementation": {
+    "assessment": "robot_motion.deploy.assess_policy_emission_target_compatibility",
+    "preparation": "robot_motion.deploy.prepare_policy_emission_target_proposal",
+    "result_type": "robot_motion.deploy.PolicyEmissionTargetProposalPreparation",
+    "proposal_type": "robot_motion.action.ActionProposalDraft",
+    "assessment_binds_exact_emission_id_and_hash": true,
+    "target_identity_source": "TargetRuntimeActionContract",
+    "authority_request": "none",
+    "accepted_assessment_required_for_proposal_draft": true,
+    "records_control_trace": false,
+    "calls_arbiter_or_safety": false,
+    "calls_ik_or_target": false,
+    "grants_authority": false,
+    "dispatches_action": false
+  },
+  "virtual_target_characterization": {
+    "receiver": "robot_motion.action.ProposalBuffer",
+    "first_admission": "accepted",
+    "duplicate_same_identity": "rejected_duplicate",
+    "scheduled_lead_insufficient": "no_proposal_draft",
+    "legacy_and_typed_representation_proofs": "preserved_distinct"
+  },
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_rtc_emission_target.py",
+      "result": "12 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_rtc_emission_target.py tests/test_deploy_action_emission.py tests/test_action_proposal_contracts.py tests/test_rtc_generic_deploy_runtime.py tests/test_rtc_final_chunk_backend.py tests/test_openpi_rtc_final_chunk_adapter.py tests/test_vla_scratch_rtc_adapter.py",
+      "result": "101 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_rtc_*.py tests/test_openpi_common_deploy.py tests/test_openpi_rtc_final_chunk_adapter.py tests/test_vla_scratch_rtc_adapter.py",
+      "result": "199 passed"
+    },
+    {
+      "command": "python -m py_compile robot_motion/deploy/emission_target.py tests/test_rtc_emission_target.py",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check -- robot_motion/deploy/emission_target.py robot_motion/deploy/__init__.py tests/test_rtc_emission_target.py DEPLOY_SCHEMA.md todos/dexteleop_rtc_landing_plan.md",
+      "result": "passed"
+    }
+  ],
+  "boundary": {
+    "control_station_or_hitl_changed_by_tx3a": false,
+    "control_trace_schema_changed_by_tx3a": false,
+    "human_or_replay_schema_changed_by_tx3a": false,
+    "mujoco_runtime_changed_by_tx3a": false,
+    "teleop_or_replay_runtime_changed": false,
+    "sync_queue_v1_changed": false,
+    "rtc_worker_plan_or_pop_changed": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "proposal_receiver_admission_claimed": false,
+    "execution_target_admission_claimed": false,
+    "sim_or_real_authority_claimed": false
+  },
+  "scoped_source_sha256": {
+    "robot_motion/deploy/emission_target.py": "8024dfb6d2ba4b04eec44d3d3422489aa7375dbe74454a1aec80e416add1942d",
+    "robot_motion/deploy/__init__.py": "64dc79196aad08f754c610bd1b2294971c7b60d24229b6ce6e37670ca2be516a",
+    "tests/test_rtc_emission_target.py": "d17cfd9d86ffd8ea988897aed380b74bd8a992ba4ea554f9fd74794685e8979f",
+    "DEPLOY_SCHEMA.md": "98f17391f2beb055497c4302a6dc62b2ed84eb4a085a529c500432c107424cc8",
+    "todos/dexteleop_rtc_landing_plan.md": "c5ca0ac70a5063201abf532c72de425d67f3f8f3bf80a7a8a1fdf43a5738f16f"
+  },
+  "claims": [
+    "accepted target compatibility can be converted into a target-neutral policy proposal draft without ControlTrace or target calls",
+    "the preparation binds exact emission identity and content hash plus target, catalog, activation and representation proof identities",
+    "target control-domain and embodiment identities are sourced from the target runtime contract",
+    "rejected compatibility cannot produce a proposal draft",
+    "a receiver-owned ProposalBuffer still performs the only formal proposal admission and rejects duplicate identity"
+  ],
+  "non_claims": [
+    "typed policy_action_emission ControlTrace is not implemented by TX3a",
+    "Control Station or HITL policy contribution is not connected",
+    "MuJoCo target receiver admission is not implemented by TX3a",
+    "canonical safety, IK, reference activation and dispatch are not executed",
+    "scheduled RTC early admission or preview identity is not implemented",
+    "sim or real motion authority is not granted"
+  ],
+  "next_gates": [
+    {
+      "id": "rtc_tx2_typed_policy_action_emission_trace",
+      "status": "deferred_to_shared_control_trace_mainline",
+      "constraint": "must remain additive and preserve legacy v1"
+    },
+    {
+      "id": "rtc_tx3b_target_receiver_admission",
+      "status": "pending_shared_target_seam_stabilization",
+      "constraint": "must consume TX3a preparation without hard-coded bimanual or legacy-only proof"
+    }
+  ]
+}

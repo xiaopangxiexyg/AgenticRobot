@@ -1,8 +1,13 @@
-"""Canonical RobotAction schema and per-effector DOF constants.
+"""Legacy-compatible canonical ``RobotAction`` v1 carrier.
 
-Arm pose vectors are always ``xyz + quat_xyzw`` with 7 values. RM65 arm qpos
-vectors are 6 values. The default hand contract is q6; hand16 action spaces
-use 16 slots and may contain NaN padding for inactive hand slots.
+Arm pose vectors are always ``xyz + quat_xyzw`` with seven representation
+values; this is not the robot's joint DoF. RM65 direct arm qpos vectors are six
+values. The default hand contract is q6; hand16 action spaces use 16 slots and
+may contain NaN padding for inactive hand slots.
+
+This v1 carrier intentionally retains left/right and legacy slot constraints.
+Generic composition topology is component-keyed; robot joint topology belongs
+to downstream resolver capabilities.
 """
 
 from __future__ import annotations
@@ -17,7 +22,9 @@ from robot_motion.runtime import TeleopCommand
 
 
 VALID_SIDES: tuple[str, ...] = ("left", "right")
-ARM_POSE_DOF = 7
+ARM_POSE_DIM = 7
+# Compatibility alias. Pose dimension must not be interpreted as arm joint DoF.
+ARM_POSE_DOF = ARM_POSE_DIM
 RM65_ARM_DOF = 6
 INSPIRE_HAND_DOF = 6
 HAND16_SLOT_DOF = 16
@@ -214,7 +221,7 @@ class RobotAction:
         hand_dof = hand_dof_for_action_space(action_space)
         arm_pose = _normalize_side_vectors(
             self.arm_pose_by_side,
-            length=ARM_POSE_DOF,
+            length=ARM_POSE_DIM,
             label="arm_pose",
         )
         arm_qpos = _normalize_side_vectors(
@@ -490,6 +497,7 @@ class ActionRecord:
 
 __all__ = [
     "ARM_POSE_DOF",
+    "ARM_POSE_DIM",
     "BIMANUAL_EE_POSE_HAND16_V1",
     "BIMANUAL_EE_POSE_V1",
     "BIMANUAL_MIXED_HAND16_V1",

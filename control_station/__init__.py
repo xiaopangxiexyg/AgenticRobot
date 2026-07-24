@@ -22,6 +22,10 @@ from .contracts import (
     StationOperationResultDraft,
 )
 from .state_machine import (
+    COMPOSITION_SESSION_OPERATION_HELD_STATUS_V1,
+    COMPOSITION_SESSION_OPERATION_READY_STATUS_V1,
+    COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1,
+    COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1,
     CONTROL_STATION_LIFECYCLE_STATES_V1,
     HUMAN_TAKEOVER_OPERATION_FAULTED_STATUS_V1,
     HUMAN_TAKEOVER_OPERATION_HELD_STATUS_V1,
@@ -37,6 +41,18 @@ from .state_machine import (
     apply_station_operation_result,
     apply_station_intent,
     initial_control_station_state,
+)
+from .composition_session import (
+    COMPOSITION_SESSION_PHASES_V1,
+    CompositionSessionController,
+    CompositionSessionOperationSpec,
+    CompositionSessionRearmReceipt,
+    CompositionSessionRearmSpec,
+    CompositionSessionState,
+    CompositionSessionTransition,
+    advance_composition_session,
+    initial_composition_session_state,
+    validate_composition_session_rearm,
 )
 from .adapters import (
     DeterministicNoIoStationAdapter,
@@ -56,6 +72,10 @@ from .publication_barrier import (
 )
 from .control_trace import (
     StationControlTraceBridge,
+    project_composition_session_rearm_receipt,
+    project_composition_session_rearm_spec,
+    project_composition_session_spec,
+    project_composition_session_transition,
     project_station_intent_transition,
     project_station_operation_transition,
     project_station_publication_barrier_transition,
@@ -133,6 +153,11 @@ from .sources import (
 )
 
 __all__ = [
+    "COMPOSITION_SESSION_OPERATION_HELD_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_READY_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1",
+    "COMPOSITION_SESSION_PHASES_V1",
     "CONTROL_STATION_INTENT_KINDS_V1",
     "CONTROL_STATION_LIFECYCLE_STATES_V1",
     "CONTROL_STATION_SOURCE_KINDS_V1",
@@ -164,6 +189,12 @@ __all__ = [
     "ControlStationOperationTransition",
     "ControlStationState",
     "ControlStationTransition",
+    "CompositionSessionController",
+    "CompositionSessionOperationSpec",
+    "CompositionSessionRearmReceipt",
+    "CompositionSessionRearmSpec",
+    "CompositionSessionState",
+    "CompositionSessionTransition",
     "ExecutionDomainBinding",
     "ExecutionHoldReceipt",
     "ExecutionReadyReceipt",
@@ -226,6 +257,7 @@ __all__ = [
     "admit_station_intent",
     "apply_station_operation_result",
     "apply_station_intent",
+    "advance_composition_session",
     "apply_authority_release",
     "apply_execution_hold",
     "apply_execution_ready",
@@ -236,6 +268,12 @@ __all__ = [
     "fail_human_takeover",
     "build_control_station_status_payload",
     "initial_control_station_state",
+    "initial_composition_session_state",
+    "validate_composition_session_rearm",
+    "project_composition_session_spec",
+    "project_composition_session_rearm_receipt",
+    "project_composition_session_rearm_spec",
+    "project_composition_session_transition",
     "project_station_intent_transition",
     "project_station_operation_transition",
     "project_station_publication_barrier_transition",

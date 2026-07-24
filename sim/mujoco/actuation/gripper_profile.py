@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -30,11 +30,14 @@ def _finite_tuple(
 
 @dataclass(frozen=True)
 class GripperContactTuning:
-    """Optional pad-contact override reserved for later real-data fitting."""
+    """Versioned contact overrides; current CubeLift tuning is simulation-only."""
 
     friction: tuple[float, float, float] | None = None
     solref: tuple[float, float] | None = None
     solimp: tuple[float, float, float] | None = None
+    post_settle_geom_friction_by_name: Mapping[
+        str, tuple[float, float, float]
+    ] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.friction is not None:
@@ -54,13 +57,39 @@ class GripperContactTuning:
                 "solimp",
                 _finite_tuple(self.solimp, name="solimp", length=3),
             )
+        post_settle_geoms: dict[str, tuple[float, float, float]] = {}
+        for raw_name, raw_friction in (
+            self.post_settle_geom_friction_by_name.items()
+        ):
+            name = str(raw_name).strip()
+            if not name:
+                raise ValueError("post-settle geom names must be non-empty.")
+            friction = _finite_tuple(
+                raw_friction,
+                name=f"{name}.friction",
+                length=3,
+            )
+            if any(value < 0.0 for value in friction):
+                raise ValueError("post-settle geom friction must be non-negative.")
+            post_settle_geoms[name] = friction
+        object.__setattr__(
+            self,
+            "post_settle_geom_friction_by_name",
+            MappingProxyType(post_settle_geoms),
+        )
 
     def to_metadata(self) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "friction": None if self.friction is None else list(self.friction),
             "solref": None if self.solref is None else list(self.solref),
             "solimp": None if self.solimp is None else list(self.solimp),
         }
+        if self.post_settle_geom_friction_by_name:
+            metadata["post_settle_geom_friction_by_name"] = {
+                name: list(values)
+                for name, values in self.post_settle_geom_friction_by_name.items()
+            }
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -362,9 +391,36 @@ def temporary_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     return identified_bimanual_dmtac_gripper_profile()
 
 
+def cube_lift_contact_dmtac_gripper_profile() -> GripperActuationProfile:
+    """Simulation-only Cube-Lift contact variant of the identified actuator."""
+
+    base = identified_bimanual_dmtac_gripper_profile()
+    return replace(
+        base,
+        name="dmtac_bimanual_position_cube_lift_contact_20260724.v2",
+        contact_tuning=GripperContactTuning(
+            post_settle_geom_friction_by_name={
+                "right_gripper_left_finger_collision_0": (1.0, 0.05, 0.005),
+                "right_gripper_right_finger_collision_0": (1.0, 0.05, 0.005),
+                "debug_cube_collision": (1.0, 0.05, 0.005),
+            },
+        ),
+        calibration_status=(
+            "identified_free_motion_simulation_only_cube_lift_contact_tuned"
+        ),
+        evidence=(
+            f"{base.evidence} Cube-Lift scripted physical-contact gate on "
+            "2026-07-24 selected MuJoCo pad friction=(1, 0.05, 0.005); "
+            "this contact tuple is simulation-only and is not hardware force "
+            "identification."
+        ),
+    )
+
+
 __all__ = [
     "GripperActuationProfile",
     "GripperContactTuning",
+    "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
     "temporary_bimanual_dmtac_gripper_profile",
 ]

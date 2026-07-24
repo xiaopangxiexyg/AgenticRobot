@@ -193,6 +193,36 @@ def test_deferred_finalize_starts_only_after_explicit_post_control_launch(tmp_pa
     }
 
 
+def test_stop_episode_carries_terminal_collision_summary_to_formal_finalize(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    recorder = _new_recorder(tmp_path, events)
+
+    task = recorder.stop_episode(
+        reason="force_collision",
+        step_index=43,
+        last_state="RUNNING",
+        summary={
+            "force_collision_detected": True,
+            "force_collision_event": {
+                "detected": True,
+                "source": "controller_hard_stop",
+            },
+        },
+        defer_finalize_start=True,
+    )
+
+    assert task is not None
+    assert task.pending
+    assert task.summary["stop_reason"] == "force_collision"
+    assert task.summary["force_collision_detected"] is True
+    assert task.summary["force_collision_event"] == {
+        "detected": True,
+        "source": "controller_hard_stop",
+    }
+
+
 def test_finalize_summary_persists_collection_integrity_failure(tmp_path: Path) -> None:
     recorder = _new_recorder(tmp_path, [])
     recorder._mark_collection_integrity_issue("collection_snapshot_thread_busy")

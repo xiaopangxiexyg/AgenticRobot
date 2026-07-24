@@ -172,6 +172,18 @@ _STATION_LIFECYCLE_REQUIRED = frozenset(
         "station_publication_barrier_transition",
     }
 )
+_COMPOSITION_SESSION_REQUIRED = frozenset(
+    {
+        "composition_session_spec",
+        "composition_session_transition",
+        "composition_spec",
+        "composition_input_admission",
+        "composition_contributor_input",
+        "composition_input_snapshot",
+        "composition_result",
+        "composition_authority_disposition",
+    }
+)
 _AUTHORITATIVE_REPLAY_SOURCE_REQUIRED = frozenset(
     {
         "replay_source_frame_emission",
@@ -600,6 +612,34 @@ TRACE_REQUIREMENT_PROFILES_V1: Mapping[str, TraceRequirementProfile] = MappingPr
                 profile_scope="formal_capture",
                 implementation_status="runtime_integrated",
             ),
+            _profile(
+                "deployable_sim_scheduled_pose_composer_station_v1",
+                "deployable_sim_scheduled_pose_composer_station",
+                required=(
+                    _AUTHORITATIVE_SIM_CORE_REQUIRED
+                    | _EXECUTION_MANIFEST_REQUIRED
+                    | _SCHEDULED_POSE_TO_QPOS_EVENT_TYPES
+                    | _STATION_LIFECYCLE_REQUIRED
+                    | _COMPOSITION_SESSION_REQUIRED
+                    | _AUTHORITATIVE_HUMAN_SOURCE_REQUIRED
+                    | {
+                        "replay_source_frame_emission",
+                        "replay_source_adapter_receipt",
+                        "execution_gate_event",
+                        "execution_cancellation",
+                        "execution_cancellation_ack",
+                    }
+                ),
+                not_applicable=_AUTHORITATIVE_NOT_APPLICABLE,
+                receipt_policy="required",
+                measurement_policy="required",
+                writer_failure_behavior="mark_uncommitted_continue",
+                lineage_policy_id=(
+                    "authoritative_station_pose_composition_session_lineage_v1"
+                ),
+                profile_scope="formal_capture",
+                implementation_status="runtime_integrated",
+            ),
         )
     }
 )
@@ -709,6 +749,15 @@ def evaluate_control_trace_lineage(
         "authoritative_station_scheduled_pose_human_replay_lineage_v1"
     ):
         enabled_barrier_authority_operations.add("request_human_takeover")
+    if profile.lineage_policy_id == (
+        "authoritative_station_pose_composition_session_lineage_v1"
+    ):
+        enabled_barrier_authority_operations.update(
+            {
+                "rearm_composition_session",
+                "start_composition_session",
+            }
+        )
 
     station_state_transitions = sorted(
         (
@@ -804,6 +853,18 @@ def evaluate_control_trace_lineage(
                         == "request_human_takeover"
                         and results[0].payload.get("result_status")
                         != "human_takeover_ready"
+                    )
+                    or (
+                        results[0].payload["operation_kind"]
+                        == "start_composition_session"
+                        and results[0].payload.get("result_status")
+                        != "composition_session_ready"
+                    )
+                    or (
+                        results[0].payload["operation_kind"]
+                        == "rearm_composition_session"
+                        and results[0].payload.get("result_status")
+                        != "composition_session_rearmed"
                     )
                     or not tuple(fact.payload["authority_evidence_refs"])
                 ):
@@ -966,11 +1027,36 @@ def evaluate_control_trace_lineage(
         event_type="policy_context",
         payload_key="context_id",
     )
+    composition_context_by_id = _payload_index(
+        ordered,
+        event_type="composition_context",
+        payload_key="context_id",
+    )
+    context_by_id = dict(policy_context_by_id)
+    for context_id, facts in composition_context_by_id.items():
+        context_by_id[context_id] = [
+            *context_by_id.get(context_id, ()),
+            *facts,
+        ]
     composition_input_by_id = _payload_index(
         ordered,
         event_type="composition_input",
         payload_key="composition_input_id",
     )
+    composition_spec_by_hash = _payload_index(
+        ordered,
+        event_type="composition_spec",
+        payload_key="semantic_content_hash",
+    )
+    for input_id, facts in _payload_index(
+        ordered,
+        event_type="composition_contributor_input",
+        payload_key="composition_input_id",
+    ).items():
+        composition_input_by_id[input_id] = (
+            *composition_input_by_id.get(input_id, ()),
+            *facts,
+        )
     composition_snapshot_by_id = _payload_index(
         ordered,
         event_type="composition_input_snapshot",
@@ -980,6 +1066,21 @@ def evaluate_control_trace_lineage(
         ordered,
         event_type="composition_result",
         payload_key="composition_result_id",
+    )
+    composition_disposition_by_result_id = _payload_index(
+        ordered,
+        event_type="composition_authority_disposition",
+        payload_key="composition_result_id",
+    )
+    composition_session_spec_by_id = _payload_index(
+        ordered,
+        event_type="composition_session_spec",
+        payload_key="operation_spec_id",
+    )
+    composition_session_rearm_spec_by_id = _payload_index(
+        ordered,
+        event_type="composition_session_rearm_spec",
+        payload_key="rearm_spec_id",
     )
     reference_segment_by_id = _payload_index(
         ordered,
@@ -1094,46 +1195,72 @@ def evaluate_control_trace_lineage(
 
     for fact in ordered:
         payload = fact.payload
-        if fact.event_type == "policy_context_admission" and bool(payload["accepted"]):
+        if fact.event_type in {
+            "policy_context_admission",
+            "composition_context_admission",
+        } and bool(payload["accepted"]):
             context_id = str(payload["context_id"])
-            contexts = policy_context_by_id.get(context_id, ())
+            contexts = context_by_id.get(context_id, ())
             if len(contexts) != 1 or contexts[0].payload[
                 "context_semantic_content_hash"
             ] != payload["context_semantic_content_hash"]:
+                prefix = (
+                    "policy_context"
+                    if fact.event_type == "policy_context_admission"
+                    else "composition_context"
+                )
                 issue(
-                    "policy_context_admission_missing_context",
+                    f"{prefix}_admission_missing_context",
                     fact.fact_id,
-                    "Accepted policy context admission must resolve its exact context.",
+                    "Accepted context admission must resolve its exact context.",
                     context_id,
                 )
-        elif fact.event_type == "policy_context":
-            observation_cut_id = str(payload["observation_cut_id"])
-            observation = by_id.get(observation_cut_id)
-            if observation is None or observation.event_type != "observation_cut":
+        elif fact.event_type in {"policy_context", "composition_context"}:
+            observation_cut_id = payload.get("observation_cut_id")
+            if observation_cut_id is not None:
+                observation = by_id.get(str(observation_cut_id))
+            else:
+                observation = None
+            if (
+                fact.event_type == "policy_context"
+                or observation_cut_id is not None
+            ) and (
+                observation is None
+                or observation.event_type != "observation_cut"
+            ):
+                prefix = fact.event_type
                 issue(
-                    "policy_context_missing_observation_cut",
+                    f"{prefix}_missing_observation_cut",
                     fact.fact_id,
-                    "Policy context must resolve its producer observation cut.",
-                    observation_cut_id,
+                    "Context observation-cut lineage must resolve when declared.",
+                    None if observation_cut_id is None else str(observation_cut_id),
                 )
             for parent_id in payload["parent_context_ids"]:
-                if len(policy_context_by_id.get(str(parent_id), ())) != 1:
+                if len(context_by_id.get(str(parent_id), ())) != 1:
                     issue(
-                        "policy_context_missing_parent",
+                        f"{fact.event_type}_missing_parent",
                         fact.fact_id,
-                        "Policy context parent dependency is absent.",
+                        "Context parent dependency is absent.",
                         str(parent_id),
                     )
-        elif fact.event_type == "policy_context_snapshot":
+        elif fact.event_type in {
+            "policy_context_snapshot",
+            "composition_context_snapshot",
+        }:
             selected_ids = payload["selected_context_id_by_channel"]
             selected_hashes = payload["selected_context_hash_by_channel"]
             for channel, context_id in selected_ids.items():
-                contexts = policy_context_by_id.get(str(context_id), ())
+                contexts = context_by_id.get(str(context_id), ())
                 if len(contexts) != 1 or contexts[0].payload[
                     "context_semantic_content_hash"
                 ] != selected_hashes[channel]:
+                    prefix = (
+                        "policy_context"
+                        if fact.event_type == "policy_context_snapshot"
+                        else "composition_context"
+                    )
                     issue(
-                        "policy_context_snapshot_missing_context",
+                        f"{prefix}_snapshot_missing_context",
                         fact.fact_id,
                         "Context snapshot must resolve each selected context and hash.",
                         str(context_id),
@@ -1152,9 +1279,12 @@ def evaluate_control_trace_lineage(
                     "Accepted composition input admission must resolve its exact input.",
                     input_id,
                 )
-        elif fact.event_type == "composition_input":
+        elif fact.event_type in {
+            "composition_input",
+            "composition_contributor_input",
+        }:
             for context_id in payload["context_ids"]:
-                if len(policy_context_by_id.get(str(context_id), ())) != 1:
+                if len(context_by_id.get(str(context_id), ())) != 1:
                     issue(
                         "composition_input_missing_context",
                         fact.fact_id,
@@ -1171,7 +1301,39 @@ def evaluate_control_trace_lineage(
                         "Composition input must resolve its producer observation cut.",
                         str(observation_cut_id),
                     )
+            if fact.event_type == "composition_contributor_input":
+                source_ids = tuple(payload["source_fact_ids"])
+                source_hashes = tuple(payload["source_fact_hashes"])
+                if len(source_ids) != len(source_hashes):
+                    issue(
+                        "composition_contributor_lineage_length_mismatch",
+                        fact.fact_id,
+                        "Contributor source IDs and hashes must have equal length.",
+                    )
+                for source_id, source_hash in zip(
+                    source_ids,
+                    source_hashes,
+                ):
+                    source_fact = by_id.get(str(source_id))
+                    if (
+                        source_fact is None
+                        or source_fact.semantic_content_hash != source_hash
+                    ):
+                        issue(
+                            "composition_contributor_missing_source_fact",
+                            fact.fact_id,
+                            "Contributor input must resolve each exact source fact.",
+                            str(source_id),
+                        )
         elif fact.event_type == "composition_input_snapshot":
+            spec_hash = str(payload["composition_spec_hash"])
+            if len(composition_spec_by_hash.get(spec_hash, ())) != 1:
+                issue(
+                    "composition_snapshot_missing_spec",
+                    fact.fact_id,
+                    "Composition snapshot must resolve its exact numerical spec.",
+                    spec_hash,
+                )
             selected_ids = payload["selected_input_ids_by_role"]
             selected_hashes = payload["selected_input_hashes_by_role"]
             for role, input_id in selected_ids.items():
@@ -1186,6 +1348,14 @@ def evaluate_control_trace_lineage(
                         str(input_id),
                     )
         elif fact.event_type == "composition_result":
+            spec_hash = str(payload["composition_spec_hash"])
+            if len(composition_spec_by_hash.get(spec_hash, ())) != 1:
+                issue(
+                    "composition_result_missing_spec",
+                    fact.fact_id,
+                    "Composition result must resolve its exact numerical spec.",
+                    spec_hash,
+                )
             snapshot_id = str(payload["composition_input_snapshot_id"])
             snapshots = composition_snapshot_by_id.get(snapshot_id, ())
             if len(snapshots) != 1 or snapshots[0].payload[
@@ -1216,6 +1386,97 @@ def evaluate_control_trace_lineage(
                         "Composition result input lineage is absent or hash-mismatched.",
                         str(input_id),
                     )
+        elif fact.event_type == "composition_authority_disposition":
+            result_id = str(payload["composition_result_id"])
+            results = composition_result_by_id.get(result_id, ())
+            if len(results) != 1 or results[0].payload[
+                "semantic_content_hash"
+            ] != payload["composition_result_hash"]:
+                issue(
+                    "composition_disposition_missing_result",
+                    fact.fact_id,
+                    "Composition authority disposition must resolve its exact result.",
+                    result_id,
+                )
+        elif fact.event_type == "composition_session_spec":
+            spec_hash = str(payload["composition_spec_hash"])
+            if len(composition_spec_by_hash.get(spec_hash, ())) != 1:
+                issue(
+                    "composition_session_missing_numerical_spec",
+                    fact.fact_id,
+                    "Composition session must resolve its exact numerical spec.",
+                    spec_hash,
+                )
+        elif fact.event_type == "composition_session_rearm_spec":
+            logical_spec_id = str(payload["logical_operation_spec_id"])
+            specs = composition_session_spec_by_id.get(logical_spec_id, ())
+            if (
+                len(specs) != 1
+                or specs[0].payload["semantic_content_hash"]
+                != payload["logical_operation_spec_hash"]
+            ):
+                issue(
+                    "composition_session_rearm_missing_logical_spec",
+                    fact.fact_id,
+                    "Composition rearm spec must resolve its exact logical session.",
+                    logical_spec_id,
+                )
+        elif fact.event_type == "composition_session_rearm_receipt":
+            rearm_spec_id = str(payload["rearm_spec_id"])
+            specs = composition_session_rearm_spec_by_id.get(rearm_spec_id, ())
+            if (
+                len(specs) != 1
+                or specs[0].payload["semantic_content_hash"]
+                != payload["rearm_spec_hash"]
+            ):
+                issue(
+                    "composition_session_rearm_receipt_missing_spec",
+                    fact.fact_id,
+                    "Composition rearm receipt must resolve its exact rearm spec.",
+                    rearm_spec_id,
+                )
+            if (
+                int(payload["next_session_epoch"])
+                != int(payload["prior_session_epoch"]) + 1
+                or int(payload["composer_producer_epoch"])
+                <= int(payload["prior_composer_producer_epoch"])
+                or int(payload["authority_epoch"])
+                <= int(payload["prior_authority_epoch"])
+                or int(payload["execution_epoch"])
+                <= int(payload["prior_execution_epoch"])
+            ):
+                issue(
+                    "composition_session_rearm_epoch_not_advanced",
+                    fact.fact_id,
+                    "Composition rearm must advance activation, producer, authority, and execution epochs.",
+                )
+        elif fact.event_type == "composition_session_transition":
+            spec_id = str(payload["operation_spec_id"])
+            specs = composition_session_spec_by_id.get(spec_id, ())
+            if (
+                len(specs) != 1
+                or specs[0].payload["semantic_content_hash"]
+                != payload["operation_spec_hash"]
+            ):
+                issue(
+                    "composition_session_transition_missing_spec",
+                    fact.fact_id,
+                    "Composition session transition must resolve its exact spec.",
+                    spec_id,
+                )
+            source_id = str(payload["source_fact_id"])
+            source_fact = by_id.get(source_id)
+            if (
+                source_fact is None
+                or source_fact.semantic_content_hash
+                != payload["source_fact_hash"]
+            ):
+                issue(
+                    "composition_session_transition_missing_source_fact",
+                    fact.fact_id,
+                    "Composition session transition must resolve its exact source fact.",
+                    source_id,
+                )
         elif fact.event_type == "reference_segment":
             parents = tuple(payload["endpoint_parents"])
             if len(parents) != 2 or tuple(item["role"] for item in parents) != (
@@ -1839,6 +2100,20 @@ def evaluate_control_trace_lineage(
                         "Composite proposal and composition result specs disagree.",
                         result_id,
                     )
+            dispositions = composition_disposition_by_result_id.get(
+                result_id,
+                (),
+            )
+            if dispositions and (
+                len(dispositions) != 1
+                or dispositions[0].payload["action"] != "publish_proposal"
+            ):
+                issue(
+                    "composite_proposal_disposition_invalid",
+                    fact.fact_id,
+                    "Formal composite proposal requires one publish disposition.",
+                    result_id,
+                )
         elif fact.event_type == "proposal_snapshot":
             for candidate in payload["candidates"]:
                 proposal_id = str(candidate["proposal_id"])
@@ -2368,6 +2643,139 @@ def evaluate_control_trace_lineage(
                         item.fact_id
                         for item in generation_activations + target_activations
                     ),
+                )
+
+    session_transitions_by_spec: dict[str, list[ControlTraceFact]] = {}
+    for fact in ordered:
+        if fact.event_type == "composition_session_transition":
+            session_transitions_by_spec.setdefault(
+                str(fact.payload["operation_spec_id"]),
+                [],
+            ).append(fact)
+    for spec_id, transitions in session_transitions_by_spec.items():
+        transitions_by_epoch: dict[int, list[ControlTraceFact]] = {}
+        epoch_order: list[int] = []
+        for transition in transitions:
+            epoch = int(transition.payload["session_epoch"])
+            if epoch not in transitions_by_epoch:
+                epoch_order.append(epoch)
+                transitions_by_epoch[epoch] = []
+            transitions_by_epoch[epoch].append(transition)
+        if epoch_order != sorted(epoch_order) or any(
+            next_epoch != epoch + 1
+            for epoch, next_epoch in zip(epoch_order, epoch_order[1:])
+        ):
+            issue(
+                "composition_session_epoch_sequence_invalid",
+                transitions[0].fact_id,
+                "Composition activation epochs must be ordered and contiguous.",
+                spec_id,
+            )
+        for epoch_index, epoch in enumerate(epoch_order):
+            epoch_transitions = transitions_by_epoch[epoch]
+            previous_after_hash: str | None = None
+            terminal_seen = False
+            for index, transition_fact in enumerate(epoch_transitions):
+                payload = transition_fact.payload
+                event = str(payload["transition"])
+                if index == 0 and event not in {"start", "start_failed"}:
+                    issue(
+                        "composition_session_missing_start",
+                        transition_fact.fact_id,
+                        "Each composition activation must begin with start or start_failed.",
+                        spec_id,
+                    )
+                if terminal_seen:
+                    issue(
+                        "composition_session_transition_after_terminal",
+                        transition_fact.fact_id,
+                        "A composition activation cannot transition after its terminal event.",
+                        spec_id,
+                    )
+                if (
+                    previous_after_hash is not None
+                    and payload["state_before_hash"] != previous_after_hash
+                ):
+                    issue(
+                        "composition_session_state_chain_mismatch",
+                        transition_fact.fact_id,
+                        "State hashes must form one exact chain within an activation epoch.",
+                        spec_id,
+                    )
+                source_fact = by_id.get(str(payload["source_fact_id"]))
+                expected_operation = None
+                if event == "start":
+                    expected_operation = (
+                        "start_composition_session"
+                        if epoch_index == 0
+                        else "rearm_composition_session"
+                    )
+                elif event == "supersede":
+                    expected_operation = "rearm_composition_session"
+                elif event == "stop":
+                    expected_operation = "stop_composition_session"
+                if expected_operation is not None and (
+                    source_fact is None
+                    or source_fact.event_type != "station_operation_transition"
+                    or source_fact.payload["operation_kind"]
+                    != expected_operation
+                    or not bool(source_fact.payload["succeeded"])
+                ):
+                    issue(
+                        "composition_session_terminal_source_invalid",
+                        transition_fact.fact_id,
+                        "Session activation transitions require the matching successful Station operation.",
+                        str(payload["source_fact_id"]),
+                    )
+                if (
+                    expected_operation == "rearm_composition_session"
+                    and source_fact is not None
+                    and source_fact.event_type == "station_operation_transition"
+                ):
+                    receipt_facts = tuple(
+                        by_id.get(str(evidence_ref))
+                        for evidence_ref in source_fact.payload["evidence_refs"]
+                        if (
+                            by_id.get(str(evidence_ref)) is not None
+                            and by_id[str(evidence_ref)].event_type
+                            == "composition_session_rearm_receipt"
+                        )
+                    )
+                    expected_prior_epoch = (
+                        epoch if event == "supersede" else epoch - 1
+                    )
+                    if (
+                        len(receipt_facts) != 1
+                        or int(
+                            receipt_facts[0].payload["prior_session_epoch"]
+                        )
+                        != expected_prior_epoch
+                        or int(receipt_facts[0].payload["next_session_epoch"])
+                        != expected_prior_epoch + 1
+                    ):
+                        issue(
+                            "composition_session_rearm_transition_missing_receipt",
+                            transition_fact.fact_id,
+                            "Rearm transitions must resolve one receipt for the exact prior/next activation epochs.",
+                            str(payload["source_fact_id"]),
+                        )
+                previous_after_hash = str(payload["state_after_hash"])
+                terminal_seen = event in {
+                    "start_failed",
+                    "supersede",
+                    "stop",
+                    "fault",
+                }
+            if epoch_index < len(epoch_order) - 1 and (
+                not epoch_transitions
+                or str(epoch_transitions[-1].payload["transition"])
+                != "supersede"
+            ):
+                issue(
+                    "composition_session_epoch_not_superseded",
+                    epoch_transitions[-1].fact_id,
+                    "A later activation requires the prior held activation to be superseded.",
+                    spec_id,
                 )
 
     issues.sort(key=lambda item: (item.root_fact_id, item.code, item.related_fact_ids))

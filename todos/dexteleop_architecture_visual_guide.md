@@ -1,6 +1,6 @@
 # DexTeleop 控制、数据与训练闭环图示
 
-更新日期：2026-07-23
+更新日期：2026-07-24
 
 ## 文档用途
 
@@ -22,6 +22,68 @@
 | ⛔ | 当前阶段明确禁止启用 |
 
 所有“完成”都受作用域限制；本地测试通过不等于已合并、发布、真机验收或公开数据集可提交。
+
+当前多源组合框架的长期 owner 已修正为 `control_composition/`：
+
+```mermaid
+flowchart TD
+    A["control_station / sim / teleop / deployment adapters"] --> B["control_composition<br/>cut / strategy / session / lineage / difference"]
+    B --> C["robot_motion<br/>proposal admission / authority / safety / execution"]
+    B --> D["dataset_contracts<br/>typed ControlTrace facts"]
+```
+
+`control_composition`不拥有最终动作许可，也不导入MuJoCo、硬件、遥操设备或模型实现。当前package/ports/
+依赖守卫已落地；composition、pose/qpos strategy、observability、专属trace、runtime及composition-aware
+policy-node协议均已物理迁入，旧RobotMotion实现/API已删除；pure handoff reducer已经物理迁入lifecycle，
+composition-session contract/re-arm/registry也已迁入；
+Station controller只保留operation/
+publication/HOLD适配，旧路径维持exact identity。其余逻辑只有通过hash、数值和default-off回归后才物理迁移。
+
+```mermaid
+flowchart LR
+    S["human / replay / policy / RTC / synthetic"] --> A["source adapters<br/>canonical RobotAction + lineage"]
+    M["history / state / future / vision / labels"] --> XA["generic context admission<br/>clock + TTL + contract + lineage"]
+    XA --> X["StrategyContextView<br/>same-cut latest/window"]
+    A --> C["receiver admission + one ControlCut"]
+    X --> C
+    C --> F["replaceable pose/qpos strategy"]
+    F --> R["CompositionEvaluationRecord<br/>spec + cut + epochs + inputs + result + diagnostics"]
+    F --> D["Immediate difference<br/>off / summary / full"]
+    R --> P["optional proposal admission"]
+    P --> Q["authority + canonical safety + resolver/reference + dispatch"]
+    Q --> E["Post-execution difference<br/>optional async + exact receipts"]
+    D --> V["future visualization / feedback"]
+    E --> V
+```
+
+多频对齐不是在该包内启动额外loop：input/context以receiver clock声明有效区间，同一cut只选择覆盖
+`target_effective_at`且在active epoch内的最新事实；slow source在TTL内复用，fast/late source只进入后续cut。
+`CompositionEvaluationRecord`现让调用方一次取得exact spec/cut/epoch/selected lineage/context/result/difference/
+diagnostic/trace batch；ControlTrace同时保存完整`composition_spec`。高频reference、canonical safety和物理下发仍由
+RobotMotion拥有。当前长期store pruning/backpressure、动态任意effector拓扑、formal compound hand execution、
+真实可视化/触觉适配和多backend/真机验收仍为后续gate。
+
+```text
+context现状：formal runtime、synthetic policy node、MuJoCo统一使用CompositionContextRecord/Store/Snapshot
+旧兼容：PolicyContext runtime已删除；v2.4 policy_context_*只保留离线读取，新事实写composition_context_*
+禁止：live backend/model读取、hidden latest cache、composer等待慢模型
+
+inline strategy：pure/no-I/O，profile声明deadline；初始建议p99 <= min(2 ms, 10% composition period)
+slow/model mixer：独立异步producer -> typed time-bound advisory context -> local deterministic strategy
+
+store现状：显式TimeWindowRetentionSpec；snapshot先物化，再推进单调target watermark并prune窗口外full payload
+保留：已返回snapshot的immutable record + producer-epoch last-sequence tombstone
+待补：窗口内producer rate/blob quota和durable trace backpressure；禁止lossy ring overwrite
+
+拓扑目标：named component set；arm始终pose，机械臂joint DOF只属于downstream resolver capability
+end-effector：每个component自声明dimension/names/units/mask；一个arm可以绑定多个末端
+当前限制：RobotAction v1的left/right + one hand per side + q6/q16与现有coupled target；不是框架目标限制
+
+difference A：same-cut source -> composed，低资源同步，off/summary/full
+difference B：composed -> safe/IK/reference/dispatch/measured，异步且有receipt才称actual，off/summary/full
+record core：实际行为与可重放lineage永远持久化
+record debug：重型替代项/矩阵/中间量只在debug构建与保存
+```
 
 当前远端真机前置状态（2026-07-21）已到有限步只读 SDK state 层：左右 RM65 的 ping 与 TCP 8080 均可达，远端
 `dexteleop310` pure M5.8 tests 通过；严格禁用启动写入、streaming 与 force-position 后，两侧各 5 次 state/tool-frame
@@ -99,7 +161,7 @@ fail closed。
 ```mermaid
 flowchart LR
     Generic["已较通用<br/>domain / time / authority / trace / permit"]
-    V1["v1 compatibility surface<br/>left/right + arm6 + hand q6/q16"]
+    V1["v1 compatibility surface<br/>left/right + direct arm qpos6 + hand q6/q16"]
     Profile["profile-specific<br/>RM65 IK / safety / backend / sim"]
     Future["第二本体 EG1–EG3<br/>generic component payload"]
 
@@ -112,7 +174,8 @@ flowchart LR
 | 同一 RM65 profile 更换 mock/sim/SDK sink | 低至中 | 控制协议可复用，但仍需单位、frame、worker、receipt、stop/permit 验收 |
 | 同为左右双6DoF且完全匹配 canonical contract | 中 | 可新增 execution adapter，不等于零成本 backend swap |
 | Inspire/DMTAC 等已有 q6/q16 末端 | 中 | 有 compatibility adapter；不同 safety/permit/receipt 仍需独立 profile |
-| 单7DoF、6+7DoF、非 left/right 或第三 component | 高/当前不支持 | 现有测试只会 fail closed；等待第二本体 EG1–EG3 |
+| 单臂或7DoF arm（同pose component语义） | composition低；execution中 | 混合不依赖joint count；仍需target capability、resolver、IK/safety验收 |
+| 非left/right、一个arm多末端或第三component | 高/当前carrier不支持 | 需component-keyed carrier与v1无损adapter，不能按shape扩展 |
 
 首个真机候选 `m6_candidate_policy_arm_qpos_v1` 保持不变；本轮只增加依赖/硬编码防火墙，不重构
 `RobotAction`、Arbiter payload、安全数值、policy tensor layout 或公开兼容列。当前准确表述是：
@@ -125,7 +188,8 @@ flowchart LR
   RobotAction v1 hardcode allowlist               ✅
   dataset/postprocess import boundary             ✅
   DM-Tac calibration contract/provider 分离        ✅
-  7DoF / generic payload 正向支持                   ⏳ EG1–EG3
+  新7DoF resolver/execution profile                  ⏳ target-specific gate
+  component-keyed generic payload正向支持            ⏳ EG1–EG3
 ```
 
 ---
@@ -224,6 +288,8 @@ CS-6b1d arm-pose mixed Sim            ✅ scoped + replaceable strategy shadow
 CS-6b1e passive live pose source      ✅ device-neutral; replay remains authority
 CS-6b1f sim pose HIL formal capture    ✅ opt-in; virtual readiness + external recorder
 CS-6b1g weighted SE(3) pose fusion     ✅ shared receiver human+replay sim shadow; default-off
+CS-6b1h composer-only formal pose fusion ✅ deterministic sim data plane/default-off
+CS-6b1i typed composition session        ✅ Station + formal sim capture/default-off; re-arm/real pending
 CS-6b2 component shadow + trace/lifecycle fixture ✅ scoped; authoritative compound gate pending
 CS-6b2e native stream same-episode seal/commit ✅ scoped
 CS-6b2f bounded inline pose/qpos process seam ✅ scoped; RGBD/tactile SHM pending
@@ -462,10 +528,12 @@ flowchart LR
     A["Arm authority + ActionArbiter"]
     M["Replaceable arm PoseMixingStrategy<br/>v1 shadow only"]
     W["weighted_se3_pose_fusion_v1<br/>no-proposal shadow; fail closed"]
+    B["CS-6b1h formal gate<br/>ready→publish; missing/conflict/error→HOLD"]
+    O["One pose-composer proposal<br/>only formal arms candidate"]
     E["Gripper / q6 / q16 candidates"]
     G["Mask-aware qpos/native strategy<br/>pure + shadow; admission gate pending"]
     J["Unique compound component assembly"]
-    K["Frozen history / future action /<br/>modality / label / policy context"]
+    K["Frozen history / future action /<br/>modality / label / policy advisory"]
     V["Arm selection + output-pose parity"]
     S["Canonical safety by component"]
     F["Verified frame transform"]
@@ -473,6 +541,8 @@ flowchart LR
     Q["Resolved arm qpos execution target"]
     D["Hand/gripper qpos/native target"]
     T["component_mixing_shadow<br/>ControlTrace/WAL; non-authoritative"]
+    Z["SourceDifferenceObservation<br/>same snapshot/result; non-authoritative"]
+    Y["Bounded guidance cue<br/>TTL; no-I/O only"]
     X["One dispatch envelope → component backends"]
 
     H -. authority_candidate=false .-> C
@@ -485,6 +555,12 @@ flowchart LR
     M -. optional strategy .-> W
     M -. no authority / no dispatch .-> V
     W -. decision only .-> V
+    W -. exact source/output residual .-> Z
+    Z -. optional virtual guidance .-> Y
+    Y -. no authority / no device I/O .-> T
+    W -. exact result .-> B
+    B -->|ready| O --> A
+    B -->|fail closed| HLD["Execution HOLD + cancellation"]
     A -. authoritative comparison .-> V
     E -. future .-> G
     V --> J
@@ -503,13 +579,28 @@ gripper/hand mixed contract：1DoF/q6/q16 qpos或typed native continuous；不�
 已实现可选arm strategy：weighted_se3_pose_fusion_v1，显式weights/frame/disagreement/missing policy；
                     CS-6b1g已将passive human + replay接入同一receiver prefix，只形成no-proposal sim shadow；
                     default-off关闭时原cut/decision不变，开启时只允许trace cut/hash因新增admission变化
+pose topology：共享v1 strategy/composer接受left/right arm的显式非空subset；默认仍为原coupled双臂并保持hash/顺序；
+               当前CS-6b1i MuJoCo target仍是双臂，单臂必须由新target capability manifest显式放行
+差异链：同一composition snapshot/result上计算source pair及source→output pose/qpos residual；
+       `SourceDifferenceSpec`显式声明可比较role，禁止按shape猜测base/residual等语义；
+       通用TopologyRuntime可选生成并返回，CS-6b1h/1i只透传；frame/representation不一致拒绝；
+       diagnostic error不改composition/HOLD，结果只进入non-authoritative ControlTrace
+引导链：首版仅把pose差异映射为bounded、TTL、无量纲`guidance_haptic_non_force` command和no-I/O receipt；
+       qpos差异可记录但映射未定义；未接GUI/VIVE/真机，不是物理力反馈，也不能改变authority/HOLD/dispatch
 后续hand strategy：只在相同action spec、joint order、units、active mask和同一causal cut内插值；
                  q16 NaN/padding slot不参与，离散token不插值
 当前pure seam：`LinearHandQposInterpolationStrategy` + strict compound assembly；同一cut的component shadow已写入
              `component_mixing_shadow` ControlTrace/WAL，但仍未接authority/safety/dispatch
+当前formal sim seam：CS-6b1h关闭raw human/replay/primary-policy authority，只允许pose composer proposal；
+                    contributor input绑定source fact ID/hash；exact result promotion幂等，
+                    TTL/epoch/conflict/error→HOLD，HOLD后不自动恢复
+session control：CS-6b1i用独立composition_session spec冻结composer/contributors/gate/boundary；
+                generic controller持有registry/epoch/lifecycle/trace/barrier，MuJoCo wrapper只做backend接线；
+                start READY后才开composer barrier，pause/end/error先barrier-off→HOLD/cancel；
+                held不可由fresh input恢复，formal episode已seal/commit
 sim-only capture fixture复用唯一`EpisodeTraceRecorderSink`，覆盖HOLD/no-action、abort→restart、多episode owner复用、WAL
 writer failure与terminal closure；profile仍是`fixture_only`，sealed不等于capture-commit eligible。
-可替换输入：已接纳且不晚于同一cut的history/future-action/modality/label/policy-context
+可替换输入：已接纳且不晚于同一cut的history/future-action/modality/label/policy-advisory
 正式激活gate：versioned spec + proposal/admission + ControlTrace + fallback/latency + safety + shadow parity
 debug-only：direct arm-qpos human/replay mixed fixture
 未来：同构臂profile重新评估arm direct-qpos mixed；不影响hand qpos interpolation主线
@@ -523,7 +614,7 @@ debug-only：direct arm-qpos human/replay mixed fixture
 flowchart TB
     subgraph Visible["模型可见域（由 artifact contract 显式声明）"]
         Obs["PolicyObservationView"]
-        Ctx["PolicyContext / history token"]
+        Ctx["CompositionContext / history token"]
         Raw["model-native output / chunk / adaptation evidence"]
         Proposal["decoded absolute ActionProposal"]
         Obs --> Raw
@@ -893,7 +984,7 @@ noise 或 model-native chunk evidence。它不阻塞 M5.7e2，也不能因没有
 | P2 | native tactile/state stream 未落地 | 不能构造高频 tactile/fast-policy view | M7A StreamCatalog、native writer、cut/window reader、gap policy |
 | P2 | learning observability 只有纯 contract | Flow/noise、episodic adaptation 等不可恢复事实尚未产生 | concrete policy adapter 提供真实 API 后接 typed evidence hook |
 | P2 | learner/artifact closure 未实现 | 尚未完成 capture→train→artifact→redeploy 的实证闭环 | M7B deterministic views、training manifest、artifact preflight 与 shadow |
-| P2 | canonical action/execution v1 仍绑定左右双6DoF/q6-q16 | 不阻塞首个RM65窄profile；阻塞任意7DoF/异构拓扑的低成本接入 | RM65验收后按EG1 contract→EG2 lossless bridge→EG3第二本体迁移 |
+| P2 | canonical action carrier/execution v1 仍绑定left/right、direct arm qpos6与每side一个q6/q16末端 | 不限制arm pose fusion；阻塞非left/right和一个arm多个末端的低成本接入 | additive component carrier→v1 lossless adapter→新target profile；7DoF resolver独立验收 |
 | P1 capability gap | committed v2.4没有copy-on-write维护工具 | in-place episode compact与tactile recompress已在任何写入前fail closed，原capture保持immutable；不影响capture/read/train或纯控制M5.8-b | 后续实现parent-hash + derivation manifest + 新dataset/commit identity的derived maintenance；禁止重写原root |
 
 ### 并行改动对主线的影响图

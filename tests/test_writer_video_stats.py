@@ -235,6 +235,56 @@ class WriterVideoStatsTest(unittest.TestCase):
             self.assertEqual(record["summary"]["force_collision_label"], "clean")
             self.assertFalse(record["metadata"]["force_collision_detected"])
 
+    def test_terminal_force_collision_summary_marks_episode_without_terminal_row(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = LeRobotV21Writer(
+                LeRobotV21WriterConfig(
+                    root_dir=tmpdir,
+                    write_parquet=False,
+                    write_video=False,
+                )
+            )
+            writer.start_episode(episode_index=0)
+            row_job = next(
+                job
+                for job in writer.plan_sample_jobs(_camera_sample())
+                if job.kind == ROW_JOB_KIND
+            )
+            writer.handle_job(row_job)
+
+            writer.finalize_episode(
+                0,
+                summary={
+                    "stop_reason": "position_force_guard",
+                    "force_collision_detected": True,
+                    "force_collision_event": {
+                        "detected": True,
+                        "source": "position_force_guard",
+                        "reason": "force_limit_exceeded",
+                    },
+                },
+            )
+
+            episodes_path = Path(tmpdir) / "meta" / "episodes.jsonl"
+            record = json.loads(episodes_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertTrue(record["summary"]["force_collision_detected"])
+            self.assertEqual(
+                record["summary"]["force_collision_label"],
+                "detected_collision",
+            )
+            self.assertEqual(
+                record["summary"]["force_collision_event"]["source"],
+                "position_force_guard",
+            )
+            self.assertTrue(record["metadata"]["force_collision_detected"])
+
+            stats_path = Path(tmpdir) / "meta" / "episodes_stats.jsonl"
+            stats = json.loads(stats_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertTrue(stats["force_collision_detected"])
+            self.assertEqual(stats["force_collision_label"], "detected_collision")
+
 
 if __name__ == "__main__":
     unittest.main()

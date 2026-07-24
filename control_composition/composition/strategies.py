@@ -28,24 +28,26 @@ from scipy.spatial.transform import Rotation
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.runtime.immutable import deep_freeze
 
-from .proposal import (
+from .context import (
+    POSE_MIXING_CONTEXT_KINDS_V1,
+    CompositionContext,
+    PoseMixingContext,
+)
+
+from robot_motion.action.proposal import (
     ActionProposal,
     freeze_robot_action,
     robot_action_semantic_payload,
 )
-from .execution_target import project_robot_action_to_components
-from .hand_spec import HandActionSpec
-from .schema import (
+from robot_motion.action.execution_target import project_robot_action_to_components
+from robot_motion.action.hand_spec import HandActionSpec
+from robot_motion.action.schema import (
     BIMANUAL_EE_POSE_HAND16_V1,
     BIMANUAL_EE_POSE_V1,
     RobotAction,
 )
 
 
-POSE_MIXING_CONTEXT_KINDS_V1 = frozenset(
-    {"history", "future_action", "modality", "label", "policy_context"}
-)
-POSE_MIXING_CONTEXT_HASH_DOMAIN_V1 = "dexteleop.pose_mixing_context.v1"
 POSE_MIXING_SNAPSHOT_HASH_DOMAIN_V1 = "dexteleop.pose_mixing_snapshot.v1"
 POSE_MIXING_STRATEGY_SPEC_HASH_DOMAIN_V1 = (
     "dexteleop.pose_mixing_strategy_spec.v1"
@@ -54,6 +56,7 @@ POSE_MIXING_DECISION_HASH_DOMAIN_V1 = "dexteleop.pose_mixing_decision.v1"
 DISCRETE_OWNER_POSE_STRATEGY_ID_V1 = "discrete_authority_owner_pose_v1"
 WEIGHTED_SE3_POSE_FUSION_STRATEGY_ID_V1 = "weighted_se3_pose_fusion_v1"
 POSE_MIXING_ARM_COMPONENTS_V1 = ("left_arm", "right_arm")
+POSE_MIXING_ARM_COMPONENT_SET_V1 = frozenset(POSE_MIXING_ARM_COMPONENTS_V1)
 POSE_MIXING_ACTION_SPACES_V1 = frozenset(
     {BIMANUAL_EE_POSE_V1, BIMANUAL_EE_POSE_HAND16_V1}
 )
@@ -109,7 +112,39 @@ def _hand_action_hash(action: RobotAction) -> str:
     )
 
 
-def _require_pose_action(action: RobotAction) -> RobotAction:
+def normalize_pose_component_dependencies(
+    component_dependencies: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Validate the explicit arm-pose component subset supported by v1."""
+
+    dependencies = tuple(
+        _required(value, name="component_dependency")
+        for value in component_dependencies
+    )
+    if not dependencies or len(dependencies) != len(set(dependencies)):
+        raise ValueError(
+            "Pose mixing component_dependencies must be non-empty and unique."
+        )
+    unsupported = tuple(
+        component
+        for component in dependencies
+        if component not in POSE_MIXING_ARM_COMPONENT_SET_V1
+    )
+    if unsupported:
+        raise ValueError(
+            "Pose mixing v1 supports only left_arm/right_arm pose components; "
+            f"got {unsupported!r}."
+        )
+    return dependencies
+
+
+def _require_pose_action(
+    action: RobotAction,
+    *,
+    component_dependencies: tuple[str, ...] = POSE_MIXING_ARM_COMPONENTS_V1,
+) -> RobotAction:
+    dependencies = normalize_pose_component_dependencies(component_dependencies)
+    sides = tuple(component.removesuffix("_arm") for component in dependencies)
     frozen = freeze_robot_action(action)
     if frozen.action_space not in POSE_MIXING_ACTION_SPACES_V1:
         raise ValueError(
@@ -124,112 +159,17 @@ def _require_pose_action(action: RobotAction) -> RobotAction:
             "Arm pose mixing v1 excludes hand/end-effector payloads; "
             "route them through a qpos/native component strategy."
         )
-    if set(frozen.arm_pose_by_side) != {"left", "right"}:
-        raise ValueError("Pose mixing v1 requires exact left/right arm poses.")
-    if not {"left_arm", "right_arm"}.issubset(frozen.active_effectors):
-        raise ValueError("Pose mixing v1 requires both arm effectors to be active.")
+    if set(frozen.arm_pose_by_side) != set(sides):
+        raise ValueError(
+            "Pose mixing action must contain exactly its declared arm-pose "
+            f"components {dependencies!r}."
+        )
+    if set(frozen.active_effectors) != set(dependencies):
+        raise ValueError(
+            "Pose mixing action active_effectors must exactly match "
+            "component_dependencies."
+        )
     return frozen
-
-
-@dataclass(frozen=True)
-class PoseMixingContext:
-    """One already-admitted causal fact available to a mixing strategy.
-
-    ``semantic_payload`` is limited to immutable semantic data or stable blob
-    references.  A strategy must not read a mutable device/model backend after
-    the decision cut through this object.
-    """
-
-    context_id: str
-    context_kind: str
-    source_fact_id: str
-    source_fact_hash: str
-    payload_contract_hash: str
-    semantic_payload: Mapping[str, Any]
-    available_at: float
-    available_clock_domain_id: str
-    control_admission_sequence: int
-    effective_from: float | None = None
-    effective_until: float | None = None
-    blob_refs: tuple[str, ...] = ()
-    semantic_content_hash: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        context_id = _required(self.context_id, name="context_id")
-        kind = _required(self.context_kind, name="context_kind")
-        if kind not in POSE_MIXING_CONTEXT_KINDS_V1:
-            raise ValueError(f"Unsupported pose mixing context kind {kind!r}.")
-        source_fact_id = _required(self.source_fact_id, name="source_fact_id")
-        source_fact_hash = _required(self.source_fact_hash, name="source_fact_hash")
-        contract_hash = _required(
-            self.payload_contract_hash,
-            name="payload_contract_hash",
-        )
-        available_at = _finite(self.available_at, name="available_at")
-        clock_domain = _required(
-            self.available_clock_domain_id,
-            name="available_clock_domain_id",
-        )
-        admission_sequence = _nonnegative(
-            self.control_admission_sequence,
-            name="control_admission_sequence",
-        )
-        effective_from = (
-            None
-            if self.effective_from is None
-            else _finite(self.effective_from, name="effective_from")
-        )
-        effective_until = (
-            None
-            if self.effective_until is None
-            else _finite(self.effective_until, name="effective_until")
-        )
-        if (effective_from is None) != (effective_until is None):
-            raise ValueError("Mixing context effective bounds must be both set or absent.")
-        if (
-            effective_from is not None
-            and effective_until is not None
-            and effective_until <= effective_from
-        ):
-            raise ValueError("Mixing context effective interval must be non-empty.")
-        blob_refs = tuple(_required(value, name="blob_ref") for value in self.blob_refs)
-        if len(blob_refs) != len(set(blob_refs)):
-            raise ValueError("Mixing context blob_refs must be unique.")
-        payload = deep_freeze(dict(self.semantic_payload))
-        semantic = {
-            "context_id": context_id,
-            "context_kind": kind,
-            "source_fact_id": source_fact_id,
-            "source_fact_hash": source_fact_hash,
-            "payload_contract_hash": contract_hash,
-            "semantic_payload": payload,
-            "available_at": available_at,
-            "available_clock_domain_id": clock_domain,
-            "control_admission_sequence": admission_sequence,
-            "effective_from": effective_from,
-            "effective_until": effective_until,
-            "blob_refs": blob_refs,
-        }
-        object.__setattr__(self, "context_id", context_id)
-        object.__setattr__(self, "context_kind", kind)
-        object.__setattr__(self, "source_fact_id", source_fact_id)
-        object.__setattr__(self, "source_fact_hash", source_fact_hash)
-        object.__setattr__(self, "payload_contract_hash", contract_hash)
-        object.__setattr__(self, "semantic_payload", payload)
-        object.__setattr__(self, "available_at", available_at)
-        object.__setattr__(self, "available_clock_domain_id", clock_domain)
-        object.__setattr__(self, "control_admission_sequence", admission_sequence)
-        object.__setattr__(self, "effective_from", effective_from)
-        object.__setattr__(self, "effective_until", effective_until)
-        object.__setattr__(self, "blob_refs", blob_refs)
-        object.__setattr__(
-            self,
-            "semantic_content_hash",
-            canonical_content_hash(
-                semantic,
-                domain=POSE_MIXING_CONTEXT_HASH_DOMAIN_V1,
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -237,19 +177,29 @@ class PoseMixingCandidate:
     source_slot_id: str
     proposal: ActionProposal
     projected_action: RobotAction | None = field(default=None, repr=False, compare=False)
+    component_dependencies: tuple[str, ...] = field(
+        default=POSE_MIXING_ARM_COMPONENTS_V1,
+        repr=False,
+        compare=False,
+    )
     action: RobotAction = field(init=False)
     action_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         source_slot_id = _required(self.source_slot_id, name="source_slot_id")
+        dependencies = normalize_pose_component_dependencies(
+            self.component_dependencies
+        )
         if not isinstance(self.proposal, ActionProposal):
             raise TypeError("proposal must be an admitted ActionProposal.")
         action = _require_pose_action(
             self.proposal.action
             if self.projected_action is None
-            else self.projected_action
+            else self.projected_action,
+            component_dependencies=dependencies,
         )
         object.__setattr__(self, "source_slot_id", source_slot_id)
+        object.__setattr__(self, "component_dependencies", dependencies)
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "action_hash", _pose_action_hash(action))
 
@@ -268,10 +218,8 @@ class PoseMixingStrategySpec:
             _required(value, name="accepted_context_kind")
             for value in self.accepted_context_kinds
         )
-        if len(kinds) != len(set(kinds)) or not set(kinds).issubset(
-            POSE_MIXING_CONTEXT_KINDS_V1
-        ):
-            raise ValueError("accepted_context_kinds must be unique supported kinds.")
+        if len(kinds) != len(set(kinds)):
+            raise ValueError("accepted_context_kinds must be unique.")
         object.__setattr__(self, "strategy_id", strategy_id)
         object.__setattr__(self, "algorithm", algorithm)
         object.__setattr__(self, "accepted_context_kinds", kinds)
@@ -306,7 +254,7 @@ class PoseMixingInputSnapshot:
     execution_gate_status: str
     current_owner_by_group: Mapping[str, str]
     candidate_by_source_slot: Mapping[str, PoseMixingCandidate]
-    contexts: tuple[PoseMixingContext, ...]
+    contexts: tuple[CompositionContext, ...]
     semantic_content_hash: str
     component_dependencies: tuple[str, ...] = POSE_MIXING_ARM_COMPONENTS_V1
 
@@ -322,9 +270,9 @@ class PoseMixingInputSnapshot:
             MappingProxyType(dict(self.candidate_by_source_slot)),
         )
         object.__setattr__(self, "contexts", tuple(self.contexts))
-        dependencies = tuple(_required(value, name="component_dependency") for value in self.component_dependencies)
-        if len(dependencies) != len(set(dependencies)) or not dependencies:
-            raise ValueError("Pose mixing component_dependencies must be unique and non-empty.")
+        dependencies = normalize_pose_component_dependencies(
+            self.component_dependencies
+        )
         object.__setattr__(self, "component_dependencies", dependencies)
 
 
@@ -357,7 +305,7 @@ def build_pose_mixing_input_snapshot(
     *,
     source_slot_by_producer: Mapping[str, str],
     clock_domain_id: str,
-    contexts: tuple[PoseMixingContext, ...] = (),
+    contexts: tuple[CompositionContext, ...] = (),
     component_dependencies: tuple[str, ...] | None = None,
 ) -> PoseMixingInputSnapshot:
     """Project one arbitration cut into the model/device-independent seam."""
@@ -371,7 +319,7 @@ def build_pose_mixing_input_snapshot(
         name="cutoff_admission_sequence",
     )
     clock_domain_id = _required(clock_domain_id, name="clock_domain_id")
-    dependencies = (
+    dependencies = normalize_pose_component_dependencies(
         POSE_MIXING_ARM_COMPONENTS_V1
         if component_dependencies is None
         else tuple(
@@ -379,10 +327,6 @@ def build_pose_mixing_input_snapshot(
             for value in component_dependencies
         )
     )
-    if dependencies != POSE_MIXING_ARM_COMPONENTS_V1:
-        raise ValueError(
-            "Pose mixing v1 currently requires the coupled left/right arm components."
-        )
     candidates: dict[str, PoseMixingCandidate] = {}
     producer_slots = {
         _required(producer, name="producer_id"): _required(slot, name="source_slot_id")
@@ -405,18 +349,20 @@ def build_pose_mixing_input_snapshot(
             source_slot_id=slot,
             proposal=proposal,
             projected_action=projected_action,
+            component_dependencies=dependencies,
         )
     context_tuple = tuple(contexts)
     if len({item.context_id for item in context_tuple}) != len(context_tuple):
         raise ValueError("Pose mixing context IDs must be unique.")
     for context in context_tuple:
-        if context.available_clock_domain_id != clock_domain_id:
-            raise ValueError("Mixing context uses a different control clock domain.")
-        if (
-            context.available_at > cutoff_at
-            or context.control_admission_sequence > cutoff_sequence
-        ):
-            raise ValueError("Mixing context was not available at the decision cut.")
+        if not isinstance(context, CompositionContext):
+            raise TypeError("contexts must contain CompositionContext values.")
+        context.validate_for_cut(
+            cutoff_at=cutoff_at,
+            cutoff_admission_sequence=cutoff_sequence,
+            target_effective_at=float(tick.target_effective_at),
+            clock_domain_id=clock_domain_id,
+        )
     owners = {
         group: lease.owner_producer_id
         for group, lease in authority_snapshot.active_leases.items()
@@ -502,7 +448,14 @@ def build_pose_mixing_decision(
         available_context_ids
     ):
         raise ValueError("used_context_ids must uniquely reference the input snapshot.")
-    frozen_action = None if output_action is None else _require_pose_action(output_action)
+    frozen_action = (
+        None
+        if output_action is None
+        else _require_pose_action(
+            output_action,
+            component_dependencies=snapshot.component_dependencies,
+        )
+    )
     if (normalized_status == "selected") != (frozen_action is not None):
         raise ValueError("Only a selected pose mixing decision may contain an action.")
     selected_slots = tuple(item.source_slot_id for item in selected)
@@ -554,14 +507,26 @@ def build_pose_mixing_decision(
 class DiscreteOwnerPoseMixingStrategy:
     """Behavior-equivalent v1 branch: pass through the active lease owner."""
 
-    def __init__(self, *, selection_group_id: str = "arms") -> None:
+    def __init__(
+        self,
+        *,
+        selection_group_id: str = "arms",
+        component_dependencies: tuple[str, ...] = POSE_MIXING_ARM_COMPONENTS_V1,
+    ) -> None:
         group = _required(selection_group_id, name="selection_group_id")
+        dependencies = normalize_pose_component_dependencies(
+            component_dependencies
+        )
         self.selection_group_id = group
+        self.component_dependencies = dependencies
+        parameters: dict[str, Any] = {"selection_group_id": group}
+        if dependencies != POSE_MIXING_ARM_COMPONENTS_V1:
+            parameters["component_dependencies"] = dependencies
         self._spec = PoseMixingStrategySpec(
             strategy_id=DISCRETE_OWNER_POSE_STRATEGY_ID_V1,
             algorithm="pass_through_current_authority_owner",
             accepted_context_kinds=(),
-            parameters={"selection_group_id": group},
+            parameters=parameters,
         )
 
     @property
@@ -569,6 +534,10 @@ class DiscreteOwnerPoseMixingStrategy:
         return self._spec
 
     def decide(self, snapshot: PoseMixingInputSnapshot) -> PoseMixingDecision:
+        if snapshot.component_dependencies != self.component_dependencies:
+            raise ValueError(
+                "Pose mixing strategy/snapshot component dependency mismatch."
+            )
         if snapshot.execution_gate_status != "ready":
             return build_pose_mixing_decision(
                 snapshot,
@@ -629,7 +598,15 @@ def _normalized_pose_quaternion(
 
 def _pose_action_frame_signature(
     action: RobotAction,
+    *,
+    component_dependencies: tuple[str, ...],
 ) -> tuple[str, tuple[tuple[str, str, str], ...]]:
+    sides = tuple(
+        component.removesuffix("_arm")
+        for component in normalize_pose_component_dependencies(
+            component_dependencies
+        )
+    )
     return (
         action.action_space,
         tuple(
@@ -638,7 +615,7 @@ def _pose_action_frame_signature(
                 action.arm_frame(side),
                 action.arm_controlled_frame(side),
             )
-            for side in ("left", "right")
+            for side in sides
         ),
     )
 
@@ -650,12 +627,18 @@ def fuse_weighted_se3_pose_actions(
     target_effective_at: float,
     max_translation_disagreement_m: float,
     max_rotation_disagreement_rad: float,
+    component_dependencies: tuple[str, ...] = POSE_MIXING_ARM_COMPONENTS_V1,
     source: str = "pose_fusion:weighted_se3_pose_fusion_v1",
 ) -> RobotAction:
-    """Fuse compatible bilateral arm poses without authority or side effects."""
+    """Fuse one explicit compatible arm-pose subset without side effects."""
 
+    dependencies = normalize_pose_component_dependencies(component_dependencies)
+    sides = tuple(component.removesuffix("_arm") for component in dependencies)
     actions = {
-        _required(slot, name="source_slot_id"): _require_pose_action(action)
+        _required(slot, name="source_slot_id"): _require_pose_action(
+            action,
+            component_dependencies=dependencies,
+        )
         for slot, action in dict(actions_by_source_slot).items()
     }
     weights = {
@@ -689,7 +672,11 @@ def fuse_weighted_se3_pose_actions(
         slot: weight / total_weight for slot, weight in sorted(weights.items())
     }
     signatures = {
-        _pose_action_frame_signature(action) for action in actions.values()
+        _pose_action_frame_signature(
+            action,
+            component_dependencies=dependencies,
+        )
+        for action in actions.values()
     }
     if len(signatures) != 1:
         raise ValueError("frame_or_action_space_mismatch")
@@ -699,7 +686,7 @@ def fuse_weighted_se3_pose_actions(
     )
     reference_action = actions[reference_slot]
     fused_pose_by_side: dict[str, np.ndarray] = {}
-    for side in ("left", "right"):
+    for side in sides:
         translations = {
             slot: np.asarray(action.arm_pose_by_side[side][:3], dtype=np.float64)
             for slot, action in actions.items()
@@ -761,14 +748,14 @@ def fuse_weighted_se3_pose_actions(
         action_space=reference_action.action_space,
         timestamp=target,
         arm_pose_by_side=fused_pose_by_side,
-        active_effectors=POSE_MIXING_ARM_COMPONENTS_V1,
+        active_effectors=dependencies,
         frame_by_effector={
             effector: reference_action.frame_by_effector[effector]
-            for effector in POSE_MIXING_ARM_COMPONENTS_V1
+            for effector in dependencies
         },
         controlled_frame_by_effector={
             effector: reference_action.controlled_frame_by_effector[effector]
-            for effector in POSE_MIXING_ARM_COMPONENTS_V1
+            for effector in dependencies
         },
         source=_required(source, name="source"),
     )
@@ -791,6 +778,7 @@ class WeightedSE3PoseFusionStrategy:
         max_rotation_disagreement_rad: float = math.radians(60.0),
         missing_candidate_behavior: str = "no_action",
         selection_group_id: str = "arms",
+        component_dependencies: tuple[str, ...] = POSE_MIXING_ARM_COMPONENTS_V1,
     ) -> None:
         weights: dict[str, float] = {}
         for raw_slot, raw_weight in dict(weights_by_source_slot).items():
@@ -827,11 +815,28 @@ class WeightedSE3PoseFusionStrategy:
             selection_group_id,
             name="selection_group_id",
         )
+        dependencies = normalize_pose_component_dependencies(
+            component_dependencies
+        )
         self.weights_by_source_slot = MappingProxyType(weights)
         self.max_translation_disagreement_m = translation_limit
         self.max_rotation_disagreement_rad = rotation_limit
         self.missing_candidate_behavior = missing_behavior
         self.selection_group_id = selection_group
+        self.component_dependencies = dependencies
+        parameters: dict[str, Any] = {
+            "weights_by_source_slot": weights,
+            "max_translation_disagreement_m": translation_limit,
+            "max_rotation_disagreement_rad": rotation_limit,
+            "missing_candidate_behavior": missing_behavior,
+            "selection_group_id": selection_group,
+            "quaternion_layout": "xyzw",
+            "reference_selection": (
+                "highest_normalized_weight_then_source_slot"
+            ),
+        }
+        if dependencies != POSE_MIXING_ARM_COMPONENTS_V1:
+            parameters["component_dependencies"] = dependencies
         self._spec = PoseMixingStrategySpec(
             strategy_id=WEIGHTED_SE3_POSE_FUSION_STRATEGY_ID_V1,
             algorithm=(
@@ -839,17 +844,7 @@ class WeightedSE3PoseFusionStrategy:
                 "so3_reference_tangent_weighted_mean_v1"
             ),
             accepted_context_kinds=(),
-            parameters={
-                "weights_by_source_slot": weights,
-                "max_translation_disagreement_m": translation_limit,
-                "max_rotation_disagreement_rad": rotation_limit,
-                "missing_candidate_behavior": missing_behavior,
-                "selection_group_id": selection_group,
-                "quaternion_layout": "xyzw",
-                "reference_selection": (
-                    "highest_normalized_weight_then_source_slot"
-                ),
-            },
+            parameters=parameters,
         )
 
     @property
@@ -857,6 +852,10 @@ class WeightedSE3PoseFusionStrategy:
         return self._spec
 
     def decide(self, snapshot: PoseMixingInputSnapshot) -> PoseMixingDecision:
+        if snapshot.component_dependencies != self.component_dependencies:
+            raise ValueError(
+                "Pose fusion strategy/snapshot component dependency mismatch."
+            )
         if snapshot.execution_gate_status != "ready":
             return build_pose_mixing_decision(
                 snapshot,
@@ -928,6 +927,7 @@ class WeightedSE3PoseFusionStrategy:
                 max_rotation_disagreement_rad=(
                     self.max_rotation_disagreement_rad
                 ),
+                component_dependencies=self.component_dependencies,
                 source=f"pose_fusion:{self.spec.strategy_id}",
             )
         except ValueError as exc:
@@ -1025,6 +1025,7 @@ class HandQposMixingInputSnapshot:
     execution_gate_status: str
     candidate_by_source_slot: Mapping[str, HandQposMixingCandidate]
     semantic_content_hash: str
+    contexts: tuple[CompositionContext, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1032,6 +1033,7 @@ class HandQposMixingInputSnapshot:
             "candidate_by_source_slot",
             MappingProxyType(dict(self.candidate_by_source_slot)),
         )
+        object.__setattr__(self, "contexts", tuple(self.contexts))
 
     @property
     def snapshot_id(self) -> str:
@@ -1046,6 +1048,7 @@ def build_hand_qpos_mixing_input_snapshot(
     hand_spec: HandActionSpec,
     clock_domain_id: str,
     component_id: str | None = None,
+    contexts: tuple[CompositionContext, ...] = (),
 ) -> HandQposMixingInputSnapshot:
     """Project one arbitration cut into a hand/gripper qpos component cut."""
 
@@ -1084,6 +1087,18 @@ def build_hand_qpos_mixing_input_snapshot(
         candidates[slot] = candidate
     action_space = next(iter(candidates.values())).action.action_space if candidates else ""
     component = _required(component_id or f"{hand_spec.side}_hand", name="component_id")
+    context_tuple = tuple(contexts)
+    if len({item.context_id for item in context_tuple}) != len(context_tuple):
+        raise ValueError("Hand qpos mixing context IDs must be unique.")
+    for context in context_tuple:
+        if not isinstance(context, CompositionContext):
+            raise TypeError("contexts must contain CompositionContext values.")
+        context.validate_for_cut(
+            cutoff_at=cutoff_at,
+            cutoff_admission_sequence=cutoff_sequence,
+            target_effective_at=float(tick.target_effective_at),
+            clock_domain_id=clock_domain_id,
+        )
     payload = {
         "component_id": component,
         "side": hand_spec.side,
@@ -1108,6 +1123,15 @@ def build_hand_qpos_mixing_input_snapshot(
             for slot, candidate in sorted(candidates.items())
         },
     }
+    if context_tuple:
+        payload["contexts"] = tuple(
+            {
+                "context_id": context.context_id,
+                "context_kind": context.context_kind,
+                "semantic_content_hash": context.semantic_content_hash,
+            }
+            for context in context_tuple
+        )
     digest = canonical_content_hash(
         payload,
         domain=HAND_QPOS_MIXING_SNAPSHOT_HASH_DOMAIN_V1,
@@ -1127,6 +1151,7 @@ def build_hand_qpos_mixing_input_snapshot(
         execution_gate_status=arbitration_input.execution_gate_snapshot.status,
         candidate_by_source_slot=candidates,
         semantic_content_hash=digest,
+        contexts=context_tuple,
     )
 
 
@@ -1139,6 +1164,7 @@ class HandQposMixingStrategySpec:
     hand_action_spec_hash: str
     weights_by_source_slot: Mapping[str, float]
     missing_candidate_behavior: str = "no_action"
+    accepted_context_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         strategy_id = _required(self.strategy_id, name="strategy_id")
@@ -1157,25 +1183,35 @@ class HandQposMixingStrategySpec:
             raise ValueError("Hand qpos interpolation requires a positive weight.")
         if self.missing_candidate_behavior not in {"no_action", "renormalize_available"}:
             raise ValueError("Unsupported missing_candidate_behavior.")
+        kinds = tuple(
+            _required(value, name="accepted_context_kind")
+            for value in self.accepted_context_kinds
+        )
+        if len(kinds) != len(set(kinds)):
+            raise ValueError("accepted_context_kinds must be unique.")
         object.__setattr__(self, "strategy_id", strategy_id)
         object.__setattr__(self, "algorithm", algorithm)
         object.__setattr__(self, "component_id", component_id)
         object.__setattr__(self, "action_space", action_space)
         object.__setattr__(self, "hand_action_spec_hash", spec_hash)
         object.__setattr__(self, "weights_by_source_slot", MappingProxyType(weights))
+        object.__setattr__(self, "accepted_context_kinds", kinds)
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "strategy_id": self.strategy_id,
+            "algorithm": self.algorithm,
+            "component_id": self.component_id,
+            "action_space": self.action_space,
+            "hand_action_spec_hash": self.hand_action_spec_hash,
+            "weights_by_source_slot": self.weights_by_source_slot,
+            "missing_candidate_behavior": self.missing_candidate_behavior,
+        }
+        if self.accepted_context_kinds:
+            payload["accepted_context_kinds"] = self.accepted_context_kinds
         return canonical_content_hash(
-            {
-                "strategy_id": self.strategy_id,
-                "algorithm": self.algorithm,
-                "component_id": self.component_id,
-                "action_space": self.action_space,
-                "hand_action_spec_hash": self.hand_action_spec_hash,
-                "weights_by_source_slot": self.weights_by_source_slot,
-                "missing_candidate_behavior": self.missing_candidate_behavior,
-            },
+            payload,
             domain=HAND_QPOS_MIXING_SPEC_HASH_DOMAIN_V1,
         )
 
@@ -1197,6 +1233,7 @@ class HandQposMixingDecision:
     output_hand_qpos: np.ndarray | None
     output_hand_qpos_hash: str | None
     semantic_content_hash: str
+    used_context_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1206,6 +1243,7 @@ class HandQposMixingDecision:
         )
         if self.output_hand_qpos is not None:
             object.__setattr__(self, "output_hand_qpos", deep_freeze(self.output_hand_qpos))
+        object.__setattr__(self, "used_context_ids", tuple(self.used_context_ids))
 
 
 class HandQposMixingStrategy(Protocol):
@@ -1224,7 +1262,7 @@ def _hand_qpos_hash(values: np.ndarray | None) -> str | None:
     )
 
 
-def _build_hand_qpos_mixing_decision(
+def build_hand_qpos_mixing_decision(
     snapshot: HandQposMixingInputSnapshot,
     *,
     spec: HandQposMixingStrategySpec,
@@ -1233,6 +1271,7 @@ def _build_hand_qpos_mixing_decision(
     selected: tuple[HandQposMixingCandidate, ...] = (),
     normalized_weights: Mapping[str, float] = MappingProxyType({}),
     output_hand_qpos: np.ndarray | None = None,
+    used_context_ids: tuple[str, ...] = (),
 ) -> HandQposMixingDecision:
     if status not in {"selected", "no_action", "invalid"}:
         raise ValueError("Unsupported hand qpos mixing decision status.")
@@ -1258,6 +1297,22 @@ def _build_hand_qpos_mixing_decision(
         )
     ):
         raise ValueError("Selected hand qpos candidate is not in the input snapshot.")
+    context_ids = tuple(
+        _required(value, name="used_context_id") for value in used_context_ids
+    )
+    context_by_id = {item.context_id: item for item in snapshot.contexts}
+    if len(context_ids) != len(set(context_ids)) or not set(
+        context_ids
+    ).issubset(context_by_id):
+        raise ValueError(
+            "used_context_ids must uniquely reference the hand input snapshot."
+        )
+    if any(
+        context_by_id[context_id].context_kind
+        not in spec.accepted_context_kinds
+        for context_id in context_ids
+    ):
+        raise ValueError("Strategy used a context kind not declared by its spec.")
     output_hash = _hand_qpos_hash(output_hand_qpos)
     payload = {
         "strategy_id": spec.strategy_id,
@@ -1272,6 +1327,8 @@ def _build_hand_qpos_mixing_decision(
         "normalized_weights_by_source_slot": dict(normalized_weights),
         "output_hand_qpos_hash": output_hash,
     }
+    if context_ids:
+        payload["used_context_ids"] = context_ids
     digest = canonical_content_hash(payload, domain=HAND_QPOS_MIXING_DECISION_HASH_DOMAIN_V1)
     return HandQposMixingDecision(
         decision_id=f"hand-qpos-mixing-decision:{digest}",
@@ -1289,6 +1346,7 @@ def _build_hand_qpos_mixing_decision(
         output_hand_qpos=output_hand_qpos,
         output_hand_qpos_hash=output_hash,
         semantic_content_hash=digest,
+        used_context_ids=context_ids,
     )
 
 
@@ -1328,21 +1386,21 @@ class LinearHandQposInterpolationStrategy:
 
     def decide(self, snapshot: HandQposMixingInputSnapshot) -> HandQposMixingDecision:
         if not snapshot.candidate_by_source_slot:
-            return _build_hand_qpos_mixing_decision(
+            return build_hand_qpos_mixing_decision(
                 snapshot,
                 spec=self.spec,
                 status="no_action",
                 reason="no_candidate",
             )
         if snapshot.action_space != self.action_space:
-            return _build_hand_qpos_mixing_decision(
+            return build_hand_qpos_mixing_decision(
                 snapshot,
                 spec=self.spec,
                 status="invalid",
                 reason="action_space_mismatch",
             )
         if snapshot.execution_gate_status != "ready":
-            return _build_hand_qpos_mixing_decision(
+            return build_hand_qpos_mixing_decision(
                 snapshot,
                 spec=self.spec,
                 status="no_action",
@@ -1355,7 +1413,7 @@ class LinearHandQposInterpolationStrategy:
         }
         missing = tuple(slot for slot in positive_weights if slot not in snapshot.candidate_by_source_slot)
         if missing and self.spec.missing_candidate_behavior == "no_action":
-            return _build_hand_qpos_mixing_decision(
+            return build_hand_qpos_mixing_decision(
                 snapshot,
                 spec=self.spec,
                 status="no_action",
@@ -1367,7 +1425,7 @@ class LinearHandQposInterpolationStrategy:
             if slot in snapshot.candidate_by_source_slot
         )
         if not selected:
-            return _build_hand_qpos_mixing_decision(
+            return build_hand_qpos_mixing_decision(
                 snapshot,
                 spec=self.spec,
                 status="no_action",
@@ -1388,7 +1446,7 @@ class LinearHandQposInterpolationStrategy:
             dtype=np.float32,
         )
         output[np.asarray(self.hand_spec.active_mask, dtype=bool)] = active
-        return _build_hand_qpos_mixing_decision(
+        return build_hand_qpos_mixing_decision(
             snapshot,
             spec=self.spec,
             status="selected",
@@ -1441,7 +1499,7 @@ def evaluate_component_mixing_shadow(
     arm_strategy: PoseMixingStrategy,
     hand_strategy_by_side: Mapping[str, HandQposMixingStrategy] | None = None,
     hand_spec_by_side: Mapping[str, HandActionSpec] | None = None,
-    contexts: tuple[PoseMixingContext, ...] = (),
+    contexts: tuple[CompositionContext, ...] = (),
 ) -> ComponentMixingShadowDecision:
     """Evaluate replaceable arm and hand strategies at one causal cut.
 
@@ -1489,6 +1547,7 @@ def evaluate_component_mixing_shadow(
             side=side,
             hand_spec=hand_specs[side],
             clock_domain_id=clock_domain_id,
+            contexts=tuple(contexts),
         )
         hand_snapshot_ids[side] = hand_snapshot.snapshot_id
         hand_decisions[side] = hand_strategies[side].decide(hand_snapshot)
@@ -1630,6 +1689,7 @@ __all__ = [
     "HandQposMixingStrategySpec",
     "LinearHandQposInterpolationStrategy",
     "PoseMixingCandidate",
+    "CompositionContext",
     "PoseMixingContext",
     "PoseMixingDecision",
     "PoseMixingInputSnapshot",
@@ -1639,7 +1699,9 @@ __all__ = [
     "build_pose_mixing_decision",
     "build_pose_mixing_input_snapshot",
     "assemble_compound_component_action",
+    "build_hand_qpos_mixing_decision",
     "build_hand_qpos_mixing_input_snapshot",
     "evaluate_component_mixing_shadow",
     "fuse_weighted_se3_pose_actions",
+    "normalize_pose_component_dependencies",
 ]

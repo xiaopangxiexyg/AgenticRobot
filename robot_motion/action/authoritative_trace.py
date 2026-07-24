@@ -8,7 +8,7 @@ runtime handles into the dataset contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.control_trace import ControlTraceFact
@@ -33,13 +33,6 @@ from .candidate_authorization import (
     CandidateAuthorizationAdmissionReceipt,
     CandidateAuthorizationDraft,
 )
-from .composition import (
-    CompositionInputAdmissionReceipt,
-    CompositionInputRecord,
-    CompositionInputSnapshot,
-    CompositionResult,
-    composition_input_semantic_payload,
-)
 from .arbitration_runtime import (
     ArbitrationComputationMetrics,
     ArbitrationPublicationAttempt,
@@ -50,7 +43,6 @@ from .authority import AuthorityEvent
 from .executor import teleop_command_semantic_payload
 from .execution_shadow import SharedExecutionShadowEvaluation
 from .execution_manifest import ControlExecutionManifest
-from .mixing_strategy import ComponentMixingShadowDecision
 from .persistence import ExecutionDirective
 from .proposal import (
     ProposalAdmissionReceipt,
@@ -58,14 +50,6 @@ from .proposal import (
     robot_action_semantic_payload,
 )
 from .safety import SharedCanonicalSafetyResult
-
-if TYPE_CHECKING:
-    from robot_motion.deploy.context import (
-        PolicyContextAdmissionReceipt,
-        PolicyContextRecord,
-        PolicyContextSnapshot,
-    )
-
 
 AUTHORITATIVE_COMMAND_HASH_DOMAIN_V1 = "dexteleop.authoritative_command.v1"
 AUTHORITATIVE_SAFETY_HASH_DOMAIN_V1 = "dexteleop.authoritative_safety_result.v1"
@@ -331,169 +315,6 @@ def project_execution_gate_event(
             "available_clock_domain_id": event.available_clock_domain_id,
             "control_admission_sequence": event.control_admission_sequence,
             "semantic_content_hash": event.semantic_content_hash,
-        },
-    )
-
-
-def project_policy_context_admission(
-    context: AuthoritativeTraceContext,
-    receipt: PolicyContextAdmissionReceipt,
-    *,
-    occurred_at: float,
-) -> ControlTraceFact:
-    context_id = receipt.context_id or "policy-context:rejected-unidentified"
-    return context.fact(
-        fact_id=f"policy-context-admission:{context_id}",
-        event_type="policy_context_admission",
-        occurred_at=occurred_at,
-        payload={
-            "context_id": receipt.context_id,
-            "accepted": receipt.accepted,
-            "rejection_code": receipt.rejection_code,
-            "message": receipt.message,
-            "available_at": receipt.available_at,
-            "available_clock_domain_id": receipt.available_clock_domain_id,
-            "control_admission_sequence": receipt.control_admission_sequence,
-            "context_semantic_content_hash": receipt.semantic_content_hash,
-        },
-    )
-
-
-def project_policy_context(
-    context: AuthoritativeTraceContext,
-    record: PolicyContextRecord,
-) -> ControlTraceFact:
-    from robot_motion.deploy.context import policy_context_semantic_payload
-
-    payload = policy_context_semantic_payload(record)
-    payload["context_semantic_content_hash"] = record.semantic_content_hash
-    return context.fact(
-        fact_id=record.context_id,
-        event_type="policy_context",
-        occurred_at=record.available_at,
-        payload=payload,
-    )
-
-
-def project_policy_context_snapshot(
-    context: AuthoritativeTraceContext,
-    snapshot: PolicyContextSnapshot,
-) -> ControlTraceFact:
-    return context.fact(
-        fact_id=snapshot.context_snapshot_id,
-        event_type="policy_context_snapshot",
-        occurred_at=snapshot.cutoff_at,
-        payload={
-            "context_snapshot_id": snapshot.context_snapshot_id,
-            "control_domain_id": snapshot.control_domain_id,
-            "cutoff_at": snapshot.cutoff_at,
-            "cutoff_admission_sequence": snapshot.cutoff_admission_sequence,
-            "target_effective_at": snapshot.target_effective_at,
-            "required_channels": snapshot.required_channels,
-            "selected_context_id_by_channel": snapshot.selected_context_id_by_channel,
-            "selected_context_hash_by_channel": snapshot.selected_context_hash_by_channel,
-            "missing_channels": snapshot.missing_channels,
-            "producer_epoch_snapshot_hash": snapshot.producer_epoch_snapshot_hash,
-            "semantic_content_hash": snapshot.semantic_content_hash,
-        },
-    )
-
-
-def project_composition_input_admission(
-    context: AuthoritativeTraceContext,
-    receipt: CompositionInputAdmissionReceipt,
-    *,
-    occurred_at: float,
-) -> ControlTraceFact:
-    input_id = receipt.composition_input_id or "composition-input:rejected-unidentified"
-    return context.fact(
-        fact_id=f"composition-input-admission:{input_id}",
-        event_type="composition_input_admission",
-        occurred_at=occurred_at,
-        payload={
-            "composition_input_id": receipt.composition_input_id,
-            "accepted": receipt.accepted,
-            "rejection_code": receipt.rejection_code,
-            "message": receipt.message,
-            "available_at": receipt.available_at,
-            "available_clock_domain_id": receipt.available_clock_domain_id,
-            "control_admission_sequence": receipt.control_admission_sequence,
-            "input_semantic_content_hash": receipt.semantic_content_hash,
-        },
-    )
-
-
-def project_composition_input(
-    context: AuthoritativeTraceContext,
-    record: CompositionInputRecord,
-) -> ControlTraceFact:
-    payload = composition_input_semantic_payload(record)
-    payload["input_semantic_content_hash"] = record.semantic_content_hash
-    return context.fact(
-        fact_id=record.composition_input_id,
-        event_type="composition_input",
-        occurred_at=record.available_at,
-        payload=payload,
-    )
-
-
-def project_composition_input_snapshot(
-    context: AuthoritativeTraceContext,
-    snapshot: CompositionInputSnapshot,
-) -> ControlTraceFact:
-    return context.fact(
-        fact_id=snapshot.composition_input_snapshot_id,
-        event_type="composition_input_snapshot",
-        occurred_at=snapshot.cutoff_at,
-        payload={
-            "composition_input_snapshot_id": snapshot.composition_input_snapshot_id,
-            "control_domain_id": snapshot.control_domain_id,
-            "cutoff_at": snapshot.cutoff_at,
-            "cutoff_admission_sequence": snapshot.cutoff_admission_sequence,
-            "target_effective_at": snapshot.target_effective_at,
-            "composition_spec_hash": snapshot.composition_spec_hash,
-            "selected_input_ids_by_role": {
-                role: record.composition_input_id
-                for role, record in snapshot.selected_input_by_role.items()
-            },
-            "selected_input_hashes_by_role": {
-                role: record.semantic_content_hash
-                for role, record in snapshot.selected_input_by_role.items()
-            },
-            "missing_roles": snapshot.missing_roles,
-            "producer_epoch_snapshot_hash": snapshot.producer_epoch_snapshot_hash,
-            "semantic_content_hash": snapshot.semantic_content_hash,
-        },
-    )
-
-
-def project_composition_result(
-    context: AuthoritativeTraceContext,
-    result: CompositionResult,
-    *,
-    occurred_at: float,
-) -> ControlTraceFact:
-    return context.fact(
-        fact_id=result.composition_result_id,
-        event_type="composition_result",
-        occurred_at=occurred_at,
-        payload={
-            "composition_result_id": result.composition_result_id,
-            "composition_input_snapshot_id": result.composition_input_snapshot_id,
-            "composition_input_snapshot_hash": result.composition_input_snapshot_hash,
-            "composition_spec_hash": result.composition_spec_hash,
-            "output_status": result.output_status,
-            "reason": result.reason,
-            "composed_action": (
-                None
-                if result.composed_action is None
-                else robot_action_semantic_payload(result.composed_action)
-            ),
-            "composed_action_hash": result.composed_action_hash,
-            "input_ids": result.input_ids,
-            "input_hashes": result.input_hashes,
-            "context_ids": result.context_ids,
-            "semantic_content_hash": result.semantic_content_hash,
         },
     )
 
@@ -1022,75 +843,6 @@ def project_shared_execution_shadow_evaluation(
     )
 
 
-def project_component_mixing_shadow(
-    context: AuthoritativeTraceContext,
-    decision: ComponentMixingShadowDecision,
-    *,
-    evaluated_at: float,
-) -> ControlTraceFact:
-    """Project pure arm/hand component mixing without granting authority.
-
-    The fact records the exact strategy and immutable snapshot lineage used by
-    the shadow.  ``output_action`` is a preview only: it has not passed shared
-    canonical safety, target admission, reference scheduling, or dispatch.
-    """
-
-    if not isinstance(decision, ComponentMixingShadowDecision):
-        raise TypeError("decision must be a ComponentMixingShadowDecision.")
-    hand_decisions = decision.hand_decisions_by_side
-    shadow_id = f"component-mixing-shadow:{decision.semantic_content_hash}"
-    return context.fact(
-        fact_id=shadow_id,
-        event_type="component_mixing_shadow",
-        occurred_at=evaluated_at,
-        payload={
-            "shadow_id": shadow_id,
-            "status": decision.status,
-            "reason": decision.reason,
-            "non_authoritative": True,
-            "arm_decision_id": decision.arm_decision.decision_id,
-            "arm_decision_hash": decision.arm_decision.semantic_content_hash,
-            "arm_strategy_id": decision.arm_decision.strategy_id,
-            "arm_strategy_spec_hash": decision.arm_decision.strategy_spec_hash,
-            "arm_input_snapshot_id": decision.arm_decision.input_snapshot_id,
-            "arm_input_snapshot_hash": decision.arm_decision.input_snapshot_hash,
-            "hand_decision_id_by_side": {
-                side: item.decision_id
-                for side, item in sorted(hand_decisions.items())
-            },
-            "hand_decision_hash_by_side": {
-                side: item.semantic_content_hash
-                for side, item in sorted(hand_decisions.items())
-            },
-            "hand_strategy_id_by_side": {
-                side: item.strategy_id
-                for side, item in sorted(hand_decisions.items())
-            },
-            "hand_strategy_spec_hash_by_side": {
-                side: item.strategy_spec_hash
-                for side, item in sorted(hand_decisions.items())
-            },
-            "hand_input_snapshot_id_by_side": {
-                side: item.input_snapshot_id
-                for side, item in sorted(hand_decisions.items())
-            },
-            "hand_input_snapshot_hash_by_side": {
-                side: item.input_snapshot_hash
-                for side, item in sorted(hand_decisions.items())
-            },
-            "component_decision_hash_by_id": decision.component_decision_hash_by_id,
-            "output_action": (
-                None
-                if decision.output_action is None
-                else robot_action_semantic_payload(decision.output_action)
-            ),
-            "output_action_hash": decision.output_action_hash,
-            "evaluated_at": float(evaluated_at),
-            "semantic_content_hash": decision.semantic_content_hash,
-        },
-    )
-
-
 def project_execution_cancellation(
     context: AuthoritativeTraceContext,
     cancellation: ExecutionCancellation,
@@ -1446,12 +1198,7 @@ __all__ = [
     "project_authority_event",
     "project_candidate_authorization_admission",
     "project_command",
-    "project_component_mixing_shadow",
     "project_control_execution_manifest",
-    "project_composition_input",
-    "project_composition_input_admission",
-    "project_composition_input_snapshot",
-    "project_composition_result",
     "project_dispatch_owner_validation",
     "project_dispatch_permit_validation",
     "project_dispatch_receipts",
@@ -1461,9 +1208,6 @@ __all__ = [
     "project_execution_gate_event",
     "project_measurement_alignment",
     "project_observation_cut",
-    "project_policy_context",
-    "project_policy_context_admission",
-    "project_policy_context_snapshot",
     "project_producer_epoch_activation",
     "project_proposal_admission",
     "project_publication",

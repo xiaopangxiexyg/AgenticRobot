@@ -35,11 +35,42 @@ class ActorCritic(nn.Module):
         proprio_dim: int | None = None,
         image_shape: Sequence[int] | None = None,
         image_pool_size: int = 1,
+        environment_action_dim: int | None = None,
+        active_action_indices: Sequence[int] | None = None,
+        trainable_log_std: bool = True,
+        initial_log_std: float = -0.5,
     ) -> None:
         super().__init__()
         self.observation_dim = int(observation_dim)
         self.action_dim = int(action_dim)
         self.hidden_dim = int(hidden_dim)
+        self.environment_action_dim = (
+            self.action_dim
+            if environment_action_dim is None
+            else int(environment_action_dim)
+        )
+        self.active_action_indices = (
+            tuple(range(self.action_dim))
+            if active_action_indices is None
+            else tuple(int(value) for value in active_action_indices)
+        )
+        if self.action_dim <= 0 or self.environment_action_dim <= 0:
+            raise ValueError("Policy and environment action dimensions must be positive.")
+        if len(self.active_action_indices) != self.action_dim:
+            raise ValueError(
+                "active_action_indices length must match the policy action dimension."
+            )
+        if (
+            len(set(self.active_action_indices)) != self.action_dim
+            or any(
+                value < 0 or value >= self.environment_action_dim
+                for value in self.active_action_indices
+            )
+        ):
+            raise ValueError(
+                "active_action_indices must be unique environment action indices."
+            )
+        self.trainable_log_std = bool(trainable_log_std)
         self.image_shape = None if image_shape is None else tuple(int(v) for v in image_shape)
         self.image_pool_size = int(image_pool_size)
         if self.image_shape is not None:
@@ -99,7 +130,10 @@ class ActorCritic(nn.Module):
             )
         self.actor_mean = nn.Linear(self.hidden_dim, self.action_dim)
         self.critic = nn.Linear(self.hidden_dim, 1)
-        self.log_std = nn.Parameter(torch.full((self.action_dim,), -0.5))
+        self.log_std = nn.Parameter(
+            torch.full((self.action_dim,), float(initial_log_std)),
+            requires_grad=self.trainable_log_std,
+        )
         self.apply(self._initialize_layer)
         nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
         nn.init.zeros_(self.actor_mean.bias)
@@ -161,6 +195,26 @@ class ActorCritic(nn.Module):
         action = torch.tanh(pre_tanh)
         log_prob = self._squashed_log_prob(distribution, pre_tanh, action)
         return action, log_prob, value
+
+    def expand_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Expand compact learned actions into the environment's public layout."""
+
+        if action.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Expected compact action dim {self.action_dim}, got {action.shape}."
+            )
+        if (
+            self.environment_action_dim == self.action_dim
+            and self.active_action_indices == tuple(range(self.action_dim))
+        ):
+            return action
+        expanded = torch.zeros(
+            (*action.shape[:-1], self.environment_action_dim),
+            dtype=action.dtype,
+            device=action.device,
+        )
+        expanded[..., list(self.active_action_indices)] = action
+        return expanded
 
     def evaluate_actions(
         self,

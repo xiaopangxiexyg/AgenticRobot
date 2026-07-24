@@ -16,9 +16,24 @@ from dataset_contracts.replay import (
     replay_source_action_contract_payload,
     target_runtime_action_contract_payload,
 )
+from control_composition.composition import (
+    CompositionInputAdmissionReceipt,
+    CompositionInputRecord,
+    CompositionInputSnapshot,
+    CompositionResult,
+    CompositionSpec,
+)
+from control_composition.trace import (
+    project_composition_input as _project_composition_input,
+    project_composition_input_admission as _project_composition_input_admission,
+    project_composition_input_snapshot as _project_composition_input_snapshot,
+    project_composition_result as _project_composition_result,
+    project_composition_spec as _project_composition_spec,
+)
 from robot_motion.action.arbiter import ArbitrationResult
 from robot_motion.action.arbitration_input import ArbitrationInputSnapshot
 from robot_motion.action.authority import AuthorityEvent, AuthorityStateSnapshot
+from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
 from robot_motion.action.proposal import (
     ActionProposal,
     ProposalAdmissionReceipt,
@@ -26,20 +41,7 @@ from robot_motion.action.proposal import (
     robot_action_semantic_payload,
 )
 from robot_motion.action.snapshot import ProposalSnapshot
-from robot_motion.action.composition import (
-    CompositionInputAdmissionReceipt,
-    CompositionInputRecord,
-    CompositionInputSnapshot,
-    CompositionResult,
-    composition_input_semantic_payload,
-)
 from robot_motion.deploy.control_trace import project_policy_action_emission
-from robot_motion.deploy.context import (
-    PolicyContextAdmissionReceipt,
-    PolicyContextRecord,
-    PolicyContextSnapshot,
-    policy_context_semantic_payload,
-)
 from robot_motion.runtime.execution_gate import ExecutionGateEvent, ExecutionGateSnapshot
 from robot_motion.runtime.producer_epoch import ProducerEpochActivation, ProducerEpochSnapshot
 from robot_motion.replay.proposal_source import (
@@ -435,93 +437,6 @@ def project_replay_proposal_adapter_result(
     return tuple(facts)
 
 
-def project_policy_context_admission(
-    receipt: PolicyContextAdmissionReceipt,
-    *,
-    runtime_session_id: str,
-    control_domain_id: str,
-    embodiment_instance_id: str,
-    occurred_at: float,
-    clock_domain_id: str,
-) -> ControlTraceFact:
-    context_id = receipt.context_id or "policy-context:rejected-unidentified"
-    return ControlTraceFact.create(
-        fact_id=f"policy-context-admission:{context_id}",
-        event_type="policy_context_admission",
-        runtime_session_id=runtime_session_id,
-        control_domain_id=control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=float(occurred_at),
-        clock_domain_id=clock_domain_id,
-        payload={
-            "context_id": receipt.context_id,
-            "accepted": receipt.accepted,
-            "rejection_code": receipt.rejection_code,
-            "message": receipt.message,
-            "available_at": receipt.available_at,
-            "available_clock_domain_id": receipt.available_clock_domain_id,
-            "control_admission_sequence": receipt.control_admission_sequence,
-            "context_semantic_content_hash": receipt.semantic_content_hash,
-        },
-    )
-
-
-def project_policy_context(
-    context: PolicyContextRecord,
-    *,
-    embodiment_instance_id: str,
-) -> ControlTraceFact:
-    payload = policy_context_semantic_payload(context)
-    payload["context_semantic_content_hash"] = context.semantic_content_hash
-    return ControlTraceFact.create(
-        fact_id=context.context_id,
-        event_type="policy_context",
-        runtime_session_id=context.runtime_session_id,
-        control_domain_id=context.control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=context.available_at,
-        clock_domain_id=context.available_clock_domain_id,
-        payload=payload,
-    )
-
-
-def project_policy_context_snapshot(
-    snapshot: PolicyContextSnapshot,
-    *,
-    runtime_session_id: str,
-    embodiment_instance_id: str,
-    clock_domain_id: str,
-) -> ControlTraceFact:
-    return ControlTraceFact.create(
-        fact_id=snapshot.context_snapshot_id,
-        event_type="policy_context_snapshot",
-        runtime_session_id=runtime_session_id,
-        control_domain_id=snapshot.control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=snapshot.cutoff_at,
-        clock_domain_id=clock_domain_id,
-        payload={
-            "context_snapshot_id": snapshot.context_snapshot_id,
-            "control_domain_id": snapshot.control_domain_id,
-            "cutoff_at": snapshot.cutoff_at,
-            "cutoff_admission_sequence": snapshot.cutoff_admission_sequence,
-            "target_effective_at": snapshot.target_effective_at,
-            "required_channels": snapshot.required_channels,
-            "selected_context_id_by_channel": (
-                snapshot.selected_context_id_by_channel
-            ),
-            "selected_context_hash_by_channel": (
-                snapshot.selected_context_hash_by_channel
-            ),
-            "missing_channels": snapshot.missing_channels,
-            "producer_epoch_snapshot_hash": (
-                snapshot.producer_epoch_snapshot_hash
-            ),
-            "semantic_content_hash": snapshot.semantic_content_hash,
-        },
-    )
-
-
 def project_composition_input_admission(
     receipt: CompositionInputAdmissionReceipt,
     *,
@@ -531,25 +446,38 @@ def project_composition_input_admission(
     occurred_at: float,
     clock_domain_id: str,
 ) -> ControlTraceFact:
-    input_id = receipt.composition_input_id or "composition-input:rejected-unidentified"
-    return ControlTraceFact.create(
-        fact_id=f"composition-input-admission:{input_id}",
-        event_type="composition_input_admission",
-        runtime_session_id=runtime_session_id,
-        control_domain_id=control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=float(occurred_at),
-        clock_domain_id=clock_domain_id,
-        payload={
-            "composition_input_id": receipt.composition_input_id,
-            "accepted": receipt.accepted,
-            "rejection_code": receipt.rejection_code,
-            "message": receipt.message,
-            "available_at": receipt.available_at,
-            "available_clock_domain_id": receipt.available_clock_domain_id,
-            "control_admission_sequence": receipt.control_admission_sequence,
-            "input_semantic_content_hash": receipt.semantic_content_hash,
-        },
+    return _project_composition_input_admission(
+        AuthoritativeTraceContext(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            embodiment_instance_id=embodiment_instance_id,
+            clock_domain_id=clock_domain_id,
+        ),
+        receipt,
+        occurred_at=occurred_at,
+    )
+
+
+def project_composition_spec(
+    spec: CompositionSpec,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str,
+    occurred_at: float,
+    clock_domain_id: str,
+) -> ControlTraceFact:
+    """Compatibility projection; canonical implementation lives in the package."""
+
+    return _project_composition_spec(
+        AuthoritativeTraceContext(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            embodiment_instance_id=embodiment_instance_id,
+            clock_domain_id=clock_domain_id,
+        ),
+        spec,
+        occurred_at=occurred_at,
     )
 
 
@@ -558,17 +486,14 @@ def project_composition_input(
     *,
     embodiment_instance_id: str,
 ) -> ControlTraceFact:
-    payload = composition_input_semantic_payload(record)
-    payload["input_semantic_content_hash"] = record.semantic_content_hash
-    return ControlTraceFact.create(
-        fact_id=record.composition_input_id,
-        event_type="composition_input",
-        runtime_session_id=record.runtime_session_id,
-        control_domain_id=record.control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=record.available_at,
-        clock_domain_id=record.available_clock_domain_id,
-        payload=payload,
+    return _project_composition_input(
+        AuthoritativeTraceContext(
+            runtime_session_id=record.runtime_session_id,
+            control_domain_id=record.control_domain_id,
+            embodiment_instance_id=embodiment_instance_id,
+            clock_domain_id=record.available_clock_domain_id,
+        ),
+        record,
     )
 
 
@@ -579,33 +504,14 @@ def project_composition_input_snapshot(
     embodiment_instance_id: str,
     clock_domain_id: str,
 ) -> ControlTraceFact:
-    return ControlTraceFact.create(
-        fact_id=snapshot.composition_input_snapshot_id,
-        event_type="composition_input_snapshot",
-        runtime_session_id=runtime_session_id,
-        control_domain_id=snapshot.control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=snapshot.cutoff_at,
-        clock_domain_id=clock_domain_id,
-        payload={
-            "composition_input_snapshot_id": snapshot.composition_input_snapshot_id,
-            "control_domain_id": snapshot.control_domain_id,
-            "cutoff_at": snapshot.cutoff_at,
-            "cutoff_admission_sequence": snapshot.cutoff_admission_sequence,
-            "target_effective_at": snapshot.target_effective_at,
-            "composition_spec_hash": snapshot.composition_spec_hash,
-            "selected_input_ids_by_role": {
-                role: record.composition_input_id
-                for role, record in snapshot.selected_input_by_role.items()
-            },
-            "selected_input_hashes_by_role": {
-                role: record.semantic_content_hash
-                for role, record in snapshot.selected_input_by_role.items()
-            },
-            "missing_roles": snapshot.missing_roles,
-            "producer_epoch_snapshot_hash": snapshot.producer_epoch_snapshot_hash,
-            "semantic_content_hash": snapshot.semantic_content_hash,
-        },
+    return _project_composition_input_snapshot(
+        AuthoritativeTraceContext(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=snapshot.control_domain_id,
+            embodiment_instance_id=embodiment_instance_id,
+            clock_domain_id=clock_domain_id,
+        ),
+        snapshot,
     )
 
 
@@ -618,32 +524,15 @@ def project_composition_result(
     occurred_at: float,
     clock_domain_id: str,
 ) -> ControlTraceFact:
-    return ControlTraceFact.create(
-        fact_id=result.composition_result_id,
-        event_type="composition_result",
-        runtime_session_id=runtime_session_id,
-        control_domain_id=control_domain_id,
-        embodiment_instance_id=embodiment_instance_id,
-        occurred_at=float(occurred_at),
-        clock_domain_id=clock_domain_id,
-        payload={
-            "composition_result_id": result.composition_result_id,
-            "composition_input_snapshot_id": result.composition_input_snapshot_id,
-            "composition_input_snapshot_hash": result.composition_input_snapshot_hash,
-            "composition_spec_hash": result.composition_spec_hash,
-            "output_status": result.output_status,
-            "reason": result.reason,
-            "composed_action": (
-                None
-                if result.composed_action is None
-                else robot_action_semantic_payload(result.composed_action)
-            ),
-            "composed_action_hash": result.composed_action_hash,
-            "input_ids": result.input_ids,
-            "input_hashes": result.input_hashes,
-            "context_ids": result.context_ids,
-            "semantic_content_hash": result.semantic_content_hash,
-        },
+    return _project_composition_result(
+        AuthoritativeTraceContext(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            embodiment_instance_id=embodiment_instance_id,
+            clock_domain_id=clock_domain_id,
+        ),
+        result,
+        occurred_at=occurred_at,
     )
 
 
@@ -1512,9 +1401,7 @@ __all__ = [
     "project_composition_input_admission",
     "project_composition_input_snapshot",
     "project_composition_result",
-    "project_policy_context",
-    "project_policy_context_admission",
-    "project_policy_context_snapshot",
+    "project_composition_spec",
     "project_candidate_binding_eligibility",
     "project_legacy_replay_contract_derivation",
     "project_replay_binding_assessment",

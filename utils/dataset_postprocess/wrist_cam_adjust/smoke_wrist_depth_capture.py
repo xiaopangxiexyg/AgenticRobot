@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+from teleop_runtime.configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from dataset_contracts.wrist_depth import (
     DepthRangeMaskConfig,
     depth_range_mask,

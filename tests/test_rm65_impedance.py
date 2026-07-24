@@ -237,7 +237,7 @@ class RM65ImpedanceTest(unittest.TestCase):
         self.assertEqual(backend_config.actual_send_dt_max_scale, 1.0)
         self.assertFalse(backend_config.scale_outer_execution_step_by_actual_dt)
 
-    def test_dmtac_impedance_profiles_allow_small_joint_hint_offsets(self) -> None:
+    def test_dmtac_impedance_profiles_disable_direct_joint_hint_offsets(self) -> None:
         for profile_name in (
             "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json",
             "hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json",
@@ -245,11 +245,8 @@ class RM65ImpedanceTest(unittest.TestCase):
             profile = load_profile(profile_name)
             for mode in ("pose", "joint"):
                 config = RM65ImpedanceConfig.from_profile(profile, mode=mode)
-                self.assertAlmostEqual(config.direct_joint_hint_max_linear_offset_m, 0.003)
-                self.assertAlmostEqual(
-                    config.direct_joint_hint_max_angular_offset_rad,
-                    np.deg2rad(0.5),
-                )
+                self.assertAlmostEqual(config.direct_joint_hint_max_linear_offset_m, 0.0)
+                self.assertAlmostEqual(config.direct_joint_hint_max_angular_offset_rad, 0.0)
 
     def test_hard_deadline_rejects_blocking_rm65_sdk_candidate_provider(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-blocking candidate providers"):

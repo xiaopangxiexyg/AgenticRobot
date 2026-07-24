@@ -10,7 +10,10 @@ import torch
 from torch import nn
 
 from sim.mujoco.runtime import CubeLiftVectorExecutor
-from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+from sim.mujoco.tasks.cube_lift.config import (
+    CubeLiftTaskConfig,
+    is_cube_lift_success_reason,
+)
 from sim.mujoco.learning import encode_model_input
 from sim.mujoco.tasks.cube_lift.learning import (
     build_action_binding,
@@ -24,6 +27,16 @@ from .config import PPOConfig, RewardShapingConfig
 from .normalization import RunningMeanStd
 from .policy import ActorCritic, resolve_device
 from .reward import shape_rewards
+
+
+UNSAFE_TERMINATION_REASONS = frozenset(
+    {
+        "sim_joint_position_limit_violation",
+        "sim_collision_margin_violation",
+        "robot_environment_penetration",
+        "robot_environment_clearance_violation",
+    }
+)
 
 
 @dataclass
@@ -57,9 +70,48 @@ class RolloutBatch:
     reward_term_means: dict[str, float]
 
 
-class PPOSmokeTrainer:
-    action_dim = 7
+def compute_gae(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    bootstrap_values: np.ndarray,
+    terminated: np.ndarray,
+    episode_done: np.ndarray,
+    *,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute GAE while bootstrapping time-limit truncations only."""
 
+    shape = rewards.shape
+    if rewards.ndim != 2:
+        raise ValueError(f"rewards must be [steps, envs], got shape {shape}.")
+    for name, array in {
+        "values": values,
+        "bootstrap_values": bootstrap_values,
+        "terminated": terminated,
+        "episode_done": episode_done,
+    }.items():
+        if np.asarray(array).shape != shape:
+            raise ValueError(f"{name} must match reward shape {shape}.")
+    advantages = np.zeros(shape, dtype=np.float32)
+    last_gae = np.zeros(shape[1], dtype=np.float32)
+    for step in reversed(range(shape[0])):
+        bootstrap_mask = 1.0 - terminated[step]
+        continuation_mask = 1.0 - episode_done[step]
+        delta = (
+            rewards[step]
+            + gamma * bootstrap_values[step] * bootstrap_mask
+            - values[step]
+        )
+        last_gae = (
+            delta
+            + gamma * gae_lambda * continuation_mask * last_gae
+        )
+        advantages[step] = last_gae
+    return advantages, advantages + values
+
+
+class PPOSmokeTrainer:
     def __init__(
         self,
         ppo_config: PPOConfig,
@@ -74,6 +126,11 @@ class PPOSmokeTrainer:
         self.task_config_path = str(task_config_path)
         self.task_config = CubeLiftTaskConfig.load(task_config_path)
         self.observation_dim = self.task_config.observation_dim
+        self.environment_action_dim = self.task_config.action_dim
+        self.active_action_indices = (
+            self.task_config.policy_active_action_indices
+        )
+        self.action_dim = len(self.active_action_indices)
         self.device = resolve_device(ppo_config.device)
         np.random.seed(ppo_config.seed)
         torch.manual_seed(ppo_config.seed)
@@ -87,9 +144,17 @@ class PPOSmokeTrainer:
             proprio_dim=self.task_config.proprio_observation_dim,
             image_shape=self.task_config.wrist_rgb_shape,
             image_pool_size=self.task_config.wrist_rgb_spatial_pool_size,
+            environment_action_dim=self.environment_action_dim,
+            active_action_indices=self.active_action_indices,
+            trainable_log_std=False,
+            initial_log_std=ppo_config.initial_log_std,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(
-            self.policy.parameters(),
+            (
+                parameter
+                for parameter in self.policy.parameters()
+                if parameter.requires_grad
+            ),
             lr=ppo_config.learning_rate,
             eps=1e-5,
         )
@@ -109,6 +174,13 @@ class PPOSmokeTrainer:
             self.learning_observation_contract,
         )
         self.learning_action_binding = build_action_binding(self.task_config)
+        if self.learning_action_binding.output_dim != self.environment_action_dim:
+            self.env.close()
+            raise RuntimeError(
+                "CubeLift environment action binding dimension does not match "
+                f"the task: binding={self.learning_action_binding.output_dim}, "
+                f"environment={self.environment_action_dim}."
+            )
         expected_input_dim = self.learning_model_input_binding.expected_flat_dim(
             self.learning_observation_contract
         )
@@ -149,6 +221,15 @@ class PPOSmokeTrainer:
         self._reward_observation = np.stack(
             [self._training_reward_state(info) for info in reset_infos]
         )
+        self.pose_ik_solvers = tuple(
+            sorted(
+                {
+                    str(info["pose_ik_solver"])
+                    for info in reset_infos
+                    if info.get("pose_ik_solver") is not None
+                }
+            )
+        )
         self.observation_normalizer.update(self.observation)
         self.global_step = 0
         self.update_index = 0
@@ -158,6 +239,14 @@ class PPOSmokeTrainer:
         self._episode_resting_cube_z = CubeLiftRewardState.from_flat(
             self._reward_observation
         ).cube_z.astype(np.float32, copy=True)
+        self._previous_bilateral_contact = np.asarray(
+            [
+                bool(info.get("bilateral_finger_cube_contact", False))
+                for info in reset_infos
+            ],
+            dtype=np.float32,
+        )
+        self._apply_exploration_schedule()
 
     @staticmethod
     def _training_reward_state(info: dict[str, Any]) -> np.ndarray:
@@ -169,8 +258,28 @@ class PPOSmokeTrainer:
     def close(self) -> None:
         self.env.close()
 
+    def _apply_exploration_schedule(self) -> float:
+        anneal_steps = max(
+            float(self.config.total_timesteps)
+            * float(self.config.std_anneal_fraction),
+            1.0,
+        )
+        progress = min(max(float(self.global_step) / anneal_steps, 0.0), 1.0)
+        log_std = (
+            float(self.config.initial_log_std)
+            + progress
+            * (
+                float(self.config.final_log_std)
+                - float(self.config.initial_log_std)
+            )
+        )
+        with torch.no_grad():
+            self.policy.log_std.fill_(log_std)
+        return log_std
+
     def collect_rollout(self) -> RolloutBatch:
         cfg = self.config
+        self._apply_exploration_schedule()
         shape = (cfg.rollout_steps, cfg.num_envs)
         observations = np.empty((*shape, self.observation_dim), dtype=np.float32)
         actions = np.empty((*shape, self.action_dim), dtype=np.float32)
@@ -178,7 +287,9 @@ class PPOSmokeTrainer:
         values = np.empty(shape, dtype=np.float32)
         rewards = np.empty(shape, dtype=np.float32)
         raw_rewards_buffer = np.empty(shape, dtype=np.float32)
-        dones = np.empty(shape, dtype=np.float32)
+        terminated_buffer = np.empty(shape, dtype=np.float32)
+        episode_done_buffer = np.empty(shape, dtype=np.float32)
+        bootstrap_values = np.empty(shape, dtype=np.float32)
         episode_returns: list[float] = []
         episode_records: list[dict[str, Any]] = []
         completed = 0
@@ -210,8 +321,16 @@ class PPOSmokeTrainer:
                 action_tensor, log_prob_tensor, value_tensor = self.policy.act(
                     observation_tensor
                 )
+                environment_action_tensor = self.policy.expand_action(action_tensor)
             action = action_tensor.cpu().numpy().astype(np.float32, copy=False)
-            next_observation, raw_reward, terminated, truncated, infos = self.env.step(action)
+            environment_action = (
+                environment_action_tensor.cpu().numpy().astype(
+                    np.float32, copy=False
+                )
+            )
+            next_observation, raw_reward, terminated, truncated, infos = self.env.step(
+                environment_action
+            )
             done = np.logical_or(terminated, truncated)
             safety_alpha = np.asarray(
                 [float(info.get("safety_projection_alpha", 1.0)) for info in infos],
@@ -269,13 +388,35 @@ class PPOSmokeTrainer:
                     )
             succeeded = np.asarray(
                 [
-                    info.get("termination_reason") == "height_only_lift_success"
+                    is_cube_lift_success_reason(
+                        info.get("termination_reason")
+                    )
                     for info in infos
+                ],
+                dtype=np.float32,
+            )
+            termination_reasons = [
+                info.get("termination_reason") for info in infos
+            ]
+            failure_termination = (
+                terminated.astype(np.float32) * (1.0 - succeeded)
+            )
+            unsafe_termination = np.asarray(
+                [
+                    reason in UNSAFE_TERMINATION_REASONS
+                    for reason in termination_reasons
                 ],
                 dtype=np.float32,
             )
             grasp_latched = np.asarray(
                 [bool(info.get("grasp_latched", False)) for info in infos],
+                dtype=np.float32,
+            )
+            bilateral_contact = np.asarray(
+                [
+                    bool(info.get("bilateral_finger_cube_contact", False))
+                    for info in infos
+                ],
                 dtype=np.float32,
             )
             shaped_reward, terms = shape_rewards(
@@ -288,6 +429,11 @@ class PPOSmokeTrainer:
                 lift_delta_m=self.task_config.lift_delta_m,
                 success=succeeded,
                 grasp_latched=grasp_latched,
+                bilateral_contact=bilateral_contact,
+                previous_bilateral_contact=self._previous_bilateral_contact,
+                time_limit=truncated,
+                failure_termination=failure_termination,
+                unsafe_termination=unsafe_termination,
             )
             for name, term_values in terms.items():
                 reward_term_sums[name] = reward_term_sums.get(name, 0.0) + float(
@@ -301,7 +447,25 @@ class PPOSmokeTrainer:
             values[step] = value_tensor.cpu().numpy()
             rewards[step] = shaped_reward
             raw_rewards_buffer[step] = raw_reward
-            dones[step] = done.astype(np.float32)
+            terminated_buffer[step] = terminated.astype(np.float32)
+            episode_done_buffer[step] = done.astype(np.float32)
+
+            bootstrap_observation = next_observation.copy()
+            for env_id in np.flatnonzero(done):
+                final_observation = infos[env_id].get("final_observation")
+                if final_observation is not None:
+                    bootstrap_observation[env_id] = np.asarray(
+                        final_observation, dtype=np.float32
+                    )
+            with torch.no_grad():
+                bootstrap_values[step] = self.policy.value(
+                    torch.as_tensor(
+                        self.observation_normalizer.normalize(
+                            bootstrap_observation
+                        ),
+                        device=self.device,
+                    )
+                ).cpu().numpy()
 
             self._episode_raw_return += raw_reward
             self._episode_shaped_return += shaped_reward
@@ -310,7 +474,7 @@ class PPOSmokeTrainer:
                 completed += 1
                 episode_returns.append(float(self._episode_raw_return[env_id]))
                 termination_reason = infos[env_id].get("termination_reason")
-                success = termination_reason == "height_only_lift_success"
+                success = is_cube_lift_success_reason(termination_reason)
                 if success:
                     successful += 1
                 episode_records.append(
@@ -336,39 +500,32 @@ class PPOSmokeTrainer:
                     next_reward_observation[env_id] = self._training_reward_state(
                         reset_info
                     )
+                    bilateral_contact[env_id] = float(
+                        bool(
+                            reset_info.get(
+                                "bilateral_finger_cube_contact", False
+                            )
+                        )
+                    )
             self._episode_resting_cube_z[done] = CubeLiftRewardState.from_flat(
                 next_reward_observation[done]
             ).cube_z
+            self._previous_bilateral_contact = bilateral_contact
 
             self.observation = next_observation
             self._reward_observation = next_reward_observation
             self.observation_normalizer.update(next_observation)
             self.global_step += cfg.num_envs
 
-        with torch.no_grad():
-            next_value = self.policy.value(
-                torch.as_tensor(
-                    self.observation_normalizer.normalize(self.observation),
-                    device=self.device,
-                )
-            ).cpu().numpy()
-
-        advantages = np.zeros(shape, dtype=np.float32)
-        last_gae = np.zeros(cfg.num_envs, dtype=np.float32)
-        for step in reversed(range(cfg.rollout_steps)):
-            next_values = next_value if step == cfg.rollout_steps - 1 else values[step + 1]
-            next_non_terminal = 1.0 - dones[step]
-            delta = (
-                rewards[step]
-                + cfg.gamma * next_values * next_non_terminal
-                - values[step]
-            )
-            last_gae = (
-                delta
-                + cfg.gamma * cfg.gae_lambda * next_non_terminal * last_gae
-            )
-            advantages[step] = last_gae
-        returns = advantages + values
+        advantages, returns = compute_gae(
+            rewards,
+            values,
+            bootstrap_values,
+            terminated_buffer,
+            episode_done_buffer,
+            gamma=cfg.gamma,
+            gae_lambda=cfg.gae_lambda,
+        )
 
         def tensor(values_: np.ndarray) -> torch.Tensor:
             return torch.as_tensor(
@@ -487,4 +644,9 @@ class PPOSmokeTrainer:
         return {name: float(np.mean(values_)) for name, values_ in metrics.items()}
 
 
-__all__ = ["PPOSmokeTrainer", "RolloutBatch"]
+__all__ = [
+    "PPOSmokeTrainer",
+    "RolloutBatch",
+    "UNSAFE_TERMINATION_REASONS",
+    "compute_gae",
+]

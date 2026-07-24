@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from serial.tools import list_ports
 
-from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+from .configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 
 from .sources.camera import load_realsense_camera_config_map
 

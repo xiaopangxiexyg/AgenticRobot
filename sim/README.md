@@ -128,11 +128,15 @@ The actuated v1 task keeps the gripper prescribed and the grasp helper as
 the default training environment: both arms and both DM-Tac grippers use
 MuJoCo actuators, policy observation reports measured gripper close, and the
 identified free-motion profile is bound by name and SHA-256. The latch remains
-a temporary grasp helper because contact force is not Newton-calibrated. Success is
-deliberately only `height_only_lift_success`: the cube must remain
-above its settled center height plus 8 cm and leave table contact for a short
-physics-tick hold. This is an environment/API milestone, not evidence of
-actuator dynamics, physical grasp stability, or sim2real transfer.
+a temporary grasp helper because contact force is not Newton-calibrated. Legacy
+tasks use `height_only_lift_success`: the cube must remain above its settled
+center height plus 8 cm and leave table contact for a short physics-tick hold.
+The state-only normal v2 training task additionally requires simultaneous
+left/right finger contact and reports `bilateral_contact_lift_success`. It uses
+a separately hashed, simulation-only contact-friction variant while retaining
+the identified free-motion DM-Tac response. This is an environment/API
+milestone, not evidence of actuator dynamics, physical grasp stability, or
+sim2real transfer.
 
 ## High-throughput Cube-Lift runtime
 

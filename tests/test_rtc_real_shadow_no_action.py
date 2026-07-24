@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+from unittest.mock import call, patch
 
 import numpy as np
 import pytest
@@ -102,6 +103,123 @@ def test_openpi_real_shadow_profile_drops_qpos_init_authority() -> None:
     assert "--auto-start" in shadow
     assert "--no-wait-for-ready-confirm" in shadow
     assert "--dmtac-no-tactile" in shadow
+    assert "--camera-startup-hardware-reset" not in ordinary
+    assert "--camera-start-stagger-sec" not in ordinary
+    assert "--camera-startup-hardware-reset" in shadow
+    stagger_index = shadow.index("--camera-start-stagger-sec")
+    assert shadow[stagger_index + 1] == "0.5"
+
+
+def test_real_shadow_manual_dmtac_ports_bypass_stale_assignment_without_command_authority() -> None:
+    args, argv = _raw_args(
+        "--rtc-real-shadow",
+        "--active-sides",
+        "both",
+        "--end-effector-sides",
+        "both",
+        "--enable-hands",
+        "--hand-backend",
+        "dmtac-gripper",
+        "--dmtac-no-tactile",
+        "--no-dmtac-use-config",
+        "--require-dmtac-config",
+        "--left-gripper-port",
+        "/dev/ttyUSB0",
+        "--right-gripper-port",
+        "/dev/ttyUSB1",
+    )
+    run_policy.validate_args(args, raw_argv=argv)
+
+    configs = run_policy._dmtac_backend_configs(args, ("left", "right"))
+
+    assert set(configs) == {"left", "right"}
+    assert configs["left"].gripper_port == "/dev/ttyUSB0"
+    assert configs["right"].gripper_port == "/dev/ttyUSB1"
+    assert all(config.observation_only for config in configs.values())
+    assert all(config.send_commands is False for config in configs.values())
+    assert all(config.clear_fault_on_start is False for config in configs.values())
+    assert all(config.open_on_start is False for config in configs.values())
+    assert all(config.connect_tactile is False for config in configs.values())
+
+
+def test_deploy_camera_sources_start_in_config_order_with_stagger() -> None:
+    started: list[str] = []
+
+    class _Config:
+        def __init__(self, serial: str) -> None:
+            self.serial = serial
+            self.startup_hardware_reset = True
+
+    class _Source:
+        def __init__(self, name: str, serial: str) -> None:
+            self.name = name
+            self.config = _Config(serial)
+
+        def start(self) -> None:
+            started.append(self.name)
+
+    sources = {
+        "front": _Source("front", "FRONT"),
+        "left_wrist": _Source("left_wrist", "LEFT"),
+        "right_wrist": _Source("right_wrist", "RIGHT"),
+    }
+
+    with patch.object(run_policy.time, "sleep") as sleep_mock:
+        run_policy.start_camera_sources(sources, stagger_sec=0.5)
+
+    assert started == ["front", "left_wrist", "right_wrist"]
+    assert sleep_mock.call_args_list == [call(0.5), call(0.5)]
+
+
+def test_deploy_camera_reset_override_is_explicit_and_applies_to_each_config() -> None:
+    args = _parser().parse_args(
+        [
+            "--camera-mode",
+            "multi",
+            "--camera-startup-hardware-reset",
+        ]
+    )
+    configs = {
+        "front": argparse.Namespace(startup_hardware_reset=False),
+        "left_wrist": argparse.Namespace(startup_hardware_reset=False),
+        "right_wrist": argparse.Namespace(startup_hardware_reset=False),
+    }
+
+    with patch.object(
+        run_policy,
+        "load_realsense_camera_config_map",
+        return_value=configs,
+    ), patch.object(
+        run_policy,
+        "RealSenseRGBSource",
+        side_effect=lambda config: config,
+    ):
+        sources = run_policy.build_camera_sources(args)
+
+    assert list(sources) == ["front", "left_wrist", "right_wrist"]
+    assert all(config.startup_hardware_reset for config in configs.values())
+
+
+def test_deploy_camera_defaults_preserve_config_owned_reset_behavior() -> None:
+    args = _parser().parse_args(["--camera-mode", "multi"])
+    configs = {
+        "front": argparse.Namespace(startup_hardware_reset=True),
+        "left_wrist": argparse.Namespace(startup_hardware_reset=False),
+    }
+
+    with patch.object(
+        run_policy,
+        "load_realsense_camera_config_map",
+        return_value=configs,
+    ), patch.object(
+        run_policy,
+        "RealSenseRGBSource",
+        side_effect=lambda config: config,
+    ):
+        run_policy.build_camera_sources(args)
+
+    assert configs["front"].startup_hardware_reset is True
+    assert configs["left_wrist"].startup_hardware_reset is False
 
 
 def test_debug_logger_serializes_worker_exchange_events_without_interleaving(tmp_path) -> None:

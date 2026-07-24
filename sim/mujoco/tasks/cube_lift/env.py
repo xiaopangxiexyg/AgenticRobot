@@ -232,7 +232,7 @@ class CubeLiftEnv(_EnvBase):
 
         terminated = self._termination_reason is not None
         truncated = not terminated and self._episode_steps >= self.config.max_episode_steps
-        success = self._termination_reason == "height_only_lift_success"
+        success = self._termination_reason == self.config.success_termination_reason
         cube_position = self._cube_qpos()[:3]
         progress = lift_progress(
             cube_z_m=float(cube_position[2]),
@@ -339,6 +339,20 @@ class CubeLiftEnv(_EnvBase):
             table_body_name=self.config.table_body_name,
         )
 
+    def _cube_finger_contacts(
+        self,
+        contacts: CubeLiftContactSummary,
+    ) -> tuple[bool, bool]:
+        body_names = {
+            body_name
+            for contact in contacts.object_contacts
+            for body_name in (contact.body1_name, contact.body2_name)
+        }
+        return (
+            self.config.grasp_latch_left_finger_body_name in body_names,
+            self.config.grasp_latch_right_finger_body_name in body_names,
+        )
+
     def _check_physics_termination(self, _tick) -> bool:
         if not self.scene.state_is_finite():
             self._termination_reason = "non_finite_simulation_state"
@@ -359,15 +373,20 @@ class CubeLiftEnv(_EnvBase):
             self._termination_reason = "robot_environment_penetration"
             return True
         contacts = self._contact_summary()
+        left_finger_contact, right_finger_contact = self._cube_finger_contacts(contacts)
+        required_contact = (
+            not self.config.success_requires_bilateral_contact
+            or (left_finger_contact and right_finger_contact)
+        )
         above_target = float(cube_position[2]) >= (
             self._resting_center_z_m + self.config.lift_delta_m
         )
-        if above_target and not contacts.table_contact:
+        if above_target and not contacts.table_contact and required_contact:
             self._success_hold_ticks += 1
         else:
             self._success_hold_ticks = 0
         if self._success_hold_ticks >= self.config.success_hold_physics_ticks:
-            self._termination_reason = "height_only_lift_success"
+            self._termination_reason = self.config.success_termination_reason
             return True
         return False
 
@@ -395,6 +414,7 @@ class CubeLiftEnv(_EnvBase):
     def _info(self, *, reset: bool) -> dict[str, Any]:
         cube_qpos = self._cube_qpos()
         contacts = self._contact_summary()
+        left_finger_contact, right_finger_contact = self._cube_finger_contacts(contacts)
         last_tick = self.controller.ticks[-1] if self.controller.ticks else None
         return {
             **self.config.to_metadata(),
@@ -406,6 +426,11 @@ class CubeLiftEnv(_EnvBase):
             "cube_z_m": float(cube_qpos[2]),
             "termination_reason": self._termination_reason,
             "success_hold_physics_ticks": self._success_hold_ticks,
+            "left_finger_cube_contact": left_finger_contact,
+            "right_finger_cube_contact": right_finger_contact,
+            "bilateral_finger_cube_contact": (
+                left_finger_contact and right_finger_contact
+            ),
             "grasp_latched": self._grasp_latch.active,
             "grasp_latch_acquisition_count": self._grasp_latch.acquisition_count,
             "controller_sequence": None if last_tick is None else last_tick.active_command_sequence,

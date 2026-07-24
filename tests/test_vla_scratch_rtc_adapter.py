@@ -235,7 +235,7 @@ def test_existing_infer_client_shape_composes_without_framework_subclass() -> No
         clock=_CounterClock(),
     )
     assert isinstance(adapter, RtcModelRuntimeAdapter)
-    assert isinstance(adapter.backend, FinalChunkRtcBackend)
+    assert type(adapter.backend) is FinalChunkRtcBackend
 
     bundles = []
     result = adapter.create_worker_executor(observe_bundle=bundles.append)(

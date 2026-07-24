@@ -6,7 +6,16 @@ import pytest
 
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 DEFAULT_PHYSICAL_TASK_CONFIG = Path(
-    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json"
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json"
+)
+CONTACT_CURRICULUM_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v1.json"
+)
+CONTACT_CURRICULUM_V2_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v2.json"
+)
+CONTACT_CURRICULUM_V3_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
 )
 PRIVILEGED_EXPERT_TASK_CONFIG = Path(
     "sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_v1.json"
@@ -54,6 +63,324 @@ def test_normal_rgb_v4_is_the_no_episode_clock_real_observation_profile() -> Non
     assert config.observation_layout.endswith("right_wrist_rgb_chw_3x48x48.v4")
 
 
+def test_normal_v2_disables_rgb_and_requires_physical_grasp_success() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_observation_contract
+
+    config = CubeLiftTaskConfig.load(DEFAULT_PHYSICAL_TASK_CONFIG)
+    contract = build_observation_contract(config)
+    assert config.policy_class == "normal"
+    assert config.wrist_rgb_enabled is False
+    assert config.wrist_rgb_shape is None
+    assert config.observation_dim == 28
+    assert "episode_progress" not in contract.field_names
+    assert config.success_requires_bilateral_contact is True
+    assert config.success_termination_reason == "bilateral_contact_lift_success"
+    assert config.pose_target_anti_windup is True
+    assert config.lift_delta_m == pytest.approx(0.07)
+    assert config.reward_shaping["closed_grasp_height_offset_m"] == pytest.approx(
+        0.022
+    )
+    assert config.reward_shaping["gripper_reward_scale"] == 0.0
+    assert config.reward_shaping["require_bilateral_contact_for_lift_reward"] is True
+    assert config.reward_shaping["time_limit_penalty"] == 0.0
+    assert config.reward_shaping["failure_termination_penalty"] == 5.0
+    assert config.reward_shaping["unsafe_termination_penalty"] == 5.0
+
+
+def test_normal_v2_scripted_physical_grasp_gate_reaches_bilateral_lift() -> None:
+    from sim.mujoco.tasks.cube_lift.scripted_grasp_gate import (
+        run_scripted_physical_grasp_gate,
+    )
+
+    result = run_scripted_physical_grasp_gate(DEFAULT_PHYSICAL_TASK_CONFIG)
+    if result.pose_ik_solver != "robot_motion.rm65.position_collision":
+        pytest.skip(
+            "Current process loaded the MuJoCo DLS fallback before the canonical "
+            "Pinocchio runtime; spawned training workers repair LD_LIBRARY_PATH."
+        )
+    assert result.success is True
+    assert result.termination_reason == "bilateral_contact_lift_success"
+    assert result.bilateral_contact_steps >= 5
+    assert result.max_cube_lift_m >= 0.07
+    assert result.steps <= 150
+
+
+def test_contact_curriculum_reset_starts_from_real_bilateral_contact() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    config = CubeLiftTaskConfig.load(CONTACT_CURRICULUM_TASK_CONFIG)
+    assert config.scripted_contact_reset_min_measured_close == pytest.approx(0.55)
+    assert config.scripted_contact_reset_max_attempts == 2
+    env = FastCubeLiftEnv(
+        config,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        observation, info = env.reset(seed=1)
+    finally:
+        env.close()
+    assert observation.shape == (28,)
+    assert info["scripted_contact_reset"] is True
+    assert info["bilateral_finger_cube_contact"] is True
+    assert info["termination_reason"] is None
+    assert info["right_gripper_measured_close"] >= 0.55
+    assert info["scripted_contact_reset_attempts"] == 1
+
+
+def test_contact_curriculum_reset_retries_recoverable_failure(monkeypatch) -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+    from sim.mujoco.tasks.cube_lift.kernel import ScriptedContactResetError
+
+    env = FastCubeLiftEnv(
+        CONTACT_CURRICULUM_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    original_reset = env.kernel.reset
+    calls = 0
+
+    def flaky_reset(*, seed=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ScriptedContactResetError("injected transient reset failure")
+        return original_reset(seed=seed)
+
+    monkeypatch.setattr(env.kernel, "reset", flaky_reset)
+    try:
+        observation, info = env.reset(seed=1)
+    finally:
+        env.close()
+    assert observation.shape == (28,)
+    assert info["bilateral_finger_cube_contact"] is True
+    assert info["scripted_contact_reset_attempts"] == 2
+    assert info["scripted_contact_reset_failures"] == (
+        "injected transient reset failure",
+    )
+
+
+def test_contact_curriculum_v2_preserves_learning_contract_and_rebalances_reward() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
+
+    v1 = CubeLiftTaskConfig.load(CONTACT_CURRICULUM_TASK_CONFIG)
+    v2 = CubeLiftTaskConfig.load(CONTACT_CURRICULUM_V2_TASK_CONFIG)
+    assert build_learning_metadata(v2) == build_learning_metadata(v1)
+    assert v2.scripted_contact_reset_min_measured_close == pytest.approx(0.59)
+    assert v2.scripted_contact_reset_max_attempts == 3
+    assert v2.scripted_contact_loss_grace_steps == 0
+    assert v2.scripted_contact_action_scale == pytest.approx(
+        (0.05, 0.05, 1.0, 0.02, 0.02, 0.02, 0.0)
+    )
+    assert v2.scripted_contact_nonnegative_lift_action is True
+    assert v2.reward_shaping["safety_projection_penalty"] == pytest.approx(0.02)
+    assert v2.reward_shaping["bilateral_contact_acquire_bonus"] == 0.0
+    assert v2.reward_shaping["lift_progress_scale"] == pytest.approx(100.0)
+    assert v2.reward_shaping["time_limit_penalty"] == pytest.approx(5.0)
+
+
+def test_contact_curriculum_v3_is_strict_lift_only_with_loss_aware_reward() -> None:
+    from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+    from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
+
+    v2 = CubeLiftTaskConfig.load(CONTACT_CURRICULUM_V2_TASK_CONFIG)
+    v3 = CubeLiftTaskConfig.load(CONTACT_CURRICULUM_V3_TASK_CONFIG)
+    assert build_learning_metadata(v3) == build_learning_metadata(v2)
+    assert v3.scripted_contact_action_scale == pytest.approx(
+        (0.0, 0.0, 0.15, 0.0, 0.0, 0.0, 0.0)
+    )
+    assert v3.scripted_contact_action_bias == pytest.approx(
+        (0.0, 0.0, 0.35, 0.0, 0.0, 0.0, 0.0)
+    )
+    assert v3.policy_active_action_indices == (2,)
+    assert v3.lift_delta_m == pytest.approx(0.04)
+    assert v3.scripted_contact_nonnegative_lift_action is True
+    assert v3.reward_shaping["reach_reward_scale"] == 0.0
+    assert v3.reward_shaping["reach_progress_scale"] == 0.0
+    assert v3.reward_shaping["grasp_region_reward_scale"] == 0.0
+    assert v3.reward_shaping["bilateral_contact_missing_penalty"] == pytest.approx(
+        0.1
+    )
+    assert v3.reward_shaping["ungated_negative_lift_progress"] is True
+    assert v3.reward_shaping["safety_projection_penalty"] == pytest.approx(0.5)
+    assert v3.reward_shaping["unsafe_termination_penalty"] == pytest.approx(10.0)
+
+
+def test_contact_curriculum_v2_scripted_gate_lifts_from_reset() -> None:
+    from sim.mujoco.tasks.cube_lift.scripted_grasp_gate import (
+        run_scripted_physical_grasp_gate,
+    )
+
+    result = run_scripted_physical_grasp_gate(CONTACT_CURRICULUM_V2_TASK_CONFIG)
+    if result.pose_ik_solver != "robot_motion.rm65.position_collision":
+        pytest.skip(
+            "Current process loaded the MuJoCo DLS fallback before the canonical "
+            "Pinocchio runtime; spawned training workers repair LD_LIBRARY_PATH."
+        )
+    assert result.success is True
+    assert result.termination_reason == "bilateral_contact_lift_success"
+    assert result.bilateral_contact_steps >= 20
+    assert result.max_cube_lift_m >= 0.07
+
+
+def test_contact_curriculum_v2_repeated_reset_preserves_liftable_grasp() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        CONTACT_CURRICULUM_V2_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    lift_action = np.zeros(7, dtype=np.float32)
+    lift_action[2] = 0.4
+    try:
+        for seed in (1, 2):
+            _observation, reset_info = env.reset(seed=seed)
+            if (
+                reset_info["pose_ik_solver"]
+                != "robot_motion.rm65.position_collision"
+            ):
+                pytest.skip(
+                    "Current process loaded the MuJoCo DLS fallback before the "
+                    "canonical Pinocchio runtime; spawned training workers repair "
+                    "LD_LIBRARY_PATH."
+                )
+            assert reset_info["bilateral_finger_cube_contact"] is True
+            for _step in range(30):
+                _observation, _reward, terminated, truncated, info = env.step(
+                    lift_action
+                )
+                if terminated or truncated:
+                    break
+            assert terminated is True
+            assert truncated is False
+            assert info["termination_reason"] == "bilateral_contact_lift_success"
+    finally:
+        env.close()
+
+
+def test_contact_curriculum_v2_applies_lift_first_action_constraints() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        CONTACT_CURRICULUM_V2_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=1)
+        _observation, _reward, terminated, truncated, info = env.step(
+            np.asarray((1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0), dtype=np.float32)
+        )
+    finally:
+        env.close()
+    assert terminated is False
+    assert truncated is False
+    assert info["scripted_contact_action_modified"] is True
+    assert info["training_reward_state"][23:30] == pytest.approx(
+        (0.05, -0.05, 0.0, 0.02, -0.02, 0.02, 0.0),
+        abs=1e-6,
+    )
+
+
+def test_contact_curriculum_v2_tracks_contact_loss_without_early_termination() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        CONTACT_CURRICULUM_V2_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=1)
+        cube_qpos_addr = env.kernel._cube_qpos_addr
+        env.kernel.data.qpos[cube_qpos_addr + 1] += 0.20
+        env.kernel.data.qvel[env.kernel._cube_dof_addr : env.kernel._cube_dof_addr + 6] = 0.0
+        env.kernel.mujoco.mj_forward(env.kernel.model, env.kernel.data)
+        for expected_loss_steps in range(1, 6):
+            _observation, _reward, terminated, truncated, info = env.step(
+                np.zeros(7, dtype=np.float32)
+            )
+            assert info["scripted_contact_loss_steps"] == expected_loss_steps
+            assert terminated is False
+            assert truncated is False
+            assert info["termination_reason"] is None
+    finally:
+        env.close()
+
+
+def test_contact_curriculum_v3_applies_only_nonnegative_lift_action() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        CONTACT_CURRICULUM_V3_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=1)
+        _observation, _reward, terminated, truncated, info = env.step(
+            np.ones(7, dtype=np.float32)
+        )
+    finally:
+        env.close()
+    assert terminated is False
+    assert truncated is False
+    assert info["scripted_contact_action_modified"] is True
+    assert info["training_reward_state"][23:30] == pytest.approx(
+        (0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0),
+        abs=1e-6,
+    )
+
+
+def test_contact_curriculum_v3_projection_preserves_locked_gripper_target() -> None:
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        CONTACT_CURRICULUM_V3_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    raw_lift_actions = (-0.6057, 0.1739, 0.4411, 0.3184, -0.5249)
+    try:
+        _observation, reset_info = env.reset(seed=1)
+        reset_target_close = reset_info["right_gripper_target_close"]
+        safety_modified = False
+        for raw_lift_action in raw_lift_actions:
+            action = np.zeros(7, dtype=np.float32)
+            action[2] = raw_lift_action
+            _observation, _reward, terminated, truncated, info = env.step(action)
+            safety_modified = safety_modified or info["safety_modified"]
+            assert info["right_gripper_target_close"] == pytest.approx(
+                reset_target_close
+            )
+            assert terminated is False
+            assert truncated is False
+    finally:
+        env.close()
+    assert safety_modified is True
+
+
+def test_contact_curriculum_v3_scripted_gate_lifts_from_reset() -> None:
+    from sim.mujoco.tasks.cube_lift.scripted_grasp_gate import (
+        run_scripted_physical_grasp_gate,
+    )
+
+    result = run_scripted_physical_grasp_gate(CONTACT_CURRICULUM_V3_TASK_CONFIG)
+    if result.pose_ik_solver != "robot_motion.rm65.position_collision":
+        pytest.skip(
+            "Current process loaded the MuJoCo DLS fallback before the canonical "
+            "Pinocchio runtime; spawned training workers repair LD_LIBRARY_PATH."
+        )
+    assert result.success is True
+    assert result.termination_reason == "bilateral_contact_lift_success"
+    assert result.bilateral_contact_steps >= 20
+    assert result.max_cube_lift_m >= 0.039
+
+
 def test_temp_training_progress_line_shows_progress_and_key_metrics() -> None:
     from sim.mujoco_temp_pipeline.train import format_training_progress
 
@@ -71,11 +398,15 @@ def test_temp_training_progress_line_shows_progress_and_key_metrics() -> None:
             "recent_episode_raw_return_mean": -0.304,
             "reward_distance_m_mean": 0.334,
             "reward_gripper_close_mean": 0.39,
+            "reward_bilateral_contact_mean": 0.12,
             "reward_lift_fraction_mean": 0.0,
             "safety_projection_rate": 0.13,
             "safety_rejection_rate": 0.02,
             "clearance_violation_count": 0,
             "hard_penetration_count": 0,
+            "contact_loss_termination_count": 5,
+            "joint_limit_termination_count": 3,
+            "time_limit_termination_count": 4,
             "arm_tracking_error_rad_mean": 0.0179,
             "gripper_tracking_error_mean": 0.09,
             "policy_loss": -0.004,
@@ -90,8 +421,9 @@ def test_temp_training_progress_line_shows_progress_and_key_metrics() -> None:
     assert "eta=" in line
     assert "succ=2( 2.8%)" in line
     assert "reach=0.334m" in line
+    assert "contact=12.0%" in line
     assert "proj=13.0%" in line
-    assert "clr=0 pen=0" in line
+    assert "clr=0 pen=0 closs=5 jlim=3 tout=4" in line
     assert "armerr=0.0179rad" in line
     assert "griperr=0.090" in line
     assert "kl=6.00e-04" in line
@@ -109,6 +441,33 @@ def test_temp_training_can_restore_full_json_terminal_output() -> None:
     assert args.print_full_metrics is True
 
 
+def test_temp_training_init_checkpoint_is_an_explicit_warm_start() -> None:
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    args = build_arg_parser().parse_args(["--init-checkpoint", "/tmp/curriculum.pt"])
+    assert args.init_checkpoint == Path("/tmp/curriculum.pt")
+
+
+def test_temp_training_exploration_schedule_is_explicit() -> None:
+    from sim.mujoco_temp_pipeline.config import PPOConfig
+    from sim.mujoco_temp_pipeline.train import build_arg_parser
+
+    args = build_arg_parser().parse_args([])
+    assert args.initial_log_std == pytest.approx(-0.5)
+    assert args.final_log_std == pytest.approx(-2.5)
+    assert args.std_anneal_fraction == pytest.approx(0.75)
+    config = PPOConfig(
+        total_timesteps=16,
+        num_envs=2,
+        rollout_steps=8,
+        update_epochs=1,
+        minibatch_size=16,
+    )
+    assert config.final_log_std < config.initial_log_std
+    with pytest.raises(ValueError, match="cannot exceed"):
+        PPOConfig(final_log_std=0.0)
+
+
 def test_temp_training_rgb_health_guard_is_explicit() -> None:
     from sim.mujoco_temp_pipeline.train import build_arg_parser
 
@@ -116,14 +475,14 @@ def test_temp_training_rgb_health_guard_is_explicit() -> None:
     assert args.require_rgb_health is True
 
 
-def test_normal_and_expert_configs_share_identified_actuators() -> None:
+def test_normal_contact_profile_preserves_identified_free_motion_actuator() -> None:
     from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
 
     normal = CubeLiftTaskConfig.load(DEFAULT_PHYSICAL_TASK_CONFIG)
     expert = CubeLiftTaskConfig.load(PRIVILEGED_EXPERT_TASK_CONFIG)
     assert normal.policy_class == "normal"
-    assert normal.observation_mode == "proprioceptive_real_motion_tracking_no_episode_clock_wrist_rgb"
-    assert normal.observation_dim == 28 + 3 * 48 * 48
+    assert normal.observation_mode == "proprioceptive_real_motion_tracking_no_episode_clock"
+    assert normal.observation_dim == 28
     assert normal.grasp_mode == "physical_contact"
     assert expert.policy_class == "privileged_expert"
     assert expert.observation_mode == "state_privileged"
@@ -131,8 +490,18 @@ def test_normal_and_expert_configs_share_identified_actuators() -> None:
     assert expert.grasp_mode == "contact_latch_debug"
     assert normal.position_actuation_profile_name == expert.position_actuation_profile_name
     assert normal.position_actuation_profile_sha256 == expert.position_actuation_profile_sha256
-    assert normal.gripper_actuation_profile_name == expert.gripper_actuation_profile_name
-    assert normal.gripper_actuation_profile_sha256 == expert.gripper_actuation_profile_sha256
+    normal_gripper = normal.gripper_actuation_profile()
+    expert_gripper = expert.gripper_actuation_profile()
+    assert normal_gripper.name != expert_gripper.name
+    assert (
+        normal_gripper.normalized_position_profile().to_metadata()
+        == expert_gripper.normalized_position_profile().to_metadata()
+    )
+    assert normal_gripper.position_kp_n_m == expert_gripper.position_kp_n_m
+    assert normal_gripper.force_limit_n == expert_gripper.force_limit_n
+    assert normal_gripper.contact_tuning.post_settle_geom_friction_by_name[
+        "debug_cube_collision"
+    ] == pytest.approx((1.0, 0.05, 0.005))
 
 
 def test_rgb_policy_configs_append_only_active_wrist_camera() -> None:
@@ -423,6 +792,160 @@ def test_staged_reward_opens_close_gate_before_strict_lift_gate() -> None:
     assert shaped[0] > terms["gripper_term"][0]
 
 
+def test_contact_aware_reward_removes_close_hover_and_rewards_bilateral_acquisition() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[:, 9] = 0.025
+    current[:, 9] = 0.065
+    previous[:, 22] = -0.025
+    current[:, 22] = -0.025
+    previous[:, 6] = 0.8
+    current[:, 6] = 0.8
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        grasp_acquire_bonus=0.0,
+        bilateral_contact_reward_scale=0.05,
+        bilateral_contact_acquire_bonus=2.0,
+        require_bilateral_contact_for_lift_reward=True,
+        latch_reward_scale=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+        time_limit_penalty=5.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        resting_cube_z_m=0.025,
+        bilateral_contact=np.asarray((0.0, 1.0), dtype=np.float32),
+        previous_bilateral_contact=np.zeros(2, dtype=np.float32),
+        time_limit=np.asarray((1.0, 0.0), dtype=np.float32),
+    )
+    assert terms["gripper_term"].tolist() == pytest.approx((0.0, 0.0))
+    assert terms["lift_term"][0] == pytest.approx(0.0)
+    assert terms["lift_term"][1] > 0.0
+    assert terms["bilateral_contact_acquire_term"].tolist() == pytest.approx(
+        (0.0, 2.0)
+    )
+    assert terms["time_limit_term"].tolist() == pytest.approx((-5.0, 0.0))
+    assert shaped[1] > shaped[0]
+
+
+def test_lift_curriculum_penalizes_missing_contact_and_ungated_drop() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    previous = np.zeros((2, 31), dtype=np.float32)
+    current = previous.copy()
+    previous[:, 9] = 0.065
+    current[:, 9] = 0.025
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        grasp_acquire_bonus=0.0,
+        bilateral_contact_reward_scale=0.0,
+        bilateral_contact_acquire_bonus=0.0,
+        bilateral_contact_missing_penalty=0.1,
+        require_bilateral_contact_for_lift_reward=True,
+        ungated_negative_lift_progress=True,
+        latch_reward_scale=0.0,
+        lift_reward_scale=0.0,
+        lift_progress_scale=100.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+    )
+    shaped, terms = shape_rewards(
+        previous,
+        current,
+        np.zeros(2, dtype=np.float32),
+        config,
+        resting_cube_z_m=0.025,
+        lift_delta_m=0.08,
+        bilateral_contact=np.asarray((1.0, 0.0), dtype=np.float32),
+        previous_bilateral_contact=np.ones(2, dtype=np.float32),
+    )
+    assert terms["lift_progress_term"].tolist() == pytest.approx((-50.0, -50.0))
+    assert terms["bilateral_contact_missing_term"].tolist() == pytest.approx(
+        (0.0, -0.1)
+    )
+    assert shaped.tolist() == pytest.approx((-50.0, -50.1))
+
+
+def test_failure_reward_makes_unsafe_termination_worse_than_timeout() -> None:
+    from sim.mujoco_temp_pipeline.config import RewardShapingConfig
+    from sim.mujoco_temp_pipeline.reward import shape_rewards
+
+    state = np.zeros((3, 31), dtype=np.float32)
+    config = RewardShapingConfig(
+        reach_reward_scale=0.0,
+        reach_progress_scale=0.0,
+        grasp_region_reward_scale=0.0,
+        gripper_reward_scale=0.0,
+        gripper_progress_scale=0.0,
+        premature_close_penalty=0.0,
+        grasp_acquire_bonus=0.0,
+        latch_reward_scale=0.0,
+        lift_reward_scale=0.0,
+        lift_progress_scale=0.0,
+        action_penalty=0.0,
+        safety_projection_penalty=0.0,
+        time_limit_penalty=0.0,
+        failure_termination_penalty=5.0,
+        unsafe_termination_penalty=5.0,
+    )
+    shaped, terms = shape_rewards(
+        state,
+        state,
+        np.zeros(3, dtype=np.float32),
+        config,
+        time_limit=np.asarray((0.0, 1.0, 0.0), dtype=np.float32),
+        failure_termination=np.asarray((0.0, 0.0, 1.0), dtype=np.float32),
+        unsafe_termination=np.asarray((0.0, 0.0, 1.0), dtype=np.float32),
+    )
+    assert terms["time_limit_term"].tolist() == pytest.approx((0.0, 0.0, 0.0))
+    assert terms["failure_termination_term"].tolist() == pytest.approx(
+        (0.0, 0.0, -5.0)
+    )
+    assert terms["unsafe_termination_term"].tolist() == pytest.approx(
+        (0.0, 0.0, -5.0)
+    )
+    assert shaped.tolist() == pytest.approx((0.0, 0.0, -10.0))
+
+
+def test_compute_gae_bootstraps_time_limit_but_not_true_terminal() -> None:
+    from sim.mujoco_temp_pipeline.ppo import compute_gae
+
+    rewards = np.zeros((1, 2), dtype=np.float32)
+    values = np.zeros_like(rewards)
+    bootstrap_values = np.full_like(rewards, 10.0)
+    terminated = np.asarray(((0.0, 1.0),), dtype=np.float32)
+    episode_done = np.ones_like(rewards)
+    advantages, returns = compute_gae(
+        rewards,
+        values,
+        bootstrap_values,
+        terminated,
+        episode_done,
+        gamma=0.99,
+        gae_lambda=0.95,
+    )
+    assert advantages[0].tolist() == pytest.approx((9.9, 0.0))
+    np.testing.assert_array_equal(returns, advantages)
+
+
 def test_temp_reward_shaping_penalizes_collision_projection() -> None:
     from sim.mujoco_temp_pipeline.config import RewardShapingConfig
     from sim.mujoco_temp_pipeline.reward import shape_rewards
@@ -513,6 +1036,16 @@ def test_legacy_collision_diagnostic_cli_flags_are_explicit() -> None:
     assert play_args.print_safety_events is True
 
 
+def test_temp_evaluation_action_offsets_are_explicit() -> None:
+    from sim.mujoco_temp_pipeline.evaluate import build_arg_parser
+
+    args = build_arg_parser().parse_args(
+        ["--action-offsets=-0.1,0.0,0.1", "--stochastic"]
+    )
+    assert args.action_offsets == pytest.approx((-0.1, 0.0, 0.1))
+    assert args.stochastic is True
+
+
 def test_temp_policy_actions_and_log_probs_are_finite() -> None:
     torch = pytest.importorskip("torch")
     from sim.mujoco_temp_pipeline.policy import ActorCritic
@@ -528,6 +1061,32 @@ def test_temp_policy_actions_and_log_probs_are_finite() -> None:
     torch.testing.assert_close(log_prob, evaluated_log_prob)
     torch.testing.assert_close(value, evaluated_value)
     assert torch.isfinite(entropy).all()
+
+
+def test_temp_policy_expands_compact_action_into_public_layout() -> None:
+    torch = pytest.importorskip("torch")
+    from sim.mujoco_temp_pipeline.policy import ActorCritic
+
+    policy = ActorCritic(
+        action_dim=1,
+        environment_action_dim=7,
+        active_action_indices=(2,),
+        trainable_log_std=False,
+        hidden_dim=16,
+    )
+    observation = torch.zeros((5, 31))
+    action, log_prob, value = policy.act(observation)
+    expanded = policy.expand_action(action)
+    assert action.shape == (5, 1)
+    assert expanded.shape == (5, 7)
+    torch.testing.assert_close(expanded[:, 2], action[:, 0])
+    torch.testing.assert_close(
+        expanded[:, (0, 1, 3, 4, 5, 6)],
+        torch.zeros((5, 6)),
+    )
+    assert log_prob.shape == (5,)
+    assert value.shape == (5,)
+    assert policy.log_std.requires_grad is False
 
 
 def test_temp_rgb_policy_uses_cnn_and_keeps_action_contract() -> None:

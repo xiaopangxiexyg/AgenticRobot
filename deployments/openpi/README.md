@@ -256,7 +256,7 @@ cd "$DEXTELEOP_ROOT"
   --arm-execution-profile impedance_40hz \
   --enable-hands --hand-backend dmtac-gripper --dmtac-config latest \
   --camera-mode multi \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
   --require-camera-frame --require-ready-observation \
   --action-queue-policy replace --min-action-queue 0 \
   --init-source current \
@@ -299,7 +299,7 @@ cd "$DEXTELEOP_ROOT"
   --arm-execution-profile impedance_40hz \
   --enable-hands --hand-backend dmtac-gripper --dmtac-config latest \
   --camera-mode multi \
-  --camera-config cameras/configs/rm65/devices/realsense.json \
+  --camera-config teleop_runtime/configs/devices/realsense.json \
   --require-camera-frame --require-ready-observation \
   --action-queue-policy replace --min-action-queue 0 \
   --init-source current --wait-for-ready-confirm \

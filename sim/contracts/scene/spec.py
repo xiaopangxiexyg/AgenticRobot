@@ -14,7 +14,7 @@ DEFAULT_RM65_PHYSICS_URDF = (
     "assets/rm65_inspire_gripper_v3/"
     "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 )
-DEFAULT_CAMERA_REGISTRY = "cameras/configs/rm65/cameras/realsense_registry.json"
+DEFAULT_CAMERA_REGISTRY = "robot_motion/configs/rm65_camera_registry.json"
 
 
 @dataclass(frozen=True)

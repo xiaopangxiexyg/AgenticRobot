@@ -17,7 +17,12 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CAMERA_REGISTRY = REPO_ROOT / "cameras" / "configs" / "rm65" / "cameras" / "realsense_registry.json"
+DEFAULT_CAMERA_REGISTRY = (
+    REPO_ROOT
+    / "robot_motion"
+    / "configs"
+    / "rm65_camera_registry.json"
+)
 DEFAULT_CAMERA_KEY = "front"
 DEFAULT_LAG = 8
 SIDES = ("left", "right")

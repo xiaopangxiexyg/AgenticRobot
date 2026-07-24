@@ -468,6 +468,49 @@ def test_label_force_collisions_override_all_detected(tmp_path) -> None:
     assert info["postprocess_history"][-1]["override"] == "all-detected"
 
 
+def test_label_force_collisions_preserves_terminal_episode_evidence(tmp_path) -> None:
+    root = tmp_path / "dataset"
+    episode = {
+        "episode_index": 9,
+        "frame_count": 1,
+        "parquet_path": "data/chunk-000/episode_000009.parquet",
+        "summary": {
+            "stop_reason": "position_force_guard",
+            "force_collision_detected": True,
+            "force_collision_event": {
+                "detected": True,
+                "source": "position_force_guard",
+            },
+        },
+    }
+    _write_jsonl(root / "meta" / "episodes.jsonl", [episode])
+    _write_jsonl(
+        root / "meta" / "episodes_stats.jsonl",
+        [{"episode_index": 9, "frame_count": 1}],
+    )
+    (root / "meta" / "info.json").write_text(
+        json.dumps({"nominal_fps": 15.0}),
+        encoding="utf-8",
+    )
+    _write_parquet(
+        root / "data/chunk-000/episode_000009.parquet",
+        [{"timestamp": 1.0, "faults_json": json.dumps([])}],
+    )
+
+    plan = plan_force_collision_labels(root)
+    assert plan.detected_indices == (9,)
+    assert plan.clean_indices == ()
+
+    label_force_collisions(root)
+
+    updated = json.loads(
+        (root / "meta" / "episodes.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert updated["summary"]["force_collision_detected"] is True
+    assert updated["summary"]["force_collision_label"] == "detected_collision"
+    assert updated["summary"]["force_collision_event"]["source"] == "position_force_guard"
+
+
 def test_causal_align_dataset_uses_latest_non_future_refs(tmp_path) -> None:
     root = tmp_path / "dataset"
     out = tmp_path / "dataset_causal"

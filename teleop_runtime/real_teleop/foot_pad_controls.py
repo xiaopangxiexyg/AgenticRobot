@@ -341,7 +341,7 @@ class FootPadSpecialArmInput:
                 sleep(max(0.1, float(retry_sec)))
                 continue
             mapping = (
-                "F13=fix-left, F14=fix-right"
+                "F13=left-arm-only (fix right), F14=right-arm-only (fix left)"
                 if source.foot_pad_count == 2
                 else "F13=fix-left, F14=fix-right, F15=init-left, F16=init-right"
             )
@@ -382,12 +382,28 @@ class FootPadSpecialArmInput:
     def consume_events(self) -> list[str]:
         """Return new pedal press edges; releases and key-repeat events are ignored."""
 
+        return self._consume_events(self._event_by_key_code)
+
+    def consume_test_events(self) -> list[str]:
+        """Return all F13--F16 edges for the diagnostic pedal test only.
+
+        This does not alter the configured two-pedal control map.  In
+        particular, F15/F16 observed during the test are labels only and can
+        never reach the real Fix/Init routing path.
+        """
+
+        return self._consume_events(FOOT_PAD_EVENT_BY_KEY_CODE)
+
+    def _consume_events(self, event_by_key_code: dict[int, str]) -> list[str]:
         if self._closed or self._device is None or self._evdev is None:
             return []
         device = self._device
         evdev = self._evdev
         try:
-            events = device.read()
+            # evdev.read() returns a lazy iterator on some versions.  EAGAIN
+            # may therefore be raised by iteration rather than by read()
+            # itself; materialize it inside the protected region.
+            events = list(device.read())
         except BlockingIOError:
             return []
         except OSError:
@@ -403,7 +419,7 @@ class FootPadSpecialArmInput:
                 continue
             if int(getattr(event, "value", 0)) != 1:
                 continue
-            action = self._event_by_key_code.get(int(getattr(event, "code", -1)))
+            action = event_by_key_code.get(int(getattr(event, "code", -1)))
             if action:
                 mapped.append(action)
         return mapped

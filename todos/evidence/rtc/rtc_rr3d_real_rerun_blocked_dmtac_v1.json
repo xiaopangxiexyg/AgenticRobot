@@ -1,0 +1,128 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr3d_real_rerun_blocked_dmtac_2026_07_24",
+  "captured_at": "2026-07-24T12:39:34+08:00",
+  "scope": "real_observation_openpi_raw_rtc_no_action_rerun_before_camera_start",
+  "gate_result": "blocked_before_camera_reset_and_rtc_loop_by_unstable_dmtac_serial_enumeration",
+  "repository": {
+    "commit": "a79c180a6ea415c239e3a74c8999b6eb07acadfd",
+    "worktree_global_state": "dirty_concurrent_mainline_work_preserved",
+    "rtc_changes_scope": "deploy_only_default_off",
+    "teleop_or_replay_modified_by_rtc": false,
+    "sim_observation_modified_by_rtc": false,
+    "openpi_checkout_modified": false
+  },
+  "camera_preflight": {
+    "authoritative_config": "cameras/configs/rm65/devices/realsense.json",
+    "enumerator": "pyrealsense2_context_query_devices",
+    "configured_serial_match_count": 3,
+    "devices": {
+      "front": {
+        "serial": "213222079798",
+        "model": "Intel RealSense D435"
+      },
+      "left_wrist": {
+        "serial": "261122273924",
+        "model": "Intel RealSense D405"
+      },
+      "right_wrist": {
+        "serial": "260522278055",
+        "model": "Intel RealSense D405"
+      }
+    },
+    "v4l2_serial_field_used_for_assignment": false
+  },
+  "boundary": {
+    "rtc_profile": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "rtc_real_shadow": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "arm_observation_only": true,
+    "gripper_observation_only": true,
+    "gripper_send_commands": false,
+    "tactile_enabled": false,
+    "action_send_authority": false
+  },
+  "server": {
+    "model_id": "0715-cube-front-ready-mix-4to1-relative",
+    "checkpoint_step": 149999,
+    "action_pose_mode": "relative",
+    "prediction_horizon_steps": 50,
+    "correct_environment": "/home/user/zc/openpi/.venv",
+    "client_environment": "/home/user/miniconda3/envs/dexteleop310",
+    "initial_wrong_environment_attempt": {
+      "environment": "/home/user/miniconda3/envs/dexteleop310",
+      "result": "failed_before_listen",
+      "reason": "ModuleNotFoundError: tyro"
+    },
+    "correct_environment_loaded_checkpoint": true,
+    "test_port": 8078,
+    "test_port_closed_after_bounded_timeout": true,
+    "unrelated_mainline_port_18080_not_modified": true
+  },
+  "attempts": [
+    {
+      "started_at": "2026-07-24T12:21:21+08:00",
+      "result": "dmtac_assignment_failed_before_camera_start",
+      "missing_configured_device": "/dev/ttyUSB0",
+      "camera_hardware_reset_executed": false,
+      "rtc_frontend_step_count": 0,
+      "dispatch_count": 0
+    },
+    {
+      "started_at": "2026-07-24T12:25:52+08:00",
+      "result": "dmtac_assignment_failed_before_camera_start",
+      "missing_configured_device": "/dev/ttyUSB1",
+      "camera_hardware_reset_executed": false,
+      "rtc_frontend_step_count": 0,
+      "dispatch_count": 0
+    }
+  ],
+  "device_observation": {
+    "ttyusb0_and_ttyusb1_present_between_attempts": true,
+    "both_nodes_reenumerated_after_second_failure_at": "2026-07-24T12:28:00+08:00",
+    "saved_assignment_by_path": {
+      "left": "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0",
+      "right": "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0"
+    },
+    "current_by_path": {
+      "ttyUSB0": "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.3.4:1.0-port0",
+      "ttyUSB1": "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.4.4.4:1.0-port0"
+    },
+    "unique_by_id_available_for_both_grippers": false,
+    "single_non_unique_by_id_alias": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+    "interpretation": "both saved physical paths are stale and no unique serial identity exists, so left/right reassignment requires owner confirmation",
+    "bypass_attempted": false
+  },
+  "rtc_observation": {
+    "camera_start_called": false,
+    "camera_hardware_reset_executed": false,
+    "rtc_frontend_started": false,
+    "transport_exchange_count": 0,
+    "formal_emission_count": 0,
+    "dispatch_count": 0,
+    "control_budget_conclusion_available": false
+  },
+  "verification": {
+    "targeted_test_result": "79 passed",
+    "py_compile_passed": true,
+    "rtc_scoped_git_diff_check_passed": true,
+    "global_git_diff_check_blocked_by_unrelated_concurrent_trailing_whitespace": "docs/real/README.md:44"
+  },
+  "raw_log_attestation": {
+    "local_pull_root": "/tmp/rtc_rr3d_real_shadow_logs",
+    "first_client_log_sha256": "22f11628ea5dc9ad343556fa1ad4fa1f5cab1ce1b500883803a5714c5d106dbe",
+    "second_client_log_sha256": "fa28785fa8eff17aa8a892f3c3510feb7be99df98281405a1367c8b3e4e89770",
+    "wrong_environment_server_log_sha256": "07f13ed8f838eb16567d5436839ddea6e5ba099c6e44d95d4c046eaaa35ab46a",
+    "first_correct_server_log_sha256": "175091455de77c13696b439eb4f36f7fa8c01b87d3f3914854d825e9761945cf",
+    "second_correct_server_log_sha256": "17fb44b6e8c7357085f2713c7bd229e2dfef6457a1cb2a7c0fd450d3bc47d93f"
+  },
+  "next_gate": {
+    "action_send_authorized": false,
+    "required": [
+      "DMTAC owner confirms physical left/right identity and regenerates the shared latest assignment for the current USB topology",
+      "repeat the identical real no-action raw-RTC gate without disabling end effectors or synthesizing hand state",
+      "require real camera reset receipts, request/result/epoch/plan admission, unique formal emissions, zero dispatch, zero 30 Hz budget exceedances, and drained close"
+    ]
+  }
+}

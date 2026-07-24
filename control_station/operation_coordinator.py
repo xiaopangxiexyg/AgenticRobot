@@ -242,6 +242,7 @@ class NoIoStationOperationCoordinator:
         try:
             transition = self.runtime.submit_intent(draft)
             self._publish_intent(transition)
+            self._after_intent_admission(transition)
             if transition.receipt.status == "operation_requested":
                 if not reserved:
                     raise RuntimeError(
@@ -288,11 +289,25 @@ class NoIoStationOperationCoordinator:
                 self._release_capacity()
             raise
 
+    def _after_intent_admission(
+        self,
+        transition: ControlStationTransition,
+    ) -> None:
+        """Optional hook for accepted non-operation safety intents."""
+
+        del transition
+
     def _prepare_enqueued_operation(
         self,
         transition: ControlStationTransition,
     ) -> None:
-        """Optional no-fail hook after admission and before queue publication."""
+        """Prepare an admitted pending operation before queue publication.
+
+        The caller converts ordinary preparation exceptions into a typed
+        failed operation result.  Non-operation intents (for example lease
+        acquisition) never reach this hook because they do not own a pending
+        operation.
+        """
 
         del transition
 
@@ -601,6 +616,29 @@ class SideEffectStationOperationCoordinator(NoIoStationOperationCoordinator):
         transition: ControlStationTransition,
     ) -> None:
         self._operation_prepare(transition)
+
+    _NON_OPERATION_SAFETY_PREPARE_INTENTS = frozenset({"hold", "estop"})
+
+    def _after_intent_admission(
+        self,
+        transition: ControlStationTransition,
+    ) -> None:
+        """Prepare accepted safety latches that have no pending operation.
+
+        Lease acquisition/release is deliberately excluded: those intents
+        only update receiver state and must not run a lower-operation hook.
+        HOLD/ESTOP are the explicit non-operation safety seam; their prepare
+        failure remains an exception because there is no pending operation
+        that could be resolved into a typed result.
+        """
+
+        if (
+            transition.receipt.accepted
+            and transition.receipt.status != "operation_requested"
+            and transition.intent.intent_kind
+            in self._NON_OPERATION_SAFETY_PREPARE_INTENTS
+        ):
+            self._operation_prepare(transition)
 
     @property
     def transition_observer_failure_count(self) -> int:

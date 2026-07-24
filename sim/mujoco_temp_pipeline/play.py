@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from sim.mujoco.tasks.cube_lift import CubeLiftEnv
+from sim.mujoco.tasks.cube_lift.config import is_cube_lift_success_reason
 
 from .checkpoint import build_policy_from_checkpoint, check_task_config_compatibility
 from .policy import resolve_device
@@ -108,8 +109,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         ).unsqueeze(0),
                         deterministic=True,
                     )
+                    environment_action = policy.expand_action(action)
                 observation, reward, terminated, truncated, info = env.step(
-                    action.squeeze(0).cpu().numpy()
+                    environment_action.squeeze(0).cpu().numpy()
                 )
                 total_raw_reward += reward
                 policy_steps += 1
@@ -178,7 +180,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 if terminated or truncated:
                     episodes += 1
                     successes += int(
-                        info.get("termination_reason") == "height_only_lift_success"
+                        is_cube_lift_success_reason(
+                            info.get("termination_reason")
+                        )
                     )
                     if args.episodes > 0 and episodes >= args.episodes:
                         break

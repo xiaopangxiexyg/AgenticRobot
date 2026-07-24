@@ -30,6 +30,8 @@ class FootPadControlModeTests(unittest.TestCase):
             foot_pad_startup_error="FootPadUnavailableError: virtual keyboard missing",
         )
         control._foot_pad_test_active = False
+        control._foot_pad_test_completed = False
+        control._foot_pad_test_seen_events = set()
         control._foot_pad_test_last_event = ""
         control._foot_pad_test_status = ""
 
@@ -160,6 +162,33 @@ class FootPadControlModeTests(unittest.TestCase):
 
         source = FootPadSpecialArmInput(Device(), FakeEvdev(), foot_pad_count=2)
         self.assertEqual(source.consume_events(), ["fix_arm_left"])
+        self.assertEqual(
+            source.consume_test_events(),
+            ["fix_arm_left", "init_arm_left"],
+        )
+        source.close()
+
+    def test_lazy_evdev_eagain_is_a_normal_empty_poll(self) -> None:
+        class FakeCodes:
+            EV_KEY = 1
+
+        class FakeEvdev:
+            ecodes = FakeCodes()
+
+        class Device:
+            def read(self):
+                def events():
+                    raise BlockingIOError(11, "Resource temporarily unavailable")
+                    yield  # pragma: no cover
+
+                return events()
+
+            def close(self):
+                return None
+
+        source = FootPadSpecialArmInput(Device(), FakeEvdev(), foot_pad_count=2)
+        self.assertEqual(source.consume_events(), [])
+        self.assertTrue(source.is_online)
         source.close()
 
     def test_live_keyboard_capabilities_identify_two_pedal_topology(self) -> None:
@@ -444,6 +473,8 @@ class FootPadControlModeTests(unittest.TestCase):
         control.ui = FakeUi()
         control.foot_pad_input = object()
         control._foot_pad_test_active = False
+        control._foot_pad_test_completed = False
+        control._foot_pad_test_seen_events = set()
         control._foot_pad_test_last_event = ""
         control._foot_pad_test_status = ""
         control._teleop_started = False
@@ -462,6 +493,44 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertIn("未执行实际操作", control.ui.messages[-1][1])
         control._stop_foot_pad_test()
         self.assertFalse(control._foot_pad_test_active)
+        self.assertTrue(control._foot_pad_test_completed)
+        self.assertIn("本次检测到 1/4", control._foot_pad_test_status)
+
+    def test_gui_test_mode_auto_completes_after_all_four_key_positions(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.ui = SimpleNamespace(
+            published=[],
+            messages=[],
+            publish=lambda **updates: control.ui.published.append(updates),
+            append_message=lambda tag, message: control.ui.messages.append(
+                (tag, message)
+            ),
+        )
+        control.foot_pad_input = SimpleNamespace(
+            foot_pad_count=2,
+            is_online=True,
+        )
+        control._foot_pad_test_active = True
+        control._foot_pad_test_completed = False
+        control._foot_pad_test_seen_events = set()
+        control._foot_pad_test_last_event = ""
+        control._foot_pad_test_status = ""
+        control._current_active_controls = lambda: ["q", "two_pedal_b", "two_pedal_c"]
+        control._control_hint = lambda: "normal"
+        control.args = SimpleNamespace(foot_pad_requested=True)
+
+        for index, event in enumerate(
+            ("fix_arm_left", "fix_arm_right", "init_arm_left", "init_arm_right"),
+            start=1,
+        ):
+            control._record_foot_pad_test_event(event, now=float(index))
+
+        self.assertFalse(control._foot_pad_test_active)
+        self.assertTrue(control._foot_pad_test_completed)
+        self.assertEqual(len(control._foot_pad_test_seen_events), 4)
+        self.assertIn("自动完成", control._foot_pad_test_status)
+        self.assertTrue(control.ui.published[-1]["foot_pad_test_completed"])
+        self.assertEqual(control.ui.published[-1]["foot_pad_test_seen_count"], 4)
 
     def test_fourth_pedal_routes_to_exact_qpos_not_legacy_init_pose(self) -> None:
         class InitController:
@@ -493,6 +562,62 @@ class FootPadControlModeTests(unittest.TestCase):
 
         self.assertEqual(controller.selected, ["right"])
         self.assertEqual(exact_calls, [12.5])
+
+    def test_two_pedal_routes_mean_moving_side_and_never_init(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 2
+        control._two_pedal_mode_active = lambda: True
+        requests = []
+        control._request_two_pedal_fixed_side = (
+            lambda side, *, now, source: requests.append((side, now, source))
+        )
+
+        control._handle_foot_pad_special_arm_event("fix_arm_left", now=10.0)
+        control._handle_foot_pad_special_arm_event("fix_arm_right", now=11.0)
+        control._handle_foot_pad_special_arm_event("init_arm_left", now=12.0)
+
+        self.assertEqual(
+            requests,
+            [
+                ("right", 10.0, "pedal_1"),
+                ("left", 11.0, "pedal_2"),
+            ],
+        )
+
+    def test_two_pedal_alerts_replace_each_other_and_red_expires(self) -> None:
+        published = []
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.ui = SimpleNamespace(
+            publish=lambda **updates: published.append(updates)
+        )
+        control._control_hint = lambda: "normal"
+
+        control._publish_two_pedal_alert(
+            level="red",
+            message="failed",
+            now=10.0,
+            duration_sec=3.0,
+        )
+        control._publish_two_pedal_alert(
+            level="orange",
+            message="waiting",
+            now=11.0,
+        )
+        self.assertEqual(published[-1]["two_pedal_alert"]["level"], "orange")
+        self.assertEqual(control._two_pedal_alert_expires_at, 0.0)
+
+        control._publish_two_pedal_alert(
+            level="red",
+            message="failed again",
+            now=12.0,
+            duration_sec=3.0,
+        )
+        control._poll_two_pedal_alert_timeout(now=14.9)
+        self.assertTrue(published[-1]["two_pedal_alert"]["active"])
+        control._poll_two_pedal_alert_timeout(now=15.0)
+        self.assertEqual(published[-1]["two_pedal_alert"], {})
+        self.assertEqual(published[-1]["control_hint"], "normal")
 
     def test_matching_init_pedal_during_qpos_pauses_and_starts_home_recapture(self) -> None:
         class InitController:

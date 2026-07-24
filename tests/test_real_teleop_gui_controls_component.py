@@ -309,6 +309,22 @@ def test_exact_qpos_operation_keeps_home_recapture_hold_quit_and_debug_controls(
     ]
 
 
+def test_startup_exact_qpos_hides_runtime_hold_but_keeps_operation_stop() -> None:
+    state = GuiControlState(
+        teleop_started=False,
+        init_arm_available=True,
+        init_arm_qpos_active=True,
+        startup_qpos_maintenance_enabled=True,
+        active_side_count=2,
+    )
+
+    controls = current_active_controls(state, GuiControlEvents())
+
+    assert "h" not in controls
+    assert "init_qpos_emergency_stop" in controls
+    assert "q" in controls
+
+
 def test_impedance_gui_exposes_exact_qpos_only_with_capable_dual_backends() -> None:
     class CapableBackend:
         def begin_exact_qpos_transit(self, _operation_id: str) -> None:

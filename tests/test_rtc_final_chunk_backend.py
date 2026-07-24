@@ -10,13 +10,18 @@ from deployments.client import (
     FinalChunkModelOutput,
     FinalChunkRtcBackend,
     FinalChunkRtcBinding,
+    MappingFinalChunkOutputAdapter,
     ModelAgnosticRtcClient,
+    RtcModelRuntimeAdapter,
+    RtcPreparedModelInput,
+    create_final_chunk_rtc_runtime_adapter,
 )
 from robot_motion.deploy import DEPLOY_ACTION_DIM, NormalizedAction, nan_vector
 from robot_motion.deploy.inference import (
     ASYNC_ALIGNED_CHUNK_MODE_V1,
     PolicyInferenceRequest,
 )
+from robot_motion.deploy.observation_view import PolicyObservationView
 
 
 HORIZON = 3
@@ -179,3 +184,160 @@ def test_generic_final_chunk_backend_cancel_is_optional_and_typed() -> None:
     )
     with pytest.raises(TypeError, match="must return bool"):
         invalid_cancel.request_cancel()
+
+
+def test_sessionless_mapping_model_composes_without_request_spec_copy() -> None:
+    actions = np.arange(HORIZON * 2, dtype=np.float32).reshape(HORIZON, 2)
+    discrete = np.arange(HORIZON, dtype=np.int64).reshape(HORIZON, 1)
+    model_calls: list[dict[str, Any]] = []
+    cancel_calls: list[bool] = []
+
+    def prepare_input(_request, observation):
+        model_input = observation.model_input()
+        return RtcPreparedModelInput(
+            model_input=model_input,
+            model_input_hash=_input_hash(model_input),
+        )
+
+    def call_model(model_input):
+        model_calls.append(model_input)
+        return {
+            "chunk": actions,
+            "tokens": discrete,
+            "output_id": "server-output:unit",
+            "server_timing": {"infer_sec": 0.01},
+        }
+
+    decoded_discrete = []
+
+    def decode(model_actions, discrete_actions, _request):
+        assert discrete_actions is not None
+        decoded_discrete.append(discrete_actions.copy())
+        decoded = []
+        for row in model_actions:
+            vector = nan_vector(DEPLOY_ACTION_DIM)
+            vector[:2] = row
+            decoded.append(NormalizedAction(vector=vector))
+        return tuple(decoded)
+
+    adapter = create_final_chunk_rtc_runtime_adapter(
+        binding=_binding(),
+        prepare_input=prepare_input,
+        call_model=call_model,
+        hash_model_input=_input_hash,
+        decoder=decode,
+        adapt_output=MappingFinalChunkOutputAdapter(
+            actions_key="chunk",
+            discrete_actions_key="tokens",
+            source_output_id_key="output_id",
+        ),
+        request_cancel=lambda: cancel_calls.append(True) is None,
+        clock=_clock(),
+    )
+
+    assert isinstance(adapter, RtcModelRuntimeAdapter)
+    assert adapter.request_spec is adapter.backend.request_spec
+    observation = PolicyObservationView(
+        contract_id="contract:final-chunk-factory-unit",
+        contract_hash="contract-hash:final-chunk-factory-unit",
+        payload={"state": np.asarray([1.0, 2.0], dtype=np.float32)},
+    )
+    result = adapter.create_worker_executor()(
+        _request(adapter.backend),
+        observation,
+    )
+
+    assert len(model_calls) == 1
+    assert result.source_chunk_size == HORIZON
+    assert len(result.decoded_absolute_actions) == HORIZON
+    assert len(decoded_discrete) == 1
+    np.testing.assert_array_equal(decoded_discrete[0], discrete)
+    assert adapter.create_worker_executor().request_cancel()
+    assert cancel_calls == [True]
+
+
+@pytest.mark.parametrize(
+    ("binding", "output_adapter"),
+    (
+        (_binding(discrete_dim=1), MappingFinalChunkOutputAdapter()),
+        (
+            _binding(discrete_dim=0),
+            MappingFinalChunkOutputAdapter(discrete_actions_key="tokens"),
+        ),
+    ),
+)
+def test_mapping_output_contract_matches_discrete_binding_at_construction(
+    binding: FinalChunkRtcBinding,
+    output_adapter: MappingFinalChunkOutputAdapter,
+) -> None:
+    with pytest.raises(ValueError, match="discrete output key"):
+        create_final_chunk_rtc_runtime_adapter(
+            binding=binding,
+            prepare_input=lambda *_args: None,
+            call_model=lambda _value: {},
+            hash_model_input=_input_hash,
+            decoder=lambda *_args: (),
+            adapt_output=output_adapter,
+        )
+
+
+def test_mapping_output_adapter_rejects_ambiguous_or_missing_keys() -> None:
+    with pytest.raises(ValueError, match="must be distinct"):
+        MappingFinalChunkOutputAdapter(
+            actions_key="output",
+            source_output_id_key="output",
+        )
+
+    output_adapter = MappingFinalChunkOutputAdapter(actions_key="chunk")
+    with pytest.raises(ValueError, match="missing exact output key"):
+        output_adapter({"actions": np.zeros((HORIZON, 2), dtype=np.float32)})
+    with pytest.raises(TypeError, match="must be a mapping"):
+        output_adapter(np.zeros((HORIZON, 2), dtype=np.float32))
+    with pytest.raises(TypeError, match="source output id"):
+        MappingFinalChunkOutputAdapter(
+            actions_key="chunk",
+            source_output_id_key="output_id",
+        )(
+            {
+                "chunk": np.zeros((HORIZON, 2), dtype=np.float32),
+                "output_id": 7,
+            }
+        )
+
+
+def test_typed_final_chunk_output_needs_no_mapping_adapter() -> None:
+    calls = []
+
+    def decode(model_actions, _discrete_actions, _request):
+        decoded = []
+        for row in model_actions:
+            vector = nan_vector(DEPLOY_ACTION_DIM)
+            vector[:2] = row
+            decoded.append(NormalizedAction(vector=vector))
+        return tuple(decoded)
+
+    adapter = create_final_chunk_rtc_runtime_adapter(
+        binding=_binding(discrete_dim=0),
+        prepare_input=lambda *_args: None,
+        call_model=lambda value: (
+            calls.append(value)
+            or FinalChunkModelOutput(
+                actions=np.zeros((HORIZON, 2), dtype=np.float32),
+            )
+        ),
+        hash_model_input=_input_hash,
+        decoder=decode,
+    )
+    model_input = {"state": np.zeros(2, dtype=np.float32)}
+    bundle = ModelAgnosticRtcClient(
+        backend=adapter.backend,
+        decoder=adapter.decoder,
+        request_spec=adapter.request_spec,
+    ).infer(
+        _request(adapter.backend),
+        model_input=model_input,
+        model_input_hash=_input_hash(model_input),
+    )
+
+    assert bundle.response.model_space_actions.shape == (HORIZON, 2)
+    assert calls == [model_input]

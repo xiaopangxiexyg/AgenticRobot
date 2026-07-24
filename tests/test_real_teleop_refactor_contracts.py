@@ -526,6 +526,9 @@ def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> 
     control._camera_visualization_toggle_requested = False
     control._tactile_visualization_toggle_requested = False
     control._ik_debug_log_toggle_requested = False
+    control._tracker_side_request_pending = False
+    control._tracker_side_request_kind = "normal"
+    control._tracker_side_request_deadline = 0.0
     control._q6_hold_recalibration_gesture = SimpleNamespace()
     control._handle_foot_pad_special_arm_event = (
         lambda event, *, now: events.append(f"foot_pad.route:{event}")
@@ -539,12 +542,12 @@ def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> 
 
     assert events == [
         "terminal.poll",
-        # UI events are sampled before foot-pad events so a same-poll
-        # foot_pad_test_start can suppress physical fix/init routing.
+        # UI safety events are sampled before foot-pad routing.  The terminal
+        # quit latch is checked first, then the foot-pad fd is drained without
+        # routing because this batch contains Hold.
         "ui.consume_events",
-        "foot_pad.consume_events",
-        "foot_pad.route:fix_arm_left",
         "terminal.should_quit",
+        "foot_pad.consume_events",
         "terminal.consume_calibration",
         "request_hold:manual",
         "q6.poll",

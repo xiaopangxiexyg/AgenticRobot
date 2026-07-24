@@ -19,6 +19,11 @@ def shape_rewards(
     lift_delta_m: float = 0.08,
     success: np.ndarray | None = None,
     grasp_latched: np.ndarray | None = None,
+    bilateral_contact: np.ndarray | None = None,
+    previous_bilateral_contact: np.ndarray | None = None,
+    time_limit: np.ndarray | None = None,
+    failure_termination: np.ndarray | None = None,
+    unsafe_termination: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Compute staged rewards without exposing this state to a normal policy."""
 
@@ -56,6 +61,45 @@ def shape_rewards(
             raise ValueError("grasp_latched must match the reward batch.")
         latched = np.clip(latched, 0.0, 1.0)
     pre_latch = 1.0 - latched
+    if bilateral_contact is None:
+        bilateral = np.zeros_like(raw, dtype=np.float32)
+    else:
+        bilateral = np.asarray(bilateral_contact, dtype=np.float32).reshape(-1)
+        if bilateral.shape != raw.shape:
+            raise ValueError("bilateral_contact must match the reward batch.")
+        bilateral = np.clip(bilateral, 0.0, 1.0)
+    if previous_bilateral_contact is None:
+        previous_bilateral = np.zeros_like(raw, dtype=np.float32)
+    else:
+        previous_bilateral = np.asarray(
+            previous_bilateral_contact, dtype=np.float32
+        ).reshape(-1)
+        if previous_bilateral.shape != raw.shape:
+            raise ValueError(
+                "previous_bilateral_contact must match the reward batch."
+            )
+        previous_bilateral = np.clip(previous_bilateral, 0.0, 1.0)
+    if time_limit is None:
+        timed_out = np.zeros_like(raw, dtype=np.float32)
+    else:
+        timed_out = np.asarray(time_limit, dtype=np.float32).reshape(-1)
+        if timed_out.shape != raw.shape:
+            raise ValueError("time_limit must match the reward batch.")
+        timed_out = np.clip(timed_out, 0.0, 1.0)
+    if failure_termination is None:
+        failed = np.zeros_like(raw, dtype=np.float32)
+    else:
+        failed = np.asarray(failure_termination, dtype=np.float32).reshape(-1)
+        if failed.shape != raw.shape:
+            raise ValueError("failure_termination must match the reward batch.")
+        failed = np.clip(failed, 0.0, 1.0)
+    if unsafe_termination is None:
+        unsafe = np.zeros_like(raw, dtype=np.float32)
+    else:
+        unsafe = np.asarray(unsafe_termination, dtype=np.float32).reshape(-1)
+        if unsafe.shape != raw.shape:
+            raise ValueError("unsafe_termination must match the reward batch.")
+        unsafe = np.clip(unsafe, 0.0, 1.0)
 
     previous_gripper_close = np.clip(
         previous_state.right_gripper_close, 0.0, 1.0
@@ -171,19 +215,45 @@ def shape_rewards(
         else np.zeros_like(raw)
     )
     grasp_acquire_term = config.grasp_acquire_bonus * grasp_acquire * pre_latch
+    bilateral_contact_term = config.bilateral_contact_reward_scale * bilateral
+    bilateral_contact_acquire = bilateral * (previous_bilateral < 0.5)
+    bilateral_contact_acquire_term = (
+        config.bilateral_contact_acquire_bonus * bilateral_contact_acquire
+    )
+    bilateral_contact_missing_term = (
+        -config.bilateral_contact_missing_penalty * (1.0 - bilateral)
+    )
     # A lifted cube is the reliable grasp signal available in the current
     # observation. Gate the sustained lift reward by proximity and closure so
     # table jitter alone cannot be harvested as task progress.
     latch_term = config.latch_reward_scale * latched
     grasp_confidence = np.maximum(grasp_gate * close_confidence, latched)
+    if config.require_bilateral_contact_for_lift_reward:
+        grasp_confidence = np.maximum(latched, grasp_confidence * bilateral)
     lift_term = config.lift_reward_scale * current_lift * grasp_confidence
+    lift_progress_confidence = grasp_confidence
+    if config.ungated_negative_lift_progress:
+        # Positive lift remains contact-gated so free-object jitter cannot be
+        # harvested. A subsequent drop must still repay that progress even
+        # after contact has already been lost; otherwise repeated tiny lifts
+        # followed by ungated falls create a one-way reward ratchet.
+        lift_progress_confidence = np.where(
+            lift_progress < 0.0,
+            1.0,
+            grasp_confidence,
+        )
     lift_progress_term = (
-        config.lift_progress_scale * lift_progress * grasp_confidence
+        config.lift_progress_scale
+        * lift_progress
+        * lift_progress_confidence
     )
     action_term = -config.action_penalty * np.mean(
         np.square(current_state.last_action), axis=1
     )
     success_term = config.success_bonus * succeeded
+    time_limit_term = -config.time_limit_penalty * timed_out
+    failure_termination_term = -config.failure_termination_penalty * failed
+    unsafe_termination_term = -config.unsafe_termination_penalty * unsafe
     if safety_projection_alpha is None:
         projection_alpha = np.ones_like(raw)
     else:
@@ -200,11 +270,17 @@ def shape_rewards(
         + gripper_progress_term
         + premature_close_term
         + grasp_acquire_term
+        + bilateral_contact_term
+        + bilateral_contact_acquire_term
+        + bilateral_contact_missing_term
         + latch_term
         + lift_term
         + lift_progress_term
         + action_term
         + success_term
+        + time_limit_term
+        + failure_termination_term
+        + unsafe_termination_term
         + safety_term
         if config.enabled
         else raw + safety_term
@@ -221,6 +297,8 @@ def shape_rewards(
         "reach_phase_weight": reach_phase_weight.astype(np.float32),
         "gripper_close": gripper_close.astype(np.float32),
         "grasp_latched": latched.astype(np.float32),
+        "bilateral_contact": bilateral.astype(np.float32),
+        "bilateral_contact_acquire": bilateral_contact_acquire.astype(np.float32),
         "lift_fraction": current_lift.astype(np.float32),
         "reach_term": reach_term.astype(np.float32),
         "reach_progress_term": reach_progress_term.astype(np.float32),
@@ -230,11 +308,21 @@ def shape_rewards(
         "premature_close_term": premature_close_term.astype(np.float32),
         "grasp_close_confidence": close_confidence.astype(np.float32),
         "grasp_acquire_term": grasp_acquire_term.astype(np.float32),
+        "bilateral_contact_term": bilateral_contact_term.astype(np.float32),
+        "bilateral_contact_acquire_term": bilateral_contact_acquire_term.astype(
+            np.float32
+        ),
+        "bilateral_contact_missing_term": (
+            bilateral_contact_missing_term.astype(np.float32)
+        ),
         "latch_term": latch_term.astype(np.float32),
         "lift_term": lift_term.astype(np.float32),
         "lift_progress_term": lift_progress_term.astype(np.float32),
         "action_term": action_term.astype(np.float32),
         "success_term": success_term.astype(np.float32),
+        "time_limit_term": time_limit_term.astype(np.float32),
+        "failure_termination_term": failure_termination_term.astype(np.float32),
+        "unsafe_termination_term": unsafe_termination_term.astype(np.float32),
         "safety_projection_term": safety_term.astype(np.float32),
     }
 

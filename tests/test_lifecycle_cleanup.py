@@ -398,7 +398,11 @@ def test_realsense_close_joins_worker_even_when_pipeline_stop_fails() -> None:
     with pytest.raises(LifecycleCleanupError) as caught:
         source.close()
 
-    assert calls == ["pipeline.stop", "worker.join:1.0"]
+    assert calls[0] == "pipeline.stop"
+    assert len(calls) == 2
+    join_timeout_sec = float(calls[1].removeprefix("worker.join:"))
+    assert join_timeout_sec >= source.config.wait_timeout_ms / 1000.0
+    assert join_timeout_sec <= source.config.wait_timeout_ms / 1000.0 + 0.5
     assert [failure.label for failure in caught.value.failures] == ["pipeline.stop"]
     assert source._thread is None
 

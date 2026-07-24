@@ -31,23 +31,43 @@ Task configurations live in `tasks/`, rather than pretending to be a second
   four physical finger actuators, and exposes measured rather than target
   gripper closure in the privileged observation. Contact force and the grasp
   latch remain explicitly provisional.
-- `tasks/rm65_right_cube_lift_rl_normal_v1.json`: the default normal-policy
+- `tasks/rm65_right_cube_lift_rl_normal_v1.json`: the retained original normal
   task. It exposes only the 15-D real-observable proprioceptive policy state,
   uses physical MuJoCo contact, forbids the debug grasp latch, and binds the
   same fitted RM65/DM-Tac profiles as every current expert configuration.
+- `tasks/rm65_right_cube_lift_rl_normal_v2.json`: the current state-only
+  training default. It uses the 28-D measured motion/tracking profile without
+  RGB or an episode clock, smaller pose/gripper increments, bilateral-contact
+  reward/success gates, a validated 22 mm closed-grasp target / 70 mm lift
+  milestone, failure-aware terminal rewards, and pose-target anti-windup. Its
+  versioned DM-Tac variant preserves the identified free-motion actuator and
+  applies a simulation-only post-settle contact-friction tuple.
+- `tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v1.json`: lift-first
+  diagnostic retained for the completed 200k run. It established bilateral
+  contact, but its dense projection penalty made leaving the cube more
+  profitable than lifting; do not use that checkpoint for home-reset warm-start.
+  The contact criterion uses a 0.55 measured-close floor because bilateral
+  cube contact physically stalls closure below 0.60 on some resets; one
+  recoverable retry prevents that numerical edge from aborting a vector run.
+- `tasks/rm65_right_cube_lift_rl_normal_contact_curriculum_v2.json`: corrected
+  lift-first curriculum with the same 28-D input and 7-D output contract. It
+  keeps the gripper target closed, limits horizontal/rotation motion, admits
+  only non-negative lift motion, terminates sustained bilateral-contact loss,
+  removes the contact-reacquisition bonus, reduces dense projection penalty,
+  and strengthens lift progress. Its reset follows the validated float32 grasp
+  path and executes the gate's final centered stabilization step before policy
+  control. It remains simulator-only.
 - `tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json`: the retained camera
   baseline. It keeps the normal 15-D state contract and appends the active
   wrist RGB image at 48x48 with the fitted actuator profiles.
-- `tasks/rm65_right_cube_lift_rl_normal_rgb_v3.json`: the current normal-policy
+- `tasks/rm65_right_cube_lift_rl_normal_rgb_v3.json`: a retained normal-policy
   input/reward candidate. It remains real-observable (29-D measured
   motion/tracking proprioception plus the active 48x48 wrist RGB image), uses
   the same pose action and identified actuator profiles, and records staged
   close-gate reward parameters on the simulator task boundary only.
-- `tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json`: the recommended normal
-  policy profile. It keeps the v3 measured motion/tracking and 48x48 wrist RGB
-  paths but removes the simulator reset-relative `episode_progress` field;
-  the resulting 28-D proprioceptive input is the default for new temporary PPO
-  training. v3 remains available for checkpoint compatibility.
+- `tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json`: the retained no-episode-
+  clock RGB profile. New camera training is paused; use it only explicitly for
+  checkpoint compatibility.
 - `tasks/rm65_right_cube_lift_rl_privileged_expert_v1.json`: the opt-in expert
   task. It exposes the 31-D simulator state and retains the task-local debug
   latch for teacher/curriculum experiments. It does not define a deployment

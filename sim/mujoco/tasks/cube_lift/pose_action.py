@@ -445,6 +445,17 @@ class CubeLiftPoseActionController:
 
         return self._reset_planner_from_scene()
 
+    def reanchor_target_from_scene(self) -> np.ndarray:
+        """Drop an unexecuted pose target after IK/safety intervention.
+
+        The planner qpos is synchronized separately.  This method only resets
+        the next relative-action anchor to the measured tool pose so rejected
+        increments cannot accumulate into an unreachable target.
+        """
+
+        self._target_pose_arm_base = self._current_tool_pose_arm_base()
+        return self.target_pose_arm_base
+
     def apply(self, action: Any) -> CubeLiftPoseActionStep:
         values = np.asarray(action, dtype=float).reshape(-1)
         if values.shape != (7,) or not np.all(np.isfinite(values)):

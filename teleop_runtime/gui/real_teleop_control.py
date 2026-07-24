@@ -14,6 +14,7 @@ import inspect
 import threading
 
 from ..collection.episode_curation import EpisodeCurationSession
+from ..real_teleop.tracker_side_check import evaluate_tracker_side_assignment
 
 
 _SUPPORT_NAMES = (
@@ -123,6 +124,12 @@ _FOOT_PAD_TEST_LABELS = {
     "init_arm_left": "踏板 3 / F15 → 左臂精确 Init qpos",
     "init_arm_right": "踏板 4 / F16 → 右臂精确 Init qpos",
 }
+_TWO_PEDAL_TEST_LABELS = {
+    "fix_arm_left": "踏板 1 / F13 → 仅左臂遥操（Fix 右臂）",
+    "fix_arm_right": "踏板 2 / F14 → 仅右臂遥操（Fix 左臂）",
+    "init_arm_left": "踏板 3 / F15 → 测试键位（双踏板模式不执行 Init）",
+    "init_arm_right": "踏板 4 / F16 → 测试键位（双踏板模式不执行 Init）",
+}
 
 
 def bind_legacy_support(namespace: Mapping[str, object]) -> None:
@@ -188,9 +195,45 @@ class RealTeleopControlInput:
         self._calibration_requested = False
         self._calibration_request_from_hold = False
         self._last_calibration_started_from_hold = False
+        self._tracker_side_check: dict[str, object] = {
+            "status": "unavailable",
+            "warning_required": False,
+            "operator_lateral_axis": "+Y=left",
+            "basis": "vive_virtual_desk_before_post_yaw",
+            "message": "等待左右 wrist tracker 和 VIVE desk 坐标系。",
+            "confirmation_required": False,
+            "confirmation_token": "",
+            "session_check_completed": False,
+            "monitoring_active": True,
+        }
+        # The left/right spatial check is a startup admission guard, not a
+        # runtime safety monitor.  Once the first Home has either passed the
+        # check or received explicit operator confirmation, keep that result
+        # for this GUI/controller lifetime and stop evaluating tracker sides.
+        self._tracker_side_initial_check_completed = False
+        self._tracker_side_confirmation_pending = False
+        self._tracker_side_confirmation_token_counter = 0
+        self._tracker_side_confirmation_from_hold = False
+        self._tracker_side_confirmation_request_kind = "normal"
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
         self._hold_requested = False
         self._hold_active = False
         self._fix_hold_active = False
+        self._two_pedal_transition_active = False
+        self._two_pedal_transition_target_fixed_side: str | None = None
+        self._two_pedal_post_home_fixed_side: str | None = None
+        self._two_pedal_fast_home_requested = False
+        self._two_pedal_fast_home_deadline = 0.0
+        self._two_pedal_fast_home_timeout_sec = 1.0
+        self._two_pedal_alert_level = ""
+        self._two_pedal_alert_message = ""
+        self._two_pedal_alert_expires_at = 0.0
         self._gripper_control_before_fix_hold = False
         self._tracker_swap_locked = False
         self._teleop_started = False
@@ -259,16 +302,18 @@ class RealTeleopControlInput:
         self._plus_curation_request: dict[str, object] | None = None
         self._plus_curation_save_thread: threading.Thread | None = None
         self._foot_pad_test_active = False
+        self._foot_pad_test_completed = False
+        self._foot_pad_test_seen_events: set[str] = set()
         self._foot_pad_test_last_event = ""
         self._foot_pad_test_status = (
-            "测试模式关闭；点击“开始测试踏板”后逐个踩踏板。"
+            "测试模式关闭；映射测试是可选诊断，不会阻塞踏板或 A/B/C 控制。"
             if foot_pad_input is not None
             else "脚踏测试不可用：当前未启用 foot-pad 输入。"
         )
         if foot_pad_input is not None and self._foot_pad_count() == 2:
             self._foot_pad_test_status = (
-                "已连接 2 个踏板：踏板仅提供左右 Fix 快捷输入；"
-                "GUI/键盘的 Fix、Init 与精确归位保持可用。"
+                "已连接 2 个踏板：踏板 1 进入仅左臂遥操，"
+                "踏板 2 进入仅右臂遥操；双踏板不执行 Init。"
             )
         self._manual_gripper_force_by_side: dict[str, float] = {}
         self._camera_visualization_toggle_requested = False
@@ -307,6 +352,9 @@ class RealTeleopControlInput:
             episode_recording_available=(
                 not bool(getattr(self.args, "no_collection", False))
                 or not bool(getattr(self.args, "no_episode_recording", False))
+            ),
+            episode_delete_available=not bool(
+                getattr(self.args, "no_collection", False)
             ),
             episode_recording_active=bool(
                 getattr(self, "_episode_recording_ui_active", False)
@@ -367,6 +415,9 @@ class RealTeleopControlInput:
                 getattr(getattr(self, "foot_pad_input", None), "foot_pad_count", 0) or 0
             ),
             foot_pad_test_active=bool(getattr(self, "_foot_pad_test_active", False)),
+            foot_pad_test_completed=bool(
+                getattr(self, "_foot_pad_test_completed", False)
+            ),
         )
 
     def _foot_pad_test_ui_state(self) -> dict[str, object]:
@@ -404,6 +455,12 @@ class RealTeleopControlInput:
             "foot_pad_status_label": status_label,
             "foot_pad_status_message": status_message,
             "foot_pad_test_active": bool(getattr(self, "_foot_pad_test_active", False)),
+            "foot_pad_test_completed": bool(
+                getattr(self, "_foot_pad_test_completed", False)
+            ),
+            "foot_pad_test_seen_count": len(
+                getattr(self, "_foot_pad_test_seen_events", set())
+            ),
             "foot_pad_test_last_event": getattr(self, "_foot_pad_test_last_event", ""),
             "foot_pad_test_status": getattr(self, "_foot_pad_test_status", ""),
         }
@@ -442,6 +499,57 @@ class RealTeleopControlInput:
 
     def _foot_pad_count(self) -> int:
         return int(getattr(getattr(self, "foot_pad_input", None), "foot_pad_count", 0) or 0)
+
+    def _two_pedal_mode_active(self) -> bool:
+        return bool(
+            self._foot_pad_mode_enabled()
+            and self._foot_pad_online()
+            and self._foot_pad_count() == 2
+        )
+
+    def _publish_two_pedal_alert(
+        self,
+        *,
+        level: str,
+        message: str,
+        now: float,
+        duration_sec: float | None = None,
+    ) -> None:
+        normalized = str(level or "").strip().lower()
+        self._two_pedal_alert_level = normalized
+        self._two_pedal_alert_message = str(message or "")
+        self._two_pedal_alert_expires_at = (
+            0.0
+            if duration_sec is None
+            else float(now) + max(0.0, float(duration_sec))
+        )
+        if self.ui is not None:
+            self.ui.publish(
+                two_pedal_alert={
+                    "active": bool(normalized and message),
+                    "level": normalized,
+                    "message": str(message or ""),
+                },
+                control_hint=str(message or ""),
+            )
+
+    def _clear_two_pedal_alert(self) -> None:
+        self._two_pedal_alert_level = ""
+        self._two_pedal_alert_message = ""
+        self._two_pedal_alert_expires_at = 0.0
+        if self.ui is not None:
+            self.ui.publish(
+                two_pedal_alert={},
+                control_hint=self._control_hint(),
+            )
+
+    def _poll_two_pedal_alert_timeout(self, *, now: float) -> None:
+        if (
+            float(getattr(self, "_two_pedal_alert_expires_at", 0.0)) > 0.0
+            and float(now)
+            >= float(getattr(self, "_two_pedal_alert_expires_at", 0.0))
+        ):
+            self._clear_two_pedal_alert()
 
     def _manual_fix_arm_controls_enabled(self) -> bool:
         """Foot pads supplement rather than replace keyboard/GUI Fix controls."""
@@ -714,7 +822,49 @@ class RealTeleopControlInput:
             and plus_curation.status not in {"saving"}
         ):
             controls.append("plus_curation_save")
-        return controls
+        if self._two_pedal_mode_active() and self._teleop_started:
+            if not self._two_pedal_switch_blocked_by_init():
+                controls.append("two_pedal_b")
+            # C is the unconditional route to regular Hold, including while
+            # an Init operation is active.
+            controls.append("two_pedal_c")
+        tracker_side_gate_pending = bool(
+            getattr(self, "_tracker_side_confirmation_pending", False)
+            or getattr(self, "_tracker_side_request_pending", False)
+        )
+        if tracker_side_gate_pending:
+            controls = [
+                control
+                for control in controls
+                if control not in {"p", "two_pedal_b"}
+            ]
+        if bool(getattr(self, "_tracker_side_confirmation_pending", False)):
+            controls.extend(
+                (
+                    "tracker_side_confirm_continue",
+                    "tracker_side_confirm_cancel",
+                )
+            )
+        if bool(getattr(self, "_hold_requested", False)):
+            controls = [
+                control
+                for control in controls
+                if control
+                not in {
+                    "device_retry",
+                    "foot_pad_test_start",
+                    "calibrate_vive_coordinate_profile",
+                    "load_vive_calibration_profile",
+                    "movement_multiple_down",
+                    "movement_multiple_up",
+                    "movement_multiple_reset",
+                    "movement_multiple_set",
+                    "init_arm_move_to_qpos",
+                    "init_arm_move_both_to_qpos",
+                    "enable_tactile_solving",
+                }
+            ]
+        return list(dict.fromkeys(controls))
 
     def _fix_arm_available(self) -> bool:
         return self._gui_control_state().fix_arm_available
@@ -833,6 +983,7 @@ class RealTeleopControlInput:
             capture_prep_total_sec=DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
             capture_waiting_for_samples=False,
             special_arm_control_mode=self._gui_control_state().special_arm_control_mode,
+            tracker_side_check=dict(self._tracker_side_check),
             **self._foot_pad_test_ui_state(),
         )
         self.ui.start()
@@ -861,23 +1012,80 @@ class RealTeleopControlInput:
 
     def poll(self) -> None:
         current_time = time.time()
+        self._poll_two_pedal_alert_timeout(now=current_time)
+        self._poll_tracker_side_request_timeout(now=current_time)
         self.terminal.poll()
         foot_pad_state_published = False
         ui_events = (
             list(self.ui.consume_events()) if self.ui is not None else []
         )
+        # Treat safety/lifecycle events as barriers for the entire input
+        # batch.  The GUI queue may contain stale clicks behind one another,
+        # and foot-pad input is polled in this same control frame.  Once quit,
+        # Init emergency stop, or Hold has been requested, no lower-priority
+        # operation may run before the main loop applies that transition.
+        terminal_quit_requested = bool(self.terminal.should_quit)
+        ui_quit_requested = "q" in ui_events
+        ui_init_emergency_stop_requested = (
+            not ui_quit_requested
+            and "init_qpos_emergency_stop" in ui_events
+        )
+        ui_hold_requested = bool(
+            not ui_quit_requested
+            and not ui_init_emergency_stop_requested
+            and self._teleop_started
+            and (
+                "h" in ui_events
+                or (
+                    self._two_pedal_mode_active()
+                    and "two_pedal_c" in ui_events
+                )
+            )
+        )
+        suppress_foot_pad_events = bool(
+            terminal_quit_requested
+            or ui_quit_requested
+            or ui_init_emergency_stop_requested
+            or ui_hold_requested
+        )
+        if terminal_quit_requested:
+            self.should_quit = True
+            ui_events = []
+        elif ui_quit_requested:
+            ui_events = ["q"]
+        elif ui_init_emergency_stop_requested:
+            ui_events = ["init_qpos_emergency_stop"]
+        elif ui_hold_requested:
+            ui_events = [
+                event
+                for event in ui_events
+                if event in {"h", "two_pedal_c", "episode_stop"}
+            ]
         foot_pad_test_batch = bool(getattr(self, "_foot_pad_test_active", False)) or any(
             event in {"foot_pad_test_start", "foot_pad_test_stop"}
             for event in ui_events
         )
         if self.foot_pad_input is not None:
-            for event in self.foot_pad_input.consume_events():
+            consume_foot_pad_events = (
+                getattr(self.foot_pad_input, "consume_test_events", None)
+                if foot_pad_test_batch
+                else None
+            )
+            if not callable(consume_foot_pad_events):
+                consume_foot_pad_events = self.foot_pad_input.consume_events
+            for event in consume_foot_pad_events():
+                if suppress_foot_pad_events:
+                    # Drain the non-blocking device queue so a press that
+                    # coincided with the barrier cannot fire on the next loop.
+                    continue
                 if foot_pad_test_batch:
                     self._record_foot_pad_test_event(event, now=current_time)
                 else:
                     self._handle_foot_pad_special_arm_event(event, now=current_time)
             if bool(getattr(self, "_foot_pad_test_active", False)) and not self._foot_pad_online():
                 self._foot_pad_test_active = False
+                self._foot_pad_test_completed = False
+                self._foot_pad_test_seen_events = set()
                 self._foot_pad_test_status = (
                     "脚踏设备已断开，测试模式已安全关闭；"
                     "运行中请先进入 Hold，再点击“重连失败设备”；成功连接后可重新测试。"
@@ -898,6 +1106,8 @@ class RealTeleopControlInput:
                 self._last_foot_pad_online = online_now
             elif online_now != bool(previous_online) and not foot_pad_state_published:
                 self._last_foot_pad_online = online_now
+                self._foot_pad_test_completed = False
+                self._foot_pad_test_seen_events = set()
                 self._publish_foot_pad_test_state(
                     message=(
                         "脚踏设备已重连；已恢复对应踏板 fix/init 映射。"
@@ -910,11 +1120,10 @@ class RealTeleopControlInput:
                 )
             else:
                 self._last_foot_pad_online = online_now
-        if self.terminal.should_quit:
+        if terminal_quit_requested:
             self.should_quit = True
-        if self.terminal.consume_calibration_request():
-            self._calibration_requested = True
-            self._calibration_request_from_hold = bool(self._hold_active)
+        if not self.should_quit and self.terminal.consume_calibration_request():
+            self._request_calibration_with_tracker_side_guard(source="terminal")
         if self.ui is not None:
             for event in ui_events:
                 if event == "init_qpos_emergency_stop":
@@ -942,9 +1151,17 @@ class RealTeleopControlInput:
                             capture_waiting_for_samples=False,
                         )
                         self.ui.append_message("EmergencyStop", "网页退出已触发机械臂停臂请求。")
+                elif event == "tracker_side_confirm_continue":
+                    self._confirm_tracker_side_warning()
+                elif event == "tracker_side_confirm_cancel":
+                    self._cancel_tracker_side_warning()
                 elif event == "p":
-                    self._calibration_requested = True
-                    self._calibration_request_from_hold = bool(self._hold_active)
+                    self._request_calibration_with_tracker_side_guard(source="gui")
+                elif event == "two_pedal_b":
+                    self._handle_two_pedal_b_event(now=current_time)
+                elif event == "two_pedal_c":
+                    if self._two_pedal_mode_active():
+                        self.request_hold(reason="two_pedal_c")
                 elif event == "foot_pad_test_start":
                     self._start_foot_pad_test()
                 elif event == "foot_pad_test_stop":
@@ -1066,7 +1283,15 @@ class RealTeleopControlInput:
                 elif event == "enable_tactile_solving":
                     self._tactile_solving_enable_requested = True
                 elif event == "device_retry":
-                    self._device_retry_requested = True
+                    admitted, message = self.device_retry_admission()
+                    if admitted:
+                        self._device_retry_requested = True
+                    elif self.ui is not None:
+                        self.ui.append_message("Device", message)
+                        self.ui.publish(
+                            active_controls=self._current_active_controls(),
+                            control_hint=message,
+                        )
                 elif event == "calibrate_vive_coordinate_profile":
                     self._calibrate_vive_coordinate_profile()
                 elif event == "save_vive_calibration_profile":
@@ -1078,8 +1303,12 @@ class RealTeleopControlInput:
                 elif event in MOVEMENT_MULTIPLE_GUI_EVENTS:
                     self._handle_movement_multiple_event(event)
         self._poll_q6_hold_recalibration_gesture(now=current_time)
+        # Until the first Home admission, keep the latest tracker-side result
+        # available to both GUI and terminal compatibility flows.  After that
+        # one-time check is latched, publish_raw_tracker_pose_state keeps only
+        # the raw visualization current and skips side evaluation.
+        self.publish_raw_tracker_pose_state(now=current_time)
         if self.ui is not None:
-            self.publish_raw_tracker_pose_state(now=current_time)
             self.publish_gripper_status(now=current_time)
 
     def _publish_foot_pad_test_state(self, *, message: str = "") -> None:
@@ -1108,22 +1337,22 @@ class RealTeleopControlInput:
             self._foot_pad_test_status = "脚踏测试未开启：请先停止当前数采/倒计时/保存流程。"
             self._publish_foot_pad_test_state(message=self._foot_pad_test_status)
             return
+        if bool(getattr(self, "_hold_requested", False)):
+            self._foot_pad_test_status = "脚踏测试未开启：Hold 正在生效，请稍后重试。"
+            self._publish_foot_pad_test_state(message=self._foot_pad_test_status)
+            return
         if self._teleop_started and not self._hold_active:
             self._foot_pad_test_status = "脚踏测试未开启：运行中请先 Hold / 冻结。"
             self._publish_foot_pad_test_state(message=self._foot_pad_test_status)
             return
         self._foot_pad_test_active = True
+        self._foot_pad_test_completed = False
+        self._foot_pad_test_seen_events = set()
         self._foot_pad_test_last_event = ""
-        if self._foot_pad_count() == 2:
-            self._foot_pad_test_status = (
-                "脚踏测试进行中：请依次踩踏板 1、2；这里只显示固定左右臂映射，"
-                "不执行任何臂操作。"
-            )
-        else:
-            self._foot_pad_test_status = (
-                "脚踏测试进行中：请依次踩踏板 1、2、3、4；这里只显示映射，"
-                "不执行任何臂操作。"
-            )
+        self._foot_pad_test_status = (
+            "脚踏测试进行中：无论当前识别为 2/4 踏板，都请依次踩踏板 1、2、3、4；"
+            "这里只显示映射，不执行任何臂操作。"
+        )
         self._publish_foot_pad_test_state(message="已开启脚踏测试模式；踏板事件不会触发 fix/init。")
 
     def _stop_foot_pad_test(self) -> None:
@@ -1132,19 +1361,49 @@ class RealTeleopControlInput:
             self._publish_foot_pad_test_state(message=self._foot_pad_test_status)
             return
         self._foot_pad_test_active = False
-        self._foot_pad_test_status = "脚踏测试已关闭；确认映射后才可使用脚踏执行对应操作。"
+        self._foot_pad_test_completed = True
+        seen_count = len(getattr(self, "_foot_pad_test_seen_events", set()))
+        self._foot_pad_test_status = (
+            f"脚踏测试已完成（本次检测到 {seen_count}/4 个键位）；"
+            "踏板控制与 A/B/C 快捷键均已恢复。"
+        )
         self._publish_foot_pad_test_state(message=self._foot_pad_test_status)
 
     def _record_foot_pad_test_event(self, event: str, *, now: float) -> None:
         del now
-        label = _FOOT_PAD_TEST_LABELS.get(str(event))
+        labels = (
+            _TWO_PEDAL_TEST_LABELS
+            if self._foot_pad_count() == 2
+            else _FOOT_PAD_TEST_LABELS
+        )
+        label = labels.get(str(event))
         if label is None:
             return
+        seen_events = getattr(self, "_foot_pad_test_seen_events", None)
+        if not isinstance(seen_events, set):
+            seen_events = set()
+            self._foot_pad_test_seen_events = seen_events
+        seen_events.add(str(event))
         self._foot_pad_test_last_event = label
+        seen_count = len(seen_events)
+        if seen_count >= 4:
+            self._foot_pad_test_active = False
+            self._foot_pad_test_completed = True
+            self._foot_pad_test_status = (
+                "踏板 1–4 均已检测，测试自动完成；"
+                "踏板控制与 A/B/C 快捷键均已恢复。"
+            )
+            self._publish_foot_pad_test_state(
+                message=f"检测到 {label}；4/4 键位齐全，测试已自动完成。"
+            )
+            return
         self._foot_pad_test_status = (
-            f"最近检测：{label}。测试模式仍开启；确认无误后点击“停止测试踏板”。"
+            f"最近检测：{label}（已检测 {seen_count}/4）。"
+            "测试模式仍开启；可继续测试，或点击“停止测试踏板”确认完成。"
         )
-        self._publish_foot_pad_test_state(message=f"检测到 {label}；未执行实际操作。")
+        self._publish_foot_pad_test_state(
+            message=f"检测到 {label}；未执行实际操作。"
+        )
 
     def _handle_foot_pad_special_arm_event(self, event: str, *, now: float) -> None:
         """Route one physical pedal to the existing GUI special-arm transition."""
@@ -1162,6 +1421,17 @@ class RealTeleopControlInput:
             return
         operation, side = route
         if self._foot_pad_count() == 2 and operation == "init":
+            return
+        if self._two_pedal_mode_active() and operation == "fix":
+            # Pedal 1 means left-only teleop (fix right); pedal 2 means
+            # right-only teleop (fix left).
+            moving_side = side
+            target_fixed_side = "right" if moving_side == "left" else "left"
+            self._request_two_pedal_fixed_side(
+                target_fixed_side,
+                now=now,
+                source=f"pedal_{1 if moving_side == 'left' else 2}",
+            )
             return
         side_label = "左臂" if side == "left" else "右臂"
         if not self._fix_init_allowed_in_controls():
@@ -1220,6 +1490,192 @@ class RealTeleopControlInput:
             self._publish_init_arm_state(message=message, control_hint=message)
             return
         self._handle_init_arm_move_to_qpos_event(now=now)
+
+    def _handle_two_pedal_b_event(self, *, now: float) -> None:
+        if not self._two_pedal_mode_active():
+            return
+        if self._reject_two_pedal_switch_during_init(now=now):
+            return
+        controller = getattr(self.components, "fix_arm_controller", None)
+        if self._hold_active:
+            # The runtime consumes this as a fast, no-start-delay Home request.
+            self._supersede_tracker_side_home_gate(
+                reason="superseded_by_two_pedal_b"
+            )
+            self._two_pedal_transition_target_fixed_side = None
+            self._two_pedal_fast_home_deadline = float(now) + 1.0
+            self._request_calibration_with_tracker_side_guard(
+                source="two_pedal_b",
+                request_kind="two_pedal_fast",
+                now=now,
+            )
+            self._publish_two_pedal_alert(
+                level="orange",
+                message=(
+                    "双踏板切换：正在检查左右 Tracker，并尽快采集双臂稳定 "
+                    "Home 后恢复双臂遥操。"
+                ),
+                now=now,
+            )
+            return
+        if bool(getattr(controller, "fixed", False)):
+            # Single-arm -> bimanual is an in-loop atomic Fix release.  Keep
+            # the currently moving arm and collection running; the fixed arm
+            # remains frozen until its background Home refresh is ready.
+            self._request_two_pedal_fixed_side(None, now=now, source="key_b")
+            return
+        self.request_hold(reason="two_pedal_b")
+
+    def _request_two_pedal_fixed_side(
+        self,
+        fixed_side: str | None,
+        *,
+        now: float,
+        source: str,
+    ) -> None:
+        if not self._two_pedal_mode_active():
+            return
+        if self._reject_two_pedal_switch_during_init(now=now):
+            return
+        if self._hold_active:
+            self._supersede_tracker_side_home_gate(
+                reason=f"superseded_by_{source}"
+            )
+            self._two_pedal_transition_target_fixed_side = fixed_side
+            self._two_pedal_fast_home_deadline = float(now) + 1.0
+            self._request_calibration_with_tracker_side_guard(
+                source=source,
+                request_kind="two_pedal_fast",
+                now=now,
+            )
+            target_text = (
+                "仅左臂遥操"
+                if fixed_side == "right"
+                else "仅右臂遥操"
+            )
+            self._publish_two_pedal_alert(
+                level="orange",
+                message=f"双踏板切换：正在尽快采集稳定 Home，随后进入{target_text}。",
+                now=now,
+            )
+            return
+        controller = getattr(self.components, "fix_arm_controller", None)
+        if controller is None or not self._teleop_started:
+            return
+        current_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
+        if current_fixed:
+            transition = controller.start_two_pedal_transition(
+                fixed_side=fixed_side,
+                now=now,
+                timeout_sec=1.0,
+                min_samples=1,
+            )
+            if transition.ok:
+                pending_state = getattr(
+                    controller,
+                    "two_pedal_transition_pending",
+                    None,
+                )
+                transition_pending = (
+                    bool(pending_state)
+                    if pending_state is not None
+                    else bool(getattr(controller, "recapturing", True))
+                )
+                self._two_pedal_transition_active = transition_pending
+                self._two_pedal_transition_target_fixed_side = (
+                    fixed_side if transition_pending else None
+                )
+                if transition_pending:
+                    target_text = (
+                        "双臂遥操"
+                        if fixed_side is None
+                        else (
+                            "仅左臂遥操"
+                            if fixed_side == "right"
+                            else "仅右臂遥操"
+                        )
+                    )
+                    self._publish_two_pedal_alert(
+                        level="orange",
+                        message=(
+                            f"双踏板切换目标已更新为{target_text}；"
+                            "当前控制状态保持不变，正在等待稳定 Home，最长 1 秒。"
+                            f"\n{transition.message}"
+                        ),
+                        now=now,
+                    )
+                else:
+                    self._clear_two_pedal_alert()
+                    self._publish_fix_arm_state(
+                        message=transition.message,
+                        control_hint=transition.message,
+                    )
+            else:
+                if not bool(
+                    getattr(
+                        controller,
+                        "two_pedal_transition_pending",
+                        self._two_pedal_transition_active,
+                    )
+                ):
+                    self._two_pedal_transition_active = False
+                    self._two_pedal_transition_target_fixed_side = None
+                self._publish_two_pedal_alert(
+                    level="red",
+                    message=f"双踏板切换失败：{transition.message}",
+                    now=now,
+                    duration_sec=3.0,
+                )
+            return
+        if fixed_side is None:
+            return
+        transition = controller.select_side(fixed_side)
+        if transition.ok:
+            transition = controller.freeze_selected(now=now)
+        if transition.ok:
+            self._clear_two_pedal_alert()
+            self._reset_runtime_tracking_for_side(
+                fixed_side,
+                tag="TwoPedal",
+                now=now,
+            )
+            side_text = "右臂" if fixed_side == "right" else "左臂"
+            moving_text = "左臂" if fixed_side == "right" else "右臂"
+            message = f"双踏板切换完成：{side_text} Fix，仅{moving_text}遥操。"
+            self._publish_fix_arm_state(message=message, control_hint=message)
+        else:
+            self._publish_two_pedal_alert(
+                level="red",
+                message=f"双踏板切换失败：{transition.message}",
+                now=now,
+                duration_sec=3.0,
+            )
+
+    def _two_pedal_switch_blocked_by_init(self) -> bool:
+        controller = getattr(self.components, "init_arm_controller", None)
+        return bool(
+            controller is not None
+            and (
+                bool(getattr(controller, "active", False))
+                or bool(getattr(controller, "qpos_active", False))
+                or bool(getattr(controller, "moving", False))
+                or bool(getattr(controller, "recapturing", False))
+            )
+        )
+
+    def _reject_two_pedal_switch_during_init(self, *, now: float) -> bool:
+        if not self._two_pedal_switch_blocked_by_init():
+            return False
+        self._publish_two_pedal_alert(
+            level="red",
+            message=(
+                "双踏板切换未执行：Init 移动、精确 qpos 或 Home 重采仍在进行；"
+                "请先按 C 进入常规 Hold，再选择单臂/双臂遥操。"
+            ),
+            now=now,
+            duration_sec=3.0,
+        )
+        return True
 
     def _start_active_init_home_recapture(self, controller, *, now: float):
         """End the Init label and recapture only the active target-side Home."""
@@ -1541,6 +1997,10 @@ class RealTeleopControlInput:
             not self._teleop_started and not startup_maintenance
         ):
             return False
+        if self._hold_requested:
+            message = "Hold 正在生效，尚未启动 Init qpos；请在停臂完成后重试。"
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
         if self._hold_active and not hold_maintenance:
             return False
         if self._episode_transition_busy():
@@ -1587,6 +2047,10 @@ class RealTeleopControlInput:
             not self._teleop_started and not startup_maintenance
         ):
             return False
+        if self._hold_requested:
+            message = "Hold 正在生效，尚未启动双臂顺序归位；请在停臂完成后重试。"
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
         if self._hold_active and not hold_maintenance:
             return False
         if self._episode_transition_busy():
@@ -1882,6 +2346,569 @@ class RealTeleopControlInput:
         self._pose_snapshot_requested = False
         return requested
 
+    def _queue_runtime_home_request(
+        self,
+        *,
+        from_hold: bool,
+        request_kind: str = "normal",
+    ) -> None:
+        self._calibration_requested = True
+        self._calibration_request_from_hold = bool(from_hold)
+        self._two_pedal_fast_home_requested = (
+            str(request_kind) == "two_pedal_fast"
+        )
+        if (
+            self._two_pedal_fast_home_requested
+            and self._two_pedal_fast_home_deadline <= 0.0
+        ):
+            self._two_pedal_fast_home_deadline = time.time() + 1.0
+        self._tracker_side_guard_request_active = not bool(
+            self._tracker_side_initial_check_completed
+        )
+
+    def _complete_initial_tracker_side_check(self, *, result: str) -> None:
+        """Latch the one-time tracker-side admission result for this GUI."""
+
+        self._tracker_side_initial_check_completed = True
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
+        self._tracker_side_check.update(
+            {
+                "warning_required": False,
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": str(result),
+                "session_check_completed": True,
+                "monitoring_active": False,
+            }
+        )
+
+    def _supersede_tracker_side_home_gate(self, *, reason: str) -> None:
+        """Give a later non-interactive Home request sole ownership.
+
+        A two-pedal request may replace an earlier explicit Home action.  If
+        both requests stayed alive, a stale confirmation could mutate the
+        later transition or make the main loop select the wrong Home path.
+        """
+
+        had_pending_gate = bool(
+            self._tracker_side_confirmation_pending
+            or self._tracker_side_request_pending
+            or self._tracker_side_guard_request_active
+            or self._tracker_side_override_granted
+        )
+        if had_pending_gate:
+            self._calibration_requested = False
+            self._calibration_request_from_hold = False
+        self._tracker_side_confirmation_pending = False
+        self._tracker_side_confirmation_from_hold = False
+        self._tracker_side_confirmation_request_kind = "normal"
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
+        self._two_pedal_fast_home_requested = False
+        self._two_pedal_fast_home_deadline = 0.0
+        self._tracker_side_check.update(
+            {
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": str(reason),
+            }
+        )
+        if had_pending_gate:
+            _log(
+                "InputMapping",
+                "pending explicit tracker-side Home gate "
+                f"{reason.replace('_', ' ')}",
+            )
+
+    def _tracker_side_swap_available(self) -> bool:
+        return bool(
+            not self._tracker_swap_locked
+            or self._single_arm_tracker_swap_allowed_in_hold()
+        )
+
+    def _tracker_side_correction_hint(self) -> str:
+        if self._tracker_side_swap_available():
+            return "选择“取消”后可点击“交换左右 Tracker”，再重新开始。"
+        return (
+            "当前双臂运行映射已锁定；请选择“取消”，把左右手恢复到身体对应一侧后重试。"
+            "若确认启动映射本身错误，请安全退出并重新启动后交换。"
+        )
+
+    def _begin_tracker_side_confirmation(
+        self,
+        *,
+        from_hold: bool,
+        source: str,
+        request_kind: str = "normal",
+    ) -> None:
+        self._tracker_side_confirmation_pending = True
+        self._tracker_side_confirmation_from_hold = bool(from_hold)
+        self._tracker_side_confirmation_request_kind = str(request_kind)
+        self._tracker_side_confirmation_token_counter += 1
+        token = f"tracker-side-{self._tracker_side_confirmation_token_counter}"
+        warning_message = str(
+            self._tracker_side_check.get("message")
+            or "Tracker 左右位置检查未通过。"
+        )
+        correction_hint = self._tracker_side_correction_hint()
+        confirmation_message = (
+            f"{warning_message}\n\n"
+            "是否仍要忽略此警告并继续本次 runtime Home？\n\n"
+            f"{correction_hint}"
+        )
+        self._tracker_side_check.update(
+            {
+                "home_request_pending": False,
+                "confirmation_required": True,
+                "confirmation_token": token,
+                "confirmation_message": confirmation_message,
+                "confirmation_result": "pending",
+                "swap_available": self._tracker_side_swap_available(),
+            }
+        )
+        _log(
+            "InputMapping",
+            "runtime Home blocked for tracker-side confirmation: "
+            + warning_message,
+        )
+        if self.ui is not None:
+            self.ui.publish(
+                tracker_side_check=dict(self._tracker_side_check),
+                stage="确认 Tracker 左右位置",
+                active_controls=self._current_active_controls(),
+                control_hint=(
+                    "检测到 Tracker 左右位置异常或无法可靠判定；"
+                    "请在弹窗中二次确认。"
+                ),
+                home_ready=False,
+            )
+            self.ui.append_message(
+                "InputMapping",
+                f"{warning_message} {correction_hint}",
+            )
+        elif source == "terminal":
+            _log(
+                "InputMapping",
+                "再次按 Home 键将忽略左右位置警告并继续；"
+                "也可先修正 Tracker 佩戴或映射。",
+            )
+
+    def _request_calibration_with_tracker_side_guard(
+        self,
+        *,
+        source: str,
+        request_kind: str = "normal",
+        now: float | None = None,
+    ) -> None:
+        """Gate an explicit runtime-Home request on the latest side check."""
+
+        if self._calibration_requested:
+            _log(
+                "InputMapping",
+                "explicit runtime Home ignored because another Home request "
+                "is already queued",
+            )
+            return
+        if self._teleop_started and not self._hold_active:
+            message = "运行中重采前请先点击 Hold / 冻结。"
+            if self.ui is not None:
+                self.ui.append_message("Hold", message)
+                self.ui.publish(
+                    active_controls=self._current_active_controls(),
+                    control_hint=message,
+                    teleop_running=True,
+                    gripper_control_enabled=self.gripper_control_enabled(),
+                )
+            return
+        if self._tracker_side_confirmation_pending:
+            if source == "terminal" and self.ui is None:
+                self._confirm_tracker_side_warning()
+            elif source == "terminal":
+                _log(
+                    "InputMapping",
+                    "terminal Home confirmation ignored while Web GUI confirmation is pending",
+                )
+            return
+        if self._tracker_side_request_pending:
+            return
+
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
+        from_hold = bool(self._hold_active)
+        if self._tracker_side_initial_check_completed:
+            self._tracker_side_check.update(
+                {
+                    "home_request_pending": False,
+                    "confirmation_required": False,
+                    "session_check_completed": True,
+                    "monitoring_active": False,
+                }
+            )
+            self._queue_runtime_home_request(
+                from_hold=from_hold,
+                request_kind=request_kind,
+            )
+            return
+        if bool(self._tracker_side_check.get("warning_required", False)):
+            self._begin_tracker_side_confirmation(
+                from_hold=from_hold,
+                source=source,
+                request_kind=request_kind,
+            )
+            return
+
+        status = str(self._tracker_side_check.get("status", "unavailable"))
+        dual_side = set(self.components.active_sides) == {"left", "right"}
+        if dual_side and status != "correct":
+            self._tracker_side_request_pending = True
+            self._tracker_side_request_from_hold = from_hold
+            self._tracker_side_request_source = str(source)
+            self._tracker_side_request_kind = str(request_kind)
+            self._tracker_side_request_deadline = (
+                (
+                    self._two_pedal_fast_home_deadline
+                    if self._two_pedal_fast_home_deadline > 0.0
+                    else (time.time() if now is None else float(now)) + 1.0
+                )
+                if str(request_kind) == "two_pedal_fast"
+                else 0.0
+            )
+            self._tracker_side_check.update(
+                {
+                    "home_request_pending": True,
+                    "confirmation_required": False,
+                    "confirmation_result": "waiting_for_fresh_check",
+                }
+            )
+            message = (
+                "Home 请求已暂缓：正在等待左右 Tracker 同时在线、数据新鲜，"
+                "并完成左右空间位置检查。"
+            )
+            _log("InputMapping", message)
+            if self.ui is not None:
+                self.ui.publish(
+                    tracker_side_check=dict(self._tracker_side_check),
+                    stage="等待 Tracker 左右检查",
+                    active_controls=self._current_active_controls(),
+                    control_hint=message,
+                    home_ready=False,
+                )
+                self.ui.append_message("InputMapping", message)
+            return
+
+        self._tracker_side_check["home_request_pending"] = False
+        self._queue_runtime_home_request(
+            from_hold=from_hold,
+            request_kind=request_kind,
+        )
+
+    def _confirm_tracker_side_warning(self) -> None:
+        if not self._tracker_side_confirmation_pending:
+            return
+        from_hold = bool(self._tracker_side_confirmation_from_hold)
+        request_kind = str(self._tracker_side_confirmation_request_kind)
+        self._tracker_side_confirmation_pending = False
+        self._tracker_side_confirmation_from_hold = False
+        self._tracker_side_confirmation_request_kind = "normal"
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+        if request_kind == "two_pedal_fast":
+            # Operator deliberation in the mandatory warning popup is not a
+            # failed stability acquisition.  Start the one-second switching
+            # budget when they explicitly continue.
+            self._two_pedal_fast_home_deadline = time.time() + 1.0
+        self._tracker_side_check.update(
+            {
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": "continued",
+            }
+        )
+        self._complete_initial_tracker_side_check(
+            result="continued_for_gui_session"
+        )
+        self._queue_runtime_home_request(
+            from_hold=from_hold,
+            request_kind=request_kind,
+        )
+        message = (
+            "已二次确认忽略 Tracker 左右位置警告；本 GUI 会话后续 Home "
+            "不再重复执行左右位置检测。"
+        )
+        _log("InputMapping", message)
+        if self.ui is not None:
+            self.ui.publish(
+                tracker_side_check=dict(self._tracker_side_check),
+                active_controls=self._current_active_controls(),
+                control_hint=message,
+            )
+            self.ui.append_message("InputMapping", message)
+
+    def _cancel_tracker_side_warning(self) -> None:
+        if not self._tracker_side_confirmation_pending:
+            return
+        request_kind = str(self._tracker_side_confirmation_request_kind)
+        self._tracker_side_confirmation_pending = False
+        self._tracker_side_confirmation_from_hold = False
+        self._tracker_side_confirmation_request_kind = "normal"
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
+        self._two_pedal_fast_home_requested = False
+        self._two_pedal_fast_home_deadline = 0.0
+        if request_kind == "two_pedal_fast":
+            self._two_pedal_transition_target_fixed_side = None
+            self._clear_two_pedal_alert()
+        self._tracker_side_check.update(
+            {
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": "cancelled",
+            }
+        )
+        message = (
+            "已取消本次 runtime Home；请确认 Tracker 佩戴。"
+            f"{self._tracker_side_correction_hint()}"
+        )
+        _log("InputMapping", message)
+        if self.ui is not None:
+            self.ui.publish(
+                tracker_side_check=dict(self._tracker_side_check),
+                active_controls=self._current_active_controls(),
+                control_hint=message,
+            )
+            self.ui.append_message("InputMapping", message)
+
+    def _update_tracker_side_check(self, payload: Mapping[str, object]) -> None:
+        if self._tracker_side_initial_check_completed:
+            self._tracker_side_check.update(
+                {
+                    "warning_required": False,
+                    "home_request_pending": False,
+                    "confirmation_required": False,
+                    "session_check_completed": True,
+                    "monitoring_active": False,
+                }
+            )
+            return
+        next_payload = dict(payload)
+        next_payload.update(
+            {
+                "session_check_completed": False,
+                "monitoring_active": True,
+            }
+        )
+        if self._tracker_side_confirmation_pending:
+            if bool(next_payload.get("warning_required", False)):
+                next_payload.update(
+                    {
+                        "confirmation_required": True,
+                        "confirmation_token": self._tracker_side_check.get(
+                            "confirmation_token", ""
+                        ),
+                        "confirmation_message": (
+                            f"{next_payload.get('message', '')}\n\n"
+                            "是否仍要忽略此警告并继续本次 runtime Home？\n\n"
+                            f"{self._tracker_side_correction_hint()}"
+                        ),
+                        "confirmation_result": "pending",
+                        "swap_available": self._tracker_side_swap_available(),
+                    }
+                )
+            elif str(next_payload.get("status", "")) == "correct":
+                resolved_request_kind = str(
+                    self._tracker_side_confirmation_request_kind
+                )
+                self._tracker_side_confirmation_pending = False
+                self._tracker_side_confirmation_from_hold = False
+                self._tracker_side_confirmation_request_kind = "normal"
+                if resolved_request_kind == "two_pedal_fast":
+                    self._two_pedal_transition_target_fixed_side = None
+                    self._two_pedal_fast_home_deadline = 0.0
+                    self._clear_two_pedal_alert()
+                next_payload.update(
+                    {
+                        "confirmation_required": False,
+                        "confirmation_token": self._tracker_side_check.get(
+                            "confirmation_token", ""
+                        ),
+                        "confirmation_result": "resolved",
+                    }
+                )
+                if self.ui is not None:
+                    self.ui.append_message(
+                        "InputMapping",
+                        "Tracker 左右位置现已通过检查；已撤销待确认警告，请重新点击“开始遥操”。",
+                    )
+            else:
+                # A transient packet loss must not invalidate a confirmation
+                # dialog that the operator is currently reading.  Keep the
+                # last concrete warning and expose the live unavailable state
+                # only as diagnostic context.
+                previous = dict(self._tracker_side_check)
+                previous["live_status"] = next_payload.get("status", "")
+                previous["live_message"] = next_payload.get("message", "")
+                next_payload = previous
+        else:
+            next_payload.setdefault("confirmation_required", False)
+            next_payload.setdefault(
+                "confirmation_token",
+                self._tracker_side_check.get("confirmation_token", ""),
+            )
+        self._tracker_side_check = next_payload
+        if self._tracker_side_request_pending:
+            status = str(self._tracker_side_check.get("status", "unavailable"))
+            if bool(self._tracker_side_check.get("warning_required", False)):
+                from_hold = bool(self._tracker_side_request_from_hold)
+                source = str(self._tracker_side_request_source or "runtime")
+                request_kind = str(self._tracker_side_request_kind)
+                self._tracker_side_request_pending = False
+                self._tracker_side_request_from_hold = False
+                self._tracker_side_request_source = ""
+                self._tracker_side_request_kind = "normal"
+                self._tracker_side_request_deadline = 0.0
+                self._begin_tracker_side_confirmation(
+                    from_hold=from_hold,
+                    source=source,
+                    request_kind=request_kind,
+                )
+                return
+            if status == "correct":
+                from_hold = bool(self._tracker_side_request_from_hold)
+                request_kind = str(self._tracker_side_request_kind)
+                self._tracker_side_request_pending = False
+                self._tracker_side_request_from_hold = False
+                self._tracker_side_request_source = ""
+                self._tracker_side_request_kind = "normal"
+                self._tracker_side_request_deadline = 0.0
+                self._tracker_side_check.update(
+                    {
+                        "home_request_pending": False,
+                        "confirmation_required": False,
+                        "confirmation_result": "check_passed",
+                    }
+                )
+                self._queue_runtime_home_request(
+                    from_hold=from_hold,
+                    request_kind=request_kind,
+                )
+                message = "Tracker 左右位置检查通过；继续本次 runtime Home。"
+                _log("InputMapping", message)
+                if self.ui is not None:
+                    self.ui.publish(
+                        tracker_side_check=dict(self._tracker_side_check),
+                        stage="即将开始 runtime Home",
+                        active_controls=["q"],
+                        control_hint=message,
+                        home_ready=False,
+                    )
+                    self.ui.append_message("InputMapping", message)
+                return
+            self._tracker_side_check["home_request_pending"] = True
+        if self.ui is not None:
+            self.ui.publish(
+                tracker_side_check=dict(self._tracker_side_check),
+                active_controls=self._current_active_controls(),
+            )
+
+    def _poll_tracker_side_request_timeout(self, *, now: float) -> None:
+        if (
+            not self._tracker_side_request_pending
+            or self._tracker_side_request_kind != "two_pedal_fast"
+            or self._tracker_side_request_deadline <= 0.0
+            or float(now) < self._tracker_side_request_deadline
+        ):
+            return
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
+        self._two_pedal_fast_home_requested = False
+        self._two_pedal_fast_home_deadline = 0.0
+        self._two_pedal_transition_target_fixed_side = None
+        self._tracker_side_check.update(
+            {
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": "two_pedal_tracker_timeout",
+            }
+        )
+        message = (
+            "双踏板切换失败：1 秒内未获得新鲜且可判定的左右 Tracker；"
+            "本次切换已取消。"
+        )
+        self._publish_two_pedal_alert(
+            level="red",
+            message=message,
+            now=now,
+            duration_sec=3.0,
+        )
+        if self.ui is not None:
+            self.ui.publish(
+                tracker_side_check=dict(self._tracker_side_check),
+                active_controls=self._current_active_controls(),
+            )
+            self.ui.append_message("TwoPedal", message)
+
+    def _final_tracker_side_home_admission(self) -> bool:
+        """Recheck the fresh side relation immediately before Home capture."""
+
+        if self._tracker_side_initial_check_completed:
+            self._tracker_side_guard_request_active = False
+            self._tracker_side_override_granted = False
+            return True
+        if not self._tracker_side_guard_request_active:
+            return True
+        self._tracker_side_guard_request_active = False
+        override_granted = bool(self._tracker_side_override_granted)
+        self._tracker_side_override_granted = False
+        if override_granted:
+            self._complete_initial_tracker_side_check(
+                result="continued_for_gui_session"
+            )
+            return True
+        if set(self.components.active_sides) != {"left", "right"}:
+            self._complete_initial_tracker_side_check(result="not_required")
+            return True
+        if str(self._tracker_side_check.get("status", "")) == "correct":
+            self._complete_initial_tracker_side_check(result="check_passed")
+            return True
+        self._last_calibration_started_from_hold = False
+        if self._teleop_started:
+            self._hold_active = True
+            self._gripper_control_enabled = False
+        message = (
+            "Home 已取消：准备倒计时结束时没有通过新鲜的 Tracker 左右位置复核。"
+            f"{self._tracker_side_check.get('message', '')}"
+            "请恢复左右位置/连接后重新点击“开始遥操”。"
+        )
+        _log("InputMapping", message)
+        if self.ui is not None:
+            self.ui.publish(
+                tracker_side_check=dict(self._tracker_side_check),
+                active_controls=self._current_active_controls(),
+                control_hint=message,
+                home_ready=False,
+            )
+            self.ui.append_message("InputMapping", message)
+        return False
+
     def set_pose_snapshot_state(
         self,
         *,
@@ -1934,34 +2961,102 @@ class RealTeleopControlInput:
                 )
         return requested
 
+    def consume_two_pedal_fast_home_target(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str | None]:
+        """Return and clear a pending Hold-to-teleop two-pedal transition."""
+
+        if (
+            not self._two_pedal_fast_home_requested
+            or not self._calibration_requested
+            or not self._calibration_request_from_hold
+        ):
+            return False, None
+        current_time = time.time() if now is None else float(now)
+        remaining_sec = self._two_pedal_fast_home_deadline - current_time
+        if remaining_sec <= 0.0:
+            self._two_pedal_fast_home_requested = False
+            self._calibration_requested = False
+            self._calibration_request_from_hold = False
+            self._tracker_side_guard_request_active = False
+            self._tracker_side_override_granted = False
+            self._two_pedal_transition_target_fixed_side = None
+            self._two_pedal_fast_home_deadline = 0.0
+            self._publish_two_pedal_alert(
+                level="red",
+                message="双踏板切换失败：总切换时间已超过 1 秒；本次切换已取消。",
+                now=current_time,
+                duration_sec=3.0,
+            )
+            return False, None
+        target = self._two_pedal_transition_target_fixed_side
+        self._two_pedal_fast_home_timeout_sec = max(0.001, remaining_sec)
+        self._two_pedal_fast_home_requested = False
+        self._calibration_requested = False
+        self._calibration_request_from_hold = False
+        if not self._final_tracker_side_home_admission():
+            self._two_pedal_transition_target_fixed_side = None
+            self._two_pedal_fast_home_deadline = 0.0
+            self._publish_two_pedal_alert(
+                level="red",
+                message=(
+                    "双踏板切换失败：执行快速 Home 前的 Tracker 左右复核未通过；"
+                    "本次切换已取消。"
+                ),
+                now=time.time(),
+                duration_sec=3.0,
+            )
+            return False, None
+        self._last_calibration_started_from_hold = True
+        self._hold_active = False
+        self._gripper_control_enabled = False
+        return True, target
+
+    def two_pedal_fast_home_timeout_sec(self) -> float:
+        return max(
+            0.001,
+            min(1.0, float(self._two_pedal_fast_home_timeout_sec)),
+        )
+
+    def finish_two_pedal_fast_home(
+        self,
+        *,
+        success: bool,
+        now: float,
+        message: str,
+    ) -> None:
+        target = self._two_pedal_transition_target_fixed_side
+        self._two_pedal_transition_target_fixed_side = None
+        self._two_pedal_fast_home_deadline = 0.0
+        self._two_pedal_fast_home_timeout_sec = 1.0
+        if success:
+            self._two_pedal_post_home_fixed_side = target
+            if target is None:
+                self._clear_two_pedal_alert()
+            if self.ui is not None:
+                self.ui.append_message("TwoPedal", message)
+        else:
+            self._hold_active = True
+            self._publish_two_pedal_alert(
+                level="red",
+                message=message,
+                now=now,
+                duration_sec=3.0,
+            )
+            if self.ui is not None:
+                self.ui.append_message("TwoPedal", message)
+
+    def consume_two_pedal_post_home_fixed_side(self) -> str | None:
+        side = self._two_pedal_post_home_fixed_side
+        self._two_pedal_post_home_fixed_side = None
+        return side
+
     def _request_runtime_home_calibration_from_gui(self) -> None:
         if self.ui is None:
             return
-        if self._teleop_started and not self._hold_active:
-            message = "运行中重新标定前请先点击 Hold / 冻结。"
-            self.ui.append_message("Calibration", message)
-            self.ui.publish(
-                active_controls=self._current_active_controls(),
-                control_hint=message,
-                teleop_running=True,
-                gripper_control_enabled=self.gripper_control_enabled(),
-            )
-            return
-        self._calibration_requested = True
-        self._calibration_request_from_hold = bool(self._hold_active)
-        self._gripper_control_enabled = False
-        self.ui.publish(
-            stage="准备重新标定 runtime home",
-            active_controls=["q"],
-            control_hint="已请求重新进入 Home 标定流程；后端将先倒计时，再采集当前 VIVE/机械臂 home。",
-            capture_stage="runtime_home",
-            capture_phase="ready",
-            teleop_running=False,
-            home_ready=False,
-            gripper_control_enabled=False,
-            capture_waiting_for_samples=False,
-        )
-        self.ui.append_message("Calibration", "已请求重新进入 runtime home 标定流程。")
+        self._request_calibration_with_tracker_side_guard(source="gui")
 
     def _publish_movement_multiple(self, *, message: str = "") -> None:
         if self.ui is None:
@@ -1974,6 +3069,11 @@ class RealTeleopControlInput:
         if self._episode_busy():
             message = "数采录制、暂停、倒计时或保存中不修改 movement_multiple；请先停止当前 episode。"
             _log("MovementMultiple", f"{source}: rejected while episode busy")
+            self._publish_movement_multiple(message=message)
+            return None
+        if self._hold_requested:
+            message = "Hold 正在生效，暂不修改 movement_multiple；请在停臂完成后重试。"
+            _log("MovementMultiple", f"{source}: rejected during hold transition")
             self._publish_movement_multiple(message=message)
             return None
         if self._teleop_started and not self._hold_active:
@@ -2256,6 +3356,11 @@ class RealTeleopControlInput:
                 )
             return False
 
+        if self._episode_busy():
+            return reject(
+                "数采录制、暂停、倒计时或保存中不能切换任务、数据目录或忽视模态；"
+                "请先停止当前 episode。"
+            )
         try:
             payload = json.loads(str(text or "{}"))
         except json.JSONDecodeError as exc:
@@ -2588,6 +3693,33 @@ class RealTeleopControlInput:
         self._tactile_solving_enable_requested = False
         return requested
 
+    def device_retry_admission(self) -> tuple[bool, str]:
+        """Authoritative backend gate for reconstructing failed devices."""
+
+        if self._episode_busy():
+            return (
+                False,
+                "设备重连未执行：请先停止当前数采、倒计时或后台保存流程。",
+            )
+        if self._hold_requested:
+            return (
+                False,
+                "设备重连未执行：Hold 正在生效，请等待停臂完成后重试。",
+            )
+        init_controller = getattr(self.components, "init_arm_controller", None)
+        if bool(getattr(init_controller, "qpos_active", False)):
+            return (
+                False,
+                "设备重连未执行：精确 Init qpos 正在规划、执行或保持；"
+                "请先停止该流程并进入常规 Hold。",
+            )
+        if self._teleop_started and not self._hold_active:
+            return (
+                False,
+                "设备重连未执行：运行中请先进入 Hold / 冻结。",
+            )
+        return True, ""
+
     def consume_device_retry_request(self) -> bool:
         requested = bool(self._device_retry_requested)
         self._device_retry_requested = False
@@ -2655,10 +3787,12 @@ class RealTeleopControlInput:
                 now=now,
             )
         elif event == Q6HoldRecalibrationGesture.EVENT_RESTART:
-            self._calibration_requested = True
-            self._calibration_request_from_hold = True
+            self._request_calibration_with_tracker_side_guard(
+                source="q6_restart",
+                now=now,
+            )
             self._gripper_control_enabled = False
-            if self.ui is not None:
+            if self.ui is not None and self._calibration_requested:
                 self.ui.publish(
                     stage="准备重采 runtime home",
                     active_controls=["q", *self._visualization_controls()],
@@ -2666,7 +3800,10 @@ class RealTeleopControlInput:
                     teleop_running=False,
                     gripper_control_enabled=False,
                 )
-                self.ui.append_message("Q6Gesture", "已检测到第二次同时握紧；准备重采 runtime home。")
+                self.ui.append_message(
+                    "Q6Gesture",
+                    "已检测到第二次同时握紧；准备重采 runtime home。",
+                )
             _log(
                 "Q6Gesture",
                 "both hands q6 dims 4/5/6 closed again; requested runtime home recalibration",
@@ -2876,6 +4013,11 @@ class RealTeleopControlInput:
             self.terminal.poll()
             if self.terminal.should_quit:
                 self.should_quit = True
+            # Key repeat or a pasted newline during the preparation window
+            # must not survive as a second Home/episode request after capture.
+            self.terminal.consume_calibration_request()
+            self.terminal.consume_episode_start_request()
+            self.terminal.consume_episode_stop_request()
             if self.ui is not None:
                 for event in self.ui.consume_events():
                     if event == "q":
@@ -2883,6 +4025,9 @@ class RealTeleopControlInput:
             if self.should_quit:
                 return False
             time.sleep(min(0.05, remaining))
+        self.publish_raw_tracker_pose_state(force=True)
+        if not self._final_tracker_side_home_admission():
+            return False
         if self.ui is not None:
             self.ui.publish(
                 stage="采集 runtime home",
@@ -2903,7 +4048,6 @@ class RealTeleopControlInput:
                 capture_prep_remaining_sec=0.0,
                 capture_waiting_for_samples=False,
             )
-        self.publish_raw_tracker_pose_state(force=True)
         return True
 
     def publish_force_control_warmup_progress(
@@ -3018,6 +4162,25 @@ class RealTeleopControlInput:
         self._calibration_requested = False
         self._calibration_request_from_hold = False
         self._last_calibration_started_from_hold = False
+        self._tracker_side_confirmation_pending = False
+        self._tracker_side_confirmation_from_hold = False
+        self._tracker_side_confirmation_request_kind = "normal"
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+        self._tracker_side_guard_request_active = False
+        self._tracker_side_override_granted = False
+        self._two_pedal_fast_home_requested = False
+        self._two_pedal_fast_home_deadline = 0.0
+        self._two_pedal_fast_home_timeout_sec = 1.0
+        self._tracker_side_check.update(
+            {
+                "home_request_pending": False,
+                "confirmation_required": False,
+            }
+        )
         if self._teleop_started:
             self._hold_active = True
             self._gripper_control_enabled = False
@@ -3108,13 +4271,26 @@ class RealTeleopControlInput:
         )
 
     def publish_fix_arm_home_capture_progress(self, progress) -> None:
-        if self.ui is None or not progress.active:
+        if not progress.active:
             return
         side_label = "左臂" if progress.side == "left" else "右臂"
         if progress.completed:
             message = progress.message or f"{side_label} home 重采完成，已恢复遥操。"
+            if self._two_pedal_transition_active:
+                self._two_pedal_transition_active = False
+                self._two_pedal_transition_target_fixed_side = None
+                self._clear_two_pedal_alert()
         elif progress.failed:
             message = progress.message or f"{side_label} home 重采失败，保持固定。"
+            if self._two_pedal_transition_active:
+                self._two_pedal_transition_active = False
+                self._two_pedal_transition_target_fixed_side = None
+                self._publish_two_pedal_alert(
+                    level="red",
+                    message=f"双踏板切换失败：1 秒内未获得稳定 Home；{message}",
+                    now=time.time(),
+                    duration_sec=3.0,
+                )
         else:
             stability = str(getattr(progress, "stability_reason", "") or "")
             message = (
@@ -3123,6 +4299,10 @@ class RealTeleopControlInput:
                 else f"{side_label}保持固定并重采 home: "
                 f"{progress.sample_count}/{progress.min_samples} samples"
             )
+        # Transition ownership is runtime state, not presentation state.  The
+        # cleanup above must also run in terminal/headless compatibility mode.
+        if self.ui is None:
+            return
         self.ui.publish(
             **_fix_arm_ui_state(self.components),
             **_init_arm_ui_state(self.components),
@@ -3176,6 +4356,11 @@ class RealTeleopControlInput:
             return
         if self._episode_busy():
             message = "数采录制、暂停、倒计时或保存中不能重新标定 VIVE 坐标系；请先停止当前 episode。"
+            self.ui.append_message("ViveCalibration", message)
+            self.ui.publish(control_hint=message)
+            return
+        if self._hold_requested:
+            message = "Hold 正在生效，暂不标定 VIVE 坐标系；请在停臂完成后重试。"
             self.ui.append_message("ViveCalibration", message)
             self.ui.publish(control_hint=message)
             return
@@ -3268,6 +4453,14 @@ class RealTeleopControlInput:
             return
         if self._episode_busy():
             message = "数采录制、暂停、倒计时或保存中不能加载 VIVE 坐标系；请先停止当前 episode。"
+            self.ui.append_message("ViveCalibration", message)
+            self.ui.publish(
+                control_hint=message,
+                **_vive_calibration_profile_ui_state(self.args, self.components),
+            )
+            return
+        if self._hold_requested:
+            message = "Hold 正在生效，暂不加载 VIVE 坐标系；请在停臂完成后重试。"
             self.ui.append_message("ViveCalibration", message)
             self.ui.publish(
                 control_hint=message,
@@ -3480,6 +4673,19 @@ class RealTeleopControlInput:
                     "已开始遥操准备，运行中不能互换 VIVE tracker。",
                 )
             return
+        if self._tracker_side_confirmation_pending:
+            self._cancel_tracker_side_warning()
+        elif self._tracker_side_request_pending:
+            self._tracker_side_request_pending = False
+            self._tracker_side_request_from_hold = False
+            self._tracker_side_request_source = ""
+            self._tracker_side_check.update(
+                {
+                    "home_request_pending": False,
+                    "confirmation_required": False,
+                    "confirmation_result": "cancelled_for_tracker_swap",
+                }
+            )
         self.args.swap_operator_sides = not bool(
             getattr(self.args, "swap_operator_sides", False)
         )
@@ -3512,14 +4718,26 @@ class RealTeleopControlInput:
         now: float | None = None,
         force: bool = False,
     ) -> None:
-        if self.ui is None:
-            return
         current_time = time.time() if now is None else float(now)
         if not force and current_time - self._last_raw_pose_publish_at < self._raw_pose_publish_interval_sec:
             return
         if channels is None:
             source = _vive_pose_source_from_components(self.components)
             channels = {} if source is None else source.get_latest_channels()
+        if not self._tracker_side_initial_check_completed:
+            self._update_tracker_side_check(
+                evaluate_tracker_side_assignment(
+                    channels,
+                    calibration=self.components.session.calibration,
+                    active_sides=self.components.active_sides,
+                    now=current_time,
+                    post_yaw_deg=getattr(
+                        self.args,
+                        "virtual_desk_post_yaw_deg",
+                        None,
+                    ),
+                )
+            )
         _publish_raw_tracker_pose_state(
             self.ui,
             channels,

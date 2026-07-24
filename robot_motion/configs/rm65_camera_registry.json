@@ -1,6 +1,6 @@
 {
   "schema_version": "dexteleop.camera_registry.v1",
-  "description": "Project-level RealSense camera registry. Intrinsics are profile-specific and may be filled from runtime device_info; extrinsics are keyed by camera frame so multiple URDFs can reuse the same logical camera.",
+  "description": "RM65 shared RealSense camera registry v1. Intrinsics are profile-specific and may be filled from runtime device_info; extrinsics are keyed by camera frame so multiple URDFs can reuse the same logical camera.",
   "cameras": {
     "front": {
       "serial": "213222079798",

@@ -5,6 +5,12 @@ replay, policy, dataset, sim, and real-target modules. It does not replace the
 canonical teleop, replay, collection, or deploy entrypoints and lower-level
 packages must never import it.
 
+Reusable multi-source composition semantics are migrating to
+`control_composition`. Station remains responsible for application operations,
+side-effect coordination, publication barriers, GUI/API state, and binding
+concrete source/target adapters. It must not duplicate composition strategies
+or canonical motion authority.
+
 ## Reuse model
 
 Keep extension work on the narrowest stable seam:
@@ -17,6 +23,25 @@ Keep extension work on the narrowest stable seam:
 | Model/checkpoint/server | `PolicyActionEmission` or RTC chunk protocol | Observation/action representation adapter only when the model contract differs |
 | Replay dataset/profile | Replay emission/proposal source and Station replay binding | Dataset reader/compatibility assessment, never a second cursor in Station |
 | Mixed-source handoff | `request_human_takeover` plus the pure handoff receipt reducer | One operation executor binding; never a reducer or coordinator per source pair |
+
+### Operation preparation contract
+
+`SideEffectStationOperationCoordinator.operation_prepare` is called for an
+intent whose receiver receipt is `operation_requested`, after the runtime has
+created its pending operation and before the request enters the worker queue.
+The only non-operation exception is the explicit lower-safety seam for
+accepted `hold`/`estop`; lease acquisition/release and `stop_runtime` do not
+invoke this hook because they do not own a pending operation.
+
+If preparation for a pending operation raises an ordinary `Exception`, the
+coordinator admits a typed failed operation result
+(`operation_prepare_exception:<ExceptionType>`), which resolves and removes
+the pending operation, releases reserved capacity, and returns
+`operation_prepare_failed`. It does not run the adapter or publish a queue
+item. Preparation failure on the non-operation safety seam remains an
+exception because fabricating a completion for an intent with no pending
+operation would break the receiver contract. Coordinator/lifecycle bugs that
+prevent result admission also remain exceptions.
 
 The reusable target lifecycle lives in `targets/authoritative.py`. Concrete
 MuJoCo validation and manifests remain in `composition/mujoco_*.py` because
@@ -41,9 +66,9 @@ assembly. Existing direct arm-qpos human/replay mixed compositions are retained
 only as scoped debug/contract fixtures. Direct arm-qpos mixing is deferred until
 the planned homogeneous-arm profile.
 
-The numerical/source-mixing rule is a replaceable, pure strategy below
-`robot_motion/action/mixing_strategy.py`, not a branch embedded in a device,
-model client, simulator, or Station reducer. Its input is one immutable
+The numerical/source-mixing rule is a replaceable, pure strategy physically
+owned by `control_composition.composition`; it is not a branch embedded in a
+device, model client, simulator, or Station reducer. Its input is one immutable
 decision-cut snapshot containing admitted arm-pose candidates plus optional
 history, future-action, modality, label, and policy-context facts. Every
 context carries source identity/hash, receiver availability time, admission
@@ -59,6 +84,42 @@ history/future/modality/label strategy is plugged into the same seam, but may
 become authoritative only after a separate versioned proposal/admission,
 ControlTrace, safety, latency/fallback, and shadow-parity gate. Unversioned
 pose averaging or GUI-controlled blend weights remain forbidden.
+
+The shared pose strategy/composer now accepts an explicit non-empty subset of
+the current v1 arm components (`left_arm`, `right_arm`). A one-arm profile
+projects every candidate to that declared subset before strategy evaluation;
+the decision and composed action must contain exactly the same components.
+The omitted/default declaration remains the historical coupled bimanual
+contract and keeps its strategy/composition spec hash and behavior. This is a
+topology-manifest improvement, not permission to make the current CS-6b1i
+MuJoCo target single-arm: that concrete profile remains bimanual and must fail
+closed until a target binding advertises a matching resolver/safety capability.
+Arbitrary named arms require a later component-schema version.
+
+`control_composition.observability` owns the non-authoritative observation over
+one exact composition snapshot/result. An explicit `SourceDifferenceSpec`
+binds the composition spec hash and declares comparable `(compared, reference)`
+role pairs plus source-to-output residual roles; the runtime never infers that
+`base` and `residual`, or any other same-shaped payloads, are semantically
+comparable. Cartesian pose uses signed `reference - compared` translation plus
+an SO(3) rotation vector; qpos uses only jointly finite slots. Action-space,
+representation, shape, or pose-frame mismatch fails explicitly.
+
+`ControlCompositionRuntime.evaluate_composition()` now accepts that optional spec,
+returns the observation on `CompositeProposalSubmission`, and emits the exact
+hash-linked `source_difference_spec` and `source_difference_observation` v2.4
+ControlTrace facts through its existing backend-neutral trace sink. Diagnostic
+failure is returned separately and cannot rewrite the
+composition result. CS-6b1h/1i only forward the opt-in spec and expose the same
+observation on their step result. With the default `None`, no observation,
+extra trace fact, clock read, or legacy binding-hash field is added.
+`guidance_feedback.py` can map one configured pose pair to bounded dimensionless
+guidance cues with TTL and lineage. The only adapter currently provided is
+deterministic no-I/O validation; commands are typed
+`guidance_haptic_non_force`, carry `authoritative=false`, and cannot move a
+target or reflect physical force. Real haptics, GUI visualization, automatic
+HOLD clearing, qpos-to-guidance mapping, and production profile wiring remain
+separate gates.
 
 The same module now contains a pure hand/gripper qpos component seam for
 DMTAC-style 1DoF slots, q6 hands, and q16 active-mask slots. It interpolates
@@ -177,6 +238,33 @@ readiness: no post-boundary sample, a stale queued sample, or a late worker
 completion leaves the station in HOLD and cannot reopen the human barrier.
 These cases are covered by the HIL corner regressions; real readiness remains a
 separate provider gate.
+
+## Opt-in CS-6b1i composition session
+
+`control_composition.lifecycle.CompositionSessionRegistry` owns the
+backend-independent logical-session spec registry, per-activation epoch/state
+transitions, re-arm binding, and trace observers. Station's
+`CompositionSessionController` subclasses it only to bind typed Station
+operation results, the publication barrier, and lower HOLD/cancel ordering.
+`build_scoped_cs6b1i_mujoco_pose_composition_session()` is only the first
+MuJoCo binding around the existing CS-6b1h data plane: it supplies concrete
+readiness, lower HOLD/cancel, adapters, input admission, and sim stepping.
+Human/replay slots are explicit
+contributors and never parallel proposal owners; only the composite slot may
+become active after `start_composition_session` returns the evidenced
+`composition_session_ready` status.
+
+Pause, ESTOP, stop, or a non-publishable composition closes the composer
+publication barrier before lower HOLD/cancellation. Fresh input cannot reopen
+the held activation. The opt-in MuJoCo re-arm operation keeps the logical
+session identity but retires the held activation and creates the next epoch
+only after typed cancellation, measurement, producer/authority epoch, READY,
+and fresh-input-barrier evidence. Old proposals and contributor inputs cannot
+cross that boundary, and re-arm itself admits no action. Trace contracts cover
+the re-arm spec/receipt and activation transitions. This remains deterministic
+sim only: no GUI, device start, replay cursor, policy/RTC source, real binding,
+or production entrypoint is added, and no physical deadman/retarget evidence is
+claimed.
 
 The reusable boundary is intentional: a new tracker only supplies the public
 passive-session profile, a new target supplies the shared authoritative target

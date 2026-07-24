@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -47,6 +48,17 @@ class _RecalibrationState:
     stability: HomeCaptureStabilityState = field(
         default_factory=HomeCaptureStabilityState
     )
+
+
+@dataclass
+class _PassiveHomeCache:
+    stability: HomeCaptureStabilityState = field(
+        default_factory=HomeCaptureStabilityState
+    )
+    pose: np.ndarray | None = None
+    source_timestamp: float = 0.0
+    last_observed_at: float = 0.0
+    unavailable_reason: str = "waiting_for_valid_fresh_tracker_sample"
 
 
 class FixArmCommandController:
@@ -96,11 +108,16 @@ class FixArmCommandController:
         self._fixed_side = ""
         self._fixed_sides: set[str] = set()
         self._recapturing_side = ""
+        self._post_recalibration_fixed_side: str | None = None
+        self._two_pedal_transition_pending = False
         self._latest_by_effector: dict[str, EffectorCommand] = {}
         self._fixed_by_effector: dict[str, EffectorCommand] = {}
         self._latest_by_channel: dict[str, ObservationChannel] = {}
         self._fixed_by_channel: dict[str, ObservationChannel] = {}
         self._recalibration = _RecalibrationState()
+        self._passive_home_cache = {
+            side: _PassiveHomeCache() for side in self.active_sides
+        }
         self._status_message = "fix-arm ready"
 
     def scope_for_side(self, side: str) -> str:
@@ -145,6 +162,14 @@ class FixArmCommandController:
         return self._mode == "recapturing" and bool(self._recapturing_side)
 
     @property
+    def two_pedal_transition_pending(self) -> bool:
+        return bool(self._two_pedal_transition_pending)
+
+    @property
+    def two_pedal_transition_target_fixed_side(self) -> str | None:
+        return self._post_recalibration_fixed_side
+
+    @property
     def status_message(self) -> str:
         return self._status_message
 
@@ -170,6 +195,52 @@ class FixArmCommandController:
     @property
     def recalibration_stability_reason(self) -> str:
         return str(self._recalibration.stability.reason or "")
+
+    def note_recalibration_unavailable(self, reason: str) -> None:
+        if not self.recapturing:
+            return
+        self._recalibration.stability.reason = (
+            str(reason).strip() or "waiting_for_valid_fresh_tracker_sample"
+        )
+
+    def note_two_pedal_home_unavailable(
+        self,
+        side: str,
+        *,
+        reason: str,
+        observed_at: float,
+    ) -> None:
+        normalized = normalize_fix_arm_side(side)
+        cache = self._passive_home_cache[normalized]
+        cache.last_observed_at = float(observed_at)
+        cache.unavailable_reason = (
+            str(reason).strip() or "waiting_for_valid_fresh_tracker_sample"
+        )
+
+    def passive_home_cache_status(
+        self,
+        side: str,
+        *,
+        now: float,
+    ) -> dict[str, object]:
+        normalized = normalize_fix_arm_side(side)
+        cache = self._passive_home_cache[normalized]
+        age_sec = (
+            None
+            if cache.pose is None or cache.source_timestamp <= 0.0
+            else max(0.0, float(now) - float(cache.source_timestamp))
+        )
+        ready = bool(age_sec is not None and age_sec <= 0.5)
+        return {
+            "side": normalized,
+            "ready": ready,
+            "age_sec": age_sec,
+            "reason": (
+                "stable_home_cache_ready"
+                if ready
+                else str(cache.unavailable_reason)
+            ),
+        }
 
     def select_side(self, side: str) -> FixArmTransition:
         normalized = normalize_fix_arm_side(side)
@@ -275,6 +346,8 @@ class FixArmCommandController:
             )
         self._fixed_side = side
         self._recapturing_side = side
+        self._post_recalibration_fixed_side = None
+        self._two_pedal_transition_pending = False
         self._mode = "recapturing"
         self._recalibration = _RecalibrationState(
             started_at=float(now),
@@ -288,6 +361,198 @@ class FixArmCommandController:
             side=side,
             mode=self._mode,
         )
+
+    def start_two_pedal_transition(
+        self,
+        *,
+        fixed_side: str | None,
+        now: float,
+        timeout_sec: float = 1.0,
+        min_samples: int = 1,
+    ) -> FixArmTransition:
+        """Prepare one atomic two-pedal Fix transition.
+
+        The currently fixed side remains fixed while its Home is refreshed.
+        Once that refresh is applied, ``complete_recalibration`` replaces the
+        fixed-side set in one mutation, so collection can never observe both
+        sides fixed during a left-only/right-only switch.
+        """
+
+        target = None if fixed_side is None else normalize_fix_arm_side(fixed_side)
+        current = self.fixed_side
+        if not current:
+            return FixArmTransition(
+                ok=False,
+                message="two-pedal transition requires one currently fixed side",
+                side="",
+                mode=self._mode,
+            )
+
+        # A newer pedal event owns the requested destination.  If it asks to
+        # remain in the current single-arm state, cancel any older pending
+        # transition instead of allowing that stale target to commit later.
+        if target == current:
+            if self.recapturing:
+                self._recapturing_side = ""
+                self._post_recalibration_fixed_side = None
+                self._two_pedal_transition_pending = False
+                self._selected_side = current
+                self._fixed_side = current
+                self._mode = "fixed"
+                self._recalibration = _RecalibrationState()
+                self._status_message = (
+                    f"two-pedal transition cancelled; {current} remains fixed"
+                )
+                return FixArmTransition(
+                    ok=True,
+                    message=self._status_message,
+                    side=current,
+                    mode=self._mode,
+                )
+            return FixArmTransition(
+                ok=True,
+                message=f"{current} is already the two-pedal fixed side",
+                side=current,
+                mode=self._mode,
+            )
+        if target is not None:
+            required = self.required_effectors_by_side.get(target, ())
+            missing = tuple(name for name in required if name not in self._latest_by_effector)
+            required_channels = self._required_channels_for_side(target)
+            missing_channels = tuple(
+                name
+                for name in required_channels
+                if name not in self._latest_by_channel
+                or not bool(getattr(self._latest_by_channel[name], "valid", False))
+            )
+            if missing or missing_channels:
+                if self.recapturing:
+                    # The newest pedal event supersedes the older pending
+                    # destination even when its own target cannot be prepared.
+                    # Remain in the current single-arm state; never allow the
+                    # stale older destination to commit later.
+                    self._recapturing_side = ""
+                    self._post_recalibration_fixed_side = None
+                    self._two_pedal_transition_pending = False
+                    self._selected_side = current
+                    self._fixed_side = current
+                    self._mode = "fixed"
+                    self._recalibration = _RecalibrationState()
+                return FixArmTransition(
+                    ok=False,
+                    message=f"cannot prepare atomic switch to {target}",
+                    side=current,
+                    mode=self._mode,
+                    missing_effectors=missing,
+                    missing_channels=missing_channels,
+                )
+
+        # Do not discard a new pedal/B request while the current fixed-side
+        # Home is being refreshed.  Reuse the in-flight stable sample window
+        # and atomically commit only the newest requested destination.
+        if self.recapturing:
+            self._selected_side = current
+            self._post_recalibration_fixed_side = target
+            self._two_pedal_transition_pending = True
+            self._recalibration.started_at = float(now)
+            self._recalibration.timeout_sec = min(
+                1.0,
+                max(0.1, float(timeout_sec)),
+            )
+            self._recalibration.min_samples = max(1, int(min_samples))
+            target_text = target or "live"
+            self._status_message = (
+                f"updated two-pedal target to {target_text}; "
+                f"waiting for stable {current} Home"
+            )
+            return FixArmTransition(
+                ok=True,
+                message=self._status_message,
+                side=current,
+                mode=self._mode,
+            )
+
+        # GUI selection is display/input state and may legitimately differ
+        # from the side that is actually fixed.  Home must always be captured
+        # for the real fixed side, otherwise the transition is permanently
+        # rejected after a selection-only change.
+        self._selected_side = current
+        transition = self.start_recalibration(
+            now=now,
+            timeout_sec=min(1.0, max(0.1, float(timeout_sec))),
+            min_samples=max(1, int(min_samples)),
+        )
+        if transition.ok:
+            self._post_recalibration_fixed_side = target
+            self._two_pedal_transition_pending = True
+            cache = self._passive_home_cache.get(current)
+            cache_status = self.passive_home_cache_status(current, now=now)
+            if (
+                cache is not None
+                and cache.pose is not None
+                and 0.0 <= float(now) - float(cache.source_timestamp) <= 0.5
+            ):
+                self._recalibration.samples = [cache.pose.copy()]
+            target_text = target or "live"
+            if self._recalibration.samples:
+                self._status_message = (
+                    f"fresh stable {current} Home cache ready; "
+                    f"committing atomic switch to {target_text}"
+                )
+            else:
+                self._status_message = (
+                    f"waiting for stable {current} Home before atomic switch to "
+                    f"{target_text}; reason={cache_status['reason']}"
+                )
+            transition = FixArmTransition(
+                ok=True,
+                message=self._status_message,
+                side=current,
+                mode=self._mode,
+            )
+        return transition
+
+    def observe_two_pedal_home_cache(
+        self,
+        side: str,
+        pose_desk: np.ndarray,
+        *,
+        source_timestamp: float,
+    ) -> bool:
+        """Maintain stable per-side Home candidates throughout single-arm mode.
+
+        Both trackers remain live while exactly one robot arm is fixed.  Cache
+        both sides so the arm that becomes fixed after an atomic switch already
+        has a recent candidate if the operator immediately switches again.
+        These passive candidates never change an active retargeter Home; only
+        the side being released is applied by the transition path.
+        """
+
+        normalized = normalize_fix_arm_side(side)
+        if (
+            normalized not in self.active_sides
+            or not self._fixed_sides
+            or self.recapturing
+        ):
+            return False
+        cache = self._passive_home_cache[normalized]
+        cache.last_observed_at = float(source_timestamp)
+        decision = cache.stability.observe(
+            pose_desk,
+            source_timestamp=float(source_timestamp),
+            first_accepted_pose=cache.pose,
+        )
+        if decision.reset_samples:
+            cache.pose = None
+            cache.source_timestamp = 0.0
+            cache.unavailable_reason = str(decision.reason)
+        if decision.accepted:
+            cache.pose = np.asarray(pose_desk, dtype=float).reshape(4, 4).copy()
+            cache.source_timestamp = float(source_timestamp)
+            cache.unavailable_reason = "stable_home_cache_ready"
+            return True
+        cache.unavailable_reason = str(decision.reason)
+        return False
 
     def add_recalibration_sample(self, pose_desk: np.ndarray) -> int:
         if not self.recapturing:
@@ -326,13 +591,45 @@ class FixArmCommandController:
     def complete_recalibration(self, *, now: float, message: str = "") -> FixArmTransition:
         del now
         side = self._recapturing_side or self._fixed_side
-        self._fixed_sides.discard(side)
-        for name in self.required_effectors_by_side.get(side, ()):
-            self._fixed_by_effector.pop(name, None)
-        for name in self._required_channels_for_side(side):
-            self._fixed_by_channel.pop(name, None)
+        target = self._post_recalibration_fixed_side
+        if not self._two_pedal_transition_pending:
+            self._fixed_sides.discard(side)
+            for name in self.required_effectors_by_side.get(side, ()):
+                self._fixed_by_effector.pop(name, None)
+            for name in self._required_channels_for_side(side):
+                self._fixed_by_channel.pop(name, None)
+            self._recapturing_side = ""
+            self._fixed_side = next(iter(self.fixed_sides), "")
+            self._mode = "fixed" if self._fixed_sides else "live"
+            self._recalibration = _RecalibrationState()
+            self._status_message = message or f"{side} home recaptured; fix-arm released"
+            return FixArmTransition(
+                ok=True,
+                message=self._status_message,
+                side=side,
+                mode=self._mode,
+            )
+        replacement_effectors: dict[str, EffectorCommand] = {}
+        replacement_channels: dict[str, ObservationChannel] = {}
+        if target is not None:
+            replacement_effectors = {
+                name: self._latest_by_effector[name].copy()
+                for name in self.required_effectors_by_side.get(target, ())
+                if name in self._latest_by_effector
+            }
+            replacement_channels = {
+                name: self._latest_by_channel[name].copy()
+                for name in self._required_channels_for_side(target)
+                if name in self._latest_by_channel
+            }
+        self._fixed_sides = set() if target is None else {target}
+        self._fixed_by_effector = replacement_effectors
+        self._fixed_by_channel = replacement_channels
         self._recapturing_side = ""
-        self._fixed_side = next(iter(self.fixed_sides), "")
+        self._post_recalibration_fixed_side = None
+        self._two_pedal_transition_pending = False
+        self._fixed_side = target or ""
+        self._selected_side = target or side
         self._mode = "fixed" if self._fixed_sides else "live"
         self._recalibration = _RecalibrationState()
         self._status_message = message or f"{side} home recaptured; fix-arm released"
@@ -352,6 +649,8 @@ class FixArmCommandController:
         self._fixed_side = ""
         self._fixed_sides.clear()
         self._recapturing_side = ""
+        self._post_recalibration_fixed_side = None
+        self._two_pedal_transition_pending = False
         self._fixed_by_effector = {}
         self._fixed_by_channel = {}
         self._recalibration = _RecalibrationState()
@@ -374,6 +673,8 @@ class FixArmCommandController:
         del now
         side = self._recapturing_side or self._fixed_side
         self._recapturing_side = ""
+        self._post_recalibration_fixed_side = None
+        self._two_pedal_transition_pending = False
         self._mode = "fixed" if self._fixed_sides else "live"
         self._recalibration = _RecalibrationState()
         self._status_message = str(message)
@@ -515,6 +816,10 @@ class FixArmCommandController:
             "fix_arm_effectors": list(self.required_effectors_by_side.get(fixed_side, ())),
             "fix_arm_sample_count": self.sample_count if self.recapturing else None,
             "fix_arm_min_samples": self.min_samples if self.recapturing else None,
+            "fix_arm_home_cache": {
+                side: self.passive_home_cache_status(side, now=time.time())
+                for side in self.active_sides
+            },
         }
 
     def _required_channels_for_side(self, side: str) -> tuple[str, ...]:

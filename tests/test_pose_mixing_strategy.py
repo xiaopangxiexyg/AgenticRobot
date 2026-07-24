@@ -4,6 +4,21 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+from control_composition.composition import (
+    CompositionContext,
+    DiscreteOwnerPoseMixingStrategy,
+    HandQposMixingStrategySpec,
+    LinearHandQposInterpolationStrategy,
+    PoseMixingContext,
+    PoseMixingStrategySpec,
+    WeightedSE3PoseFusionStrategy,
+    assemble_compound_component_action,
+    build_hand_qpos_mixing_decision,
+    build_hand_qpos_mixing_input_snapshot,
+    build_pose_mixing_decision,
+    build_pose_mixing_input_snapshot,
+    evaluate_component_mixing_shadow,
+)
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_EE_POSE_HAND16_V1,
@@ -16,19 +31,9 @@ from robot_motion.action import (
     AuthorityStore,
     DecisionScheduleSpec,
     DecisionScheduler,
-    DiscreteOwnerPoseMixingStrategy,
     HandActionSpec,
-    LinearHandQposInterpolationStrategy,
-    PoseMixingContext,
-    PoseMixingStrategySpec,
     ProposalBuffer,
     RobotAction,
-    WeightedSE3PoseFusionStrategy,
-    assemble_compound_component_action,
-    build_hand_qpos_mixing_input_snapshot,
-    build_pose_mixing_decision,
-    build_pose_mixing_input_snapshot,
-    evaluate_component_mixing_shadow,
 )
 from robot_motion.action.arbitration_input import capture_arbitration_input
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
@@ -190,7 +195,12 @@ def _capture(
     return snapshot
 
 
-def _mixing_snapshot(arbitration_input, *, contexts=()):
+def _mixing_snapshot(
+    arbitration_input,
+    *,
+    contexts=(),
+    component_dependencies=None,
+):
     return build_pose_mixing_input_snapshot(
         arbitration_input,
         source_slot_by_producer={
@@ -199,6 +209,7 @@ def _mixing_snapshot(arbitration_input, *, contexts=()):
         },
         clock_domain_id="control.monotonic",
         contexts=tuple(contexts),
+        component_dependencies=component_dependencies,
     )
 
 
@@ -287,6 +298,62 @@ def test_context_snapshot_is_frozen_and_rejects_late_information() -> None:
     )
     with pytest.raises(ValueError, match="not available at the decision cut"):
         _mixing_snapshot(arbitration_input, contexts=(late,))
+
+
+def test_generic_context_accepts_new_modalities_and_enforces_target_ttl() -> None:
+    arbitration_input = _capture()
+    vision = CompositionContext(
+        context_id="vision:embedding:7",
+        context_kind="vision.embedding.v2",
+        source_fact_id="camera-feature:7",
+        source_fact_hash="sha256:camera-feature-7",
+        payload_contract_hash="sha256:vision-embedding-v2",
+        semantic_payload={"blob_ref": "features/7.npy", "quality": 0.92},
+        available_at=10.4,
+        available_clock_domain_id="control.monotonic",
+        control_admission_sequence=(
+            arbitration_input.proposal_snapshot.cutoff_admission_sequence
+        ),
+        effective_from=10.0,
+        effective_until=11.0,
+        blob_refs=("features/7.npy",),
+    )
+    snapshot = _mixing_snapshot(arbitration_input, contexts=(vision,))
+    candidate = snapshot.candidate_by_source_slot["human-slot"]
+    decision = build_pose_mixing_decision(
+        snapshot,
+        spec=PoseMixingStrategySpec(
+            strategy_id="fixture-vision-router-v1",
+            algorithm="select_with_frozen_vision_context",
+            accepted_context_kinds=("vision.embedding.v2",),
+        ),
+        status="selected",
+        reason="vision_context_admitted",
+        selected=(candidate,),
+        used_context_ids=(vision.context_id,),
+        output_action=candidate.action,
+    )
+
+    assert decision.used_context_ids == ("vision:embedding:7",)
+    assert snapshot.contexts[0].semantic_payload["quality"] == pytest.approx(0.92)
+
+    stale = CompositionContext(
+        context_id="state:stale",
+        context_kind="state",
+        source_fact_id="state:6",
+        source_fact_hash="sha256:state-6",
+        payload_contract_hash="sha256:state-v1",
+        semantic_payload={"phase": "approach"},
+        available_at=10.4,
+        available_clock_domain_id="control.monotonic",
+        control_admission_sequence=(
+            arbitration_input.proposal_snapshot.cutoff_admission_sequence
+        ),
+        effective_from=9.0,
+        effective_until=10.0,
+    )
+    with pytest.raises(ValueError, match="not effective at the decision target"):
+        _mixing_snapshot(arbitration_input, contexts=(stale,))
 
 
 class _LabelRoutingStrategy:
@@ -404,6 +471,62 @@ def test_weighted_se3_pose_fusion_uses_shortest_rotation_path() -> None:
     assert first.output_action.source == (
         "pose_fusion:weighted_se3_pose_fusion_v1"
     )
+
+
+@pytest.mark.parametrize("component", ("left_arm", "right_arm"))
+def test_pose_mixing_supports_one_explicit_arm_component(component: str) -> None:
+    dependencies = (component,)
+    snapshot = _mixing_snapshot(
+        _capture(owner="human-main"),
+        component_dependencies=dependencies,
+    )
+    discrete = DiscreteOwnerPoseMixingStrategy(
+        component_dependencies=dependencies
+    ).decide(snapshot)
+    fused = WeightedSE3PoseFusionStrategy(
+        weights_by_source_slot={
+            "human-slot": 0.25,
+            "replay-slot": 0.75,
+        },
+        component_dependencies=dependencies,
+    ).decide(snapshot)
+    side = component.removesuffix("_arm")
+
+    assert discrete.status == "selected"
+    assert discrete.output_action is not None
+    assert discrete.output_action.active_effectors == dependencies
+    assert set(discrete.output_action.arm_pose_by_side) == {side}
+    assert fused.status == "selected"
+    assert fused.output_action is not None
+    assert fused.output_action.active_effectors == dependencies
+    assert set(fused.output_action.arm_pose_by_side) == {side}
+    np.testing.assert_allclose(
+        fused.output_action.arm_pose_by_side[side][0],
+        0.425,
+        atol=1e-7,
+    )
+
+
+def test_pose_strategy_rejects_component_manifest_mismatch() -> None:
+    snapshot = _mixing_snapshot(
+        _capture(),
+        component_dependencies=("left_arm",),
+    )
+    with pytest.raises(ValueError, match="dependency mismatch"):
+        WeightedSE3PoseFusionStrategy(
+            weights_by_source_slot={
+                "human-slot": 0.5,
+                "replay-slot": 0.5,
+            },
+        ).decide(snapshot)
+
+
+def test_pose_mixing_rejects_non_arm_component_subset() -> None:
+    with pytest.raises(ValueError, match="only left_arm/right_arm"):
+        _mixing_snapshot(
+            _capture(),
+            component_dependencies=("left_hand",),
+        )
 
 
 def test_weighted_se3_pose_fusion_handles_antipodal_quaternions() -> None:
@@ -557,7 +680,12 @@ def test_arm_pose_mixing_rejects_silently_carried_hand_qpos() -> None:
         _mixing_snapshot(arbitration_input)
 
 
-def _hand_input_snapshot(*, hand_spec: HandActionSpec, action_space: str = BIMANUAL_EE_POSE_V1):
+def _hand_input_snapshot(
+    *,
+    hand_spec: HandActionSpec,
+    action_space: str = BIMANUAL_EE_POSE_V1,
+    contexts=(),
+):
     arbitration_input = _capture()
     values = (0.2, 0.8)
     for item, value in zip(arbitration_input.proposal_snapshot.candidates, values):
@@ -599,6 +727,7 @@ def _hand_input_snapshot(*, hand_spec: HandActionSpec, action_space: str = BIMAN
         side="left",
         hand_spec=hand_spec,
         clock_domain_id="control.monotonic",
+        contexts=tuple(contexts),
     )
 
 
@@ -624,6 +753,52 @@ def test_hand_qpos_interpolation_uses_active_slots_and_preserves_lineage() -> No
     assert decision.input_snapshot_id == snapshot.snapshot_id
     assert decision.input_snapshot_hash == snapshot.semantic_content_hash
     assert decision.semantic_content_hash
+
+
+def test_hand_qpos_strategy_can_consume_the_same_generic_context_contract() -> None:
+    hand_spec = HandActionSpec.dmtac_gripper("left")
+    arbitration_input = _capture()
+    context = CompositionContext(
+        context_id="state:grasp-phase:1",
+        context_kind="task_state",
+        source_fact_id="task-state:1",
+        source_fact_hash="sha256:task-state-1",
+        payload_contract_hash="sha256:task-state-v1",
+        semantic_payload={"phase": "pregrasp"},
+        available_at=10.4,
+        available_clock_domain_id="control.monotonic",
+        control_admission_sequence=(
+            arbitration_input.proposal_snapshot.cutoff_admission_sequence
+        ),
+        effective_from=10.0,
+        effective_until=11.0,
+    )
+    snapshot = _hand_input_snapshot(
+        hand_spec=hand_spec,
+        contexts=(context,),
+    )
+    candidate = snapshot.candidate_by_source_slot["human-slot"]
+    decision = build_hand_qpos_mixing_decision(
+        snapshot,
+        spec=HandQposMixingStrategySpec(
+            strategy_id="fixture-contextual-qpos-v1",
+            algorithm="select_human_qpos_in_pregrasp",
+            component_id=snapshot.component_id,
+            action_space=snapshot.action_space,
+            hand_action_spec_hash=snapshot.hand_action_spec_hash,
+            weights_by_source_slot={"human-slot": 1.0},
+            accepted_context_kinds=("task_state",),
+        ),
+        status="selected",
+        reason="task_state_pregrasp",
+        selected=(candidate,),
+        normalized_weights={"human-slot": 1.0},
+        output_hand_qpos=candidate.action.hand_qpos_by_side["left"],
+        used_context_ids=(context.context_id,),
+    )
+
+    assert snapshot.contexts == (context,)
+    assert decision.used_context_ids == (context.context_id,)
 
 
 def test_hand_qpos_interpolation_preserves_q16_nan_padding() -> None:

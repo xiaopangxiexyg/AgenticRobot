@@ -5,9 +5,10 @@ import math
 import unittest
 from pathlib import Path
 
-from cameras.configs import (
+from teleop_runtime.configs.camera_paths import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
+    DEFAULT_REALSENSE_FRONT_DEVICE_CONFIG_PATH,
 )
 from sim.mujoco.config import default_camera_registry_path
 from teleop_runtime.cameras.registry import (
@@ -17,6 +18,7 @@ from teleop_runtime.cameras.registry import (
     normalize_camera_registry,
     pinhole_fov_from_intrinsics,
 )
+from utils.dataset_postprocess.wrist_cam_adjust.geometry import resolve_repo_relative_path
 
 
 class CameraRegistryTest(unittest.TestCase):
@@ -47,28 +49,57 @@ class CameraRegistryTest(unittest.TestCase):
         self.assertEqual(len(right_wrist_placements), 1)
         self.assertEqual(right_wrist_placements[0]["urdf"], expected_dual_arm_urdf)
 
-    def test_canonical_cameras_configs_exist_and_legacy_mirrors_match(self) -> None:
-        legacy_device_config = Path("teleop_runtime/configs/devices/realsense.json")
-        legacy_registry = Path("teleop_runtime/configs/cameras/realsense_registry.json")
-
+    def test_canonical_camera_configs_exist_without_root_cameras_package(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
         self.assertTrue(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.exists())
+        self.assertTrue(DEFAULT_REALSENSE_FRONT_DEVICE_CONFIG_PATH.exists())
         self.assertTrue(DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.exists())
-        self.assertEqual(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.parts[-3:-1], ("rm65", "devices"))
         self.assertEqual(
-            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.parts[-3:-1],
-            ("rm65", "cameras"),
+            DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.resolve(),
+            (project_root / "teleop_runtime/configs/devices/realsense.json").resolve(),
         )
         self.assertEqual(
-            DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.read_text(encoding="utf-8"),
-            legacy_device_config.read_text(encoding="utf-8"),
+            DEFAULT_REALSENSE_FRONT_DEVICE_CONFIG_PATH.resolve(),
+            (
+                project_root
+                / "teleop_runtime/configs/devices/realsense_front.json"
+            ).resolve(),
         )
         self.assertEqual(
-            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.read_text(encoding="utf-8"),
-            legacy_registry.read_text(encoding="utf-8"),
+            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.resolve(),
+            (
+                project_root
+                / "robot_motion/configs/rm65_camera_registry.json"
+            ).resolve(),
         )
+        self.assertFalse((project_root / "cameras").exists())
 
-    def test_real2sim_default_camera_registry_uses_cameras_config(self) -> None:
+    def test_real2sim_default_camera_registry_uses_shared_robot_motion_config(self) -> None:
         self.assertEqual(default_camera_registry_path(), DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH)
+
+    def test_historical_registry_path_alias_resolves_to_shared_config(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            resolve_repo_relative_path(
+                "cameras/configs/rm65/cameras/realsense_registry.json",
+                repo_root=project_root,
+            ),
+            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.resolve(),
+        )
+        self.assertEqual(
+            resolve_repo_relative_path(
+                "cameras/configs/rm65/devices/realsense.json",
+                repo_root=project_root,
+            ),
+            DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.resolve(),
+        )
+        self.assertEqual(
+            resolve_repo_relative_path(
+                "teleop_runtime/configs/cameras/realsense_registry.json",
+                repo_root=project_root,
+            ),
+            DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH.resolve(),
+        )
 
     def test_default_realsense_profiles_are_15hz(self) -> None:
         devices = json.loads(DEFAULT_REALSENSE_DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))

@@ -14,6 +14,12 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.control_trace import ControlTraceFact
 
 from .contracts import ControlStationRunManifest
+from .composition_session import (
+    CompositionSessionOperationSpec,
+    CompositionSessionRearmReceipt,
+    CompositionSessionRearmSpec,
+    CompositionSessionTransition,
+)
 from .publication_barrier import StationPublicationBarrierSnapshot
 from .state_machine import (
     ControlStationOperationTransition,
@@ -138,6 +144,67 @@ class StationControlTraceBridge:
             )
         )
 
+    def record_composition_session_spec(
+        self,
+        spec: CompositionSessionOperationSpec,
+    ) -> ControlTraceFact:
+        return self._admit(
+            project_composition_session_spec(
+                spec,
+                runtime_session_id=self.runtime_session_id,
+                control_domain_id=self.manifest.control_domain_id,
+                embodiment_instance_id=self.embodiment_instance_id,
+                occurred_at=float(self.clock()),
+                clock_domain_id=self.clock_domain_id,
+            )
+        )
+
+    def record_composition_session_transition(
+        self,
+        transition: CompositionSessionTransition,
+        *,
+        occurred_at: float,
+        clock_domain_id: str,
+    ) -> ControlTraceFact:
+        return self._admit(
+            project_composition_session_transition(
+                transition,
+                runtime_session_id=self.runtime_session_id,
+                control_domain_id=self.manifest.control_domain_id,
+                embodiment_instance_id=self.embodiment_instance_id,
+                occurred_at=occurred_at,
+                clock_domain_id=clock_domain_id,
+            )
+        )
+
+    def record_composition_session_rearm_spec(
+        self,
+        spec: CompositionSessionRearmSpec,
+    ) -> ControlTraceFact:
+        return self._admit(
+            project_composition_session_rearm_spec(
+                spec,
+                runtime_session_id=self.runtime_session_id,
+                control_domain_id=self.manifest.control_domain_id,
+                embodiment_instance_id=self.embodiment_instance_id,
+                occurred_at=float(self.clock()),
+                clock_domain_id=self.clock_domain_id,
+            )
+        )
+
+    def record_composition_session_rearm_receipt(
+        self,
+        receipt: CompositionSessionRearmReceipt,
+    ) -> ControlTraceFact:
+        return self._admit(
+            project_composition_session_rearm_receipt(
+                receipt,
+                runtime_session_id=self.runtime_session_id,
+                control_domain_id=self.manifest.control_domain_id,
+                embodiment_instance_id=self.embodiment_instance_id,
+            )
+        )
+
 
 def _lease_payload(state: ControlStationState) -> dict[str, object] | None:
     lease = state.operator_control_lease
@@ -246,6 +313,166 @@ def project_station_run_manifest(
             "operator_control_lease_sec": manifest.operator_control_lease_sec,
             "explicit_exclusions": manifest.explicit_exclusions,
             "semantic_content_hash": manifest.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_session_spec(
+    spec: CompositionSessionOperationSpec,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str | None,
+    occurred_at: float,
+    clock_domain_id: str,
+) -> ControlTraceFact:
+    if not isinstance(spec, CompositionSessionOperationSpec):
+        raise TypeError("spec must be a CompositionSessionOperationSpec.")
+    return ControlTraceFact.create(
+        fact_id=spec.operation_spec_id,
+        event_type="composition_session_spec",
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        embodiment_instance_id=embodiment_instance_id,
+        occurred_at=occurred_at,
+        clock_domain_id=clock_domain_id,
+        payload={
+            "operation_spec_id": spec.operation_spec_id,
+            "session_key": spec.session_key,
+            "composer_source_slot_id": spec.composer_source_slot_id,
+            "contributor_source_slot_ids": spec.contributor_source_slot_ids,
+            "composition_spec_hash": spec.composition_spec_hash,
+            "authority_gate_spec_hash": spec.authority_gate_spec_hash,
+            "execution_binding_hash": spec.execution_binding_hash,
+            "capture_boundary_id": spec.capture_boundary_id,
+            "pause_behavior": spec.pause_behavior,
+            "end_behavior": spec.end_behavior,
+            "resume_behavior": spec.resume_behavior,
+            "semantic_content_hash": spec.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_session_transition(
+    transition: CompositionSessionTransition,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str | None,
+    occurred_at: float,
+    clock_domain_id: str,
+) -> ControlTraceFact:
+    if not isinstance(transition, CompositionSessionTransition):
+        raise TypeError(
+            "transition must be a CompositionSessionTransition."
+        )
+    return ControlTraceFact.create(
+        fact_id=transition.transition_id,
+        event_type="composition_session_transition",
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        embodiment_instance_id=embodiment_instance_id,
+        occurred_at=occurred_at,
+        clock_domain_id=clock_domain_id,
+        payload={
+            "transition_id": transition.transition_id,
+            "operation_spec_id": transition.operation_spec_id,
+            "operation_spec_hash": transition.operation_spec_hash,
+            "session_epoch": transition.session_epoch,
+            "transition": transition.transition,
+            "reason": transition.reason,
+            "source_fact_id": transition.source_fact_id,
+            "source_fact_hash": transition.source_fact_hash,
+            "state_before_hash": transition.state_before_hash,
+            "state_after_hash": transition.state_after_hash,
+            "semantic_content_hash": transition.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_session_rearm_spec(
+    spec: CompositionSessionRearmSpec,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str | None,
+    occurred_at: float,
+    clock_domain_id: str,
+) -> ControlTraceFact:
+    if not isinstance(spec, CompositionSessionRearmSpec):
+        raise TypeError("spec must be a CompositionSessionRearmSpec.")
+    return ControlTraceFact.create(
+        fact_id=spec.rearm_spec_id,
+        event_type="composition_session_rearm_spec",
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        embodiment_instance_id=embodiment_instance_id,
+        occurred_at=occurred_at,
+        clock_domain_id=clock_domain_id,
+        payload={
+            "rearm_spec_id": spec.rearm_spec_id,
+            "rearm_key": spec.rearm_key,
+            "logical_operation_spec_id": spec.logical_operation_spec_id,
+            "logical_operation_spec_hash": spec.logical_operation_spec_hash,
+            "prior_session_epoch": spec.prior_session_epoch,
+            "prior_state_hash": spec.prior_state_hash,
+            "execution_binding_hash": spec.execution_binding_hash,
+            "readiness_observer_binding_id": (
+                spec.readiness_observer_binding_id
+            ),
+            "readiness_timeout_sec": spec.readiness_timeout_sec,
+            "required_readiness_checks": spec.required_readiness_checks,
+            "semantic_content_hash": spec.semantic_content_hash,
+        },
+    )
+
+
+def project_composition_session_rearm_receipt(
+    receipt: CompositionSessionRearmReceipt,
+    *,
+    runtime_session_id: str,
+    control_domain_id: str,
+    embodiment_instance_id: str | None,
+) -> ControlTraceFact:
+    if not isinstance(receipt, CompositionSessionRearmReceipt):
+        raise TypeError("receipt must be a CompositionSessionRearmReceipt.")
+    return ControlTraceFact.create(
+        fact_id=receipt.receipt_id,
+        event_type="composition_session_rearm_receipt",
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        embodiment_instance_id=embodiment_instance_id,
+        occurred_at=receipt.completed_at,
+        clock_domain_id=receipt.clock_domain_id,
+        payload={
+            field_name: getattr(receipt, field_name)
+            for field_name in (
+                "receipt_id",
+                "rearm_spec_id",
+                "rearm_spec_hash",
+                "logical_operation_spec_id",
+                "logical_operation_spec_hash",
+                "prior_session_epoch",
+                "next_session_epoch",
+                "prior_composer_producer_epoch",
+                "composer_producer_epoch",
+                "prior_authority_epoch",
+                "authority_epoch",
+                "prior_execution_epoch",
+                "execution_epoch",
+                "cancellation_receipt_id",
+                "measurement_id",
+                "measurement_hash",
+                "producer_activation_id",
+                "authority_event_ids",
+                "ready_gate_event_id",
+                "activation_input_barrier_time",
+                "completed_at",
+                "clock_domain_id",
+                "satisfied_readiness_checks",
+                "status",
+                "semantic_content_hash",
+            )
         },
     )
 
@@ -382,6 +609,10 @@ def project_station_publication_barrier_transition(
 
 __all__ = [
     "StationControlTraceBridge",
+    "project_composition_session_rearm_receipt",
+    "project_composition_session_rearm_spec",
+    "project_composition_session_spec",
+    "project_composition_session_transition",
     "project_station_intent_transition",
     "project_station_operation_transition",
     "project_station_publication_barrier_transition",

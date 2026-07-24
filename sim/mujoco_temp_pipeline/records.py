@@ -29,6 +29,9 @@ METRIC_COLUMNS = (
     "approx_kl",
     "clip_fraction",
     "policy_std_mean",
+    "policy_log_std_mean",
+    "policy_action_dim",
+    "environment_action_dim",
     "learning_rate",
     "safety_projection_rate",
     "safety_rejection_rate",
@@ -37,6 +40,7 @@ METRIC_COLUMNS = (
     "safety_minimum_distance_m",
     "hard_penetration_count",
     "clearance_violation_count",
+    "contact_loss_termination_count",
     "arm_tracking_error_rad_mean",
     "arm_tracking_error_rad_max",
     "gripper_tracking_error_mean",
@@ -54,6 +58,9 @@ METRIC_COLUMNS = (
     "reward_gripper_close_mean",
     "reward_grasp_close_confidence_mean",
     "reward_grasp_acquire_term_mean",
+    "reward_bilateral_contact_term_mean",
+    "reward_bilateral_contact_acquire_term_mean",
+    "reward_bilateral_contact_missing_term_mean",
     "reward_grasp_latched_mean",
     "reward_lift_fraction_mean",
     "reward_reach_term_mean",
@@ -181,11 +188,11 @@ h1,h2{color:#f0f6fc}.cards{display:flex;flex-wrap:wrap;gap:10px}.card{background
 <h2>PPO losses</h2><canvas id="loss" width="1100" height="300"></canvas>
 <h2>最近 updates</h2><div id="table"></div><details><summary>Run config</summary><pre id="config"></pre></details>
 <script>const metrics=__METRICS__,summary=__SUMMARY__,config=__CONFIG__;
-const latest=metrics.at(-1)||{};const cards=[['step',latest.global_step],['update',latest.update],['TPS',latest.transitions_per_second],['success',latest.success_rate],['reach distance',latest.reward_distance_m_mean],['gripper close',latest.reward_gripper_close_mean],['lift fraction',latest.reward_lift_fraction_mean],['projection rate',latest.safety_projection_rate],['clearance violation',latest.clearance_violation_count],['hard penetration',latest.hard_penetration_count],['raw return',latest.recent_episode_raw_return_mean],['policy std',latest.policy_std_mean]];
+const latest=metrics.at(-1)||{};const cards=[['step',latest.global_step],['update',latest.update],['TPS',latest.transitions_per_second],['success',latest.success_rate],['reach distance',latest.reward_distance_m_mean],['gripper close',latest.reward_gripper_close_mean],['lift fraction',latest.reward_lift_fraction_mean],['projection rate',latest.safety_projection_rate],['contact loss',latest.contact_loss_termination_count],['clearance violation',latest.clearance_violation_count],['hard penetration',latest.hard_penetration_count],['raw return',latest.recent_episode_raw_return_mean],['policy std',latest.policy_std_mean]];
 document.getElementById('cards').innerHTML=cards.map(([k,v])=>`<div class="card"><div>${k}</div><div class="value">${typeof v==='number'?v.toFixed(4):v??'-'}</div></div>`).join('');
 function chart(id,series){const c=document.getElementById(id),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);const all=series.flatMap(s=>metrics.map(m=>m[s[1]]).filter(Number.isFinite));if(!all.length)return;let lo=Math.min(...all),hi=Math.max(...all);if(lo===hi){lo-=1;hi+=1}x.strokeStyle='#ddd';x.strokeRect(45,10,c.width-55,c.height-35);series.forEach((s,j)=>{x.strokeStyle=s[2];x.beginPath();metrics.forEach((m,i)=>{const v=m[s[1]];if(!Number.isFinite(v))return;const px=45+i/Math.max(metrics.length-1,1)*(c.width-55),py=10+(hi-v)/(hi-lo)*(c.height-35);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.fillStyle=s[2];x.fillText(s[0],55+j*170,25)});x.fillStyle='#222';x.fillText(hi.toFixed(3),2,18);x.fillText(lo.toFixed(3),2,c.height-25)}
 chart('reward',[['raw reward','raw_reward_mean','#0969da'],['shaped reward','shaped_reward_mean','#1a7f37'],['recent return','recent_episode_raw_return_mean','#bf8700'],['success rate','success_rate','#cf222e']]);chart('loss',[['policy loss','policy_loss','#8250df'],['value loss','value_loss','#cf222e'],['KL','approx_kl','#0969da']]);
-const cols=['update','global_step','shaped_reward_mean','success_rate','reward_distance_m_mean','reward_grasp_distance_m_mean','reward_grasp_gate_mean','reward_gripper_close_mean','reward_grasp_latched_mean','reward_lift_fraction_mean','reward_reach_term_mean','reward_grasp_region_term_mean','reward_gripper_term_mean','reward_latch_term_mean','reward_lift_term_mean','safety_projection_rate','clearance_violation_count','hard_penetration_count','policy_loss','value_loss','approx_kl'];const rows=metrics.slice(-20).reverse();document.getElementById('table').innerHTML=`<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${typeof r[c]==='number'?r[c].toFixed(5):r[c]??''}</td>`).join('')}</tr>`).join('')}</tbody></table>`;document.getElementById('config').textContent=JSON.stringify(config,null,2);</script></body></html>"""
+const cols=['update','global_step','shaped_reward_mean','success_rate','reward_distance_m_mean','reward_grasp_distance_m_mean','reward_grasp_gate_mean','reward_gripper_close_mean','reward_grasp_latched_mean','reward_lift_fraction_mean','reward_reach_term_mean','reward_grasp_region_term_mean','reward_gripper_term_mean','reward_latch_term_mean','reward_lift_term_mean','safety_projection_rate','contact_loss_termination_count','clearance_violation_count','hard_penetration_count','policy_loss','value_loss','approx_kl'];const rows=metrics.slice(-20).reverse();document.getElementById('table').innerHTML=`<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${typeof r[c]==='number'?r[c].toFixed(5):r[c]??''}</td>`).join('')}</tr>`).join('')}</tbody></table>`;document.getElementById('config').textContent=JSON.stringify(config,null,2);</script></body></html>"""
 
 
 __all__ = ["METRIC_COLUMNS", "RunRecorder"]

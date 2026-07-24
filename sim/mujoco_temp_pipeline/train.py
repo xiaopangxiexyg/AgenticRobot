@@ -13,21 +13,67 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
-from .checkpoint import file_sha256, save_checkpoint
+from .checkpoint import (
+    build_policy_from_checkpoint,
+    check_task_config_compatibility,
+    file_sha256,
+    save_checkpoint,
+)
 from .config import PPOConfig, RewardShapingConfig
 from .ppo import PPOSmokeTrainer
 from .records import RunRecorder
-from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+from sim.mujoco.tasks.cube_lift.config import (
+    CubeLiftTaskConfig,
+    SCRIPTED_CONTACT_LOST_REASON,
+)
 from sim.mujoco.tasks.cube_lift.learning import build_learning_metadata
 
 
-# New training defaults to the real-observable, no-episode-clock profile.  The
-# older v1/v3 profiles remain explicit compatibility options for old runs.
+# New training defaults to the state-only, no-episode-clock physical-contact
+# profile. RGB profiles remain explicit compatibility options for old runs.
 DEFAULT_TASK_CONFIG = Path(
-    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v4.json"
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json"
 )
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "latest.pt"
 DEFAULT_RECORD_ROOT = Path(__file__).resolve().parent / "records"
+
+
+def initialize_policy_weights(
+    trainer: PPOSmokeTrainer,
+    checkpoint: str | Path,
+    *,
+    task_config_path: str | Path,
+) -> dict[str, object]:
+    """Warm-start policy/normalizer while resetting PPO optimizer and counters."""
+
+    restored, normalizer, payload = build_policy_from_checkpoint(
+        checkpoint,
+        device=trainer.device,
+    )
+    compatibility = check_task_config_compatibility(
+        payload,
+        task_config_path,
+        allow_mismatch=True,
+    )
+    if (
+        restored.environment_action_dim != trainer.policy.environment_action_dim
+        or restored.active_action_indices
+        != trainer.policy.active_action_indices
+    ):
+        raise ValueError(
+            "Warm-start checkpoint policy action mapping is incompatible: "
+            f"checkpoint={restored.active_action_indices}/"
+            f"{restored.environment_action_dim}, "
+            f"runtime={trainer.policy.active_action_indices}/"
+            f"{trainer.policy.environment_action_dim}. Start a fresh checkpoint."
+        )
+    trainer.policy.load_state_dict(restored.state_dict())
+    trainer.observation_normalizer = normalizer
+    return {
+        "path": str(Path(checkpoint).resolve()),
+        "source_global_step": int(payload.get("global_step", 0)),
+        **compatibility,
+    }
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -108,14 +154,19 @@ def format_training_progress(
         f"return={_format_metric(record.get('recent_episode_raw_return_mean'), decimals=3)} "
         f"reach={_format_metric(record.get('reward_distance_m_mean'), suffix='m')} "
         f"close={_format_metric(record.get('reward_gripper_close_mean'))} "
+        f"contact={_format_metric(100.0 * float(record.get('reward_bilateral_contact_mean', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"lift={_format_metric(record.get('reward_lift_fraction_mean'))} "
         f"proj={_format_metric(100.0 * float(record.get('safety_projection_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"reject={_format_metric(100.0 * float(record.get('safety_rejection_rate', 0.0) or 0.0), decimals=1, suffix='%')} "
         f"clr={int(record.get('clearance_violation_count', 0))} "
         f"pen={int(record.get('hard_penetration_count', 0))} "
+        f"closs={int(record.get('contact_loss_termination_count', 0))} "
+        f"jlim={int(record.get('joint_limit_termination_count', 0))} "
+        f"tout={int(record.get('time_limit_termination_count', 0))} "
         f"armerr={_format_metric(record.get('arm_tracking_error_rad_mean'), decimals=4)}rad "
         f"griperr={_format_metric(record.get('gripper_tracking_error_mean'), decimals=3)} "
         f"{rgb_health}"
+        f"std={_format_metric(record.get('policy_std_mean'))} "
         f"loss={_format_metric(record.get('policy_loss'), decimals=3)} "
         f"v={_format_metric(record.get('value_loss'), decimals=3)} "
         f"kl={_format_metric(record.get('approx_kl'), decimals=2, scientific=True)} "
@@ -128,7 +179,8 @@ def format_training_start(
     task_name: str,
     policy_class: str,
     observation_dim: int,
-    action_dim: int,
+    policy_action_dim: int,
+    environment_action_dim: int,
     total_timesteps: int,
     num_envs: int,
     rollout_steps: int,
@@ -140,7 +192,8 @@ def format_training_start(
 ) -> str:
     return (
         f"[train] start task={task_name} policy={policy_class} "
-        f"obs={observation_dim} action={action_dim} "
+        f"obs={observation_dim} "
+        f"action={policy_action_dim}->{environment_action_dim} "
         f"envs={num_envs} rollout={rollout_steps} "
         f"total={int(total_timesteps):,} device={device} seed={seed} "
         f"reward={'shaped' if reward_shaping else 'raw'} "
@@ -169,6 +222,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Warm-start compatible policy weights and observation normalization "
+            "without restoring optimizer state or training counters."
+        ),
+    )
     parser.add_argument("--record-root", type=Path, default=DEFAULT_RECORD_ROOT)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--total-timesteps", type=int, default=200_000)
@@ -177,6 +239,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--initial-log-std", type=float, default=-0.5)
+    parser.add_argument("--final-log-std", type=float, default=-2.5)
+    parser.add_argument("--std-anneal-fraction", type=float, default=0.75)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
@@ -223,6 +288,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         update_epochs=args.update_epochs,
         minibatch_size=args.minibatch_size,
         learning_rate=args.learning_rate,
+        initial_log_std=args.initial_log_std,
+        final_log_std=args.final_log_std,
+        std_anneal_fraction=args.std_anneal_fraction,
         hidden_dim=args.hidden_dim,
         seed=args.seed,
         checkpoint_interval=args.checkpoint_interval,
@@ -242,6 +310,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         ),
         require_wrist_rgb_health=bool(args.require_rgb_health),
     )
+    initialization = (
+        None
+        if args.init_checkpoint is None
+        else initialize_policy_weights(
+            trainer,
+            args.init_checkpoint,
+            task_config_path=args.task_config,
+        )
+    )
     recorder = RunRecorder(
         args.record_root,
         run_name=args.run_name,
@@ -253,7 +330,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "task_config_sha256": file_sha256(args.task_config),
             "task_metadata": trainer.task_config.to_metadata(),
             "learning_contract": build_learning_metadata(trainer.task_config),
+            "policy_action_mapping": {
+                "policy_action_dim": trainer.action_dim,
+                "environment_action_dim": trainer.environment_action_dim,
+                "active_action_indices": list(
+                    trainer.active_action_indices
+                ),
+            },
             "checkpoint_target": str(Path(args.checkpoint).resolve()),
+            "initialization_checkpoint": initialization,
             "model_cache_dir": (
                 None if args.model_cache_dir is None else str(Path(args.model_cache_dir).resolve())
             ),
@@ -263,6 +348,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "torch_cuda": torch.version.cuda,
             "cuda_available": torch.cuda.is_available(),
             "resolved_device": str(trainer.device),
+            "pose_ik_solvers": list(trainer.pose_ik_solvers),
             "log_interval_updates": int(args.log_interval_updates),
             "print_full_metrics": bool(args.print_full_metrics),
             "require_rgb_health": bool(args.require_rgb_health),
@@ -276,7 +362,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     "task": trainer.task_config.name,
                     "policy_class": trainer.task_config.policy_class,
                     "observation_dim": trainer.observation_dim,
-                    "action_dim": trainer.task_config.action_dim,
+                    "policy_action_dim": trainer.action_dim,
+                    "environment_action_dim": trainer.environment_action_dim,
+                    "active_action_indices": list(
+                        trainer.active_action_indices
+                    ),
                     "total_timesteps": ppo_config.total_timesteps,
                     "num_envs": ppo_config.num_envs,
                     "rollout_steps": ppo_config.rollout_steps,
@@ -296,7 +386,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 task_name=trainer.task_config.name,
                 policy_class=trainer.task_config.policy_class,
                 observation_dim=trainer.observation_dim,
-                action_dim=trainer.task_config.action_dim,
+                policy_action_dim=trainer.action_dim,
+                environment_action_dim=trainer.environment_action_dim,
                 total_timesteps=ppo_config.total_timesteps,
                 num_envs=ppo_config.num_envs,
                 rollout_steps=ppo_config.rollout_steps,
@@ -322,6 +413,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             recent_returns.extend(rollout.episode_raw_returns)
             recent_returns = recent_returns[-100:]
             elapsed = max(time.monotonic() - started, 1e-9)
+            rollout_termination_reasons = [
+                episode.get("termination_reason") for episode in rollout.episodes
+            ]
             record = {
                 "update": trainer.update_index,
                 "global_step": trainer.global_step,
@@ -344,6 +438,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     .mean()
                     .cpu()
                 ),
+                "policy_log_std_mean": float(
+                    trainer.policy.log_std.detach().mean().cpu()
+                ),
+                "policy_action_dim": trainer.action_dim,
+                "environment_action_dim": trainer.environment_action_dim,
                 "learning_rate": float(trainer.optimizer.param_groups[0]["lr"]),
                 "safety_projection_rate": rollout.safety_projection_rate,
                 "safety_rejection_rate": rollout.safety_rejection_rate,
@@ -352,6 +451,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "safety_minimum_distance_m": rollout.safety_minimum_distance_m,
                 "hard_penetration_count": rollout.hard_penetration_count,
                 "clearance_violation_count": rollout.clearance_violation_count,
+                "contact_loss_termination_count": sum(
+                    reason == SCRIPTED_CONTACT_LOST_REASON
+                    for reason in rollout_termination_reasons
+                ),
+                "joint_limit_termination_count": sum(
+                    reason == "sim_joint_position_limit_violation"
+                    for reason in rollout_termination_reasons
+                ),
+                "time_limit_termination_count": sum(
+                    reason == "time_limit"
+                    for reason in rollout_termination_reasons
+                ),
                 "arm_tracking_error_rad_mean": rollout.arm_tracking_error_rad_mean,
                 "arm_tracking_error_rad_max": rollout.arm_tracking_error_rad_max,
                 "gripper_tracking_error_mean": rollout.gripper_tracking_error_mean,

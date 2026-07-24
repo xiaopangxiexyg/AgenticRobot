@@ -93,6 +93,32 @@ class StationPublicationBarrier:
             transition_reason="typed_human_takeover_completion",
         )
 
+    def enable_from_composition_session_result(
+        self,
+        result: StationOperationResult,
+    ) -> StationPublicationBarrierSnapshot:
+        """Open only after the registered composition session is READY."""
+
+        return self._enable_from_result(
+            result,
+            operation_kind="start_composition_session",
+            required_status="composition_session_ready",
+            transition_reason="typed_composition_session_completion",
+        )
+
+    def enable_from_composition_session_rearm_result(
+        self,
+        result: StationOperationResult,
+    ) -> StationPublicationBarrierSnapshot:
+        """Open only after a held session receives a typed rearm completion."""
+
+        return self._enable_from_result(
+            result,
+            operation_kind="rearm_composition_session",
+            required_status="composition_session_rearmed",
+            transition_reason="typed_composition_session_rearm_completion",
+        )
+
     def _enable_from_result(
         self,
         result: StationOperationResult,

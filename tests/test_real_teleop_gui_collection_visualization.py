@@ -269,6 +269,658 @@ def _args(**overrides: object) -> SimpleNamespace:
 
 
 class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
+    def test_tracker_side_warning_requires_explicit_confirmation_before_home(self) -> None:
+        calibration = real_teleop.TeleopCalibration()
+        post_yaw = np.eye(4)
+        post_yaw[:3, :3] = [
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        calibration.set_world_to_desk(post_yaw)
+        calibration.metadata["virtual_desk_post_yaw_deg"] = 180.0
+        components = _components()
+        components.active_sides = ("left", "right")
+        components.session.calibration = calibration
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(virtual_desk_post_yaw_deg=180.0),
+            components=components,
+        )
+        now = time.time()
+        channels = {
+            "left_wrist_pose": ObservationChannel(
+                channel_name="left_wrist_pose",
+                capability="pose",
+                side="left",
+                value=np.array(
+                    [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, -0.2],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ]
+                ),
+                frame_name="vive_world",
+                timestamp=now,
+                source_name="vive",
+            ),
+            "right_wrist_pose": ObservationChannel(
+                channel_name="right_wrist_pose",
+                capability="pose",
+                side="right",
+                value=np.array(
+                    [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.2],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ]
+                ),
+                frame_name="vive_world",
+                timestamp=now,
+                source_name="vive",
+            ),
+        }
+
+        control.publish_raw_tracker_pose_state(channels=channels, force=True)
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        self.assertFalse(control._calibration_requested)
+        self.assertTrue(control._tracker_side_confirmation_pending)
+        confirmation_publish = ui.published[-1]
+        self.assertIn(
+            "tracker_side_confirm_continue",
+            confirmation_publish["active_controls"],
+        )
+        self.assertIn(
+            "tracker_side_confirm_cancel",
+            confirmation_publish["active_controls"],
+        )
+        self.assertTrue(
+            confirmation_publish["tracker_side_check"]["confirmation_required"]
+        )
+
+        control._confirm_tracker_side_warning()
+
+        self.assertTrue(control.consume_calibration_request())
+        self.assertFalse(control._tracker_side_confirmation_pending)
+        self.assertTrue(control._tracker_side_initial_check_completed)
+
+    def test_tracker_side_warning_cancel_keeps_tracker_swap_available(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control._tracker_side_check = {
+            "status": "ambiguous",
+            "warning_required": True,
+            "message": "too close",
+        }
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        control._cancel_tracker_side_warning()
+
+        self.assertFalse(control.consume_calibration_request())
+        self.assertFalse(control._tracker_side_confirmation_pending)
+        self.assertIn("w", control._current_active_controls())
+
+    def test_tracker_side_confirmation_survives_transient_tracker_dropout(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=_components(),
+        )
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "swapped",
+        }
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        control._update_tracker_side_check(
+            {
+                "status": "unavailable",
+                "warning_required": False,
+                "message": "temporary dropout",
+            }
+        )
+
+        self.assertTrue(control._tracker_side_confirmation_pending)
+        self.assertTrue(control._tracker_side_check["confirmation_required"])
+        self.assertEqual(control._tracker_side_check["live_status"], "unavailable")
+
+    def test_tracker_side_home_request_waits_for_fresh_check_then_continues(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=components,
+        )
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        self.assertTrue(control._tracker_side_request_pending)
+        self.assertFalse(control._calibration_requested)
+        self.assertNotIn("p", control._current_active_controls())
+
+        control._update_tracker_side_check(
+            {
+                "status": "correct",
+                "warning_required": False,
+                "message": "correct",
+            }
+        )
+
+        self.assertFalse(control._tracker_side_request_pending)
+        self.assertTrue(control._calibration_requested)
+        self.assertEqual(ui.published[-1]["active_controls"], ["q"])
+
+    def test_terminal_cannot_bypass_web_tracker_side_confirmation(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=_components(),
+        )
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "swapped",
+        }
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        control._request_calibration_with_tracker_side_guard(source="terminal")
+
+        self.assertTrue(control._tracker_side_confirmation_pending)
+        self.assertFalse(control._calibration_requested)
+
+    def test_two_pedal_fast_home_supersedes_pending_tracker_confirmation(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "swapped",
+        }
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        self.assertTrue(control._tracker_side_confirmation_pending)
+        self.assertNotIn("two_pedal_b", control._current_active_controls())
+
+        control._handle_two_pedal_b_event(now=10.0)
+
+        self.assertTrue(control._tracker_side_confirmation_pending)
+        self.assertEqual(
+            control._tracker_side_confirmation_request_kind,
+            "two_pedal_fast",
+        )
+        self.assertEqual(
+            control._tracker_side_check["confirmation_result"], "pending"
+        )
+
+        control._confirm_tracker_side_warning()
+
+        self.assertTrue(control._calibration_requested)
+        self.assertTrue(control._two_pedal_fast_home_requested)
+        self.assertFalse(control._tracker_side_guard_request_active)
+        self.assertTrue(control._tracker_side_initial_check_completed)
+        self.assertEqual(
+            control.consume_two_pedal_fast_home_target(),
+            (True, None),
+        )
+
+    def test_explicit_home_does_not_override_queued_two_pedal_fast_home(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=_components(),
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "swapped",
+        }
+
+        control._handle_two_pedal_b_event(now=10.0)
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        self.assertFalse(control._calibration_requested)
+        self.assertTrue(control._tracker_side_confirmation_pending)
+        self.assertEqual(
+            control._tracker_side_confirmation_request_kind,
+            "two_pedal_fast",
+        )
+
+    def test_two_pedal_request_replaces_queued_normal_home_kind(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "correct",
+            "warning_required": False,
+            "message": "correct",
+        }
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        self.assertFalse(control._two_pedal_fast_home_requested)
+
+        control._handle_two_pedal_b_event(now=10.0)
+
+        self.assertTrue(control._calibration_requested)
+        self.assertTrue(control._two_pedal_fast_home_requested)
+        self.assertEqual(
+            control.consume_two_pedal_fast_home_target(now=10.0),
+            (True, None),
+        )
+
+    def test_two_pedal_b_releases_single_arm_fix_without_hold_or_collection_pause(self) -> None:
+        class FixController:
+            fixed = True
+            fixed_sides = ("right",)
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def start_two_pedal_transition(self, **kwargs: object):
+                self.calls.append(dict(kwargs))
+                return SimpleNamespace(ok=True, message="pending")
+
+        controller = FixController()
+        components = _components()
+        components.fix_arm_controller = controller
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = False
+        control._episode_recording_ui_active = True
+        control.request_hold = lambda **_kwargs: self.fail(
+            "single-arm to bimanual B must not request global Hold"
+        )
+
+        control._handle_two_pedal_b_event(now=10.0)
+
+        self.assertEqual(
+            controller.calls,
+            [
+                {
+                    "fixed_side": None,
+                    "now": 10.0,
+                    "timeout_sec": 1.0,
+                    "min_samples": 1,
+                }
+            ],
+        )
+        self.assertFalse(control._hold_active)
+        self.assertFalse(control._calibration_requested)
+        self.assertTrue(control._episode_recording_ui_active)
+        self.assertTrue(control._two_pedal_transition_active)
+
+    def test_two_pedal_mode_switch_is_rejected_while_init_is_active(self) -> None:
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            active=True,
+            qpos_active=True,
+            moving=True,
+            recapturing=False,
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+
+        control._handle_two_pedal_b_event(now=10.0)
+
+        self.assertFalse(control._calibration_requested)
+        self.assertFalse(control._two_pedal_fast_home_requested)
+        self.assertNotIn("two_pedal_b", control._current_active_controls())
+        self.assertIn("two_pedal_c", control._current_active_controls())
+        self.assertEqual(control._two_pedal_alert_level, "red")
+        self.assertIn("请先按 C", control._two_pedal_alert_message)
+
+    def test_current_single_arm_request_cancels_pending_gui_transition_state(self) -> None:
+        class FixController:
+            fixed = True
+            fixed_sides = ("left",)
+            two_pedal_transition_pending = False
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def start_two_pedal_transition(self, **kwargs: object):
+                self.calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    ok=True,
+                    message="older transition cancelled; left remains fixed",
+                )
+
+        controller = FixController()
+        components = _components()
+        components.fix_arm_controller = controller
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._two_pedal_transition_active = True
+        control._two_pedal_transition_target_fixed_side = "right"
+
+        control._request_two_pedal_fixed_side(
+            "left",
+            now=10.0,
+            source="pedal_2",
+        )
+
+        self.assertEqual(len(controller.calls), 1)
+        self.assertFalse(control._two_pedal_transition_active)
+        self.assertIsNone(control._two_pedal_transition_target_fixed_side)
+
+    def test_two_pedal_transition_cleanup_does_not_depend_on_web_ui(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=_components(),
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._two_pedal_transition_active = True
+        control._two_pedal_transition_target_fixed_side = "right"
+        control._two_pedal_alert_level = "orange"
+
+        control.publish_fix_arm_home_capture_progress(
+            SimpleNamespace(
+                active=True,
+                completed=True,
+                failed=False,
+                side="left",
+                message="completed",
+            )
+        )
+
+        self.assertFalse(control._two_pedal_transition_active)
+        self.assertIsNone(control._two_pedal_transition_target_fixed_side)
+        self.assertEqual(control._two_pedal_alert_level, "")
+
+    def test_normal_home_is_not_misclassified_as_two_pedal_fast_home(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=_components(),
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "correct",
+            "warning_required": False,
+            "message": "correct",
+        }
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        self.assertTrue(control._calibration_requested)
+        self.assertFalse(control._two_pedal_fast_home_requested)
+        self.assertEqual(
+            control.consume_two_pedal_fast_home_target(),
+            (False, None),
+        )
+        self.assertTrue(control.consume_calibration_request())
+
+    def test_two_pedal_fresh_tracker_wait_times_out_after_one_second(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "unavailable",
+            "warning_required": False,
+            "message": "stale",
+        }
+
+        control._handle_two_pedal_b_event(now=10.0)
+        self.assertTrue(control._tracker_side_request_pending)
+
+        control._poll_tracker_side_request_timeout(now=11.0)
+
+        self.assertFalse(control._tracker_side_request_pending)
+        self.assertFalse(control._calibration_requested)
+        self.assertEqual(control._two_pedal_alert_level, "red")
+        self.assertEqual(control._two_pedal_alert_expires_at, 14.0)
+
+    def test_two_pedal_tracker_wait_and_home_share_one_second_budget(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(special_arm_control_mode="foot-pad"),
+            components=components,
+            foot_pad_input=SimpleNamespace(foot_pad_count=2, is_online=True),
+        )
+        control._teleop_started = True
+        control._hold_active = True
+        control._tracker_side_check = {
+            "status": "unavailable",
+            "warning_required": False,
+            "message": "stale",
+        }
+
+        control._handle_two_pedal_b_event(now=10.0)
+        control._update_tracker_side_check(
+            {
+                "status": "correct",
+                "warning_required": False,
+                "message": "correct",
+            }
+        )
+
+        self.assertEqual(
+            control.consume_two_pedal_fast_home_target(now=10.6),
+            (True, None),
+        )
+        self.assertAlmostEqual(
+            control.two_pedal_fast_home_timeout_sec(),
+            0.4,
+            places=6,
+        )
+
+    def test_locked_dual_arm_tracker_warning_does_not_offer_disabled_swap(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=components,
+        )
+        control._tracker_swap_locked = True
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "swapped",
+        }
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        confirmation = str(
+            control._tracker_side_check["confirmation_message"]
+        )
+        self.assertIn("当前双臂运行映射已锁定", confirmation)
+        self.assertNotIn("点击“交换左右 Tracker”", confirmation)
+        self.assertFalse(control._tracker_side_check["swap_available"])
+
+    def test_tracker_side_is_rechecked_immediately_before_home_capture(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=components,
+        )
+        control._tracker_side_check = {
+            "status": "correct",
+            "warning_required": False,
+            "message": "correct",
+        }
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        self.assertTrue(control._tracker_side_guard_request_active)
+
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "crossed during countdown",
+        }
+
+        self.assertFalse(control._final_tracker_side_home_admission())
+        self.assertFalse(control._tracker_side_guard_request_active)
+
+    def test_explicit_tracker_side_confirmation_completes_gui_session_check(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=components,
+        )
+        control._tracker_side_check = {
+            "status": "swapped",
+            "warning_required": True,
+            "message": "swapped",
+        }
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        control._confirm_tracker_side_warning()
+
+        self.assertTrue(control._final_tracker_side_home_admission())
+        self.assertFalse(control._tracker_side_override_granted)
+        self.assertFalse(control._tracker_side_guard_request_active)
+        self.assertTrue(control._tracker_side_initial_check_completed)
+        self.assertFalse(control._tracker_side_check["monitoring_active"])
+
+    def test_tracker_side_check_runs_only_for_first_home_in_gui_session(self) -> None:
+        components = _components()
+        components.active_sides = ("left", "right")
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=components,
+        )
+        control._tracker_side_check = {
+            "status": "correct",
+            "warning_required": False,
+            "message": "correct",
+        }
+
+        control._request_calibration_with_tracker_side_guard(source="gui")
+        self.assertTrue(control._final_tracker_side_home_admission())
+        self.assertTrue(control._tracker_side_initial_check_completed)
+        self.assertTrue(control.consume_calibration_request())
+
+        control._tracker_side_check.update(
+            {
+                "status": "swapped",
+                "warning_required": True,
+                "message": "must be ignored after first admission",
+            }
+        )
+        control._request_calibration_with_tracker_side_guard(source="gui")
+
+        self.assertTrue(control._calibration_requested)
+        self.assertFalse(control._tracker_side_confirmation_pending)
+        self.assertFalse(control._tracker_side_guard_request_active)
+
+    def test_tracker_side_evaluator_stops_after_first_gui_session_check(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=_components(),
+        )
+        control._complete_initial_tracker_side_check(result="check_passed")
+
+        with patch(
+            "teleop_runtime.gui.real_teleop_control.evaluate_tracker_side_assignment"
+        ) as evaluator:
+            control.publish_raw_tracker_pose_state(
+                channels={},
+                now=10.0,
+                force=True,
+            )
+
+        evaluator.assert_not_called()
+
+    def test_q6_dmtac_command_contract_survives_missing_startup_device(self) -> None:
+        self.assertTrue(
+            real_teleop._dmtac_command_contract_configured(
+                gripper_input_source="q6",
+                angle_trigger_source=None,
+            )
+        )
+        self.assertTrue(
+            real_teleop._dmtac_command_contract_configured(
+                gripper_input_source="angle_trigger",
+                angle_trigger_source=None,
+            )
+        )
+        self.assertFalse(
+            real_teleop._dmtac_command_contract_configured(
+                gripper_input_source="none",
+                angle_trigger_source=None,
+            )
+        )
+
     def test_gui_keeps_only_tracker_swap_from_legacy_view_and_pose_tuning_controls(self) -> None:
         html = calibration_web_ui._HTML_PAGE
 
@@ -1418,7 +2070,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("record_pose_snapshot", active_controls)
         self.assertFalse(running_publish["pose_snapshot_available"])
 
-    def test_device_retry_is_restored_in_hold_and_survives_status_refresh(self) -> None:
+    def test_device_retry_is_restored_only_after_hold_is_consumed(self) -> None:
         ui = _FakeUi()
         control = real_teleop.RealTeleopControlInput(
             terminal=_FakeTerminal(),
@@ -1436,10 +2088,145 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("device_retry", running_publish["active_controls"])
 
         control.request_hold()
-        self.assertIn("device_retry", ui.published[-1]["active_controls"])
+        self.assertNotIn("device_retry", ui.published[-1]["active_controls"])
+        admitted, message = control.device_retry_admission()
+        self.assertFalse(admitted)
+        self.assertIn("Hold 正在生效", message)
 
         control.set_visualization_state(camera_active=True)
+        self.assertNotIn("device_retry", ui.published[-1]["active_controls"])
+
+        self.assertTrue(control.consume_hold_request())
+        control.set_visualization_state(camera_active=True)
         self.assertIn("device_retry", ui.published[-1]["active_controls"])
+
+    def test_stale_device_retry_event_is_rejected_by_running_backend_state(self) -> None:
+        ui = _FakeUi(["device_retry"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control.poll()
+
+        self.assertFalse(control.consume_device_retry_request())
+        self.assertTrue(
+            any(
+                title == "Device" and "运行中请先进入 Hold" in message
+                for title, message in ui.messages
+            )
+        )
+
+    def test_device_retry_backend_gate_rechecks_state_after_event_was_queued(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=_components(),
+        )
+        admitted, _message = control.device_retry_admission()
+        self.assertTrue(admitted)
+
+        control._teleop_started = True
+        control._hold_active = False
+        admitted, message = control.device_retry_admission()
+
+        self.assertFalse(admitted)
+        self.assertIn("运行中请先进入 Hold", message)
+
+    def test_device_retry_backend_gate_rejects_exact_qpos_activity(self) -> None:
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(qpos_active=True)
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(),
+            components=components,
+        )
+
+        admitted, message = control.device_retry_admission()
+
+        self.assertFalse(admitted)
+        self.assertIn("精确 Init qpos", message)
+
+    def test_pending_hold_rejects_movement_change_until_hardware_hold_runs(self) -> None:
+        args = _args(movement_multiple=1.0)
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=args,
+            components=_components(),
+        )
+        control.publish_teleop_running()
+        control.request_hold()
+
+        self.assertIsNone(
+            control._set_movement_multiple_value(1.5, source="test")
+        )
+        self.assertEqual(args.movement_multiple, 1.0)
+
+        self.assertTrue(control.consume_hold_request())
+        self.assertEqual(
+            control._set_movement_multiple_value(1.5, source="test"),
+            1.5,
+        )
+        self.assertEqual(args.movement_multiple, 1.5)
+
+    def test_hold_event_is_a_barrier_for_later_events_in_same_gui_batch(self) -> None:
+        ui = _FakeUi(["device_retry", "p", "h", "movement_multiple_up"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(movement_multiple=1.0),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control.poll()
+
+        self.assertTrue(control.consume_hold_request())
+        self.assertFalse(control.consume_device_retry_request())
+        self.assertFalse(control.consume_calibration_request())
+        self.assertEqual(control.args.movement_multiple, 1.0)
+
+    def test_quit_event_discards_all_other_events_in_same_gui_batch(self) -> None:
+        ui = _FakeUi(["device_retry", "p", "q", "movement_multiple_up"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(movement_multiple=1.0),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control.poll()
+
+        self.assertTrue(control.should_quit)
+        self.assertFalse(control.consume_device_retry_request())
+        self.assertFalse(control.consume_calibration_request())
+        self.assertEqual(control.args.movement_multiple, 1.0)
+
+    def test_init_emergency_stop_discards_other_events_in_same_gui_batch(self) -> None:
+        ui = _FakeUi(
+            ["device_retry", "p", "init_qpos_emergency_stop", "movement_multiple_up"]
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(movement_multiple=1.0),
+            components=_components(),
+        )
+        control.publish_teleop_running()
+
+        control.poll()
+
+        self.assertTrue(control.consume_init_qpos_emergency_stop_request())
+        self.assertFalse(control.consume_device_retry_request())
+        self.assertFalse(control.consume_calibration_request())
+        self.assertEqual(control.args.movement_multiple, 1.0)
 
     def test_visualization_refresh_cannot_reenable_controls_during_recording(self) -> None:
         ui = _FakeUi()
@@ -1856,6 +2643,27 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(ready_publish["capture_phase"], "ready")
         self.assertFalse(ready_publish["teleop_running"])
 
+    def test_debug_episode_only_mode_does_not_expose_formal_dataset_delete(self) -> None:
+        ui = _FakeUi()
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(no_collection=True, no_episode_recording=False),
+            components=_components(),
+        )
+
+        control.publish_teleop_running()
+
+        running_publish = next(
+            published
+            for published in reversed(ui.published)
+            if published.get("stage") == "RM65 真机遥操运行中"
+        )
+        active_controls = set(running_publish["active_controls"])
+        self.assertIn("episode_start", active_controls)
+        self.assertIn("episode_stop", active_controls)
+        self.assertNotIn("episode_delete", active_controls)
+
     def test_gui_events_feed_episode_and_visualization_requests(self) -> None:
         ui = _FakeUi(
             [
@@ -1882,6 +2690,41 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(control.consume_tactile_visualization_toggle_request())
         self.assertTrue(control.consume_tactile_solving_enable_request())
 
+    def test_stale_task_select_event_cannot_mutate_active_episode_contract(self) -> None:
+        ui = _FakeUi()
+        args = _args(
+            collection_task_name="original_task",
+            collection_task_id="original_task",
+            dataset_root="/tmp/original_dataset",
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=args,
+            components=_components(),
+        )
+        control._episode_recording_ui_active = True
+
+        applied = control._apply_episode_start_payload(
+            json.dumps(
+                {
+                    "task_key": "replacement_task",
+                    "task_english_name": "Replacement Task",
+                    "dataset_base_root": "/tmp/replacement_dataset",
+                    "ignored_camera_keys": [],
+                    "ignored_tactile_keys": [],
+                }
+            )
+        )
+
+        self.assertFalse(applied)
+        self.assertEqual(args.collection_task_name, "original_task")
+        self.assertEqual(args.collection_task_id, "original_task")
+        self.assertEqual(args.dataset_root, "/tmp/original_dataset")
+        self.assertTrue(
+            any("不能切换任务" in message for _title, message in ui.messages)
+        )
+
     def test_gui_tactile_solving_control_is_only_available_before_teleop_or_in_hold(self) -> None:
         args = _args(
             tactile_solving_available=True,
@@ -1906,6 +2749,13 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("enable_tactile_solving", running["active_controls"])
 
         control.request_hold(reason="unit_test")
+        pending_hold = next(
+            item for item in reversed(ui.published) if "active_controls" in item
+        )
+        self.assertNotIn("enable_tactile_solving", pending_hold["active_controls"])
+
+        self.assertTrue(control.consume_hold_request())
+        control.set_visualization_state(status="hold settled")
         hold = next(
             item for item in reversed(ui.published) if "active_controls" in item
         )
@@ -5001,6 +5851,29 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         html = calibration_web_ui._HTML_PAGE
         self.assertIn(".episode-banner.preparing", html)
         self.assertIn("3 秒后开始数采", html)
+
+    def test_gui_foot_pad_test_completion_is_persistent_for_connection(self) -> None:
+        html_and_fallback = (
+            calibration_web_ui._HTML_PAGE + calibration_web_ui._FALLBACK_SCRIPT
+        )
+
+        self.assertIn("foot_pad_test_completed", html_and_fallback)
+        self.assertIn("本次连接的踏板测试已完成", html_and_fallback)
+        self.assertIn("重新测试踏板", html_and_fallback)
+        self.assertIn(".foot-pad-test-banner.completed", calibration_web_ui._HTML_PAGE)
+
+    def test_gui_abc_shortcuts_follow_backend_active_controls(self) -> None:
+        html_and_fallback = (
+            calibration_web_ui._HTML_PAGE + calibration_web_ui._FALLBACK_SCRIPT
+        )
+
+        self.assertIn('activeControls.has("episode_start")', html_and_fallback)
+        self.assertIn('activeControls.has("two_pedal_b")', html_and_fallback)
+        self.assertIn('activeControls.has("two_pedal_c")', html_and_fallback)
+        self.assertIn('legacyActiveControls["two_pedal_b"]', html_and_fallback)
+        self.assertIn('fallbackActiveControls["two_pedal_c"]', html_and_fallback)
+        self.assertIn('code === "keya"', html_and_fallback)
+        self.assertIn('code === "keyc"', html_and_fallback)
 
     def test_gui_c_shortcut_only_sends_fix_arm_not_runtime_home_or_quit(self) -> None:
         html_and_fallback = calibration_web_ui._HTML_PAGE + calibration_web_ui._FALLBACK_SCRIPT

@@ -24,7 +24,7 @@ from robot_motion.runtime.lifecycle import (
     run_best_effort_cleanup,
 )
 
-from cameras.configs import (
+from ..configs.camera_paths import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )

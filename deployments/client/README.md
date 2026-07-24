@@ -117,15 +117,30 @@ The application then passes this adapter to
 `build_rtc_model_shadow_frontend(...)`; it does not copy protocol identity
 fields or implement worker/plan scheduling.
 
-`rtc_final_chunk.py` removes the remaining protocol boilerplate for existing
-servers that already return a complete chunk. A framework supplies one
-`FinalChunkRtcBinding`, a blocking `infer_model(model_input)` callable, a model
-input hash callable, and its input preparer/decoder. `FinalChunkRtcBackend`
-then constructs capability/request spec, checks the prepared-input hash,
-validates continuous and optional discrete rows, measures local monotonic
-timing and constructs the RTC response envelope. It always advertises
-`continuation=none`; it does not make a legacy final-chunk model a conditioned
-RTC model.
+`rtc_final_chunk.py` removes the protocol boilerplate for existing servers
+that already return a complete chunk. For a sessionless local/HTTP/IPC client,
+the public one-step composition is:
+
+```python
+adapter = create_final_chunk_rtc_runtime_adapter(
+    binding=instance_binding,
+    prepare_input=prepare_actor_observation,
+    call_model=existing_client.infer,
+    hash_model_input=hash_exact_prepared_input,
+    decoder=decode_to_canonical_absolute_actions,
+    adapt_output=MappingFinalChunkOutputAdapter(actions_key="actions"),
+)
+```
+
+`FinalChunkRtcBackend` derives capability and request spec from the single
+`FinalChunkRtcBinding`; an integration must not copy those identity or horizon
+fields. `MappingFinalChunkOutputAdapter` uses exact configured keys, ignores
+unselected diagnostic metadata, and supports a separately typed discrete
+matrix. The backend checks the prepared-input hash, validates all rows,
+measures local monotonic timing and constructs the RTC response envelope.
+It always advertises `continuation=none`; it does not make a legacy final-chunk
+model a conditioned RTC model. A framework with a custom session/reconnect
+lifecycle implements `RtcModelRuntimeAdapter` directly.
 
 This extraction was driven by the second-framework `vla-scratch` integration:
 its framework-specific layer now only builds the processed sample, calls the

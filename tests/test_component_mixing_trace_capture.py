@@ -4,18 +4,18 @@ from pathlib import Path
 
 import pytest
 
-from dataset_contracts.control_trace import ControlTraceFact
-from robot_motion.action import (
-    BIMANUAL_EE_POSE_V1,
+from control_composition.composition import (
     DiscreteOwnerPoseMixingStrategy,
-    HandActionSpec,
     LinearHandQposInterpolationStrategy,
     evaluate_component_mixing_shadow,
 )
-from robot_motion.action.authoritative_trace import (
-    AuthoritativeTraceContext,
-    project_component_mixing_shadow,
+from dataset_contracts.control_trace import ControlTraceFact
+from robot_motion.action import (
+    BIMANUAL_EE_POSE_V1,
+    HandActionSpec,
 )
+from robot_motion.action.authoritative_trace import AuthoritativeTraceContext
+from control_composition.trace import project_component_mixing_shadow
 from teleop_runtime.control_trace import (
     ControlTraceRuntime,
     ControlTraceSpool,

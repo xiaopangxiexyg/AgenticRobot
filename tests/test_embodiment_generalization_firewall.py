@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHARED_CONTROL_ROOTS = (
+    REPO_ROOT / "control_composition",
     REPO_ROOT / "robot_motion/action",
     REPO_ROOT / "robot_motion/runtime",
 )
@@ -68,11 +69,16 @@ def test_robot_action_v1_assumptions_do_not_spread_to_new_shared_files() -> None
         '"right_arm"',
     )
     allowed_v1_surfaces = {
+        # Explicit RobotAction-v1 compatibility inside the otherwise
+        # backend-neutral composition package.  Keeping these named prevents
+        # current left/right topology debt from spreading to new modules.
+        "control_composition/composition/core.py",
+        "control_composition/composition/strategies.py",
+        "control_composition/observability/difference.py",
         "robot_motion/action/__init__.py",
         "robot_motion/action/arbiter.py",
         "robot_motion/action/arm_spec.py",
         "robot_motion/action/codec.py",
-        "robot_motion/action/composition.py",
         "robot_motion/action/execution_manifest.py",
         "robot_motion/action/execution_target.py",
         "robot_motion/action/executor.py",

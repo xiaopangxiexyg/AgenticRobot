@@ -102,6 +102,10 @@ the runtime exposes the gate transition, requests a fault/hold. It does not
 construct an OpenPI client or choose an IK/pose-frame profile; those remain
 explicit caller configuration. The existing generic action adapter and this
 runtime's explicit target profile therefore remain the only execution path.
+The default catalog is arms-only; a policy chunk carrying hand keyframes is
+accepted only when the caller explicitly constructs the DMTAC compound target
+profile (including its shared safety callback), so gripper commands cannot be
+silently dropped or routed through an arms-only runtime.
 
 The RM65-specific accepted-qcmd/delay/filter state machine now lives in
 `sim/rm65/actuation`; this package only maps its target to MuJoCo position
@@ -129,8 +133,13 @@ while compact task info reports mean/max target-tracking error. V1 retains a
 prescribed gripper for regression. V2 is the default training task and compiles
 four additional DM-Tac finger actuators; its observation and latch use measured
 gripper closure after the identified delay and acceleration-limited response.
+The state-only normal v2 profile preserves that free-motion response and adds a
+separately hashed simulation-only post-settle contact-friction override.
 
-The camera-conditioned policy variants are explicit task configs:
+The current temporary PPO default is the state-only
+`sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json`. Camera-conditioned
+policy variants remain explicit compatibility configs while RGB training is
+paused:
 
 ```text
 sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json
@@ -140,6 +149,16 @@ sim/configs/tasks/rm65_right_cube_lift_rl_privileged_expert_rgb_v2.json
 They append only the active `right_wrist` RGB camera as a fixed 3x48x48 CHW
 input; the pose action and fitted arm/gripper actuators are unchanged. The
 earlier 3x32x32 RGB configs remain available as compatibility baselines.
+
+The `48x48` RGB size in these PPO configs is a compact learning input, not the
+OpenPI camera contract. For the current sim-only OpenPI smoke path, the three
+model camera slots may also be rendered at `48x48`; OpenPI accepts that payload
+and resizes it server-side to `224x224`. This proves transport, model-adapter,
+action, and MuJoCo execution compatibility only. It does not prove visual
+sim-real alignment with the real RM65 `640x480` camera streams, whose 4:3
+content is resized with top/bottom padding. A separate OpenPI observation
+profile must use camera-contract-matched source resolution, aspect ratio, view,
+and timing before making a visual-alignment claim.
 
 If the latest Q6 assignment is available, the same command starts the
 left/right Q6 readers and adds two continuous DM-Tac grippers. Explicit ports

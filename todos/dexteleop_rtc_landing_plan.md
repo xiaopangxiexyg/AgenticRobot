@@ -1,8 +1,8 @@
 # DexTeleop 实时 Action Chunk 推理（RTC）落地计划
 
-状态：`OpenPI relative R-R2 live synthetic no-action complete / T2d framework-neutral composition helper local complete / T3 raw-RTC caller default-off / no real observation shadow / no-hardware-authorization`
+状态：`OpenPI relative R-R2 live synthetic no-action complete / T2h final-chunk composition kit local complete / TX1 target compatibility pure complete / T3 raw-RTC caller default-off / R-R4 real observation no-action + drain passed / no-hardware-authorization`
 
-最后审计日期：2026-07-23
+最后审计日期：2026-07-24
 
 本文只规划 action-producing policy 的异步 chunk execution 与 flow/diffusion RTC。严格区分：raw-RTC 保持模型
 既有 `observation -> final action chunk` 接口，由客户端执行异步 timed-plan；model-RTC 才允许模型消费未来
@@ -10,7 +10,7 @@
 production entrypoint，不改变当前真机 dispatch owner，不授权任何设备动作，也不把 RTC 变成 M5.8/M6
 已有 gate 的隐含前提。
 
-## 当前实施状态（2026-07-23）
+## 当前实施状态（2026-07-24）
 
 RTC-1 已按 deployment-only 边界形成第一版 local-only 实现：
 
@@ -146,8 +146,9 @@ RTC-4b-T3（raw-RTC caller）已完成最小部署接线，但只开放 shadow�
 - 新增显式 `--rtc-real-shadow` 只读 guard：仅 raw-RTC 可用，live arm/hand endpoint 未显式开启时 fail-closed；RM65
   跳过奇异点/force/CANFD/tool-frame 写入，阻断 command/stop，阻断 DMTAC 启动配置与 tactile calibration 写入，并用
   直接 `Get_Current_Arm_State` 作为 impedance observation；`--debug` 还会记录统一的
-  `rtc_transport_exchange` identity/latency 事实，但它仍是 non-authoritative observability。该实现仍未在真机运行，不能
-  替代 RTC-6 证据；
+  `rtc_transport_exchange` identity/latency 事实，但它仍是 non-authoritative observability。R-R3/R-R3b/R-R4 已在显式
+  `send_actions=false` 边界下取得真实 observation/transport no-action 证据，R-R4 的显式 validity/drain 复跑已闭合
+  worker close；这些证据仍不能替代 canonical safety/IK、target acceptance 或 RTC-7 motion authority；
 - model-RTC 仍不在本批：任何 prefix/mask/conditioning receipt/identity promotion 继续归 RTC-4b-B 后续 gate。
 
 2026-07-23 受控回归：raw-RTC/OpenPI 四文件为 `82 passed`，仓内 RTC/OpenPI 全集为 `213 passed, 1 skipped`；只包含
@@ -312,9 +313,115 @@ transport relay连接这两个进程，不要求把两仓依赖合并。
 T2g scoped evidence见
 [`todos/evidence/rtc/rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json`](evidence/rtc/rtc_4b_t2g_vla_scratch_process_boundary_virtual_policy_evidence_v1.json)。
 
+RTC-4b-T2h 把第二框架验证中剩余的 final-chunk 接线重复收敛为公共 composition kit：
+
+- 新增 `create_final_chunk_rtc_runtime_adapter()`，由一个 instance-derived `FinalChunkRtcBinding` 唯一派生
+  capability/request spec，并组合 input preparation、blocking model call、精确 input hash、output mapping 与 decoder；
+  helper 不拥有 worker、timed plan、safety、target、reference 或 dispatch；
+- 新增精确 key 的 `MappingFinalChunkOutputAdapter`，允许 server 保留额外 diagnostics，同时分别校验 continuous/discrete
+  matrix 和 optional source-output identity；binding 声明离散维度但 mapping 未配置离散 key（或反向不一致）时在构造期拒绝；
+- vla-scratch 默认入口已直接使用公共 helper 和原生 `FinalChunkRtcBackend`，保留原命名 backend 作为兼容薄封装；
+  外部 `/home/zc/HandMotion/vla-scratch` 仍零修改。OpenPI 因拥有 metadata/session/reconnect 生命周期，继续直接实现
+  `RtcModelRuntimeAdapter`，本批不强迫其降级到 sessionless helper；
+- 聚焦跨适配器回归为 `87 passed`，覆盖公共 final-chunk、vla-scratch、通用 deploy runtime、OpenPI final-chunk 和
+  absolute canonicalizer；没有新增 production caller、依赖或动作权限，也没有修改 teleop/replay、Control Station、
+  `sync_queue_v1` 或 position lookahead。
+
+T2h 只提升“不同 final-chunk 模型框架接入 raw-RTC”的通用性，不宣称任意本体、任意 sim target 或 model-RTC 已自动适配。
+下一通用化 gate 应收敛 launcher 向 adapter factory 传递的 typed context，替代各 launcher 的大段 opaque kwargs；由于
+`teleop_runtime.deploy.run_policy` 与 OpenPI launcher 正在并行主线中变化，该 gate 必须先做接口审计和兼容 characterization，
+不能在本批直接改写 production caller。
+
+T2h scoped evidence见
+[`todos/evidence/rtc/rtc_4b_t2h_raw_rtc_final_chunk_composition_local_evidence_v1.json`](evidence/rtc/rtc_4b_t2h_raw_rtc_final_chunk_composition_local_evidence_v1.json)。
+
+### 下一执行主线：source portability 与 target intersection 分轨收敛
+
+2026-07-24 对“OpenPI raw-RTC → canonical pose/hand → MuJoCo scheduled target”建议进行代码级复核后，保留其
+raw-RTC 定义、canonical pre-safety 边界、target acceptance 独立性、latency-aware coverage、protocol-smoke/visual-alignment
+分证据和跨 provider/target 验收方向，但不原样执行其阶段顺序。当前代码事实要求分为两轨：
+
+```text
+S: model/source portability
+   final-chunk composition kit
+   -> typed launcher adapter-factory context
+
+T: target intersection
+   emission proof/catalog preflight
+   -> typed ControlTrace
+   -> early target admission
+   -> scheduled pose+DMTAC target
+
+S + T -> OpenPI+MuJoCo raw-RTC shadow -> sim authority
+```
+
+以下已有主线事实不得重复实现：
+
+- `PolicyDeployRuntime` 是 deployment source/emission seam，不是 MuJoCo/real target；RTC frontend 依赖它不等于依赖
+  real target。先保留该 owner，只有第二个非 `PolicyDeployRuntime` producer fixture 证明其接口过宽时才抽 protocol；
+- `ActionComponentCatalog`、`TargetRuntimeActionContract`、`ReferenceActivationSpec`、minimum activation margin 和
+  `ExecutionTargetAdmissionReceipt` 已存在；RTC 不再定义同名 catalog/target/receipt；
+- cadence 与 shadow gate 目前继续由 default-off `PolicyAsyncExecutionProfile` 表达。target authorization 使用既有
+  execution manifest/target contract；在首个 sim authority gate 前不先做三套 profile 的大范围重构；
+- Control Station 只组合已存在的 RTC source 与 target，不拥有 worker、plan、pop、canonicalizer 或 target safety。
+
+当前存在两个必须先闭合的真实阻塞：
+
+1. typed `PolicyActionEmission` 已以 canonicalization receipt 表达 source representation，但现有 MuJoCo emission
+   admission仍要求 legacy receipt；更早的阻塞是 `policy_action_emission` ControlTrace v1 使用精确字段集，typed payload
+   会因 canonical action/receipt 字段而 fail closed。typed trace 必须以新增 schema/version 落地，不能改写 v1 或影响
+   teleop/replay 已提交记录；
+2. 当前 keyframe 在 due-pop 时才形成唯一正式 emission，而 scheduled pose target 要求在生效前提交并满足 activation
+   lead。仅增大 `first_target_effective_at` 无效，因为 submission 仍发生在 due 时刻；提前使用 future successor 又违反
+   RTC-3c A 的 no-lookahead/no-hidden-reference 决定。因此 scheduled pose+DMTAC 必须等待 RTC-3d typed early-admission
+   gate，或一个等价、唯一且可 promotion 的正式提前 emission 协议。
+
+据此冻结后续 gate：
+
+1. **RTC-4b-T2i source factory context：** 在 `run_policy`/OpenPI launcher 主线接口稳定后，把 opaque kwargs 收敛为
+   typed、向后兼容的 adapter-factory context；不改变 sync caller、server payload 或模型；
+2. **RTC-TX1 target compatibility pure gate（已完成）：** `robot_motion/deploy/emission_target.py`只复用既有 target
+   contract/catalog/activation spec，评估 action space、clock、component scope、coupled group、pose frame/transform、
+   activation lead和 legacy/typed representation proof；assessment 只允许进入后续 target preflight，不调用
+   target、trace、IK、安全或 dispatch。assessment现同时绑定exact emission ID/hash；legacy pose frame contract/hash
+   必须与独立binding hash成对提供；
+3. **RTC-TX3a target-neutral proposal preparation（已完成）：** accepted assessment可形成绑定emission、
+   assessment、target/catalog/activation、representation proof和producer identity的`ActionProposalDraft`；target
+   control-domain/embodiment只能来自`TargetRuntimeActionContract`，固定`authority_request=none`。rejected assessment
+   不产生draft。真实`ProposalBuffer`伪target已验证首次admission和重复identity拒绝；本层不写ControlTrace、不调用
+   Arbiter/safety/IK/target/dispatch，也不接Control Station/HITL；
+4. **RTC-TX2 typed emission trace：** 新增 typed `policy_action_emission` schema/version及 committed-reader
+   characterization；legacy v1 hash/字段/reader保持不变。该项需等待并行 ControlTrace 主线稳定；
+5. **RTC-TX3b target receiver admission：** 待shared target seam稳定后，MuJoCo消费TX3a preparation，使用catalog
+   而非双臂字面量，并接受legacy representation receipt或typed canonicalization receipt；两者都只证明source
+   representation，不等于target safety receipt。不得在此步骤旁路TX2 formal trace要求；
+6. **RTC-3d early-admission：** typed identity、valid-until、canonical safety verdict、target acceptance receipt、
+   reference generation/source index、commit-through 与 later promotion 全部闭合后，才允许 scheduled target lead；
+7. **RTC-TX4 OpenPI+MuJoCo shadow：** 先用 `protocol_smoke`、`send_actions=false`，记录 target preflight、seam jump、
+   p50/p95/p99 latency、coverage/underrun、target rejection 和 drain；不授权 MuJoCo dispatch；
+8. **RTC-TX5 sim authority：** warm-up、startup coverage、latency-derived trigger、zero duplicate/catch-up、HOLD/rearm、
+   target safety/IK/reference receipts 和 DRAINED 全部满足后，仅授权 MuJoCo；
+9. **RTC-TX6 visual/generalization：** 独立 `visual_alignment` profile；再接一个非 OpenPI final-chunk provider和一个
+   非 MuJoCo deterministic target。sim authority 不推导 real authority。
+
+coverage trigger 的初始配置不得继续假设 `2 steps` 可覆盖 OpenPI 延迟；启用 TX4 前必须按同一 transport/profile
+实测值满足
+`ceil(p95 observation-to-admission / action_period) + guard_steps`，同时分别记录 prediction horizon、request TTL、
+admitted coverage、committed prefix 与 mutable future。冷启动结果只用于 warm-up，target保持 HOLD。
+
+本次审计曾尝试验证“typed canonical + immediate MuJoCo pose”，但现有安全契约明确禁止 production typed qpos，且
+MuJoCo pose profile明确只允许 scheduled reference；随后 target-only probe又被 typed ControlTrace v1字段检查拒绝。
+相关未闭合代码已撤回，没有在 runtime 留下 bypass。该 negative characterization 是上述 TX2/RTC-3d 排序的依据，
+不得表述为 target admission 已完成。
+
+TX1 scoped evidence见
+[`todos/evidence/rtc/rtc_tx1_policy_emission_target_compatibility_local_evidence_v1.json`](evidence/rtc/rtc_tx1_policy_emission_target_compatibility_local_evidence_v1.json)。
+TX3a scoped evidence见
+[`todos/evidence/rtc/rtc_tx3a_policy_emission_target_proposal_preparation_local_evidence_v1.json`](evidence/rtc/rtc_tx3a_policy_emission_target_proposal_preparation_local_evidence_v1.json)。
+
 RTC ownership与Control Station现明确分离：RTC core只位于`robot_motion/deploy`和`deployments/client`；Control Station
 不是RTC scheduler、worker、plan owner或必要caller。既有可选passive consumer属于外部application composition，不进入
-RTC-4b-T0/T1/T2a/T2b/T2c/T2d/T2e/T2f/T2g实现与测试依赖闭包。
+RTC-4b-T0/T1/T2a/T2b/T2c/T2d/T2e/T2f/T2g/T2h实现与测试依赖闭包。
 
 选择了第7.2节的窄 harness方案：RTC completion、plan merge与due pop需要同一个plan owner和control-loop顺序，
 不把这些职责塞进现有通用`DeterministicAsyncTopologyHarness`。两个fixture都使用显式ManualClock，但RTC runner是
@@ -2258,6 +2365,48 @@ fixture决定 contract：
 	     `todos/evidence/rtc/rtc_rr3b_openpi_relative_real_observation_admission_no_action_evidence_v1.json`以及
 	     `todos/evidence/rtc/rtc_rr3c_local_request_path_regression_v1.json`、
 	     `todos/evidence/rtc/rtc_rr3c_real_rerun_blocked_camera_v1.json`。
+	     2026-07-23追加deploy-only相机启动编排：通用deploy CLI新增default-off的
+	     `--camera-startup-hardware-reset`与`--camera-start-stagger-sec`；显式RTC real-shadow profile才固定启用
+	     serial-targeted hardware reset，并与当前真机遥操一致地按camera config插入顺序逐台启动、相邻启动间隔
+	     `0.5 s`。ordinary OpenPI profile、相机配置默认值和遥操/replay均不变。
+	     `teleop_runtime/configs/devices/realsense.json`是本gate唯一的逻辑角色来源：
+	     `front/left_wrist/right_wrist`只能绑定其中各自的librealsense serial，不按`/dev/video*`或V4L2展示的
+	     `Serial`字段重映射。2026-07-24用远端`pyrealsense2`只读枚举确认三台设备精确为
+	     `213222079798(D435)/261122273924(D405)/260522278055(D405)`，与权威配置完整匹配；此前依据V4L2字段作出的
+	     “配置设备缺失”判断已废止。
+	     随后按no-action边界尝试R-R3c gate，但两次均在camera start/reset之前被DMTAC assignment fail-closed：
+	     第一次缺`/dev/ttyUSB0`，第二次缺`/dev/ttyUSB1`。只读核对进一步确认，shared `dmtac/latest.json`保存的
+	     left/right `by-path`均不再匹配当前USB拓扑；两只CH340也没有可分别绑定的唯一USB serial，当前`by-id`只有
+	     一个非唯一别名。因此不能由RTC按`ttyUSB`序号推断左右，现有assignment的fail-closed对依赖共享assignment的
+	     production路径仍然合理。本批没有camera
+	     hardware reset、RTC frontend step、transport exchange、formal emission或dispatch。不得通过禁用末端、
+	     伪造hand state或重写assignment绕过。对于严格限定为`send_actions=false`、双侧observation-only且只验
+	     raw-RTC时序/identity/admission/emission/drain的mechanics shadow，可以使用现有deploy CLI的显式manual port
+	     override，并把左右物理身份未复核写入证据；该豁免不适用于policy side-semantics、canonical target或任何
+	     motion gate。证据见
+	     `todos/evidence/rtc/rtc_rr3d_real_rerun_blocked_dmtac_v1.json`。
+	     随后以当前默认参数完成R-R4 deploy-only回归：真实双臂/双DM-Tac/三相机观测在600个30 Hz step内进入同一
+	     OpenPI raw-RTC worker，完成19次request、18次response，10次merge接纳并形成9个唯一formal emission；
+	     `request_deadline_expired` 1次、`no_eligible_future` 7次，control budget exceedance为0，且全程
+	     `send_actions=false`、lookahead disabled、dispatch/action-step均为0。该默认profile的`request_validity_steps=10`
+	     与`worker_stop_timeout_sec=0`保持兼容，但最后一个in-flight request使close为`ABANDONED_UNDRAINED`，所以本批只
+	     证明真实输入→transport→admission/emission的shadow接线，不证明drained close或action readiness。证据见
+	     `todos/evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_evidence_v1.json`；
+	     下一步只需在仍然`send_actions=false`的边界下单独收敛raw-RTC drain/cancellation gate，不改变teleop/replay或
+	     `sync_queue_v1`。
+	     紧接着用显式`request_validity_steps=50`与`worker_stop_timeout_sec=2`完成R-R4 drain-gate复跑：900个30 Hz
+	     step内8次request/response，7次merge接纳、1次cold TTL拒绝，273个keyframe接纳、253个唯一formal emission；
+	     control tick最大`16.80 ms`、超预算为0，close为`DRAINED/thread_exited=true`，仍全程零dispatch/action-step。
+	     这闭合了真实输入→transport→admission/emission→bounded worker close的shadow gate，但不提升canonical safety/IK、
+	     target acceptance或motion authority。证据见
+	     `todos/evidence/rtc/rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_evidence_v1.json`。
+	     同参数独立复跑再次得到900个30 Hz step、8次完成exchange、7次merge接纳、1次cold TTL拒绝；
+	     290个admitted keyframe全部形成290个唯一formal emission，零重复、零budget exceedance，control tick
+	     median/p95/max为`0.58/13.17/17.58 ms`，close仍为`DRAINED/thread_exited=true`。日志中的442个underrun
+	     step分布在16段无可执行plan的窗口，未触发动作或隐藏lookahead；它们是本shadow下显式可观察的hold窗口，
+	     不是side identity的证明。三路相机按配置顺序reset/start，腕部少量约`0.11–0.13 s`的stale提示均自恢复。
+	     本次manual `ttyUSB0/1`绑定沿用共享遥操assignment中的历史side alias，但没有重新确认物理左右，因此只增强
+	     raw-RTC mechanics的可重复性证据，不增加model input语义或motion readiness结论。
    - 本批OpenPI adapter/launcher定向回归`69 passed`，RTC/OpenPI无硬件扩展矩阵`246 passed, 1 skipped`，
      canonical/position/deploy兼容矩阵`83 passed`；远端实际absolute `92599`与relative h16 `150000` artifact已拉取到
      临时目录并由本地新config解析；R-R2 live证据见

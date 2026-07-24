@@ -1,25 +1,31 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from control_composition.composition import (
+    CompositionAuthorityGateSpec,
+    CompositionInputDraft,
+    CompositionInputStore,
+    CompositionSpec,
+    DeterministicComposer,
+    build_composite_action_proposal_draft,
+    build_composition_input_snapshot,
+    decide_composition_authority_disposition,
+    project_composition_inputs,
+)
+from control_composition.retention import TimeWindowRetentionSpec
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     BIMANUAL_QPOS_V1,
     ActionComponentCatalog,
     ActionComponentSpec,
-    CompositionInputDraft,
-    CompositionInputStore,
-    CompositionSpec,
-    DeterministicComposer,
     ProposalBuffer,
     RobotAction,
-    build_composite_action_proposal_draft,
-    build_composition_input_snapshot,
-    project_composition_inputs,
 )
 from robot_motion.runtime.control_admission import ControlAdmissionCoordinator
 from robot_motion.runtime.identity import ClockDomainDescriptor
@@ -30,6 +36,7 @@ from teleop_runtime.control_trace.projection import (
     project_composition_input_admission,
     project_composition_input_snapshot,
     project_composition_result,
+    project_composition_spec,
 )
 
 
@@ -68,7 +75,12 @@ def runtime():
         runtime_session_id="session-0",
         coordinator=coordinator,
         producer_epochs=epochs,
-        capacity=32,
+        retention_spec=TimeWindowRetentionSpec(
+            spec_id="action-composition-test-window-v1",
+            history_window_sec=0.0,
+            max_future_lead_sec=2.0,
+            max_effective_duration_sec=2.0,
+        ),
     )
     proposals = ProposalBuffer(
         runtime_session_id="session-0",
@@ -129,6 +141,8 @@ def input_draft(
     action: RobotAction,
     sequence: int = 0,
     context_ids=(),
+    source_fact_ids=(),
+    source_fact_hashes=(),
 ) -> CompositionInputDraft:
     return CompositionInputDraft(
         runtime_session_id="session-0",
@@ -146,6 +160,8 @@ def input_draft(
         context_ids=tuple(context_ids),
         observation_cut_id=f"cut:{producer}:{sequence}",
         policy_output_id=f"output:{producer}:{sequence}",
+        source_fact_ids=tuple(source_fact_ids),
+        source_fact_hashes=tuple(source_fact_hashes),
     )
 
 
@@ -388,6 +404,95 @@ def test_weighted_se3_pose_composition_is_generic_and_deterministic() -> None:
     assert math.isclose(yaw, 45.0, abs_tol=1e-4)
 
 
+def test_weighted_pose_composition_supports_single_arm_manifest() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    for producer, role, x in (
+        ("slow-base", "policy_pose", 0.2),
+        ("fast-residual", "human_pose", 0.4),
+    ):
+        store.admit(
+            input_draft(
+                producer=producer,
+                role=role,
+                action=RobotAction(
+                    action_space=BIMANUAL_EE_POSE_V1,
+                    arm_pose_by_side={
+                        "left": np.asarray(
+                            [x, -0.1, 0.3, 0.0, 0.0, 0.0, 1.0],
+                            dtype=np.float32,
+                        )
+                    },
+                    active_effectors=("left_arm",),
+                    source=role,
+                ),
+            )
+        )
+    spec = CompositionSpec(
+        spec_id="weighted-se3-left-arm-v1",
+        algebra="weighted_se3_pose_fusion",
+        input_roles=("human_pose", "policy_pose"),
+        required_roles=("human_pose", "policy_pose"),
+        weight_by_role={"human_pose": 0.5, "policy_pose": 0.5},
+        max_translation_disagreement_m=0.3,
+        max_rotation_disagreement_rad=math.radians(60.0),
+        pose_component_dependencies=("left_arm",),
+    )
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+    result = DeterministicComposer().compose(snapshot, spec=spec)
+
+    assert result.output_status == "ready"
+    assert result.composed_action is not None
+    assert result.composed_action.active_effectors == ("left_arm",)
+    assert set(result.composed_action.arm_pose_by_side) == {"left"}
+    np.testing.assert_allclose(
+        result.composed_action.arm_pose_by_side["left"][:3],
+        [0.3, -0.1, 0.3],
+        atol=1e-7,
+    )
+
+
+def test_default_weighted_pose_spec_hash_keeps_legacy_payload() -> None:
+    spec = CompositionSpec(
+        spec_id="weighted-se3-pose-v1",
+        algebra="weighted_se3_pose_fusion",
+        input_roles=("human_pose", "policy_pose"),
+        required_roles=("human_pose", "policy_pose"),
+        weight_by_role={"human_pose": 0.5, "policy_pose": 0.5},
+        max_translation_disagreement_m=0.3,
+        max_rotation_disagreement_rad=math.radians(100.0),
+    )
+    expected = canonical_content_hash(
+        {
+            "spec_id": spec.spec_id,
+            "algebra": spec.algebra,
+            "input_roles": spec.input_roles,
+            "required_roles": spec.required_roles,
+            "missing_required_behavior": spec.missing_required_behavior,
+            "missing_residual_behavior": spec.missing_residual_behavior,
+            "residual_limit_by_component": spec.residual_limit_by_component,
+            "weight_by_role": spec.weight_by_role,
+            "max_translation_disagreement_m": (
+                spec.max_translation_disagreement_m
+            ),
+            "max_rotation_disagreement_rad": (
+                spec.max_rotation_disagreement_rad
+            ),
+            "rotation_fusion": (
+                "deterministic_reference_shortest_path_so3_tangent_mean_v1"
+            ),
+        },
+        domain="dexteleop.composition_spec.v1",
+    )
+
+    assert spec.semantic_content_hash == expected
+
+
 def test_weighted_se3_pose_composition_missing_role_and_conflict_fail_closed() -> None:
     _, coordinator, epochs, store, _, _ = runtime()
     store.admit(
@@ -482,6 +587,167 @@ def test_existing_composition_spec_hash_does_not_gain_pose_fusion_fields() -> No
     assert spec.semantic_content_hash == expected
 
 
+def test_formal_composition_gate_publishes_only_ready_result() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    for producer, role, value in (
+        ("slow-base", "human_pose", 0.2),
+        ("fast-residual", "replay_pose", 0.3),
+    ):
+        assert store.admit(
+            input_draft(
+                producer=producer,
+                role=role,
+                action=pose_action(value),
+            )
+        ).accepted
+    spec = CompositionSpec(
+        spec_id="formal-human-replay-se3-v1",
+        algebra="weighted_se3_pose_fusion",
+        input_roles=("human_pose", "replay_pose"),
+        required_roles=("human_pose", "replay_pose"),
+        weight_by_role={"human_pose": 0.5, "replay_pose": 0.5},
+        max_translation_disagreement_m=0.2,
+        max_rotation_disagreement_rad=math.radians(60.0),
+    )
+    gate = CompositionAuthorityGateSpec(
+        gate_spec_id="formal-human-replay-authority-v1",
+        composition_spec_hash=spec.semantic_content_hash,
+        composer_producer_id="composer",
+        missing_behavior_by_role={
+            "human_pose": "hold",
+            "replay_pose": "hold",
+        },
+        proposal_ttl_sec=0.1,
+    )
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+    result = DeterministicComposer().compose(snapshot, spec=spec)
+    first = decide_composition_authority_disposition(
+        snapshot,
+        result,
+        spec=spec,
+        gate_spec=gate,
+    )
+    second = decide_composition_authority_disposition(
+        snapshot,
+        result,
+        spec=spec,
+        gate_spec=gate,
+    )
+    assert first.action == "publish_proposal"
+    assert first.reason == "ready_composition"
+    assert first.semantic_content_hash == second.semantic_content_hash
+
+
+def test_formal_composition_gate_holds_on_required_ttl_or_conflict() -> None:
+    _, coordinator, epochs, store, _, _ = runtime()
+    assert store.admit(
+        input_draft(
+            producer="slow-base",
+            role="replay_pose",
+            action=pose_action(0.2),
+        )
+    ).accepted
+    spec = CompositionSpec(
+        spec_id="formal-human-replay-fail-closed-v1",
+        algebra="weighted_se3_pose_fusion",
+        input_roles=("human_pose", "replay_pose"),
+        required_roles=("human_pose", "replay_pose"),
+        weight_by_role={"human_pose": 0.5, "replay_pose": 0.5},
+        max_translation_disagreement_m=0.05,
+        max_rotation_disagreement_rad=math.radians(30.0),
+    )
+    gate = CompositionAuthorityGateSpec(
+        gate_spec_id="formal-human-replay-gate-v1",
+        composition_spec_hash=spec.semantic_content_hash,
+        composer_producer_id="composer",
+        missing_behavior_by_role={
+            "human_pose": "hold",
+            "replay_pose": "hold",
+        },
+        proposal_ttl_sec=0.1,
+    )
+    cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    missing_snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, cut),
+        producer_epochs=epochs.snapshot(cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+    missing_result = DeterministicComposer().compose(
+        missing_snapshot,
+        spec=spec,
+    )
+    missing = decide_composition_authority_disposition(
+        missing_snapshot,
+        missing_result,
+        spec=spec,
+        gate_spec=gate,
+    )
+    assert missing.action == "hold"
+    assert missing.reason == "required_contributor_missing"
+
+    assert store.admit(
+        input_draft(
+            producer="fast-residual",
+            role="human_pose",
+            action=pose_action(0.5),
+            sequence=1,
+        )
+    ).accepted
+    conflict_cut = coordinator.capture_cut(cutoff_at=10.0).cut
+    conflict_snapshot = build_composition_input_snapshot(
+        project_composition_inputs(store, conflict_cut),
+        producer_epochs=epochs.snapshot(conflict_cut),
+        spec=spec,
+        target_effective_at=10.5,
+    )
+    conflict_result = DeterministicComposer().compose(
+        conflict_snapshot,
+        spec=spec,
+    )
+    conflict = decide_composition_authority_disposition(
+        conflict_snapshot,
+        conflict_result,
+        spec=spec,
+        gate_spec=gate,
+    )
+    assert conflict.action == "hold"
+    assert conflict.reason == "composition_invalid"
+
+
+def test_formal_composition_gate_rejects_unsafe_required_fallback() -> None:
+    spec = CompositionSpec(
+        spec_id="formal-required-role-v1",
+        algebra="weighted_se3_pose_fusion",
+        input_roles=("human_pose", "replay_pose"),
+        required_roles=("human_pose",),
+        weight_by_role={"human_pose": 0.5, "replay_pose": 0.5},
+        max_translation_disagreement_m=0.2,
+        max_rotation_disagreement_rad=math.radians(60.0),
+    )
+    gate = CompositionAuthorityGateSpec(
+        gate_spec_id="unsafe-formal-fallback-v1",
+        composition_spec_hash=spec.semantic_content_hash,
+        composer_producer_id="composer",
+        missing_behavior_by_role={
+            "human_pose": "drop_and_renormalize",
+            "replay_pose": "drop_and_renormalize",
+        },
+        proposal_ttl_sec=0.1,
+    )
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "Required formal contributors must HOLD",
+    ):
+        gate.validate_composition_spec(spec)
+
+
 def test_composition_trace_records_keep_input_ids_and_hashes() -> None:
     _, coordinator, epochs, store, _, _ = runtime()
     receipt = store.admit(
@@ -522,10 +788,102 @@ def test_composition_trace_records_keep_input_ids_and_hashes() -> None:
         occurred_at=10.0,
         clock_domain_id="control.monotonic",
     )
+    spec_fact = project_composition_spec(
+        spec,
+        runtime_session_id="session-0",
+        control_domain_id="robot-0",
+        embodiment_instance_id="rm65-pair-0",
+        occurred_at=10.0,
+        clock_domain_id="control.monotonic",
+    )
     assert admission_fact.event_type == "composition_input_admission"
+    assert input_fact.event_type == "composition_input"
+    assert "source_fact_ids" not in input_fact.payload
     assert input_fact.payload["authority_candidate"] is False
     assert snapshot_fact.payload["selected_input_ids_by_role"]["base"] == (
         receipt.composition_input_id
     )
     assert result_fact.payload["input_ids"] == result.input_ids
     assert result_fact.payload["input_hashes"] == result.input_hashes
+    assert spec_fact.event_type == "composition_spec"
+    assert spec_fact.payload["algebra"] == spec.algebra
+    assert spec_fact.payload["semantic_content_hash"] == (
+        spec.semantic_content_hash
+    )
+
+
+def test_generic_contributor_input_has_explicit_source_lineage() -> None:
+    _, _, _, store, _, _ = runtime()
+    source_ids = ("human-emission:0", "human-adapter-receipt:0")
+    source_hashes = ("a" * 64, "b" * 64)
+    receipt = store.admit(
+        input_draft(
+            producer="slow-base",
+            role="human_pose",
+            action=pose_action(0.2),
+            source_fact_ids=source_ids,
+            source_fact_hashes=source_hashes,
+        )
+    )
+    assert receipt.accepted and receipt.composition_input is not None
+    fact = project_composition_input(
+        receipt.composition_input,
+        embodiment_instance_id="rm65-pair-0",
+    )
+    assert fact.event_type == "composition_contributor_input"
+    assert fact.payload["source_fact_ids"] == source_ids
+    assert fact.payload["source_fact_hashes"] == source_hashes
+    assert fact.payload["context_ids"] == ()
+
+
+def test_input_snapshot_closes_time_window_without_losing_sequence_tombstone() -> None:
+    clock, coordinator, epochs, store, _, _ = runtime()
+    original_draft = replace(
+        input_draft(
+            producer="slow-base",
+            role="base",
+            action=qpos_action(0.1),
+        ),
+        effective_from=10.0,
+        effective_until=10.2,
+    )
+    receipt = store.admit(original_draft)
+    assert receipt.accepted
+
+    clock.value = 10.15
+    cut = coordinator.capture_cut(cutoff_at=clock.value).cut
+    selected = store.capture_snapshot(
+        cut,
+        producer_epochs=epochs.snapshot(cut),
+        spec=residual_spec(),
+        target_effective_at=clock.value,
+    )
+    assert selected.selected_input_by_role["base"].composition_input_id == (
+        receipt.composition_input_id
+    )
+    assert len(store) == 1
+
+    clock.value = 10.25
+    later_cut = coordinator.capture_cut(cutoff_at=clock.value).cut
+    missing = store.capture_snapshot(
+        later_cut,
+        producer_epochs=epochs.snapshot(later_cut),
+        spec=residual_spec(),
+        target_effective_at=clock.value,
+    )
+    assert "base" in missing.missing_roles
+    health = store.retention_snapshot()
+    assert health.closed_target_through == clock.value
+    assert health.retained_record_count == 0
+    assert health.pruned_record_count == 1
+    assert health.producer_epoch_tombstone_count == 1
+
+    duplicate = store.admit(
+        replace(
+            original_draft,
+            effective_from=10.25,
+            effective_until=10.5,
+        )
+    )
+    assert not duplicate.accepted
+    assert duplicate.rejection_code == "duplicate"

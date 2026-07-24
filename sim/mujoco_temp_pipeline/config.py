@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -31,12 +32,20 @@ class RewardShapingConfig:
     grasp_acquire_gate: float = 0.25
     grasp_acquire_bonus: float = 1.0
     grasp_close_confidence_width: float = 0.05
+    bilateral_contact_reward_scale: float = 0.0
+    bilateral_contact_acquire_bonus: float = 0.0
+    bilateral_contact_missing_penalty: float = 0.0
+    require_bilateral_contact_for_lift_reward: bool = False
+    ungated_negative_lift_progress: bool = False
     latch_reward_scale: float = 0.50
     lift_reward_scale: float = 6.0
     lift_progress_scale: float = 30.0
     success_bonus: float = 20.0
     action_penalty: float = 0.01
     safety_projection_penalty: float = 0.25
+    time_limit_penalty: float = 0.0
+    failure_termination_penalty: float = 0.0
+    unsafe_termination_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         non_negative = {
@@ -53,6 +62,14 @@ class RewardShapingConfig:
             "action_penalty": self.action_penalty,
             "safety_projection_penalty": self.safety_projection_penalty,
             "grasp_acquire_bonus": self.grasp_acquire_bonus,
+            "bilateral_contact_reward_scale": self.bilateral_contact_reward_scale,
+            "bilateral_contact_acquire_bonus": self.bilateral_contact_acquire_bonus,
+            "bilateral_contact_missing_penalty": (
+                self.bilateral_contact_missing_penalty
+            ),
+            "time_limit_penalty": self.time_limit_penalty,
+            "failure_termination_penalty": self.failure_termination_penalty,
+            "unsafe_termination_penalty": self.unsafe_termination_penalty,
         }
         invalid = {name: value for name, value in non_negative.items() if value < 0.0}
         if invalid:
@@ -87,6 +104,16 @@ class RewardShapingConfig:
                 "Staged reward unit values must lie in [0, 1]: "
                 f"{unit_values}."
             )
+        object.__setattr__(
+            self,
+            "require_bilateral_contact_for_lift_reward",
+            bool(self.require_bilateral_contact_for_lift_reward),
+        )
+        object.__setattr__(
+            self,
+            "ungated_negative_lift_progress",
+            bool(self.ungated_negative_lift_progress),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,6 +142,9 @@ class PPOConfig:
     checkpoint_interval: int = 50_000
     start_method: str = "spawn"
     device: str = "auto"
+    initial_log_std: float = -0.5
+    final_log_std: float = -2.5
+    std_anneal_fraction: float = 0.75
 
     def __post_init__(self) -> None:
         positive_ints = {
@@ -140,6 +170,16 @@ class PPOConfig:
             raise ValueError(f"PPO unit-interval settings invalid: {unit_interval}.")
         if self.learning_rate <= 0.0 or self.max_grad_norm <= 0.0:
             raise ValueError("learning_rate and max_grad_norm must be positive.")
+        if not math.isfinite(float(self.initial_log_std)) or not math.isfinite(
+            float(self.final_log_std)
+        ):
+            raise ValueError("PPO log standard deviations must be finite.")
+        if self.final_log_std > self.initial_log_std:
+            raise ValueError(
+                "final_log_std cannot exceed initial_log_std for exploration annealing."
+            )
+        if not 0.0 < float(self.std_anneal_fraction) <= 1.0:
+            raise ValueError("std_anneal_fraction must lie in (0, 1].")
 
     @property
     def batch_size(self) -> int:

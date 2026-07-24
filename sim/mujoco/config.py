@@ -6,7 +6,13 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from cameras.configs import DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH = (
+    REPO_ROOT
+    / "robot_motion"
+    / "configs"
+    / "rm65_camera_registry.json"
+)
 
 
 @dataclass(frozen=True)

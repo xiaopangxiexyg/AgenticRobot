@@ -86,6 +86,15 @@ held-out result, while v2 and v1 remain historical. Promotion to `identified`
 requires a new clean capture collected after v4 is frozen and never used for
 tuning.
 
+The v4 fit manifest remains immutable when unrelated runtime configuration
+ownership changes. The current complete simulation contract is bound to that
+fit through
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260724_v1.json`.
+This binding records the camera-registry move into `robot_motion/configs/`,
+binds both current inputs by content hash, and explicitly carries forward the
+v4 `provisional` and held-out `not_run` status. It is a runtime contract rebind,
+not a refit or a new fidelity result.
+
 ### DM-Tac position baseline: `20260722.v1`
 
 The bilateral suite `dmtac_bimanual_position_20260722_184856_698964` completed

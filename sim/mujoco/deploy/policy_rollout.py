@@ -23,7 +23,11 @@ from typing import Any, Mapping, Protocol, Sequence
 import numpy as np
 
 from robot_motion.action import RobotAction
-from robot_motion.deploy import DeployRobotActionAdapter, DeploymentObservation
+from robot_motion.deploy import (
+    DeployRobotActionAdapter,
+    DeploymentObservation,
+    NormalizedAction,
+)
 
 
 class MujocoPolicyRolloutError(RuntimeError):
@@ -147,6 +151,36 @@ def _prediction_metadata(prediction: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _raw_action_with_observation_specs(
+    action: Any,
+    observation: DeploymentObservation,
+) -> Any:
+    """Carry typed embodiment specs across the legacy dense-vector boundary.
+
+    Legacy OpenPI clients return plain ``[26]`` vectors, while the compound
+    DMTAC profile needs the hand action spec to remain explicit.  The
+    observation is the authoritative source for those model-neutral component
+    semantics; numeric action values and already-typed ``NormalizedAction``
+    values are left unchanged.
+    """
+
+    if isinstance(action, NormalizedAction):
+        return action
+    observation_metadata = observation.metadata
+    semantic_metadata = {
+        key: observation_metadata[key]
+        for key in ("arm_action_specs_by_side", "hand_action_specs_by_side")
+        if key in observation_metadata
+    }
+    if not semantic_metadata:
+        return action
+    try:
+        vector = np.asarray(action, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return action
+    return NormalizedAction(vector=vector, metadata=semantic_metadata)
+
+
 class MujocoPolicyRollout:
     """Own one sim-only model deployment lifecycle.
 
@@ -232,7 +266,7 @@ class MujocoPolicyRollout:
         for index, raw_action in enumerate(raw_actions):
             try:
                 result = self.action_adapter.adapt(
-                    raw_action,
+                    _raw_action_with_observation_specs(raw_action, observation),
                     observation,
                     policy_name=self.config.policy_output_prefix,
                 )

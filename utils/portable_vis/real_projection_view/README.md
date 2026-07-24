@@ -60,7 +60,7 @@ Sources:
   `metadata.load_profile` when needed.
 - Runtime camera intrinsics from `<dataset>/meta/devices/realsense.json`.
 - Static front camera extrinsic from
-  `cameras/configs/rm65/cameras/realsense_registry.json`.
+  `robot_motion/configs/rm65_camera_registry.json`.
 
 The current implementation intentionally targets the static `front` camera,
 whose parent frame is `right_arm_base_link`.

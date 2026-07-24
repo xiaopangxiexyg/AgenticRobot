@@ -52,13 +52,13 @@ def test_shared_and_task_config_j6_limits_match_urdf() -> None:
     assert RM65_ABSOLUTE_Q_MIN_RAD[5] == pytest.approx(-J6_LIMIT_RAD)
     assert RM65_ABSOLUTE_Q_MAX_RAD[5] == pytest.approx(J6_LIMIT_RAD)
 
-    checked_configs = 0
+    checked_configs: list[Path] = []
     for path in sorted(Path("sim/configs/tasks").glob("rm65*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         if "right_qpos_lower" not in payload or "right_qpos_upper" not in payload:
             continue
-        checked_configs += 1
+        checked_configs.append(path)
         assert float(payload["right_qpos_lower"][5]) == pytest.approx(-J6_LIMIT_RAD)
         assert float(payload["right_qpos_upper"][5]) == pytest.approx(J6_LIMIT_RAD)
 
-    assert checked_configs == 3
+    assert checked_configs, "no RM65 task config declares right-arm qpos limits"

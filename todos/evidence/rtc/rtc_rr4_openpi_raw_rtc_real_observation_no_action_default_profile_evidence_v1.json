@@ -1,0 +1,139 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr4_openpi_raw_rtc_real_observation_no_action_default_profile_2026_07_24",
+  "captured_at": "2026-07-24T15:05:56+08:00",
+  "scope": "real_observation_openpi_raw_rtc_default_profile_no_action_regression",
+  "gate_result": "transport_admission_and_emission_passed_default_profile_drain_gate_not_passed",
+  "repository": {
+    "worktree_global_state": "dirty_concurrent_mainline_preserved",
+    "rtc_changes_scope": "deploy_only_default_off",
+    "teleop_or_replay_modified_by_rtc": false,
+    "sim_observation_modified_by_rtc": false,
+    "openpi_checkout_modified": false
+  },
+  "loaded_instance": {
+    "evidence_only_not_compatibility_allowlist": true,
+    "model_id": "0715-cube-front-ready-mix-4to1-relative",
+    "checkpoint_step": 149999,
+    "action_pose_mode": "relative",
+    "prediction_horizon_steps": 50,
+    "model_action_dim": 16,
+    "model_state_dim": 32,
+    "camera_source_keys": ["front", "left_wrist", "right_wrist"]
+  },
+  "identity_bindings": {
+    "layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+    "frame_contract_hash": "sha256:c8d881305707dc8d83da3a4d0dab9c3bbb0057ecfd560a9e9ac4ae00fb66b71c",
+    "normalization_hash": "sha256:66debe51033f068bcb71029799dd26fe9e523c4aaef068e4746c60c997dbae6b",
+    "pose_chunk_contract_hash": "sha256:da33eafb4ce6a065ded8934abd3db73249b8c6e1868ca51dc838a63a5f5427a4",
+    "continuation_mode": "none"
+  },
+  "boundary": {
+    "rtc_profile": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "rtc_real_shadow": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "arm_observation_only": true,
+    "left_gripper_observation_only": true,
+    "right_gripper_observation_only": true,
+    "gripper_send_commands": false,
+    "tactile_enabled": false,
+    "position_reference_called": false,
+    "dispatch_called": false,
+    "action_send_authority": false
+  },
+  "real_observation": {
+    "loop_steps": 600,
+    "effective_action_hz": 30.0,
+    "effective_policy_hz": 30.0,
+    "state_valid_after_warmup": "38/38",
+    "camera_startup_hardware_reset": true,
+    "camera_start_stagger_sec": 0.5,
+    "camera_serials": {
+      "front": "213222079798",
+      "left_wrist": "261122273924",
+      "right_wrist": "260522278055"
+    },
+    "dmtac_assignment": {
+      "left": "/dev/ttyUSB0",
+      "right": "/dev/ttyUSB1",
+      "observation_only": true,
+      "send_commands": false
+    }
+  },
+  "explicit_rtc_parameters": {
+    "request_validity_steps": 10,
+    "worker_stop_timeout_sec": 0.0,
+    "control_budget_sec": 0.03333333333333333
+  },
+  "transport_and_admission": {
+    "request_submitted_count": 19,
+    "completed_exchange_count": 18,
+    "source_chunk_horizon": 50,
+    "exchange_duration_sec": {
+      "min": 0.7078618,
+      "mean": 0.7146511,
+      "max": 0.7402261
+    },
+    "accepted_merge_count": 10,
+    "rejected_merge_count": 8,
+    "rejection_reasons": {
+      "request_deadline_expired": 1,
+      "no_eligible_future": 7
+    },
+    "formal_emission_count": 9,
+    "unique_formal_emission_id_count": 9,
+    "selected_emission_count": 9,
+    "duplicate_formal_emission_detected": false,
+    "control_budget_exceeded_count": 0,
+    "all_exchanges_non_authoritative": true
+  },
+  "control_and_authority": {
+    "blocking_model_inference_ran_in_worker": true,
+    "action_step_count": 0,
+    "legacy_execution_observation_count": 0,
+    "dispatch_count": 0,
+    "exchange_action_send_authority_all_false": true,
+    "position_lookahead_values": [false],
+    "send_actions_values": [false]
+  },
+  "shutdown": {
+    "worker_session_state": "ABANDONED_UNDRAINED",
+    "worker_thread_exited_at_frontend_close": false,
+    "client_process_exited": true,
+    "server_process_cleaned": true,
+    "loopback_port_8078_closed": true,
+    "gate_passed": false,
+    "interpretation": "worker_stop_timeout_sec=0.0 left one inference in flight at bounded test close; this is a drain caveat, not an action dispatch"
+  },
+  "raw_log_attestation": {
+    "remote_debug_jsonl": "/tmp/rtc_rr4_client_final_debug/deploy_debug_20260724_150556_762.jsonl",
+    "remote_wrapper_log": "/tmp/rtc_rr4_client_final/remote_python_20260724_150556.log",
+    "local_pull_root": "/tmp/rtc_rr4_real_shadow_logs",
+    "debug_jsonl_sha256": "da81d860666a91468a98c140072f744e9c0a9669743fdf31b05ef1199f10f44b",
+    "wrapper_log_sha256": "6310d22ec6cedced5b5917a3eba7593029f626dfda625272217153490ec564a8",
+    "debug_event_counts": {
+      "startup": 1,
+      "rtc_frontend_step": 600,
+      "rtc_transport_exchange": 18,
+      "rtc_frontend_close": 1
+    }
+  },
+  "interpretation": {
+    "verified": [
+      "real arm/gripper/camera observations reached the raw-RTC client",
+      "OpenPI final-chunk transport, request/result identity and timed-plan admission ran in a worker without control-budget exceedance",
+      "accepted keyframes produced one formal emission each under position-lookahead-disabled shadow",
+      "send_actions=false and observation-only guards resulted in zero dispatch/action-step calls"
+    ],
+    "not_established": [
+      "production motion or action authority",
+      "drained worker close for the default zero-second stop policy",
+      "real-time action deployment readiness"
+    ],
+    "next_gate": [
+      "repeat with an explicit raw-RTC drain/cancellation policy and require worker_thread_exited_at_frontend_close=true",
+      "keep send_actions=false and preserve sync_queue_v1, teleop and replay behavior"
+    ]
+  }
+}

@@ -61,11 +61,16 @@ def advance_fix_arm_home_capture(
     if elapsed_sec > timeout_sec:
         sample_count = controller.sample_count
         min_samples = controller.min_samples
+        stability_reason = (
+            controller.recalibration_stability_reason
+            or "waiting_for_valid_fresh_tracker_sample"
+        )
         transition = controller.fail_recalibration(
             now=now,
             message=(
                 f"fix-arm {side} home recapture timed out: "
-                f"{sample_count}/{min_samples} samples"
+                f"{sample_count}/{min_samples} samples; "
+                f"reason={stability_reason}"
             ),
         )
         return FixArmHomeCaptureProgress(
@@ -78,6 +83,8 @@ def advance_fix_arm_home_capture(
             elapsed_sec=elapsed_sec,
             timeout_sec=timeout_sec,
             waiting_for_samples=True,
+            waiting_for_stability=sample_count == 0,
+            stability_reason=stability_reason,
         )
 
     channel = channels.get(f"{side}_wrist_pose")
@@ -89,6 +96,16 @@ def advance_fix_arm_home_capture(
         and np.isfinite(source_timestamp)
         and -0.05 <= source_age_sec <= 0.5
     )
+    if not valid:
+        if channel is None:
+            unavailable_reason = "tracker_channel_missing"
+        elif not bool(getattr(channel, "valid", False)):
+            unavailable_reason = "tracker_channel_invalid"
+        elif not np.isfinite(source_timestamp):
+            unavailable_reason = "tracker_timestamp_invalid"
+        else:
+            unavailable_reason = f"tracker_sample_age_out_of_range:{source_age_sec:.3f}s"
+        controller.note_recalibration_unavailable(unavailable_reason)
     if valid:
         try:
             pose = pose_from_channel(channel, calibration)
@@ -119,7 +136,10 @@ def advance_fix_arm_home_capture(
     stability_reason = (
         controller.recalibration_stability_reason
         if valid
-        else "waiting_for_valid_fresh_tracker_sample"
+        else (
+            controller.recalibration_stability_reason
+            or "waiting_for_valid_fresh_tracker_sample"
+        )
     )
 
     if controller.sample_count < controller.min_samples:

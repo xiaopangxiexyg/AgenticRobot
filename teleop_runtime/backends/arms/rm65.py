@@ -809,6 +809,12 @@ class RM65ArmBackend(EffectorBackend):
         self._prepared_effective_step_time: float | None = None
         self._state_lock = threading.RLock()
         self._send_lock = threading.RLock()
+        # Dedicated state connections may serve both dataset qpos polling and
+        # the position-force safety guard.  The RM65 SDK handle is not safe for
+        # concurrent request/response calls, so serialize reads without
+        # contending with the independent command connection.
+        self._hardware_read_lock = threading.RLock()
+        self._last_force_query_monotonic: float | None = None
         self._singularity_analysis_lock = threading.RLock()
         self._emergency_stopped = False
         self._stream_target_qpos: np.ndarray | None = None
@@ -4418,7 +4424,10 @@ class RM65ArmBackend(EffectorBackend):
         qpos_from_joint_now = None
         for attempt in range(retry_count):
             try:
-                raw_result, joint_now, pose_now, arm_err, sys_err = self.arm.Get_Current_Arm_State()
+                with self._hardware_read_lock:
+                    raw_result, joint_now, pose_now, arm_err, sys_err = (
+                        self.arm.Get_Current_Arm_State()
+                    )
             except Exception as exc:
                 raw_result = f"EXCEPTION: {exc}"
                 joint_now = None
@@ -4470,6 +4479,69 @@ class RM65ArmBackend(EffectorBackend):
             include_derived_pose=bool(include_derived_pose),
             include_timing_percentiles=bool(include_timing_percentiles),
         )
+
+    def read_force_data(self) -> dict[str, object]:
+        """Read one validated RM65 force sample from this backend connection."""
+
+        if self.arm is None:
+            raise RuntimeError(f"{self.name} RM65 force read requires a hardware connection")
+        started_monotonic = time.monotonic()
+        # The vendor SDK requires at least 50 ms between *actual* repeated
+        # Get_Force_Data calls.  Pacing only the monitor loop is insufficient:
+        # an intervening qpos read can shift one force call later and make the
+        # next call occur less than 50 ms afterwards.  Enforce the interval at
+        # the serialized SDK boundary while leaving the lock free during the
+        # wait so qpos feedback can continue.
+        while True:
+            with self._hardware_read_lock:
+                query_now = time.monotonic()
+                previous_query = self._last_force_query_monotonic
+                wait_sec = (
+                    0.0
+                    if previous_query is None
+                    else 0.05 - (query_now - previous_query)
+                )
+                if wait_sec <= 0.0:
+                    self._last_force_query_monotonic = query_now
+                    result = self.arm.Get_Force_Data()
+                    break
+            time.sleep(wait_sec)
+        if not isinstance(result, (tuple, list)) or len(result) != 5:
+            raise RuntimeError(
+                f"{self.name} Get_Force_Data returned an invalid result shape"
+            )
+        raw_code, raw, zero, work, tool = result
+        code, result_text = _parse_rm65_result(raw_code)
+        if code != 0:
+            raise RuntimeError(
+                f"{self.name} Get_Force_Data failed: {result_text}"
+            )
+        sources: dict[str, np.ndarray] = {}
+        for source, values in (
+            ("raw", raw),
+            ("zero", zero),
+            ("work", work),
+            ("tool", tool),
+        ):
+            try:
+                vector = np.asarray(values, dtype=float).reshape(-1)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{self.name} {source} force is not numeric"
+                ) from exc
+            if vector.shape != (6,) or not np.all(np.isfinite(vector)):
+                raise RuntimeError(
+                    f"{self.name} {source} force must contain 6 finite values"
+                )
+            sources[source] = vector.copy()
+        return {
+            "sources": sources,
+            "monotonic_time_sec": time.monotonic(),
+            "wall_time_sec": time.time(),
+            "read_elapsed_sec": time.monotonic() - started_monotonic,
+            "result_code": code,
+            "result_text": result_text,
+        }
 
     def get_state(
         self,

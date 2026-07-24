@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from robot_motion.action import CompositionInputDraft, CompositionSpec, RobotAction
-from robot_motion.deploy import PolicyContextDraft
+from control_composition.composition import (
+    CompositionContextDraft,
+    CompositionInputDraft,
+    CompositionSpec,
+)
+from robot_motion.action import RobotAction
 from sim.contracts import TimingSpec
 from sim.mujoco.adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
 from sim.mujoco.deploy import (
@@ -115,18 +119,18 @@ def context_draft(
     epoch: int,
     produced_at: float,
     effective_until: float,
-) -> PolicyContextDraft:
+) -> CompositionContextDraft:
     observation = runtime.capture_policy_observation(
         policy_node_id="slow-vision",
         trigger_reason="async_fixture",
     )
-    return PolicyContextDraft(
+    return CompositionContextDraft(
         runtime_session_id=runtime.config.runtime_session_id,
         control_domain_id=runtime.config.control_domain_id,
         producer_id="slow-context",
         producer_epoch=epoch,
         sequence=sequence,
-        policy_node_id="slow-vision",
+        producer_node_id="slow-vision",
         context_channel="motion-plan",
         context_kind="trajectory_plan",
         semantic_payload={"sequence": sequence},
@@ -135,7 +139,7 @@ def context_draft(
         effective_from=produced_at,
         effective_until=effective_until,
         effective_clock_domain_id=runtime.config.clock_domain_id,
-        context_contract_hash="async-motion-plan-v1",
+        payload_contract_hash="async-motion-plan-v1",
         observation_cut_id=observation.record.observation_cut_id,
         policy_output_id=f"slow-context-output-{epoch}-{sequence}",
     )
@@ -201,7 +205,7 @@ def test_async_completion_cutoff_restart_and_burst_remain_receiver_admitted() ->
         produced_at=10.0,
         effective_until=10.2,
     )
-    async_runtime.schedule_policy_context(
+    async_runtime.schedule_composition_context(
         job_id="context-0",
         draft=context_job,
         submitted_at=10.0,
@@ -358,7 +362,7 @@ def test_stale_context_blocks_composite_proposal_at_one_causal_cut() -> None:
         produced_at=10.0,
         effective_until=10.030,
     )
-    async_runtime.schedule_policy_context(
+    async_runtime.schedule_composition_context(
         job_id="context-short",
         draft=context_job,
         submitted_at=10.0,
@@ -421,7 +425,7 @@ def test_hold_between_composition_and_decision_prevents_dispatch() -> None:
         produced_at=10.0,
         effective_until=10.2,
     )
-    async_runtime.schedule_policy_context(
+    async_runtime.schedule_composition_context(
         job_id="context",
         draft=context_job,
         submitted_at=10.0,

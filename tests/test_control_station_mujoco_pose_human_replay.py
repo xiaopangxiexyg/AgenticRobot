@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from control_composition.composition import (
+    CompositionAuthorityGateSpec,
+    CompositionSpec,
+)
+from control_composition.observability import SourceDifferenceSpec
 from control_station import (
+    CompositionSessionOperationSpec,
+    CompositionSessionRearmSpec,
     HumanTakeoverOperationSpec,
     HumanTakeoverReadinessCandidate,
     SideEffectStationOperationCoordinator,
@@ -21,6 +28,9 @@ from control_station.composition import (
     CS6B1F_POSE_HUMAN_REPLAY_STATION_MANIFEST_ID_V1,
     VirtualSimHumanTakeoverReadinessProvider,
     ReplaySourceObserverBinding,
+    build_cs6b1i_pose_composition_session_execution_manifest,
+    build_scoped_cs6b1i_mujoco_pose_composition_session,
+    build_scoped_cs6b1h_mujoco_pose_composer_authority,
     build_mujoco_pose_human_proposal_adapter,
     build_scoped_cs6b1f_mujoco_pose_human_replay_station,
     build_cs6b1f_pose_human_replay_execution_manifest,
@@ -47,9 +57,9 @@ from dataset_contracts.replay import (
     ReplaySourceContract,
 )
 from robot_motion.action import (
-    CompositionSpec,
     RobotAction,
     SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
+    SharedCanonicalSafetyResult,
 )
 from robot_motion.action.proposal import robot_action_semantic_payload
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -152,6 +162,7 @@ def _runtime(
     clock: ManualClock,
     *,
     trace_sink=None,
+    composer_authority: bool = False,
 ) -> MujocoDeployRuntime:
     scene = DeterministicScene()
     rig = MujocoPositionExecutionRig(
@@ -182,18 +193,36 @@ def _runtime(
             control_domain_id="cs6b1d-pose-domain",
             embodiment_instance_id="cs6b1d-pose-rm65",
             producer_id="human-main",
+            composer_producer_id="pose-composer",
             replay_producer_id="replay-main",
-            enable_replay_authority=True,
+            enable_replay_authority=not composer_authority,
+            enable_composer_authority=composer_authority,
+            enable_primary_policy_authority=not composer_authority,
             decision_hz=30.0,
             authority_policy_id="cs6b1d-pose-human-replay-lease-v1",
             initial_control_mode="hybrid",
             reference_activation_profile_id=SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
             clock_domain_id="local_monotonic",
             pose_frame_contract_hash=POSE_FRAME_HASH,
-            authority_takeover_allowed_producers=("human-main", "replay-main"),
+            authority_takeover_allowed_producers=(
+                ()
+                if composer_authority
+                else ("human-main", "replay-main")
+            ),
         ),
         trace_sink=trace_sink,
         pose_resolver=resolver,
+        shared_safety=(
+            (
+                lambda action, input_action_id: SharedCanonicalSafetyResult(
+                    input_action_id=input_action_id,
+                    safe_action=action,
+                    status="safe",
+                )
+            )
+            if composer_authority
+            else None
+        ),
         clock=clock,
     )
 
@@ -340,7 +369,14 @@ def _passive_pose_session_source(
     return PassiveTeleopPoseSessionSource(session, spec)
 
 
-def _replay_emission(path: Path, clock: ManualClock):
+def _replay_emission(
+    path: Path,
+    clock: ManualClock,
+    *,
+    source_action_index: int = 4,
+    group_key: str = "pose-group-0",
+    local_frame_index: int = 0,
+):
     action = RobotAction(
         action_space="bimanual_ee_pose_v1",
         timestamp=clock(),
@@ -361,9 +397,9 @@ def _replay_emission(path: Path, clock: ManualClock):
     return create_replay_source_frame_emission(
         source_path=str(path),
         source_episode_index=0,
-        group_key="pose-group-0",
-        local_frame_index=0,
-        source_action_index=4,
+        group_key=group_key,
+        local_frame_index=local_frame_index,
+        source_action_index=source_action_index,
         source_relative_time=0.0,
         action=action,
         observed_at=clock(),
@@ -499,6 +535,195 @@ def _pose_fusion_shadow_spec(
     )
 
 
+def _pose_composer_authority_gate(
+    spec: CompositionSpec,
+) -> CompositionAuthorityGateSpec:
+    return CompositionAuthorityGateSpec(
+        gate_spec_id="cs6b1h-human-replay-formal-v1",
+        composition_spec_hash=spec.semantic_content_hash,
+        composer_producer_id="pose-composer",
+        missing_behavior_by_role={
+            "human_pose": "hold",
+            "replay_pose": "hold",
+        },
+        proposal_ttl_sec=0.1,
+    )
+
+
+def _build_cs6b1h_pose_composer(
+    clock: ManualClock,
+    *,
+    translation_limit: float = 0.2,
+    source_differences: bool = False,
+):
+    runtime = _runtime(clock, composer_authority=True)
+    source_spec = PassiveTeleopPoseSourceSpec(source_id="human-slot")
+    passive_source = _passive_pose_session_source(
+        source_spec,
+        timestamp=clock(),
+    )
+    spec = _pose_fusion_shadow_spec(translation_limit=translation_limit)
+    difference_spec = (
+        SourceDifferenceSpec(
+            spec_id="cs6b1h-human-replay-difference-v1",
+            composition_spec_hash=spec.semantic_content_hash,
+            compared_reference_role_pairs=(
+                ("human_pose", "replay_pose"),
+            ),
+            output_residual_roles=("human_pose", "replay_pose"),
+        )
+        if source_differences
+        else None
+    )
+    composition = build_scoped_cs6b1h_mujoco_pose_composer_authority(
+        runtime,
+        source_spec,
+        _replay_source(runtime),
+        spec,
+        _pose_composer_authority_gate(spec),
+        source_difference_spec=difference_spec,
+    )
+    return composition, runtime, passive_source
+
+
+def _build_cs6b1i_pose_composition_session(
+    tmp_path: Path,
+    clock: ManualClock,
+    *,
+    trace_sink=None,
+    source_differences: bool = False,
+):
+    runtime = _runtime(
+        clock,
+        composer_authority=True,
+        trace_sink=trace_sink,
+    )
+    source_spec = PassiveTeleopPoseSourceSpec(source_id="human-slot")
+    passive_source = _passive_pose_session_source(
+        source_spec,
+        timestamp=clock(),
+    )
+    replay_source = _replay_source(runtime)
+    composition_spec = _pose_fusion_shadow_spec()
+    difference_spec = (
+        SourceDifferenceSpec(
+            spec_id="cs6b1i-human-replay-difference-v1",
+            composition_spec_hash=composition_spec.semantic_content_hash,
+            compared_reference_role_pairs=(
+                ("human_pose", "replay_pose"),
+            ),
+            output_residual_roles=("human_pose", "replay_pose"),
+        )
+        if source_differences
+        else None
+    )
+    observer = ReplaySourceObserverBinding.create(
+        source_slot_id="replay-slot",
+        source_locator_id=replay_source.config.source_contract.source_dataset_id,
+        expected_source_path=str(tmp_path / "cs6b1i-replay.parquet"),
+        source_episode_index=0,
+        group_key="pose-group-0",
+        source_start_index=4,
+        clock_domain_id=runtime.config.clock_domain_id,
+    )
+    station = build_scoped_cs6b1i_mujoco_pose_composition_session(
+        runtime,
+        source_spec,
+        replay_source,
+        observer,
+        composition_spec,
+        _pose_composer_authority_gate(composition_spec),
+        station_clock=clock,
+        station_clock_domain_id="local_monotonic",
+        source_difference_spec=difference_spec,
+    )
+    session_spec = CompositionSessionOperationSpec(
+        session_key="cs6b1i-session-0",
+        composer_source_slot_id=station.composer_source_slot_id,
+        contributor_source_slot_ids=(
+            station.human_source_slot_id,
+            station.replay_source_slot_id,
+        ),
+        composition_spec_hash=composition_spec.semantic_content_hash,
+        authority_gate_spec_hash=(
+            station.data_plane.authority_gate_spec.semantic_content_hash
+        ),
+        execution_binding_hash=(
+            station.station.manifest.execution_binding.semantic_content_hash
+        ),
+        capture_boundary_id="episode-boundary:cs6b1i-session-0",
+    )
+    return station, runtime, passive_source, session_spec
+
+
+def _setup_and_start_cs6b1i_station(
+    station,
+    session_spec: CompositionSessionOperationSpec,
+    clock: ManualClock,
+) -> int:
+    sequence = 0
+
+    def submit(kind, subject_id=None, *, operation_spec_id=None):
+        nonlocal sequence
+        state = station.station.state
+        transition = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind=kind,
+                produced_at=clock(),
+                produced_clock_domain_id="local_monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                subject_id=subject_id,
+                resource_binding_id=(
+                    station.station.manifest.execution_binding.binding_id
+                    if kind
+                    in {
+                        "start_composition_session",
+                        "stop_composition_session",
+                    }
+                    else None
+                ),
+                operation_spec_id=operation_spec_id,
+                reason="cs6b1i deterministic sim fixture",
+            )
+        )
+        sequence += 1
+        if transition.receipt.status == "operation_requested":
+            execution = station.complete_pending_operation(transition)
+            assert execution.completion_transition.accepted
+            assert execution.completion_transition.result.succeeded
+        else:
+            assert transition.receipt.accepted
+        return transition
+
+    submit("acquire_control_lease")
+    target_id = station.station.manifest.execution_binding.binding_id
+    submit("connect_target", target_id)
+    for source_id in (
+        station.human_source_slot_id,
+        station.replay_source_slot_id,
+        station.composer_source_slot_id,
+    ):
+        submit("connect_source", source_id)
+    submit("run_preflight", target_id)
+    for source_id in (
+        station.human_source_slot_id,
+        station.replay_source_slot_id,
+        station.composer_source_slot_id,
+    ):
+        submit("run_preflight", source_id)
+    submit("request_candidate", station.composer_source_slot_id)
+    station.register_composition_session(session_spec)
+    submit(
+        "start_composition_session",
+        station.composer_source_slot_id,
+        operation_spec_id=session_spec.operation_spec_id,
+    )
+    return sequence
+
+
 def _action_hash(action: RobotAction) -> str:
     return canonical_content_hash(
         robot_action_semantic_payload(action),
@@ -585,7 +810,7 @@ def test_cs6b1g_shared_cut_fuses_passive_human_and_replay_without_authority(
         and not receipt.composition_input.authority_candidate
         for receipt in receipts.values()
     )
-    assert "composition_input" in shadow["trace_types"]
+    assert "composition_contributor_input" in shadow["trace_types"]
     assert "composition_input_snapshot" in shadow["trace_types"]
     assert "composition_result" in shadow["trace_types"]
     assert "human_command_emission" in shadow["trace_types"]
@@ -597,7 +822,7 @@ def test_cs6b1g_shared_cut_fuses_passive_human_and_replay_without_authority(
         for fact in shadow["trace_facts"]
         if fact.event_type == "source_adapter_receipt"
     }
-    representation_fact_ids = set(human_input.context_ids).intersection(
+    representation_fact_ids = set(human_input.source_fact_ids).intersection(
         source_representation_facts
     )
     assert len(representation_fact_ids) == 1
@@ -725,12 +950,1298 @@ def test_cs6b1g_duplicate_passive_emission_is_isolated_from_replay(
             for fact in runtime.trace_facts
         ) == 1
         assert sum(
-            fact.event_type == "composition_input"
+            fact.event_type == "composition_contributor_input"
             and fact.payload["input_role"] == "human_pose"
             for fact in runtime.trace_facts
         ) == 1
     finally:
         station.close()
+
+
+def test_cs6b1h_composer_is_the_only_formal_pose_producer(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        replay = composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission_valid and human_step.emission is not None
+        human = composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        assert replay.accepted and human.accepted
+        assert all(
+            receipt.composition_input is not None
+            and not receipt.composition_input.authority_candidate
+            for receipt in (replay, human)
+        )
+        formal = composition.compose_at(
+            decision_key="cs6b1h-decision-0",
+            target_effective_at=clock(),
+        )
+        assert formal.error is None
+        assert formal.source_difference_observation is None
+        assert formal.source_difference_error is None
+        assert composition.binding.source_difference_spec_hash is None
+        binding = composition.binding
+        assert binding.semantic_content_hash == canonical_content_hash(
+            {
+                "runtime_session_id": binding.runtime_session_id,
+                "control_domain_id": binding.control_domain_id,
+                "embodiment_instance_id": binding.embodiment_instance_id,
+                "composer_producer_id": binding.composer_producer_id,
+                "human_producer_id": binding.human_producer_id,
+                "replay_producer_id": binding.replay_producer_id,
+                "composition_spec_hash": binding.composition_spec_hash,
+                "authority_gate_spec_hash": (
+                    binding.authority_gate_spec_hash
+                ),
+                "target_runtime_contract_hash": (
+                    binding.target_runtime_contract_hash
+                ),
+            },
+            domain="dexteleop.cs6b1h_pose_composer_binding.v1",
+        )
+        assert formal.disposition is not None
+        assert formal.disposition.action == "publish_proposal"
+        assert formal.proposal_admission is not None
+        assert formal.proposal_admission.accepted
+        proposal = formal.proposal_admission.proposal
+        assert proposal is not None
+        assert proposal.producer_kind == "composer"
+        assert proposal.producer_id == "pose-composer"
+        assert len(runtime.core.proposals) == 1
+        facts_by_id = {fact.fact_id: fact for fact in runtime.trace_facts}
+        contributor_facts = tuple(
+            fact
+            for fact in runtime.trace_facts
+            if fact.event_type == "composition_contributor_input"
+        )
+        assert len(contributor_facts) == 2
+        for contributor in contributor_facts:
+            for source_id, source_hash in zip(
+                contributor.payload["source_fact_ids"],
+                contributor.payload["source_fact_hashes"],
+            ):
+                assert facts_by_id[source_id].semantic_content_hash == source_hash
+        disposition_facts = tuple(
+            fact
+            for fact in runtime.trace_facts
+            if fact.event_type == "composition_authority_disposition"
+        )
+        assert len(disposition_facts) == 1
+        assert disposition_facts[0].payload["action"] == "publish_proposal"
+        assert not any(
+            fact.event_type
+            in {"source_difference_spec", "source_difference_observation"}
+            for fact in runtime.trace_facts
+        )
+
+        duplicate = composition.compose_at(
+            decision_key="cs6b1h-decision-0",
+            target_effective_at=clock(),
+        )
+        assert duplicate is formal
+        assert len(runtime.core.proposals) == 1
+
+        dispatched = runtime.step(
+            now=clock(),
+            physics_ticks_after_dispatch=1,
+        )
+        assert dispatched.status == "dispatched"
+        assert dispatched.decision is not None
+        assert dispatched.decision.selected_by_group == {
+            "arms": proposal.proposal_id,
+        }
+    finally:
+        passive_source.close()
+        composition.close()
+
+
+def test_cs6b1h_missing_or_conflicting_contributor_forces_hold(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock,
+        translation_limit=0.005,
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h-missing.parquet", clock)
+        )
+        missing = composition.compose_at(
+            decision_key="cs6b1h-missing-human",
+            target_effective_at=clock(),
+        )
+        assert missing.proposal_admission is None
+        assert missing.disposition is not None
+        assert missing.disposition.reason == "required_contributor_missing"
+        assert missing.hold_transition is not None
+        assert missing.hold_transition.event.status == "hold"
+        assert len(runtime.core.proposals) == 0
+        assert any(
+            fact.event_type == "composition_authority_disposition"
+            and fact.payload["action"] == "hold"
+            for fact in runtime.trace_facts
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission_valid and human_step.emission is not None
+        composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        still_held = composition.compose_at(
+            decision_key="cs6b1h-no-auto-reopen",
+            target_effective_at=clock(),
+        )
+        assert still_held.blocked_reason == "execution_gate_not_ready:hold"
+        assert still_held.proposal_admission is None
+        assert len(runtime.core.proposals) == 0
+    finally:
+        passive_source.close()
+        composition.close()
+
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock,
+        translation_limit=0.005,
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h-conflict.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        conflict = composition.compose_at(
+            decision_key="cs6b1h-conflict",
+            target_effective_at=clock(),
+        )
+        assert conflict.proposal_admission is None
+        assert conflict.disposition is not None
+        assert conflict.disposition.reason == "composition_invalid"
+        assert conflict.hold_transition is not None
+        assert conflict.hold_transition.event.status == "hold"
+        assert len(runtime.core.proposals) == 0
+    finally:
+        passive_source.close()
+        composition.close()
+
+
+def test_cs6b1h_ttl_and_producer_epoch_invalidate_old_contributors(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h-ttl.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        clock.value += 0.2
+        expired = composition.compose_at(
+            decision_key="cs6b1h-all-expired",
+            target_effective_at=clock(),
+        )
+        assert expired.disposition is not None
+        assert expired.disposition.action == "hold"
+        assert expired.disposition.reason == "all_inputs_missing"
+        assert expired.hold_transition is not None
+        assert len(runtime.core.proposals) == 0
+    finally:
+        passive_source.close()
+        composition.close()
+
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h-epoch.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        runtime.activate_policy_node_producer(
+            "replay-main",
+            producer_epoch=2,
+            reason="cs6b1h replay contributor replacement",
+        )
+        invalidated = composition.compose_at(
+            decision_key="cs6b1h-old-replay-epoch",
+            target_effective_at=clock(),
+        )
+        assert invalidated.evaluation is not None
+        assert invalidated.evaluation.input_snapshot.missing_roles == (
+            "replay_pose",
+        )
+        assert invalidated.disposition is not None
+        assert invalidated.disposition.reason == (
+            "required_contributor_missing"
+        )
+        assert invalidated.hold_transition is not None
+        assert len(runtime.core.proposals) == 0
+    finally:
+        passive_source.close()
+        composition.close()
+
+
+def test_cs6b1h_promotion_error_holds_without_source_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(30.0)
+    composition, runtime, passive_source = _build_cs6b1h_pose_composer(
+        clock
+    )
+    try:
+        composition.start()
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        composition.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1h-error.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        composition.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+
+        def fail_promotion(*_args, **_kwargs):
+            raise RuntimeError("synthetic composer promotion failure")
+
+        monkeypatch.setattr(
+            runtime,
+            "submit_evaluated_composition",
+            fail_promotion,
+        )
+        failed = composition.compose_at(
+            decision_key="cs6b1h-promotion-error",
+            target_effective_at=clock(),
+        )
+        assert failed.error == (
+            "RuntimeError:synthetic composer promotion failure"
+        )
+        assert failed.hold_transition is not None
+        assert failed.hold_transition.event.status == "hold"
+        assert len(runtime.core.proposals) == 0
+    finally:
+        passive_source.close()
+        composition.close()
+
+
+def test_cs6b1i_station_session_publishes_only_composer_and_stops_in_hold(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    station, runtime, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(tmp_path, clock)
+    )
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        sequence = _setup_and_start_cs6b1i_station(
+            station,
+            session_spec,
+            clock,
+        )
+        session_state = station.current_session_state
+        assert session_state is not None and session_state.phase == "active"
+        assert station.publication_barrier.snapshot().enabled
+        assert station.station.state.source_state_by_slot == {
+            station.human_source_slot_id: "preflighted",
+            station.replay_source_slot_id: "preflighted",
+            station.composer_source_slot_id: "active",
+        }
+        station.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1i-replay.parquet", clock)
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        station.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        composed = station.compose_at(
+            decision_key="cs6b1i-decision-0",
+            target_effective_at=clock(),
+        )
+        assert composed.source_difference_observation is None
+        assert composed.source_difference_error is None
+        assert composed.proposal_admission is not None
+        proposal = composed.proposal_admission.proposal
+        assert proposal is not None
+        assert proposal.producer_kind == "composer"
+        assert proposal.producer_id == runtime.config.composer_producer_id
+        assert len(runtime.core.proposals) == 1
+        dispatched = station.step(
+            now=clock(),
+            physics_ticks_after_dispatch=60,
+        )
+        assert dispatched.status == "dispatched"
+
+        state = station.station.state
+        stop_request = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="stop_composition_session",
+                produced_at=clock(),
+                produced_clock_domain_id="local_monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                subject_id=station.composer_source_slot_id,
+                resource_binding_id=(
+                    station.station.manifest.execution_binding.binding_id
+                ),
+                operation_spec_id=session_spec.operation_spec_id,
+                reason="cs6b1i episode end",
+            )
+        )
+        assert stop_request.receipt.status == "operation_requested"
+        stopped = station.complete_pending_operation(stop_request)
+        assert stopped.completion_transition.result.succeeded
+        assert station.current_session_state is not None
+        assert station.current_session_state.phase == "ended"
+        assert station.station.state.lifecycle_state == "hold"
+        assert not station.publication_barrier.snapshot().enabled
+        with pytest.raises(RuntimeError, match="not active"):
+            station.submit_replay_emission(
+                _replay_emission(
+                    tmp_path / "cs6b1i-after-end.parquet",
+                    clock,
+                )
+            )
+    finally:
+        passive_source.close()
+        station.close()
+
+
+def test_cs6b1i_optional_source_difference_is_same_cut_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    station, runtime, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(
+            tmp_path,
+            clock,
+            source_differences=True,
+        )
+    )
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        _setup_and_start_cs6b1i_station(station, session_spec, clock)
+        station.submit_replay_emission(
+            _replay_emission(
+                tmp_path / "cs6b1i-difference-replay.parquet",
+                clock,
+            )
+        )
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        station.submit_human_emission(
+            human_step.emission,
+            observed_at=clock(),
+        )
+        composed = station.compose_at(
+            decision_key="cs6b1i-difference-0",
+            target_effective_at=clock(),
+        )
+        observation = composed.source_difference_observation
+        assert composed.source_difference_error is None
+        assert observation is not None
+        assert composed.evaluation is not None
+        assert observation.composition_input_snapshot_id == (
+            composed.evaluation.input_snapshot.composition_input_snapshot_id
+        )
+        assert observation.composition_input_snapshot_hash == (
+            composed.evaluation.input_snapshot.semantic_content_hash
+        )
+        assert observation.composition_result_id == (
+            composed.evaluation.composition_result.composition_result_id
+        )
+        assert observation.composition_result_hash == (
+            composed.evaluation.composition_result.semantic_content_hash
+        )
+        assert observation.target_effective_at == clock()
+        assert len(observation.pairwise_differences) == 1
+        pair = observation.pairwise_differences[0]
+        assert (pair.compared_role, pair.reference_role) == (
+            "human_pose",
+            "replay_pose",
+        )
+        assert tuple(
+            metric.component_id for metric in pair.component_metrics
+        ) == ("left_arm", "right_arm")
+        assert len(observation.output_residuals) == 2
+        assert composed.evaluation.evaluation_record is not None
+        human_differences = (
+            composed.evaluation.evaluation_record.differences_for_role(
+                "human_pose"
+            )
+        )
+        assert len(human_differences) == 2
+        assert {
+            difference.reference_role for difference in human_differences
+        } == {"replay_pose", "composed_output"}
+        assert station.data_plane.binding.source_difference_spec_hash == (
+            observation.source_difference_spec_hash
+        )
+        facts = tuple(
+            fact
+            for fact in runtime.trace_facts
+            if fact.event_type == "source_difference_observation"
+        )
+        assert len(facts) == 1
+        spec_facts = tuple(
+            fact
+            for fact in runtime.trace_facts
+            if fact.event_type == "source_difference_spec"
+        )
+        assert len(spec_facts) == 1
+        assert spec_facts[0].payload["semantic_content_hash"] == (
+            observation.source_difference_spec_hash
+        )
+        assert facts[0].fact_id == observation.observation_id
+        assert facts[0].payload["composition_input_snapshot_id"] == (
+            observation.composition_input_snapshot_id
+        )
+        assert facts[0].payload["composition_result_id"] == (
+            observation.composition_result_id
+        )
+        duplicate = station.compose_at(
+            decision_key="cs6b1i-difference-0",
+            target_effective_at=clock(),
+        )
+        assert duplicate is composed
+        assert sum(
+            fact.event_type == "source_difference_observation"
+            for fact in runtime.trace_facts
+        ) == 1
+        assert composed.proposal_admission is not None
+        assert composed.proposal_admission.accepted
+        dispatched = station.step(
+            now=clock(),
+            physics_ticks_after_dispatch=1,
+        )
+        assert dispatched.status == "dispatched"
+    finally:
+        passive_source.close()
+        station.close()
+
+
+def test_cs6b1i_missing_contributor_holds_without_fresh_input_rearm(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    station, _, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(tmp_path, clock)
+    )
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        _setup_and_start_cs6b1i_station(station, session_spec, clock)
+        station.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1i-replay.parquet", clock)
+        )
+        held = station.compose_at(
+            decision_key="cs6b1i-missing-human",
+            target_effective_at=clock(),
+        )
+        assert held.disposition is not None
+        assert held.disposition.action == "hold"
+        assert station.current_session_state is not None
+        assert station.current_session_state.phase == "held"
+        assert not station.publication_barrier.snapshot().enabled
+        human_step = passive_source.step(now=clock())
+        assert human_step.emission is not None
+        with pytest.raises(RuntimeError, match="not active"):
+            station.submit_human_emission(
+                human_step.emission,
+                observed_at=clock(),
+            )
+        assert len(station.data_plane.runtime.core.proposals) == 0
+    finally:
+        passive_source.close()
+        station.close()
+
+
+def test_cs6b1i_typed_rearm_creates_new_activation_and_rejects_old_inputs(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    station, runtime, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(tmp_path, clock)
+    )
+    observed_specs = []
+    observed_rearm_specs = []
+    observed_rearm_receipts = []
+    observed_transitions = []
+    station.bind_session_trace_observers(
+        spec_observer=observed_specs.append,
+        transition_observer=lambda transition, **_metadata: (
+            observed_transitions.append(transition)
+        ),
+        rearm_spec_observer=observed_rearm_specs.append,
+        rearm_receipt_observer=observed_rearm_receipts.append,
+    )
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        sequence = _setup_and_start_cs6b1i_station(
+            station,
+            session_spec,
+            clock,
+        )
+        station.submit_replay_emission(
+            _replay_emission(
+                tmp_path / "cs6b1i-before-rearm.parquet",
+                clock,
+                source_action_index=4,
+            )
+        )
+        human_before = passive_source.step(now=clock())
+        assert human_before.emission is not None
+        station.submit_human_emission(
+            human_before.emission,
+            observed_at=clock(),
+        )
+        old_composition = station.compose_at(
+            decision_key="cs6b1i-before-rearm",
+            target_effective_at=clock(),
+        )
+        assert old_composition.proposal_admission is not None
+        old_proposal = old_composition.proposal_admission.proposal
+        assert old_proposal is not None
+        assert old_proposal.producer_epoch == runtime.config.producer_epoch
+
+        state = station.station.state
+        hold = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="hold",
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                reason="pause before typed activation rearm",
+            )
+        )
+        sequence += 1
+        assert hold.receipt.accepted
+        station.prepare_pending_operation(hold)
+        held_state = station.current_session_state
+        assert held_state is not None and held_state.phase == "held"
+        hold_outcome = station._last_hold_outcome
+        assert hold_outcome is not None
+        assert hold_outcome.cancellation_receipt is not None
+        assert hold_outcome.cancellation_receipt.complete
+
+        rearm_spec = CompositionSessionRearmSpec(
+            rearm_key="cs6b1i-rearm-1",
+            logical_operation_spec_id=session_spec.operation_spec_id,
+            logical_operation_spec_hash=session_spec.semantic_content_hash,
+            prior_session_epoch=held_state.session_epoch,
+            prior_state_hash=held_state.semantic_content_hash,
+            execution_binding_hash=session_spec.execution_binding_hash,
+            readiness_observer_binding_id=(
+                station.rearm_readiness_observer_binding_id
+            ),
+            readiness_timeout_sec=0.1,
+        )
+        unsupported_rearm_spec = CompositionSessionRearmSpec(
+            rearm_key="cs6b1i-rearm-unsupported-real-check",
+            logical_operation_spec_id=session_spec.operation_spec_id,
+            logical_operation_spec_hash=session_spec.semantic_content_hash,
+            prior_session_epoch=held_state.session_epoch,
+            prior_state_hash=held_state.semantic_content_hash,
+            execution_binding_hash=session_spec.execution_binding_hash,
+            readiness_observer_binding_id=(
+                station.rearm_readiness_observer_binding_id
+            ),
+            readiness_timeout_sec=0.1,
+            required_readiness_checks=(
+                *rearm_spec.required_readiness_checks,
+                "physical_deadman_rearmed",
+            ),
+        )
+        with pytest.raises(ValueError, match="unsupported readiness"):
+            station.register_composition_rearm(unsupported_rearm_spec)
+        station.register_composition_rearm(rearm_spec)
+        state = station.station.state
+        rearm = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="rearm_composition_session",
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                subject_id=station.composer_source_slot_id,
+                resource_binding_id=(
+                    station.station.manifest.execution_binding.binding_id
+                ),
+                operation_spec_id=rearm_spec.rearm_spec_id,
+                reason="typed activation rearm",
+            )
+        )
+        assert rearm.receipt.status == "operation_requested"
+        sequence += 1
+        rearmed = station.complete_pending_operation(rearm)
+        assert rearmed.completion_transition.accepted
+        assert rearmed.completion_transition.result.succeeded
+        active_state = station.current_session_state
+        assert active_state is not None and active_state.phase == "active"
+        assert active_state.operation_spec_id == session_spec.operation_spec_id
+        assert active_state.session_epoch == held_state.session_epoch + 1
+        assert station.station.state.lifecycle_state == "running"
+        assert station.publication_barrier.snapshot().enabled
+        receipt = station._rearm_receipt_by_spec_id[rearm_spec.rearm_spec_id]
+        assert receipt.execution_epoch == (
+            receipt.prior_execution_epoch + 1
+        )
+        assert receipt.composer_producer_epoch == (
+            receipt.prior_composer_producer_epoch + 1
+        )
+        assert receipt.authority_epoch > receipt.prior_authority_epoch
+        assert station.data_plane.input_receipt_by_role == {}
+        assert observed_specs == [session_spec]
+        assert observed_rearm_specs == [rearm_spec]
+        assert observed_rearm_receipts == [receipt]
+        assert [
+            (transition.session_epoch, transition.transition)
+            for transition in observed_transitions
+        ] == [
+            (held_state.session_epoch, "start"),
+            (held_state.session_epoch, "hold"),
+            (held_state.session_epoch, "supersede"),
+            (active_state.session_epoch, "start"),
+        ]
+        with pytest.raises(ValueError, match="predates"):
+            station.submit_replay_emission(
+                _replay_emission(
+                    tmp_path / "cs6b1i-stale-after-rearm.parquet",
+                    clock,
+                    source_action_index=4,
+                )
+            )
+        assert station.data_plane.input_receipt_by_role == {}
+
+        stale_only = station.step(now=clock())
+        assert stale_only.status != "dispatched"
+
+        # The authoritative scheduler is 30 Hz and never catch-up dispatches.
+        # Cross the next decision boundary before admitting the new activation.
+        clock.value += 0.04
+        station.submit_replay_emission(
+            _replay_emission(
+                tmp_path / "cs6b1i-after-rearm.parquet",
+                clock,
+                source_action_index=5,
+                group_key="pose-group-1",
+                local_frame_index=1,
+            )
+        )
+        human_after = passive_source.step(now=clock())
+        assert human_after.emission is not None
+        station.submit_human_emission(
+            human_after.emission,
+            observed_at=clock(),
+        )
+        fresh_composition = station.compose_at(
+            decision_key="cs6b1i-after-rearm",
+            target_effective_at=clock(),
+        )
+        assert fresh_composition.proposal_admission is not None
+        fresh_proposal = fresh_composition.proposal_admission.proposal
+        assert fresh_proposal is not None
+        assert (
+            fresh_proposal.producer_epoch
+            == receipt.composer_producer_epoch
+        )
+
+        state = station.station.state
+        second_hold = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="hold",
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                reason="second pause before typed activation rearm",
+            )
+        )
+        sequence += 1
+        assert second_hold.receipt.accepted
+        station.prepare_pending_operation(second_hold)
+        second_held_state = station.current_session_state
+        assert second_held_state is not None
+        assert second_held_state.phase == "held"
+        assert second_held_state.session_epoch == active_state.session_epoch
+
+        second_rearm_spec = CompositionSessionRearmSpec(
+            rearm_key="cs6b1i-rearm-2",
+            logical_operation_spec_id=session_spec.operation_spec_id,
+            logical_operation_spec_hash=session_spec.semantic_content_hash,
+            prior_session_epoch=second_held_state.session_epoch,
+            prior_state_hash=second_held_state.semantic_content_hash,
+            execution_binding_hash=session_spec.execution_binding_hash,
+            readiness_observer_binding_id=(
+                station.rearm_readiness_observer_binding_id
+            ),
+            readiness_timeout_sec=0.1,
+        )
+        station.register_composition_rearm(second_rearm_spec)
+        state = station.station.state
+        second_request = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="rearm_composition_session",
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                subject_id=station.composer_source_slot_id,
+                resource_binding_id=(
+                    station.station.manifest.execution_binding.binding_id
+                ),
+                operation_spec_id=second_rearm_spec.rearm_spec_id,
+                reason="second typed activation rearm",
+            )
+        )
+        assert second_request.receipt.status == "operation_requested"
+        second_rearmed = station.complete_pending_operation(second_request)
+        assert second_rearmed.completion_transition.accepted
+        assert second_rearmed.completion_transition.result.succeeded
+        second_active_state = station.current_session_state
+        assert second_active_state is not None
+        assert second_active_state.phase == "active"
+        assert second_active_state.operation_spec_id == (
+            session_spec.operation_spec_id
+        )
+        assert second_active_state.session_epoch == active_state.session_epoch + 1
+        second_receipt = station._rearm_receipt_by_spec_id[
+            second_rearm_spec.rearm_spec_id
+        ]
+        assert second_receipt.prior_composer_producer_epoch == (
+            receipt.composer_producer_epoch
+        )
+        assert second_receipt.composer_producer_epoch == (
+            receipt.composer_producer_epoch + 1
+        )
+        assert second_receipt.prior_execution_epoch == receipt.execution_epoch
+        assert second_receipt.execution_epoch == receipt.execution_epoch + 1
+        assert second_receipt.prior_authority_epoch == receipt.authority_epoch
+        assert second_receipt.authority_epoch > receipt.authority_epoch
+        assert station.data_plane.input_receipt_by_role == {}
+        assert [transition.transition for transition in observed_transitions] == [
+            "start",
+            "hold",
+            "supersede",
+            "start",
+            "hold",
+            "supersede",
+            "start",
+        ]
+    finally:
+        passive_source.close()
+        station.close()
+
+
+def test_cs6b1i_rearm_without_prior_cancellation_receipt_stays_held(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    station, runtime, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(tmp_path, clock)
+    )
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        sequence = _setup_and_start_cs6b1i_station(
+            station,
+            session_spec,
+            clock,
+        )
+        state = station.station.state
+        hold = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="hold",
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                reason="negative rearm fixture",
+            )
+        )
+        sequence += 1
+        station.prepare_pending_operation(hold)
+        held_state = station.current_session_state
+        assert held_state is not None and held_state.phase == "held"
+        producer_epoch_before = runtime.core.producer_epochs.current_epoch(
+            runtime.config.composer_producer_id
+        )
+        station._last_hold_outcome = None
+        rearm_spec = CompositionSessionRearmSpec(
+            rearm_key="cs6b1i-rearm-missing-cancellation",
+            logical_operation_spec_id=session_spec.operation_spec_id,
+            logical_operation_spec_hash=session_spec.semantic_content_hash,
+            prior_session_epoch=held_state.session_epoch,
+            prior_state_hash=held_state.semantic_content_hash,
+            execution_binding_hash=session_spec.execution_binding_hash,
+            readiness_observer_binding_id=(
+                station.rearm_readiness_observer_binding_id
+            ),
+            readiness_timeout_sec=0.1,
+        )
+        station.register_composition_rearm(rearm_spec)
+        state = station.station.state
+        request = station.station.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="rearm_composition_session",
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                subject_id=station.composer_source_slot_id,
+                resource_binding_id=(
+                    station.station.manifest.execution_binding.binding_id
+                ),
+                operation_spec_id=rearm_spec.rearm_spec_id,
+                reason="must fail without exact cancellation receipt",
+            )
+        )
+        assert request.receipt.status == "operation_requested"
+        failed = station.complete_pending_operation(request)
+        assert failed.completion_transition.accepted
+        assert not failed.completion_transition.result.succeeded
+        assert failed.completion_transition.result.status == (
+            "composition_session_held"
+        )
+        assert station.station.state.lifecycle_state == "hold"
+        assert station.current_session_state == held_state
+        assert not station.publication_barrier.snapshot().enabled
+        assert runtime.core.producer_epochs.current_epoch(
+            runtime.config.composer_producer_id
+        ) == producer_epoch_before
+        assert station._last_hold_outcome is not None
+        assert station._last_hold_outcome.cancellation_receipt is not None
+        assert station._last_hold_outcome.cancellation_receipt.complete
+    finally:
+        passive_source.close()
+        station.close()
+
+
+def test_cs6b1i_station_hold_closes_publication_before_return(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    station, _, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(tmp_path, clock)
+    )
+    coordinator = None
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        sequence = _setup_and_start_cs6b1i_station(
+            station,
+            session_spec,
+            clock,
+        )
+        coordinator = SideEffectStationOperationCoordinator(
+            coordinator_id="cs6b1i-hold-coordinator",
+            runtime=station.station,
+            adapters=station.adapters,
+            operation_prepare=station.prepare_pending_operation,
+            operation_executor=station.complete_pending_operation,
+            queue_capacity=2,
+            clock=clock,
+            clock_domain_id="local_monotonic",
+        )
+        coordinator.start()
+        state = station.station.state
+        submission = coordinator.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i",
+                client_sequence=sequence,
+                intent_kind="hold",
+                produced_at=clock(),
+                produced_clock_domain_id="local_monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                reason="operator pause",
+            )
+        )
+        assert submission.transition.receipt.accepted
+        assert submission.transition.state_after.lifecycle_state == "hold"
+        assert not station.publication_barrier.snapshot().enabled
+        assert station.current_session_state is not None
+        assert station.current_session_state.phase == "held"
+    finally:
+        if coordinator is not None:
+            assert coordinator.stop(timeout_sec=2.0)
+        passive_source.close()
+        station.close()
+
+
+def test_cs6b1i_formal_composition_session_capture_seals(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock(30.0)
+    profile = trace_requirement_profile(
+        "deployable_sim_scheduled_pose_composer_station_v1"
+    )
+    trace_session_id = "cs6b1i-formal-trace"
+    episode_uuid = "cs6b1i-formal-episode"
+    trace_runtime = ControlTraceRuntime(
+        RuntimeTraceSession(
+            trace_session_id=trace_session_id,
+            runtime_session_id="cs6b1d-pose-runtime",
+            control_domain_id="cs6b1d-pose-domain",
+            profile_id=profile.profile_id,
+            started_at=clock(),
+            clock_domain_id="local_monotonic",
+        ),
+        profile=profile,
+        capacity=16384,
+    )
+    session_root = (
+        tmp_path / CONTROL_TRACE_SESSION_RELATIVE_ROOT_V1 / trace_session_id
+    )
+    session_root.mkdir(parents=True)
+    spool = ControlTraceSpool(
+        session_root / "control_trace.wal",
+        trace_session_id=trace_session_id,
+        max_bytes=32 << 20,
+        physical_preallocation=False,
+    )
+    health = ControlTraceWriterHealthLedger(
+        session_root / "writer_health.ledger",
+        trace_session_id=trace_session_id,
+    )
+    durable_sink = ControlTraceSpoolSink(
+        sink_id="cs6b1i-formal-spool",
+        runtime=trace_runtime,
+        spool=spool,
+        health_ledger=health,
+        clock=clock,
+    )
+    dependency_sequences: list[int] = []
+    recorder = EpisodeTraceRecorderSink(
+        trace_runtime,
+        lifecycle_owner_id="cs6b1i-formal-owner",
+        flush_to_durable=durable_sink.flush_pending,
+        dependency_sequences=lambda _runtime: tuple(dependency_sequences),
+        manifest_store=EpisodeCaptureManifestStore(tmp_path),
+        uuid_factory=lambda: episode_uuid,
+        control_clock=clock,
+        commit_clock=clock,
+    )
+
+    def admit_trace(fact):
+        receipt = trace_runtime.issue(fact)
+        if not receipt.accepted:
+            raise RuntimeError(
+                f"CS6b1i trace rejected {fact.event_type}: "
+                f"{receipt.rejection_code}"
+            )
+        return receipt
+
+    station, runtime, passive_source, session_spec = (
+        _build_cs6b1i_pose_composition_session(
+            tmp_path,
+            clock,
+            trace_sink=admit_trace,
+            source_differences=True,
+        )
+    )
+    execution_manifest = (
+        build_cs6b1i_pose_composition_session_execution_manifest(
+            station.data_plane,
+            station.station.manifest,
+        )
+    )
+    for dependency_fact in (
+        project_control_execution_manifest(
+            runtime.core.trace_context,
+            execution_manifest,
+            occurred_at=clock(),
+        ),
+        project_station_run_manifest(
+            station.station.manifest,
+            runtime_session_id=runtime.config.runtime_session_id,
+            occurred_at=clock(),
+            clock_domain_id="local_monotonic",
+        ),
+    ):
+        receipt = admit_trace(dependency_fact)
+        assert receipt.sink_accepted_sequence is not None
+        dependency_sequences.append(receipt.sink_accepted_sequence)
+    bridge = StationControlTraceBridge(
+        manifest=station.station.manifest,
+        runtime_session_id=runtime.config.runtime_session_id,
+        embodiment_instance_id=runtime.config.embodiment_instance_id,
+        trace_sink=admit_trace,
+        clock=clock,
+        clock_domain_id="local_monotonic",
+    )
+    station.bind_publication_barrier_observer(
+        bridge.record_publication_barrier_transition
+    )
+    station.bind_session_trace_observers(
+        spec_observer=bridge.record_composition_session_spec,
+        transition_observer=bridge.record_composition_session_transition,
+        rearm_spec_observer=bridge.record_composition_session_rearm_spec,
+        rearm_receipt_observer=(
+            bridge.record_composition_session_rearm_receipt
+        ),
+    )
+    coordinator = SideEffectStationOperationCoordinator(
+        coordinator_id="cs6b1i-formal-coordinator",
+        runtime=station.station,
+        adapters=station.adapters,
+        operation_prepare=station.prepare_pending_operation,
+        operation_executor=station.complete_pending_operation,
+        intent_transition_observer=bridge.record_intent_transition,
+        operation_transition_observer=bridge.record_operation_transition,
+        queue_capacity=2,
+        clock=clock,
+        clock_domain_id="local-monotonic",
+    )
+
+    sequence = 0
+
+    def submit(kind, subject_id=None, *, spec_id=None):
+        nonlocal sequence
+        before = len(coordinator.completions)
+        state = station.station.state
+        submission = coordinator.submit_intent(
+            StationIntentDraft(
+                client_id="operator:cs6b1i-formal",
+                client_sequence=sequence,
+                intent_kind=kind,
+                produced_at=clock(),
+                produced_clock_domain_id="local-monotonic",
+                expected_state_revision=state.state_revision,
+                manifest_hash=station.station.manifest.semantic_content_hash,
+                subject_id=subject_id,
+                resource_binding_id=(
+                    station.station.manifest.execution_binding.binding_id
+                    if kind
+                    in {
+                        "rearm_composition_session",
+                        "start_composition_session",
+                        "stop_composition_session",
+                    }
+                    else None
+                ),
+                operation_spec_id=spec_id,
+                reason="cs6b1i formal capture",
+            )
+        )
+        sequence += 1
+        if submission.transition.receipt.status == "operation_requested":
+            assert coordinator.wait_until_idle(timeout_sec=2.0)
+            completion = coordinator.completions[-1]
+            assert len(coordinator.completions) == before + 1
+            assert completion.completion_transition.accepted
+            assert completion.completion_transition.result.succeeded
+        return submission
+
+    prepared = recorder.prepare_episode(legacy_episode_index=0, prepared_at=clock())
+    recorder.bind_prepared_episode(prepared, bound_at=clock())
+    coordinator.start()
+    released = None
+    try:
+        passive_source.start()
+        passive_source.set_calibration_ready()
+        submit("acquire_control_lease")
+        target_id = station.station.manifest.execution_binding.binding_id
+        submit("connect_target", target_id)
+        for source_id in (
+            station.human_source_slot_id,
+            station.replay_source_slot_id,
+            station.composer_source_slot_id,
+        ):
+            submit("connect_source", source_id)
+        submit("run_preflight", target_id)
+        for source_id in (
+            station.human_source_slot_id,
+            station.replay_source_slot_id,
+            station.composer_source_slot_id,
+        ):
+            submit("run_preflight", source_id)
+        submit("request_candidate", station.composer_source_slot_id)
+        station.register_composition_session(session_spec)
+        submit(
+            "start_composition_session",
+            station.composer_source_slot_id,
+            spec_id=session_spec.operation_spec_id,
+        )
+        station.submit_replay_emission(
+            _replay_emission(tmp_path / "cs6b1i-replay.parquet", clock)
+        )
+        passive = passive_source.step(now=clock())
+        assert passive.emission is not None
+        station.submit_human_emission(passive.emission, observed_at=clock())
+        formal = station.compose_at(
+            decision_key="cs6b1i-formal-decision",
+            target_effective_at=clock(),
+        )
+        assert formal.proposal_admission is not None
+        dispatched = station.step(
+            now=clock(),
+            physics_ticks_after_dispatch=60,
+        )
+        assert dispatched.status == "dispatched"
+        submit("hold")
+        held_state = station.current_session_state
+        assert held_state is not None and held_state.phase == "held"
+        rearm_spec = CompositionSessionRearmSpec(
+            rearm_key="cs6b1i-formal-rearm-1",
+            logical_operation_spec_id=session_spec.operation_spec_id,
+            logical_operation_spec_hash=session_spec.semantic_content_hash,
+            prior_session_epoch=held_state.session_epoch,
+            prior_state_hash=held_state.semantic_content_hash,
+            execution_binding_hash=session_spec.execution_binding_hash,
+            readiness_observer_binding_id=(
+                station.rearm_readiness_observer_binding_id
+            ),
+            readiness_timeout_sec=0.1,
+        )
+        station.register_composition_rearm(rearm_spec)
+        submit(
+            "rearm_composition_session",
+            station.composer_source_slot_id,
+            spec_id=rearm_spec.rearm_spec_id,
+        )
+        active_state = station.current_session_state
+        assert active_state is not None and active_state.phase == "active"
+        assert active_state.session_epoch == held_state.session_epoch + 1
+
+        # The authoritative scheduler is 30 Hz and never catch-up dispatches.
+        # Cross the next decision boundary before the second formal decision.
+        clock.value += 0.04
+        station.submit_replay_emission(
+            _replay_emission(
+                tmp_path / "cs6b1i-replay-after-rearm.parquet",
+                clock,
+                source_action_index=5,
+                group_key="pose-group-1",
+                local_frame_index=1,
+            )
+        )
+        passive_after_rearm = passive_source.step(now=clock())
+        assert passive_after_rearm.emission is not None
+        station.submit_human_emission(
+            passive_after_rearm.emission,
+            observed_at=clock(),
+        )
+        formal_after_rearm = station.compose_at(
+            decision_key="cs6b1i-formal-decision-after-rearm",
+            target_effective_at=clock(),
+        )
+        assert formal_after_rearm.proposal_admission is not None
+        # The first dispatch already exercises the deterministic plant. Keep
+        # the second check at the authority boundary: the fixture's manual
+        # station clock is intentionally independent of the rig physics clock.
+        dispatched_after_rearm = station.step(now=clock())
+        assert dispatched_after_rearm.status == "dispatched"
+        submit(
+            "stop_composition_session",
+            station.composer_source_slot_id,
+            spec_id=session_spec.operation_spec_id,
+        )
+        terminal = runtime.step(now=clock())
+        assert terminal.status in {"execution_hold_active", "not_due"}
+        clock.value += 0.01
+        released = recorder.release_episode(
+            prepared,
+            unbound_at=clock(),
+            reason="cs6b1i_formal_finalize",
+        )
+        assert released.seal.trace_sealed, (
+            released.seal.reason_codes,
+            released.seal.missing_required_event_types,
+            released.seal.lineage_issue_codes,
+        )
+        assert released.seal.capture_commit_eligible
+        finalized = recorder.legacy_finalize_completed(
+            released,
+            completed_at=clock() + 0.1,
+        )
+        assert finalized.capture_commit_status == "committed"
+        assert bridge.admission_failures == ()
+        assert coordinator.transition_observer_failure_count == 0
+    finally:
+        assert coordinator.stop(timeout_sec=2.0)
+        passive_source.close()
+        station.close()
+        durable_sink.flush_pending()
+        health.close()
+        spool.close()
+
+    captured = load_episode_control_trace(tmp_path, episode_uuid)
+    assert captured.committed
+    event_types = tuple(
+        record.fact.event_type for record in captured.episode_records
+    )
+    assert event_types.count("composition_session_spec") == 1
+    assert event_types.count("composition_session_rearm_spec") == 1
+    assert event_types.count("composition_session_rearm_receipt") == 1
+    assert event_types.count("composition_session_transition") == 6
+    assert event_types.count("composition_contributor_input") == 4
+    assert event_types.count("composition_authority_disposition") == 2
+    assert event_types.count("source_difference_spec") == 1
+    assert event_types.count("source_difference_observation") == 2
+    assert event_types.count("station_publication_barrier_transition") >= 4
 
 
 def _cs6b1f_takeover_spec(station, provider, *, timeout_sec: float):

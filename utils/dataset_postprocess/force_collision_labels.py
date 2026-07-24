@@ -6,7 +6,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from dataset_contracts.stats import EpisodeStatsAccumulator
+from dataset_contracts.stats import (
+    FORCE_COLLISION_LABEL_DETECTED,
+    EpisodeStatsAccumulator,
+    summary_has_force_collision,
+)
 
 from .io import episode_records, episode_stats_records, read_json, write_json, write_jsonl
 
@@ -108,8 +112,14 @@ def _compute_label(
     for row in rows:
         accumulator.update(row)
     stats = accumulator.finalize(nominal_fps=nominal_fps)
-    detected = bool(stats.force_collision_detected)
+    detected = bool(
+        stats.force_collision_detected
+        or summary_has_force_collision(record.get("summary"))
+        or summary_has_force_collision(record.get("metadata"))
+    )
     label = str(stats.force_collision_label)
+    if detected:
+        label = FORCE_COLLISION_LABEL_DETECTED
     if override == "all-detected":
         detected = True
         label = "detected_collision"

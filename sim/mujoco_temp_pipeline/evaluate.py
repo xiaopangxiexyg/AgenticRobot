@@ -11,10 +11,25 @@ import numpy as np
 import torch
 
 from sim.mujoco.runtime import CubeLiftVectorExecutor
+from sim.mujoco.tasks.cube_lift.config import is_cube_lift_success_reason
 
 from .checkpoint import build_policy_from_checkpoint, check_task_config_compatibility
 from .policy import resolve_device
 from .train import DEFAULT_CHECKPOINT, DEFAULT_TASK_CONFIG
+
+
+def _parse_action_offsets(value: str) -> tuple[float, ...]:
+    try:
+        offsets = tuple(float(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "action offsets must be comma-separated finite floats"
+        ) from exc
+    if not offsets or not all(np.isfinite(offset) for offset in offsets):
+        raise argparse.ArgumentTypeError(
+            "action offsets must be comma-separated finite floats"
+        )
+    return offsets
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -28,6 +43,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-method", choices=("spawn", "forkserver"), default="spawn")
     parser.add_argument("--model-cache-dir", type=Path, default=None)
     parser.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="Sample the policy distribution instead of using its mean.",
+    )
+    parser.add_argument(
+        "--action-offsets",
+        type=_parse_action_offsets,
+        default=(0.0,),
+        help=(
+            "Comma-separated compact-action offsets. Non-zero robustness "
+            "offsets require a one-dimensional policy and balanced env/episode counts."
+        ),
+    )
+    parser.add_argument(
         "--allow-task-config-mismatch",
         action="store_true",
         help="Diagnostics only: run a legacy checkpoint in the current environment.",
@@ -38,10 +67,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict[str, object]:
     if args.episodes <= 0 or args.num_envs <= 0:
         raise ValueError("episodes and num_envs must be positive.")
+    action_offsets = tuple(float(value) for value in args.action_offsets)
+    if args.num_envs % len(action_offsets) != 0:
+        raise ValueError("num_envs must be divisible by the number of action offsets.")
+    if args.episodes % args.num_envs != 0:
+        raise ValueError("episodes must be divisible by num_envs for balanced evaluation.")
     device = resolve_device(args.device)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     policy, normalizer, payload = build_policy_from_checkpoint(
         args.checkpoint, device=device
     )
+    if policy.action_dim != 1 and any(
+        abs(offset) > 0.0 for offset in action_offsets
+    ):
+        raise ValueError(
+            "Non-zero action offsets require a one-dimensional compact policy."
+        )
     compatibility = check_task_config_compatibility(
         payload,
         args.task_config,
@@ -59,6 +101,24 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     lengths = np.zeros(args.num_envs, dtype=np.int32)
     completed_returns: list[float] = []
     completed_lengths: list[int] = []
+    target_episodes_per_env = args.episodes // args.num_envs
+    completed_by_env = np.zeros(args.num_envs, dtype=np.int32)
+    offset_by_env = np.asarray(
+        [
+            action_offsets[env_id % len(action_offsets)]
+            for env_id in range(args.num_envs)
+        ],
+        dtype=np.float32,
+    )
+    offset_metrics = {
+        offset: {
+            "episodes": 0,
+            "successes": 0,
+            "returns": [],
+            "lengths": [],
+        }
+        for offset in action_offsets
+    }
     successes = 0
     projected_actions = 0
     rejected_actions = 0
@@ -78,10 +138,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             with torch.no_grad():
                 action, _log_prob, _value = policy.act(
                     torch.as_tensor(normalizer.normalize(observation), device=device),
-                    deterministic=True,
+                    deterministic=not args.stochastic,
                 )
+                if policy.action_dim == 1:
+                    action[:, 0] = torch.clamp(
+                        action[:, 0]
+                        + torch.as_tensor(offset_by_env, device=device),
+                        -1.0,
+                        1.0,
+                    )
+                environment_action = policy.expand_action(action)
             observation, reward, terminated, truncated, infos = env.step(
-                action.cpu().numpy().astype(np.float32, copy=False)
+                environment_action.cpu().numpy().astype(np.float32, copy=False)
             )
             evaluated_actions += args.num_envs
             for info in infos:
@@ -119,17 +187,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             lengths += 1
             done = np.logical_or(terminated, truncated)
             for env_id in np.flatnonzero(done):
-                if len(completed_returns) >= args.episodes:
-                    break
-                completed_returns.append(float(returns[env_id]))
-                completed_lengths.append(int(lengths[env_id]))
-                successes += int(
-                    infos[env_id].get("termination_reason")
-                    == "height_only_lift_success"
-                )
+                if completed_by_env[env_id] < target_episodes_per_env:
+                    episode_return = float(returns[env_id])
+                    episode_length = int(lengths[env_id])
+                    success = int(
+                        is_cube_lift_success_reason(
+                            infos[env_id].get("termination_reason")
+                        )
+                    )
+                    completed_returns.append(episode_return)
+                    completed_lengths.append(episode_length)
+                    successes += success
+                    completed_by_env[env_id] += 1
+                    offset = action_offsets[env_id % len(action_offsets)]
+                    metrics = offset_metrics[offset]
+                    metrics["episodes"] += 1
+                    metrics["successes"] += success
+                    metrics["returns"].append(episode_return)
+                    metrics["lengths"].append(episode_length)
                 returns[env_id] = 0.0
                 lengths[env_id] = 0
-            if len(completed_returns) >= args.episodes:
+            if np.all(completed_by_env >= target_episodes_per_env):
                 break
         if len(completed_returns) < args.episodes:
             raise RuntimeError(
@@ -144,6 +222,28 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "episodes": args.episodes,
         "successes": successes,
         "success_rate": successes / args.episodes,
+        "deterministic": not args.stochastic,
+        "policy_action_dim": policy.action_dim,
+        "environment_action_dim": policy.environment_action_dim,
+        "active_action_indices": list(policy.active_action_indices),
+        "action_offset_results": [
+            {
+                "action_offset": offset,
+                "episodes": int(offset_metrics[offset]["episodes"]),
+                "successes": int(offset_metrics[offset]["successes"]),
+                "success_rate": (
+                    float(offset_metrics[offset]["successes"])
+                    / max(int(offset_metrics[offset]["episodes"]), 1)
+                ),
+                "raw_return_mean": float(
+                    np.mean(offset_metrics[offset]["returns"])
+                ),
+                "episode_length_mean": float(
+                    np.mean(offset_metrics[offset]["lengths"])
+                ),
+            }
+            for offset in action_offsets
+        ],
         "raw_return_mean": float(np.mean(completed_returns)),
         "raw_return_std": float(np.std(completed_returns)),
         "episode_length_mean": float(np.mean(completed_lengths)),

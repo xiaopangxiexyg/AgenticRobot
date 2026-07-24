@@ -279,6 +279,7 @@ def test_device_retry_wires_angle_trigger_fallback_to_q6_promotion() -> None:
     retry_source = source[retry_start:retry_end]
 
     assert "_promote_angle_trigger_gripper_input_to_q6(" in retry_source
-    assert "recording_active()" in retry_source
-    assert "episode_start_countdown_deadline is not None" in retry_source
+    assert "clutch_input._episode_busy()" in retry_source
+    assert "recording_active()" not in retry_source
+    assert "episode_start_countdown_deadline" not in retry_source
     assert "clutch_input.hold_active()" in retry_source

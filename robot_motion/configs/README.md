@@ -2,6 +2,10 @@
 
 本文解释 `default_ik_safety_profiles.json` 中各字段的实际含义和调参影响。该文件由 `robot_motion.profiles.load_ik_safety_profiles()` 读取成 `IKSafetyProfile`，主要被 `robot_motion.ik_resolver.IKSafetyResolver` 使用；`dual_arm_teleop` 还会被 `teleop_runtime.retargeters.dual_arm_collision_aware` 的双臂局部步进逻辑读取。
 
+## RM65 相机 registry（过渡配置）
+
+`rm65_camera_registry.json` 是 RM65/Rig 共享的相机映射配置，供 Real2Sim 相机挂载发现、离线投影和运行时相机快照使用。当前 v1 为兼容旧数据，仍保留历史 registry 中的序列号、profile 和外参字段；新配置不要继续扩展这种混合结构。后续迁移会把遥操作工作站的设备分配、机器人挂载 profile 与运行时快照拆成独立契约。
+
 ## 配置结构
 
 顶层字段：

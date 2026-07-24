@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from cameras.configs import (
+from ..configs.camera_paths import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )

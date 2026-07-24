@@ -1,0 +1,102 @@
+{
+  "schema_id": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_tx1_policy_emission_target_compatibility_local_2026_07_24",
+  "scope": "pure_policy_emission_target_compatibility_no_target_no_action",
+  "captured_at": "2026-07-24T17:20:45+08:00",
+  "repository": {
+    "dexteleop_commit": "a79c180a6ea415c239e3a74c8999b6eb07acadfd",
+    "worktree_global_state": "dirty_concurrent_work_preserved",
+    "dependency_or_lock_change": false
+  },
+  "implementation": {
+    "assessment": "robot_motion.deploy.assess_policy_emission_target_compatibility",
+    "result_type": "robot_motion.deploy.PolicyEmissionTargetCompatibilityAssessment",
+    "reused_target_facts": [
+      "TargetRuntimeActionContract",
+      "ActionComponentCatalog",
+      "ReferenceActivationSpec"
+    ],
+    "representation_proofs": [
+      "legacy_representation_receipt_v1",
+      "typed_canonicalization_receipt_v1"
+    ],
+    "legacy_pose_frame_requires_independent_binding_hash": true,
+    "records_control_trace": false,
+    "calls_target_or_safety": false,
+    "grants_authority": false
+  },
+  "negative_characterization": [
+    {
+      "attempt": "typed canonical qpos target fixture",
+      "result": "rejected because production typed canonical policy actions require pose"
+    },
+    {
+      "attempt": "typed canonical pose with immediate MuJoCo target",
+      "result": "rejected because MuJoCo pose v1 requires scheduled reference segments"
+    },
+    {
+      "attempt": "early typed pose emission into existing MuJoCo target",
+      "result": "rejected before proposal by exact ControlTrace policy_action_emission v1 payload fields"
+    }
+  ],
+  "verification": [
+    {
+      "command": "python -m pytest -q tests/test_rtc_emission_target.py",
+      "result": "5 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_rtc_emission_target.py tests/test_control_station_mujoco_rtc_policy.py tests/test_mujoco_deploy_runtime.py tests/test_rtc_absolute_canonicalizer.py tests/test_rtc_generic_deploy_runtime.py tests/test_openpi_rtc_final_chunk_adapter.py",
+      "result": "115 passed"
+    },
+    {
+      "command": "python -m pytest -q tests/test_rtc_*.py tests/test_openpi_common_deploy.py tests/test_openpi_rtc_final_chunk_adapter.py tests/test_vla_scratch_rtc_adapter.py",
+      "result": "192 passed"
+    },
+    {
+      "command": "python -m py_compile robot_motion/deploy/emission_target.py robot_motion/deploy/__init__.py tests/test_rtc_emission_target.py",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check -- <TX1 scoped files>",
+      "result": "passed"
+    }
+  ],
+  "boundary": {
+    "mujoco_runtime_changed_by_tx1": false,
+    "control_station_changed_by_tx1": false,
+    "teleop_or_replay_runtime_changed": false,
+    "sync_queue_v1_changed": false,
+    "rtc_worker_plan_or_pop_changed": false,
+    "trace_schema_changed": false,
+    "hardware_accessed": false,
+    "action_send_enabled": false,
+    "target_preflight_or_admission_claimed": false,
+    "sim_or_real_authority_claimed": false
+  },
+  "scoped_source_sha256": {
+    "robot_motion/deploy/emission_target.py": "9df94d8bdb4456d48facb3b79fe7d4b2cbc4da2edf68791e18af06e75b2312f3",
+    "robot_motion/deploy/__init__.py": "6b72e85b72a89bc97ab534e51bbf1c5ce39a22ee30e7ba4fa4e13bfdf46df931",
+    "tests/test_rtc_emission_target.py": "a255ed0baf6638f3867292b2f7a8fdbb3eafbeccce7e5ffb7c0106235131b0d6",
+    "DEPLOY_SCHEMA.md": "1be9824e1e102513ff2b317a61661e61620c9bbf5697a122cdc0aca03138f06b"
+  },
+  "claims": [
+    "source representation proof, target catalog, explicit component authority, pose frame and activation lead can be assessed without a model or target dependency",
+    "legacy and typed source proofs remain distinct",
+    "a due-pop emission cannot satisfy a positive scheduled target lead",
+    "component, frame, clock and coupled-group mismatches fail closed"
+  ],
+  "non_claims": [
+    "typed policy_action_emission ControlTrace is not implemented",
+    "MuJoCo typed target admission is not implemented",
+    "scheduled RTC early admission or preview identity is not implemented",
+    "OpenPI plus MuJoCo raw-RTC shadow or authority is not implemented"
+  ],
+  "next_gate": {
+    "id": "rtc_tx2_typed_policy_action_emission_trace",
+    "blocked_by": [
+      "concurrent ControlTrace mainline stabilization",
+      "additive typed schema and committed-reader characterization"
+    ],
+    "parallel_source_gate": "rtc_4b_t2i_typed_launcher_adapter_factory_context"
+  }
+}

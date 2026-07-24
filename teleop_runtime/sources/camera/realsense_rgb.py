@@ -340,8 +340,9 @@ class RealSenseRGBSource(ObservationSource):
             raise RuntimeError(
                 f"RealSense pipeline start failed for camera_key={self.config.camera_key!r} "
                 f"serial={self.config.serial!r} request={request}: {exc}. "
-                "If this is a D405 wrist camera with depth enabled, color and depth may need "
-                "matching resolutions, for example color=480x270@15 and depth=480x270@15."
+                "The configured profile was preserved. Verify the device's enumerated native "
+                "profiles, USB link, firmware, and exclusive access; do not silently lower "
+                "collection resolution to bypass a device/profile failure."
             ) from exc
         self._active_color_format = self.config.color_format
         try:

@@ -8,6 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from control_station import (
+    COMPOSITION_SESSION_OPERATION_READY_STATUS_V1,
+    COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1,
+    COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1,
+    CompositionSessionController,
+    CompositionSessionOperationSpec,
+    CompositionSessionRearmReceipt,
+    CompositionSessionRearmSpec,
     ControlStationRunManifest,
     ControlStationRuntime,
     ExecutionDomainBinding,
@@ -23,7 +30,11 @@ from control_station import (
     admit_station_intent,
     apply_station_operation_result,
     apply_station_intent,
+    advance_composition_session,
+    initial_composition_session_state,
     initial_control_station_state,
+    project_composition_session_rearm_receipt,
+    project_composition_session_rearm_spec,
 )
 from control_station.targets.authoritative import (
     authoritative_authority_epoch_source_id,
@@ -685,6 +696,364 @@ def test_safety_intent_bypasses_normal_control_lease_but_grants_no_motion() -> N
     rejected = apply_station_intent(manifest, state, request)
     assert not rejected.receipt.accepted
     assert rejected.receipt.status == "runtime_hold_or_fault_latched"
+
+
+def test_composition_session_contract_is_single_direction_and_non_resumable() -> None:
+    spec = CompositionSessionOperationSpec(
+        session_key="episode:composition:0",
+        composer_source_slot_id="composer",
+        contributor_source_slot_ids=("replay", "human"),
+        composition_spec_hash="composition:weighted-se3",
+        authority_gate_spec_hash="composition-gate:formal",
+        execution_binding_hash="target-binding:sim",
+        capture_boundary_id="capture-boundary:0",
+    )
+    state = initial_composition_session_state(spec, session_epoch=0)
+    active, started = advance_composition_session(
+        state,
+        transition="start",
+        reason="station_ready",
+        source_fact_id="station-result:start",
+        source_fact_hash="hash:start",
+        start_intent_id="station-intent:start",
+    )
+    assert active.phase == "active"
+    held, paused = advance_composition_session(
+        active,
+        transition="hold",
+        reason="operator_pause",
+        source_fact_id="station-intent:hold",
+        source_fact_hash="hash:hold",
+    )
+    assert held.phase == "held"
+    assert paused.operation_spec_id == spec.operation_spec_id
+    with pytest.raises(ValueError, match="Unsupported composition session"):
+        advance_composition_session(
+            held,
+            transition="start",
+            reason="fresh_input_is_not_rearm",
+            source_fact_id="input:fresh",
+            source_fact_hash="hash:fresh",
+            start_intent_id="station-intent:start-2",
+        )
+    ended, stopped = advance_composition_session(
+        held,
+        transition="stop",
+        reason="episode_end",
+        source_fact_id="station-result:stop",
+        source_fact_hash="hash:stop",
+    )
+    assert ended.phase == "ended"
+    assert stopped.transition == "stop"
+
+
+def test_composition_session_rearm_spec_and_receipt_have_typed_trace_schema() -> None:
+    logical = CompositionSessionOperationSpec(
+        session_key="episode:composition:trace-rearm",
+        composer_source_slot_id="composer",
+        contributor_source_slot_ids=("replay", "human"),
+        composition_spec_hash="composition:weighted-se3",
+        authority_gate_spec_hash="composition-gate:formal",
+        execution_binding_hash="target-binding:sim",
+        capture_boundary_id="capture-boundary:trace-rearm",
+    )
+    held = initial_composition_session_state(logical, session_epoch=3)
+    active, _ = advance_composition_session(
+        held,
+        transition="start",
+        reason="station_ready",
+        source_fact_id="station-operation:start",
+        source_fact_hash="hash:start",
+        start_intent_id="station-intent:start",
+    )
+    held, _ = advance_composition_session(
+        active,
+        transition="hold",
+        reason="operator_pause",
+        source_fact_id="station-intent:hold",
+        source_fact_hash="hash:hold",
+    )
+    rearm = CompositionSessionRearmSpec(
+        rearm_key="trace-rearm:4",
+        logical_operation_spec_id=logical.operation_spec_id,
+        logical_operation_spec_hash=logical.semantic_content_hash,
+        prior_session_epoch=held.session_epoch,
+        prior_state_hash=held.semantic_content_hash,
+        execution_binding_hash=logical.execution_binding_hash,
+        readiness_observer_binding_id="sim-readiness:v1",
+        readiness_timeout_sec=0.1,
+    )
+    receipt = CompositionSessionRearmReceipt(
+        rearm_spec_id=rearm.rearm_spec_id,
+        rearm_spec_hash=rearm.semantic_content_hash,
+        logical_operation_spec_id=logical.operation_spec_id,
+        logical_operation_spec_hash=logical.semantic_content_hash,
+        prior_session_epoch=3,
+        next_session_epoch=4,
+        prior_composer_producer_epoch=7,
+        composer_producer_epoch=8,
+        prior_authority_epoch=10,
+        authority_epoch=11,
+        prior_execution_epoch=20,
+        execution_epoch=21,
+        cancellation_receipt_id="cancel:21",
+        measurement_id="measurement:4",
+        measurement_hash="measurement-hash:4",
+        producer_activation_id="producer-activation:8",
+        authority_event_ids=("authority-event:11",),
+        ready_gate_event_id="gate-ready:4",
+        activation_input_barrier_time=8.0,
+        completed_at=8.01,
+        clock_domain_id="sim-monotonic",
+        satisfied_readiness_checks=rearm.required_readiness_checks,
+        status=COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1,
+    )
+    spec_fact = project_composition_session_rearm_spec(
+        rearm,
+        runtime_session_id="runtime:trace-rearm",
+        control_domain_id="domain:arms",
+        embodiment_instance_id="embodiment:sim",
+        occurred_at=8.0,
+        clock_domain_id="sim-monotonic",
+    )
+    receipt_fact = project_composition_session_rearm_receipt(
+        receipt,
+        runtime_session_id="runtime:trace-rearm",
+        control_domain_id="domain:arms",
+        embodiment_instance_id="embodiment:sim",
+    )
+    assert spec_fact.event_type == "composition_session_rearm_spec"
+    assert spec_fact.payload["prior_state_hash"] == held.semantic_content_hash
+    assert receipt_fact.event_type == "composition_session_rearm_receipt"
+    assert receipt_fact.payload["next_session_epoch"] == 4
+    assert receipt_fact.payload["status"] == (
+        COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1
+    )
+
+
+def test_composition_session_controller_owns_generic_identity_barrier_and_hold() -> None:
+    clock = lambda: 7.0
+    controller = CompositionSessionController(
+        composer_source_slot_id="composer",
+        contributor_source_slot_ids=("replay", "human"),
+        composition_spec_hash="composition:weighted-se3",
+        authority_gate_spec_hash="composition-gate:formal",
+        execution_binding_hash="target-binding:sim-or-real",
+        clock=clock,
+        clock_domain_id="controller-monotonic",
+    )
+    spec = CompositionSessionOperationSpec(
+        session_key="episode:composition:controller",
+        composer_source_slot_id="composer",
+        contributor_source_slot_ids=("human", "replay"),
+        composition_spec_hash="composition:weighted-se3",
+        authority_gate_spec_hash="composition-gate:formal",
+        execution_binding_hash="target-binding:sim-or-real",
+        capture_boundary_id="capture-boundary:controller",
+    )
+    observed_specs = []
+    observed_transitions = []
+    observed_barriers = []
+    controller.bind_session_trace_observers(
+        spec_observer=observed_specs.append,
+        transition_observer=lambda event, **metadata: (
+            observed_transitions.append((event, metadata))
+        ),
+    )
+    controller.bind_publication_barrier_observer(
+        lambda snapshot, **metadata: (
+            observed_barriers.append((snapshot, metadata))
+        )
+    )
+    assert controller.register(spec) == spec.operation_spec_id
+    assert controller.register(spec) == spec.operation_spec_id
+    assert observed_specs == [spec]
+    assert controller.current_state is not None
+    assert controller.current_state.session_epoch == 0
+
+    start_result = admit_station_operation_result(
+        StationOperationResultDraft(
+            source_intent_id="intent:start",
+            operation_kind="start_composition_session",
+            subject_id="composer",
+            succeeded=True,
+            completed_at=6.9,
+            completed_clock_domain_id="adapter-monotonic",
+            status=COMPOSITION_SESSION_OPERATION_READY_STATUS_V1,
+            evidence_refs=(spec.operation_spec_id,),
+        ),
+        runtime_session_id="runtime:composition",
+        control_domain_id="control:composition",
+        available_at=7.0,
+        available_clock_domain_id="controller-monotonic",
+        admission_sequence=0,
+    )
+    controller.complete_start_operation(
+        operation_spec_id=spec.operation_spec_id,
+        result=start_result,
+        completion_accepted=True,
+        source_fact_id="station-operation:start",
+        source_fact_hash="station-operation-hash:start",
+        start_intent_id="intent:start",
+    )
+    assert controller.current_state is not None
+    assert controller.current_state.phase == "active"
+    assert controller.publication_barrier.snapshot().enabled
+    with pytest.raises(RuntimeError, match="single-use"):
+        controller.require_registered_spec(spec.operation_spec_id)
+
+    lower_transitions = []
+
+    def lower_hold() -> None:
+        assert not controller.publication_barrier.snapshot().enabled
+        lower_transitions.append("hold")
+
+    controller.prepare_safety_transition(
+        intent_kind="hold",
+        causal_station_fact_id="intent:hold",
+        source_fact_id="station-intent:hold",
+        source_fact_hash="station-intent-hash:hold",
+        occurred_at=7.1,
+        clock_domain_id="controller-monotonic",
+        lower_hold_or_fault=lower_hold,
+    )
+    assert lower_transitions == ["hold"]
+    assert controller.current_state.phase == "held"
+    assert not controller.publication_barrier.snapshot().enabled
+    assert [item[0].transition for item in observed_transitions] == [
+        "start",
+        "hold",
+    ]
+    assert [item[0].enabled for item in observed_barriers] == [True, False]
+
+
+def test_station_composition_session_has_one_composer_authority_owner() -> None:
+    slots = (
+        _source_slot(
+            "human",
+            source_kind="human",
+            producer_id="human:one",
+            supported_uses=("contributor",),
+        ),
+        _source_slot(
+            "replay",
+            source_kind="replay",
+            producer_id="replay:one",
+            supported_uses=("contributor",),
+        ),
+        _source_slot(
+            "composer",
+            source_kind="composite",
+            producer_id="composer:one",
+            supported_uses=("candidate", "authority"),
+        ),
+    )
+    base = _manifest(target_kind="sim", slots=slots)
+    manifest = replace(
+        base,
+        allowed_intent_kinds=tuple(
+            sorted(
+                {
+                    *base.allowed_intent_kinds,
+                    "request_candidate",
+                    "release_candidate",
+                    "start_composition_session",
+                    "stop_composition_session",
+                }
+            )
+        ),
+    )
+    initial = initial_control_station_state(
+        manifest,
+        runtime_session_id="session:composition",
+    )
+    leased, lease_transition = _apply(
+        manifest,
+        initial,
+        sequence=0,
+        kind="acquire_control_lease",
+    )
+    assert lease_transition.receipt.accepted
+    armed = replace(
+        leased,
+        lifecycle_state="armed",
+        target_state="preflighted",
+        source_state_by_slot={
+            "human": "preflighted",
+            "replay": "preflighted",
+            "composer": "candidate",
+        },
+    )
+    pending, request = _apply(
+        manifest,
+        armed,
+        sequence=1,
+        kind="start_composition_session",
+        subject_id="composer",
+        resource_binding_id=manifest.execution_binding.binding_id,
+        operation_spec_id="composition-session-spec:one",
+    )
+    assert request.receipt.status == "operation_requested"
+    assert pending.source_state_by_slot["composer"] == "candidate"
+    result = admit_station_operation_result(
+        StationOperationResultDraft(
+            source_intent_id=request.intent.intent_id,
+            operation_kind="start_composition_session",
+            subject_id="composer",
+            succeeded=True,
+            completed_at=3.0,
+            completed_clock_domain_id="adapter-monotonic",
+            status=COMPOSITION_SESSION_OPERATION_READY_STATUS_V1,
+            evidence_refs=("composition-session-spec:one",),
+        ),
+        runtime_session_id=pending.runtime_session_id,
+        control_domain_id=pending.control_domain_id,
+        available_at=3.1,
+        available_clock_domain_id="control-monotonic",
+        admission_sequence=20,
+    )
+    started = apply_station_operation_result(manifest, pending, result)
+    assert started.accepted
+    assert started.state_after.lifecycle_state == "running"
+    assert started.state_after.source_state_by_slot == {
+        "human": "preflighted",
+        "replay": "preflighted",
+        "composer": "active",
+    }
+    stop_pending, stop_request = _apply(
+        manifest,
+        started.state_after,
+        sequence=2,
+        kind="stop_composition_session",
+        subject_id="composer",
+        resource_binding_id=manifest.execution_binding.binding_id,
+        operation_spec_id="composition-session-spec:one",
+    )
+    stop_result = admit_station_operation_result(
+        StationOperationResultDraft(
+            source_intent_id=stop_request.intent.intent_id,
+            operation_kind="stop_composition_session",
+            subject_id="composer",
+            succeeded=True,
+            completed_at=4.0,
+            completed_clock_domain_id="adapter-monotonic",
+            status=COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1,
+            evidence_refs=("execution-hold:one",),
+        ),
+        runtime_session_id=stop_pending.runtime_session_id,
+        control_domain_id=stop_pending.control_domain_id,
+        available_at=4.1,
+        available_clock_domain_id="control-monotonic",
+        admission_sequence=21,
+    )
+    stopped = apply_station_operation_result(
+        manifest,
+        stop_pending,
+        stop_result,
+    )
+    assert stopped.accepted
+    assert stopped.state_after.lifecycle_state == "hold"
+    assert stopped.state_after.source_state_by_slot["composer"] == "candidate"
 
 
 def test_sim_candidate_and_authority_require_typed_operation_completion() -> None:

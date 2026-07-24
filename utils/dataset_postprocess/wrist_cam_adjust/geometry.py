@@ -365,13 +365,30 @@ def resolve_repo_relative_path(value: str | Path | None, *, repo_root: Path) -> 
     # Historical metadata can contain repository-relative paths captured before
     # package moves. These aliases are data migration support only; runtime code
     # must import the canonical ``utils.dataset_postprocess`` package.
+    exact_aliases = {
+        "cameras/configs/rm65/cameras/realsense_registry.json": (
+            "robot_motion/configs/rm65_camera_registry.json"
+        ),
+        "teleop_runtime/configs/cameras/realsense_registry.json": (
+            "robot_motion/configs/rm65_camera_registry.json"
+        ),
+    }
+    exact_replacement = exact_aliases.get(text)
+    if exact_replacement is not None:
+        candidate = (repo_root / exact_replacement).resolve()
+        if candidate.exists():
+            return candidate
     marker_roots = {
         "hardware/": "hardware/",
         "teleop_records/": "teleop_records/",
         "dataset_postprocess/": "utils/dataset_postprocess/",
         "utils/dataset_postprocess/": "utils/dataset_postprocess/",
-        "cameras/": "cameras/",
-        "camera_process/configs/": "cameras/configs/",
+        # Historical camera config paths are aliases only; the files now live
+        # with the owning teleop station config or RM65 robot profile.
+        "cameras/configs/rm65/cameras/": "robot_motion/configs/",
+        "cameras/configs/rm65/devices/": "teleop_runtime/configs/devices/",
+        "camera_process/configs/": "robot_motion/configs/",
+        "cameras/": "robot_motion/configs/",
         "camera_process/real_undistort/": "utils/dataset_postprocess/real_undistort/",
         "camera_process/wrist_cam_adjust/": "utils/dataset_postprocess/wrist_cam_adjust/",
         "assets/": "assets/",

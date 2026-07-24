@@ -28,9 +28,12 @@ from deployments.client.rtc_executor import (
     RtcPreparedModelInput,
 )
 from deployments.client.rtc_final_chunk import (
-    FinalChunkModelOutput,
     FinalChunkRtcBackend,
     FinalChunkRtcBinding,
+)
+from deployments.client.rtc_final_chunk_adapter import (
+    MappingFinalChunkOutputAdapter,
+    create_final_chunk_rtc_runtime_adapter,
 )
 from deployments.client.rtc_frontend import SimpleRtcModelRuntimeAdapter
 from robot_motion.deploy.inference import PolicyInferenceRequest
@@ -153,6 +156,50 @@ class VlaScratchFinalChunkRtcConfig:
         )
 
 
+def _vla_scratch_model_seam(
+    *,
+    transport: VlaScratchPolicyTransport,
+    config: VlaScratchFinalChunkRtcConfig,
+) -> tuple[
+    Callable[[Any], Mapping[str, Any]],
+    Callable[[Any], str],
+    Callable[[], bool] | None,
+]:
+    """Return only the framework-specific call/hash/cancel functions."""
+
+    if not isinstance(transport, VlaScratchPolicyTransport):
+        raise TypeError("transport must implement VlaScratchPolicyTransport.")
+    if not isinstance(config, VlaScratchFinalChunkRtcConfig):
+        raise TypeError("config must be VlaScratchFinalChunkRtcConfig.")
+    expected_spec_hash = config.sample_spec.semantic_content_hash
+
+    def validate_input(value: Any) -> VlaScratchProcessedObservation:
+        if not isinstance(value, VlaScratchProcessedObservation):
+            raise TypeError(
+                "vla-scratch RTC backend requires VlaScratchProcessedObservation."
+            )
+        if value.spec.semantic_content_hash != expected_spec_hash:
+            raise ValueError("vla-scratch processed sample spec changed.")
+        return value
+
+    def hash_model_input(value: Any) -> str:
+        return validate_input(value).semantic_content_hash
+
+    def call_model(value: Any) -> Mapping[str, Any]:
+        prepared = validate_input(value)
+        raw_response = transport.infer(prepared.to_wire_payload())
+        if not isinstance(raw_response, Mapping):
+            raise TypeError("vla-scratch infer response must be a mapping.")
+        return raw_response
+
+    cancel_hook = getattr(transport, "request_cancel", None)
+    return (
+        call_model,
+        hash_model_input,
+        cancel_hook if callable(cancel_hook) else None,
+    )
+
+
 class VlaScratchFinalChunkRtcBackend(FinalChunkRtcBackend):
     """Thin extraction seam over the shared final-chunk RTC backend."""
 
@@ -163,49 +210,22 @@ class VlaScratchFinalChunkRtcBackend(FinalChunkRtcBackend):
         config: VlaScratchFinalChunkRtcConfig,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not isinstance(transport, VlaScratchPolicyTransport):
-            raise TypeError("transport must implement VlaScratchPolicyTransport.")
-        if not isinstance(config, VlaScratchFinalChunkRtcConfig):
-            raise TypeError("config must be VlaScratchFinalChunkRtcConfig.")
         if not callable(clock):
             raise TypeError("clock must be callable.")
         self._transport = transport
         self.config = config
-        expected_spec_hash = config.sample_spec.semantic_content_hash
-
-        def validate_input(value: Any) -> VlaScratchProcessedObservation:
-            if not isinstance(value, VlaScratchProcessedObservation):
-                raise TypeError(
-                    "vla-scratch RTC backend requires "
-                    "VlaScratchProcessedObservation."
-                )
-            if value.spec.semantic_content_hash != expected_spec_hash:
-                raise ValueError("vla-scratch processed sample spec changed.")
-            return value
-
-        def hash_model_input(value: Any) -> str:
-            return validate_input(value).semantic_content_hash
-
-        def infer_model(value: Any) -> FinalChunkModelOutput:
-            prepared = validate_input(value)
-            raw_response = transport.infer(prepared.to_wire_payload())
-            if not isinstance(raw_response, Mapping):
-                raise TypeError("vla-scratch infer response must be a mapping.")
-            if config.output_key not in raw_response:
-                raise ValueError(
-                    "vla-scratch infer response is missing exact output key "
-                    f"{config.output_key!r}."
-                )
-            return FinalChunkModelOutput(
-                actions=raw_response[config.output_key],
-            )
-
-        cancel_hook = getattr(transport, "request_cancel", None)
+        call_model, hash_model_input, cancel_hook = _vla_scratch_model_seam(
+            transport=transport,
+            config=config,
+        )
+        adapt_output = MappingFinalChunkOutputAdapter(
+            actions_key=config.output_key,
+        )
         super().__init__(
             binding=config.final_chunk_binding,
-            infer_model=infer_model,
+            infer_model=lambda value: adapt_output(call_model(value)),
             hash_model_input=hash_model_input,
-            request_cancel=(cancel_hook if callable(cancel_hook) else None),
+            request_cancel=cancel_hook,
             clock=clock,
         )
 
@@ -251,22 +271,29 @@ def create_vla_scratch_runtime_adapter(
     task: str,
     clock: Callable[[], float] = time.monotonic,
 ) -> SimpleRtcModelRuntimeAdapter:
-    """Compose the framework-neutral adapter without a registry or subclass."""
+    """Compose through the generic final-chunk runtime adapter factory."""
 
-    backend = VlaScratchFinalChunkRtcBackend(
+    if not callable(clock):
+        raise TypeError("clock must be callable.")
+    call_model, hash_model_input, cancel_hook = _vla_scratch_model_seam(
         transport=transport,
         config=config,
-        clock=clock,
     )
     preparer: RtcModelInputPreparer = VlaScratchRtcInputPreparer(
         sample_spec=config.sample_spec,
         task=task,
     )
-    return SimpleRtcModelRuntimeAdapter(
-        backend=backend,
-        decoder=decoder,
-        request_spec=backend.request_spec,
+    return create_final_chunk_rtc_runtime_adapter(
+        binding=config.final_chunk_binding,
         prepare_input=preparer,
+        call_model=call_model,
+        hash_model_input=hash_model_input,
+        decoder=decoder,
+        adapt_output=MappingFinalChunkOutputAdapter(
+            actions_key=config.output_key,
+        ),
+        request_cancel=cancel_hook,
+        clock=clock,
     )
 
 

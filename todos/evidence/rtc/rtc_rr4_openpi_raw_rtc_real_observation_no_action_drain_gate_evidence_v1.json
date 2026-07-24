@@ -1,0 +1,193 @@
+{
+  "schema": "dexteleop_rtc_scoped_non_formal_evidence_v1",
+  "evidence_id": "rtc_rr4_openpi_raw_rtc_real_observation_no_action_drain_gate_2026_07_24",
+  "captured_at": "2026-07-24T15:23:10+08:00",
+  "scope": "real_observation_openpi_raw_rtc_explicit_validity_admission_emission_and_drain_no_action",
+  "gate_result": "real_observation_transport_admission_emission_control_budget_and_worker_drain_passed_no_motion_authority",
+  "repository": {
+    "commit": "a79c180a6ea415c239e3a74c8999b6eb07acadfd",
+    "worktree_global_state": "dirty_concurrent_mainline_preserved",
+    "rtc_changes_scope": "deploy_only_default_off",
+    "teleop_or_replay_modified_by_rtc": false,
+    "sim_observation_modified_by_rtc": false,
+    "openpi_checkout_modified": false
+  },
+  "loaded_instance": {
+    "evidence_only_not_compatibility_allowlist": true,
+    "model_id": "0715-cube-front-ready-mix-4to1-relative",
+    "checkpoint_step": 149999,
+    "action_pose_mode": "relative",
+    "prediction_horizon_steps": 50,
+    "model_action_dim": 16,
+    "model_state_dim": 32,
+    "camera_source_keys": ["front", "left_wrist", "right_wrist"]
+  },
+  "identity_bindings": {
+    "layout_hash": "sha256:a94b05fd5e94eaa0d431af726009ba7113ea8e8b774edf45d42f591e80690e89",
+    "frame_contract_hash": "sha256:c8d881305707dc8d83da3a4d0dab9c3bbb0057ecfd560a9e9ac4ae00fb66b71c",
+    "normalization_hash": "sha256:66debe51033f068bcb71029799dd26fe9e523c4aaef068e4746c60c997dbae6b",
+    "pose_chunk_contract_hash": "sha256:da33eafb4ce6a065ded8934abd3db73249b8c6e1868ca51dc838a63a5f5427a4",
+    "continuation_mode": "none"
+  },
+  "boundary": {
+    "rtc_profile": "raw_rtc_final_chunk_15_30_60_120_v1",
+    "rtc_real_shadow": true,
+    "send_actions": false,
+    "position_lookahead_enabled": false,
+    "arm_observation_only": true,
+    "left_gripper_observation_only": true,
+    "right_gripper_observation_only": true,
+    "gripper_send_commands": false,
+    "tactile_enabled": false,
+    "position_reference_called": false,
+    "dispatch_called": false,
+    "action_send_authority": false
+  },
+  "real_observation": {
+    "loop_steps": 900,
+    "effective_action_hz": 30.0,
+    "effective_policy_hz": 30.0,
+    "state_valid_after_warmup": "38/38",
+    "camera_startup_hardware_reset": true,
+    "camera_start_stagger_sec": 0.5,
+    "camera_serials": {
+      "front": "213222079798",
+      "left_wrist": "261122273924",
+      "right_wrist": "260522278055"
+    },
+    "dmtac_assignment": {
+      "left": "/dev/ttyUSB0",
+      "right": "/dev/ttyUSB1",
+      "source": "explicit_manual_override_using_shared_teleop_assignment_aliases",
+      "saved_assignment": "teleop_runtime/configs/hardware/dmtac/latest.json",
+      "saved_physical_by_paths_currently_stale": true,
+      "physical_left_right_identity_reverified_for_this_gate": false,
+      "side_label_uncertainty_blocks_rtc_mechanics_shadow": false,
+      "side_label_uncertainty_blocks_policy_semantic_or_motion_claims": true,
+      "observation_only": true,
+      "send_commands": false
+    }
+  },
+  "explicit_rtc_parameters": {
+    "request_validity_steps": 50,
+    "worker_stop_timeout_sec": 2.0,
+    "control_budget_sec": 0.03333333333333333
+  },
+  "transport_and_admission": {
+    "request_submitted_count": 8,
+    "completed_exchange_count": 8,
+    "source_chunk_horizon": 50,
+    "cold_inference_duration_sec": 10.573249122000561,
+    "warm_inference_duration_median_sec": 0.7594240910002554,
+    "warm_inference_duration_min_sec": 0.7576535130010598,
+    "warm_inference_duration_max_sec": 0.7630858890006493,
+    "accepted_merge_count": 7,
+    "rejected_merge_count": 1,
+    "rejection_reasons": {
+      "request_deadline_expired": 1
+    },
+    "admitted_keyframe_count": 273,
+    "discarded_obsolete_count": 77,
+    "formal_emission_count": 253,
+    "unique_formal_emission_id_count": 253,
+    "selected_emission_count": 253,
+    "duplicate_formal_emission_detected": false,
+    "all_exchanges_non_authoritative": true
+  },
+  "control_and_authority": {
+    "blocking_model_inference_ran_in_worker": true,
+    "control_budget_exceeded_count": 0,
+    "max_control_duration_sec": 0.01680335299897706,
+    "action_step_count": 0,
+    "legacy_execution_observation_count": 0,
+    "dispatch_count": 0,
+    "exchange_action_send_authority_all_false": true,
+    "position_lookahead_values": [false],
+    "send_actions_values": [false]
+  },
+  "shutdown": {
+    "worker_session_state": "DRAINED",
+    "worker_thread_exited_at_frontend_close": true,
+    "client_process_exited": true,
+    "server_process_cleaned": true,
+    "loopback_port_8078_closed": true,
+    "gate_passed": true
+  },
+  "repeatability_check": {
+    "captured_at": "2026-07-24T15:31:39+08:00",
+    "same_model_checkpoint_and_explicit_rtc_parameters": true,
+    "loop_steps": 900,
+    "loop_wall_span_sec": 30.150779247283936,
+    "request_submitted_count": 9,
+    "completed_exchange_count": 8,
+    "unique_request_id_count": 8,
+    "final_inflight_request_drained_on_close": true,
+    "accepted_merge_count": 7,
+    "rejected_merge_count": 1,
+    "rejection_reasons": {
+      "request_deadline_expired": 1
+    },
+    "admitted_keyframe_count": 290,
+    "discarded_obsolete_count": 60,
+    "formal_emission_count": 290,
+    "unique_formal_emission_id_count": 290,
+    "duplicate_formal_emission_detected": false,
+    "all_admitted_keyframes_formally_emitted_before_close": true,
+    "underrun_step_count": 442,
+    "underrun_interval_count": 16,
+    "control_duration_median_sec": 0.0005770580000898917,
+    "control_duration_p95_sec": 0.013172187899817795,
+    "control_duration_p99_sec": 0.015074955650670746,
+    "control_duration_max_sec": 0.01757836400065571,
+    "control_budget_exceeded_count": 0,
+    "cold_inference_duration_sec": 9.697724224999547,
+    "warm_inference_duration_median_sec": 0.6782719249986258,
+    "warm_inference_duration_max_sec": 0.6852092360004463,
+    "send_actions_values": [false],
+    "position_lookahead_values": [false],
+    "exchange_action_send_authority_values": [false],
+    "worker_session_state": "DRAINED",
+    "worker_thread_exited_at_frontend_close": true,
+    "camera_transient_stale_warnings_self_recovered": true,
+    "raw_log_attestation": {
+      "local_pull_root": "/tmp/rtc_rr3e_manual_ports_logs",
+      "client_log_sha256": "4d7db0ed9cc5e24e8bc78bf30e97db55da9a954275025349d1502956850b0656",
+      "debug_jsonl_sha256": "75afef9c6991f60f16c793586c490ca9ab6cbb30b0b79b943642302681006926",
+      "server_log_sha256": "0578c7f59ccbe14b9cafb82439ca5bc1485e4ca1d8ebbaa5fe40401c9f971c98"
+    }
+  },
+  "raw_log_attestation": {
+    "remote_debug_jsonl": "/tmp/rtc_rr4_client_drain_gate_debug/deploy_debug_20260724_152311_239.jsonl",
+    "remote_wrapper_log": "/tmp/rtc_rr4_client_drain_gate/remote_python_20260724_152310.log",
+    "local_pull_root": "/tmp/rtc_rr4_real_shadow_logs/drain_gate",
+    "debug_jsonl_sha256": "6becaac7ca63d57bfabced1319c04a0a3a79c2e1a4f7bd7b99c817da616c93bc",
+    "wrapper_log_sha256": "88ffe2023cd62744ea186e6b8724f280db18c78b30e8bcf972f67881e9e76b3d",
+    "debug_event_counts": {
+      "startup": 1,
+      "rtc_frontend_step": 900,
+      "rtc_transport_exchange": 8,
+      "rtc_frontend_close": 1
+    }
+  },
+  "interpretation": {
+    "verified": [
+      "real arm/gripper/camera observations reached the raw-RTC client",
+      "OpenPI final-chunk transport, request/result identity, timed-plan admission and unique emission ran in a worker without control-budget exceedance",
+      "cold inference was rejected by the declared request TTL while warm results were admitted without stale-plan resurrection",
+      "explicit bounded close returned DRAINED with worker_thread_exited=true",
+      "send_actions=false and observation-only guards resulted in zero dispatch/action-step calls",
+      "a second identical gate reproduced unique admission/emission, zero budget exceedance and drained close"
+    ],
+    "not_established": [
+      "canonical safety/IK/target acceptance or downstream hardware command authority",
+      "physical left/right DMTAC identity or side-correct policy observation semantics",
+      "production motion readiness",
+      "model-RTC prefix/conditioning behavior"
+    ],
+    "next_gate": [
+      "keep the raw-RTC profile deployment-only and validate target-side canonical safety/IK through the separate sim/authority gates",
+      "refresh or physically verify the shared DMTAC assignment before any side-semantic or action-authority gate",
+      "do not enable action send based on this shadow evidence alone"
+    ]
+  }
+}

@@ -79,6 +79,10 @@ CONTROL_STATION_OPERATION_TRANSITION_HASH_DOMAIN_V1 = (
 HUMAN_TAKEOVER_OPERATION_READY_STATUS_V1 = "human_takeover_ready"
 HUMAN_TAKEOVER_OPERATION_HELD_STATUS_V1 = "human_takeover_held"
 HUMAN_TAKEOVER_OPERATION_FAULTED_STATUS_V1 = "human_takeover_faulted"
+COMPOSITION_SESSION_OPERATION_READY_STATUS_V1 = "composition_session_ready"
+COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1 = "composition_session_rearmed"
+COMPOSITION_SESSION_OPERATION_HELD_STATUS_V1 = "composition_session_held"
+COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1 = "composition_session_stopped"
 
 _LEASE_BYPASS_INTENTS = frozenset({"acquire_control_lease", "hold", "estop"})
 _IMPLEMENTED_INTENTS = frozenset(
@@ -97,6 +101,9 @@ _IMPLEMENTED_INTENTS = frozenset(
         "request_motion_authority",
         "release_motion_authority",
         "request_human_takeover",
+        "start_composition_session",
+        "rearm_composition_session",
+        "stop_composition_session",
         "hold",
         "estop",
         "stop_runtime",
@@ -620,6 +627,8 @@ def apply_station_intent(
         "stop_shadow",
         "release_candidate",
         "release_motion_authority",
+        "rearm_composition_session",
+        "stop_composition_session",
         "hold",
         "estop",
         "stop_runtime",
@@ -662,15 +671,31 @@ def apply_station_intent(
 
     source_states = dict(state.source_state_by_slot)
     pending_operations = dict(state.pending_operation_by_subject)
-    human_takeover_pending = any(
-        operation.operation_kind == "request_human_takeover"
+    pending_exclusive_kinds = {
+        operation.operation_kind
         for operation in pending_operations.values()
-    )
-    if human_takeover_pending and kind not in {"hold", "estop", "stop_runtime"}:
+        if operation.operation_kind
+        in {
+            "request_human_takeover",
+            "start_composition_session",
+            "rearm_composition_session",
+            "stop_composition_session",
+        }
+    }
+    exclusive_operation_pending = bool(pending_exclusive_kinds)
+    if exclusive_operation_pending and kind not in {
+        "hold",
+        "estop",
+        "stop_runtime",
+    }:
         return _rejected_transition(
             state,
             intent,
-            status="human_takeover_operation_pending",
+            status=(
+                "human_takeover_operation_pending"
+                if pending_exclusive_kinds == {"request_human_takeover"}
+                else "composition_session_operation_pending"
+            ),
         )
     if kind == "request_human_takeover":
         human_slot_id = intent.subject_id
@@ -773,6 +798,139 @@ def apply_station_intent(
             requested_runtime_state="active",
             resource_binding_id=previous_slot_id,
             resource_prior_runtime_state=source_states[previous_slot_id],
+            operation_spec_id=intent.operation_spec_id,
+        )
+        return _accepted_transition(
+            state,
+            intent,
+            pending_operations=pending_operations,
+            lease=lease,
+            status="operation_requested",
+        )
+
+    if kind in {
+        "start_composition_session",
+        "rearm_composition_session",
+        "stop_composition_session",
+    }:
+        composer_slot_id = intent.subject_id
+        target_binding_id = intent.resource_binding_id
+        if (
+            composer_slot_id is None
+            or target_binding_id is None
+            or intent.operation_spec_id is None
+        ):
+            return _rejected_transition(
+                state,
+                intent,
+                status="composition_session_binding_incomplete",
+            )
+        if (
+            composer_slot_id not in source_states
+            or target_binding_id != manifest.execution_binding.binding_id
+        ):
+            return _rejected_transition(
+                state,
+                intent,
+                status="composition_session_binding_mismatch",
+            )
+        if manifest.execution_binding.target_kind == "null":
+            return _rejected_transition(
+                state,
+                intent,
+                status="target_has_no_motion_authority",
+            )
+        if "station_motion_authority_lifecycle" in manifest.explicit_exclusions:
+            return _rejected_transition(
+                state,
+                intent,
+                status="station_motion_authority_lifecycle_excluded",
+            )
+        composer_slot = manifest.source_slot(composer_slot_id)
+        if (
+            composer_slot.source_kind != "composite"
+            or "authority" not in composer_slot.supported_uses
+        ):
+            return _rejected_transition(
+                state,
+                intent,
+                status="composition_session_subject_is_not_composer_authority",
+            )
+        if state.target_state != "preflighted":
+            return _rejected_transition(
+                state,
+                intent,
+                status="target_not_preflighted",
+            )
+        current = source_states[composer_slot_id]
+        expected = (
+            "candidate"
+            if kind == "start_composition_session"
+            else "active"
+        )
+        if current != expected:
+            return _rejected_transition(
+                state,
+                intent,
+                status=f"composition_session_composer_not_{expected}",
+            )
+        if kind == "start_composition_session":
+            if state.lifecycle_state != "armed":
+                return _rejected_transition(
+                    state,
+                    intent,
+                    status="composition_session_requires_armed_runtime",
+                )
+            if any(
+                slot_id != composer_slot_id and status == "active"
+                for slot_id, status in source_states.items()
+            ):
+                return _rejected_transition(
+                    state,
+                    intent,
+                    status="composition_session_parallel_authority_forbidden",
+                )
+        elif kind == "rearm_composition_session":
+            if state.lifecycle_state != "hold":
+                return _rejected_transition(
+                    state,
+                    intent,
+                    status="composition_session_rearm_requires_hold",
+                )
+            if any(
+                slot_id != composer_slot_id and status == "active"
+                for slot_id, status in source_states.items()
+            ):
+                return _rejected_transition(
+                    state,
+                    intent,
+                    status="composition_session_parallel_authority_forbidden",
+                )
+        elif state.lifecycle_state not in {"running", "hold", "fault"}:
+            return _rejected_transition(
+                state,
+                intent,
+                status="composition_session_not_running",
+            )
+        if pending_operations:
+            return _rejected_transition(
+                state,
+                intent,
+                status="operation_pending_prevents_composition_session",
+            )
+        subject_key = f"composition:{composer_slot_id}"
+        pending_operations[subject_key] = PendingStationOperation(
+            source_intent_id=intent.intent_id,
+            operation_kind=kind,
+            subject_id=composer_slot_id,
+            prior_runtime_state=current,
+            requested_runtime_state=(
+                "candidate"
+                if kind == "stop_composition_session"
+                else "active"
+            ),
+            resource_binding_id=target_binding_id,
+            resource_prior_runtime_state=state.target_state,
             operation_spec_id=intent.operation_spec_id,
         )
         return _accepted_transition(
@@ -1016,7 +1174,13 @@ def apply_station_intent(
         retained_operations = {
             key: operation
             for key, operation in pending_operations.items()
-            if operation.operation_kind != "request_human_takeover"
+            if operation.operation_kind
+            not in {
+                "request_human_takeover",
+                "start_composition_session",
+                "rearm_composition_session",
+                "stop_composition_session",
+            }
         }
         return _accepted_transition(
             state,
@@ -1029,7 +1193,13 @@ def apply_station_intent(
         retained_operations = {
             key: operation
             for key, operation in pending_operations.items()
-            if operation.operation_kind != "request_human_takeover"
+            if operation.operation_kind
+            not in {
+                "request_human_takeover",
+                "start_composition_session",
+                "rearm_composition_session",
+                "stop_composition_session",
+            }
         }
         return _accepted_transition(
             state,
@@ -1085,6 +1255,93 @@ def apply_station_operation_result(
         return rejected("operation_result_runtime_mismatch")
     if state.lifecycle_state == "stopped":
         return rejected("runtime_stopped")
+
+    if result.operation_kind in {
+        "start_composition_session",
+        "rearm_composition_session",
+        "stop_composition_session",
+    }:
+        matching = tuple(
+            (key, operation)
+            for key, operation in state.pending_operation_by_subject.items()
+            if operation.operation_kind == result.operation_kind
+            and operation.subject_id == result.subject_id
+        )
+        if len(matching) != 1:
+            return rejected("unknown_or_resolved_operation")
+        subject_key, pending = matching[0]
+        if pending.source_intent_id != result.source_intent_id:
+            return rejected("operation_result_binding_mismatch")
+        if (
+            result.subject_id not in state.source_state_by_slot
+            or pending.resource_binding_id
+            != manifest.execution_binding.binding_id
+            or state.target_state != pending.resource_prior_runtime_state
+            or state.source_state_by_slot[result.subject_id]
+            != pending.prior_runtime_state
+        ):
+            return rejected("composition_session_pending_state_changed")
+        if result.succeeded and not result.evidence_refs:
+            return rejected("operation_result_missing_control_evidence")
+        expected_status = (
+            COMPOSITION_SESSION_OPERATION_READY_STATUS_V1
+            if result.operation_kind == "start_composition_session"
+            else (
+                COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1
+                if result.operation_kind == "rearm_composition_session"
+                else COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1
+            )
+        )
+        if result.succeeded and result.status != expected_status:
+            return rejected("composition_session_result_status_invalid")
+        source_states = dict(state.source_state_by_slot)
+        source_states[result.subject_id] = (
+            pending.requested_runtime_state
+            if result.succeeded
+            else pending.prior_runtime_state
+        )
+        pending_operations = dict(state.pending_operation_by_subject)
+        pending_operations.pop(subject_key)
+        if result.operation_kind in {
+            "start_composition_session",
+            "rearm_composition_session",
+        }:
+            lifecycle = (
+                "running"
+                if result.succeeded
+                else (
+                    "hold"
+                    if result.status
+                    == COMPOSITION_SESSION_OPERATION_HELD_STATUS_V1
+                    else "fault"
+                )
+            )
+        else:
+            lifecycle = "hold" if result.succeeded else "fault"
+        next_state = ControlStationState(
+            runtime_session_id=state.runtime_session_id,
+            manifest_hash=state.manifest_hash,
+            control_domain_id=state.control_domain_id,
+            lifecycle_state=lifecycle,
+            state_revision=state.state_revision + 1,
+            source_state_by_slot=source_states,
+            target_state=state.target_state,
+            pending_operation_by_subject=pending_operations,
+            last_client_sequence_by_id=state.last_client_sequence_by_id,
+            operator_control_lease=state.operator_control_lease,
+            last_intent_id=state.last_intent_id,
+        )
+        return ControlStationOperationTransition(
+            result=result,
+            state_before=state,
+            state_after=next_state,
+            accepted=True,
+            status=(
+                "operation_succeeded"
+                if result.succeeded
+                else f"operation_failed:{result.status}"
+            ),
+        )
 
     if result.operation_kind == "request_human_takeover":
         if state.lifecycle_state in {"hold", "fault"}:
@@ -1263,6 +1520,10 @@ __all__ = [
     "HUMAN_TAKEOVER_OPERATION_FAULTED_STATUS_V1",
     "HUMAN_TAKEOVER_OPERATION_HELD_STATUS_V1",
     "HUMAN_TAKEOVER_OPERATION_READY_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_HELD_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_READY_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_REARMED_STATUS_V1",
+    "COMPOSITION_SESSION_OPERATION_STOPPED_STATUS_V1",
     "ControlStationState",
     "ControlStationOperationTransition",
     "ControlStationTransition",

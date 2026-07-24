@@ -19,10 +19,14 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as SciPyRotation
 
-from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from dataset_contracts.pose_frames import legacy_rm65_source_id, load_pose_frame_contract
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from dataset_contracts.gripper_force import GripperForceDatasetContract
+from dataset_contracts.stats import (
+    FORCE_COLLISION_LABEL_DETECTED,
+    has_force_limit_collision_text,
+)
 from dataset_interface.capture_modalities import bind_capture_modality_contract
 from dataset_interface.gripper_force import (
     bind_gripper_force_contract,
@@ -266,6 +270,12 @@ from ..real_teleop.actuator_command_trace import (
     ActuatorCommandTraceRecorder,
 )
 from ..real_teleop.fix_arm_collision_guard import fixed_arm_final_collision_fault
+from ..real_teleop.position_force_guard import (
+    POSITION_FORCE_SOURCES,
+    PositionForceGuardConfig,
+    PositionForceGuardFault,
+    PositionForceGuardMonitor,
+)
 from ..real_teleop import dataset_layout as real_teleop_dataset_layout
 from .log_utils import ChangeGate
 from .run_vive_sapien_virtual import (
@@ -3012,6 +3022,79 @@ def parse_args() -> argparse.Namespace:
         help="Required stillness/tare duration after runtime home before enabling impedance force control.",
     )
     parser.add_argument(
+        "--position-force-guard",
+        dest="position_force_guard",
+        action="store_true",
+        help=(
+            "Require the latched RM65 force/torque emergency-stop monitor in real "
+            "position mode. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-position-force-guard",
+        dest="position_force_guard",
+        action="store_false",
+        help=(
+            "Disable the real-position RM65 force emergency-stop monitor. "
+            "Unsafe; intended only for explicit diagnostics."
+        ),
+    )
+    parser.set_defaults(position_force_guard=True)
+    parser.add_argument(
+        "--position-force-guard-source",
+        choices=POSITION_FORCE_SOURCES,
+        default="tool",
+        help="RM65 force source used by the position emergency-stop monitor.",
+    )
+    parser.add_argument(
+        "--position-force-guard-max-force-n",
+        type=_positive_float,
+        default=15.0,
+        help="Position-mode bimanual emergency-stop threshold for force-vector norm.",
+    )
+    parser.add_argument(
+        "--position-force-guard-max-torque-nm",
+        type=_positive_float,
+        default=2.0,
+        help="Position-mode bimanual emergency-stop threshold for torque-vector norm.",
+    )
+    parser.add_argument(
+        "--position-force-guard-hz",
+        type=_positive_float,
+        default=20.0,
+        help=(
+            "Per-arm RM65 force polling rate. Must be <=20 Hz because the SDK "
+            "requires at least 50 ms between repeated force queries."
+        ),
+    )
+    parser.add_argument(
+        "--position-force-guard-consecutive-samples",
+        type=_positive_int,
+        default=1,
+        help="Consecutive over-limit samples required before the latched bimanual stop.",
+    )
+    parser.add_argument(
+        "--position-force-guard-max-read-errors",
+        type=_positive_int,
+        default=3,
+        help="Consecutive RM65 force-read errors allowed before fail-closed bimanual stop.",
+    )
+    parser.add_argument(
+        "--position-force-guard-stale-sec",
+        type=_positive_float,
+        default=0.25,
+        help="Maximum age of the latest valid force sample before fail-closed stop.",
+    )
+    parser.add_argument(
+        "--position-force-guard-startup-timeout-sec",
+        type=_positive_float,
+        default=2.0,
+        help=(
+            "Startup deadline for one valid force sample from every active arm; "
+            "failure stops both arms and aborts arming."
+        ),
+    )
+    parser.add_argument(
         "--strict-tool-profile",
         dest="strict_tool_profile",
         action="store_true",
@@ -5034,6 +5117,24 @@ def _q6_gripper_retargeter_for_side(
             input_max=float(policy["input_max"]),
             output_max=float(policy["max_action"]),
         )
+    )
+
+
+def _dmtac_command_contract_configured(
+    *,
+    gripper_input_source: str,
+    angle_trigger_source: object | None,
+) -> bool:
+    """Whether the configured input mode has a stable command contract.
+
+    Q6 is reconnectable, so its schema exists even when no serial device was
+    present during startup.  Angle-trigger uses the same registered scalar
+    command vocabulary; source startup failure makes its channel unavailable
+    but must not erase the writer schema either.
+    """
+
+    return bool(
+        str(gripper_input_source) in {"q6", "angle_trigger"}
     )
 
 
@@ -7097,6 +7198,10 @@ def _build_episode_metadata(
     )
     debug_episode_enabled = _debug_episode_recording_enabled(args)
     episode_root = _episode_root_dir(args, components) if debug_episode_enabled else None
+    position_force_guard_enabled = bool(
+        _arm_control_mode_arg(args) == "position"
+        and getattr(args, "position_force_guard", True)
+    )
     return {
         "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
         "start_reason": start_reason,
@@ -7107,6 +7212,15 @@ def _build_episode_metadata(
         "impedance_mode": _impedance_mode_arg(args),
         "strict_tool_profile": _strict_tool_profile_arg(args),
         "force_tare_sec": _force_tare_sec_arg(args),
+        "position_force_guard": {
+            "enabled": position_force_guard_enabled,
+            **_position_force_guard_config(args).to_dict(),
+            "fail_closed": position_force_guard_enabled,
+            "latched": position_force_guard_enabled,
+            "stop_scope": (
+                "bimanual" if position_force_guard_enabled else None
+            ),
+        },
         **_debug_timing_metadata(args),
         "arm_mode": "real",
         "active_sides": list(components.active_sides),
@@ -8873,6 +8987,7 @@ class RealTeleopDatasetRecorder:
         reason: str,
         step_index: int,
         last_state: str | None,
+        summary: Mapping[str, Any] | None = None,
         defer_finalize_start: bool = False,
         before_finalize: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> RealDatasetFinalizeTask | None:
@@ -8956,6 +9071,8 @@ class RealTeleopDatasetRecorder:
             frequency_status=frequency_status,
             pause_summary=pause_summary,
         )
+        if summary is not None:
+            task.summary.update(dict(summary))
         self.finalize_tasks.append(task)
         if not defer_finalize_start:
             self._start_finalize_task(task)
@@ -9975,7 +10092,15 @@ def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
         if mode == HAND_BACKEND_DMTAC_GRIPPER:
             dmtac_config = dmtac_configs.get(side)
             policy = gripper_policies_by_side.get(side, gripper_policy)
-            input_ready = hand_port if gripper_input_source == "q6" else angle_trigger_source is not None
+            # The command/measured-state contract must remain stable when Q6
+            # is absent at startup and connects later.  A missing Q6 channel
+            # makes live input invalid; it must not erase the configured
+            # ScalarToGripperRetargeter and make the dataset schema depend on
+            # device connection timing.
+            input_ready = _dmtac_command_contract_configured(
+                gripper_input_source=gripper_input_source,
+                angle_trigger_source=angle_trigger_source,
+            )
             if input_ready and dmtac_config is not None and bool(dmtac_config.connect_hardware):
                 hand_retargeters_by_side[side] = ScalarToGripperRetargeter(
                     ScalarToGripperRetargeterConfig(
@@ -11284,12 +11409,20 @@ def _emergency_stop_real_arms(
     *,
     reason: str,
     now: float | None = None,
-) -> None:
+    raise_on_failure: bool = False,
+) -> dict[str, str]:
     stop_time = time.time() if now is None else float(now)
-    for side in components.active_sides:
+
+    def stop_one(side: str) -> tuple[str, str | None]:
         backend = _command_backend_for_side(components, side)
         if backend is None:
-            continue
+            detail = "command backend unavailable"
+            _log(
+                "EmergencyStop",
+                f"{side}_arm stop failed reason={reason}: {detail}",
+                now=stop_time,
+            )
+            return side, detail
         stop = getattr(backend, "emergency_stop", None)
         label = f"{side}_arm"
         try:
@@ -11303,8 +11436,149 @@ def _emergency_stop_real_arms(
                 f"{label} stop failed reason={reason}: {type(exc).__name__}: {exc}",
                 now=stop_time,
             )
+            return side, f"{type(exc).__name__}: {exc}"
         else:
             _log("EmergencyStop", f"{label} stop requested reason={reason}", now=stop_time)
+            return side, None
+
+    active_sides = tuple(str(side) for side in components.active_sides)
+    results: list[tuple[str, str | None]]
+    if len(active_sides) <= 1:
+        results = [stop_one(side) for side in active_sides]
+    else:
+        # A force trip is bimanual by definition.  Do not wait for one
+        # controller's Arm_Stop response before requesting the other arm.
+        with ThreadPoolExecutor(
+            max_workers=len(active_sides),
+            thread_name_prefix="rm65_bimanual_emergency_stop",
+        ) as executor:
+            futures = [executor.submit(stop_one, side) for side in active_sides]
+            results = [future.result() for future in futures]
+    errors = {
+        side: detail
+        for side, detail in results
+        if detail is not None
+    }
+    if errors and raise_on_failure:
+        raise RuntimeError(
+            "bimanual emergency stop was not acknowledged by all active arms: "
+            + "; ".join(f"{side}={detail}" for side, detail in sorted(errors.items()))
+        )
+    return errors
+
+
+def _position_force_guard_config(
+    args: argparse.Namespace,
+) -> PositionForceGuardConfig:
+    return PositionForceGuardConfig(
+        source=str(getattr(args, "position_force_guard_source", "tool")),
+        max_force_n=float(
+            getattr(args, "position_force_guard_max_force_n", 15.0)
+        ),
+        max_torque_nm=float(
+            getattr(args, "position_force_guard_max_torque_nm", 2.0)
+        ),
+        poll_hz=float(getattr(args, "position_force_guard_hz", 20.0)),
+        consecutive_limit_samples=int(
+            getattr(args, "position_force_guard_consecutive_samples", 1)
+        ),
+        max_consecutive_read_errors=int(
+            getattr(args, "position_force_guard_max_read_errors", 3)
+        ),
+        stale_timeout_sec=float(
+            getattr(args, "position_force_guard_stale_sec", 0.25)
+        ),
+        startup_timeout_sec=float(
+            getattr(args, "position_force_guard_startup_timeout_sec", 2.0)
+        ),
+    )
+
+
+def _force_collision_recording_summary(
+    *,
+    source: str,
+    control_mode: str,
+    reason: str,
+    message: str,
+    side: str | None = None,
+    fault: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "detected": True,
+        "source": str(source),
+        "control_mode": str(control_mode),
+        "reason": str(reason),
+        "message": str(message),
+    }
+    if side:
+        event["side"] = str(side)
+    if fault is not None:
+        event["fault"] = dict(fault)
+    return {
+        "force_collision_detected": True,
+        "force_collision_label": FORCE_COLLISION_LABEL_DETECTED,
+        "force_collision_event": event,
+    }
+
+
+def _position_force_guard_collision_summary(
+    fault: PositionForceGuardFault | None,
+) -> dict[str, object]:
+    if fault is None or str(fault.reason) != "force_limit_exceeded":
+        return {}
+    fault_payload = fault.to_dict()
+    return _force_collision_recording_summary(
+        source="position_force_guard",
+        control_mode="position",
+        reason=str(fault.reason),
+        message=str(fault.message),
+        side=fault.side,
+        fault=fault_payload,
+    )
+
+
+def _force_guard_recording_stop_context(
+    fault: PositionForceGuardFault | None,
+    *,
+    fallback_end_reason: str,
+    fallback_summary: Mapping[str, object] | None = None,
+) -> tuple[str, dict[str, object]]:
+    """Bind an asynchronous force-guard trip before the episode closes."""
+
+    summary = dict(fallback_summary or {})
+    if fault is None:
+        return str(fallback_end_reason), summary
+    summary["reason"] = "position_force_guard"
+    summary["position_force_guard_fault"] = fault.to_dict()
+    summary.update(_position_force_guard_collision_summary(fault))
+    return "position_force_guard", summary
+
+
+def _exception_chain_messages(error: BaseException | None) -> tuple[str, ...]:
+    messages: list[str] = []
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return tuple(messages)
+
+
+def _terminal_force_collision_summary(
+    error: BaseException | None,
+    *,
+    control_mode: str,
+) -> dict[str, object]:
+    messages = _exception_chain_messages(error)
+    if not messages or not has_force_limit_collision_text(messages):
+        return {}
+    return _force_collision_recording_summary(
+        source="controller_hard_stop",
+        control_mode=control_mode,
+        reason="force_limit_exceeded",
+        message=" <- ".join(messages),
+    )
 
 
 def _handle_init_qpos_emergency_stop(
@@ -14994,11 +15268,13 @@ def main() -> None:
             message="输入与诊断组件已就绪",
         )
     startup_device_errors: dict[str, str] = {}
+    position_force_guard_monitor: PositionForceGuardMonitor | None = None
 
     def startup_device_label(key: str) -> str:
         return {
             "arm.left.qpos": "左臂状态反馈",
             "arm.right.qpos": "右臂状态反馈",
+            "arm.force_guard": "双臂位控受力急停",
             "hand.left": "左手 / 左夹爪",
             "hand.right": "右手 / 右夹爪",
             "rig.session": "遥操核心 Rig",
@@ -15109,6 +15385,149 @@ def main() -> None:
             )
             if control_ui is not None:
                 control_ui.append_message("Device", f"遥操核心连接失败：{detail}")
+        position_force_guard_requested = bool(
+            _arm_control_mode_arg(args) == "position"
+            and getattr(args, "position_force_guard", True)
+        )
+        if (
+            _arm_control_mode_arg(args) == "position"
+            and not position_force_guard_requested
+        ):
+            message = (
+                "WARNING: real-position RM65 force emergency-stop monitor is "
+                "disabled by --no-position-force-guard"
+            )
+            _log("PositionForceGuard", message)
+            if control_ui is not None:
+                control_ui.append_message("PositionForceGuard", message)
+        if session_started and position_force_guard_requested:
+            if startup_progress is not None:
+                startup_progress.begin(
+                    "arm.force_guard",
+                    label=startup_device_label("arm.force_guard"),
+                    message="正在验证双臂力传感器并启动锁存急停监控",
+                    requirement="motion_safety",
+                )
+            try:
+                state_backends = {
+                    "left": components.left_state_backend,
+                    "right": components.right_state_backend,
+                }
+                readers_by_side: dict[str, Callable[[], Mapping[str, Any]]] = {}
+                for side in components.active_sides:
+                    backend = state_backends.get(str(side))
+                    reader = getattr(backend, "read_force_data", None)
+                    if not callable(reader):
+                        raise RuntimeError(
+                            f"{side} RM65 state backend does not expose read_force_data"
+                        )
+                    readers_by_side[str(side)] = reader
+
+                def position_force_guard_stop(
+                    fault: PositionForceGuardFault,
+                ) -> None:
+                    # Latch process exit before entering the blocking vendor
+                    # stop calls.  If an SDK acknowledgement stalls, no later
+                    # control frame may still be admitted by the main loop.
+                    clutch_input.should_quit = True
+                    stop_error: Exception | None = None
+                    try:
+                        _emergency_stop_real_arms(
+                            components,
+                            reason=(
+                                "position_force_guard:"
+                                f"{fault.reason}:{fault.side or 'all'}"
+                            ),
+                            now=fault.wall_time_sec,
+                            raise_on_failure=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report after both requests.
+                        stop_error = exc
+                    _log(
+                        "PositionForceGuard",
+                        "TRIPPED; bimanual emergency stop is latched; "
+                        f"{fault.message}",
+                        now=fault.wall_time_sec,
+                    )
+                    if control_ui is not None:
+                        control_ui.append_message(
+                            "PositionForceGuard",
+                            "位控受力急停已触发，左右臂均已锁存停机；"
+                            "当前启动/遥操进程将退出，必须检查设备后重启。"
+                            f"\n{fault.message}",
+                        )
+                    if stop_error is not None:
+                        _log(
+                            "PositionForceGuard",
+                            "CRITICAL: force guard tripped but one or more Arm_Stop "
+                            f"requests failed: {type(stop_error).__name__}: {stop_error}",
+                            now=fault.wall_time_sec,
+                        )
+                        raise stop_error
+
+                position_force_guard_monitor = PositionForceGuardMonitor(
+                    readers_by_side=readers_by_side,
+                    emergency_stop=position_force_guard_stop,
+                    config=_position_force_guard_config(args),
+                )
+                force_guard_snapshot = position_force_guard_monitor.start(
+                    arm_stale_watchdog=False
+                )
+            except Exception as exc:
+                monitor_fault = (
+                    None
+                    if position_force_guard_monitor is None
+                    else position_force_guard_monitor.fault
+                )
+                if monitor_fault is None:
+                    # Configuration/setup failures happen before the monitor
+                    # can invoke its trip callback, but are still fail-closed.
+                    _emergency_stop_real_arms(
+                        components,
+                        reason="position_force_guard_setup_failed",
+                    )
+                    clutch_input.should_quit = True
+                if startup_progress is not None:
+                    startup_progress.fail(
+                        "arm.force_guard",
+                        f"{type(exc).__name__}: {exc}",
+                        message="位控受力急停未能安全就绪，拒绝启动遥操",
+                    )
+                # This safety component is always fail-closed, including
+                # capability-admission GUI mode.
+                raise
+            else:
+                readings = force_guard_snapshot.get("last_reading_by_side", {})
+                reading_text = []
+                if isinstance(readings, Mapping):
+                    for side in components.active_sides:
+                        reading = readings.get(side, {})
+                        if isinstance(reading, Mapping):
+                            reading_text.append(
+                                f"{side}=|F|{float(reading.get('force_norm_n', 0.0)):.2f}N/"
+                                f"|T|{float(reading.get('torque_norm_nm', 0.0)):.2f}Nm"
+                            )
+                config = position_force_guard_monitor.config
+                _log(
+                    "PositionForceGuard",
+                    "force_limits_armed=true stale_watchdog=deferred_until_camera_ready "
+                    "fail_closed=true latched=true stop_scope=bimanual "
+                    f"source={config.source} poll_hz={config.poll_hz:g} "
+                    f"max_force_n={config.max_force_n:g} "
+                    f"max_torque_nm={config.max_torque_nm:g} "
+                    f"consecutive={config.consecutive_limit_samples} "
+                    f"max_read_errors={config.max_consecutive_read_errors} "
+                    f"stale_sec={config.stale_timeout_sec:g} "
+                    + " ".join(reading_text),
+                )
+                if startup_progress is not None:
+                    startup_progress.succeed(
+                        "arm.force_guard",
+                        message=(
+                            "双臂受力阈值与读取错误急停已锁存；"
+                            "数据陈旧 watchdog 将在相机启动后取得新鲜样本再启用"
+                        ),
+                    )
         if session_started and components.human_shadow_frontend is not None:
             if startup_progress is not None:
                 startup_progress.begin(
@@ -15327,6 +15746,8 @@ def main() -> None:
             if components.right_hand_backend is not None:
                 configured_status_keys.add("hand.right")
             configured_status_keys.add("dataset.writer")
+            if position_force_guard_requested:
+                configured_status_keys.add("arm.force_guard")
             if bool(getattr(args, "foot_pad_requested", False)):
                 configured_status_keys.add("foot_pad")
             configured_status_keys.update(startup_device_errors)
@@ -15362,6 +15783,8 @@ def main() -> None:
             if components.right_hand_backend is not None:
                 status_keys.add("hand.right")
             status_keys.add("dataset.writer")
+            if position_force_guard_requested:
+                status_keys.add("arm.force_guard")
             if bool(getattr(args, "foot_pad_requested", False)):
                 status_keys.add("foot_pad")
             control_ui.publish(
@@ -15402,6 +15825,37 @@ def main() -> None:
 
         def retry_failed_devices() -> None:
             nonlocal dataset_recorder, foot_pad_input
+            recorder_busy = bool(
+                dataset_recorder is not None
+                and (
+                    bool(getattr(dataset_recorder, "is_recording", False))
+                    or bool(getattr(dataset_recorder, "finalizing", False))
+                )
+            )
+            if recorder_busy:
+                rejection_message = (
+                    "设备重连未执行：正式 dataset recorder 仍在录制或后台保存。"
+                )
+                _log("Device", rejection_message)
+                if control_ui is not None:
+                    control_ui.append_message("Device", rejection_message)
+                    control_ui.publish(
+                        active_controls=clutch_input._current_active_controls(),
+                        control_hint=rejection_message,
+                    )
+                publish_runtime_hardware_status()
+                return
+            admitted, rejection_message = clutch_input.device_retry_admission()
+            if not admitted:
+                _log("Device", rejection_message)
+                if control_ui is not None:
+                    control_ui.append_message("Device", rejection_message)
+                    control_ui.publish(
+                        active_controls=clutch_input._current_active_controls(),
+                        control_hint=rejection_message,
+                    )
+                publish_runtime_hardware_status()
+                return
             q6_retry_handled = False
             if (
                 str(getattr(components, "gripper_input_source", "") or "")
@@ -15413,8 +15867,7 @@ def main() -> None:
                     getattr(clutch_input, "_teleop_started", False)
                 ) and not clutch_input.hold_active()
                 if (
-                    recording_active()
-                    or episode_start_countdown_deadline is not None
+                    clutch_input._episode_busy()
                     or teleop_running
                 ):
                     q6_message = (
@@ -15553,6 +16006,48 @@ def main() -> None:
         )
         if clutch_input.should_quit:
             return
+        if position_force_guard_monitor is not None:
+            try:
+                force_guard_snapshot = (
+                    position_force_guard_monitor.arm_stale_watchdog()
+                )
+            except Exception as exc:
+                _log(
+                    "PositionForceGuard",
+                    "stale watchdog failed to arm after camera startup; "
+                    f"motion remains rejected: {type(exc).__name__}: {exc}",
+                )
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "PositionForceGuard",
+                        "相机启动后无法取得双侧新鲜力数据；"
+                        "已拒绝归位/遥操并锁存双臂停机。"
+                        f"\n{type(exc).__name__}: {exc}",
+                    )
+                raise
+            readings = force_guard_snapshot.get("last_reading_by_side", {})
+            reading_text: list[str] = []
+            if isinstance(readings, Mapping):
+                for side in components.active_sides:
+                    reading = readings.get(side, {})
+                    if isinstance(reading, Mapping):
+                        reading_text.append(
+                            f"{side}=|F|"
+                            f"{float(reading.get('force_norm_n', 0.0)):.2f}N/"
+                            f"|T|{float(reading.get('torque_norm_nm', 0.0)):.2f}Nm"
+                        )
+            _log(
+                "PositionForceGuard",
+                "stale_watchdog=armed_after_fresh_post_camera_samples "
+                "motion_admission=ready "
+                + " ".join(reading_text),
+            )
+            if control_ui is not None:
+                control_ui.append_message(
+                    "PositionForceGuard",
+                    "相机启动后双侧新鲜力数据已确认；"
+                    "位控受力与读取陈旧急停均已锁存就绪。",
+                )
         if camera_sources:
             _log(
                 "Camera",
@@ -17162,6 +17657,7 @@ def main() -> None:
                     reason=end_reason,
                     step_index=step_index,
                     last_state=episode_last_state,
+                    summary=summary,
                     # In force/impedance mode, launch finalization after the
                     # stop-request control frame has produced its final normal
                     # command. The worker remains asynchronous: recording
@@ -17603,7 +18099,12 @@ def main() -> None:
                 else:
                     open_camera_preview(loop_start)
             if clutch_input.consume_tactile_solving_enable_request():
-                if recording_active() or episode_start_countdown_deadline is not None:
+                if bool(getattr(clutch_input, "_hold_requested", False)):
+                    message = "Hold 正在生效，暂不重启触觉 worker；请在停臂完成后重试。"
+                    clutch_input.set_visualization_state(status=message)
+                    if control_ui is not None:
+                        control_ui.append_message("TactileSolve", message)
+                elif recording_active() or episode_start_countdown_deadline is not None:
                     message = "数采或开始倒计时期间不能切换触觉解算；请停止数采并进入 Hold。"
                     clutch_input.set_visualization_state(status=message)
                     if control_ui is not None:
@@ -17667,13 +18168,25 @@ def main() -> None:
                     emergency_stop_sent = True
                 cancel_recording_countdown(loop_start, reason="quit_requested")
                 if recording_active():
+                    force_guard_fault = (
+                        None
+                        if position_force_guard_monitor is None
+                        else position_force_guard_monitor.fault
+                    )
+                    recording_end_reason, recording_summary = (
+                        _force_guard_recording_stop_context(
+                            force_guard_fault,
+                            fallback_end_reason="quit_requested",
+                            fallback_summary={
+                                "last_step_index": step_index,
+                                "last_state": episode_last_state,
+                            },
+                        )
+                    )
                     stop_recording(
                         loop_start,
-                        end_reason="quit_requested",
-                        summary={
-                            "last_step_index": step_index,
-                            "last_state": episode_last_state,
-                        },
+                        end_reason=recording_end_reason,
+                        summary=recording_summary,
                     )
                 break
             if clutch_input.consume_hold_request():
@@ -17762,6 +18275,65 @@ def main() -> None:
                             + "；重新采集 runtime home 后恢复普通遥操。",
                         )
                 continue
+            fast_two_pedal_home, fast_two_pedal_fixed_side = (
+                clutch_input.consume_two_pedal_fast_home_target(now=time.time())
+            )
+            if fast_two_pedal_home:
+                if recording_active():
+                    pause_recording(
+                        loop_start,
+                        reason="two_pedal_fast_home_transition",
+                    )
+                _cancel_special_arm_modes_for_hold(
+                    components,
+                    now=loop_start,
+                    reason="two_pedal_fast_home_transition",
+                )
+                recovery_plan = None
+                try:
+                    _runtime_home_calibration(
+                        components,
+                        arm_mode="real",
+                        timeout_sec=clutch_input.two_pedal_fast_home_timeout_sec(),
+                        num_samples=1,
+                        progress_callback=clutch_input.publish_runtime_home_progress,
+                        require_stable=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    message = (
+                        "双踏板切换失败：1 秒内未获得稳定、同步的 runtime Home；"
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    components.session.hold_hardware(message)
+                    _disengage_position_backends_for_manual_interaction(
+                        components,
+                        now=loop_start,
+                        reason=message,
+                    )
+                    clutch_input.finish_two_pedal_fast_home(
+                        success=False,
+                        now=loop_start,
+                        message=message,
+                    )
+                    continue
+                _emit_home_alignment_logs(components)
+                # Preserve the requested single-arm target until the first
+                # fresh post-Home control frame has populated Fix snapshots.
+                clutch_input._two_pedal_transition_target_fixed_side = (
+                    fast_two_pedal_fixed_side
+                )
+                _arm_after_start_calibration(
+                    args,
+                    components,
+                    clutch_input,
+                    home_captured=True,
+                )
+                clutch_input.finish_two_pedal_fast_home(
+                    success=True,
+                    now=loop_start,
+                    message="双踏板快速 Home 已完成，正在无缝接入目标遥操状态。",
+                )
+                continue
             if clutch_input.consume_calibration_request():
                 if recording_active():
                     pause_recording(loop_start, reason="runtime_recalibration_requested")
@@ -17833,7 +18405,19 @@ def main() -> None:
                         status="error",
                         message="删除失败：Plus 整理旁路正在写入，请等待写入完成后重试。",
                     )
-                elif recording_active() or episode_start_countdown_deadline is not None or dataset_recorder.finalizing:
+                elif dataset_recorder is None:
+                    clutch_input.set_episode_finalize_state(
+                        status="error",
+                        message=(
+                            "删除失败：当前运行未启用正式 dataset collection；"
+                            "debug episode 不支持此删除入口。"
+                        ),
+                    )
+                elif (
+                    recording_active()
+                    or episode_start_countdown_deadline is not None
+                    or dataset_recorder.finalizing
+                ):
                     clutch_input.set_episode_finalize_state(
                         status="error",
                         message="删除失败：数采、开始倒计时或后台保存仍在进行，请等待空闲后重试。",
@@ -17994,6 +18578,35 @@ def main() -> None:
                 channels=raw_step_channels,
                 now=loop_start,
             )
+            post_home_fixed_side = (
+                clutch_input.consume_two_pedal_post_home_fixed_side()
+            )
+            if post_home_fixed_side is not None:
+                fix_controller = getattr(components, "fix_arm_controller", None)
+                transition = (
+                    fix_controller.select_side(post_home_fixed_side)
+                    if fix_controller is not None
+                    else None
+                )
+                if transition is not None and transition.ok:
+                    transition = fix_controller.freeze_selected(now=loop_start)
+                if transition is None or not transition.ok:
+                    message = (
+                        "双踏板切换失败：快速 Home 完成后无法建立目标 Fix 快照；"
+                        + (
+                            str(getattr(transition, "message", "fix controller unavailable"))
+                            if transition is not None
+                            else "fix controller unavailable"
+                        )
+                    )
+                    clutch_input.request_hold(reason="two_pedal_post_home_fix_failed")
+                    clutch_input.finish_two_pedal_fast_home(
+                        success=False,
+                        now=loop_start,
+                        message=message,
+                    )
+                    continue
+                clutch_input._clear_two_pedal_alert()
             if (
                 step_result.home_recalibration_required
                 and not clutch_input.hold_active()
@@ -18080,8 +18693,75 @@ def main() -> None:
                 command_status=gripper_command_status,
                 now=loop_start,
             )
+            fix_controller = getattr(components, "fix_arm_controller", None)
+            if (
+                fix_controller is not None
+                and clutch_input._two_pedal_mode_active()
+                and not bool(getattr(fix_controller, "recapturing", False))
+                and components.session.calibration is not None
+                and bool(getattr(fix_controller, "fixed_sides", ()) or ())
+            ):
+                # Keep fresh candidates for both trackers during single-arm
+                # control.  A newly fixed side can then be released again
+                # immediately without starting its cache from an empty dwell
+                # window.  Applying Home remains restricted to the side that
+                # the atomic transition is actually releasing.
+                for cache_side in tuple(
+                    getattr(fix_controller, "active_sides", ()) or ()
+                ):
+                    tracker_channel = raw_step_channels.get(
+                        f"{cache_side}_wrist_pose"
+                    )
+                    source_timestamp = float(
+                        getattr(tracker_channel, "timestamp", float("nan"))
+                    )
+                    if (
+                        tracker_channel is None
+                        or not bool(getattr(tracker_channel, "valid", False))
+                        or not np.isfinite(source_timestamp)
+                        or not -0.05 <= loop_start - source_timestamp <= 0.5
+                    ):
+                        if tracker_channel is None:
+                            unavailable_reason = "tracker_channel_missing"
+                        elif not bool(getattr(tracker_channel, "valid", False)):
+                            unavailable_reason = "tracker_channel_invalid"
+                        elif not np.isfinite(source_timestamp):
+                            unavailable_reason = "tracker_timestamp_invalid"
+                        else:
+                            unavailable_reason = (
+                                "tracker_sample_age_out_of_range:"
+                                f"{loop_start - source_timestamp:.3f}s"
+                            )
+                        fix_controller.note_two_pedal_home_unavailable(
+                            cache_side,
+                            reason=unavailable_reason,
+                            observed_at=loop_start,
+                        )
+                        continue
+                    try:
+                        cached_pose = _channel_pose_in_desk(
+                            tracker_channel,
+                            components.session.calibration,
+                        )
+                        fix_controller.observe_two_pedal_home_cache(
+                            cache_side,
+                            cached_pose,
+                            source_timestamp=source_timestamp,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        fix_controller.note_two_pedal_home_unavailable(
+                            cache_side,
+                            reason=f"tracker_pose_rejected:{type(exc).__name__}",
+                            observed_at=loop_start,
+                        )
+                        _log(
+                            "TwoPedal",
+                            "passive Home cache sample rejected: "
+                            f"{type(exc).__name__}: {exc}",
+                            now=loop_start,
+                        )
             fix_arm_progress = advance_fix_arm_home_capture(
-                controller=getattr(components, "fix_arm_controller", None),
+                controller=fix_controller,
                 channels=raw_step_channels,
                 calibration=components.session.calibration,
                 now=loop_start,
@@ -19059,8 +19739,26 @@ def main() -> None:
                 time.sleep(remaining)
     finally:
         shutdown_steps: list[tuple[str, Callable[[], None]]] = []
+        terminal_error = sys.exc_info()[1]
+        position_force_guard_fault = (
+            None
+            if position_force_guard_monitor is None
+            else position_force_guard_monitor.fault
+        )
+        force_collision_summary = _position_force_guard_collision_summary(
+            position_force_guard_fault
+        )
+        if not force_collision_summary:
+            force_collision_summary = _terminal_force_collision_summary(
+                terminal_error,
+                control_mode=_arm_control_mode_arg(args),
+            )
         if startup_progress is not None:
             shutdown_steps.append(("startup_progress", startup_progress.close))
+        if position_force_guard_monitor is not None:
+            shutdown_steps.append(
+                ("position_force_guard_monitor", position_force_guard_monitor.close)
+            )
         if "main_loop_watchdog" in locals():
             shutdown_steps.append(("main_loop_watchdog", main_loop_watchdog.stop))
         if "debug_timing_console_writer" in locals() and debug_timing_console_writer is not None:
@@ -19098,13 +19796,38 @@ def main() -> None:
                 )
             )
         if "recording_active" in locals() and recording_active():
+            recording_end_reason = (
+                "position_force_guard"
+                if position_force_guard_fault is not None
+                else (
+                    "force_collision"
+                    if force_collision_summary
+                    else "shutdown"
+                )
+            )
+            recording_summary: dict[str, object] = {
+                "reason": (
+                    "position_force_guard"
+                    if position_force_guard_fault is not None
+                    else (
+                        "force_collision"
+                        if force_collision_summary
+                        else "finally"
+                    )
+                )
+            }
+            if position_force_guard_fault is not None:
+                recording_summary["position_force_guard_fault"] = (
+                    position_force_guard_fault.to_dict()
+                )
+            recording_summary.update(force_collision_summary)
             shutdown_steps.append(
                 (
                     "active_recording",
                     lambda: stop_recording(
                         time.time(),
-                        end_reason="shutdown",
-                        summary={"reason": "finally"},
+                        end_reason=recording_end_reason,
+                        summary=recording_summary,
                     ),
                 )
             )

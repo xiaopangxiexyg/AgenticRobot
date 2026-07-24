@@ -55,6 +55,7 @@ from ..sources.pose import (
     VivePoseSource,
     ViveTrackerConfig,
 )
+from ..special_tasks.home_capture_stability import HomeCaptureStabilityState
 from ..tcp import legacy_tcp_mode_requested
 from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
 from .log_utils import ChangeGate, log_event
@@ -1580,6 +1581,7 @@ def _runtime_home_calibration(
     timeout_sec: float,
     num_samples: int,
     progress_callback=None,
+    require_stable: bool = False,
 ) -> None:
     calibration = components.session.calibration
     assert calibration is not None
@@ -1645,6 +1647,9 @@ def _runtime_home_calibration(
     calibration_timing_start = time.perf_counter()
     start_time = time.time()
     samples: dict[str, list[np.ndarray]] = {side: [] for side in active_sides}
+    stability_by_side = {
+        side: HomeCaptureStabilityState() for side in active_sides
+    }
     observed_channels: set[str] = set()
     sample_markers = sorted({1, max(1, num_samples // 2), num_samples})
     reported: dict[str, set[int]] = {side: set() for side in active_sides}
@@ -1727,7 +1732,20 @@ def _runtime_home_calibration(
                 )
                 observed_channels.add(channel.channel_name)
             if channel.valid and len(samples[side]) < num_samples:
-                samples[side].append(_channel_pose_in_desk(channel, calibration))
+                pose_desk = _channel_pose_in_desk(channel, calibration)
+                if require_stable:
+                    decision = stability_by_side[side].observe(
+                        pose_desk,
+                        source_timestamp=float(channel.timestamp),
+                        first_accepted_pose=(
+                            samples[side][0] if samples[side] else None
+                        ),
+                    )
+                    if decision.reset_samples:
+                        samples[side].clear()
+                    if not decision.accepted:
+                        continue
+                samples[side].append(pose_desk)
                 for marker in sample_markers:
                     if len(samples[side]) >= marker and marker not in reported[side]:
                         reported[side].add(marker)

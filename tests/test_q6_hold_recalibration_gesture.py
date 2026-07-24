@@ -288,9 +288,15 @@ class Q6HoldRecalibrationGestureTests(unittest.TestCase):
         control._poll_q6_hold_recalibration_gesture(now=3.01)
         self.assertFalse(control.consume_calibration_request())
 
+        control._tracker_side_check = {
+            "status": "correct",
+            "warning_required": False,
+            "message": "correct",
+        }
         _set_q6(source, closed, closed)
         control._poll_q6_hold_recalibration_gesture(now=4.0)
         control._poll_q6_hold_recalibration_gesture(now=5.01)
+        self.assertFalse(control._two_pedal_fast_home_requested)
         self.assertTrue(control.consume_calibration_request())
 
         control.publish_teleop_running()

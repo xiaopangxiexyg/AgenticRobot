@@ -550,6 +550,26 @@ adapter 必须从已加载模型实例导出 capability、request spec、artifac
 [`deployments/client/README.md`](deployments/client/README.md) 和
 [`todos/dexteleop_rtc_landing_plan.md`](todos/dexteleop_rtc_landing_plan.md)。
 
+对于无自定义 session/reconnect 生命周期且直接返回完整 chunk 的接口，优先使用
+`create_final_chunk_rtc_runtime_adapter()`：框架只提供 instance-derived `FinalChunkRtcBinding`、input preparation、
+blocking model call、精确 input hash、output mapping 和 canonical decoder；capability/request spec 必须由同一 binding
+派生一次。mapping response 的动作 key 必须显式且精确，未选择的诊断字段可忽略；连续与离散输出保持独立 typed matrix。
+需要自定义 session/metadata/reconnect 的 transport 继续直接实现 `RtcModelRuntimeAdapter`，不得为复用 helper 削弱生命周期校验。
+
+raw-RTC source 与 execution target 的兼容性使用
+`assess_policy_emission_target_compatibility()`做纯评估：必须复用既有 `TargetRuntimeActionContract`、
+`ActionComponentCatalog`和`ReferenceActivationSpec`，绑定 target clock、显式授权 component scope、coupled group、
+action space、pose frame/transform及 activation lead。legacy representation receipt 与 typed canonicalization receipt
+是两种不同 source proof；legacy pose frame fact 还必须携带独立 binding hash，不能由调用方只抄 target frame。
+两类 proof 均不等于 target safety、IK、reference acceptance 或 motion authority。assessment accepted 只允许进入
+后续 target preflight，不得直接 dispatch。
+
+通过 assessment 后可调用 `prepare_policy_emission_target_proposal()` 形成 target-neutral
+`ActionProposalDraft`。该 preparation 必须绑定 exact emission ID/hash、assessment、target contract、component catalog、
+activation spec、representation proof 和 producer identity；target 的 control domain/embodiment identity只能来自
+`TargetRuntimeActionContract`。它固定 `authority_request=none`，不写 ControlTrace，也不等于 proposal admission、
+target admission、safety receipt 或 dispatch。assessment rejected 时不得产生 proposal draft。
+
 RTC capability/negotiation 至少绑定：`capability_id`/`provider_id`/`artifact_hash`/`protocol_version`、scheduler modes、
 continuation mode、implementation id/`implementation_parameters_hash`、model action space 与 float/token dims、支持的 pose modes
 和 component scope、`action_codec_hash`/`frame_contract_hash`/`layout_hash`/`normalization_hash`、prediction/execution
@@ -597,6 +617,16 @@ server latency不得隐式改写这两个值，非RTC caller设置override必须
 详细接入见 [`deployments/vla_scratch/README.md`](deployments/vla_scratch/README.md)。
 
 ## 10. Compatibility matrix
+
+This matrix describes current model/deployment adapter profiles; it is not the
+topology contract of `control_composition`. At the mixed-source boundary an
+arm is always a Cartesian pose component. A robot's 6DoF, 7DoF, or other joint
+count is a downstream resolver/capability property, not a mixer dimension.
+Current left/right pose14 and per-side end-effector rules remain unchanged for
+compatibility. A future component-keyed carrier may support single arm and
+multiple end-effectors per arm only through a new versioned layout/adapter; it
+must not reinterpret an existing checkpoint or silently change v1/v2 tensor
+order.
 
 | 维度 | legacy v1 | v2 |
 | --- | --- | --- |

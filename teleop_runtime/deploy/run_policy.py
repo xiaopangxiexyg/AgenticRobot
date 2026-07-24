@@ -26,7 +26,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from cameras.configs import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.layout import episode_id_from_index
 from dataset_contracts.policy_artifact import policy_artifact_from_metadata
@@ -2322,6 +2322,23 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-wait-timeout-ms", type=int, default=1000)
     parser.add_argument("--camera-stale-after-sec", type=float, default=2.0)
     parser.add_argument("--camera-auto-exposure-priority", type=int, default=None)
+    parser.add_argument(
+        "--camera-startup-hardware-reset",
+        action="store_true",
+        help=(
+            "Reset each selected RealSense by serial before opening its stream. "
+            "Default-off so existing deployment profiles and camera configs are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--camera-start-stagger-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Delay between sequential RealSense starts. Camera-config insertion order "
+            "is preserved; the default 0 keeps the existing deploy behavior."
+        ),
+    )
     parser.add_argument("--require-camera-frame", action="store_true")
     parser.add_argument("--vis_cam", "--vis-cam", dest="vis_cam", action="store_true")
     parser.add_argument("--vis-cam-key", "--vis-camera-key", type=str, default="")
@@ -2788,6 +2805,8 @@ def validate_args(
             raise ValueError("--camera-wait-timeout-ms must be positive.")
         if float(args.camera_stale_after_sec) <= 0.0:
             raise ValueError("--camera-stale-after-sec must be positive.")
+        if float(args.camera_start_stagger_sec) < 0.0:
+            raise ValueError("--camera-start-stagger-sec must be >= 0.")
     elif bool(args.vis_cam):
         raise ValueError("--vis_cam requires --camera-mode single or --camera-mode multi.")
     return active_sides
@@ -3219,8 +3238,8 @@ def build_arm_backends(
                         "ik_resolver_local_step_max_position_worsen_m": 0.003,
                         "ik_resolver_local_step_max_orientation_worsen_deg": 0.5,
                         "ik_resolver_local_step_dynamic_worsen_enabled": False,
-                        "direct_joint_hint_max_linear_offset_m": 0.003,
-                        "direct_joint_hint_max_angular_offset_rad": 0.008726646259971648,
+                        "direct_joint_hint_max_linear_offset_m": 0.0,
+                        "direct_joint_hint_max_angular_offset_rad": 0.0,
                     },
                 )
             )
@@ -3396,6 +3415,9 @@ def build_camera_sources(
             wait_timeout_ms=int(args.camera_wait_timeout_ms),
             stale_after_sec=float(args.camera_stale_after_sec),
             auto_exposure_priority=args.camera_auto_exposure_priority,
+            startup_hardware_reset=bool(
+                getattr(args, "camera_startup_hardware_reset", False)
+            ),
             metadata={"source": "teleop_runtime_deploy_cli"},
         )
         if selected_camera_keys is not None and config.camera_key not in selected_camera_keys:
@@ -3416,11 +3438,41 @@ def build_camera_sources(
         camera_configs = {
             key: config for key, config in camera_configs.items() if key in selected
         }
+    if bool(getattr(args, "camera_startup_hardware_reset", False)):
+        for config in camera_configs.values():
+            config.startup_hardware_reset = True
     if args.camera_mode == "single" and len(camera_configs) != 1:
         raise ValueError(f"--camera-mode single expects exactly one camera config, got {len(camera_configs)}.")
     if args.camera_mode == "multi" and not camera_configs:
         raise ValueError("--camera-mode multi requires at least one camera config.")
     return {key: RealSenseRGBSource(config) for key, config in camera_configs.items()}
+
+
+def start_camera_sources(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+    *,
+    stagger_sec: float = 0.0,
+) -> None:
+    """Start selected cameras serially in config order, with optional staggering."""
+
+    delay_sec = float(stagger_sec)
+    if delay_sec < 0.0:
+        raise ValueError("camera start stagger_sec must be >= 0.")
+    for index, (camera_key, camera_source) in enumerate(camera_sources.items()):
+        if index > 0 and delay_sec > 0.0:
+            print(
+                f"[Camera] waiting {delay_sec:.2f}s before starting camera {camera_key}",
+                flush=True,
+            )
+            time.sleep(delay_sec)
+        config = camera_source.config
+        print(
+            "[Camera] starting "
+            f"camera={camera_key} serial={config.serial} "
+            f"startup_hardware_reset={bool(config.startup_hardware_reset)}",
+            flush=True,
+        )
+        camera_source.start()
 
 
 def select_preview_camera_sources(camera_sources: dict[str, RealSenseRGBSource], requested_key: str) -> dict[str, RealSenseRGBSource]:
@@ -4805,8 +4857,10 @@ def main(
                     print("[Camera] --vis_cam display preflight ok.")
                 else:
                     print(f"[Camera] preview disabled: {camera_previewer.disabled_reason}")
-        for camera_source in camera_sources.values():
-            camera_source.start()
+        start_camera_sources(
+            camera_sources,
+            stagger_sec=float(args.camera_start_stagger_sec),
+        )
         if rtc_frontend is not None:
             rtc_frontend.start()
             if str(args.rtc_profile) == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:

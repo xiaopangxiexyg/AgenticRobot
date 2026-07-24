@@ -55,10 +55,13 @@ frontend = build_rtc_model_shadow_frontend(adapter, ...)
 
 The returned object is the shared `SimpleRtcModelRuntimeAdapter`; no framework
 subclass, registry entry, worker, scheduler or plan implementation is added.
-The capability/request/response/timing boilerplate is also shared through
-`deployments.client.FinalChunkRtcBackend`; the vla-scratch-specific backend
-only validates its processed input, calls `infer()` and extracts the configured
-action key.
+The default integration uses
+`deployments.client.create_final_chunk_rtc_runtime_adapter`, which derives
+capability/request identity from one binding and creates the shared
+`FinalChunkRtcBackend`. The vla-scratch layer only validates its processed
+input, calls `infer()` and selects the configured action key. The named
+`VlaScratchFinalChunkRtcBackend` remains only as an import-compatible thin
+wrapper for existing callers.
 
 ## Required binding before a real model run
 
